@@ -1,0 +1,34 @@
+{
+  "name": "@hra-internal/test",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "packages/internal/test"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src"
+  },
+  "dependencies": {
+    "fast-check": "catalog:"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  }
+}

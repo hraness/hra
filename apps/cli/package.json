@@ -1,0 +1,46 @@
+{
+  "name": "@hraness/hra-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The versioned command-line client for HRA task operations.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "bin": {
+    "taskctl": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build --compile --minify --sourcemap=none src/index.ts --outfile dist/taskctl",
+    "release:build": "bun run scripts/release.ts build --out-dir release",
+    "release:verify": "bun run scripts/release.ts verify --release-dir release",
+    "release:smoke": "bun run scripts/release.ts smoke --release-dir release",
+    "lint": "eslint src tests scripts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src ./scripts",
+    "test:release": "bun test ./scripts",
+    "test:property": "bun test ./src/*.property.test.ts"
+  },
+  "dependencies": {
+    "@hraness/agent-tasks-protocol": "workspace:*",
+    "@hraness/hra-human-client": "workspace:*",
+    "@hra-internal/schema": "workspace:*"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/test": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "@types/node": "catalog:",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  }
+}

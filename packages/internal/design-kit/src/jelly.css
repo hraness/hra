@@ -1,0 +1,1386 @@
+/*
+ * HRA owns the semantic contract; the pinned Jelly runtime owns only the
+ * painted soft-body surface. These unlayered declarations intentionally win
+ * over Jelly's layered defaults while continuing to follow HRA themes.
+ */
+
+/*
+ * The pinned Jelly 1.0 canvas reads its radius custom properties with
+ * parseFloat(), so a rem value would silently become the same number of pixels
+ * (1.25rem -> 1.25px). Keep canvas-facing radius roles in CSS pixels; browser
+ * zoom still scales CSS pixels, and ordinary border-radius recipes may continue
+ * to use the semantic rem scale.
+ */
+:root {
+  --jelly-font-display: var(--font-text);
+  --jelly-font-text: var(--font-text);
+  --jelly-font-mono: var(--font-mono);
+  --jelly-color-background-default: var(--background);
+  --jelly-color-background-surface: var(--surface);
+  --jelly-color-background-muted: var(--surface-raised);
+  --jelly-color-background-neutral: var(--grid);
+  --jelly-color-background-neutral-emphasis: var(--foreground);
+  --jelly-color-background-white: var(--surface);
+  --jelly-color-background-rose: var(--danger);
+  --jelly-color-background-amber: var(--warning);
+  --jelly-color-background-azure: var(--foreground);
+  --jelly-color-background-mint: var(--success);
+  --jelly-color-background-accent: var(--foreground);
+  --jelly-color-foreground-default: var(--foreground);
+  --jelly-color-foreground-muted: var(--muted);
+  --jelly-color-foreground-on-emphasis: var(--background);
+  --jelly-color-foreground-on-neutral: var(--foreground);
+  --jelly-color-foreground-on-white: var(--foreground);
+  --jelly-color-foreground-on-accent: var(--background);
+  --jelly-color-border-default: var(--line);
+  --jelly-color-border-focus: var(--foreground);
+  --jelly-color-shadow: 32, 27, 25;
+  --jelly-ring: var(--foreground);
+  --jelly-ring-width: 2px;
+  --jelly-ring-gap: 3px;
+  --jelly-ring-color: color-mix(in oklch, var(--foreground) 74%, transparent);
+  --jelly-focus-ring: var(--focus);
+  --jelly-radius-compact: 8px;
+  --jelly-radius-control: 16px;
+  --jelly-radius-card: 20px;
+  --jelly-radius-overlay: 24px;
+  --jelly-shadow-raised: 0 18px 44px -28px rgb(32 27 25 / 42%);
+  --jelly-shadow-overlay: 0 24px 64px -28px rgb(32 27 25 / 52%);
+}
+
+:root[data-theme="dark"],
+[data-theme="dark"],
+.dark {
+  --jelly-color-shadow: 0, 0, 0;
+  --jelly-shadow-raised: 0 20px 48px -26px rgb(0 0 0 / 72%);
+  --jelly-shadow-overlay: 0 28px 72px -24px rgb(0 0 0 / 82%);
+}
+
+:root[data-theme="light"],
+[data-theme="light"] {
+  --jelly-color-shadow: 32, 27, 25;
+  --jelly-shadow-raised: 0 18px 44px -28px rgb(32 27 25 / 42%);
+  --jelly-shadow-overlay: 0 24px 64px -28px rgb(32 27 25 / 52%);
+}
+
+.jungle-jelly-surface {
+  --jelly-card-padding-block: 0;
+  --jelly-card-padding-inline: 0;
+  --jelly-card-font-size: inherit;
+  --jelly-radius: var(--jelly-radius-control);
+  --jelly-fill: var(--surface-raised);
+  --jelly-label: var(--foreground);
+  --jelly-color-border-default: transparent;
+
+  position: relative;
+  isolation: isolate;
+  box-sizing: border-box;
+  border-radius: var(--jelly-radius);
+  color: var(--jelly-label);
+  font: inherit;
+  vertical-align: middle;
+}
+
+.jungle-jelly-surface[data-tone="primary"] {
+  --jelly-fill: var(--foreground);
+  --jelly-label: var(--background);
+}
+
+.jungle-jelly-surface[data-tone="quiet"] {
+  --jelly-fill: color-mix(in oklch, var(--surface) 64%, transparent);
+  --jelly-label: var(--muted);
+}
+
+.jungle-jelly-surface[data-tone="danger"] {
+  --jelly-fill: var(--danger);
+  --jelly-label: var(--background);
+}
+
+.jungle-jelly-surface[data-tone="field"] {
+  --jelly-fill: var(
+    --jungle-field-surface-fill,
+    color-mix(in oklch, var(--surface-raised) 88%, var(--background))
+  );
+}
+
+.jungle-jelly-surface[data-tone="overlay"] {
+  --jelly-fill: var(--surface);
+  --jelly-radius: var(--jelly-radius-overlay);
+}
+
+.jungle-jelly-surface[data-hovered][data-tone="neutral"] {
+  --jelly-fill: var(--surface-hover);
+}
+
+.jungle-jelly-surface[data-hovered][data-tone="primary"] {
+  --jelly-fill: color-mix(in oklch, var(--foreground) 88%, var(--background));
+}
+
+.jungle-jelly-surface[data-hovered][data-tone="quiet"] {
+  --jelly-fill: color-mix(in oklch, var(--foreground) 9%, var(--background));
+  --jelly-label: var(--foreground);
+}
+
+.jungle-jelly-surface[data-hovered][data-tone="danger"] {
+  --jelly-fill: color-mix(in oklch, var(--danger) 86%, var(--background));
+}
+
+.jungle-jelly-surface:not(:defined) {
+  border: 0;
+  border-radius: var(--jelly-radius);
+  background: var(--jelly-fill);
+  box-shadow: var(--jelly-shadow-raised);
+}
+
+.jungle-jelly-surface:defined {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Jelly disables selection at every host; restore it on document-like surfaces. */
+jelly-card.jungle-jelly-surface[data-interaction="passive"],
+jelly-card.jungle-jelly-surface[data-interaction="field"] {
+  user-select: text;
+}
+
+.jungle-jelly-surface[data-disabled],
+.jungle-jelly-surface[data-pending] {
+  --jungle-disabled-foreground: color-mix(
+    in oklch,
+    var(--foreground) 78%,
+    var(--background)
+  );
+  --jelly-fill: color-mix(in oklch, var(--surface-raised) 86%, var(--background));
+  --jelly-label: var(--jungle-disabled-foreground);
+
+  cursor: not-allowed;
+}
+
+.jungle-pressable-card[data-pending] {
+  cursor: not-allowed;
+}
+
+/* Shared buttons retain React Aria semantics inside a Jelly-painted host. */
+jelly-card.jungle-button,
+jelly-card.jungle-icon-button {
+  display: inline-flex;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--jelly-radius);
+  background: transparent;
+  color: var(--jelly-label);
+  transform: none;
+}
+
+/* Legacy no-runtime recipes carry state selectors up to 0,3 specificity.
+ * Once Jelly upgrades, its canvas must remain the only host paint and motion
+ * layer through hover, selection, danger, disabled, and pressed states. */
+jelly-card.jungle-jelly-surface.jungle-button:defined,
+jelly-card.jungle-jelly-surface.jungle-icon-button:defined {
+  border-color: transparent;
+  background: transparent;
+  transform: none;
+}
+
+jelly-card.jungle-button {
+  --jelly-radius: var(--jelly-radius-control);
+}
+
+jelly-card.jungle-button[data-variant="danger"],
+jelly-card.jungle-button[data-variant="danger"][data-hovered] {
+  color: var(--jelly-label);
+}
+
+jelly-card.jungle-icon-button {
+  --jungle-icon-button-size: var(--interactive-target-min);
+  --jelly-radius: var(--radius-round);
+
+  width: var(--jungle-icon-button-size);
+  max-width: 4.5rem;
+  height: var(--jungle-icon-button-size);
+  max-height: 4.5rem;
+  flex: 0 0 var(--jungle-icon-button-size);
+}
+
+jelly-card.jungle-icon-button[data-size="compact"] {
+  --jungle-icon-button-size: var(--interactive-target-compact, 2.5rem);
+}
+
+jelly-card.jungle-icon-button[data-size="large"] {
+  --jungle-icon-button-size: var(--control-height-primary, 3.5rem);
+}
+
+jelly-card.jungle-icon-button.jungle-playback-transport__button {
+  --jungle-icon-button-size: var(--control-height-transport, 4rem);
+}
+
+/* Size recipes in components.css target the legacy one-node control. Keep the
+ * composed Jelly host box identical to its owned semantic control. */
+jelly-card.jungle-button[data-size],
+jelly-card.jungle-icon-button[data-size] {
+  min-height: 0;
+  padding: 0;
+}
+
+.jungle-button__control,
+.jungle-icon-button__control {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font-family: var(--font-text, var(--font-sans));
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  touch-action: manipulation;
+}
+
+.jungle-button__control {
+  --jungle-button-content-gap: var(--space-2);
+  --jungle-button-padding-inline: calc(var(--space-4) + var(--space-1));
+
+  width: 100%;
+  min-height: var(--interactive-target-min);
+  gap: var(--jungle-button-content-gap);
+  padding-inline: var(--jungle-button-padding-inline);
+  border-radius: var(--jelly-radius-control);
+  font-size: var(--text-control);
+}
+
+.jungle-button[data-label-style="glyph"] > .jungle-button__control {
+  font-family: var(--font-mono);
+  font-size: var(--text-control-glyph, 1.25rem);
+  font-weight: var(--font-weight-bold);
+}
+
+.jungle-button[data-glyph-only] > .jungle-button__control {
+  width: var(--jungle-glyph-control-size);
+  min-width: var(--jungle-glyph-control-size);
+  height: var(--jungle-glyph-control-size);
+  min-height: var(--jungle-glyph-control-size);
+  padding: 0;
+}
+
+.jungle-button__leading {
+  display: inline-grid;
+  width: var(--text-control-glyph, 1.25rem);
+  height: var(--text-control-glyph, 1.25rem);
+  flex: 0 0 var(--text-control-glyph, 1.25rem);
+  place-items: center;
+}
+
+.jungle-button__leading:empty {
+  display: none;
+}
+
+/*
+ * Pending-capable buttons keep one constant normal-flow layout in both states.
+ * The ready slot is empty and therefore unpainted, while the label is offset by
+ * half of the reserved glyph-plus-gap so its visible content stays centered.
+ * Revealing the spinner removes only that logical offset, never changing width.
+ */
+.jungle-button__control[data-pending-leading-empty]
+  > .jungle-button__leading:empty {
+  display: inline-grid;
+}
+
+.jungle-button__control[data-pending-leading-empty]
+  > .jungle-button__label {
+  position: relative;
+  inset-inline-start: calc(
+    (
+      var(--text-control-glyph, 1.25rem)
+      + var(--jungle-button-content-gap)
+    )
+    / -2
+  );
+}
+
+.jungle-button__label {
+  min-width: 0;
+}
+
+.jungle-button__spinner,
+.jungle-icon-button__spinner {
+  border-color: color-mix(in oklch, currentcolor 28%, transparent);
+  border-top-color: currentcolor;
+}
+
+:where(.jungle-button[data-size="compact"]) > .jungle-button__control {
+  --jungle-button-padding-inline: var(--space-3);
+
+  min-height: var(--interactive-target-compact, 2.5rem);
+  font-size: var(--text-label);
+}
+
+:where(.jungle-button[data-size="large"]) > .jungle-button__control {
+  --jungle-button-padding-inline: var(--space-6);
+
+  min-height: var(--control-height-primary);
+}
+
+jelly-card.jungle-toggle-button[data-icon-only] {
+  --jungle-icon-toggle-size: var(--interactive-target-min);
+
+  width: var(--jungle-icon-toggle-size);
+  height: var(--jungle-icon-toggle-size);
+  flex: 0 0 var(--jungle-icon-toggle-size);
+}
+
+jelly-card.jungle-toggle-button[data-icon-only][data-size="compact"] {
+  --jungle-icon-toggle-size: var(--interactive-target-compact, 2.5rem);
+}
+
+jelly-card.jungle-toggle-button[data-icon-only][data-size="large"] {
+  --jungle-icon-toggle-size: var(--control-height-primary, 3.5rem);
+}
+
+.jungle-toggle-button[data-icon-only] > .jungle-button__control {
+  width: var(--jungle-icon-toggle-size);
+  height: var(--jungle-icon-toggle-size);
+  min-height: var(--jungle-icon-toggle-size);
+  padding: 0;
+}
+
+.jungle-icon-button__control {
+  width: var(--jungle-icon-button-size);
+  max-width: 4.5rem;
+  height: var(--jungle-icon-button-size);
+  max-height: 4.5rem;
+  padding: 0;
+  border-radius: var(--radius-round);
+}
+
+:where(.jungle-icon-button[data-size="compact"]) > .jungle-icon-button__control {
+  width: var(--interactive-target-compact, 2.5rem);
+  height: var(--interactive-target-compact, 2.5rem);
+}
+
+:where(.jungle-icon-button[data-size="large"]) > .jungle-icon-button__control {
+  width: var(--control-height-primary, 3.5rem);
+  height: var(--control-height-primary, 3.5rem);
+}
+
+.jungle-playback-transport__button > .jungle-icon-button__control {
+  width: var(--control-height-transport, 4rem);
+  height: var(--control-height-transport, 4rem);
+}
+
+/*
+ * Split buttons are two real controls inside one clipped outer shape. The
+ * group owns size and tone so the menu segment cannot silently fall back to
+ * the icon button's quiet circular recipe.
+ */
+.jungle-split-button {
+  --jungle-split-button-height: var(--interactive-target-min);
+  --jungle-split-button-fill: var(--surface-raised);
+  --jungle-split-button-focus-ring: var(--jelly-focus-ring);
+
+  display: inline-flex;
+  height: var(--jungle-split-button-height);
+  min-width: 0;
+  align-items: stretch;
+  gap: 0;
+  overflow: clip;
+  border-radius: var(--radius-round);
+  background: var(--jungle-split-button-fill);
+  isolation: isolate;
+}
+
+.jungle-split-button[data-size="compact"] {
+  --jungle-split-button-height: var(--interactive-target-compact, 2.5rem);
+}
+
+.jungle-split-button[data-size="large"] {
+  --jungle-split-button-height: var(--control-height-primary, 3.5rem);
+}
+
+.jungle-split-button[data-variant="primary"] {
+  --jungle-split-button-fill: var(--foreground);
+  --jungle-split-button-focus-ring: var(--background);
+}
+
+.jungle-split-button[data-variant="quiet"] {
+  --jungle-split-button-fill: transparent;
+}
+
+.jungle-split-button[data-variant="danger"] {
+  --jungle-split-button-fill: var(--danger);
+  --jungle-split-button-focus-ring: var(--background);
+}
+
+.jungle-split-button > .jungle-jelly-surface {
+  /*
+   * Jelly treats numeric zero as its default radius. A one-pixel membrane
+   * keeps both canvases square before the parent clips one outer pill.
+   */
+  --jelly-radius: 1px;
+
+  position: relative;
+  height: var(--jungle-split-button-height);
+  flex: 0 0 auto;
+  border-radius: 1px;
+}
+
+.jungle-split-button > .jungle-jelly-surface:focus-within {
+  z-index: 1;
+}
+
+.jungle-split-button__primary > .jungle-button__control {
+  height: var(--jungle-split-button-height);
+  min-height: var(--jungle-split-button-height);
+}
+
+.jungle-split-button > .jungle-icon-button.jungle-split-button__menu {
+  --jungle-icon-button-size: var(--jungle-split-button-height);
+
+  width: var(--jungle-split-button-height);
+  height: var(--jungle-split-button-height);
+  flex-basis: var(--jungle-split-button-height);
+}
+
+.jungle-split-button__menu > .jungle-icon-button__control {
+  width: var(--jungle-split-button-height);
+  height: var(--jungle-split-button-height);
+  border-inline-start: 1px solid color-mix(in oklch, var(--jelly-label) 24%, transparent);
+  border-radius: 0;
+}
+
+.jungle-split-button
+  :is(.jungle-button__control, .jungle-icon-button__control):is(
+    [data-focus-visible],
+    :focus-visible
+  ) {
+  border-radius: 0;
+  outline: 2px solid var(--jungle-split-button-focus-ring);
+  outline-offset: -2px;
+  box-shadow: none;
+}
+
+.jungle-button__control:is([data-focus-visible], :focus-visible),
+.jungle-icon-button__control:is([data-focus-visible], :focus-visible) {
+  outline: 2px solid var(--jelly-focus-ring);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 1px var(--background);
+}
+
+.jungle-button__control[data-disabled],
+.jungle-button__control[data-pending],
+.jungle-icon-button__control[data-disabled],
+.jungle-icon-button__control[data-pending] {
+  cursor: not-allowed;
+}
+
+.jungle-button:has(> .jungle-toggle-button[data-selected]) {
+  --jelly-fill: var(--foreground);
+  --jelly-label: var(--background);
+}
+
+.jungle-button[data-variant="danger"]:has(> .jungle-toggle-button[data-selected]) {
+  --jelly-fill: var(--danger);
+  --jelly-label: var(--background);
+}
+
+/* React Aria owns selected state on the slotted control. Keep that semantic
+ * layer transparent so the host canvas remains visible in every variant. */
+.jungle-button__control.jungle-toggle-button[data-selected] {
+  border-color: transparent;
+  background: transparent;
+  color: inherit;
+}
+
+jelly-badge.jungle-badge {
+  --jelly-fill: var(--surface-raised);
+  --jelly-label: var(--foreground);
+
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--jelly-label);
+}
+
+jelly-badge.jungle-badge[data-tone="success"] {
+  --jelly-fill: var(--success);
+  --jelly-label: var(--background);
+  color: var(--jelly-label);
+}
+
+jelly-badge.jungle-badge[data-tone="warning"] {
+  --jelly-fill: var(--warning);
+  --jelly-label: var(--background);
+  color: var(--jelly-label);
+}
+
+jelly-badge.jungle-badge[data-tone="danger"] {
+  --jelly-fill: var(--danger);
+  --jelly-label: var(--background);
+  color: var(--jelly-label);
+}
+
+jelly-badge.jungle-badge::part(badge) {
+  gap: var(--space-1);
+  color: var(--jelly-label);
+}
+
+jelly-badge.jungle-badge:not(:defined) {
+  min-height: 1.25rem;
+  padding-inline: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-round);
+  background: var(--jelly-fill);
+  color: var(--jelly-label);
+}
+
+/* Fields keep native/RAC input behavior while the surrounding surface moves. */
+jelly-card.jungle-field__surface,
+jelly-card.jungle-search-field__control {
+  --jelly-radius: var(--jelly-radius-control);
+
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+jelly-card.jungle-field__surface::part(card) {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: inherit;
+  padding: 0;
+}
+
+jelly-card.jungle-search-field__control {
+  max-width: 100%;
+}
+
+/* Jelly Card's default slot does not preserve the semantic search row. Rebuild
+ * that row on the public part so the icon, input, and clear action share one
+ * padded painted surface after the custom element upgrades. */
+jelly-card.jungle-search-field__control::part(card) {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  min-height: inherit;
+  align-items: center;
+  gap: var(--space-2, 0.5rem);
+  padding-inline: max(0.75rem, var(--space-3, 0.75rem));
+}
+
+.jungle-search-field__control .jungle-search-field__input {
+  flex: 1 1 0;
+}
+
+/* Public field surface variants change the Jelly paint token rather than
+ * placing an opaque legacy rectangle over its canvas. */
+.jungle-field[data-surface="card"] > jelly-card.jungle-field__surface,
+.jungle-search-field[data-surface="card"] > jelly-card.jungle-search-field__control,
+.jungle-number-field[data-surface="card"] jelly-card.jungle-number-field__surface,
+.jungle-select-field[data-surface="card"] > jelly-card.jungle-select-field__surface {
+  --jungle-field-surface-fill: var(--surface);
+}
+
+.jungle-field[data-surface="pane"] > jelly-card.jungle-field__surface,
+.jungle-search-field[data-surface="pane"] > jelly-card.jungle-search-field__control,
+.jungle-number-field[data-surface="pane"] jelly-card.jungle-number-field__surface,
+.jungle-select-field[data-surface="pane"] > jelly-card.jungle-select-field__surface {
+  --jungle-field-surface-fill: var(--surface-hover);
+}
+
+jelly-card.jungle-field__surface:defined > .jungle-field__input,
+jelly-card.jungle-jelly-surface.jungle-search-field__control:defined {
+  border-color: transparent;
+  background: transparent;
+}
+
+jelly-card.jungle-number-field__surface {
+  --jelly-radius: var(--jelly-radius-control);
+
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: none;
+}
+
+jelly-card.jungle-number-field__surface::part(card) {
+  width: 100%;
+  height: 100%;
+}
+
+.jungle-field__surface .jungle-field__input,
+.jungle-search-field__control .jungle-search-field__input,
+.jungle-number-field__control .jungle-number-field__input {
+  border-color: transparent;
+  background: transparent;
+}
+
+.jungle-field:focus-within .jungle-field__surface,
+.jungle-search-field:focus-within .jungle-search-field__control,
+.jungle-number-field:focus-within .jungle-number-field__surface {
+  --jelly-fill: var(--surface);
+  --jelly-ring: var(--focus);
+
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.jungle-field__surface .jungle-field__input[data-focused] {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.jungle-field__surface:has([aria-invalid="true"]),
+.jungle-search-field__control:has([aria-invalid="true"]),
+.jungle-select-field__surface:has([aria-invalid="true"]),
+.jungle-file-field__surface:has([aria-invalid="true"]),
+.jungle-checkbox-field__surface:has([aria-invalid="true"]),
+.jungle-number-field[data-invalid] .jungle-number-field__surface {
+  --jelly-color-border-default: var(--danger);
+  --jelly-ring: var(--danger);
+
+  border-color: transparent;
+}
+
+.jungle-number-field[data-surface="card"] .jungle-number-field__surface {
+  background: transparent;
+}
+
+.jungle-number-field[data-surface="pane"] .jungle-number-field__surface {
+  background: transparent;
+}
+
+.jungle-field--multiline .jungle-field__surface {
+  min-height: 7.5rem;
+}
+
+.jungle-field--multiline .jungle-field__input {
+  display: block;
+}
+
+/* Rich RAC composites keep their interaction model on one Jelly surface. */
+jelly-card.jungle-segmented-control__surface,
+jelly-card.jungle-toggle-group__surface {
+  --jelly-radius: var(--jelly-radius-control);
+
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+}
+
+jelly-card.jungle-segmented-control__surface > .jungle-segmented-control {
+  margin: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+jelly-card.jungle-toggle-group__surface > .jungle-toggle-group {
+  margin: 0;
+  padding: var(--space-1);
+}
+
+jelly-card.jungle-tabs__surface {
+  --jelly-radius: var(--jelly-radius-control);
+
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+}
+
+.jungle-tabs__surface > .jungle-tabs__bar {
+  padding-inline: var(--space-1);
+  border-bottom-color: transparent;
+}
+
+jelly-card.jungle-menu__surface {
+  --jelly-radius: var(--jelly-radius-overlay);
+
+  display: block;
+  min-width: 100%;
+  max-width: 100%;
+  overflow: visible;
+  border: 0;
+  border-radius: var(--jelly-radius-overlay);
+  background: transparent;
+}
+
+.jungle-menu-popover {
+  overflow: visible;
+  overscroll-behavior: contain;
+  border: 0;
+  border-radius: var(--jelly-radius-overlay);
+  background: transparent;
+  box-shadow: none;
+}
+
+jelly-card.jungle-help-popover__surface {
+  --jelly-radius: var(--jelly-radius-overlay);
+
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible;
+  border: 0;
+  border-radius: var(--jelly-radius-overlay);
+  background: transparent;
+}
+
+.jungle-help-popover {
+  overflow: visible;
+  overscroll-behavior: contain;
+  border: 0;
+  border-radius: var(--jelly-radius-overlay);
+  background: transparent;
+  box-shadow: none;
+}
+
+.jungle-help-popover__surface > .jungle-help-popover__dialog {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+jelly-card.jungle-modal__surface {
+  --jungle-modal-max-width: 32rem;
+  --jelly-radius: var(--jelly-radius-overlay);
+
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: var(--jungle-modal-max-width);
+  justify-self: center;
+  overflow: clip;
+  overflow-clip-margin: var(--jungle-modal-edge-clearance);
+  border: 0;
+  border-radius: var(--jelly-radius-overlay);
+  background: transparent;
+}
+
+jelly-card.jungle-modal__surface[data-size="small"] {
+  --jungle-modal-max-width: 24rem;
+}
+
+jelly-card.jungle-modal__surface[data-size="large"] {
+  --jungle-modal-max-width: 48rem;
+}
+
+.jungle-modal__surface > .jungle-modal {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.jungle-modal__body .jungle-jelly-surface,
+.jungle-modal__footer .jungle-jelly-surface {
+  overflow: clip;
+  overflow-clip-margin: var(--jungle-modal-inset);
+}
+
+jelly-card.jungle-icon-button.jungle-modal__close {
+  position: relative;
+  z-index: 1;
+  align-self: start;
+}
+
+/* Reusable product surfaces and dense domain pressables. */
+jelly-card.jungle-card {
+  --jelly-card-padding-block: var(
+    --jungle-card-padding-block,
+    clamp(var(--space-4), 2vw, var(--space-6))
+  );
+  --jelly-card-padding-inline: var(
+    --jungle-card-padding-inline,
+    clamp(var(--space-4), 2vw, var(--space-6))
+  );
+  --jelly-radius: var(--jelly-radius-card);
+
+  display: block;
+}
+
+jelly-card.jungle-pressable-card {
+  --jelly-card-padding-block: 0;
+  --jelly-card-padding-inline: 0;
+  --jelly-radius: var(--jelly-radius-card);
+
+  display: block;
+}
+
+jelly-card.jungle-link-card {
+  --jelly-card-padding-block: 0;
+  --jelly-card-padding-inline: 0;
+  --jelly-radius: var(--jelly-radius-card);
+
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+jelly-card.jungle-card[data-shape="rectangular"],
+jelly-card.jungle-pressable-card[data-shape="rectangular"],
+jelly-card.jungle-link-card[data-shape="rectangular"],
+jelly-card.jungle-disclosure[data-shape="rectangular"] {
+  --jelly-radius: 1px;
+
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.jungle-link-card__control {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--interactive-target-min);
+  padding: var(
+    --jungle-card-padding,
+    clamp(var(--space-4), 2vw, var(--space-6))
+  );
+  border-radius: var(--jelly-radius-card);
+  outline: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.jungle-link-card[data-shape="rectangular"] .jungle-link-card__control,
+.jungle-pressable-card[data-shape="rectangular"] .jungle-pressable-card__control {
+  border-radius: 0;
+}
+
+jelly-card.jungle-icon-link {
+  --jungle-icon-button-size: var(--interactive-target-min);
+  --jelly-card-padding-block: 0;
+  --jelly-card-padding-inline: 0;
+  --jelly-radius: var(--radius-round);
+
+  display: inline-flex;
+  width: var(--jungle-icon-button-size);
+  max-width: 4.5rem;
+  height: var(--jungle-icon-button-size);
+  max-height: 4.5rem;
+  flex: 0 0 var(--jungle-icon-button-size);
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--jelly-label);
+  vertical-align: middle;
+}
+
+.jungle-icon-link__control {
+  display: inline-grid;
+  width: var(--jungle-icon-button-size);
+  max-width: 4.5rem;
+  height: var(--jungle-icon-button-size);
+  max-height: 4.5rem;
+  padding: 0;
+  place-items: center;
+  border-radius: var(--radius-round);
+  outline: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.jungle-icon-link[data-size="compact"] .jungle-icon-link__control {
+  --jungle-icon-button-size: var(--interactive-target-compact, 2.5rem);
+}
+
+jelly-card.jungle-icon-link[data-size="compact"] {
+  --jungle-icon-button-size: var(--interactive-target-compact, 2.5rem);
+}
+
+.jungle-icon-link[data-size="large"] .jungle-icon-link__control,
+jelly-card.jungle-icon-link[data-size="large"] {
+  --jungle-icon-button-size: var(--control-height-primary, 3.5rem);
+}
+
+.jungle-pressable-card__control {
+  display: block;
+  width: 100%;
+  min-height: var(--interactive-target-min);
+  padding: var(
+    --jungle-card-padding,
+    clamp(var(--space-4), 2vw, var(--space-6))
+  );
+  border: 0;
+  border-radius: var(--jelly-radius-card);
+  outline: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: inherit;
+}
+
+.jungle-pressable-card__control:is([data-focus-visible], :focus-visible),
+.jungle-link-card__control:is([data-focus-visible], :focus-visible),
+.jungle-icon-link__control:is([data-focus-visible], :focus-visible) {
+  outline: 2px solid var(--jelly-focus-ring);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 1px var(--background);
+}
+
+.jungle-pressable-card[data-shape="rectangular"]
+  .jungle-pressable-card__control:is([data-focus-visible], :focus-visible),
+.jungle-link-card[data-shape="rectangular"]
+  .jungle-link-card__control:is([data-focus-visible], :focus-visible) {
+  outline-offset: -2px;
+}
+
+.jungle-pressable {
+  font: inherit;
+  touch-action: manipulation;
+}
+
+.jungle-link-button__control {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+/* Native select, checkbox, and file controls fill Jelly API gaps. */
+.jungle-select-field,
+.jungle-file-field {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+  color: var(--foreground);
+}
+
+.jungle-select-field__label,
+.jungle-file-field__label {
+  font-size: var(--text-label);
+  font-weight: var(--font-weight-medium);
+}
+
+jelly-card.jungle-select-field__surface,
+jelly-card.jungle-file-field__surface {
+  --jelly-radius: var(--jelly-radius-control);
+
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.jungle-select-field__control,
+.jungle-file-field__input {
+  width: 100%;
+  min-width: 0;
+  min-height: var(--interactive-target-min);
+  border: 0;
+  border-radius: var(--jelly-radius-control);
+  outline: none;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+}
+
+.jungle-select-field[data-size="compact"] .jungle-select-field__control {
+  min-height: var(--interactive-target-compact, 2.5rem);
+}
+
+.jungle-select-field[data-size="large"] .jungle-select-field__control {
+  min-height: var(--control-height-primary, 3.5rem);
+  padding-inline: var(--space-4, 1rem) 3rem;
+}
+
+.jungle-select-field__surface[data-disabled] .jungle-select-field__control,
+.jungle-file-field__surface[data-disabled] .jungle-file-field__input {
+  -webkit-text-fill-color: currentColor;
+  color: var(--jungle-disabled-foreground);
+  opacity: 1;
+}
+
+.jungle-select-field__control {
+  appearance: none;
+  padding-inline: var(--space-3) 2.75rem;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 1.25rem) 50%,
+    calc(100% - 0.95rem) 50%;
+  background-repeat: no-repeat;
+  background-size: 0.35rem 0.35rem, 0.35rem 0.35rem;
+}
+
+.jungle-file-field__input {
+  padding: var(--space-2) var(--space-3);
+}
+
+.jungle-file-field__input::file-selector-button {
+  min-height: 2rem;
+  margin-inline-end: var(--space-3);
+  padding-inline: var(--space-3);
+  border: 0;
+  border-radius: calc(var(--jelly-radius-control) - var(--space-1));
+  background: var(--foreground);
+  color: var(--background);
+  cursor: pointer;
+  font: inherit;
+  font-weight: var(--font-weight-medium);
+}
+
+.jungle-select-field__control:focus-visible,
+.jungle-file-field__input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.jungle-select-field__description,
+.jungle-file-field__description,
+.jungle-checkbox-field__description {
+  color: var(--muted);
+  font-size: var(--text-caption);
+  line-height: 1.4;
+}
+
+.jungle-select-field__error {
+  color: var(--danger);
+  font-size: var(--text-caption);
+  line-height: 1.4;
+}
+
+.jungle-checkbox-field {
+  display: inline-grid;
+  min-height: var(--interactive-target-min);
+  align-content: center;
+  gap: var(--space-1);
+  color: var(--foreground);
+}
+
+.jungle-checkbox-field__control {
+  display: inline-flex;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--interactive-target-min);
+  align-items: center;
+  gap: var(--space-3);
+  cursor: pointer;
+}
+
+jelly-card.jungle-checkbox-field__surface {
+  --jelly-radius: var(--jelly-radius-compact);
+
+  position: relative;
+  display: inline-grid;
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  place-items: center;
+}
+
+/* The indicator is slotted into Jelly Card's shadow-owned `.card`, so host
+ * grid alignment cannot size or center it after the custom element upgrades.
+ * Make the public part own the 2rem semantic box and keep the slotted mark a
+ * real block instead of an inline line box that can grow to the text line-height. */
+jelly-card.jungle-checkbox-field__surface::part(card) {
+  box-sizing: border-box;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  place-items: center;
+}
+
+.jungle-checkbox-field__input {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: inherit;
+}
+
+.jungle-checkbox-field__indicator {
+  display: block;
+  width: 1rem;
+  height: 1rem;
+  border: 1px solid var(--control-border, var(--line));
+  border-radius: var(--radius-sm);
+  color: var(--jelly-label);
+}
+
+.jungle-checkbox-field__surface:has(.jungle-checkbox-field__input:checked) {
+  --jelly-fill: var(--foreground);
+  --jelly-label: var(--background);
+}
+
+.jungle-checkbox-field__surface[data-disabled]:has(.jungle-checkbox-field__input:checked) {
+  --jelly-fill: color-mix(in oklch, var(--surface-raised) 86%, var(--background));
+  --jelly-label: var(--muted);
+}
+
+.jungle-checkbox-field__input:checked + .jungle-checkbox-field__indicator::after {
+  display: block;
+  width: 0.52rem;
+  height: 0.28rem;
+  margin: 0.22rem auto 0;
+  border-bottom: 2px solid currentColor;
+  border-left: 2px solid currentColor;
+  content: "";
+  transform: rotate(-45deg);
+}
+
+.jungle-checkbox-field__surface:has(.jungle-checkbox-field__input:focus-visible) {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+}
+
+.jungle-checkbox-field:has(.jungle-checkbox-field__input:disabled) {
+  --jungle-disabled-foreground: color-mix(
+    in oklch,
+    var(--foreground) 78%,
+    var(--background)
+  );
+
+  color: var(--jungle-disabled-foreground);
+  cursor: not-allowed;
+}
+
+.jungle-checkbox-field:has(.jungle-checkbox-field__input:disabled)
+  .jungle-checkbox-field__control {
+  cursor: not-allowed;
+}
+
+.jungle-checkbox-field__label {
+  font-weight: var(--font-weight-medium);
+}
+
+.jungle-checkbox-field__copy {
+  display: grid;
+  min-width: 0;
+  align-self: center;
+  gap: var(--space-1);
+}
+
+/* Native details/summary owns semantics; Jelly supplies only the painted surface.
+ * Product disclosures may anchor demand-driven popovers outside their expanded
+ * content box. Jelly paints the rounded surface itself, so host clipping is
+ * unnecessary and would truncate those overlays. The summary and content own
+ * the insets; host padding would become blank painted canvas space. */
+jelly-card.jungle-disclosure {
+  --jelly-radius: var(--jelly-radius-card);
+
+  display: block;
+  overflow: visible;
+  border: 0;
+  border-radius: var(--jelly-radius-card);
+  padding: 0;
+}
+
+:where(jelly-card.jungle-disclosure[data-size="compact"]) {
+  --jungle-disclosure-header-font-size: var(--text-label);
+  --jungle-disclosure-padding-block: var(--space-2);
+  --jungle-disclosure-padding-inline: var(--space-3);
+}
+
+:where(jelly-card.jungle-disclosure[data-size="default"]) {
+  --jungle-disclosure-header-font-size: inherit;
+  --jungle-disclosure-padding-block: var(--space-4);
+  --jungle-disclosure-padding-inline: var(--space-4);
+}
+
+:where(jelly-card.jungle-disclosure[data-size="large"]) {
+  --jungle-disclosure-header-font-size: var(--text-control);
+  --jungle-disclosure-padding-block: var(--space-4);
+  --jungle-disclosure-padding-inline: var(--space-6);
+}
+
+.jungle-disclosure__details {
+  display: block;
+}
+
+.jungle-disclosure__summary {
+  display: flex;
+  min-height: var(--interactive-target-min);
+  align-items: center;
+  gap: var(--space-3);
+  padding-block: var(--jungle-disclosure-padding-block, var(--space-4));
+  padding-inline: var(--jungle-disclosure-padding-inline, var(--space-4));
+  color: var(--muted);
+  cursor: pointer;
+  font-size: var(--jungle-disclosure-header-font-size, inherit);
+  font-weight: var(--font-weight-medium);
+  list-style: none;
+  user-select: none;
+}
+
+.jungle-disclosure[data-size="compact"] .jungle-disclosure__summary {
+  min-height: var(--interactive-target-compact, 2.5rem);
+}
+
+.jungle-disclosure[data-size="default"] .jungle-disclosure__summary {
+  min-height: var(--interactive-target-min, 3rem);
+}
+
+.jungle-disclosure[data-size="large"] .jungle-disclosure__summary {
+  min-height: var(--control-height-primary, 3.5rem);
+}
+
+.jungle-disclosure__summary::-webkit-details-marker {
+  display: none;
+}
+
+.jungle-disclosure__summary::after {
+  width: 0.48rem;
+  height: 0.48rem;
+  flex: 0 0 auto;
+  margin-left: auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: rotate(45deg) translate(-0.1rem, 0.1rem);
+  transition: transform 120ms ease;
+}
+
+.jungle-disclosure__details[open] > .jungle-disclosure__summary::after {
+  transform: rotate(225deg) translate(-0.05rem, -0.05rem);
+}
+
+.jungle-disclosure__summary:hover,
+.jungle-disclosure__summary:focus-visible,
+.jungle-disclosure__details[open] > .jungle-disclosure__summary {
+  color: var(--foreground);
+}
+
+.jungle-disclosure__summary:focus-visible {
+  outline: 2px solid var(--jelly-focus-ring);
+  outline-offset: 2px;
+}
+
+.jungle-disclosure[data-shape="rectangular"]
+  .jungle-disclosure__summary:focus-visible {
+  outline-offset: -2px;
+}
+
+.jungle-disclosure__title {
+  min-width: 0;
+  color: inherit;
+}
+
+.jungle-disclosure__content {
+  padding: 0 var(--jungle-disclosure-padding-inline, var(--space-4))
+    var(--jungle-disclosure-padding-block, var(--space-4));
+  user-select: text;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jungle-disclosure__summary::after {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  jelly-badge.jungle-badge {
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  jelly-badge.jungle-badge::part(badge) {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .jungle-jelly-surface:not(:defined) {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .jungle-jelly-surface:defined {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  /* The hydrated button recipes above deliberately make the host transparent
+   * so Jelly's canvas is the only normal-color paint. High-contrast mode hides
+   * that canvas, so this selector must match their specificity and restore a
+   * native system-color boundary on both text and icon actions. */
+  jelly-card.jungle-jelly-surface.jungle-button:defined,
+  jelly-card.jungle-jelly-surface.jungle-icon-button:defined {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .jungle-split-button {
+    position: relative;
+    background: Canvas;
+    box-shadow: none;
+    forced-color-adjust: auto;
+  }
+
+  /* Forced-colors UAs may suppress box shadows. Paint one non-layout-affecting
+   * system-color perimeter on the joined pill and leave exactly one internal
+   * seam between its independently focusable targets. */
+  .jungle-split-button::after {
+    position: absolute;
+    z-index: 2;
+    inset: 0;
+    border: 1px solid CanvasText;
+    border-radius: inherit;
+    content: "";
+    forced-color-adjust: auto;
+    pointer-events: none;
+  }
+
+  .jungle-split-button
+    > jelly-card.jungle-jelly-surface:is(.jungle-button, .jungle-icon-button):defined {
+    border: 0;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+
+  .jungle-split-button__menu > .jungle-icon-button__control {
+    border-inline-start: 1px solid CanvasText;
+  }
+
+  .jungle-jelly-surface:defined::part(jelly) {
+    display: none;
+  }
+
+  .jungle-button__control[data-focus-visible],
+  .jungle-icon-button__control[data-focus-visible],
+  .jungle-link-card__control[data-focus-visible],
+  .jungle-icon-link__control[data-focus-visible] {
+    outline-color: Highlight;
+  }
+}

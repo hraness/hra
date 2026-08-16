@@ -1,0 +1,8 @@
+{
+  "extends": "@hra-internal/typescript-config/base.json",
+  "compilerOptions": {
+    "lib": ["DOM", "ES2023"],
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,901 @@
+const std = @import("std");
+
+const PlatformOption = enum {
+    auto,
+    null,
+    macos,
+    linux,
+    windows,
+};
+
+const TraceOption = enum {
+    off,
+    events,
+    runtime,
+    all,
+};
+
+const WebEngineOption = enum {
+    system,
+    chromium,
+};
+
+const WebLayerOption = enum {
+    auto,
+    include,
+    exclude,
+};
+
+const PackageTarget = enum {
+    macos,
+    windows,
+    linux,
+};
+
+const default_native_sdk_path = "node_modules/@native-sdk/cli";
+// Opaque signed executable identity retained for the in-place 0.1.7 bridge.
+const app_exe_name = "oprte";
+// Sparkle must replace the existing installation in place during the first
+// HRA bridge. A second `HRA.app` bundle would create two update authorities.
+const legacy_install_bundle_name = "OPRTE";
+
+pub fn build(b: *std.Build) void {
+    const target = nativeSdkTarget(b);
+    // -Doptimize is registered by hand (not the std helper) so the
+    // graph can tell "unset" from "explicit": run defaults to Debug,
+    // while `zig build package` wraps its own release-shaped executable.
+    // An explicit -Doptimize (or --release) pins both roles.
+    const optimize_request = b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size");
+    const optimize = optimizeMode(b, optimize_request, .Debug);
+    const package_optimize = optimizeMode(b, optimize_request, .ReleaseFast);
+    const platform_option = b.option(PlatformOption, "platform", "Desktop backend: auto, null, macos, linux, windows") orelse .auto;
+    const trace_option = b.option(TraceOption, "trace", "Trace output: off, events, runtime, all") orelse .events;
+    const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay output") orelse false;
+    const automation_enabled = b.option(bool, "automation", "Enable Native SDK automation artifacts") orelse false;
+    const js_bridge_enabled = b.option(bool, "js-bridge", "Enable optional JavaScript bridge stubs") orelse false;
+    const web_engine_override = b.option(WebEngineOption, "web-engine", "Override app.zon web engine: system, chromium");
+    const web_layer_override = b.option(WebLayerOption, "web-layer", "Override app.zon webview_layer: auto, include, exclude");
+    const cef_dir_override = b.option([]const u8, "cef-dir", "Override CEF root directory for Chromium builds");
+    const cef_auto_install_override = b.option(bool, "cef-auto-install", "Override app.zon CEF auto-install setting");
+    const package_target = b.option(PackageTarget, "package-target", "Package target: macos, windows, linux") orelse .macos;
+    const native_sdk_path = b.option([]const u8, "native-sdk-path", "Path to the Native SDK framework checkout") orelse default_native_sdk_path;
+    const package_optimize_name = @tagName(package_optimize);
+    const selected_platform: PlatformOption = switch (platform_option) {
+        .auto => if (target.result.os.tag == .macos) .macos else if (target.result.os.tag == .linux) .linux else if (target.result.os.tag == .windows) .windows else .null,
+        else => platform_option,
+    };
+    if (selected_platform == .macos and target.result.os.tag != .macos) {
+        @panic("-Dplatform=macos requires a macOS target");
+    }
+    if (selected_platform == .macos and target.result.cpu.arch != .aarch64) {
+        @panic("HRA currently packages pinned Apple Silicon runtimes and requires a macOS arm64 target");
+    }
+    if (selected_platform == .linux and target.result.os.tag != .linux) {
+        @panic("-Dplatform=linux requires a Linux target");
+    }
+    if (selected_platform == .windows and target.result.os.tag != .windows) {
+        @panic("-Dplatform=windows requires a Windows target");
+    }
+    const app_config = appManifestBuildConfig(b);
+    const web_engine = web_engine_override orelse app_config.web_engine;
+    const cef_dir = cef_dir_override orelse defaultCefDir(selected_platform, app_config.cef_dir);
+    const cef_auto_install = cef_auto_install_override orelse app_config.cef_auto_install;
+    if (web_engine == .chromium and selected_platform != .macos) {
+        @panic("-Dweb-engine=chromium currently requires -Dplatform=macos");
+    }
+    const web_layer = resolveWebLayer(app_config, web_engine, web_layer_override);
+
+    const native_sdk_mod = nativeSdkModule(b, target, optimize, native_sdk_path);
+    const options = b.addOptions();
+    options.addOption([]const u8, "platform", switch (selected_platform) {
+        .auto => unreachable,
+        .null => "null",
+        .macos => "macos",
+        .linux => "linux",
+        .windows => "windows",
+    });
+    options.addOption([]const u8, "trace", @tagName(trace_option));
+    options.addOption([]const u8, "web_engine", @tagName(web_engine));
+    options.addOption(bool, "debug_overlay", debug_overlay);
+    options.addOption(bool, "automation", automation_enabled);
+    options.addOption(bool, "js_bridge", js_bridge_enabled);
+    options.addOption(bool, "web_layer", web_layer);
+    const options_mod = options.createModule();
+
+    const runner_mod = localModule(b, target, optimize, "src/runner.zig");
+    runner_mod.addImport("native_sdk", native_sdk_mod);
+    runner_mod.addImport("build_options", options_mod);
+    runner_mod.addImport("app_manifest_zon", b.createModule(.{ .root_source_file = b.path("app.zon") }));
+
+    const app_mod = localModule(b, target, optimize, "src/main.zig");
+    app_mod.addImport("native_sdk", native_sdk_mod);
+    app_mod.addImport("runner", runner_mod);
+    app_mod.addImport("build_options", options_mod);
+    const exe = b.addExecutable(.{
+        .name = app_exe_name,
+        .root_module = app_mod,
+    });
+    // Windows subsystem posture (mirrors the Native SDK build graph):
+    // release-shaped exes are GUI-subsystem so the app never flashes a
+    // console behind its window; Debug keeps the console for dev logs.
+    // Redirected logging still works on GUI exes - only console
+    // AUTO-allocation is subsystem-gated.
+    if (target.result.os.tag == .windows and optimize != .Debug) {
+        exe.subsystem = .windows;
+    }
+    linkPlatform(b, target, app_mod, exe, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
+    b.installArtifact(exe);
+
+    const data_remover = if (selected_platform == .macos) helper: {
+        const helper_mod = localModule(
+            b,
+            target,
+            package_optimize,
+            "src/data_remover.zig",
+        );
+        const built = b.addExecutable(.{
+            .name = "oprte-data-remover",
+            .root_module = helper_mod,
+        });
+        break :helper built;
+    } else null;
+
+    const git_executor = if (selected_platform == .macos) helper: {
+        const helper_mod = localModule(
+            b,
+            target,
+            package_optimize,
+            "src/git_executor.zig",
+        );
+        helper_mod.link_libc = true;
+        const built = b.addExecutable(.{
+            .name = "oprte-git-executor",
+            .root_module = helper_mod,
+        });
+        break :helper built;
+    } else null;
+
+    const keychain_custodian = if (selected_platform == .macos) helper: {
+        break :helper addKeychainCustodian(
+            b,
+            target,
+            package_optimize,
+        );
+    } else null;
+
+    // The package assembler copies these helpers from zig-out/bin. Merely
+    // depending on the compile step produces a cache artifact, not that stable
+    // install path, so retain the explicit install steps and join them into
+    // both `zig build install` and `zig build package` below.
+    const data_remover_install = if (data_remover) |helper|
+        b.addInstallArtifact(helper, .{})
+    else
+        null;
+    const git_executor_install = if (git_executor) |helper|
+        b.addInstallArtifact(helper, .{})
+    else
+        null;
+    const keychain_custodian_install = if (keychain_custodian) |helper|
+        b.addInstallArtifact(helper, .{})
+    else
+        null;
+    if (data_remover_install) |install| {
+        b.getInstallStep().dependOn(&install.step);
+    }
+    if (git_executor_install) |install| {
+        b.getInstallStep().dependOn(&install.step);
+    }
+    if (keychain_custodian_install) |install| {
+        b.getInstallStep().dependOn(&install.step);
+    }
+
+    const frontend_build = b.addSystemCommand(&.{ "bun", "run", "build:frontend" });
+    const frontend_step = b.step("frontend-build", "Build the frontend");
+    frontend_step.dependOn(&frontend_build.step);
+
+    const run = b.addRunArtifact(exe);
+    run.step.dependOn(&frontend_build.step);
+    addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
+    addWebView2RuntimeRunFiles(b, target, run, web_engine, web_layer, native_sdk_path);
+    const run_step = b.step("run", "Run the app");
+    run_step.dependOn(&run.step);
+
+    // `zig build package` wraps its own exe: release-shaped by default
+    // (ReleaseFast, GUI subsystem on Windows) so the packaged artifact
+    // is never a Debug console binary just because the dev loop
+    // defaults to Debug. When -Doptimize/--release pinned one mode for
+    // everything, the roles agree and the dev exe is reused as-is.
+    const package_exe = if (package_optimize == optimize) exe else pkg: {
+        const package_sdk_mod = nativeSdkModule(b, target, package_optimize, native_sdk_path);
+        const package_runner_mod = localModule(b, target, package_optimize, "src/runner.zig");
+        package_runner_mod.addImport("native_sdk", package_sdk_mod);
+        package_runner_mod.addImport("build_options", options_mod);
+        package_runner_mod.addImport("app_manifest_zon", b.createModule(.{ .root_source_file = b.path("app.zon") }));
+        const package_app_mod = localModule(b, target, package_optimize, "src/main.zig");
+        package_app_mod.addImport("native_sdk", package_sdk_mod);
+        package_app_mod.addImport("runner", package_runner_mod);
+        package_app_mod.addImport("build_options", options_mod);
+        const built = b.addExecutable(.{
+            .name = app_exe_name,
+            .root_module = package_app_mod,
+        });
+        // Same subsystem posture as the dev exe above, keyed on this
+        // exe's own mode: release-shaped Windows exes are GUI-subsystem.
+        if (target.result.os.tag == .windows and package_optimize != .Debug) {
+            built.subsystem = .windows;
+        }
+        linkPlatform(b, target, package_app_mod, built, selected_platform, web_engine, web_layer, native_sdk_path, cef_dir, cef_auto_install);
+        break :pkg built;
+    };
+
+    const package_output_path = b.fmt(
+        "zig-out/package/{s}-{s}-{s}-{s}{s}",
+        .{
+            legacy_install_bundle_name,
+            app_config.version,
+            @tagName(package_target),
+            package_optimize_name,
+            packageSuffix(package_target),
+        },
+    );
+    const packaged_frontend_path = switch (package_target) {
+        .macos => b.fmt("{s}/Contents/Resources/frontend/dist", .{package_output_path}),
+        .windows, .linux => b.fmt("{s}/resources/frontend/dist", .{package_output_path}),
+    };
+    // macOS packaging gets a separate, ephemeral Vite manifest. The
+    // product-owned preflight proves every emitted chunk is reachable,
+    // removes only that proof, and clears only the exact .app target before
+    // Native copies assets. This chain prevents both stale source chunks and
+    // stale package files from surviving a release-shaped build.
+    const prepare_macos_package = if (package_target == .macos) prepare: {
+        const vite = b.addSystemCommand(&.{
+            "bunx",
+            "--no-install",
+            "vite",
+            "build",
+            "--config",
+            "frontend/vite.config.ts",
+            "--manifest",
+        });
+        const direct_boundary = b.addSystemCommand(&.{ "bun", "run", "check:direct-boundary" });
+        direct_boundary.step.dependOn(&vite.step);
+        const command = b.addSystemCommand(&.{
+            "bun",
+            "run",
+            "runtime/prepare-package-output.ts",
+            "--source",
+            "frontend/dist",
+            "--app-bundle",
+            package_output_path,
+        });
+        command.step.dependOn(&direct_boundary.step);
+        break :prepare command;
+    } else null;
+
+    const package = b.addSystemCommand(&.{
+        "bunx",
+        "--no-install",
+        "native",
+        "package",
+        "--target",
+        @tagName(package_target),
+        "--manifest",
+        "app.zon",
+        "--assets",
+        "frontend/dist",
+        "--optimize",
+        package_optimize_name,
+        "--signing",
+        "none",
+        "--output",
+        package_output_path,
+        "--binary",
+    });
+    // The CLI resolves SDK-owned package inputs (the vendored WebView2
+    // loader) from the framework root; a PATH-resolved `native` could
+    // belong to a different checkout than the one this build compiled
+    // against, so hand the same root over explicitly.
+    package.setEnvironmentVariable("NATIVE_SDK_PATH", b.pathFromRoot(native_sdk_path));
+    package.addFileArg(package_exe.getEmittedBin());
+    package.addArgs(&.{ "--web-engine", @tagName(web_engine), "--cef-dir", cef_dir });
+    // Forward the RESOLVED web-layer decision, never the raw inputs:
+    // this graph already decided web vs native-only for the exe it is
+    // packaging (app.zon declarations plus -Dweb-layer/-Dweb-engine),
+    // and the CLI re-inferring from app.zon alone would miss a
+    // flag-driven override. Handing over the decision itself makes
+    // exe/package agreement structural.
+    package.addArgs(&.{ "--web-layer", if (web_layer) "include" else "exclude" });
+    if (cef_auto_install) package.addArg("--cef-auto-install");
+    package.step.dependOn(&package_exe.step);
+    if (data_remover_install) |install| {
+        package.step.dependOn(&install.step);
+    }
+    if (git_executor_install) |install| {
+        package.step.dependOn(&install.step);
+    }
+    if (keychain_custodian_install) |install| {
+        package.step.dependOn(&install.step);
+    }
+    if (prepare_macos_package) |prepare| {
+        package.step.dependOn(&prepare.step);
+    } else {
+        package.step.dependOn(&frontend_build.step);
+    }
+    const package_step = b.step("package", "Create a local package artifact");
+    if (package_target == .macos) {
+        const integrity = b.addSystemCommand(&.{
+            "bun",
+            "run",
+            "runtime/frontend-package-integrity.ts",
+            "--source",
+            "frontend/dist",
+            "--package",
+            packaged_frontend_path,
+            "--manifest-source",
+            "frontend/dist",
+        });
+        integrity.step.dependOn(&package.step);
+        package_step.dependOn(&integrity.step);
+    } else {
+        package_step.dependOn(&package.step);
+    }
+
+    const tests = b.addTest(.{ .root_module = app_mod });
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    const runtime_host_test_mod = localModule(
+        b,
+        target,
+        optimize,
+        "src/runtime_host.zig",
+    );
+    runtime_host_test_mod.addImport("native_sdk", native_sdk_mod);
+    runtime_host_test_mod.addImport("build_options", options_mod);
+    const runtime_host_tests = b.addTest(.{
+        .root_module = runtime_host_test_mod,
+    });
+    linkPlatform(
+        b,
+        target,
+        runtime_host_test_mod,
+        runtime_host_tests,
+        selected_platform,
+        web_engine,
+        web_layer,
+        native_sdk_path,
+        cef_dir,
+        cef_auto_install,
+    );
+    test_step.dependOn(&b.addRunArtifact(runtime_host_tests).step);
+    if (keychain_custodian) |helper| {
+        const parent_probe = b.addExecutable(.{
+            .name = "oprte-keychain-custodian-parent-probe",
+            .root_module = localModule(
+                b,
+                target,
+                .Debug,
+                "src/keychain_custodian_parent_probe.zig",
+            ),
+        });
+        const run_parent_probe = b.addRunArtifact(parent_probe);
+        run_parent_probe.addArtifactArg(helper);
+        test_step.dependOn(&run_parent_probe.step);
+    }
+    if (data_remover) |_| {
+        const helper_tests = b.addTest(.{
+            .root_module = localModule(
+                b,
+                target,
+                optimize,
+                "src/data_remover.zig",
+            ),
+        });
+        test_step.dependOn(&b.addRunArtifact(helper_tests).step);
+    }
+}
+
+// Resolve the optimize mode for one exe role (mirrors the Native SDK
+// build graph): an explicit -Doptimize wins for every role, --release
+// resolves through zig's release_mode, and only when neither was
+// passed does the role keep its own default — Debug for the dev loop,
+// ReleaseFast for the exe `zig build package` wraps.
+fn optimizeMode(b: *std.Build, requested: ?std.builtin.OptimizeMode, default_mode: std.builtin.OptimizeMode) std.builtin.OptimizeMode {
+    if (requested) |mode| return mode;
+    return switch (b.release_mode) {
+        .off => default_mode,
+        .any, .fast => .ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
+}
+
+fn nativeSdkTarget(b: *std.Build) std.Build.ResolvedTarget {
+    const target = b.standardTargetOptions(.{});
+    if (target.result.os.tag != .macos) return target;
+
+    if (b.sysroot == null) {
+        b.sysroot = macosSdkPath(b) orelse b.sysroot;
+    }
+
+    var query = target.query;
+    query.os_tag = .macos;
+    query.os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+    return b.resolveTargetQuery(query);
+}
+
+fn macosSdkPath(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+        if (sdkroot.len > 0) return sdkroot;
+    }
+
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer b.allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        b.allocator.free(result.stdout);
+        return null;
+    }
+    return std.mem.trimEnd(u8, result.stdout, "\r\n");
+}
+
+fn localModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, path: []const u8) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(path),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn nativeSdkPath(b: *std.Build, native_sdk_path: []const u8, sub_path: []const u8) std.Build.LazyPath {
+    return .{ .cwd_relative = b.pathJoin(&.{ native_sdk_path, sub_path }) };
+}
+
+fn nativeSdkModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native_sdk_path: []const u8) *std.Build.Module {
+    const geometry_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/geometry/root.zig");
+    const assets_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/assets/root.zig");
+    const app_dirs_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/app_dirs/root.zig");
+    const trace_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/trace/root.zig");
+    const app_manifest_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/app_manifest/root.zig");
+    const diagnostics_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/diagnostics/root.zig");
+    const platform_info_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/platform_info/root.zig");
+    const json_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/json/root.zig");
+    const canvas_mod = externalModule(b, target, optimize, native_sdk_path, "src/primitives/canvas/root.zig");
+    canvas_mod.addImport("geometry", geometry_mod);
+    canvas_mod.addImport("json", json_mod);
+    const debug_mod = externalModule(b, target, optimize, native_sdk_path, "src/debug/root.zig");
+    debug_mod.addImport("app_dirs", app_dirs_mod);
+    debug_mod.addImport("trace", trace_mod);
+
+    const native_sdk_mod = externalModule(b, target, optimize, native_sdk_path, "src/root.zig");
+    native_sdk_mod.addImport("geometry", geometry_mod);
+    native_sdk_mod.addImport("assets", assets_mod);
+    native_sdk_mod.addImport("app_dirs", app_dirs_mod);
+    native_sdk_mod.addImport("trace", trace_mod);
+    native_sdk_mod.addImport("app_manifest", app_manifest_mod);
+    native_sdk_mod.addImport("diagnostics", diagnostics_mod);
+    native_sdk_mod.addImport("platform_info", platform_info_mod);
+    native_sdk_mod.addImport("json", json_mod);
+    native_sdk_mod.addImport("canvas", canvas_mod);
+    return native_sdk_mod;
+}
+
+fn externalModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, native_sdk_path: []const u8, path: []const u8) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = nativeSdkPath(b, native_sdk_path, path),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+fn addKeychainCustodian(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const helper_mod = localModule(
+        b,
+        target,
+        optimize,
+        "src/keychain_custodian.zig",
+    );
+    const sdk_include = if (b.sysroot) |sysroot|
+        b.fmt("-I{s}/usr/include", .{sysroot})
+    else
+        "";
+    const flags: []const []const u8 = if (b.sysroot) |sysroot|
+        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0", "-isysroot", sysroot, sdk_include }
+    else
+        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0" };
+    helper_mod.addCSourceFile(.{
+        .file = b.path("src/macos_keychain_custodian.m"),
+        .flags = flags,
+    });
+    helper_mod.addCSourceFile(.{
+        .file = b.path("src/macos_self_managed_code_identity.m"),
+        .flags = flags,
+    });
+    if (b.sysroot) |sysroot| {
+        helper_mod.addFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }),
+        });
+    }
+    helper_mod.linkFramework("Foundation", .{});
+    helper_mod.linkFramework("Security", .{});
+    helper_mod.linkSystemLibrary("c", .{});
+    return b.addExecutable(.{
+        // Keep the code-signing identifier identical. Only the install path,
+        // compile-time parent policy, and package exclusion distinguish the
+        // smoke artifact.
+        .name = "oprte-keychain-custodian",
+        .root_module = helper_mod,
+    });
+}
+
+fn linkPlatform(b: *std.Build, target: std.Build.ResolvedTarget, app_mod: *std.Build.Module, exe: *std.Build.Step.Compile, platform: PlatformOption, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8, cef_dir: []const u8, cef_auto_install: bool) void {
+    if (platform == .macos) {
+        const directory_picker_sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
+        const directory_picker_flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0", "-isysroot", sysroot, directory_picker_sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0" };
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_directory_picker.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_updater.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_application_lifecycle.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_code_identity.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_keychain_custodian.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_self_managed_code_identity.m"), .flags = directory_picker_flags });
+        app_mod.addCSourceFile(.{ .file = b.path("src/macos_instance_guard.m"), .flags = directory_picker_flags });
+        switch (web_engine) {
+            .system => {
+                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-I{s}/usr/include", .{sysroot}) else "";
+                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=13.0", "-isysroot", sysroot, sdk_include } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=13.0" };
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/appkit_host.m"), .flags = flags });
+                app_mod.linkFramework("WebKit", .{});
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                // The SDK's usr/include must stay a system include dir (searched after zig's
+                // bundled libc++/libc headers). A plain -I shadows libc++'s <string.h>/<math.h>
+                // wrappers in ObjC++ and surfaces SDK nullability gaps as a diagnostic flood.
+                const sdk_include = if (b.sysroot) |sysroot| b.fmt("-isystem{s}/usr/include", .{sysroot}) else "";
+                const flags: []const []const u8 = if (b.sysroot) |sysroot| &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=13.0", "-isysroot", sysroot, sdk_include, include_arg, define_arg } else &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC++", "-std=c++17", "-stdlib=libc++", "-mmacosx-version-min=13.0", include_arg, define_arg };
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/macos/cef_host.mm"), .flags = flags });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
+                app_mod.addFrameworkPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+                app_mod.linkFramework("Chromium Embedded Framework", .{});
+                app_mod.addRPath(.{ .cwd_relative = "@executable_path/Frameworks" });
+            },
+        }
+        if (b.sysroot) |sysroot| {
+            app_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }) });
+        }
+        app_mod.linkFramework("AppKit", .{});
+        app_mod.linkFramework("AVFoundation", .{});
+        app_mod.linkFramework("MediaToolbox", .{});
+        app_mod.linkFramework("Accelerate", .{});
+        app_mod.linkFramework("Foundation", .{});
+        app_mod.linkFramework("CoreText", .{});
+        app_mod.linkFramework("UniformTypeIdentifiers", .{});
+        app_mod.linkFramework("Security", .{});
+        app_mod.linkFramework("ServiceManagement", .{});
+        app_mod.linkFramework("Metal", .{});
+        app_mod.linkFramework("QuartzCore", .{});
+        app_mod.linkSystemLibrary("c", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("c++", .{});
+    } else if (platform == .linux) {
+        switch (web_engine) {
+            .system => if (web_layer) {
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/gtk_host.c"), .flags = &.{} });
+                app_mod.linkSystemLibrary("gtk4", .{});
+                app_mod.linkSystemLibrary("webkitgtk-6.0", .{});
+                app_mod.linkSystemLibrary("dl", .{});
+            } else {
+                // Native-only app (nothing in app.zon declares web use):
+                // compile the GTK host without the embedded web layer.
+                // The stub define excludes the layer outright — the host
+                // honors it before probing for the WebKitGTK header, so
+                // the layer stays out even on machines where the
+                // development package is installed — libwebkitgtk is
+                // neither linked nor required at runtime, and the
+                // executable carries no WebKit reference at all.
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/gtk_host.c"), .flags = &.{"-DNATIVE_SDK_ALLOW_WEBKITGTK_STUB"} });
+                app_mod.linkSystemLibrary("gtk4", .{});
+                app_mod.linkSystemLibrary("dl", .{});
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/linux/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.a", .{cef_dir})));
+                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+                app_mod.linkSystemLibrary("cef", .{});
+                app_mod.addRPath(.{ .cwd_relative = "$ORIGIN" });
+            },
+        }
+        app_mod.linkSystemLibrary("c", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("stdc++", .{});
+    } else if (platform == .windows) {
+        switch (web_engine) {
+            .system => if (web_layer) {
+                // The vendored WebView2 SDK header (third_party/webview2)
+                // turns on the host's embedded-WebView layer; the host
+                // fails the compile by design if it cannot be found.
+                app_mod.addIncludePath(nativeSdkPath(b, native_sdk_path, "third_party/webview2/include"));
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/webview2_host.cpp"), .flags = &.{"-std=c++17"} });
+                // WebView2Loader.dll rides next to the installed app
+                // executable: the host loads it at runtime to discover
+                // the machine's WebView2 runtime. Canvas apps never
+                // touch it.
+                const loader = b.addInstallBinFile(nativeSdkPath(b, native_sdk_path, webView2LoaderSubPath(target)), "WebView2Loader.dll");
+                b.getInstallStep().dependOn(&loader.step);
+            } else {
+                // Native-only app (nothing in app.zon declares web use):
+                // compile the host without the embedded-WebView layer.
+                // The stub define excludes the layer outright — the host
+                // honors it before probing for the WebView2 header, so
+                // the layer stays out even on machines where the SDK
+                // headers are reachable through the system include paths
+                // — no WebView2Loader.dll is installed or path-wired,
+                // and the executable carries no reference to it at all.
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/webview2_host.cpp"), .flags = &.{ "-std=c++17", "-DNATIVE_SDK_ALLOW_WEBVIEW2_STUB" } });
+            },
+            .chromium => {
+                const cef_check = addCefCheck(b, target, cef_dir);
+                if (cef_auto_install) {
+                    const cef_auto = b.addSystemCommand(&.{ "native", "cef", "install", "--dir", cef_dir });
+                    cef_check.step.dependOn(&cef_auto.step);
+                }
+                exe.step.dependOn(&cef_check.step);
+                const include_arg = b.fmt("-I{s}", .{cef_dir});
+                const define_arg = b.fmt("-DNATIVE_SDK_CEF_DIR=\"{s}\"", .{cef_dir});
+                app_mod.addCSourceFile(.{ .file = nativeSdkPath(b, native_sdk_path, "src/platform/windows/cef_host.cpp"), .flags = &.{ "-std=c++17", include_arg, define_arg } });
+                app_mod.addObjectFile(b.path(b.fmt("{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib", .{cef_dir})));
+                app_mod.addLibraryPath(b.path(b.fmt("{s}/Release", .{cef_dir})));
+            },
+        }
+        app_mod.linkSystemLibrary("c", .{});
+        app_mod.linkSystemLibrary("c++", .{});
+        app_mod.linkSystemLibrary("user32", .{});
+        app_mod.linkSystemLibrary("gdi32", .{});
+        app_mod.linkSystemLibrary("imm32", .{});
+        app_mod.linkSystemLibrary("comctl32", .{});
+        app_mod.linkSystemLibrary("ole32", .{});
+        app_mod.linkSystemLibrary("oleacc", .{});
+        app_mod.linkSystemLibrary("shell32", .{});
+        // The audio backend: Media Foundation (session + source resolver
+        // + streaming audio renderer) and WinHTTP (the cache fill).
+        app_mod.linkSystemLibrary("mf", .{});
+        app_mod.linkSystemLibrary("mfplat", .{});
+        app_mod.linkSystemLibrary("winhttp", .{});
+        if (web_engine == .chromium) app_mod.linkSystemLibrary("libcef", .{});
+    }
+}
+
+/// The vendored WebView2Loader.dll for the target architecture, relative
+/// to the framework root.
+fn webView2LoaderSubPath(target: std.Build.ResolvedTarget) []const u8 {
+    return if (target.result.cpu.arch == .aarch64)
+        "third_party/webview2/arm64/WebView2Loader.dll"
+    else
+        "third_party/webview2/x64/WebView2Loader.dll";
+}
+
+/// `zig build run` executes the cached artifact, which has no installed
+/// WebView2Loader.dll beside it; the vendored loader's directory goes on the
+/// step's PATH so the host's LoadLibrary resolves it. A native-only build never
+/// loads the library, so its PATH stays clean.
+fn addWebView2RuntimeRunFiles(b: *std.Build, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, web_engine: WebEngineOption, web_layer: bool, native_sdk_path: []const u8) void {
+    if (web_engine != .system) return;
+    if (!web_layer) return;
+    if (target.result.os.tag != .windows) return;
+    const loader_dir = std.fs.path.dirname(webView2LoaderSubPath(target)).?;
+    run.addPathDir(b.pathFromRoot(b.pathJoin(&.{ native_sdk_path, loader_dir })));
+}
+
+fn addCefRuntimeRunFiles(b: *std.Build, target: std.Build.ResolvedTarget, run: *std.Build.Step.Run, exe: *std.Build.Step.Compile, web_engine: WebEngineOption, cef_dir: []const u8) void {
+    if (web_engine != .chromium) return;
+    if (target.result.os.tag != .macos) return;
+    const copy = b.addSystemCommand(&.{
+        "sh", "-c",
+        b.fmt(
+            \\set -e
+            \\exe="$0"
+            \\exe_dir="$(dirname "$exe")"
+            \\rm -rf "zig-out/Frameworks/Chromium Embedded Framework.framework" "zig-out/bin/Frameworks/Chromium Embedded Framework.framework" ".zig-cache/o/Frameworks/Chromium Embedded Framework.framework" &&
+            \\mkdir -p "zig-out/Frameworks" "zig-out/bin/Frameworks" ".zig-cache/o/Frameworks" "$exe_dir" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" "zig-out/Frameworks/" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" "zig-out/bin/Frameworks/" &&
+            \\cp -R "{s}/Release/Chromium Embedded Framework.framework" ".zig-cache/o/Frameworks/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libEGL.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libGLESv2.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/libvk_swiftshader.dylib" "$exe_dir/" &&
+            \\cp "{s}/Release/Chromium Embedded Framework.framework/Libraries/vk_swiftshader_icd.json" "$exe_dir/"
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir }),
+    });
+    copy.addFileArg(exe.getEmittedBin());
+    run.step.dependOn(&copy.step);
+}
+
+fn addCefCheck(b: *std.Build, target: std.Build.ResolvedTarget, cef_dir: []const u8) *std.Build.Step.Run {
+    const script = switch (target.result.os.tag) {
+        .macos => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -d "{s}/Release/Chromium Embedded Framework.framework" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Expected:" >&2
+            \\  echo "  {s}/include/cef_app.h" >&2
+            \\  echo "  {s}/Release/Chromium Embedded Framework.framework" >&2
+            \\  echo "  {s}/libcef_dll_wrapper/libcef_dll_wrapper.a" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  echo "Or rerun with: -Dcef-auto-install=true" >&2
+            \\  echo "Pass -Dcef-dir=/path/to/cef if your bundle lives elsewhere." >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir, cef_dir }),
+        .linux => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -f "{s}/Release/libcef.so" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.a" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
+        .windows => b.fmt(
+            \\test -f "{s}/include/cef_app.h" &&
+            \\test -f "{s}/Release/libcef.dll" &&
+            \\test -f "{s}/libcef_dll_wrapper/libcef_dll_wrapper.lib" || {{
+            \\  echo "missing CEF dependency for -Dweb-engine=chromium" >&2
+            \\  echo "Fix with: native cef install --dir {s}" >&2
+            \\  exit 1
+            \\}}
+        , .{ cef_dir, cef_dir, cef_dir, cef_dir }),
+        else => "echo unsupported CEF target >&2; exit 1",
+    };
+    return b.addSystemCommand(&.{ "sh", "-c", script });
+}
+
+fn packageSuffix(target: PackageTarget) []const u8 {
+    return switch (target) {
+        .macos => ".app",
+        .windows, .linux => "",
+    };
+}
+
+/// What this build graph reads out of app.zon: the web-engine/CEF
+/// knobs and the web-layer inference inputs. An unreadable or
+/// unparsable manifest falls back to the system engine WITH the web
+/// layer kept — over-inclusion is a size cost, wrong exclusion is a
+/// broken app.
+const AppManifestBuildConfig = struct {
+    display_name: []const u8 = "HRA",
+    version: []const u8 = "0.1.6",
+    web_engine: WebEngineOption = .system,
+    cef_dir: []const u8 = "third_party/cef/macos",
+    cef_auto_install: bool = false,
+    webview_layer: WebLayerOption = .auto,
+    /// The first web declaration found (for teaching messages), or
+    /// null when app.zon declares no web use. `web_engine = "system"`
+    /// alone is NOT web intent — it is the default in many canvas
+    /// manifests.
+    web_declaration: ?[]const u8 = null,
+};
+
+/// The lenient app.zon shape parsed for inference: only the fields
+/// that decide the web layer and the web engine; everything else is
+/// ignored. Full schema validation stays with `native validate`.
+const InferenceManifest = struct {
+    display_name: []const u8 = "HRA",
+    version: []const u8 = "0.1.6",
+    capabilities: []const []const u8 = &.{},
+    web_engine: []const u8 = "system",
+    webview_layer: []const u8 = "auto",
+    cef: struct {
+        dir: []const u8 = "third_party/cef/macos",
+        auto_install: bool = false,
+    } = .{},
+    frontend: ?struct {} = null,
+    shell: struct {
+        windows: []const struct {
+            views: []const struct {
+                kind: []const u8 = "",
+            } = &.{},
+        } = &.{},
+    } = .{},
+};
+
+fn defaultCefDir(platform: PlatformOption, configured: []const u8) []const u8 {
+    if (!std.mem.eql(u8, configured, "third_party/cef/macos")) return configured;
+    return switch (platform) {
+        .linux => "third_party/cef/linux",
+        .windows => "third_party/cef/windows",
+        else => configured,
+    };
+}
+
+fn appManifestBuildConfig(b: *std.Build) AppManifestBuildConfig {
+    // The fallback for a manifest this lenient parse cannot read
+    // keeps the web layer (see AppManifestBuildConfig): a shape
+    // mismatch here is not proof the app declares no web use.
+    const fallback: AppManifestBuildConfig = .{ .web_declaration = "an app.zon this build graph could not parse" };
+    const source: [:0]const u8 = @embedFile("app.zon");
+    @setEvalBranchQuota(2000);
+    const raw = std.zon.parse.fromSliceAlloc(InferenceManifest, b.allocator, source, null, .{ .ignore_unknown_fields = true }) catch return fallback;
+    var config: AppManifestBuildConfig = .{
+        .display_name = raw.display_name,
+        .version = raw.version,
+        .web_engine = parseWebEngine(raw.web_engine) orelse .system,
+        .cef_dir = raw.cef.dir,
+        .cef_auto_install = raw.cef.auto_install,
+        .webview_layer = parseWebLayer(raw.webview_layer) orelse @panic("app.zon .webview_layer must be \"auto\", \"include\", or \"exclude\""),
+    };
+    config.web_declaration = blk: {
+        if (raw.frontend != null) break :blk "a .frontend block";
+        for (raw.capabilities) |capability| {
+            if (std.mem.eql(u8, capability, "webview")) break :blk "the \"webview\" capability";
+        }
+        for (raw.shell.windows) |window| {
+            for (window.views) |view| {
+                if (std.mem.eql(u8, view.kind, "webview")) break :blk "a .shell webview view";
+            }
+        }
+        break :blk null;
+    };
+    return config;
+}
+
+/// The web-layer decision for this build — the same declare-to-use
+/// contract the Native SDK's standard build graph, CLI, and runner
+/// apply: an app is WEB when app.zon declares web use (a .frontend
+/// block, the "webview" capability, a .shell webview view) or the
+/// build resolves to the Chromium engine; otherwise it is
+/// NATIVE-ONLY and the platform host compiles without the
+/// embedded-WebView layer. `.webview_layer` (and `-Dweb-layer`)
+/// override the inference — but an exclude that contradicts a web
+/// declaration is a hard configure error, never a silently broken
+/// app.
+fn resolveWebLayer(config: AppManifestBuildConfig, web_engine: WebEngineOption, override: ?WebLayerOption) bool {
+    const setting = override orelse config.webview_layer;
+    const declaration: ?[]const u8 = config.web_declaration orelse
+        (if (web_engine == .chromium) "the Chromium web engine" else null);
+    return switch (setting) {
+        .include => true,
+        .auto => declaration != null,
+        .exclude => {
+            if (declaration) |reason| {
+                std.debug.panic(
+                    "the web layer is excluded ({s}) but the app declares web use ({s}); remove the exclude or drop the web declaration",
+                    .{ if (override != null) "-Dweb-layer=exclude" else "app.zon .webview_layer = \"exclude\"", reason },
+                );
+            }
+            return false;
+        },
+    };
+}
+
+fn parseWebEngine(value: []const u8) ?WebEngineOption {
+    if (std.mem.eql(u8, value, "system")) return .system;
+    if (std.mem.eql(u8, value, "chromium")) return .chromium;
+    return null;
+}
+
+fn parseWebLayer(value: []const u8) ?WebLayerOption {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "include")) return .include;
+    if (std.mem.eql(u8, value, "exclude")) return .exclude;
+    return null;
+}

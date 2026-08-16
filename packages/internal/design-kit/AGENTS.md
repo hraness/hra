@@ -1,0 +1,28 @@
+<!-- kb:context scopes/packages-design-kit--88e40367792d -->
+# Contents
+
+- `src/index.ts`, token CSS, plain-site and plain-publication CSS, and framework-neutral helpers – HRA's private typed compatibility contract for native, server-rendered syntax, quiet sites, long-form publications, and browser consumers.
+- `src/react/`, chart/component CSS, and the executable gallery – browser-only integrations over `@hraness/ui`, Recharts-backed data views, appearance boundaries, application compositions, and effects.
+- `src/fonts/` and font CSS – pinned OFL-licensed Geist text and Geist Mono heading/code faces, exact family identities, provenance, and browser declarations.
+- `vendor/` – pinned Jelly UI runtime artifacts plus EvilCharts license/provenance; colocated tests enforce portable exports, token parity, syntax safety, and vendor integrity.
+
+# Guidelines
+
+- Keep portable browser tokens, reset rules, component recipes, and React Aria primitives in `@hraness/ui`. The private design kit composes that core with licensed typography, compatibility aliases, product integrations, charts, effects, and vendor-constrained presentation; it must not grow a second independent public primitive layer.
+- Keep framework-neutral private exports at `@hra-internal/design-kit`; keep every private React, DOM, custom-element, and browser-runtime dependency behind `@hra-internal/design-kit/react` or an explicit CSS subpath. Browser and WebView products import `@hra-internal/design-kit/styles.css`; native consumers must not acquire React transitively.
+- Keep Recharts and EvilCharts-derived presentation behind `@hra-internal/design-kit/react`. Shared chart recipes own responsive geometry, semantic chart chrome, exact-value accessibility, reduced motion, and forced colors; products own the dataset, unit formatting, categorical colors, and the question each chart answers.
+- Keep reusable recipes product-neutral. Products own routes, copy, domain state, categorical color, semantic icon choice, and exceptional layout; shared code owns cross-product tokens, interaction state, and presentation contracts.
+- Keep compact public-site header, wordmark, navigation, footer-link, reading-measure, and responsive-gutter rules in `plain-site.css`. Keep sourced index, article, table, citation, callout, and related-reading structure in the opt-in `plain-publication.css`; consumers may add a product root modifier but must not copy the shared grammar into local CSS.
+- Preserve native or React Aria semantics as the only interactive layer. Jelly is a pinned internal presentation engine: products never import its runtime, render or query raw `jelly-*` elements, or style their tag names.
+- Preserve accessible names, native landmarks, focus visibility and restoration, keyboard and touch behavior, forced-color legibility, and reduced-motion behavior. Shared controls retain a 48 px minimum touch target unless a documented expert-density variant owns an accessible alternative, and painted hosts remain congruent with semantic targets.
+- Keep `Fader` geometry owned by its typed density. The compact vertical fader retains one 48 px draggable target around a shorter measured center-travel rail, contains its painted thumb and focus ring, and leaves the thumb pseudo-element pointer-transparent. Product docks use ordinary gaps instead of negative margins or oversized block padding.
+- Use `ViewportFrame` for experiences that must occupy exactly one visual viewport; never add a content minimum block size to that frame, and put any intentional scrolling on a named descendant.
+- Use `WrappingRow` or an equally explicit product composition when inline content can outgrow its track. Responsive flex and grid children must be shrinkable, and clipping must not substitute for wrapping or reflow.
+- Render portable web HugeIcons through `@hraness/ui`; `@hra-internal/design-kit/react` re-exports the renderer for compatibility. Product code owns semantic icon selection from the available HugeIcons catalog.
+- Render code through the framework-neutral highlighter or `SyntaxCode`. Parse foreign language labels into the closed language union, preserve the exact accessible source text, and keep syntax roles semantic and forced-color safe.
+- Keep the vendored Geist and Geist Mono files byte-for-byte aligned with pinned provenance, retain both SIL Open Font Licenses, and use them only through semantic typography tokens.
+- Keep Jelly UI and EvilCharts artifacts pinned and internal. An upstream-derived change updates exact provenance and retained licenses; a Jelly upgrade additionally remains SSR-safe without evaluating the browser bundle and passes real-browser interaction and visual verification.
+- Keep procedural and canvas effects decorative, pointer-transparent, reduced-motion aware, and safe to remove under forced colors. Meaningful content must remain ordinary SSR-visible DOM, and the first useful paint must not depend on ambient randomness, hydration, DOM capture, raster snapshots, or WebGL.
+- Treat `DesignSystemGallery` as the public recipe specification. A public token, component, composition, or interaction change must update its representative gallery states and tests in the same change.
+- Verify viewport-filling and persistent-control compositions in both narrow portrait and short landscape sizes; width-only breakpoints are insufficient for mobile browser chrome, keyboards, split views, and rotation.
+- For package source edits run `bun run --cwd packages/internal/design-kit test`, `bun run --cwd packages/internal/design-kit typecheck`, and `bun run --cwd packages/internal/design-kit lint`; before repository-wide handoff run `bun run check`.

@@ -1,0 +1,20 @@
+/* Geist is the open-source proportional face for product text. The exact
+ * Google Fonts artifact and SIL Open Font License are retained under
+ * fonts/geist/. */
+@font-face {
+  font-display: swap;
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 100 900;
+  src: url("./fonts/geist/Geist[wght].ttf") format("truetype");
+}
+
+/* Geist Mono is the open-source heading and code face. The exact upstream
+ * artifact and SIL Open Font License are retained under fonts/geist-mono/. */
+@font-face {
+  font-display: swap;
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 100 900;
+  src: url("./fonts/geist-mono/GeistMono[wght].woff2") format("woff2");
+}

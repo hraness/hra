@@ -1,0 +1,110 @@
+/* The public reset owns the cross-project baseline. The declarations below
+ * are the private theme's compatibility overrides and verification surface. */
+@import "@hraness/ui/reset.css";
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  * {
+    margin: 0;
+  }
+
+  html,
+  body {
+    min-width: 0;
+    min-height: 100%;
+    overflow-x: clip;
+  }
+
+  html {
+    background: var(--background);
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
+  body {
+    background: var(--canvas-background, var(--background));
+    color: var(--foreground);
+    font-family: var(--font-text, var(--font-sans));
+    font-size: 16px;
+    font-synthesis: none;
+    font-variant-ligatures: common-ligatures contextual;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  code,
+  kbd,
+  pre,
+  samp {
+    font-family: var(--font-mono);
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  :where(button, select, input[type="button"], input[type="submit"], input[type="reset"]) {
+    touch-action: manipulation;
+  }
+
+  a {
+    color: inherit;
+    text-underline-offset: 3px;
+  }
+
+  :where(
+    blockquote,
+    dd,
+    dt,
+    figcaption,
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6,
+    li,
+    p
+  ) {
+    overflow-wrap: anywhere;
+  }
+
+  :where(canvas, img, picture, svg, video) {
+    max-inline-size: 100%;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 3px;
+  }
+
+  ::selection {
+    background: var(--foreground);
+    color: var(--background);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-delay: 0s !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      transition-delay: 0s !important;
+    }
+  }
+}

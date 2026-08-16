@@ -1,0 +1,29 @@
+.hraness-ra-mark {
+  display: block;
+  flex: 0 0 auto;
+  height: 2rem;
+  width: 2rem;
+}
+
+.hraness-brand {
+  align-items: center;
+  border-radius: var(--radius-xs);
+  color: inherit;
+  display: inline-flex;
+  font-family: var(--font-text);
+  font-size: 1.125rem;
+  font-weight: var(--font-weight-bold);
+  gap: 0.625rem;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  min-height: var(--interactive-target-min);
+  text-decoration: none;
+}
+
+.hraness-brand:hover {
+  color: inherit;
+}
+
+.hraness-brand__name {
+  transform: translateY(-0.02em);
+}

@@ -1,0 +1,71 @@
+{
+  "name": "@hra-internal/design-kit",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "packages/internal/design-kit"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "sideEffects": ["./src/*.css", "./vendor/jelly-ui/jelly.js"],
+  "exports": {
+    ".": "./src/index.ts",
+    "./components.css": "./src/components.css",
+    "./effects.css": "./src/effects.css",
+    "./fonts.css": "./src/fonts.css",
+    "./plain-publication.css": "./src/plain-publication.css",
+    "./plain-site.css": "./src/plain-site.css",
+    "./tokens.css": "./src/tokens.css",
+    "./reset.css": "./src/reset.css",
+    "./syntax-highlighting": "./src/syntax-highlighting.ts",
+    "./syntax-highlighting.css": "./src/syntax-highlighting.css",
+    "./typography.css": "./src/typography.css",
+    "./zov2.css": "./src/zov2.css",
+    "./styles.css": "./src/styles.css",
+    "./charts.css": "./src/charts.css",
+    "./react": "./src/react/index.ts",
+    "./vendor/evilcharts/LICENSE": "./vendor/evilcharts/LICENSE",
+    "./vendor/jelly-ui/LICENSE": "./vendor/jelly-ui/LICENSE"
+  },
+  "scripts": {
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src",
+    "test:property": "bun test ./src/*.property.test.ts ./src/react/*.property.test.ts"
+  },
+  "dependencies": {
+    "@hraness/ui": "catalog:",
+    "@hugeicons/core-free-icons": "catalog:",
+    "@react-types/shared": "catalog:",
+    "motion": "catalog:",
+    "next-themes": "catalog:",
+    "react-aria-components": "catalog:",
+    "react-stately": "catalog:",
+    "recharts": "catalog:",
+    "sugar-high": "catalog:",
+    "web-haptics": "catalog:"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0 <20.0.0",
+    "react-dom": ">=18.0.0 <20.0.0"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/test": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "eslint": "catalog:",
+    "linkedom": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "typescript": "catalog:"
+  }
+}

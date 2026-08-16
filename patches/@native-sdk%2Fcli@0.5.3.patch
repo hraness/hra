@@ -1,0 +1,893 @@
+diff --git a/src/platform/macos/appkit_host.h b/src/platform/macos/appkit_host.h
+index 5a512cf..b05332a 100644
+--- a/src/platform/macos/appkit_host.h
++++ b/src/platform/macos/appkit_host.h
+@@ -325,9 +325,9 @@ typedef void (*native_sdk_appkit_bridge_callback_t)(void *context, uint64_t wind
+ // Quit labels, the process name, the Dock/app-switcher entry, and the
+ // About panel, which also shows version and about_description when
+ // non-empty. has_web_content declares whether the app hosts a webview;
+-// web-only default menu items (Reload, Toggle Web Inspector, Undo/Redo)
+-// exist only when it is set.
+-native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy);
++// web_inspector_enabled independently gates WebKit developer extras,
++// inspectability, the inspector menu item, and its action.
++native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, int web_inspector_enabled, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy);
+ void native_sdk_appkit_destroy(native_sdk_appkit_host_t *host);
+ // Adopt pre-rendered straight-alpha RGBA8 pixels as the Dock icon (and
+ // the About panel copy). The pixels are copied before return, so the
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+index caf9770..8efa673 100644
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -747,10 +747,12 @@ @interface NativeSdkAppKitHost : NSObject <WKNavigationDelegate>
+ /* app.zon description, the About panel credits line; empty when
+  * undeclared. */
+ @property(nonatomic, strong) NSString *aboutDescription;
+-/* Whether the manifest declares web content. Gates the web-only default
+- * menu items (Reload, Toggle Web Inspector, Undo/Redo) so canvas-only
+- * apps never ship menu items nothing answers. */
++/* Whether the manifest declares web content. Gates web-only defaults so
++ * canvas-only apps never ship menu items nothing answers. */
+ @property(nonatomic, assign) BOOL hasWebContent;
++/* Explicit capability for WebKit developer extras and the inspector UI.
++ * Release hosts keep this false unless an application knowingly opts in. */
++@property(nonatomic, assign) BOOL webInspectorEnabled;
+ /* The decoded manifest icon (nil until the async decode lands, or when
+  * the file is missing). The About panel needs it passed explicitly:
+  * unbundled dev binaries have no bundle icon for the standard panel to
+@@ -777,7 +779,7 @@ @interface NativeSdkAppKitHost : NSObject <WKNavigationDelegate>
+ @property(nonatomic, strong) NSArray<NSString *> *allowedNavigationOrigins;
+ @property(nonatomic, strong) NSArray<NSString *> *allowedExternalURLs;
+ @property(nonatomic, assign) NSInteger externalLinkAction;
+-- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy;
++- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent webInspectorEnabled:(BOOL)webInspectorEnabled windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy;
+ - (BOOL)createWindowWithId:(uint64_t)windowId title:(NSString *)title label:(NSString *)label x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy makeMain:(BOOL)makeMain;
+ - (void)showDeferredWindowIfPending:(uint64_t)windowId reason:(const char *)reason;
+ - (void)applyWindowClearColor:(uint64_t)windowId red:(uint8_t)red green:(uint8_t)green blue:(uint8_t)blue alpha:(uint8_t)alpha;
+@@ -6379,7 +6381,7 @@ @implementation NativeSdkShortcut
+
+ @implementation NativeSdkAppKitHost
+
+-- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy {
++- (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)displayName version:(NSString *)version aboutDescription:(NSString *)aboutDescription hasWebContent:(BOOL)hasWebContent webInspectorEnabled:(BOOL)webInspectorEnabled windowTitle:(NSString *)windowTitle bundleIdentifier:(NSString *)bundleIdentifier iconPath:(NSString *)iconPath windowLabel:(NSString *)windowLabel x:(double)x y:(double)y width:(double)width height:(double)height restoreFrame:(BOOL)restoreFrame resizable:(BOOL)resizable titlebarStyle:(int)titlebarStyle showPolicy:(int)showPolicy {
+     self = [super init];
+     if (!self) {
+         return nil;
+@@ -6387,7 +6389,9 @@ - (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)disp
+
+     NativeSdkLaunchLap("host_init");
+     [NSApplication sharedApplication];
+-    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++    if (NSApp.activationPolicy == NSApplicationActivationPolicyProhibited) {
++        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
++    }
+     NativeSdkLaunchLap("nsapp_ready");
+     NativeSdkRegisterBundledFonts();
+     NativeSdkLaunchLap("fonts_registered");
+@@ -6396,6 +6400,7 @@ - (instancetype)initWithAppName:(NSString *)appName displayName:(NSString *)disp
+     self.appVersion = version ?: @"";
+     self.aboutDescription = aboutDescription ?: @"";
+     self.hasWebContent = hasWebContent;
++    self.webInspectorEnabled = webInspectorEnabled;
+     self.bundleIdentifier = bundleIdentifier.length > 0 ? bundleIdentifier : @"dev.native_sdk.app";
+     self.iconPath = iconPath ?: @"";
+     self.windowLabel = windowLabel.length > 0 ? windowLabel : @"main";
+@@ -6772,7 +6777,7 @@ - (WKWebView *)ensureMainWebViewForWindowId:(uint64_t)windowId {
+                                                      forMainFrameOnly:YES];
+     [userContentController addUserScript:bridgeScript];
+     configuration.userContentController = userContentController;
+-    if ([configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
++    if (self.webInspectorEnabled && [configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
+         [configuration.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
+     }
+     WKWebView *webView = [[NativeSdkWebView alloc] initWithFrame:container.bounds configuration:configuration];
+@@ -6783,7 +6788,7 @@ - (WKWebView *)ensureMainWebViewForWindowId:(uint64_t)windowId {
+     webView.layer.zPosition = 0;
+     webView.layer.backgroundColor = NSColor.clearColor.CGColor;
+     [webView setValue:@NO forKey:@"drawsBackground"];
+-    if ([webView respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
++    if (self.webInspectorEnabled && [webView respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
+         [webView setValue:@YES forKey:@"inspectable"];
+     }
+     webView.navigationDelegate = self;
+@@ -7453,7 +7458,7 @@ - (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NS
+         [controller addUserScript:[[WKUserScript alloc] initWithSource:NativeSdkAppKitBridgeScript() injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:YES]];
+         configuration.userContentController = controller;
+     }
+-    if ([configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
++    if (self.webInspectorEnabled && [configuration.preferences respondsToSelector:NSSelectorFromString(@"setDeveloperExtrasEnabled:")]) {
+         [configuration.preferences setValue:@YES forKey:@"developerExtrasEnabled"];
+     }
+
+@@ -7467,7 +7472,7 @@ - (BOOL)createWebViewInWindow:(uint64_t)windowId label:(NSString *)label url:(NS
+         webview.layer.backgroundColor = NSColor.clearColor.CGColor;
+         [webview setValue:@NO forKey:@"drawsBackground"];
+     }
+-    if ([webview respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
++    if (self.webInspectorEnabled && [webview respondsToSelector:NSSelectorFromString(@"setInspectable:")]) {
+         [webview setValue:@YES forKey:@"inspectable"];
+     }
+     webview.navigationDelegate = self;
+@@ -8113,7 +8118,11 @@ - (void)buildMenuBar {
+     [viewMenuItem setSubmenu:viewMenu];
+     if (self.hasWebContent) {
+         [viewMenu addItem:[self menuItem:@"Reload" action:@selector(reload:) key:@"r" modifiers:NSEventModifierFlagCommand]];
++    }
++    if (self.hasWebContent && self.webInspectorEnabled) {
+         [viewMenu addItem:[self menuItem:@"Toggle Web Inspector" action:@selector(toggleWebInspector:) key:@"i" modifiers:(NSEventModifierFlagCommand | NSEventModifierFlagOption)]];
++    }
++    if (self.hasWebContent) {
+         [viewMenu addItem:[NSMenuItem separatorItem]];
+     }
+     [viewMenu addItem:[self menuItem:@"Enter Full Screen" action:@selector(toggleFullScreen:) key:@"f" modifiers:(NSEventModifierFlagCommand | NSEventModifierFlagControl)]];
+@@ -9621,6 +9630,7 @@ - (void)reload:(id)sender {
+
+ - (void)toggleWebInspector:(id)sender {
+     (void)sender;
++    if (!self.webInspectorEnabled) return;
+     WKWebView *webView = [self mainWebViewForWindow:NSApp.keyWindow];
+     if (!webView) return;
+     SEL selector = NSSelectorFromString(@"_showInspector");
+@@ -9756,7 +9766,7 @@ static BOOL NativeSdkPolicyListMatches(NSArray<NSString *> *values, NSURL *url)
+     return NO;
+ }
+
+-native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
++native_sdk_appkit_host_t *native_sdk_appkit_create(const char *app_name, size_t app_name_len, const char *display_name, size_t display_name_len, const char *version, size_t version_len, const char *about_description, size_t about_description_len, int has_web_content, int web_inspector_enabled, const char *window_title, size_t window_title_len, const char *bundle_id, size_t bundle_id_len, const char *icon_path, size_t icon_path_len, const char *window_label, size_t window_label_len, double x, double y, double width, double height, int restore_frame, int resizable, int titlebar_style, int show_policy) {
+     @autoreleasepool {
+         NSString *appNameString = [[NSString alloc] initWithBytes:app_name length:app_name_len encoding:NSUTF8StringEncoding] ?: @"native-sdk";
+         NSString *displayNameString = [[NSString alloc] initWithBytes:display_name length:display_name_len encoding:NSUTF8StringEncoding] ?: @"";
+@@ -9766,7 +9776,7 @@ static BOOL NativeSdkPolicyListMatches(NSArray<NSString *> *values, NSURL *url)
+         NSString *bundleIdString = [[NSString alloc] initWithBytes:bundle_id length:bundle_id_len encoding:NSUTF8StringEncoding] ?: @"dev.native_sdk.app";
+         NSString *iconPathString = [[NSString alloc] initWithBytes:icon_path length:icon_path_len encoding:NSUTF8StringEncoding] ?: @"";
+         NSString *windowLabelString = [[NSString alloc] initWithBytes:window_label length:window_label_len encoding:NSUTF8StringEncoding] ?: @"main";
+-        NativeSdkAppKitHost *host = [[NativeSdkAppKitHost alloc] initWithAppName:appNameString displayName:displayNameString version:versionString aboutDescription:aboutDescriptionString hasWebContent:(has_web_content != 0) windowTitle:windowTitleString bundleIdentifier:bundleIdString iconPath:iconPathString windowLabel:windowLabelString x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy];
++        NativeSdkAppKitHost *host = [[NativeSdkAppKitHost alloc] initWithAppName:appNameString displayName:displayNameString version:versionString aboutDescription:aboutDescriptionString hasWebContent:(has_web_content != 0) webInspectorEnabled:(web_inspector_enabled != 0) windowTitle:windowTitleString bundleIdentifier:bundleIdString iconPath:iconPathString windowLabel:windowLabelString x:x y:y width:width height:height restoreFrame:(restore_frame != 0) resizable:(resizable != 0) titlebarStyle:titlebar_style showPolicy:show_policy];
+         return (__bridge_retained native_sdk_appkit_host_t *)host;
+     }
+ }
+diff --git a/src/platform/macos/root.zig b/src/platform/macos/root.zig
+index 32969fb..99d16ad 100644
+--- a/src/platform/macos/root.zig
++++ b/src/platform/macos/root.zig
+@@ -125,7 +125,7 @@ const shortcut_modifier_control: u32 = 1 << 2;
+ const shortcut_modifier_option: u32 = 1 << 3;
+ const shortcut_modifier_shift: u32 = 1 << 4;
+
+-extern fn native_sdk_appkit_create(app_name: [*]const u8, app_name_len: usize, display_name: [*]const u8, display_name_len: usize, version: [*]const u8, version_len: usize, about_description: [*]const u8, about_description_len: usize, has_web_content: c_int, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int) ?*AppKitHost;
++extern fn native_sdk_appkit_create(app_name: [*]const u8, app_name_len: usize, display_name: [*]const u8, display_name_len: usize, version: [*]const u8, version_len: usize, about_description: [*]const u8, about_description_len: usize, has_web_content: c_int, web_inspector_enabled: c_int, window_title: [*]const u8, window_title_len: usize, bundle_id: [*]const u8, bundle_id_len: usize, icon_path: [*]const u8, icon_path_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, show_policy: c_int) ?*AppKitHost;
+ extern fn native_sdk_appkit_destroy(host: *AppKitHost) void;
+ extern fn native_sdk_appkit_set_dock_icon_rgba(host: *AppKitHost, pixels: [*]const u8, width: usize, height: usize) void;
+ extern fn native_sdk_appkit_set_dock_icon_file(host: *AppKitHost, path: [*]const u8, path_len: usize) void;
+@@ -361,6 +361,13 @@ fn devDockIconNeedsMask(path: []const u8) bool {
+ /// no icon of their own never carry a copy that can drift stale.
+ const default_icon_png = @embedFile("../../tooling/default_icon.png");
+
++pub const HostOptions = struct {
++    /// WebKit inspection is a development capability, not an implicit
++    /// property of hosting web content. Debug keeps the edit-loop default;
++    /// every release-shaped build disables it unless an app opts in.
++    web_inspector_enabled: bool = builtin.mode == .Debug,
++};
++
+ /// How the startup Dock icon resolves for this process.
+ const DockIconPlan = enum {
+     /// The host loads the configured icon file itself (the classic
+@@ -519,6 +526,10 @@ pub const MacPlatform = struct {
+     }
+
+     pub fn initWithOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo) Error!MacPlatform {
++        return initWithHostOptions(size, web_engine, app_info, .{});
++    }
++
++    pub fn initWithHostOptions(size: geometry.SizeF, web_engine: platform_mod.WebEngine, app_info: platform_mod.AppInfo, host_options: HostOptions) Error!MacPlatform {
+         const window_options = app_info.resolvedMainWindow();
+         const window_title = window_options.resolvedTitle(app_info.app_name);
+         const frame = window_options.default_frame;
+@@ -535,7 +546,7 @@ pub const MacPlatform = struct {
+         // the classic load byte-for-byte.
+         const dock_icon = planDockIcon(app_info.icon_path);
+         const icon_path = if (dock_icon == .host_file) app_info.icon_path else "";
+-        const host = native_sdk_appkit_create(app_info.app_name.ptr, app_info.app_name.len, display_name.ptr, display_name.len, app_info.version.ptr, app_info.version.len, app_info.description.ptr, app_info.description.len, if (app_info.has_web_content) 1 else 0, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, icon_path.ptr, icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), showModeInt(window_options.show)) orelse return error.CreateFailed;
++        const host = native_sdk_appkit_create(app_info.app_name.ptr, app_info.app_name.len, display_name.ptr, display_name.len, app_info.version.ptr, app_info.version.len, app_info.description.ptr, app_info.description.len, if (app_info.has_web_content) 1 else 0, if (host_options.web_inspector_enabled) 1 else 0, window_title.ptr, window_title.len, app_info.bundle_id.ptr, app_info.bundle_id.len, icon_path.ptr, icon_path.len, window_options.label.ptr, window_options.label.len, frame.x, frame.y, frame.width, frame.height, if (window_options.restore_state) 1 else 0, if (window_options.resizable) 1 else 0, titlebarStyleInt(window_options.titlebar), showModeInt(window_options.show)) orelse return error.CreateFailed;
+         switch (dock_icon) {
+             .host_file => {},
+             .masked_render => spawnDevDockIconRender(host, app_info.icon_path),
+@@ -2292,3 +2303,7 @@ test "mac appearance event carries accessibility preferences" {
+     try std.testing.expect(event.reduce_motion != 0);
+     try std.testing.expect(event.high_contrast != 0);
+ }
++
++test "mac web inspector host option defaults only in Debug" {
++    try std.testing.expectEqual(builtin.mode == .Debug, (HostOptions{}).web_inspector_enabled);
++}
+diff --git a/src/tooling/assets.zig b/src/tooling/assets.zig
+index 81b8e031..4dee0b74 100644
+--- a/src/tooling/assets.zig
++++ b/src/tooling/assets.zig
+@@ -6,17 +6,68 @@ pub const BundleStats = struct {
+     manifest_path: []const u8 = "asset-manifest.zon",
+ };
+
++pub const BundleLimits = struct {
++    /// Preserve the Native SDK's historical generic ceiling. Large assets
++    /// require an explicit path, size, and digest pin at the product boundary.
++    maximum_file_bytes: u64 = 16 * 1024 * 1024,
++    maximum_total_bytes: u64 = 512 * 1024 * 1024,
++    maximum_asset_count: usize = 100_000,
++};
++
++pub const PinnedOversizedAsset = struct {
++    bundle_path: []const u8,
++    byte_len: u64,
++    hash: zig_assets.Hash,
++};
++
++const maximum_pinned_file_bytes: u64 = 64 * 1024 * 1024;
++
++const BundleOptions = struct {
++    limits: BundleLimits = .{},
++    pinned_oversized_assets: []const PinnedOversizedAsset = &.{},
++};
++
+ pub fn bundle(allocator: std.mem.Allocator, io: std.Io, assets_dir_path: []const u8, output_dir_path: []const u8) !BundleStats {
++    return bundleConfigured(allocator, io, assets_dir_path, output_dir_path, .{});
++}
++
++pub fn bundleWithPinnedOversizedAssets(
++    allocator: std.mem.Allocator,
++    io: std.Io,
++    assets_dir_path: []const u8,
++    output_dir_path: []const u8,
++    pinned_oversized_assets: []const PinnedOversizedAsset,
++) !BundleStats {
++    return bundleConfigured(allocator, io, assets_dir_path, output_dir_path, .{
++        .pinned_oversized_assets = pinned_oversized_assets,
++    });
++}
++
++fn bundleConfigured(
++    allocator: std.mem.Allocator,
++    io: std.Io,
++    assets_dir_path: []const u8,
++    output_dir_path: []const u8,
++    options: BundleOptions,
++) !BundleStats {
++    try validatePinnedOversizedAssets(options);
++
+     var cwd = std.Io.Dir.cwd();
+-    cwd.createDirPath(io, output_dir_path) catch {};
+-    var assets_dir = cwd.openDir(io, assets_dir_path, .{ .iterate = true }) catch |err| switch (err) {
++    var assets_dir = cwd.openDir(io, assets_dir_path, .{
++        .iterate = true,
++        .follow_symlinks = false,
++    }) catch |err| switch (err) {
+         error.FileNotFound => {
++            if (options.pinned_oversized_assets.len != 0) return error.PinnedAssetMissing;
++            try cwd.createDirPath(io, output_dir_path);
+             try writeManifest(allocator, io, output_dir_path, &.{});
+             return .{};
+         },
+         else => return err,
+     };
+     defer assets_dir.close(io);
++    if ((try assets_dir.stat(io)).kind != .directory) return error.AssetSpecialFileNotAllowed;
++    try cwd.createDirPath(io, output_dir_path);
+
+     var copied: std.ArrayList(zig_assets.Asset) = .empty;
+     defer {
+@@ -28,33 +79,167 @@ pub fn bundle(allocator: std.mem.Allocator, io: std.Io, assets_dir_path: []const
+         copied.deinit(allocator);
+     }
+
++    const pin_seen = try allocator.alloc(bool, options.pinned_oversized_assets.len);
++    defer allocator.free(pin_seen);
++    @memset(pin_seen, false);
++
+     var walker = try assets_dir.walk(allocator);
+     defer walker.deinit();
++    var total_bytes: u64 = 0;
+     while (try walker.next(io)) |entry| {
+-        if (entry.kind != .file) continue;
++        switch (entry.kind) {
++            .directory => continue,
++            .file => {},
++            .sym_link => return error.AssetSymlinkNotAllowed,
++            else => return error.AssetSpecialFileNotAllowed,
++        }
++        if (copied.items.len >= options.limits.maximum_asset_count) return error.TooManyAssets;
++
++        const pin_index = pinnedAssetIndex(options.pinned_oversized_assets, entry.path);
++        const pin = if (pin_index) |index| options.pinned_oversized_assets[index] else null;
+         const source_path = try std.fs.path.join(allocator, &.{ assets_dir_path, entry.path });
+         defer allocator.free(source_path);
+         const output_path = try std.fs.path.join(allocator, &.{ output_dir_path, entry.path });
+         defer allocator.free(output_path);
+-        const bytes = try readFile(allocator, io, source_path);
+-        defer allocator.free(bytes);
+-        try writeFilePath(io, output_path, bytes);
++        const copied_file = try copyFileAndHash(io, source_path, output_path, options.limits, total_bytes, pin);
++        total_bytes += copied_file.byte_len;
++        if (pin_index) |index| pin_seen[index] = true;
+         try copied.append(allocator, .{
+             .id = try allocator.dupe(u8, entry.path),
+             .kind = zig_assets.inferKind(entry.path),
+             .source_path = try allocator.dupe(u8, source_path),
+             .bundle_path = try allocator.dupe(u8, entry.path),
+-            .byte_len = bytes.len,
+-            .hash = zig_assets.sha256(bytes),
++            .byte_len = copied_file.byte_len,
++            .hash = copied_file.hash,
+             .media_type = zig_assets.inferMediaType(entry.path),
+         });
+     }
+
++    for (pin_seen) |seen| {
++        if (!seen) return error.PinnedAssetMissing;
++    }
+     std.mem.sort(zig_assets.Asset, copied.items, {}, lessAsset);
+     try writeManifest(allocator, io, output_dir_path, copied.items);
+     return .{ .asset_count = copied.items.len };
+ }
+
++fn validatePinnedOversizedAssets(options: BundleOptions) !void {
++    for (options.pinned_oversized_assets, 0..) |pin, index| {
++        _ = try zig_assets.AssetPath.init(pin.bundle_path, pin.bundle_path);
++        if (pin.byte_len <= options.limits.maximum_file_bytes) return error.PinnedAssetNotOversized;
++        if (pin.byte_len > maximum_pinned_file_bytes) return error.PinnedAssetTooLarge;
++        if (pin.byte_len > options.limits.maximum_total_bytes) return error.AssetBundleTooLarge;
++        for (options.pinned_oversized_assets[0..index]) |previous| {
++            if (std.mem.eql(u8, previous.bundle_path, pin.bundle_path)) return error.DuplicatePinnedAsset;
++        }
++    }
++}
++
++fn pinnedAssetIndex(pins: []const PinnedOversizedAsset, bundle_path: []const u8) ?usize {
++    for (pins, 0..) |pin, index| {
++        if (std.mem.eql(u8, pin.bundle_path, bundle_path)) return index;
++    }
++    return null;
++}
++
++const CopiedFile = struct {
++    byte_len: u64,
++    hash: zig_assets.Hash,
++};
++
++fn copyFileAndHash(
++    io: std.Io,
++    source_path: []const u8,
++    output_path: []const u8,
++    limits: BundleLimits,
++    total_bytes: u64,
++    pinned: ?PinnedOversizedAsset,
++) !CopiedFile {
++    const cwd = std.Io.Dir.cwd();
++    var source = try cwd.openFile(io, source_path, .{
++        .allow_directory = false,
++        .follow_symlinks = false,
++    });
++    defer source.close(io);
++
++    const before = try source.stat(io);
++    if (before.kind != .file) return error.AssetSpecialFileNotAllowed;
++    if (before.nlink != 1) return error.AssetHardLinkNotAllowed;
++    if (pinned) |pin| {
++        if (before.size != pin.byte_len) return error.PinnedAssetSizeMismatch;
++    } else if (before.size > limits.maximum_file_bytes) {
++        return error.AssetFileTooLarge;
++    }
++    if (total_bytes > limits.maximum_total_bytes or before.size > limits.maximum_total_bytes - total_bytes) {
++        return error.AssetBundleTooLarge;
++    }
++
++    var output = try cwd.createFileAtomic(io, output_path, .{
++        .make_path = true,
++        .replace = true,
++    });
++    defer output.deinit(io);
++
++    var source_buffer: [64 * 1024]u8 = undefined;
++    var reader = source.reader(io, &source_buffer);
++    var output_buffer: [64 * 1024]u8 = undefined;
++    var writer = output.file.writer(io, &output_buffer);
++    var transfer_buffer: [64 * 1024]u8 = undefined;
++    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
++    var copied_bytes: u64 = 0;
++    while (copied_bytes < before.size) {
++        const remaining = before.size - copied_bytes;
++        const requested: usize = @intCast(@min(remaining, transfer_buffer.len));
++        const read_bytes = try reader.interface.readSliceShort(transfer_buffer[0..requested]);
++        if (read_bytes == 0) return error.AssetChangedDuringBundle;
++        try writer.interface.writeAll(transfer_buffer[0..read_bytes]);
++        hasher.update(transfer_buffer[0..read_bytes]);
++        copied_bytes += read_bytes;
++    }
++
++    var extra: [1]u8 = undefined;
++    if (try reader.interface.readSliceShort(&extra) != 0) return error.AssetChangedDuringBundle;
++    try writer.interface.flush();
++    const after = try source.stat(io);
++    if (!sameSourceSnapshot(before, after)) return error.AssetChangedDuringBundle;
++
++    var digest: [zig_assets.Hash.digest_len]u8 = undefined;
++    hasher.final(&digest);
++    const hash = zig_assets.Hash.init(digest);
++    if (pinned) |pin| {
++        if (!zig_assets.Hash.eql(hash, pin.hash)) return error.PinnedAssetHashMismatch;
++    }
++
++    try output.replace(io);
++    verifyMaterializedFile(io, output_path, copied_bytes) catch |err| {
++        cwd.deleteFile(io, output_path) catch {};
++        return err;
++    };
++    return .{ .byte_len = copied_bytes, .hash = hash };
++}
++
++fn verifyMaterializedFile(io: std.Io, output_path: []const u8, expected_size: u64) !void {
++    var output = try std.Io.Dir.cwd().openFile(io, output_path, .{
++        .allow_directory = false,
++        .follow_symlinks = false,
++    });
++    defer output.close(io);
++    const stat = try output.stat(io);
++    if (stat.kind != .file or stat.nlink != 1 or stat.size != expected_size) {
++        return error.AssetOutputChangedDuringBundle;
++    }
++}
++
++fn sameSourceSnapshot(before: std.Io.File.Stat, after: std.Io.File.Stat) bool {
++    return before.inode == after.inode and
++        before.nlink == after.nlink and
++        before.size == after.size and
++        before.kind == after.kind and
++        std.meta.eql(before.permissions, after.permissions) and
++        std.meta.eql(before.mtime, after.mtime) and
++        std.meta.eql(before.ctime, after.ctime);
++}
++
+ fn lessAsset(_: void, a: zig_assets.Asset, b: zig_assets.Asset) bool {
+     return std.mem.lessThan(u8, a.id, b.id);
+ }
+@@ -88,37 +273,228 @@ fn writeManifest(allocator: std.mem.Allocator, io: std.Io, output_dir_path: []co
+         try out.appendSlice(allocator, " },\n");
+     }
+     try out.appendSlice(allocator, "} }\n");
+-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = out.items });
++
++    var manifest = try std.Io.Dir.cwd().createFileAtomic(io, manifest_path, .{
++        .make_path = true,
++        .replace = true,
++    });
++    defer manifest.deinit(io);
++    var buffer: [4096]u8 = undefined;
++    var writer = manifest.file.writer(io, &buffer);
++    try writer.interface.writeAll(out.items);
++    try writer.interface.flush();
++    try manifest.replace(io);
++    try verifyMaterializedFile(io, manifest_path, out.items.len);
+ }
+
+-fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+-    defer file.close(io);
+-    var read_buffer: [4096]u8 = undefined;
+-    var reader = file.reader(io, &read_buffer);
+-    return reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
++/// Runs a package command against a private placeholder tree and replaces only
++/// its packaged asset directory with a fully verified tree before succeeding.
++/// The command must package unsigned; signing belongs after this mutation.
++pub fn main(init: std.process.Init) !void {
++    var arguments = std.process.Args.Iterator.init(init.minimal.args);
++    _ = arguments.next();
++    const mode = arguments.next() orelse return error.InvalidArguments;
++    if (!std.mem.eql(u8, mode, "package-with-pinned-asset")) return error.InvalidArguments;
++
++    const source_path = arguments.next() orelse return error.InvalidArguments;
++    const staging_path = arguments.next() orelse return error.InvalidArguments;
++    const packaged_assets_path = arguments.next() orelse return error.InvalidArguments;
++    const bundle_path = arguments.next() orelse return error.InvalidArguments;
++    const byte_len_text = arguments.next() orelse return error.InvalidArguments;
++    const hash_text = arguments.next() orelse return error.InvalidArguments;
++    const separator = arguments.next() orelse return error.InvalidArguments;
++    if (!std.mem.eql(u8, separator, "--")) return error.InvalidArguments;
++
++    var command: std.ArrayList([]const u8) = .empty;
++    defer command.deinit(init.gpa);
++    while (arguments.next()) |argument| try command.append(init.gpa, argument);
++    if (command.items.len == 0) return error.InvalidArguments;
++
++    const pin: PinnedOversizedAsset = .{
++        .bundle_path = bundle_path,
++        .byte_len = try std.fmt.parseInt(u64, byte_len_text, 10),
++        .hash = try zig_assets.Hash.parseHex(hash_text),
++    };
++    try packageWithPinnedAsset(
++        init.gpa,
++        init.io,
++        init.environ_map,
++        source_path,
++        staging_path,
++        packaged_assets_path,
++        pin,
++        command.items,
++    );
++}
++
++fn packageWithPinnedAsset(
++    allocator: std.mem.Allocator,
++    io: std.Io,
++    environ_map: *const std.process.Environ.Map,
++    source_path: []const u8,
++    staging_path: []const u8,
++    packaged_assets_path: []const u8,
++    pin: PinnedOversizedAsset,
++    command: []const []const u8,
++) !void {
++    try validatePackageCommand(command, staging_path);
++    const cwd = std.Io.Dir.cwd();
++    deleteTreeIfPresent(io, staging_path) catch return error.StagingCleanupFailed;
++    try cwd.createDirPath(io, staging_path);
++    errdefer cwd.deleteTree(io, staging_path) catch {};
++    // `prepare-package-output` removes the exact prior app before this helper
++    // starts. If anything here fails, remove the packaged frontend as well so
++    // a partial or pre-existing artifact can never look launchable.
++    errdefer cwd.deleteTree(io, packaged_assets_path) catch {};
++
++    try prepareStagingBundle(allocator, io, source_path, staging_path, pin);
++    var child = try std.process.spawn(io, .{
++        .argv = command,
++        .environ_map = environ_map,
++        .stdin = .inherit,
++        .stdout = .inherit,
++        .stderr = .inherit,
++    });
++    const term = try child.wait(io);
++    switch (term) {
++        .exited => |code| if (code != 0) return error.PackageCommandFailed,
++        else => return error.PackageCommandFailed,
++    }
++
++    try replacePackagedAssets(allocator, io, source_path, packaged_assets_path, pin);
++    cwd.deleteTree(io, staging_path) catch return error.StagingCleanupFailed;
+ }
+
+-fn writeFilePath(io: std.Io, path: []const u8, bytes: []const u8) !void {
+-    if (std.fs.path.dirname(path)) |parent| {
+-        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
++fn validatePackageCommand(command: []const []const u8, staging_path: []const u8) !void {
++    var assets_matches: usize = 0;
++    var signing_none_matches: usize = 0;
++    var index: usize = 0;
++    while (index < command.len) : (index += 1) {
++        if (std.mem.eql(u8, command[index], "--assets")) {
++            index += 1;
++            if (index >= command.len or !std.mem.eql(u8, command[index], staging_path)) return error.InvalidPackageAssetsPath;
++            assets_matches += 1;
++            continue;
++        }
++        if (std.mem.eql(u8, command[index], "--signing")) {
++            index += 1;
++            if (index >= command.len or !std.mem.eql(u8, command[index], "none")) return error.PackageSigningMustRunAfterAssets;
++            signing_none_matches += 1;
++            continue;
++        }
++        if (std.mem.startsWith(u8, command[index], "--signing=")) {
++            return error.PackageSigningMustBeExplicitNone;
++        }
+     }
+-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
++    if (assets_matches != 1) return error.InvalidPackageAssetsPath;
++    if (signing_none_matches != 1) return error.PackageSigningMustBeExplicitNone;
++}
++
++fn prepareStagingBundle(
++    allocator: std.mem.Allocator,
++    io: std.Io,
++    source_path: []const u8,
++    staging_path: []const u8,
++    pin: PinnedOversizedAsset,
++) !void {
++    _ = try bundleWithPinnedOversizedAssets(allocator, io, source_path, staging_path, &.{pin});
++    const placeholder_path = try std.fs.path.join(allocator, &.{ staging_path, pin.bundle_path });
++    defer allocator.free(placeholder_path);
++    var placeholder = try std.Io.Dir.cwd().openFile(io, placeholder_path, .{
++        .mode = .read_write,
++        .allow_directory = false,
++        .follow_symlinks = false,
++    });
++    defer placeholder.close(io);
++    const before = try placeholder.stat(io);
++    if (before.kind != .file or before.nlink != 1 or before.size != pin.byte_len) return error.InvalidPinnedPlaceholder;
++    try placeholder.setLength(io, 0);
++    const after = try placeholder.stat(io);
++    if (before.inode != after.inode or after.kind != .file or after.nlink != 1 or after.size != 0) return error.InvalidPinnedPlaceholder;
++
++    const manifest_path = try std.fs.path.join(allocator, &.{ staging_path, "asset-manifest.zon" });
++    defer allocator.free(manifest_path);
++    try std.Io.Dir.cwd().deleteFile(io, manifest_path);
++}
++
++fn replacePackagedAssets(
++    allocator: std.mem.Allocator,
++    io: std.Io,
++    source_path: []const u8,
++    packaged_assets_path: []const u8,
++    pin: PinnedOversizedAsset,
++) !void {
++    const replacement_path = try std.fmt.allocPrint(allocator, "{s}.oprte-verified-new", .{packaged_assets_path});
++    defer allocator.free(replacement_path);
++    const backup_path = try std.fmt.allocPrint(allocator, "{s}.oprte-placeholder-old", .{packaged_assets_path});
++    defer allocator.free(backup_path);
++    try deleteTreeIfPresent(io, replacement_path);
++    try deleteTreeIfPresent(io, backup_path);
++    errdefer std.Io.Dir.cwd().deleteTree(io, replacement_path) catch {};
++
++    _ = try bundleWithPinnedOversizedAssets(allocator, io, source_path, replacement_path, &.{pin});
++    try replaceDirectory(io, packaged_assets_path, replacement_path, backup_path);
++}
++
++fn replaceDirectory(io: std.Io, destination_path: []const u8, replacement_path: []const u8, backup_path: []const u8) !void {
++    const cwd = std.Io.Dir.cwd();
++    const destination_stat = statDirectoryNoFollow(io, destination_path) catch return error.InvalidPackagedAssetsDirectory;
++    if (destination_stat.kind != .directory) return error.InvalidPackagedAssetsDirectory;
++    const replacement_stat = statDirectoryNoFollow(io, replacement_path) catch return error.InvalidPackagedAssetsDirectory;
++    if (replacement_stat.kind != .directory) return error.InvalidPackagedAssetsDirectory;
++
++    try cwd.rename(destination_path, cwd, backup_path, io);
++    var backup_moved = true;
++    var replacement_moved = false;
++    errdefer {
++        if (replacement_moved) cwd.deleteTree(io, destination_path) catch {};
++        if (backup_moved) cwd.rename(backup_path, cwd, destination_path, io) catch {};
++    }
++
++    const backup_stat = statDirectoryNoFollow(io, backup_path) catch return error.PackagedAssetsChangedDuringReplacement;
++    if (!sameDirectoryIdentity(destination_stat, backup_stat)) return error.PackagedAssetsChangedDuringReplacement;
++
++    try cwd.rename(replacement_path, cwd, destination_path, io);
++    replacement_moved = true;
++    const installed_stat = statDirectoryNoFollow(io, destination_path) catch return error.PackagedAssetsChangedDuringReplacement;
++    if (!sameDirectoryIdentity(replacement_stat, installed_stat)) return error.PackagedAssetsChangedDuringReplacement;
++
++    cwd.deleteTree(io, backup_path) catch return error.PackagedAssetsBackupCleanupFailed;
++    backup_moved = false;
++}
++
++fn sameDirectoryIdentity(before: std.Io.File.Stat, after: std.Io.File.Stat) bool {
++    return before.inode == after.inode and before.kind == .directory and after.kind == .directory;
++}
++
++fn statDirectoryNoFollow(io: std.Io, path: []const u8) !std.Io.File.Stat {
++    var directory = try std.Io.Dir.cwd().openDir(io, path, .{ .follow_symlinks = false });
++    defer directory.close(io);
++    return directory.stat(io);
++}
++
++fn deleteTreeIfPresent(io: std.Io, path: []const u8) !void {
++    try std.Io.Dir.cwd().deleteTree(io, path);
+ }
+
+ test "empty missing asset directory creates empty manifest" {
+-    const result = try bundle(std.testing.allocator, std.testing.io, "does-not-exist-assets", ".zig-cache/test-empty-assets");
++    const root = ".zig-cache/test-empty-assets";
++    const cwd = std.Io.Dir.cwd();
++    cwd.deleteTree(std.testing.io, root) catch {};
++    defer cwd.deleteTree(std.testing.io, root) catch {};
++    const result = try bundle(std.testing.allocator, std.testing.io, root ++ "/missing", root ++ "/out");
+     try std.testing.expectEqual(@as(usize, 0), result.asset_count);
+ }
+
+ test "bundle recursively copies frontend asset trees" {
+     const cwd = std.Io.Dir.cwd();
+-    cwd.createDirPath(std.testing.io, ".zig-cache/test-recursive-assets/src/assets") catch {};
++    cwd.deleteTree(std.testing.io, ".zig-cache/test-recursive-assets") catch {};
++    defer cwd.deleteTree(std.testing.io, ".zig-cache/test-recursive-assets") catch {};
++    try cwd.createDirPath(std.testing.io, ".zig-cache/test-recursive-assets/src/assets");
+     try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-recursive-assets/src/index.html", .data = "<script src=\"/assets/app.js\"></script>" });
+     try cwd.writeFile(std.testing.io, .{ .sub_path = ".zig-cache/test-recursive-assets/src/assets/app.js", .data = "console.log('native-sdk');" });
+
+     const result = try bundle(std.testing.allocator, std.testing.io, ".zig-cache/test-recursive-assets/src", ".zig-cache/test-recursive-assets/out");
+-
+     try std.testing.expectEqual(@as(usize, 2), result.asset_count);
+     var buffer: [64]u8 = undefined;
+     var file = try cwd.openFile(std.testing.io, ".zig-cache/test-recursive-assets/out/assets/app.js", .{});
+@@ -126,3 +502,197 @@ test "bundle recursively copies frontend asset trees" {
+     const len = try file.readPositionalAll(std.testing.io, &buffer, 0);
+     try std.testing.expectEqualStrings("console.log('native-sdk');", buffer[0..len]);
+ }
++
++test "generic bundle preserves the exact sixteen MiB per-file ceiling" {
++    const cwd = std.Io.Dir.cwd();
++    const root = ".zig-cache/test-generic-asset-ceiling";
++    cwd.deleteTree(std.testing.io, root) catch {};
++    defer cwd.deleteTree(std.testing.io, root) catch {};
++    try cwd.createDirPath(std.testing.io, root ++ "/src");
++    var oversized = try cwd.createFile(std.testing.io, root ++ "/src/oversized.bin", .{});
++    try oversized.setLength(std.testing.io, (BundleLimits{}).maximum_file_bytes + 1);
++    oversized.close(std.testing.io);
++    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), (BundleLimits{}).maximum_file_bytes);
++    try std.testing.expectError(error.AssetFileTooLarge, bundle(std.testing.allocator, std.testing.io, root ++ "/src", root ++ "/out"));
++}
++
++test "an exact oversized asset pin streams bytes and records the verified hash" {
++    const cwd = std.Io.Dir.cwd();
++    const root = ".zig-cache/test-pinned-streamed-assets";
++    const source_path = root ++ "/src/library.sf3";
++    const output_path = root ++ "/out/library.sf3";
++    const byte_len: u64 = 16 * 1024 * 1024 + 4096;
++    cwd.deleteTree(std.testing.io, root) catch {};
++    defer cwd.deleteTree(std.testing.io, root) catch {};
++    try cwd.createDirPath(std.testing.io, root ++ "/src");
++    var source = try cwd.createFile(std.testing.io, source_path, .{});
++    try source.setLength(std.testing.io, byte_len);
++    source.close(std.testing.io);
++
++    const zero_hash = hashRepeatedByte(0, byte_len);
++    const pin: PinnedOversizedAsset = .{ .bundle_path = "library.sf3", .byte_len = byte_len, .hash = zero_hash };
++    const result = try bundleWithPinnedOversizedAssets(std.testing.allocator, std.testing.io, root ++ "/src", root ++ "/out", &.{pin});
++    try std.testing.expectEqual(@as(usize, 1), result.asset_count);
++
++    var output = try cwd.openFile(std.testing.io, output_path, .{});
++    defer output.close(std.testing.io);
++    try std.testing.expectEqual(byte_len, try output.length(std.testing.io));
++    try std.testing.expect(zig_assets.Hash.eql(try hashFile(std.testing.io, output), zero_hash));
++
++    var manifest = try cwd.openFile(std.testing.io, root ++ "/out/asset-manifest.zon", .{});
++    defer manifest.close(std.testing.io);
++    var manifest_buffer: [4096]u8 = undefined;
++    const manifest_len = try manifest.readPositionalAll(std.testing.io, &manifest_buffer, 0);
++    const hash_hex = zero_hash.toHex();
++    try std.testing.expect(std.mem.indexOf(u8, manifest_buffer[0..manifest_len], &hash_hex) != null);
++    try std.testing.expect(std.mem.indexOf(u8, manifest_buffer[0..manifest_len], "byte_len = 16781312") != null);
++}
++
++test "oversized pins reject aliases size drift byte drift and missing paths" {
++    const cwd = std.Io.Dir.cwd();
++    const limits: BundleLimits = .{ .maximum_file_bytes = 4, .maximum_total_bytes = 32 };
++    const expected = zig_assets.sha256("12345678");
++    const pin: PinnedOversizedAsset = .{ .bundle_path = "library.sf3", .byte_len = 8, .hash = expected };
++
++    const alias_root = ".zig-cache/test-pinned-alias";
++    cwd.deleteTree(std.testing.io, alias_root) catch {};
++    defer cwd.deleteTree(std.testing.io, alias_root) catch {};
++    try cwd.createDirPath(std.testing.io, alias_root ++ "/src");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = alias_root ++ "/src/alias.sf3", .data = "12345678" });
++    try std.testing.expectError(error.AssetFileTooLarge, bundleConfigured(std.testing.allocator, std.testing.io, alias_root ++ "/src", alias_root ++ "/out", .{ .limits = limits, .pinned_oversized_assets = &.{pin} }));
++
++    const size_root = ".zig-cache/test-pinned-size";
++    cwd.deleteTree(std.testing.io, size_root) catch {};
++    defer cwd.deleteTree(std.testing.io, size_root) catch {};
++    try cwd.createDirPath(std.testing.io, size_root ++ "/src");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = size_root ++ "/src/library.sf3", .data = "short" });
++    try std.testing.expectError(error.PinnedAssetSizeMismatch, bundleConfigured(std.testing.allocator, std.testing.io, size_root ++ "/src", size_root ++ "/out", .{ .limits = limits, .pinned_oversized_assets = &.{pin} }));
++
++    const hash_root = ".zig-cache/test-pinned-hash";
++    cwd.deleteTree(std.testing.io, hash_root) catch {};
++    defer cwd.deleteTree(std.testing.io, hash_root) catch {};
++    try cwd.createDirPath(std.testing.io, hash_root ++ "/src");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = hash_root ++ "/src/library.sf3", .data = "12345679" });
++    try std.testing.expectError(error.PinnedAssetHashMismatch, bundleConfigured(std.testing.allocator, std.testing.io, hash_root ++ "/src", hash_root ++ "/out", .{ .limits = limits, .pinned_oversized_assets = &.{pin} }));
++
++    const missing_root = ".zig-cache/test-pinned-missing";
++    cwd.deleteTree(std.testing.io, missing_root) catch {};
++    defer cwd.deleteTree(std.testing.io, missing_root) catch {};
++    try cwd.createDirPath(std.testing.io, missing_root ++ "/src");
++    try std.testing.expectError(error.PinnedAssetMissing, bundleConfigured(std.testing.allocator, std.testing.io, missing_root ++ "/src", missing_root ++ "/out", .{ .limits = limits, .pinned_oversized_assets = &.{pin} }));
++}
++
++test "bundle rejects aggregate overflow symlinks and hardlinks without following output symlinks" {
++    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
++    const cwd = std.Io.Dir.cwd();
++
++    const total_root = ".zig-cache/test-asset-total-limit";
++    cwd.deleteTree(std.testing.io, total_root) catch {};
++    defer cwd.deleteTree(std.testing.io, total_root) catch {};
++    try cwd.createDirPath(std.testing.io, total_root ++ "/src");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = total_root ++ "/src/a.bin", .data = "aa" });
++    try cwd.writeFile(std.testing.io, .{ .sub_path = total_root ++ "/src/b.bin", .data = "bb" });
++    try std.testing.expectError(error.AssetBundleTooLarge, bundleConfigured(std.testing.allocator, std.testing.io, total_root ++ "/src", total_root ++ "/out", .{ .limits = .{ .maximum_file_bytes = 2, .maximum_total_bytes = 3 } }));
++
++    const link_root = ".zig-cache/test-asset-links";
++    cwd.deleteTree(std.testing.io, link_root) catch {};
++    defer cwd.deleteTree(std.testing.io, link_root) catch {};
++    try cwd.createDirPath(std.testing.io, link_root ++ "/src");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = link_root ++ "/src/target.bin", .data = "target" });
++    try cwd.symLink(std.testing.io, "target.bin", link_root ++ "/src/link.bin", .{});
++    try std.testing.expectError(error.AssetSymlinkNotAllowed, bundle(std.testing.allocator, std.testing.io, link_root ++ "/src", link_root ++ "/out"));
++    try std.testing.expectError(error.SymLinkLoop, copyFileAndHash(std.testing.io, link_root ++ "/src/link.bin", link_root ++ "/out/link.bin", .{}, 0, null));
++
++    try cwd.deleteFile(std.testing.io, link_root ++ "/src/link.bin");
++    try cwd.hardLink(link_root ++ "/src/target.bin", cwd, link_root ++ "/src/hard.bin", std.testing.io, .{});
++    try std.testing.expectError(error.AssetHardLinkNotAllowed, bundle(std.testing.allocator, std.testing.io, link_root ++ "/src", link_root ++ "/hard-out"));
++
++    const output_root = ".zig-cache/test-asset-output-link";
++    cwd.deleteTree(std.testing.io, output_root) catch {};
++    defer cwd.deleteTree(std.testing.io, output_root) catch {};
++    try cwd.createDirPath(std.testing.io, output_root ++ "/src");
++    try cwd.createDirPath(std.testing.io, output_root ++ "/out");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = output_root ++ "/src/file.bin", .data = "new" });
++    try cwd.writeFile(std.testing.io, .{ .sub_path = output_root ++ "/sentinel.bin", .data = "sentinel" });
++    try cwd.symLink(std.testing.io, "../sentinel.bin", output_root ++ "/out/file.bin", .{});
++    _ = try bundle(std.testing.allocator, std.testing.io, output_root ++ "/src", output_root ++ "/out");
++    var sentinel_buffer: [16]u8 = undefined;
++    var sentinel = try cwd.openFile(std.testing.io, output_root ++ "/sentinel.bin", .{});
++    defer sentinel.close(std.testing.io);
++    const sentinel_len = try sentinel.readPositionalAll(std.testing.io, &sentinel_buffer, 0);
++    try std.testing.expectEqualStrings("sentinel", sentinel_buffer[0..sentinel_len]);
++}
++
++test "package command requires the private staging tree and unsigned mutation order" {
++    const valid = &.{ "bunx", "native", "package", "--assets", ".zig-cache/stage", "--signing", "none" };
++    try validatePackageCommand(valid, ".zig-cache/stage");
++    try std.testing.expectError(error.InvalidPackageAssetsPath, validatePackageCommand(&.{ "native", "package", "--assets", "frontend/dist" }, ".zig-cache/stage"));
++    try std.testing.expectError(error.PackageSigningMustRunAfterAssets, validatePackageCommand(&.{ "native", "package", "--assets", ".zig-cache/stage", "--signing", "adhoc" }, ".zig-cache/stage"));
++    try std.testing.expectError(error.PackageSigningMustBeExplicitNone, validatePackageCommand(&.{ "native", "package", "--assets", ".zig-cache/stage" }, ".zig-cache/stage"));
++    try std.testing.expectError(error.PackageSigningMustBeExplicitNone, validatePackageCommand(&.{ "native", "package", "--assets", ".zig-cache/stage", "--signing=none" }, ".zig-cache/stage"));
++    try std.testing.expectError(error.PackageSigningMustBeExplicitNone, validatePackageCommand(&.{ "native", "package", "--assets", ".zig-cache/stage", "--signing", "none", "--signing", "none" }, ".zig-cache/stage"));
++}
++
++test "staging uses one verified placeholder and directory replacement is rollback-shaped" {
++    const cwd = std.Io.Dir.cwd();
++    const root = ".zig-cache/test-pinned-package-replacement";
++    cwd.deleteTree(std.testing.io, root) catch {};
++    defer cwd.deleteTree(std.testing.io, root) catch {};
++    try cwd.createDirPath(std.testing.io, root ++ "/source");
++    try cwd.createDirPath(std.testing.io, root ++ "/package/frontend/dist");
++    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/source/library.sf3", .data = "12345678" });
++    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/package/frontend/dist/library.sf3", .data = "" });
++    try cwd.writeFile(std.testing.io, .{ .sub_path = root ++ "/package/frontend/dist/asset-manifest.zon", .data = "placeholder" });
++
++    const pin: PinnedOversizedAsset = .{ .bundle_path = "library.sf3", .byte_len = 8, .hash = zig_assets.sha256("12345678") };
++    const options: BundleOptions = .{ .limits = .{ .maximum_file_bytes = 4, .maximum_total_bytes = 32 }, .pinned_oversized_assets = &.{pin} };
++    try cwd.createDirPath(std.testing.io, root ++ "/stage");
++    _ = try bundleConfigured(std.testing.allocator, std.testing.io, root ++ "/source", root ++ "/stage", options);
++    var placeholder = try cwd.openFile(std.testing.io, root ++ "/stage/library.sf3", .{ .mode = .read_write, .follow_symlinks = false });
++    try placeholder.setLength(std.testing.io, 0);
++    placeholder.close(std.testing.io);
++    try cwd.deleteFile(std.testing.io, root ++ "/stage/asset-manifest.zon");
++    var staged_placeholder = try cwd.openFile(std.testing.io, root ++ "/stage/library.sf3", .{});
++    defer staged_placeholder.close(std.testing.io);
++    try std.testing.expectEqual(@as(u64, 0), try staged_placeholder.length(std.testing.io));
++
++    const replacement = root ++ "/package/frontend/dist.oprte-verified-new";
++    _ = try bundleConfigured(std.testing.allocator, std.testing.io, root ++ "/source", replacement, options);
++    try replaceDirectory(std.testing.io, root ++ "/package/frontend/dist", replacement, root ++ "/package/frontend/dist.oprte-placeholder-old");
++    var installed = try cwd.openFile(std.testing.io, root ++ "/package/frontend/dist/library.sf3", .{});
++    defer installed.close(std.testing.io);
++    var bytes: [8]u8 = undefined;
++    const len = try installed.readPositionalAll(std.testing.io, &bytes, 0);
++    try std.testing.expectEqualStrings("12345678", bytes[0..len]);
++    try std.testing.expectError(error.FileNotFound, cwd.openDir(std.testing.io, root ++ "/package/frontend/dist.oprte-placeholder-old", .{}));
++}
++
++fn hashFile(io: std.Io, file: std.Io.File) !zig_assets.Hash {
++    var buffer: [64 * 1024]u8 = undefined;
++    var reader = file.reader(io, &buffer);
++    var transfer: [64 * 1024]u8 = undefined;
++    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
++    while (true) {
++        const read_bytes = try reader.interface.readSliceShort(&transfer);
++        if (read_bytes == 0) break;
++        hasher.update(transfer[0..read_bytes]);
++    }
++    var digest: [zig_assets.Hash.digest_len]u8 = undefined;
++    hasher.final(&digest);
++    return zig_assets.Hash.init(digest);
++}
++
++fn hashRepeatedByte(byte: u8, byte_len: u64) zig_assets.Hash {
++    var bytes: [64 * 1024]u8 = undefined;
++    @memset(&bytes, byte);
++    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
++    var remaining = byte_len;
++    while (remaining != 0) {
++        const update_len: usize = @intCast(@min(remaining, bytes.len));
++        hasher.update(bytes[0..update_len]);
++        remaining -= update_len;
++    }
++    var digest: [zig_assets.Hash.digest_len]u8 = undefined;
++    hasher.final(&digest);
++    return zig_assets.Hash.init(digest);
++}

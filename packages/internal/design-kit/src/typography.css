@@ -1,0 +1,25 @@
+.jungle-text-chrome {
+  background: var(--chrome-text-gradient);
+  background-clip: text;
+  color: var(--chrome-deep);
+  text-shadow: var(--chrome-text-shadow);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+@supports not ((background-clip: text) or (-webkit-background-clip: text)) {
+  .jungle-text-chrome {
+    background: none;
+    color: var(--chrome-deep);
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
+@media (forced-colors: active) {
+  .jungle-text-chrome {
+    background: none;
+    color: CanvasText;
+    text-shadow: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}

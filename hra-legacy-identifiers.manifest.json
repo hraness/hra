@@ -1,0 +1,2225 @@
+{
+  "entries": [
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d81488879d1e23981af576d0ecb42d3575cba5280a0a146929e2600cb68d7d7d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/README.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "aa3f9a637b647f49f009fa48c9adf7ebe243e6830392d3b069fef562fc458213",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/app.zon"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5e0cdc77844bf09788038cec4d0e47584afc53eb3766a328f3ee5f3272ec38ed",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/build.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "de9517b95de13607c1819320a3c7ce1acccf099ff1a67db38d581cc988e0c5f2",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/contracts/runtime.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d70232e4bac7fe23076f779a352d5ffc5734249d990d5ccec0b8f81e1eb5c290",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/frontend/direct/check-production-boundary.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5e24018a8acbc6a32d27a5e5e7587c78e3ffdd2907e58f3d1c0adc277b8ec149",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/frontend/direct/check-production-boundary.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f89dcfdc740dc9cf713fe58f5b5138c6cf769c0ec9b4fe7f308a840aeb0d3614",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/frontend/direct/verify-browser.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "663fa7ba9435c75c840a6f38264b180114da3683399969718335e23d24654ca0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/frontend/src/ui-scale.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fd7f85a801073aac773d6a2927f12b67b462fb417278a7536b6bc0fb0ae32df3",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/frontend/src/ui-scale.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5018a5b9ae4885ab7b53b828adf101fb23d1d07a634e02577c877ed7a42b9bd8",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/package.json"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c71f27161a33b580cb6b9fe0fecbff0e5adf4f695a711555691869a7f6ccddef",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/dev-protocol.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3bf8c55bfc1a15b2bb365521d1a9a16569eeac2fe4113babe6cc89c06ec531e9",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/prepare-package-output.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4d0f7bb1912a4396879a88b95110aff3f8b2493531618b2c727b239d601d6467",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/run-native.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4bb243153ead2e788b53d8729e8037650ffc5c5070d4b7ab38d0ad8de923c94d",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/accounts/local-data-remover.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f6baec0d4bb6c15b644541099f23036c2ff864cfeef9f6da3ef26c5a736fe20d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/chat/codex-chat-provider.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0539511e529c40babdb3bd8e4b270a75ab6bdd079ee5b74e8180ce496aeb1cde",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/cloud/AGENTS.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "8bc0e95db8bb3936caa75aa308e3ab4912aee9b33b4e9bfc202139294bf14de6",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/cloud/session-sync-key-custody.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "82127b08f598e14ff7d5c214e1f5fff0a606e9db472b25b4bf7aaf3bd663018d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/cloud/session-sync-local-crypto.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a5bb49f3d918b05e0d615dbb08a0cb344e19796557c18cd0e70ab08f00f84aed",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/codex/dynamic-tool-capability.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "54dcce7a759abee6323483b924458324c8b4873d475eb6377fec4adbe29b54bf",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/codex/dynamic-tool.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "bda3186fb624af8e83c8dc4789be78f7df779f4dca06441c859074648eaa43b7",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/codex/facts.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "aacb3b45a217287d123562acf480f6af1617826d722e39f91cf27f533683ccf4",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/codex/pinned-codecs.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d188a87b3bae64d41c4e113d3ddd2b9b37845a9ea7e1d46d060f27bbf9dae6f0",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/dispatch/activity-adapter.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "20811f7e0dd65fe010a64379420feb2b076621e0580dc67e3b3bd839991ef50b",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/dispatch/completion-adapter.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "310b0d15ecb642bd036e5ea6b2e210d9f7e063a20346683cd9549bb59846a5e9",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/dispatch/coordinator.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cc8b837b2b694fca4c742eef96c5c04c6208528797bf5ed4d1ae837db3bd2685",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/dispatch/runner.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "80658c515e83ded84d0f9c0db5e144456b0cf7d25a2ddb07b418deb7375622eb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/src/harness/actor-continuation-intent-identity-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "29481ad48ce6fd3288e49b3cba4dc940720a6a8ed182a6733aa85b226d920377",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/harness/actor-domain.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3d65003fd00d1f7403acd8fec11fc021fea023ce28bc69ed01fc622c7347c515",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/harness/actor-result-transfer-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "901655f8b5c65821524fea14c5d436e0ed931edbeec2b4f6a349bd04f59acdeb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/harness/actor-token-usage-identity-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "edcb91daeea54f2dcdac476a5da0c5274cc44c8f1ebcc1c71af7f663c369b8b3",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/src/harness/codex-persistent-actor-provider.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "965786a16b06e02071423461fd8602d7aeeb96a696238735d1e181338868851e",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/harness/completed-prefix-container-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9bae7c668494357e108b1ead0c965c31b6933e0681942e06c32d1fb8dc92ec06",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/context-operation-service-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "49e3d510dc1b3667ca7d31ad0842f281e21355027cb70cf8679b445da0c4fa38",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/harness/context-value-ports-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9a827f495c3072ad827eb38410da9a246e93b6dcd44f03f361e181e57d7bf3ba",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/src/harness/context-value-store.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "299fc6f780bea16fbd23a68baf7c974886570328d4d4f2d0f77883d76a22c1bf",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/src/harness/dynamic-tool-context-identity-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "da0974f2adc2b003d4ed711ff6dc50f6d2c05b71b876aa18ef3a6989184d20d0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/dynamic-tool-evidence-settings-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "654d5d831247b756ac500bf1155f535695ed18511df552870d7a6c56b72f48e5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/harness/dynamic-tool-stable-caller-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e927ea60538d525c3a77963a7568d575d1061bc97d238d3f661607e206cd79c3",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/desktop/runtime/src/harness/key-custody.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2501987301155798470070f64e998fb2a4614a07ca02dbf63c4177e03f49ee1d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/src/harness/persistent-actors.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cd90c30c2b279a69eb29fa3879ac58128c0c33df85786409b09a4949c68180da",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/src/harness/production-context-adapters-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "261ef028d984bfbbc6a2df0aa8c1d16d5af4bdeda3d8d85288232d86a58ceca0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/proposal-service.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f367f232a581c16cde515ecc9ae21023294a0220fcef2ce5e2de3d7ace059e83",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/renderer-authority-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4e07c53b6f5a752d3d490a6ba785fe2a03030ef041c04c27ea78fd95c3bd5061",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/harness/renderer-effects-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4d6838a01da102b58d21f8ce4711838d7ddd7b8dc091173ce0eaaf89549e66ea",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/src/harness/rlm-runtime-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "70a6000ae9bd9973eedd9ebc3df7e3982960c4fce5be3abec19ab023a1de1e06",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/rlm-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d83cbbb3b51b77cfcb079a2f8b151a3a7b67ad6972f64bdf66e3930f0fe5c048",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/src/harness/root-actor-authority-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ef920ddcb87487f20a19d54519b1370011d2e485bef6283b71ab89d1fe19a952",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/harness/root-chat-admission-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0451fd76dee023bb84699739ec59311502429019a236be7f04dd268a9537b619",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/semantic-evidence-custody-v2.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "22d891827d14ee41655366b593d00600857f3886aad9a0a15222790ff9947771",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/harness/storage-layout.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "90d4602e18dd58d3e00b31bc904a2d7fe498087ef7feeac4c6546a202b43daef",
+      "occurrences": {
+        "kitchen": 8,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/src/maintenance/local-data-removal-inventory.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "113a8ee51fe5e4b4a6efceda3e2ea1e496d8b5ac120d72d55d58d1985080d769",
+      "occurrences": {
+        "kitchen": 25,
+        "operateStylized": 2,
+        "oprte": 18
+      },
+      "path": "apps/desktop/runtime/src/maintenance/local-data-removal.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e78fc245581f19877af343cde91d01685f8869697e8fe100048c4a25e5e21eb7",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/promotion/runner-pairing.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "261d3d3528a2aa16495dce37ea1740fd942e4ef8975bf93e2ae1c19d8adda1b7",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/security/renamed-environment.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "dc9f37ac0157dee1f0ddeb17111982b253f363f83a63269b2a06423db310e29e",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/sessions/interaction-coordinator.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "69b3817de9f3e1cb20d4503da5c075ef873a028bb5ca115e1a8c5bae3f80fe1f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/sessions/interaction-protocol.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c6950ff002f2306c17b1b33a19afd4a83e4e176229d8249ab26642858feb1e41",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/src/sessions/session-service.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "903b691c95689976e7ebb81daa12ea6e3542c26322f0d0366b0dd8a980e3daf3",
+      "occurrences": {
+        "kitchen": 3,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/application-support-worktree-repair.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e13cf68009b03f9c9e808d600db19b6e004db04aeff8c9685b717229f47710d1",
+      "occurrences": {
+        "kitchen": 20,
+        "operateStylized": 1,
+        "oprte": 35
+      },
+      "path": "apps/desktop/runtime/src/state/application-support.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1ecc894da5d4dfe99c11ce10a64f60ec489dd1a2c447fd6047e18e77cae2f00f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 9
+      },
+      "path": "apps/desktop/runtime/src/state/chat-pane-store.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "62c77fd2296b1f20297b6144b8d0d4951c58dd12a862b4349be9a9be9abf1996",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/state/chat-workspace-store.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "31539c340bbf99f23b9f94c958d939ea0ab49f16cded88b42242b51952171b43",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/control-plane-backup.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "89a2877c4d4aa25df9bd4b41256cdb90a014d7c3f94b3c069c5adb9acde89637",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/control-plane-restore-state.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2f84e5c59ea1a1ccbb8b8ed4a5af6c4b76b05175a471c99db7762535ac61c625",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/dispatch-runner-installation.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "bc2815b2aee173ab94d47c010f6f59abce16e819a1d9a4f629f8d97f13da0705",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/dispatch-store.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cc7a535d52d613e875df21e9289aefc8df0f6c93df3c9faf56500d3e793ef3bf",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/local-promotion-store.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3103f168914861f8b0483567ea48dec19728b0359ad2500e3b7630293f6d7107",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/state/migrations.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d5cbfa70612b823c40851febb1e541dbb474848bc6f5376ec8be9d9a2b89edfb",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/state/release-compatibility.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2604bba7f254abb9386c79ff35607e8343e95c38d0ecd303a3a52c0a78c114ba",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/workspaces/git-runner.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "63235abb0706a13684d9879aa92d73a6141a1f51c1fba251e3f88af71bd40ccd",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/src/workspaces/workspace-broker.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f2050bd65dcd0b915a10f6842b629b1e1ab6be504d0e60ebc758def68efe646a",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/account-local-data-remover.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "81b82a9fe7a36d1f7f5a0be8da89b24faac8859841525b3439eaa7fc76d0ee6e",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/account-profile-state.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "81cf91614667a4495782ca008945c21b547523221199ec786b216295cdbb8a09",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/account-runtime-router.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "53172ae95ac2973756e4e9d836bf580ad3c2c0ae0d58c39db3891ebb016d8db3",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/account-service.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "38497553dda5912c335c57c79a4725dbd81393408f710d7c8a0db35f6bfb3e7b",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/app-server-process.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4b3a152e7e99825d932df360e5dc0fc8a2299b8d0198eee2844ec53d6f5b62ae",
+      "occurrences": {
+        "kitchen": 16,
+        "operateStylized": 0,
+        "oprte": 27
+      },
+      "path": "apps/desktop/runtime/test/application-support-migration.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ffb70a2c21f2863b49b77adb897fbef4fa5c06d4034d31a01a0336354bc0b1d7",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/test/application-support-worktree-repair.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "72bb1379889bae3c9b594731fd3e13838e24d8da5c4471d5dcaf5264defb442a",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/chat-pane-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "aee5d3d3a388fa0a3b7c7199a40b14fb13701d1cba6a2bde57587ebdde3ddb7d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/chat-session-integration.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c4a4a21ba6830eeb46c1522d6f0a1c673d652e4e4b8ef296dc979dcb589a8919",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/chat-stream-persistence.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "dcf0520b475f609d1a45464baca546efc3b76858ee53c516e5ee20646b9d37eb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/desktop/runtime/test/chat-workspace-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "636721940f4f84afdf0d30c1a9342f3a62fcff578d8b5a72e537194d8f4e8ecd",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/cloud-http-client.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a60f7230caa705df8b790a227f07cdd466a6041b9b1d968ca0ee0bc7e7d80f05",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 20
+      },
+      "path": "apps/desktop/runtime/test/cloud-human-account-service.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "663894777e3482c8f47f8f1b2f00f9a7c4e95ddfa7a6831b3e6c4ad527233e4d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/cloud-human-operation-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "b58ec5b46ac6507adf3b0dc6e8744a015132a0a2bc73ee60df66ee4c760390b7",
+      "occurrences": {
+        "kitchen": 3,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/cloud-keychain-custody.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "82beac5ad1d0052bdb96201ab40f69aca0c60e867d60b937e486e15834542be0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/test/codex-dynamic-tool-capability.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5e0101fa77272cf87d64d77523d05c44ef479990110d4f83b0da94b8851c7535",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/codex-dynamic-tool.property.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4a2ccf3c8199eb3d52f552f6458df4c12d4bcbbdd5f8d02a7813b575088f184f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 14
+      },
+      "path": "apps/desktop/runtime/test/codex-dynamic-tool.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ac18ffdf74467810d926bb381d1a9afc0a21e6ef3b4ba8b067e0e3bb56d46d52",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 11
+      },
+      "path": "apps/desktop/runtime/test/codex-pinned-fixtures.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2a3b44d4b2649a3996834fb1b7a1bdf422b73867043c8b78ae565c29bfbeea78",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 18
+      },
+      "path": "apps/desktop/runtime/test/codex-pinned-protocol.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fae8b2b9adaef7b842d85f3df252ef7e40af02ad7f53314d4f5c470af5046759",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/codex-reconciliation.property.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "b9245f26b01ca31226302e90db07c326760c07be364181c767c9315ca78ab484",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/codex-reconciliation.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a4bb611262fd911ed7b54583fa4cb779e4ef1aefcd91efbd5039a3182e5da5be",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/context-value-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d9534fef9d6591c0742036ea5866c4462076d1d1b6c7683d256285c449e0f5b2",
+      "occurrences": {
+        "kitchen": 3,
+        "operateStylized": 0,
+        "oprte": 19
+      },
+      "path": "apps/desktop/runtime/test/control-plane-backup.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "de165335417d6aac9ae665ff312b2a873003b543b3acc75fccbcbf2facf9d3d9",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/control-plane-lock.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d80ede1fac73f8d45e017c62cc3874ab883255758eb7f81f7a8e7921155c70a5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/desktop/runtime/test/control-plane-maintenance.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "037e142937c8af644ccc1a9bdb429b753bde69bcfd2e2a093d6abc01b0f47b80",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/dev-supervisor.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "385fa66d276e5876ac2fff16593984bdec58a3147a0ee14a170dd6e9d3213303",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/dispatch-cloud-client.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "14c5ba90598c5a45415fb540bf75eed1d68fd5a44e5d6c101b05b32863cf11f1",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/dispatch-completion-adapter.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "54e7aaf88cbfca233114c07cbe2a2048d65d926719d3fc9eec10dfd8ccf0545f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/dispatch-coordinator.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4a0fc429273c60183680973abc64ac34e002866f988f5692aab03cb77c411079",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/dispatch-pairing.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a5216ecc6246c89db3a2811dfc9318120449b9d8a0c4aa03c21efa3a29c6b07e",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/desktop/runtime/test/dispatch-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "96886ef628fe4a24e392d96a303a0a86277da3218dc588c2f135ddafb4b28653",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/fake-app-server.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "dc8d8083810717f123caebffc20ec72b25f0fbf1724d060544fb879912b61d0b",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/feasibility.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "683579fb33cde9ddb1e0ecea52ededfa65468e3577af4f864f3a6f1f1be25604",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/fixtures/account-app-server.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fd9ea244c28ec084796c1f7e3366cca4788835db641b3f97fba80579ef024c30",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/fixtures/scenario-contract.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c214078ac29b9d81d08bfee2c839a27aeee300f28d84a8f99d676eec1334e995",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/frontend-package-integrity.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "594d2c7533ac695837d3a4a4546214fe668532ee0d930bbf192665b4e71d9fca",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 24
+      },
+      "path": "apps/desktop/runtime/test/gateway.integration.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6308ca0b835a2e2373ff71ea7513ab88f7f08427bc03ea6084a52f72344245b6",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 11
+      },
+      "path": "apps/desktop/runtime/test/git-runner.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1516c8876d7a7479999ed83d174a5f6421549eac48fc6362931d4392aa93425f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/test/harness-actor-continuation-intent-sqlite-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1d79871c6b87d7771399eafb1b3872a66db927486c26048d5106a2d53c154b2c",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/test/harness-actor-session-recovery-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "68651d12045423d93a756b78e3d2d197d8ead918a900abb5b1925072fbe9e9ef",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-actor-workspace-adapter.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6c0ca513623b40bf463239dd67cb7b205c1dee6c9792d4b0056d96f4278fdc14",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/harness-actor-workspace-runtime-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "158a234c652c7d72712523be8e4de52bc98f1e27f5a762e278c6c7bc244d4301",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/test/harness-codex-persistent-actor-provider.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "648bfe6e4c6d252cf407a932543b9207e765ae76d695eea4231813ed08ea2589",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-context-value-ports-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9b030f782ddf170364d25100d9afbcb5817d7bb0801314afe7d0b1fa0a188d1f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-continuation-history-capsule-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a7c7e51ecd1083a0876bfe8d41475060ae94993b1bbcca2ee91fa90bfe5063b9",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-dynamic-tool-evidence-settings-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d7d3a6e4f54dce7d9165e8e4797b6866730bfaedaea0eb948479b01fa1742b68",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-dynamic-tool-service-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "442ca87e38ec7ef3b17562041dced32944f5ba00a156b02ab5a925d5b3eab108",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-main-shutdown-order-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "688a9d93ee3a5c6a5955a87917d963ab84adc77547bf6c26fc978e7c5c87ef90",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-native-key-custody.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fdc2ca6f1587fb775196a4ea42dc93028e227aecd1c1e7fce4d335a41704cd61",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/harness-object-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "583a80ccb21579fba4b84138583ae4dd450879f13d5a1dfa8a9134b209b7f640",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 15
+      },
+      "path": "apps/desktop/runtime/test/harness-persistent-actors.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "7b0a7b599deaacdc56380e0a422c22c35191202d4e4b573e13b79c1d1467e9c1",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-production-adapters-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c72db276b867f15d114f3d7381632f92c849f937e4a998426ea8a4e6a153bdf5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-production-composition-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1570a975fb428f074b5a257e98b272a9b04addac5df3bdfda1db5d780a90b728",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-production-context-adapters-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "646ce1e66405645da18e709601b00c13d18ed1c7e00d858829b3f7278ebe49b9",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/harness-production-semantic-evidence-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "435069a0f0eb8dc5f0a7f7b9072ab81d063ed6c7cdc867d6120f4e81f52a8611",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-proposal-recovery-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "210f8123fabfe9d5e037af214247f6c3a4bba488b8b04669921e7a5e9e34d51d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/harness-renderer-effects-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "40872faf29869f0b4734fa496924be7f1d2e5f24e7e335f9e5bde80521cdd7a5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-rlm-caller-authority-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6e66927308f3fab91d7d9926d73d83b752914f224d96b79164c2b26e2f4ea629",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-root-actor-authority-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f927dc56ec13e1340c48d56591675b477f93a50668f1100e59a09deb8e1895ce",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-root-chat-admission-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2e67a55b05c2ebec75604ab7ec8a9cc5932c179ef4376020c28081e2d823f805",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-root-project-resolver-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "bf88ee2745e9ca45da9f8987e21c4f2daca0096fcd1f482d8a6f38e671ce57aa",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-root-session-lifecycle-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "14b1b67096bd770e926c88ee20f6b049318603dd4d82675da1ae945235ebfc99",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/harness-semantic-evidence-custody-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5217c6f7721f508d208c5f55e72b38aaddbcb76d9d3cb4b8a75db284efb35555",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 11
+      },
+      "path": "apps/desktop/runtime/test/harness-sqlite-authority-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "b85546f0879b8a2ede46c5cdcd65d1ae76003db742dc70bcc9282320d770a61c",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-v2-migrations.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fbbeb36cde88762618e01ef9ff26d6e7d33a3e8079708f014465db3c33b8ba0f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/host-protocol.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1c50200dfc79dd119dd115c2f8bf25b0b4410cfd7ef79ea3535e050dd5af63af",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/human-account-metadata-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f45051c1a5646f43d5b3864f9ac54f9ca0eaf3d7033f67da1f5290001193c63e",
+      "occurrences": {
+        "kitchen": 8,
+        "operateStylized": 0,
+        "oprte": 43
+      },
+      "path": "apps/desktop/runtime/test/local-data-removal-inventory.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "7d23b6ef4fd3e14fe623b0c914305cf1f23b4ad56f8d2a8fd5072adf357014b5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/local-data-removal-recovery.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "791e5461da4b74aa5ff0cc3b70afd4247bf7ed5edfabc88d548eadc9e4cde2ef",
+      "occurrences": {
+        "kitchen": 6,
+        "operateStylized": 0,
+        "oprte": 24
+      },
+      "path": "apps/desktop/runtime/test/local-data-removal.property.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c696ed27df6ed56f3c90a56181f1ab87844308136a21705201fadcf5c371ffcc",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 14
+      },
+      "path": "apps/desktop/runtime/test/local-data-removal.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6cfd5e8f5d75c3e341a4a089fd11f1fbaa367615b084cdd88e5d175aaebd47eb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/local-promotion-http-transport.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "99034f2733900bed174b8c959eec88b7cc21b76ae4cac45ec273f81976f3f259",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/local-promotion-migration-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0fd1d408da38f0e9ef1f9d16c8d32a403c695b8f9fa6dafe8a143df0d81bdd76",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/local-promotion-v2-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "22209cd587600e5c699b681d551e6eef771e76cc97935b4f2406fa3999f5328d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/local-repository-readiness.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0daad34d640dd2590221f1ff517acb2eaed5ab37c8ce857fc4e2fb8d48f34372",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/local-run-execution-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "60e4edbf302bd28266eaa51404063e1696d6e2f32e24e1f42a659e8997e375fb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/local-task-migrations.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6c57aa2a747e2c5b0c2729e779074a7be1ce83014b5a9954c64da7cb5c7bb786",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/local-task-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fb2f299805624d949e5989b8f615d2d45be87377abcedc63b475610e2d7b40d9",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/probes/cli.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9349cf07ba4b7291c47dbfc33b9e363689caf79f317aa627117783a6b9a85fcf",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/probes/scenarios.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "43f52b93bd758e1a366b5c0c3c3a6e330b244e51b48a7366ba44d9d46e8fb5dc",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/test/probes/scenarios.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6067dab93084d97e2e46e5d4f4d3cea643755ceaa25995e6a42fbdf2eb785c20",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 12
+      },
+      "path": "apps/desktop/runtime/test/project-onboarding-service.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "73cd6f245b57f973439d586062ab98420c99bcac486f0fbd664707716e853af0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/reactive-baseline-policy.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d63805ed15d752d8ef5a4ee684a3f9d82f4753dd6200f6bee667ff0669ffcc4b",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/runtime/test/release-compatibility.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0f7fc2b9c0cfbcd2b19887a8e573ca218d97b8b7a765f1e5c021356b33666ac7",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/renamed-environment.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1e7c2638fa9456d8fda22512bd016bf4a18deae2b14cf2689a38fd8d03689faa",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/test/runner-pairing-http-client.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0bd90fd33458035ea8c929b14d5130cce47a9b3007b5957f46693fb47a309a02",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/desktop/runtime/test/runner-pairing.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0f94774a25eaa0ac1d77a5ce75fac8678910bdc1e9730e8bc43b5183fa5d002b",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/desktop/runtime/test/runtime-paths.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "eea20918ea4d9faf2c149f0ea2ba33a4a697c92161db875edb35d437b0d20d5d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 25
+      },
+      "path": "apps/desktop/runtime/test/session-service-harness-actor.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "761cd7aed4bbc74d97261c007cc1cf598768b63f05185de7815337306b1a8fda",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/desktop/runtime/test/session-service.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "2258ba89898d0f795d3fc92aa2478df0305a49f49eef095fb8e8c907c4060509",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/session-sync-coordinator.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ccb8675b2b2e7b6ebfd07b31f37515dff4a727272eb9ec9f146cced53f7182d6",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/test/session-sync-http-client.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "739a0a99cc84fed35d097f90470b488e1aabcfa376e32146fbc7a14b976a7520",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/test/session-sync-operation-journal.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "38389b50733221014da91dc820c92c1086087fdb2537e692248dfc3118382b88",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "apps/desktop/runtime/test/state.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "463cc64762c73e25c1ccbc36cf8680ff9509701bdeeb9fc5605ecbdb10aa5357",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 29
+      },
+      "path": "apps/desktop/runtime/test/workspace-broker.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d70c941e76c68b367bcdeae755ee59d53acc76df7d609b01dbb87769e7e52cbc",
+      "occurrences": {
+        "kitchen": 12,
+        "operateStylized": 0,
+        "oprte": 25
+      },
+      "path": "apps/desktop/src/data_remover.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "71cc43d70dcee8a317dce4141096e4e7d57910dfffc2ae25840cb1a0e1ccf2eb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/src/keychain_custodian_parent_probe.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a5ceab7e37d3be2ebcde676c66079181942d360e240166e573e86f1b08bf4a10",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/src/macos_code_identity.m"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "b74f644579fbbcd1c23b143ebee52eb987aa04eaa732cfcec7fa47cc01903cb1",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/src/macos_instance_guard.m"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "590ce863d789be770ca95c0784539d1234bb762553ccd34599e40f095bc115a4",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/src/macos_keychain_custodian.h"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "19227aaa054f6560cb2fbc7d6cdc2ef390317d9b20353bc9deec27fe7868a26a",
+      "occurrences": {
+        "kitchen": 3,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/desktop/src/macos_keychain_custodian.m"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "648b8c24b84dcc8333aa80bacedef70550cb5744f68fa9a0bf0fe61ae3693223",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/src/macos_self_managed_code_identity.h"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "7bf2f1ff83a8d7d4f8c4974f03d93bf347efdfe3f30b24af2076bc43b027c753",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/desktop/src/macos_updater.m"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "66032bc35292c64aa4072d2b2caa65f00d75af4c022baa747b3f4e346823889a",
+      "occurrences": {
+        "kitchen": 93,
+        "operateStylized": 0,
+        "oprte": 36
+      },
+      "path": "apps/desktop/src/main.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6a927c21bddfca0e197d8c5a2a070314a7c6523378765d79c8a24eeb14c06239",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/src/runner.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e2052abec0bc6500817bd90e4a22f954231fc17c0726233a7467cdc4dcc16a7f",
+      "occurrences": {
+        "kitchen": 8,
+        "operateStylized": 0,
+        "oprte": 75
+      },
+      "path": "apps/desktop/src/runtime_host.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d829c883e338f8bb75755d5bf4fdcc8f095c11c41106a2fb2a9c50b53c7292a6",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/web/.env.example"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9451bae4f201762a3c60c1ad9256b200a7cfcab814e651b0eb0358b6fb0c4081",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/README.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "462e3a6a9296a41151c135959074225eac3e4a8bb62f1ad31ca7f319e2f24984",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/app/hosted-mutation-attempt-journal.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "aa79999d0c5e18945773309fbbe4a1b01cd9e369fa8d1f5369b7de1916aae693",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/app/hosted-mutation-attempt-journal.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f1a9328d3bb1ba0e23b29226225f8b995f382e39fc46c966476f67c8db11f87d",
+      "occurrences": {
+        "kitchen": 3,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/web/app/suite-account-protocol.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1115caaeb2885981a9a2acdb39415f317492926fe061b0022bf8d1a51e8e470c",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/app/suite-account-protocol.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "870019bc7f785ca6ab41d2654f34152ec3376211887c35dabb729b9475838ec6",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/web/convex/_generated/server.d.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "90be797b330a16dc3299d585756a0ab5c483a7532398987adb82406f1fe8e7e0",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/web/convex/convex.config.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6585c392d4f950f52d43e32b36e23df619c1c3b78c64c086a41a83d48041efe7",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 18
+      },
+      "path": "apps/web/convex/hostedMutationAttempts.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "954ae271357b5abe824b00344a5e35ed5814d8f1502daf32b916180bbdfbb866",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/convex/hostedMutationAttempts.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "c7c145c9d9c4b4abc243ebd036b4128a9e16bb55d1fdfa4b4c20fb05e9e179ba",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/web/convex/hostedMutationFingerprint.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "8a81bf0c1a83a09d12dedf966549ff1282bc2a78d9fe2a09586a498c0f6ebccb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/web/convex/hostedMutationFingerprint.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "67b6bb74b6c6001c01e5d537c995205684c2e8b55d41d24a09aedb6dbc933d11",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/convex/hostedMutationPersistence.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ba92e0a633e5ac5025e16af73d4f96b93ca6a47dee2beb98e7887875d51ac281",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/convex/hraEnvironment.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "68080f864f8794ee74831464407fc562c761493e04d84d2b1e7340bcc3827f23",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/web/convex/hraEnvironment.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4330460c03266504173154ec9eec762de10d247fa8f273bddd8804323a1b4642",
+      "occurrences": {
+        "kitchen": 6,
+        "operateStylized": 0,
+        "oprte": 6
+      },
+      "path": "apps/web/convex/hraHttp.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "934717accba62cd0e86c16ad18f9807de6d89ae77591ddcc84dabc530c46ff1a",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/web/convex/hraHuman.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e7b8807bfac1b2de5d39813448b3b0e6bc45f407aee27c0c1c161bee93452326",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/web/convex/hraPromotion.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d559283beb3b44c20929ed451f909fa9e6a02bcf58206739d4fe80720d09653b",
+      "occurrences": {
+        "kitchen": 5,
+        "operateStylized": 0,
+        "oprte": 7
+      },
+      "path": "apps/web/convex/http.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1d9099f1a1ddf908aa9e9078d3529176661d8d24d6bb4e4f1e79d20bc6fda2b9",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/web/convex/humanTaskMutations.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a57b535ae637f69a90f240378f54e685ee0ea578c0c1403f41f2944658a4a911",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/web/convex/receiptMaintenance.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "68b203f4280dc3b5e7ceeaaf0ce15f8e31bffac949b3ad62c9eace6aac2077de",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 10
+      },
+      "path": "apps/web/convex/sessionSync.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "29b26ac241a5459e2fe60cb574c50e9c78ed520e4ec3932134cbc611b03db7bb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/convex/sessionSync.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "294bff8038281495e0a9a1262fa71d09ed3c4b45bcdf02966dbbdbf2fa48923b",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/web/convex/sessionSyncHttp.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9a3f5bdf8d2d8fd465b3c4433d564072e751dbb786113d5b01cdc8e66ba7d9cb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/convex/sessionSyncHttp.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "598667752284f72c30e3f32ba2b04cc51bab2da02ef6c0bcf94cbd157eb4aafb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/convex/sessionSyncLaws.property.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "8339e9e647482b17137d857f93debaf86f12d1b18c288b5dea889a0de4806360",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/web/convex/sessionSyncModel.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "5f9958561da03fc3574bfd668e1a74a453dfded98a0c9dd5438f84a82e78e0b9",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/convex/suiteIdentity.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "8c81b438719dfc6be1fd8e4134a535561f36e11d587fec98004f658ba2b5daec",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/convex/suiteIdentityRules.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3758329c7b5d9386c13a50acde7778f38049b6ce21f29eaeab0d08099be08c5b",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/suite-account-contracts.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "0e81101f8438b666eedbf18ed2bbfe7f39fe46cf54443eb1e00cfe7739a6d56d",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/suite-account-contracts.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "48dc5cea8d2d96e1e0000cefa3024cade60494300c2a56db6812b0a7c6fd6aec",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "packages/human-client/src/human-auth.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "568e1c1fbb60add32e210a520ca7b60994f0f24cd0d3bf11843e339a0b24e1c3",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "packages/human-client/src/human-auth.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "58f58238a5be7a7403853f980d45d9b16d3f682e2c57612ce26c04e597896e7f",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "packages/task-domain/src/integrity.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e408a06e947cbac9ed0aa933abb7e40aa48d226a08223f957a6d0042d7f42ac4",
+      "occurrences": {
+        "kitchen": 8,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "packages/task-domain/src/promotion.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "813a4ddd9a6470a276ff4377378fe460cbe67e029c2a7e29de40e679f23342ab",
+      "occurrences": {
+        "kitchen": 11,
+        "operateStylized": 0,
+        "oprte": 9
+      },
+      "path": "packages/task-protocol/src/hra-human-wire.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3831c1ae911a2f184cf93a9285ac5500a1f47718c6eff30a91d2e951e3d75ed7",
+      "occurrences": {
+        "kitchen": 13,
+        "operateStylized": 0,
+        "oprte": 14
+      },
+      "path": "packages/task-protocol/src/hra-wire.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ebe899f12d2bf4e1c1f8b2160683c55b8a7672eecf30077cf54bafe6d1df1763",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "packages/task-protocol/src/interaction-crypto.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "711256473383e50212dfb3b4135b7388b6bfc7b6c767f5d8871aa340774d8067",
+      "occurrences": {
+        "kitchen": 10,
+        "operateStylized": 0,
+        "oprte": 9
+      },
+      "path": "packages/task-protocol/src/promotion-wire.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "61c4dcf04622915e318cc5a0675e3c38c326571333e691415590204d072d4b90",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "packages/task-protocol/src/session-sync-crypto.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "162642756df55f97ae87fa722824fe56671c68850997feec181d75feb748eebb",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "packages/task-protocol/src/session-sync-pairing.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "dbd5b3a479919f62e2cc26172997c404d375489d6085b91e4ba5040d035000e5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "packages/task-protocol/src/session-sync-recovery-crypto.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "df4689b6f8e93ddcade57bd04cb8bc2cb92eb14f33108584cf6ae4dd3853f94e",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 8
+      },
+      "path": "packages/task-protocol/src/session-sync-wire.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "fd0bc7a0b5264aebc26568994f520eb1f6d8f1bfb17a14041b9b47d3372a2d14",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "packages/task-protocol/src/session-sync.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d1ffe1527ed606fb5e851d273a56ad119d02528354fe60e81180f0eb41379966",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "patches/@native-sdk%2Fcli@0.5.3.patch"
+    }
+  ],
+  "version": 1
+}

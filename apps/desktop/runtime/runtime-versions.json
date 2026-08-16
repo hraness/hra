@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "minimumMacOS": "13.0",
+  "codex": {
+    "package": "@openai/codex",
+    "version": "0.144.6",
+    "packageIntegrity": "sha512-wk+2CWiBNXiJLBoN2D08N9RceWkSBnlgk5g2K1a4CXrP/C0gdlHyRUG7RFzm9y41DCK/7tvCct233JVxyFmznw==",
+    "platformPackage": "@openai/codex-darwin-arm64",
+    "platformIntegrity": "sha512-6zgvh70MzBNSeT17HEhSOrmmGGZGAKzSC7x6JAq+edkJkdPYA9P0I1tG7aJ49GlBkBxuC+MKBH1qm6+2Cghcww==",
+    "target": "aarch64-apple-darwin",
+    "binarySha256": "80a3933d11a9d13ef806aa24f7bb8afc9169cfe4e9b09d6da6a92922cbde9cff"
+  },
+  "git": {
+    "providerPackage": "dugite",
+    "providerVersion": "3.2.2",
+    "providerIntegrity": "sha512-pGTVaxea0WqauGXF5A3GmpmPOim6oTnfYM6dS6s8nHyJxf4pRTjwtFHkqLkT5de87uUPhTI+LtlmcJQ2WkqeGA==",
+    "version": "2.53.0",
+    "release": "v2.53.0-3",
+    "asset": "dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
+    "assetSha256": "e561cfc80c755e6f3e938653e81efcd025c9827a5b76dd42778b1159b3fab437",
+    "binarySha256": "ee73b116cc37f44ecdaa9e3fdfbc25ce827675859f5f966ec671112fd5caf074"
+  }
+}

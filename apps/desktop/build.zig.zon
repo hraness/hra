@@ -1,0 +1,8 @@
+.{
+    .name = .hra,
+    .fingerprint = 0x9e390930c8800723,
+    .version = "0.1.7",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "frontend", "app.zon", "README.md" },
+}

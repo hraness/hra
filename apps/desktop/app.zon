@@ -1,0 +1,64 @@
+.{
+    // Stable opaque storage/signing identity. User-facing identity is HRA.
+    .id = "kitchen.hraness",
+    .name = "hra",
+    .display_name = "HRA",
+    .version = "0.1.7",
+    .icons = .{"assets/icon.png"},
+    .platforms = .{"macos"},
+    .permissions = .{},
+    .capabilities = .{ "webview", "js_bridge", "shortcuts" },
+    .bridge = .{
+        .commands = .{
+            .{
+                .name = "hra.runtime.snapshot",
+                .origins = .{"zero://app"},
+            },
+            .{
+                .name = "hra.runtime.dispatch",
+                .origins = .{"zero://app"},
+            },
+            .{
+                .name = "hra.project.add",
+                .origins = .{"zero://app"},
+            },
+            .{
+                .name = "hra.runtime.retryTransport",
+                .origins = .{"zero://app"},
+            },
+            .{
+                .name = "hra.runtime.confirmTransportHealth",
+                .origins = .{"zero://app"},
+            },
+        },
+    },
+    .commands = .{
+        .{ .id = "hra.update.check", .title = "Check for Updates…" },
+    },
+    .menus = .{
+        .{ .title = "Help", .items = .{
+            .{ .label = "Check for Updates…", .command = "hra.update.check" },
+        } },
+    },
+    .shortcuts = .{
+        .{ .id = "hra.ui-scale.increase", .key = "=", .modifiers = .{"primary"} },
+        .{ .id = "hra.ui-scale.decrease", .key = "-", .modifiers = .{"primary"} },
+        .{ .id = "hra.ui-scale.reset", .key = "0", .modifiers = .{"primary"} },
+    },
+    .frontend = .{
+        .dist = "frontend/dist",
+        .entry = "index.html",
+        .spa_fallback = true,
+    },
+    .security = .{
+        .navigation = .{
+            .allowed_origins = .{"zero://app"},
+            .external_links = .{ .action = "deny" },
+        },
+    },
+    .web_engine = "system",
+    .cef = .{ .dir = "third_party/cef/macos", .auto_install = false },
+    .windows = .{
+        .{ .label = "main", .title = "HRA", .width = 1120, .height = 720, .restore_state = true },
+    },
+}

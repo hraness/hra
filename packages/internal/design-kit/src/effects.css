@@ -1,0 +1,413 @@
+.jungle-aurora-background {
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      ellipse 54% 40% at 16% 24%,
+      color-mix(in oklch, var(--aurora-cyan) 26%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      ellipse 52% 38% at 82% 20%,
+      color-mix(in oklch, var(--aurora-gold) 24%, transparent) 0%,
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 58% 42% at 58% 76%,
+      color-mix(in oklch, var(--aurora-violet) 22%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      ellipse 48% 34% at 24% 78%,
+      color-mix(in oklch, var(--aurora-mint) 20%, transparent) 0%,
+      transparent 58%
+    ),
+    color-mix(in oklch, var(--background) 86%, transparent);
+  filter: saturate(1.08);
+}
+
+.jungle-aurora-background::before {
+  position: absolute;
+  inset: -18%;
+  background:
+    radial-gradient(
+      ellipse 44% 78% at 10% 54%,
+      oklch(0.92 0.07 22 / 0.2) 0%,
+      transparent 78%
+    ),
+    radial-gradient(
+      ellipse 44% 78% at 32% 44%,
+      oklch(0.95 0.06 80 / 0.18) 0%,
+      transparent 78%
+    ),
+    radial-gradient(
+      ellipse 44% 78% at 54% 54%,
+      oklch(0.94 0.07 158 / 0.18) 0%,
+      transparent 78%
+    ),
+    radial-gradient(
+      ellipse 44% 78% at 74% 44%,
+      oklch(0.92 0.07 230 / 0.18) 0%,
+      transparent 78%
+    ),
+    radial-gradient(
+      ellipse 44% 78% at 92% 54%,
+      oklch(0.9 0.07 304 / 0.18) 0%,
+      transparent 78%
+    );
+  content: "";
+  filter: blur(56px) saturate(0.98);
+  opacity: 0.84;
+  transform: translate3d(0, -4vh, 0);
+}
+
+.jungle-aurora-background::after {
+  position: absolute;
+  inset: -10%;
+  background:
+    linear-gradient(
+      136deg,
+      transparent 0%,
+      rgb(255 255 255 / 0.16) 18%,
+      transparent 34%
+    ),
+    radial-gradient(
+      ellipse 42% 32% at 76% 26%,
+      color-mix(in oklch, var(--aurora-rose) 16%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      ellipse 46% 32% at 22% 54%,
+      color-mix(in oklch, white 16%, transparent) 0%,
+      transparent 64%
+    );
+  content: "";
+  filter: blur(44px);
+  mix-blend-mode: soft-light;
+  opacity: 0.36;
+}
+
+[data-theme="dark"] .jungle-aurora-background,
+.dark .jungle-aurora-background {
+  background:
+    radial-gradient(
+      ellipse 54% 40% at 16% 24%,
+      color-mix(in oklch, var(--aurora-cyan) 15%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      ellipse 52% 38% at 82% 20%,
+      color-mix(in oklch, var(--aurora-gold) 13%, transparent) 0%,
+      transparent 60%
+    ),
+    radial-gradient(
+      ellipse 58% 42% at 58% 76%,
+      color-mix(in oklch, var(--aurora-violet) 13%, transparent) 0%,
+      transparent 62%
+    ),
+    radial-gradient(
+      ellipse 48% 34% at 24% 78%,
+      color-mix(in oklch, var(--aurora-mint) 12%, transparent) 0%,
+      transparent 58%
+    ),
+    color-mix(in oklch, var(--background) 90%, transparent);
+}
+
+[data-theme="dark"] .jungle-aurora-background::before,
+.dark .jungle-aurora-background::before {
+  opacity: 0.52;
+}
+
+[data-theme="dark"] .jungle-aurora-background::after,
+.dark .jungle-aurora-background::after {
+  opacity: 0.18;
+}
+
+.jungle-aurora-dots {
+  --phaser-dots-static-color: color-mix(
+    in oklch,
+    var(--phaser-dots-accent, oklch(0.572 0.1561 254.537)) 20%,
+    transparent
+  );
+  --phaser-dots-static-opacity: 0.3;
+  --phaser-dots-trail-color: var(--phaser-dots-accent, oklch(0.572 0.1561 254.537));
+  --phaser-dots-trail-opacity: 1;
+
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+}
+
+.jungle-phaser-dots,
+.jungle-phaser-dots__static,
+.jungle-phaser-dots__trail {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.jungle-phaser-dots {
+  z-index: 0;
+}
+
+.jungle-phaser-dots__static {
+  background-image: radial-gradient(currentcolor 1px, transparent 1px);
+  background-size: 6px 6px;
+}
+
+.jungle-phaser-dots__trail {
+  width: 100%;
+  height: 100%;
+}
+
+.jungle-procedural-backdrop {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+  isolation: isolate;
+  pointer-events: none;
+  user-select: none;
+}
+
+.jungle-procedural-backdrop__atmosphere,
+.jungle-procedural-backdrop__grid,
+.jungle-procedural-backdrop__ripples {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.jungle-procedural-backdrop__atmosphere {
+  z-index: 0;
+}
+
+.jungle-procedural-backdrop__cloud {
+  position: absolute;
+  top: var(--jungle-procedural-layer-y);
+  left: var(--jungle-procedural-layer-x);
+  width: var(--jungle-procedural-layer-width);
+  height: var(--jungle-procedural-layer-height);
+  border-radius: 46% 54% 52% 48% / 58% 44% 56% 42%;
+  animation: jungle-procedural-cloud-drift
+    var(--jungle-procedural-layer-duration)
+    var(--motion-easing-emphasized)
+    var(--jungle-procedural-layer-delay)
+    infinite
+    alternate;
+  background: radial-gradient(
+    ellipse at center,
+    color-mix(
+      in oklch,
+      var(--jungle-procedural-layer-color) 58%,
+      transparent
+    ) 0%,
+    color-mix(
+      in oklch,
+      var(--jungle-procedural-layer-color) 24%,
+      transparent
+    ) 48%,
+    transparent 74%
+  );
+  filter: blur(var(--jungle-procedural-layer-blur));
+  opacity: var(--jungle-procedural-layer-opacity);
+  transform: translate3d(-50%, -50%, 0)
+    rotate(var(--jungle-procedural-layer-rotation));
+}
+
+.jungle-procedural-backdrop__grid {
+  z-index: 1;
+  inset: -8%;
+  animation: jungle-procedural-grid-drift 18s linear infinite;
+  background-image:
+    linear-gradient(
+      color-mix(
+        in oklch,
+        var(--jungle-procedural-support) 44%,
+        transparent
+      ) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      color-mix(
+        in oklch,
+        var(--jungle-procedural-shadow) 38%,
+        transparent
+      ) 1px,
+      transparent 1px
+    );
+  background-position:
+    var(--jungle-procedural-grid-offset-x)
+      var(--jungle-procedural-grid-offset-y),
+    var(--jungle-procedural-grid-offset-x)
+      var(--jungle-procedural-grid-offset-y);
+  background-size:
+    var(--jungle-procedural-grid-size)
+      var(--jungle-procedural-grid-size);
+  mask-image: radial-gradient(ellipse at center, black 8%, transparent 78%);
+  opacity: var(--jungle-procedural-grid-opacity);
+  transform: rotate(var(--jungle-procedural-grid-rotation)) scale(1.04);
+  -webkit-mask-image:
+    radial-gradient(ellipse at center, black 8%, transparent 78%);
+}
+
+.jungle-procedural-backdrop__ripples {
+  z-index: 2;
+  transform: rotate(var(--jungle-procedural-ripple-rotation));
+}
+
+.jungle-procedural-backdrop__ripple {
+  position: absolute;
+  top: var(--jungle-procedural-ripple-y);
+  left: var(--jungle-procedural-ripple-x);
+  width: var(--jungle-procedural-ripple-size);
+  aspect-ratio: 1 / var(--jungle-procedural-ripple-aspect);
+  border: 1px solid color-mix(
+    in oklch,
+    var(--jungle-procedural-ripple-color) 46%,
+    transparent
+  );
+  border-radius: 50%;
+  animation: jungle-procedural-ripple-breathe
+    var(--jungle-procedural-ripple-duration)
+    var(--motion-easing-standard)
+    var(--jungle-procedural-ripple-delay)
+    infinite
+    alternate;
+  box-shadow:
+    inset 0 0 24px color-mix(
+      in oklch,
+      var(--jungle-procedural-ripple-color) 8%,
+      transparent
+    ),
+    0 0 28px color-mix(
+      in oklch,
+      var(--jungle-procedural-ripple-color) 6%,
+      transparent
+    );
+  opacity: var(--jungle-procedural-ripple-opacity);
+  transform: translate3d(-50%, -50%, 0) scale(0.98);
+}
+
+.jungle-particle-halo {
+  position: relative;
+  display: inline-grid;
+  isolation: isolate;
+  place-items: center;
+}
+
+.jungle-particle-halo__particles {
+  position: absolute;
+  z-index: 0;
+  inset: -18%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.jungle-particle-halo__particle {
+  position: absolute;
+  top: var(--jungle-particle-y);
+  left: var(--jungle-particle-x);
+  width: var(--jungle-particle-size);
+  height: var(--jungle-particle-size);
+  border-radius: var(--radius-round);
+  animation: jungle-particle-halo-drift
+    var(--jungle-particle-duration)
+    var(--motion-easing-emphasized)
+    var(--jungle-particle-delay)
+    infinite
+    alternate;
+  background: var(--jungle-particle-color);
+  box-shadow: 0 0 calc(
+    var(--jungle-particle-size) + var(--jungle-particle-size)
+  )
+    color-mix(in oklch, var(--jungle-particle-color) 34%, transparent);
+  opacity: var(--jungle-particle-opacity);
+  transform: translate3d(-50%, -50%, 0);
+}
+
+.jungle-particle-halo__content {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+@keyframes jungle-procedural-cloud-drift {
+  to {
+    transform:
+      translate3d(
+        calc(-50% + var(--jungle-procedural-layer-drift-x)),
+        calc(-50% + var(--jungle-procedural-layer-drift-y)),
+        0
+      )
+      rotate(calc(var(--jungle-procedural-layer-rotation) + 3deg))
+      scale(var(--jungle-procedural-layer-scale));
+  }
+}
+
+@keyframes jungle-procedural-grid-drift {
+  to {
+    background-position:
+      calc(
+        var(--jungle-procedural-grid-offset-x)
+        + var(--jungle-procedural-grid-size)
+      )
+      calc(
+        var(--jungle-procedural-grid-offset-y)
+        + var(--jungle-procedural-grid-size)
+      ),
+      calc(
+        var(--jungle-procedural-grid-offset-x)
+        + var(--jungle-procedural-grid-size)
+      )
+      calc(
+        var(--jungle-procedural-grid-offset-y)
+        + var(--jungle-procedural-grid-size)
+      );
+  }
+}
+
+@keyframes jungle-procedural-ripple-breathe {
+  to {
+    transform: translate3d(-50%, -50%, 0) scale(1.025);
+  }
+}
+
+@keyframes jungle-particle-halo-drift {
+  to {
+    transform:
+      translate3d(
+        calc(-50% + var(--jungle-particle-drift-x)),
+        calc(-50% + var(--jungle-particle-drift-y)),
+        0
+      )
+      scale(1.08);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jungle-procedural-backdrop__cloud,
+  .jungle-procedural-backdrop__grid,
+  .jungle-procedural-backdrop__ripple,
+  .jungle-particle-halo__particle {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .jungle-aurora-background,
+  .jungle-aurora-dots,
+  .jungle-procedural-backdrop__atmosphere,
+  .jungle-procedural-backdrop__grid,
+  .jungle-procedural-backdrop__ripples,
+  .jungle-particle-halo__particles {
+    display: none;
+  }
+}

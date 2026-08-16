@@ -1,0 +1,237 @@
+.jungle-bar-list-chart,
+.jungle-range-plot-chart,
+.jungle-radar-profile-chart {
+  min-width: 0;
+  color: var(--foreground);
+  font-family: var(--font-text);
+}
+
+.jungle-bar-list-chart__rows,
+.jungle-range-plot-chart__rows {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.jungle-chart-row {
+  display: grid;
+  min-width: 0;
+  padding: var(--space-2);
+  color: inherit;
+  font: inherit;
+  gap: var(--space-1);
+  text-align: start;
+}
+
+.jungle-chart-row--selectable {
+  width: 100%;
+  min-height: var(--interactive-target-min);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  transition: background-color var(--motion-duration-fast) var(--motion-easing-standard);
+}
+
+.jungle-chart-row--selectable:is(:hover, :focus-visible),
+.jungle-chart-row[data-selected] {
+  background: color-mix(in oklch, var(--foreground) 7%, transparent);
+}
+
+.jungle-chart-row--selectable:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.jungle-chart-row__heading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.jungle-chart-row__label {
+  overflow: hidden;
+  font-size: var(--text-caption);
+  font-weight: var(--font-weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jungle-chart-row__value {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.jungle-chart-row__detail {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.jungle-bar-list-chart__track,
+.jungle-range-plot-chart__track {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  width: 100%;
+  height: 8px;
+  border-radius: var(--radius-round);
+  background: color-mix(in oklch, var(--foreground) 8%, transparent);
+}
+
+.jungle-bar-list-chart__bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--jungle-chart-value);
+  border-radius: inherit;
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in oklch, var(--jungle-chart-color) 55%, transparent),
+      var(--jungle-chart-color)
+    );
+  box-shadow: 0 0 18px color-mix(in oklch, var(--jungle-chart-color) 20%, transparent);
+  transform-origin: left center;
+  animation: jungle-chart-bar-reveal var(--motion-duration-slow) var(--motion-easing-emphasized) both;
+}
+
+.jungle-range-plot-chart__track {
+  overflow: visible;
+  height: 2px;
+  margin-block: 5px;
+}
+
+.jungle-range-plot-chart__range {
+  position: absolute;
+  top: 50%;
+  left: var(--jungle-chart-range-left);
+  width: var(--jungle-chart-range-width);
+  height: 5px;
+  border-radius: var(--radius-round);
+  background: var(--jungle-chart-color);
+  opacity: 0.64;
+  transform: translateY(-50%);
+}
+
+.jungle-range-plot-chart__median {
+  position: absolute;
+  top: 50%;
+  left: var(--jungle-chart-median);
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--background);
+  border-radius: 50%;
+  background: var(--jungle-chart-color);
+  box-shadow: 0 0 0 1px color-mix(in oklch, var(--foreground) 42%, transparent);
+  transform: translate(-50%, -50%);
+}
+
+.jungle-radar-profile-chart__plot {
+  width: 100%;
+  height: clamp(250px, 30vw, 320px);
+  min-height: 250px;
+}
+
+.jungle-radar-profile-chart__plot .recharts-surface {
+  overflow: visible;
+}
+
+.jungle-radar-profile-chart__legend {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+}
+
+.jungle-radar-profile-chart__legend > .jungle-chart-row {
+  display: inline-flex;
+  width: auto;
+  min-height: var(--interactive-target-compact);
+  flex: 0 1 auto;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-round);
+  font-size: 11px;
+}
+
+.jungle-radar-profile-chart__legend i,
+.jungle-chart-tooltip i {
+  display: inline-block;
+  width: 12px;
+  height: 4px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-round);
+}
+
+.jungle-chart-tooltip {
+  min-width: 152px;
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklch, var(--popover) 94%, transparent);
+  box-shadow: var(--elevation-overlay);
+  color: var(--popover-foreground);
+  font-size: var(--text-caption);
+}
+
+.jungle-chart-tooltip > strong {
+  display: block;
+  margin-bottom: var(--space-2);
+  font-weight: var(--font-weight-medium);
+}
+
+.jungle-chart-tooltip dl {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+}
+
+.jungle-chart-tooltip dl > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.jungle-chart-tooltip dt {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--muted);
+}
+
+.jungle-chart-tooltip dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes jungle-chart-bar-reveal {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jungle-bar-list-chart__bar {
+    animation: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .jungle-bar-list-chart__track,
+  .jungle-range-plot-chart__track,
+  .jungle-bar-list-chart__bar,
+  .jungle-range-plot-chart__range,
+  .jungle-range-plot-chart__median {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    forced-color-adjust: auto;
+  }
+}

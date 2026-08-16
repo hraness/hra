@@ -1,0 +1,36 @@
+diff --git a/dist/private/utils/filterDOMProps.cjs b/dist/private/utils/filterDOMProps.cjs
+index 9abc55092fa91252b0a8b84520f9ed72d2f66c32..d116aeea6de38ba6662e6b591105fd909808350f 100644
+--- a/dist/private/utils/filterDOMProps.cjs
++++ b/dist/private/utils/filterDOMProps.cjs
+@@ -34,6 +34,7 @@ const $b97366b6eabbb2cc$var$linkPropNames = new Set([
+     'referrerPolicy'
+ ]);
+ const $b97366b6eabbb2cc$var$globalAttrs = new Set([
++    'aria-busy',
+     'dir',
+     'lang',
+     'hidden',
+diff --git a/dist/private/utils/filterDOMProps.js b/dist/private/utils/filterDOMProps.js
+index 4289328abe9720f12a7a9873c5bff298fba74039..e3e961ec88f4ebe9e66d45a68b11f89656bb785a 100644
+--- a/dist/private/utils/filterDOMProps.js
++++ b/dist/private/utils/filterDOMProps.js
+@@ -28,6 +28,7 @@ const $6a28a4717b9a4e1c$var$linkPropNames = new Set([
+     'referrerPolicy'
+ ]);
+ const $6a28a4717b9a4e1c$var$globalAttrs = new Set([
++    'aria-busy',
+     'dir',
+     'lang',
+     'hidden',
+diff --git a/dist/private/utils/filterDOMProps.mjs b/dist/private/utils/filterDOMProps.mjs
+index bc7686cdc590405375f54e9a3ac5eaab4e9d95bf..0d1f8be18cb1b33eb4343fd4edd9baf976ba56eb 100644
+--- a/dist/private/utils/filterDOMProps.mjs
++++ b/dist/private/utils/filterDOMProps.mjs
+@@ -28,6 +28,7 @@ const $8e9d2fae0ecb9001$var$linkPropNames = new Set([
+     'referrerPolicy'
+ ]);
+ const $8e9d2fae0ecb9001$var$globalAttrs = new Set([
++    'aria-busy',
+     'dir',
+     'lang',
+     'hidden',

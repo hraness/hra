@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+*.tsbuildinfo
+dist/
+.next/
+out/
+coverage/
+zig-cache/
+.zig-cache/
+zig-out/
+.turbo/
+.vercel/
+artifacts/

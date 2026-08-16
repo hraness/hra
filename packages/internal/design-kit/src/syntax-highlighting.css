@@ -1,0 +1,60 @@
+.syntax-code {
+  --syntax-comment: var(--muted, currentColor);
+  --syntax-keyword: var(--warning, var(--accent, currentColor));
+  --syntax-string: var(--success, var(--accent, currentColor));
+  --syntax-number: var(--danger, var(--accent, currentColor));
+  --syntax-name: var(--info, var(--accent, currentColor));
+  --syntax-sign: var(--muted, currentColor);
+  --sh-class: var(--syntax-name);
+  --sh-comment: var(--syntax-comment);
+  --sh-entity: var(--syntax-number);
+  --sh-identifier: var(--foreground, currentColor);
+  --sh-jsxliterals: var(--syntax-string);
+  --sh-keyword: var(--syntax-keyword);
+  --sh-property: var(--syntax-name);
+  --sh-sign: var(--syntax-sign);
+  --sh-space: currentColor;
+  --sh-string: var(--syntax-string);
+  color: var(--foreground, inherit);
+  font: inherit;
+  text-shadow: none;
+}
+
+.syntax-token--comment {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+.syntax-token--keyword,
+.syntax-token--marker {
+  color: var(--syntax-keyword);
+}
+
+.syntax-token--string,
+.syntax-token--inline {
+  color: var(--syntax-string);
+}
+
+.syntax-token--command,
+.syntax-token--heading,
+.syntax-token--variable {
+  color: var(--syntax-name);
+}
+
+.syntax-token--flag,
+.syntax-token--operator {
+  color: var(--syntax-sign);
+}
+
+.syntax-token--command,
+.syntax-token--heading {
+  font-weight: var(--font-weight-bold, 700);
+}
+
+@media (forced-colors: active) {
+  .syntax-code,
+  .syntax-code span {
+    color: CanvasText;
+    forced-color-adjust: auto;
+  }
+}

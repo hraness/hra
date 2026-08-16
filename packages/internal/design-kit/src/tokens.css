@@ -1,0 +1,337 @@
+/* Portable public semantics and scales; the private recipe below supplies
+ * Hraness' licensed typography and product-specific palette. */
+@import "@hraness/ui/tokens.css";
+@import "./fonts.css";
+
+:root {
+  color-scheme: light;
+  --background: #fbf6f2;
+  --foreground: #201b19;
+  --muted: #6b625d;
+  --faint: #6b625d;
+  --grid: #eaded8;
+  --line: #bbaaa2;
+  --control-border: #8f8f8f;
+  --surface: #ffffff;
+  --surface-raised: #f3ece8;
+  --surface-hover: #eaded8;
+  --card: #ffffff;
+  --card-foreground: #201b19;
+  --popover: #ffffff;
+  --popover-foreground: #201b19;
+  --primary: #201b19;
+  --primary-foreground: #fbf6f2;
+  --secondary: #f3ece8;
+  --secondary-foreground: #201b19;
+  --accent: #eaded8;
+  --accent-foreground: #201b19;
+  --info: #0d61ac;
+  --info-soft: #d8eaff;
+  --focus: #0d61ac;
+  --scrim: rgba(2, 2, 2, 0.44);
+  --disabled: #e8ded9;
+  --disabled-foreground: #717171;
+  --inverse: #201b19;
+  --inverse-foreground: #fbf6f2;
+  --success: #2d6a42;
+  --success-soft: rgba(45, 106, 66, 0.12);
+  --warning: #785f28;
+  --warning-soft: rgba(120, 95, 40, 0.12);
+  --danger: #9f3631;
+  --danger-soft: rgba(159, 54, 49, 0.12);
+  --aurora-violet: oklch(0.82 0.048 312);
+  --aurora-rose: oklch(0.85 0.044 12);
+  --aurora-gold: oklch(0.92 0.036 96);
+  --aurora-mint: oklch(0.9 0.036 172);
+  --aurora-cyan: oklch(0.84 0.042 236);
+  --chrome-deep: rgb(52 52 64);
+  --chrome-shadow: rgb(58 58 72);
+  --chrome-mid: rgb(92 92 106);
+  --chrome-high: rgb(88 88 100);
+  --chrome-glint: rgb(100 100 112);
+  --canvas-background: var(--background);
+  --chrome-foil-gradient: linear-gradient(
+    118deg,
+    color-mix(in oklch, var(--aurora-cyan) 78%, transparent) 0%,
+    color-mix(in oklch, var(--aurora-violet) 78%, transparent) 22%,
+    color-mix(in oklch, var(--aurora-rose) 72%, transparent) 42%,
+    color-mix(in oklch, var(--aurora-gold) 78%, transparent) 62%,
+    color-mix(in oklch, var(--aurora-mint) 78%, transparent) 82%,
+    color-mix(in oklch, var(--aurora-cyan) 78%, transparent) 100%
+  );
+  --chrome-text-gradient: linear-gradient(
+    170deg,
+    rgb(52 52 64) 0%,
+    rgb(88 88 100) 10%,
+    rgb(58 58 72) 20%,
+    rgb(100 100 112) 32%,
+    rgb(64 64 78) 42%,
+    rgb(92 92 106) 52%,
+    rgb(54 54 68) 62%,
+    rgb(86 86 100) 72%,
+    rgb(56 56 70) 82%,
+    rgb(80 80 94) 91%,
+    rgb(60 60 74) 100%
+  );
+  --chrome-text-shadow:
+    0 -1px 0 rgb(255 255 255 / 45%),
+    0 1px 1px rgb(0 0 0 / 30%),
+    0 3px 6px rgb(0 0 0 / 12%);
+  --font-text: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-heading: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --font-sans: var(--font-text);
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+  --layout-edge-inset: 1.5rem;
+  --layout-chrome-inset: 0.5rem;
+  --interactive-target-compact: 2.5rem;
+  --interactive-target-min: 3rem;
+  --control-height: 3.25rem;
+  --control-height-primary: 3.5rem;
+  --control-height-transport: 4rem;
+  --text-caption: 0.75rem;
+  --text-label: 0.875rem;
+  --text-body: 1rem;
+  --text-control: 1rem;
+  --text-control-glyph: 1.25rem;
+  --text-heading: 1.5rem;
+  --text-title: 2rem;
+  --text-display: 3.5rem;
+  --font-weight-regular: 450;
+  --font-weight-medium: 550;
+  --font-weight-bold: 700;
+  --radius-sharp: 0;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-round: 999px;
+  --control-radius: 1rem;
+  --motion-duration-instant: 0ms;
+  --motion-duration-fast: 120ms;
+  --motion-duration-standard: 180ms;
+  --motion-duration-slow: 280ms;
+  --motion-distance-rail-enter: 14px;
+  --motion-distance-rail-exit: 10px;
+  --motion-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-easing-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+  --elevation-none: none;
+  --elevation-low: 0 1px 2px oklch(0 0 0 / 0.08);
+  --elevation-raised: 0 8px 24px -12px oklch(0 0 0 / 0.22);
+  --elevation-overlay: 0 18px 48px -18px oklch(0 0 0 / 0.32);
+  --z-chrome: 50;
+  --z-modal: 2000;
+  --z-tooltip: 3000;
+  --z-skip-link: 4000;
+  --breakpoint-compact: 30rem;
+  --breakpoint-medium: 48rem;
+  --breakpoint-wide: 75rem;
+  --breakpoint-canvas: 90rem;
+}
+
+:root[data-theme="dark"],
+[data-theme="dark"],
+.dark {
+  color-scheme: dark;
+  --background: #000000;
+  --foreground: #f2f2ed;
+  --muted: #8f938c;
+  --faint: #8f938c;
+  --grid: #1c1e1b;
+  --line: #5f645d;
+  --control-border: #666666;
+  --surface: #0d0e0c;
+  --surface-raised: #161814;
+  --surface-hover: #1c1e1b;
+  --card: #0d0e0c;
+  --card-foreground: #f2f2ed;
+  --popover: #161814;
+  --popover-foreground: #f2f2ed;
+  --primary: #f2f2ed;
+  --primary-foreground: #0d0e0c;
+  --secondary: #252820;
+  --secondary-foreground: #f2f2ed;
+  --accent: #1c1e1b;
+  --accent-foreground: #f2f2ed;
+  --info: #6aa9ed;
+  --info-soft: #152d46;
+  --focus: #6aa9ed;
+  --scrim: rgba(0, 0, 0, 0.72);
+  --disabled: #262626;
+  --disabled-foreground: #777777;
+  --inverse: #f2f2ed;
+  --inverse-foreground: #0d0e0c;
+  --success: #76b38e;
+  --success-soft: rgba(118, 179, 142, 0.12);
+  --warning: #c9ad74;
+  --warning-soft: rgba(201, 173, 116, 0.12);
+  --danger: #e18982;
+  --danger-soft: rgba(225, 137, 130, 0.12);
+  --aurora-violet: oklch(0.58 0.045 312);
+  --aurora-rose: oklch(0.61 0.04 12);
+  --aurora-gold: oklch(0.69 0.035 96);
+  --aurora-mint: oklch(0.63 0.035 172);
+  --aurora-cyan: oklch(0.6 0.04 236);
+  --chrome-deep: rgb(100 102 122);
+  --chrome-shadow: rgb(112 114 136);
+  --chrome-mid: rgb(166 168 190);
+  --chrome-high: rgb(158 160 182);
+  --chrome-glint: rgb(178 180 200);
+  --canvas-background: var(--background);
+  --chrome-text-gradient: linear-gradient(
+    170deg,
+    rgb(100 102 122) 0%,
+    rgb(158 160 182) 10%,
+    rgb(112 114 136) 20%,
+    rgb(178 180 200) 32%,
+    rgb(122 124 148) 42%,
+    rgb(166 168 190) 52%,
+    rgb(106 108 132) 62%,
+    rgb(160 162 186) 72%,
+    rgb(110 112 136) 82%,
+    rgb(152 154 178) 91%,
+    rgb(118 120 142) 100%
+  );
+  --chrome-text-shadow:
+    0 -1px 0 rgb(255 255 255 / 8%),
+    0 1px 1px rgb(0 0 0 / 45%),
+    0 3px 8px rgb(0 0 0 / 22%);
+}
+
+/* An explicit light island must win even when a product shell carries the
+ * legacy `.dark` class. Keep this after the dark recipe for the root case
+ * where both selectors match the same element. */
+:root[data-theme="light"],
+[data-theme="light"] {
+  color-scheme: light;
+  --background: #fbf6f2;
+  --foreground: #201b19;
+  --muted: #6b625d;
+  --faint: #6b625d;
+  --grid: #eaded8;
+  --line: #bbaaa2;
+  --control-border: #8f8f8f;
+  --surface: #ffffff;
+  --surface-raised: #f3ece8;
+  --surface-hover: #eaded8;
+  --card: #ffffff;
+  --card-foreground: #201b19;
+  --popover: #ffffff;
+  --popover-foreground: #201b19;
+  --primary: #201b19;
+  --primary-foreground: #fbf6f2;
+  --secondary: #f3ece8;
+  --secondary-foreground: #201b19;
+  --accent: #eaded8;
+  --accent-foreground: #201b19;
+  --info: #0d61ac;
+  --info-soft: #d8eaff;
+  --focus: #0d61ac;
+  --scrim: rgba(2, 2, 2, 0.44);
+  --disabled: #e8ded9;
+  --disabled-foreground: #717171;
+  --inverse: #201b19;
+  --inverse-foreground: #fbf6f2;
+  --success: #2d6a42;
+  --success-soft: rgba(45, 106, 66, 0.12);
+  --warning: #785f28;
+  --warning-soft: rgba(120, 95, 40, 0.12);
+  --danger: #9f3631;
+  --danger-soft: rgba(159, 54, 49, 0.12);
+  --aurora-violet: oklch(0.82 0.048 312);
+  --aurora-rose: oklch(0.85 0.044 12);
+  --aurora-gold: oklch(0.92 0.036 96);
+  --aurora-mint: oklch(0.9 0.036 172);
+  --aurora-cyan: oklch(0.84 0.042 236);
+  --chrome-deep: rgb(52 52 64);
+  --chrome-shadow: rgb(58 58 72);
+  --chrome-mid: rgb(92 92 106);
+  --chrome-high: rgb(88 88 100);
+  --chrome-glint: rgb(100 100 112);
+  --canvas-background: var(--background);
+  --chrome-text-gradient: linear-gradient(
+    170deg,
+    rgb(52 52 64) 0%,
+    rgb(88 88 100) 10%,
+    rgb(58 58 72) 20%,
+    rgb(100 100 112) 32%,
+    rgb(64 64 78) 42%,
+    rgb(92 92 106) 52%,
+    rgb(54 54 68) 62%,
+    rgb(86 86 100) 72%,
+    rgb(56 56 70) 82%,
+    rgb(80 80 94) 91%,
+    rgb(60 60 74) 100%
+  );
+  --chrome-text-shadow:
+    0 -1px 0 rgb(255 255 255 / 45%),
+    0 1px 1px rgb(0 0 0 / 30%),
+    0 3px 6px rgb(0 0 0 / 12%);
+}
+
+/* Bridge legacy private token names to the namespaced public contract without
+ * changing the established meaning of private variables such as --muted. */
+:root,
+:root[data-theme="dark"],
+[data-theme="dark"],
+.dark,
+:root[data-theme="light"],
+[data-theme="light"] {
+  --ui-background: var(--background);
+  --ui-foreground: var(--foreground);
+  --ui-card: var(--card);
+  --ui-card-foreground: var(--card-foreground);
+  --ui-popover: var(--popover);
+  --ui-popover-foreground: var(--popover-foreground);
+  --ui-primary: var(--primary);
+  --ui-primary-foreground: var(--primary-foreground);
+  --ui-secondary: var(--secondary);
+  --ui-secondary-foreground: var(--secondary-foreground);
+  --ui-muted: var(--surface-raised);
+  --ui-muted-foreground: var(--muted);
+  --ui-accent: var(--accent);
+  --ui-accent-foreground: var(--accent-foreground);
+  --ui-destructive: var(--danger);
+  --ui-destructive-foreground: var(--background);
+  --ui-border: var(--line);
+  --ui-input: var(--control-border);
+  --ui-ring: var(--focus);
+  --ui-success: var(--success);
+  --ui-success-foreground: var(--background);
+  --ui-success-soft: var(--success-soft);
+  --ui-warning: var(--warning);
+  --ui-warning-foreground: var(--background);
+  --ui-warning-soft: var(--warning-soft);
+  --ui-info: var(--info);
+  --ui-info-foreground: var(--background);
+  --ui-info-soft: var(--info-soft);
+  --ui-chart-1: var(--aurora-rose);
+  --ui-chart-2: var(--aurora-mint);
+  --ui-chart-3: var(--aurora-cyan);
+  --ui-chart-4: var(--aurora-gold);
+  --ui-chart-5: var(--aurora-violet);
+  --ui-font-sans: var(--font-text);
+  --ui-font-heading: var(--font-heading);
+  --ui-font-mono: var(--font-mono);
+  --ui-radius: var(--radius-lg);
+}
+
+@media (pointer: coarse) {
+  :root {
+    --interactive-target-compact: max(2.75rem, var(--interactive-target-min, 3rem));
+  }
+}
+
+/* Automated browser verification cannot reliably override the host pointer
+ * media query, so it opts into the identical recipe through this root seam. */
+:root[data-verification-pointer="coarse"] {
+  --interactive-target-compact: max(2.75rem, var(--interactive-target-min, 3rem));
+}

@@ -1,0 +1,8 @@
+.{
+    // Public, release-pinned coordinates only. Provider secrets never belong
+    // in the app bundle. Enable this after the matching WorkOS client and
+    // hosted HRA relay have passed production readback.
+    .enabled = false,
+    .api_origin = "https://benevolent-akita-439.convex.site",
+    .workos_client_id = "",
+}

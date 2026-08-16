@@ -1,0 +1,44 @@
+Dugite Native Git corresponding source
+=======================================
+
+The macOS arm64 Git bundle in HRA is the checksum-pinned
+Dugite Native release v2.53.0-3:
+
+  Binary release:
+  https://github.com/desktop/dugite-native/releases/tag/v2.53.0-3
+
+  Binary asset:
+  dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz
+
+  Binary asset SHA-256:
+  e561cfc80c755e6f3e938653e81efcd025c9827a5b76dd42778b1159b3fab437
+
+Exact corresponding Git source
+------------------------------
+
+Git tag: v2.53.0
+Git commit: 67ad42147a7acc2af6074753ebd03d904476118f
+
+  https://github.com/git/git/tree/67ad42147a7acc2af6074753ebd03d904476118f
+  https://github.com/git/git/archive/67ad42147a7acc2af6074753ebd03d904476118f.tar.gz
+
+The checked GIT-COPYING.txt file is the verbatim COPYING file from that
+commit. Its SHA-256 is:
+
+  5b2198d1645f767585e8a88ac0499b04472164c0d2da22e75ecf97ef443ab32e
+
+Exact build and packaging source
+--------------------------------
+
+Dugite Native tag: v2.53.0-3
+Dugite Native commit: f49d0098409aa243de8b9162127025ab0bb07a88
+
+  https://github.com/desktop/dugite-native/tree/f49d0098409aa243de8b9162127025ab0bb07a88
+  https://github.com/desktop/dugite-native/archive/f49d0098409aa243de8b9162127025ab0bb07a88.tar.gz
+
+That source tree pins its `git` submodule to the Git commit above and
+contains the macOS build script, build flags, dependency checksums, custom
+gitconfig, and packaging steps used to produce the distributed archive.
+
+These commit-addressed URLs identify the preferred source and the scripts
+used to control compilation and installation of the exact bundled Git.

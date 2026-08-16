@@ -1,0 +1,140 @@
+{
+  "name": "hra",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The tokenmaxxing metaharness for Codex",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "keywords": [
+    "codex",
+    "multi-agent",
+    "agent-orchestration",
+    "ai-agents",
+    "macos",
+    "typescript",
+    "bun"
+  ],
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "node": "24.x"
+  },
+  "workspaces": {
+    "packages": [
+      "apps/*",
+      "packages/*",
+      "packages/internal/*"
+    ],
+    "catalog": {
+      "@convex-dev/better-auth": "0.12.5",
+      "@eslint/js": "^9.39.2",
+      "@hraness/codex-app-sdk": "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
+      "@hraness/direct": "github:hraness/direct#v0.6.2",
+      "@hraness/result": "github:hraness/result#v0.2.1",
+      "@hraness/types": "github:hraness/types#v0.1.1",
+      "@hraness/ui": "github:hraness/ui#v0.3.1",
+      "@hugeicons/core-free-icons": "^4.2.2",
+      "@native-sdk/cli": "0.5.3",
+      "@openai/codex": "0.144.6",
+      "@react-types/shared": "^3.36.0",
+      "@types/bun": "^1.3.14",
+      "@types/node": "^24.10.0",
+      "@types/react": "^19.2.14",
+      "@types/react-dom": "^19.2.3",
+      "@vitejs/plugin-react": "^6.0.3",
+      "@workos-inc/authkit-nextjs": "4.2.0",
+      "@workos-inc/node": "10.8.0",
+      "agent-browser": "0.32.3",
+      "better-auth": "1.6.25",
+      "convex": "^1.42.3",
+      "convex-test": "^0.0.54",
+      "dugite": "3.2.2",
+      "eslint": "^9.39.2",
+      "eslint-config-next": "16.2.12",
+      "fast-check": "^4.8.0",
+      "jose": "6.2.4",
+      "linkedom": "^0.18.13",
+      "motion": "12.42.0",
+      "next": "16.2.12",
+      "next-themes": "0.4.6",
+      "playwright-core": "1.62.0",
+      "react": "19.2.3",
+      "react-aria-components": "1.19.0",
+      "react-dom": "19.2.3",
+      "react-stately": "^3.48.0",
+      "recharts": "3.8.0",
+      "sharp": "0.35.3",
+      "streamdown": "2.5.0",
+      "sugar-high": "^1.2.1",
+      "typescript": "^6.0.3",
+      "typescript-eslint": "^8.53.0",
+      "vite": "^8.1.5",
+      "web-haptics": "0.0.6",
+      "zod": "^4.4.3"
+    }
+  },
+  "scripts": {
+    "hra": "bun run dev:desktop",
+    "web:hra": "bun run dev:web",
+    "taskctl": "bun run --cwd apps/cli start --",
+    "dev:web": "bun run --cwd apps/web dev",
+    "dev:desktop": "bun run --cwd apps/desktop dev",
+    "direct:web": "bun run --cwd apps/web dev:direct",
+    "direct:desktop": "bun run --cwd apps/desktop dev:direct",
+    "build": "bun run scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-production-build -- bun run build:uncoordinated",
+    "build:uncoordinated": "bun run --sequential --filter '@hraness/*' --filter '@hra-internal/*' build",
+    "typecheck:root": "tsc --noEmit -p tsconfig.json",
+    "typecheck:workspaces": "bun run --sequential --filter '@hraness/*' --filter '@hra-internal/*' typecheck",
+    "typecheck": "bun run typecheck:root && bun run typecheck:workspaces",
+    "lint:root": "eslint scripts",
+    "lint:workspaces": "bun run --sequential --filter '@hraness/*' --filter '@hra-internal/*' lint",
+    "lint": "bun run lint:root && bun run lint:workspaces",
+    "test": "bun run --sequential --filter '@hraness/*' --filter '@hra-internal/*' test",
+    "test:root": "bun test ./scripts",
+    "test:hra:local": "bun run --cwd apps/web test:local:convex",
+    "test:hra:human:local": "bun run --cwd apps/web test:local:human",
+    "check:agent-guides": "bun run scripts/check-agent-guides.ts",
+    "brand-assets:generate": "bun run scripts/generate-brand-assets.ts",
+    "brand-assets:check": "bun run scripts/generate-brand-assets.ts --check",
+    "generate:brand-assets": "bun run scripts/generate-brand-assets.ts",
+    "check:brand-assets": "bun run scripts/generate-brand-assets.ts --check",
+    "check:standalone": "bun run scripts/check-standalone.ts",
+    "check:public-boundary": "bun run scripts/check-public-boundary.ts",
+    "check:public-tree": "bun run scripts/check-public-tree.ts",
+    "check:structure": "bun run scripts/check-public-structure.ts",
+    "check:policies": "bun run check:standalone && bun run check:agent-guides && bun run check:structure && bun run check:public-boundary && bun run check:public-tree && bun run brand-assets:check",
+    "check": "bun run scripts/check-resource-scheduler.ts --mode=heavy --label=HRA-source-check -- bun run check:uncoordinated",
+    "check:uncoordinated": "bun run check:policies && bun run test:root && bun run typecheck && bun run lint && bun run test",
+    "check:complete": "bun run scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-complete-check -- bun run check:complete:uncoordinated",
+    "check:complete:uncoordinated": "bun run check:uncoordinated && bun run build:uncoordinated"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@hraness/direct": "catalog:",
+    "@types/bun": "catalog:",
+    "@types/node": "catalog:",
+    "agent-browser": "catalog:",
+    "eslint": "catalog:",
+    "sharp": "catalog:",
+    "typescript": "catalog:"
+  },
+  "overrides": {
+    "postcss": "8.5.23",
+    "sharp": "0.35.3"
+  },
+  "trustedDependencies": [
+    "dugite"
+  ],
+  "patchedDependencies": {
+    "@native-sdk/cli@0.5.3": "patches/@native-sdk%2Fcli@0.5.3.patch",
+    "react-aria@3.50.0": "patches/react-aria@3.50.0.patch"
+  }
+}

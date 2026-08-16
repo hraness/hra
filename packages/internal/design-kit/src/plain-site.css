@@ -1,0 +1,366 @@
+/**
+ * Plain site theme
+ *
+ * An opt-in document grammar for personal sites, open-source project pages,
+ * and quiet documentation. Color appearance remains owned by `data-theme`;
+ * this layer owns measure, typography, spacing, links, and minimal chrome.
+ */
+
+:root:has(> body.plain-site) {
+  background: #ffffff;
+  overflow-x: clip;
+  scrollbar-gutter: stable;
+}
+
+.plain-site {
+  --plain-link-target-min: 0px;
+  --plain-shell-measure: 34rem;
+  --plain-shell-gutter: 1.25rem;
+  --plain-background: #ffffff;
+  --plain-foreground: #171717;
+  --plain-link: #2457a6;
+  --plain-line: #d8d8d8;
+  --plain-muted: #666666;
+  --plain-surface: #f4f4f4;
+  --plain-syntax-keyword: #785f28;
+  --plain-syntax-string: #2d6a42;
+  --plain-syntax-number: #9f3631;
+  --plain-syntax-name: #0d61ac;
+
+  background: var(--plain-background);
+  color: var(--plain-foreground);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 1rem;
+  line-height: 1.55;
+  margin: 0;
+  overflow-x: clip;
+}
+
+body.plain-site {
+  display: flex;
+  flex-direction: column;
+  min-block-size: 100vh;
+  min-block-size: 100svh;
+  min-block-size: 100dvh;
+}
+
+body.plain-site > main {
+  flex: 1 0 auto;
+}
+
+:root[data-theme="dark"]:has(> body.plain-site) {
+  background: #151515;
+}
+
+:root[data-theme="dark"] .plain-site,
+.plain-site[data-theme="dark"] {
+  --plain-background: #151515;
+  --plain-foreground: #f2f2f2;
+  --plain-link: #8ab4ed;
+  --plain-line: #484848;
+  --plain-muted: #b6b6b6;
+  --plain-surface: #222222;
+  --plain-syntax-keyword: #c9ad74;
+  --plain-syntax-string: #76b38e;
+  --plain-syntax-number: #e18982;
+  --plain-syntax-name: #6aa9ed;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]):has(> body.plain-site) {
+    background: #151515;
+  }
+
+  :root:not([data-theme]) > .plain-site {
+    --plain-background: #151515;
+    --plain-foreground: #f2f2f2;
+    --plain-link: #8ab4ed;
+    --plain-line: #484848;
+    --plain-muted: #b6b6b6;
+    --plain-surface: #222222;
+    --plain-syntax-keyword: #c9ad74;
+    --plain-syntax-string: #76b38e;
+    --plain-syntax-number: #e18982;
+    --plain-syntax-name: #6aa9ed;
+  }
+}
+
+.plain-site .syntax-code {
+  --syntax-comment: var(--plain-muted);
+  --syntax-keyword: var(--plain-syntax-keyword);
+  --syntax-string: var(--plain-syntax-string);
+  --syntax-number: var(--plain-syntax-number);
+  --syntax-name: var(--plain-syntax-name);
+  --syntax-sign: var(--plain-muted);
+}
+
+.plain-site *,
+.plain-site *::before,
+.plain-site *::after {
+  box-sizing: border-box;
+}
+
+:where(.plain-header a, .plain-page a, .plain-footer a) {
+  color: var(--plain-link);
+  overflow-wrap: anywhere;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.15em;
+}
+
+:where(.plain-header a:hover, .plain-page a:hover, .plain-footer a:hover) {
+  text-decoration-thickness: 2px;
+}
+
+.plain-site :where(
+  .plain-header a:focus-visible,
+  .plain-page a:focus-visible,
+  .plain-footer a:focus-visible
+) {
+  border-radius: 1px;
+  outline: 1px dotted currentColor;
+  outline-offset: 3px;
+}
+
+.plain-site :where(
+  .plain-header a:focus:not(:focus-visible),
+  .plain-page a:focus:not(:focus-visible),
+  .plain-footer a:focus:not(:focus-visible)
+) {
+  outline: none;
+}
+
+.plain-site ::selection {
+  background: color-mix(in srgb, var(--plain-link) 20%, transparent);
+  color: var(--plain-foreground);
+}
+
+.plain-page {
+  inline-size: 100%;
+  margin: clamp(3.5rem, 12vh, 7rem) auto;
+  max-width: var(--plain-shell-measure);
+  padding-inline: var(--plain-shell-gutter);
+}
+
+.plain-header {
+  border: 0;
+  inline-size: 100%;
+  padding: 0;
+}
+
+.plain-header__inner {
+  --plain-header-block-padding: 1.15rem;
+
+  align-items: baseline;
+  border-bottom: 1px solid var(--plain-line);
+  display: flex;
+  gap: 0.75rem 1.5rem;
+  inline-size: 100%;
+  justify-content: space-between;
+  margin-inline: auto;
+  max-width: var(--plain-shell-measure);
+  padding-top: max(
+    var(--plain-header-block-padding),
+    env(safe-area-inset-top)
+  );
+  padding-right: max(var(--plain-shell-gutter), env(safe-area-inset-right));
+  padding-bottom: var(--plain-header-block-padding);
+  padding-left: max(var(--plain-shell-gutter), env(safe-area-inset-left));
+}
+
+.plain-wordmark {
+  align-items: center;
+  color: var(--plain-foreground);
+  display: inline-flex;
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0;
+  min-block-size: var(--plain-link-target-min);
+  min-inline-size: var(--plain-link-target-min);
+  text-decoration: none;
+  text-transform: none;
+}
+
+.plain-nav,
+.plain-footer__links {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.85rem;
+}
+
+.plain-nav a,
+.plain-footer__links a {
+  align-items: center;
+  color: var(--plain-muted);
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  min-block-size: var(--plain-link-target-min);
+  min-inline-size: var(--plain-link-target-min);
+  padding: 0;
+  text-decoration: underline;
+  text-transform: none;
+}
+
+.plain-page :where(h1, h2, h3, p, ul, ol, pre, figure) {
+  font-size: inherit;
+}
+
+.plain-page :where(h1, h2, h3) {
+  line-height: inherit;
+}
+
+.plain-page h1 {
+  font-weight: 700;
+  margin: 0 0 1rem;
+}
+
+.plain-page > p,
+.plain-muted {
+  color: var(--plain-muted);
+}
+
+.plain-page > p {
+  margin: 0;
+}
+
+.plain-page section {
+  margin-top: 2rem;
+}
+
+.plain-page h2 {
+  font-weight: 700;
+  margin: 0 0 0.3rem;
+}
+
+.plain-page section > p {
+  margin: 0;
+}
+
+.plain-page section > p + p {
+  margin-top: 1rem;
+}
+
+.plain-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.plain-links li {
+  margin: 0.1rem 0;
+}
+
+.plain-links a {
+  display: inline-block;
+  min-height: 1.5rem;
+  min-width: 1.5rem;
+}
+
+.plain-code {
+  color: var(--plain-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.55;
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding-block: 0.65rem;
+  white-space: pre-wrap;
+}
+
+.plain-code code {
+  font: inherit;
+}
+
+.plain-footer {
+  --background: var(--plain-background);
+  --foreground: var(--plain-foreground);
+  --focus: var(--plain-link);
+  --line: var(--plain-line);
+  --muted: var(--plain-muted);
+  --secondary: var(--plain-surface);
+  --secondary-foreground: var(--plain-foreground);
+  --surface: var(--plain-background);
+  --surface-raised: var(--plain-surface);
+
+  align-items: center;
+  border-top: 1px solid var(--plain-line);
+  color: var(--plain-muted);
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 1rem;
+  inline-size: 100%;
+  justify-content: space-between;
+  margin: 0 auto;
+  max-width: var(--plain-shell-measure);
+  overflow: clip;
+  padding-top: 1.25rem;
+  padding-right: max(var(--plain-shell-gutter), env(safe-area-inset-right));
+  padding-bottom: max(1.25rem, env(safe-area-inset-bottom));
+  padding-left: max(var(--plain-shell-gutter), env(safe-area-inset-left));
+}
+
+.plain-footer:has(.jungle-jelly-surface) {
+  padding-top: var(--space-6);
+  padding-right: max(var(--plain-shell-gutter), var(--space-6), env(safe-area-inset-right));
+  padding-bottom: max(var(--space-6), env(safe-area-inset-bottom));
+  padding-left: max(var(--plain-shell-gutter), var(--space-6), env(safe-area-inset-left));
+}
+
+.plain-site main:has(> .design-gallery[data-design-gallery-nested="true"]) {
+  padding-inline: max(var(--plain-shell-gutter), var(--space-6));
+}
+
+.plain-footer p {
+  margin: 0;
+}
+
+.plain-footer :where(a) {
+  align-items: center;
+  color: inherit;
+  display: inline-flex;
+  min-block-size: var(--plain-link-target-min);
+  min-inline-size: var(--plain-link-target-min);
+}
+
+@media (max-width: 42rem) {
+  .plain-header__inner {
+    --plain-header-block-padding: 1rem;
+
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+@media (pointer: coarse) {
+  .plain-site {
+    --plain-link-target-min: var(--interactive-target-min, 48px);
+  }
+}
+
+:root[data-verification-pointer="coarse"] .plain-site {
+  --plain-link-target-min: var(--interactive-target-min, 48px);
+}
+
+@media (max-width: 420px) {
+  .plain-site {
+    --plain-shell-gutter: 1rem;
+  }
+
+  .plain-page {
+    margin-block: 2.5rem;
+  }
+}
+
+@media (forced-colors: active) {
+  .plain-header__inner {
+    border-bottom: 1px solid CanvasText;
+  }
+
+  .plain-footer {
+    border-top: 1px solid CanvasText;
+  }
+}

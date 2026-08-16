@@ -1,0 +1,311 @@
+import { z } from "@hra-internal/schema";
+
+import { agentScopeSchema, positiveGenerationSchema, taskKeySchema } from "./model";
+import { requestIdSchema, uuidV7Schema } from "./tokens";
+
+export const errorCodeValues = [
+  "VALIDATION_ERROR",
+  "AUTHENTICATION_FAILED",
+  "SESSION_REQUIRED",
+  "SESSION_INVALID",
+  "AUTHORIZATION_DENIED",
+  "SCOPE_REQUIRED",
+  "ORGANIZATION_REQUIRED",
+  "ORGANIZATION_MISMATCH",
+  "MEMBERSHIP_INACTIVE",
+  "WORKSPACE_ROLE_REQUIRED",
+  "PROVISIONING_IN_PROGRESS",
+  "PROVISIONING_FAILED",
+  "AUTH_REFRESH_INDETERMINATE",
+  "IDEMPOTENCY_REQUIRED",
+  "IDEMPOTENCY_EXPIRED",
+  "IDEMPOTENCY_CONFLICT",
+  "ENROLLMENT_EXPIRED",
+  "ENROLLMENT_REDEEMED",
+  "ENROLLMENT_CONFLICT",
+  "NOT_FOUND",
+  "TASK_NOT_READY",
+  "TASK_ALREADY_CLAIMED",
+  "TASK_BLOCKED",
+  "TASK_IN_REVIEW",
+  "TASK_STATE_CONFLICT",
+  "DEPENDENCY_DUPLICATE",
+  "DEPENDENCY_CYCLE",
+  "HIERARCHY_CYCLE",
+  "GRAPH_VALIDATION_LIMIT",
+  "BLOCKER_LIMIT",
+  "DEPENDENT_LIMIT",
+  "CLAIM_STALE",
+  "CLAIM_NOT_OWNED",
+  "LEASE_NOT_RENEWABLE",
+  "RUNNER_ALREADY_CONNECTED",
+  "RUN_INTERACTION_LIMIT",
+  "PROJECTION_MISMATCH",
+  "SELF_REVIEW_DENIED",
+  "SUBMISSION_STALE",
+  "WORKSPACE_TASK_LIMIT",
+  "DEFER_HORIZON",
+  "RATE_LIMITED",
+  "SERVICE_UNAVAILABLE",
+  "INTERNAL_ERROR",
+] as const;
+export const errorCodeSchema = z.enum(errorCodeValues);
+export type ErrorCode = z.infer<typeof errorCodeSchema>;
+
+export const safeErrorMessage = {
+  VALIDATION_ERROR: "The request is invalid.",
+  AUTHENTICATION_FAILED: "Authentication failed.",
+  SESSION_REQUIRED: "An active agent session is required.",
+  SESSION_INVALID: "The agent session is invalid or expired.",
+  AUTHORIZATION_DENIED: "This principal is not authorized for the operation.",
+  SCOPE_REQUIRED: "The agent credential lacks a required scope.",
+  ORGANIZATION_REQUIRED: "An organization-bound human session is required.",
+  ORGANIZATION_MISMATCH: "The human session is bound to another organization.",
+  MEMBERSHIP_INACTIVE: "The organization membership is not active.",
+  WORKSPACE_ROLE_REQUIRED: "The human principal lacks a required workspace role.",
+  PROVISIONING_IN_PROGRESS: "Organization provisioning is still in progress.",
+  PROVISIONING_FAILED: "Organization provisioning could not be completed.",
+  AUTH_REFRESH_INDETERMINATE: "The authentication refresh outcome is indeterminate.",
+  IDEMPOTENCY_REQUIRED: "A valid idempotency key is required.",
+  IDEMPOTENCY_EXPIRED: "The idempotency key is outside the accepted time window.",
+  IDEMPOTENCY_CONFLICT: "The idempotency key was already used for a different request.",
+  ENROLLMENT_EXPIRED: "The agent enrollment has expired.",
+  ENROLLMENT_REDEEMED: "The agent enrollment was already redeemed.",
+  ENROLLMENT_CONFLICT: "The agent enrollment conflicts with an existing redemption.",
+  NOT_FOUND: "The requested resource was not found.",
+  TASK_NOT_READY: "The task is not ready to claim.",
+  TASK_ALREADY_CLAIMED: "The task has an active claim.",
+  TASK_BLOCKED: "The task has unresolved blockers.",
+  TASK_IN_REVIEW: "The task review surface is frozen.",
+  TASK_STATE_CONFLICT: "The task state does not permit this operation.",
+  DEPENDENCY_DUPLICATE: "The blocking dependency already exists.",
+  DEPENDENCY_CYCLE: "The blocking dependency would create a cycle.",
+  HIERARCHY_CYCLE: "The parent relationship would create a cycle.",
+  GRAPH_VALIDATION_LIMIT: "The graph could not be validated within its safety limits.",
+  BLOCKER_LIMIT: "The task has reached its direct blocker limit.",
+  DEPENDENT_LIMIT: "The task has reached its blocking dependent limit.",
+  CLAIM_STALE: "The task claim fence is stale.",
+  CLAIM_NOT_OWNED: "The task claim belongs to another agent.",
+  LEASE_NOT_RENEWABLE: "The task claim cannot be renewed.",
+  RUNNER_ALREADY_CONNECTED: "Another runner is already connected to this workspace.",
+  RUN_INTERACTION_LIMIT: "The run reached its interaction safety limit.",
+  PROJECTION_MISMATCH: "The task projection is inconsistent and requires repair.",
+  SELF_REVIEW_DENIED: "An actor cannot accept its own submission.",
+  SUBMISSION_STALE: "The task submission revision is stale.",
+  WORKSPACE_TASK_LIMIT: "The workspace task limit has been reached.",
+  DEFER_HORIZON: "The requested availability time exceeds the accepted horizon.",
+  RATE_LIMITED: "The request was rate limited.",
+  SERVICE_UNAVAILABLE: "The service is temporarily unavailable.",
+  INTERNAL_ERROR: "The service could not complete the request.",
+} as const satisfies Record<ErrorCode, string>;
+
+export const errorDetailsSchema = z
+  .object({
+    taskKey: taskKeySchema.optional(),
+    currentRevision: positiveGenerationSchema.optional(),
+    fence: positiveGenerationSchema.optional(),
+    leaseUntil: z.number().int().nonnegative().safe().optional(),
+    blockingCount: z.number().int().nonnegative().safe().optional(),
+    ownerAgentId: z.string().min(1).max(128).optional(),
+    requiredScope: agentScopeSchema.optional(),
+    retryAfterMs: z.number().int().nonnegative().safe().optional(),
+    idempotencyKey: uuidV7Schema.optional(),
+    exhaustedLimit: z.enum(["visited_tasks", "examined_edges", "parent_depth"]).optional(),
+  })
+  .strict();
+export type ErrorDetails = z.infer<typeof errorDetailsSchema>;
+
+const allowedErrorDetailKeys = {
+  VALIDATION_ERROR: [],
+  AUTHENTICATION_FAILED: [],
+  SESSION_REQUIRED: [],
+  SESSION_INVALID: [],
+  AUTHORIZATION_DENIED: [],
+  SCOPE_REQUIRED: ["requiredScope"],
+  ORGANIZATION_REQUIRED: [],
+  ORGANIZATION_MISMATCH: [],
+  MEMBERSHIP_INACTIVE: [],
+  WORKSPACE_ROLE_REQUIRED: [],
+  PROVISIONING_IN_PROGRESS: ["retryAfterMs"],
+  PROVISIONING_FAILED: [],
+  AUTH_REFRESH_INDETERMINATE: [],
+  IDEMPOTENCY_REQUIRED: [],
+  IDEMPOTENCY_EXPIRED: [],
+  IDEMPOTENCY_CONFLICT: [],
+  ENROLLMENT_EXPIRED: [],
+  ENROLLMENT_REDEEMED: [],
+  ENROLLMENT_CONFLICT: [],
+  NOT_FOUND: [],
+  TASK_NOT_READY: ["taskKey", "blockingCount", "currentRevision"],
+  TASK_ALREADY_CLAIMED: ["taskKey", "ownerAgentId", "leaseUntil", "currentRevision"],
+  TASK_BLOCKED: ["taskKey", "blockingCount", "currentRevision"],
+  TASK_IN_REVIEW: ["taskKey", "currentRevision"],
+  TASK_STATE_CONFLICT: ["taskKey", "currentRevision"],
+  DEPENDENCY_DUPLICATE: ["taskKey", "currentRevision"],
+  DEPENDENCY_CYCLE: ["taskKey", "currentRevision"],
+  HIERARCHY_CYCLE: ["taskKey", "currentRevision"],
+  GRAPH_VALIDATION_LIMIT: ["taskKey", "currentRevision", "exhaustedLimit"],
+  BLOCKER_LIMIT: ["taskKey", "currentRevision", "blockingCount"],
+  DEPENDENT_LIMIT: ["taskKey", "currentRevision", "blockingCount"],
+  CLAIM_STALE: ["taskKey", "fence", "currentRevision"],
+  CLAIM_NOT_OWNED: ["taskKey", "fence"],
+  LEASE_NOT_RENEWABLE: ["taskKey", "fence", "leaseUntil"],
+  RUNNER_ALREADY_CONNECTED: ["leaseUntil", "retryAfterMs"],
+  RUN_INTERACTION_LIMIT: [],
+  PROJECTION_MISMATCH: ["taskKey", "blockingCount", "currentRevision"],
+  SELF_REVIEW_DENIED: ["taskKey", "currentRevision"],
+  SUBMISSION_STALE: ["taskKey", "currentRevision"],
+  WORKSPACE_TASK_LIMIT: [],
+  DEFER_HORIZON: [],
+  RATE_LIMITED: ["retryAfterMs"],
+  SERVICE_UNAVAILABLE: [],
+  INTERNAL_ERROR: [],
+} as const satisfies Record<ErrorCode, readonly (keyof z.infer<typeof errorDetailsSchema>)[]>;
+
+export const errorEnvelopeSchema = z
+  .object({
+    error: z
+      .object({
+        code: errorCodeSchema,
+        message: z.string().min(1).max(1_000),
+        requestId: requestIdSchema,
+        details: errorDetailsSchema,
+      })
+      .strict(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.error.message !== safeErrorMessage[value.error.code]) {
+      context.addIssue({
+        code: "custom",
+        message: `${value.error.code} must use its fixed public message`,
+        path: ["error", "message"],
+      });
+    }
+    const allowed = new Set<string>([
+      ...allowedErrorDetailKeys[value.error.code],
+      "idempotencyKey",
+    ]);
+    const unexpected = Object.keys(value.error.details).find((key) => !allowed.has(key));
+    if (unexpected !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: `${value.error.code} cannot expose detail ${unexpected}`,
+        path: ["error", "details", unexpected],
+      });
+    }
+  });
+export type ErrorEnvelope = z.infer<typeof errorEnvelopeSchema>;
+
+export const successEnvelopeSchema = <Schema extends z.ZodType>(data: Schema) =>
+  z
+    .object({
+      ok: z.literal(true),
+      data,
+      requestId: requestIdSchema,
+    })
+    .strict();
+
+export const errorHttpStatus = {
+  VALIDATION_ERROR: 400,
+  AUTHENTICATION_FAILED: 401,
+  SESSION_REQUIRED: 401,
+  SESSION_INVALID: 401,
+  AUTHORIZATION_DENIED: 403,
+  SCOPE_REQUIRED: 403,
+  ORGANIZATION_REQUIRED: 403,
+  ORGANIZATION_MISMATCH: 403,
+  MEMBERSHIP_INACTIVE: 403,
+  WORKSPACE_ROLE_REQUIRED: 403,
+  PROVISIONING_IN_PROGRESS: 409,
+  PROVISIONING_FAILED: 502,
+  AUTH_REFRESH_INDETERMINATE: 503,
+  IDEMPOTENCY_REQUIRED: 400,
+  IDEMPOTENCY_EXPIRED: 400,
+  IDEMPOTENCY_CONFLICT: 409,
+  ENROLLMENT_EXPIRED: 410,
+  ENROLLMENT_REDEEMED: 409,
+  ENROLLMENT_CONFLICT: 409,
+  NOT_FOUND: 404,
+  TASK_NOT_READY: 409,
+  TASK_ALREADY_CLAIMED: 409,
+  TASK_BLOCKED: 409,
+  TASK_IN_REVIEW: 409,
+  TASK_STATE_CONFLICT: 409,
+  DEPENDENCY_DUPLICATE: 409,
+  DEPENDENCY_CYCLE: 409,
+  HIERARCHY_CYCLE: 409,
+  GRAPH_VALIDATION_LIMIT: 409,
+  BLOCKER_LIMIT: 409,
+  DEPENDENT_LIMIT: 409,
+  CLAIM_STALE: 409,
+  CLAIM_NOT_OWNED: 409,
+  LEASE_NOT_RENEWABLE: 409,
+  RUNNER_ALREADY_CONNECTED: 409,
+  RUN_INTERACTION_LIMIT: 409,
+  PROJECTION_MISMATCH: 409,
+  SELF_REVIEW_DENIED: 403,
+  SUBMISSION_STALE: 409,
+  WORKSPACE_TASK_LIMIT: 409,
+  DEFER_HORIZON: 400,
+  RATE_LIMITED: 429,
+  SERVICE_UNAVAILABLE: 503,
+  INTERNAL_ERROR: 500,
+} as const satisfies Record<ErrorCode, number>;
+
+export const errorExitCode = {
+  VALIDATION_ERROR: 2,
+  AUTHENTICATION_FAILED: 3,
+  SESSION_REQUIRED: 3,
+  SESSION_INVALID: 3,
+  AUTHORIZATION_DENIED: 3,
+  SCOPE_REQUIRED: 3,
+  ORGANIZATION_REQUIRED: 3,
+  ORGANIZATION_MISMATCH: 3,
+  MEMBERSHIP_INACTIVE: 3,
+  WORKSPACE_ROLE_REQUIRED: 3,
+  PROVISIONING_IN_PROGRESS: 4,
+  PROVISIONING_FAILED: 6,
+  AUTH_REFRESH_INDETERMINATE: 6,
+  IDEMPOTENCY_REQUIRED: 2,
+  IDEMPOTENCY_EXPIRED: 2,
+  IDEMPOTENCY_CONFLICT: 4,
+  ENROLLMENT_EXPIRED: 4,
+  ENROLLMENT_REDEEMED: 4,
+  ENROLLMENT_CONFLICT: 4,
+  NOT_FOUND: 5,
+  TASK_NOT_READY: 4,
+  TASK_ALREADY_CLAIMED: 4,
+  TASK_BLOCKED: 4,
+  TASK_IN_REVIEW: 4,
+  TASK_STATE_CONFLICT: 4,
+  DEPENDENCY_DUPLICATE: 4,
+  DEPENDENCY_CYCLE: 4,
+  HIERARCHY_CYCLE: 4,
+  GRAPH_VALIDATION_LIMIT: 4,
+  BLOCKER_LIMIT: 4,
+  DEPENDENT_LIMIT: 4,
+  CLAIM_STALE: 4,
+  CLAIM_NOT_OWNED: 4,
+  LEASE_NOT_RENEWABLE: 4,
+  RUNNER_ALREADY_CONNECTED: 4,
+  RUN_INTERACTION_LIMIT: 4,
+  PROJECTION_MISMATCH: 4,
+  SELF_REVIEW_DENIED: 3,
+  SUBMISSION_STALE: 4,
+  WORKSPACE_TASK_LIMIT: 4,
+  DEFER_HORIZON: 2,
+  RATE_LIMITED: 6,
+  SERVICE_UNAVAILABLE: 6,
+  INTERNAL_ERROR: 6,
+} as const satisfies Record<ErrorCode, 2 | 3 | 4 | 5 | 6>;
+
+export function makeErrorEnvelope(
+  code: ErrorCode,
+  requestId: z.infer<typeof requestIdSchema>,
+  details: z.input<typeof errorDetailsSchema> = {},
+): ErrorEnvelope {
+  return errorEnvelopeSchema.parse({
+    error: { code, message: safeErrorMessage[code], requestId, details },
+  });
+}

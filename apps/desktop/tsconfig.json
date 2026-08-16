@@ -1,0 +1,15 @@
+{
+  "extends": "@hra-internal/typescript-config/base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "types": ["@native-sdk/cli", "bun", "vite/client"]
+  },
+  "include": [
+    "frontend/**/*.ts",
+    "frontend/**/*.tsx",
+    "contracts/runtime.ts",
+    "contracts/*.test.ts",
+    "runtime/**/*.ts"
+  ]
+}
