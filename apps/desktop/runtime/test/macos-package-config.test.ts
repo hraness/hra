@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 
-import { correspondingSourceSpecs } from "../corresponding-sources";
+import { consumeUtf8Lines, correspondingSourceSpecs } from "../corresponding-sources";
 import {
   hranessUiStylesheetInput,
   macosPackage,
@@ -21,6 +21,67 @@ import runtimeVersions from "../runtime-versions.json";
 import { verifyRegularReleaseEntries } from "../verify-macos-package";
 
 describe("macOS ad-hoc package contract", () => {
+  test("streams large archive listings with bounded line memory", async () => {
+    const encoder = new TextEncoder();
+    const totalLines = 200_000;
+    let nextLine = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (nextLine === totalLines) {
+          controller.close();
+          return;
+        }
+        const lines: string[] = [];
+        const end = Math.min(totalLines, nextLine + 1_000);
+        while (nextLine < end) {
+          lines.push(`entry-${nextLine}-🐦‍🔥\n`);
+          nextLine += 1;
+        }
+        controller.enqueue(encoder.encode(lines.join("")));
+      },
+    });
+    let first = "";
+    let last = "";
+    const count = await consumeUtf8Lines(stream, "fixture", (line, index) => {
+      if (index === 0) first = line;
+      last = line;
+    });
+    expect(count).toBe(totalLines);
+    expect(first).toBe("entry-0-🐦‍🔥");
+    expect(last).toBe(`entry-${totalLines - 1}-🐦‍🔥`);
+
+    const splitBytes = encoder.encode("alpha-🐦‍🔥\nbeta-unterminated");
+    const splitStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < splitBytes.length; offset += 3) {
+          controller.enqueue(splitBytes.slice(offset, offset + 3));
+        }
+        controller.close();
+      },
+    });
+    const splitLines: string[] = [];
+    expect(await consumeUtf8Lines(splitStream, "fixture", (line) => splitLines.push(line)))
+      .toBe(2);
+    expect(splitLines).toEqual(["alpha-🐦‍🔥", "beta-unterminated"]);
+
+    const oversized = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode("x".repeat(1024 * 1024 + 1)));
+        controller.close();
+      },
+    });
+    let oversizedRejection: unknown;
+    try {
+      await consumeUtf8Lines(oversized, "fixture", () => undefined);
+    } catch (error) {
+      oversizedRejection = error;
+    }
+    expect(oversizedRejection).toBeInstanceOf(Error);
+    expect((oversizedRejection as Error).message).toContain(
+      "fixture emitted an oversized output line",
+    );
+  });
+
   test("binds the public artifact to the compiled release identity", () => {
     expect(macosPackage).toMatchObject({
       appBundleName: "HRA",

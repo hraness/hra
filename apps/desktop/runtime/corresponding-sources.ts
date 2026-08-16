@@ -489,6 +489,81 @@ async function run(
   return stdout;
 }
 
+const maximumCommandOutputLineLength = 1024 * 1024;
+
+export async function consumeUtf8Lines(
+  stream: ReadableStream<Uint8Array>,
+  label: string,
+  onLine: (line: string, index: number) => void,
+): Promise<number> {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const reader = stream.getReader();
+  let remainder = "";
+  let lineCount = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      remainder += decoder.decode(result.value, { stream: true });
+      let newlineIndex = remainder.indexOf("\n");
+      while (newlineIndex !== -1) {
+        const line = remainder.slice(0, newlineIndex);
+        remainder = remainder.slice(newlineIndex + 1);
+        if (line.length > maximumCommandOutputLineLength) {
+          throw new Error(`${label} emitted an oversized output line.`);
+        }
+        if (line.length > 0) {
+          onLine(line, lineCount);
+          lineCount += 1;
+        }
+        newlineIndex = remainder.indexOf("\n");
+      }
+      if (remainder.length > maximumCommandOutputLineLength) {
+        throw new Error(`${label} emitted an oversized output line.`);
+      }
+    }
+    remainder += decoder.decode();
+    if (remainder.length > maximumCommandOutputLineLength) {
+      throw new Error(`${label} emitted an oversized output line.`);
+    }
+    if (remainder.length > 0) {
+      onLine(remainder, lineCount);
+      lineCount += 1;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return lineCount;
+}
+
+async function forEachOutputLine(
+  argv: readonly string[],
+  onLine: (line: string, index: number) => void,
+  options: Readonly<{ cwd?: string; env?: Readonly<Record<string, string | undefined>> }> = {},
+): Promise<number> {
+  const child = Bun.spawn([...argv], {
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    env: options.env ?? process.env,
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  const stderrPromise = new Response(child.stderr).text();
+  const exitPromise = child.exited;
+  let lineCount: number;
+  try {
+    lineCount = await consumeUtf8Lines(child.stdout, argv.join(" "), onLine);
+  } catch (error) {
+    child.kill();
+    await Promise.allSettled([exitPromise, stderrPromise]);
+    throw error;
+  }
+  const [exitCode, stderr] = await Promise.all([exitPromise, stderrPromise]);
+  if (exitCode !== 0) {
+    throw new Error(`${argv.join(" ")} failed with exit code ${exitCode}: ${stderr.trim()}`);
+  }
+  return lineCount;
+}
+
 async function sha256File(path: string): Promise<string> {
   const handle = await open(path, "r");
   const hasher = createHash("sha256");
@@ -544,42 +619,69 @@ function safeSymlinkTarget(target: string, resolved: string): boolean {
     && safeArchivePath(resolved);
 }
 
-function verifyArchiveEntryTypes(
-  entries: readonly string[],
-  verboseLines: readonly string[],
+function verifyArchiveEntryType(
+  entry: string,
+  line: string,
   project: string,
   archivePrefix: string,
 ): void {
-  if (entries.length !== verboseLines.length) {
+  const type = line[0];
+  if (type !== "-" && type !== "d" && type !== "l") {
+    throw new Error(`${project} source archive contains a special or hardlink entry.`);
+  }
+  if (type !== "l") return;
+  const marker = `${entry} -> `;
+  const markerIndex = line.lastIndexOf(marker);
+  if (markerIndex === -1) {
+    throw new Error(`${project} source archive symlink listing is malformed.`);
+  }
+  const target = line.slice(markerIndex + marker.length);
+  const relativeEntry = entry.slice(archivePrefix.length);
+  const resolved = posix.normalize(posix.join(posix.dirname(relativeEntry), target));
+  if (!safeSymlinkTarget(target, resolved)) {
+    throw new Error(`${project} source archive symlink escapes its root.`);
+  }
+}
+
+async function readAndVerifyArchiveEntries(
+  archivePath: string,
+  project: string,
+  archivePrefix: string,
+): Promise<Readonly<{ entries: readonly string[]; paths: ReadonlySet<string> }>> {
+  const entries: string[] = [];
+  const paths = new Set<string>();
+  await forEachOutputLine(["/usr/bin/tar", "-tzf", archivePath], (entry) => {
+    if (!entry.startsWith(archivePrefix) || !safeArchivePath(entry)) {
+      throw new Error(`${project} source archive contains an unsafe path.`);
+    }
+    if (paths.has(entry)) {
+      throw new Error(`${project} source archive contains duplicate paths.`);
+    }
+    paths.add(entry);
+    entries.push(entry);
+  });
+  const verboseCount = await forEachOutputLine(
+    ["/usr/bin/tar", "-tvzf", archivePath],
+    (line, index) => {
+      const entry = entries[index];
+      if (entry === undefined) {
+        throw new Error(`${project} source archive listings disagree.`);
+      }
+      verifyArchiveEntryType(entry, line, project, archivePrefix);
+    },
+  );
+  if (verboseCount !== entries.length) {
     throw new Error(`${project} source archive listings disagree.`);
   }
-  for (const [index, entry] of entries.entries()) {
-    const line = verboseLines[index]!;
-    const type = line[0];
-    if (type !== "-" && type !== "d" && type !== "l") {
-      throw new Error(`${project} source archive contains a special or hardlink entry.`);
-    }
-    if (type !== "l") continue;
-    const marker = `${entry} -> `;
-    const markerIndex = line.lastIndexOf(marker);
-    if (markerIndex === -1) {
-      throw new Error(`${project} source archive symlink listing is malformed.`);
-    }
-    const target = line.slice(markerIndex + marker.length);
-    const relativeEntry = entry.slice(archivePrefix.length);
-    const resolved = posix.normalize(posix.join(posix.dirname(relativeEntry), target));
-    if (!safeSymlinkTarget(target, resolved)) {
-      throw new Error(`${project} source archive symlink escapes its root.`);
-    }
-  }
+  return { entries, paths };
 }
 
 async function verifyExternalSources(
   archivePath: string,
   entries: readonly string[],
+  paths: ReadonlySet<string>,
   spec: CorrespondingSourceSpec,
 ): Promise<void> {
-  const paths = new Set(entries);
   const embedded = spec.externalSources.filter(
     (source): source is CorrespondingSourceExternalArchive | CorrespondingSourceExternalGit =>
       source.kind !== "linked-archive",
@@ -722,23 +824,14 @@ export async function verifyCorrespondingSourceArchive(
   if (status.size >= githubReleaseAssetByteLimit) {
     throw new Error(`Corresponding source archive exceeds GitHub's 2 GiB asset limit: ${archivePath}`);
   }
-  const listing = await run(["/usr/bin/tar", "-tzf", archivePath]);
-  const entries = listing.split("\n").filter((entry) => entry.length > 0);
-  const verboseListing = await run(["/usr/bin/tar", "-tvzf", archivePath]);
-  const verboseLines = verboseListing.split("\n").filter((entry) => entry.length > 0);
+  const { entries, paths } = await readAndVerifyArchiveEntries(
+    archivePath,
+    spec.project,
+    spec.archivePrefix,
+  );
   if (entries.length < spec.minimumEntries) {
     throw new Error(`${spec.project} source archive is unexpectedly small.`);
   }
-  if (entries.some((entry) =>
-    !entry.startsWith(spec.archivePrefix)
-    || !safeArchivePath(entry))) {
-    throw new Error(`${spec.project} source archive contains an unsafe path.`);
-  }
-  if (new Set(entries).size !== entries.length) {
-    throw new Error(`${spec.project} source archive contains duplicate paths.`);
-  }
-  verifyArchiveEntryTypes(entries, verboseLines, spec.project, spec.archivePrefix);
-  const paths = new Set(entries);
   for (const sentinel of spec.sentinels) {
     if (!paths.has(`${spec.archivePrefix}${sentinel}`)) {
       throw new Error(`${spec.project} source archive lacks ${sentinel}.`);
@@ -763,7 +856,7 @@ export async function verifyCorrespondingSourceArchive(
   if (JSON.stringify(parsedManifest) !== JSON.stringify(sourceManifest(spec))) {
     throw new Error(`${spec.project} source manifest differs from its pin.`);
   }
-  await verifyExternalSources(archivePath, entries, spec);
+  await verifyExternalSources(archivePath, entries, paths, spec);
   return {
     archiveName: spec.archiveName,
     bytes: status.size,
@@ -972,19 +1065,14 @@ async function verifyDownloadedSourceArchive(
   if (await sha256File(archivePath) !== source.sha256) {
     throw new Error(`${source.project} download hash differs from its pin.`);
   }
-  const entries = (await run(["/usr/bin/tar", "-tzf", archivePath]))
-    .split("\n").filter((entry) => entry.length > 0);
-  const verboseLines = (await run(["/usr/bin/tar", "-tvzf", archivePath]))
-    .split("\n").filter((entry) => entry.length > 0);
-  if (
-    entries.length < source.minimumEntries
-    || entries.some((entry) =>
-      !entry.startsWith(source.sourceArchivePrefix) || !safeArchivePath(entry))
-    || new Set(entries).size !== entries.length
-  ) {
+  const { entries } = await readAndVerifyArchiveEntries(
+    archivePath,
+    source.project,
+    source.sourceArchivePrefix,
+  );
+  if (entries.length < source.minimumEntries) {
     throw new Error(`${source.project} download tree differs from its pin.`);
   }
-  verifyArchiveEntryTypes(entries, verboseLines, source.project, source.sourceArchivePrefix);
 }
 
 async function downloadExternalArchive(
