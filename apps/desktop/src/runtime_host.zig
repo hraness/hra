@@ -66,19 +66,17 @@ const harness_custody_native_result_kind =
 const removal_deletion_capability_bytes: usize = 32;
 const removal_deletion_capability_hex_bytes: usize =
     removal_deletion_capability_bytes * 2;
-// A first reconciliation performs at most five v2 helper calls and two legacy
-// calls. Each call also receives the one absolute operation deadline. Keep the
-// aggregate success budget below the gateway client's fixed timeout so a
-// mutation can never finish after its reporter abandons it.
+// Direct v2 custody performs at most three helper calls. Each call also
+// receives the one absolute operation deadline. Keep the aggregate success
+// budget below the gateway client's fixed timeout so a mutation can never
+// finish after its reporter abandons it.
 const harness_custody_helper_timeout_ms: u32 = 5_000;
 const legacy_harness_custody_timeout_ms: u32 = 10_000;
 const harness_custody_helper_reap_timeout_ms: u32 = 1_000;
 const legacy_harness_group_absence_timeout_ms: u32 = 1_000;
 const max_harness_custody_native_operation_ms: u32 =
-    5 * harness_custody_helper_timeout_ms +
-    2 * legacy_harness_custody_timeout_ms +
-    harness_custody_helper_reap_timeout_ms +
-    3 * legacy_harness_group_absence_timeout_ms;
+    3 * harness_custody_helper_timeout_ms +
+    harness_custody_helper_reap_timeout_ms;
 const harness_custody_native_deadline_ms: u32 = 50_000;
 const harness_custody_gateway_timeout_ms: u32 = 55_000;
 const max_harness_install_envelope_bytes: usize = 256;
@@ -359,7 +357,6 @@ pub const PathOptions = struct {
     git_bin: ?[]const u8 = null,
     data_remover_path: ?[]const u8 = null,
     keychain_custodian_path: ?[]const u8 = null,
-    legacy_harness_gateway_path: ?[]const u8 = null,
 };
 
 pub const RuntimePaths = struct {
@@ -370,7 +367,6 @@ pub const RuntimePaths = struct {
     git_bin: []u8,
     data_remover_path: []u8,
     keychain_custodian_path: []u8,
-    legacy_harness_gateway_path: []u8,
 
     pub fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
         allocator.free(self.runtime_root);
@@ -380,7 +376,6 @@ pub const RuntimePaths = struct {
         allocator.free(self.git_bin);
         allocator.free(self.data_remover_path);
         allocator.free(self.keychain_custodian_path);
-        allocator.free(self.legacy_harness_gateway_path);
         self.* = undefined;
     }
 };
@@ -467,13 +462,6 @@ fn resolveRuntimePathsForExecutable(
                 "OPRTE_KEYCHAIN_CUSTODIAN_PATH",
                 "KITCHEN_KEYCHAIN_CUSTODIAN_PATH",
             ),
-        .legacy_harness_gateway_path = options.legacy_harness_gateway_path orelse
-            try renamedEnvironmentValue(
-                parent,
-                "HRA_PREVIEW_LEGACY_GATEWAY_PATH",
-                "OPRTE_PREVIEW_LEGACY_GATEWAY_PATH",
-                null,
-            ),
     });
 }
 
@@ -510,7 +498,6 @@ const ToolOverrides = struct {
     git_bin: ?[]const u8 = null,
     data_remover_path: ?[]const u8 = null,
     keychain_custodian_path: ?[]const u8 = null,
-    legacy_harness_gateway_path: ?[]const u8 = null,
 };
 
 fn runtimePathsFromRoot(
@@ -572,18 +559,6 @@ fn runtimePathsFromRoot(
         );
     errdefer allocator.free(paths.keychain_custodian_path);
 
-    paths.legacy_harness_gateway_path = if (overrides.legacy_harness_gateway_path) |path|
-        try normalizedAbsolute(allocator, path)
-    else
-        try joinAbsolute(
-            allocator,
-            &.{
-                paths.runtime_root,
-                "legacy",
-                "preview-0.1.4-5",
-                "oprte-gateway",
-            },
-        );
     return paths;
 }
 
@@ -690,6 +665,71 @@ pub fn buildSanitizedEnvironment(
     defer allocator.free(path);
     try environment.put("PATH", path);
     return environment;
+}
+
+fn normalizedPackageSmokeRoot(
+    allocator: std.mem.Allocator,
+    raw_root: []const u8,
+) ResolvePathError![]u8 {
+    const normalized = try normalizedAbsolute(allocator, raw_root);
+    errdefer allocator.free(normalized);
+    if (!std.mem.eql(u8, raw_root, normalized) or
+        !std.mem.startsWith(
+            u8,
+            std.fs.path.basename(normalized),
+            "hra-package-smoke-",
+        ) or
+        std.fs.path.dirname(normalized) == null)
+    {
+        return error.InvalidAbsolutePath;
+    }
+    return normalized;
+}
+
+/// Starts only the packaged native executable and its bundled Bun gateway.
+/// This verifier-only path never initializes AppKit, WebKit, updater state,
+/// account profiles, or Keychain custody. The gateway admits only its matching
+/// marker routine and writes exclusively beneath `raw_root`.
+pub fn runPackagedSmoke(
+    init: std.process.Init,
+    raw_root: []const u8,
+) !void {
+    const allocator = std.heap.page_allocator;
+    const root = try normalizedPackageSmokeRoot(allocator, raw_root);
+    defer allocator.free(root);
+    var paths = try resolveRuntimePaths(
+        init.io,
+        allocator,
+        init.environ_map,
+        .{},
+    );
+    defer paths.deinit(allocator);
+    var environment = try buildSanitizedEnvironment(
+        allocator,
+        init.environ_map,
+        &paths,
+        .production,
+        null,
+    );
+    defer environment.deinit();
+    try environment.put("HRA_PACKAGE_SMOKE_ROOT", root);
+
+    var child = try std.process.spawn(init.io, .{
+        .argv = &.{paths.gateway_path},
+        .environ_map = &environment,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = gatewayStderrForMode(builtin.mode),
+        // Inherit the verifier-owned host process group so its bounded cleanup
+        // terminates both exact births without a global process search.
+        .create_no_window = true,
+    });
+    defer child.kill(init.io);
+    std.Io.sleep(
+        init.io,
+        .fromMilliseconds(30_000),
+        .awake,
+    ) catch {};
 }
 
 fn addStartupRemovalRecoveryEnvironment(
@@ -4148,6 +4188,78 @@ fn deleteHarnessReconciliationMarker(
     };
 }
 
+/// Executes the prerelease v2 custody protocol without consulting historical
+/// app binaries. HRA has no installed v1 population, so a missing v2 envelope
+/// is authoritative and can initialize directly. The legacy reconciliation
+/// implementation below remains test-only reference code until its protocol
+/// surface is removed in a later source cleanup.
+fn executeDirectHarnessCustodyOperation(
+    helper: HarnessCustodyHelperRunner,
+    helper_path: []const u8,
+    request: *const HarnessCustodyNativeRequest,
+    deadline: HarnessCustodyDeadline,
+) HarnessCustodyOperationResult {
+    switch (request.action) {
+        .read => {
+            const current = readHarnessEnvelope(
+                helper,
+                helper_path,
+                &deadline,
+            ) orelse return .{ .failed = .envelope_read };
+            return .{ .read = .{
+                .value = current,
+                .migrated_from_legacy = false,
+                .legacy_preserved = false,
+            } };
+        },
+        .set_if_absent => {
+            const requested = request.valueSlice() orelse
+                return .{ .failed = .reconciliation };
+            if (!canonicalHarnessInstallEnvelope(requested))
+                return .{ .failed = .reconciliation };
+            var set = setHarnessEnvelopeIfAbsent(
+                helper,
+                helper_path,
+                &deadline,
+                requested,
+            ) orelse return .{ .failed = .envelope_set_if_absent };
+            defer wipeHarnessCustodyValue(&set.value);
+            const authoritative = set.value.valueSlice() orelse
+                return .{ .failed = .reconciliation };
+            if (!std.mem.eql(u8, requested, authoritative))
+                return .{ .failed = .reconciliation };
+            return .{ .set_if_absent = .{
+                .value = set.value,
+                .created = set.created,
+            } };
+        },
+        .delete_both => {
+            const deleted_v2 = deleteHarnessEnvelope(
+                helper,
+                helper_path,
+                &deadline,
+            ) orelse return .{ .failed = .envelope_delete };
+            var current = readHarnessEnvelope(
+                helper,
+                helper_path,
+                &deadline,
+            ) orelse return .{ .failed = .envelope_read };
+            defer wipeHarnessCustodyValue(&current);
+            if (current.state != .absent)
+                return .{ .failed = .reconciliation };
+            _ = deleteHarnessReconciliationMarker(
+                helper,
+                helper_path,
+                &deadline,
+            ) orelse return .{ .failed = .marker_delete };
+            return .{ .delete_both = .{
+                .deleted_v1 = false,
+                .deleted_v2 = deleted_v2,
+            } };
+        },
+    }
+}
+
 fn migratePreparedHarnessEnvelope(
     helper: HarnessCustodyHelperRunner,
     legacy: LegacyHarnessCustodyRunner,
@@ -5020,7 +5132,6 @@ pub const RuntimeHost = struct {
     writer_buffer: ?[]u8 = null,
     data_remover_path: ?[]u8 = null,
     keychain_custodian_path: ?[]u8 = null,
-    legacy_harness_gateway_path: ?[]u8 = null,
 
     handlers: [5]native_sdk.bridge.AsyncHandler = undefined,
     pending: [max_pending_requests]?*Pending = .{null} ** max_pending_requests,
@@ -5196,17 +5307,6 @@ pub const RuntimeHost = struct {
                 self.keychain_custodian_path = null;
             }
         }
-        self.legacy_harness_gateway_path = try self.allocator.dupe(
-            u8,
-            paths.legacy_harness_gateway_path,
-        );
-        errdefer {
-            if (self.legacy_harness_gateway_path) |path| {
-                self.allocator.free(path);
-                self.legacy_harness_gateway_path = null;
-            }
-        }
-
         self.reader_buffer = try self.allocator.alloc(u8, reader_buffer_bytes);
         errdefer {
             if (self.reader_buffer) |buffer| {
@@ -5264,9 +5364,6 @@ pub const RuntimeHost = struct {
         if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
             if (self.options.harness_custody_runner == null) {
                 hra_macos_prepare_attested_keychain_custodian_operations();
-            }
-            if (self.options.legacy_harness_custody_runner == null) {
-                hra_macos_prepare_attested_legacy_harness_custody_operations();
             }
         }
         self.mutex.lockUncancelable(self.io);
@@ -5359,9 +5456,9 @@ pub const RuntimeHost = struct {
         const harness_runner = self.options.harness_custody_runner orelse
             production_harness_custody_runner;
         harness_runner.cancel_fn(harness_runner.context);
-        const legacy_runner = self.options.legacy_harness_custody_runner orelse
-            production_legacy_harness_custody_runner;
-        legacy_runner.cancel_fn(legacy_runner.context);
+        if (self.options.legacy_harness_custody_runner) |legacy_runner| {
+            legacy_runner.cancel_fn(legacy_runner.context);
+        }
         self.recovery_ready.broadcast(self.io);
         if (self.recovery_thread) |thread| thread.join();
         self.recovery_thread = null;
@@ -5434,12 +5531,10 @@ pub const RuntimeHost = struct {
         if (self.writer_buffer) |buffer| secureWipeAndFree(self.allocator, buffer);
         if (self.data_remover_path) |path| self.allocator.free(path);
         if (self.keychain_custodian_path) |path| self.allocator.free(path);
-        if (self.legacy_harness_gateway_path) |path| self.allocator.free(path);
         self.reader_buffer = null;
         self.writer_buffer = null;
         self.data_remover_path = null;
         self.keychain_custodian_path = null;
-        self.legacy_harness_gateway_path = null;
     }
 
     fn abortGeneration(
@@ -5462,9 +5557,9 @@ pub const RuntimeHost = struct {
         const harness_runner = self.options.harness_custody_runner orelse
             production_harness_custody_runner;
         harness_runner.cancel_fn(harness_runner.context);
-        const legacy_runner = self.options.legacy_harness_custody_runner orelse
-            production_legacy_harness_custody_runner;
-        legacy_runner.cancel_fn(legacy_runner.context);
+        if (self.options.legacy_harness_custody_runner) |legacy_runner| {
+            legacy_runner.cancel_fn(legacy_runner.context);
+        }
         self.cleanupGeneration(.forced);
     }
 
@@ -6669,18 +6764,13 @@ pub const RuntimeHost = struct {
 
             const helper = self.options.harness_custody_runner orelse
                 production_harness_custody_runner;
-            const legacy = self.options.legacy_harness_custody_runner orelse
-                production_legacy_harness_custody_runner;
             var operation_result = if (request.deadline_admitted and
                 (request.action != .delete_both or
                     request.deletion_authorized) and
-                self.keychain_custodian_path != null and
-                self.legacy_harness_gateway_path != null)
-                executeHarnessCustodyOperation(
+                self.keychain_custodian_path != null)
+                executeDirectHarnessCustodyOperation(
                     helper,
-                    legacy,
                     self.keychain_custodian_path.?,
-                    self.legacy_harness_gateway_path.?,
                     &request,
                     .{
                         .io = self.io,
@@ -7481,9 +7571,9 @@ pub const RuntimeHost = struct {
         const harness_runner = self.options.harness_custody_runner orelse
             production_harness_custody_runner;
         harness_runner.cancel_fn(harness_runner.context);
-        const legacy_runner = self.options.legacy_harness_custody_runner orelse
-            production_legacy_harness_custody_runner;
-        legacy_runner.cancel_fn(legacy_runner.context);
+        if (self.options.legacy_harness_custody_runner) |legacy_runner| {
+            legacy_runner.cancel_fn(legacy_runner.context);
+        }
         if (rollback_removal) {
             rollbackRemovalHelper(
                 self.options.removal_lifecycle orelse
@@ -8129,7 +8219,7 @@ const testing_harness_envelope_zero =
 const testing_harness_envelope_one =
     "{\"version\":1,\"algorithm\":\"hkdf-sha256\",\"key\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\"}";
 const testing_keychain_custodian_path =
-    "/Applications/OPRTE.app/Contents/Resources/runtime/bin/oprte-keychain-custodian";
+    "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-keychain-custodian";
 const testing_legacy_harness_gateway_path =
     "/Applications/OPRTE.app/Contents/Resources/runtime/legacy/preview-0.1.4-5/oprte-gateway";
 
@@ -9610,6 +9700,62 @@ test "Harness custody delete never touches v2 when v1 deletion fails" {
     );
 }
 
+test "direct Harness custody initializes and mutates v2 without a legacy runner" {
+    var probe: HarnessCustodyOperationProbe = .{};
+
+    var read_request = testingHarnessCustodyRequest(.read);
+    var initial = executeDirectHarnessCustodyOperation(
+        probe.helperRunner(),
+        testing_keychain_custodian_path,
+        &read_request,
+        testingHarnessCustodyDeadline(&read_request),
+    );
+    defer wipeHarnessCustodyOperationResult(&initial);
+    try std.testing.expect(switch (initial) {
+        .read => |read| read.value.state == .absent and
+            !read.migrated_from_legacy and !read.legacy_preserved,
+        else => false,
+    });
+
+    var set_request = testingHarnessCustodyRequest(.set_if_absent);
+    setTestingHarnessCustodyValue(&set_request, testing_harness_envelope_zero);
+    var set = executeDirectHarnessCustodyOperation(
+        probe.helperRunner(),
+        testing_keychain_custodian_path,
+        &set_request,
+        testingHarnessCustodyDeadline(&set_request),
+    );
+    defer wipeHarnessCustodyOperationResult(&set);
+    try std.testing.expect(switch (set) {
+        .set_if_absent => |created| created.created and
+            std.mem.eql(
+                u8,
+                created.value.valueSlice() orelse "",
+                testing_harness_envelope_zero,
+            ),
+        else => false,
+    });
+
+    var delete_request = testingHarnessCustodyRequest(.delete_both);
+    var deleted = executeDirectHarnessCustodyOperation(
+        probe.helperRunner(),
+        testing_keychain_custodian_path,
+        &delete_request,
+        testingHarnessCustodyDeadline(&delete_request),
+    );
+    defer wipeHarnessCustodyOperationResult(&deleted);
+    try std.testing.expect(switch (deleted) {
+        .delete_both => |result| !result.deleted_v1 and result.deleted_v2,
+        else => false,
+    });
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_read_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_delete_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.marker_read_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.marker_prepare_count);
+    try std.testing.expectEqual(@as(usize, 0), probe.marker_commit_count);
+    try std.testing.expectEqual(@as(usize, 1), probe.marker_delete_count);
+}
+
 test "packaged runtime paths ignore every executable and root override" {
     var parent: std.process.Environ.Map = .init(std.testing.allocator);
     defer parent.deinit();
@@ -9624,25 +9770,21 @@ test "packaged runtime paths ignore every executable and root override" {
         .codex_bin = "/tmp/explicit/codex",
         .git_root = "/tmp/explicit/git",
         .git_bin = "/tmp/explicit/git/bin/git",
-    }, "/Applications/OPRTE.app/Contents/MacOS/oprte");
+    }, "/Applications/HRA.app/Contents/MacOS/hra");
     defer paths.deinit(std.testing.allocator);
 
-    try std.testing.expectEqualStrings("/Applications/OPRTE.app/Contents/Resources/runtime", paths.runtime_root);
-    try std.testing.expectEqualStrings("/Applications/OPRTE.app/Contents/Resources/runtime/bin/oprte-gateway", paths.gateway_path);
-    try std.testing.expectEqualStrings("/Applications/OPRTE.app/Contents/Resources/runtime/codex/bin/codex", paths.codex_bin);
-    try std.testing.expectEqualStrings("/Applications/OPRTE.app/Contents/Resources/runtime/git", paths.git_root);
-    try std.testing.expectEqualStrings("/Applications/OPRTE.app/Contents/Resources/runtime/git/bin/git", paths.git_bin);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime", paths.runtime_root);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-gateway", paths.gateway_path);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/codex/bin/codex", paths.codex_bin);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git", paths.git_root);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git/bin/git", paths.git_bin);
     try std.testing.expectEqualStrings(
-        "/Applications/OPRTE.app/Contents/Resources/runtime/bin/oprte-data-remover",
+        "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-data-remover",
         paths.data_remover_path,
     );
     try std.testing.expectEqualStrings(
         testing_keychain_custodian_path,
         paths.keychain_custodian_path,
-    );
-    try std.testing.expectEqualStrings(
-        testing_legacy_harness_gateway_path,
-        paths.legacy_harness_gateway_path,
     );
 }
 
@@ -9658,7 +9800,7 @@ test "packaged runtime ignores package smoke custodian environment" {
         std.testing.allocator,
         &parent,
         .{},
-        "/Applications/OPRTE.app/Contents/MacOS/oprte",
+        "/Applications/HRA.app/Contents/MacOS/hra",
     );
     defer paths.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(
@@ -9755,6 +9897,7 @@ test "sidecar environment is allowlisted and pins runtime tools" {
     var parent: std.process.Environ.Map = .init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("HOME", "/Users/tester");
+    try parent.put("CFFIXED_USER_HOME", "/Users/tester");
     try parent.put("LANG", "en_US.UTF-8");
     try parent.put("HRA_CLOUD_API_URL", "https://hra.example.com");
     try parent.put("OPRTE_CLOUD_API_URL", "https://hra.example.com");
@@ -9782,6 +9925,7 @@ test "sidecar environment is allowlisted and pins runtime tools" {
     defer environment.deinit();
 
     try std.testing.expect(environment.get("HOME") == null);
+    try std.testing.expect(environment.get("CFFIXED_USER_HOME") == null);
     try std.testing.expectEqualStrings("en_US.UTF-8", environment.get("LANG").?);
     try std.testing.expectEqualStrings("https://hra.example.com", environment.get("HRA_CLOUD_API_URL").?);
     try std.testing.expectEqualStrings("https://hra.example.com", environment.get("OPRTE_CLOUD_API_URL").?);

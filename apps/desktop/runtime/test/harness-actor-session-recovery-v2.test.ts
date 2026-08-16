@@ -2099,7 +2099,7 @@ describe("actor session recovery v2", () => {
     }
   });
 
-  test("quota continuation capsule binding is exact, idempotent, and terminally narrow", () => {
+  test("legacy quota continuation capsule binding stays exact and terminally narrow", () => {
     const value = openFixture();
     try {
       prepareBoundSession(value.authority, value.database);
@@ -2111,13 +2111,6 @@ describe("actor session recovery v2", () => {
         marker: "8",
       });
 
-      expect(() => value.authority.transitionActorAttempt({
-        attemptId: attempt.id,
-        expectedState: "running",
-        nextState: "quotaRejected",
-        quotaProofDigest: digest("9"),
-        now: recoveredAt,
-      })).toThrow("requires sealed continuation history");
       const bound = value.authority.bindActorQuotaContinuationCapsule({
         attemptId: attempt.id,
         expectedState: "running",

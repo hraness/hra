@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { IconButton } from "@hraness/ui";
+import { IconButton } from "../ui";
 
 import type { RuntimeShell } from "../runtime";
 import { HRAIcon } from "./chat/Icon";

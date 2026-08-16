@@ -6,7 +6,7 @@ import {
   useState,
   type DragEvent as ReactDragEvent,
 } from "react";
-import { IconButton } from "@hraness/ui";
+import { IconButton } from "../../ui";
 
 import type { ChatPaneProjection } from "../../../../contracts/runtime";
 import type { RuntimeShell, RuntimeShellState } from "../../runtime";

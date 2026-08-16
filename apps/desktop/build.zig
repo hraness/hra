@@ -33,11 +33,9 @@ const PackageTarget = enum {
 };
 
 const default_native_sdk_path = "node_modules/@native-sdk/cli";
-// Opaque signed executable identity retained for the in-place 0.1.7 bridge.
-const app_exe_name = "oprte";
-// Sparkle must replace the existing installation in place during the first
-// HRA bridge. A second `HRA.app` bundle would create two update authorities.
-const legacy_install_bundle_name = "OPRTE";
+const app_exe_name = "hra";
+const app_bundle_name = "HRA";
+const release_build_number = 8;
 
 pub fn build(b: *std.Build) void {
     const target = nativeSdkTarget(b);
@@ -228,16 +226,22 @@ pub fn build(b: *std.Build) void {
         break :pkg built;
     };
 
-    const package_output_path = b.fmt(
-        "zig-out/package/{s}-{s}-{s}-{s}{s}",
-        .{
-            legacy_install_bundle_name,
-            app_config.version,
-            @tagName(package_target),
-            package_optimize_name,
-            packageSuffix(package_target),
-        },
-    );
+    const package_output_path = if (package_target == .macos)
+        b.fmt(
+            "zig-out/package/{s}-{s}-{d}-macos-arm64.app",
+            .{ app_bundle_name, app_config.version, release_build_number },
+        )
+    else
+        b.fmt(
+            "zig-out/package/{s}-{s}-{s}-{s}{s}",
+            .{
+                app_bundle_name,
+                app_config.version,
+                @tagName(package_target),
+                package_optimize_name,
+                packageSuffix(package_target),
+            },
+        );
     const packaged_frontend_path = switch (package_target) {
         .macos => b.fmt("{s}/Contents/Resources/frontend/dist", .{package_output_path}),
         .windows, .linux => b.fmt("{s}/resources/frontend/dist", .{package_output_path}),

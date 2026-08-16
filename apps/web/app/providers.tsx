@@ -16,6 +16,8 @@ import { ConvexProviderWithAuth, ConvexReactClient } from "convex/react";
 import { usePathname, useRouter } from "next/navigation";
 import { type ReactNode, useCallback, useMemo } from "react";
 
+import { isHraPublicComparisonPath } from "./alternatives/slugs";
+
 function useWorkOSConvexAuth() {
   const { loading, user } = useAuth();
   const { getAccessToken, loading: tokenLoading, refresh } = useAccessToken();
@@ -63,7 +65,8 @@ export function Providers({
   const standalonePublicRoute =
     pathname === "/"
     || pathname === "/download"
-    || pathname === "/download/";
+    || pathname === "/download/"
+    || isHraPublicComparisonPath(pathname);
   const content = standalonePublicRoute || !authConfigured ? children : (
     <AuthKitProvider>
       {deployment.kind !== "ready" ? (

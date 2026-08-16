@@ -204,6 +204,10 @@ const App = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("HRA_PACKAGE_SMOKE_ROOT")) |root| {
+        try runtime_host.runPackagedSmoke(init, root);
+        return;
+    }
     const development_frontend_enabled = try developmentFrontendEnabled(
         builtin.mode,
         init.environ_map,

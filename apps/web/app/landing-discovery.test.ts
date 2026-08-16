@@ -6,6 +6,7 @@ import {
   websiteJsonLd,
 } from "@hra-internal/web-discovery";
 
+import { hraComparisons } from "./alternatives/comparisons";
 import OpenGraphImage from "./opengraph-image";
 import robots from "./robots";
 import { hraSearchSite } from "./site";
@@ -19,7 +20,7 @@ describe("HRA public discovery contract", () => {
       description: hraSearchSite.description,
       openGraph: {
         images: [{
-          alt: "HRA — durable control for parallel Codex work",
+          alt: "HRA: a durable metaharness for Codex",
           height: 630,
           url: "https://hra.sh/opengraph-image",
           width: 1200,
@@ -33,7 +34,7 @@ describe("HRA public discovery contract", () => {
     });
   });
 
-  test("indexes only the public landing and download surfaces", () => {
+  test("indexes the public product, download, and sourced comparison surfaces", () => {
     expect(robots()).toEqual({
       host: "https://hra.sh",
       rules: {
@@ -54,6 +55,16 @@ describe("HRA public discovery contract", () => {
         priority: 0.8,
         url: "https://hra.sh/download",
       },
+      {
+        changeFrequency: "monthly",
+        priority: 0.8,
+        url: "https://hra.sh/alternatives",
+      },
+      ...hraComparisons.map(({ slug }) => ({
+        changeFrequency: "monthly" as const,
+        priority: 0.7,
+        url: `https://hra.sh/alternatives/${slug}`,
+      })),
     ]);
   });
 
@@ -79,10 +90,10 @@ describe("HRA public discovery contract", () => {
 
   test("pins the generated social card dimensions and copy", async () => {
     const image = await Bun.file(new URL("./opengraph-image.tsx", import.meta.url)).text();
-    expect(image).toContain('export const alt = "HRA — durable control for parallel Codex work"');
+    expect(image).toContain('export const alt = "HRA: a durable metaharness for Codex"');
     expect(image).toContain("height: 630, width: 1200");
-    expect(image).toContain("Run parallel project work without losing the thread.");
-    expect(image).toContain("Durable tasks · Human review · Local authority");
+    expect(image).toContain("Give Codex a team, a memory, and a budget.");
+    expect(image).toContain("Authorized accounts · Durable delegation · Recoverable work");
   });
 
   test("renders the local phoenix into the full-size social card", async () => {

@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 
-import { NativeSelectField, SwitchField, ToggleButton } from "@hraness/ui";
+import { NativeSelectField, SwitchField, ToggleButton } from "../../ui";
 
 import type {
   HarnessAutomaticFastMode,

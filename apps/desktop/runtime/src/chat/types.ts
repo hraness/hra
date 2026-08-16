@@ -418,7 +418,7 @@ export interface ChatTurnTerminal {
   readonly paneId: ChatPaneId;
   readonly turnId: ChatTurnId;
   readonly outcome: "completed" | "failed" | "interrupted";
-  /** Only this exact parsed provider proof permits automatic account failover. */
+  /** This exact parsed provider proof terminalizes the logical turn. */
   readonly quotaProof?: "provider_rate_limit_reached";
 }
 

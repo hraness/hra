@@ -31,11 +31,12 @@ closed lexical RLM v2 program boundary, context references, encrypted local
 state, actor receipts, inherited budgets, and reconciliation. It never falls
 back to a reusable CLI, SDK, socket bearer, or raw provider RPC.
 
-HRA's goal is to be the tokenmaxxing metaharness for Codex. In this document,
-that means using multiple configured Codex subscriptions and durable parallel
-sessions deliberately, while keeping provider authority on the paired Mac. It
-does not mean claiming a measured speed, quality, or token-cost advantage. The
-policy is experimental and remains subject to held-out evaluation.
+HRA is an experimental metaharness for coordinated Codex work. It can keep
+multiple configured subscriptions isolated and run durable sessions in
+parallel while provider authority remains on the paired Mac. Every account
+remains subject to its own provider terms and limits. HRA does not combine
+subscriptions to evade a usage limit, and it makes no measured speed, quality,
+or token-cost claim before held-out evaluation.
 
 ## Model and acceleration policy
 
@@ -93,12 +94,10 @@ policy is experimental and remains subject to held-out evaluation.
 - A token-usage fact may arrive before its provider turn binds. Migration v29
   stores that fact in an identity-bound inbox and consumes it exactly once
   after binding. Unknown or conflicting attribution fails closed.
-- Definitive post-admission quota exhaustion may continue one logical turn on
-  an unvisited configured subscription. HRA captures bounded visible
-  history, opens a fresh thread, verifies exact history injection, and sends
-  the literal `continue` once. Every stage has a durable CAS receipt, including
-  N to N+1 to N+2 recovery. Missing history, unstable readback, ambiguous
-  dispatch, or account reuse stops the handoff.
+- Provider usage-limit exhaustion terminates the affected logical turn. HRA
+  does not continue, replay, or reconstruct that turn on another subscription.
+  Durable quota evidence remains available only to settle the turn fail-closed
+  and prevent ambiguous mutation replay.
 - Dynamic provider callbacks remain routable during boot and shutdown, but
   program admission stays closed until every context, proposal, root, actor,
   session, liveness, program, RLM, projection, and renderer recovery barrier

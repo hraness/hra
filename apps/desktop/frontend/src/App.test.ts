@@ -217,9 +217,11 @@ test("project onboarding is available only through the rendered New pane flow", 
   expect(runtimeHost).not.toContain("beginNativeProjectOnboarding");
 });
 
-test("the design gallery remains independent from the native product shell", async () => {
+test("the production root always mounts the app-owned native product shell", async () => {
   const source = await Bun.file(new URL("./main.tsx", import.meta.url)).text();
-  expect(source).toContain("isDesignRoute(window.location.pathname)");
-  expect(source).toContain('designRoute ? "design" : "product"');
+  expect(source).toContain('<App runtimeShellFactory={detectRuntimeShell} />');
+  expect(source).toContain('setAttribute("data-hra-surface", "product")');
+  expect(source).not.toContain("isDesignRoute");
+  expect(source).not.toContain('import("./design")');
   expect(source).not.toContain("agent-tasks-ui/styles.css");
 });

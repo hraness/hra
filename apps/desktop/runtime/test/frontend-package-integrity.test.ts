@@ -381,7 +381,7 @@ describe("package output preparation", () => {
     const packageRoot = join(fixture.projectDirectory, "zig-out/package");
     const appBundlePath = join(
       packageRoot,
-      "OPRTE-0.1.0-macos-ReleaseFast.app",
+      "HRA-0.1.0-1-macos-arm64.app",
     );
     const sibling = join(packageRoot, "keep-me");
     await mkdir(appBundlePath, { recursive: true });
@@ -416,7 +416,7 @@ describe("package output preparation", () => {
       sourceDirectory: fixture.sourceDirectory,
     })).rejects.toBeInstanceOf(PackageOutputPreparationError);
 
-    const fileTarget = join(packageRoot, "OPRTE-0.1.0-macos-Debug.app");
+    const fileTarget = join(packageRoot, "HRA-0.1.0-1-macos-arm64.app");
     await writeFile(fileTarget, "not a bundle");
     expect(preparePackageOutput({
       appBundlePath: fileTarget,
@@ -441,7 +441,7 @@ describe("package output preparation", () => {
     const fixture = await createFixture();
     const appBundlePath = join(
       fixture.projectDirectory,
-      "zig-out/package/OPRTE-0.1.0-macos-ReleaseFast.app",
+      "zig-out/package/HRA-0.1.0-1-macos-arm64.app",
     );
     await mkdir(appBundlePath, { recursive: true });
     await writeFile(join(appBundlePath, "retained"), "retained");

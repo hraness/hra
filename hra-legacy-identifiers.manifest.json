@@ -22,11 +22,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "5e0cdc77844bf09788038cec4d0e47584afc53eb3766a328f3ee5f3272ec38ed",
+      "matchingLinesSha256": "fddf33eca0073724c3cb7e9094f3afe81fe740998d36cdaf07dc260bb9916777",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 6
+        "oprte": 4
       },
       "path": "apps/desktop/build.zig"
     },
@@ -42,7 +42,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d70232e4bac7fe23076f779a352d5ffc5734249d990d5ccec0b8f81e1eb5c290",
+      "matchingLinesSha256": "17dafd8351ee447eebdf4e964589d1a2b912d15b564bd00a5e5791077dda0336",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -52,7 +52,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "5e24018a8acbc6a32d27a5e5e7587c78e3ffdd2907e58f3d1c0adc277b8ec149",
+      "matchingLinesSha256": "8971c9558075b65a2ad25591aaf8fde3f7fd13ba75661c1f5e433a19de756420",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -92,13 +92,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "5018a5b9ae4885ab7b53b828adf101fb23d1d07a634e02577c877ed7a42b9bd8",
+      "matchingLinesSha256": "d95a189971a3df337e478122aa68e65a6e30621a1b47a9e16b36dbee4dfa7595",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 2
+        "oprte": 1
       },
       "path": "apps/desktop/package.json"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9765e1ac2bef5ea4c228d9b5ca5b0a6fa3f51f805ab535de1718127f482991be",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/build-release-gateway.ts"
     },
     {
       "category": "compatibility",
@@ -112,13 +122,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "3bf8c55bfc1a15b2bb365521d1a9a16569eeac2fe4113babe6cc89c06ec531e9",
+      "matchingLinesSha256": "15afffb4ecaa99fea6c47da617b1dd8c6279396cf7415b2c2f1b9b17664f5fd7",
       "occurrences": {
-        "kitchen": 0,
+        "kitchen": 1,
         "operateStylized": 0,
-        "oprte": 4
+        "oprte": 0
       },
-      "path": "apps/desktop/runtime/prepare-package-output.ts"
+      "path": "apps/desktop/runtime/macos-package-config.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f727c6f6f35c6bc68a1d26dc7ea238e48f783855019d0e461d443ea9f6bdb16b",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 21
+      },
+      "path": "apps/desktop/runtime/package-macos.ts"
     },
     {
       "category": "compatibility",
@@ -302,7 +322,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "edcb91daeea54f2dcdac476a5da0c5274cc44c8f1ebcc1c71af7f663c369b8b3",
+      "matchingLinesSha256": "305cdaec1e6ecfcd7c5bf03227732b965a1adc440c7e61a3938c0e5ea8f39595",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -392,7 +412,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "2501987301155798470070f64e998fb2a4614a07ca02dbf63c4177e03f49ee1d",
+      "matchingLinesSha256": "f7c87bf8a53c215afbd7331d13d9f1a04536de44e580debd882e933f7acad0c4",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -962,7 +982,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "037e142937c8af644ccc1a9bdb429b753bde69bcfd2e2a093d6abc01b0f47b80",
+      "matchingLinesSha256": "ff97853ea73ef1a7a1b3e559709effb69766e7aefc6fd7f097304db903643369",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1062,11 +1082,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c214078ac29b9d81d08bfee2c839a27aeee300f28d84a8f99d676eec1334e995",
+      "matchingLinesSha256": "ee88976ccdcbe305c8f87bc951cd580630bafbb0db18f9ddb0ca3446cc1e8f79",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 5
+        "oprte": 2
       },
       "path": "apps/desktop/runtime/test/frontend-package-integrity.test.ts"
     },
@@ -1102,7 +1122,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1d79871c6b87d7771399eafb1b3872a66db927486c26048d5106a2d53c154b2c",
+      "matchingLinesSha256": "24fd84678acb014cca755b6c53931fd91ae8c3bd03c39f4eeca6704f66345c39",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1132,11 +1152,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "158a234c652c7d72712523be8e4de52bc98f1e27f5a762e278c6c7bc244d4301",
+      "matchingLinesSha256": "d7061b9013038d1928673d5bacc00ae0faeda9b67e5a88907247a37082245dbf",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 8
+        "oprte": 7
       },
       "path": "apps/desktop/runtime/test/harness-codex-persistent-actor-provider.test.ts"
     },
@@ -1212,11 +1232,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "583a80ccb21579fba4b84138583ae4dd450879f13d5a1dfa8a9134b209b7f640",
+      "matchingLinesSha256": "1a3df5f21dd971eadd7864abcfb379993abd7cec6bb3e49a28f1973269297dfa",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 15
+        "oprte": 19
       },
       "path": "apps/desktop/runtime/test/harness-persistent-actors.test.ts"
     },
@@ -1282,7 +1302,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "40872faf29869f0b4734fa496924be7f1d2e5f24e7e335f9e5bde80521cdd7a5",
+      "matchingLinesSha256": "63db08a538ca8a6713c77eac3f3d648bddc00baa1e97eeb65f5513fc9fe91a79",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1472,7 +1492,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "60e4edbf302bd28266eaa51404063e1696d6e2f32e24e1f42a659e8997e375fb",
+      "matchingLinesSha256": "bc737a98e573a8815293800d651198bbdadaa03e49d48da7454ecd605417ddf2",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1489,6 +1509,16 @@
         "oprte": 1
       },
       "path": "apps/desktop/runtime/test/local-task-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9703859fc0fdeb803c56f9f8b89572b33270048948d3c21774a2260afbc2566b",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/test/macos-package-config.test.ts"
     },
     {
       "category": "compatibility",
@@ -1662,6 +1692,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "d7c002aab86410390a1e8028748107fd4cd339dfa906e0826f3acc475a8195bb",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 17
+      },
+      "path": "apps/desktop/runtime/verify-macos-package.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "d70c941e76c68b367bcdeae755ee59d53acc76df7d609b01dbb87769e7e52cbc",
       "occurrences": {
         "kitchen": 12,
@@ -1742,7 +1782,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "66032bc35292c64aa4072d2b2caa65f00d75af4c022baa747b3f4e346823889a",
+      "matchingLinesSha256": "79f50dc90e6efda78b6895ecdf17e3aac422879c79281843ccdf87b72b43222b",
       "occurrences": {
         "kitchen": 93,
         "operateStylized": 0,
@@ -1762,11 +1802,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "e2052abec0bc6500817bd90e4a22f954231fc17c0726233a7467cdc4dcc16a7f",
+      "matchingLinesSha256": "1511ffee735765fe562d413327541c3a92ee16fe604277486673254f6b6e6d7f",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
-        "oprte": 75
+        "oprte": 62
       },
       "path": "apps/desktop/src/runtime_host.zig"
     },

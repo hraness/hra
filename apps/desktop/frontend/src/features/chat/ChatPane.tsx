@@ -22,7 +22,7 @@ import {
   TextAreaField,
   TextField,
   ToggleButton,
-} from "@hraness/ui";
+} from "../../ui";
 
 import {
   runtimeChatTurnPromptUtf8ByteLimit,

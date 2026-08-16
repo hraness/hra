@@ -1,6 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 
-import { IconButton } from "@hraness/ui";
+import { IconButton } from "../../ui";
 
 import type { RemoteSessionSummaryProjection } from "../../../../contracts/runtime";
 import { paneAccessibleName } from "./model";

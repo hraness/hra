@@ -140,12 +140,18 @@ describe("HRA development lifecycle", () => {
     ).json() as { readonly scripts?: Readonly<Record<string, string>> };
     const developmentBuild = manifest.scripts?.["build:runtime:dev"];
     const releaseBuild = manifest.scripts?.["build:runtime"];
+    const releaseBuilder = await Bun.file(
+      new URL("../build-release-gateway.ts", import.meta.url),
+    ).text();
 
     expect(developmentBuild).toContain("--sourcemap=inline");
     expect(developmentBuild).not.toContain("check:direct-boundary");
     expect(developmentBuild).not.toContain("build:frontend");
-    expect(releaseBuild).toContain("--minify");
+    expect(releaseBuild).toContain("build-release-gateway.ts");
     expect(releaseBuild).toContain("check:direct-boundary");
+    expect(releaseBuilder).toContain("verifyBunCompiler");
+    expect(releaseBuilder).toContain('"--minify"');
+    expect(releaseBuilder).toContain('"--sourcemap=none"');
     expect(manifest.scripts?.hra).toBe(
       "bun run build:runtime:dev && bun run runtime/run-native.ts dev",
     );

@@ -2,121 +2,133 @@
 
 [![HRA](https://hra.sh/opengraph-image)](https://hra.sh)
 
-HRA is the tokenmaxxing metaharness for Codex. It coordinates durable,
-parallel Codex work across multiple accounts so a human can plan, supervise,
-review, and recover long-running project work.
+**A metaharness for Codex.** HRA turns the Codex accounts you already use into
+one durable system for planning work, delegating it, running it in parallel,
+and bringing it back for review.
 
-[Website](https://hra.sh) · [Build for macOS](https://hra.sh/download) ·
-[Open HRA](https://hra.sh/app)
+[Download for macOS](https://hra.sh/download) · [Website](https://hra.sh) ·
+[Compare HRA](https://hra.sh/alternatives) · [Open HRA](https://hra.sh/app)
 
-HRA is an independent project. It is not affiliated with, endorsed by, or
-sponsored by OpenAI. “OpenAI” and “Codex” are used only to identify the product
-that HRA interoperates with.
+> HRA is a prerelease for Apple Silicon Macs. The current binary is ad-hoc
+> signed for bundle integrity, but it is not Developer ID signed or notarized.
+> Read the install disclosure before opening it.
 
-## What HRA does
+## Why HRA exists
 
-- Keeps tasks, dependencies, claims, leases, submissions, reviews, and recovery
-  durable across agent processes.
-- Routes work across eligible Codex accounts while enforcing bounded local
-  capacity and account isolation.
-- Runs repository work in managed Git worktrees on a paired Mac.
-- Keeps Codex credentials, provider sessions, raw transcripts, tool details,
-  commands, output, and canonical filesystem paths on that Mac.
-- Gives the browser a bounded task and supervision view without making it an
-  authority for local execution.
-- Supports an optional encrypted, summary-only session directory for viewing
-  bounded session state on another approved device.
+Codex can already run several agents in parallel. HRA handles what happens
+between those sessions: which work belongs together, which account may run it,
+what a child task owes its parent, how a follow-up keeps continuity, and what to
+do after a process stops at an uncertain moment.
 
-HRA is under active development. The desktop application supports Apple
-Silicon Macs running macOS 13 or newer.
+HRA adds five things:
 
-## Repository map
+- **Several authorized accounts, kept separate.** Pair Codex accounts you own
+  or are allowed to use without merging their credentials or provider sessions.
+- **A durable task graph.** Parent work, bounded children, dependencies,
+  ownership, questions, submissions, and review survive any one agent window.
+- **Work-aware routing.** Wide work gets more reasoning room; bounded work can
+  use a lighter lane; safe follow-ups stay on their owned conversation.
+- **Recovery with evidence.** Durable receipts distinguish work that happened,
+  work that did not, and work that must be contained instead of guessed or
+  replayed.
+- **Local execution authority.** Repositories, commands, raw transcripts,
+  provider sessions, and Codex credentials stay on the paired Mac.
 
-- [`apps/desktop`](apps/desktop) contains the native macOS host, local gateway,
-  Codex account connections, chat panes, runner, and local state.
-- [`apps/web`](apps/web) contains the Next.js task control plane, Convex
-  functions, WorkOS authentication boundary, and deterministic browser lab.
-- [`apps/cli`](apps/cli) contains `taskctl`, the versioned command-line client
-  for human and agent task operations.
-- [`packages`](packages) contains shared task contracts, client code, interface
-  components, and repository tooling.
+HRA does not combine subscriptions or bypass provider limits. Every account
+remains subject to its own plan, organization policy, and
+[OpenAI terms](https://openai.com/policies/terms-of-use/). Only group accounts
+that are authorized for the same repository and data.
 
-The web control plane owns task and review state. The paired desktop runner
-claims eligible work over outbound HTTPS, provisions a managed worktree, and
-starts the corresponding Codex session locally. A renewable lease and
-generation-bound fences prevent an old runner or stale claim from continuing
-to mutate task state.
+## Is HRA the right tool?
 
-See [Security architecture](SECURITY_ARCHITECTURE.md) for the trust boundaries
-and data-handling model.
+Choose HRA when one project needs several coordinated Codex sessions and the
+coordination itself must be durable. The first-party Codex app is usually the
+better starting point for a few independent sessions. A multi-provider IDE or
+worktree manager may be a better fit when model choice or workspace isolation
+is the main problem, and a remote client may be better when the main job is
+checking an agent from your phone.
 
-## Requirements
+The [comparison pages](https://hra.sh/alternatives) explain those tradeoffs
+using current first-party sources, including Codex app, OpenCode Desktop,
+Paseo, Conductor, Superset, OpenChamber, and Happy Coder.
 
-Repository development uses:
+## How it works
 
-- Bun 1.3.14
-- Node.js 24
-- Apple Silicon macOS 13 or newer for the desktop host and native tests
-- Zig 0.16.0, Xcode Command Line Tools, and a macOS SDK for native builds
+The web control plane keeps bounded task and review state. The paired desktop
+app keeps Codex account custody and runs work inside managed Git worktrees. A
+renewable lease and generation-bound fences prevent an old runner or stale
+claim from continuing to mutate task state.
 
-Install the exact dependency graph from the repository root:
-
-```sh
-bun install --frozen-lockfile
+```text
+one outcome
+    │
+    ├── durable root task ──┬── bounded child
+    │                      └── bounded child
+    │
+    └── review, recovery, and continuation
+             │
+             └── authorized Codex accounts on the paired Mac
 ```
+
+See [Security architecture](SECURITY_ARCHITECTURE.md) for the complete trust
+and data boundary.
+
+## Install the prerelease
+
+The native app targets Apple Silicon and macOS 13 or newer. Download the DMG,
+verify its published SHA-256, and follow the unknown-developer instructions on
+[hra.sh/download](https://hra.sh/download). You can also build the exact source
+locally.
 
 ## Develop HRA
 
-Start the desktop application:
+Repository development uses Bun 1.3.14 and Node.js 24. Native work additionally
+requires Zig 0.16.0, Xcode Command Line Tools, and an Apple Silicon Mac.
 
 ```sh
+bun install --frozen-lockfile
 bun hra
 ```
 
-Start the web control plane and its Convex development process:
+Start the web control plane and its Convex development process with:
 
 ```sh
 bun run web:hra
 ```
 
-The web workspace needs a local Convex project before its first run. Follow
-[`apps/web/README.md`](apps/web/README.md) for environment setup. See
-[`apps/desktop/README.md`](apps/desktop/README.md) for account connection,
-runner pairing, local data, and native development. See
-[`apps/cli/README.md`](apps/cli/README.md) for `taskctl` authentication and
-commands.
+The web workspace needs a local Convex project before its first run. See the
+[web guide](apps/web/README.md), [desktop guide](apps/desktop/README.md), and
+[`taskctl` guide](apps/cli/README.md) for setup and architecture details.
 
 ## Verify a change
 
-Run the repository source gate:
-
 ```sh
 bun run check
-```
-
-Run source checks and production builds:
-
-```sh
 bun run check:complete
 ```
 
-On a supported Mac, verify the native host separately:
+On a supported Mac, also run:
 
 ```sh
 bun run --cwd apps/desktop test:macos
 bun run --cwd apps/desktop build:macos
+bun run --cwd apps/desktop package:macos:adhoc
 ```
 
-Focused workspace checks are documented in each workspace README and
-`package.json`.
+The package command creates the self-contained DMG and checksum under
+`apps/desktop/zig-out/release/macos/arm64`. The full release command and its
+corresponding-source artifacts are documented in the
+[desktop guide](apps/desktop/README.md#verification).
 
-## Contribute and report security issues
+## Project and license
+
+HRA is under active development. It is an independent project and is not
+affiliated with, endorsed by, or sponsored by OpenAI. “OpenAI” and “Codex” are
+used only to identify the product HRA interoperates with.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report a
-suspected vulnerability through the private process in [SECURITY.md](SECURITY.md),
-not through a public issue.
-
-HRA-authored source is licensed under the [Apache License 2.0](LICENSE).
-Bundled and vendored components retain their own licenses and notices, listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The source license does not
-grant trademark rights; see [TRADEMARKS.md](TRADEMARKS.md).
+suspected vulnerability through [SECURITY.md](SECURITY.md), not a public issue.
+HRA-authored source is licensed under [Apache License 2.0](LICENSE). Bundled and
+vendored components retain their own terms in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). See
+[TRADEMARKS.md](TRADEMARKS.md) for mark use.

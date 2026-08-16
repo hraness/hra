@@ -42,6 +42,7 @@ import {
   runtimeChatPaneUpsertEventOrInvalidation,
 } from "../../contracts/runtime-delivery";
 import runtimeVersions from "../runtime-versions.json";
+import { packageSmokeRoot, runPackageSmoke } from "./package-smoke";
 import { optionalRenamedEnvironmentValue } from "./security/renamed-environment";
 import {
   AccountService,
@@ -5578,19 +5579,24 @@ async function consumeHostInput(): Promise<void> {
   }
 }
 
-const hostInput = consumeHostInput();
-try {
-  if (!startupRemovalRecovery) {
-    await initializeGateway();
+const activePackageSmokeRoot = packageSmokeRoot();
+if (activePackageSmokeRoot === null) {
+  const hostInput = consumeHostInput();
+  try {
+    if (!startupRemovalRecovery) {
+      await initializeGateway();
+    }
+  } finally {
+    // Initialization publishes either ready or a closed failed projection.
+    // Releasing in both cases lets already-admitted requests observe that exact
+    // terminal startup state instead of racing partially constructed services.
+    releaseGatewayInitialization();
   }
-} finally {
-  // Initialization publishes either ready or a closed failed projection.
-  // Releasing in both cases lets already-admitted requests observe that exact
-  // terminal startup state instead of racing partially constructed services.
-  releaseGatewayInitialization();
+  await hostInput;
+  await Promise.allSettled([...pendingHostRequests]);
+} else {
+  await runPackageSmoke(activePackageSmokeRoot);
 }
-await hostInput;
-await Promise.allSettled([...pendingHostRequests]);
 function currentAccountService(): AccountService | null {
   return accountService;
 }

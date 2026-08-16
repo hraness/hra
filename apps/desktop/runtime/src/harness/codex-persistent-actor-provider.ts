@@ -46,7 +46,6 @@ import type {
   PersistentActorInterruptOutcome,
   PersistentActorInterruptRequest,
   PersistentActorProviderPort,
-  PersistentActorQuotaContinuationCaptureRequest,
   PersistentActorTerminalObservation,
   PersistentActorThreadOutcome,
   PersistentActorThreadRequest,
@@ -485,15 +484,6 @@ type PersistentActorContinuationHistoryCapsuleHandle = z.infer<
   typeof continuationHistoryCapsuleHandleSchema
 >;
 
-export type PersistentActorQuotaContinuationCaptureOutcome =
-  | Readonly<{
-      kind: "captured";
-      handle: PersistentActorContinuationHistoryCapsuleHandle;
-      proof: PersistentActorEffectProof;
-    }>
-  | Readonly<{ kind: "pending"; proof: PersistentActorEffectProof }>
-  | Readonly<{ kind: "ambiguous"; proof: PersistentActorEffectProof }>;
-
 type ContinuationPreparation =
   | Readonly<{ kind: "pending" }>
   | Readonly<{ kind: "ambiguous" }>
@@ -558,120 +548,6 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
     this.#tokenUsage = options.tokenUsage ?? null;
     this.#toolsetDigest = digestSchema.parse(options.toolsetDigest);
     this.#now = options.now ?? (() => new Date());
-  }
-
-  async captureQuotaContinuation(
-    request: PersistentActorQuotaContinuationCaptureRequest,
-  ): Promise<PersistentActorQuotaContinuationCaptureOutcome> {
-    const effectKey = quotaContinuationCaptureEffectKey(request);
-    let historyValue: unknown;
-    try {
-      historyValue = await this.#sessions.readHarnessActorContinuationHistory({
-        actorId: request.actorId,
-        accountProfileId: request.sourceAccountProfileId,
-        expectedGeneration: request.sourceObservationGeneration,
-        providerThreadId: request.sourceProviderThreadId,
-        providerTurnId: request.sourceProviderTurnId,
-      });
-    } catch {
-      // Source registration, runtime, and transport gaps may heal while the
-      // exact observed generation remains live. They authorize no fallback.
-      return {
-        kind: "pending",
-        proof: this.#proof(
-          "quota-continuation-source-pending",
-          effectKey,
-          "observation",
-          false,
-        ),
-      };
-    }
-
-    let history: PersistentActorContinuationHistory;
-    try {
-      history = continuationHistorySchema.parse(historyValue);
-    } catch {
-      return {
-        kind: "ambiguous",
-        proof: this.#proof(
-          "quota-continuation-source-invalid",
-          effectKey,
-          "observation",
-          true,
-        ),
-      };
-    }
-
-    let handleValue: unknown;
-    try {
-      handleValue = await this.#values.putActorContinuationHistoryCapsule({
-        epochId: request.epochId,
-        actorId: request.actorId,
-        actorTurnId: request.actorTurnId,
-        sourceAttemptId: request.sourceAttemptId,
-        historyDigest: history.historyDigest,
-        items: history.items,
-      });
-    } catch (cause: unknown) {
-      const definitive = isContinuationCapsuleDefinitiveFailure(cause);
-      return {
-        kind: definitive ? "ambiguous" : "pending",
-        proof: this.#proof(
-          definitive
-            ? "quota-continuation-capsule-write-invalid"
-            : "quota-continuation-capsule-write-pending",
-          effectKey,
-          "observation",
-          definitive,
-          [history.historyDigest],
-        ),
-      };
-    }
-
-    let handle: PersistentActorContinuationHistoryCapsuleHandle;
-    try {
-      handle = continuationHistoryCapsuleHandleSchema.parse(handleValue);
-    } catch {
-      return {
-        kind: "ambiguous",
-        proof: this.#proof(
-          "quota-continuation-capsule-handle-invalid",
-          effectKey,
-          "observation",
-          true,
-          [history.historyDigest],
-        ),
-      };
-    }
-    if (!continuationCapsuleHandleMatchesCapture(handle, request)) {
-      return {
-        kind: "ambiguous",
-        proof: this.#proof(
-          "quota-continuation-capsule-lineage-mismatch",
-          effectKey,
-          "observation",
-          true,
-          [history.historyDigest, handle.valueId],
-        ),
-      };
-    }
-    return Object.freeze({
-      kind: "captured",
-      handle: Object.freeze(handle),
-      proof: this.#proof(
-        "quota-continuation-capsule-captured",
-        effectKey,
-        "postDispatch",
-        true,
-        [
-          String(request.sourceObservationGeneration),
-          history.historyDigest,
-          String(history.itemCount),
-          String(history.totalUtf8Bytes),
-          handle.valueId,
-        ],
-      ),
-    });
   }
 
   async startThread(
@@ -1116,6 +992,7 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
   async observeTurn(
     request: PersistentActorTurnObservationRequest,
   ): Promise<PersistentActorTurnOutcome | PersistentActorTerminalObservation> {
+    assertMetaharnessTurnRequest(request);
     const scans = await this.#stableTurnScans(request);
     if (scans === null) return this.#pending("turn-observe-unavailable", request.effectKey);
     const matches = scans[0].turns.filter(
@@ -2601,17 +2478,6 @@ function continuationIntentMetadata(
   });
 }
 
-function continuationCapsuleHandleMatchesCapture(
-  handle: PersistentActorContinuationHistoryCapsuleHandle,
-  request: PersistentActorQuotaContinuationCaptureRequest,
-): boolean {
-  return handle.version === 2 &&
-    handle.epochId === request.epochId &&
-    handle.actorId === request.actorId &&
-    handle.actorTurnId === request.actorTurnId &&
-    handle.sourceAttemptId === request.sourceAttemptId;
-}
-
 function continuationCapsuleHandlesEqual(
   left: PersistentActorContinuationHistoryCapsuleHandle,
   right: PersistentActorContinuationHistoryCapsuleHandle,
@@ -2631,18 +2497,6 @@ function isContinuationCapsuleDefinitiveFailure(cause: unknown): boolean {
     (candidate.code === "not_found" ||
       candidate.code === "identity_conflict" ||
       candidate.code === "corrupt_store");
-}
-
-function quotaContinuationCaptureEffectKey(
-  request: PersistentActorQuotaContinuationCaptureRequest,
-): string {
-  return digest(
-    "quota-continuation-capture-effect",
-    request.epochId,
-    request.actorId,
-    request.actorTurnId,
-    request.sourceAttemptId,
-  );
 }
 
 function isContinuationIntentConflict(cause: unknown): boolean {
@@ -2832,6 +2686,9 @@ function assertFreshMetaharnessThreadRequest(
 function assertMetaharnessTurnRequest(
   request: PersistentActorTurnRequest,
 ): void {
+  if (request.continuation !== null) {
+    throw new Error("provider quota continuation is disabled");
+  }
   const profileIsValid = Object.values(HRA_METAHARNESS_PROFILES).some(
     (profile) =>
       profile.modelId === request.modelId &&

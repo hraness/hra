@@ -6,7 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 
-import { IconButton, IconLink } from "@hraness/ui";
+import { IconButton, IconLink } from "./ui";
 
 import type {
   RuntimeDispatchResponse,

@@ -1,6 +1,5 @@
 "use client";
 
-import { Cancel01Icon } from "@hugeicons/core-free-icons";
 import { createUuidV7 } from "@hraness/agent-tasks-protocol";
 import { HranessBrand } from "@hra-internal/brand-ui";
 import {
@@ -54,6 +53,7 @@ import {
 } from "./admin-state";
 import { listOrganizationOptions } from "./organization-actions";
 import type { OrganizationOptionsResult } from "./organization-options";
+import { Cancel01Icon } from "./hra-icon-data";
 import { HRA_BRAND_ICON_PATH } from "./site";
 import { SuiteAccountControl } from "./suite-account-control";
 import { ConvexTaskWorkspaceAdapter } from "./convex-task-workspace-adapter";

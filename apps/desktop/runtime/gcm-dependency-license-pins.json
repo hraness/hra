@@ -1,0 +1,246 @@
+{
+  "schemaVersion": 1,
+  "gcm": {
+    "version": "2.7.3",
+    "sourceCommit": "5fa7116896c82164996a609accd1c5ad90fe730a",
+    "depsJsonSha256": "6f76c87e5b3600f4ceea4ce67e312504ab5933c750fb665cc489fcb751b7ada9",
+    "runtimeConfigSha256": "8c52de784a65b3984659fff01d9c7c72d15f4f6129200e33aad57591e7931ac1",
+    "runtimeTarget": ".NETCoreApp,Version=v8.0/osx-arm64",
+    "ownedContributors": [
+      "Atlassian.Bitbucket/2.7.3",
+      "GitHub/2.7.3",
+      "GitLab/2.7.3",
+      "Microsoft.AzureRepos/2.7.3",
+      "gcmcore.Reference/2.7.3.0",
+      "gcmcore/2.7.3",
+      "git-credential-manager/2.7.3"
+    ]
+  },
+  "dotnetRuntime": {
+    "identity": "runtimepack.Microsoft.NETCore.App.Runtime.osx-arm64/8.0.24",
+    "repository": "https://github.com/dotnet/runtime.git",
+    "sourceCommit": "b3b35ce80e9eb94f72c4aa36a171a5e1cde72ace",
+    "documents": [
+      {
+        "name": "dotnet-runtime-LICENSE.TXT",
+        "sha256": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310",
+        "url": "https://raw.githubusercontent.com/dotnet/runtime/b3b35ce80e9eb94f72c4aa36a171a5e1cde72ace/LICENSE.TXT"
+      },
+      {
+        "name": "dotnet-runtime-THIRD-PARTY-NOTICES.TXT",
+        "sha256": "97c1a7b3da6a4c6ad516448719f45114b41a4d4c5aa300a944476e2e4f5da438",
+        "url": "https://raw.githubusercontent.com/dotnet/runtime/b3b35ce80e9eb94f72c4aa36a171a5e1cde72ace/THIRD-PARTY-NOTICES.TXT"
+      }
+    ]
+  },
+  "packages": [
+    {
+      "identity": "Avalonia/11.1.3",
+      "archiveSha256": "933fa4fef92e5a82f45c1bd14fc49a74c3a699108593d5bf27893f20cea8617d",
+      "depsSha512": "sha512-kpVAnKTbg/ZVnWyYLGPYXR0Ce4uiHLT1y6BcgJYpdFfn3b0TmvbxFZV37lpc1wEjUyaU28V+DoNnRbYSLsv0nw==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia/11.1.3/avalonia.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.nuspec",
+      "nuspecSha256": "20dfa6dcdcd3fe0df6df752d69e0afc222168930a99d7ae78946fa353d4c3e6b",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Desktop/11.1.3",
+      "archiveSha256": "98d16c71bb72a8b96877319add2277a15638ebb2635b0638e4bc5988a0c09ffc",
+      "depsSha512": "sha512-GwvshQIXyka+JUmmAtwLSRnpSJZUIxcrV0XeV3secwnbRzl6ekwFEChAxbKFjte177eA76E/SI/425AWZEL6/w==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.desktop/11.1.3/avalonia.desktop.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Desktop.nuspec",
+      "nuspecSha256": "9d36750f9e034c199bf19b64847f63a0bd5a88188e135d557dd0581189d17aa0",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.FreeDesktop/11.1.3",
+      "archiveSha256": "9d4061491134065cb77550b5e305f0535f6f3f783455b1386c2528871ec30952",
+      "depsSha512": "sha512-dK7wxP00bJwh/kaAkjqnaIMA0ugNuaCGE92bJMBTDzh6hUStzkPri76x+/m+TKeep4JGeqGkvFhB8x4PbTbUVg==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.freedesktop/11.1.3/avalonia.freedesktop.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.FreeDesktop.nuspec",
+      "nuspecSha256": "92a0a10cd2daa42399fc2fd660fb96f53d08a28a87eed4b88c486e48b5b2e3c6",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Native/11.1.3",
+      "archiveSha256": "6f2015196ed7824cb30e3d539ea68278353fc530fdcfc0021ab48983027e5d7b",
+      "depsSha512": "sha512-eIFIIri3F/C/ZaCRJQg8Mmlm/PfWeGxo4AHkhIRc6MWS8v78fTR9MbN3GCzZAp+Eo8IqMPh4FnxsAEqtoGjdMA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.native/11.1.3/avalonia.native.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Native.nuspec",
+      "nuspecSha256": "d16e0ffc037105cf212e81aebbe0e537fad951c73a5387e267db1b710f3d2291",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Remote.Protocol/11.1.3",
+      "archiveSha256": "08a17eeb6cc26cad5177f1e20ba306ada82cdf2957ad54359678b7526d0cbaa9",
+      "depsSha512": "sha512-ByXwboJC1jg13Qdxfs3/aX/yY4wi9n1XKT+a6+ckLnpSeesjQ0J6N1+wix7ISuGwFo0cyT0nXpvI4s2Zo+rkSA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.remote.protocol/11.1.3/avalonia.remote.protocol.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Remote.Protocol.nuspec",
+      "nuspecSha256": "4de3036980a14083ed2b2fba6e379dac84bda824136f717cd0b290574f30f3dd",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Skia/11.1.3",
+      "archiveSha256": "12d07cea0fa7cfa8bcc0beb1cad324625d84860b7718530c34fcd07e16dfa293",
+      "depsSha512": "sha512-TmRbtvZGjtS4Ir9bhzMH/7k8oH2bdgel+QzvG0mrP+7c423/BdSFqXle0mnyg6DCkwF+tbNPdnKHBqkLdssVqw==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.skia/11.1.3/avalonia.skia.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Skia.nuspec",
+      "nuspecSha256": "47a2e9700e6b05bc57e6875d3349a61f8d9cac6be6768bd55a2b211753972306",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Themes.Fluent/11.1.3",
+      "archiveSha256": "a9f9912b680b192807c7874d21e55eb16c4b523728a24f444f6c6bbbf5f28b0f",
+      "depsSha512": "sha512-/2O9HXnnqRVGQ6VUjLLOkCNQx1/gXu69yyzUmDgS13Q0LdbGaYUYzSnPFnIBtOABuVCmdwbu+W+YI6jSwnT0uw==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.themes.fluent/11.1.3/avalonia.themes.fluent.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Themes.Fluent.nuspec",
+      "nuspecSha256": "5efaed9c3aa40c982c1fb7e72caeacdf9c9adeaaec8e2f31e60cc1293b13fe74",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.Win32/11.1.3",
+      "archiveSha256": "cdcc53a449e92dfe74a7c61a8b2964e7f092f4c3437bb94ad6e5f508f6890547",
+      "depsSha512": "sha512-Rls4lqr67/3vSrZz5/H9QoxuAmRWdzDMtSitLPkFLZAttZ9MfyC4gIl2gpRx5EkTYSwTfqnVD7hdg0wHPP320Q==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.win32/11.1.3/avalonia.win32.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.Win32.nuspec",
+      "nuspecSha256": "c76a7622565b7a0b8ce751e4c23eb1126fc37dba8360e0fbe5e6e3820d3d669a",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "Avalonia.X11/11.1.3",
+      "archiveSha256": "336fb2ebad7fce70f16517703512108b8992da6e93e2442405b61e13b2b2400c",
+      "depsSha512": "sha512-aFkg6ZH2Xob/R3jjF6hWEwFudI4sRXLIxriW6OsMdnJ2V3nXqspCasf8yBltfUEfrZzjaF8524SykBWP7uuRoA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/avalonia.x11/11.1.3/avalonia.x11.11.1.3.nupkg",
+      "nuspecEntry": "Avalonia.X11.nuspec",
+      "nuspecSha256": "0abc27914fd48f431138e130341037032dfd37d459c25fbd82e89e3819e366fd",
+      "documents": [{ "name": "Avalonia-LICENSE.md", "sha256": "213814d306090074d234d760239ff0f67eb9b8d20eefb4d5631bb39dbe0b769b", "url": "https://raw.githubusercontent.com/AvaloniaUI/Avalonia/45a2d36e3214ac4b3623940ba728b2503de5c668/licence.md" }]
+    },
+    {
+      "identity": "HarfBuzzSharp/7.3.0.2",
+      "archiveSha256": "89b828ab34f5355ed0a397bb5f65ba56defdf3d4caae4776336a6efa58520e0f",
+      "depsSha512": "sha512-0tCd6HyCmNsX/DniCp2b00fo0xPbdNwKOs9BxxyT8oOOuMlWjcSFwzONKyeckCKVBFEsbSmsAHPDTqxoSDwZMg==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp/7.3.0.2/harfbuzzsharp.7.3.0.2.nupkg",
+      "nuspecEntry": "HarfBuzzSharp.nuspec",
+      "nuspecSha256": "094411692e7ee63558a618d3b8fa4840c57130b7327f1c3ceaef151c29f88129",
+      "documents": [
+        { "entry": "LICENSE.txt", "name": "SkiaSharp-HarfBuzzSharp-LICENSE.txt", "sha256": "89101e35a8c66fd4d6dffc1763259161d35cb564c169714ec227a768c89f2938" },
+        { "entry": "THIRD-PARTY-NOTICES.txt", "name": "SkiaSharp-HarfBuzzSharp-THIRD-PARTY-NOTICES.txt", "sha256": "21504c46c4c58aa64c1055bd2dcbc5f9a136b4b8c412ed3cc6740e22c5b127f5" }
+      ]
+    },
+    {
+      "identity": "HarfBuzzSharp.NativeAssets.macOS/7.3.0.2",
+      "archiveSha256": "76612a47d326a42c0af00bac71f0bbc5496728863bf8dbe2d3a574bb925f7f4f",
+      "depsSha512": "sha512-nycYH/WLJ6ogm+I+QSFCdPJsdxSb5GANWYbQyp1vsd/KjXN56RVUJWPhbgP2GKb/Y7mrsHM7EProqVXlO/EMsA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/harfbuzzsharp.nativeassets.macos/7.3.0.2/harfbuzzsharp.nativeassets.macos.7.3.0.2.nupkg",
+      "nuspecEntry": "HarfBuzzSharp.NativeAssets.macOS.nuspec",
+      "nuspecSha256": "b8aee1c49cd27026a32fc10151262073d126c0eeb669d5afc876f6bf5bca63cc",
+      "documents": [
+        { "entry": "LICENSE.txt", "name": "SkiaSharp-HarfBuzzSharp-LICENSE.txt", "sha256": "89101e35a8c66fd4d6dffc1763259161d35cb564c169714ec227a768c89f2938" },
+        { "entry": "THIRD-PARTY-NOTICES.txt", "name": "SkiaSharp-HarfBuzzSharp-THIRD-PARTY-NOTICES.txt", "sha256": "21504c46c4c58aa64c1055bd2dcbc5f9a136b4b8c412ed3cc6740e22c5b127f5" }
+      ]
+    },
+    {
+      "identity": "MicroCom.Runtime/0.11.0",
+      "archiveSha256": "55dc293f97ec725bcda89ba9a5a3afc04c2fda87e7008e594b3d95f9411d2c5d",
+      "depsSha512": "sha512-MEnrZ3UIiH40hjzMDsxrTyi8dtqB5ziv3iBeeU4bXsL/7NLSal9F1lZKpK+tfBRnUoDSdtcW3KufE4yhATOMCA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/microcom.runtime/0.11.0/microcom.runtime.0.11.0.nupkg",
+      "nuspecEntry": "MicroCom.Runtime.nuspec",
+      "nuspecSha256": "74072c279aeaa6d5ab52dc8833a446f9f0f6cc8e6ecccd52684b732e0f88c495",
+      "provenanceNote": "The NuGet manifest omits a source commit. Commit 7e773759cfc1012a5d080d4129c4718a662884b0 sets version 0.11.0 on the package publication date; this is evidence-backed attribution, not a cryptographic package-to-commit binding.",
+      "documents": [{ "name": "MicroCom-LICENSE", "sha256": "6ee769c9ac4dac9abb16b98b1341e9528ff9f4ab685481410d3376d14148f3a9", "url": "https://raw.githubusercontent.com/kekekeks/MicroCom/7e773759cfc1012a5d080d4129c4718a662884b0/LICENSE" }]
+    },
+    {
+      "identity": "Microsoft.Identity.Client/4.65.0",
+      "archiveSha256": "8240552dbf1a70b61ec4d338673309d2a7c3a7652a8d4b74ca2bb731f31c5a28",
+      "depsSha512": "sha512-RV35ZcJ5/P7n+Zu6J3wmtiDdK6MW5h6EpZ0ojjB9sMwNhGHEJCv829cb3kZ4PZ664llYFv8sbUITWWGvBTqv0Q==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client/4.65.0/microsoft.identity.client.4.65.0.nupkg",
+      "nuspecEntry": "Microsoft.Identity.Client.nuspec",
+      "nuspecSha256": "9cf27c0033835bb3d4d2206d8eaf4112a503780baa273156c937bb2df004b4a7",
+      "documents": [{ "name": "MSAL-LICENSE", "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c", "url": "https://raw.githubusercontent.com/AzureAD/microsoft-authentication-library-for-dotnet/e8baa99af1726fe40b9a0ba302dfb9f3bde12803/LICENSE" }]
+    },
+    {
+      "identity": "Microsoft.Identity.Client.Extensions.Msal/4.65.0",
+      "archiveSha256": "5e6cbf7af89c2ef99b0beeb2b71c1513ae3ab95709079c8ca442bbdc7e6dcc3d",
+      "depsSha512": "sha512-JIOBFMAyVSqGWP4dNoST+A9BRJMGC8m73BNbR1oKA8nUjGyR8Fd4eOOME/VDrd26I5JWU4RtmWqpt20lpp2r5w==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/microsoft.identity.client.extensions.msal/4.65.0/microsoft.identity.client.extensions.msal.4.65.0.nupkg",
+      "nuspecEntry": "Microsoft.Identity.Client.Extensions.Msal.nuspec",
+      "nuspecSha256": "0721634a850d7c2a65a89c873293f3f2b545eecec4858babc970e4a0c49ec3ed",
+      "documents": [{ "name": "MSAL-LICENSE", "sha256": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c", "url": "https://raw.githubusercontent.com/AzureAD/microsoft-authentication-library-for-dotnet/e8baa99af1726fe40b9a0ba302dfb9f3bde12803/LICENSE" }]
+    },
+    {
+      "identity": "Microsoft.IdentityModel.Abstractions/6.35.0",
+      "archiveSha256": "6f1c98bbafd081a0384d0601af977e6f32022fe92d964772fed6ffd5f06ed344",
+      "depsSha512": "sha512-xuR8E4Rd96M41CnUSCiOJ2DBh+z+zQSmyrYHdYhD6K4fXBcQGVnRCFQ0efROUYpP+p0zC1BLKr0JRpVuujTZSg==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/microsoft.identitymodel.abstractions/6.35.0/microsoft.identitymodel.abstractions.6.35.0.nupkg",
+      "nuspecEntry": "Microsoft.IdentityModel.Abstractions.nuspec",
+      "nuspecSha256": "8d1718c51429e55cd8097a869a9f7bc971b62e65359d6029aea138059a8f45ff",
+      "documents": [{ "name": "IdentityModel-LICENSE.txt", "sha256": "b09ac0e46520eec4ee7b16af87d4ccbf8180551f3b2ff0f6c9b4f3ddcd585640", "sourceSha256": "cba03f5387b05405e56b688376421acae396136af4b5116738dc6e5160f87ddd", "url": "https://raw.githubusercontent.com/AzureAD/azure-activedirectory-identitymodel-extensions-for-dotnet/c94c7fc235501d478221e979062bd8837a55575b/LICENSE.txt" }]
+    },
+    {
+      "identity": "SkiaSharp/2.88.8",
+      "archiveSha256": "ac3e607384a79514d7c33dfaeee1e6f171b9780210a599681aa2d11a7bcdbb40",
+      "depsSha512": "sha512-bRkp3uKp5ZI8gXYQT57uKwil1uobb2p8c69n7v5evlB/2JNcMAXVcw9DZAP5Ig3WSvgzGm2YSn27UVeOi05NlA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/skiasharp/2.88.8/skiasharp.2.88.8.nupkg",
+      "nuspecEntry": "SkiaSharp.nuspec",
+      "nuspecSha256": "d525d071420136807eee6de192951cb7a7ad6440e722dd6280d7a37f336fd73e",
+      "documents": [
+        { "entry": "LICENSE.txt", "name": "SkiaSharp-HarfBuzzSharp-LICENSE.txt", "sha256": "89101e35a8c66fd4d6dffc1763259161d35cb564c169714ec227a768c89f2938" },
+        { "entry": "THIRD-PARTY-NOTICES.txt", "name": "SkiaSharp-HarfBuzzSharp-THIRD-PARTY-NOTICES.txt", "sha256": "21504c46c4c58aa64c1055bd2dcbc5f9a136b4b8c412ed3cc6740e22c5b127f5" }
+      ]
+    },
+    {
+      "identity": "SkiaSharp.NativeAssets.macOS/2.88.8",
+      "archiveSha256": "09d72bcd01f009c98e08fb52f041adc2c2ac81d9639c7e35b05cad5bb37d3e62",
+      "depsSha512": "sha512-6Kn5TSkKlfyS6azWHF3Jk2sW5C4jCE5uSshM/5AbfFrR+5n6qM5XEnz9h4VaVl7LTxBvHvMkuPb/3bpbq0vxTw==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/skiasharp.nativeassets.macos/2.88.8/skiasharp.nativeassets.macos.2.88.8.nupkg",
+      "nuspecEntry": "SkiaSharp.NativeAssets.macOS.nuspec",
+      "nuspecSha256": "2ecb4bc65cc5b8fcc4cdd8115aed05bae482928c3000d3fe572debb01c11f217",
+      "documents": [
+        { "entry": "LICENSE.txt", "name": "SkiaSharp-HarfBuzzSharp-LICENSE.txt", "sha256": "89101e35a8c66fd4d6dffc1763259161d35cb564c169714ec227a768c89f2938" },
+        { "entry": "THIRD-PARTY-NOTICES.txt", "name": "SkiaSharp-HarfBuzzSharp-THIRD-PARTY-NOTICES.txt", "sha256": "21504c46c4c58aa64c1055bd2dcbc5f9a136b4b8c412ed3cc6740e22c5b127f5" }
+      ]
+    },
+    {
+      "identity": "System.CommandLine/2.0.0-beta4.22272.1",
+      "archiveSha256": "cd23be0989cc1fc75e0470c8f431e108f8fbf427b718ecc70b21f5fd3887c5c7",
+      "depsSha512": "sha512-1uqED/q2H0kKoLJ4+hI2iPSBSEdTuhfCYADeJrAqERmiGQ2NNacYKRNEQ+gFbU4glgVyK8rxI+ZOe1onEtr/Pg==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/system.commandline/2.0.0-beta4.22272.1/system.commandline.2.0.0-beta4.22272.1.nupkg",
+      "nuspecEntry": "System.CommandLine.nuspec",
+      "nuspecSha256": "1af8ac9da46db8d6a09f37ae89d00179aca651a087d5b5c759c896a25f5c724f",
+      "documents": [{ "name": "System.CommandLine-LICENSE.md", "sha256": "58fd5ebf25d75b5bb5f4cd407a9fef3befd3641e1af90a1d0716618e6430fc19", "url": "https://raw.githubusercontent.com/dotnet/command-line-api/209b724a3c843253d3071e8348c353b297b0b8b5/LICENSE.md" }]
+    },
+    {
+      "identity": "System.IO.Pipelines/6.0.0",
+      "archiveSha256": "c5f8c5e14a93309a5ff0ab01594c899499333d338efc7e4c5b4db7c9360d4120",
+      "depsSha512": "sha512-mXX66shZ4xLlI3vNLaJ0lt8OIZdmXTvIqXRdQX5HLVGSkLhINLsVhyZuX2UdRFnOGkqnwmMUs40pIIQ7mna4+A==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/system.io.pipelines/6.0.0/system.io.pipelines.6.0.0.nupkg",
+      "nuspecEntry": "System.IO.Pipelines.nuspec",
+      "nuspecSha256": "d066cce4232e8a7bf4c93e576a816d23dd4ead1aa960bec93278c52034508bd2",
+      "documents": [
+        { "entry": "LICENSE.TXT", "name": "dotnet-package-LICENSE.TXT", "sha256": "d7a68596ab69b06f51ca278a6545148e4269a9381c26d597c13df5d88e08cf5b" },
+        { "entry": "THIRD-PARTY-NOTICES.TXT", "name": "System.IO.Pipelines-THIRD-PARTY-NOTICES.TXT", "sha256": "a6344bfb229bc08d1071cec400eea216e307439f961c5943ec1b56d2245acb95" }
+      ]
+    },
+    {
+      "identity": "System.Security.Cryptography.ProtectedData/4.5.0",
+      "archiveSha256": "67e5f5676944acb2fb627b768c5b3392eebf220ae780edd5d5b49f6530621487",
+      "depsSha512": "sha512-wLBKzFnDCxP12VL9ANydSYhk59fC4cvOr9ypYQLPnAj48NQIhqnjdD2yhP8yEKyBJEjERWS9DisKL7rX5eU25Q==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/system.security.cryptography.protecteddata/4.5.0/system.security.cryptography.protecteddata.4.5.0.nupkg",
+      "nuspecEntry": "System.Security.Cryptography.ProtectedData.nuspec",
+      "nuspecSha256": "01eef7797263378955835e3cfe569ec9467f3974f4dadc0f8aa60628abae816d",
+      "documents": [
+        { "entry": "LICENSE.TXT", "name": "dotnet-package-LICENSE.TXT", "sha256": "d7a68596ab69b06f51ca278a6545148e4269a9381c26d597c13df5d88e08cf5b" },
+        { "entry": "THIRD-PARTY-NOTICES.TXT", "name": "ProtectedData-THIRD-PARTY-NOTICES.TXT", "sha256": "7864a01e2fdef7e8fdf81b906efb1466f083206affea7ba7e6dadea429754765" }
+      ]
+    },
+    {
+      "identity": "Tmds.DBus.Protocol/0.16.0",
+      "archiveSha256": "bca60469ad44b3347b6a51e3e3c47c1b7b9802b848fb3876660881bfde7913df",
+      "depsSha512": "sha512-9Ne9AvrRWrDQvzbMcbTz3EaGRE1vQmkeeu0Xp7Ii0Wdlhwfjst8FDRas+RBslU5kdPWs2aeMLErzyT1DwH9zeA==",
+      "nugetUrl": "https://api.nuget.org/v3-flatcontainer/tmds.dbus.protocol/0.16.0/tmds.dbus.protocol.0.16.0.nupkg",
+      "nuspecEntry": "Tmds.DBus.Protocol.nuspec",
+      "nuspecSha256": "c87ed08e9f66e7429304527ff9ce3638d147cb1a9780e9142a83b7cf1b2ede12",
+      "documents": [{ "name": "Tmds.DBus-COPYING", "sha256": "5b7663cf70274bdeafa45f792fee68c40db2bf5e2ac91ba8f1b2f24fef3d0a31", "sourceSha256": "aca3b49277abcc7886ccb2f115603a9f5b15fc3f96019a10c00f2974098b210c", "url": "https://raw.githubusercontent.com/tmds/Tmds.DBus/ee8c7b698b320c19c0e0e8acb05622d99ee8f157/COPYING" }]
+    }
+  ]
+}

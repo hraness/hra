@@ -12,7 +12,9 @@ import { isWorkOSEnvironmentConfigured } from "./workos-configuration";
 export const metadata = {
   ...createPublicSiteMetadata(hraSearchSite),
   keywords: [
-    "Codex control plane",
+    "Codex metaharness",
+    "multiple Codex accounts",
+    "Codex orchestration",
     "coding agents",
     "parallel agents",
     "human in the loop",

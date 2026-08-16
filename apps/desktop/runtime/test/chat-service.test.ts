@@ -1402,7 +1402,7 @@ test("closing admission settles a late ordinary quota terminal without failover 
     expect(value.provider.injected).toEqual([]);
     expect(value.store.require(PANE).projection).toMatchObject({
       state: "attention",
-      attention: { code: "runtime_unavailable", retryable: true },
+      attention: { code: "all_accounts_exhausted", retryable: true },
       turn: { id: TURN_ONE, status: "failed" },
     });
   } finally {
@@ -1787,7 +1787,7 @@ test("an early replacement-thread event rebinds and drains through actor authori
       paneId: pane.id,
       expectedRevision: pane.revision,
       turnId: TURN_ONE,
-      prompt: "Continue after quota failover.",
+      prompt: "Continue after a later account change.",
     });
     await value.service.settled();
     expect(actors.routeCalls).toHaveLength(1);
@@ -2536,7 +2536,7 @@ test("a delayed prior-turn event cannot enter the next logical turn", async () =
   }
 });
 
-test("an exact quota proof hands off once and sends literal continue on a fresh account", async () => {
+test("an exact quota proof terminalizes once without account selection, history capture, or replay", async () => {
   const roots = new FakeHarnessRoots();
   const value = harness(() => [
     { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
@@ -2564,123 +2564,31 @@ test("an exact quota proof hands off once and sends literal continue on a fresh 
       quotaProof: "provider_usage_limit_exceeded",
     });
 
-    const pane = value.store.require(PANE).projection;
-    expect(pane).toMatchObject({
-      accountProfileId: ACCOUNT_TWO,
-      state: "streaming",
-      turn: { continuationCount: 1 },
+    expect(value.store.require(PANE).projection).toMatchObject({
+      accountProfileId: ACCOUNT_ONE,
+      state: "attention",
+      attention: { code: "all_accounts_exhausted", retryable: true },
+      turn: { continuationCount: 0, status: "failed" },
     });
+    expect(value.provider.startedThreads).toHaveLength(1);
     expect(value.provider.startedTurns.map(({ request }) => request.prompt)).toEqual([
       "Original request",
-      "continue",
     ]);
-    expect(value.provider.injected).toHaveLength(1);
-    expect(value.provider.injected[0]?.history).toEqual([
-      { role: "user", text: "Original request" },
-      { role: "assistant", text: "Partial answer" },
-    ]);
+    expect(value.provider.injected).toEqual([]);
     expect(roots.admissions).toHaveLength(1);
-    expect(roots.observations).toEqual([]);
-    expect(roots.settlements).toEqual([]);
+    expect(roots.observations).toEqual([{
+      ...lifecycle(first.request, first.turnId, "failed"),
+      quotaProof: "provider_usage_limit_exceeded",
+    }]);
 
     await value.service.observeSessionLifecycle({
       ...lifecycle(first.request, first.turnId, "failed"),
       quotaProof: "provider_usage_limit_exceeded",
     });
-    expect(value.provider.startedTurns).toHaveLength(2);
-    const continuation = value.provider.startedTurns[1];
-    if (continuation === undefined) throw new Error("Expected continuation provider turn");
-    await value.service.observeSessionActivity({
-      accountProfileId: continuation.request.accountProfileId,
-      threadId: continuation.request.threadId,
-      turnId: continuation.turnId,
-      kind: "assistant_message_delta",
-      assistantItemId: "item_chatassistant02",
-      displayText: "Finished answer",
-    });
-    await value.service.observeSessionAssistantCompletion({
-      accountProfileId: continuation.request.accountProfileId,
-      threadId: continuation.request.threadId,
-      turnId: continuation.turnId,
-      assistantItemId: "item_chatassistant02",
-      displayText: "Finished answer",
-      truncated: false,
-    });
-    await value.service.observeSessionLifecycle(lifecycle(
-      continuation.request,
-      continuation.turnId,
-      "completed",
-    ));
-    expect(roots.observations).toEqual([
-      lifecycle(continuation.request, continuation.turnId, "completed"),
-    ]);
-  } finally {
-    value.database.close();
-  }
-});
-
-test("Stop consumes a proven quota terminal before candidate refresh without interrupt", async () => {
-  const roots = new FakeHarnessRoots();
-  const refreshEntered = deferred<void>();
-  const refreshRelease = deferred<readonly ChatAccountCandidate[]>();
-  let refreshCalls = 0;
-  const value = harness(() => {
-    refreshCalls += 1;
-    if (refreshCalls === 1) {
-      return [
-        { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
-        { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-      ];
-    }
-    refreshEntered.resolve();
-    return refreshRelease.promise;
-  }, undefined, roots);
-  try {
-    const created = await createPane(value);
-    await startTurn(value, created.revision, TURN_ONE, "quota-race prompt");
-    await value.service.settled();
-    const started = value.provider.startedTurns[0];
-    if (started === undefined) throw new Error("Expected provider turn");
-    await value.service.observeSessionActivity(activity(
-      started.request,
-      started.turnId,
-      "assistant_message_delta",
-      "partial",
-    ));
-    await value.service.observeSessionAssistantCompletion(completion(
-      started.request,
-      started.turnId,
-      "partial",
-    ));
-    const quotaProjection = value.service.observeSessionLifecycle({
-      ...lifecycle(started.request, started.turnId, "failed"),
-      quotaProof: "provider_usage_limit_exceeded",
-    });
-    await refreshEntered.promise;
-
-    const stopped = await withinDeadline(
-      stopTurn(value, value.store.require(PANE).projection.revision),
-      "pre-refresh quota Stop",
-      250,
-    );
-    expect(stopped).toMatchObject({ state: "attention", turn: { status: "failed" } });
-    expect(value.provider.interrupts).toEqual([]);
-    expect(value.containedAccounts).toEqual([]);
-    expect(roots.observations).toEqual([{
-      ...lifecycle(started.request, started.turnId, "failed"),
-      quotaProof: "provider_usage_limit_exceeded",
-    }]);
-
-    refreshRelease.resolve([
-      { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-    ]);
-    await quotaProjection;
-    await value.service.settled();
     expect(value.provider.startedTurns).toHaveLength(1);
+    expect(value.provider.injected).toEqual([]);
     expect(roots.observations).toHaveLength(1);
   } finally {
-    refreshRelease.resolve([]);
-    await value.service.settled();
     value.database.close();
   }
 });
@@ -2712,152 +2620,6 @@ test("a quota terminal after interrupt ACK but within grace avoids account fenci
       ...lifecycle(started.request, started.turnId, "failed"),
       quotaProof: "provider_usage_limit_exceeded",
     }]);
-  } finally {
-    await value.service.settled();
-    value.database.close();
-  }
-});
-
-test("Stop fences reserved account B during a hung quota handoff and settles A once", async () => {
-  const roots = new FakeHarnessRoots();
-  let refreshCalls = 0;
-  const secondThreadEntered = deferred<void>();
-  const secondThread = deferred<Readonly<{
-    threadId: string;
-    restartThreadId: string;
-  }>>();
-  const value = harness(() => {
-    refreshCalls += 1;
-    return refreshCalls === 1
-      ? [
-          { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
-          { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-        ]
-      : [
-          { id: ACCOUNT_ONE, selected: true, budget: "exhausted" },
-          { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-        ];
-  }, undefined, roots);
-  try {
-    const created = await createPane(value);
-    await startTurn(value, created.revision, TURN_ONE, "quota handoff");
-    await value.service.settled();
-    const first = value.provider.startedTurns[0];
-    if (first === undefined) throw new Error("Expected provider turn");
-    await value.service.observeSessionActivity(activity(
-      first.request,
-      first.turnId,
-      "assistant_message_delta",
-      "partial",
-    ));
-    await value.service.observeSessionAssistantCompletion(completion(
-      first.request,
-      first.turnId,
-      "partial",
-    ));
-    value.provider.onStartThread = async (request) => {
-      if (request.accountProfileId !== ACCOUNT_TWO) {
-        throw new Error("Only account B may enter the hung handoff");
-      }
-      secondThreadEntered.resolve();
-      return await secondThread.promise;
-    };
-    value.provider.onInterrupt = () => Promise.resolve();
-    const quotaProjection = value.service.observeSessionLifecycle({
-      ...lifecycle(first.request, first.turnId, "failed"),
-      quotaProof: "provider_usage_limit_exceeded",
-    });
-    await secondThreadEntered.promise;
-
-    const stopped = await stopTurn(
-      value,
-      value.store.require(PANE).projection.revision,
-    );
-    expect(stopped).toMatchObject({
-      state: "attention",
-      accountProfileId: null,
-      attention: { code: "runtime_unavailable" },
-    });
-    expect(value.containedAccounts).toEqual([ACCOUNT_TWO]);
-    expect(value.containedAccounts).not.toContain(ACCOUNT_ONE);
-    expect(roots.observations).toEqual([{
-      ...lifecycle(first.request, first.turnId, "failed"),
-      quotaProof: "provider_usage_limit_exceeded",
-    }]);
-
-    secondThread.resolve({
-      threadId: "thread_chat_late_quota_b",
-      restartThreadId: "raw_thread_chat_late_quota_b",
-    });
-    await quotaProjection;
-    await value.service.settled();
-    expect(value.provider.startedTurns).toHaveLength(1);
-    expect(roots.observations).toHaveLength(1);
-  } finally {
-    secondThread.resolve({
-      threadId: "thread_chat_late_quota_b",
-      restartThreadId: "raw_thread_chat_late_quota_b",
-    });
-    await Bun.sleep(0);
-    value.database.close();
-  }
-});
-
-test("after account B accepts a quota continuation Stop settles B without stale A replay", async () => {
-  const roots = new FakeHarnessRoots();
-  let refreshCalls = 0;
-  const value = harness(() => {
-    refreshCalls += 1;
-    return refreshCalls === 1
-      ? [
-          { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
-          { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-        ]
-      : [
-          { id: ACCOUNT_ONE, selected: true, budget: "exhausted" },
-          { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
-        ];
-  }, undefined, roots, null, null, undefined, null, undefined, undefined,
-  undefined, null, null, 100);
-  try {
-    const created = await createPane(value);
-    await startTurn(value, created.revision, TURN_ONE, "quota continuation");
-    await value.service.settled();
-    const first = value.provider.startedTurns[0];
-    if (first === undefined) throw new Error("Expected provider turn");
-    await value.service.observeSessionActivity(activity(
-      first.request,
-      first.turnId,
-      "assistant_message_delta",
-      "partial",
-    ));
-    await value.service.observeSessionAssistantCompletion(completion(
-      first.request,
-      first.turnId,
-      "partial",
-    ));
-    await value.service.observeSessionLifecycle({
-      ...lifecycle(first.request, first.turnId, "failed"),
-      quotaProof: "provider_usage_limit_exceeded",
-    });
-    const second = value.provider.startedTurns[1];
-    if (second === undefined) throw new Error("Expected account B continuation");
-    expect(second.request.accountProfileId).toBe(ACCOUNT_TWO);
-    value.provider.onInterrupt = () => Promise.resolve();
-
-    const stopping = stopTurn(value, value.store.require(PANE).projection.revision);
-    while (value.provider.interrupts.length === 0) await Promise.resolve();
-    await value.service.observeSessionLifecycle(
-      lifecycle(second.request, second.turnId, "interrupted"),
-    );
-    await stopping;
-    await value.service.settled();
-
-    expect(value.containedAccounts).toEqual([]);
-    expect(roots.observations).toEqual([
-      lifecycle(second.request, second.turnId, "interrupted"),
-    ]);
-    expect(roots.observations[0]?.accountProfileId).toBe(ACCOUNT_TWO);
   } finally {
     await value.service.settled();
     value.database.close();
@@ -2915,7 +2677,7 @@ test("positioned quota proof normalizes a proof-only failure for root settlement
   }
 });
 
-test("missing usage telemetry and a low positive budget never block a recoverable failover", async () => {
+test("pre-turn routing may select an unknown budget, but quota still stops that turn", async () => {
   const value = harness(() => [
     { id: ACCOUNT_ONE, selected: true, budget: "unknown" },
     { id: ACCOUNT_TWO, selected: false, budget: "low" },
@@ -2948,15 +2710,19 @@ test("missing usage telemetry and a low positive budget never block a recoverabl
       prompt: request.prompt,
     }))).toEqual([
       { accountProfileId: ACCOUNT_ONE, prompt: "Keep working" },
-      { accountProfileId: ACCOUNT_TWO, prompt: "continue" },
     ]);
+    expect(value.provider.injected).toEqual([]);
+    expect(value.store.require(PANE).projection).toMatchObject({
+      state: "attention",
+      attention: { code: "all_accounts_exhausted" },
+    });
   } finally {
     await value.service.settled();
     value.database.close();
   }
 });
 
-test("a quota failure with incomplete history clears context without sending continue", async () => {
+test("a quota failure never reads or reconstructs incomplete history", async () => {
   const value = harness(() => [
     { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
     { id: ACCOUNT_TWO, selected: false, budget: "healthy" },
@@ -2989,13 +2755,13 @@ test("a quota failure with incomplete history clears context without sending con
     expect(value.provider.injected).toHaveLength(0);
     expect(value.store.require(PANE)).toMatchObject({
       binding: null,
-      historyTruncated: false,
+      historyTruncated: true,
       projection: {
         state: "attention",
-        attention: { code: "continuation_failed", retryable: true },
+        attention: { code: "all_accounts_exhausted", retryable: true },
       },
     });
-    expect(value.store.handoffHistory(PANE, false)).toEqual({ complete: true, items: [] });
+    expect(value.store.handoffHistory(PANE, false).complete).toBeFalse();
   } finally {
     value.database.close();
   }
@@ -3076,13 +2842,13 @@ test("a retained thread stays incomplete after failed or interrupted work", asyn
       expect(value.provider.injected).toHaveLength(0);
       expect(value.store.require(PANE)).toMatchObject({
         binding: null,
-        historyTruncated: false,
+        historyTruncated: true,
         projection: {
           state: "attention",
-          attention: { code: "continuation_failed", retryable: true },
+          attention: { code: "all_accounts_exhausted", retryable: true },
         },
       });
-      expect(value.store.handoffHistory(PANE, false)).toEqual({ complete: true, items: [] });
+      expect(value.store.handoffHistory(PANE, false).complete).toBeFalse();
     } finally {
       value.database.close();
     }

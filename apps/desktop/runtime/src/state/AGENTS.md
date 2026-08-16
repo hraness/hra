@@ -15,16 +15,16 @@
 - `dispatch-interaction-store.ts` – bounded provider-declared request projections, published markers, durable fair-run cursor, and answer-free applied/expired sync acknowledgements.
 - `dispatch-runner-installation.ts` – stable installation identity, boot generation, accepted heartbeat sequence, and exact secret-free pending heartbeat replay.
 - `local-task-store.ts` – account-free workspace onboarding, atomic portable task commands, keyed receipts, metadata-only renderer effect recovery and legacy quarantine, typed event sequences, and fixed-query atomic renderer-safe workspace projections with immutable list continuations.
-- `chat-pane-store.ts` – private bounded chat panes, exact pane and turn revision clocks, provider-thread bindings, failover history, idempotent turn receipts, and restart recovery.
+- `chat-pane-store.ts` – private bounded chat panes, exact pane and turn revision clocks, provider-thread bindings, bounded local conversation history, idempotent turn receipts, and restart recovery.
 - `local-task-due-work-store.ts` – boot generations, due-work claims, retry/backoff, queued-run intent fencing, and crash-after-start recovery scheduling.
 - `local-task-authority-command-store.ts` – entity-specific due-work revalidation and atomic portable system-command execution with post-commit invalidation hints.
 - `local-promotion-store.ts` – immutable local promotion snapshots, family digests, exact upload receipts, frozen authority phases, activation, and proven pre-activation aborts.
 
 # Guidelines
 
-- Store only HRA control-plane mappings, redacted diagnostics, and the explicitly private bounded chat-pane text needed to render the latest response and establish a proven subscription handoff. Codex remains authoritative for full transcripts, provider turns, and credentials.
-- Treat chat prompts, response tails, reasoning summaries, provider bindings, and failover history as private local data. Enforce per-field, per-pane, and database-wide byte ceilings before writes; never expose provider IDs, canonical paths, historical handoff text, or truncation internals to the renderer.
-- Keep pane, turn, continuation, delta-offset, and provider-binding transitions in one SQLite transaction with exact CAS revisions. A duplicate turn ID may replay only its identical durable receipt; changed input is a conflict, late activity is ignored or rejected by the owning state transition, and restart converts every uncertain active turn to a retryable attention state without replaying provider effects.
+- Store only HRA control-plane mappings, redacted diagnostics, and the explicitly private bounded chat-pane text needed to render the latest response or begin a later user-authored turn after an account change. Codex remains authoritative for full transcripts, provider turns, and credentials.
+- Treat chat prompts, response tails, reasoning summaries, provider bindings, and local conversation history as private local data. Enforce per-field, per-pane, and database-wide byte ceilings before writes; never expose provider IDs, canonical paths, historical text, or truncation internals to the renderer.
+- Keep pane, turn, legacy-continuation, delta-offset, and provider-binding transitions in one SQLite transaction with exact CAS revisions. A duplicate turn ID may replay only its identical durable receipt; changed input is a conflict, late activity is ignored or rejected by the owning state transition, and restart converts every uncertain active turn to a retryable attention state without replaying provider effects. Legacy continuation rows are recovery input only and cannot authorize a provider mutation.
 - Preserve removed-profile tombstones and local-data state until the separate full-home deletion completes; never persist login authority or human-in-the-loop answers.
 - Append migrations instead of rewriting an applied migration, and reject checksum drift at startup.
 - Check release and migration compatibility through a read-only connection

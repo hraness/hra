@@ -25,6 +25,11 @@ const EMITTED_MARKERS = Object.freeze([
   "__direct",
   "Direct ready:",
 ]);
+const FORBIDDEN_FRONTEND_EMITTED_MARKERS = Object.freeze([
+  "@hugeicons/core-free-icons",
+  "@hugeicons/react",
+  "Hugeicons",
+]);
 const RENDERER_CONTRACT_MARKERS = Object.freeze([
   '"project.',
   '"workspace.upserted',
@@ -182,6 +187,11 @@ export async function checkHRAProductionBoundary(
     RENDERER_EMITTED_MARKERS,
     ["**/*"],
   );
+  const forbiddenFrontendDependencies = await scanExisting(
+    path.join(frontend, "dist"),
+    FORBIDDEN_FRONTEND_EMITTED_MARKERS,
+    ["**/*"],
+  );
   const rendererBoundary = combineResults([
     rendererSourceBoundary,
     rendererEmittedBoundary,
@@ -202,12 +212,25 @@ export async function checkHRAProductionBoundary(
       "**/Contents/Resources/runtime/bin/oprte-gateway",
     ]),
   ]));
-  const emitted = combineResults([directEmitted, rendererEmittedBoundary]);
+  const emitted = combineResults([
+    directEmitted,
+    forbiddenFrontendDependencies,
+    rendererEmittedBoundary,
+  ]);
 
   if (rendererBoundary.violations.length > 0) {
     throw new Error([
       "HRA renderer boundary exposes gateway-private state:",
       ...rendererBoundary.violations.map(
+        (violation) => `${violation.file}: ${violation.markers.join(", ")}`,
+      ),
+    ].join("\n"));
+  }
+
+  if (forbiddenFrontendDependencies.violations.length > 0) {
+    throw new Error([
+      "HRA production assets contain forbidden frontend dependencies:",
+      ...forbiddenFrontendDependencies.violations.map(
         (violation) => `${violation.file}: ${violation.markers.join(", ")}`,
       ),
     ].join("\n"));

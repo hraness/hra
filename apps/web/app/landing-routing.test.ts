@@ -10,6 +10,8 @@ describe("HRA public and control-plane route boundary", () => {
   test("keeps only exact public surfaces outside configured WorkOS auth", () => {
     for (const path of [
       "/",
+      "/alternatives",
+      "/alternatives/codex-app",
       "/download",
       "/opengraph-image",
       "/robots.txt",
@@ -24,6 +26,8 @@ describe("HRA public and control-plane route boundary", () => {
       "/auth/sign-in",
       "/design",
       "/download/private",
+      "/alternative",
+      "/alternatives/missing",
     ]) {
       expect(shouldApplyConfiguredAuthProxy(path), path).toBeTrue();
     }

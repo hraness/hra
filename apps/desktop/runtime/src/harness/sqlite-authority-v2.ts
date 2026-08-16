@@ -5001,7 +5001,7 @@ export class HarnessSQLiteAuthorityV2 {
     attemptId: string;
     expectedState: "running" | "reconciling";
     providerTurnId: string;
-    continuationHistoryValueId: string;
+    continuationHistoryValueId?: string | null;
     quotaProofDigest: string;
     inputTokens: number;
     outputTokens: number;
@@ -5011,7 +5011,7 @@ export class HarnessSQLiteAuthorityV2 {
       attemptId: actorAttemptIdSchema,
       expectedState: z.enum(["running", "reconciling"]),
       providerTurnId: boundedProviderIdSchema,
-      continuationHistoryValueId: contextValueIdSchema,
+      continuationHistoryValueId: contextValueIdSchema.nullable().optional(),
       quotaProofDigest: digestSchema,
       inputTokens: z.number().int().nonnegative().safe(),
       outputTokens: z.number().int().nonnegative().safe(),
@@ -5023,8 +5023,9 @@ export class HarnessSQLiteAuthorityV2 {
       if (attempt.state === "quotaRejected") {
         if (
           attempt.providerTurnId !== input.providerTurnId ||
-          attempt.continuationHistoryValueId !==
-            input.continuationHistoryValueId ||
+          (input.continuationHistoryValueId !== undefined &&
+            attempt.continuationHistoryValueId !==
+              input.continuationHistoryValueId) ||
           attempt.quotaProofDigest !== input.quotaProofDigest ||
           attempt.inputTokens !== input.inputTokens ||
           attempt.outputTokens !== input.outputTokens
@@ -5039,13 +5040,19 @@ export class HarnessSQLiteAuthorityV2 {
         attempt.state !== input.expectedState ||
         attempt.providerTurnId !== input.providerTurnId
       ) invalidTransition("quota settlement attempt fence changed");
-      if (attempt.continuationHistoryValueId === null) {
+      if (
+        attempt.continuationHistoryValueId === null &&
+        input.continuationHistoryValueId !== null &&
+        input.continuationHistoryValueId !== undefined
+      ) {
         attempt = this.bindActorQuotaContinuationCapsule({
           attemptId: attempt.id,
           expectedState: input.expectedState,
           continuationHistoryValueId: input.continuationHistoryValueId,
         });
       } else if (
+        input.continuationHistoryValueId !== null &&
+        input.continuationHistoryValueId !== undefined &&
         attempt.continuationHistoryValueId !== input.continuationHistoryValueId
       ) {
         lineage("quota settlement changed its continuation history capsule");
@@ -5229,12 +5236,6 @@ export class HarnessSQLiteAuthorityV2 {
       }
       if ((nextState === "quotaRejected") !== (quotaProofDigest !== null)) {
         lineage("only a proven quota rejection may carry quota evidence");
-      }
-      if (
-        nextState === "quotaRejected" && providerTurnId !== null &&
-        current.continuationHistoryValueId === null
-      ) {
-        lineage("post-admission quota rejection requires sealed continuation history");
       }
       if (
         current.continuationHistoryValueId !== null &&

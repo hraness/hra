@@ -6,7 +6,7 @@
 - `scripts/` – public-boundary, standalone structure, agent-guide, asset, resource-scheduling, and Direct checks.
 - `.agents/skills/` – portable repository orchestration and knowledge-base workflows.
 - `kb/` – the public-safe Git-backed Markdown vault for rationale, evidence, maintained synthesis, plans, and scoped agent context.
-- `.github/workflows/` – credential-free source, test, and build verification.
+- `.github/workflows/` – credential-free source, test, build, and ad-hoc package verification.
 - `README.md` – product overview, repository map, development setup, and verification commands.
 - `SECURITY.md` and `SECURITY_ARCHITECTURE.md` – vulnerability reporting and the public product security model.
 - `CONTRIBUTING.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, and `TRADEMARKS.md` – contribution, licensing, attribution, and mark-use terms.
@@ -32,5 +32,5 @@
 - Keep the CLI a versioned API consumer. It must not import Convex server implementation or generated data-model types.
 - Keep `taskctl`, its configuration names, and its credential custody product-neutral.
 - Preserve third-party license and notice files beside vendored source or assets. Update `THIRD_PARTY_NOTICES.md` when a bundled dependency, runtime, font, or artwork changes.
-- Keep public GitHub workflows read-only. Pin third-party actions to full commit SHAs, persist no checkout credential, use no repository secrets, and upload no release artifact.
+- Keep public GitHub workflows read-only. Pin third-party actions to full commit SHAs, persist no checkout credential, use no repository secrets, and upload no release artifact. The source workspace may build and verify an ad-hoc-signed macOS package, but Developer ID signing, notarization, and publication require separately provisioned release custody.
 - Run focused checks while editing. Run `bun run check:agent-guides` after guide changes and `bun run check` before handoff. Run `bun run check:complete` for production-build changes.

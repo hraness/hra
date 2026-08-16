@@ -150,6 +150,20 @@ describe("HRA production Direct boundary", () => {
     expect((await boundaryFailure(contractLeak)).message).toContain("@hraness/direct");
   });
 
+  test("rejects distinctive Hugeicons module and compiled glyph markers", async () => {
+    for (const marker of [
+      "@hugeicons/core-free-icons",
+      "@hugeicons/react",
+      "Hugeicons",
+    ]) {
+      const frontend = await makeFrontend({ emitted: `const iconRuntime = ${JSON.stringify(marker)};\n` });
+
+      expect((await boundaryFailure(frontend)).message).toContain(
+        "production assets contain forbidden frontend dependencies",
+      );
+    }
+  });
+
   test("scans both retained oprte native executable locations", async () => {
     const installedLeak = await makeFrontend({
       emitted: "export const production = true;\n",

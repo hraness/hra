@@ -58,8 +58,8 @@ jobs:
         run: bun run check:complete
       - name: Run native macOS tests
         run: bun run --cwd apps/desktop test:macos
-      - name: Build ReleaseFast macOS native binaries
-        run: bun run --cwd apps/desktop build:macos
+      - name: Build and verify ad-hoc macOS package
+        run: bun run --cwd apps/desktop package:macos:adhoc
 
   required:
     name: Required

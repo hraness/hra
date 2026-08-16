@@ -495,7 +495,7 @@ export class ChatPaneStore {
 
   /**
    * Rebinds an attached actor pane after the persistent actor proves a new
-   * idle incarnation or quota failover. The actor-to-pane identity is stable;
+   * idle incarnation for a later logical turn. The actor-to-pane identity is stable;
    * only gateway-private session routing changes.
    */
   rebindAttachedHarnessSession(input: Readonly<{

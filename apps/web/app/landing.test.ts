@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { HRA_BRAND_EMOJI } from "./site";
+import {
+  HRA_BRAND_EMOJI,
+  HRA_RELEASE,
+  HRA_RELEASE_CHECKSUM_URL,
+  HRA_RELEASE_MANIFEST_URL,
+  HRA_RELEASE_URL,
+} from "./site";
 
 async function source(name: string): Promise<string> {
   return Bun.file(new URL(name, import.meta.url)).text();
@@ -52,20 +58,41 @@ describe("HRA public landing", () => {
   test("leads with the outcome and exposes the complete public decision path", async () => {
     const page = await source("./page.tsx");
 
-    expect(page).toContain("The tokenmaxxing metaharness for Codex");
-    expect(page).toContain("Run more Codex work without losing the thread.");
-    expect(page).toContain("multiple Codex subscriptions and durable parallel sessions");
-    expect(page).toContain("Sol Max by default, Sol Ultra for genuinely wide work, and Luna Max for bounded leaves");
-    expect(page).toContain("Fast sparingly on the critical path");
-    expect(page).toContain("cache-compatible context");
+    expect(page).toContain("A metaharness for Codex");
+    expect(page).toContain("Give Codex a team, a memory, and a budget.");
+    expect(page).toContain("Codex accounts you already use");
+    expect(page).toContain("Delegate work with structure");
+    expect(page).toContain("Spend reasoning deliberately");
+    expect(page).toContain("Recover the work, not just the window");
     expect(page.match(/<h1\b/gu)).toHaveLength(1);
-    expect(page).toContain('href="/app">Open HRA</Link>');
-    expect(page).toContain('href="/download">Build for macOS</Link>');
+    expect(page).toContain('href="/download">Download for macOS</Link>');
+    expect(page).toContain('href="/alternatives">Compare HRA</Link>');
     expect(page).toContain('href="https://github.com/hraness/hra"');
-    expect(page).toContain("Keep local authority local");
-    expect(page).toContain("The cloud sees enough to coordinate, never enough to become your Mac.");
-    expect(page).toContain("Questions HRA should answer plainly");
+    expect(page).toContain("Let the Mac keep the authority.");
+    expect(page).toContain("HRA is intentionally narrower than an AI IDE.");
+    expect(page).toContain("A provider limit ends the affected turn.");
+    expect(page).toContain("Before you give it a repository.");
     expect(page).toContain("The public repository includes the product source");
+  });
+
+  test("pins the exact honest native prerelease contract", async () => {
+    const download = await source("./download/page.tsx");
+
+    expect(HRA_RELEASE).toEqual({
+      architecture: "Apple Silicon",
+      asset: "HRA-0.1.7-8-macos-arm64.dmg",
+      build: 8,
+      manifestAsset: "HRA-0.1.7-8-release-manifest.json",
+      minimumMacOS: "13",
+      tag: "v0.1.7",
+      version: "0.1.7",
+    });
+    expect(HRA_RELEASE_URL).toEndWith("/v0.1.7/HRA-0.1.7-8-macos-arm64.dmg");
+    expect(HRA_RELEASE_CHECKSUM_URL).toBe(`${HRA_RELEASE_URL}.sha256`);
+    expect(HRA_RELEASE_MANIFEST_URL).toEndWith("/v0.1.7/HRA-0.1.7-8-release-manifest.json");
+    expect(download).toContain("Unknown developer.");
+    expect(download).toContain("not Developer ID signed or notarized");
+    expect(download).toContain("HRA_RELEASE_MANIFEST_URL");
   });
 
   test("keeps navigation, sections, disclosure, and structured data semantic", async () => {
@@ -100,14 +127,16 @@ describe("HRA public landing", () => {
     const readme = await source("../../../README.md");
 
     expect(readme).toContain("# HRA");
-    expect(readme).toContain("HRA is the tokenmaxxing metaharness for Codex.");
-    expect(readme).toContain("durable,\nparallel Codex work across multiple accounts");
+    expect(readme).toContain("**A metaharness for Codex.**");
+    expect(readme).toContain("one durable system for planning work, delegating it, running it in parallel");
     expect(readme).toContain("[Website](https://hra.sh)");
     expect(readme).toContain("[![HRA](https://hra.sh/opengraph-image)](https://hra.sh)");
-    expect(readme).toContain("[Build for macOS](https://hra.sh/download)");
+    expect(readme).toContain("[Download for macOS](https://hra.sh/download)");
+    expect(readme).toContain("[Compare HRA](https://hra.sh/alternatives)");
     expect(readme).toContain("[Open HRA](https://hra.sh/app)");
-    expect(readme).toContain("## What HRA does");
-    expect(readme).toContain("Keeps Codex credentials, provider sessions, raw transcripts");
+    expect(readme).toContain("## Why HRA exists");
+    expect(readme).toContain("Several authorized accounts, kept separate.");
+    expect(readme).toContain("HRA does not combine subscriptions or bypass provider limits.");
     expect(readme).toContain("See [Security architecture](SECURITY_ARCHITECTURE.md)");
     expect(readme).toContain("HRA is under active development.");
   });

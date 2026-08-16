@@ -1,6 +1,7 @@
 import { createSitemap } from "@hra-internal/web-discovery";
 
 import { hraSearchSite } from "./site";
+import { hraComparisons } from "./alternatives/comparisons";
 
 export default function sitemap() {
   return createSitemap(hraSearchSite.origin, [
@@ -14,5 +15,15 @@ export default function sitemap() {
       path: "/download",
       priority: 0.8,
     },
+    {
+      changeFrequency: "monthly",
+      path: "/alternatives",
+      priority: 0.8,
+    },
+    ...hraComparisons.map(({ slug }) => ({
+      changeFrequency: "monthly" as const,
+      path: `/alternatives/${slug}` as `/${string}`,
+      priority: 0.7,
+    })),
   ]);
 }

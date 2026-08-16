@@ -7,19 +7,27 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import Image from "next/image";
 
-import { HRA_BRAND_ICON_PATH, hraSearchSite } from "../site";
+import {
+  HRA_BRAND_ICON_PATH,
+  HRA_RELEASE,
+  HRA_RELEASE_CHECKSUM_URL,
+  HRA_RELEASE_MANIFEST_URL,
+  HRA_RELEASE_URL,
+  hraSearchSite,
+} from "../site";
 
 export const metadata = createPublicSiteMetadata({
   ...hraSearchSite,
   description:
-    "Build the HRA prerelease for Apple Silicon from its public source.",
-  socialTitle: "Build HRA for Apple Silicon",
+    "Download the HRA Apple Silicon prerelease, verify its checksum, or build it from public source.",
+  socialTitle: "Download HRA for Apple Silicon",
   title: "HRA for macOS",
 }, { canonicalPath: "/download" }) satisfies Metadata;
 
 export default function DownloadPage() {
   return (
-    <main className="download-page" id="main-content">
+    <div className="download-page">
+      <a className="landing-skip-link" href="#main-content">Skip to content</a>
       <div className="download-shell">
         <header className="download-header">
           <Link className="download-wordmark" href="/download" aria-label="HRA download">
@@ -42,36 +50,35 @@ export default function DownloadPage() {
           </div>
         </header>
 
-        <section className="download-hero" aria-labelledby="download-title">
+        <main id="main-content">
+          <section className="download-hero" aria-labelledby="download-title">
           <div className="download-hero__copy">
             <p className="download-channel">
               <span aria-hidden="true" />
               Public prerelease
             </p>
-            <h1 id="download-title">Build HRA on your Mac.</h1>
+            <h1 id="download-title">Download HRA for your Mac.</h1>
             <p className="download-summary">
-              The native HRA app is available as source for Apple Silicon. Binary
-              downloads are not published yet.
+              The native prerelease bundles HRA, Codex, and Git for Apple Silicon Macs running macOS {HRA_RELEASE.minimumMacOS} or newer.
             </p>
             <p className="download-trust-callout">
-              <strong>Prerelease software.</strong> Expect breaking changes while
-              the public build and release process settles.
+              <strong>Unknown developer.</strong> This build has an ad-hoc code seal, but it is not Developer ID signed or notarized by Apple. The published SHA-256 verifies the exact release bytes; macOS will still ask you to approve the app manually.
             </p>
             <div className="download-primary-action">
               <LinkButton
-                href="https://github.com/hraness/hra#develop-hra"
+                href={HRA_RELEASE_URL}
                 size="large"
                 variant="primary"
               >
-                Build from source <span aria-hidden="true">↗</span>
+                Download the DMG <span aria-hidden="true">↓</span>
               </LinkButton>
-              <p>Apple Silicon · macOS 13 or newer</p>
+              <p>Version {HRA_RELEASE.version} ({HRA_RELEASE.build}) · Apple Silicon · macOS {HRA_RELEASE.minimumMacOS}+</p>
             </div>
           </div>
 
-          <aside className="download-release-card" aria-label="HRA source build details">
+          <aside className="download-release-card" aria-label="HRA prerelease details">
             <div className="download-release-card__topline">
-              <span>macOS source build</span>
+              <span>macOS {HRA_RELEASE.version}</span>
               <span className="download-release-state download-release-state--pending">
                 Prerelease
               </span>
@@ -92,83 +99,87 @@ export default function DownloadPage() {
               </div>
               <div>
                 <dt>Minimum system</dt>
-                <dd>macOS 13</dd>
+                <dd>macOS {HRA_RELEASE.minimumMacOS}</dd>
               </div>
               <div>
-                <dt>Toolchain</dt>
-                <dd>Bun 1.3.14 · Zig 0.16.0</dd>
+                <dt>Signing</dt>
+                <dd>Ad-hoc · not notarized</dd>
               </div>
               <div>
                 <dt>Distribution</dt>
-                <dd>Source only</dd>
+                <dd>GitHub prerelease</dd>
               </div>
             </dl>
             <p className="download-release-disclosure">
-              This repository builds the native app locally. It does not create,
-              sign, notarize, or publish an official consumer artifact.
+              The exact source, runtime pins, corresponding-source archives, <a href={HRA_RELEASE_MANIFEST_URL}>release manifest</a>, and checksum are public. This is an early testing build, not a normal Apple-trusted release.
             </p>
           </aside>
-        </section>
+          </section>
 
-        <section className="download-install" aria-labelledby="install-title">
+          <section className="download-install" aria-labelledby="install-title">
           <div className="download-section-heading">
-            <p className="eyebrow">Local build</p>
-            <h2 id="install-title">Run the checked public source.</h2>
+            <p className="eyebrow">Install the prerelease</p>
+            <h2 id="install-title">Verify it before you open it.</h2>
           </div>
           <ol className="download-steps" role="list">
             <li>
               <span aria-hidden="true">01</span>
               <div>
-                <h3>Clone the repository</h3>
-                <p>Clone <code>github.com/hraness/hra</code> on an Apple Silicon Mac.</p>
+                <h3>Download both files</h3>
+                <p>Save the <a href={HRA_RELEASE_URL}>DMG</a> and its <a href={HRA_RELEASE_CHECKSUM_URL}>SHA-256 file</a> in the same folder.</p>
               </div>
             </li>
             <li>
               <span aria-hidden="true">02</span>
               <div>
-                <h3>Install the pinned workspace</h3>
-                <p>Use Bun 1.3.14 and run <code>bun install --frozen-lockfile</code>.</p>
+                <h3>Check the bytes</h3>
+                <p>In Terminal, run <code>shasum -a 256 -c {HRA_RELEASE.asset}.sha256</code>. Continue only when it prints <code>OK</code>.</p>
               </div>
             </li>
             <li>
               <span aria-hidden="true">03</span>
               <div>
-                <h3>Build the native app</h3>
-                <p>Install Zig 0.16.0 and run <code>bun run --cwd apps/desktop build:macos</code>.</p>
+                <h3>Copy HRA to Applications</h3>
+                <p>Open the DMG and drag <strong>HRA</strong> into the Applications folder.</p>
+              </div>
+            </li>
+            <li>
+              <span aria-hidden="true">04</span>
+              <div>
+                <h3>Approve the unknown developer</h3>
+                <p>Control-click HRA in Finder and choose <strong>Open</strong>. If macOS still blocks it, use <strong>System Settings → Privacy &amp; Security → Open Anyway</strong>.</p>
               </div>
             </li>
           </ol>
           <p className="download-security-note">
-            Read the repository requirements before running the app. HRA can
-            coordinate coding agents with local filesystem and process authority.
+            HRA can run coding agents with local filesystem and process authority. Pair only repositories and Codex accounts you intend it to use.
           </p>
-        </section>
+          </section>
 
-        <section className="download-trust-grid" aria-label="Source and release status">
+          <section className="download-trust-grid" aria-label="Source and release status">
           <article>
-            <p className="eyebrow">Source</p>
-            <h2>Inspect every component.</h2>
+            <p className="eyebrow">Build it yourself</p>
+            <h2>Build HRA from source.</h2>
             <p>
-              The product source, build commands, tests, security model, and
-              third-party notices live together in the public repository.
+              The public repository pins Bun, Zig, Codex, Git, native build inputs, and the package verifier. Build the same app locally if the ad-hoc release boundary is not right for you.
             </p>
-            <a href="https://github.com/hraness/hra">Browse the repository →</a>
+            <a href="https://github.com/hraness/hra#develop-hra">Read the build instructions →</a>
           </article>
           <article>
-            <p className="eyebrow">Binaries</p>
-            <h2>Consumer downloads are still ahead.</h2>
+            <p className="eyebrow">What remains</p>
+            <h2>Developer ID signing is not available yet.</h2>
             <p>
-              This page will identify downloadable releases only after a public,
-              reproducible signing and publication boundary exists.
+              A later release needs a Developer ID certificate and Apple notarization before normal double-click installation can replace the unknown-developer flow. Automatic updates remain disabled until HRA owns a signed update channel.
             </p>
           </article>
-        </section>
+          </section>
+        </main>
 
         <footer className="download-footer">
           <span>HRA prerelease</span>
           <a href="https://github.com/hraness/hra">github.com/hraness/hra</a>
         </footer>
       </div>
-    </main>
+    </div>
   );
 }

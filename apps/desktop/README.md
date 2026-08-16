@@ -2,7 +2,7 @@
 
 HRA is a local-first macOS interface for long-running, parallel Codex work. Panes are repository-bound chats that can run independently. Settings manages local Codex subscriptions. HRA keeps the pane grid unavailable until at least one subscription is signed in.
 
-HRA does not require a separate HRA account for local use. Each pane exposes the fixed Sol model, Ultra or Max reasoning, Standard or Fast speed when supported, current activity, and the latest assistant response. The gateway selects a healthy signed-in subscription before each turn and can continue a quota-exhausted turn on another subscription only after it proves a complete bounded handoff.
+HRA does not require a separate HRA account for local use. Each pane exposes the fixed Sol model, Ultra or Max reasoning, Standard or Fast speed when supported, current activity, and the latest assistant response. The gateway admits work only to an eligible signed-in subscription. A provider usage limit stops the affected work; HRA does not move that work to another subscription or use multiple subscriptions to circumvent provider limits.
 
 ## Supported platform
 
@@ -48,7 +48,7 @@ The current application-state root is:
 
 The `OPRTE` spelling is a retained on-disk compatibility identifier. Product copy and public commands use HRA.
 
-Directories are checked for symlink escapes and repaired to user-only permissions. SQLite stores bounded HRA state such as profile labels, revisions, durable generations, pane state, receipts, and the text needed for the latest response and an explicit subscription handoff. Codex owns credentials, complete sessions, configuration, and logs inside each account home.
+Directories are checked for symlink escapes and repaired to user-only permissions. SQLite stores bounded HRA state such as profile labels, revisions, durable generations, pane state, receipts, account-routing evidence, recovery evidence, and the text needed for the latest response. Codex owns credentials, complete sessions, configuration, and logs inside each account home.
 
 Removing a profile, deleting its local Codex data, and removing all HRA local data are separate operations. None of them deletes user repositories. Destructive flows require revision fences and exact confirmation; the shipping Panes and Settings interface does not expose whole-app removal.
 
@@ -129,9 +129,39 @@ bun run --cwd apps/desktop validate
 bun run --cwd apps/desktop doctor:macos
 bun run --cwd apps/desktop test:macos
 bun run --cwd apps/desktop build:macos
+bun run --cwd apps/desktop package:macos:adhoc
+bun run --cwd apps/desktop package:macos
 ```
 
-`build:macos` is source-build evidence. This public workspace does not create, sign, notarize, or publish official consumer artifacts.
+`build:macos` produces the ReleaseFast host and native helpers. `package:macos:adhoc` builds the self-contained app, stages the pinned Codex and Git runtimes with their notices, applies an inside-out ad-hoc signature, and creates the DMG and checksum without downloading release source archives. `package:macos` performs the full clean-tree release assembly and creates these artifacts:
+
+```text
+zig-out/release/macos/arm64/
+  HRA-0.1.7-8-macos-arm64.dmg
+  HRA-0.1.7-8-macos-arm64.dmg.sha256
+  HRA-0.1.7-8-release-manifest.json
+  bun-0d9b296af33f2b851fcbf4df3e9ec89751734ba4-source.tar.gz
+  bun-webkit-5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b-source.tar.gz
+  git-67ad42147a7acc2af6074753ebd03d904476118f-source.tar.gz
+  dugite-native-f49d0098409aa243de8b9162127025ab0bb07a88-source.tar.gz
+```
+
+The Bun archive is a deterministic complete-source bundle containing its pinned native build inputs, nested Git sources, Node headers, and locked `lol-html` Cargo closure. Patched WebKit and JavaScriptCore remain in their own archive because it is close to GitHub's 2 GiB asset limit. The Git and Dugite Native archives close the bundled Git source boundary. Full packaging requires network access and a clean source tree. CI uses `package:macos:adhoc` to verify the same compiler, runtime, and license pins, app, DMG, and checksum without downloading the large source archives.
+
+The ad-hoc package proves bundle integrity but does not identify a registered Apple developer. macOS may require **Privacy & Security → Open Anyway** after download. It is not notarized, and automatic updates remain disabled. Developer ID signing, notarization, and publication require separately provisioned release credentials.
+
+Verify an existing package without rebuilding it:
+
+```sh
+bun run --cwd apps/desktop verify:package:macos
+bun run --cwd apps/desktop verify:package:macos:adhoc
+```
+
+The explicit launch smoke starts the packaged native executable and its bundled gateway for a bounded interval, verifies their pinned runtime identity through an owned temporary marker, and then terminates the exact process group. The smoke path does not initialize AppKit, WebKit, updater state, account profiles, or Keychain custody, and removes its private temporary root in `finally`:
+
+```sh
+bun run --cwd apps/desktop smoke:package:macos
+```
 
 ## Manual account-isolation smoke
 
@@ -139,6 +169,6 @@ Use throwaway repositories and two test Codex subscriptions. Do not record email
 
 - Sign both subscriptions in and confirm one profile's authentication and budget state never changes the other.
 - Run parallel turns and confirm each pane receives only its own bounded response and activity.
-- Trigger deterministic quota, approval, stale-turn, duplicated-terminal, and interrupted-runtime fixtures. Confirm the affected pane fails closed without repainting another pane.
+- Trigger deterministic usage-limit, approval, stale-turn, duplicated-terminal, and interrupted-runtime fixtures. Confirm the affected pane stops without cross-subscription continuation or repainting another pane.
 - Quit and reopen HRA. Confirm pane order, account selection, and distinct process generations recover without cross-profile prompts.
 - Inspect diagnostics and SQLite. Confirm they contain no credentials, raw provider payloads, tool details, local paths, or full transcripts.

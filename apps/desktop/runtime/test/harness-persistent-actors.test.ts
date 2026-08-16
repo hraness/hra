@@ -37,7 +37,6 @@ import {
   type PersistentActorInterruptRequest,
   type PersistentActorLivenessPortV2,
   type PersistentActorProviderPort,
-  type PersistentActorQuotaContinuationCaptureRequest,
   type PersistentActorTerminalObservation,
   type PersistentActorThreadOutcome,
   type PersistentActorThreadRequest,
@@ -323,8 +322,6 @@ function epochAndRoot(): Readonly<{ epoch: ActorEpoch; rootActor: Actor }> {
 }
 
 class FakeProvider implements PersistentActorProviderPort {
-  readonly #database: Database;
-  readonly continuationCaptures: PersistentActorQuotaContinuationCaptureRequest[] = [];
   readonly threadStarts: PersistentActorThreadRequest[] = [];
   readonly threadReconciliations: PersistentActorThreadRequest[] = [];
   readonly turnStarts: PersistentActorTurnRequest[] = [];
@@ -350,44 +347,6 @@ class FakeProvider implements PersistentActorProviderPort {
     request: PersistentActorTurnRequest,
     outcome: PersistentActorTurnOutcome,
   ) => Promise<void>) | null = null;
-  continuationCaptureOutcome: unknown = null;
-
-  constructor(database: Database) {
-    this.#database = database;
-  }
-
-  captureQuotaContinuation(
-    request: PersistentActorQuotaContinuationCaptureRequest,
-  ): Promise<unknown> {
-    this.continuationCaptures.push(request);
-    if (this.continuationCaptureOutcome !== null) {
-      return Promise.resolve(this.continuationCaptureOutcome);
-    }
-    const suffix = createHmac(
-      "sha256",
-      "oprte-persistent-actor-test-continuation-capsule",
-    ).update(JSON.stringify(request)).digest("hex").slice(0, 48);
-    const valueId = `ctxval_${suffix}`;
-    insertContextValue(this.#database, {
-      actorId: request.actorId,
-      turnId: request.actorTurnId,
-      valueId,
-      purpose: "completedPrefix",
-    });
-    return Promise.resolve({
-      kind: "captured",
-      handle: {
-        version: 2,
-        epochId: request.epochId,
-        actorId: request.actorId,
-        actorTurnId: request.actorTurnId,
-        sourceAttemptId: request.sourceAttemptId,
-        valueId,
-      },
-      proof: proof("c", { phase: "observation" }),
-    });
-  }
-
   startThread(request: PersistentActorThreadRequest): Promise<unknown> {
     this.threadStarts.push(request);
     if (this.throwNextThreadStart) {
@@ -496,6 +455,7 @@ interface Fixture {
     workspaceBarrier: (() => Promise<void>) | null;
     accountEligibilityCalls: number;
     accountEligibilityBarrier: ((call: number) => Promise<void>) | null;
+    valueCalls: number;
     crashBeforeAccountLease: boolean;
     crashAfterAuthorityStep:
       | "quotaSettlement"
@@ -558,7 +518,7 @@ function fixture(
     tokenUsageIdentities,
   });
   authority.createActorEpoch(epochAndRoot());
-  const provider = new FakeProvider(database);
+  const provider = new FakeProvider();
   const controls: Fixture["controls"] = {
     now: at,
     prepareInputFailure: null,
@@ -566,6 +526,7 @@ function fixture(
     workspaceBarrier: null,
     accountEligibilityCalls: 0,
     accountEligibilityBarrier: null,
+    valueCalls: 0,
     crashBeforeAccountLease: false,
     crashAfterAuthorityStep: null,
     legacyFastContainmentPrefix: null,
@@ -810,6 +771,7 @@ function fixture(
     },
     values: {
       prepareActorInput: ({ targetActorId, sourceValueId }) => {
+        controls.valueCalls += 1;
         if (controls.prepareInputFailure !== null) {
           return Promise.reject(controls.prepareInputFailure);
         }
@@ -827,6 +789,7 @@ function fixture(
         return Promise.resolve({ valueId: sourceValueId });
       },
       assertResultAvailable: ({ actorId, turnId, valueId }) => {
+        controls.valueCalls += 1;
         insertContextValue(database, {
           actorId,
           turnId,
@@ -856,6 +819,23 @@ function fixture(
     restart: createCoordinator,
     controls,
   };
+}
+
+function externalCallCounts(value: Fixture) {
+  return Object.freeze({
+    accountEligibility: value.controls.accountEligibilityCalls,
+    workspaceAcquisitions: value.controls.workspaceAcquisitions.length,
+    valueCalls: value.controls.valueCalls,
+    threadStarts: value.provider.threadStarts.length,
+    threadReconciliations: value.provider.threadReconciliations.length,
+    turnStarts: value.provider.turnStarts.length,
+    turnReconciliations: value.provider.turnReconciliations.length,
+    fastCapacityReconciliations:
+      value.provider.fastCapacityReconciliations.length,
+    observations: value.provider.observations.length,
+    interrupts: value.provider.interrupts.length,
+    interruptReconciliations: value.provider.interruptReconciliations.length,
+  });
 }
 
 function spawnInput(
@@ -1450,16 +1430,18 @@ async function observeTerminalWithExactUsage(
   return await value.coordinator.observeTerminal(event);
 }
 
-async function preparePostAdmissionQuota(
-  value: Fixture,
-  suffix: string,
-): Promise<Readonly<{
+type PostAdmissionQuotaFixture = Readonly<{
   actorId: string;
   turnId: string;
   attemptId: string;
   incarnationId: string;
   event: PersistentActorTerminalObservation;
-}>> {
+}>;
+
+async function preparePostAdmissionQuota(
+  value: Fixture,
+  suffix: string,
+): Promise<PostAdmissionQuotaFixture> {
   const spawned = await value.coordinator.spawn(spawnInput(suffix));
   const attempt = value.authority.listActorAttempts({
     turnId: spawned.turn.turn.id,
@@ -1492,6 +1474,380 @@ async function preparePostAdmissionQuota(
     incarnationId: attempt.incarnationId,
     event,
   });
+}
+
+function seedLegacyClosedQuotaSource(
+  value: Fixture,
+  quota: PostAdmissionQuotaFixture,
+  suffix: string,
+) {
+  const turn = value.authority.readActorTurn(quota.turnId);
+  const actor = value.authority.readActor(quota.actorId);
+  const sourceIncarnation = value.authority.readActorIncarnation(
+    quota.incarnationId,
+  );
+  if (
+    turn === null || actor === null ||
+    sourceIncarnation?.providerThreadId === null ||
+    sourceIncarnation?.providerThreadId === undefined
+  ) {
+    throw new Error("legacy closed quota fixture lacks durable lineage");
+  }
+  const historyValueId = `ctxval_quota_history_${suffix}`;
+  insertContextValue(value.database, {
+    actorId: actor.id,
+    turnId: turn.id,
+    valueId: historyValueId,
+    purpose: "completedPrefix",
+  });
+  value.authority.bindActorQuotaContinuationCapsule({
+    attemptId: quota.attemptId,
+    expectedState: "running",
+    continuationHistoryValueId: historyValueId,
+  });
+  value.authority.settleActorQuotaRejection({
+    attemptId: quota.attemptId,
+    expectedState: "running",
+    providerTurnId: quota.event.providerTurnId,
+    continuationHistoryValueId: historyValueId,
+    quotaProofDigest: quota.event.proof.digest,
+    inputTokens: quota.event.inputTokens!,
+    outputTokens: quota.event.outputTokens!,
+    now: at,
+  });
+  const reconciling = value.authority.transitionActorTurn({
+    turnId: turn.id,
+    expectedRevision: turn.revision,
+    nextState: "reconciling",
+    now: at,
+  });
+  value.authority.transitionActorIncarnation({
+    incarnationId: sourceIncarnation.id,
+    expectedState: "running",
+    nextState: "closed",
+    providerThreadId: sourceIncarnation.providerThreadId,
+    now: at,
+  });
+  return Object.freeze({
+    actor,
+    historyValueId,
+    turn: reconciling,
+  });
+}
+
+function seedLegacyQuotaActorStart(
+  value: Fixture,
+  quota: PostAdmissionQuotaFixture,
+  suffix: string,
+  state: "prepared" | "effectStarted",
+): Readonly<{ incarnationId: string; operationId: string }> {
+  const { actor, turn } = seedLegacyClosedQuotaSource(value, quota, suffix);
+  const target = value.accounts.find((candidate) =>
+    candidate.accountProfileId !== quota.event.accountProfileId
+  );
+  if (target === undefined) {
+    throw new Error("legacy actor-start fixture lacks a replacement account");
+  }
+  const operationId = deriveTestOpaqueId(
+    "hoperation",
+    "legacy-quota-replacement-thread",
+    [turn.id, suffix],
+  );
+  const incarnationId = deriveTestOpaqueId(
+    "hincarnation",
+    "incarnation",
+    [operationId],
+  );
+  const request: PersistentActorThreadRequest = Object.freeze({
+    actorId: actor.id,
+    epochId: actor.epochId,
+    policyVersion: 1,
+    workClass: "largeChange",
+    accountProfileId: target.accountProfileId,
+    processGeneration: target.processGeneration,
+    modelId: target.modelId,
+    reasoningEffort: target.reasoningEffort,
+    selectedProfile: target.selectedProfile,
+    profileFallbackReason: target.profileFallbackReason,
+    capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+    supportsFast: target.supportsFast,
+    clientRequestId: deriveTestOpaqueId(
+      "client",
+      "legacy-quota-replacement-thread-request",
+      [operationId],
+    ),
+    threadSource: `oprte:harness:v2:${actor.epochId}:${actor.id}:${incarnationId}`,
+    toolsetDigest,
+    workspaceLaneId: "lane_persistent_snapshot",
+    effectKey: digestCanonicalTest([
+      "oprte.actor.effect.v2",
+      operationId,
+      "thread/start",
+    ]),
+    continuation: null,
+  });
+  let operation = value.authority.prepareActorOperation({
+    operationId,
+    actorId: actor.id,
+    turnId: null,
+    kind: "actorStart",
+    requestDigest: digestCanonicalTest(request),
+    effectKey: request.effectKey,
+    providerIdentityJson: canonicalTestJson({ version: 1, request }),
+    createdAt: at,
+  });
+  if (state === "effectStarted") {
+    operation = value.authority.transitionActorOperation({
+      operationId,
+      expectedState: "prepared",
+      nextState: "effectStarted",
+      providerIdentityJson: operation.providerIdentityJson,
+      now: at,
+    });
+  }
+  value.authority.createActorIncarnation({
+    incarnationId,
+    actorId: actor.id,
+    accountProfileId: target.accountProfileId,
+    processGeneration: target.processGeneration,
+    startOperationId: operation.id,
+    clientRequestId: request.clientRequestId,
+    threadSource: request.threadSource,
+    toolsetDigest: request.toolsetDigest,
+    profile: {
+      modelId: target.modelId,
+      reasoningEffort: target.reasoningEffort,
+      profileFallbackReason: target.profileFallbackReason,
+      capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+      supportsFast: target.supportsFast,
+    },
+    createdAt: at,
+  });
+  return Object.freeze({ incarnationId, operationId });
+}
+
+async function seedLegacyStartedQuotaReplacement(
+  value: Fixture,
+  quota: PostAdmissionQuotaFixture,
+  suffix: string,
+): Promise<Readonly<{
+  attemptId: string;
+  incarnationId: string;
+  providerTurnId: string;
+}>> {
+  const { actor, historyValueId, turn } =
+    seedLegacyClosedQuotaSource(value, quota, suffix);
+  const target = value.accounts.find((candidate) =>
+    candidate.accountProfileId !== quota.event.accountProfileId
+  );
+  if (
+    target === undefined
+  ) {
+    throw new Error("legacy started replacement fixture lacks durable lineage");
+  }
+
+  const startOperationId = deriveTestOpaqueId(
+    "hoperation",
+    "legacy-quota-replacement-thread",
+    [turn.id, suffix],
+  );
+  const incarnationId = deriveTestOpaqueId(
+    "hincarnation",
+    "incarnation",
+    [startOperationId],
+  );
+  const threadRequest: PersistentActorThreadRequest = Object.freeze({
+    actorId: actor.id,
+    epochId: actor.epochId,
+    policyVersion: 1,
+    workClass: "largeChange",
+    accountProfileId: target.accountProfileId,
+    processGeneration: target.processGeneration,
+    modelId: target.modelId,
+    reasoningEffort: target.reasoningEffort,
+    selectedProfile: target.selectedProfile,
+    profileFallbackReason: target.profileFallbackReason,
+    capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+    supportsFast: target.supportsFast,
+    clientRequestId: deriveTestOpaqueId(
+      "client",
+      "legacy-quota-replacement-thread-request",
+      [startOperationId],
+    ),
+    threadSource: `oprte:harness:v2:${actor.epochId}:${actor.id}:${incarnationId}`,
+    toolsetDigest,
+    workspaceLaneId: "lane_persistent_snapshot",
+    effectKey: digestCanonicalTest([
+      "oprte.actor.effect.v2",
+      startOperationId,
+      "thread/start",
+    ]),
+    continuation: null,
+  });
+  let startOperation = value.authority.prepareActorOperation({
+    operationId: startOperationId,
+    actorId: actor.id,
+    turnId: null,
+    kind: "actorStart",
+    requestDigest: digestCanonicalTest(threadRequest),
+    effectKey: threadRequest.effectKey,
+    providerIdentityJson: canonicalTestJson({ version: 1, request: threadRequest }),
+    createdAt: at,
+  });
+  startOperation = value.authority.transitionActorOperation({
+    operationId: startOperation.id,
+    expectedState: "prepared",
+    nextState: "effectStarted",
+    providerIdentityJson: startOperation.providerIdentityJson,
+    now: at,
+  });
+  const threadOutcome = appliedThreadOutcome(
+    threadRequest,
+    `provider-thread-legacy-replacement-${suffix}`,
+  );
+  value.authority.transitionActorOperation({
+    operationId: startOperation.id,
+    expectedState: "effectStarted",
+    nextState: "succeeded",
+    providerIdentityJson: canonicalTestJson({
+      version: 1,
+      request: threadRequest,
+      outcome: threadOutcome,
+    }),
+    now: at,
+  });
+  let incarnation = value.authority.createActorIncarnation({
+    incarnationId,
+    actorId: actor.id,
+    accountProfileId: target.accountProfileId,
+    processGeneration: target.processGeneration,
+    startOperationId,
+    clientRequestId: threadRequest.clientRequestId,
+    threadSource: threadRequest.threadSource,
+    toolsetDigest: threadRequest.toolsetDigest,
+    profile: {
+      modelId: target.modelId,
+      reasoningEffort: target.reasoningEffort,
+      profileFallbackReason: target.profileFallbackReason,
+      capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+      supportsFast: target.supportsFast,
+    },
+    createdAt: at,
+  });
+  incarnation = value.authority.recordActorIncarnationObservedProfile({
+    incarnationId: incarnation.id,
+    observedProfile: threadOutcome.observedProfile,
+    observedAt: at,
+  });
+  incarnation = value.authority.transitionActorIncarnation({
+    incarnationId: incarnation.id,
+    expectedState: "starting",
+    nextState: "idle",
+    providerThreadId: threadOutcome.providerThreadId,
+    now: at,
+  });
+  const session = value.authority.bindActorSession({
+    incarnationId: incarnation.id,
+    liveCapabilityEvidence: threadOutcome.liveCapabilityEvidence,
+    recoveryProof: threadOutcome.sessionRecoveryProof,
+    createdAt: at,
+  });
+
+  const attemptId = deriveTestOpaqueId("hattempt", "attempt", [
+    turn.id,
+    incarnation.id,
+  ]);
+  const clientUserMessageId = deriveTestOpaqueId("message", "turn-message", [
+    turn.id,
+    incarnation.id,
+  ]);
+  const claimed = value.authority.claimActorAttempt({
+    attemptId,
+    turnId: turn.id,
+    incarnationId: incarnation.id,
+    accountProfileId: incarnation.accountProfileId,
+    processGeneration: incarnation.processGeneration,
+    clientUserMessageId,
+    dispatch: {
+      capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+    },
+    createdAt: at,
+  });
+  const turnOperationId = deriveTestOpaqueId("hoperation", "turn-start", [
+    turn.id,
+    incarnation.id,
+  ]);
+  const providerTurnId = `provider-turn-legacy-replacement-${suffix}`;
+  const turnRequest: PersistentActorTurnRequest = Object.freeze({
+    actorId: actor.id,
+    epochId: actor.epochId,
+    turnId: turn.id,
+    incarnationId: incarnation.id,
+    accountProfileId: incarnation.accountProfileId,
+    processGeneration: session.liveGeneration,
+    observationGeneration: session.liveGeneration,
+    providerThreadId: threadOutcome.providerThreadId,
+    modelId: incarnation.requestedModel,
+    reasoningEffort: incarnation.requestedReasoningEffort,
+    requestedAcceleration: { mode: "standard" as const },
+    serviceTier: "standard",
+    tierFallbackReason: null,
+    capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+    fastReservationId: null,
+    toolsetDigest: incarnation.toolsetDigest,
+    clientUserMessageId,
+    inputValueId: turn.inputValueId,
+    effectKey: digestCanonicalTest([
+      "oprte.actor.effect.v2",
+      turnOperationId,
+      "turn/start",
+    ]),
+    continuation: {
+      sourceAttemptId: quota.attemptId,
+      historyValueId,
+      sourceAccountProfileId: quota.event.accountProfileId,
+      sourceProcessGeneration: quota.event.processGeneration,
+      sourceProviderThreadId: quota.event.providerThreadId,
+      sourceProviderTurnId: quota.event.providerTurnId,
+    },
+  });
+  const turnOperation = value.authority.prepareActorOperation({
+    operationId: turnOperationId,
+    actorId: actor.id,
+    turnId: turn.id,
+    kind: "turnStart",
+    requestDigest: digestCanonicalTest(turnRequest),
+    effectKey: turnRequest.effectKey,
+    providerIdentityJson: canonicalTestJson({ version: 1, request: turnRequest }),
+    createdAt: at,
+  });
+  const started = value.authority.startActorTurnEffect({
+    operationId: turnOperation.id,
+    attemptId: claimed.attempt.id,
+    expectedOperationRequestDigest: turnOperation.requestDigest,
+    expectedSessionRevision: session.revision,
+    effectGeneration: session.liveGeneration,
+    capabilityEvidenceDigest: target.capabilityEvidenceDigest,
+    requestDigest: digestCanonicalTest(turnRequest),
+    effectKey: turnRequest.effectKey,
+    providerIdentityJson: canonicalTestJson({ version: 1, request: turnRequest }),
+    now: at,
+  });
+  if (started.kind !== "effectStarted") {
+    throw new Error("legacy replacement unexpectedly lost Fast admission");
+  }
+  const bound = await value.authority.bindActorAttemptProviderTurn({
+    attemptId: started.attempt.id,
+    expectedState: "starting",
+    providerTurnId,
+  });
+  value.authority.transitionActorAttempt({
+    attemptId: bound.id,
+    expectedState: bound.state,
+    nextState: "running",
+    now: at,
+  });
+  return Object.freeze({ attemptId, incarnationId, providerTurnId });
 }
 
 function insertContextValue(
@@ -1711,7 +2067,7 @@ async function expectRejectedMessage(
 }
 
 describe("PersistentActorCoordinator", () => {
-  test("quota failover requires definitive terminal observation proof", () => {
+  test("quota terminalization requires definitive terminal observation proof", () => {
     const event = {
       accountProfileId: "acct_terminal_proof",
       processGeneration: 1,
@@ -1952,7 +2308,6 @@ describe("PersistentActorCoordinator", () => {
           SELECT COUNT(*) AS count FROM ${table}
         `).get()?.count ?? 0;
       const providerCounts = () => ({
-        continuationCaptures: value.provider.continuationCaptures.length,
         threadStarts: value.provider.threadStarts.length,
         threadReconciliations: value.provider.threadReconciliations.length,
         turnStarts: value.provider.turnStarts.length,
@@ -3472,7 +3827,7 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
-  test("fails over only after definitive pre-effect quota proof", async () => {
+  test("definitive pre-effect quota proof terminalizes without selecting another account", async () => {
     const value = fixture();
     try {
       const firstAccount = value.accounts[0]!.accountProfileId;
@@ -3482,22 +3837,24 @@ describe("PersistentActorCoordinator", () => {
         proof: proof("6", { phase: "preEffect" }),
       });
       const spawned = await value.coordinator.spawn(spawnInput("0000000000000002"));
-      expect(spawned.turn.turn.state).toBe("running");
+      expect(spawned.turn).toMatchObject({
+        turn: { state: "quotaRejected", outcomeCode: "quota_exhausted" },
+        result: { outcome: "quotaRejected" },
+      });
       expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual(value.accounts.map(({ accountProfileId }) => accountProfileId));
+        .toEqual([firstAccount]);
       expect(value.provider.turnStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual(value.accounts.map(({ accountProfileId }) => accountProfileId));
-      expect(value.authority.readActiveIncarnationForActor(spawned.actor.id))
-        .toMatchObject({ accountProfileId: value.accounts[1]!.accountProfileId });
+        .toEqual([firstAccount]);
+      expect(value.authority.readActiveIncarnationForActor(spawned.actor.id)).toBeNull();
     } finally {
       value.database.close();
     }
   });
 
-  test("recovers a crash after pre-effect quota settlement without repeating a provider effect", async () => {
+  test("recovers legacy pre-effect quota settlement without provider mutation", async () => {
     const value = fixture(2);
     try {
-      const [sourceAccount, targetAccount] = value.accounts;
+      const [sourceAccount] = value.accounts;
       value.provider.turnOutcomes.set(sourceAccount!.accountProfileId, {
         kind: "notApplied",
         reason: "quota",
@@ -3534,65 +3891,17 @@ describe("PersistentActorCoordinator", () => {
       await restarted.reconcile();
 
       expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual([
-          sourceAccount!.accountProfileId,
-          targetAccount!.accountProfileId,
-        ]);
+        .toEqual([sourceAccount!.accountProfileId]);
       expect(value.provider.turnStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual([
-          sourceAccount!.accountProfileId,
-          targetAccount!.accountProfileId,
-        ]);
-      expect(value.provider.turnStarts[1]?.continuation).toBeNull();
+        .toEqual([sourceAccount!.accountProfileId]);
       expect(value.authority.readActorTurn(turn.id)).toMatchObject({
-        state: "running",
+        state: "quotaRejected",
+        outcomeCode: "quota_exhausted",
       });
 
       await restarted.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-    } finally {
-      value.database.close();
-    }
-  });
-
-  test("waits for an unvisited subscription whose exact-generation capability is still converging", async () => {
-    const value = fixture();
-    try {
-      const first = value.accounts[0]!;
-      const second = value.accounts[1]!;
-      value.controls.accountCandidates.splice(0, Infinity, first);
-      value.controls.temporarilyUnavailableAccountProfileIds.push(
-        second.accountProfileId,
-      );
-      value.provider.turnOutcomes.set(first.accountProfileId, {
-        kind: "notApplied",
-        reason: "quota",
-        proof: proof("6", { phase: "preEffect" }),
-      });
-
-      await expectPersistentActorError(
-        value.coordinator.spawn(spawnInput("temporaryaccount01")),
-        "provider_pending",
-      );
-      expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual([first.accountProfileId]);
-      const child = value.authority.listActorChildren({
-        parentActorId: rootActorId,
-        limit: 51,
-      })[0]!;
-      const turn = value.authority.listLiveActorTurns({ limit: 16 })
-        .find(({ actorId }) => actorId === child.id);
-      expect(turn).toMatchObject({ state: "reconciling" });
-      expect(value.authority.readActorResultForTurn(turn!.id)).toBeNull();
-
-      value.controls.temporarilyUnavailableAccountProfileIds.length = 0;
-      value.controls.accountCandidates.push(second);
-      await value.coordinator.reconcile();
-      expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual([first.accountProfileId, second.accountProfileId]);
-      expect(value.authority.readActiveIncarnationForActor(child.id))
-        .toMatchObject({ accountProfileId: second.accountProfileId });
+      expect(value.provider.threadStarts).toHaveLength(1);
+      expect(value.provider.turnStarts).toHaveLength(1);
     } finally {
       value.database.close();
     }
@@ -3679,817 +3988,197 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
-  test("stop and deadline between quota candidates never start candidate two", async () => {
-    for (const mode of ["cancel", "deadline"] as const) {
-      const value = fixture(2);
-      const entered = deferred<void>();
-      const release = deferred<void>();
-      let spawning: Promise<unknown> | null = null;
-      try {
-        const first = value.accounts[0]!;
-        value.provider.turnOutcomes.set(first.accountProfileId, {
-          kind: "notApplied",
-          reason: "quota",
-          proof: proof("6", { phase: "preEffect" }),
-        });
-        value.controls.accountEligibilityBarrier = async (call) => {
-          if (call !== 2) return;
-          entered.resolve();
-          await release.promise;
-        };
-        spawning = value.coordinator.spawn(
-          spawnInput(`candidate${mode}02`),
-        );
-        await entered.promise;
-        const turn = value.authority.listLiveActorTurns({ limit: 16 })[0];
-        if (turn === undefined) throw new Error("quota candidate turn is missing");
-        if (mode === "cancel") {
-          await value.coordinator.cancel({
-            callerActorId: rootActorId,
-            turnId: turn.id,
-          });
-        } else {
-          value.controls.now = deadline;
-        }
-        release.resolve();
-        await Promise.allSettled([spawning]);
-
-        expect(value.provider.threadStarts.map(({ accountProfileId }) =>
-          accountProfileId)).toEqual([first.accountProfileId]);
-        expect(value.provider.turnStarts.map(({ accountProfileId }) =>
-          accountProfileId)).toEqual([first.accountProfileId]);
-        expect(value.authority.readActorResultForTurn(turn.id)).toMatchObject({
-          outcome: "quotaRejected",
-        });
-        expect(value.authority.readActorTurn(turn.id)).toMatchObject({
-          outcomeCode: mode === "cancel"
-            ? "actor_start_stopped_before_effect"
-            : "deadline_before_actor_start",
-        });
-      } finally {
-        release.resolve();
-        if (spawning !== null) await Promise.allSettled([spawning]);
-        value.database.close();
-      }
-    }
-  });
-
-  test("post-admission quota starts one fresh thread on the first unvisited subscription", async () => {
-    const rankedAccounts = [
-      { accountProfileId: "acct_quota_source", processGeneration: 7 },
-      { accountProfileId: "acct_quota_target", processGeneration: 11 },
-      { accountProfileId: "acct_quota_later", processGeneration: 13 },
-    ] as const;
-    const value = fixture(rankedAccounts);
-    try {
-      const spawned = await value.coordinator.spawn(
-        spawnInput("postadmission0001"),
-      );
-      const [sourceAttempt] = value.authority.listActorAttempts({
-        turnId: spawned.turn.turn.id,
-        limit: 16,
-      });
-      if (sourceAttempt?.providerTurnId === null ||
-        sourceAttempt?.providerTurnId === undefined) {
-        throw new Error("source attempt lacks its provider turn identity");
-      }
-      const sourceIncarnation = value.authority.readActorIncarnation(
-        sourceAttempt.incarnationId,
-      );
-      if (sourceIncarnation?.providerThreadId === null ||
-        sourceIncarnation?.providerThreadId === undefined) {
-        throw new Error("source attempt lacks its provider thread identity");
-      }
-      const event: PersistentActorTerminalObservation = {
-        accountProfileId: sourceAttempt.accountProfileId,
-        processGeneration: sourceAttempt.processGeneration,
-        providerThreadId: sourceIncarnation.providerThreadId,
-        providerTurnId: sourceAttempt.providerTurnId,
-        terminal: "failed",
-        resultValueId: null,
-        outcomeCode: "usage_limit_exceeded",
-        quotaProof: "provider_usage_limit_exceeded",
-        inputTokens: 144,
-        outputTokens: 55,
-        proof: proof("8", { phase: "observation" }),
-      };
-      await recordExactTerminalUsage(value, event);
-
-      // A process restart may advance a configured subscription's generation.
-      // Visitation is subscription-scoped, so the source account must remain
-      // excluded even when the live account candidate now has a new generation.
-      expect(Reflect.set(
-        rankedAccounts[0],
-        "processGeneration",
-        rankedAccounts[0].processGeneration + 1,
-      )).toBe(true);
-
-      const continued = await value.coordinator.observeTerminal(event);
-
-      expect(continued).toMatchObject({
-        turn: { id: spawned.turn.turn.id, state: "running" },
-        result: null,
-      });
-      const attempts = value.authority.listActorAttempts({
-        turnId: spawned.turn.turn.id,
-        limit: 16,
-      });
-      expect(attempts).toHaveLength(2);
-      expect(attempts[0]).toMatchObject({
-        id: sourceAttempt.id,
-        accountProfileId: rankedAccounts[0].accountProfileId,
-        processGeneration: event.processGeneration,
-        providerTurnId: event.providerTurnId,
-        state: "quotaRejected",
-        quotaProofDigest: event.proof.digest,
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-      });
-      expect(attempts[1]).toMatchObject({
-        accountProfileId: rankedAccounts[1].accountProfileId,
-        processGeneration: rankedAccounts[1].processGeneration,
-        state: "running",
-      });
-      expect(value.provider.threadStarts.map((request) => ({
-        accountProfileId: request.accountProfileId,
-        processGeneration: request.processGeneration,
-      }))).toEqual([
-        {
-          accountProfileId: rankedAccounts[0].accountProfileId,
-          processGeneration: event.processGeneration,
-        },
-        {
-          accountProfileId: rankedAccounts[1].accountProfileId,
-          processGeneration: rankedAccounts[1].processGeneration,
-        },
-      ]);
-      expect(value.provider.turnStarts).toHaveLength(2);
-      const continuationRequest = value.provider.turnStarts[1]!;
-      expect(continuationRequest.continuation?.historyValueId)
-        .toMatch(/^ctxval_[A-Za-z0-9_-]+$/u);
-      expect(continuationRequest.continuation).toMatchObject({
-        sourceAttemptId: sourceAttempt.id,
-        sourceAccountProfileId: event.accountProfileId,
-        sourceProcessGeneration: event.processGeneration,
-        sourceProviderThreadId: sourceIncarnation.providerThreadId,
-        sourceProviderTurnId: event.providerTurnId,
-      });
-      // The coordinator transfers only opaque value identity plus exact lineage.
-      // The provider continuation branch injects verified history and owns the
-      // literal `continue`; no original prompt text crosses this boundary again.
-      expect("prompt" in continuationRequest).toBe(false);
-      expect("message" in continuationRequest).toBe(false);
-      expect("text" in continuationRequest).toBe(false);
-      expect(value.authority.readActor(spawned.actor.id)).toMatchObject({
-        state: "active",
-      });
-      expect(value.authority.remainingActorTokens(spawned.actor.id)).toBe(9_801);
-      expect(value.authority.readActiveIncarnationForActor(spawned.actor.id))
-        .toMatchObject({
-          accountProfileId: rankedAccounts[1].accountProfileId,
-          processGeneration: rankedAccounts[1].processGeneration,
-          state: "running",
-        });
-    } finally {
-      value.database.close();
-    }
-  });
-
-  test("contains the current replacement for a retired quota-source reroute", async () => {
-    const rankedAccounts = [
-      { accountProfileId: "acct_reroute_quota_source", processGeneration: 7 },
-      { accountProfileId: "acct_reroute_quota_target", processGeneration: 11 },
-    ] as const;
-    const value = fixture(rankedAccounts);
-    try {
-      const spawned = await value.coordinator.spawn(
-        spawnInput("reroutequotasource1"),
-      );
-      const [initialSource] = value.authority.listActorAttempts({
-        turnId: spawned.turn.turn.id,
-        limit: 16,
-      });
-      if (initialSource?.providerTurnId === null ||
-        initialSource?.providerTurnId === undefined) {
-        throw new Error("reroute quota source lacks provider turn identity");
-      }
-      const initialSourceIncarnation = value.authority.readActorIncarnation(
-        initialSource.incarnationId,
-      );
-      if (initialSourceIncarnation?.providerThreadId === null ||
-        initialSourceIncarnation?.providerThreadId === undefined) {
-        throw new Error("reroute quota source lacks provider thread identity");
-      }
-      const event: PersistentActorTerminalObservation = {
-        accountProfileId: initialSource.accountProfileId,
-        processGeneration: initialSource.processGeneration,
-        providerThreadId: initialSourceIncarnation.providerThreadId,
-        providerTurnId: initialSource.providerTurnId,
-        terminal: "failed",
-        resultValueId: null,
-        outcomeCode: "usage_limit_exceeded",
-        quotaProof: "provider_usage_limit_exceeded",
-        inputTokens: 233,
-        outputTokens: 89,
-        proof: proof("9", { phase: "observation" }),
-      };
-      await recordExactTerminalUsage(value, event);
-      await value.coordinator.observeTerminal(event);
-      const [sourceAttempt, replacementAttempt] =
-        value.authority.listActorAttempts({
-          turnId: spawned.turn.turn.id,
-          limit: 16,
-        });
-      if (sourceAttempt === undefined || replacementAttempt === undefined) {
-        throw new Error("reroute quota continuation is incomplete");
-      }
-      const sourceIncarnation = value.authority.readActorIncarnation(
-        sourceAttempt.incarnationId,
-      );
-      const replacementIncarnation = value.authority.readActorIncarnation(
-        replacementAttempt.incarnationId,
-      );
-      if (
-        sourceIncarnation === null || replacementIncarnation === null ||
-        sourceIncarnation.providerThreadId === null ||
-        sourceAttempt.providerTurnId === null
-      ) {
-        throw new Error("reroute quota lineage is incomplete");
-      }
-      expect(sourceAttempt).toMatchObject({
-        state: "quotaRejected",
-        quotaProofDigest: event.proof.digest,
-        providerTurnId: event.providerTurnId,
-      });
-      expect(sourceIncarnation.state).toBe("closed");
-      expect(value.authority.readActorSessionBinding(sourceIncarnation.id))
-        .toMatchObject({ state: "retired" });
-      expect(replacementAttempt).toMatchObject({ state: "running" });
-      expect(replacementIncarnation).toMatchObject({ state: "running" });
-      const sourceProfileBefore = {
-        observedModel: sourceIncarnation.observedModel,
-        observedReasoningEffort: sourceIncarnation.observedReasoningEffort,
-        observedProfileState: sourceIncarnation.observedProfileState,
-        observedProfileAt: sourceIncarnation.observedProfileAt,
-      };
-      const replacementProfileBefore = {
-        observedModel: replacementIncarnation.observedModel,
-        observedReasoningEffort: replacementIncarnation.observedReasoningEffort,
-        observedProfileState: replacementIncarnation.observedProfileState,
-        observedProfileAt: replacementIncarnation.observedProfileAt,
-      };
-      const replacementRequest = value.provider.turnStarts.at(-1);
-      if (replacementRequest === undefined) {
-        throw new Error("reroute quota replacement request is missing");
-      }
-      const replacementOperationId = value.database.query<
-        { operation_id: string },
-        [string]
-      >(`
-        SELECT operation_id FROM harness_actor_operations
-        WHERE effect_key = ?1
-      `).get(replacementRequest.effectKey)?.operation_id;
-      if (replacementOperationId === undefined) {
-        throw new Error("reroute quota replacement operation is missing");
-      }
-      const replacementOperationBefore = value.authority.readActorOperation(
-        replacementOperationId,
-      );
-      const providerCounts = {
-        threadStarts: value.provider.threadStarts.length,
-        turnStarts: value.provider.turnStarts.length,
-        turnReconciliations: value.provider.turnReconciliations.length,
-        observations: value.provider.observations.length,
-      };
-      const fact = modelRerouteFact({
-        accountProfileId: sourceAttempt.accountProfileId,
-        generation: sourceAttempt.processGeneration,
-        providerThreadId: sourceIncarnation.providerThreadId,
-        providerTurnId: sourceAttempt.providerTurnId,
-        streamPosition: 93,
-      });
-
-      expect(await value.coordinator.containActorModelReroute(fact)).toBe(true);
-
-      expect(value.authority.readActorModelRerouteForAttempt(sourceAttempt.id))
-        .toMatchObject({ state: "settled", attemptId: sourceAttempt.id });
-      expect(value.authority.readActorAttempt(sourceAttempt.id))
-        .toEqual(sourceAttempt);
-      expect(value.authority.readActorIncarnation(sourceIncarnation.id))
-        .toEqual(sourceIncarnation);
-      expect(value.authority.readActorAttempt(replacementAttempt.id))
-        .toMatchObject({
-          state: "ambiguous",
-          providerTurnId: replacementAttempt.providerTurnId,
-        });
-      expect(value.authority.readActorIncarnation(replacementIncarnation.id))
-        .toMatchObject({
-          ...replacementProfileBefore,
-          state: "quarantined",
-        });
-      expect(value.authority.readActorSessionBinding(replacementIncarnation.id))
-        .toMatchObject({ state: "quarantined" });
-      expect(value.authority.readActorIncarnation(sourceIncarnation.id))
-        .toMatchObject(sourceProfileBefore);
-      expect(value.authority.readActorOperation(replacementOperationId))
-        .toEqual(replacementOperationBefore);
-      expect(value.authority.readActorTurn(spawned.turn.turn.id))
-        .toMatchObject({ state: "ambiguous" });
-      expect(value.authority.readActor(spawned.actor.id))
-        .toMatchObject({ state: "quarantined" });
-
-      expect(await value.restart().containActorModelReroute(fact)).toBe(true);
-      await value.restart().reconcile();
-      expect(value.authority.readActorAttempt(sourceAttempt.id))
-        .toEqual(sourceAttempt);
-      expect(value.authority.readActorIncarnation(sourceIncarnation.id))
-        .toEqual(sourceIncarnation);
-      expect(value.authority.readActorOperation(replacementOperationId))
-        .toEqual(replacementOperationBefore);
-      expect({
-        threadStarts: value.provider.threadStarts.length,
-        turnStarts: value.provider.turnStarts.length,
-        turnReconciliations: value.provider.turnReconciliations.length,
-        observations: value.provider.observations.length,
-      }).toEqual(providerCounts);
-    } finally {
-      value.database.close();
-    }
-  });
-
-  test("reconcile resumes post-admission quota failover after the source settlement", async () => {
+  test("legacy post-admission quotaRejected recovery converges without provider mutation", async () => {
     const value = fixture(2);
     try {
-      const spawned = await value.coordinator.spawn(
-        spawnInput("postadmission0002"),
-      );
-      const [sourceAttempt] = value.authority.listActorAttempts({
-        turnId: spawned.turn.turn.id,
-        limit: 16,
-      });
-      if (sourceAttempt?.providerTurnId === null ||
-        sourceAttempt?.providerTurnId === undefined) {
-        throw new Error("source attempt lacks its provider turn identity");
-      }
-      const sourceIncarnation = value.authority.readActorIncarnation(
-        sourceAttempt.incarnationId,
-      );
-      if (sourceIncarnation?.providerThreadId === null ||
-        sourceIncarnation?.providerThreadId === undefined) {
-        throw new Error("source attempt lacks its provider thread identity");
-      }
-      const event: PersistentActorTerminalObservation = {
-        accountProfileId: sourceAttempt.accountProfileId,
-        processGeneration: sourceAttempt.processGeneration,
-        providerThreadId: sourceIncarnation.providerThreadId,
-        providerTurnId: sourceAttempt.providerTurnId,
-        terminal: "failed",
-        resultValueId: null,
-        outcomeCode: "usage_limit_exceeded",
-        quotaProof: "provider_usage_limit_exceeded",
-        inputTokens: 21,
-        outputTokens: 8,
-        proof: proof("8", { phase: "observation" }),
-      };
-      await recordExactTerminalUsage(value, event);
-      const workspaceFailure = new Error("replacement workspace unavailable");
-      value.controls.workspaceFailure = workspaceFailure;
-
-      let observed: unknown = null;
-      try {
-        await value.coordinator.observeTerminal(event);
-      } catch (error: unknown) {
-        observed = error;
-      }
-
-      expect(observed).toBe(workspaceFailure);
-      expect(value.authority.readActorAttempt(sourceAttempt.id)).toMatchObject({
-        state: "quotaRejected",
-        providerTurnId: event.providerTurnId,
-        quotaProofDigest: event.proof.digest,
-        inputTokens: event.inputTokens,
-        outputTokens: event.outputTokens,
-      });
-      expect(value.authority.readActorTurn(spawned.turn.turn.id)).toMatchObject({
-        state: "reconciling",
-      });
-      expect(value.authority.readActiveIncarnationForActor(spawned.actor.id)).toBeNull();
-      expect(value.provider.threadStarts).toHaveLength(1);
-      expect(value.provider.turnStarts).toHaveLength(1);
-
-      value.controls.workspaceFailure = null;
-      const recovery = await value.coordinator.reconcile();
-
-      expect(recovery.inspectedTurns).toBe(1);
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-      expect(value.provider.threadStarts[1]).toMatchObject({
-        accountProfileId: value.accounts[1]!.accountProfileId,
-      });
-      expect(value.provider.turnStarts[1]?.continuation?.historyValueId)
-        .toMatch(/^ctxval_[A-Za-z0-9_-]+$/u);
-      expect(value.provider.turnStarts[1]?.continuation).toMatchObject({
-        sourceAttemptId: sourceAttempt.id,
-        sourceAccountProfileId: event.accountProfileId,
-        sourceProcessGeneration: event.processGeneration,
-        sourceProviderThreadId: sourceIncarnation.providerThreadId,
-        sourceProviderTurnId: event.providerTurnId,
-      });
-      expect(value.authority.readActorTurn(spawned.turn.turn.id)).toMatchObject({
-        state: "running",
-      });
-
-      await value.coordinator.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-    } finally {
-      value.database.close();
-    }
-  });
-
-  test("every post-admission quota crash cut resumes one continuation without duplicate effects", async () => {
-    const cuts = [
-      "quotaSettlement",
-      "turnReconciling",
-      "sourceClosed",
-      "beforeFailover",
-    ] as const;
-    for (const [index, cut] of cuts.entries()) {
-      const value = fixture(2);
-      try {
-        const quota = await preparePostAdmissionQuota(
-          value,
-          `quotacrashcut${String(index).padStart(2, "0")}`,
-        );
-        const injected = new Error(`injected crash at ${cut}`);
-        if (cut === "beforeFailover") {
-          value.controls.workspaceFailure = injected;
-        } else {
-          value.controls.crashAfterAuthorityStep = cut;
-        }
-
-        let observed: unknown = null;
-        try {
-          await value.coordinator.observeTerminal(quota.event);
-        } catch (error: unknown) {
-          observed = error;
-        }
-        expect(observed).toBeInstanceOf(Error);
-        expect(value.provider.threadStarts).toHaveLength(1);
-        expect(value.provider.turnStarts).toHaveLength(1);
-
-        value.controls.workspaceFailure = null;
-        value.controls.crashAfterAuthorityStep = null;
-        const restarted = value.restart();
-        await restarted.reconcile();
-
-        expect(value.authority.readActorAttempt(quota.attemptId)).toMatchObject({
-          state: "quotaRejected",
-          providerTurnId: quota.event.providerTurnId,
-          quotaProofDigest: quota.event.proof.digest,
-          inputTokens: quota.event.inputTokens,
-          outputTokens: quota.event.outputTokens,
-        });
-        expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
-          state: "running",
-        });
-        expect(value.provider.threadStarts).toHaveLength(2);
-        expect(value.provider.turnStarts).toHaveLength(2);
-        expect(value.provider.turnStarts.filter(
-          ({ continuation }) => continuation !== null,
-        )).toHaveLength(1);
-        expect(value.provider.turnStarts[1]?.continuation).toMatchObject({
-          sourceAttemptId: quota.attemptId,
-          sourceProviderTurnId: quota.event.providerTurnId,
-        });
-
-        await restarted.reconcile();
-        expect(value.provider.threadStarts).toHaveLength(2);
-        expect(value.provider.turnStarts).toHaveLength(2);
-        expect(value.provider.turnStarts.filter(
-          ({ continuation }) => continuation !== null,
-        )).toHaveLength(1);
-      } finally {
-        value.database.close();
-      }
-    }
-  });
-
-  test("restart terminalizes proven quota exhaustion but preserves temporary unavailability", async () => {
-    const exhausted = fixture(1);
-    try {
-      const quota = await preparePostAdmissionQuota(
-        exhausted,
-        "quotarestartexhausted",
-      );
-      exhausted.controls.crashAfterAuthorityStep = "quotaSettlement";
-      await expectRejectedMessage(
-        exhausted.coordinator.observeTerminal(quota.event),
-        "injected crash after quotaSettlement",
-      );
-      const restarted = exhausted.restart();
-      await restarted.reconcile();
-      expect(exhausted.authority.readActorTurn(quota.turnId)).toMatchObject({
-        state: "quotaRejected",
-        outcomeCode: "quota_exhausted",
-      });
-      expect(exhausted.authority.readActorResultForTurn(quota.turnId))
-        .toMatchObject({
-          terminalAttemptId: quota.attemptId,
-          outcome: "quotaRejected",
-        });
-      expect(exhausted.provider.threadStarts).toHaveLength(1);
-      expect(exhausted.provider.turnStarts).toHaveLength(1);
-      await restarted.reconcile();
-      expect(exhausted.provider.threadStarts).toHaveLength(1);
-      expect(exhausted.provider.turnStarts).toHaveLength(1);
-    } finally {
-      exhausted.database.close();
-    }
-
-    const pending = fixture(2);
-    try {
-      const quota = await preparePostAdmissionQuota(
-        pending,
-        "quotarestartpending",
-      );
-      const [source, successor] = pending.accounts;
-      pending.controls.accountCandidates.splice(0, Infinity, source!);
-      pending.controls.temporarilyUnavailableAccountProfileIds.push(
-        successor!.accountProfileId,
-      );
-      pending.controls.crashAfterAuthorityStep = "quotaSettlement";
-      await expectRejectedMessage(
-        pending.coordinator.observeTerminal(quota.event),
-        "injected crash after quotaSettlement",
-      );
-
-      const restarted = pending.restart();
-      const report = await restarted.reconcile();
-      expect(report.pending).toBeGreaterThanOrEqual(1);
-      expect(pending.authority.readActorTurn(quota.turnId)).toMatchObject({
-        state: "reconciling",
-      });
-      expect(pending.authority.readActorResultForTurn(quota.turnId)).toBeNull();
-      expect(pending.provider.threadStarts).toHaveLength(1);
-      expect(pending.provider.turnStarts).toHaveLength(1);
-
-      pending.controls.temporarilyUnavailableAccountProfileIds.length = 0;
-      pending.controls.accountCandidates.push(successor!);
-      await restarted.reconcile();
-      expect(pending.provider.threadStarts).toHaveLength(2);
-      expect(pending.provider.turnStarts).toHaveLength(2);
-      expect(pending.provider.turnStarts[1]?.continuation).toMatchObject({
-        sourceAttemptId: quota.attemptId,
-      });
-    } finally {
-      pending.database.close();
-    }
-  });
-
-  test("a quarantined quota source is contained before any target provider effect", async () => {
-    const value = fixture(2);
-    try {
-      const quota = await preparePostAdmissionQuota(
-        value,
-        "quotaquarantinesource",
-      );
+      const quota = await preparePostAdmissionQuota(value, "legacyquotarecover1");
       value.controls.crashAfterAuthorityStep = "quotaSettlement";
+
       await expectRejectedMessage(
         value.coordinator.observeTerminal(quota.event),
         "injected crash after quotaSettlement",
       );
-      const session = value.authority.readActorSessionBinding(
-        quota.incarnationId,
-      );
-      if (session === null) throw new Error("quota source session is missing");
-      value.authority.quarantineActorSessionBinding({
-        incarnationId: quota.incarnationId,
-        expectedRevision: session.revision,
-        reason: "provider_identity_mismatch",
-        now: at,
+
+      expect(value.authority.readActorAttempt(quota.attemptId)).toMatchObject({
+        state: "quotaRejected",
+        continuationHistoryValueId: null,
       });
-
-      await expectPersistentActorError(
-        value.restart().reconcile(),
-        "ambiguous_effect",
-      );
-
+      expect(value.authority.readActorResultForTurn(quota.turnId)).toBeNull();
       expect(value.provider.threadStarts).toHaveLength(1);
       expect(value.provider.turnStarts).toHaveLength(1);
+
+      const restarted = value.restart();
+      await restarted.reconcile();
       expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
         state: "quotaRejected",
-        outcomeCode: "quota_continuation_source_invalid",
+        outcomeCode: "quota_exhausted",
       });
       expect(value.authority.readActorResultForTurn(quota.turnId)).toMatchObject({
         terminalAttemptId: quota.attemptId,
         outcome: "quotaRejected",
       });
-      expect(value.authority.readActor(quota.actorId)).toMatchObject({
-        state: "quarantined",
-      });
-      expect(value.authority.readActorSessionBinding(quota.incarnationId))
-        .toMatchObject({
-          state: "quarantined",
-          quarantineReason: "provider_identity_mismatch",
-        });
+      expect(value.provider.threadStarts).toHaveLength(1);
+      expect(value.provider.turnStarts).toHaveLength(1);
+      expect(value.provider.turnReconciliations).toEqual([]);
+      expect(value.provider.observations).toEqual([]);
+
+      await restarted.reconcile();
+      expect(value.provider.threadStarts).toHaveLength(1);
+      expect(value.provider.turnStarts).toHaveLength(1);
     } finally {
       value.database.close();
     }
   });
 
-  test("contains a continuation source invalidated after replacement claim without live target state", async () => {
-    const value = fixture(2);
+  test("restart terminalizes a closed legacy quota source before external recovery", async () => {
+    let sessionReadinessCalls = 0;
+    const value = fixture(2, undefined, {
+      isActorSessionReady() {
+        sessionReadinessCalls += 1;
+        return true;
+      },
+    });
     try {
       const quota = await preparePostAdmissionQuota(
         value,
-        "quotasourcerace001",
+        "legacyclosedquotacrash",
       );
-      const replacementClaims: Readonly<{
-        attemptId: string;
-        incarnationId: string;
-      }>[] = [];
-      value.controls.afterAttemptClaim = (claim) => {
-        value.controls.afterAttemptClaim = null;
-        replacementClaims.push(claim);
-        value.controls.invalidSessionIncarnationId = quota.incarnationId;
-      };
+      seedLegacyClosedQuotaSource(value, quota, "closedquotacrash");
+      const callsBefore = externalCallCounts(value);
+      const readinessCallsBefore = sessionReadinessCalls;
 
-      let containmentFailure: unknown = null;
+      const restarted = value.restart();
+      await restarted.reconcile();
+
+      expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
+        state: "quotaRejected",
+        outcomeCode: "quota_exhausted",
+      });
+      expect(value.authority.readActorResultForTurn(quota.turnId)).toMatchObject({
+        terminalAttemptId: quota.attemptId,
+        outcome: "quotaRejected",
+      });
+      expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+      expect(externalCallCounts(value)).toEqual(callsBefore);
+
+      await restarted.reconcile();
+      expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+      expect(externalCallCounts(value)).toEqual(callsBefore);
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("restart fences legacy replacement actor-start crash cuts without external calls", async () => {
+    for (const operationState of ["prepared", "effectStarted"] as const) {
+      let sessionReadinessCalls = 0;
+      const value = fixture(2, undefined, {
+        isActorSessionReady() {
+          sessionReadinessCalls += 1;
+          return true;
+        },
+      });
       try {
-        await value.coordinator.observeTerminal(quota.event);
-      } catch (error: unknown) {
-        containmentFailure = error;
-      }
+        const quota = await preparePostAdmissionQuota(
+          value,
+          `legacyactorstart${operationState}`,
+        );
+        const replacement = seedLegacyQuotaActorStart(
+          value,
+          quota,
+          `actorstart${operationState}`,
+          operationState,
+        );
+        expect(value.authority.readActorOperation(replacement.operationId))
+          .toMatchObject({ state: operationState });
+        expect(value.authority.readActorIncarnation(replacement.incarnationId))
+          .toMatchObject({ state: "starting" });
+        const callsBefore = externalCallCounts(value);
+        const readinessCallsBefore = sessionReadinessCalls;
 
-      const replacement = replacementClaims[0];
-      if (replacement === undefined) {
-        throw new Error("replacement attempt was not claimed before containment");
-      }
-      const replacementAttemptId = replacement.attemptId;
-      const replacementIncarnationId = replacement.incarnationId;
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(1);
-      expect(value.authority.readActorAttempt(replacementAttemptId)).toMatchObject({
-        state: "interrupted",
-        providerTurnId: null,
-      });
-      expect(value.authority.readActorIncarnation(replacementIncarnationId))
-        .toMatchObject({ state: "quarantined" });
-      expect(value.authority.readActorSessionBinding(replacementIncarnationId))
-        .toMatchObject({
-          state: "quarantined",
-          quarantineReason: "recovery_protocol_error",
+        const restarted = value.restart();
+        const report = await restarted.reconcile();
+
+        expect(report.fenced).toBeGreaterThanOrEqual(1);
+        expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
+          state: "quotaRejected",
+          outcomeCode: "quota_continuation_source_invalid",
         });
-      expect(value.authority.readActiveIncarnationForActor(quota.actorId)).toBeNull();
-      expect(value.authority.listLiveActorAttempts({ limit: 16 })).toEqual([]);
-      expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
-        state: "quotaRejected",
-        outcomeCode: "quota_continuation_source_invalid",
-      });
-      expect(value.authority.readActor(quota.actorId)).toMatchObject({
-        state: "quarantined",
-      });
-      expect(containmentFailure).toBeInstanceOf(PersistentActorError);
-      expect(containmentFailure).toMatchObject({ code: "ambiguous_effect" });
+        expect(value.authority.readActorResultForTurn(quota.turnId)).toMatchObject({
+          terminalAttemptId: quota.attemptId,
+          outcome: "quotaRejected",
+        });
+        expect(value.authority.readActorIncarnation(replacement.incarnationId))
+          .toMatchObject({ state: "quarantined" });
+        expect(value.authority.readActor(quota.actorId))
+          .toMatchObject({ state: "quarantined" });
+        expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+        expect(externalCallCounts(value)).toEqual(callsBefore);
 
-      const restarted = value.restart();
-      await restarted.reconcile();
-      await restarted.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(1);
-      expect(value.authority.listLiveActorAttempts({ limit: 16 })).toEqual([]);
-      expect(value.authority.listLiveActorTurns({ limit: 16 })).toEqual([]);
-    } finally {
-      value.database.close();
+        await restarted.reconcile();
+        expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+        expect(externalCallCounts(value)).toEqual(callsBefore);
+      } finally {
+        value.database.close();
+      }
     }
   });
 
-  test("restart contains source invalidation after a pre-effect replacement claim crash", async () => {
-    const value = fixture(2);
+  test("restart fences a legacy started quota replacement before session or provider calls", async () => {
+    let sessionReadinessCalls = 0;
+    const value = fixture(2, undefined, {
+      isActorSessionReady() {
+        sessionReadinessCalls += 1;
+        return true;
+      },
+    });
     try {
       const quota = await preparePostAdmissionQuota(
         value,
-        "quotaclaimcrashrestart",
+        "legacystartedreplacement",
       );
-      const replacementClaims: Readonly<{
-        attemptId: string;
-        incarnationId: string;
-      }>[] = [];
-      value.controls.afterAttemptClaim = (claim) => {
-        value.controls.afterAttemptClaim = null;
-        replacementClaims.push(claim);
-        // Fail after the replacement claim has committed but before its turn
-        // effect can start. This leaves the same durable cut as a process crash
-        // without invalidating the still-valid quota source yet.
-        value.controls.invalidSessionIncarnationId = claim.incarnationId;
-      };
-
-      await expectPersistentActorError(
-        value.coordinator.observeTerminal(quota.event),
-        "conflict",
+      const replacement = await seedLegacyStartedQuotaReplacement(
+        value,
+        quota,
+        "startedreplacement",
       );
-      const replacement = replacementClaims[0];
-      if (replacement === undefined) {
-        throw new Error("replacement attempt was not claimed before the crash cut");
-      }
-      const replacementAttemptId = replacement.attemptId;
-      const replacementIncarnationId = replacement.incarnationId;
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(1);
-      expect(value.authority.readActorAttempt(replacementAttemptId)).toMatchObject({
-        state: "starting",
-        providerTurnId: null,
+      expect(value.authority.readActorAttempt(replacement.attemptId)).toMatchObject({
+        state: "running",
+        providerTurnId: replacement.providerTurnId,
       });
-      expect(value.authority.readActorIncarnation(replacementIncarnationId))
-        .toMatchObject({ state: "running" });
-      expect(value.authority.readActorSessionBinding(replacementIncarnationId))
-        .toMatchObject({ state: "bound" });
-
-      // The source becomes untrustworthy while the process is down. Recovery
-      // must contain the claimed replacement atomically before reconstructing
-      // or dispatching its request.
-      value.controls.invalidSessionIncarnationId = quota.incarnationId;
-      const restarted = value.restart();
-      await expectPersistentActorError(
-        restarted.reconcile(),
-        "ambiguous_effect",
-      );
-
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(1);
-      expect(value.authority.readActorAttempt(replacementAttemptId)).toMatchObject({
-        state: "interrupted",
-        providerTurnId: null,
-      });
-      expect(value.authority.readActorIncarnation(replacementIncarnationId))
-        .toMatchObject({ state: "quarantined" });
-      expect(value.authority.readActorSessionBinding(replacementIncarnationId))
-        .toMatchObject({
-          state: "quarantined",
-          quarantineReason: "recovery_protocol_error",
-        });
-      expect(value.authority.readActiveIncarnationForActor(quota.actorId)).toBeNull();
-      expect(value.authority.listLiveActorAttempts({ limit: 16 })).toEqual([]);
-      expect(value.authority.listLiveActorTurns({ limit: 16 })).toEqual([]);
       expect(value.authority.readActorTurn(quota.turnId)).toMatchObject({
-        state: "quotaRejected",
-        outcomeCode: "quota_continuation_source_invalid",
+        state: "reconciling",
       });
-      expect(value.authority.readActor(quota.actorId)).toMatchObject({
-        state: "quarantined",
+      const providerCallsBefore = Object.freeze({
+        threadStarts: value.provider.threadStarts.length,
+        threadReconciliations: value.provider.threadReconciliations.length,
+        turnStarts: value.provider.turnStarts.length,
+        turnReconciliations: value.provider.turnReconciliations.length,
+        fastCapacityReconciliations:
+          value.provider.fastCapacityReconciliations.length,
+        observations: value.provider.observations.length,
+        interrupts: value.provider.interrupts.length,
+        interruptReconciliations: value.provider.interruptReconciliations.length,
       });
+      const readinessCallsBefore = sessionReadinessCalls;
 
-      value.controls.invalidSessionIncarnationId = null;
-      await restarted.reconcile();
-      await restarted.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(1);
-      expect(value.authority.listLiveActorAttempts({ limit: 16 })).toEqual([]);
-      expect(value.authority.listLiveActorTurns({ limit: 16 })).toEqual([]);
-    } finally {
-      value.database.close();
-    }
-  });
-
-  test("restart fences source invalidation after the replacement provider effect", async () => {
-    const value = fixture(2);
-    try {
-      const quota = await preparePostAdmissionQuota(
-        value,
-        "quotaappliedsourcelost",
-      );
-      await value.coordinator.observeTerminal(quota.event);
-      const replacement = value.authority.listActorAttempts({
-        turnId: quota.turnId,
-        limit: 16,
-      }).find((attempt) => attempt.id !== quota.attemptId);
-      if (replacement?.providerTurnId === null ||
-        replacement?.providerTurnId === undefined) {
-        throw new Error("replacement provider effect was not durably applied");
-      }
-      const replacementIncarnation = value.authority.readActorIncarnation(
-        replacement.incarnationId,
-      );
-      if (replacementIncarnation === null) {
-        throw new Error("replacement incarnation is missing");
-      }
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-      expect(value.provider.observations).toHaveLength(0);
-
-      // Once the replacement provider turn exists, loss of its quota source
-      // can no longer be treated as an effect-free containment. Recovery must
-      // make the possibly-running provider effect visible as ambiguous.
-      value.controls.invalidSessionIncarnationId = quota.incarnationId;
       const restarted = value.restart();
       const report = await restarted.reconcile();
 
       expect(report.fenced).toBeGreaterThanOrEqual(1);
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-      expect(value.provider.observations).toHaveLength(0);
-      expect(value.authority.readActorAttempt(replacement.id)).toMatchObject({
+      expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+      expect({
+        threadStarts: value.provider.threadStarts.length,
+        threadReconciliations: value.provider.threadReconciliations.length,
+        turnStarts: value.provider.turnStarts.length,
+        turnReconciliations: value.provider.turnReconciliations.length,
+        fastCapacityReconciliations:
+          value.provider.fastCapacityReconciliations.length,
+        observations: value.provider.observations.length,
+        interrupts: value.provider.interrupts.length,
+        interruptReconciliations: value.provider.interruptReconciliations.length,
+      }).toEqual(providerCallsBefore);
+      expect(value.authority.readActorAttempt(replacement.attemptId)).toMatchObject({
         state: "ambiguous",
         providerTurnId: replacement.providerTurnId,
       });
@@ -4503,25 +4192,30 @@ describe("PersistentActorCoordinator", () => {
           state: "quarantined",
           quarantineReason: "recovery_protocol_error",
         });
-      expect(value.authority.readActiveIncarnationForActor(quota.actorId)).toBeNull();
       expect(value.authority.readActor(quota.actorId)).toMatchObject({
         state: "quarantined",
       });
-      expect(value.authority.listLiveActorAttempts({ limit: 16 })).toEqual([]);
-      expect(value.authority.listLiveActorTurns({ limit: 16 })).toEqual([]);
 
-      value.controls.invalidSessionIncarnationId = null;
       await restarted.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(2);
-      expect(value.provider.turnStarts).toHaveLength(2);
-      expect(value.provider.observations).toHaveLength(0);
+      expect(sessionReadinessCalls).toBe(readinessCallsBefore);
+      expect({
+        threadStarts: value.provider.threadStarts.length,
+        threadReconciliations: value.provider.threadReconciliations.length,
+        turnStarts: value.provider.turnStarts.length,
+        turnReconciliations: value.provider.turnReconciliations.length,
+        fastCapacityReconciliations:
+          value.provider.fastCapacityReconciliations.length,
+        observations: value.provider.observations.length,
+        interrupts: value.provider.interrupts.length,
+        interruptReconciliations: value.provider.interruptReconciliations.length,
+      }).toEqual(providerCallsBefore);
     } finally {
       value.database.close();
     }
   });
 
-  test("post-admission quota exhaustion terminalizes only the logical turn", async () => {
-    const value = fixture(1);
+  test("post-admission quota terminalizes without history capture or replacement effects", async () => {
+    const value = fixture(2);
     try {
       const spawned = await value.coordinator.spawn(
         spawnInput("postadmission0003"),
@@ -4585,7 +4279,7 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
-  test("preserves the account adapter's health and selection rank", async () => {
+  test("uses the account adapter's pre-turn selection rank exactly once", async () => {
     const rankedAccounts = [
       { accountProfileId: "acct_selected_healthy_z", processGeneration: 7 },
       { accountProfileId: "acct_healthy_a", processGeneration: 5 },
@@ -4604,17 +4298,17 @@ describe("PersistentActorCoordinator", () => {
 
       const spawned = await value.coordinator.spawn(spawnInput("0000000000000067"));
 
-      expect(spawned.turn.turn.state).toBe("running");
+      expect(spawned.turn.turn.state).toBe("quotaRejected");
       expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual(rankedAccounts.map(({ accountProfileId }) => accountProfileId));
+        .toEqual([rankedAccounts[0].accountProfileId]);
       expect(value.provider.turnStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual(rankedAccounts.map(({ accountProfileId }) => accountProfileId));
+        .toEqual([rankedAccounts[0].accountProfileId]);
     } finally {
       value.database.close();
     }
   });
 
-  test("all-account quota exhaustion terminalizes only the turn", async () => {
+  test("the first definitive turn quota rejection terminalizes only the turn", async () => {
     const value = fixture();
     try {
       for (const account of value.accounts) {
@@ -4643,7 +4337,7 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
-  test("all thread admissions rejecting quota settle an effect-free turn exactly once", async () => {
+  test("the first thread-admission quota rejection settles effect-free exactly once", async () => {
     const value = fixture(2);
     try {
       for (const account of value.accounts) {
@@ -4660,14 +4354,14 @@ describe("PersistentActorCoordinator", () => {
 
       expect(spawned.turn.turn).toMatchObject({
         state: "quotaRejected",
-        outcomeCode: "quota_exhausted_before_actor_start",
+        outcomeCode: "quota_rejected_before_actor_start",
       });
       expect(spawned.turn.result).toMatchObject({
         terminalAttemptId: null,
         outcome: "quotaRejected",
       });
       expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
-        .toEqual(value.accounts.map(({ accountProfileId }) => accountProfileId));
+        .toEqual([value.accounts[0]!.accountProfileId]);
       expect(value.provider.turnStarts).toEqual([]);
       expect(value.authority.listActorAttempts({
         turnId: spawned.turn.turn.id,
@@ -4679,7 +4373,7 @@ describe("PersistentActorCoordinator", () => {
       const restarted = value.restart();
       await restarted.reconcile();
       await restarted.reconcile();
-      expect(value.provider.threadStarts).toHaveLength(value.accounts.length);
+      expect(value.provider.threadStarts).toHaveLength(1);
       expect(value.provider.turnStarts).toEqual([]);
       expect(value.authority.listLiveActorTurns({ limit: 16 })).toEqual([]);
     } finally {
@@ -6174,7 +5868,7 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
-  test("quota-prefix failover and replay are deterministic for arbitrary eligible sets", async () => {
+  test("quota rejection and idempotent replay never advance beyond the pre-turn route", async () => {
     await assertAsyncProperty(fc.asyncProperty(
       fc.integer({ min: 0, max: 4 }),
       fc.integer({ min: 1, max: 4 }),
@@ -6208,15 +5902,19 @@ describe("PersistentActorCoordinator", () => {
             expect(replay.actor.id).toBe(first.actor.id);
             expect(replay.turn.turn.id).toBe(first.turn.turn.id);
           }
-          const expectedAccounts = value.accounts.slice(0, quotaPrefix + 1)
-            .map(({ accountProfileId }) => accountProfileId);
+          const expectedAccounts = [value.accounts[0]!.accountProfileId];
           expect(value.provider.threadStarts.map(({ accountProfileId }) => accountProfileId))
             .toEqual(expectedAccounts);
           expect(value.provider.turnStarts.map(({ accountProfileId }) => accountProfileId))
             .toEqual(expectedAccounts);
           expect(value.authority.readActor(first.actor.id)?.state).toBe("active");
-          expect(value.authority.readActiveIncarnationForActor(first.actor.id))
-            .toMatchObject({ accountProfileId: expectedAccounts.at(-1) });
+          if (quotaPrefix === 0) {
+            expect(value.authority.readActiveIncarnationForActor(first.actor.id))
+              .toMatchObject({ accountProfileId: expectedAccounts[0] });
+          } else {
+            expect(first.turn.turn.state).toBe("quotaRejected");
+            expect(value.authority.readActiveIncarnationForActor(first.actor.id)).toBeNull();
+          }
         } finally {
           value.database.close();
         }

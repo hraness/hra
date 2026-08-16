@@ -7,11 +7,13 @@
 - `dev-protocol.ts` and `dev-supervisor.ts` – localhost ownership, readiness, launch ordering, environment scrubbing, and bounded process cleanup.
 - `run-zig.ts` and `zig-toolchain.ts` – shared Zig launch and deterministic executable discovery for native commands.
 - `verify-runtime-pins.ts` and `runtime-versions.json` – portable package metadata checks and explicit Apple Silicon runtime hashes.
+- `shipped-javascript-licenses.ts` – fail-closed, overinclusive production dependency inventory with nested license text and reviewed package exceptions.
 - `generate-codex-schema.ts` – pinned Codex schema generation and checked-source verification.
 - `frontend-package-integrity.ts` and `prepare-package-output.ts` – deterministic frontend asset validation used by the native build graph.
+- `package-macos.ts`, `verify-macos-package.ts`, `create-dmg.ts`, and `corresponding-sources.ts` – credential-free runtime staging, inside-out ad-hoc signing, package verification, DMG assembly, and full-commit GPL/LGPL source archives.
 - `control-plane-maintenance.ts` – app-stopped health checks plus encrypted backup, inspection, verification, and restore.
 - `reactive-baseline.ts` – the owned gateway, projection, SQLite, Direct bridge, React, containment, and cleanup baseline.
-- `THIRD_PARTY_NOTICES.md` and adjacent license texts – notices for the pinned runtimes used by desktop builds.
+- `THIRD_PARTY_NOTICES.md` and adjacent license texts – exact notices and provenance for pinned Bun, Codex, ripgrep, Git, Git LFS, Git Credential Manager, JavaScript, and asset runtimes.
 
 # Guidelines
 
@@ -24,4 +26,7 @@
 - Page immutable snapshots that exceed Native's response limit. Replace oversized recoverable events with `snapshot.invalidated`; never discard terminal or human-in-the-loop events to make them fit.
 - Keep the gateway as the semantic proxy. Native owns launch, lifecycle, trusted directory selection, and transport plumbing.
 - Recovery-only local-data removal startup may resume only its strict recovery state machine. It must not open normal application writers.
-- Keep release signing, notarization, official artifact verification, provider writes, and publication code outside the public source workspace.
+- Keep Developer ID signing, notarization, provider writes, and publication code outside the public source workspace. Ad-hoc packaging must remain credential-free, preserve trusted upstream signatures, sign HRA code inside-out, and keep Sparkle disabled.
+- Inventory the installed frontend and gateway production dependency closure, including nested license files. Fail packaging on missing identity, version, license metadata, text, unexpected file types, UTF-8 BOMs, or hash drift; every defective upstream tarball needs an exact version-bound reviewed exception and provenance.
+- Inventory Bun and Codex native closures separately from JavaScript. Bind every shipped Codex payload, target Cargo package, source-built native component, Bun build input, and locked Cargo package to exact license documents. Make missing upstream documents explicit with reviewed, identity-bound evidence; never invent attribution.
+- Treat Bun/WebKit and Git/Dugite Native corresponding source as release-blocking. The Bun archive must include every pinned native build input, nested Git source, downloaded header archive, and locked Cargo package. Bind upstream commits, exact declarations, archive roots, safe entry types and symlink targets, license/build sentinels, bytes, and SHA-256 evidence. Never publish the native DMG without all four source archives beside it.

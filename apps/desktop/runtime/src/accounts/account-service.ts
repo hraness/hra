@@ -641,8 +641,8 @@ export class AccountService {
     const refreshes = candidates.flatMap((candidate) => {
       // Usage telemetry is advisory. Never queue another refresh behind an
       // unrelated sign-in, removal, or already-running refresh for the same
-      // account; its cached candidate remains eligible for exact provider
-      // admission and definitive quota failover.
+      // account; its cached candidate remains eligible for pre-effect provider
+      // admission. A later provider quota rejection never triggers rerouting.
       if (this.#mutationTails.has(candidate.id)) return [];
       return [this.#serialize(candidate.id, async () => {
         const profile = this.#requireActive(candidate.id);

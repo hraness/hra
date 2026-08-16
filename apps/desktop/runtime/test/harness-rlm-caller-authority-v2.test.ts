@@ -39,8 +39,7 @@ const programDigest = "a".repeat(64);
 const witnessA = "b".repeat(64);
 const witnessB = "c".repeat(64);
 const releaseDigest = "d".repeat(64);
-const firstAccountId = "acct_caller_authority_01";
-const nextAccountId = "acct_caller_authority_02";
+const quotaAccountId = "acct_caller_quota_cut_01";
 
 const caller = parseRlmV2Caller({
   epochId,
@@ -217,125 +216,22 @@ function operationContext(
   };
 }
 
-function seedQuotaFailoverWindow(
-  database: Database,
-  options: Readonly<{
-    successorAccountId?: string;
-    successorState?: "starting" | "running";
-  }> = {},
-): void {
-  for (const [profileId, selected] of [
-    [firstAccountId, 1],
-    [nextAccountId, 0],
-  ] as const) {
-    database.query(`
-      INSERT INTO account_profiles (
-        profile_id, label, auth_state, process_generation,
-        selected, created_at, updated_at
-      ) VALUES (?1, ?1, 'signed_in', 1, ?2, ?3, ?3)
-    `).run(profileId, selected, at);
-  }
+function seedQuotaRejectedAttemptCrashCut(database: Database): void {
   database.query(`
-    INSERT INTO harness_context_values (
-      value_id, operation_id, epoch_id, owner_actor_id, source_turn_id,
-      kind, purpose, schema_version, name_digest, utf8_bytes,
-      content_digest, chunk_size, chunk_count, manifest_digest,
-      manifest_byte_length, quota_limit_bytes, state, recovery_reason,
-      revision, created_at, updated_at, effect_started_at, activated_at
-    ) VALUES (
-      'ctxval_callercontinuation01', 'callercontinuationoperation1',
-      ?1, ?2, ?3, 'selection', 'completedPrefix', 1, NULL, 2,
-      ?4, 65536, 1, ?4, 64, 16777216, 'active', NULL, 3,
-      ?5, ?5, ?5, ?5
-    )
-  `).run(epochId, actorId, turnId, witnessB, later);
-  database.query(`
-    INSERT INTO harness_context_value_chunks (
-      value_id, ordinal, plaintext_bytes, object_digest, object_byte_length
-    ) VALUES ('ctxval_callercontinuation01', 0, 2, ?1, 64)
-  `).run(witnessB);
-  insertIncarnation(database, {
-    accountProfileId: firstAccountId,
-    incarnationId: "hincarnation_callerquota01",
-    operationId: "hoperation_callerquota001",
-    ordinal: 1,
-    providerThreadId: "provider-thread-caller-quota-1",
-    state: "closed",
-  });
-  database.query(`
-    INSERT INTO harness_actor_turn_attempts (
-      attempt_id, turn_id, incarnation_id, ordinal, account_profile_id,
-      process_generation, client_user_message_id, provider_turn_id,
-      state, quota_proof_digest, input_tokens, output_tokens,
-      created_at, started_at, settled_at
-    ) VALUES (
-      'hattempt_callerquota001', ?1, 'hincarnation_callerquota01',
-      1, ?2, 1, 'client-message-caller-quota-01',
-      'provider-turn-caller-quota-1', 'running', NULL, NULL, NULL,
-      ?3, ?3, NULL
-    )
-  `).run(turnId, firstAccountId, later);
-  database.query(`
-    UPDATE harness_actor_turn_attempts
-    SET continuation_history_value_id = 'ctxval_callercontinuation01'
-    WHERE attempt_id = 'hattempt_callerquota001'
-  `).run();
-  database.query(`
-    UPDATE harness_actor_turn_attempts
-    SET state = 'quotaRejected', quota_proof_digest = ?2, settled_at = ?3
-    WHERE attempt_id = ?1
-  `).run("hattempt_callerquota001", witnessA, laterStill);
-
-  if (options.successorState !== undefined) {
-    const successorAccountId = options.successorAccountId ?? nextAccountId;
-    insertIncarnation(database, {
-      accountProfileId: successorAccountId,
-      incarnationId: "hincarnation_callernext001",
-      operationId: "hoperation_callernext0001",
-      ordinal: 2,
-      providerThreadId: "provider-thread-caller-quota-2",
-      state: "running",
-    });
-    database.query(`
-      INSERT INTO harness_actor_turn_attempts (
-        attempt_id, turn_id, incarnation_id, ordinal, account_profile_id,
-        process_generation, client_user_message_id, provider_turn_id,
-        state, quota_proof_digest, input_tokens, output_tokens,
-        created_at, started_at, settled_at
-      ) VALUES (
-        'hattempt_callernext0001', ?1, 'hincarnation_callernext001',
-        2, ?2, 1, 'client-message-caller-quota-02',
-        CASE WHEN ?3 = 'running' THEN 'provider-turn-caller-quota-2' ELSE NULL END,
-        ?3, NULL, NULL, NULL, ?4,
-        CASE WHEN ?3 = 'running' THEN ?4 ELSE NULL END, NULL
-      )
-    `).run(turnId, successorAccountId, options.successorState, laterStill);
-  }
-  database.query(`
-    UPDATE harness_actor_turns
-    SET state = 'reconciling', revision = revision + 1
-    WHERE turn_id = ?1
-  `).run(turnId);
-}
-
-function insertIncarnation(
-  database: Database,
-  input: Readonly<{
-    accountProfileId: string;
-    incarnationId: string;
-    operationId: string;
-    ordinal: number;
-    providerThreadId: string;
-    state: "closed" | "running";
-  }>,
-): void {
+    INSERT INTO account_profiles (
+      profile_id, label, auth_state, process_generation,
+      selected, created_at, updated_at
+    ) VALUES (?1, ?1, 'signed_in', 1, 1, ?2, ?2)
+  `).run(quotaAccountId, at);
   database.query(`
     INSERT INTO harness_actor_operations (
       operation_id, actor_id, turn_id, kind, request_digest, effect_key,
       state, provider_identity_json, created_at, updated_at, settled_at
-    ) VALUES (?1, ?2, NULL, 'actorStart', ?3, ?4, 'succeeded', '{}',
-      ?5, ?5, ?5)
-  `).run(input.operationId, actorId, witnessA, witnessB, later);
+    ) VALUES (
+      'hoperation_callerquotacut01', ?1, NULL, 'actorStart', ?2, ?3,
+      'succeeded', '{}', ?4, ?4, ?4
+    )
+  `).run(actorId, witnessA, witnessB, later);
   database.query(`
     INSERT INTO harness_actor_incarnations (
       incarnation_id, actor_id, ordinal, account_profile_id,
@@ -344,22 +240,31 @@ function insertIncarnation(
       created_at, updated_at, closed_at,
       token_usage_observation_generation
     ) VALUES (
-      ?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10,
-      ?11, ?11, CASE WHEN ?10 = 'closed' THEN ?11 ELSE NULL END, 1
+      'hincarnation_callerquotacut01', ?1, 1, ?2, 1,
+      'hoperation_callerquotacut01', 'client-request-caller-quota-cut-01',
+      'oprte:caller-authority:quota-cut', 'provider-thread-caller-quota-cut',
+      ?3, 'closed', ?4, ?4, ?4, 1
     )
-  `).run(
-    input.incarnationId,
-    actorId,
-    input.ordinal,
-    input.accountProfileId,
-    input.operationId,
-    `client-request-caller-${input.ordinal.toString().padStart(8, "0")}`,
-    `oprte:caller-authority:incarnation:${input.ordinal}`,
-    input.providerThreadId,
-    releaseDigest,
-    input.state,
-    later,
-  );
+  `).run(actorId, quotaAccountId, releaseDigest, later);
+  database.query(`
+    INSERT INTO harness_actor_turn_attempts (
+      attempt_id, turn_id, incarnation_id, ordinal, account_profile_id,
+      process_generation, client_user_message_id, provider_turn_id,
+      state, quota_proof_digest, input_tokens, output_tokens,
+      created_at, started_at, settled_at
+    ) VALUES (
+      'hattempt_callerquotacut01', ?1,
+      'hincarnation_callerquotacut01', 1, ?2, 1,
+      'client-message-caller-quota-cut-01',
+      'provider-turn-caller-quota-cut', 'running', NULL, NULL, NULL,
+      ?3, ?3, NULL
+    )
+  `).run(turnId, quotaAccountId, later);
+  database.query(`
+    UPDATE harness_actor_turn_attempts
+    SET state = 'quotaRejected', quota_proof_digest = ?2, settled_at = ?3
+    WHERE attempt_id = ?1
+  `).run("hattempt_callerquotacut01", witnessA, laterStill);
 }
 
 async function expectAuthorityError(
@@ -429,10 +334,13 @@ describe("RLM v2 durable caller authority", () => {
     }
   });
 
-  test("revalidates each existing-run operation across an exact quota handoff", async () => {
+  test("revokes every provider-adjacent operation while its origin turn reconciles", async () => {
     const value = fixture();
     try {
-      seedQuotaFailoverWindow(value.database, { successorState: "starting" });
+      value.database.query(`
+        UPDATE harness_actor_turns SET state = 'reconciling'
+        WHERE turn_id = ?1
+      `).run(turnId);
       const invokedReceipts: string[] = [];
       const unused = () => Promise.reject(new Error("unused test port"));
       const router = new RlmV2OperationRouter({
@@ -455,111 +363,59 @@ describe("RLM v2 durable caller authority", () => {
         actorResults: { transfer: unused },
         proposals: { propose: unused },
       });
-      const duringFailover = operationContext(value.run, [["step", 0]]);
-      expect(await router.invoke("context.snapshot", {}, duringFailover))
-        .toEqual({ ok: true });
-
-      value.database.query(`
-        UPDATE harness_actor_turn_attempts
-        SET state = 'running', provider_turn_id = ?2, started_at = ?3
-        WHERE attempt_id = ?1 AND state = 'starting'
-      `).run(
-        "hattempt_callernext0001",
-        "provider-turn-caller-quota-2",
-        laterStill,
+      await expectAuthorityError(
+        router.invoke("context.snapshot", {}, operationContext(value.run)),
+        "revoked",
       );
-      value.database.query(`
-        UPDATE harness_actor_turn_attempts
-        SET state = 'completed', settled_at = ?2
-        WHERE attempt_id = ?1 AND state = 'running'
-      `).run("hattempt_callernext0001", laterStill);
-      value.database.query(`
-        UPDATE harness_actor_turns
-        SET state = 'succeeded', revision = revision + 1,
-          settled_at = ?2, outcome_code = 'completed'
-        WHERE turn_id = ?1 AND state = 'reconciling'
-      `).run(turnId, laterStill);
-      const afterSuccess = operationContext(value.run, [["step", 1]]);
-      expect(await router.invoke("context.snapshot", {}, afterSuccess))
-        .toEqual({ ok: true });
-
-      expect(invokedReceipts).toEqual([
-        duringFailover.receiptId,
-        afterSuccess.receiptId,
-      ]);
-      expect(new Set(invokedReceipts).size).toBe(2);
-      expect(value.database.query<{ count: number }, []>(`
-        SELECT COUNT(*) AS count FROM harness_program_runs
-      `).get()?.count).toBe(1);
+      expect(invokedReceipts).toEqual([]);
     } finally {
       value.database.close();
     }
   });
 
-  test("fails closed for reconciling turns without exact quota-handoff lineage", async () => {
-    const absent = fixture();
+  test("revokes the quota-settlement crash cut before the turn row reconciles", async () => {
+    const value = fixture();
     try {
-      absent.database.query(`
-        UPDATE harness_actor_turns SET state = 'reconciling'
-        WHERE turn_id = ?1
-      `).run(turnId);
-      await expectAuthorityError(
-        absent.adapter.resolve(operationContext(absent.run)),
-        "revoked",
-      );
-    } finally {
-      absent.database.close();
-    }
+      seedQuotaRejectedAttemptCrashCut(value.database);
+      expect(value.database.query<{ state: string }, [string]>(`
+        SELECT state FROM harness_actor_turns WHERE turn_id = ?1
+      `).get(turnId)).toEqual({ state: "running" });
+      expect(value.database.query<{ state: string }, []>(`
+        SELECT state FROM harness_actor_turn_attempts
+        WHERE attempt_id = 'hattempt_callerquotacut01'
+      `).get()).toEqual({ state: "quotaRejected" });
 
-    const revisited = fixture();
-    try {
-      seedQuotaFailoverWindow(revisited.database, {
-        successorAccountId: firstAccountId,
-        successorState: "starting",
+      await expectAuthorityError(value.adapter.resolveCaller(value.run), "revoked");
+
+      const invokedReceipts: string[] = [];
+      const unused = () => Promise.reject(new Error("unused test port"));
+      const router = new RlmV2OperationRouter({
+        bindings: value.adapter,
+        context: {
+          invoke(_operation, _argumentsValue, input) {
+            invokedReceipts.push(input.receiptId);
+            return Promise.resolve({ ok: true });
+          },
+        },
+        actors: {
+          spawn: unused,
+          send: unused,
+          status: unused,
+          waitAny: unused,
+          waitAll: unused,
+          result: unused,
+          cancel: unused,
+        },
+        actorResults: { transfer: unused },
+        proposals: { propose: unused },
       });
       await expectAuthorityError(
-        revisited.adapter.resolve(operationContext(revisited.run)),
+        router.invoke("context.snapshot", {}, operationContext(value.run)),
         "revoked",
       );
+      expect(invokedReceipts).toEqual([]);
     } finally {
-      revisited.database.close();
-    }
-
-    const incompatible = fixture();
-    try {
-      seedQuotaFailoverWindow(incompatible.database, {
-        successorState: "running",
-      });
-      incompatible.database.query(`
-        UPDATE harness_actor_turn_attempts
-        SET state = 'failed', settled_at = ?2
-        WHERE attempt_id = ?1
-      `).run("hattempt_callernext0001", laterStill);
-      await expectAuthorityError(
-        incompatible.adapter.resolve(operationContext(incompatible.run)),
-        "revoked",
-      );
-    } finally {
-      incompatible.database.close();
-    }
-
-    const missingHistory = fixture();
-    try {
-      seedQuotaFailoverWindow(missingHistory.database, {
-        successorState: "starting",
-      });
-      missingHistory.database.query(`
-        UPDATE harness_context_values SET state = 'recoveryRequired',
-          recovery_reason = 'ciphertext_invalid', activated_at = NULL,
-          revision = revision + 1, updated_at = ?2
-        WHERE value_id = ?1
-      `).run("ctxval_callercontinuation01", laterStill);
-      await expectAuthorityError(
-        missingHistory.adapter.resolve(operationContext(missingHistory.run)),
-        "revoked",
-      );
-    } finally {
-      missingHistory.database.close();
+      value.database.close();
     }
   });
 

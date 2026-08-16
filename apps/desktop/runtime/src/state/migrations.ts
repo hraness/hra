@@ -3298,4 +3298,19 @@ export const migrations = [
       END;
     `,
   },
+  {
+    version: 43,
+    name: "terminalize-provider-quota-without-history-replay",
+    sql: `
+      DROP TRIGGER harness_actor_turn_attempt_continuation_terminal_guard;
+
+      CREATE TRIGGER harness_actor_turn_attempt_continuation_terminal_guard
+      BEFORE UPDATE OF state ON harness_actor_turn_attempts
+      WHEN NEW.continuation_history_value_id IS NOT NULL
+        AND NEW.state IN ('completed', 'failed', 'interrupted', 'ambiguous')
+      BEGIN
+        SELECT RAISE(ABORT, 'actor continuation history terminal state is incoherent');
+      END;
+    `,
+  },
 ] as const satisfies readonly Migration[];

@@ -2,6 +2,7 @@ import { authkitProxy } from "@workos-inc/authkit-nextjs";
 import type { NextFetchEvent, NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
+import { isHraPublicComparisonPath } from "./app/alternatives/slugs";
 import { isWorkOSEnvironmentConfigured } from "./app/workos-configuration";
 
 const configuredProxy = authkitProxy();
@@ -31,6 +32,7 @@ function isPathAtOrBelow(pathname: string, root: string): boolean {
 
 export function shouldApplyConfiguredAuthProxy(pathname: string): boolean {
   return !AUTH_PROXY_EXCLUDED_EXACT_PATHS.has(pathname)
+    && !isHraPublicComparisonPath(pathname)
     && !AUTH_PROXY_EXCLUDED_PATH_TREES.some((root) =>
       isPathAtOrBelow(pathname, root));
 }

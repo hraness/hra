@@ -1,6 +1,16 @@
 {
   "schemaVersion": 1,
   "minimumMacOS": "13.0",
+  "bun": {
+    "version": "1.3.14",
+    "sourceCommit": "0d9b296af33f2b851fcbf4df3e9ec89751734ba4",
+    "releaseAsset": "bun-darwin-aarch64.zip",
+    "releaseAssetSha256": "d8b96221828ad6f97ac7ac0ab7e95872341af763001e8803e8267652c2652620",
+    "binarySha256": "e0c90ec15d33363e6b70713d56bc3b2c7585c17f40a0fe0f8fd9305901d4e233",
+    "completeSourceArchiveSha256": "3c349132dee8226d33ec169062064e66cc292a1bcb05ccb19fed84f435eac529",
+    "dependencyLicenseInventorySha256": "507345b2eac69d57d8298c0db01a6e6cab40c5f864cfbc0d25f36a09bb13e578",
+    "dependencyLicenseNoticesSha256": "2040901aab37516e398fb21fa90646920700a9db66926b6ce7a72228699cd589"
+  },
   "codex": {
     "package": "@openai/codex",
     "version": "0.144.6",
@@ -8,7 +18,10 @@
     "platformPackage": "@openai/codex-darwin-arm64",
     "platformIntegrity": "sha512-6zgvh70MzBNSeT17HEhSOrmmGGZGAKzSC7x6JAq+edkJkdPYA9P0I1tG7aJ49GlBkBxuC+MKBH1qm6+2Cghcww==",
     "target": "aarch64-apple-darwin",
-    "binarySha256": "80a3933d11a9d13ef806aa24f7bb8afc9169cfe4e9b09d6da6a92922cbde9cff"
+    "binarySha256": "80a3933d11a9d13ef806aa24f7bb8afc9169cfe4e9b09d6da6a92922cbde9cff",
+    "sourceCommit": "5d1fbf26c43abc65a203928b2e31561cb039e06d",
+    "dependencyLicenseInventorySha256": "7d7bae53e8b3c9bde29294caa138c9652fdf00cce9d91cc07c7a35d75b6ca5bd",
+    "dependencyLicenseNoticesSha256": "b992bd0bd3cb5a516a98bde525cafdfa333cbdc6fcffa1c4cda3ecf5b3982e34"
   },
   "git": {
     "providerPackage": "dugite",
@@ -19,5 +32,41 @@
     "asset": "dugite-native-v2.53.0-f49d009-macOS-arm64.tar.gz",
     "assetSha256": "e561cfc80c755e6f3e938653e81efcd025c9827a5b76dd42778b1159b3fab437",
     "binarySha256": "ee73b116cc37f44ecdaa9e3fdfbc25ce827675859f5f966ec671112fd5caf074"
+  },
+  "gitLfs": {
+    "version": "3.7.1",
+    "sourceCommit": "b84b33847fe6458f36ef521534dc0eac953cb379",
+    "versionOutput": "git-lfs/3.7.1 (GitHub; darwin arm64; go 1.25.1; git b84b3384)",
+    "binarySha256": "48bb6497160105ef852044da75147acee19502efd5f164b9a4429c3a60be7d4a",
+    "licenseSha256": "4fae9062ab5cdd5fb15486b728534d8aded8b4ae9d84b6d66a956f5162c366b6"
+  },
+  "gitCredentialManager": {
+    "version": "2.7.3",
+    "sourceCommit": "5fa7116896c82164996a609accd1c5ad90fe730a",
+    "versionOutput": "2.7.3+5fa7116896c82164996a609accd1c5ad90fe730a",
+    "binarySha256": "312ee623fc8ac8946db49effd5e67532439415c4958692df3e7870138358cf8a",
+    "licenseSha256": "b47f1a8a744ecdc7a3da35804f88552805d33f51a726b87a2105acdfae406b07",
+    "noticeSha256": "f573f5d21d5d8a054aad1ffcbe0165391a4d93a5aa3e23c3db0752759adfd50c",
+    "officialAssetSha256": "7051a5e953bcd37a182330a0f18bc6842c4cac143b537f8c49a8c5906d335c80",
+    "depsJsonSha256": "6f76c87e5b3600f4ceea4ce67e312504ab5933c750fb665cc489fcb751b7ada9",
+    "runtimeConfigSha256": "8c52de784a65b3984659fff01d9c7c72d15f4f6129200e33aad57591e7931ac1",
+    "dependencyLicenseInventorySha256": "68eb5f5e555987b2a8637055a364743989c8da7cd188432c0f1f605ca72acec1",
+    "dependencyLicenseNoticesSha256": "58b92f2d423e170e0d49950855cd8c5145bf11ede028a0be849d48374a846c50",
+    "dotnetRuntimeVersion": "8.0.24",
+    "dotnetRuntimeSourceCommit": "b3b35ce80e9eb94f72c4aa36a171a5e1cde72ace"
+  },
+  "ripgrep": {
+    "version": "15.1.0",
+    "sourceCommit": "af60c2de9d85e7f3d81c78601669468cf02dabab",
+    "versionOutput": "ripgrep 15.1.0 (rev af60c2de9d)\n\nfeatures:+pcre2\nsimd(compile):+NEON\nsimd(runtime):+NEON\n\nPCRE2 10.45 is available (JIT is available)",
+    "binarySha256": "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94",
+    "copyingSha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+    "licenseMitSha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+    "unlicenseSha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+    "pcre2": {
+      "version": "10.45",
+      "sourceCommit": "2dce7761b1831fd3f82a9c2bd5476259d945da4d",
+      "licenseSha256": "9cf7ac6976099a1d856826d3ef1b093bd6b84489dc6100628ac79e740cf9885a"
+    }
   }
 }

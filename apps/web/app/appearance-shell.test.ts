@@ -19,12 +19,14 @@ describe("HRA shared appearance and shell contract", () => {
     expect(providers).toContain("<DesignKitRouterProvider");
   });
 
-  test("keeps only the landing and exact download page outside hosted auth providers", async () => {
+  test("keeps the public editorial routes outside hosted auth providers", async () => {
     const providers = await source("./providers.tsx");
 
     expect(providers).toContain('pathname === "/"');
     expect(providers).toContain('pathname === "/download"');
     expect(providers).toContain('pathname === "/download/"');
+    expect(providers).toContain("isHraPublicComparisonPath(pathname)");
+    expect(providers).not.toContain('pathname.startsWith("/alternatives/")');
     expect(providers).toContain("standalonePublicRoute || !authConfigured");
     expect(providers).not.toContain('pathname.startsWith("/download")');
   });

@@ -278,7 +278,7 @@ export function paneStatusLabel(state: ChatPaneState): string {
     case "streaming":
       return "Working";
     case "continuing":
-      return "Continuing on another subscription";
+      return "Preparing account change";
     case "attention":
       return "Needs attention";
   }

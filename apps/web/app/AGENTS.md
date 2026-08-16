@@ -6,6 +6,7 @@
 - `workos-configuration.ts` – one whitespace-safe WorkOS configuration predicate shared by proxy, auth routes, layout providers, and the `/app` configuration state.
 - `global-error.tsx`, `error.tsx`, `loading.tsx`, and `not-found.tsx` – shared, themed route-state boundaries, including the root-layout replacement.
 - `page.tsx` – canonical public landing page with product capabilities, boundaries, public-source entry points, and an honest analytics disclosure.
+- `alternatives/` – public, dated, first-party-sourced comparisons that explain HRA's fit without inventing competitor limitations.
 - `app/page.tsx` – authenticated WorkOS/Convex control-plane entry and exact local missing-configuration states.
 - `download/` – public macOS prerelease status and source-build guidance.
 - `admin-shell.tsx` – authenticated human identity and agent lifecycle supervision inside the persistent rail, shared Hraness footer identity, suite-account status, and query-addressed Tasks/Access stages.
@@ -14,6 +15,7 @@
 - `convex-task-workspace-adapter.tsx` – authenticated Convex subscriptions and human commands mapped into the shared task-workspace port.
 - `hosted-task-workspace-source.ts` – strict atomic roots, immutable continuations, scoped change-feed replay, and fenced human mutations behind the provider-free task client.
 - `hosted-mutation-attempt-journal.ts` – the SDK journal adapter for authenticated, principal-scoped Convex mutation recovery without persisted intent payloads.
+- `hra-icon-data.ts` and `hra-icon-runtime.tsx` – HRA-owned geometric SVG data and the production renderer used in place of the shared Hugeicons runtime.
 - `task-run-boundary.ts` – strict provider-to-portable run projection mapping that keeps reply bindings out of shared UI props.
 - `convex-task-workspace-adapter.test.ts` – deterministic pagination, capability, and browser-boundary mapping tests.
 - `convex-task-workspace-adapter-ui.test.tsx` – accessible loading, error, capped-count, and actor-identity adapter tests.
@@ -24,7 +26,8 @@
 
 - Keep route components focused on human supervision: work readiness, task state, agent identity, leases, and review.
 - Keep `/` public and indexable without mounting WorkOS or Convex. Keep `/app` behind the configured WorkOS proxy and preserve its server-rendered configuration failures before the authenticated control plane mounts.
-- Keep `/download` honest about prerelease status. Until a public artifact pipeline exists, point people to the checked source build and do not embed release origins, signing custody, or generated publication descriptors in the web app.
+- Keep `/download` honest about prerelease status. Link only to the exact public GitHub release contract in `site.ts`, disclose ad-hoc signing and missing notarization before the action, and never embed signing credentials or publication authority in the web app.
+- Keep `/alternatives` and its exact static child routes public. Date each review, cite current first-party sources, distinguish “not documented” from “absent,” and write product-specific analysis rather than name-swapped SEO pages.
 - Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex, WorkOS, and generated-API import in hosted adapters.
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.
 - Resolve the transient semantic digest to a server-keyed, tenant/principal/source-bound HMAC before entering the generic mutation journal. Preserve that opaque fingerprint exactly across prepare, reads, and transitions. Prepare before effect, mark immediately before the command, and settle only a definitive authority result. Retain ambiguous attempts with their exact idempotency key, HRA operation ID, and supplied task ID. Never persist the browser digest, raw intent, answers, transcript, or provider data.

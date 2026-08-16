@@ -17,7 +17,6 @@ import {
 } from "../src/harness/codex-persistent-actor-provider";
 import type {
   PersistentActorInterruptRequest,
-  PersistentActorQuotaContinuationCaptureRequest,
   PersistentActorThreadRequest,
   PersistentActorTurnObservationRequest,
   PersistentActorTurnRequest,
@@ -109,24 +108,6 @@ const continuationTurnRequest: PersistentActorTurnRequest = {
   },
 };
 
-const recoveredContinuationTurnRequest: PersistentActorTurnRequest = {
-  ...continuationTurnRequest,
-  processGeneration: 8,
-  observationGeneration: 9,
-};
-
-const continuationCaptureRequest: PersistentActorQuotaContinuationCaptureRequest = {
-  epochId: continuationTurnRequest.epochId,
-  actorId: continuationTurnRequest.actorId,
-  actorTurnId: continuationTurnRequest.turnId,
-  sourceAttemptId: continuationTurnRequest.continuation!.sourceAttemptId,
-  sourceAccountProfileId: turnRequest.accountProfileId,
-  sourceProcessGeneration: turnRequest.processGeneration,
-  sourceObservationGeneration: turnRequest.observationGeneration,
-  sourceProviderThreadId: turnRequest.providerThreadId,
-  sourceProviderTurnId: "provider-turn-1",
-};
-
 const interruptRequest: PersistentActorInterruptRequest = {
   actorId: turnRequest.actorId,
   turnId: turnRequest.turnId,
@@ -180,15 +161,6 @@ function userItem() {
   };
 }
 
-function continuationUserItem() {
-  return {
-    type: "userMessage" as const,
-    id: "item-user-continuation",
-    clientId: continuationTurnRequest.clientUserMessageId,
-    text: "continue",
-  };
-}
-
 function finalItem(text = "finished") {
   return {
     type: "agentMessage" as const,
@@ -209,7 +181,6 @@ function commentaryItem(text = "working") {
 
 type TestHistoryItem = ReturnType<
   | typeof userItem
-  | typeof continuationUserItem
   | typeof finalItem
   | typeof commentaryItem
 >;
@@ -257,10 +228,10 @@ const continuationHistory = Object.freeze({
 
 const continuationCapsuleHandle = Object.freeze({
   version: 2 as const,
-  epochId: continuationCaptureRequest.epochId,
-  actorId: continuationCaptureRequest.actorId,
-  actorTurnId: continuationCaptureRequest.actorTurnId,
-  sourceAttemptId: continuationCaptureRequest.sourceAttemptId,
+  epochId: continuationTurnRequest.epochId,
+  actorId: continuationTurnRequest.actorId,
+  actorTurnId: continuationTurnRequest.turnId,
+  sourceAttemptId: continuationTurnRequest.continuation!.sourceAttemptId,
   valueId: "ctxval_history0001",
 });
 
@@ -1512,17 +1483,6 @@ describe("Codex persistent actor provider", () => {
     )).toMatchObject({ kind: "held", reason: "mutationFenceUnavailable" });
   });
 
-  test("pins quota history capture to the source observation generation", async () => {
-    const value = fixture({ capsulePreseeded: false });
-    expect(await value.provider.captureQuotaContinuation({
-      ...continuationCaptureRequest,
-      sourceObservationGeneration: 8,
-    })).toMatchObject({ kind: "captured" });
-    expect(value.calls.find(([name]) =>
-      name === "readHarnessActorContinuationHistory"
-    )?.[1]).toMatchObject({ expectedGeneration: 8 });
-  });
-
   test("treats a directly returned quota turn as admitted", async () => {
     const quotaTurn = rawTurn("failed", {
       quotaProof: "provider_usage_limit_exceeded" as const,
@@ -1551,557 +1511,28 @@ describe("Codex persistent actor provider", () => {
     expect(calls.filter(([name]) => name === "startHarnessActorTurn")).toHaveLength(0);
   });
 
-  test("captures terminal quota history before the source generation disappears", async () => {
-    const value = fixture({
-      capsulePreseeded: false,
-      injectionError: true,
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    const captured = await value.provider.captureQuotaContinuation(
-      continuationCaptureRequest,
-    );
-    expect(captured).toMatchObject({
-      kind: "captured",
-      handle: continuationCapsuleHandle,
-      proof: { phase: "postDispatch", definitive: true },
-    });
-    if (captured.kind !== "captured") {
-      throw new Error("continuation capsule was not captured");
+  test("rejects legacy quota continuation before any provider or value operation", async () => {
+    const value = fixture();
+    for (const invoke of [
+      () => value.provider.startTurn(continuationTurnRequest),
+      () => value.provider.reconcileTurn(continuationTurnRequest),
+      () => value.provider.observeTurn({
+        ...continuationTurnRequest,
+        providerTurnId: "provider-turn-legacy-continuation",
+      }),
+    ]) {
+      let caught: unknown = null;
+      try {
+        await invoke();
+      } catch (error: unknown) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe(
+        "provider quota continuation is disabled",
+      );
     }
-    expect(Object.keys(captured.handle).toSorted()).toEqual([
-      "actorId",
-      "actorTurnId",
-      "epochId",
-      "sourceAttemptId",
-      "valueId",
-      "version",
-    ]);
-    expect(JSON.stringify(captured.handle)).not.toContain("acct_");
-    expect(JSON.stringify(captured.handle)).not.toContain("provider-");
-
-    value.setSourceHistoryAvailable(false);
-    expect(await value.provider.startTurn({
-      ...continuationTurnRequest,
-      continuation: {
-        ...continuationTurnRequest.continuation!,
-        historyValueId: captured.handle.valueId,
-      },
-    })).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-    expect(value.calls.filter(([name]) => name ===
-      "readHarnessActorContinuationHistory")).toHaveLength(1);
-    expect(value.calls.filter(([name]) => name ===
-      "readActorContinuationHistoryCapsule")).toHaveLength(1);
-    expect(value.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(1);
-  });
-
-  test("fails closed when capsule publication returns different OPRTE lineage", async () => {
-    const value = fixture({
-      capsulePreseeded: false,
-      capsuleHandleMismatch: true,
-    });
-    expect(await value.provider.captureQuotaContinuation(
-      continuationCaptureRequest,
-    )).toMatchObject({
-      kind: "ambiguous",
-      proof: { definitive: true, phase: "observation" },
-    });
-  });
-
-  test("distinguishes transient capsule storage from definitive corruption", async () => {
-    const transientCapture = fixture({
-      capsulePreseeded: false,
-      capsulePutFailure: "transient",
-    });
-    expect(await transientCapture.provider.captureQuotaContinuation(
-      continuationCaptureRequest,
-    )).toMatchObject({ kind: "pending", proof: { definitive: false } });
-
-    const corruptCapture = fixture({
-      capsulePreseeded: false,
-      capsulePutFailure: "corrupt_store",
-    });
-    expect(await corruptCapture.provider.captureQuotaContinuation(
-      continuationCaptureRequest,
-    )).toMatchObject({ kind: "ambiguous", proof: { definitive: true } });
-  });
-
-  test("never injects missing or tampered continuation capsules", async () => {
-    const missing = fixture({ capsulePreseeded: false });
-    expect(await missing.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-      proof: { definitive: true },
-    });
-    expect(missing.calls.filter(([name]) => name ===
-      "readHarnessActorContinuationHistory")).toHaveLength(0);
-    expect(missing.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-
-    const tampered = fixture({ capsuleTampered: true });
-    expect(await tampered.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-      proof: { definitive: true },
-    });
-    expect(tampered.calls.filter(([name]) => name ===
-      "readHarnessActorContinuationHistory")).toHaveLength(0);
-    expect(tampered.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-
-    const transient = fixture({ capsuleReadFailure: "transient" });
-    expect(await transient.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "pending",
-      proof: { definitive: false },
-    });
-    expect(transient.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-  });
-
-  test("opens captured history and dispatches literal continue without rereading the source", async () => {
-    const { provider, calls, continuationIntent } = fixture({
-      injectionError: true,
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-      proof: { phase: "postDispatch", definitive: true },
-    });
-
-    expect(calls.filter(([name]) => name === "readInput")).toHaveLength(0);
-    expect(calls.filter(([name]) => name === "readHarnessActorContinuationHistory"))
-      .toHaveLength(0);
-    expect(calls.filter(([name]) => name ===
-      "readActorContinuationHistoryCapsule")).toHaveLength(1);
-    expect(calls.filter(([name]) => name === "injectHarnessActorContinuationHistory"))
-      .toHaveLength(1);
-    expect(calls.filter(([name]) => name === "verifyHarnessActorContinuationHistory"))
-      .toHaveLength(1);
-    expect(calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-    expect(calls.find(([name]) => name === "startHarnessActorTurn")?.[1]).toEqual({
-      actorId: continuationTurnRequest.actorId,
-      clientUserMessageId: continuationTurnRequest.clientUserMessageId,
-      expectedGeneration: continuationTurnRequest.processGeneration,
-      model: "gpt-5.6-sol",
-      prompt: "continue",
-      reasoningEffort: "max",
-      serviceTier: "standard",
-      thread: {
-        accountProfileId: continuationTurnRequest.accountProfileId,
-        kind: "provider",
-        providerThreadId: continuationTurnRequest.providerThreadId,
-      },
-    });
-    expect(continuationIntent()).toMatchObject({
-      state: "continueDispatchEffectStarted",
-      exactReadbackDigest: continuationHistory.historyDigest,
-      historyItemCount: 2,
-      historyUtf8Bytes: continuationHistory.totalUtf8Bytes,
-    });
-
-    const intentPortCalls = calls.filter(([name]) => [
-      "prepareInjection",
-      "readInjection",
-      "markInjectionEffectStarted",
-      "settleInjectionApplied",
-      "prepareContinueDispatch",
-      "markContinueDispatchEffectStarted",
-      "fenceInjectionAmbiguous",
-    ].includes(name));
-    expect(JSON.stringify(intentPortCalls)).not.toContain("Original bounded request");
-    expect(JSON.stringify(intentPortCalls)).not.toContain("Partial bounded answer");
-    expect(Object.keys(calls.find(([name]) => name === "startHarnessActorTurn")?.[1] as object))
-      .not.toContain("fork");
-    expect(Object.keys(calls.find(([name]) => name === "startHarnessActorTurn")?.[1] as object))
-      .not.toContain("steer");
-  });
-
-  test("keeps identical raw thread ids isolated by account during continuation", async () => {
-    const { provider } = fixture({
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await provider.startTurn({
-      ...continuationTurnRequest,
-      providerThreadId: turnRequest.providerThreadId,
-    })).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-  });
-
-  test("never dispatches continue without exact history readback", async () => {
-    const unavailable = fixture({ continuationReadback: "unavailable" });
-    expect(await unavailable.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "pending",
-    });
-    expect(unavailable.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(0);
-    expect(unavailable.continuationIntent()).toMatchObject({
-      state: "injectionEffectStarted",
-      exactReadbackDigest: null,
-    });
-
-    const mismatched = fixture({ continuationReadback: "mismatched" });
-    expect(await mismatched.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-    });
-    expect(mismatched.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(0);
-    expect(mismatched.continuationIntent()).toMatchObject({
-      state: "ambiguous",
-      ambiguityCode: "injection_readback_mismatch",
-    });
-  });
-
-  test("surfaces a durable continuation identity conflict as ambiguous", async () => {
-    const value = fixture({ continuationIntentConflict: true });
-    expect(await value.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-    });
-    expect(value.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-    expect(value.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(0);
-  });
-
-  test("reconciles a lost continue response by client identity without redispatch", async () => {
-    const lost = fixture({
-      startTurnError: true,
-      observedTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-      items: [continuationUserItem()],
-    });
-    expect(await lost.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "pending",
-    });
-    expect(await lost.provider.reconcileTurn(continuationTurnRequest)).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-      proof: { phase: "observation", definitive: true },
-    });
-    expect(await lost.provider.reconcileTurn(continuationTurnRequest)).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-      proof: { phase: "observation", definitive: true },
-    });
-    expect(lost.calls.filter(([name]) => name === "readInput")).toHaveLength(0);
-    expect(lost.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-    expect(lost.continuationIntent()).toMatchObject({
-      state: "continueDispatchEffectStarted",
-    });
-  });
-
-  test("reconcile dispatches only after definitive absence and a fresh CAS win", async () => {
-    const retry = fixture({
-      markContinueDispatchErrorOnce: true,
-      fence: {
-        previousGenerationTerminated: true,
-        exclusiveMutationLease: true,
-        externalDeletionExcluded: true,
-      },
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await retry.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "pending",
-    });
-    expect(retry.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(0);
-    expect(retry.continuationIntent()).toMatchObject({
-      state: "continueDispatchPrepared",
-      absenceProofDigest: null,
-    });
-
-    expect(await retry.provider.reconcileTurn(continuationTurnRequest)).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-      proof: { phase: "postDispatch", definitive: true },
-    });
-    expect(retry.calls.filter(([name]) => name === "readInput")).toHaveLength(0);
-    expect(retry.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-    expect(retry.calls.filter(([name]) => name === "markContinueDispatchEffectStarted"))
-      .toHaveLength(2);
-    expect(retry.continuationIntent()?.state).toBe("continueDispatchEffectStarted");
-    expect(retry.continuationIntent()?.absenceProofDigest)
-      .toMatch(/^[a-f0-9]{64}$/u);
-  });
-
-  test("definitive absence after dispatch fences ambiguity and never replays", async () => {
-    const lost = fixture({
-      startTurnError: true,
-      fence: {
-        previousGenerationTerminated: true,
-        exclusiveMutationLease: true,
-        externalDeletionExcluded: true,
-      },
-    });
-    expect(await lost.provider.startTurn(continuationTurnRequest)).toMatchObject({
-      kind: "pending",
-    });
-    expect(await lost.provider.reconcileTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-    });
-    expect(lost.calls.filter(([name]) => name === "readInput")).toHaveLength(0);
-    expect(await lost.provider.reconcileTurn(continuationTurnRequest)).toMatchObject({
-      kind: "ambiguous",
-    });
-    expect(lost.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-    expect(lost.continuationIntent()).toMatchObject({
-      state: "ambiguous",
-      ambiguityCode: "continue_definitively_absent_after_dispatch",
-    });
-  });
-
-  test("recovers every pre-dispatch stage into one higher-generation owner", async () => {
-    const cases = [
-      {
-        state: "prepared" as const,
-        readbacks: ["empty", "matched"] as const,
-        expectedTerminal: "supersededNotApplied",
-        expectedInjections: 1,
-      },
-      {
-        state: "injectionEffectStarted" as const,
-        readbacks: ["matched", "matched"] as const,
-        expectedTerminal: "supersededApplied",
-        expectedInjections: 0,
-      },
-      {
-        state: "injected" as const,
-        readbacks: ["matched", "matched"] as const,
-        expectedTerminal: "supersededApplied",
-        expectedInjections: 0,
-      },
-      {
-        state: "continueDispatchPrepared" as const,
-        readbacks: ["matched", "matched"] as const,
-        expectedTerminal: "supersededApplied",
-        expectedInjections: 0,
-      },
-    ];
-    for (const scenario of cases) {
-      const value = fixture({
-        continuationPredecessor: {
-          targetProcessGeneration: 8,
-          state: scenario.state,
-        },
-        continuationReadbacks: scenario.readbacks,
-        startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-      });
-      expect(await value.provider.startTurn(recoveredContinuationTurnRequest))
-        .toMatchObject({
-        kind: "applied",
-        providerTurnId: "provider-continue-turn",
-      });
-      const intents = value.continuationIntents();
-      expect(intents).toHaveLength(2);
-      expect(intents[0]).toMatchObject({
-        targetProcessGeneration: 8,
-        state: scenario.expectedTerminal,
-      });
-      expect(intents[0]!.recoveryProofDigest).toMatch(/^[a-f0-9]{64}$/u);
-      expect(intents[1]).toMatchObject({
-        targetProcessGeneration: 9,
-        state: "continueDispatchEffectStarted",
-        predecessorIntentId: intents[0]!.intentId,
-        recoveryProofDigest: intents[0]!.recoveryProofDigest,
-      });
-      expect(value.calls.filter(([name]) => name ===
-        "injectHarnessActorContinuationHistory")).toHaveLength(
-          scenario.expectedInjections,
-        );
-      expect(value.calls.filter(([name]) => name ===
-        "startHarnessActorTurn")).toHaveLength(1);
-    }
-  });
-
-  test("requires a complete old-generation fence before retrying a lost injection", async () => {
-    const pending = fixture({
-      continuationPredecessor: {
-        targetProcessGeneration: 8,
-        state: "injectionEffectStarted",
-      },
-      continuationReadback: "empty",
-    });
-    expect(await pending.provider.startTurn(recoveredContinuationTurnRequest))
-      .toMatchObject({
-      kind: "pending",
-    });
-    expect(pending.continuationIntents()).toHaveLength(1);
-    expect(pending.calls.find(([name]) => name === "fence")?.[1]).toMatchObject({
-      accountProfileId: continuationTurnRequest.accountProfileId,
-      processGeneration: 8,
-    });
-    expect(pending.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-
-    const retry = fixture({
-      continuationPredecessor: {
-        targetProcessGeneration: 8,
-        state: "injectionEffectStarted",
-      },
-      continuationReadbacks: ["empty", "matched"],
-      fence: {
-        previousGenerationTerminated: true,
-        exclusiveMutationLease: true,
-        externalDeletionExcluded: true,
-      },
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await retry.provider.startTurn(recoveredContinuationTurnRequest))
-      .toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-    expect(retry.continuationIntents()[0]?.state)
-      .toBe("supersededNotApplied");
-    expect(retry.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(1);
-  });
-
-  test("fails closed for every unstable or contradictory recovery readback", async () => {
-    const cases = [
-      ["prepared", "matched", "ambiguous"],
-      ["prepared", "mismatched", "ambiguous"],
-      ["prepared", "unavailable", "pending"],
-      ["injectionEffectStarted", "mismatched", "ambiguous"],
-      ["injectionEffectStarted", "unavailable", "pending"],
-      ["injected", "empty", "ambiguous"],
-      ["injected", "mismatched", "ambiguous"],
-      ["injected", "unavailable", "pending"],
-      ["continueDispatchPrepared", "empty", "ambiguous"],
-      ["continueDispatchPrepared", "mismatched", "ambiguous"],
-      ["continueDispatchPrepared", "unavailable", "pending"],
-      ["continueDispatchEffectStarted", "empty", "ambiguous"],
-      ["continueDispatchEffectStarted", "mismatched", "ambiguous"],
-      ["continueDispatchEffectStarted", "unavailable", "pending"],
-    ] as const;
-    for (const [state, readback, expectedKind] of cases) {
-      const value = fixture({
-        continuationPredecessor: {
-          targetProcessGeneration: 8,
-          state,
-        },
-        continuationReadback: readback,
-        fence: {
-          previousGenerationTerminated: true,
-          exclusiveMutationLease: true,
-          externalDeletionExcluded: true,
-        },
-      });
-      const outcome = state === "continueDispatchEffectStarted"
-        ? await value.provider.reconcileTurn(recoveredContinuationTurnRequest)
-        : await value.provider.startTurn(recoveredContinuationTurnRequest);
-      expect(outcome).toMatchObject({ kind: expectedKind });
-      expect(value.calls.filter(([name]) => name === "startHarnessActorTurn"))
-        .toHaveLength(0);
-      expect(value.calls.filter(([name]) => name ===
-        "injectHarnessActorContinuationHistory")).toHaveLength(0);
-      expect(value.continuationIntents()).toHaveLength(1);
-    }
-  });
-
-  test("settles a recovered continue found by client identity without resending", async () => {
-    const value = fixture({
-      continuationPredecessor: {
-        targetProcessGeneration: 8,
-        state: "continueDispatchEffectStarted",
-      },
-      continuationReadback: "mismatched",
-      observedTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-      items: [continuationUserItem()],
-    });
-    expect(await value.provider.reconcileTurn(recoveredContinuationTurnRequest))
-      .toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-      proof: { definitive: true, phase: "observation" },
-    });
-    expect(value.continuationIntents()).toHaveLength(1);
-    expect(value.continuationIntents()[0]).toMatchObject({
-      state: "supersededApplied",
-    });
-    expect(value.continuationIntents()[0]!.recoveryProofDigest)
-      .toMatch(/^[a-f0-9]{64}$/u);
-    expect(value.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(0);
-  });
-
-  test("retries an absent recovered continue exactly once in the new generation", async () => {
-    const value = fixture({
-      continuationPredecessor: {
-        targetProcessGeneration: 8,
-        state: "continueDispatchEffectStarted",
-      },
-      continuationReadbacks: ["matched", "matched"],
-      fence: {
-        previousGenerationTerminated: true,
-        exclusiveMutationLease: true,
-        externalDeletionExcluded: true,
-      },
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await value.provider.reconcileTurn(recoveredContinuationTurnRequest))
-      .toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-    expect(value.continuationIntents()).toHaveLength(2);
-    expect(value.continuationIntents()[0]?.state)
-      .toBe("supersededNotApplied");
-    expect(value.continuationIntents()[1]).toMatchObject({
-      state: "continueDispatchEffectStarted",
-      targetProcessGeneration: 9,
-    });
-    expect(value.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-    expect(value.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-  });
-
-  test("survives N to N+1 to N+2 without duplicate history or continue", async () => {
-    const value = fixture({
-      continuationPredecessor: {
-        targetProcessGeneration: 8,
-        state: "injected",
-      },
-      continuationReadbacks: ["matched", "matched", "mismatched"],
-      observedTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-      items: [continuationUserItem()],
-      startTurn: rawTurn("inProgress", { id: "provider-continue-turn" }),
-    });
-    expect(await value.provider.startTurn(recoveredContinuationTurnRequest))
-      .toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-    expect(await value.provider.reconcileTurn({
-      ...recoveredContinuationTurnRequest,
-      observationGeneration: 10,
-    })).toMatchObject({
-      kind: "applied",
-      providerTurnId: "provider-continue-turn",
-    });
-    expect(value.continuationIntents().map((intent) => ({
-      generation: intent.targetProcessGeneration,
-      state: intent.state,
-    }))).toEqual([
-      { generation: 8, state: "supersededApplied" },
-      { generation: 9, state: "supersededApplied" },
-    ]);
-    expect(value.calls.filter(([name]) => name ===
-      "injectHarnessActorContinuationHistory")).toHaveLength(0);
-    expect(value.calls.filter(([name]) => name === "startHarnessActorTurn"))
-      .toHaveLength(1);
-    for (const call of value.calls.filter(([name]) =>
-      name === "threadTurnsList" || name === "threadItemsList"
-    )) {
-      expect(call[1]).toMatchObject({ expectedGeneration: 10 });
-    }
+    expect(value.calls).toEqual([]);
   });
 
   test("double-scans thread and turn identities before reconciliation", async () => {

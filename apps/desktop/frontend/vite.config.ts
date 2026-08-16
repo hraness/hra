@@ -17,6 +17,61 @@ const DEVELOPMENT_CONNECT_SOURCE =
   `${BASE_CONNECT_SOURCE} http://127.0.0.1:5173 ws://127.0.0.1:5173`;
 export const HRA_DESKTOP_PUBLIC_DIRECTORY = false;
 
+const FORBIDDEN_PRODUCTION_MODULES = Object.freeze([
+  Object.freeze({
+    label: "Hugeicons JavaScript",
+    matches: (moduleId: string) => moduleId.includes("@hugeicons"),
+  }),
+  Object.freeze({
+    label: "design-kit React JavaScript",
+    matches: (moduleId: string) => (
+      moduleId.includes("@hra-internal/design-kit/react")
+      || moduleId.replaceAll("\\", "/").includes("/design-kit/src/react/")
+    ),
+  }),
+]);
+
+export interface ProductionModuleBoundaryViolation {
+  readonly moduleId: string;
+  readonly rule: string;
+}
+
+export function productionModuleBoundaryViolations(
+  moduleIds: readonly string[],
+): readonly ProductionModuleBoundaryViolation[] {
+  return moduleIds.flatMap((moduleId) => FORBIDDEN_PRODUCTION_MODULES
+    .filter((rule) => rule.matches(moduleId))
+    .map((rule) => ({ moduleId, rule: rule.label })))
+    .sort((left, right) => (
+      left.moduleId.localeCompare(right.moduleId) || left.rule.localeCompare(right.rule)
+    ));
+}
+
+export function assertHraProductionModuleIds(moduleIds: readonly string[]): void {
+  if (moduleIds.length === 0) {
+    throw new Error("HRA production module boundary did not inspect a compiled chunk.");
+  }
+  const violations = productionModuleBoundaryViolations(moduleIds);
+  if (violations.length === 0) return;
+  throw new Error([
+    "HRA production renderer contains forbidden module IDs:",
+    ...violations.map((violation) => `${violation.rule}: ${violation.moduleId}`),
+  ].join("\n"));
+}
+
+export function hraProductionModuleBoundaryPlugin(): Plugin {
+  return {
+    name: "hra-production-module-boundary",
+    apply: "build",
+    generateBundle(_options, bundle) {
+      const moduleIds = Object.values(bundle).flatMap((output) => (
+        output.type === "chunk" ? Object.keys(output.modules) : []
+      ));
+      assertHraProductionModuleIds(moduleIds);
+    },
+  };
+}
+
 export function desktopConnectSourceDirective(
   command: ConfigEnv["command"],
 ): string {
@@ -149,6 +204,7 @@ export default defineConfig(({ command }) => ({
     ...(command === "serve"
       ? [hraDevReadinessPlugin(devSessionIdForVite(process.env))]
       : []),
+    hraProductionModuleBoundaryPlugin(),
     react(),
   ],
   build: {

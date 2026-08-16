@@ -66,12 +66,7 @@ const executableBindingRowSchema = z.object({
   turn_outcome_code: z.string().min(1).max(96).nullable(),
   turn_settled_at: z.string().length(24).datetime().nullable(),
   pane_binding_count: z.number().int().nonnegative().safe(),
-  attempt_count: z.number().int().nonnegative().safe(),
-  distinct_attempt_account_count: z.number().int().nonnegative().safe(),
-  live_attempt_count: z.number().int().nonnegative().safe(),
-  quota_handoff_count: z.number().int().nonnegative().safe(),
-  incompatible_terminal_attempt_count: z.number().int().nonnegative().safe(),
-  result_count: z.number().int().nonnegative().safe(),
+  quota_rejected_attempt_count: z.number().int().nonnegative().safe(),
   context_quota_bytes: z.number().int().min(1024 * 1024)
     .max(64 * 1024 * 1024),
 }).strict();
@@ -169,9 +164,10 @@ export class RlmCallerAuthorityV2
   /**
    * The run's turn is immutable origin provenance. This resolver never admits
    * a new run: it only revalidates a durable run that is already `running`.
-   * Such a run may cross the exact quota-continuation handoff it was admitted
-   * before, or the one root-only restart settlement below. New admissions stay
-   * restricted to `running` turns by RlmRunAuthorityV2.
+   * Such a run may cross a successful origin settlement or the one root-only
+   * restart settlement below. A reconciling quota-rejected origin is revoked;
+   * recovery cannot authorize another provider-adjacent operation. New
+   * admissions stay restricted to `running` turns by RlmRunAuthorityV2.
    */
   #requireExecutableBinding(
     run: RlmRunRecord,
@@ -200,43 +196,8 @@ export class RlmCallerAuthorityV2
         (
           SELECT COUNT(*) FROM harness_actor_turn_attempts AS attempt
           WHERE attempt.turn_id = turn.turn_id
-        ) AS attempt_count,
-        (
-          SELECT COUNT(DISTINCT attempt.account_profile_id)
-          FROM harness_actor_turn_attempts AS attempt
-          WHERE attempt.turn_id = turn.turn_id
-        ) AS distinct_attempt_account_count,
-        (
-          SELECT COUNT(*) FROM harness_actor_turn_attempts AS attempt
-          WHERE attempt.turn_id = turn.turn_id
-            AND attempt.state IN ('starting', 'running', 'reconciling')
-        ) AS live_attempt_count,
-        (
-          SELECT COUNT(*)
-          FROM harness_actor_turn_attempts AS attempt
-          JOIN harness_context_values AS history
-            ON history.value_id = attempt.continuation_history_value_id
-            AND history.epoch_id = turn.epoch_id
-            AND history.owner_actor_id = turn.actor_id
-            AND history.source_turn_id = turn.turn_id
-            AND history.kind = 'selection'
-            AND history.purpose = 'completedPrefix'
-            AND history.state = 'active'
-          WHERE attempt.turn_id = turn.turn_id
             AND attempt.state = 'quotaRejected'
-            AND attempt.provider_turn_id IS NOT NULL
-            AND attempt.quota_proof_digest IS NOT NULL
-            AND attempt.continuation_history_value_id IS NOT NULL
-        ) AS quota_handoff_count,
-        (
-          SELECT COUNT(*) FROM harness_actor_turn_attempts AS attempt
-          WHERE attempt.turn_id = turn.turn_id
-            AND attempt.state IN ('completed', 'failed', 'interrupted', 'ambiguous')
-        ) AS incompatible_terminal_attempt_count,
-        (
-          SELECT COUNT(*) FROM harness_actor_results AS result
-          WHERE result.turn_id = turn.turn_id
-        ) AS result_count,
+        ) AS quota_rejected_attempt_count,
         settings.context_quota_bytes AS context_quota_bytes
       FROM harness_program_runs AS run
       JOIN harness_actor_epochs AS epoch
@@ -258,12 +219,6 @@ export class RlmCallerAuthorityV2
     const row = executableBindingRowSchema.parse(rows[0]);
     const ordinaryLiveOrigin = row.turn_state === "running" ||
       row.turn_state === "succeeded";
-    const quotaFailoverOrigin = row.turn_state === "reconciling" &&
-      row.turn_outcome_code === null && row.turn_settled_at === null &&
-      row.result_count === 0 && row.incompatible_terminal_attempt_count === 0 &&
-      row.live_attempt_count <= 1 && row.attempt_count > 0 &&
-      row.attempt_count === row.distinct_attempt_account_count &&
-      row.quota_handoff_count > 0;
     const recoveredRootOrigin = row.turn_state === "failed" &&
       row.turn_outcome_code === ROOT_RESTART_OUTCOME &&
       row.turn_settled_at !== null &&
@@ -273,7 +228,8 @@ export class RlmCallerAuthorityV2
       row.pane_binding_count === 1;
     if (
       row.epoch_state !== "active" || row.actor_state !== "active" ||
-      (!ordinaryLiveOrigin && !quotaFailoverOrigin && !recoveredRootOrigin) ||
+      row.quota_rejected_attempt_count !== 0 ||
+      (!ordinaryLiveOrigin && !recoveredRootOrigin) ||
       row.turn_desired_state !== "run"
     ) {
       throw new RlmCallerAuthorityV2Error("revoked");

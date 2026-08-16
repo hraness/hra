@@ -347,6 +347,10 @@ describe("local task SQLite migrations", () => {
             version: 42,
             name: "tokenmaxxing-metaharness-policy-evidence",
           },
+          {
+            version: 43,
+            name: "terminalize-provider-quota-without-history-replay",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`

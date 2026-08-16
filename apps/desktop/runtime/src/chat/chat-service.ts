@@ -1773,20 +1773,11 @@ export class ChatService {
           lifecycle: quotaLifecycle,
         }));
       }
-      if (this.#admissionClosed) {
-        await this.#settleHarnessAfterExhaustedQuota(
-          event.paneId,
-          event.turnId,
-          quotaLifecycle,
-        );
-        await this.#publishAttention(event.paneId, event.turnId, {
-          code: "runtime_unavailable",
-          message: "HRA is stopping. Send another message after it restarts.",
-          retryable: true,
-        }, true);
-        return;
-      }
-      await this.#continueAfterProvenQuota(event.paneId, event.turnId, quotaLifecycle);
+      await this.#stopAfterProvenQuota(
+        event.paneId,
+        event.turnId,
+        quotaLifecycle,
+      );
       return;
     }
     if (lifecycle !== null) {
@@ -3078,7 +3069,7 @@ export class ChatService {
       }
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       if (provenQuotaRejection(error)) {
-        await this.#continueAfterProvenQuota(paneId, turnId, null);
+        await this.#stopAfterProvenQuota(paneId, turnId, null);
         return;
       }
       await this.#settleHarnessBeforeProvider(
@@ -3097,199 +3088,31 @@ export class ChatService {
     }
   }
 
-  async #continueAfterProvenQuota(
+  async #stopAfterProvenQuota(
     paneId: ChatPaneId,
     turnId: ChatTurnId,
     priorQuotaLifecycle: SessionTurnLifecycle | null,
   ): Promise<void> {
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    let pane = this.#store.require(paneId);
-    if (pane.projection.turn?.id !== turnId || !activePane(pane.projection)) return;
+    const pane = this.#store.get(paneId);
+    if (pane?.projection.turn?.id !== turnId || !activePane(pane.projection)) return;
     if (priorQuotaLifecycle !== null) {
-      // Record the already-observed terminal fact before candidate refresh or
-      // any other await. Stop can race those waits and must never synthesize a
-      // second terminal for the exhausted attempt.
+      // Retain the provider's exact terminal fact before root settlement. Stop
+      // may race this await, but neither path may synthesize another terminal.
       this.#priorQuotaTerminals.set(paneId, Object.freeze({
         turnId,
         lifecycle: priorQuotaLifecycle,
       }));
     }
-    if (this.#admissionClosed) {
-      await this.#settleHarnessAfterExhaustedQuota(
-        paneId,
-        turnId,
-        priorQuotaLifecycle,
-      );
-      await this.#publishAttention(paneId, turnId, {
-        code: "runtime_unavailable",
-        message: "HRA is stopping. Send another message after it restarts.",
-        retryable: true,
-      }, true);
-      return;
-    }
-    let candidates: readonly ChatAccountCandidate[];
-    try {
-      candidates = await this.#accounts.refreshCandidates();
-    } catch {
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#settleHarnessAfterExhaustedQuota(
-        paneId,
-        turnId,
-        priorQuotaLifecycle,
-      );
-      await this.#publishAttention(paneId, turnId, {
-        code: "account_unavailable",
-        message: "A continuation account could not be selected safely. You can send another message.",
-        retryable: true,
-      }, true);
-      return;
-    }
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    pane = this.#store.require(paneId);
-    const ranked = rankChatAccountCandidates(
-      candidates,
-      pane.projection.accountProfileId,
-      pane.visitedAccountProfileIds,
+    await this.#settleHarnessAfterExhaustedQuota(
+      paneId,
+      turnId,
+      priorQuotaLifecycle,
     );
-    const account = ranked[0];
-    if (account === undefined) {
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#settleHarnessAfterExhaustedQuota(
-        paneId,
-        turnId,
-        priorQuotaLifecycle,
-      );
-      await this.#publishAttention(paneId, turnId, {
-        code: "all_accounts_exhausted",
-        message: "Every connected Codex account is unavailable or near its usage limit. You can send another message later.",
-        retryable: true,
-      }, true);
-      return;
-    }
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    const history = this.#store.handoffHistory(paneId, true);
-    if (!history.complete || history.items.length === 0) {
-      await this.#settleHarnessAfterExhaustedQuota(
-        paneId,
-        turnId,
-        priorQuotaLifecycle,
-      );
-      await this.#publishContextReset(paneId, turnId);
-      return;
-    }
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    const continuing = this.#store.beginContinuation(paneId, turnId, account.id, this.#now());
-    await this.#projection.paneStateChanged(continuing);
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    pane = this.#store.require(paneId);
-    const repository = await this.#resolveActiveRepository(pane, turnId);
-    if (repository === null) {
-      await this.#settleHarnessAfterExhaustedQuota(
-        paneId,
-        turnId,
-        priorQuotaLifecycle,
-      );
-      return;
-    }
-    if (this.#turnStartupMustStop(paneId, turnId)) return;
-    const configuration = configurationFor(pane);
-    let providerTurnAttempted = false;
-    try {
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#provider.validateConfiguration(
-        account.id,
-        CHAT_MODEL,
-        pane.projection.reasoningEffort,
-        pane.projection.serviceTier,
-      );
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      const started = await this.#provider.startThread({
-        ...configuration,
-        accountProfileId: account.id,
-        title: pane.projection.title,
-        workingDirectory: repository.workingDirectory,
-      });
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      const binding: ChatThreadBinding = {
-        accountProfileId: account.id,
-        threadId: started.threadId,
-        restartThreadId: started.restartThreadId,
-      };
-      const prepared = this.#store.prepareProviderThread(paneId, turnId, binding, this.#now());
-      await this.#projection.paneStateChanged(prepared);
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#tryName(binding, pane.projection.title);
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#provider.injectHistory(binding, history.items);
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      // This literal is sent once, only after the new thread and text history are confirmed.
-      providerTurnAttempted = true;
-      const accepted = await this.#startProviderTurn(
-        {
-          ...configuration,
-          ...binding,
-          clientTurnId: turnId,
-          prompt: "continue",
-          workingDirectory: repository.workingDirectory,
-        },
-        { paneId, turnId, binding, providerTurnId: null },
-      );
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      try {
-        this.#rememberQuotaFloor(paneId, turnId, binding.accountProfileId, accepted.quotaProofCursor);
-        const streaming = this.#store.markTurnAccepted(paneId, turnId, accepted.turnId, this.#now());
-        this.#priorQuotaTerminals.delete(paneId);
-        await this.#projection.paneStateChanged(streaming);
-        await this.#drainEarlySessionEvents(
-          paneId,
-          binding.accountProfileId,
-          binding.threadId,
-          accepted.turnId,
-        );
-      } catch {
-        await this.#beginPoisonExactTurn({
-          paneId,
-          turnId,
-          binding,
-          providerTurnId: accepted.turnId,
-        });
-        throw new ChatContainmentFailure();
-      }
-    } catch (error: unknown) {
-      if (error instanceof ChatContainmentFailure) {
-        if (providerTurnAttempted) {
-          await this.#settleHarnessBeforeProvider(
-            paneId,
-            turnId,
-            "provider_start_ambiguous",
-          );
-        }
-        return;
-      }
-      if (this.#turnStartupMustStop(paneId, turnId)) return;
-      if (provenQuotaRejection(error)) {
-        await this.#continueAfterProvenQuota(
-          paneId,
-          turnId,
-          priorQuotaLifecycle,
-        );
-        return;
-      }
-      if (providerTurnAttempted && ambiguousProviderEffect(error)) {
-        await this.#settleHarnessBeforeProvider(
-          paneId,
-          turnId,
-          "provider_start_ambiguous",
-        );
-      } else {
-        await this.#settleHarnessAfterExhaustedQuota(
-          paneId,
-          turnId,
-          priorQuotaLifecycle,
-        );
-      }
-      await this.#publishProviderFailure(paneId, turnId, error, "continuation_failed");
-    }
+    await this.#publishAttention(paneId, turnId, {
+      code: "all_accounts_exhausted",
+      message: "This Codex subscription reached its provider usage limit, so the turn stopped. You can send a new message later.",
+      retryable: true,
+    }, true);
   }
 
   async #startProviderTurn(

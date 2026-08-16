@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 
-import { Button, IconButton } from "@hraness/ui";
+import { Button, IconButton } from "../../ui";
 
 import type {
   AccountSummary,

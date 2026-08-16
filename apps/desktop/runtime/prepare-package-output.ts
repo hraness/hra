@@ -2,9 +2,8 @@ import { lstat, rm } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { validateFrontendBuild } from "./frontend-package-integrity";
 
-// The bridge package is versioned with its exact legacy outer bundle name.
-const LEGACY_OPRTE_PACKAGE_APP_NAME =
-  /^OPRTE-[A-Za-z0-9][A-Za-z0-9._+-]*-macos-(?:Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\.app$/u;
+const HRA_PACKAGE_APP_NAME =
+  /^HRA-[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*-macos-arm64\.app$/u;
 const DEFAULT_PROJECT_DIRECTORY = resolve(import.meta.dir, "..");
 
 export class PackageOutputPreparationError extends Error {
@@ -34,10 +33,10 @@ export async function preparePackageOutput(options: {
   const appBundlePath = resolve(options.appBundlePath);
   if (
     dirname(appBundlePath) !== packageRoot ||
-    !LEGACY_OPRTE_PACKAGE_APP_NAME.test(basename(appBundlePath))
+    !HRA_PACKAGE_APP_NAME.test(basename(appBundlePath))
   ) {
     throw new PackageOutputPreparationError(
-      `Refusing to remove a target outside the exact legacy OPRTE bridge package pattern: ${appBundlePath}.`,
+      `Refusing to remove a target outside the exact HRA package pattern: ${appBundlePath}.`,
     );
   }
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { Button, IconButton, TextField } from "@hraness/ui";
+import { Button, IconButton, TextField } from "../../ui";
 
 import {
   type RuntimeSessionSyncDomainCommand,

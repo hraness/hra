@@ -23,6 +23,6 @@
 - Keep the compiled gateway responsible for hosted connections. Do not add Convex clients or deployment configuration to the renderer.
 - Require a fresh launch nonce before a Debug host loads `http://127.0.0.1:5173/`. Release-shaped hosts use bundled `zero://app` assets.
 - Bind each interactive pane to a repository selected through the trusted Native directory picker. Browser-only development has no Codex, arbitrary-filesystem, or local execution authority.
-- Keep source builds independent from distribution credentials. Signing, notarization, official release creation, and publication are outside this public workspace.
+- Keep source builds independent from distribution credentials. Local packaging may apply an ad-hoc signature to prove nested-code integrity and create a manual prerelease DMG. Developer ID signing, notarization, official release creation, and publication remain separately provisioned operations.
 - Run `bun run --cwd apps/desktop test`, `bun run --cwd apps/desktop typecheck`, `bun run --cwd apps/desktop lint`, and `bun run --cwd apps/desktop build` after desktop changes. Add `test:macos` or `build:macos` for native changes.
-- Keep `verify:direct`, `build:macos`, and `test:macos` behind the repository resource scheduler. Their `:uncoordinated` commands are internal to an acquired lease.
+- Keep `verify:direct`, native build/test, package, DMG, and package-smoke commands behind the repository resource scheduler. Their `:uncoordinated` commands are internal to an acquired lease.

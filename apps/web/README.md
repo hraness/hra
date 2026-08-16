@@ -61,16 +61,18 @@ fail closed. Enable it only after the
 exact WorkOS application, Convex environment, desktop public coordinates, and
 production HTTP route readbacks pass for the same source revision.
 
-## macOS prerelease
+## Public product pages
 
-`/download` describes the current source-only prerelease. It points to the
-checked Apple Silicon build documented in the repository and does not proxy an
-artifact store or embed signing, notarization, or publication custody. Exact
-near-miss routes remain protected when WorkOS authentication is configured.
+`/download` links to the exact Apple Silicon GitHub prerelease named in
+`app/site.ts`. It publishes the checksum path and discloses that the current
+app is ad-hoc signed, not Developer ID signed or notarized. The web workspace
+never holds signing credentials or release authority.
 
-The public workspace does not create or publish an official consumer binary.
-Run `bun run --cwd apps/desktop build:macos` on an Apple Silicon Mac with the
-pinned toolchain to produce local source-build evidence.
+`/alternatives` and its static child routes compare HRA with adjacent tools.
+Every positive competitor claim must cite a current first-party source, every
+page carries a review date, and “not documented” must never be presented as
+proof of absence. These routes remain public when WorkOS is configured; exact
+near-miss and control-plane routes remain protected.
 
 ## Hraness suite account
 
@@ -103,7 +105,7 @@ bun run direct:hra:web
 bun run verify:hra:web:direct
 ```
 
-From this directory, `bun run test:direct` checks the strict world parser, inferred definition, session-owned exact action scripts and deterministic backend, canonical probe/coverage wire parsing, verifier policy, and production-exclusion boundary. `bun run build:direct` compiles only the isolated Vite lab. `bun run build` compiles only the Next.js application; run `bun run check:direct-boundary` as a separate production-boundary check.
+From this directory, `bun run test:direct` checks the strict world parser, inferred definition, session-owned exact action scripts and deterministic backend, canonical probe/coverage wire parsing, verifier policy, and production-exclusion boundary. `bun run build:direct` compiles only the isolated Vite lab. `bun run build` compiles the Next.js application and rejects any resolved or emitted Hugeicons module. Run `bun run check:direct-boundary` as a separate production-boundary check.
 
 The browser verifier exercises representative read, mutation, failure, and retry paths at wide, stacked, and compact viewports. It waits for identical canonical probes, rejects console, page, request, pending-work, and script-drain failures, then writes ignored screenshots and an atomic manifest below `artifacts/direct/hra-web`.
 

@@ -241,7 +241,7 @@ export const persistentActorTerminalObservationSchema = z.object({
   ) {
     context.addIssue({
       code: "custom",
-      message: "quota failover requires definitive terminal observation proof",
+      message: "quota terminalization requires definitive terminal observation proof",
       path: ["proof"],
     });
   }
@@ -316,48 +316,6 @@ const persistentActorQuotaContinuationSchema: z.ZodType<PersistentActorQuotaCont
     sourceProviderThreadId: boundedIdentitySchema,
     sourceProviderTurnId: boundedIdentitySchema,
   }).strict();
-
-export interface PersistentActorQuotaContinuationCaptureRequest {
-  readonly epochId: string;
-  readonly actorId: string;
-  readonly actorTurnId: string;
-  readonly sourceAttemptId: string;
-  readonly sourceAccountProfileId: string;
-  /** Generation at which the source turn effect was durably admitted. */
-  readonly sourceProcessGeneration: number;
-  /** Current proven source runtime generation used for the history read. */
-  readonly sourceObservationGeneration: number;
-  readonly sourceProviderThreadId: string;
-  readonly sourceProviderTurnId: string;
-}
-
-const persistentActorQuotaContinuationCapsuleHandleSchema = z.object({
-  version: z.literal(2),
-  epochId: actorEpochIdSchema,
-  actorId: actorIdSchema,
-  actorTurnId: actorTurnIdSchema,
-  sourceAttemptId: z.string().min(16).max(96)
-    .regex(/^hattempt_[A-Za-z0-9_-]+$/u),
-  valueId: z.string().min(16).max(96)
-    .regex(/^ctxval_[A-Za-z0-9_-]+$/u),
-}).strict();
-
-const persistentActorQuotaContinuationCaptureOutcomeSchema =
-  z.discriminatedUnion("kind", [
-    z.object({
-      kind: z.literal("captured"),
-      handle: persistentActorQuotaContinuationCapsuleHandleSchema,
-      proof: persistentActorEffectProofSchema,
-    }).strict(),
-    z.object({
-      kind: z.literal("pending"),
-      proof: persistentActorEffectProofSchema,
-    }).strict(),
-    z.object({
-      kind: z.literal("ambiguous"),
-      proof: persistentActorEffectProofSchema,
-    }).strict(),
-  ]);
 
 export interface PersistentActorThreadRequest {
   readonly actorId: string;
@@ -434,9 +392,6 @@ export interface PersistentActorTurnObservationRequest
  * are treated as lost responses and reconciled before any further mutation.
  */
 export interface PersistentActorProviderPort {
-  captureQuotaContinuation(
-    request: PersistentActorQuotaContinuationCaptureRequest,
-  ): Promise<unknown>;
   startThread(request: PersistentActorThreadRequest): Promise<unknown>;
   reconcileThread(request: PersistentActorThreadRequest): Promise<unknown>;
   startTurn(request: PersistentActorTurnRequest): Promise<unknown>;
@@ -830,7 +785,7 @@ export interface PersistentActorAuthorityPort {
     attemptId: string;
     expectedState: "running" | "reconciling";
     providerTurnId: string;
-    continuationHistoryValueId: string;
+    continuationHistoryValueId?: string | null;
     quotaProofDigest: string;
     inputTokens: number;
     outputTokens: number;
@@ -1936,6 +1891,34 @@ export class PersistentActorCoordinator {
         incarnationIdFor(operation.id),
       );
       if (!selection.includesOperation(operation, incarnation)) continue;
+      const operationActor = this.#requireActor(operation.actorId);
+      if (
+        operationActor.state === "quarantined" ||
+        operationActor.state === "stopped"
+      ) {
+        inspectedOperations += 1;
+        fenced += 1;
+        continue;
+      }
+      const liveTurns = this.#readActorReconciliation(operation.actorId).turns;
+      if (liveTurns.length > 1) {
+        throw new PersistentActorError(
+          "conflict",
+          "actor-start recovery found multiple live logical turns",
+        );
+      }
+      const liveTurn = liveTurns[0];
+      if (
+        liveTurn !== undefined &&
+        this.#settleLegacyQuotaLineageBeforeProvider(liveTurn, operation) !== "none"
+      ) {
+        // Actor-start operations have no turn_id, so they are audited before
+        // turn attempts. Retired continuation rows must be contained here,
+        // before session readiness or provider thread reconciliation.
+        inspectedOperations += 1;
+        fenced += 1;
+        continue;
+      }
       if (
         incarnation !== null &&
         !this.#sessionReadiness.isActorSessionReady(incarnation.id)
@@ -1955,6 +1938,30 @@ export class PersistentActorCoordinator {
       const turn = this.#requireTurn(attempt.turnId);
       const incarnation = this.#requireIncarnation(attempt.incarnationId);
       if (!selection.includesAttempt(attempt, turn, incarnation)) continue;
+      const earlierQuotaRejection = this.#listAttemptsForTurn(turn.id).some(
+        (candidate) =>
+          candidate.ordinal < attempt.ordinal &&
+          candidate.state === "quotaRejected",
+      );
+      if (earlierQuotaRejection) {
+        // A prerelease database may contain a replacement that was claimed or
+        // started by the retired quota-continuation path. Contain a provably
+        // pre-effect replacement, or expose a possibly-started effect as
+        // ambiguous, before session readiness or any provider reconciliation.
+        inspectedAttempts += 1;
+        try {
+          this.#containInvalidQuotaContinuationSource(turn);
+        } catch {
+          this.#fenceAmbiguousTurn(
+            turn,
+            attempt,
+            incarnation,
+            recoveryProof(),
+          );
+          fenced += 1;
+        }
+        continue;
+      }
       if (incarnation.state === "quarantined" || incarnation.state === "closed") {
         inspectedAttempts += 1;
         this.#fenceAmbiguousTurn(
@@ -2144,6 +2151,12 @@ export class PersistentActorCoordinator {
       if (!selection.includesTurn(turn, unsettledAttempt, activeIncarnation)) {
         continue;
       }
+      const quotaDisposition = this.#settleLegacyQuotaLineageBeforeProvider(turn);
+      if (quotaDisposition !== "none") {
+        inspectedTurns += 1;
+        if (quotaDisposition === "fenced") fenced += 1;
+        continue;
+      }
       if (
         unsettledAttempt !== null &&
         !this.#sessionReadiness.isActorSessionReady(
@@ -2261,6 +2274,7 @@ export class PersistentActorCoordinator {
   ): Promise<void> {
     let turn = this.#requireTurn(turnValue.id);
     if (isTerminalActorTurnState(turn.state)) return;
+    if (this.#settleLegacyQuotaLineageBeforeProvider(turn) !== "none") return;
     if (turn.desiredState === "stop") {
       if (turn.state === "prepared") {
         this.#settlePreparedCancellation(turn, "cancelled_before_effect");
@@ -2272,15 +2286,10 @@ export class PersistentActorCoordinator {
     this.#assertActorTokenCapacity(actor);
     let incarnation = this.#authority.readActiveIncarnationForActor(actor.id);
     if (incarnation === null || incarnation.state === "starting") {
-      const visitedAccounts = new Set(
-        this.#listAttemptsForTurn(turn.id)
-          .map(({ accountProfileId }) => accountProfileId),
-      );
       incarnation = await this.#launchIncarnation(
         actor,
         turn,
         workspaceLaneId,
-        visitedAccounts,
       );
       if (incarnation === null) {
         if (isTerminalActorTurnState(this.#requireTurn(turn.id).state)) return;
@@ -2400,7 +2409,7 @@ export class PersistentActorCoordinator {
       return true;
     }
     if (attempt.state === "quotaRejected") {
-      await this.#resumeQuotaContinuation(turn, attempt, incarnation);
+      this.#resumeQuotaContinuation(turn, attempt, incarnation);
       return true;
     }
     if (attempt.providerTurnId === null) {
@@ -2436,17 +2445,15 @@ export class PersistentActorCoordinator {
   }
 
   /**
-   * Completes the durable half of a quota handoff after any crash cut. The
-   * provider rejection and encrypted history capsule are already terminal
-   * evidence, so recovery must never observe or resend the exhausted turn.
-   * It first closes that exact incarnation, then either admits one unvisited
-   * subscription or records definitive exhaustion for the logical turn.
+   * Converges a legacy quota-rejected attempt after any crash cut. Recovery
+   * consumes only durable evidence: it never captures history, selects another
+   * subscription, or creates/reconciles a replacement provider effect.
    */
-  async #resumeQuotaContinuation(
+  #resumeQuotaContinuation(
     turnValue: ActorTurn,
     attemptValue: PersistedActorAttempt,
     incarnationValue: ActorIncarnationRecord,
-  ): Promise<void> {
+  ): void {
     let turn = this.#requireTurn(turnValue.id);
     const attempt = this.#requireAttempt(attemptValue.id);
     const incarnation = this.#requireIncarnation(incarnationValue.id);
@@ -2455,8 +2462,7 @@ export class PersistentActorCoordinator {
     if (
       attempt.state !== "quotaRejected" || attempt.turnId !== turn.id ||
       attempt.incarnationId !== incarnation.id ||
-      attempt.providerTurnId === null ||
-      attempt.continuationHistoryValueId === null
+      attempt.quotaProofDigest === null
     ) {
       throw new PersistentActorError(
         "conflict",
@@ -2465,46 +2471,11 @@ export class PersistentActorCoordinator {
     }
     turn = this.#markTurnReconciling(turn);
     this.#closeIncarnation(incarnation);
-    if (turn.desiredState === "stop") {
-      this.#authority.settleActorResult({
-        resultId: resultId(turn.id),
-        turnId: turn.id,
-        terminalAttemptId: attempt.id,
-        outcome: "quotaRejected",
-        valueId: null,
-        expectedTurnRevision: turn.revision,
-        outcomeCode: "quota_exhausted",
-        createdAt: this.#timestamp(),
-      });
-      return;
-    }
-    try {
-      const source = this.#quotaContinuationSourceForTurn(turn);
-      if (source?.source.id !== attempt.id) {
-        throw new PersistentActorError(
-          "conflict",
-          "quota continuation recovery selected another terminal source",
-        );
-      }
-    } catch (cause: unknown) {
-      this.#containInvalidQuotaContinuationSource(turn);
+    if (!this.#settleDurableQuotaExhaustion(turn)) {
       throw new PersistentActorError(
-        "ambiguous_effect",
-        "quota continuation recovery failed exact source validation",
-        cause,
+        "conflict",
+        "legacy quota rejection did not terminalize its logical turn",
       );
-    }
-    const actor = this.#requireActor(turn.actorId);
-    const epoch = this.#requireEpoch(actor.epochId);
-    const lease = await this.#acquireWorkspace(epoch, actor);
-    try {
-      await this.#driveTurn(turn, lease.laneId);
-    } catch (error: unknown) {
-      if (
-        !(error instanceof PersistentActorError) ||
-        error.code !== "account_exhausted"
-      ) throw error;
-      if (!this.#settleDurableQuotaExhaustion(turn)) throw error;
     }
   }
 
@@ -2515,6 +2486,21 @@ export class PersistentActorCoordinator {
   ): Promise<void> {
     const turn = this.#requireTurn(turnValue.id);
     let attempt = this.#requireAttempt(attemptValue.id);
+    const priorQuotaAttempt = this.#listAttemptsForTurn(turn.id).find(
+      (candidate) =>
+        candidate.ordinal < attempt.ordinal && candidate.state === "quotaRejected",
+    );
+    if (priorQuotaAttempt !== undefined) {
+      // Old prerelease databases may contain a claimed replacement. Contain a
+      // proven pre-effect replacement, or fence an effect that might already
+      // exist. Neither branch calls the provider.
+      try {
+        this.#containInvalidQuotaContinuationSource(turn);
+      } catch {
+        this.#fenceAmbiguousTurn(turn, attempt, incarnation, recoveryProof());
+      }
+      return;
+    }
     this.#assertActorSessionReady(incarnation);
     if (isTerminalActorAttemptState(attempt.state)) return;
     try {
@@ -2677,8 +2663,6 @@ export class PersistentActorCoordinator {
     actorValue: Actor,
     turnValue: ActorTurn,
     workspaceLaneId: string,
-    visitedAccounts: ReadonlySet<string> = new Set(),
-    quotaAdmissionOperationIds: readonly string[] = [],
   ): Promise<ActorIncarnationRecord | null> {
     const actor = this.#requireActor(actorValue.id);
     const initiatingTurn = this.#requireTurn(turnValue.id);
@@ -2696,18 +2680,12 @@ export class PersistentActorCoordinator {
         initiatingTurn,
         incarnation: existing,
         workspaceLaneId,
-        visitedAccounts,
-        quotaAdmissionOperationIds,
       });
     }
     const eligibility = await this.#accountCandidates(actor);
-    const candidates = eligibility.candidates.filter(
-      ({ accountProfileId }) => !visitedAccounts.has(accountProfileId),
-    );
-    const temporarilyUnavailable = eligibility.temporarilyUnavailableAccountProfileIds
-      .filter((accountProfileId) => !visitedAccounts.has(accountProfileId));
-    const unsupported = eligibility.unsupportedAccountProfileIds
-      .filter((accountProfileId) => !visitedAccounts.has(accountProfileId));
+    const candidates = eligibility.candidates;
+    const temporarilyUnavailable = eligibility.temporarilyUnavailableAccountProfileIds;
+    const unsupported = eligibility.unsupportedAccountProfileIds;
     if (candidates.length === 0) {
       if (temporarilyUnavailable.length > 0) {
         throw new PersistentActorError(
@@ -2715,20 +2693,14 @@ export class PersistentActorCoordinator {
           "unvisited subscriptions are awaiting exact-generation capability convergence",
         );
       }
-      if (unsupported.length > 0 && quotaAdmissionOperationIds.length === 0) {
+      if (unsupported.length > 0) {
         this.#settleEffectFreeTurn(
           initiatingTurn,
           "capability_unavailable_before_actor_start",
         );
         return null;
       }
-      if (quotaAdmissionOperationIds.length > 0) {
-        this.#settleEffectFreeQuotaTurn(
-          initiatingTurn,
-          "quota_exhausted_before_actor_start",
-          quotaAdmissionOperationIds,
-        );
-      } else if (!this.#settleDurableQuotaExhaustion(initiatingTurn)) {
+      if (!this.#settleDurableQuotaExhaustion(initiatingTurn)) {
         this.#settleEffectFreeTurn(
           initiatingTurn,
           "account_unavailable_before_actor_start",
@@ -2761,8 +2733,6 @@ export class PersistentActorCoordinator {
           initiatingTurn,
           incarnation: durableIncarnation,
           workspaceLaneId,
-          visitedAccounts,
-          quotaAdmissionOperationIds,
         });
       }
       if (operation.state === "succeeded") {
@@ -2787,13 +2757,12 @@ export class PersistentActorCoordinator {
             "actor start was definitively rejected for a non-quota reason",
           );
         }
-        return await this.#launchIncarnation(
-          actor,
+        this.#settleEffectFreeQuotaTurn(
           initiatingTurn,
-          workspaceLaneId,
-          new Set([...visitedAccounts, durableRequest.accountProfileId]),
-          [...quotaAdmissionOperationIds, operation.id],
+          "quota_rejected_before_actor_start",
+          [operation.id],
         );
+        return null;
       }
       this.#fenceActorStartRecovery(operation);
       throw new PersistentActorError(
@@ -2873,8 +2842,6 @@ export class PersistentActorCoordinator {
       initiatingTurn,
       incarnation: leased.incarnation,
       workspaceLaneId,
-      visitedAccounts,
-      quotaAdmissionOperationIds,
     });
   }
 
@@ -2883,8 +2850,6 @@ export class PersistentActorCoordinator {
     initiatingTurn: ActorTurn;
     incarnation: ActorIncarnationRecord;
     workspaceLaneId: string;
-    visitedAccounts: ReadonlySet<string>;
-    quotaAdmissionOperationIds: readonly string[];
   }>): Promise<ActorIncarnationRecord | null> {
     let operation = this.#requireOperation(input.incarnation.startOperationId);
     const request = this.#threadRequestForOperation(operation);
@@ -2921,13 +2886,12 @@ export class PersistentActorCoordinator {
           "actor start was definitively rejected for a non-quota reason",
         );
       }
-      return await this.#launchIncarnation(
-        input.actor,
+      this.#settleEffectFreeQuotaTurn(
         input.initiatingTurn,
-        input.workspaceLaneId,
-        new Set([...input.visitedAccounts, request.accountProfileId]),
-        [...input.quotaAdmissionOperationIds, operation.id],
+        "quota_rejected_before_actor_start",
+        [operation.id],
       );
+      return null;
     }
     if (operation.state === "ambiguous" || operation.state === "recoveryRequired") {
       this.#fenceActorStartRecovery(operation);
@@ -2959,6 +2923,7 @@ export class PersistentActorCoordinator {
         if (!this.#preflightActorStartEffect(
           input.actor.id,
           input.initiatingTurn.id,
+          operation,
         )) return null;
         const transitioned = this.#tryTransitionOperation({
           operation,
@@ -2974,8 +2939,6 @@ export class PersistentActorCoordinator {
         input.actor,
         input.initiatingTurn,
         input.workspaceLaneId,
-        input.visitedAccounts,
-        input.quotaAdmissionOperationIds,
       );
     }
     let outcome: PersistentActorThreadOutcome;
@@ -2992,13 +2955,12 @@ export class PersistentActorCoordinator {
     if (incarnation !== null) return incarnation;
     if (isDefinitiveQuota(outcome)) {
       this.#closeIncarnation(input.incarnation);
-      return await this.#launchIncarnation(
-        input.actor,
+      this.#settleEffectFreeQuotaTurn(
         input.initiatingTurn,
-        input.workspaceLaneId,
-        new Set([...input.visitedAccounts, request.accountProfileId]),
-        [...input.quotaAdmissionOperationIds, operation.id],
+        "quota_rejected_before_actor_start",
+        [operation.id],
       );
+      return null;
     }
     if (outcome.kind === "pending") return null;
     throw new PersistentActorError(
@@ -3011,6 +2973,18 @@ export class PersistentActorCoordinator {
     operation: ActorOperationRecord,
   ): Promise<"materialized" | "pending" | "fenced"> {
     const actor = this.#requireActor(operation.actorId);
+    const liveTurns = this.#readActorReconciliation(actor.id).turns;
+    if (liveTurns.length > 1) {
+      throw new PersistentActorError(
+        "conflict",
+        "actor-start recovery found multiple live logical turns",
+      );
+    }
+    const liveTurn = liveTurns[0];
+    if (
+      liveTurn !== undefined &&
+      this.#settleLegacyQuotaLineageBeforeProvider(liveTurn, operation) !== "none"
+    ) return "fenced";
     if (actor.state === "quarantined" || actor.state === "stopped") {
       // Emergency ambiguity containment deliberately preserves immutable
       // provider receipts. A terminal actor is the durable no-replay fence;
@@ -3320,43 +3294,11 @@ export class PersistentActorCoordinator {
         });
         turn = this.#markTurnReconciling(turn);
         this.#closeIncarnation(incarnation);
-        if (turn.desiredState === "stop") {
-          const result = this.#authority.settleActorResult({
-            resultId: resultId(turn.id),
-            turnId: turn.id,
-            terminalAttemptId: attempt.id,
-            outcome: "quotaRejected",
-            valueId: null,
-            expectedTurnRevision: turn.revision,
-            outcomeCode: "quota_exhausted",
-            createdAt: this.#timestamp(),
-          });
-          return { turn: this.#requireTurn(turn.id), result };
-        }
-        const actor = this.#requireActor(turn.actorId);
-        const epoch = this.#requireEpoch(actor.epochId);
-        const lease = await this.#acquireWorkspace(epoch, actor);
-        try {
-          await this.#driveTurn(turn, lease.laneId);
-        } catch (error: unknown) {
-          if (error instanceof PersistentActorError && error.code === "account_exhausted") {
-            turn = this.#requireTurn(turn.id);
-            if (!isTerminalActorTurnState(turn.state)) {
-              const result = this.#authority.settleActorResult({
-                resultId: resultId(turn.id),
-                turnId: turn.id,
-                terminalAttemptId: attempt.id,
-                outcome: "quotaRejected",
-                valueId: null,
-                expectedTurnRevision: turn.revision,
-                outcomeCode: "quota_exhausted",
-                createdAt: this.#timestamp(),
-              });
-              return { turn: this.#requireTurn(turn.id), result };
-            }
-            return this.#turnView(turn);
-          }
-          throw error;
+        if (!this.#settleDurableQuotaExhaustion(turn)) {
+          throw new PersistentActorError(
+            "conflict",
+            "proven quota rejection did not terminalize its logical turn",
+          );
         }
         return this.#turnView(this.#requireTurn(turn.id));
       }
@@ -3637,16 +3579,11 @@ export class PersistentActorCoordinator {
       if (existingResult !== null) {
         return { turn: this.#requireTurn(turn.id), result: existingResult };
       }
-      const continuationHistoryValueId = await this.#captureQuotaContinuation(
-        attempt,
-        turn,
-        this.#requireIncarnation(attempt.incarnationId),
-      );
       attempt = this.#authority.settleActorQuotaRejection({
         attemptId: attempt.id,
         expectedState: attempt.state === "running" ? "running" : "reconciling",
         providerTurnId: event.providerTurnId,
-        continuationHistoryValueId,
+        continuationHistoryValueId: null,
         quotaProofDigest: event.proof.digest,
         inputTokens: event.inputTokens,
         outputTokens: event.outputTokens,
@@ -3654,43 +3591,11 @@ export class PersistentActorCoordinator {
       });
       turn = this.#markTurnReconciling(turn);
       this.#closeIncarnation(this.#requireIncarnation(attempt.incarnationId));
-      if (turn.desiredState === "stop") {
-        const result = this.#authority.settleActorResult({
-          resultId: resultId(turn.id),
-          turnId: turn.id,
-          terminalAttemptId: attempt.id,
-          outcome: "quotaRejected",
-          valueId: null,
-          expectedTurnRevision: turn.revision,
-          outcomeCode: "quota_exhausted",
-          createdAt: this.#timestamp(),
-        });
-        return { turn: this.#requireTurn(turn.id), result };
-      }
-      const actor = this.#requireActor(turn.actorId);
-      const epoch = this.#requireEpoch(actor.epochId);
-      const lease = await this.#acquireWorkspace(epoch, actor);
-      try {
-        await this.#driveTurn(turn, lease.laneId);
-      } catch (error: unknown) {
-        if (
-          !(error instanceof PersistentActorError) ||
-          error.code !== "account_exhausted"
-        ) throw error;
-        turn = this.#requireTurn(turn.id);
-        if (!isTerminalActorTurnState(turn.state)) {
-          const result = this.#authority.settleActorResult({
-            resultId: resultId(turn.id),
-            turnId: turn.id,
-            terminalAttemptId: attempt.id,
-            outcome: "quotaRejected",
-            valueId: null,
-            expectedTurnRevision: turn.revision,
-            outcomeCode: "quota_exhausted",
-            createdAt: this.#timestamp(),
-          });
-          return { turn: this.#requireTurn(turn.id), result };
-        }
+      if (!this.#settleDurableQuotaExhaustion(turn)) {
+        throw new PersistentActorError(
+          "conflict",
+          "observed quota rejection did not terminalize its logical turn",
+        );
       }
       return this.#turnView(this.#requireTurn(turn.id));
     }
@@ -3739,110 +3644,6 @@ export class PersistentActorCoordinator {
       now: this.#timestamp(),
     });
     return { turn: this.#requireTurn(turn.id), result: settled.result };
-  }
-
-  async #captureQuotaContinuation(
-    attemptValue: PersistedActorAttempt,
-    turnValue: ActorTurn,
-    incarnationValue: ActorIncarnationRecord,
-  ): Promise<string> {
-    const attempt = this.#requireAttempt(attemptValue.id);
-    const turn = this.#requireTurn(turnValue.id);
-    const incarnation = this.#requireIncarnation(incarnationValue.id);
-    if (attempt.continuationHistoryValueId !== null) {
-      return attempt.continuationHistoryValueId;
-    }
-    this.#assertActorSessionReady(incarnation);
-    if (
-      attempt.turnId !== turn.id ||
-      attempt.incarnationId !== incarnation.id ||
-      attempt.providerTurnId === null ||
-      incarnation.providerThreadId === null ||
-      attempt.accountProfileId !== incarnation.accountProfileId ||
-      attempt.processGeneration !== incarnation.processGeneration
-    ) {
-      throw new PersistentActorError(
-        "conflict",
-        "post-admission quota history lost its exact source lineage",
-      );
-    }
-    const sourceSession = this.#requireLiveSessionBinding(incarnation, attempt);
-    const sourceOperation = this.#requireOperation(
-      turnOperationId(turn.id, incarnation.id),
-    );
-    const sourceRequest = parseStoredTurnRequestEnvelope(
-      sourceOperation.providerIdentityJson,
-    );
-    if (
-      sourceOperation.kind !== "turnStart" ||
-      sourceOperation.requestDigest !== digestCanonical(sourceRequest) ||
-      sourceRequest.actorId !== turn.actorId ||
-      sourceRequest.turnId !== turn.id ||
-      sourceRequest.incarnationId !== incarnation.id ||
-      sourceRequest.accountProfileId !== attempt.accountProfileId ||
-      sourceRequest.providerThreadId !== incarnation.providerThreadId ||
-      sourceRequest.observationGeneration > sourceSession.liveGeneration
-    ) {
-      throw new PersistentActorError(
-        "conflict",
-        "quota history capture lost its immutable source effect lineage",
-      );
-    }
-    let outcome: z.infer<
-      typeof persistentActorQuotaContinuationCaptureOutcomeSchema
-    >;
-    try {
-      outcome = persistentActorQuotaContinuationCaptureOutcomeSchema.parse(
-        await this.#provider.captureQuotaContinuation({
-          epochId: turn.epochId,
-          actorId: turn.actorId,
-          actorTurnId: turn.id,
-          sourceAttemptId: attempt.id,
-          sourceAccountProfileId: attempt.accountProfileId,
-          sourceProcessGeneration: sourceRequest.processGeneration,
-          sourceObservationGeneration: sourceSession.liveGeneration,
-          sourceProviderThreadId: incarnation.providerThreadId,
-          sourceProviderTurnId: attempt.providerTurnId,
-        }),
-      );
-    } catch (cause: unknown) {
-      this.#markAttemptReconciling(attempt);
-      this.#markTurnReconciling(turn);
-      throw new PersistentActorError(
-        "provider_pending",
-        "verified quota history is awaiting encrypted durable capture",
-        cause,
-      );
-    }
-    if (outcome.kind === "pending") {
-      this.#markAttemptReconciling(attempt);
-      this.#markTurnReconciling(turn);
-      throw new PersistentActorError(
-        "provider_pending",
-        "verified quota history is awaiting encrypted durable capture",
-      );
-    }
-    if (outcome.kind === "ambiguous") {
-      this.#fenceAmbiguousTurn(turn, attempt, incarnation, outcome.proof);
-      throw new PersistentActorError(
-        "ambiguous_effect",
-        "quota history capture conflicts with durable continuation evidence",
-      );
-    }
-    const handle = outcome.handle;
-    if (
-      handle.epochId !== turn.epochId ||
-      handle.actorId !== turn.actorId ||
-      handle.actorTurnId !== turn.id ||
-      handle.sourceAttemptId !== attempt.id
-    ) {
-      this.#fenceAmbiguousTurn(turn, attempt, incarnation, outcome.proof);
-      throw new PersistentActorError(
-        "ambiguous_effect",
-        "quota history capsule returned another actor lineage",
-      );
-    }
-    return handle.valueId;
   }
 
   #fenceAmbiguousTurn(
@@ -3944,7 +3745,11 @@ export class PersistentActorCoordinator {
       toolsetDigest === HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256;
   }
 
-  #preflightActorStartEffect(actorId: string, turnId: string): boolean {
+  #preflightActorStartEffect(
+    actorId: string,
+    turnId: string,
+    operation: ActorOperationRecord,
+  ): boolean {
     const actor = this.#requireActor(actorId);
     let turn = this.#requireTurn(turnId);
     if (turn.actorId !== actor.id) {
@@ -3971,16 +3776,9 @@ export class PersistentActorCoordinator {
       return false;
     }
     this.#assertActorTokenCapacity(actor);
-    try {
-      this.#quotaContinuationSourceForTurn(turn);
-    } catch (cause: unknown) {
-      this.#containInvalidQuotaContinuationSource(turn);
-      throw new PersistentActorError(
-        "ambiguous_effect",
-        "quota continuation source failed exact historical-session preflight",
-        cause,
-      );
-    }
+    if (
+      this.#settleLegacyQuotaLineageBeforeProvider(turn, operation) !== "none"
+    ) return false;
     return true;
   }
 
@@ -4106,6 +3904,73 @@ export class PersistentActorCoordinator {
       outcomeCode,
       createdAt: this.#timestamp(),
     });
+  }
+
+  /**
+   * Retired prerelease databases may contain a quota-rejected source whose
+   * logical turn was left live so a second subscription could continue it.
+   * Consume that evidence locally before account selection, session readiness,
+   * or any provider call. A source with no replacement settles as the original
+   * quota result. Any durable replacement plan or attempt is contained and its
+   * actor-start lineage is fenced without reconstructing continuation history.
+   */
+  #settleLegacyQuotaLineageBeforeProvider(
+    turnValue: ActorTurn,
+    actorStartOperation?: ActorOperationRecord,
+  ): "none" | "terminalized" | "fenced" {
+    const turn = this.#requireTurn(turnValue.id);
+    if (isTerminalActorTurnState(turn.state)) return "terminalized";
+    const attempts = this.#listAttemptsForTurn(turn.id);
+    const source = attempts.find((attempt) => attempt.state === "quotaRejected");
+    if (source === undefined) return "none";
+
+    const sourceIncarnation = this.#requireIncarnation(source.incarnationId);
+    const actorRecovery = this.#readActorReconciliation(turn.actorId);
+    const replacementActorStarts = new Map<string, ActorOperationRecord>();
+    for (const operation of actorRecovery.operations) {
+      if (
+        operation.kind === "actorStart" &&
+        operation.id !== sourceIncarnation.startOperationId
+      ) replacementActorStarts.set(operation.id, operation);
+    }
+    if (
+      actorStartOperation !== undefined &&
+      actorStartOperation.id !== sourceIncarnation.startOperationId
+    ) replacementActorStarts.set(actorStartOperation.id, actorStartOperation);
+    const hasLaterAttempt = attempts.some(
+      (attempt) => attempt.ordinal > source.ordinal,
+    );
+
+    if (!hasLaterAttempt && replacementActorStarts.size === 0) {
+      const reconciling = this.#markTurnReconciling(turn);
+      if (!this.#settleDurableQuotaExhaustion(reconciling)) {
+        throw new PersistentActorError(
+          "conflict",
+          "legacy quota rejection did not terminalize its logical turn",
+        );
+      }
+      return "terminalized";
+    }
+
+    try {
+      this.#containInvalidQuotaContinuationSource(turn);
+    } catch (cause: unknown) {
+      const replacementAttempt = this.#findUnsettledAttempt(turn.id);
+      if (replacementAttempt !== null) {
+        this.#fenceAmbiguousTurn(
+          turn,
+          replacementAttempt,
+          this.#requireIncarnation(replacementAttempt.incarnationId),
+          recoveryProof(),
+        );
+      } else if (replacementActorStarts.size === 0) {
+        throw cause;
+      }
+    }
+    for (const operation of replacementActorStarts.values()) {
+      this.#fenceActorStartRecovery(operation);
+    }
+    return "fenced";
   }
 
   #settleDurableQuotaExhaustion(turnValue: ActorTurn): boolean {
