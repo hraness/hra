@@ -1,4 +1,4 @@
-<!-- kb:context scopes/projects-hra-apps-desktop-runtime--032f7f1c1a1d -->
+<!-- kb:context scopes/apps-desktop-runtime--ca7b731d583e -->
 # Contents
 
 - `src/` – the compiled Bun gateway, account routing, durable supervision, projection, persistence, security, and workspace implementation.

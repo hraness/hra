@@ -1,4 +1,4 @@
-<!-- kb:context scopes/projects-hra-apps-web-convex--eef9a5464795 -->
+<!-- kb:context scopes/apps-web-convex--fc397b5fde8f -->
 # Contents
 
 - `convex.config.ts`, `model.ts`, `schema.ts`, `domain.ts`, `authorization.ts`, `portableLawsBoundary.test.ts`, and `events.ts` – typed configuration, bounded domain values, multi-tenant persistence, authorization, exact provider-neutral law parity, receipts, and events.

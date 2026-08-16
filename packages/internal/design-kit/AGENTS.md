@@ -1,4 +1,4 @@
-<!-- kb:context scopes/packages-design-kit--88e40367792d -->
+<!-- kb:context scopes/packages-internal-design-kit--ffa87e503fef -->
 # Contents
 
 - `src/index.ts`, token CSS, plain-site and plain-publication CSS, and framework-neutral helpers – HRA's private typed compatibility contract for native, server-rendered syntax, quiet sites, long-form publications, and browser consumers.

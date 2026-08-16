@@ -1,4 +1,4 @@
-<!-- kb:context scopes/projects-hra-apps-desktop--535675ca1b9e -->
+<!-- kb:context scopes/apps-desktop--a98dfc0ab16f -->
 # Contents
 
 - `contracts/` – renderer-safe account, chat, task, projection, receipt, and generated Codex protocol contracts.

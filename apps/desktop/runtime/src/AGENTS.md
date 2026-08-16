@@ -1,4 +1,4 @@
-<!-- kb:context scopes/projects-hra-apps-desktop-runtime-src--889ce08ec57f -->
+<!-- kb:context scopes/apps-desktop-runtime-src--336952000c8d -->
 # Contents
 
 - `main.ts` – compiled private-stdio gateway entrypoint, account-service initialization, snapshots, dispatch, and lifecycle integration.

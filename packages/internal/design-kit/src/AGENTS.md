@@ -1,4 +1,4 @@
-<!-- kb:context scopes/packages-design-kit-src--8d750f62c53c -->
+<!-- kb:context scopes/packages-internal-design-kit-src--3194a5a12620 -->
 # Contents
 
 - `index.ts`, `tokens.css`, and parity/property tests – private typed roles and the CSS bridge from public `--ui-*` semantics to legacy compatibility aliases, typography, motion, elevation, breakpoints, layout, and theme selection.
