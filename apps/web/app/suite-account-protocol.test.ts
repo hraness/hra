@@ -54,7 +54,7 @@ describe("HRA suite account browser boundary", () => {
       )?.product).toBe(product);
     }
     expect(parseHRASuiteLinkReceipt(
-      { ...receipt, product: "gnrte" },
+      { ...receipt, product: "unknown-product" },
       nowMs,
     )).toBeNull();
     expect(parseHRASuiteLinkReceipt(receipt, receipt.expiresAtMs)).toBeNull();
