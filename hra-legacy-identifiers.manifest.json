@@ -2,11 +2,11 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d81488879d1e23981af576d0ecb42d3575cba5280a0a146929e2600cb68d7d7d",
+      "matchingLinesSha256": "e6abb6ea8777c8b6fb3d8e89ae25b3b42cc7759fbc11c8dc7aed677fed8ae654",
       "occurrences": {
-        "kitchen": 0,
+        "kitchen": 1,
         "operateStylized": 0,
-        "oprte": 2
+        "oprte": 8
       },
       "path": "apps/desktop/README.md"
     },
@@ -102,6 +102,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "aa575b34c3426acc13f033446a4c0a3777cdc2fb98c67fc0e83850aa6972b33d",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/AGENTS.md"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "9765e1ac2bef5ea4c228d9b5ca5b0a6fa3f51f805ab535de1718127f482991be",
       "occurrences": {
         "kitchen": 0,
@@ -132,6 +142,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "5d5d8c161267fa03b325bafd81409858fd3f0ebcb75b13c4fbbb8bac540c5676",
+      "occurrences": {
+        "kitchen": 9,
+        "operateStylized": 0,
+        "oprte": 15
+      },
+      "path": "apps/desktop/runtime/installation-handoff.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "15afffb4ecaa99fea6c47da617b1dd8c6279396cf7415b2c2f1b9b17664f5fd7",
       "occurrences": {
         "kitchen": 1,
@@ -142,7 +162,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "f727c6f6f35c6bc68a1d26dc7ea238e48f783855019d0e461d443ea9f6bdb16b",
+      "matchingLinesSha256": "10b76714f49d2316b418635e38fb0f3ab3d43c83aa4476635af4b61743b6aa63",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -1112,7 +1132,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6308ca0b835a2e2373ff71ea7513ab88f7f08427bc03ea6084a52f72344245b6",
+      "matchingLinesSha256": "deb1f0710abc2f533ae4574ae17e7c46b41dd740a541459a001c5e43c5efa152",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1419,6 +1439,46 @@
         "oprte": 1
       },
       "path": "apps/desktop/runtime/test/human-account-metadata-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "d1cec2f0bd9974b8ef2480ee991dbbe6842356f7bb08548cde42341049dc1142",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/installation-handoff-schema.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "380082cd4794ad78a732fef645250fd34a7df0457c35384f75781cc67caecfe3",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/installation-handoff.property.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "dcdbcfd296ccd55425911203cba3bc6e8efebee77dbf88da533157891ae5e0af",
+      "occurrences": {
+        "kitchen": 4,
+        "operateStylized": 0,
+        "oprte": 20
+      },
+      "path": "apps/desktop/runtime/test/installation-handoff.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "6f927df026e8258371d76a7014b0a51da8a14cbfc16bc31c1c77114ea1609700",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/desktop/runtime/test/installation-process-authority.test.ts"
     },
     {
       "category": "compatibility",
@@ -1842,13 +1902,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9451bae4f201762a3c60c1ad9256b200a7cfcab814e651b0eb0358b6fb0c4081",
+      "matchingLinesSha256": "df8cb2069926c1b4a244b698410ad9d91a38d39bffe15d03b142c07e0aa53ccb",
+      "occurrences": {
+        "kitchen": 2,
+        "operateStylized": 0,
+        "oprte": 9
+      },
+      "path": "apps/web/README.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "01bfffe9434210bfd563a40ec0cb75ebd40ed720988a444a245db8c3a742814f",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 2
+        "oprte": 1
       },
-      "path": "apps/web/README.md"
+      "path": "apps/web/app/download/page.tsx"
     },
     {
       "category": "compatibility",
@@ -1869,6 +1939,16 @@
         "oprte": 1
       },
       "path": "apps/web/app/hosted-mutation-attempt-journal.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "bd2c120d175adf81466ad6e452122f1017958803ff644405052f0240c1fe31ac",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/app/landing.test.ts"
     },
     {
       "category": "compatibility",
@@ -2112,7 +2192,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "8c81b438719dfc6be1fd8e4134a535561f36e11d587fec98004f658ba2b5daec",
+      "matchingLinesSha256": "582441468738e2f2a05173d8467cf034e3f9570dd65c501cdef63b457154a68c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2122,11 +2202,31 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "3758329c7b5d9386c13a50acde7778f38049b6ce21f29eaeab0d08099be08c5b",
+      "matchingLinesSha256": "089b20cced81f2017909a3b3c8bcdf1bf149a14d14f9ebc51b674d7b8315d339",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/scripts/vercel-build.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "78911f8943866291cca9e2657ccd4047f647e1b68cca86bf287d0f76176eecb5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/web/scripts/vercel-build.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "f7d389a30b7cbf1c7b95c3bea55a7de7680e9588566306cdf6be19c3ce6e628f",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
-        "oprte": 2
+        "oprte": 3
       },
       "path": "apps/web/suite-account-contracts.test.ts"
     },
@@ -2139,6 +2239,46 @@
         "oprte": 1
       },
       "path": "apps/web/suite-account-contracts.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "b638d8745bdbd141e2ef5c0fc63ed52114a53ef5944b15cd3b67968e44050962",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "kb/AGENTS.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ee4ecdd05fe5229896b99e80319a08c193865256a59d8e14100dc41ea48bf432",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "kb/VISION.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "3b7db6f7e7963100ffd81087a609aeaef41b7096c57b39f38246524bfa18b3f3",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "kb/index.md"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "928dd8f1b604caf6cc15c75bdbf46264642faa127c5d04f23c311fcbc96ecf21",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 29
+      },
+      "path": "kb/notes/hra-predecessor-market-and-competitor-dossier.md"
     },
     {
       "category": "compatibility",

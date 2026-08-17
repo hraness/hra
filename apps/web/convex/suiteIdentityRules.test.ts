@@ -21,6 +21,7 @@ import {
 } from "./suiteIdentityRules";
 
 const accountId = "acct_018f1f7a7a367ccdbd5d706d4dc5c018";
+const currentSecret = Buffer.alloc(32, 0x6e).toString("base64url");
 const projection = {
   catalogRevision: SUITE_CATALOG_REVISION,
   expiresAt: 2_000,
@@ -33,29 +34,18 @@ const projection = {
 } as const satisfies SuiteEntitlementProjectionUpdate;
 
 describe("HRA suite identity laws", () => {
-  test("issues with one active key while verifying configured retired receipts", async () => {
+  test("requires one exact production/v1 HRA key and verifies a compatibility receipt", async () => {
     const selected = selectSuiteReceiptConfiguration({
-      keys: [
-        {
-          environment: "production",
-          keyVersion: "v1",
-          product: "hra",
-          secret: "o".repeat(32),
-        },
-        {
-          environment: "production",
-          keyVersion: "v2",
-          product: "hra",
-          secret: "n".repeat(32),
-        },
-      ],
+      keys: [{
+        environment: "production",
+        keyVersion: "v1",
+        product: "hra",
+        secret: currentSecret,
+      }],
       version: 1,
-    }, "hra", "v2");
-    expect(selected?.key.keyVersion).toBe("v2");
-    expect(selected?.keyring.keys.map((key) => key.keyVersion)).toEqual([
-      "v1",
-      "v2",
-    ]);
+    }, "hra", "v1");
+    expect(selected?.key.keyVersion).toBe("v1");
+    expect(selected?.keyring.keys).toHaveLength(1);
     if (selected === null) throw new Error("Expected an HRA receipt configuration.");
     const retiredPayload = {
       challengeId: "retired_challenge_abcdefghijklmn",
@@ -69,7 +59,7 @@ describe("HRA suite identity laws", () => {
     } as const;
     const retiredReceipt: SuiteLinkReceipt = {
       ...retiredPayload,
-      signature: createHmac("sha256", "o".repeat(32))
+      signature: createHmac("sha256", currentSecret)
         .update(suiteLinkReceiptMessage(retiredPayload))
         .digest("base64url"),
       version: "suite-link-receipt-v1",
@@ -84,6 +74,17 @@ describe("HRA suite identity laws", () => {
       "hra",
       "missing",
     )).toBeNull();
+    expect(selectSuiteReceiptConfiguration({
+      keys: [
+        selected.key,
+        { ...selected.key, keyVersion: "v2" },
+      ],
+      version: 1,
+    }, "hra", "v1")).toBeNull();
+    expect(selectSuiteReceiptConfiguration({
+      keys: [{ ...selected.key, environment: "development" }],
+      version: 1,
+    }, "hra", "v1")).toBeNull();
   });
 
   test("permits one exact alias and rejects either-direction conflicts", () => {

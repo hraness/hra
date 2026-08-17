@@ -7,10 +7,11 @@ import {
   readFile,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { RuntimePaths } from "../src/runtime-paths";
 import {
@@ -34,6 +35,7 @@ const unsafePathExecution = {
   unsafeTestOnlyAllowPathExecution: true,
 } as const;
 let descriptorExecutorBinary: string | null = null;
+let descriptorExecutorCacheRoots: readonly [string, string] | null = null;
 let descriptorExecutorRoot: string | null = null;
 // A clean release-safe Zig compile can exceed Bun's 30-second hook default
 // when the repository gate is sharing an Apple Silicon runner with another
@@ -42,9 +44,19 @@ const descriptorExecutorBuildTimeoutMs = 120_000;
 
 beforeAll(async () => {
   if (process.platform !== "darwin") return;
-  descriptorExecutorRoot = await mkdtemp(
-    join(tmpdir(), "oprte-git-directory-executor-"),
+  descriptorExecutorRoot = await realpath(
+    await mkdtemp(join(tmpdir(), "oprte-git-directory-executor-")),
   );
+  const localCacheRoot = join(descriptorExecutorRoot, "zig-local-cache");
+  const globalCacheRoot = join(descriptorExecutorRoot, "zig-global-cache");
+  await Promise.all([
+    mkdir(localCacheRoot, { mode: 0o700 }),
+    mkdir(globalCacheRoot, { mode: 0o700 }),
+  ]);
+  descriptorExecutorCacheRoots = [
+    await realpath(localCacheRoot),
+    await realpath(globalCacheRoot),
+  ];
   const binary = join(
     descriptorExecutorRoot,
     "oprte-git-executor",
@@ -58,6 +70,11 @@ beforeAll(async () => {
     "-lc",
     `-femit-bin=${binary}`,
   ], {
+    env: {
+      ...process.env,
+      ZIG_GLOBAL_CACHE_DIR: descriptorExecutorCacheRoots[1],
+      ZIG_LOCAL_CACHE_DIR: descriptorExecutorCacheRoots[0],
+    },
     stderr: "pipe",
     stdout: "pipe",
   });
@@ -87,6 +104,19 @@ afterEach(async () => {
 });
 
 describe("bundled Git execution boundary", () => {
+  test("builds its descriptor executor with fixture-owned Zig caches", async () => {
+    if (process.platform !== "darwin") return;
+    const root = descriptorExecutorRoot;
+    const cacheRoots = descriptorExecutorCacheRoots;
+    if (root === null || cacheRoots === null) {
+      throw new Error("Descriptor executor cache fixture was not initialized");
+    }
+    for (const cacheRoot of cacheRoots) {
+      expect(dirname(cacheRoot)).toBe(root);
+      expect((await stat(cacheRoot)).isDirectory()).toBeTrue();
+    }
+  });
+
   test("runs every admitted Git builtin through the sealed generation boundary", async () => {
     if (process.platform !== "darwin") return;
     const root = await temporaryRoot("oprte-real-git-generation-");

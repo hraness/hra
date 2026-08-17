@@ -51,15 +51,155 @@ Configure `WORKOS_WEBHOOK_SECRET` in the Convex deployment and send WorkOS webho
 
 Two leased, paginated Convex jobs run every 15 minutes. One rechecks projected membership IDs, including provider-side deletion; the other enumerates active, inactive, and pending provider memberships for every projected WorkOS organization so a missed create webhook is recoverable. Bounded runs schedule immediate cursor-based continuations instead of waiting for the next interval. Provider calls remain in actions, and projection writes remain in transactions.
 
-The workspace serves the canonical `hra.sh` origin. `bun run build` compiles
-the Next.js application and never deploys Convex or mutates a hosting
-provider. Configure deployments outside this public source tree. Session sync
-remains fail-closed while
+The workspace serves the canonical `hra.sh` origin. Local `bun run build`
+compiles the application without provider mutation. Vercel uses the separate
+checked build entry in `vercel.json`: only its exact Production target may
+deploy Convex functions to `benevolent-akita-439`. A generated Preview skips
+Convex deployment and builds an anonymous app-only client of the exact
+`benevolent-akita-439.convex.cloud` and `benevolent-akita-439.convex.site`
+public endpoints. Custom staging and every unrecognized provider target fail
+closed. Session sync remains fail-closed while
 `HRA_SESSION_SYNC_ENABLED` is absent or `false`; the unchanged
 `OPRTE_SESSION_SYNC_ENABLED` value remains a fallback, and conflicting names
 fail closed. Enable it only after the
 exact WorkOS application, Convex environment, desktop public coordinates, and
 production HTTP route readbacks pass for the same source revision.
+
+## Production provider cutover
+
+Before any provider deployment, enable Vercel's **Automatically expose System
+Environment Variables** setting on the exact HRA project and read it back as
+enabled for Production and Preview. The source gate requires Vercel's own
+`VERCEL`, target, Git provider, repository owner/name, branch, and full commit
+SHA evidence. It intentionally refuses when that project setting is disabled
+or any system identity is absent; caller-created substitutes are not an
+accepted deployment path.
+
+Scope the public `NEXT_PUBLIC_CONVEX_URL` and
+`NEXT_PUBLIC_CONVEX_SITE_URL` records to Vercel Production and Preview, with
+the exact `benevolent-akita-439` URLs. Scope the Convex production deploy-key record,
+`SUITE_IDENTITY_RECEIPT_KEY_VERSION`, `SUITE_OIDC_COOKIE_SECRET`, and
+`NEXT_PUBLIC_SITE_URL` to Production only. The deploy key must name
+`benevolent-akita-439`, the selector must be `v1`, and the site URL must be
+`https://hra.sh`. Create a fresh HRA-held deploy key for that deployment and a
+fresh independent HRA cookie secret. Do not copy or share the predecessor
+deploy key or cookie secret. Cookies cannot cross from `oprte.com` to `hra.sh`,
+and deploy keys are exact project/environment custody. Do not copy the
+predecessor `https://oprte.com` site value.
+
+Do not configure Convex-only custody in Vercel, even as an empty record. The
+Production wrapper refuses the receipt keyring, session flags, hosted-mutation
+keys, taskctl peppers or fixture settings, WorkOS webhook secret and owner
+role, and local WorkOS provider overrides. Configure those values only on the
+exact Convex deployment.
+
+Leave `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST` unset while the release
+contract is `candidate`. After the Required CI job succeeds on the exact
+publication commit P, set this non-secret trusted manual allowlist to P for
+Vercel Production and Preview, then redeploy that exact P. The provider wrapper
+proves only that Vercel's canonical `hraness/hra` Git SHA equals the allowlist;
+the operator's Required-CI readback is what authorizes setting it. A mismatch,
+missing value, non-Git build, wrong repository, or Production branch other
+than `main` makes a published build refuse. The wrapper removes the allowlist
+before launching the final Next build.
+
+Transfer no custom-staging record. Preview refuses the deploy key, deployment
+token, Convex selector, canonical production site claim, Suite cookie or key
+selector, WorkOS credentials, and every other checked production capability,
+including an empty provider record. Its two public Convex URLs grant no
+backend publication authority.
+
+Use this order for the shared backend:
+
+1. Freeze the exact predecessor OPRTE Vercel project before retaining its
+   deploy key for rollback. Disconnect its Git integration and disable every
+   automatic deployment or retry path without deleting its last READY
+   Production deployment. Read back and record that the project has no Git
+   connection, no queued or running deployment, and one unchanged READY
+   Production rollback anchor. A retained key without this publication freeze
+   is not a safe rollback boundary because old source could republish to the
+   shared Convex deployment.
+2. Generate the fresh HRA deploy key and cookie secret, then install the scoped
+   HRA Vercel values. Leave Preview without every production-only record and
+   transfer zero predecessor secret values.
+3. After Required CI succeeds, run a Vercel Production deployment from the
+   exact reviewed candidate commit C on canonical `hraness/hra` `main`, and
+   read back that Vercel's system commit SHA is C. Convex 1.44 runs the checked
+   nested Next artifact build first, then pushes the HRA parser and functions
+   to `benevolent-akita-439`. Vercel promotes the new app only after that
+   complete build command succeeds, so the parser lands before the app becomes
+   production-visible. Do not change source between this deployment and C's
+   package and tag gates.
+4. Generate one fresh independent secret in a mode-0600 file as canonical
+   unpadded base64url for at least 32 random bytes. Derive the HRA keyring from
+   that file only. Do not use the unrelated key already held by Accounts.
+5. Append the candidate HRA entry to Accounts without deleting or copying its
+   unrelated entry, then prove the Accounts readback against the candidate.
+   Next set HRA Convex `SUITE_IDENTITY_LINK_KEYS` to an HRA-only keyring
+   containing `hra:production:v1` and prove its readback. Set HRA Convex
+   `SUITE_IDENTITY_RECEIPT_KEY_VERSION=v1` last, then rerun the exact HRA audit.
+   This verifier-first order avoids a window where HRA can mint a proof that
+   Accounts cannot verify. Remove the candidate file only after both
+   candidate-match gates pass inside the same bounded custody window.
+6. Redeploy and read back the HRA production routes. A missing or invalid
+   predecessor OPRTE/Kitchen receipt is expected and is not a health gate.
+7. From the same candidate commit C recorded in step 3, complete its full
+   package, then follow the desktop release runbook to create and push the
+   direct annotated `v0.1.8` tag and
+   publish the exact seven-asset immutable GitHub prerelease. Fill the
+   working-tree publication contract from C's emitted evidence and require
+   `bun run verify:remote-release` to read back exact remote names, byte counts,
+   SHA-256 digests, checksum, manifest, DMG binding, and corresponding-source
+   binding before committing P. Create P as the exact contract-only child,
+   push it, and require the green Required CI source-and-remote readback for
+   that exact P. Only then set
+   `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST=P` in Production and Preview, and
+   redeploy exact P before enabling or exercising the installation handoff.
+8. Retain the predecessor deploy key only for the bounded rollback window.
+   Revoke it after HRA authority and rollback disposition are complete.
+
+The deployed source owns a read-only internal audit. Its no-candidate form
+returns only selector state, exact-key counts, and a closed status:
+
+```sh
+bun x convex run suiteIdentityAudit:audit '{}' \
+  --deployment benevolent-akita-439
+```
+
+After both HRA and Accounts have been configured from the same mode-0600
+candidate file, verify HRA with the source-owned wrapper:
+
+```sh
+bun run verify:receipt-provider -- \
+  --secret-file /private/absolute/canonical/path/to/receipt-secret
+```
+
+The wrapper validates the file descriptor and permissions, sends only a fresh
+random challenge to the internal audit, and compares its domain-separated HMAC
+response locally with a timing-safe check. It accepts only
+`keyCount=1`, `hraProductionV1Count=1`, `otherKeyCount=0`, `selectorV1=true`,
+`status=ready`, and `candidateSecretMatch=true`. Its output contains only those
+counts, status, and match bit. Run the Accounts counterpart against the same
+candidate before deleting it; shape-only readback does not prove shared-secret
+equality.
+The file argument must use its exact native `realpath` spelling. In particular,
+macOS temporary paths often print `/var/...` while the canonical path is
+`/private/var/...`; pass the canonical result rather than the alias.
+
+Never install the HRA-only keyring until the candidate deployment in step 3
+has completed and its HRA parser is live. The predecessor backend may reject
+the new shape, which would leave neither checked source nor a safe rollback
+path in authority.
+
+The shared deployment may retain
+`OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT`, its exact `_VERSION`, and
+`OPRTE_SESSION_SYNC_ENABLED` as compatibility inputs. HRA adopts the matching
+HRA names only when absent or byte-for-byte equal, so do not rotate or delete
+those values during this authority cutover. A production suite-link E2E also
+requires separately provisioned WorkOS provider authority. If it is absent,
+verify the parser, deployment readbacks, and unavailable response, and record
+the WorkOS-backed E2E as an external gate rather than creating credentials or
+claiming it passed.
 
 ## Public product pages
 
@@ -85,7 +225,8 @@ Linking requires both a live Hraness session and a currently authorized WorkOS h
 Product-local identity linking fails closed until the HRA runtimes are configured:
 
 - The web host needs `NEXT_PUBLIC_SITE_URL=https://hra.sh`, a distinct `SUITE_OIDC_COOKIE_SECRET`, and `SUITE_IDENTITY_RECEIPT_KEY_VERSION`. Missing or mismatched values make the suite route return `503 SUITE_OIDC_UNAVAILABLE`.
-- The HRA Convex environment needs an HRA-only `SUITE_IDENTITY_LINK_KEYS` keyring and the same active `SUITE_IDENTITY_RECEIPT_KEY_VERSION` selector. Verification retains older versions for the same environment through the maximum five-minute receipt lifetime. Missing, ambiguous, or malformed configuration makes proof and receipt actions return `unavailable`.
+- Deploy exact Suite Accounts v0.3.0 overlap support before changing either receipt keyring. Generate a fresh independent secret as the canonical unpadded base64url encoding of at least 32 random bytes. The HRA Convex `SUITE_IDENTITY_LINK_KEYS` keyring contains only the `hra:production:v1` entry. Accounts appends that same HRA entry alongside its unrelated existing entry. Never copy the unrelated Accounts key into HRA. Both environments use `SUITE_IDENTITY_RECEIPT_KEY_VERSION=v1`.
+- This cutover admits exactly one HRA production/v1 key. Extra HRA versions, development entries, non-HRA entries, a selector other than `v1`, and malformed configuration make proof and receipt actions return `unavailable`. Rotate only through a later reviewed contract that restores bounded multi-key verification. No predecessor OPRTE/Kitchen receipt key is expected to exist, and the predecessor receipt authority being unavailable or invalid is not a rollout health gate.
 - The ordinary hosted WorkOS and HRA Convex configuration described above must also be live, because suite linking reuses the existing WorkOS human and active organization-membership authorization rather than creating another product principal.
 
 WorkOS-to-Hraness identity linking remains unavailable until the web session

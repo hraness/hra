@@ -1,26 +1,52 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   buildLegacyManifest,
+  collectPublicBoundaryEntries,
   parseLegacyManifest,
   publicBoundaryErrors,
   validateLegacyManifest,
 } from "./check-public-boundary";
 
 describe("public repository boundary", () => {
+  test("collects source without local compiler cache debris", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-collector-"));
+    try {
+      await mkdir(join(root, "apps/desktop/.zig-cache"), { recursive: true });
+      await mkdir(join(root, "apps/web"), { recursive: true });
+      await writeFile(join(root, "apps/desktop/.zig-cache/object.o"), "cache");
+      await writeFile(join(root, "apps/web/tsconfig.tsbuildinfo"), "cache");
+      await writeFile(join(root, "apps/web/source.ts"), "export {};\n");
+      const paths = (await collectPublicBoundaryEntries(root))
+        .map(({ path }) => path);
+      expect(paths).toContain("apps/web/source.ts");
+      expect(paths.some(path => path.includes(".zig-cache"))).toBeFalse();
+      expect(paths.some(path => path.endsWith(".tsbuildinfo"))).toBeFalse();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("rejects excluded authority, generated output, and unsafe file kinds", () => {
     const authorityPath = ["release", "authority.json"].join("-");
     const excludedPackage = ["packages/codex-", "app-sdk"].join("");
     expect(publicBoundaryErrors([
       { kind: "file", path: authorityPath, source: "{}" },
       { kind: "directory", path: "apps/web/.next" },
+      { kind: "directory", path: "apps/desktop/.zig-cache" },
+      { kind: "file", path: "apps/web/tsconfig.tsbuildinfo" },
       { kind: "symlink", path: "packages/link", source: "../outside" },
       { kind: "directory", path: excludedPackage },
       { kind: "special", path: "scripts/control.pipe" },
       { kind: "file", path: "apps/web/.env.production", source: "" },
     ])).toEqual([
+      "apps/desktop/.zig-cache: generated build output is present",
       "apps/web/.env.production: private environment file is present",
       "apps/web/.next: generated build output is present",
+      "apps/web/tsconfig.tsbuildinfo: generated build output is present",
       `${excludedPackage}: excluded private path is present`,
       "packages/link: symbolic links are forbidden",
       `${authorityPath}: excluded private path is present`,

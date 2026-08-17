@@ -29,6 +29,7 @@ import {
   requiredLicenseFileNames,
   trustedThirdPartyTeams,
 } from "./macos-package-config";
+import { inspectReleaseSourceRepository } from "./release-provenance";
 import runtimeVersions from "./runtime-versions.json";
 import {
   createShippedJavaScriptLicenseInventory,
@@ -439,19 +440,11 @@ async function signRuntimeTree(
   return preserved.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-async function gitCommit(): Promise<string> {
-  const result = await run(["/usr/bin/git", "rev-parse", "HEAD"]);
-  const commit = result.stdout.trim();
-  if (!/^[0-9a-f]{40}$/u.test(commit)) {
-    throw new Error("Could not resolve the source commit for the package manifest.");
-  }
-  return commit;
-}
-
 async function main(): Promise<void> {
   if (process.platform !== "darwin" || process.arch !== "arm64") {
     throw new Error("HRA macOS packaging requires Apple Silicon macOS.");
   }
+  const sourceRepository = await inspectReleaseSourceRepository();
   await requireRealDirectory(appRoot);
   const canonicalPackageRoot = await realpath(join(macosPackage.desktopRoot, "zig-out/package"));
   const canonicalAppRoot = await realpath(appRoot);
@@ -536,7 +529,7 @@ async function main(): Promise<void> {
     release: {
       architecture: macosPackage.architecture,
       build: macosPackage.build,
-      commit: await gitCommit(),
+      commit: sourceRepository.commit,
       minimumMacOS: macosPackage.minimumMacOS,
       signing: "adhoc",
       version: macosPackage.version,

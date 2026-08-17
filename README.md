@@ -9,9 +9,10 @@ and bringing it back for review.
 [Download for macOS](https://hra.sh/download) · [Website](https://hra.sh) ·
 [Compare HRA](https://hra.sh/alternatives) · [Open HRA](https://hra.sh/app)
 
-> HRA is a prerelease for Apple Silicon Macs. The current binary is ad-hoc
-> signed for bundle integrity, but it is not Developer ID signed or notarized.
-> Read the install disclosure before opening it.
+> HRA 0.1.8 build 9 is a source release candidate for Apple Silicon Macs.
+> Direct downloads remain disabled until its exact source commit, annotated
+> tag, runtime tree, manifest, checksum, and artifact hashes are published. The
+> candidate uses an ad-hoc code seal; it is not Developer ID signed or notarized.
 
 ## Why HRA exists
 
@@ -75,10 +76,11 @@ and data boundary.
 
 ## Install the prerelease
 
-The native app targets Apple Silicon and macOS 13 or newer. Download the DMG,
-verify its published SHA-256, and follow the unknown-developer instructions on
-[hra.sh/download](https://hra.sh/download). You can also build the exact source
-locally.
+The native app targets Apple Silicon and macOS 13 or newer. The
+[download page](https://hra.sh/download) exposes no draft asset while the
+checked release contract is a candidate. After publication, download the DMG
+and checksum from that page, verify the SHA-256, and follow the
+unknown-developer instructions. You can build the candidate source locally.
 
 ## Develop HRA
 
