@@ -47,7 +47,7 @@
     "@hra-internal/web-discovery": "workspace:*",
     "@hraness/agent-tasks-domain": "workspace:*",
     "@hraness/agent-tasks-protocol": "workspace:*",
-    "@hraness/codex-app-sdk": "catalog:",
+    "@hra-internal/codex-app-sdk": "workspace:*",
     "@workos-inc/authkit-nextjs": "catalog:",
     "@workos-inc/node": "catalog:",
     "convex": "catalog:",

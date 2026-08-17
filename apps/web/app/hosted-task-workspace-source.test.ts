@@ -4,8 +4,8 @@ import {
   createAttemptId,
   createMutationFingerprint,
   type MutationAttemptJournal,
-} from "@hraness/codex-app-sdk";
-import { createMemoryMutationAttemptJournal } from "@hraness/codex-app-sdk/testing";
+} from "@hra-internal/codex-app-sdk";
+import { createMemoryMutationAttemptJournal } from "@hra-internal/codex-app-sdk/testing";
 import type { TaskWorkspaceView } from "@hraness/agent-tasks-domain";
 import type {
   TaskWorkspaceEffectContext,

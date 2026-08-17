@@ -71,34 +71,40 @@ describe("standalone package graph", () => {
     ]);
   });
 
-  test("rejects workspaces and workspace edges owned by excluded repositories", () => {
+  test("permits the internal SDK and rejects workspaces owned by excluded repositories", () => {
     expect(standalonePackageErrors([
       {
         path: "package.json",
         value: {
           name: "hra",
-          workspaces: {
-            catalog: {
-              "@hraness/codex-app-sdk":
-                "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
-            },
-          },
+          workspaces: { catalog: {} },
         },
       },
       {
-        path: "packages/codex-app-sdk/package.json",
-        value: { name: "@hraness/codex-app-sdk" },
+        path: "packages/internal/codex-app-sdk/package.json",
+        value: { name: "@hra-internal/codex-app-sdk" },
       },
       {
         path: "packages/task-ui/package.json",
         value: {
           name: "@hraness/agent-tasks-ui",
-          dependencies: { "@hraness/codex-app-sdk": "workspace:*" },
+          dependencies: { "@hra-internal/codex-app-sdk": "workspace:*" },
+        },
+      },
+      {
+        path: "packages/internal/identity/package.json",
+        value: { name: "@hra-internal/identity" },
+      },
+      {
+        path: "apps/example/package.json",
+        value: {
+          name: "@hraness/example",
+          dependencies: { "@hra-internal/identity": "workspace:*" },
         },
       },
     ])).toEqual([
-      "packages/codex-app-sdk/package.json: excluded workspace @hraness/codex-app-sdk is present",
-      "packages/task-ui/package.json: @hraness/codex-app-sdk must not use the workspace protocol",
+      "packages/internal/identity/package.json: excluded workspace @hra-internal/identity is present",
+      "apps/example/package.json: @hra-internal/identity must not use the workspace protocol",
     ]);
   });
 });

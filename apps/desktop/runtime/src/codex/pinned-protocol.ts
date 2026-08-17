@@ -1,7 +1,7 @@
 import {
   defineOperation,
   type OperationSemantics,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 
 import type { CodexRequestId } from "./envelope";
 import { classifyCodex01446RemoteError } from "./compatibility-0-144-6";

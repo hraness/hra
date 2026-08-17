@@ -14,6 +14,7 @@
 - Keep every production input backend-neutral and foreign values out of the component boundary until an authority adapter validates them.
 - Keep source authority generations separate from durable projection revisions. Install only coherent bundles, and bind continuations to one exact coordinate, source generation, and revision.
 - Keep the headless client React-free. React may select snapshots but must not own source requests, paging cursors, mutation synchronization, or revision floors.
+- Build the headless client and selector on `@hra-internal/codex-app-sdk`; do not duplicate its store, lifecycle, coordinate, or persistence contracts here.
 - Keep fixtures out of the root production export.
 - Preserve keyboard operation, semantic headings, live-region behavior, visible focus, and distinct local-owner, human, agent, and system identity.
 - Keep public phase and event copy backend-neutral and execution-mode-neutral. Stable `worktree.*` event kinds must render as execution-workspace activity rather than claiming every run owns a worktree.

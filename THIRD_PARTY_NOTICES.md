@@ -28,12 +28,13 @@ endorsement, or sponsorship.
 
 ## Codex App SDK
 
-HRA consumes `@hraness/codex-app-sdk` from commit
-`e7d5167ca5389ac834714a8a0a2c1602071963e2` of the
-[`hraness/codex-app-sdk`](https://github.com/hraness/codex-app-sdk) repository.
-The SDK is distributed under the MIT License, retained in the
-[upstream source](https://github.com/hraness/codex-app-sdk/blob/e7d5167ca5389ac834714a8a0a2c1602071963e2/LICENSE).
-Packaged distributions that include the SDK must include that license text.
+`packages/internal/codex-app-sdk` contains the unchanged runtime and test source
+from public `@hraness/codex-app-sdk` v0.1.1 at commit
+`e7d5167ca5389ac834714a8a0a2c1602071963e2`. The snapshot record and original
+MIT terms are retained in
+[`PROVENANCE.md`](packages/internal/codex-app-sdk/PROVENANCE.md) and
+[`LICENSE`](packages/internal/codex-app-sdk/LICENSE). Packaged distributions
+that include the SDK include that license text.
 
 ## Desktop runtime components
 

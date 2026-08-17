@@ -23,6 +23,7 @@
 # Guidelines
 
 - Keep protocol-generated values inside `codex/`. Parse each accepted notification once, translate it into bounded HRA-owned facts, and fan the same immutable fact batch to explicit consumers.
+- Use `@hra-internal/codex-app-sdk` only for provider-neutral client lifecycle, operation, coordinate, persistence, and store contracts. Keep the pinned protocol, process driver, SQLite adapters, and product projection in this runtime.
 - Parse stdin, app-server stdout, files, environment values, and database rows from `unknown` before use.
 - Persist a process generation before creating its account child; reject stale requests, notifications, login authority, and interaction responses after generation change.
 - Keep credentials and Codex-owned transcripts in the isolated account home. Chat persistence may retain only bounded user/assistant text needed to render local panes and start a later explicit turn after an account change, never raw reasoning, provider payloads, paths, commands, output, or credentials.

@@ -17,6 +17,7 @@ const names = new Map([
   ["packages/internal/brand-ui", "@hra-internal/brand-ui"],
   ["packages/internal/browser-storage", "@hra-internal/browser-storage"],
   ["packages/internal/convex", "@hra-internal/convex"],
+  ["packages/internal/codex-app-sdk", "@hra-internal/codex-app-sdk"],
   ["packages/internal/design-kit", "@hra-internal/design-kit"],
   ["packages/internal/eslint-config", "@hra-internal/eslint-config"],
   ["packages/internal/schema", "@hra-internal/schema"],
@@ -32,7 +33,7 @@ function metadata(directory?: string): Record<string, unknown> {
   return {
     bugs,
     homepage,
-    license: "Apache-2.0",
+    license: directory === "packages/internal/codex-app-sdk" ? "MIT" : "Apache-2.0",
     private: true,
     repository: {
       type: "git",
@@ -67,8 +68,6 @@ function completeFixture(): Readonly<{
       },
       workspaces: {
         catalog: {
-          "@hraness/codex-app-sdk":
-            "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
           "agent-browser": "0.32.3",
           "react-aria-components": "1.19.0",
         },
@@ -91,8 +90,10 @@ function completeFixture(): Readonly<{
               },
             }
           : {}),
-        ...(directory === "packages/task-ui"
-          ? { dependencies: { "@hraness/codex-app-sdk": "catalog:" } }
+        ...(directory === "apps/desktop"
+          || directory === "apps/web"
+          || directory === "packages/task-ui"
+          ? { dependencies: { "@hra-internal/codex-app-sdk": "workspace:*" } }
           : {}),
       },
     });
@@ -115,6 +116,8 @@ function completeFixture(): Readonly<{
     "bunfig.toml",
     "hra-legacy-identifiers.manifest.json",
     "package.json",
+    "packages/internal/codex-app-sdk/LICENSE",
+    "packages/internal/codex-app-sdk/PROVENANCE.md",
     "scripts/check-public-boundary.ts",
     "scripts/check-public-structure.ts",
     "scripts/check-public-tree.ts",
@@ -157,7 +160,7 @@ describe("public repository structure", () => {
     expect(errors).toContain(`${privateWorkspace}: excluded private path is present`);
   });
 
-  test("rejects a workspace SDK edge and an unpinned public SDK revision", () => {
+  test("rejects an external SDK pin and a non-workspace internal SDK edge", () => {
     const fixture = completeFixture();
     const manifests = fixture.manifests.map((manifest) => {
       if (manifest.path === "package.json") {
@@ -165,7 +168,16 @@ describe("public repository structure", () => {
         const workspaces = value["workspaces"] as Record<string, unknown>;
         return {
           ...manifest,
-          value: { ...value, workspaces: { ...workspaces, catalog: {} } },
+          value: {
+            ...value,
+            workspaces: {
+              ...workspaces,
+              catalog: {
+                "@hraness/codex-app-sdk":
+                  "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
+              },
+            },
+          },
         };
       }
       if (manifest.path === "packages/task-ui/package.json") {
@@ -173,7 +185,7 @@ describe("public repository structure", () => {
           ...manifest,
           value: {
             ...(manifest.value as Record<string, unknown>),
-            dependencies: { "@hraness/codex-app-sdk": "workspace:*" },
+            dependencies: { "@hra-internal/codex-app-sdk": "catalog:" },
           },
         };
       }
@@ -184,10 +196,10 @@ describe("public repository structure", () => {
       presentPaths: fixture.presentPaths,
     });
     expect(errors).toContain(
-      "package.json: Codex App SDK must resolve from the audited public commit",
+      "package.json: external Codex App SDK catalog pin must be absent",
     );
     expect(errors).toContain(
-      "packages/task-ui/package.json: Codex App SDK must use the root catalog",
+      "packages/task-ui/package.json: Codex App SDK must use the internal workspace",
     );
   });
 });

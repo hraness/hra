@@ -2,7 +2,7 @@ import {
   createReducerStore,
   type ReducerStore,
   type StoreListener,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 
 import type { CodexFact } from "../codex";
 import { createSessionState, type SessionState } from "./model";

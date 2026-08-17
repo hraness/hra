@@ -39,7 +39,7 @@ import {
   rejected,
   type DispatchOutcome,
   type MutationAttemptRecord,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 import {
   type TaskWorkspaceClientMutationIntent,
   type TaskWorkspaceContinuationRequest,

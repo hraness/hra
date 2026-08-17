@@ -2,7 +2,7 @@ import {
   createExternalStoreSelectorReader,
   useExternalStoreSelector,
   type SelectionEquality,
-} from "@hraness/codex-app-sdk/react";
+} from "@hra-internal/codex-app-sdk/react";
 import { useMemo } from "react";
 
 import type { HraStore, TaskWorkspaceSnapshot } from "./task-workspace-model";
