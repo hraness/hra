@@ -792,6 +792,7 @@ describe("actor session recovery v2", () => {
       binding,
     ]));
     const value = isolatedAuthority([stalled, ...healthy]);
+    const scheduler = new ManualRecoveryScheduler();
     let active = 0;
     let maximumActive = 0;
     const recovery = new HarnessActorSessionRecoveryV2({
@@ -802,7 +803,11 @@ describe("actor session recovery v2", () => {
           if (accountProfileId === stalled.accountProfileId) {
             return await new Promise<never>(() => undefined);
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, 2));
+          // Keep healthy completion asynchronous without spending the real
+          // pass budget. Wall-clock timers made runner load indistinguishable
+          // from a healthy account fault and legitimately deferred later
+          // accounts before this fixture could assert the intended law.
+          await Promise.resolve();
           active -= 1;
           return { generation: 2 };
         },
@@ -819,10 +824,9 @@ describe("actor session recovery v2", () => {
       concurrency: 2,
       recoveryTimeoutMs: 40,
       retryDelayMs: 60_000,
+      scheduler,
     });
-    const startedAt = performance.now();
     const report = await recovery.recoverActorSessions();
-    const elapsed = performance.now() - startedAt;
 
     expect(report).toEqual({
       recoveredIncarnationIds: healthy.map(({ incarnationId }) => incarnationId)
@@ -831,10 +835,12 @@ describe("actor session recovery v2", () => {
       deferredIncarnationIds: [stalled.incarnationId],
     });
     expect(maximumActive).toBeLessThanOrEqual(2);
-    expect(elapsed).toBeLessThan(200);
+    expect(scheduler.scheduled).toHaveLength(1);
+    expect(scheduler.scheduled[0]?.delayMilliseconds).toBe(60_000);
     // The deliberately unresolved runtime remains in flight, so shutdown
     // correctly refuses to claim a drain in this latency-only fixture.
     void recovery.close();
+    expect(scheduler.scheduled[0]?.timer.cancelled).toBeTrue();
   });
 
   test("rotates retry admission past eight wedged accounts so later accounts recover", async () => {
