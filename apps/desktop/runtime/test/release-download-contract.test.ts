@@ -3,12 +3,15 @@ import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   parseReleaseDownloadContract,
   readReleaseDownloadContract,
   requirePublishedReleaseSource,
   verifyReleaseDownloadContract,
+  verifyLocalReleaseCandidate,
+  verifyPublishedReleaseArtifacts,
   verifyPublishedReleaseCandidate,
   verifyPublishedReleaseSourceEvidence,
   verifyReleaseSourceGate,
@@ -278,6 +281,12 @@ describe("release and download convergence", () => {
     expect(desktopManifest.scripts?.["verify:remote-release"]).toBe(
       "bun run runtime/release-download-contract.ts remote",
     );
+    expect(desktopManifest.scripts?.["verify:release-candidate"]).toBe(
+      "bun run runtime/release-download-contract.ts candidate",
+    );
+    expect(desktopManifest.scripts?.["verify:published-release"]).toBe(
+      "bun run runtime/release-download-contract.ts published",
+    );
     expect(desktopManifest.scripts?.build).toStartWith(
       "bun run check:release-source &&",
     );
@@ -289,6 +298,34 @@ describe("release and download convergence", () => {
     );
     expect(workflow).toContain("run: bun run check:release-source");
     expect(workflow).toContain("run: bun run verify:remote-release");
+  });
+
+  test("keeps caller-supplied release directories absolute and normalized", async () => {
+    await expectRejection(
+      verifyLocalReleaseCandidate("zig-out/release/macos/arm64"),
+      "absolute normalized path",
+    );
+    await expectRejection(
+      verifyPublishedReleaseArtifacts("zig-out/release/macos/arm64"),
+      "absolute normalized path",
+    );
+  });
+
+  test("routes no-argument local release commands and rejects every extra argument", async () => {
+    for (const command of ["candidate", "published"] as const) {
+      const local = await runReleaseContractCli([command]);
+      expect(local.stderr).not.toContain("Usage: release-download-contract.ts");
+      expect(local.stderr).not.toContain("absolute normalized path");
+
+      for (const arguments_ of [
+        [command, "unexpected"],
+        [command, "--release-directory", "/tmp", "unexpected"],
+      ]) {
+        const extra = await runReleaseContractCli(arguments_);
+        expect(extra.exitCode).not.toBe(0);
+        expect(extra.stderr).toContain("Usage: release-download-contract.ts");
+      }
+    }
   });
 
   test("verifies the strict candidate C to publication P protocol without a commit fixed point", async () => {
@@ -741,6 +778,25 @@ async function runSetupGit(
     throw new Error(`git ${args[0] ?? "command"} failed: ${stderr.trim()}`);
   }
   return stdout;
+}
+
+async function runReleaseContractCli(
+  arguments_: readonly string[],
+): Promise<Readonly<{ exitCode: number; stderr: string }>> {
+  const child = Bun.spawn([
+    process.execPath,
+    fileURLToPath(new URL("../release-download-contract.ts", import.meta.url)),
+    ...arguments_,
+  ], {
+    stdin: "ignore",
+    stderr: "pipe",
+    stdout: "ignore",
+  });
+  const [stderr, exitCode] = await Promise.all([
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  return { exitCode, stderr };
 }
 
 async function expectRejection(

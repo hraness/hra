@@ -1110,42 +1110,42 @@ function requireDigest(value: unknown, label: string): string {
 }
 
 async function main(): Promise<void> {
-  const [command, flag, value] = process.argv.slice(2);
-  if (command === "contract" && flag === undefined) {
+  const arguments_ = process.argv.slice(2);
+  const [command, flag, value] = arguments_;
+  if (command === "contract" && arguments_.length === 1) {
     const contract = await verifyReleaseDownloadContract();
     process.stdout.write(`${JSON.stringify({ contract, status: "valid" })}\n`);
     return;
   }
-  if (command === "source" && flag === undefined) {
+  if (command === "source" && arguments_.length === 1) {
     process.stdout.write(`${JSON.stringify(await verifyReleaseSourceGate())}\n`);
     return;
   }
-  if (command === "remote" && flag === undefined) {
+  if (command === "remote" && arguments_.length === 1) {
     process.stdout.write(`${JSON.stringify(await verifyRemoteReleaseGate())}\n`);
     return;
   }
-  if (
-    command === "candidate"
-    && flag === "--release-directory"
-    && value !== undefined
-  ) {
+  const releaseDirectory = arguments_.length === 1
+    ? macosPackage.releaseDirectory
+    : arguments_.length === 3 && flag === "--release-directory"
+      ? value
+      : undefined;
+  if (command === "candidate" && releaseDirectory !== undefined) {
     process.stdout.write(
-      `${JSON.stringify(await verifyLocalReleaseCandidate(value))}\n`,
+      `${JSON.stringify(await verifyLocalReleaseCandidate(releaseDirectory))}\n`,
     );
     return;
   }
-  if (
-    command === "published"
-    && flag === "--release-directory"
-    && value !== undefined
-  ) {
+  if (command === "published" && releaseDirectory !== undefined) {
     process.stdout.write(
-      `${JSON.stringify(await verifyPublishedReleaseArtifacts(value))}\n`,
+      `${JSON.stringify(await verifyPublishedReleaseArtifacts(
+        releaseDirectory,
+      ))}\n`,
     );
     return;
   }
   throw new Error(
-    "Usage: release-download-contract.ts contract | source | remote | candidate --release-directory ABS | published --release-directory ABS",
+    "Usage: release-download-contract.ts contract | source | remote | candidate [--release-directory ABS] | published [--release-directory ABS]",
   );
 }
 
