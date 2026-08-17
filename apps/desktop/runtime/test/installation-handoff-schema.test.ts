@@ -102,6 +102,22 @@ describe("installation handoff receipt schema", () => {
       );
     }
   });
+
+  test("rejects prototype-sensitive keys in nested receipt evidence", () => {
+    for (const key of ["__proto__", "constructor", "prototype"]) {
+      const mutation = receipt();
+      const candidate = mutation["candidate"] as Record<string, unknown>;
+      const candidateTree = candidate["tree"] as Record<string, unknown>;
+      candidate["tree"] = Object.fromEntries([
+        ...Object.entries(candidateTree),
+        [key, []],
+      ]);
+      expect(Object.hasOwn(candidate["tree"] as object, key)).toBeTrue();
+      expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
+        "Handoff receipt is invalid",
+      );
+    }
+  });
 });
 
 function custodyDatabase(): Database {

@@ -87,6 +87,7 @@ const maximumTreeBytes = 128 * 1024 * 1024 * 1024;
 const maximumJournalBytes = 1024 * 1024;
 const commitPattern = /^[0-9a-f]{40}$/u;
 const operationIdPattern = /^handoff_[a-f0-9]{24}$/u;
+const forbiddenJournalKeys = new Set(["__proto__", "constructor", "prototype"]);
 
 export type InstallationHandoffFaultPoint =
   | "after_full_backup"
@@ -1896,10 +1897,24 @@ const handoffJournalSchema = z.object({
   }
 });
 export function parseInstallationHandoffJournal(value: unknown): HandoffJournal {
+  if (containsForbiddenJournalKey(value, new WeakSet<object>())) {
+    throw invalidJournal();
+  }
   const parsed = handoffJournalSchema.safeParse(value);
   if (!parsed.success) throw invalidJournal();
   const { priorHra, ...required } = parsed.data;
   return priorHra === undefined ? required : { ...required, priorHra };
+}
+
+function containsForbiddenJournalKey(
+  value: unknown,
+  seen: WeakSet<object>,
+): boolean {
+  if (value === null || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  return Object.entries(value).some(([key, child]) =>
+    forbiddenJournalKeys.has(key) || containsForbiddenJournalKey(child, seen)
+  );
 }
 
 function invalidJournal(): InstallationHandoffError {
