@@ -1902,11 +1902,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "df8cb2069926c1b4a244b698410ad9d91a38d39bffe15d03b142c07e0aa53ccb",
+      "matchingLinesSha256": "ad7baa6bac86c6577a03dce0eb37ac35a9b781f427fcc1c65fb648f68ffbbb28",
       "occurrences": {
-        "kitchen": 2,
+        "kitchen": 3,
         "operateStylized": 0,
-        "oprte": 9
+        "oprte": 18
       },
       "path": "apps/web/README.md"
     },
@@ -2199,6 +2199,26 @@
         "oprte": 1
       },
       "path": "apps/web/convex/suiteIdentityRules.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "306b6013660216b9d2eb619def0b22468634d3e5cd48e08cd8132e312a7bcbde",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 4
+      },
+      "path": "apps/web/scripts/create-convex-deploy-key.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "820c0f96916477fe4221cc6b1f75b471d48072a66d9bcfad32868dbf2466b0cc",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/web/scripts/create-convex-deploy-key.ts"
     },
     {
       "category": "compatibility",

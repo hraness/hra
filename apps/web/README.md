@@ -87,6 +87,44 @@ deploy key or cookie secret. Cookies cannot cross from `oprte.com` to `hra.sh`,
 and deploy keys are exact project/environment custody. Do not copy the
 predecessor `https://oprte.com` site value.
 
+Create the deploy key only with the source-owned Management API helper. The
+helper requires the immutable Convex project ID `2680173`, Production
+deployment ID `4677913`, deployment name `benevolent-akita-439`, and pre-rename
+`cclrte:oprte` identity. It requests exactly `deployment:deploy`, verifies the
+new key metadata, and writes the returned secret only through an already-open
+caller-owned mode-0600 file descriptor. Its report contains IDs, names,
+permissions, file mode, and byte count, never the personal access token, deploy
+key, or a stable secret digest.
+
+First restrict every retained copy of the Convex personal-token config,
+including dated backups, to its owner. Then create a fresh empty destination
+in a fresh owner-only directory and pass only canonical paths:
+
+```sh
+find ~/.convex -maxdepth 1 -type f -name 'config.json*' -exec chmod 0600 {} \;
+CONVEX_AUTH_FILE="$(realpath ~/.convex/config.json)"
+HRA_PROVIDER_DIR="$(mktemp -d /private/tmp/hra-provider-cutover.XXXXXX)"
+chmod 0700 "$HRA_PROVIDER_DIR"
+HRA_DEPLOY_KEY_FILE="$(mktemp "$HRA_PROVIDER_DIR/deploy-key.XXXXXX")"
+chmod 0600 "$HRA_DEPLOY_KEY_FILE"
+bun run provider:create-convex-deploy-key -- \
+  --auth-file "$CONVEX_AUTH_FILE" \
+  --secret-file "$HRA_DEPLOY_KEY_FILE"
+```
+
+Do not use `convex deployment token create` for this key. Convex 1.44 does not
+send an `allowedActions` constraint from that command, and its default path
+prints the generated secret. If the checked helper reports any failure, or
+exits abnormally after sending the create request, do not rerun it until you
+inspect the fixed
+`vercel-hra-production-2026-08-17` name in the dashboard, revoke any incomplete
+result, empty the destination, and begin again. This recovery rule includes
+post-create readback, file write, `fsync`, path-identity, and abnormal-exit
+failures because the provider key may exist even when local custody did not
+commit. Install the successful file as the HRA Vercel Production deploy-key
+record without copying it through argv, shell history, or terminal output.
+Remove the local file only after Vercel scope and build readback succeed.
+
 Do not configure Convex-only custody in Vercel, even as an empty record. The
 Production wrapper refuses the receipt keyring, session flags, hosted-mutation
 keys, taskctl peppers or fixture settings, WorkOS webhook secret and owner
@@ -119,9 +157,10 @@ Use this order for the shared backend:
    Production rollback anchor. A retained key without this publication freeze
    is not a safe rollback boundary because old source could republish to the
    shared Convex deployment.
-2. Generate the fresh HRA deploy key and cookie secret, then install the scoped
-   HRA Vercel values. Leave Preview without every production-only record and
-   transfer zero predecessor secret values.
+2. Generate the fresh HRA deploy key with the checked helper above, generate
+   the independent cookie secret, then install the scoped HRA Vercel values.
+   Leave Preview without every production-only record and transfer zero
+   predecessor secret values.
 3. After Required CI succeeds, run a Vercel Production deployment from the
    exact reviewed candidate commit C on canonical `hraness/hra` `main`, and
    read back that Vercel's system commit SHA is C. Convex 1.44 runs the checked
@@ -157,6 +196,96 @@ Use this order for the shared backend:
    redeploy exact P before enabling or exercising the installation handoff.
 8. Retain the predecessor deploy key only for the bounded rollback window.
    Revoke it after HRA authority and rollback disposition are complete.
+
+### Convex project identity retirement
+
+Rename the Convex project only after candidate C, publication P, the HRA-only
+Suite keyring readbacks, production route checks, and installed-app acceptance
+have all passed. Keeping the project named OPRTE during those gates avoids
+labeling the still-running predecessor functions and environment as HRA before
+the actual authority cutover. The fresh HRA deploy key and retained predecessor
+key both use the `prod:benevolent-akita-439|...` deployment identity, so the
+later project-slug change does not alter either key's target or provide a reason
+to shorten the rollback window.
+
+Bind every mutation to immutable IDs in its before-and-after evidence, and use
+an ID-addressed endpoint wherever the Management API provides one. Deployment
+and deploy-key retirement endpoints are name-addressed, so resolve each name to
+the exact ID below immediately before mutation and require that exact ID to be
+absent afterward:
+
+- Project `2680173` belongs to team `513923` / `cclrte`, initially has name and
+  slug `oprte`, and names `benevolent-akita-439` as its default Production
+  deployment.
+- Production deployment `4677913` remains project `2680173`, cloud type
+  `prod`, default `true`, reference `production`, region `aws-us-east-1`, and
+  URL `https://benevolent-akita-439.convex.cloud`.
+- Environment-variable **names only** and every deploy-key ID, name,
+  permission set, expiry, and last-used timestamp remain byte-for-byte equal.
+  Never print or export environment values or deploy-key values for this
+  comparison.
+
+Use `GET /v1/projects/2680173`,
+`GET /v1/deployments/benevolent-akita-439`, and
+`GET /v1/deployments/benevolent-akita-439/list_deploy_keys` for those filtered
+Management API records. Capture the environment-name set without values:
+
+These HTTP literals are evidence contracts, not `curl` instructions. Perform
+the readbacks and later mutations in the signed-in Convex dashboard while
+checking the exact method, path, request body, and non-secret response fields,
+or through a separately reviewed client that opens the mode-0600 personal-token
+file itself and redacts foreign provider errors. Never put the bearer token in
+argv, an environment variable, shell history, or terminal output. Stop if
+neither safe path is available.
+
+```sh
+bun x convex env list --names-only --deployment benevolent-akita-439
+```
+
+Clear every slug-bound authority before renaming. Team Settings must still
+show one active Admin member, no Authorized Applications for that member, no
+other active member, and no custom roles. The authenticated Management API
+readback
+`GET /v1/projects/2680173/list_preview_deploy_keys?includeManaged=true` must
+return an empty `items` array. These checks rule out custom-role selectors,
+project OAuth tokens, and both manual and integration-managed preview keys that
+would otherwise follow or break on an `oprte` slug change. Search operator
+bookmarks and external automation for the old `cclrte:oprte` selector and
+replace each confirmed consumer with `cclrte:hra`; HRA source itself selects
+the deployment by name and requires no source change.
+
+Retire the stale staging deployment separately after the same acceptance gate.
+Its current immutable identity is deployment `4828041`, name `cool-bear-228`,
+project `2680173`, cloud type `prod`, non-default, reference `staging`. Its two
+known broad keys, `vercel-oprte-staging-2026-08-10-c` and
+`vercel-staging-2026-08-08`, have never been used. Before deletion, read back
+that no provider, domain, integration, automation, data, file, or required
+backup still depends on it. Preserve an explicit backup or defer retirement if
+that evidence is not closed. Otherwise revoke both keys and delete only
+deployment `4828041`. Require `GET /v1/deployments/cool-bear-228` to return not
+found and `GET /v1/projects/2680173/list_deployments` to contain neither ID
+`4828041` nor name `cool-bear-228`. Do not treat deletion of the shared
+Production deployment as part of this cleanup.
+
+After staging retirement and the slug-bound-authority checks, send only
+`PATCH /v1/projects/2680173` with the Management API body
+`{"name":"HRA","slug":"hra"}`.
+Read back the exact HRA name/slug, unchanged team and Production project/deploy
+identities, unchanged Production URL, unchanged environment-name set, and
+unchanged deploy-key metadata. The direct deployment dashboard URL and both
+public Convex endpoints must remain reachable. This is an in-place label and
+slug update, not a deployment transfer, data copy, environment rewrite, or key
+rotation.
+
+During the bounded rollback window, send only
+`PATCH /v1/projects/2680173` with `{"name":"oprte","slug":"oprte"}` if the
+rename readback or a known external selector fails. Repeat the same
+immutable-ID, Production URL, names-only environment, and key-metadata
+comparison. After HRA acceptance and rollback disposition are final, revoke
+the predecessor Production keys, detach
+`oprte.com` and `hraness.kitchen` while retaining the domains in the account,
+then delete the predecessor Vercel project. Deleting that project earlier would
+destroy its READY deployment and environment rollback anchor.
 
 The deployed source owns a read-only internal audit. Its no-candidate form
 returns only selector state, exact-key counts, and a closed status:

@@ -38,6 +38,7 @@
     "test:property": "bun test ./app/*.property.test.ts ./convex/*.property.test.ts ./direct/*.property.test.ts",
     "verify:direct": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-web-Direct-verification -- bun run verify:direct:uncoordinated",
     "verify:direct:uncoordinated": "bun run direct/verify-browser.ts",
+    "provider:create-convex-deploy-key": "bun run scripts/create-convex-deploy-key.ts",
     "verify:receipt-provider": "bun run scripts/verify-receipt-provider.ts",
     "typecheck": "tsc --noEmit"
   },

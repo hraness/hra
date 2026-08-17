@@ -1971,6 +1971,8 @@
     "apps/web/production-icon-boundary.ts",
     "apps/web/proxy.ts",
     "apps/web/scripts/AGENTS.md",
+    "apps/web/scripts/create-convex-deploy-key.test.ts",
+    "apps/web/scripts/create-convex-deploy-key.ts",
     "apps/web/scripts/vercel-build.property.test.ts",
     "apps/web/scripts/vercel-build.test.ts",
     "apps/web/scripts/vercel-build.ts",
