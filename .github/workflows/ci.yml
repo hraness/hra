@@ -60,3 +60,21 @@ jobs:
         run: bun run --cwd apps/desktop test:macos
       - name: Build ReleaseFast macOS native binaries
         run: bun run --cwd apps/desktop build:macos
+
+  required:
+    name: Required
+    if: ${{ always() }}
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every blocking job
+        shell: bash
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$VERIFY_RESULT" != "success" ]]; then
+            echo "::error::verify finished with $VERIFY_RESULT"
+            exit 1
+          fi
