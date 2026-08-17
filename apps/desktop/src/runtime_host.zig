@@ -131,6 +131,11 @@ fn gatewayGroupMatchesUnreapedChild(
         observed_process_group == process_id;
 }
 
+const GroupRetirementPollPreparation = struct {
+    context: ?*anyopaque,
+    run_fn: *const fn (context: ?*anyopaque, io: std.Io) bool,
+};
+
 fn gatewayStderrForMode(
     mode: std.builtin.OptimizeMode,
 ) std.process.SpawnOptions.StdIo {
@@ -5783,6 +5788,18 @@ pub const RuntimeHost = struct {
         child: *std.process.Child,
         io: std.Io,
     ) bool {
+        return terminateGatewayProcessTreeWithPollPreparation(
+            child,
+            io,
+            null,
+        );
+    }
+
+    fn terminateGatewayProcessTreeWithPollPreparation(
+        child: *std.process.Child,
+        io: std.Io,
+        poll_preparation: ?GroupRetirementPollPreparation,
+    ) bool {
         // std.process.Child retains this exact, unreaped birth until kill/wait
         // returns and clears `id`. POSIX cannot reuse its PID, or create an
         // unrelated group with that numeric ID, while the leader is live or a
@@ -5813,6 +5830,14 @@ pub const RuntimeHost = struct {
         if (!contained) return false;
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
             return true;
+        }
+
+        // Tests may synchronously reap another directly owned group member
+        // here, after the real group SIGKILL and before the first real kernel
+        // absence poll. Production passes null and retains the exact signal,
+        // timeout, and fail-closed oracle below.
+        if (poll_preparation) |preparation| {
+            if (!preparation.run_fn(preparation.context, io)) return false;
         }
 
         // Signal delivery is not exit evidence. Observe only after the one
@@ -10417,7 +10442,7 @@ test "generation fencing reaps a retained stubborn group member after abrupt gat
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     var child = try std.process.spawn(std.testing.io, .{
-        .argv = &.{ "/bin/sleep", "5" },
+        .argv = &.{ "/bin/sleep", "60" },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -10436,54 +10461,53 @@ test "generation fencing reaps a retained stubborn group member after abrupt gat
 
     // Keep the group member as a direct child of the test process. A shell-
     // spawned orphan becomes launchd's zombie after SIGKILL, making group
-    // disappearance depend on unrelated runner load. A dedicated waiter owns
-    // and reaps this birth while RuntimeHost performs the same group-wide
-    // signal and exact-leader fence used in production.
+    // disappearance depend on unrelated runner load.
     var group_member = try std.process.spawn(std.testing.io, .{
         .argv = &.{
             "/bin/sh",
             "-c",
-            "trap '' TERM; exec sleep 5",
+            "trap '' TERM; exec sleep 60",
         },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = leader_process_id,
     });
-    var group_member_transferred = false;
-    defer if (!group_member_transferred) group_member.kill(std.testing.io);
+    defer if (group_member.id != null) group_member.kill(std.testing.io);
     const group_member_process_id = group_member.id.?;
     try std.testing.expectEqual(
         leader_process_id,
         getpgid(group_member_process_id),
     );
-    const Reaper = struct {
-        fn run(owned_child: *std.process.Child, io: std.Io) void {
-            _ = owned_child.wait(io) catch {};
+    const OwnedGroupMember = struct {
+        child: *std.process.Child,
+        termination: ?std.process.Child.Term = null,
+
+        fn reap(context: ?*anyopaque, io: std.Io) bool {
+            const self: *@This() = @ptrCast(@alignCast(
+                context orelse return false,
+            ));
+            self.termination = self.child.wait(io) catch return false;
+            return self.child.id == null;
         }
     };
-    const reaper = try std.Thread.spawn(
-        .{},
-        Reaper.run,
-        .{ &group_member, std.testing.io },
-    );
-    group_member_transferred = true;
-    var reaper_joined = false;
-    defer if (!reaper_joined) {
-        _ = RuntimeHost.terminateGatewayProcessTree(&child, std.testing.io);
-        terminated = true;
-        reaper.join();
-    };
+    var owned_group_member: OwnedGroupMember = .{ .child = &group_member };
 
     // The gateway leader exits first while its owned group member remains.
     // Retaining the unreaped Child keeps the exact PID/PGID birth fenced until
     // terminateGatewayProcessTree has signalled the whole generation.
     try std.posix.kill(leader_process_id, .KILL);
 
-    try std.testing.expect(RuntimeHost.terminateGatewayProcessTree(
-        &child,
-        std.testing.io,
-    ));
+    try std.testing.expect(
+        RuntimeHost.terminateGatewayProcessTreeWithPollPreparation(
+            &child,
+            std.testing.io,
+            .{
+                .context = &owned_group_member,
+                .run_fn = OwnedGroupMember.reap,
+            },
+        ),
+    );
     terminated = true;
     try std.testing.expect(child.id == null);
     // The owned birth was reaped. A repeated cleanup is a no-op and therefore
@@ -10492,10 +10516,12 @@ test "generation fencing reaps a retained stubborn group member after abrupt gat
         &child,
         std.testing.io,
     ));
-    reaper.join();
-    reaper_joined = true;
     try std.testing.expect(!processExistsForTest(leader_process_id));
     try std.testing.expect(group_member.id == null);
+    try std.testing.expectEqual(
+        std.process.Child.Term{ .signal = .KILL },
+        owned_group_member.termination.?,
+    );
     try std.testing.expect(!processExistsForTest(group_member_process_id));
 }
 
