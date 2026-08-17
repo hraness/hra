@@ -35,7 +35,6 @@
     "catalog": {
       "@convex-dev/better-auth": "0.12.5",
       "@eslint/js": "^9.39.2",
-      "@hraness/codex-app-sdk": "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
       "@hraness/direct": "github:hraness/direct#v0.6.2",
       "@hraness/result": "github:hraness/result#v0.2.1",
       "@hraness/types": "github:hraness/types#v0.1.1",

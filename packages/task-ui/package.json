@@ -29,7 +29,7 @@
     "@hugeicons/core-free-icons": "catalog:",
     "@hraness/agent-tasks-domain": "workspace:*",
     "@hraness/agent-tasks-protocol": "workspace:*",
-    "@hraness/codex-app-sdk": "catalog:",
+    "@hra-internal/codex-app-sdk": "workspace:*",
     "@hra-internal/design-kit": "workspace:*"
   },
   "peerDependencies": {

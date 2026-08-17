@@ -30,7 +30,7 @@ import { runnerPresenceViewSchema } from "@hraness/agent-tasks-protocol";
 import {
   createReducerStore,
   type ExternalStore,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 
 import type {
   TaskWorkspaceAgent,

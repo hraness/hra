@@ -223,7 +223,7 @@ async function stageLicenseFiles(options: Readonly<{
     ["BUN-DEPENDENCY-LICENSES.txt", join(macosPackage.desktopRoot, "runtime/BUN-DEPENDENCY-LICENSES.txt")],
     ["BUN-LICENSE.md", join(macosPackage.desktopRoot, "runtime/BUN-LICENSE.md")],
     ["BUN-PROVENANCE.md", join(macosPackage.desktopRoot, "runtime/BUN-PROVENANCE.md")],
-    ["CODEX-APP-SDK-LICENSE.txt", join(macosPackage.desktopRoot, "node_modules/@hraness/codex-app-sdk/LICENSE")],
+    ["CODEX-APP-SDK-LICENSE.txt", join(repositoryRoot, "packages/internal/codex-app-sdk/LICENSE")],
     ["CODEX-LICENSE.txt", join(macosPackage.desktopRoot, "runtime/CODEX-LICENSE.txt")],
     ["CODEX-NATIVE-LICENSES.json", join(macosPackage.desktopRoot, "runtime/CODEX-NATIVE-LICENSES.json")],
     ["CODEX-NATIVE-LICENSES.txt", join(macosPackage.desktopRoot, "runtime/CODEX-NATIVE-LICENSES.txt")],

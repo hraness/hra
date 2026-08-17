@@ -9,7 +9,6 @@ const provenanceExceptions = new Set([
 const excludedWorkspaceNames = new Set([
   "@hra-internal/identity",
   "@hra-internal/suite-accounts",
-  "@hraness/codex-app-sdk",
 ]);
 
 const forbiddenPatterns = [

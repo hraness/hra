@@ -26,7 +26,7 @@
 - Keep mandatory edit-time rules in the closest `AGENTS.md`, current procedures in repository documentation, executable contracts in types, schemas, and tests, and public-safe rationale, evidence, synthesis, and plans in `kb/`. KB lanes run `bun run kb:check:lane`; the integrator performs one refresh and `bun run kb:check`.
 - Use Bun 1.3.14 and Node 24. Do not add another package manager or lockfile.
 - Keep product packages under `@hraness/hra-*`, neutral task packages under `@hraness/agent-tasks-*`, and repository-support packages under `@hra-internal/*`.
-- Consume `@hraness/codex-app-sdk` from the exact public commit in the root catalog. Do not add a workspace copy of that separately maintained SDK.
+- Use `@hra-internal/codex-app-sdk` for provider-neutral client state, command, persistence, React selection, and deterministic test contracts shared by desktop, web, and task UI. Keep provider adapters and concrete storage in consumers.
 - Treat persisted identifiers, cryptographic namespaces, updater contracts, and Keychain services as explicit protocol decisions. This project is prerelease, so a deliberate breaking change is acceptable when its storage and recovery effects are covered by deterministic tests.
 - Keep provider account and Codex runtime custody in the installed desktop app. Keep multi-tenant task authority, subscriptions, and human administration in the web app.
 - Keep the CLI a versioned API consumer. It must not import Convex server implementation or generated data-model types.

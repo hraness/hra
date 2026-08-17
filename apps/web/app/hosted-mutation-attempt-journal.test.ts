@@ -2,7 +2,7 @@ import {
   confirmed,
   createAttemptId,
   createMutationFingerprint,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 import type { ConvexReactClient } from "convex/react";
 import {
   describe,

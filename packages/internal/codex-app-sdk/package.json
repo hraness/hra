@@ -1,0 +1,52 @@
+{
+  "name": "@hra-internal/codex-app-sdk",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Headless state, command, persistence, and React contracts for Codex app-server interfaces.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "packages/internal/codex-app-sdk"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "sideEffects": [
+    "./src/index.ts",
+    "./src/react.ts",
+    "./src/testing/index.ts"
+  ],
+  "exports": {
+    ".": "./src/index.ts",
+    "./react": "./src/react.ts",
+    "./testing": "./src/testing/index.ts"
+  },
+  "scripts": {
+    "lint": "eslint src contract",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src ./contract",
+    "test:property": "bun test ./src/*.property.test.ts ./src/testing/*.property.test.ts"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0 <20.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "eslint": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "typescript": "catalog:"
+  }
+}

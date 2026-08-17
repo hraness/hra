@@ -10,7 +10,7 @@ import {
   type OpenMutationAttempt,
   type PrepareMutationAttemptResult,
   type TransitionMutationAttemptResult,
-} from "@hraness/codex-app-sdk";
+} from "@hra-internal/codex-app-sdk";
 import {
   operationIdSchema,
   taskPublicIdSchema,

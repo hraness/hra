@@ -77,7 +77,7 @@
   "dependencies": {
     "@hraness/agent-tasks-protocol": "workspace:*",
     "@hra-internal/browser-storage": "workspace:*",
-    "@hraness/codex-app-sdk": "catalog:",
+    "@hra-internal/codex-app-sdk": "workspace:*",
     "@hraness/hra-human-client": "workspace:*",
     "@hra-internal/schema": "workspace:*",
     "@openai/codex": "catalog:",

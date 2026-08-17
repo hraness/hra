@@ -6,9 +6,6 @@ const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const publicRepositoryUrl = "git+https://github.com/hraness/hra.git";
 const publicHomepage = "https://hra.sh";
 const publicBugsUrl = "https://github.com/hraness/hra/issues";
-const codexAppSdkRevision =
-  "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2";
-
 const expectedNamedWorkspaces: ReadonlyMap<string, string> = new Map([
   ["apps/cli", "@hraness/hra-cli"],
   ["apps/desktop", "@hraness/hra"],
@@ -17,6 +14,7 @@ const expectedNamedWorkspaces: ReadonlyMap<string, string> = new Map([
   ["packages/internal/brand-ui", "@hra-internal/brand-ui"],
   ["packages/internal/browser-storage", "@hra-internal/browser-storage"],
   ["packages/internal/convex", "@hra-internal/convex"],
+  ["packages/internal/codex-app-sdk", "@hra-internal/codex-app-sdk"],
   ["packages/internal/design-kit", "@hra-internal/design-kit"],
   ["packages/internal/eslint-config", "@hra-internal/eslint-config"],
   ["packages/internal/schema", "@hra-internal/schema"],
@@ -46,6 +44,8 @@ const requiredRootPaths = [
   "bunfig.toml",
   "hra-legacy-identifiers.manifest.json",
   "package.json",
+  "packages/internal/codex-app-sdk/LICENSE",
+  "packages/internal/codex-app-sdk/PROVENANCE.md",
   "scripts/check-public-boundary.ts",
   "scripts/check-public-structure.ts",
   "scripts/check-public-tree.ts",
@@ -99,8 +99,11 @@ function metadataErrors(
   const repository = value["repository"];
   const bugs = value["bugs"];
   if (value["private"] !== true) errors.push(`${path}: workspace must remain private`);
-  if (value["license"] !== "Apache-2.0") {
-    errors.push(`${path}: license must be Apache-2.0`);
+  const expectedLicense = directory === "packages/internal/codex-app-sdk"
+    ? "MIT"
+    : "Apache-2.0";
+  if (value["license"] !== expectedLicense) {
+    errors.push(`${path}: license must be ${expectedLicense}`);
   }
   if (
     !isRecord(repository)
@@ -151,11 +154,8 @@ export function publicStructureErrors(options: Readonly<{
       errors.push("package.json: workspace patterns must match the public graph");
     }
     const catalog = isRecord(workspaces) ? workspaces["catalog"] : undefined;
-    if (
-      !isRecord(catalog)
-      || catalog["@hraness/codex-app-sdk"] !== codexAppSdkRevision
-    ) {
-      errors.push("package.json: Codex App SDK must resolve from the audited public commit");
+    if (isRecord(catalog) && "@hraness/codex-app-sdk" in catalog) {
+      errors.push("package.json: external Codex App SDK catalog pin must be absent");
     }
     if (!isRecord(catalog) || catalog["react-aria-components"] !== "1.19.0") {
       errors.push("package.json: react-aria-components must remain pinned to 1.19.0");
@@ -214,13 +214,17 @@ export function publicStructureErrors(options: Readonly<{
     if (!options.presentPaths.has(`${directory}/AGENTS.md`)) {
       errors.push(`${directory}/AGENTS.md: workspace guide is missing`);
     }
-    if (directory === "packages/task-ui") {
+    if (
+      directory === "apps/desktop"
+      || directory === "apps/web"
+      || directory === "packages/task-ui"
+    ) {
       const dependencies = value["dependencies"];
       if (
         !isRecord(dependencies)
-        || dependencies["@hraness/codex-app-sdk"] !== "catalog:"
+        || dependencies["@hra-internal/codex-app-sdk"] !== "workspace:*"
       ) {
-        errors.push(`${path}: Codex App SDK must use the root catalog`);
+        errors.push(`${path}: Codex App SDK must use the internal workspace`);
       }
     }
   }

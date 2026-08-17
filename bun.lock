@@ -42,9 +42,9 @@
       "version": "0.1.7",
       "dependencies": {
         "@hra-internal/browser-storage": "workspace:*",
+        "@hra-internal/codex-app-sdk": "workspace:*",
         "@hra-internal/schema": "workspace:*",
         "@hraness/agent-tasks-protocol": "workspace:*",
-        "@hraness/codex-app-sdk": "catalog:",
         "@hraness/hra-human-client": "workspace:*",
         "@openai/codex": "catalog:",
         "dugite": "catalog:",
@@ -76,12 +76,12 @@
       "version": "0.1.0",
       "dependencies": {
         "@hra-internal/brand-ui": "workspace:*",
+        "@hra-internal/codex-app-sdk": "workspace:*",
         "@hra-internal/convex": "workspace:*",
         "@hra-internal/schema": "workspace:*",
         "@hra-internal/web-discovery": "workspace:*",
         "@hraness/agent-tasks-domain": "workspace:*",
         "@hraness/agent-tasks-protocol": "workspace:*",
-        "@hraness/codex-app-sdk": "catalog:",
         "@workos-inc/authkit-nextjs": "catalog:",
         "@workos-inc/node": "catalog:",
         "convex": "catalog:",
@@ -157,6 +157,27 @@
         "eslint": "catalog:",
         "typescript": "catalog:",
       },
+    },
+    "packages/internal/codex-app-sdk": {
+      "name": "@hra-internal/codex-app-sdk",
+      "version": "0.1.1",
+      "devDependencies": {
+        "@hra-internal/eslint-config": "workspace:*",
+        "@hra-internal/typescript-config": "workspace:*",
+        "@types/bun": "catalog:",
+        "@types/react": "catalog:",
+        "@types/react-dom": "catalog:",
+        "eslint": "catalog:",
+        "react": "catalog:",
+        "react-dom": "catalog:",
+        "typescript": "catalog:",
+      },
+      "peerDependencies": {
+        "react": ">=18.0.0 <20.0.0",
+      },
+      "optionalPeers": [
+        "react",
+      ],
     },
     "packages/internal/convex": {
       "name": "@hra-internal/convex",
@@ -303,10 +324,10 @@
       "name": "@hraness/agent-tasks-ui",
       "version": "0.1.0",
       "dependencies": {
+        "@hra-internal/codex-app-sdk": "workspace:*",
         "@hra-internal/design-kit": "workspace:*",
         "@hraness/agent-tasks-domain": "workspace:*",
         "@hraness/agent-tasks-protocol": "workspace:*",
-        "@hraness/codex-app-sdk": "catalog:",
         "@hugeicons/core-free-icons": "catalog:",
       },
       "devDependencies": {
@@ -341,7 +362,6 @@
   "catalog": {
     "@convex-dev/better-auth": "0.12.5",
     "@eslint/js": "^9.39.2",
-    "@hraness/codex-app-sdk": "github:hraness/codex-app-sdk#e7d5167ca5389ac834714a8a0a2c1602071963e2",
     "@hraness/direct": "github:hraness/direct#v0.6.2",
     "@hraness/result": "github:hraness/result#v0.2.1",
     "@hraness/types": "github:hraness/types#v0.1.1",
@@ -504,6 +524,8 @@
 
     "@hra-internal/browser-storage": ["@hra-internal/browser-storage@workspace:packages/internal/browser-storage"],
 
+    "@hra-internal/codex-app-sdk": ["@hra-internal/codex-app-sdk@workspace:packages/internal/codex-app-sdk"],
+
     "@hra-internal/convex": ["@hra-internal/convex@workspace:packages/internal/convex"],
 
     "@hra-internal/design-kit": ["@hra-internal/design-kit@workspace:packages/internal/design-kit"],
@@ -523,8 +545,6 @@
     "@hraness/agent-tasks-protocol": ["@hraness/agent-tasks-protocol@workspace:packages/task-protocol"],
 
     "@hraness/agent-tasks-ui": ["@hraness/agent-tasks-ui@workspace:packages/task-ui"],
-
-    "@hraness/codex-app-sdk": ["@hraness/codex-app-sdk@github:hraness/codex-app-sdk#e7d5167", { "peerDependencies": { "react": ">=18.0.0 <20.0.0" }, "optionalPeers": ["react"] }, "hraness-codex-app-sdk-e7d5167", "sha512-gEWqh3B2sM89G1EEHOBH557AD3y7siOtI3JMVd5kisu4iZNbfEVE0yGygPi/3Yk2huuzkHS+SgC9B/AdRr9L0A=="],
 
     "@hraness/direct": ["@hraness/direct@github:hraness/direct#5e58fd5", { "peerDependencies": { "react": ">=18 <20" }, "optionalPeers": ["react"] }, "hraness-direct-5e58fd5", "sha512-i972Fy1Yp0BXpx1pRKDEaTmL8XwbYCP9pDwEtywRLMgjq4UODUSAR3S0V67ovUk2RSqYN2llqz/NMut/Admz3g=="],
 
@@ -1955,14 +1975,6 @@
     "@eslint-community/eslint-utils/eslint-visitor-keys": ["eslint-visitor-keys@3.4.3", "", {}, "sha512-wpc+LXeiyiisxPlEkUzU6svyS1frIO3Mgxj1fdy7Pm8Ygzguax2N3Fa/D/ag1WqbOprdI+uY6wMUl8/a2G+iag=="],
 
     "@eslint/eslintrc/globals": ["globals@14.0.0", "", {}, "sha512-oahGvuMGQlPw/ivIYBjVSrWAfWLBeku5tpPE2fOPLi+WHffIWbuh2tCjhyQhTBPMf5E9jDEH4FOmTYgYwbKwtQ=="],
-
-    "@hra-internal/schema/@hraness/result": ["@hraness/result@github:hraness/result#17b311c", {}, "hraness-result-17b311c", "sha512-OzIzJ598pWxKqpuYO+Omki/LYlhZ+bg04u7N0DuhW9FoAruP3ocRs4eyCyWxEEa4gtpEG9AEaTlheYnDlXh2mQ=="],
-
-    "@hraness/hra/@hraness/codex-app-sdk": ["@hraness/codex-app-sdk@github:hraness/codex-app-sdk#e7d5167", { "peerDependencies": { "react": ">=18.0.0 <20.0.0" }, "optionalPeers": ["react"] }, "hraness-codex-app-sdk-e7d5167", "sha512-gEWqh3B2sM89G1EEHOBH557AD3y7siOtI3JMVd5kisu4iZNbfEVE0yGygPi/3Yk2huuzkHS+SgC9B/AdRr9L0A=="],
-
-    "@hraness/hra/@hraness/ui": ["@hraness/ui@github:hraness/ui#7d4af51", { "dependencies": { "@hugeicons/core-free-icons": "^4.2.2", "@hugeicons/react": "^1.1.9", "clsx": "^2.1.1", "react-aria": "3.50.0", "react-aria-components": "1.19.0", "tailwind-merge": "^3.6.0" }, "peerDependencies": { "react": ">=18 <20", "react-dom": ">=18 <20" } }, "hraness-ui-7d4af51", "sha512-1YPNT1L2ZWVvhpX9f6IknAHnGJx8Z/4HIZDF2+wCLbPeIV9IVnErtPXeKJ6h3/j5qOCoh5W9WOoPvLpagsFG4A=="],
-
-    "@hraness/hra-web/@hraness/direct": ["@hraness/direct@github:hraness/direct#5e58fd5", { "peerDependencies": { "react": ">=18 <20" }, "optionalPeers": ["react"] }, "hraness-direct-5e58fd5", "sha512-i972Fy1Yp0BXpx1pRKDEaTmL8XwbYCP9pDwEtywRLMgjq4UODUSAR3S0V67ovUk2RSqYN2llqz/NMut/Admz3g=="],
 
     "@reduxjs/toolkit/immer": ["immer@11.1.16", "", {}, "sha512-Xs7H9rBc+kti1J6RueUvbEBkmOz7jqj11XYgf+YMXAYzu8EeE7hwZ9poLXdVfVnGmJu7QAf41T7H2KuF6QoK6Q=="],
 
