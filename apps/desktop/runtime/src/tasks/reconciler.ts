@@ -377,6 +377,18 @@ export class LocalTaskReconciler {
     await this.#pass;
   }
 
+  hasUnsettledWork(): boolean {
+    return this.#pass !== null;
+  }
+
+  closeAdmission(): void {
+    if (this.#state === "stopped" || this.#state === "stopping") return;
+    this.#state = "stopping";
+    this.#queuedReason = null;
+    this.#cancelTimer?.();
+    this.#cancelTimer = null;
+  }
+
   async stop(
     beforeBootClose: () => void | Promise<void> = () => undefined,
   ): Promise<void> {
@@ -386,10 +398,7 @@ export class LocalTaskReconciler {
       await beforeBootClose();
       return;
     }
-    this.#state = "stopping";
-    this.#queuedReason = null;
-    this.#cancelTimer?.();
-    this.#cancelTimer = null;
+    this.closeAdmission();
     await this.#pass;
     try {
       // The active boot remains a valid local fence while already-admitted

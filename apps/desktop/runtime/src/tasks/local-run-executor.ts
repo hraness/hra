@@ -150,8 +150,16 @@ export class LocalQueuedRunExecutor implements LocalQueuedRunExecutorPort {
     await Promise.allSettled([...this.#executions.values()]);
   }
 
-  async stop(): Promise<void> {
+  hasUnsettledWork(): boolean {
+    return this.#executions.size > 0;
+  }
+
+  closeAdmission(): void {
     this.#stopping = true;
+  }
+
+  async stop(): Promise<void> {
+    this.closeAdmission();
     for (const controller of this.#executionControllers.values()) {
       controller.abort();
     }

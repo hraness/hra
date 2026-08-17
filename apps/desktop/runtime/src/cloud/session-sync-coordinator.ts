@@ -270,6 +270,9 @@ export class SessionSyncCoordinator {
   readonly #recoveryCustody: SessionSyncRecoveryKeyCustody;
   readonly #store: SessionSyncStore;
   #abort: AbortController | null = null;
+  #activeExclusiveWork = 0;
+  #activeOperations = 0;
+  #admissionClosed = false;
   #commandTail: Promise<void> = Promise.resolve();
   #exclusiveTail: Promise<void> = Promise.resolve();
   #lastScopeFingerprint: string | null = null;
@@ -299,6 +302,7 @@ export class SessionSyncCoordinator {
   }
 
   start(): void {
+    if (this.#admissionClosed) return;
     if (this.#abort !== null) return;
     const abort = new AbortController();
     this.#abort = abort;
@@ -332,9 +336,26 @@ export class SessionSyncCoordinator {
     await this.#clearRemoteProjection();
   }
 
+  closeAdmission(): void {
+    this.#admissionClosed = true;
+    this.#abort?.abort();
+  }
+
+  hasUnsettledWork(): boolean {
+    return this.#activeExclusiveWork > 0 || this.#activeOperations > 0;
+  }
+
   async execute(
     command: RuntimeSessionSyncDomainCommand,
   ): Promise<SessionSyncCommandResult> {
+    if (this.#admissionClosed) {
+      throw new SessionSyncCoordinatorError(
+        "operation_failed",
+        "Session sync admission is closed.",
+      );
+    }
+    this.#activeOperations += 1;
+    try {
     let result: SessionSyncCommandResult | undefined;
     let failure: Error | undefined;
     const run = this.#commandTail.then(async () => {
@@ -359,11 +380,20 @@ export class SessionSyncCoordinator {
       );
     }
     return result;
+    } finally {
+      this.#activeOperations -= 1;
+    }
   }
 
   async authenticationChanged(): Promise<void> {
-    await this.#observeScope();
-    await this.#publishCurrentStatus();
+    if (this.#admissionClosed) return;
+    this.#activeOperations += 1;
+    try {
+      await this.#observeScope();
+      await this.#publishCurrentStatus();
+    } finally {
+      this.#activeOperations -= 1;
+    }
   }
 
   async #executeSerialized(
@@ -513,6 +543,7 @@ export class SessionSyncCoordinator {
   }
 
   async #runWorkerCycle(worker: SessionSyncWorker, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || this.#admissionClosed) return;
     const retry = this.#store.retry(worker);
     if (retry !== null && retry.notBefore > this.#now()) return;
     try {
@@ -572,9 +603,11 @@ export class SessionSyncCoordinator {
       release = resolve;
     });
     await predecessor;
+    this.#activeExclusiveWork += 1;
     try {
       return await operation();
     } finally {
+      this.#activeExclusiveWork -= 1;
       release();
     }
   }

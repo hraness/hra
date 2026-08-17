@@ -438,6 +438,14 @@ export class ChatService {
     return this.#store.findByProviderThread(accountProfileId, providerThreadId);
   }
 
+  /** Reports whether any pane, provider, projection, or persistence task remains active. */
+  hasUnsettledWork(): boolean {
+    return this.#paneTails.size > 0 ||
+      this.#providerEffects.size > 0 ||
+      this.#sessionProjectionEventCount > 0 ||
+      this.#pendingStreamPersistence.length > 0;
+  }
+
   /** Waits until every operation currently admitted to a pane tail has settled. */
   async settled(): Promise<void> {
     for (;;) {

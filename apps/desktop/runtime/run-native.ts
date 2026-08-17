@@ -5,6 +5,8 @@ import {
   advanceDevLaunch,
   devCleanupOrder,
   gatewayExecutableNameForNativeMode,
+  HRA_NATIVE_APPLICATION_EXECUTABLE,
+  HRA_DEV_BUN_EXECUTABLE_ENV,
   maySpawnDevApp,
   nativeDevFrontendEnvironment,
   HRA_DEV_SESSION_ENV,
@@ -27,9 +29,6 @@ import { resolveZigExecutable } from "./zig-toolchain";
 const TERMINATION_GRACE_MS = 2_000;
 const KILL_GRACE_MS = 1_000;
 const GROUP_POLL_MS = 25;
-// The bridge retains the exact signed predecessor executable filename.
-const legacyOprteNativeExecutableName = "oprte";
-
 type OwnedProcess = Readonly<{
   name: DevProcessName;
   pid: number;
@@ -293,6 +292,7 @@ async function runDevelopment(
         cwd: desktopRoot,
         env: {
           ...launcherEnvironment,
+          [HRA_DEV_BUN_EXECUTABLE_ENV]: process.execPath,
           [HRA_DEV_SESSION_ENV]: sessionId,
         },
       },
@@ -300,43 +300,11 @@ async function runDevelopment(
     processes.vite = vite;
     phase = advanceDevLaunch(phase, "vite-started");
 
-    console.log("[hra dev] compiling the Debug Zig host");
-    const build = spawnOwnedProcess(
-      "build",
-      [
-        zigExecutable,
-        ...zigArgumentsWithWorkerBudget(
-          ["build", "-Dplatform=macos"],
-          launcherEnvironment,
-        ),
-      ],
-      { cwd: desktopRoot, env: launcherEnvironment },
-    );
-    processes.build = build;
     let viteExitCode: number | undefined;
     const viteExited = vite.exited.then((code) => {
       viteExitCode = code;
       return { code, kind: "vite-exit" } as const;
     });
-    const buildOutcome = await Promise.race([
-      build.exited.then((code) => ({ code, kind: "build-exit" } as const)),
-      viteExited,
-      shutdown.promise.then((signal) => ({ kind: "signal", signal } as const)),
-    ]);
-    if (buildOutcome.kind === "signal") return signalExitCode(buildOutcome.signal);
-    if (buildOutcome.kind === "vite-exit") {
-      throw new Error(`Vite exited with status ${buildOutcome.code} before the native build completed.`);
-    }
-    if (buildOutcome.code !== 0) {
-      throw new Error(`The Zig Debug build exited with status ${buildOutcome.code}; the app was not started.`);
-    }
-    // Retire the completed build group immediately. Keeping its dead PGID in
-    // the registry for the lifetime of the app could target an unrelated group
-    // after operating-system PID reuse during a long development session.
-    await terminateOwnedProcessGroup(build);
-    delete processes.build;
-    phase = advanceDevLaunch(phase, "build-succeeded");
-    if (shutdown.requested() !== undefined) return signalExitCode(shutdown.requested()!);
 
     const readinessAbort = new AbortController();
     const readiness = waitForDevReadiness({
@@ -355,11 +323,87 @@ async function runDevelopment(
       throw new Error(`Vite exited with status ${readinessOutcome.code} before proving readiness.`);
     }
     phase = advanceDevLaunch(phase, "readiness-matched");
+
+    // The readiness endpoint is reachable only after every synchronous Vite
+    // configureServer hook has installed its watcher baseline, event listener,
+    // and reconciliation timer. Compile the stable gateway after that proof so
+    // no source edit can hide in a pre-watcher build window.
+    console.log("[hra dev] compiling the stable development gateway");
+    const gatewayBuild = spawnOwnedProcess(
+      "build",
+      [process.execPath, "run", "build:runtime:dev"],
+      { cwd: desktopRoot, env: launcherEnvironment },
+    );
+    processes.build = gatewayBuild;
+    const gatewayBuildOutcome = await Promise.race([
+      gatewayBuild.exited.then((code) => ({ code, kind: "build-exit" } as const)),
+      viteExited,
+      shutdown.promise.then((signal) => ({ kind: "signal", signal } as const)),
+    ]);
+    if (gatewayBuildOutcome.kind === "signal") {
+      return signalExitCode(gatewayBuildOutcome.signal);
+    }
+    if (gatewayBuildOutcome.kind === "vite-exit") {
+      throw new Error(
+        `Vite exited with status ${gatewayBuildOutcome.code} before the gateway build completed.`,
+      );
+    }
+    if (gatewayBuildOutcome.code !== 0) {
+      throw new Error(
+        `The development gateway build exited with status ${gatewayBuildOutcome.code}; the app was not started.`,
+      );
+    }
+    await terminateOwnedProcessGroup(gatewayBuild);
+    delete processes.build;
+    phase = advanceDevLaunch(phase, "gateway-build-succeeded");
+    if (shutdown.requested() !== undefined) return signalExitCode(shutdown.requested()!);
+    const stableGatewayPath = realpathSync(gatewayPath);
+    accessSync(stableGatewayPath, constants.X_OK);
+
+    console.log("[hra dev] compiling the Debug Zig host");
+    const nativeBuild = spawnOwnedProcess(
+      "build",
+      [
+        zigExecutable,
+        ...zigArgumentsWithWorkerBudget(
+          ["build", "-Dplatform=macos"],
+          launcherEnvironment,
+        ),
+      ],
+      { cwd: desktopRoot, env: launcherEnvironment },
+    );
+    processes.build = nativeBuild;
+    const nativeBuildOutcome = await Promise.race([
+      nativeBuild.exited.then((code) => ({ code, kind: "build-exit" } as const)),
+      viteExited,
+      shutdown.promise.then((signal) => ({ kind: "signal", signal } as const)),
+    ]);
+    if (nativeBuildOutcome.kind === "signal") {
+      return signalExitCode(nativeBuildOutcome.signal);
+    }
+    if (nativeBuildOutcome.kind === "vite-exit") {
+      throw new Error(
+        `Vite exited with status ${nativeBuildOutcome.code} before the native build completed.`,
+      );
+    }
+    if (nativeBuildOutcome.code !== 0) {
+      throw new Error(
+        `The Zig Debug build exited with status ${nativeBuildOutcome.code}; the app was not started.`,
+      );
+    }
+    // Retire the completed build group immediately. Keeping its dead PGID in
+    // the registry for the lifetime of the app could target an unrelated group
+    // after operating-system PID reuse during a long development session.
+    await terminateOwnedProcessGroup(nativeBuild);
+    delete processes.build;
+    phase = advanceDevLaunch(phase, "native-build-succeeded");
+    if (shutdown.requested() !== undefined) return signalExitCode(shutdown.requested()!);
+
     const appPath = realpathSync(resolve(
       desktopRoot,
       "zig-out",
       "bin",
-      legacyOprteNativeExecutableName,
+      HRA_NATIVE_APPLICATION_EXECUTABLE,
     ));
     accessSync(appPath, constants.X_OK);
 
@@ -375,11 +419,11 @@ async function runDevelopment(
       },
       () => {
         console.log("[hra dev] launching HRA; frontend edits now hot reload");
-        console.log("[hra dev] restart this command after Zig or gateway changes");
+        console.log("[hra dev] use the DEV control for runtime apply and restart guidance");
         return spawnOwnedProcess("app", [appPath], {
           cwd: desktopRoot,
           env: {
-            ...runtimeEnvironment(gatewayPath, runtimePaths),
+            ...runtimeEnvironment(stableGatewayPath, runtimePaths),
             ...nativeDevFrontendEnvironment(sessionId),
           },
         });
@@ -451,24 +495,26 @@ export async function main(arguments_: readonly string[] = process.argv.slice(2)
   }
 
   const desktopRoot = realpathSync(resolve(import.meta.dir, ".."));
-  const gatewayPath = realpathSync(resolve(
+  const configuredGatewayPath = resolve(
     desktopRoot,
     "runtime",
     "dist",
     gatewayExecutableNameForNativeMode(mode),
-  ));
-  accessSync(gatewayPath, constants.X_OK);
+  );
   const runtimePaths = resolvePortableRuntimeAssets();
   const zigExecutable = resolveZigExecutable();
 
-  return mode === "dev"
-    ? await runDevelopment(
-        desktopRoot,
-        gatewayPath,
-        runtimePaths,
-        zigExecutable,
-      )
-    : await runBundled(desktopRoot, gatewayPath, runtimePaths, zigExecutable);
+  if (mode === "dev") {
+    return await runDevelopment(
+      desktopRoot,
+      configuredGatewayPath,
+      runtimePaths,
+      zigExecutable,
+    );
+  }
+  const gatewayPath = realpathSync(configuredGatewayPath);
+  accessSync(gatewayPath, constants.X_OK);
+  return await runBundled(desktopRoot, gatewayPath, runtimePaths, zigExecutable);
 }
 
 if (import.meta.main) {

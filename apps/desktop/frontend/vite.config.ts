@@ -1,7 +1,11 @@
 import react from "@vitejs/plugin-react";
 import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { defineConfig, type ConfigEnv, type Plugin } from "vite";
+
+import { hraDevEntryPlugin } from "./dev/vite-plugin.ts";
+import { hraMalleableDevPlugin } from "../runtime/dev/vite-plugin.ts";
 
 import {
   devSessionIdFromBytes,
@@ -10,7 +14,7 @@ import {
   HRA_DEV_READY_SCHEMA,
   HRA_DEV_SESSION_ENV,
   type DevSessionId,
-} from "../runtime/dev-protocol";
+} from "../runtime/dev-protocol.ts";
 
 const BASE_CONNECT_SOURCE = "connect-src 'self'";
 const DEVELOPMENT_CONNECT_SOURCE =
@@ -191,29 +195,47 @@ export function hraDevReadinessPlugin(sessionId: DevSessionId): Plugin {
   };
 }
 
-export default defineConfig(({ command }) => ({
-  root: "frontend",
-  base: "./",
-  publicDir: HRA_DESKTOP_PUBLIC_DIRECTORY,
-  plugins: [
-    {
-      name: "hra-desktop-renderer-csp",
-      enforce: "pre",
-      transformIndexHtml: (html) => rewriteDesktopRendererCsp(html, command),
+export default defineConfig(({ command }) => {
+  const developmentSessionId = command === "serve"
+    ? devSessionIdForVite(process.env)
+    : undefined;
+  const desktopRoot = fileURLToPath(new URL("..", import.meta.url));
+  const repositoryRoot = fileURLToPath(new URL("../../..", import.meta.url));
+
+  return {
+    root: "frontend",
+    base: "./",
+    publicDir: HRA_DESKTOP_PUBLIC_DIRECTORY,
+    plugins: [
+      {
+        name: "hra-desktop-renderer-csp",
+        enforce: "pre",
+        transformIndexHtml: (html) => rewriteDesktopRendererCsp(html, command),
+      },
+      ...(command === "serve" && developmentSessionId !== undefined
+        ? [
+          hraDevEntryPlugin(),
+          hraDevReadinessPlugin(developmentSessionId),
+          hraMalleableDevPlugin({
+            authority: process.env[HRA_DEV_SESSION_ENV] === undefined ? "uiOnly" : "launcher",
+            desktopRoot,
+            repositoryRoot,
+            sessionId: developmentSessionId,
+          }),
+        ]
+        : []),
+      hraProductionModuleBoundaryPlugin(),
+      react(),
+    ],
+    build: {
+      emptyOutDir: true,
+      outDir: "dist",
     },
-    ...(command === "serve"
-      ? [hraDevReadinessPlugin(devSessionIdForVite(process.env))]
-      : []),
-    hraProductionModuleBoundaryPlugin(),
-    react(),
-  ],
-  build: {
-    emptyOutDir: true,
-    outDir: "dist",
-  },
-  server: {
-    host: "127.0.0.1",
-    port: 5173,
-    strictPort: true,
-  },
-}));
+    server: {
+      cors: false,
+      host: "127.0.0.1",
+      port: 5173,
+      strictPort: true,
+    },
+  };
+});

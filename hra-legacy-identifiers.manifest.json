@@ -42,7 +42,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "17dafd8351ee447eebdf4e964589d1a2b912d15b564bd00a5e5791077dda0336",
+      "matchingLinesSha256": "5776b0c57fcd0b644c71227077cfa296454dfecb744c035dd5621d6a461c11f8",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -52,7 +52,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "8971c9558075b65a2ad25591aaf8fde3f7fd13ba75661c1f5e433a19de756420",
+      "matchingLinesSha256": "9905660d24ab18472bfc278ba24c725a462516c8d17bc38caf5a2c6bca88717e",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -92,7 +92,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d95a189971a3df337e478122aa68e65a6e30621a1b47a9e16b36dbee4dfa7595",
+      "matchingLinesSha256": "18c9db6c704f185a2da0290ef91945270573e446f0694023c06e9a9eeeb5803b",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -112,13 +112,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c71f27161a33b580cb6b9fe0fecbff0e5adf4f695a711555691869a7f6ccddef",
+      "matchingLinesSha256": "cf21fefecfcbced5a05ae80d19cbeed9a219b42867799725e6df8d7c7993f513",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
         "oprte": 4
       },
       "path": "apps/desktop/runtime/dev-protocol.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "1d7f4c131a5f21e2cd1bda480fcfe114579a1a5962190cae0394ef36efe57ac5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/dev/gateway-builder.ts"
     },
     {
       "category": "compatibility",
@@ -139,16 +149,6 @@
         "oprte": 21
       },
       "path": "apps/desktop/runtime/package-macos.ts"
-    },
-    {
-      "category": "compatibility",
-      "matchingLinesSha256": "4d0f7bb1912a4396879a88b95110aff3f8b2493531618b2c727b239d601d6467",
-      "occurrences": {
-        "kitchen": 0,
-        "operateStylized": 0,
-        "oprte": 3
-      },
-      "path": "apps/desktop/runtime/run-native.ts"
     },
     {
       "category": "compatibility",
@@ -242,7 +242,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d188a87b3bae64d41c4e113d3ddd2b9b37845a9ea7e1d46d060f27bbf9dae6f0",
+      "matchingLinesSha256": "3b44c64e2084afadb4f9cfad34e44b2d403da1e654e9effc2ec1f4e20f0c19ef",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -252,7 +252,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "20811f7e0dd65fe010a64379420feb2b076621e0580dc67e3b3bd839991ef50b",
+      "matchingLinesSha256": "bc22cd7df610eb8f49e23ea6f15c07c757fc09b9e2b69e1624754708bd15fabc",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -302,6 +302,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "48fd37076846bc5b05a1cc100e9ea6eaa3bbbf7853f74d6c0c66b18ce8a05eb6",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/src/harness/actor-instruction-policy-v1.json"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "3d65003fd00d1f7403acd8fec11fc021fea023ce28bc69ed01fc622c7347c515",
       "occurrences": {
         "kitchen": 0,
@@ -322,11 +332,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "305cdaec1e6ecfcd7c5bf03227732b965a1adc440c7e61a3938c0e5ea8f39595",
+      "matchingLinesSha256": "0c401851955304cda7dcb8585e28fb3433a044a1c94047b0ad95c522a37805f9",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 4
+        "oprte": 2
       },
       "path": "apps/desktop/runtime/src/harness/codex-persistent-actor-provider.ts"
     },
@@ -982,7 +992,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "ff97853ea73ef1a7a1b3e559709effb69766e7aefc6fd7f097304db903643369",
+      "matchingLinesSha256": "77aab981a9601fdee91d095c247d48464d2a242fd38091e2c94722fb519a48ec",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1119,6 +1129,16 @@
         "oprte": 6
       },
       "path": "apps/desktop/runtime/test/harness-actor-continuation-intent-sqlite-v2.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cf28f47133c8126209cea4733685b0b249b8bd8c0a5d21c43e9361b12fa4984f",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/harness-actor-instruction-policy-v1.test.ts"
     },
     {
       "category": "compatibility",
@@ -1802,11 +1822,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9d4f33bb845bff4982dab1a5793a727016d4b3cbaf0ce9cea279bc30868b28ed",
+      "matchingLinesSha256": "489e0e5e9d7ae8d0627d827e74a79dde7812ff74699ac6dbdfa3220d95a763ac",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
-        "oprte": 62
+        "oprte": 63
       },
       "path": "apps/desktop/src/runtime_host.zig"
     },

@@ -5,6 +5,7 @@
 - `test/` – deterministic fake app-servers, fault fixtures, protocol probes, property suites, and gateway integration tests.
 - `run-native.ts` – the development launcher that resolves exact local Codex and Git paths before starting the Zig host.
 - `dev-protocol.ts` and `dev-supervisor.ts` – localhost ownership, readiness, launch ordering, environment scrubbing, and bounded process cleanup.
+- `dev/` – the path classifier, bounded development-status protocol, Vite watcher, staged gateway builder, and candidate apply reservation.
 - `run-zig.ts` and `zig-toolchain.ts` – shared Zig launch and deterministic executable discovery for native commands.
 - `verify-runtime-pins.ts` and `runtime-versions.json` – portable package metadata checks and explicit Apple Silicon runtime hashes.
 - `shipped-javascript-licenses.ts` – fail-closed, overinclusive production dependency inventory with nested license text and reviewed package exceptions.
@@ -20,6 +21,9 @@
 - Keep this directory inside the desktop workspace. It intentionally has no nested manifest or lockfile.
 - Compile the gateway into a standalone executable. An installed source build must not fall back to global Bun, Node, Python, Codex, Git, or a shared home.
 - Use a distinct unminified, inline-source-mapped gateway for local development. Do not restart it automatically while it may own an active task.
+- Compile changed development gateways beside the live executable and promote only a successful, latest, same-filesystem candidate. A failed or superseded build must leave the running generation and stable executable unchanged.
+- Keep executable runtime changes cold. Admit only strictly parsed, bounded data to development gateway apply after proving its cold renderer owns no boot-time, persistence, process, network, provider, or filesystem authority.
+- Reserve one staged candidate before hot apply and freeze the stable gateway path through generation recovery. Only the current gateway may seal admission and report itself idle; acknowledge the candidate after the exact replacement generation is ready.
 - Keep repository checks platform-neutral. Execute pinned Apple Silicon binaries only through explicit macOS commands.
 - Keep one serialized JSONL writer per account child and correlate every request by account profile, durable process generation, and JSON-RPC ID.
 - Pass each child only its validated account `CODEX_HOME` and allowlisted environment.

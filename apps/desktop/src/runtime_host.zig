@@ -9,11 +9,18 @@ const private_project_onboarding_command = "hra.runtime.onboardProject";
 pub const native_project_add_command = "hra.project.add";
 pub const transport_retry_command = "hra.runtime.retryTransport";
 pub const transport_health_command = "hra.runtime.confirmTransportHealth";
+const private_development_reload_command =
+    "hra.runtime.developmentReload";
+const development_reload_result_kind =
+    "developmentReloadDecision";
+const runtime_bridge_profile_environment =
+    "HRA_RUNTIME_BRIDGE_PROFILE";
 pub const renderer_event = "hra:runtime-event";
 pub const transport_lifecycle_event = "hra:runtime-transport";
 const runtime_protocol_version: i64 = 3;
 const transport_lifecycle_version: i64 = 1;
 const max_transport_generation: u64 = 9_007_199_254_740_991;
+const development_reload_candidate_bytes: usize = 64;
 
 const main_window_id: native_sdk.WindowId = 1;
 // The product supports 64 simultaneous pane mutations. Keep a separate,
@@ -351,6 +358,17 @@ fn bridgePolicy(profile: BridgeProfile) native_sdk.bridge.Policy {
     };
 }
 
+fn developmentReloadAvailableForMode(
+    mode: std.builtin.OptimizeMode,
+    profile: BridgeProfile,
+) bool {
+    return mode == .Debug and profile == .development;
+}
+
+fn developmentReloadAvailable(profile: BridgeProfile) bool {
+    return developmentReloadAvailableForMode(builtin.mode, profile);
+}
+
 pub const PathOptions = struct {
     /// Development/test-only values have priority over matching environment
     /// variables. Every override is ignored when the host executable is inside
@@ -649,6 +667,12 @@ pub fn buildSanitizedEnvironment(
             try environment.put("HRA_WORKOS_CLIENT_ID", configuration.workos_client_id);
         },
     }
+
+    try environment.put(runtime_bridge_profile_environment, switch (profile) {
+        .production => "production",
+        .development => "development",
+        .automation => "automation",
+    });
 
     try environment.put("HRA_GATEWAY_PATH", paths.gateway_path);
     try environment.put("HRA_CODEX_BIN", paths.codex_bin);
@@ -3147,6 +3171,7 @@ const PendingDestination = union(enum) {
     native_removal_recovery,
     native_account_profile_result,
     native_harness_custody_result,
+    development_reload: native_sdk.bridge.AsyncResponder,
 };
 
 const Pending = struct {
@@ -3161,6 +3186,9 @@ const Pending = struct {
     writer_done: bool = false,
     ui_done: bool = false,
     terminate_after_response: bool = false,
+    development_reload_accepted: bool = false,
+    development_reload_candidate: [development_reload_candidate_bytes]u8 = undefined,
+    development_reload_candidate_len: usize = 0,
 
     fn idSlice(self: *const Pending) []const u8 {
         return self.id[0..self.id_len];
@@ -3171,6 +3199,13 @@ const Pending = struct {
             null
         else
             self.removal_deletion_capability[0..self.removal_deletion_capability_len];
+    }
+
+    fn developmentReloadCandidate(self: *const Pending) ?[]const u8 {
+        return if (self.development_reload_candidate_len == 0)
+            null
+        else
+            self.development_reload_candidate[0..self.development_reload_candidate_len];
     }
 };
 
@@ -3241,6 +3276,120 @@ const TransportRetryDecision = struct {
     status: TransportRetryStatus,
     scheduled_attempt: ?u8 = null,
 };
+
+const DevelopmentReloadDecision = enum {
+    accepted,
+    busy,
+};
+
+fn parseDevelopmentReloadDecision(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    expected_id: []const u8,
+    expected_candidate: []const u8,
+) !DevelopmentReloadDecision {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        line,
+        .{},
+    ) catch return error.InvalidDevelopmentReloadDecision;
+    defer parsed.deinit();
+    const outer = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    if (outer.count() != 3) return error.InvalidDevelopmentReloadDecision;
+    const id = switch (outer.get("id") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .string => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    const ok = switch (outer.get("ok") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .bool => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    const result = switch (outer.get("result") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .object => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    if (!ok or !std.mem.eql(u8, id, expected_id) or result.count() != 4) {
+        return error.InvalidDevelopmentReloadDecision;
+    }
+    const kind = switch (result.get("kind") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .string => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    const version = switch (result.get("version") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .integer => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    const status = switch (result.get("status") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .string => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    const candidate = switch (result.get("candidateId") orelse
+        return error.InvalidDevelopmentReloadDecision) {
+        .string => |value| value,
+        else => return error.InvalidDevelopmentReloadDecision,
+    };
+    if (version != 1 or
+        !std.mem.eql(u8, kind, development_reload_result_kind) or
+        !std.mem.eql(u8, candidate, expected_candidate))
+    {
+        return error.InvalidDevelopmentReloadDecision;
+    }
+    if (std.mem.eql(u8, status, "accepted")) return .accepted;
+    if (std.mem.eql(u8, status, "busy")) return .busy;
+    return error.InvalidDevelopmentReloadDecision;
+}
+
+fn encodeDevelopmentReloadResult(
+    allocator: std.mem.Allocator,
+    id: ?[]const u8,
+    status: []const u8,
+    candidate: []const u8,
+    current_generation: u64,
+    next_generation: ?u64,
+) std.mem.Allocator.Error![]u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    if (id) |request_id| {
+        output.writer.writeAll("{\"id\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(request_id, .{}, &output.writer) catch
+            return error.OutOfMemory;
+        output.writer.writeAll(",\"ok\":true,\"result\":") catch
+            return error.OutOfMemory;
+    }
+    output.writer.writeAll(
+        "{\"version\":1,\"mode\":\"developmentReload\",\"status\":",
+    ) catch return error.OutOfMemory;
+    std.json.Stringify.value(status, .{}, &output.writer) catch
+        return error.OutOfMemory;
+    output.writer.writeAll(",\"candidateId\":") catch
+        return error.OutOfMemory;
+    std.json.Stringify.value(candidate, .{}, &output.writer) catch
+        return error.OutOfMemory;
+    output.writer.print(
+        ",\"currentGeneration\":{d},\"nextGeneration\":",
+        .{current_generation},
+    ) catch return error.OutOfMemory;
+    if (next_generation) |generation| {
+        output.writer.print("{d}", .{generation}) catch
+            return error.OutOfMemory;
+    } else {
+        output.writer.writeAll("null") catch return error.OutOfMemory;
+    }
+    output.writer.writeByte('}') catch return error.OutOfMemory;
+    if (id != null) output.writer.writeByte('}') catch
+        return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
 
 fn recoveryDelayMilliseconds(base: u16, attempt: u8) u16 {
     std.debug.assert(base > 0);
@@ -3381,6 +3530,61 @@ fn harnessInstallEnvelopeSHA256(
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     defer secureWipe(&digest);
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn developmentReloadFileSHA256(
+    io: std.Io,
+    path: []const u8,
+) ![development_reload_candidate_bytes]u8 {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    });
+    defer file.close(io);
+    const before = try file.stat(io);
+    if (before.kind != .file) return error.InvalidDevelopmentReloadCandidate;
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    defer secureWipe(&buffer);
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const remaining: usize = @intCast(@min(
+            before.size - offset,
+            buffer.len,
+        ));
+        const count = try file.readPositionalAll(
+            io,
+            buffer[0..remaining],
+            offset,
+        );
+        if (count == 0) return error.DevelopmentReloadCandidateChanged;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    const after = try file.stat(io);
+    if (offset != before.size or before.size != after.size or
+        before.inode != after.inode)
+    {
+        return error.DevelopmentReloadCandidateChanged;
+    }
+    var digest: [32]u8 = undefined;
+    defer secureWipe(&digest);
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn developmentReloadCandidatePath(
+    allocator: std.mem.Allocator,
+    stable_gateway_path: []const u8,
+    candidate: []const u8,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}.candidate-{s}",
+        .{ stable_gateway_path, candidate },
+    );
 }
 
 fn harnessReconciliationMarkerIsValid(
@@ -5166,6 +5370,15 @@ pub const RuntimeHost = struct {
     recovery_requested: bool = false,
     generation_process_tree_contained: bool = true,
     terminal_removal_committed: bool = false,
+    development_reload_sealed: bool = false,
+    development_reload_accepted: bool = false,
+    development_reload_candidate: [development_reload_candidate_bytes]u8 = undefined,
+    development_reload_candidate_len: usize = 0,
+    development_reload_desired_candidate: [development_reload_candidate_bytes]u8 = undefined,
+    development_reload_desired_candidate_len: usize = 0,
+    development_reload_target_generation: u64 = 0,
+    recovery_shutdown: GenerationShutdown = .forced,
+    recovery_skips_backoff: bool = false,
 
     pub fn init(process_init: std.process.Init, options: Options) RuntimeHost {
         return .{
@@ -5256,6 +5469,14 @@ pub const RuntimeHost = struct {
         self: *RuntimeHost,
         startup_removal_recovery: bool,
     ) !void {
+        return self.launchGenerationFromPath(startup_removal_recovery, null);
+    }
+
+    fn launchGenerationFromPath(
+        self: *RuntimeHost,
+        startup_removal_recovery: bool,
+        gateway_executable_path: ?[]const u8,
+    ) !void {
         var paths = try resolveRuntimePaths(self.io, self.allocator, self.parent_environment, self.options.paths);
         defer paths.deinit(self.allocator);
         if (startup_removal_recovery) {
@@ -5329,8 +5550,9 @@ pub const RuntimeHost = struct {
             }
         }
 
+        const executable_path = gateway_executable_path orelse paths.gateway_path;
         var child = try std.process.spawn(self.io, .{
-            .argv = &.{paths.gateway_path},
+            .argv = &.{executable_path},
             .environ_map = &environment,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -5598,6 +5820,10 @@ pub const RuntimeHost = struct {
         };
         var force_fault = false;
         self.mutex.lockUncancelable(self.io);
+        if (self.development_reload_sealed) {
+            self.mutex.unlock(self.io);
+            return decision;
+        }
         switch (self.state) {
             .running => if (force_if_running) {
                 decision.status = .accepted;
@@ -5632,6 +5858,230 @@ pub const RuntimeHost = struct {
             self.transportFault("The local runtime stopped responding.");
         }
         return decision;
+    }
+
+    fn releaseDevelopmentReloadSeal(self: *RuntimeHost) void {
+        self.mutex.lockUncancelable(self.io);
+        if (!self.development_reload_accepted) {
+            self.development_reload_sealed = false;
+            secureWipe(&self.development_reload_candidate);
+            self.development_reload_candidate_len = 0;
+        }
+        self.mutex.unlock(self.io);
+    }
+
+    fn developmentReloadFileMatches(
+        self: *RuntimeHost,
+        path: []const u8,
+        candidate: []const u8,
+    ) bool {
+        var digest = developmentReloadFileSHA256(
+            self.io,
+            path,
+        ) catch return false;
+        defer secureWipe(&digest);
+        return std.mem.eql(u8, &digest, candidate);
+    }
+
+    fn developmentReloadStagedCandidateMatches(
+        self: *RuntimeHost,
+        candidate: []const u8,
+    ) bool {
+        var paths = resolveRuntimePaths(
+            self.io,
+            self.allocator,
+            self.parent_environment,
+            self.options.paths,
+        ) catch return false;
+        defer paths.deinit(self.allocator);
+        const candidate_path = developmentReloadCandidatePath(
+            self.allocator,
+            paths.gateway_path,
+            candidate,
+        ) catch return false;
+        defer self.allocator.free(candidate_path);
+        return self.developmentReloadFileMatches(candidate_path, candidate);
+    }
+
+    fn resolveDevelopmentReloadLaunchPath(
+        self: *RuntimeHost,
+        candidate: []const u8,
+    ) ![]u8 {
+        var paths = try resolveRuntimePaths(
+            self.io,
+            self.allocator,
+            self.parent_environment,
+            self.options.paths,
+        );
+        defer paths.deinit(self.allocator);
+        const candidate_path = try developmentReloadCandidatePath(
+            self.allocator,
+            paths.gateway_path,
+            candidate,
+        );
+        if (self.developmentReloadFileMatches(candidate_path, candidate)) {
+            return candidate_path;
+        }
+        self.allocator.free(candidate_path);
+        if (!self.developmentReloadFileMatches(paths.gateway_path, candidate)) {
+            return error.InvalidDevelopmentReloadCandidate;
+        }
+        return self.allocator.dupe(u8, paths.gateway_path);
+    }
+
+    fn respondDevelopmentReloadStatus(
+        self: *RuntimeHost,
+        responder: native_sdk.bridge.AsyncResponder,
+        request_id: []const u8,
+        status: []const u8,
+        candidate: []const u8,
+        current_generation: u64,
+        next_generation: ?u64,
+    ) void {
+        const encoded = encodeDevelopmentReloadResult(
+            self.allocator,
+            null,
+            status,
+            candidate,
+            current_generation,
+            next_generation,
+        ) catch {
+            respondError(
+                responder,
+                request_id,
+                .internal_error,
+                "Development reload response allocation failed",
+            );
+            return;
+        };
+        defer self.allocator.free(encoded);
+        responder.success(request_id, encoded) catch {};
+    }
+
+    fn invokeDevelopmentReload(
+        self: *RuntimeHost,
+        invocation: native_sdk.bridge.Invocation,
+        responder: native_sdk.bridge.AsyncResponder,
+        candidate: []const u8,
+    ) void {
+        if (!developmentReloadAvailable(self.options.bridge_profile)) {
+            respondError(
+                responder,
+                invocation.request.id,
+                .invalid_request,
+                "Development reload is unavailable",
+            );
+            return;
+        }
+
+        var current_generation: u64 = 0;
+        var admitted = false;
+        self.mutex.lockUncancelable(self.io);
+        current_generation = self.generation;
+        if (self.state == .running and
+            self.generation < max_transport_generation and
+            !self.terminal_removal_committed and
+            !self.development_reload_sealed and
+            self.pending_count == 0 and
+            self.request_len == 0 and
+            self.action_len == 0 and
+            !self.renderer_delivery_in_flight and
+            !self.account_profile_busy and
+            self.account_profile_request == null and
+            !self.account_profile_result_reserved and
+            !self.harness_custody_busy and
+            self.harness_custody_request == null and
+            !self.harness_custody_result_reserved)
+        {
+            self.development_reload_sealed = true;
+            self.development_reload_candidate_len = candidate.len;
+            @memcpy(
+                self.development_reload_candidate[0..candidate.len],
+                candidate,
+            );
+            admitted = true;
+        }
+        self.mutex.unlock(self.io);
+        if (!admitted) {
+            self.respondDevelopmentReloadStatus(
+                responder,
+                invocation.request.id,
+                "unavailable",
+                candidate,
+                current_generation,
+                null,
+            );
+            return;
+        }
+
+        const request = encodeRequestWithRemovalCapability(
+            self.allocator,
+            invocation.request.id,
+            private_development_reload_command,
+            invocation.request.payload,
+            null,
+        ) catch |err| {
+            self.releaseDevelopmentReloadSeal();
+            const code: native_sdk.bridge.ErrorCode = switch (err) {
+                error.InvalidRequestId, error.InvalidJson, error.InvalidTrustedDirectoryPath => .invalid_request,
+                error.MessageTooLarge => .payload_too_large,
+                error.OutOfMemory => .internal_error,
+            };
+            respondError(responder, invocation.request.id, code, @errorName(err));
+            return;
+        };
+        const pending = self.allocator.create(Pending) catch {
+            secureWipeAndFree(self.allocator, request);
+            self.releaseDevelopmentReloadSeal();
+            respondError(
+                responder,
+                invocation.request.id,
+                .internal_error,
+                "OutOfMemory",
+            );
+            return;
+        };
+        pending.* = .{
+            .id = undefined,
+            .id_len = invocation.request.id.len,
+            .destination = .{ .development_reload = responder },
+            .request = request,
+            .development_reload_candidate = undefined,
+            .development_reload_candidate_len = candidate.len,
+        };
+        @memcpy(pending.id[0..pending.id_len], invocation.request.id);
+        @memcpy(
+            pending.development_reload_candidate[0..candidate.len],
+            candidate,
+        );
+
+        self.mutex.lockUncancelable(self.io);
+        if (self.state != .running or
+            !self.development_reload_sealed or
+            self.pending_count != 0 or
+            self.request_len != 0 or
+            self.findPendingLocked(invocation.request.id) != null)
+        {
+            self.development_reload_sealed = false;
+            secureWipe(&self.development_reload_candidate);
+            self.development_reload_candidate_len = 0;
+            self.mutex.unlock(self.io);
+            secureWipeAndFree(self.allocator, request);
+            secureWipe(&pending.development_reload_candidate);
+            self.allocator.destroy(pending);
+            respondError(
+                responder,
+                invocation.request.id,
+                .handler_failed,
+                "Development reload became unavailable",
+            );
+            return;
+        }
+        self.insertPendingLocked(pending) catch unreachable;
+        self.requests[self.request_head] = pending;
+        self.request_len = 1;
+        self.request_ready.signal(self.io);
+        self.mutex.unlock(self.io);
     }
 
     fn scheduleInitialLaunchRecovery(self: *RuntimeHost) bool {
@@ -5731,7 +6181,11 @@ pub const RuntimeHost = struct {
                 return;
             }
             const attempt = self.recovery_attempt;
+            const shutdown = self.recovery_shutdown;
+            const skips_backoff = self.recovery_skips_backoff;
             self.recovery_requested = false;
+            self.recovery_shutdown = .forced;
+            self.recovery_skips_backoff = false;
             self.mutex.unlock(self.io);
 
             // Fence the failed generation before spending any retry backoff.
@@ -5739,7 +6193,7 @@ pub const RuntimeHost = struct {
             // while its synchronous helpers still share this PGID; leaving
             // cleanup until after the delay would permit old mutations to keep
             // running even though no replacement can yet start.
-            self.cleanupGeneration(.forced);
+            self.cleanupGeneration(shutdown);
 
             self.mutex.lockUncancelable(self.io);
             if (!self.generation_process_tree_contained) {
@@ -5754,7 +6208,43 @@ pub const RuntimeHost = struct {
             }
             self.mutex.unlock(self.io);
 
-            if (!self.waitForRecoveryDelay(attempt)) continue;
+            if (!skips_backoff and
+                !self.waitForRecoveryDelay(attempt)) continue;
+
+            self.mutex.lockUncancelable(self.io);
+            var development_candidate: [development_reload_candidate_bytes]u8 = undefined;
+            const has_development_candidate =
+                self.development_reload_desired_candidate_len ==
+                development_reload_candidate_bytes;
+            if (has_development_candidate) {
+                @memcpy(
+                    &development_candidate,
+                    &self.development_reload_desired_candidate,
+                );
+            }
+            self.mutex.unlock(self.io);
+            defer secureWipe(&development_candidate);
+            const development_gateway_path = if (has_development_candidate)
+                self.resolveDevelopmentReloadLaunchPath(
+                    &development_candidate,
+                ) catch {
+                    self.mutex.lockUncancelable(self.io);
+                    if (self.state == .recovering) {
+                        self.state = .failed;
+                        self.recovery_requested = false;
+                    }
+                    self.mutex.unlock(self.io);
+                    _ = self.queueTransportLifecycle(.{ .failed = .{
+                        .can_retry = false,
+                        .message = "The staged development runtime changed before launch. Restart HRA.",
+                    } });
+                    continue;
+                }
+            else
+                null;
+            defer if (development_gateway_path) |path| {
+                self.allocator.free(path);
+            };
 
             self.mutex.lockUncancelable(self.io);
             if (self.state != .recovering or
@@ -5763,7 +6253,26 @@ pub const RuntimeHost = struct {
                 self.mutex.unlock(self.io);
                 continue;
             }
-            if (self.generation >= max_transport_generation) {
+            const development_target_generation =
+                if (self.development_reload_accepted)
+                    self.development_reload_target_generation
+                else
+                    0;
+            if (development_target_generation != 0) {
+                if (development_target_generation > max_transport_generation or
+                    self.generation > development_target_generation)
+                {
+                    self.state = .failed;
+                    self.recovery_requested = false;
+                    self.mutex.unlock(self.io);
+                    _ = self.queueTransportLifecycle(.{ .failed = .{
+                        .can_retry = false,
+                        .message = "The development runtime generation reservation became invalid. Restart HRA.",
+                    } });
+                    continue;
+                }
+                self.generation = development_target_generation;
+            } else if (self.generation >= max_transport_generation) {
                 self.state = .failed;
                 self.recovery_requested = false;
                 self.mutex.unlock(self.io);
@@ -5772,15 +6281,28 @@ pub const RuntimeHost = struct {
                     .message = "The local runtime generation limit was reached. Restart HRA.",
                 } });
                 continue;
+            } else {
+                self.generation += 1;
             }
-            self.generation += 1;
             self.mutex.unlock(self.io);
             _ = self.queueTransportLifecycle(.starting);
 
-            self.launchGeneration(false) catch {
+            self.launchGenerationFromPath(
+                false,
+                development_gateway_path,
+            ) catch {
                 self.scheduleNextRecovery(attempt);
                 continue;
             };
+            self.mutex.lockUncancelable(self.io);
+            if (self.development_reload_accepted) {
+                self.development_reload_sealed = false;
+                self.development_reload_accepted = false;
+                self.development_reload_target_generation = 0;
+                secureWipe(&self.development_reload_candidate);
+                self.development_reload_candidate_len = 0;
+            }
+            self.mutex.unlock(self.io);
         }
     }
 
@@ -5869,7 +6391,10 @@ pub const RuntimeHost = struct {
     ) bool {
         var accepted = false;
         self.mutex.lockUncancelable(self.io);
-        if (self.state == .running and self.generation == generation) {
+        if (self.state == .running and
+            self.generation == generation and
+            !self.development_reload_sealed)
+        {
             self.recovery_attempt = 0;
             accepted = true;
         }
@@ -5926,6 +6451,18 @@ pub const RuntimeHost = struct {
         }
         if (std.mem.eql(u8, command, transport_health_command)) {
             self.invokeTransportHealth(invocation, responder);
+            return;
+        }
+        self.mutex.lockUncancelable(self.io);
+        const development_admission_closed = self.development_reload_sealed;
+        self.mutex.unlock(self.io);
+        if (development_admission_closed) {
+            respondError(
+                responder,
+                invocation.request.id,
+                .handler_failed,
+                "Runtime admission is closed",
+            );
             return;
         }
         if (std.mem.eql(u8, command, native_project_add_command)) {
@@ -6113,6 +6650,60 @@ pub const RuntimeHost = struct {
             .integer => |value| value,
             else => 0,
         };
+        if (object.get("mode")) |mode_value| {
+            if (!developmentReloadAvailable(self.options.bridge_profile)) {
+                respondError(
+                    responder,
+                    invocation.request.id,
+                    .invalid_request,
+                    "Development reload is unavailable",
+                );
+                return;
+            }
+            const mode = switch (mode_value) {
+                .string => |value| value,
+                else => {
+                    respondError(
+                        responder,
+                        invocation.request.id,
+                        .invalid_request,
+                        "Invalid transport retry request",
+                    );
+                    return;
+                },
+            };
+            const candidate = switch (object.get("candidateId") orelse .null) {
+                .string => |value| value,
+                else => {
+                    respondError(
+                        responder,
+                        invocation.request.id,
+                        .invalid_request,
+                        "Invalid transport retry request",
+                    );
+                    return;
+                },
+            };
+            if (object.count() != 3 or
+                version != transport_lifecycle_version or
+                !std.mem.eql(u8, mode, "developmentReload") or
+                !validPrefixedLowerHex(
+                    candidate,
+                    "",
+                    development_reload_candidate_bytes,
+                ))
+            {
+                respondError(
+                    responder,
+                    invocation.request.id,
+                    .invalid_request,
+                    "Invalid transport retry request",
+                );
+                return;
+            }
+            self.invokeDevelopmentReload(invocation, responder, candidate);
+            return;
+        }
         const force_if_running = switch (object.count()) {
             1 => false,
             2 => switch (object.get("forceIfRunning") orelse .null) {
@@ -6507,6 +7098,7 @@ pub const RuntimeHost = struct {
                 .native_removal_recovery => true,
                 .native_account_profile_result,
                 .native_harness_custody_result,
+                .development_reload,
                 => false,
             };
             if (!correlation_matches) continue;
@@ -6526,7 +7118,9 @@ pub const RuntimeHost = struct {
 
         while (true) {
             self.mutex.lockUncancelable(self.io);
-            while (self.request_len == 0 and self.state == .running) {
+            while (self.request_len == 0 and self.state == .running and
+                !self.development_reload_accepted)
+            {
                 self.request_ready.waitUncancelable(self.io, &self.mutex);
             }
             if (self.request_len == 0) {
@@ -6539,6 +7133,35 @@ pub const RuntimeHost = struct {
             self.request_len -= 1;
             pending.writer_active = true;
             self.mutex.unlock(self.io);
+
+            const development_candidate = switch (pending.destination) {
+                .development_reload => pending.developmentReloadCandidate(),
+                else => null,
+            };
+            if (development_candidate) |candidate| {
+                if (!self.developmentReloadStagedCandidateMatches(candidate)) {
+                    self.mutex.lockUncancelable(self.io);
+                    const removed = self.takePendingLocked(
+                        pending.idSlice(),
+                    );
+                    const failed = removed == pending and
+                        self.pushActionLocked(.{ .failure = .{
+                            .pending = pending,
+                            .code = .invalid_request,
+                            .message = "Development runtime candidate changed",
+                        } }) and
+                        self.pushActionLocked(.{ .write_complete = pending });
+                    self.mutex.unlock(self.io);
+                    if (!failed) {
+                        self.transportFault(
+                            "Development runtime candidate validation failed",
+                        );
+                        return;
+                    }
+                    _ = self.wake();
+                    continue;
+                }
+            }
 
             writer.interface.writeAll(pending.request) catch {
                 self.transportFault("Runtime gateway stdin failed");
@@ -6911,6 +7534,7 @@ pub const RuntimeHost = struct {
                 return;
             };
             const line = maybe_line orelse {
+                if (self.scheduleDevelopmentReloadAfterEOF()) return;
                 self.transportFault("Runtime gateway exited");
                 return;
             };
@@ -6934,6 +7558,79 @@ pub const RuntimeHost = struct {
                         return;
                     };
                     self.mutex.unlock(self.io);
+                    if (pending.developmentReloadCandidate()) |candidate| {
+                        const decision = parseDevelopmentReloadDecision(
+                            self.allocator,
+                            line,
+                            pending.idSlice(),
+                            candidate,
+                        ) catch {
+                            self.allocator.free(bytes);
+                            _ = self.queueReaderFailure(
+                                pending,
+                                "Development reload returned an invalid decision",
+                            );
+                            self.transportFault(
+                                "Runtime gateway emitted an invalid development reload decision",
+                            );
+                            return;
+                        };
+                        self.allocator.free(bytes);
+                        self.mutex.lockUncancelable(self.io);
+                        const current_generation = self.generation;
+                        const generation_is_current =
+                            self.state == .running and
+                            self.development_reload_sealed and
+                            current_generation < max_transport_generation;
+                        self.mutex.unlock(self.io);
+                        if (!generation_is_current) {
+                            _ = self.queueReaderFailure(
+                                pending,
+                                "Development reload became unavailable",
+                            );
+                            self.transportFault(
+                                "Development reload generation changed before admission",
+                            );
+                            return;
+                        }
+                        pending.development_reload_accepted =
+                            decision == .accepted;
+                        bytes = encodeDevelopmentReloadResult(
+                            self.allocator,
+                            pending.idSlice(),
+                            if (decision == .accepted) "accepted" else "busy",
+                            candidate,
+                            current_generation,
+                            if (decision == .accepted)
+                                current_generation + 1
+                            else
+                                null,
+                        ) catch {
+                            _ = self.queueReaderFailure(
+                                pending,
+                                "Development reload response allocation failed",
+                            );
+                            self.transportFault(
+                                "Development reload response allocation failed",
+                            );
+                            return;
+                        };
+                        self.mutex.lockUncancelable(self.io);
+                        const queued = self.pushActionLocked(.{ .response = .{
+                            .pending = pending,
+                            .bytes = bytes,
+                        } });
+                        self.mutex.unlock(self.io);
+                        if (!queued) {
+                            self.allocator.free(bytes);
+                            self.transportFault(
+                                "Runtime completion queue is full",
+                            );
+                            return;
+                        }
+                        _ = self.wake();
+                        continue;
+                    }
                     const startup_recovery = switch (pending.destination) {
                         .native_removal_recovery => true,
                         else => false,
@@ -7007,6 +7704,7 @@ pub const RuntimeHost = struct {
                         .native_removal_recovery,
                         .native_account_profile_result,
                         .native_harness_custody_result,
+                        .development_reload,
                         => null,
                     };
                     if (correlation) |removal| {
@@ -7556,6 +8254,42 @@ pub const RuntimeHost = struct {
         return queued;
     }
 
+    fn scheduleDevelopmentReloadAfterEOF(self: *RuntimeHost) bool {
+        var scheduled = false;
+        self.mutex.lockUncancelable(self.io);
+        if (self.state == .running and
+            self.development_reload_sealed and
+            self.development_reload_accepted and
+            self.development_reload_candidate_len ==
+                development_reload_candidate_bytes and
+            self.development_reload_target_generation == self.generation + 1 and
+            self.pending_count == 0 and
+            self.request_len == 0 and
+            self.action_len == 0 and
+            !self.renderer_delivery_in_flight and
+            !self.account_profile_busy and
+            self.account_profile_request == null and
+            !self.account_profile_result_reserved and
+            !self.harness_custody_busy and
+            self.harness_custody_request == null and
+            !self.harness_custody_result_reserved)
+        {
+            self.state = .recovering;
+            self.recovery_attempt = 1;
+            self.recovery_requested = true;
+            self.recovery_shutdown = .graceful;
+            self.recovery_skips_backoff = true;
+            self.request_ready.broadcast(self.io);
+            self.account_profile_ready.broadcast(self.io);
+            self.harness_custody_ready.broadcast(self.io);
+            self.event_space_ready.broadcast(self.io);
+            self.recovery_ready.signal(self.io);
+            scheduled = true;
+        }
+        self.mutex.unlock(self.io);
+        return scheduled;
+    }
+
     fn transportFault(self: *RuntimeHost, message: []const u8) void {
         var scheduled = false;
         var terminal = false;
@@ -7682,10 +8416,47 @@ pub const RuntimeHost = struct {
                 .native_removal_recovery,
                 .native_account_profile_result,
                 .native_harness_custody_result,
+                .development_reload,
                 => {},
             }
         }
         return false;
+    }
+
+    fn commitDevelopmentReloadDecision(
+        self: *RuntimeHost,
+        pending: *const Pending,
+    ) bool {
+        const candidate = pending.developmentReloadCandidate() orelse
+            return true;
+        self.mutex.lockUncancelable(self.io);
+        const valid = self.state == .running and
+            self.development_reload_sealed and
+            self.development_reload_candidate_len == candidate.len and
+            std.mem.eql(
+                u8,
+                self.development_reload_candidate[0..self.development_reload_candidate_len],
+                candidate,
+            );
+        if (valid and pending.development_reload_accepted) {
+            self.development_reload_accepted = true;
+            self.development_reload_target_generation = self.generation + 1;
+            @memcpy(
+                self.development_reload_desired_candidate[0..candidate.len],
+                candidate,
+            );
+            self.development_reload_desired_candidate_len = candidate.len;
+            self.request_ready.broadcast(self.io);
+        } else {
+            self.development_reload_sealed = false;
+            self.development_reload_accepted = false;
+            self.development_reload_target_generation = 0;
+            secureWipe(&self.development_reload_candidate);
+            self.development_reload_candidate_len = 0;
+            self.request_ready.broadcast(self.io);
+        }
+        self.mutex.unlock(self.io);
+        return valid;
     }
 
     fn drain(self: *RuntimeHost, runtime: *native_sdk.Runtime) void {
@@ -7745,6 +8516,14 @@ pub const RuntimeHost = struct {
 
             switch (next) {
                 .response => |response| {
+                    const development_reload_valid = switch (
+                        response.pending.destination
+                    ) {
+                        .development_reload => self.commitDevelopmentReloadDecision(
+                            response.pending,
+                        ),
+                        else => true,
+                    };
                     switch (response.pending.destination) {
                         .renderer => |renderer| {
                             renderer.responder.respond(
@@ -7754,6 +8533,22 @@ pub const RuntimeHost = struct {
                         .native_removal_recovery => {},
                         .native_account_profile_result => {},
                         .native_harness_custody_result => {},
+                        .development_reload => |responder| {
+                            if (development_reload_valid) {
+                                // Commit the generation transaction before the
+                                // renderer can observe accepted. A later bridge
+                                // delivery failure is ambiguous to the renderer,
+                                // but Native remains bound to this candidate.
+                                responder.respond(response.bytes) catch {};
+                            } else {
+                                respondError(
+                                    responder,
+                                    response.pending.idSlice(),
+                                    .handler_failed,
+                                    "Development reload became unavailable",
+                                );
+                            }
+                        },
                     }
                     self.allocator.free(response.bytes);
                     response.pending.ui_done = true;
@@ -7764,6 +8559,11 @@ pub const RuntimeHost = struct {
                         lifecycle.terminate_fn(lifecycle.context);
                     }
                     self.releasePendingIfDone(response.pending);
+                    if (!development_reload_valid) {
+                        self.transportFault(
+                            "Development reload decision became stale before delivery",
+                        );
+                    }
                 },
                 .failure => |failure| {
                     switch (failure.pending.destination) {
@@ -7776,8 +8576,17 @@ pub const RuntimeHost = struct {
                         .native_removal_recovery => {},
                         .native_account_profile_result => {},
                         .native_harness_custody_result => {},
+                        .development_reload => |responder| respondError(
+                            responder,
+                            failure.pending.idSlice(),
+                            failure.code,
+                            failure.message,
+                        ),
                     }
                     failure.pending.ui_done = true;
+                    if (failure.pending.developmentReloadCandidate() != null) {
+                        _ = self.commitDevelopmentReloadDecision(failure.pending);
+                    }
                     self.releasePendingIfDone(failure.pending);
                 },
                 .event, .transport_lifecycle => unreachable,
@@ -10110,6 +10919,287 @@ test "bridge profiles isolate production development and automation origins" {
     try std.testing.expect(automation.allows(transport_health_command, "zero://inline"));
 }
 
+test "development reload is Debug and development profile only" {
+    try std.testing.expect(developmentReloadAvailableForMode(
+        .Debug,
+        .development,
+    ));
+    try std.testing.expect(!developmentReloadAvailableForMode(
+        .Debug,
+        .production,
+    ));
+    try std.testing.expect(!developmentReloadAvailableForMode(
+        .Debug,
+        .automation,
+    ));
+    for ([_]std.builtin.OptimizeMode{
+        .ReleaseSafe,
+        .ReleaseFast,
+        .ReleaseSmall,
+    }) |mode| {
+        try std.testing.expect(!developmentReloadAvailableForMode(
+            mode,
+            .development,
+        ));
+    }
+    try std.testing.expectEqual(
+        builtin.mode == .Debug,
+        developmentReloadAvailable(.development),
+    );
+}
+
+test "development reload private decisions and public results are exact" {
+    const candidate = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const accepted = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":\"reload-1\",\"ok\":true,\"result\":{{\"kind\":\"developmentReloadDecision\",\"version\":1,\"status\":\"accepted\",\"candidateId\":\"{s}\"}}}}",
+        .{candidate},
+    );
+    defer std.testing.allocator.free(accepted);
+    try std.testing.expectEqual(
+        DevelopmentReloadDecision.accepted,
+        try parseDevelopmentReloadDecision(
+            std.testing.allocator,
+            accepted,
+            "reload-1",
+            candidate,
+        ),
+    );
+
+    const busy = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":\"reload-1\",\"ok\":true,\"result\":{{\"kind\":\"developmentReloadDecision\",\"version\":1,\"status\":\"busy\",\"candidateId\":\"{s}\"}}}}",
+        .{candidate},
+    );
+    defer std.testing.allocator.free(busy);
+    try std.testing.expectEqual(
+        DevelopmentReloadDecision.busy,
+        try parseDevelopmentReloadDecision(
+            std.testing.allocator,
+            busy,
+            "reload-1",
+            candidate,
+        ),
+    );
+
+    const extra = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"id\":\"reload-1\",\"ok\":true,\"result\":{{\"kind\":\"developmentReloadDecision\",\"version\":1,\"status\":\"accepted\",\"candidateId\":\"{s}\",\"extra\":true}}}}",
+        .{candidate},
+    );
+    defer std.testing.allocator.free(extra);
+    try std.testing.expectError(
+        error.InvalidDevelopmentReloadDecision,
+        parseDevelopmentReloadDecision(
+            std.testing.allocator,
+            extra,
+            "reload-1",
+            candidate,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidDevelopmentReloadDecision,
+        parseDevelopmentReloadDecision(
+            std.testing.allocator,
+            accepted,
+            "reload-2",
+            candidate,
+        ),
+    );
+
+    const public_accepted = try encodeDevelopmentReloadResult(
+        std.testing.allocator,
+        null,
+        "accepted",
+        candidate,
+        4,
+        5,
+    );
+    defer std.testing.allocator.free(public_accepted);
+    const expected_public_accepted = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"mode\":\"developmentReload\",\"status\":\"accepted\",\"candidateId\":\"{s}\",\"currentGeneration\":4,\"nextGeneration\":5}}",
+        .{candidate},
+    );
+    defer std.testing.allocator.free(expected_public_accepted);
+    try std.testing.expectEqualStrings(
+        expected_public_accepted,
+        public_accepted,
+    );
+
+    const public_busy = try encodeDevelopmentReloadResult(
+        std.testing.allocator,
+        null,
+        "busy",
+        candidate,
+        4,
+        null,
+    );
+    defer std.testing.allocator.free(public_busy);
+    const expected_public_busy = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"mode\":\"developmentReload\",\"status\":\"busy\",\"candidateId\":\"{s}\",\"currentGeneration\":4,\"nextGeneration\":null}}",
+        .{candidate},
+    );
+    defer std.testing.allocator.free(expected_public_busy);
+    try std.testing.expectEqualStrings(expected_public_busy, public_busy);
+}
+
+test "development reload candidate custody never stages over the stable path" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const stable_name = "oprte-gateway-dev";
+    const contents = "candidate gateway bytes";
+    var digest_bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(contents, &digest_bytes, .{});
+    defer secureWipe(&digest_bytes);
+    const candidate = std.fmt.bytesToHex(digest_bytes, .lower);
+    const candidate_name = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}.candidate-{s}",
+        .{ stable_name, &candidate },
+    );
+    defer std.testing.allocator.free(candidate_name);
+    try temporary.dir.writeFile(io, .{
+        .sub_path = stable_name,
+        .data = "current gateway bytes",
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = candidate_name,
+        .data = contents,
+    });
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(io, &root_buffer);
+    const stable_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_len], stable_name },
+    );
+    defer std.testing.allocator.free(stable_path);
+    const expected_candidate_path = try developmentReloadCandidatePath(
+        std.testing.allocator,
+        stable_path,
+        &candidate,
+    );
+    defer std.testing.allocator.free(expected_candidate_path);
+
+    var parent: std.process.Environ.Map = .init(std.testing.allocator);
+    defer parent.deinit();
+    var host: RuntimeHost = .{
+        .allocator = std.testing.allocator,
+        .io = io,
+        .parent_environment = &parent,
+        .options = .{
+            .paths = .{ .gateway_path = stable_path },
+            .bridge_profile = .development,
+        },
+    };
+    try std.testing.expect(host.developmentReloadStagedCandidateMatches(
+        &candidate,
+    ));
+    const staged_path = try host.resolveDevelopmentReloadLaunchPath(
+        &candidate,
+    );
+    defer std.testing.allocator.free(staged_path);
+    try std.testing.expectEqualStrings(expected_candidate_path, staged_path);
+
+    try temporary.dir.writeFile(io, .{
+        .sub_path = stable_name,
+        .data = contents,
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = candidate_name,
+        .data = "changed candidate bytes",
+    });
+    try std.testing.expect(!host.developmentReloadStagedCandidateMatches(
+        &candidate,
+    ));
+    const acknowledged_path = try host.resolveDevelopmentReloadLaunchPath(
+        &candidate,
+    );
+    defer std.testing.allocator.free(acknowledged_path);
+    try std.testing.expectEqualStrings(stable_path, acknowledged_path);
+}
+
+test "development reload busy and crash cuts preserve generation authority" {
+    const candidate = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prior = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    var parent: std.process.Environ.Map = .init(std.testing.allocator);
+    defer parent.deinit();
+    const request = try std.testing.allocator.alloc(u8, 0);
+    defer std.testing.allocator.free(request);
+    var pending: Pending = .{
+        .id = undefined,
+        .id_len = 0,
+        .destination = .native_removal_recovery,
+        .request = request,
+        .development_reload_candidate = undefined,
+        .development_reload_candidate_len = candidate.len,
+    };
+    @memcpy(&pending.development_reload_candidate, candidate);
+
+    var host: RuntimeHost = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .parent_environment = &parent,
+        .options = .{},
+        .state = .running,
+        .generation = 7,
+        .development_reload_sealed = true,
+        .development_reload_candidate = undefined,
+        .development_reload_candidate_len = candidate.len,
+        .development_reload_desired_candidate = undefined,
+        .development_reload_desired_candidate_len = prior.len,
+    };
+    @memcpy(&host.development_reload_candidate, candidate);
+    @memcpy(&host.development_reload_desired_candidate, prior);
+
+    try std.testing.expect(host.commitDevelopmentReloadDecision(&pending));
+    try std.testing.expect(!host.development_reload_sealed);
+    try std.testing.expectEqualStrings(
+        prior,
+        host.development_reload_desired_candidate[0..host.development_reload_desired_candidate_len],
+    );
+
+    // A transport fault after the reader queued accepted but before the UI
+    // drained it must suppress that accepted response. Stable recovery cannot
+    // be mistaken for the candidate generation.
+    host.state = .recovering;
+    host.development_reload_sealed = true;
+    host.development_reload_candidate_len = candidate.len;
+    @memcpy(&host.development_reload_candidate, candidate);
+    pending.development_reload_accepted = true;
+    try std.testing.expect(!host.commitDevelopmentReloadDecision(&pending));
+    try std.testing.expect(!host.development_reload_accepted);
+    try std.testing.expectEqualStrings(
+        prior,
+        host.development_reload_desired_candidate[0..host.development_reload_desired_candidate_len],
+    );
+
+    host.state = .running;
+    host.development_reload_sealed = true;
+    host.development_reload_candidate_len = candidate.len;
+    @memcpy(&host.development_reload_candidate, candidate);
+    try std.testing.expect(host.commitDevelopmentReloadDecision(&pending));
+    try std.testing.expect(host.development_reload_accepted);
+    try std.testing.expectEqual(@as(u64, 8), host.development_reload_target_generation);
+    try std.testing.expectEqualStrings(
+        candidate,
+        host.development_reload_desired_candidate[0..host.development_reload_desired_candidate_len],
+    );
+
+    host.action_len = 1;
+    try std.testing.expect(!host.scheduleDevelopmentReloadAfterEOF());
+    try std.testing.expectEqual(State.running, host.state);
+    host.action_len = 0;
+    try std.testing.expect(host.scheduleDevelopmentReloadAfterEOF());
+    try std.testing.expectEqual(State.recovering, host.state);
+    try std.testing.expect(host.recovery_requested);
+    try std.testing.expectEqual(GenerationShutdown.graceful, host.recovery_shutdown);
+    try std.testing.expect(host.recovery_skips_backoff);
+    try std.testing.expectEqual(@as(u64, 8), host.development_reload_target_generation);
+}
+
 test "transport recovery backoff is bounded and lifecycle envelopes are pathless" {
     try std.testing.expectEqual(@as(u16, 250), recoveryDelayMilliseconds(250, 1));
     try std.testing.expectEqual(@as(u16, 500), recoveryDelayMilliseconds(250, 2));
@@ -10393,6 +11483,33 @@ test "explicit transport retry resets only an exhausted host and is idempotent" 
         TransportRetryStatus.already_ready,
         host.requestTransportRetry().status,
     );
+}
+
+test "development reload seal rejects competing retry and health evidence" {
+    var parent: std.process.Environ.Map = .init(std.testing.allocator);
+    defer parent.deinit();
+    var host: RuntimeHost = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .parent_environment = &parent,
+        .options = .{},
+        .state = .running,
+        .generation = 7,
+        .recovery_attempt = 2,
+        .development_reload_sealed = true,
+    };
+
+    const forced = host.requestTransportRetryMode(true);
+    try std.testing.expectEqual(TransportRetryStatus.unavailable, forced.status);
+    try std.testing.expectEqual(State.running, host.state);
+    try std.testing.expectEqual(@as(u8, 2), host.recovery_attempt);
+    try std.testing.expect(!host.recovery_requested);
+    try std.testing.expect(!host.recordGenerationHealthEvidence(7));
+    try std.testing.expectEqual(@as(u8, 2), host.recovery_attempt);
+
+    host.development_reload_sealed = false;
+    try std.testing.expect(host.recordGenerationHealthEvidence(7));
+    try std.testing.expectEqual(@as(u8, 0), host.recovery_attempt);
 }
 
 test "forced transport retry fences one live-wedged generation without replay" {

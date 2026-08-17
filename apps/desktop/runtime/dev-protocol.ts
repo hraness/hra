@@ -2,11 +2,13 @@ export const HRA_DEV_FRONTEND_HOST = "127.0.0.1";
 export const HRA_DEV_FRONTEND_PORT = 5173;
 export const HRA_DEV_FRONTEND_URL =
   `http://${HRA_DEV_FRONTEND_HOST}:${HRA_DEV_FRONTEND_PORT}/`;
+export const HRA_NATIVE_APPLICATION_EXECUTABLE = "hra";
 export const HRA_DEV_READY_PATH = "/__hra_dev_ready";
 export const HRA_DEV_READY_URL =
   `${HRA_DEV_FRONTEND_URL.slice(0, -1)}${HRA_DEV_READY_PATH}`;
 export const HRA_DEV_READY_SCHEMA = "hra-vite-dev/v1";
 export const HRA_DEV_SESSION_ENV = "HRA_DEV_SESSION_ID";
+export const HRA_DEV_BUN_EXECUTABLE_ENV = "HRA_DEV_BUN_EXECUTABLE";
 
 const RETIRED_SELF_EDIT_ENVIRONMENT = [
   "HRA_DEV_LOCAL_EXECUTION",
@@ -33,8 +35,9 @@ export interface DevReadinessHttpResponse {
 export type DevLaunchPhase =
   | "checking-listener"
   | "starting-vite"
-  | "building-native"
   | "waiting-for-readiness"
+  | "building-gateway"
+  | "building-native"
   | "starting-app"
   | "running"
   | "refused"
@@ -45,8 +48,9 @@ export type DevLaunchEvent =
   | "listener-clear"
   | "listener-reachable"
   | "vite-started"
-  | "build-succeeded"
   | "readiness-matched"
+  | "gateway-build-succeeded"
+  | "native-build-succeeded"
   | "app-started"
   | "stop-requested"
   | "cleanup-complete";
@@ -193,15 +197,19 @@ const transitionTable: Readonly<
     "stop-requested": "stopping",
   },
   "starting-vite": {
-    "vite-started": "building-native",
-    "stop-requested": "stopping",
-  },
-  "building-native": {
-    "build-succeeded": "waiting-for-readiness",
+    "vite-started": "waiting-for-readiness",
     "stop-requested": "stopping",
   },
   "waiting-for-readiness": {
-    "readiness-matched": "starting-app",
+    "readiness-matched": "building-gateway",
+    "stop-requested": "stopping",
+  },
+  "building-gateway": {
+    "gateway-build-succeeded": "building-native",
+    "stop-requested": "stopping",
+  },
+  "building-native": {
+    "native-build-succeeded": "starting-app",
     "stop-requested": "stopping",
   },
   "starting-app": {

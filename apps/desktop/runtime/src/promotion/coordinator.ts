@@ -57,6 +57,7 @@ export class LocalPromotionCoordinator {
   #wakeQueued = false;
   #timer: TimerHandle | null = null;
   #tail: Promise<void> = Promise.resolve();
+  #workInFlight = 0;
 
   constructor(options: LocalPromotionCoordinatorOptions) {
     this.#store = options.store;
@@ -76,13 +77,21 @@ export class LocalPromotionCoordinator {
   }
 
   async stop(): Promise<void> {
+    this.closeAdmission();
+    await this.#tail;
+  }
+
+  closeAdmission(): void {
     this.#active = false;
     this.#wakeQueued = false;
     if (this.#timer !== null) {
       this.#clearTimer(this.#timer);
       this.#timer = null;
     }
-    await this.#tail;
+  }
+
+  hasUnsettledWork(): boolean {
+    return this.#workInFlight > 0;
   }
 
   wake(): void {
@@ -529,7 +538,10 @@ export class LocalPromotionCoordinator {
   }
 
   #enqueue<Value>(operation: () => Promise<Value>): Promise<Value> {
-    const pending = this.#tail.then(operation, operation);
+    this.#workInFlight += 1;
+    const pending = this.#tail.then(operation, operation).finally(() => {
+      this.#workInFlight -= 1;
+    });
     this.#tail = pending.then(
       () => undefined,
       () => undefined,

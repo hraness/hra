@@ -38,6 +38,7 @@ import {
   orderedProfilesForWorkClass,
   type MetaharnessCatalogCapability,
 } from "./metaharness-policy-v1";
+import { persistentActorInstructions } from "./actor-instruction-policy-v1";
 import { actorSessionRecoveryProofV2Schema } from "./sqlite-authority-v2";
 import type {
   PersistentActorAccountCandidate,
@@ -2709,40 +2710,6 @@ function assertMetaharnessTurnRequest(
   }
   if (request.capabilityEvidenceDigest !== null) {
     digestSchema.parse(request.capabilityEvidenceDigest);
-  }
-}
-
-function persistentActorInstructions(
-  workClass: Exclude<PersistentActorThreadRequest["workClass"],
-    "legacyUnclassified">,
-  selectedProfile: PersistentActorThreadRequest["selectedProfile"],
-): string {
-  const profile = HRA_METAHARNESS_PROFILES[selectedProfile];
-  return [
-    "You are a persistent HRA recursive actor.",
-    `Durable work class: ${workClass}.`,
-    `Durable execution profile: ${profile.modelId} with ${profile.reasoningEffort} reasoning.`,
-    "Native Codex agent delegation is disabled. The oprte/rlm_run dynamic tool is the only delegation surface.",
-    persistentActorDelegationPolicy(workClass),
-    "The registered oprte/rlm_run schema is the complete authoritative v2 AST and operation contract.",
-    "Use its parser-valid shapes, allocate relative shares, retain returned run handles, and inspect, status, wait, or result those handles rather than inventing provider RPC.",
-    "Do not request interactive approvals. Finish each assigned turn with a concise final response.",
-  ].join("\n");
-}
-
-function persistentActorDelegationPolicy(
-  workClass: Exclude<PersistentActorThreadRequest["workClass"],
-    "legacyUnclassified">,
-): string {
-  switch (workClass) {
-    case "boundedLeaf":
-      return "Delegation policy: solve this bounded leaf directly; do not dispatch another actor.";
-    case "standard":
-      return "Delegation policy: dispatch only clearly bounded, independent leaves when doing so materially improves speed or quality.";
-    case "largeChange":
-      return "Delegation policy: use bounded parallel actors for independent implementation or review lanes when parallelism materially improves speed or quality.";
-    case "wideResearch":
-      return "Delegation policy: use bounded parallel actors for independent research or review lanes, then reconcile their evidence before answering.";
   }
 }
 
