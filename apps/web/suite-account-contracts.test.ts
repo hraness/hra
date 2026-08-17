@@ -18,12 +18,13 @@ import {
   hraSuiteAccountUrl,
 } from "./suite-account-configuration";
 import {
+  parseSuiteReceiptKeyring,
   selectSuiteReceiptConfiguration,
   verifySuiteLinkReceiptSignature,
 } from "./suite-account-receipts";
 
 const nowMs = Date.UTC(2026, 7, 16, 12);
-const secret = "h".repeat(32);
+const secret = Buffer.alloc(32, 0x68).toString("base64url");
 
 describe("HRA-owned suite account contracts", () => {
   test("contains only HRA and its signed compatibility aliases", () => {
@@ -75,6 +76,35 @@ describe("HRA-owned suite account contracts", () => {
       selected.keyring,
       nowMs,
     )).toBeTrue();
+  });
+
+  test("requires a fresh canonical HRA key rather than a predecessor or unrelated key", () => {
+    const hraKey = {
+      environment: "production",
+      keyVersion: "v1",
+      product: "hra",
+      secret,
+    } as const;
+    expect(parseSuiteReceiptKeyring({ keys: [hraKey], version: 1 })).toEqual({
+      keys: [hraKey],
+      version: 1,
+    });
+    expect(parseSuiteReceiptKeyring({
+      keys: [{ ...hraKey, secret: "h".repeat(32) }],
+      version: 1,
+    })).toBeNull();
+    expect(parseSuiteReceiptKeyring({
+      keys: [{ ...hraKey, secret: `${secret}=` }],
+      version: 1,
+    })).toBeNull();
+    expect(parseSuiteReceiptKeyring({
+      keys: [{ ...hraKey, product: "oprte" }],
+      version: 1,
+    })).toBeNull();
+    expect(parseSuiteReceiptKeyring({
+      keys: [{ ...hraKey, product: "unrelated-product" }, hraKey],
+      version: 1,
+    })).toBeNull();
   });
 
   test("pins only HRA's public site and canonical Accounts origin", () => {

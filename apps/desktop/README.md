@@ -127,6 +127,47 @@ Backup and restore passphrases are accepted only through standard input. Backup 
 
 Backups contain the SQLite snapshot and its bound receipt key. They do not contain Keychain items, Codex account homes, full transcripts, managed worktrees, user repositories, or cloud session-sync ciphertext.
 
+## OPRTE installation handoff
+
+HRA keeps the bundle identifier `kitchen.hraness` and the state root `~/Library/Application Support/OPRTE` as compatibility custody. The supported handoff changes the visible application authority from `/Applications/OPRTE.app` to `/Applications/HRA.app`; it does not rename or copy live state into a new product root.
+
+Run the handoff only after Suite Accounts v0.3.0 is the deployed account authority, the Accounts registry recognizes `hraness:hra:production:v1`, and `release-download.json` contains published v0.1.8 build 9 evidence. The command verifies that published source, the candidate bundle, full state and Keychain continuity, both installed bundle archives, updater quiescence, and ordered AppKit shutdown before committing HRA as the sole visible application:
+
+```sh
+bun run installation:handoff \
+  --candidate-app /absolute/path/to/HRA.app \
+  --backup-directory /absolute/new/private-backup \
+  --confirm RETIRE-OPRTE-IN-FAVOR-OF-HRA
+```
+
+The backup directory must not exist. The operation creates it with user-only permissions and writes durable phase receipts. It rejects symbolic-link, case, Unicode-normalization, inode, process-birth, AppKit launch-identity, open-file, updater, receipt, custody, bundle, and Git-provenance ambiguity. A pre-commit interruption restores both original applications. An interruption after the committed receipt preserves HRA authority. Resume only its bounded, idempotent staging cleanup with the committed receipt:
+
+```sh
+bun run installation:cleanup \
+  --backup-directory /absolute/private-backup \
+  --confirm CLEAN-COMMITTED-HRA-HANDOFF-STAGING
+```
+
+Cleanup revalidates the committed candidate, requires the predecessor path to remain absent, and deletes only the exact receipt-bound predecessor and prior-HRA staging bundles. It can be rerun after any cleanup interruption.
+
+Ordinary rollback is available only while the complete state tree still matches the pre-cutover receipt. HRA's first normal launch advances the SQLite schema, so any launch or other state change makes this command refuse without touching either application:
+
+```sh
+bun run installation:rollback \
+  --backup-directory /absolute/private-backup \
+  --confirm ROLL-BACK-HRA-TO-OPRTE
+```
+
+There is no destructive state-restore command after HRA has launched or changed
+state. Restoring only the old SQLite tree cannot prove or restore the Keychain
+slots it references, and could bind OPRTE to missing or rotated secrets. After
+the ordinary rollback gate closes, keep HRA authoritative and use forward
+repair plus explicit account, runner, and session reauthentication where
+needed. The pre-cutover backup remains diagnostic evidence, not a complete
+secret-custody restore image.
+
+Keep the backup until the new installation, account flow, and local worktrees have been verified. These commands never rewrite historical tags or releases and never mutate a provider.
+
 ## Verification
 
 Run portable desktop checks from the repository root:
@@ -154,9 +195,9 @@ bun run --cwd apps/desktop package:macos
 
 ```text
 zig-out/release/macos/arm64/
-  HRA-0.1.7-8-macos-arm64.dmg
-  HRA-0.1.7-8-macos-arm64.dmg.sha256
-  HRA-0.1.7-8-release-manifest.json
+  HRA-0.1.8-9-macos-arm64.dmg
+  HRA-0.1.8-9-macos-arm64.dmg.sha256
+  HRA-0.1.8-9-release-manifest.json
   bun-0d9b296af33f2b851fcbf4df3e9ec89751734ba4-source.tar.gz
   bun-webkit-5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b-source.tar.gz
   git-67ad42147a7acc2af6074753ebd03d904476118f-source.tar.gz
@@ -164,6 +205,71 @@ zig-out/release/macos/arm64/
 ```
 
 The Bun archive is a deterministic complete-source bundle containing its pinned native build inputs, nested Git sources, Node headers, and locked `lol-html` Cargo closure. Patched WebKit and JavaScriptCore remain in their own archive because it is close to GitHub's 2 GiB asset limit. The Git and Dugite Native archives close the bundled Git source boundary. Full packaging requires network access and a clean source tree. CI uses `package:macos:adhoc` to verify the same compiler, runtime, and license pins, app, DMG, and checksum without downloading the large source archives.
+
+The root `release-download.json` file is the strict download and publication contract. HRA 0.1.8 build 9 remains `candidate` while its source and artifact evidence are unknown. In that state every commit, tag-object, runtime-tree, byte-count, and SHA-256 field is `null`, and the website exposes no direct asset URL.
+
+Publication uses two commits so no Git commit must contain its own object ID. The clean candidate commit C retains the null candidate contract; packaging, the annotated `v0.1.8` tag, manifest, app, DMG, and checksum all name C. After those immutable values exist, publication commit P changes only `release-download.json` to the complete `published` evidence for C. P must have C as its only direct parent. The verifier rejects another changed path, another parent, a skipped or follow-up commit, a candidate-contract drift, a tag not peeled to C, or an artifact/app that does not embed C and its runtime-tree digest. The installation handoff runs only from clean P.
+
+`bun run check:release-source` is the artifact-independent gate used by CI and desktop builds. Candidate C validates the null contract. Published P additionally requires the full clean C-to-P Git transition and direct annotated tag. Vercel's shallow checkout uses a separate provider binding documented in the web runbook; it cannot substitute for the full Required CI gate.
+
+Release provenance comes from the checkout, never a caller-supplied commit. Packaging and candidate verification require the canonical repository top-level with a real `.git` directory, a clean tree, no submodules, alternates, grafts, replacement refs, shallow history, or included local Git configuration. They reject inherited `GIT_*` variables, run `/usr/bin/git` with explicit Git and work-tree paths, and disable global and system configuration. Use a primary standalone checkout rather than a linked worktree for release work.
+
+Verify the checked contract or a complete local candidate with:
+
+```sh
+bun run --cwd apps/desktop check:release-contract
+bun run --cwd apps/desktop verify:release-candidate
+```
+
+The candidate command verifies clean C, an optional collision-free annotated tag, packaged DMG, checksum, manifest commit, and runtime tree. It emits the exact evidence for P. `verify:published-release` then verifies the strict C-to-P transition and the same local assets. Historical tags and releases are immutable inputs; creating a new candidate never rewrites v0.1.7.
+
+Publish v0.1.8 from the root of the clean standalone C checkout only after the
+full package and candidate verifier pass. Create and push a new direct
+annotated tag for C, then create the non-draft prerelease with the exact seven
+package outputs. Do not use `--clobber`, a glob, or an existing release:
+
+```sh
+git tag -a v0.1.8 -m "HRA v0.1.8" HEAD
+git push origin refs/tags/v0.1.8
+gh release create v0.1.8 \
+  apps/desktop/zig-out/release/macos/arm64/HRA-0.1.8-9-macos-arm64.dmg \
+  apps/desktop/zig-out/release/macos/arm64/HRA-0.1.8-9-macos-arm64.dmg.sha256 \
+  apps/desktop/zig-out/release/macos/arm64/HRA-0.1.8-9-release-manifest.json \
+  apps/desktop/zig-out/release/macos/arm64/bun-0d9b296af33f2b851fcbf4df3e9ec89751734ba4-source.tar.gz \
+  apps/desktop/zig-out/release/macos/arm64/bun-webkit-5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b-source.tar.gz \
+  apps/desktop/zig-out/release/macos/arm64/git-67ad42147a7acc2af6074753ebd03d904476118f-source.tar.gz \
+  apps/desktop/zig-out/release/macos/arm64/dugite-native-f49d0098409aa243de8b9162127025ab0bb07a88-source.tar.gz \
+  --repo hraness/hra \
+  --verify-tag \
+  --prerelease \
+  --latest=false \
+  --title "HRA v0.1.8" \
+  --notes-from-tag
+```
+
+GitHub creates the release as a draft while it uploads and publishes it only
+after every upload succeeds. Repository release immutability must then report
+the release immutable. Fill the working-tree `release-download.json` with the
+candidate verifier's exact commit, direct tag-object, runtime-tree, byte-count,
+and SHA-256 evidence, without changing another file, and run:
+
+```sh
+bun run verify:remote-release
+```
+
+The remote gate requires one immutable, non-draft v0.1.8 prerelease with the
+exact seven assets in `uploaded` state. It checks every name, byte count,
+canonical download URL, and GitHub SHA-256 digest against the publication
+contract and the downloaded release manifest. It also downloads and hashes the
+checksum and manifest, binds the checksum to the DMG, and binds all four
+corresponding-source archives to the manifest. It does not redownload the
+multi-gigabyte immutable assets. A mutable, incomplete, additional, or
+different remote release fails before P is committed.
+
+Commit P with only `release-download.json` changed. From clean P run
+`check:release-source`, `verify:published-release`, and
+`verify:remote-release`; Required CI repeats the source and remote gates. The
+web runbook controls the later Vercel allowlist and exact-P redeployment.
 
 The ad-hoc package proves bundle integrity but does not identify a registered Apple developer. macOS may require **Privacy & Security → Open Anyway** after download. It is not notarized, and automatic updates remain disabled. Developer ID signing, notarization, and publication require separately provisioned release credentials.
 

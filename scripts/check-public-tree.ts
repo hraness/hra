@@ -2,7 +2,10 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { collectPublicBoundaryEntries } from "./check-public-boundary";
+import {
+  collectPublicBoundaryEntries,
+  publicBoundaryErrors,
+} from "./check-public-boundary";
 
 const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const manifestPath = "scripts/public-tree.manifest.json";
@@ -69,6 +72,12 @@ async function main(): Promise<void> {
     throw new Error("Usage: bun run check:public-tree [--write]");
   }
   const entries = await collectPublicBoundaryEntries(repositoryRoot);
+  const boundaryErrors = publicBoundaryErrors(entries);
+  if (boundaryErrors.length > 0) {
+    for (const error of boundaryErrors) console.error(`- ${error}`);
+    process.exitCode = 1;
+    return;
+  }
   const actualPaths = entries.flatMap(({ kind, path }) =>
     kind === "file" ? [path] : []);
   const actual = createPublicTreeManifest(actualPaths);

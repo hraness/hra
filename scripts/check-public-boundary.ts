@@ -7,7 +7,8 @@ const repositoryRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const legacyManifestPath = "hra-legacy-identifiers.manifest.json";
 const joinLiteral = (...parts: readonly string[]): string => parts.join("");
 
-const ignoredDirectoryNames = new Set([".git", "node_modules"]);
+const ignoredDirectoryNames = new Set([".git", ".zig-cache", "node_modules"]);
+const ignoredGeneratedFilePattern = /\.tsbuildinfo$/u;
 const forbiddenExactPaths = new Set([
   joinLiteral(".public-", "bootstrap"),
   joinLiteral(".github/workflows/hra-", "preview-release.yml"),
@@ -48,7 +49,7 @@ const forbiddenPrivateOperationBasenames = new Set([
   joinLiteral("preview-blob-", "store.ts"),
 ]);
 const buildOutputPattern =
-  /(?:^|\/)(?:\.next|\.turbo|build|coverage|dist|out|target)(?:\/|$)/u;
+  /(?:^|\/)(?:(?:\.next|\.turbo|\.zig-cache|build|coverage|dist|out|target)(?:\/|$)|[^/]+\.tsbuildinfo$)/u;
 const privateEnvironmentFilePattern = /(?:^|\/)\.env(?:\.[^/]+)?$/u;
 const allowedEnvironmentFilePattern = /(?:^|\/)\.env\.(?:example|sample)$/u;
 const providerIdentifierPattern = /\b(?:dpl|prj|team)_[A-Za-z0-9]{8,}\b/gu;
@@ -437,7 +438,10 @@ export async function collectPublicBoundaryEntries(
         || hasForbiddenPathPrefix(relativePath))
     ) return;
     for (const child of await readdir(absolutePath, { withFileTypes: true })) {
-      if (ignoredDirectoryNames.has(child.name)) continue;
+      if (
+        ignoredDirectoryNames.has(child.name)
+        || ignoredGeneratedFilePattern.test(child.name)
+      ) continue;
       await visit(relativePath === "" ? child.name : `${relativePath}/${child.name}`);
     }
   };

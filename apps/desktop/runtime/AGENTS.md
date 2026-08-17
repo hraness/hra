@@ -13,6 +13,8 @@
 - `frontend-package-integrity.ts` and `prepare-package-output.ts` – deterministic frontend asset validation used by the native build graph.
 - `package-macos.ts`, `verify-macos-package.ts`, `create-dmg.ts`, and `corresponding-sources.ts` – credential-free runtime staging, inside-out ad-hoc signing, package verification, DMG assembly, and full-commit GPL/LGPL source archives.
 - `control-plane-maintenance.ts` – app-stopped health checks plus encrypted backup, inspection, verification, and restore.
+- `installation-handoff.ts`, `installation-path-authority.ts`, and `installation-process-authority.ts` – the fail-closed OPRTE-to-HRA application handoff, resumable committed cleanup, exact filesystem authority, ordered native-root shutdown, and unchanged-state rollback.
+- `release-download-contract.ts`, `release-provenance.ts`, and `release-download.json` at the repository root – strict candidate/publication evidence and hermetic canonical Git provenance for downloadable releases.
 - `reactive-baseline.ts` – the owned gateway, projection, SQLite, Direct bridge, React, containment, and cleanup baseline.
 - `THIRD_PARTY_NOTICES.md` and adjacent license texts – exact notices and provenance for pinned Bun, Codex, ripgrep, Git, Git LFS, Git Credential Manager, JavaScript, and asset runtimes.
 

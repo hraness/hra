@@ -4,6 +4,7 @@ import {
   COMPARISON_REVIEW_DATE,
   alternativeSourcesForRow,
   comparisonForSlug,
+  hraComparisonCitationVersion,
   hraComparisonSources,
   hraComparisons,
   hraSourcesForRow,
@@ -31,6 +32,15 @@ describe("HRA comparison registry", () => {
   test("binds every HRA and alternative claim to current HTTPS sources", () => {
     const hraSourceIds = new Set<string>(hraComparisonSources.map(({ id }) => id));
     const versionedHraPrefix = "https://github.com/hraness/hra/blob/v0.1.7/";
+
+    expect(hraComparisonCitationVersion({
+      availability: "candidate",
+      version: "0.1.8",
+    })).toBe("0.1.7");
+    expect(hraComparisonCitationVersion({
+      availability: "published",
+      version: "0.1.8",
+    })).toBe("0.1.8");
 
     expect(hraComparisonSources.map(({ url }) => url)).toEqual([
       `${versionedHraPrefix}README.md`,

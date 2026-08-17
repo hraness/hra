@@ -1,4 +1,5 @@
 import type { HraComparisonSlug } from "./slugs";
+import { HRA_RELEASE } from "../site";
 
 export const COMPARISON_REVIEW_DATE = "2026-08-16" as const;
 export const COMPARISON_REVIEW_LABEL = "16 August 2026" as const;
@@ -32,33 +33,44 @@ export interface HraComparison {
   readonly sources: readonly ComparisonSource[];
 }
 
+export function hraComparisonCitationVersion(
+  release: Readonly<{
+    availability: "candidate" | "published";
+    version: string;
+  }>,
+): string {
+  return release.availability === "published" ? release.version : "0.1.7";
+}
+
+const HRA_COMPARISON_CITATION_VERSION =
+  hraComparisonCitationVersion(HRA_RELEASE);
 const HRA_VERSIONED_SOURCE_ROOT =
-  "https://github.com/hraness/hra/blob/v0.1.7/" as const;
+  `https://github.com/hraness/hra/blob/v${HRA_COMPARISON_CITATION_VERSION}/` as const;
 
 export const hraComparisonSources = [
   {
     id: "hra-readme",
-    label: "HRA v0.1.7: Project overview",
+    label: `HRA v${HRA_COMPARISON_CITATION_VERSION}: Project overview`,
     url: `${HRA_VERSIONED_SOURCE_ROOT}README.md`,
   },
   {
     id: "hra-desktop",
-    label: "HRA v0.1.7: macOS architecture and limits",
+    label: `HRA v${HRA_COMPARISON_CITATION_VERSION}: macOS architecture and limits`,
     url: `${HRA_VERSIONED_SOURCE_ROOT}apps/desktop/README.md`,
   },
   {
     id: "hra-harness",
-    label: "HRA v0.1.7: Recursive Codex harness",
+    label: `HRA v${HRA_COMPARISON_CITATION_VERSION}: Recursive Codex harness`,
     url: `${HRA_VERSIONED_SOURCE_ROOT}apps/desktop/HARNESS.md`,
   },
   {
     id: "hra-security",
-    label: "HRA v0.1.7: Security architecture",
+    label: `HRA v${HRA_COMPARISON_CITATION_VERSION}: Security architecture`,
     url: `${HRA_VERSIONED_SOURCE_ROOT}SECURITY_ARCHITECTURE.md`,
   },
   {
     id: "hra-routing-policy",
-    label: "HRA v0.1.7: Model and acceleration policy",
+    label: `HRA v${HRA_COMPARISON_CITATION_VERSION}: Model and acceleration policy`,
     url: `${HRA_VERSIONED_SOURCE_ROOT}apps/desktop/runtime/src/harness/metaharness-policy-v1.ts`,
   },
 ] as const satisfies readonly ComparisonSource[];

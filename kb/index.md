@@ -12,7 +12,12 @@ This vault keeps captured sources separate from maintained notes. Catalog links 
 ### Notes
 
 - [[notes/documentation-ownership|Documentation ownership]] — Repository knowledge stays useful when each kind of truth has one primary home. The closest inherited owns mandatory edit-time rules. owns current multi-step procedures. Types,…
+- [[notes/hra-predecessor-market-and-competitor-dossier|HRA predecessor market and competitor dossier]] — Predecessor market map, competitor analysis, strategic options, and validation gaps inherited by HRA.
 - [[notes/repository-seams|Repository seams]] — HRA is a standalone public multi-app workspace. Product-neutral task contracts may be shared by its apps, while HRA-specific desktop, web, account, and presentation behavior…
+
+### Notes
+
+- [[VISION|OPRTE vision]]
 
 ### Scopes
 

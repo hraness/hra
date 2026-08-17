@@ -1,6 +1,7 @@
 # Contents
 
 - `index.md` – the vault front door and deterministically refreshed note catalog.
+- `VISION.md` – Ben Guo's protected product vision, transferred byte-for-byte from the OPRTE predecessor boundary.
 - `articles/` – self-contained source captures with local attachments and capture metadata.
 - `notes/` – maintained concept, entity, comparison, and synthesis notes.
 - `plans/` – proposed through completed design and implementation plans.
@@ -10,6 +11,7 @@
 # Guidelines
 
 - Treat this directory as one Git-backed, Obsidian-compatible Markdown vault.
+- Never edit `VISION.md`; only Ben Guo may change its human-authored product authority.
 - Use vault-root wikilinks without `.md`, such as `[[notes/context-engineering|context engineering]]`.
 - Put links in explanatory prose when they carry part of the argument. Do not add bare reciprocal links to improve graph counts.
 - Keep reusable concepts as ordinary notes with `type: concept`. Store typed outbound assertions under `relations` with lower-kebab-case predicates and exact vault-root target IDs; ground each assertion in prose or evidence.

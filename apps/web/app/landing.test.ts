@@ -80,19 +80,30 @@ describe("HRA public landing", () => {
 
     expect(HRA_RELEASE).toEqual({
       architecture: "Apple Silicon",
-      asset: "HRA-0.1.7-8-macos-arm64.dmg",
-      build: 8,
-      manifestAsset: "HRA-0.1.7-8-release-manifest.json",
+      asset: "HRA-0.1.8-9-macos-arm64.dmg",
+      availability: "candidate",
+      build: 9,
+      checksumAsset: "HRA-0.1.8-9-macos-arm64.dmg.sha256",
+      manifestAsset: "HRA-0.1.8-9-release-manifest.json",
       minimumMacOS: "13",
-      tag: "v0.1.7",
-      version: "0.1.7",
+      repository: "https://github.com/hraness/hra",
+      source: {
+        commit: null,
+        runtimeTreeSha256: null,
+        tagObject: null,
+      },
+      tag: "v0.1.8",
+      version: "0.1.8",
     });
-    expect(HRA_RELEASE_URL).toEndWith("/v0.1.7/HRA-0.1.7-8-macos-arm64.dmg");
-    expect(HRA_RELEASE_CHECKSUM_URL).toBe(`${HRA_RELEASE_URL}.sha256`);
-    expect(HRA_RELEASE_MANIFEST_URL).toEndWith("/v0.1.7/HRA-0.1.7-8-release-manifest.json");
+    expect(HRA_RELEASE_URL).toBeNull();
+    expect(HRA_RELEASE_CHECKSUM_URL).toBeNull();
+    expect(HRA_RELEASE_MANIFEST_URL).toBeNull();
     expect(download).toContain("Unknown developer.");
     expect(download).toContain("not Developer ID signed or notarized");
     expect(download).toContain("HRA_RELEASE_MANIFEST_URL");
+    expect(download).toContain("Candidate verification in progress.");
+    expect(download).toContain("Do not install an unpublished draft asset.");
+    expect(download).toContain("Do not drag a second app beside an installed OPRTE predecessor");
   });
 
   test("keeps navigation, sections, disclosure, and structured data semantic", async () => {

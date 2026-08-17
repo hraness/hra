@@ -17,6 +17,7 @@ import {
   createCorrespondingSourceArchives,
 } from "./corresponding-sources";
 import { macosPackage } from "./macos-package-config";
+import { inspectReleaseSourceRepository } from "./release-provenance";
 import {
   sha256File,
   verifyMacOSApp,
@@ -52,10 +53,6 @@ async function run(argv: readonly string[]): Promise<string> {
   return stdout;
 }
 
-async function gitStatusIsClean(): Promise<boolean> {
-  return (await run(["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"])).trim() === "";
-}
-
 async function main(): Promise<void> {
   const coreOnly = process.argv.length === 3 && process.argv[2] === "--core-only";
   if (!coreOnly && process.argv.length !== 2) {
@@ -64,10 +61,13 @@ async function main(): Promise<void> {
   if (process.platform !== "darwin" || process.arch !== "arm64") {
     throw new Error("HRA DMG creation requires Apple Silicon macOS.");
   }
-  if (!coreOnly && !await gitStatusIsClean()) {
-    throw new Error("Refusing to create release artifacts from a dirty source tree.");
-  }
+  const sourceRepository = coreOnly
+    ? null
+    : await inspectReleaseSourceRepository();
   const appEvidence = await verifyMacOSApp();
+  if (sourceRepository !== null && appEvidence.commit !== sourceRepository.commit) {
+    throw new Error("The packaged app commit differs from the clean release source.");
+  }
   const releaseRoot = macosPackage.releaseDirectory;
   const dmgPath = join(releaseRoot, `${macosPackage.artifactBaseName}.dmg`);
   const checksumPath = `${dmgPath}.sha256`;
