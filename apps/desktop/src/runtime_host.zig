@@ -10413,17 +10413,13 @@ test "forced transport retry fences one live-wedged generation without replay" {
     };
 }
 
-test "generation fencing reaps a stubborn descendant after abrupt gateway exit" {
+test "generation fencing reaps a retained stubborn group member after abrupt gateway exit" {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     var child = try std.process.spawn(std.testing.io, .{
-        .argv = &.{
-            "/bin/sh",
-            "-c",
-            "trap '' TERM; sleep 120 & descendant=$!; printf '%s\\n' \"$descendant\"; exit 0",
-        },
+        .argv = &.{ "/bin/sleep", "5" },
         .stdin = .ignore,
-        .stdout = .pipe,
+        .stdout = .ignore,
         .stderr = .ignore,
         .pgid = 0,
     });
@@ -10433,19 +10429,56 @@ test "generation fencing reaps a stubborn descendant after abrupt gateway exit" 
     };
 
     const leader_process_id = child.id.?;
-    const stdout_file = child.stdout.?;
-    child.stdout = null;
-    defer stdout_file.close(std.testing.io);
-    var read_buffer: [128]u8 = undefined;
-    var reader = stdout_file.readerStreaming(std.testing.io, &read_buffer);
-    const line = (try reader.interface.takeDelimiter('\n')) orelse
-        return error.ProcessFixtureExitedEarly;
-    const descendant_process_id = try std.fmt.parseInt(std.posix.pid_t, line, 10);
-    std.Io.sleep(
-        std.testing.io,
-        .fromMilliseconds(25),
-        .awake,
-    ) catch {};
+    try std.testing.expectEqual(
+        leader_process_id,
+        getpgid(leader_process_id),
+    );
+
+    // Keep the group member as a direct child of the test process. A shell-
+    // spawned orphan becomes launchd's zombie after SIGKILL, making group
+    // disappearance depend on unrelated runner load. A dedicated waiter owns
+    // and reaps this birth while RuntimeHost performs the same group-wide
+    // signal and exact-leader fence used in production.
+    var group_member = try std.process.spawn(std.testing.io, .{
+        .argv = &.{
+            "/bin/sh",
+            "-c",
+            "trap '' TERM; exec sleep 5",
+        },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = leader_process_id,
+    });
+    var group_member_transferred = false;
+    defer if (!group_member_transferred) group_member.kill(std.testing.io);
+    const group_member_process_id = group_member.id.?;
+    try std.testing.expectEqual(
+        leader_process_id,
+        getpgid(group_member_process_id),
+    );
+    const Reaper = struct {
+        fn run(owned_child: *std.process.Child, io: std.Io) void {
+            _ = owned_child.wait(io) catch {};
+        }
+    };
+    const reaper = try std.Thread.spawn(
+        .{},
+        Reaper.run,
+        .{ &group_member, std.testing.io },
+    );
+    group_member_transferred = true;
+    var reaper_joined = false;
+    defer if (!reaper_joined) {
+        _ = RuntimeHost.terminateGatewayProcessTree(&child, std.testing.io);
+        terminated = true;
+        reaper.join();
+    };
+
+    // The gateway leader exits first while its owned group member remains.
+    // Retaining the unreaped Child keeps the exact PID/PGID birth fenced until
+    // terminateGatewayProcessTree has signalled the whole generation.
+    try std.posix.kill(leader_process_id, .KILL);
 
     try std.testing.expect(RuntimeHost.terminateGatewayProcessTree(
         &child,
@@ -10459,19 +10492,11 @@ test "generation fencing reaps a stubborn descendant after abrupt gateway exit" 
         &child,
         std.testing.io,
     ));
+    reaper.join();
+    reaper_joined = true;
     try std.testing.expect(!processExistsForTest(leader_process_id));
-
-    var descendant_exists = processExistsForTest(descendant_process_id);
-    for (0..100) |_| {
-        if (!descendant_exists) break;
-        std.Io.sleep(
-            std.testing.io,
-            .fromMilliseconds(10),
-            .awake,
-        ) catch break;
-        descendant_exists = processExistsForTest(descendant_process_id);
-    }
-    try std.testing.expect(!descendant_exists);
+    try std.testing.expect(group_member.id == null);
+    try std.testing.expect(!processExistsForTest(group_member_process_id));
 }
 
 test "removal recovery helper wait is bounded, exact, and single-owner" {
