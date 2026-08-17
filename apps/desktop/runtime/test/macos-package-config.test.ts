@@ -243,6 +243,18 @@ describe("macOS ad-hoc package contract", () => {
       expect(spec.repository).toMatch(/^https:\/\/github\.com\//u);
       expect(spec.sentinels.length).toBeGreaterThanOrEqual(3);
     }
+    expect(correspondingSourceSpecs.find((spec) => spec.project === "Git"))
+      .toMatchObject({
+        gitmodulesSha256:
+          "b618e78e69cede7466205f1e9a306bc681772bf418136a15c172057006f562ff",
+        submodules: [{
+          commit: "855827c583bc30645ba427885caa40c5b81764d2",
+          minimumEntries: 18,
+          path: "sha1collisiondetection",
+          repository: "https://github.com/cr-marcstevens/sha1collisiondetection.git",
+          sentinels: ["LICENSE.txt", "README.md", "lib/sha1.c"],
+        }],
+      });
     expect(correspondingSourceSpecs.find((spec) => spec.project === "Dugite Native")
       ?.submodules).toEqual([
         {

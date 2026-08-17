@@ -443,9 +443,18 @@ export const correspondingSourceSpecs = Object.freeze([
     minimumEntries: 4_000,
     project: "Git",
     repository: "https://github.com/git/git.git",
-    sentinels: ["COPYING", "Makefile", "git.c"],
+    sentinels: [".gitmodules", "COPYING", "Makefile", "git.c"],
     externalSources: [],
-    submodules: [],
+    gitmodulesSha256: "b618e78e69cede7466205f1e9a306bc681772bf418136a15c172057006f562ff",
+    submodules: [
+      {
+        commit: "855827c583bc30645ba427885caa40c5b81764d2",
+        minimumEntries: 18,
+        path: "sha1collisiondetection",
+        repository: "https://github.com/cr-marcstevens/sha1collisiondetection.git",
+        sentinels: ["LICENSE.txt", "README.md", "lib/sha1.c"],
+      },
+    ],
   },
   {
     archiveName: "dugite-native-f49d0098409aa243de8b9162127025ab0bb07a88-source.tar.gz",
@@ -808,6 +817,31 @@ async function verifyExternalSources(
   }
 }
 
+function verifyEmbeddedSubmodules(
+  entries: readonly string[],
+  paths: ReadonlySet<string>,
+  spec: CorrespondingSourceSpec,
+): void {
+  for (const submodule of spec.submodules) {
+    if (submodule.archiveName !== undefined) continue;
+    if (submodule.minimumEntries === undefined || submodule.sentinels === undefined) {
+      throw new Error(`${spec.project} submodule ${submodule.path} lacks embedded-source evidence.`);
+    }
+    const prefix = `${spec.archivePrefix}${submodule.path}/`;
+    const entryCount = entries.filter((entry) => entry.startsWith(prefix)).length;
+    if (entryCount < submodule.minimumEntries) {
+      throw new Error(`${spec.project} embedded submodule is unexpectedly small: ${submodule.path}.`);
+    }
+    for (const sentinel of submodule.sentinels) {
+      if (!paths.has(`${prefix}${sentinel}`)) {
+        throw new Error(
+          `${spec.project} embedded submodule lacks ${submodule.path}/${sentinel}.`,
+        );
+      }
+    }
+  }
+}
+
 export async function verifyCorrespondingSourceArchive(
   archivePath: string,
   spec: CorrespondingSourceSpec,
@@ -837,6 +871,21 @@ export async function verifyCorrespondingSourceArchive(
       throw new Error(`${spec.project} source archive lacks ${sentinel}.`);
     }
   }
+  const gitmodulesPath = `${spec.archivePrefix}.gitmodules`;
+  if (paths.has(gitmodulesPath) !== (spec.gitmodulesSha256 !== undefined)) {
+    throw new Error(`${spec.project} source archive .gitmodules presence differs from its pin.`);
+  }
+  if (spec.gitmodulesSha256 !== undefined) {
+    const gitmodules = await run([
+      "/usr/bin/tar",
+      "-xOzf",
+      archivePath,
+      gitmodulesPath,
+    ]);
+    if (sha256Text(gitmodules) !== spec.gitmodulesSha256) {
+      throw new Error(`${spec.project} source archive .gitmodules differs from its pin.`);
+    }
+  }
   const manifestPath = `${spec.archivePrefix}${sourceManifestName}`;
   if (!paths.has(manifestPath)) {
     throw new Error(`${spec.project} source archive lacks its source manifest.`);
@@ -856,6 +905,7 @@ export async function verifyCorrespondingSourceArchive(
   if (JSON.stringify(parsedManifest) !== JSON.stringify(sourceManifest(spec))) {
     throw new Error(`${spec.project} source manifest differs from its pin.`);
   }
+  verifyEmbeddedSubmodules(entries, paths, spec);
   await verifyExternalSources(archivePath, entries, paths, spec);
   return {
     archiveName: spec.archiveName,
@@ -939,11 +989,7 @@ async function verifySubmodulePins(
       ) {
         throw new Error(`${spec.project} submodule ${submodule.path} lacks a matching source archive.`);
       }
-    } else if (
-      !("archivePath" in spec)
-      || submodule.minimumEntries === undefined
-      || submodule.sentinels === undefined
-    ) {
+    } else if (submodule.minimumEntries === undefined || submodule.sentinels === undefined) {
       throw new Error(`${spec.project} submodule ${submodule.path} lacks embedded-source evidence.`);
     }
   }
@@ -1176,12 +1222,13 @@ async function deterministicTarPaths(root: string, rootName: string): Promise<st
   return paths;
 }
 
-async function createCompleteBunArchive(
+async function createCompleteSourceArchive(
   outputDirectory: string,
   spec: CorrespondingSourceSpec,
   workRoot: string,
 ): Promise<CorrespondingSourceEvidence> {
-  const repositoryRoot = await fetchGitSource(workRoot, "bun", spec);
+  const key = spec.project.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-");
+  const repositoryRoot = await fetchGitSource(workRoot, `complete-${key}`, spec);
   const stageParent = join(workRoot, "complete-stage");
   const rootName = spec.archivePrefix.slice(0, -1);
   const stageRoot = join(stageParent, rootName);
@@ -1197,6 +1244,25 @@ async function createCompleteBunArchive(
     spec.commit,
   ])).trim());
   await rm(repositoryRoot, { force: true, recursive: true });
+  for (const [submoduleIndex, submodule] of spec.submodules.entries()) {
+    if (submodule.archiveName !== undefined) continue;
+    process.stderr.write(
+      `[corresponding-source] fetching ${spec.project} submodule ${submodule.path}\n`,
+    );
+    const submoduleRepository = await fetchEmbeddedSubmoduleSource(
+      workRoot,
+      `complete-${key}-submodule-${submoduleIndex}`,
+      spec.project,
+      submodule,
+    );
+    await extractGitSource(
+      submoduleRepository,
+      submodule.commit,
+      join(stageRoot, submodule.path),
+      workRoot,
+    );
+    await rm(submoduleRepository, { force: true, recursive: true });
+  }
   for (const [index, source] of spec.externalSources.entries()) {
     if (source.kind === "linked-archive") continue;
     process.stderr.write(`[corresponding-source] fetching ${source.project}\n`);
@@ -1234,13 +1300,13 @@ async function createCompleteBunArchive(
   const manifestText = JSON.stringify(sourceManifest(spec));
   await writeFile(join(stageRoot, sourceManifestName), manifestText, { flag: "wx" });
   if (!Number.isSafeInteger(commitTimestamp) || commitTimestamp <= 0) {
-    throw new Error("Bun source timestamp is invalid.");
+    throw new Error(`${spec.project} source timestamp is invalid.`);
   }
   await normalizeTreeTimestamps(stageRoot, commitTimestamp);
   const paths = await deterministicTarPaths(stageRoot, rootName);
-  const pathsFile = join(workRoot, "bun-complete-paths.txt");
+  const pathsFile = join(workRoot, `${key}-complete-paths.txt`);
   await writeFile(pathsFile, `${paths.join("\n")}\n`, { flag: "wx" });
-  const tarPath = join(workRoot, "bun-complete-source.tar");
+  const tarPath = join(workRoot, `${key}-complete-source.tar`);
   await run([
     "/usr/bin/tar",
     "--no-xattrs",
@@ -1276,8 +1342,11 @@ export async function createCorrespondingSourceArchives(
   try {
     for (const spec of specs) {
       process.stderr.write(`[corresponding-source] fetching ${spec.project} ${spec.commit}\n`);
-      if (spec.project === "Bun") {
-        evidence.push(await createCompleteBunArchive(outputDirectory, spec, workRoot));
+      if (
+        spec.externalSources.some((source) => source.kind !== "linked-archive")
+        || spec.submodules.some((submodule) => submodule.archiveName === undefined)
+      ) {
+        evidence.push(await createCompleteSourceArchive(outputDirectory, spec, workRoot));
         process.stderr.write(`[corresponding-source] verified ${spec.archiveName}\n`);
         continue;
       }
