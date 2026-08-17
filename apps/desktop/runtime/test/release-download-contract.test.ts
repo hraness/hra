@@ -281,6 +281,12 @@ describe("release and download convergence", () => {
     expect(desktopManifest.scripts?.build).toStartWith(
       "bun run check:release-source &&",
     );
+    expect(workflow).toContain(
+      [
+        "ref: $",
+        "{{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+      ].join(""),
+    );
     expect(workflow).toContain("run: bun run check:release-source");
     expect(workflow).toContain("run: bun run verify:remote-release");
   });
