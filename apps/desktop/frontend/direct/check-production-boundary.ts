@@ -30,6 +30,12 @@ const FORBIDDEN_FRONTEND_EMITTED_MARKERS = Object.freeze([
   "@hugeicons/react",
   "Hugeicons",
 ]);
+const FORBIDDEN_FRONTEND_DEV_MARKERS = Object.freeze([
+  "hra-dev-status/v1",
+  "/__hra_dev_status",
+  "hra:dev-status",
+  "HRA — Dev",
+]);
 const RENDERER_CONTRACT_MARKERS = Object.freeze([
   '"project.',
   '"workspace.upserted',
@@ -192,6 +198,11 @@ export async function checkHRAProductionBoundary(
     FORBIDDEN_FRONTEND_EMITTED_MARKERS,
     ["**/*"],
   );
+  const forbiddenFrontendDevMarkers = await scanExisting(
+    path.join(frontend, "dist"),
+    FORBIDDEN_FRONTEND_DEV_MARKERS,
+    ["**/*"],
+  );
   const rendererBoundary = combineResults([
     rendererSourceBoundary,
     rendererEmittedBoundary,
@@ -215,6 +226,7 @@ export async function checkHRAProductionBoundary(
   const emitted = combineResults([
     directEmitted,
     forbiddenFrontendDependencies,
+    forbiddenFrontendDevMarkers,
     rendererEmittedBoundary,
   ]);
 
@@ -231,6 +243,14 @@ export async function checkHRAProductionBoundary(
     throw new Error([
       "HRA production assets contain forbidden frontend dependencies:",
       ...forbiddenFrontendDependencies.violations.map(
+        (violation) => `${violation.file}: ${violation.markers.join(", ")}`,
+      ),
+    ].join("\n"));
+  }
+  if (forbiddenFrontendDevMarkers.violations.length > 0) {
+    throw new Error([
+      "HRA production assets contain malleable-development markers:",
+      ...forbiddenFrontendDevMarkers.violations.map(
         (violation) => `${violation.file}: ${violation.markers.join(", ")}`,
       ),
     ].join("\n"));

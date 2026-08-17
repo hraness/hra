@@ -19,6 +19,11 @@ import {
   nativeHarnessCustodyResultSchema,
   type NativeHarnessCustodyResult,
 } from "./harness/native-key-custody";
+import {
+  hostDevelopmentReloadCommand,
+  hostDevelopmentReloadPayloadSchema,
+  type HostDevelopmentReloadPayload,
+} from "./development-reload";
 
 export const hostProjectOnboardingCommand =
   "hra.runtime.onboardProject" as const;
@@ -46,6 +51,7 @@ export const hostRequestSchema = z
       hostLocalDataRemovalRecoveryCommand,
       hostAccountProfileNativeResultCommand,
       hostHarnessCustodyNativeResultCommand,
+      hostDevelopmentReloadCommand,
     ]),
     payload: z.unknown(),
     nativeRemovalCapability: nativeRemovalCapabilitySchema.optional(),
@@ -250,6 +256,15 @@ export function parseHostHarnessCustodyNativeResultPayload(
     );
   }
   return nativeHarnessCustodyResultSchema.parse(request.payload);
+}
+
+export function parseHostDevelopmentReloadPayload(
+  request: HostRequest,
+): HostDevelopmentReloadPayload {
+  if (request.command !== hostDevelopmentReloadCommand) {
+    throw new TypeError("Host request is not a development reload command.");
+  }
+  return hostDevelopmentReloadPayloadSchema.parse(request.payload);
 }
 
 export function hostLocalDataRemovalNativeLaunch(input: {

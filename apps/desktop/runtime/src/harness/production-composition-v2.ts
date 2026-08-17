@@ -133,6 +133,7 @@ export class HarnessProductionCompositionV2 {
   #rendererAndRootAdmissionReady = false;
   #providerCapabilityBootConverged = false;
   #providerCapabilityTail: Promise<void> = Promise.resolve();
+  #activeWork = 0;
   #admissionsClosed = false;
   #providerSourcesStopped = false;
   #providerStopPermitted = false;
@@ -148,6 +149,10 @@ export class HarnessProductionCompositionV2 {
     return this.#state.kind === "bound"
       ? this.#state.parts.harnessFactConsumer
       : null;
+  }
+
+  hasUnsettledWork(): boolean {
+    return this.#activeWork > 0;
   }
 
   constructor(
@@ -177,22 +182,24 @@ export class HarnessProductionCompositionV2 {
     };
     const rendererCommands: HarnessProductionRendererCommandsV2 = {
       execute: (command: RuntimeHarnessDomainCommand) =>
-        this.#executeRenderer(command),
+        this.#track(this.#executeRenderer(command)),
       refresh: () => {
         const parts = this.#parts();
         this.#assertRendererAndRootAdmissionReady();
-        return parts.renderer.refresh();
+        return this.#track(parts.renderer.refresh());
       },
     };
     this.rendererCommands = Object.freeze(rendererCommands);
     const rootChat: HarnessProductionRootChatPortV2 = {
-      admit: (input: unknown) => this.#admitRoot(input),
+      admit: (input: unknown) => this.#track(this.#admitRoot(input)),
       observe: (event: SessionTurnLifecycle) =>
-        this.#parts().roots.observe(event),
+        this.#track(Promise.resolve(this.#parts().roots.observe(event))),
       settleBeforeProvider: (input: Parameters<
         HarnessProductionRootChatPortV2["settleBeforeProvider"]
       >[0]) =>
-        this.#parts().roots.settleBeforeProvider(input),
+        this.#track(Promise.resolve(
+          this.#parts().roots.settleBeforeProvider(input),
+        )),
     };
     this.rootChat = Object.freeze(rootChat);
   }
@@ -220,7 +227,7 @@ export class HarnessProductionCompositionV2 {
     // The service owns the durable admission fence and emits a bounded
     // closed/unavailable response. Rejecting here would strand the provider
     // request without any response at all.
-    return parts.dynamicTools.handle(request);
+    return this.#track(parts.dynamicTools.handle(request));
   }
 
   expireDynamicToolRequest(
@@ -454,12 +461,19 @@ export class HarnessProductionCompositionV2 {
   #serializeProviderCapability<Result>(
     operation: () => Promise<Result>,
   ): Promise<Result> {
-    const result = this.#providerCapabilityTail.then(operation);
+    const result = this.#track(this.#providerCapabilityTail.then(operation));
     this.#providerCapabilityTail = result.then(
       () => undefined,
       () => undefined,
     );
     return result;
+  }
+
+  #track<Result>(operation: Promise<Result>): Promise<Result> {
+    this.#activeWork += 1;
+    return operation.finally(() => {
+      this.#activeWork -= 1;
+    });
   }
 
   async #admitRoot(

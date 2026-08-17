@@ -99,6 +99,10 @@ export class DispatchCompletionAdapter {
     for (const [key, event] of this.#pending) this.#start(key, event);
   }
 
+  hasUnsettledWork(): boolean {
+    return this.#inFlight.size > 0;
+  }
+
   #start(key: string, event: SessionTurnLifecycle): void {
     if (this.#inFlight.has(key)) return;
     const task = this.reconcile(event).then((settled) => {

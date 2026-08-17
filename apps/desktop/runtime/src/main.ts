@@ -69,6 +69,7 @@ import {
   parseHostDispatchPayload,
   parseHostAccountProfileNativeResultPayload,
   parseHostHarnessCustodyNativeResultPayload,
+  parseHostDevelopmentReloadPayload,
   parseHostLocalDataRemovalRecoveryPayload,
   parseHostNativeRemovalCapability,
   parseHostProjectOnboardingPayload,
@@ -77,6 +78,12 @@ import {
   type HostLocalDataRemovalNativeTerminationRequired,
   type HostProjectOnboardingPayload,
 } from "./host-protocol";
+import {
+  DevelopmentReloadAdmission,
+  hostDevelopmentReloadCommand,
+  hostDevelopmentReloadDecision,
+  parseRuntimeBridgeProfile,
+} from "./development-reload";
 import { DispatchActivityAdapter } from "./dispatch/activity-adapter";
 import { DispatchAccountReservationArbiter } from "./dispatch/account-reservations";
 import { HRADispatchHttpClient } from "./dispatch/cloud-client";
@@ -354,6 +361,64 @@ const projectionCommits = new ProjectionCommitCoordinator(projection, {
   },
 });
 let projectionCommitAdmissionClosing = false;
+const developmentReloadAdmission = new DevelopmentReloadAdmission();
+let gatewayReadyForDevelopmentReload = false;
+let ordinaryHostRequestsInFlight = 0;
+let developmentReloadInternalAdmissionsClosed = false;
+
+function developmentReloadHasInMemoryWork(): boolean {
+  const human = humanAccountService;
+  return projectionDrain !== null ||
+    projection.queuedEventCount > 0 ||
+    projectionCommits.pendingCommitCount > 0 ||
+    human?.hasActiveOperation() === true ||
+    human?.snapshot().state === "signing_in" ||
+    humanOrganizationTasks.size > 0 ||
+    humanOrganizationRefilling ||
+    humanOrganizationProvisioningStopping ||
+    hraRunnerPairingTask !== null ||
+    hraRunnerPairingRecoveryActive ||
+    sessionSyncCoordinator?.hasUnsettledWork() === true ||
+    localPromotionCoordinator?.hasUnsettledWork() === true ||
+    localTaskReconciler?.hasUnsettledWork() === true ||
+    localQueuedRunExecutor?.hasUnsettledWork() === true ||
+    localRunCompletionAdapter?.hasUnsettledWork() === true ||
+    dispatchActivityAdapter?.hasUnsettledWork() === true ||
+    dispatchCompletionAdapter?.hasUnsettledWork() === true ||
+    chatService?.hasUnsettledWork() === true ||
+    harnessProductionComposition?.hasUnsettledWork() === true ||
+    localDataRemovalMaintenanceState !== "open";
+}
+
+function sealInternalDevelopmentReloadAdmissions(): void {
+  developmentReloadInternalAdmissionsClosed = true;
+  humanAccountService?.closeAdmission();
+  for (const { coordinator } of cloudInvalidationCoordinators.values()) {
+    coordinator.closeAdmission();
+  }
+  chatService?.closeAdmission();
+  harnessProductionComposition?.closeAdmissions();
+  localTaskReconciler?.closeAdmission();
+  localQueuedRunExecutor?.closeAdmission();
+  localPromotionCoordinator?.closeAdmission();
+  sessionSyncCoordinator?.closeAdmission();
+  dispatchRunnerController?.abort();
+  humanOrganizationProvisioningStopping = true;
+  for (const timer of humanOrganizationRetryTimers.values()) {
+    clearTimeout(timer);
+  }
+  humanOrganizationRetryTimers.clear();
+  if (localCompletionRetryTimer !== null) {
+    clearInterval(localCompletionRetryTimer);
+  }
+  if (localClaimRenewalTimer !== null) clearInterval(localClaimRenewalTimer);
+  if (dispatchCompletionRetryTimer !== null) {
+    clearInterval(dispatchCompletionRetryTimer);
+  }
+  if (hraRunnerPairingTimer !== null) clearInterval(hraRunnerPairingTimer);
+  localTaskChanges.close();
+  projectionCommits.closeAdmission();
+}
 const localTaskChanges = new LocalTaskChangeCoordinator({
   onChange: (invalidation) => {
     publishWithDrainRetry({
@@ -685,6 +750,7 @@ async function stopCloudInvalidations(): Promise<void> {
 }
 
 function ensureCloudInvalidations(workspaceId: string): void {
+  if (developmentReloadInternalAdmissionsClosed) return;
   const client = cloudWorkspaceClient;
   const heads = cloudInvalidationHeads;
   const accountGeneration = currentHumanCredentialGeneration;
@@ -2449,7 +2515,11 @@ async function initializeGateway(): Promise<void> {
       })
       .catch(() => undefined);
     void localTaskReadiness.then(() => {
-      if (localTaskReconciler !== initializingReconciler) return;
+      if (
+        localTaskReconciler !== initializingReconciler ||
+        initializingReconciler.state !== "running" ||
+        developmentReloadInternalAdmissionsClosed
+      ) return;
       publishWithDrainRetry({
         type: "runner.changed",
         runner: { state: "connecting" },
@@ -5519,6 +5589,49 @@ async function respondToHost(line: string): Promise<void> {
     return;
   }
 
+  if (request.command === hostDevelopmentReloadCommand) {
+    try {
+      const payload = parseHostDevelopmentReloadPayload(request);
+      if (parseRuntimeBridgeProfile() !== "development") {
+        throw new TypeError(
+          "Development reload is unavailable outside the development bridge.",
+        );
+      }
+      if (!developmentReloadAdmission.beginProbe()) {
+        await writeHost(hostSuccess(
+          request.id,
+          hostDevelopmentReloadDecision(payload, "busy"),
+        ));
+        return;
+      }
+      await gatewayInitialization;
+      const status = developmentReloadAdmission.decideProbe({
+        gatewayReady: gatewayReadyForDevelopmentReload,
+        ordinaryRequestsInFlight: ordinaryHostRequestsInFlight,
+        inMemoryWorkActive: developmentReloadHasInMemoryWork(),
+        database,
+      });
+      if (status === "accepted") sealInternalDevelopmentReloadAdmissions();
+      await writeHost(hostSuccess(
+        request.id,
+        hostDevelopmentReloadDecision(payload, status),
+      ));
+    } catch {
+      await writeHost(
+        hostFailure(request.id, "invalid_request", "Invalid runtime request"),
+      );
+    }
+    return;
+  }
+
+  if (!developmentReloadAdmission.allowsOrdinaryRequests) {
+    await writeHost(
+      hostFailure(request.id, "invalid_request", "Runtime admission is closed"),
+    );
+    return;
+  }
+  ordinaryHostRequestsInFlight += 1;
+
   try {
     if (
       request.command === hostAccountProfileNativeResultCommand
@@ -5551,6 +5664,8 @@ async function respondToHost(line: string): Promise<void> {
     await writeHost(
       hostFailure(request.id, "invalid_request", "Invalid runtime request"),
     );
+  } finally {
+    ordinaryHostRequestsInFlight -= 1;
   }
 }
 
@@ -5585,6 +5700,7 @@ if (activePackageSmokeRoot === null) {
   try {
     if (!startupRemovalRecovery) {
       await initializeGateway();
+      gatewayReadyForDevelopmentReload = true;
     }
   } finally {
     // Initialization publishes either ready or a closed failed projection.

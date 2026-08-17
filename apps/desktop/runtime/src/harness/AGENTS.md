@@ -7,6 +7,7 @@
 - `rlm-runtime-v2.ts`, `rlm-operation-router-v2.ts`, `context-operation-service-v2.ts`, and the dynamic-tool v2 modules – bounded lexical execution and the authenticated callback path into context, actor, and proposal operations.
 - `renderer-*-v2.ts`, `proposal-*-v2.ts`, `production-lifecycle-kernel-v2.ts`, and `production-composition-v2.ts` – renderer commands, immutable Suggest proposals, fail-closed startup and shutdown, and the private production composition boundary.
 - `optimizer-domain-v1.ts` and `optimizer-evidence-v1.ts` – pure research-only frozen-benchmark schemas, keyed block-balanced assignments, exact finite measures, feasibility gates, and advisory state laws with no persistence or runtime authority.
+- `actor-instruction-policy-schema-v1.ts`, `actor-instruction-policy-v1.json`, and `actor-instruction-policy-v1.ts` – JSON-free bounded policy schema, pure policy data, and its cold renderer, applied only when a fresh persistent actor thread starts. Only the JSON data is development-malleable.
 
 # Guidelines
 
@@ -23,4 +24,5 @@
 - Keep wait operations lease-free and cancellable. A barrier cannot hold CPU, repository, worktree, or provider admission while it waits.
 - Keep goals, heartbeats, evaluation, trials, canary, activation, rollback, proposal data preview/delete, provider/public, Git push, evaluator mutation, base instructions, security policy, and automatic tracked-file promotion outside the recursive harness capabilities.
 - Keep the Phase 0 optimizer pure and research-only. A complete finite gate may emit an advisory `recommendCanary`, but it grants no rollout, policy, provider, persistence, renderer, or recursive-tool authority.
+- Keep the actor instruction policy pure and fresh-thread-only. It may shape future actor instructions, but it must not parse stored rows, participate in boot recovery, own effects, or derive durable identity.
 - Add colocated examples and property tests for parser totality, transition closure, budget monotonicity, idempotency, ordering, restart reconciliation, quota atomicity, encryption, and exact deletion.

@@ -134,8 +134,13 @@ export class CloudInvalidationCoordinator {
   async stop(): Promise<void> {
     const loop = this.#loop;
     if (loop === null) return;
-    this.#controller?.abort();
+    this.closeAdmission();
     await loop;
+  }
+
+  /** Cancels only this read stream and prevents its current generation resuming. */
+  closeAdmission(): void {
+    this.#controller?.abort();
   }
 
   async #supervise(

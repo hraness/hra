@@ -82,6 +82,10 @@ export class DispatchActivityAdapter {
     await Promise.allSettled([...this.#tails.values()]);
   }
 
+  hasUnsettledWork(): boolean {
+    return this.#tails.size > 0;
+  }
+
   async #reconcile(activity: SessionTurnActivity): Promise<void> {
     let binding = this.#store.readByTurn(activity);
     if (binding === null || !isActivityStage(binding.stage)) return;

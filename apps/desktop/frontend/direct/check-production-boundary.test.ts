@@ -164,6 +164,23 @@ describe("HRA production Direct boundary", () => {
     }
   });
 
+  test("rejects serve-only malleable-development markers from production output", async () => {
+    for (const marker of [
+      "hra-dev-status/v1",
+      "/__hra_dev_status",
+      "hra:dev-status",
+      "HRA — Dev",
+    ]) {
+      const frontend = await makeFrontend({
+        emitted: `const developmentMarker = ${JSON.stringify(marker)};\n`,
+      });
+
+      expect((await boundaryFailure(frontend)).message).toContain(
+        "production assets contain malleable-development markers",
+      );
+    }
+  });
+
   test("scans both retained oprte native executable locations", async () => {
     const installedLeak = await makeFrontend({
       emitted: "export const production = true;\n",

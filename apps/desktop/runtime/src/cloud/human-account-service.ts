@@ -334,6 +334,9 @@ export class HumanAccountService {
   #loginTask: Promise<void> | null = null;
   #mutationTail: Promise<void> = Promise.resolve();
   #refreshTail: Promise<void> = Promise.resolve();
+  #activeMutations = 0;
+  #activeRefreshes = 0;
+  #admissionClosed = false;
   #credentialProjectionFence = 0;
   #recoveryGenerationFloor = -1;
   #snapshot: HumanAccountSnapshot = { state: "initializing", revision: 0 };
@@ -381,6 +384,17 @@ export class HumanAccountService {
 
   snapshot(): HumanAccountSnapshot {
     return this.#snapshot;
+  }
+
+  hasActiveOperation(): boolean {
+    return this.#loginTask !== null ||
+      this.#activeMutations > 0 ||
+      this.#activeRefreshes > 0;
+  }
+
+  /** Closes new sign-in, mutation, and refresh admission without cancelling work. */
+  closeAdmission(): void {
+    this.#admissionClosed = true;
   }
 
   availability(): CloudAttachmentAvailability {
@@ -495,6 +509,7 @@ export class HumanAccountService {
   }
 
   startSignIn(): HumanAccountSnapshot {
+    if (this.#admissionClosed) return this.#snapshot;
     if (this.#snapshot.state === "initializing") return this.#snapshot;
     if (this.#availability.state === "disabled") {
       return this.#update({
@@ -1083,6 +1098,10 @@ export class HumanAccountService {
   }
 
   async #serialized<Value>(operation: () => Promise<Value> | Value): Promise<Value> {
+    if (this.#admissionClosed) {
+      throw new Error("Human account admission is closed.");
+    }
+    this.#activeMutations += 1;
     let release = (): void => undefined;
     const previous = this.#mutationTail;
     this.#mutationTail = new Promise<void>((resolve) => {
@@ -1093,12 +1112,17 @@ export class HumanAccountService {
       return await operation();
     } finally {
       release();
+      this.#activeMutations -= 1;
     }
   }
 
   async #serializedRefresh<Value>(
     operation: () => Promise<Value>,
   ): Promise<Value> {
+    if (this.#admissionClosed) {
+      throw new Error("Human account refresh admission is closed.");
+    }
+    this.#activeRefreshes += 1;
     let release = (): void => undefined;
     const previous = this.#refreshTail;
     this.#refreshTail = new Promise<void>((resolve) => {
@@ -1109,6 +1133,7 @@ export class HumanAccountService {
       return await operation();
     } finally {
       release();
+      this.#activeRefreshes -= 1;
     }
   }
 }

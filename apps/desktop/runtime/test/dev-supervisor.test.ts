@@ -8,6 +8,7 @@ import {
   maySpawnDevApp,
   nativeDevFrontendEnvironment,
   HRA_DEV_FRONTEND_URL,
+  HRA_NATIVE_APPLICATION_EXECUTABLE,
   HRA_DEV_READY_SCHEMA,
   parseDevReadinessJson,
   parseDevReadinessResponse,
@@ -152,9 +153,7 @@ describe("HRA development lifecycle", () => {
     expect(releaseBuilder).toContain("verifyBunCompiler");
     expect(releaseBuilder).toContain('"--minify"');
     expect(releaseBuilder).toContain('"--sourcemap=none"');
-    expect(manifest.scripts?.hra).toBe(
-      "bun run build:runtime:dev && bun run runtime/run-native.ts dev",
-    );
+    expect(manifest.scripts?.hra).toBe("bun run runtime/run-native.ts dev");
     expect(manifest.scripts?.operate).toBeUndefined();
     expect(rootManifest.scripts?.hra).toBe("bun run dev:desktop");
     expect(rootManifest.scripts?.operate).toBeUndefined();
@@ -179,12 +178,14 @@ describe("HRA development lifecycle", () => {
     expect(failure.message).toContain("never reuses an existing server");
   });
 
-  test("gates app startup on listener preflight, Vite, build, and exact readiness", () => {
+  test("gates both builds and app startup on exact Vite watcher readiness", () => {
     let phase = advanceDevLaunch("checking-listener", "listener-clear");
     phase = advanceDevLaunch(phase, "vite-started");
-    expect(() => advanceDevLaunch(phase, "readiness-matched")).toThrow("Invalid");
-    phase = advanceDevLaunch(phase, "build-succeeded");
+    expect(() => advanceDevLaunch(phase, "gateway-build-succeeded")).toThrow("Invalid");
     phase = advanceDevLaunch(phase, "readiness-matched");
+    expect(maySpawnDevApp(phase)).toBeFalse();
+    phase = advanceDevLaunch(phase, "gateway-build-succeeded");
+    phase = advanceDevLaunch(phase, "native-build-succeeded");
     expect(maySpawnDevApp(phase)).toBeTrue();
     phase = advanceDevLaunch(phase, "app-started");
     expect(phase).toBe("running");
@@ -232,6 +233,7 @@ describe("HRA development lifecycle", () => {
   test("keeps the source-mapped gateway out of bundled run and release paths", () => {
     expect(gatewayExecutableNameForNativeMode("dev")).toBe("oprte-gateway-dev");
     expect(gatewayExecutableNameForNativeMode("run")).toBe("oprte-gateway");
+    expect(HRA_NATIVE_APPLICATION_EXECUTABLE).toBe("hra");
   });
 
   test("builds the native host's exact authenticated frontend envelope", () => {
@@ -245,11 +247,31 @@ describe("HRA development lifecycle", () => {
 
   test("retires the completed build process group before the app can run long enough for PID reuse", async () => {
     const source = await Bun.file(new URL("../run-native.ts", import.meta.url)).text();
-    const retire = source.indexOf("await terminateOwnedProcessGroup(build);");
+    const retire = source.indexOf("await terminateOwnedProcessGroup(nativeBuild);");
     const forget = source.indexOf("delete processes.build;", retire);
     const appSpawn = source.indexOf('spawnOwnedProcess("app"', forget);
     expect(retire).toBeGreaterThan(-1);
     expect(forget).toBeGreaterThan(retire);
     expect(appSpawn).toBeGreaterThan(forget);
+  });
+
+  test("proves the Vite watcher boundary before compiling either development binary", async () => {
+    const source = await Bun.file(new URL("../run-native.ts", import.meta.url)).text();
+    const viteSpawn = source.indexOf('[process.execPath, "run", "dev:frontend"]');
+    const readiness = source.indexOf("await Promise.race([", viteSpawn);
+    const readinessTransition = source.indexOf(
+      'advanceDevLaunch(phase, "readiness-matched")',
+      readiness,
+    );
+    const gatewayBuild = source.indexOf(
+      '[process.execPath, "run", "build:runtime:dev"]',
+      readinessTransition,
+    );
+    const nativeBuild = source.indexOf('console.log("[hra dev] compiling the Debug Zig host")');
+    expect(viteSpawn).toBeGreaterThan(-1);
+    expect(readiness).toBeGreaterThan(viteSpawn);
+    expect(readinessTransition).toBeGreaterThan(readiness);
+    expect(gatewayBuild).toBeGreaterThan(readinessTransition);
+    expect(nativeBuild).toBeGreaterThan(gatewayBuild);
   });
 });
