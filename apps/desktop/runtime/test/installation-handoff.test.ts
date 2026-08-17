@@ -33,6 +33,10 @@ import { openControlPlane } from "../src/state/database";
 
 const roots: string[] = [];
 const expectedCommit = "0123456789abcdef0123456789abcdef01234567";
+const supportedPriorHraIdentities = [
+  { build: "8", version: "0.1.7" },
+  { build: "9", version: "0.1.8" },
+] as const;
 const faultPoints: readonly InstallationHandoffFaultPoint[] = [
   "after_full_backup",
   "after_candidate_smoke",
@@ -137,6 +141,48 @@ describe("OPRTE to HRA installation handoff", () => {
     expect(await inspectTree(fixture.paths.canonicalApp)).toEqual(priorHraBefore);
     expect(await inspectTree(fixture.paths.stateRoot, stateTreeOptions)).toEqual(stateBefore);
   }, 60_000);
+
+  test("accepts and restores both supported prior HRA release identities", async () => {
+    for (const priorHra of supportedPriorHraIdentities) {
+      const fixture = await createFixture({ priorHra });
+      const priorHraBefore = await inspectTree(fixture.paths.canonicalApp);
+      await performInstallationHandoff({
+        backupDirectory: fixture.backupDirectory,
+        candidateApp: fixture.paths.candidateApp,
+        confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+        paths: fixture.paths,
+      }, fixture.dependencies);
+      const receipt = JSON.parse(
+        await readFile(join(fixture.backupDirectory, "handoff-receipt.json"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(receipt).toMatchObject({
+        hadPriorHra: true,
+        priorHra: { identity: priorHra },
+      });
+      await rollbackInstallationHandoff({
+        backupDirectory: fixture.backupDirectory,
+        confirmation: "ROLL-BACK-HRA-TO-OPRTE",
+        paths: fixture.paths,
+      }, fixture.dependencies);
+      expect(await inspectTree(fixture.paths.canonicalApp)).toEqual(priorHraBefore);
+    }
+  });
+
+  test("rejects the v0.1.9 candidate as an unreceipted prior HRA authority", async () => {
+    const fixture = await createFixture({ priorHra: false });
+    await createBundle(fixture.paths.canonicalApp, {
+      build: "10",
+      executable: "hra",
+      marker: "unreceipted-candidate",
+      version: "0.1.9",
+    });
+    expect(performInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      candidateApp: fixture.paths.candidateApp,
+      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+      paths: fixture.paths,
+    }, fixture.dependencies)).rejects.toMatchObject({ code: "candidate_invalid" });
+  });
 
   test("fails closed when a Keychain item changes during the cutover", async () => {
     const fixture = await createFixture();
@@ -337,7 +383,9 @@ describe("OPRTE to HRA installation handoff", () => {
 });
 
 async function createFixture(
-  options: Readonly<{ priorHra?: boolean }> = {},
+  options: Readonly<{
+    priorHra?: false | (typeof supportedPriorHraIdentities)[number];
+  }> = {},
 ): Promise<Readonly<{
   backupDirectory: string;
   dependencies: InstallationHandoffDependencies;
@@ -359,23 +407,28 @@ async function createFixture(
     marker: "predecessor",
     version: "0.1.4",
   });
-  if (options.priorHra !== false) {
+  const priorHra = options.priorHra === undefined
+    ? supportedPriorHraIdentities[1]
+    : options.priorHra;
+  if (priorHra !== false) {
     await createBundle(join(applicationsDirectory, "HRA.app"), {
-      build: "8",
+      build: priorHra.build,
       executable: "hra",
       marker: "prior-hra",
-      version: "0.1.7",
+      version: priorHra.version,
     });
   }
   await createBundle(candidateApp, {
-    build: "9",
+    build: "10",
     executable: "hra",
     marker: "candidate",
-    version: "0.1.8",
+    version: "0.1.9",
   });
   const controlPlanePath = join(stateRoot, "control-plane.sqlite");
   const database = openControlPlane(controlPlanePath, {
-    releaseIdentity: { version: "0.1.7", build: 8 },
+    releaseIdentity: priorHra === false
+      ? { version: "0.1.8", build: 9 }
+      : { version: priorHra.version, build: Number(priorHra.build) },
     now: () => 1_786_934_400_000,
   });
   database.close();

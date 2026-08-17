@@ -38,6 +38,40 @@ const setupEnvironment = Object.freeze({
   LC_ALL: "C",
   PATH: "/usr/bin:/bin",
 });
+const candidateContractFixture = parseReleaseDownloadContract({
+  release: {
+    architecture: "Apple Silicon",
+    artifacts: {
+      checksum: {
+        bytes: null,
+        name: "HRA-0.1.9-10-macos-arm64.dmg.sha256",
+        sha256: null,
+      },
+      dmg: {
+        bytes: null,
+        name: "HRA-0.1.9-10-macos-arm64.dmg",
+        sha256: null,
+      },
+      manifest: {
+        bytes: null,
+        name: "HRA-0.1.9-10-release-manifest.json",
+        sha256: null,
+      },
+    },
+    availability: "candidate",
+    build: 10,
+    minimumMacOS: "13",
+    source: {
+      commit: null,
+      runtimeTreeSha256: null,
+      tagObject: null,
+    },
+    tag: "v0.1.9",
+    version: "0.1.9",
+  },
+  repository: "https://github.com/hraness/hra",
+  schemaVersion: 1,
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -48,48 +82,35 @@ afterEach(async () => {
 });
 
 describe("release and download convergence", () => {
-  test("keeps the unpublished download surface on v0.1.8 build 9", async () => {
+  test("verifies the v0.1.9 build 10 repository contract in either protocol state", async () => {
     const contract = await readReleaseDownloadContract();
-    expect(contract).toEqual({
-      release: {
-        architecture: "Apple Silicon",
-        artifacts: {
-          checksum: {
-            bytes: null,
-            name: "HRA-0.1.8-9-macos-arm64.dmg.sha256",
-            sha256: null,
-          },
-          dmg: {
-            bytes: null,
-            name: "HRA-0.1.8-9-macos-arm64.dmg",
-            sha256: null,
-          },
-          manifest: {
-            bytes: null,
-            name: "HRA-0.1.8-9-release-manifest.json",
-            sha256: null,
-          },
-        },
-        availability: "candidate",
-        build: 9,
-        minimumMacOS: "13",
-        source: {
-          commit: null,
-          runtimeTreeSha256: null,
-          tagObject: null,
-        },
-        tag: "v0.1.8",
-        version: "0.1.8",
-      },
-      repository: "https://github.com/hraness/hra",
-      schemaVersion: 1,
-    });
+    expectReleaseIdentity(contract);
     expect(await verifyReleaseDownloadContract()).toEqual(contract);
-    expect(await verifyReleaseSourceGate()).toMatchObject({
-      availability: "candidate",
-      contract,
-      status: "valid_candidate_contract",
-    });
+    const source = await verifyReleaseSourceGate();
+    if (contract.release.availability === "candidate") {
+      expect(contract).toEqual(candidateContractFixture);
+      expect(source).toMatchObject({
+        availability: "candidate",
+        contract,
+        status: "valid_candidate_contract",
+      });
+      await expectRejection(requirePublishedReleaseSource(), "not published");
+      await expectRejection(
+        verifyPublishedReleaseCandidate("/Applications/HRA.app"),
+        "not published",
+      );
+    } else {
+      expect(source).toMatchObject({
+        availability: "published",
+        contract,
+        status: "verified_published_source",
+      });
+      expect(await requirePublishedReleaseSource()).toMatchObject({ contract });
+    }
+  });
+
+  test("keeps candidate-only fixtures independent from repository publication state", async () => {
+    const contract = candidateContractFixture;
     let remoteRequests = 0;
     expect(await verifyRemoteReleaseState(contract, () => {
       remoteRequests += 1;
@@ -143,8 +164,8 @@ describe("release and download convergence", () => {
     );
   });
 
-  test("models publication as one strict evidence-bearing state", async () => {
-    const candidate = await readReleaseDownloadContract();
+  test("models publication as one strict evidence-bearing state", () => {
+    const candidate = candidateContractFixture;
     const published = {
       ...candidate,
       release: {
@@ -185,7 +206,7 @@ describe("release and download convergence", () => {
 
   test("verifies the immutable seven-asset GitHub prerelease without fetching the DMG", async () => {
     const fixture = createRemoteReleaseFixture(
-      await readReleaseDownloadContract(),
+      candidateContractFixture,
     );
     expect(await verifyRemoteReleaseState(
       fixture.contract,
@@ -205,7 +226,7 @@ describe("release and download convergence", () => {
   });
 
   test("rejects mutable metadata, digest drift, and a manifest bound to another commit", async () => {
-    const candidate = await readReleaseDownloadContract();
+    const candidate = candidateContractFixture;
     const mutable = createRemoteReleaseFixture(candidate);
     mutable.metadata.immutable = false;
     await expectRejection(
@@ -233,8 +254,8 @@ describe("release and download convergence", () => {
     );
   });
 
-  test("rejects alternate repositories, extra fields, and mismatched tags", async () => {
-    const candidate = await readReleaseDownloadContract();
+  test("rejects alternate repositories, extra fields, and mismatched tags", () => {
+    const candidate = candidateContractFixture;
     expect(() => parseReleaseDownloadContract({
       ...candidate,
       repository: "https://github.com/attacker/hra",
@@ -247,11 +268,6 @@ describe("release and download convergence", () => {
       ...candidate,
       release: { ...candidate.release, tag: "v0.1.7" },
     })).toThrow();
-    await expectRejection(requirePublishedReleaseSource(), "not published");
-    await expectRejection(
-      verifyPublishedReleaseCandidate("/Applications/HRA.app"),
-      "not published",
-    );
   });
 
   test("makes the conditional source gate a required CI and build boundary", async () => {
@@ -330,8 +346,8 @@ describe("release and download convergence", () => {
     }
   });
 
-  test("verifies the strict candidate C to publication P protocol without a commit fixed point", async () => {
-    const candidate = await readReleaseDownloadContract();
+  test("keeps the full release suite valid across a synthetic contract-only publication P", async () => {
+    const candidate = candidateContractFixture;
     const repositoryRoot = await realpath(
       await mkdtemp(join(tmpdir(), "hra-publication-protocol-")),
     );
@@ -360,12 +376,15 @@ describe("release and download convergence", () => {
     await runSetupGit(repositoryRoot, [
       "tag",
       "-a",
-      "v0.1.8",
+      candidate.release.tag,
       "-m",
-      "HRA 0.1.8 candidate",
+      `HRA ${candidate.release.version} candidate`,
     ]);
     const tagObject = (
-      await runSetupGit(repositoryRoot, ["rev-parse", "refs/tags/v0.1.8"])
+      await runSetupGit(repositoryRoot, [
+        "rev-parse",
+        `refs/tags/${candidate.release.tag}`,
+      ])
     ).trim();
     const published = parseReleaseDownloadContract({
       ...candidate,
@@ -404,6 +423,7 @@ describe("release and download convergence", () => {
       repository: published.repository,
       schemaVersion: published.schemaVersion,
     };
+    expectReleaseIdentity(publishedContract);
     await writeFile(
       join(repositoryRoot, "release-download.json"),
       `${JSON.stringify(publishedContract, null, 2)}\n`,
@@ -473,7 +493,7 @@ describe("release and download convergence", () => {
   });
 
   test("rejects a schema-valid publication with forged tag evidence", async () => {
-    const candidate = await readReleaseDownloadContract();
+    const candidate = candidateContractFixture;
     const repositoryRoot = await realpath(
       await mkdtemp(join(tmpdir(), "hra-bogus-publication-")),
     );
@@ -502,12 +522,15 @@ describe("release and download convergence", () => {
     await runSetupGit(repositoryRoot, [
       "tag",
       "-a",
-      "v0.1.8",
+      candidate.release.tag,
       "-m",
-      "HRA 0.1.8 candidate",
+      `HRA ${candidate.release.version} candidate`,
     ]);
     const actualTagObject = (
-      await runSetupGit(repositoryRoot, ["rev-parse", "refs/tags/v0.1.8"])
+      await runSetupGit(repositoryRoot, [
+        "rev-parse",
+        `refs/tags/${candidate.release.tag}`,
+      ])
     ).trim();
     const forgedTagObject = actualTagObject === "f".repeat(40)
       ? "e".repeat(40)
@@ -597,6 +620,36 @@ describe("release and download convergence", () => {
     );
   });
 });
+
+function expectReleaseIdentity(contract: ReleaseDownloadContract): void {
+  expect(contract).toMatchObject({
+    release: {
+      architecture: "Apple Silicon",
+      artifacts: {
+        checksum: { name: "HRA-0.1.9-10-macos-arm64.dmg.sha256" },
+        dmg: { name: "HRA-0.1.9-10-macos-arm64.dmg" },
+        manifest: { name: "HRA-0.1.9-10-release-manifest.json" },
+      },
+      build: 10,
+      minimumMacOS: "13",
+      tag: "v0.1.9",
+      version: "0.1.9",
+    },
+    repository: "https://github.com/hraness/hra",
+    schemaVersion: 1,
+  });
+  if (contract.release.availability === "candidate") {
+    expect(contract).toEqual(candidateContractFixture);
+    return;
+  }
+  for (const artifact of Object.values(contract.release.artifacts)) {
+    expect(artifact.bytes).toBeGreaterThan(0);
+    expect(artifact.sha256).toMatch(/^[0-9a-f]{64}$/u);
+  }
+  expect(contract.release.source.commit).toMatch(/^[0-9a-f]{40}$/u);
+  expect(contract.release.source.runtimeTreeSha256).toMatch(/^[0-9a-f]{64}$/u);
+  expect(contract.release.source.tagObject).toMatch(/^[0-9a-f]{40}$/u);
+}
 
 function createRemoteReleaseFixture(
   candidate: ReleaseDownloadContract,

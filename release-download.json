@@ -6,29 +6,29 @@
     "artifacts": {
       "checksum": {
         "bytes": null,
-        "name": "HRA-0.1.8-9-macos-arm64.dmg.sha256",
+        "name": "HRA-0.1.9-10-macos-arm64.dmg.sha256",
         "sha256": null
       },
       "dmg": {
         "bytes": null,
-        "name": "HRA-0.1.8-9-macos-arm64.dmg",
+        "name": "HRA-0.1.9-10-macos-arm64.dmg",
         "sha256": null
       },
       "manifest": {
         "bytes": null,
-        "name": "HRA-0.1.8-9-release-manifest.json",
+        "name": "HRA-0.1.9-10-release-manifest.json",
         "sha256": null
       }
     },
     "availability": "candidate",
-    "build": 9,
+    "build": 10,
     "minimumMacOS": "13",
     "source": {
       "commit": null,
       "runtimeTreeSha256": null,
       "tagObject": null
     },
-    "tag": "v0.1.8",
-    "version": "0.1.8"
+    "tag": "v0.1.9",
+    "version": "0.1.9"
   }
 }
