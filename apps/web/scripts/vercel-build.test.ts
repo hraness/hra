@@ -360,6 +360,9 @@ describe("checked provider wiring", () => {
     expect(vercel).toContain(
       '"buildCommand": "bun run scripts/vercel-build.ts --production-deployment benevolent-akita-439"',
     );
+    expect(vercel).toContain(
+      '"installCommand": "bunx bun@1.3.14 install --filter @hraness/hra-web --filter @hraness/hra --frozen-lockfile"',
+    );
     expect(manifest).toContain(
       '"build": "bun run scripts/vercel-build.ts --run-app-build --production-deployment benevolent-akita-439"',
     );

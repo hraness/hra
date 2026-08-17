@@ -2,5 +2,5 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "bun run scripts/vercel-build.ts --production-deployment benevolent-akita-439",
   "framework": "nextjs",
-  "installCommand": "bunx bun@1.3.14 install --filter @hraness/hra-web --frozen-lockfile"
+  "installCommand": "bunx bun@1.3.14 install --filter @hraness/hra-web --filter @hraness/hra --frozen-lockfile"
 }
