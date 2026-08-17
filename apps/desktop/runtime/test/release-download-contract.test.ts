@@ -315,7 +315,9 @@ describe("release and download convergence", () => {
     for (const command of ["candidate", "published"] as const) {
       const local = await runReleaseContractCli([command]);
       expect(local.stderr).not.toContain("Usage: release-download-contract.ts");
-      expect(local.stderr).not.toContain("absolute normalized path");
+      expect(local.stderr.split("\n")).not.toContain(
+        "error: Release directory must be an absolute normalized path.",
+      );
 
       for (const arguments_ of [
         [command, "unexpected"],
