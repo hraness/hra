@@ -90,7 +90,13 @@ export async function inspectReleaseSourceRepository(
   await rejectForbiddenGitMetadata(gitDirectory);
 
   const runner = releaseGitRunner(repositoryRoot, gitDirectory);
-  const [reportedRoot, reportedGitDirectory, localIncludes, replacementRefs] =
+  const [
+    reportedRoot,
+    reportedGitDirectory,
+    localIncludes,
+    worktreeConfiguration,
+    replacementRefs,
+  ] =
     await Promise.all([
       runner.run(["rev-parse", "--show-toplevel"]),
       runner.run(["rev-parse", "--absolute-git-dir"]),
@@ -98,7 +104,13 @@ export async function inspectReleaseSourceRepository(
         "config",
         "--local",
         "--get-regexp",
-        "^(include\\.path|includeif\\..*\\.path|extensions\\.(partialclone|worktreeconfig)|remote\\..*\\.promisor)$",
+        "^(include\\.path|includeif\\..*\\.path|extensions\\.partialclone|remote\\..*\\.promisor)$",
+      ]),
+      runner.runAllowNoMatch([
+        "config",
+        "--local",
+        "--get-regexp",
+        "^extensions\\.worktreeconfig$",
       ]),
       runner.run(["for-each-ref", "--format=%(refname)", "refs/replace"]),
     ]);
@@ -107,6 +119,9 @@ export async function inspectReleaseSourceRepository(
   }
   if (await canonicalOutputPath(reportedGitDirectory) !== gitDirectory) {
     throw new Error("Git reported a different metadata directory.");
+  }
+  if (worktreeConfiguration.trim().length > 0) {
+    throw new Error("Release provenance refuses active Git worktree configuration.");
   }
   if (localIncludes.trim().length > 0) {
     throw new Error("Release Git config may not include configuration from another path.");
@@ -423,11 +438,13 @@ export function rejectAmbientGitSteering(
 }
 
 async function rejectForbiddenGitMetadata(gitDirectory: string): Promise<void> {
+  // actions/checkout can leave config.worktree behind after unsetting the
+  // extension that makes it influential. The local-config check above rejects
+  // any activation while permitting that ignored residue.
   const forbidden = [
     [join(gitDirectory, "objects/info/alternates"), "object alternates"],
     [join(gitDirectory, "info/grafts"), "grafts"],
     [join(gitDirectory, "info/sparse-checkout"), "sparse checkout"],
-    [join(gitDirectory, "config.worktree"), "worktree configuration"],
     [join(gitDirectory, "shallow"), "shallow history"],
   ] as const;
   for (const [path, label] of forbidden) {

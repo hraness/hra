@@ -155,6 +155,56 @@ describe("hermetic release provenance", () => {
     }), "submodule presence or drift");
   });
 
+  test("accepts checkout's inactive residual worktree configuration", async () => {
+    const repositoryRoot = await createRepository();
+    await writeFile(
+      join(repositoryRoot, ".git/config.worktree"),
+      [
+        "[core]",
+        "\tsparseCheckout = false",
+        "\tsparseCheckoutCone = false",
+        "[index]",
+        "\tsparse = false",
+        "",
+      ].join("\n"),
+    );
+
+    const evidence = await inspectReleaseSourceRepository({
+      environment: {},
+      repositoryRoot,
+    });
+
+    expect(evidence.repositoryRoot).toBe(repositoryRoot);
+  });
+
+  test("refuses active worktree configuration that can conceal source", async () => {
+    const repositoryRoot = await createRepository();
+    const excludesFile = join(
+      await createTemporaryDirectory("hra-worktree-config-"),
+      "ignore",
+    );
+    await writeFile(excludesFile, "concealed.txt\n");
+    await writeFile(
+      join(repositoryRoot, ".git/config.worktree"),
+      `[core]\n\texcludesFile = ${excludesFile}\n`,
+    );
+    await runSetupGit(repositoryRoot, [
+      "config",
+      "--local",
+      "extensions.worktreeConfig",
+      "true",
+    ]);
+    await writeFile(
+      join(repositoryRoot, "concealed.txt"),
+      "untracked release input\n",
+    );
+
+    await expectRejection(inspectReleaseSourceRepository({
+      environment: {},
+      repositoryRoot,
+    }), "active Git worktree configuration");
+  });
+
   test("refuses index flags that can conceal changed release source", async () => {
     for (const flag of ["--assume-unchanged", "--skip-worktree"] as const) {
       const repositoryRoot = await createRepository();
