@@ -9,6 +9,7 @@ import {
   browserJourneyScenarioIds,
   canAutomaticallyStartServer,
   coveragePolicyViolations,
+  directServerCommand,
   externalOrFailedRequests,
   parseArguments,
   parseHRADirectRemainingWork,
@@ -54,6 +55,16 @@ describe("HRA browser verifier policy", () => {
       "cannot contain credentials",
     );
     expect(() => parseArguments(["--unknown"])).toThrow("Unknown argument");
+  });
+
+  test("owns the Vite listener directly instead of a package-script wrapper", () => {
+    expect(directServerCommand("/repo/apps/desktop", "5174")).toEqual([
+      "/repo/apps/desktop/node_modules/.bin/vite",
+      "--config",
+      "frontend/direct/vite.config.ts",
+      "--port",
+      "5174",
+    ]);
   });
 
   test("accepts only successful same-origin GET requests", () => {

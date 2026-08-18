@@ -9,7 +9,7 @@
 - `index.html` and `vite.config.ts` – a separate development document and `dist-direct` build graph.
 - `reactive-baseline.html` and `reactive-baseline.tsx` – development-only instrumentation of the real product surface under the canonical Direct runtime and browser firewall.
 - `check-production-boundary.ts` – product-owned forbidden-marker policy across renderer, gateway, Zig, Convex, and packaged production surfaces.
-- `verify-browser.ts` – HRA probe, interactive pane-chat and subscription journey, responsive containment, coverage, console, network, and manifest policy over the shared browser-verification mechanics.
+- `verify-browser.ts` – HRA probe, interactive pane-chat and subscription journey, responsive containment, coverage, console, network, and manifest policy over `@hraness/direct/tooling/browser-verification`.
 - `*.test.ts` and `*.property.test.ts` – parser, catalog, bridge, chunking, recovery, browser-verifier policy, and generated round-trip evidence.
 
 # Guidelines
@@ -26,4 +26,6 @@
 - Parallel performance claims require concurrent active panes with interleaved scripted deltas plus deterministic sibling-isolation or bounded-responsiveness evidence. A large static pane fixture alone is density evidence, not performance evidence.
 - A React StrictMode mount owns a fresh definition-backed session, transport, bridge, and shell. Register transport and shell teardown with the session, dispose the session with that mount, and count every asynchronous request or event script in the shared activity probe.
 - Install the canonical browser bridge and fail-closed fetch boundary together during shell construction, before product effects can connect. Failed installation must dispose the session. Do not reconstruct manifests, probes, coverage snapshots, compatibility globals, or browser rollback locally.
-- Browser verification must use the repository's shared process, exact v2 contract binding, server-lease, and artifact-publication mechanics; retain one catalog hash across the run; join a stable canonical probe; reject blocked or failed script activity; reject page/console errors and external or failed requests; and preserve screenshots plus a machine-readable manifest under ignored artifacts.
+- Browser verification must use `@hraness/direct/tooling/browser-verification` for process, exact v2 contract binding, server-lease, and artifact-publication mechanics; retain one catalog hash across the run; join a stable canonical probe; reject blocked or failed script activity; reject page/console errors and external or failed requests; and preserve screenshots plus a machine-readable manifest under ignored artifacts.
+- Start the workspace Vite executable directly so the shared verifier owns the listener process, its exit, and its output pipes. Do not put a package-script wrapper between that process owner and Vite.
+- Scan production boundaries with `@hraness/direct/tooling/bundle-boundary`. Keep the HRA marker, source-root, emitted-surface, and product-private renderer policies local.

@@ -7,7 +7,6 @@
       "devDependencies": {
         "@hra-internal/eslint-config": "workspace:*",
         "@hra-internal/typescript-config": "workspace:*",
-        "@hraness/direct": "catalog:",
         "@types/bun": "catalog:",
         "@types/node": "catalog:",
         "agent-browser": "catalog:",
@@ -79,9 +78,10 @@
         "@hra-internal/codex-app-sdk": "workspace:*",
         "@hra-internal/convex": "workspace:*",
         "@hra-internal/schema": "workspace:*",
-        "@hra-internal/web-discovery": "workspace:*",
         "@hraness/agent-tasks-domain": "workspace:*",
         "@hraness/agent-tasks-protocol": "workspace:*",
+        "@hraness/vercel-delivery": "catalog:",
+        "@hraness/web-discovery": "catalog:",
         "@workos-inc/authkit-nextjs": "catalog:",
         "@workos-inc/node": "catalog:",
         "convex": "catalog:",
@@ -271,24 +271,6 @@
       "name": "@hra-internal/typescript-config",
       "version": "0.1.0",
     },
-    "packages/internal/web-discovery": {
-      "name": "@hra-internal/web-discovery",
-      "version": "0.1.0",
-      "dependencies": {
-        "react": "catalog:",
-      },
-      "devDependencies": {
-        "@hra-internal/eslint-config": "workspace:*",
-        "@hra-internal/typescript-config": "workspace:*",
-        "@types/bun": "catalog:",
-        "@types/react": "catalog:",
-        "eslint": "catalog:",
-        "typescript": "catalog:",
-      },
-      "peerDependencies": {
-        "next": ">=16.2.0 <17.0.0",
-      },
-    },
     "packages/task-domain": {
       "name": "@hraness/agent-tasks-domain",
       "version": "0.1.0",
@@ -362,10 +344,12 @@
   "catalog": {
     "@convex-dev/better-auth": "0.12.5",
     "@eslint/js": "^9.39.2",
-    "@hraness/direct": "github:hraness/direct#v0.6.2",
+    "@hraness/direct": "github:hraness/direct#v0.7.0",
     "@hraness/result": "github:hraness/result#v0.2.1",
     "@hraness/types": "github:hraness/types#v0.1.1",
     "@hraness/ui": "github:hraness/ui#v0.3.1",
+    "@hraness/vercel-delivery": "github:hraness/vercel-delivery#v0.1.2",
+    "@hraness/web-discovery": "github:hraness/web-discovery#v0.1.0",
     "@hugeicons/core-free-icons": "^4.2.2",
     "@native-sdk/cli": "0.5.3",
     "@openai/codex": "0.144.6",
@@ -538,15 +522,13 @@
 
     "@hra-internal/typescript-config": ["@hra-internal/typescript-config@workspace:packages/internal/typescript-config"],
 
-    "@hra-internal/web-discovery": ["@hra-internal/web-discovery@workspace:packages/internal/web-discovery"],
-
     "@hraness/agent-tasks-domain": ["@hraness/agent-tasks-domain@workspace:packages/task-domain"],
 
     "@hraness/agent-tasks-protocol": ["@hraness/agent-tasks-protocol@workspace:packages/task-protocol"],
 
     "@hraness/agent-tasks-ui": ["@hraness/agent-tasks-ui@workspace:packages/task-ui"],
 
-    "@hraness/direct": ["@hraness/direct@github:hraness/direct#5e58fd5", { "peerDependencies": { "react": ">=18 <20" }, "optionalPeers": ["react"] }, "hraness-direct-5e58fd5", "sha512-i972Fy1Yp0BXpx1pRKDEaTmL8XwbYCP9pDwEtywRLMgjq4UODUSAR3S0V67ovUk2RSqYN2llqz/NMut/Admz3g=="],
+    "@hraness/direct": ["@hraness/direct@github:hraness/direct#849f341", { "peerDependencies": { "agent-browser": "0.32.3", "react": ">=18 <20" }, "optionalPeers": ["agent-browser", "react"] }, "hraness-direct-849f341", "sha512-cvWcokL4EY871qpDMjaZm85pSMD3OjwmTAcN/xUgzeXDPeAt0S7+3gP0X/77MUA1hma5SoHiNJlKdnEXL3PVew=="],
 
     "@hraness/hra": ["@hraness/hra@workspace:apps/desktop"],
 
@@ -561,6 +543,10 @@
     "@hraness/types": ["@hraness/types@github:hraness/types#82d7c2d", { "dependencies": { "@total-typescript/ts-reset": "^0.6.1", "type-fest": "^5.7.0" } }, "hraness-types-82d7c2d", "sha512-5EDKXKwztPEE7RtgoFt6LXglRGHcWbqquhmd1M9iMcNnP138TmfmrHnsEyn+0WNRLNWubZZWEEuo0AXLXUPhWQ=="],
 
     "@hraness/ui": ["@hraness/ui@github:hraness/ui#7d4af51", { "dependencies": { "@hugeicons/core-free-icons": "^4.2.2", "@hugeicons/react": "^1.1.9", "clsx": "^2.1.1", "react-aria": "3.50.0", "react-aria-components": "1.19.0", "tailwind-merge": "^3.6.0" }, "peerDependencies": { "react": ">=18 <20", "react-dom": ">=18 <20" } }, "hraness-ui-7d4af51", "sha512-1YPNT1L2ZWVvhpX9f6IknAHnGJx8Z/4HIZDF2+wCLbPeIV9IVnErtPXeKJ6h3/j5qOCoh5W9WOoPvLpagsFG4A=="],
+
+    "@hraness/vercel-delivery": ["@hraness/vercel-delivery@github:hraness/vercel-delivery#7a1a0da", { "peerDependencies": { "next": ">=16.2.0 <17.0.0" } }, "hraness-vercel-delivery-7a1a0da", "sha512-7E/nkfGJq21UOHz6xZFFJlxgZWmtQj57PLlRsu5WopetsFFoJAJt/p/8MP6l0kMiBWZp7aB12T7pxmn99syiRg=="],
+
+    "@hraness/web-discovery": ["@hraness/web-discovery@github:hraness/web-discovery#1fc2cd2", { "peerDependencies": { "next": ">=16.2.0 <17.0.0", "react": ">=19.0.0 <20.0.0" } }, "hraness-web-discovery-1fc2cd2", "sha512-NCWiL+Qp4YKA0Q8XQvB52ddqtKRkl1w5uzMKU42rlP84Q0VG3I+fQjDFXWdrALiFVInQZFYNXCOoFrKdqBEwpg=="],
 
     "@hugeicons/core-free-icons": ["@hugeicons/core-free-icons@4.2.3", "", {}, "sha512-fpiU0qFZkv4ABi23xJ2m4qNr0BBfuIaYjPboN8WDA6aj9D+OzXa7eykxKOpACZRuGbDz1U9S5DsNx1d5KNnsgA=="],
 

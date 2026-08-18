@@ -4,7 +4,7 @@ import {
   serializeJsonLd,
   webApplicationJsonLd,
   websiteJsonLd,
-} from "@hra-internal/web-discovery";
+} from "@hraness/web-discovery";
 
 import { hraComparisons } from "./alternatives/comparisons";
 import OpenGraphImage from "./opengraph-image";

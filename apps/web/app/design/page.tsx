@@ -1,5 +1,5 @@
 import { DesignSystemGallery } from "@hra-internal/design-kit/react";
-import { NOINDEX_ROBOTS } from "@hra-internal/web-discovery";
+import { NOINDEX_ROBOTS } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {

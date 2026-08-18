@@ -5,7 +5,7 @@ import {
   checkBundleBoundary,
   DIRECT_WIRE_MARKERS,
   type BundleBoundaryResult,
-} from "../../../../scripts/direct/bundle-boundary";
+} from "@hraness/direct/tooling/bundle-boundary";
 
 const SOURCE_MARKERS = Object.freeze([
   "@hraness/direct",

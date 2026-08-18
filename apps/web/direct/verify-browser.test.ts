@@ -5,6 +5,7 @@ import { parseDefinitionCoverageSnapshot } from "@hraness/direct/testing";
 import {
   canAutomaticallyStartServer,
   coveragePolicyViolations,
+  directServerCommand,
   externalOrFailedRequests,
   parseArguments,
   remainingScripts,
@@ -31,6 +32,16 @@ describe("Agent Tasks browser verification policy", () => {
     expect(canAutomaticallyStartServer("http://127.0.0.1:5176")).toBe(true);
     expect(canAutomaticallyStartServer("http://localhost:5176")).toBe(true);
     expect(canAutomaticallyStartServer("https://agent-tasks.example")).toBe(false);
+  });
+
+  test("owns the Vite listener directly instead of a package-script wrapper", () => {
+    expect(directServerCommand("/repo/apps/web", "5176")).toEqual([
+      "/repo/apps/web/node_modules/.bin/vite",
+      "--config",
+      "direct/vite.config.ts",
+      "--port",
+      "5176",
+    ]);
   });
 
   test("rejects external, failed, and mutating browser requests", () => {

@@ -5,7 +5,7 @@ import {
   checkBundleBoundary,
   DIRECT_WIRE_MARKERS,
   type BundleBoundaryResult,
-} from "../../../scripts/direct/bundle-boundary";
+} from "@hraness/direct/tooling/bundle-boundary";
 
 const SOURCE_MARKERS = Object.freeze([
   "@hraness/direct",
@@ -68,9 +68,10 @@ async function scanExisting(
   directory: string,
   markers: readonly string[],
   patterns: readonly string[],
+  excludePatterns: readonly string[] = [],
 ): Promise<BundleBoundaryResult> {
   return existsSync(directory)
-    ? await checkBundleBoundary({ directory, markers, patterns })
+    ? await checkBundleBoundary({ directory, excludePatterns, markers, patterns })
     : emptyResult();
 }
 
@@ -82,7 +83,12 @@ export async function checkAgentTasksProductionBoundary(
     ...["app", "components", "convex", "lib", "public", "src"].map((directory) => (
       scanExisting(path.join(productRoot, directory), SOURCE_MARKERS, sourcePatterns)
     )),
-    scanExisting(productRoot, SOURCE_MARKERS, ["*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.css"]),
+    scanExisting(
+      productRoot,
+      SOURCE_MARKERS,
+      ["*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.css"],
+      ["production-icon-boundary.ts"],
+    ),
   ]));
   const emitted = await scanExisting(
     path.join(productRoot, ".next"),

@@ -7,15 +7,10 @@ import { z } from "@hra-internal/schema";
 import {
   classifyCoverageEvidence,
   parseDirectProbeSnapshot,
-  parseDirectSessionManifest,
   parseDefinitionCoverageSnapshot,
   type DirectProbeSnapshot,
   type CoverageEntry,
 } from "@hraness/direct/testing";
-import { DIRECT_BROWSER_BRIDGE_SCHEMA } from "@hraness/direct/web";
-
-import { agentTasksDirectDefinition } from "./scenarios";
-
 import {
   acquireVerificationServer,
   bindDirectBrowserContractEvidence,
@@ -23,9 +18,9 @@ import {
   canAutomaticallyStartLocalServer,
   createAgentBrowser,
   createArtifactRun,
-  createDirectBrowserContractReader,
   normalizeRootHttpOrigin,
   parseBaseUrlArguments,
+  readDirectBrowserContract,
   renderUnknown,
   spawnVerificationServer,
   stopVerificationServer,
@@ -33,13 +28,9 @@ import {
   type AgentBrowser,
   type BrowserVerificationArguments,
   type DirectBrowserContract,
-} from "../../../scripts/direct/browser-verification";
+} from "@hraness/direct/tooling/browser-verification";
 
-const readDirectBrowserContract = createDirectBrowserContractReader({
-  bridgeSchema: DIRECT_BROWSER_BRIDGE_SCHEMA,
-  parseManifest: parseDirectSessionManifest,
-  parseProbe: parseDirectProbeSnapshot,
-});
+import { agentTasksDirectDefinition } from "./scenarios";
 const DEFAULT_BASE_URL = "http://127.0.0.1:5176";
 const SERVER_START_TIMEOUT_MS = 30_000;
 const DIRECT_ROOT_ASSET_PATHS = new Set([
@@ -826,11 +817,22 @@ async function verifyScenario(options: Readonly<{
   };
 }
 
+export function directServerCommand(workspaceRoot: string, port: string): readonly string[] {
+  return Object.freeze([
+    join(workspaceRoot, "node_modules/.bin/vite"),
+    "--config",
+    "direct/vite.config.ts",
+    "--port",
+    port,
+  ]);
+}
+
 function startServer(repositoryRoot: string, baseUrl: string) {
   const port = new URL(baseUrl).port || "80";
+  const workspaceRoot = join(repositoryRoot, "apps/web");
   return spawnVerificationServer({
-    command: [process.execPath, "run", "dev:direct", "--", "--port", port],
-    cwd: join(repositoryRoot, "apps/web"),
+    command: directServerCommand(workspaceRoot, port),
+    cwd: workspaceRoot,
     env: { CI: "1" },
   });
 }

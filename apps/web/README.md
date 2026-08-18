@@ -58,7 +58,11 @@ deploy Convex functions to `benevolent-akita-439`. A generated Preview skips
 Convex deployment and builds an anonymous app-only client of the exact
 `benevolent-akita-439.convex.cloud` and `benevolent-akita-439.convex.site`
 public endpoints. Custom staging and every unrecognized provider target fail
-closed. Session sync remains fail-closed while
+closed. The Next.js configuration binds every verified Vercel deployment to
+the registered `hra` project and exact Git object through
+`X-Hraness-Delivery-Proof`. It preserves HRA's security and private-cache
+headers, and adds `X-Robots-Tag: noindex, nofollow, noarchive` to generated
+Preview responses. Session sync remains fail-closed while
 `HRA_SESSION_SYNC_ENABLED` is absent or `false`; the unchanged
 `OPRTE_SESSION_SYNC_ENABLED` value remains a fallback, and conflicting names
 fail closed. Enable it only after the

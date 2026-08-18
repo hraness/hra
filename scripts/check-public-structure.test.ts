@@ -23,7 +23,6 @@ const names = new Map([
   ["packages/internal/schema", "@hra-internal/schema"],
   ["packages/internal/test", "@hra-internal/test"],
   ["packages/internal/typescript-config", "@hra-internal/typescript-config"],
-  ["packages/internal/web-discovery", "@hra-internal/web-discovery"],
   ["packages/task-domain", "@hraness/agent-tasks-domain"],
   ["packages/task-protocol", "@hraness/agent-tasks-protocol"],
   ["packages/task-ui", "@hraness/agent-tasks-ui"],
@@ -68,6 +67,9 @@ function completeFixture(): Readonly<{
       },
       workspaces: {
         catalog: {
+          "@hraness/direct": "github:hraness/direct#v0.7.0",
+          "@hraness/vercel-delivery": "github:hraness/vercel-delivery#v0.1.2",
+          "@hraness/web-discovery": "github:hraness/web-discovery#v0.1.0",
           "agent-browser": "0.32.3",
           "react-aria-components": "1.19.0",
         },
@@ -94,6 +96,15 @@ function completeFixture(): Readonly<{
           || directory === "apps/web"
           || directory === "packages/task-ui"
           ? { dependencies: { "@hra-internal/codex-app-sdk": "workspace:*" } }
+          : {}),
+        ...(directory === "apps/web"
+          ? {
+              dependencies: {
+                "@hra-internal/codex-app-sdk": "workspace:*",
+                "@hraness/vercel-delivery": "catalog:",
+                "@hraness/web-discovery": "catalog:",
+              },
+            }
           : {}),
       },
     });
@@ -124,8 +135,6 @@ function completeFixture(): Readonly<{
     "scripts/check-resource-scheduler.ts",
     "scripts/check-standalone.ts",
     "scripts/direct/agent-browser.verify.json",
-    "scripts/direct/browser-verification.ts",
-    "scripts/direct/bundle-boundary.ts",
     "scripts/public-tree.manifest.json",
     "scripts/vercel-deploy-gate.ts",
     ...[...names.keys()].map((directory) => `${directory}/AGENTS.md`),
@@ -200,6 +209,51 @@ describe("public repository structure", () => {
     );
     expect(errors).toContain(
       "packages/task-ui/package.json: Codex App SDK must use the internal workspace",
+    );
+  });
+
+  test("rejects mutable shared-package pins and the retired discovery workspace edge", () => {
+    const fixture = completeFixture();
+    const manifests = fixture.manifests.map((manifest) => {
+      if (manifest.path === "package.json") {
+        const value = manifest.value as Record<string, unknown>;
+        const workspaces = value["workspaces"] as Record<string, unknown>;
+        const catalog = workspaces["catalog"] as Record<string, unknown>;
+        return {
+          ...manifest,
+          value: {
+            ...value,
+            workspaces: {
+              ...workspaces,
+              catalog: { ...catalog, "@hraness/direct": "github:hraness/direct#main" },
+            },
+          },
+        };
+      }
+      if (manifest.path === "apps/web/package.json") {
+        const value = manifest.value as Record<string, unknown>;
+        return {
+          ...manifest,
+          value: {
+            ...value,
+            dependencies: {
+              ...(value["dependencies"] as Record<string, unknown>),
+              "@hra-internal/web-discovery": "workspace:*",
+            },
+          },
+        };
+      }
+      return manifest;
+    });
+    const errors = publicStructureErrors({
+      manifests,
+      presentPaths: fixture.presentPaths,
+    });
+    expect(errors).toContain(
+      "package.json: @hraness/direct must use immutable release github:hraness/direct#v0.7.0",
+    );
+    expect(errors).toContain(
+      "apps/web/package.json: shared delivery and discovery packages must use the catalog",
     );
   });
 });

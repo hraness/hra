@@ -23,8 +23,6 @@ const nonBuildDevDependencies = new Set([
 const exactAlwaysGlobalInputs = new Set([
   ".vercelignore",
   "bunfig.toml",
-  "scripts/direct/browser-verification.ts",
-  "scripts/direct/bundle-boundary.ts",
   "scripts/vercel-deploy-gate.ts",
 ]);
 const exactTargetScopedInputs = new Set(["bun.lock", "package.json"]);

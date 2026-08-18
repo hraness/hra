@@ -1,6 +1,11 @@
 import type { NextConfig } from "next";
 import { fileURLToPath } from "node:url";
 
+import {
+  withProductionDeliveryProof,
+  type ProductionDeliveryProofEnvironment,
+} from "@hraness/vercel-delivery";
+
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const hraIconDataModule = fileURLToPath(new URL("./app/hra-icon-data.ts", import.meta.url));
 const hraIconRuntimeModule = fileURLToPath(new URL("./app/hra-icon-runtime.tsx", import.meta.url));
@@ -100,44 +105,55 @@ export const hraPrivateNoStoreHeaders = [
     value: "private, no-store, max-age=0, must-revalidate",
   },
 ] as const;
-const nextConfig: NextConfig = {
-  async headers() {
-    return [
-      { headers: [...hraSecurityHeaders], source: "/(.*)" },
-      {
-        headers: [...hraPrivateNoStoreHeaders],
-        source: "/api/suite-auth/:path*",
-      },
-      {
-        headers: [...hraPrivateNoStoreHeaders],
-        source: "/auth/:path*",
-      },
-    ];
-  },
-  images: {
-    unoptimized: true,
-  },
-  outputFileTracingRoot: repositoryRoot,
-  poweredByHeader: false,
-  reactStrictMode: true,
-  transpilePackages: [
-    "@hraness/agent-tasks-protocol",
-    "@hraness/agent-tasks-ui",
-    "@hra-internal/brand-ui",
-    "@hra-internal/design-kit",
-    "@hra-internal/schema",
-  ],
-  turbopack: {
-    root: repositoryRoot,
-  },
-  webpack(config) {
-    withHraProductionIconBoundary(config);
-    config.resolve.extensionAlias = {
-      ...config.resolve.extensionAlias,
-      ".js": [".ts", ".tsx", ".js"],
-    };
-    return config;
-  },
-};
+export const hraVercelProjectName = "hra";
 
-export default nextConfig;
+export function createHraNextConfig(
+  environment: ProductionDeliveryProofEnvironment = process.env,
+): NextConfig {
+  const nextConfig: NextConfig = {
+    async headers() {
+      return [
+        { headers: [...hraSecurityHeaders], source: "/(.*)" },
+        {
+          headers: [...hraPrivateNoStoreHeaders],
+          source: "/api/suite-auth/:path*",
+        },
+        {
+          headers: [...hraPrivateNoStoreHeaders],
+          source: "/auth/:path*",
+        },
+      ];
+    },
+    images: {
+      unoptimized: true,
+    },
+    outputFileTracingRoot: repositoryRoot,
+    poweredByHeader: false,
+    reactStrictMode: true,
+    transpilePackages: [
+      "@hraness/agent-tasks-protocol",
+      "@hraness/agent-tasks-ui",
+      "@hra-internal/brand-ui",
+      "@hra-internal/design-kit",
+      "@hra-internal/schema",
+    ],
+    turbopack: {
+      root: repositoryRoot,
+    },
+    webpack(config) {
+      withHraProductionIconBoundary(config);
+      config.resolve.extensionAlias = {
+        ...config.resolve.extensionAlias,
+        ".js": [".ts", ".tsx", ".js"],
+      };
+      return config;
+    },
+  };
+
+  return withProductionDeliveryProof(nextConfig, {
+    environment,
+    projectName: hraVercelProjectName,
+  });
+}
+
+export default createHraNextConfig();

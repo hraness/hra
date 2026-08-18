@@ -1,7 +1,7 @@
 # Contents
 
 - `human-client/` – product-private optional human authentication, strict typed HTTP transport, refresh coordination, and secret-custody contracts shared by the CLI and desktop gateway.
-- `internal/` – repository-support packages for Codex client state, schemas, testing, storage, design, discovery, and shared configuration.
+- `internal/` – repository-support packages for Codex client state, schemas, testing, storage, design, and shared configuration.
 - `task-domain/` – leaf provider-neutral task identity, authority, commands, projections, promotion contracts, and pure laws shared by cloud and local adapters.
 - `task-protocol/` – product-private task wire validators, actor types, scopes, errors, and transport contracts layered on the task domain.
 - `task-ui/` – provider-neutral React task presentation, state/action ports, fixtures, styles, and verification shared by hosted web and local desktop.

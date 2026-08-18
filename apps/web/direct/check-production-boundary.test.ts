@@ -72,6 +72,27 @@ describe("Agent Tasks production Direct boundary", () => {
     });
   });
 
+  test("excludes only the verification-only production icon boundary", async () => {
+    await withProduct({
+      "app/page.tsx": "export default function Page() { return null; }",
+      "production-icon-boundary.ts": 'import "@hraness/direct/tooling/bundle-boundary";',
+      ".next/server/app/page.js": "production page",
+    }, async (directory) => {
+      const result = await checkAgentTasksProductionBoundary(directory);
+      expect(result.source.scanned.some((file) => file.endsWith("production-icon-boundary.ts"))).toBe(false);
+    });
+
+    await withProduct({
+      "app/page.tsx": "export default function Page() { return null; }",
+      "production-icon-boundary-copy.ts": 'import "@hraness/direct/tooling/bundle-boundary";',
+      ".next/server/app/page.js": "production page",
+    }, async (directory) => {
+      await expect(checkAgentTasksProductionBoundary(directory)).rejects.toThrow(
+        "production-icon-boundary-copy.ts",
+      );
+    });
+  });
+
   test("fails closed when source or emitted output is absent", async () => {
     await withProduct({ "app/page.tsx": "export default function Page() { return null; }" }, async (directory) => {
       await expect(checkAgentTasksProductionBoundary(directory)).rejects.toThrow("emitted Next.js assets");

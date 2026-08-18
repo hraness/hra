@@ -20,7 +20,6 @@ const expectedNamedWorkspaces: ReadonlyMap<string, string> = new Map([
   ["packages/internal/schema", "@hra-internal/schema"],
   ["packages/internal/test", "@hra-internal/test"],
   ["packages/internal/typescript-config", "@hra-internal/typescript-config"],
-  ["packages/internal/web-discovery", "@hra-internal/web-discovery"],
   ["packages/task-domain", "@hraness/agent-tasks-domain"],
   ["packages/task-protocol", "@hraness/agent-tasks-protocol"],
   ["packages/task-ui", "@hraness/agent-tasks-ui"],
@@ -52,8 +51,6 @@ const requiredRootPaths = [
   "scripts/check-resource-scheduler.ts",
   "scripts/check-standalone.ts",
   "scripts/direct/agent-browser.verify.json",
-  "scripts/direct/browser-verification.ts",
-  "scripts/direct/bundle-boundary.ts",
   "scripts/public-tree.manifest.json",
   "scripts/vercel-deploy-gate.ts",
 ] as const;
@@ -160,6 +157,16 @@ export function publicStructureErrors(options: Readonly<{
     if (!isRecord(catalog) || catalog["react-aria-components"] !== "1.19.0") {
       errors.push("package.json: react-aria-components must remain pinned to 1.19.0");
     }
+    const sharedPackagePins = {
+      "@hraness/direct": "github:hraness/direct#v0.7.0",
+      "@hraness/vercel-delivery": "github:hraness/vercel-delivery#v0.1.2",
+      "@hraness/web-discovery": "github:hraness/web-discovery#v0.1.0",
+    } as const;
+    for (const [name, expected] of Object.entries(sharedPackagePins)) {
+      if (!isRecord(catalog) || catalog[name] !== expected) {
+        errors.push(`package.json: ${name} must use immutable release ${expected}`);
+      }
+    }
     const scripts = root["scripts"];
     if (
       !isRecord(scripts)
@@ -227,6 +234,18 @@ export function publicStructureErrors(options: Readonly<{
         errors.push(`${path}: Codex App SDK must use the internal workspace`);
       }
     }
+  }
+  const web = byPath.get("apps/web/package.json");
+  const webDependencies = isRecord(web) ? web["dependencies"] : undefined;
+  if (
+    !isRecord(webDependencies)
+    || webDependencies["@hraness/vercel-delivery"] !== "catalog:"
+    || webDependencies["@hraness/web-discovery"] !== "catalog:"
+    || "@hra-internal/web-discovery" in webDependencies
+  ) {
+    errors.push(
+      "apps/web/package.json: shared delivery and discovery packages must use the catalog",
+    );
   }
   const desktop = byPath.get("apps/desktop/package.json");
   const desktopScripts = isRecord(desktop) ? desktop["scripts"] : undefined;

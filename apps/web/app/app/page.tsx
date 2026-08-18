@@ -6,7 +6,7 @@ import {
   SettingsCard,
   ThemeToggle,
 } from "@hra-internal/design-kit/react";
-import { createPrivateSiteMetadata } from "@hra-internal/web-discovery";
+import { createPrivateSiteMetadata } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 
 import { AdminControlPlane } from "../admin-shell";

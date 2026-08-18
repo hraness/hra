@@ -1,5 +1,5 @@
 import { parseConvexDeployment } from "@hra-internal/convex";
-import { createPublicSiteMetadata } from "@hra-internal/web-discovery";
+import { createPublicSiteMetadata } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 

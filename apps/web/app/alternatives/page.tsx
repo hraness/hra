@@ -1,6 +1,6 @@
 import { HranessBrand } from "@hra-internal/brand-ui";
 import { ThemeToggle } from "@hra-internal/design-kit/react";
-import { createPublicSiteMetadata, serializeJsonLd } from "@hra-internal/web-discovery";
+import { createPublicSiteMetadata, serializeJsonLd } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 import Image from "next/image";
 import Link from "next/link";
