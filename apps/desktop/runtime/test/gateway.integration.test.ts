@@ -1949,16 +1949,16 @@ describe("compiled gateway boundary", () => {
       expect(fixtureLog.some((entry) => hasStringFields(entry, {
           method: "thread/start",
           model: "gpt-5.6-sol",
-          approvalPolicy: "on-request",
+          approvalPolicy: "never",
           approvalsReviewer: "auto_review",
-          sandbox: "workspace-write",
+          sandbox: "danger-full-access",
         }))).toBeTrue();
       expect(fixtureLog.some((entry) => hasStringFields(entry, {
           method: "turn/start",
           model: "gpt-5.6-sol",
-          approvalPolicy: "on-request",
+          approvalPolicy: "never",
           approvalsReviewer: "auto_review",
-          sandboxType: "workspaceWrite",
+          sandboxType: "dangerFullAccess",
         }))).toBeTrue();
       expect(fixtureLog.some((entry) => hasStringFields(entry, {
         method: "turn/interrupt",

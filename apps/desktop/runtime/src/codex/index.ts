@@ -138,6 +138,16 @@ export {
   type PinnedCodexJsonValue,
 } from "./dynamic-tool";
 export {
+  HRA_PRODUCTION_EXECUTION_POLICY,
+  ProductionExecutionPolicyError,
+  isProductionApprovalRequestMethod,
+  verifyProductionExecutionPolicyRequirements,
+  verifyProductionThreadAdmission,
+  verifyProductionTurnAdmission,
+  type ProductionExecutionPolicyProof,
+  type ProductionExecutionPolicyReceipt,
+} from "./production-execution-policy";
+export {
   createPinnedCodexDynamicToolCapabilityResolver,
   type PinnedCodexDynamicToolCapabilityResolverOptions,
 } from "./dynamic-tool-capability";

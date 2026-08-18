@@ -21,6 +21,7 @@ export type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
   | "threadSetName"
   | "threadInjectItems"
   | "modelList"
+  | "configRequirementsRead"
   | "turnStart"
   | "turnSteer"
   | "turnInterrupt">;
@@ -174,6 +175,20 @@ export class SessionCommandExecutor {
       accountProfileId,
       "modelList",
       input,
+      expectedGeneration,
+    );
+  }
+
+  configRequirementsRead(
+    accountProfileId: AccountSummary["id"],
+    expectedGeneration?: number,
+  ): Promise<PinnedCodexResponseAtPosition<
+    PinnedCodexRequestOutput<"configRequirementsRead">
+  >> {
+    return this.#positioned(
+      accountProfileId,
+      "configRequirementsRead",
+      undefined,
       expectedGeneration,
     );
   }

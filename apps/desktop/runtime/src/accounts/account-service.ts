@@ -162,6 +162,7 @@ export type SessionPinnedCodexRequestKey = Extract<AccountRuntimeRequestKey,
   | "threadSetName"
   | "threadInjectItems"
   | "modelList"
+  | "configRequirementsRead"
   | "turnStart"
   | "turnSteer"
   | "turnInterrupt">;

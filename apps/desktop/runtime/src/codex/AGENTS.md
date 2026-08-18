@@ -6,6 +6,7 @@
 - `rpc-core.ts` – private generation-scoped JSON-RPC correlation, monotonic envelope positions, and inbound method dispatch.
 - `pinned-codecs.ts` – generated-backed 0.144.6 request, response, notification, and server-request associations plus bounded owned runtime codecs.
 - `pinned-protocol.ts` – the closed operation registry, request policy, parsed callback surface, and sole owner of raw transport calls.
+- `production-execution-policy.ts` – immutable full-access production policy, managed-requirements preflight proof, and exact-generation thread and turn admission receipts.
 - `dynamic-tool.ts` – the disabled-by-default, exact-`0.144.6`-probe-witnessed lexical RLM v2 callback contract, bounds, caller identity, and generation-local replay ledger.
 - `safe-display.ts` – terminal-safe, UTF-8-byte-bounded owned display prose.
 - `facts.ts` – the closed positioned HRA fact vocabulary and aggregate fact bound.
@@ -20,6 +21,8 @@
 - Keep generated Codex types and raw protocol payloads inside this directory; expose only owned discriminated adapter types.
 - Associate every used operation and routed inbound payload with the pinned generated types, and make method-set drift fail compilation.
 - Keep timeout, concurrency, lost-response, effect, and reconciliation policy in the closed operation registry. Do not accept these policies from callers.
+- Preflight `configRequirements/read` in the exact runtime generation before every production thread or turn mutation. Require `approvalPolicy: never`, `approvalsReviewer: auto_review`, and danger-full-access at both thread and turn boundaries; fail before mutation when managed requirements exclude any field.
+- Parse and verify returned thread admission settings against the immutable production policy. Never downgrade, infer support from a partial response, or mint an admission receipt across generations.
 - Keep `CodexRpcCore` private to this directory. Code above the pinned protocol uses owned operation keys and parsed outputs only.
 - Parse bytes and foreign values from `unknown`, and report diagnostics with bounded method names and reason codes rather than payloads.
 - Project each accepted parsed notification exactly once. A malformed supported value or failed fact consumer is a generation-ending protocol fault; never retry another consumer as a fallback.

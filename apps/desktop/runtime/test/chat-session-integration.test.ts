@@ -356,6 +356,7 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
         callbackWork.push(work);
       },
     });
+    sessions.handleRuntimeState(ACCOUNT, { type: "starting", generation: 1 });
     const store = new ChatPaneStore(database);
     chat = new ChatService({
       accounts: {
@@ -406,26 +407,29 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
     expect(accepted.type === "pane" ? accepted.pane.revision : 0)
       .toBe(ready.revision + 1);
     await chat.settled();
+    sessions.handleRuntimeState(ACCOUNT, { type: "idle", generation: 1 });
 
     expect(requests.map(({ key }) => key)).toEqual([
       "modelList",
+      "configRequirementsRead",
       "threadStart",
       "threadSetName",
+      "configRequirementsRead",
       "turnStart",
     ]);
     expect(requests.find(({ key }) => key === "threadStart")?.input).toMatchObject({
       model: "gpt-5.6-luna",
-      approvalPolicy: "on-request",
+      approvalPolicy: "never",
       approvalsReviewer: "auto_review",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
       serviceTier: "fast",
     });
     expect(requests.find(({ key }) => key === "turnStart")?.input).toMatchObject({
       model: "gpt-5.6-luna",
       effort: "max",
-      approvalPolicy: "on-request",
+      approvalPolicy: "never",
       approvalsReviewer: "auto_review",
-      sandboxPolicy: { type: "workspaceWrite", networkAccess: false },
+      sandboxPolicy: { type: "dangerFullAccess" },
       serviceTier: "fast",
     });
 
@@ -544,6 +548,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       accounts: positionedAccounts(firstRequests, () => ++firstPosition),
       emit: () => undefined,
     });
+    firstSessions.handleRuntimeState(ACCOUNT, { type: "starting", generation: 1 });
     const store = new ChatPaneStore(database);
     const firstChat = new ChatService({
       accounts: {
@@ -580,6 +585,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       prompt: "Persist the provider binding",
     });
     await firstChat.settled();
+    firstSessions.handleRuntimeState(ACCOUNT, { type: "idle", generation: 1 });
     const activeFirst = store.require(PANE);
     if (activeFirst.binding === null || activeFirst.providerTurnId === null) {
       throw new Error("Expected active provider binding");
@@ -641,6 +647,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
         callbackWork.push(work);
       },
     });
+    resumedSessions.handleRuntimeState(ACCOUNT, { type: "starting", generation: 1 });
     resumedChat = new ChatService({
       accounts: {
         containAmbiguousEffect: () => Promise.resolve(),
@@ -669,18 +676,21 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       prompt: "Resume after restart",
     });
     await resumedChat.settled();
+    resumedSessions.handleRuntimeState(ACCOUNT, { type: "idle", generation: 1 });
 
     expect(resumedRequests.map(({ key }) => key)).toEqual([
       "modelList",
+      "configRequirementsRead",
       "threadResume",
+      "configRequirementsRead",
       "turnStart",
     ]);
     expect(resumedRequests.find(({ key }) => key === "threadResume")?.input).toMatchObject({
       threadId: PROVIDER_THREAD,
       model: "gpt-5.6-sol",
-      approvalPolicy: "on-request",
+      approvalPolicy: "never",
       approvalsReviewer: "auto_review",
-      sandbox: "workspace-write",
+      sandbox: "danger-full-access",
       serviceTier: null,
     });
     expect(resumedRequests.find(({ key }) => key === "turnStart")?.input).toMatchObject({
@@ -769,10 +779,22 @@ function responseFor(key: unknown, cwd: string): unknown {
         })),
         nextCursor: null,
       };
+    case "configRequirementsRead":
+      return { requirements: null };
     case "threadStart":
-      return { thread: rawThread(cwd) };
+      return {
+        thread: rawThread(cwd),
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: { type: "dangerFullAccess" },
+      };
     case "threadResume":
-      return { thread: rawThread(cwd) };
+      return {
+        thread: rawThread(cwd),
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: { type: "dangerFullAccess" },
+      };
     case "threadSetName":
       return undefined;
     case "turnStart":

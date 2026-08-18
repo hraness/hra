@@ -24,14 +24,22 @@ import type {
   PinnedCodexTurnScan,
   PinnedCodexTurn,
   PinnedCodexThread,
+  ProductionExecutionPolicyProof,
+  ProductionExecutionPolicyReceipt,
 } from "../codex";
 import {
+  HRA_PRODUCTION_EXECUTION_POLICY,
+  ProductionExecutionPolicyError,
   createCodexFactsAtPosition,
+  isProductionApprovalRequestMethod,
   pinnedCodexTurnScanEvidenceDigest,
   pinnedCodexTurnScansHaveExactEvidence,
   projectCodexThreadResponseFacts,
   projectCodexTurnResponseFacts,
   scanPinnedCodexTurns,
+  verifyProductionExecutionPolicyRequirements,
+  verifyProductionThreadAdmission,
+  verifyProductionTurnAdmission,
 } from "../codex";
 import {
   type RunInteractionRequest,
@@ -351,6 +359,12 @@ interface RegisteredHarnessActorThread {
   readonly threadSource: string;
 }
 
+interface RegisteredProductionExecutionPolicy {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly receipt: ProductionExecutionPolicyReceipt;
+  readonly threadId: ThreadSummary["id"];
+}
+
 export interface SessionChatTurnStartRequest extends SessionTurnStartRequest {
   readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly reasoningEffort: "ultra" | "max";
@@ -610,6 +624,14 @@ export class SessionService {
   readonly #onTurnActivity: (event: SessionTurnActivity) => void | Promise<void>;
   readonly #onTurnLifecycle: (event: SessionTurnLifecycle) => void;
   readonly #reportedHydrationFailureGenerations = new Map<string, number>();
+  readonly #productionPolicyByThread = new Map<
+    ThreadSummary["id"],
+    RegisteredProductionExecutionPolicy
+  >();
+  readonly #productionPolicyByTurn = new Map<
+    string,
+    RegisteredProductionExecutionPolicy
+  >();
   readonly #registry: SessionRegistry;
   readonly #saturatedToolActivityAccounts = new Set<string>();
   readonly #store = new SessionStore();
@@ -787,6 +809,7 @@ export class SessionService {
         if (this.#activeRuntimeGenerations.get(accountProfileId) === state.generation) {
           this.#clearToolActivityForAccount(accountProfileId);
           this.#clearHarnessActorThreadsForAccount(accountProfileId);
+          this.#clearProductionPolicyForAccount(accountProfileId);
           this.#activeRuntimeGenerations.delete(accountProfileId);
           this.#reportedHydrationFailureGenerations.delete(accountProfileId);
         }
@@ -805,8 +828,32 @@ export class SessionService {
     this.#factDispatch.purgeAccount(accountProfileId);
     this.#clearToolActivityForAccount(accountProfileId);
     this.#clearHarnessActorThreadsForAccount(accountProfileId);
+    this.#clearProductionPolicyForAccount(accountProfileId);
     this.#reportedHydrationFailureGenerations.delete(accountProfileId);
     this.#activeRuntimeGenerations.delete(accountProfileId);
+  }
+
+  /**
+   * Narrow future steering gate: returns opaque policy evidence only for the
+   * exact active turn admitted under the current full-access generation.
+   */
+  verifiedProductionExecutionPolicyForActiveTurn(
+    threadId: ThreadSummary["id"],
+    turnId: string,
+  ): ProductionExecutionPolicyReceipt | null {
+    const thread = this.#registry.threadByOwnedId(threadId);
+    const registered = this.#productionPolicyByTurn.get(turnId);
+    if (
+      thread === null ||
+      thread.activeTurn?.id !== turnId ||
+      thread.activeTurn.status !== "active" ||
+      registered === undefined ||
+      registered.threadId !== threadId ||
+      registered.accountProfileId !== thread.accountProfileId ||
+      this.#activeRuntimeGenerations.get(thread.accountProfileId) !==
+        registered.receipt.generation
+    ) return null;
+    return registered.receipt;
   }
 
   /**
@@ -824,26 +871,28 @@ export class SessionService {
     this.#assertHarnessGeneration(request.accountProfileId, request.expectedGeneration);
     const project = await this.#registerProject(request.workspacePath);
     this.#assertHarnessGeneration(request.accountProfileId, request.expectedGeneration);
-
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      request.accountProfileId,
+      request.expectedGeneration,
+    );
+    const threadStartInput: PinnedCodexRequestInput<"threadStart"> = {
+      model: request.model,
+      allowProviderModelFallback: false,
+      serviceTier: null,
+      cwd: project.displayPath,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      config: harnessActorThreadConfig(request.reasoningEffort),
+      developerInstructions: request.developerInstructions,
+      ephemeral: false,
+      historyMode: "paginated",
+      threadSource: request.threadSource,
+    };
     const positioned = await this.#commands.threadStart(
       request.accountProfileId,
-      {
-        model: request.model,
-        allowProviderModelFallback: false,
-        serviceTier: null,
-        cwd: project.displayPath,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandbox: request.workspaceMode === "readOnly"
-          ? "read-only"
-          : "workspace-write",
-        config: harnessActorThreadConfig(request.reasoningEffort),
-        developerInstructions: request.developerInstructions,
-        ephemeral: false,
-        historyMode: "paginated",
-        threadSource: request.threadSource,
-      },
-      request.expectedGeneration,
+      threadStartInput,
+      policyProof.generation,
     );
     this.#assertHarnessGeneration(request.accountProfileId, request.expectedGeneration);
     const raw = positioned.output.thread;
@@ -866,6 +915,12 @@ export class SessionService {
         "restartRuntime",
       );
     }
+    this.#registerProductionThreadPolicy({
+      accountProfileId: request.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: threadStartInput,
+    });
 
     const threadId = ownedCodexId("thread", request.accountProfileId, raw.id);
     const existingHarness = this.#harnessActorThreadsByOwnedId.get(threadId);
@@ -1085,21 +1140,24 @@ export class SessionService {
       );
     }
 
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      request.accountProfileId,
+      request.expectedGeneration,
+    );
+    const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
+      threadId: request.providerThreadId,
+      model: request.model,
+      serviceTier: null,
+      cwd: project.displayPath,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      config: harnessActorThreadConfig(request.reasoningEffort),
+    };
     const positioned = await this.#commands.threadResume(
       request.accountProfileId,
-      {
-        threadId: request.providerThreadId,
-        model: request.model,
-        serviceTier: null,
-        cwd: project.displayPath,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandbox: request.workspaceMode === "readOnly"
-          ? "read-only"
-          : "workspace-write",
-        config: harnessActorThreadConfig(request.reasoningEffort),
-      },
-      request.expectedGeneration,
+      threadResumeInput,
+      policyProof.generation,
     );
     this.#assertHarnessGeneration(
       request.accountProfileId,
@@ -1143,6 +1201,12 @@ export class SessionService {
         "Codex resumed an actor thread with incompatible persistence settings.",
       );
     }
+    this.#registerProductionThreadPolicy({
+      accountProfileId: request.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: threadResumeInput,
+    });
     const recoveryProof = await this.#observeHarnessActorRecoveryProof({
       actorId: request.actorId,
       accountProfileId: request.accountProfileId,
@@ -1253,29 +1317,30 @@ export class SessionService {
         "none",
       );
     }
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      binding.accountProfileId,
+      request.expectedGeneration,
+    );
+    const threadReceipt = this.#requireProductionThreadPolicy(
+      registered.threadId,
+      policyProof.generation,
+    );
+    const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
+      threadId: binding.codexThreadId,
+      clientUserMessageId: request.clientUserMessageId,
+      input: [{ type: "text", text: request.prompt, text_elements: [] }],
+      cwd: binding.cwd,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
+      model: request.model,
+      effort: request.reasoningEffort,
+      serviceTier: codexServiceTier(request.serviceTier),
+    };
     const positioned = await this.#commands.turnStart(
       binding.accountProfileId,
-      {
-        threadId: binding.codexThreadId,
-        clientUserMessageId: request.clientUserMessageId,
-        input: [{ type: "text", text: request.prompt, text_elements: [] }],
-        cwd: binding.cwd,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandboxPolicy: binding.laneMode === "readOnly"
-          ? { type: "readOnly", networkAccess: false }
-          : {
-              type: "workspaceWrite",
-              writableRoots: [binding.cwd],
-              networkAccess: false,
-              excludeTmpdirEnvVar: false,
-              excludeSlashTmp: false,
-            },
-        model: request.model,
-        effort: request.reasoningEffort,
-        serviceTier: codexServiceTier(request.serviceTier),
-      },
-      request.expectedGeneration,
+      turnStartInput,
+      policyProof.generation,
     );
     this.#assertHarnessGeneration(binding.accountProfileId, request.expectedGeneration);
     if (positioned.generation !== request.expectedGeneration) {
@@ -1286,6 +1351,14 @@ export class SessionService {
         "restartRuntime",
       );
     }
+    this.#registerProductionTurnPolicy({
+      accountProfileId: binding.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: turnStartInput,
+      threadId: registered.threadId,
+      threadReceipt,
+    });
 
     const providerTurnId = positioned.output.turn.id;
     const turnId = ownedCodexId("turn", binding.accountProfileId, providerTurnId);
@@ -2240,15 +2313,23 @@ export class SessionService {
         "none",
       );
     }
-    const positioned = await this.#commands.threadResume(request.accountProfileId, {
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      request.accountProfileId,
+    );
+    const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
       threadId: request.restartThreadId,
       model: request.model,
       serviceTier: codexServiceTier(request.serviceTier),
       cwd: project.displayPath,
-      approvalPolicy: "on-request",
-      approvalsReviewer: "auto_review",
-      sandbox: "workspace-write",
-    });
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+    };
+    const positioned = await this.#commands.threadResume(
+      request.accountProfileId,
+      threadResumeInput,
+      policyProof.generation,
+    );
     const { thread: raw } = positioned.output;
     if (
       raw.id !== request.restartThreadId ||
@@ -2262,6 +2343,12 @@ export class SessionService {
         "restartRuntime",
       );
     }
+    this.#registerProductionThreadPolicy({
+      accountProfileId: request.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: threadResumeInput,
+    });
     const snapshotFacts = projectCodexThreadResponseFacts({
       accountProfileId: request.accountProfileId,
       generation: positioned.generation,
@@ -2555,11 +2642,19 @@ export class SessionService {
               fact.threadId,
               fact.turn.id,
             );
+        if (fact.turn.status !== "active") {
+          this.#productionPolicyByTurn.delete(
+            ownedCodexId("turn", fact.accountProfileId, fact.turn.id),
+          );
+        }
         this.#registry.observeTurn(binding, fact.turn.id);
         if (completion !== null) this.#publishTurnActivity(completion);
         return true;
       }
       case "turn.completed": {
+        this.#productionPolicyByTurn.delete(
+          ownedCodexId("turn", fact.accountProfileId, fact.turnId),
+        );
         const completion = this.#closeActiveToolActivity(
           fact.accountProfileId,
           fact.threadId,
@@ -2808,6 +2903,9 @@ export class SessionService {
     accountProfileId: AccountSummary['id'],
     request: CodexServerRequest,
   ): Promise<boolean> {
+    // Full-access production turns never have an approval UI. An unexpected
+    // approval request returns to the gateway's one-shot rejection path.
+    if (isProductionApprovalRequestMethod(request.method)) return false;
     const createdAt = this.#now().getTime();
     const interactionId = this.#interactions.interactionId(accountProfileId, request);
     const reference = projectSessionServerRequestActivity(request);
@@ -2987,19 +3085,30 @@ export class SessionService {
     if (project === null) {
       throw new SessionServiceError("not_found", "The dispatch workspace is unavailable.", true, "retry");
     }
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      command.accountProfileId,
+    );
+    const threadStartInput: PinnedCodexRequestInput<"threadStart"> = {
+      model: command.model,
+      serviceTier: codexServiceTier(command.serviceTier),
+      cwd: project.displayPath,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      ephemeral: false,
+    };
     const positioned = await this.#commands.threadStart(
       command.accountProfileId,
-      {
-        model: command.model,
-        serviceTier: codexServiceTier(command.serviceTier),
-        cwd: project.displayPath,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandbox: command.laneMode === "readOnly" ? "read-only" : "workspace-write",
-        ephemeral: false,
-      },
+      threadStartInput,
+      policyProof.generation,
     );
     const { thread: raw } = positioned.output;
+    this.#registerProductionThreadPolicy({
+      accountProfileId: command.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: threadStartInput,
+    });
     const snapshotFacts = projectCodexThreadResponseFacts({
       accountProfileId: command.accountProfileId,
       generation: positioned.generation,
@@ -3027,19 +3136,30 @@ export class SessionService {
 
   async #resumeThread(threadId: ThreadSummary["id"]): Promise<SessionCommandResult> {
     const binding = this.#registry.requireBinding(threadId);
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      binding.accountProfileId,
+    );
+    const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
+      threadId: binding.codexThreadId,
+      model: "gpt-5.6-sol",
+      serviceTier: null,
+      cwd: binding.cwd,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+    };
     const positioned = await this.#commands.threadResume(
       binding.accountProfileId,
-      {
-        threadId: binding.codexThreadId,
-        model: "gpt-5.6-sol",
-        serviceTier: null,
-        cwd: binding.cwd,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandbox: binding.laneMode === "readOnly" ? "read-only" : "workspace-write",
-      },
+      threadResumeInput,
+      policyProof.generation,
     );
     const { thread: raw } = positioned.output;
+    this.#registerProductionThreadPolicy({
+      accountProfileId: binding.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: threadResumeInput,
+    });
     const project = this.#registry.projectById(binding.projectId);
     const snapshotFacts = projectCodexThreadResponseFacts({
       accountProfileId: binding.accountProfileId,
@@ -3076,27 +3196,48 @@ export class SessionService {
     readonly threadId: ThreadSummary['id'];
   }): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnStart">>> {
     const binding = this.#registry.requireBinding(command.threadId);
+    const registeredThreadPolicy = this.#productionPolicyByThread.get(command.threadId);
+    if (registeredThreadPolicy === undefined) {
+      throw new SessionServiceError(
+        "conflict",
+        "The chat lacks a verified full-access thread admission.",
+        true,
+        "retry",
+      );
+    }
+    const policyProof = await this.#preflightProductionExecutionPolicy(
+      binding.accountProfileId,
+      registeredThreadPolicy.receipt.generation,
+    );
+    const threadReceipt = this.#requireProductionThreadPolicy(
+      command.threadId,
+      policyProof.generation,
+    );
+    const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
+      threadId: binding.codexThreadId,
+      clientUserMessageId: command.clientUserMessageId,
+      input: [{ type: "text", text: command.input.text, text_elements: [] }],
+      cwd: binding.cwd,
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
+      model: command.model,
+      effort: command.reasoningEffort,
+      serviceTier: codexServiceTier(command.serviceTier),
+    };
     const positioned = await this.#commands.turnStart(
       binding.accountProfileId,
-      {
-        threadId: binding.codexThreadId,
-        clientUserMessageId: command.clientUserMessageId,
-        input: [{ type: "text", text: command.input.text, text_elements: [] }],
-        cwd: binding.cwd,
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        sandboxPolicy: {
-          type: "workspaceWrite",
-          writableRoots: [binding.cwd],
-          networkAccess: false,
-          excludeTmpdirEnvVar: false,
-          excludeSlashTmp: false,
-        },
-        model: command.model,
-        effort: command.reasoningEffort,
-        serviceTier: codexServiceTier(command.serviceTier),
-      },
+      turnStartInput,
+      policyProof.generation,
     );
+    this.#registerProductionTurnPolicy({
+      accountProfileId: binding.accountProfileId,
+      proof: policyProof,
+      positioned,
+      request: turnStartInput,
+      threadId: command.threadId,
+      threadReceipt,
+    });
     const snapshotFacts = projectCodexTurnResponseFacts({
       accountProfileId: binding.accountProfileId,
       generation: positioned.generation,
@@ -3301,6 +3442,12 @@ export class SessionService {
     const removed = this.#registry.removeThread(accountProfileId, threadId);
     if (removed === null) return false;
     this.#harnessActorThreadsByOwnedId.delete(removed.thread.id);
+    this.#productionPolicyByThread.delete(removed.thread.id);
+    for (const [turnId, registered] of this.#productionPolicyByTurn) {
+      if (registered.threadId === removed.thread.id) {
+        this.#productionPolicyByTurn.delete(turnId);
+      }
+    }
     if (removed.binding !== null) {
       const binding = removed.binding;
       const prefix = activeToolThreadPrefix(accountProfileId, binding.codexThreadId);
@@ -3322,6 +3469,7 @@ export class SessionService {
     if (this.#activeRuntimeGenerations.get(accountProfileId) !== generation) {
       this.#clearToolActivityForAccount(accountProfileId);
       this.#clearHarnessActorThreadsForAccount(accountProfileId);
+      this.#clearProductionPolicyForAccount(accountProfileId);
       this.#reportedHydrationFailureGenerations.delete(accountProfileId);
     }
     this.#activeRuntimeGenerations.set(accountProfileId, generation);
@@ -3360,6 +3508,19 @@ export class SessionService {
     for (const [threadId, registered] of this.#harnessActorThreadsByOwnedId) {
       if (registered.accountProfileId === accountProfileId) {
         this.#harnessActorThreadsByOwnedId.delete(threadId);
+      }
+    }
+  }
+
+  #clearProductionPolicyForAccount(accountProfileId: string): void {
+    for (const [threadId, registered] of this.#productionPolicyByThread) {
+      if (registered.accountProfileId === accountProfileId) {
+        this.#productionPolicyByThread.delete(threadId);
+      }
+    }
+    for (const [turnId, registered] of this.#productionPolicyByTurn) {
+      if (registered.accountProfileId === accountProfileId) {
+        this.#productionPolicyByTurn.delete(turnId);
       }
     }
   }
@@ -3483,6 +3644,150 @@ export class SessionService {
       historyTurnCount,
       historyItemCount,
     });
+  }
+
+  async #preflightProductionExecutionPolicy(
+    accountProfileId: AccountSummary["id"],
+    expectedGeneration?: number,
+  ): Promise<ProductionExecutionPolicyProof> {
+    const positioned = await this.#commands.configRequirementsRead(
+      accountProfileId,
+      expectedGeneration,
+    );
+    if (
+      expectedGeneration !== undefined &&
+      positioned.generation !== expectedGeneration
+    ) {
+      throw new SessionServiceError(
+        "conflict",
+        "The Codex runtime generation changed before execution admission.",
+        true,
+        "retry",
+      );
+    }
+    try {
+      return verifyProductionExecutionPolicyRequirements({
+        generation: positioned.generation,
+        streamPosition: positioned.streamPosition,
+        output: positioned.output,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof ProductionExecutionPolicyError &&
+        error.reason === "managed_requirements_rejected_policy"
+      ) {
+        throw new SessionServiceError(
+          "capability_unavailable",
+          "This Codex profile does not permit HRA's required full-access policy.",
+          false,
+          "none",
+        );
+      }
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex returned invalid production-policy requirements.",
+        false,
+        "restartRuntime",
+      );
+    }
+  }
+
+  #registerProductionThreadPolicy(input: Readonly<{
+    readonly accountProfileId: AccountSummary["id"];
+    readonly proof: ProductionExecutionPolicyProof;
+    readonly positioned: PinnedCodexResponseAtPosition<
+      PinnedCodexRequestOutput<"threadStart">
+    >;
+    readonly request:
+      | PinnedCodexRequestInput<"threadStart">
+      | PinnedCodexRequestInput<"threadResume">;
+  }>): ProductionExecutionPolicyReceipt {
+    let receipt: ProductionExecutionPolicyReceipt;
+    try {
+      receipt = verifyProductionThreadAdmission({
+        proof: input.proof,
+        generation: input.positioned.generation,
+        streamPosition: input.positioned.streamPosition,
+        request: input.request,
+        response: input.positioned.output,
+      });
+    } catch {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex did not preserve HRA's required full-access thread policy.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const threadId = ownedCodexId(
+      "thread",
+      input.accountProfileId,
+      input.positioned.output.thread.id,
+    );
+    this.#productionPolicyByThread.set(threadId, Object.freeze({
+      accountProfileId: input.accountProfileId,
+      receipt,
+      threadId,
+    }));
+    return receipt;
+  }
+
+  #requireProductionThreadPolicy(
+    threadId: ThreadSummary["id"],
+    generation: number,
+  ): ProductionExecutionPolicyReceipt {
+    const registered = this.#productionPolicyByThread.get(threadId);
+    if (
+      registered === undefined ||
+      registered.receipt.generation !== generation ||
+      this.#activeRuntimeGenerations.get(registered.accountProfileId) !== generation
+    ) {
+      throw new SessionServiceError(
+        "conflict",
+        "The chat's verified full-access admission is no longer active.",
+        true,
+        "retry",
+      );
+    }
+    return registered.receipt;
+  }
+
+  #registerProductionTurnPolicy(input: Readonly<{
+    readonly accountProfileId: AccountSummary["id"];
+    readonly proof: ProductionExecutionPolicyProof;
+    readonly positioned: PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnStart">>;
+    readonly request: PinnedCodexRequestInput<"turnStart">;
+    readonly threadId: ThreadSummary["id"];
+    readonly threadReceipt: ProductionExecutionPolicyReceipt;
+  }>): ProductionExecutionPolicyReceipt {
+    let receipt: ProductionExecutionPolicyReceipt;
+    try {
+      receipt = verifyProductionTurnAdmission({
+        proof: input.proof,
+        threadReceipt: input.threadReceipt,
+        generation: input.positioned.generation,
+        streamPosition: input.positioned.streamPosition,
+        request: input.request,
+      });
+    } catch {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex did not preserve HRA's required full-access turn policy.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const turnId = ownedCodexId(
+      "turn",
+      input.accountProfileId,
+      input.positioned.output.turn.id,
+    );
+    this.#productionPolicyByTurn.set(turnId, Object.freeze({
+      accountProfileId: input.accountProfileId,
+      receipt,
+      threadId: input.threadId,
+    }));
+    return receipt;
   }
 
   #assertHarnessGeneration(accountProfileId: string, expectedGeneration: number): void {

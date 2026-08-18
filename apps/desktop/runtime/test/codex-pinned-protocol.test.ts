@@ -70,6 +70,15 @@ const pinnedThreadAdmissionProfile = Object.freeze({
   model: "gpt-5.6-sol",
   reasoningEffort: "ultra",
   serviceTier: null,
+  approvalPolicy: "on-request",
+  approvalsReviewer: "user",
+  sandbox: Object.freeze({
+    type: "workspaceWrite" as const,
+    writableRoots: ["/tmp/oprte-worktree"],
+    networkAccess: false,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  }),
 });
 
 const codecCases: readonly CodecCase[] = [
@@ -411,6 +420,25 @@ const codecCases: readonly CodecCase[] = [
     },
   },
   {
+    key: "configRequirementsRead",
+    input: undefined,
+    invalidInput: {},
+    output: {
+      requirements: {
+        allowedApprovalPolicies: ["never"],
+        allowedApprovalsReviewers: ["auto_review"],
+        allowedSandboxModes: ["danger-full-access"],
+      },
+    },
+    invalidOutput: {
+      requirements: {
+        allowedApprovalPolicies: ["always"],
+        allowedApprovalsReviewers: ["auto_review"],
+        allowedSandboxModes: ["danger-full-access"],
+      },
+    },
+  },
+  {
     key: "turnStart",
     input: {
       threadId: "thread-1",
@@ -451,8 +479,8 @@ const codecCases: readonly CodecCase[] = [
 ];
 
 describe("pinned Codex request registry", () => {
-  test("closes all twenty-four operations with internally consistent policy", () => {
-    expect(Object.keys(pinnedCodexRequests)).toHaveLength(24);
+  test("closes all twenty-five operations with internally consistent policy", () => {
+    expect(Object.keys(pinnedCodexRequests)).toHaveLength(25);
     for (const { key } of codecCases) {
       const selected = pinnedCodexRequests[key];
       expect(selected.key).toBe(key);
