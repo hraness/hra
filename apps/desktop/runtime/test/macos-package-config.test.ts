@@ -13,8 +13,10 @@ import { join } from "node:path";
 import { consumeUtf8Lines, correspondingSourceSpecs } from "../corresponding-sources";
 import {
   hranessUiStylesheetInput,
+  imageNormalizerPackageContract,
   macosPackage,
   requiredLicenseFileNames,
+  requiredRuntimeBinFileNames,
   trustedThirdPartyTeams,
 } from "../macos-package-config";
 import runtimeVersions from "../runtime-versions.json";
@@ -116,6 +118,50 @@ describe("macOS ad-hoc package contract", () => {
     expect(requiredLicenseFileNames).toContain("SHIPPED-JAVASCRIPT-LICENSES.json");
     expect(requiredLicenseFileNames).toContain("SHIPPED-JAVASCRIPT-LICENSES.txt");
     expect(requiredLicenseFileNames).not.toContain("SPARKLE-LICENSE.txt");
+  });
+
+  test("keeps the signed runtime executable set exact and sorted", () => {
+    const names: readonly string[] = requiredRuntimeBinFileNames;
+    expect(names).toEqual([...new Set(names)].sort());
+    expect(names).toContain("hra-image-normalizer");
+    expect(names).toContain("oprte-gateway");
+    expect(imageNormalizerPackageContract).toEqual({
+      canonicalFileName: "canonical.png",
+      identifier: "hra-image-normalizer",
+      previewFileName: "preview.png",
+      runtimeRelativePath: "bin/hra-image-normalizer",
+      sourceRelativePath: "zig-out/bin/hra-image-normalizer",
+      temporaryDirectoryPattern:
+        /^\.hra-image-normalizer-[0-9a-f]{32}\.tmp$/u,
+    });
+    expect(imageNormalizerPackageContract.temporaryDirectoryPattern.test(
+      ".hra-image-normalizer-0123456789abcdef0123456789abcdef.tmp",
+    )).toBe(true);
+    expect(imageNormalizerPackageContract.temporaryDirectoryPattern.test(
+      ".hra-image-normalizer-0123456789ABCDEF0123456789ABCDEF.tmp",
+    )).toBe(false);
+  });
+
+  test("carries the image normalizer through build, manifest, and mounted strict verification", async () => {
+    const [buildGraph, assembler, verifier] = await Promise.all([
+      readFile(join(import.meta.dir, "../../build.zig"), "utf8"),
+      readFile(join(import.meta.dir, "../package-macos.ts"), "utf8"),
+      readFile(join(import.meta.dir, "../verify-macos-package.ts"), "utf8"),
+    ]);
+    expect(buildGraph).toContain("const package_image_normalizer");
+    expect(buildGraph).toContain("addImageNormalizer(b, target, package_optimize)");
+    expect(buildGraph).toContain('.name = "hra-image-normalizer"');
+    expect(buildGraph).toContain('helper_mod.linkFramework("CoreGraphics", .{})');
+    expect(buildGraph).toContain('helper_mod.linkFramework("ImageIO", .{})');
+    expect(assembler).toContain("imageNormalizerPackageContract.sourceRelativePath");
+    expect(assembler).toContain("identifier: imageNormalizerPackageContract.identifier");
+    expect(assembler).toContain("imageNormalizer: {");
+    expect(assembler).toContain("cdHash: imageNormalizerSignature.cdHash");
+    expect(verifier).toContain("Image normalizer CodeDirectory hash differs");
+    expect(verifier).toContain("Image normalizer must not carry entitlements");
+    expect(verifier).toContain("Image normalizer must not import network operations");
+    expect(verifier).toContain('["/usr/bin/codesign", "--verify", "--strict", imageNormalizerPath]');
+    expect(verifier).toContain("evidence = await verifyMacOSApp(mountedApp)");
   });
 
   test("requires every declared release entry to be a regular file", async () => {

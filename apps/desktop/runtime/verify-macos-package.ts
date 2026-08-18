@@ -25,8 +25,10 @@ import {
 } from "./corresponding-sources";
 import {
   hranessUiStylesheetInput,
+  imageNormalizerPackageContract,
   macosPackage,
   requiredLicenseFileNames,
+  requiredRuntimeBinFileNames,
   trustedThirdPartyTeams,
 } from "./macos-package-config";
 import { loadGcmDependencyLicenseInventory } from "./gcm-dependency-licenses";
@@ -56,13 +58,6 @@ type MacOSAppEvidence = Readonly<{
   runtimeManifest: unknown;
   treeSha256: string;
 }>;
-
-const expectedBins = Object.freeze([
-  "oprte-data-remover",
-  "oprte-gateway",
-  "oprte-git-executor",
-  "oprte-keychain-custodian",
-]);
 
 function inside(root: string, path: string): boolean {
   const fromRoot = relative(root, path);
@@ -255,6 +250,7 @@ async function verifyRuntimeManifest(
   const gateway = record(runtime["gateway"], "runtime gateway");
   const dataRemover = record(runtime["dataRemover"], "runtime data remover");
   const gitExecutor = record(runtime["gitExecutor"], "runtime Git executor");
+  const imageNormalizer = record(runtime["imageNormalizer"], "runtime image normalizer");
   const keychainCustodian = record(runtime["keychainCustodian"], "runtime Keychain custodian");
   const codex = record(runtime["codex"], "runtime Codex");
   const git = record(runtime["git"], "runtime Git");
@@ -265,6 +261,10 @@ async function verifyRuntimeManifest(
   const gitLfs = record(runtime["gitLfs"], "runtime Git LFS");
   const ripgrep = record(runtime["ripgrep"], "runtime ripgrep");
   const expectedHashes = new Map([
+    [
+      imageNormalizerPackageContract.runtimeRelativePath,
+      string(imageNormalizer["sha256"], "image normalizer SHA-256"),
+    ],
     ["bin/oprte-gateway", string(gateway["sha256"], "gateway SHA-256")],
     ["bin/oprte-data-remover", string(dataRemover["sha256"], "data remover SHA-256")],
     ["bin/oprte-git-executor", string(gitExecutor["sha256"], "Git executor SHA-256")],
@@ -329,6 +329,12 @@ async function verifyRuntimeManifest(
   const dataRemoverSignature = await codeSignature(join(runtimeRoot, "bin/oprte-data-remover"));
   if (dataRemover["cdHash"] !== dataRemoverSignature.cdHash) {
     throw new Error("Data remover CodeDirectory hash differs from the manifest.");
+  }
+  const imageNormalizerSignature = await codeSignature(
+    join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+  );
+  if (imageNormalizer["cdHash"] !== imageNormalizerSignature.cdHash) {
+    throw new Error("Image normalizer CodeDirectory hash differs from the manifest.");
   }
   const preserved = runtime["preservedSignatures"];
   if (!Array.isArray(preserved) || preserved.length === 0) {
@@ -407,7 +413,7 @@ export async function verifyMacOSApp(
   }
 
   const bins = (await readdir(join(runtimeRoot, "bin"))).sort();
-  if (JSON.stringify(bins) !== JSON.stringify([...expectedBins])) {
+  if (JSON.stringify(bins) !== JSON.stringify([...requiredRuntimeBinFileNames])) {
     throw new Error(`Runtime bin set differs: ${bins.join(", ")}`);
   }
   const licenses = (await readdir(join(runtimeRoot, "licenses"))).sort();
@@ -497,6 +503,39 @@ export async function verifyMacOSApp(
   const custodian = await codeSignature(join(runtimeRoot, "bin/oprte-keychain-custodian"));
   if (custodian.identifier !== "oprte-keychain-custodian") {
     throw new Error("Keychain custodian code identifier differs.");
+  }
+  const imageNormalizerPath = join(
+    runtimeRoot,
+    imageNormalizerPackageContract.runtimeRelativePath,
+  );
+  const imageNormalizer = await codeSignature(imageNormalizerPath);
+  if (
+    imageNormalizer.identifier !== imageNormalizerPackageContract.identifier
+    || imageNormalizer.teamIdentifier !== null
+  ) {
+    throw new Error("Image normalizer code identity differs.");
+  }
+  await run(["/usr/bin/codesign", "--verify", "--strict", imageNormalizerPath]);
+  const imageNormalizerEntitlements = await run([
+    "/usr/bin/codesign",
+    "--display",
+    "--entitlements",
+    ":-",
+    imageNormalizerPath,
+  ], { allowFailure: true });
+  if (/<key>/u.test(
+    `${imageNormalizerEntitlements.stdout}\n${imageNormalizerEntitlements.stderr}`,
+  )) {
+    throw new Error("Image normalizer must not carry entitlements.");
+  }
+  const imageNormalizerImports = await run([
+    "/usr/bin/nm",
+    "-u",
+    imageNormalizerPath,
+  ]);
+  if (/^_(?:accept|bind|connect|getaddrinfo|listen|recv(?:from|msg)?|send(?:file|msg|to)?|socket|socketpair)$/mu
+    .test(imageNormalizerImports.stdout)) {
+    throw new Error("Image normalizer must not import network operations.");
   }
   const gateway = await codeSignature(join(runtimeRoot, "bin/oprte-gateway"));
   if (gateway.identifier !== "oprte-gateway") {
