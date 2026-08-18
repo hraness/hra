@@ -80,6 +80,7 @@ import {
 } from "./host-protocol";
 import {
   DevelopmentReloadAdmission,
+  hasAuthoritativeDevelopmentReloadWork,
   hostDevelopmentReloadCommand,
   hostDevelopmentReloadDecision,
   parseRuntimeBridgeProfile,
@@ -2332,6 +2333,14 @@ async function initializeGateway(): Promise<void> {
       runtimes: router,
       sessions: initializedSessionService,
       keyCustody: initializingHarnessKeyCustody,
+      isForegroundIdle: () => ordinaryHostRequestsInFlight === 0
+        && !developmentReloadHasInMemoryWork()
+        && !hasAuthoritativeDevelopmentReloadWork(chatControlPlane),
+      onShadowRoutingAnalysisFault: () => {
+        process.stderr.write(
+          "[hra-routing-shadow] analysis failed; evidence remains pending\n",
+        );
+      },
       onActorSessionRecoveryFatalFailure: requestGatewayGenerationRecovery,
       createChat: ({ harnessActors, harnessRoots }) => new ChatService({
         accounts: {

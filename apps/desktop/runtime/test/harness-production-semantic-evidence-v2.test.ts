@@ -251,6 +251,8 @@ describe("production semantic evidence ingress v2", () => {
         repositories: inert as HarnessProductionGraphV2Options["repositories"],
         runtimes: inert as HarnessProductionGraphV2Options["runtimes"],
         sessions: inert as HarnessProductionGraphV2Options["sessions"],
+        isForegroundIdle: () => true,
+        onShadowRoutingAnalysisFault: () => undefined,
         onActorSessionRecoveryFatalFailure: () => undefined,
         createChat: () => inert as ChatService,
       });

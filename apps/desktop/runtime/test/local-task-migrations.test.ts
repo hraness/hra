@@ -351,6 +351,10 @@ describe("local task SQLite migrations", () => {
             version: 43,
             name: "terminalize-provider-quota-without-history-replay",
           },
+          {
+            version: 44,
+            name: "longitudinal-routing-shadow-memory",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -368,6 +372,11 @@ describe("local task SQLite migrations", () => {
         "chat_panes",
         "chat_turn_receipts",
         "harness_actor_account_leases",
+        "harness_longitudinal_routing_analyses",
+        "harness_longitudinal_routing_arm_stats",
+        "harness_longitudinal_routing_observations",
+        "harness_longitudinal_routing_pane_heads",
+        "harness_longitudinal_routing_usage_current",
         "harness_actor_epochs",
         "harness_actor_fast_reservations",
         "harness_actor_incarnations",

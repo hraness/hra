@@ -35,6 +35,7 @@ export function persistentActorInstructions(
     persistentActorDelegationPolicy(workClass),
     policy.schemaBoundary,
     policy.handleGuidance,
+    policy.routingGuidance,
     policy.completionGuidance,
   ].join("\n");
 }

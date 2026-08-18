@@ -55,7 +55,45 @@ or token-cost claim before held-out evaluation.
 - **Continuity is part of routing.** Actor lineage, bounded visible history,
   stable context references, and cache-compatible instruction prefixes are
   retained across turns where the provider supports them. HRA records the
-  requested and observed profile so a recovery can prove what actually ran.
+  requested execution profile and the requested and realized service tier. It
+  does not yet claim observed provider-profile compliance.
+
+## Longitudinal routing
+
+**Current v1 shadow memory.** Migration v44 attributes content-free recursive
+actor results to the durable ordinary `pane_id`, so one long-lived pane can
+accumulate routing evidence across process restarts, provider-thread changes,
+and source-SHA actor epochs. The read model groups outcomes by work class,
+requested execution profile, requested service tier, and realized service tier.
+That keeps a direct Standard request separate from a Fast request that fell
+back to Standard. The model-visible arm field is `requestedProfile`, which is
+routing intent rather than observed provider compliance. It reports exact token
+dimensions when positioned actor evidence exists, marks missing dimensions
+explicitly, and exposes at most 32 route arms through the read-only
+`routing.inspect {}` operation. Every response carries bounded coverage
+literals stating that it includes recursive actor outcomes only and excludes
+ordinary root-turn spend. It never returns pane, actor, provider, account,
+repository, path, content, or timestamp identity.
+
+A local shadow analyzer starts only after durable recovery. While foreground
+work is idle, one unref'd timer tick materializes at most one dirty pane and
+writes an immutable receipt for that exact observation revision. Its keyset
+cursor advances before inspection, so one malformed pane cannot starve later
+panes. Faults leave evidence pending and emit only a fixed content-free
+diagnostic. It has no
+model, provider, proposal, account, filesystem, network, Git, or policy port.
+An agent may consult the descriptive memory before choosing an existing work
+class or Fast intent, but current pane settings, account ranking, work-class
+routing, and Fast admission remain authoritative. User intent wins.
+
+This evidence is not whole-pane spend. Ordinary root Codex turns do not yet
+have the positioned cumulative usage, reroute, and restart receipts needed for
+honest attribution, so v1 reports recursive actor work only. Operational
+completion is not quality evidence. Until separately accepted quality evidence
+exists, the shadow recommendation is always null. The Phase 0 optimizer and
+immutable Suggest proposals still have no dispatch, provider, or rollout
+authority. Any live activation or successor-incarnation adaptation requires a
+later design with evaluation, explicit authorization, canary, and rollback.
 
 ## Accepted v1 behavior
 

@@ -47,6 +47,7 @@ const replayClasses: Readonly<Record<
   "agent.waitAll": "cancelableWait",
   "agent.result": "idempotentLocalMutation",
   "agent.cancel": "reconciledExternalMutation",
+  "routing.inspect": "pureRead",
   "harness.propose": "idempotentLocalMutation",
 };
 
@@ -530,6 +531,76 @@ describe("RLM v2 durable run authority", () => {
           replayClass: "idempotentLocalMutation",
         }),
       ]);
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("stores routing inspection through an unambiguous additive receipt alias", () => {
+    const value = fixture();
+    try {
+      const prepared = value.authority.prepareRun(admission({
+        capabilities: ["agent.wait", "routing.inspect"],
+      }));
+      value.authority.transitionRun({
+        runId,
+        expectedRevision: prepared.revision,
+        expectedState: "prepared",
+        nextState: "running",
+        now: later,
+      });
+      const routingPath = [["step", 90]] as const;
+      const routing = value.authority.prepareReceipt({
+        id: receiptId(routingPath),
+        runId,
+        nodePath: routingPath,
+        operation: "routing.inspect",
+        requestDigest: digest,
+        effectKey: otherDigest,
+        createdAt: later,
+      });
+      expect(routing).toMatchObject({
+        operation: "routing.inspect",
+        replayClass: "pureRead",
+      });
+      expect(value.database.query(`
+        SELECT operation, semantic_operation
+        FROM harness_program_operation_receipts WHERE receipt_id = ?1
+      `).get(routing.id)).toEqual({
+        operation: "agent.status",
+        semantic_operation: "routing.inspect",
+      });
+      expectAuthorityCode(() => value.authority.prepareReceipt({
+        id: routing.id,
+        runId,
+        nodePath: routingPath,
+        operation: "agent.status",
+        requestDigest: digest,
+        effectKey: otherDigest,
+        createdAt: later,
+      }), "conflict");
+
+      const statusPath = [["step", 91]] as const;
+      const status = value.authority.prepareReceipt({
+        id: receiptId(statusPath),
+        runId,
+        nodePath: statusPath,
+        operation: "agent.status",
+        requestDigest: digest,
+        effectKey: otherDigest,
+        createdAt: later,
+      });
+      expect(status.operation).toBe("agent.status");
+      expect(value.database.query(`
+        SELECT operation, semantic_operation
+        FROM harness_program_operation_receipts WHERE receipt_id = ?1
+      `).get(status.id)).toEqual({
+        operation: "agent.status",
+        semantic_operation: null,
+      });
+      expect(value.authority.listRecoverableReceipts({ limit: 10 }).map(
+        ({ operation }) => operation,
+      ).toSorted()).toEqual(["agent.status", "routing.inspect"]);
     } finally {
       value.database.close();
     }

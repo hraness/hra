@@ -15,6 +15,7 @@ export const persistentActorInstructionPolicySchema = z.object({
   toolBoundary: boundedInstructionSchema,
   schemaBoundary: boundedInstructionSchema,
   handleGuidance: boundedInstructionSchema,
+  routingGuidance: boundedInstructionSchema,
   completionGuidance: boundedInstructionSchema,
 }).strict();
 

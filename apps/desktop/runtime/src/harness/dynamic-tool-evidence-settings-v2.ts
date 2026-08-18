@@ -4,7 +4,10 @@ import type { Database } from "bun:sqlite";
 import { z } from "@hra-internal/schema";
 
 import type { AccountRuntimeRouter } from "../accounts/runtime-router";
-import { HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256 } from "../codex";
+import {
+  HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
+  classifyHraRlmDynamicToolSpecDigest,
+} from "../codex";
 import { hraReleaseIdentity } from "../../release-identity";
 import {
   actorIdSchema,
@@ -38,6 +41,7 @@ const runtimeOwnerSchema = z.object({
   accountProfileId: accountProfileIdSchema,
   admissionGeneration: positiveSafeIntegerSchema,
   liveGeneration: positiveSafeIntegerSchema,
+  toolsetDigest: digestSchema,
 }).strict();
 
 const rootOwnerRowSchema = z.object({
@@ -49,6 +53,7 @@ const nestedOwnerRowSchema = z.object({
   account_profile_id: accountProfileIdSchema,
   process_generation: positiveSafeIntegerSchema,
   provider_thread_id: z.string().min(1).max(512),
+  toolset_digest: digestSchema,
 }).strict();
 
 const capabilitySchema = z.object({
@@ -183,13 +188,16 @@ export class HarnessDynamicToolEvidenceSettingsAuthorityV2
         : []),
       "heap.read",
       "heap.write",
+      ...(owner.toolsetDigest === HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256
+        ? ["routing.inspect"]
+        : []),
     ].toSorted();
     const releaseIdentityDigest = digestCanonical({
       domain: "oprte.harness.release-identity.v2",
       build: hraReleaseIdentity.build,
       codexBinarySha256: capability.data.runtimeBinarySha256,
       codexVersion: HARNESS_PINNED_CODEX_VERSION,
-      dynamicToolSpecSha256: HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
+      dynamicToolSpecSha256: owner.toolsetDigest,
       version: hraReleaseIdentity.version,
     });
     // Preserve promise rejection semantics for the stable-caller port while
@@ -260,6 +268,7 @@ export class HarnessDynamicToolEvidenceSettingsAuthorityV2
         accountProfileId: row.account_profile_id,
         admissionGeneration: generation,
         liveGeneration: generation,
+        toolsetDigest: HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
       });
     }
 
@@ -267,7 +276,8 @@ export class HarnessDynamicToolEvidenceSettingsAuthorityV2
       SELECT incarnation.incarnation_id AS incarnation_id,
         incarnation.account_profile_id AS account_profile_id,
         incarnation.process_generation AS process_generation,
-        incarnation.provider_thread_id AS provider_thread_id
+        incarnation.provider_thread_id AS provider_thread_id,
+        incarnation.toolset_digest AS toolset_digest
       FROM harness_actor_turn_attempts AS attempt
       JOIN harness_actor_incarnations AS incarnation
         ON incarnation.incarnation_id = attempt.incarnation_id
@@ -279,6 +289,10 @@ export class HarnessDynamicToolEvidenceSettingsAuthorityV2
     `).all(turnId, actor.id);
     if (rows.length !== 1) ownerFailure(rows.length);
     const row = nestedOwnerRowSchema.parse(rows[0]);
+    if (
+      classifyHraRlmDynamicToolSpecDigest(row.toolset_digest, "recovery") ===
+        null
+    ) unavailable("the nested actor tool contract is not recognized");
     const session = this.#actors.readActorSessionBinding(row.incarnation_id);
     if (
       session === null || session.state !== "bound" ||
@@ -292,6 +306,7 @@ export class HarnessDynamicToolEvidenceSettingsAuthorityV2
       accountProfileId: row.account_profile_id,
       admissionGeneration: row.process_generation,
       liveGeneration: session.liveGeneration,
+      toolsetDigest: row.toolset_digest,
     });
   }
 }

@@ -67,6 +67,7 @@ export const rlmV2CapabilitySchema = z.enum([
   "agent.message",
   "agent.wait",
   "agent.cancel",
+  "routing.inspect",
   "harness.propose",
 ]);
 
@@ -98,6 +99,7 @@ export const rlmV2OperationSchema = z.enum([
   "agent.waitAll",
   "agent.result",
   "agent.cancel",
+  "routing.inspect",
   "harness.propose",
 ]);
 
@@ -1210,6 +1212,8 @@ export function capabilityForRlmV2Operation(operation: RlmV2Operation): RlmV2Cap
       return "agent.wait";
     case "agent.cancel":
       return "agent.cancel";
+    case "routing.inspect":
+      return "routing.inspect";
     case "harness.propose":
       return "harness.propose";
   }

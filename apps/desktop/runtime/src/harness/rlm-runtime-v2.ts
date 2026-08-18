@@ -1656,6 +1656,8 @@ function operationCapability(operation: RlmV2Operation): RlmRunRecord["capabilit
       return "agent.wait";
     case "agent.cancel":
       return "agent.cancel";
+    case "routing.inspect":
+      return "routing.inspect";
     case "harness.propose":
       return "harness.propose";
   }

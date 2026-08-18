@@ -631,10 +631,18 @@ function settingsFitCaller(
   const actorBudget = live.stable.actor.budget;
   const budget = settings.budget;
   const features = baseLocalFeatures(settings);
+  const currentCapabilities = features === null
+    ? null
+    : baseLocalCapabilities(features, true);
+  const predecessorCapabilities = features === null
+    ? null
+    : baseLocalCapabilities(features, false);
   return features !== null &&
     exactJson(settings.admittedFeatures) === exactJson(features) &&
-    exactJson(settings.capabilities) ===
-      exactJson(baseLocalCapabilities(features)) &&
+    (
+      exactJson(settings.capabilities) === exactJson(currentCapabilities) ||
+      exactJson(settings.capabilities) === exactJson(predecessorCapabilities)
+    ) &&
     settings.semanticWitnessDigests.length === 1 &&
     Date.parse(budget.deadline) > nowMs &&
     budget.depthRemaining === actorBudget.maxDepth - live.stable.actor.depth &&
@@ -668,6 +676,7 @@ function baseLocalFeatures(
 
 function baseLocalCapabilities(
   features: readonly HarnessFeature[],
+  routingInspection: boolean,
 ): readonly RlmV2Capability[] {
   const capabilities: RlmV2Capability[] = [
     "agent.cancel",
@@ -679,6 +688,7 @@ function baseLocalCapabilities(
       : []),
     "heap.read",
     "heap.write",
+    ...(routingInspection ? ["routing.inspect" as const] : []),
   ];
   return Object.freeze(capabilities.toSorted());
 }
