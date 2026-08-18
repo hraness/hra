@@ -71,16 +71,22 @@ const expectedPredecessor = Object.freeze({
   version: "0.1.4",
 });
 const expectedCandidate = Object.freeze({
-  build: "9",
+  build: "10",
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
-  version: "0.1.8",
+  version: "0.1.9",
 });
-const expectedPriorHra = Object.freeze({
+const expectedPriorHraV017 = Object.freeze({
   build: "8",
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
   version: "0.1.7",
+});
+const expectedPriorHraV018 = Object.freeze({
+  build: "9",
+  bundleIdentifier: "kitchen.hraness",
+  executable: "hra",
+  version: "0.1.8",
 });
 const maximumTreeEntries = 2_000_000;
 const maximumTreeBytes = 128 * 1024 * 1024 * 1024;
@@ -1443,8 +1449,8 @@ function assertBundleIdentity(
 
 function assertSupportedPriorHraIdentity(actual: BundleIdentity): void {
   if (
-    JSON.stringify(actual) !== JSON.stringify(expectedPriorHra)
-    && JSON.stringify(actual) !== JSON.stringify(expectedCandidate)
+    JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV017)
+    && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV018)
   ) {
     throw new InstallationHandoffError(
       "candidate_invalid",
@@ -1849,8 +1855,8 @@ const bundleEvidenceSchema = (identity: BundleIdentity) => z.object({
   tree: treeEvidenceSchema,
 }).strict();
 const priorHraEvidenceSchema = z.union([
-  bundleEvidenceSchema(expectedPriorHra),
-  bundleEvidenceSchema(expectedCandidate),
+  bundleEvidenceSchema(expectedPriorHraV017),
+  bundleEvidenceSchema(expectedPriorHraV018),
 ]);
 const keychainDescriptorSchema = z.string().max(2048).refine(value => {
   const separator = value.indexOf("\u0000");

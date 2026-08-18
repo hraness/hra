@@ -256,18 +256,18 @@ describe("hermetic release provenance", () => {
       environment: {},
       repositoryRoot,
     });
-    expect(await inspectReleaseTag(repository, "v0.1.8")).toBeNull();
+    expect(await inspectReleaseTag(repository, "v9.8.7")).toBeNull();
 
-    await runSetupGit(repositoryRoot, ["tag", "-a", "v0.1.8", "-m", "candidate"]);
+    await runSetupGit(repositoryRoot, ["tag", "-a", "v9.8.7", "-m", "candidate"]);
     const taggedRepository = await inspectReleaseSourceRepository({
       environment: {},
       repositoryRoot,
     });
-    const tag = await inspectReleaseTag(taggedRepository, "v0.1.8");
+    const tag = await inspectReleaseTag(taggedRepository, "v9.8.7");
     expect(tag).toMatchObject({
       commit: taggedRepository.commit,
       objectType: "tag",
-      tag: "v0.1.8",
+      tag: "v9.8.7",
     });
     expect(tag?.object).toMatch(/^[0-9a-f]{40}$/u);
   });
@@ -284,7 +284,7 @@ describe("hermetic release provenance", () => {
     await runSetupGit(repositoryRoot, [
       "tag",
       "-a",
-      "v0.1.8",
+      "v9.8.7",
       "candidate-object",
       "-m",
       "nested release tag",
@@ -294,7 +294,7 @@ describe("hermetic release provenance", () => {
       repositoryRoot,
     });
     await expectRejection(
-      inspectReleaseTag(repository, "v0.1.8"),
+      inspectReleaseTag(repository, "v9.8.7"),
       "point directly to the candidate commit",
     );
   });

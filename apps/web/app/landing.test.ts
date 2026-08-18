@@ -78,26 +78,38 @@ describe("HRA public landing", () => {
   test("pins the exact honest native prerelease contract", async () => {
     const download = await source("./download/page.tsx");
 
-    expect(HRA_RELEASE).toEqual({
+    expect(HRA_RELEASE).toMatchObject({
       architecture: "Apple Silicon",
-      asset: "HRA-0.1.8-9-macos-arm64.dmg",
-      availability: "candidate",
-      build: 9,
-      checksumAsset: "HRA-0.1.8-9-macos-arm64.dmg.sha256",
-      manifestAsset: "HRA-0.1.8-9-release-manifest.json",
+      asset: "HRA-0.1.9-10-macos-arm64.dmg",
+      build: 10,
+      checksumAsset: "HRA-0.1.9-10-macos-arm64.dmg.sha256",
+      manifestAsset: "HRA-0.1.9-10-release-manifest.json",
       minimumMacOS: "13",
       repository: "https://github.com/hraness/hra",
-      source: {
+      tag: "v0.1.9",
+      version: "0.1.9",
+    });
+    if (HRA_RELEASE.availability === "candidate") {
+      expect(HRA_RELEASE.source).toEqual({
         commit: null,
         runtimeTreeSha256: null,
         tagObject: null,
-      },
-      tag: "v0.1.8",
-      version: "0.1.8",
-    });
-    expect(HRA_RELEASE_URL).toBeNull();
-    expect(HRA_RELEASE_CHECKSUM_URL).toBeNull();
-    expect(HRA_RELEASE_MANIFEST_URL).toBeNull();
+      });
+      expect(HRA_RELEASE_URL).toBeNull();
+      expect(HRA_RELEASE_CHECKSUM_URL).toBeNull();
+      expect(HRA_RELEASE_MANIFEST_URL).toBeNull();
+    } else {
+      expect(HRA_RELEASE.source.commit).toMatch(/^[0-9a-f]{40}$/u);
+      expect(HRA_RELEASE.source.runtimeTreeSha256).toMatch(/^[0-9a-f]{64}$/u);
+      expect(HRA_RELEASE.source.tagObject).toMatch(/^[0-9a-f]{40}$/u);
+      expect(HRA_RELEASE_URL).toBe(
+        "https://github.com/hraness/hra/releases/download/v0.1.9/HRA-0.1.9-10-macos-arm64.dmg",
+      );
+      expect(HRA_RELEASE_CHECKSUM_URL).toBe(`${HRA_RELEASE_URL}.sha256`);
+      expect(HRA_RELEASE_MANIFEST_URL).toBe(
+        "https://github.com/hraness/hra/releases/download/v0.1.9/HRA-0.1.9-10-release-manifest.json",
+      );
+    }
     expect(download).toContain("Unknown developer.");
     expect(download).toContain("not Developer ID signed or notarized");
     expect(download).toContain("HRA_RELEASE_MANIFEST_URL");

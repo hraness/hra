@@ -188,7 +188,7 @@ Use this order for the shared backend:
    predecessor OPRTE/Kitchen receipt is expected and is not a health gate.
 7. From the same candidate commit C recorded in step 3, complete its full
    package, then follow the desktop release runbook to create and push the
-   direct annotated `v0.1.8` tag and
+   direct annotated `v0.1.9` tag and
    publish the exact seven-asset immutable GitHub prerelease. Fill the
    working-tree publication contract from C's emitted evidence and require
    `bun run verify:remote-release` to read back exact remote names, byte counts,

@@ -13,6 +13,7 @@ import {
   summarySourceIds,
 } from "./comparisons";
 import { hraComparisonSlugs, isHraPublicComparisonPath } from "./slugs";
+import { HRA_RELEASE } from "../site";
 
 describe("HRA comparison registry", () => {
   test("publishes the exact requested alternatives as unique static routes", () => {
@@ -31,16 +32,22 @@ describe("HRA comparison registry", () => {
 
   test("binds every HRA and alternative claim to current HTTPS sources", () => {
     const hraSourceIds = new Set<string>(hraComparisonSources.map(({ id }) => id));
-    const versionedHraPrefix = "https://github.com/hraness/hra/blob/v0.1.7/";
+    const repositoryCitationVersion = HRA_RELEASE.availability === "published"
+      ? "0.1.9"
+      : "0.1.8";
+    const versionedHraPrefix =
+      `https://github.com/hraness/hra/blob/v${repositoryCitationVersion}/` as const;
 
     expect(hraComparisonCitationVersion({
       availability: "candidate",
-      version: "0.1.8",
-    })).toBe("0.1.7");
+      version: "0.1.9",
+    })).toBe("0.1.8");
     expect(hraComparisonCitationVersion({
       availability: "published",
-      version: "0.1.8",
-    })).toBe("0.1.8");
+      version: "0.1.9",
+    })).toBe("0.1.9");
+    expect(hraComparisonCitationVersion(HRA_RELEASE))
+      .toBe(repositoryCitationVersion);
 
     expect(hraComparisonSources.map(({ url }) => url)).toEqual([
       `${versionedHraPrefix}README.md`,

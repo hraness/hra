@@ -2,7 +2,7 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "e6abb6ea8777c8b6fb3d8e89ae25b3b42cc7759fbc11c8dc7aed677fed8ae654",
+      "matchingLinesSha256": "fe9d1a4f6d183777f987c753e3bc087f9465fb6a91682804129e956d9012bf48",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -142,9 +142,9 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d139d64f3d8248badd1f42754d40fb87a3dff0f0a3c3f6ec635e5679467340fb",
+      "matchingLinesSha256": "7e54ce2740984e7452a2fa5efa80d0bfe7ee765e9dc537ed7a1513423d36c65d",
       "occurrences": {
-        "kitchen": 9,
+        "kitchen": 10,
         "operateStylized": 0,
         "oprte": 15
       },
@@ -1442,9 +1442,9 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "80d603d66390cb31e231d4490e8bdb4c037ec13984071b347febc065334a42ce",
+      "matchingLinesSha256": "4a311370334c3774687050dd1043c1ccb0db352ac2911f77d6784742671c0160",
       "occurrences": {
-        "kitchen": 4,
+        "kitchen": 6,
         "operateStylized": 0,
         "oprte": 1
       },
@@ -1462,11 +1462,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "dcdbcfd296ccd55425911203cba3bc6e8efebee77dbf88da533157891ae5e0af",
+      "matchingLinesSha256": "5549d551b1813fabaa52cd3bf7170787eb200df30db2a3ac827348d829f1a33c",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
-        "oprte": 20
+        "oprte": 23
       },
       "path": "apps/desktop/runtime/test/installation-handoff.test.ts"
     },
@@ -1942,7 +1942,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "bd2c120d175adf81466ad6e452122f1017958803ff644405052f0240c1fe31ac",
+      "matchingLinesSha256": "85607be23ebddd945ce36063c8da6a3a04a1c139cea1b2105604bf79d4586cb3",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2222,7 +2222,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "089b20cced81f2017909a3b3c8bcdf1bf149a14d14f9ebc51b674d7b8315d339",
+      "matchingLinesSha256": "f951fa53bd4b13e03b896bf74cf44d5b837d92a88f1356b9f9491038e70c9c8a",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
