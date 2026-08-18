@@ -38,7 +38,7 @@
     },
     "apps/desktop": {
       "name": "@hraness/hra",
-      "version": "0.1.9",
+      "version": "0.1.10",
       "dependencies": {
         "@hra-internal/browser-storage": "workspace:*",
         "@hra-internal/codex-app-sdk": "workspace:*",
