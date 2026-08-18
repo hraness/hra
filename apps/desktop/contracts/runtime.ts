@@ -106,6 +106,10 @@ export const runtimeHarnessContextQuotaMaximumBytes = 64 * 1024 * 1024;
 export const runtimeChatResponseTailUtf8ByteLimit = 256 * 1024;
 export const runtimeChatReasoningTailUtf8ByteLimit = 64 * 1024;
 export const runtimeChatTurnPromptUtf8ByteLimit = 128 * 1024;
+export const runtimeChatQueuedMessageLimit = 32;
+export const runtimeChatMessageAttachmentLimit = 8;
+export const runtimeChatMessageUtf8ByteLimit = runtimeChatTurnPromptUtf8ByteLimit;
+export const runtimeChatQueueUtf8ByteLimit = 512 * 1024;
 export const runtimeNativeBridgeRequestUtf8ByteLimit = 1024 * 1024;
 export const runtimeChatDeltaUtf8ByteLimit = 4 * 1024;
 export const runtimeEventUtf8ByteLimit = 7_168;
@@ -122,6 +126,8 @@ export const accountProfileIdSchema = opaqueId("acct");
 export const chatPaneIdSchema = opaqueId("pane");
 export const chatTurnIdSchema = opaqueId("chatturn");
 export const chatToolIdSchema = opaqueId("chattool");
+export const chatMessageIdSchema = opaqueId("chatmsg");
+export const chatMessageAttachmentIdSchema = opaqueId("attachment");
 export const harnessActorIdSchema = opaqueId("hactor");
 export const harnessProposalIdSchema = opaqueId("hproposal");
 export const snapshotTransferIdSchema = opaqueId("snapshot");
@@ -805,6 +811,87 @@ export const chatAttentionCodeSchema = z.enum([
   "runtime_unavailable",
   "turn_failed",
 ]);
+
+export const chatMessageQueuePauseReasonSchema = z.enum([
+  "stop",
+  "runtimeRestart",
+  "attention",
+  "ambiguousEffect",
+]);
+
+export const chatMessageContentSchema = z
+  .object({
+    text: utf8StringSchema({ maxBytes: runtimeChatMessageUtf8ByteLimit }),
+    attachmentRefs: z
+      .array(chatMessageAttachmentIdSchema)
+      .max(runtimeChatMessageAttachmentLimit),
+  })
+  .strict()
+  .superRefine((content, context) => {
+    if (content.text.trim().length === 0 && content.attachmentRefs.length === 0) {
+      context.addIssue({
+        code: "custom",
+        message: "a chat message requires nonblank text or a ready attachment reference",
+        path: ["text"],
+      });
+    }
+    if (new Set(content.attachmentRefs).size !== content.attachmentRefs.length) {
+      context.addIssue({
+        code: "custom",
+        message: "chat message attachment references must be unique",
+        path: ["attachmentRefs"],
+      });
+    }
+  });
+
+export const chatQueuedMessageProjectionSchema = chatMessageContentSchema
+  .extend({
+    id: chatMessageIdSchema,
+    ordinal: z.number().int().positive().safe(),
+    revision: revisionSchema,
+  })
+  .strict();
+
+export const chatMessageQueueProjectionSchema = z
+  .object({
+    revision: revisionSchema,
+    pauseReason: chatMessageQueuePauseReasonSchema.nullable(),
+    messages: z
+      .array(chatQueuedMessageProjectionSchema)
+      .max(runtimeChatQueuedMessageLimit),
+  })
+  .strict()
+  .superRefine((queue, context) => {
+    const ids = new Set<string>();
+    let previousOrdinal = 0;
+    let totalUtf8Bytes = 0;
+    queue.messages.forEach((message, index) => {
+      if (ids.has(message.id)) {
+        context.addIssue({
+          code: "custom",
+          message: "queued chat message IDs must be unique",
+          path: ["messages", index, "id"],
+        });
+      }
+      if (message.ordinal <= previousOrdinal) {
+        context.addIssue({
+          code: "custom",
+          message: "queued chat messages must be in strict FIFO ordinal order",
+          path: ["messages", index, "ordinal"],
+        });
+      }
+      ids.add(message.id);
+      previousOrdinal = message.ordinal;
+      totalUtf8Bytes += utf8ByteLength(message.text);
+    });
+    if (totalUtf8Bytes > runtimeChatQueueUtf8ByteLimit) {
+      context.addIssue({
+        code: "custom",
+        message: "queued chat message text exceeds the per-pane projection limit",
+        path: ["messages"],
+      });
+    }
+  });
 
 function chatUtf8TailSchema(maxTailUtf8Bytes: number) {
   return z
@@ -2265,6 +2352,94 @@ const runtimeChatTurnRetryCommandSchema = z
     "chat retry requires a fresh logical turn ID",
   );
 
+const runtimeChatMessageEnqueueCommandSchema = z
+  .object({
+    type: z.literal("chat.message.enqueue"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+    messageId: chatMessageIdSchema,
+    content: chatMessageContentSchema,
+    delivery: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("queue") }).strict(),
+      z.object({
+        kind: z.literal("steerHead"),
+        expectedTurnId: chatTurnIdSchema,
+      }).strict(),
+    ]),
+  })
+  .strict();
+
+const runtimeChatMessageEditCommandSchema = z
+  .object({
+    type: z.literal("chat.message.edit"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+    messageId: chatMessageIdSchema,
+    expectedMessageRevision: revisionSchema,
+    content: chatMessageContentSchema,
+  })
+  .strict();
+
+const runtimeChatMessageRemoveCommandSchema = z
+  .object({
+    type: z.literal("chat.message.remove"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+    messageId: chatMessageIdSchema,
+    expectedMessageRevision: revisionSchema,
+  })
+  .strict();
+
+const runtimeChatMessageQueueResumeCommandSchema = z
+  .object({
+    type: z.literal("chat.messageQueue.resume"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+  })
+  .strict();
+
+const runtimeChatMessageSteerHeadCommandSchema = z
+  .object({
+    type: z.literal("chat.message.steerHead"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+    messageId: chatMessageIdSchema,
+    expectedMessageRevision: revisionSchema,
+    expectedTurnId: chatTurnIdSchema,
+  })
+  .strict();
+
+/**
+ * Frozen Phase 1 queue command surface. It remains separate from the live
+ * runtime union until the gateway can exhaustively journal and drain it.
+ */
+export const runtimeChatMessageLedgerCommandSchema = z.discriminatedUnion(
+  "type",
+  [
+    runtimeChatMessageEnqueueCommandSchema,
+    runtimeChatMessageEditCommandSchema,
+    runtimeChatMessageRemoveCommandSchema,
+    runtimeChatMessageQueueResumeCommandSchema,
+    runtimeChatMessageSteerHeadCommandSchema,
+  ],
+);
+
+export const runtimeChatMessageQueueResultSchema = z
+  .object({
+    type: z.literal("chatMessageQueue"),
+    paneId: chatPaneIdSchema,
+    queue: chatMessageQueueProjectionSchema,
+  })
+  .strict();
+
+export const runtimeChatMessageQueueChangedEventSchema = z
+  .object({
+    type: z.literal("chat.messageQueue.changed"),
+    paneId: chatPaneIdSchema,
+    revision: revisionSchema,
+  })
+  .strict();
+
 const runtimeHarnessSettingsUpdateCommandSchema = z
   .object({
     type: z.literal("harness.settings.update"),
@@ -3157,6 +3332,18 @@ export type ChatPaneActivity = z.infer<typeof chatPaneActivitySchema>;
 export type ChatPaneState = z.infer<typeof chatPaneStateSchema>;
 export type ChatPaneInteractionMode = z.infer<typeof chatPaneInteractionModeSchema>;
 export type ChatTurnStatus = z.infer<typeof chatTurnStatusSchema>;
+export type ChatMessageId = z.infer<typeof chatMessageIdSchema>;
+export type ChatMessageAttachmentId = z.infer<typeof chatMessageAttachmentIdSchema>;
+export type ChatMessageContent = z.infer<typeof chatMessageContentSchema>;
+export type ChatQueuedMessageProjection = z.infer<
+  typeof chatQueuedMessageProjectionSchema
+>;
+export type ChatMessageQueuePauseReason = z.infer<
+  typeof chatMessageQueuePauseReasonSchema
+>;
+export type ChatMessageQueueProjection = z.infer<
+  typeof chatMessageQueueProjectionSchema
+>;
 export type ChatToolCategory = z.infer<typeof chatToolCategorySchema>;
 export type ChatToolStatus = z.infer<typeof chatToolStatusSchema>;
 export type ChatAttentionCode = z.infer<typeof chatAttentionCodeSchema>;
@@ -3187,6 +3374,15 @@ export type RuntimeSnapshotChunkResponse = z.infer<typeof runtimeSnapshotChunkRe
 export type RuntimeSnapshotTransportResponse = z.infer<typeof runtimeSnapshotTransportResponseSchema>;
 export type RuntimeDomainCommand = z.infer<typeof runtimeDomainCommandSchema>;
 export type RuntimeChatDomainCommand = z.infer<typeof runtimeChatDomainCommandSchema>;
+export type RuntimeChatMessageLedgerCommand = z.infer<
+  typeof runtimeChatMessageLedgerCommandSchema
+>;
+export type RuntimeChatMessageQueueResult = z.infer<
+  typeof runtimeChatMessageQueueResultSchema
+>;
+export type RuntimeChatMessageQueueChangedEvent = z.infer<
+  typeof runtimeChatMessageQueueChangedEventSchema
+>;
 export type RuntimeHarnessDomainCommand = z.infer<
   typeof runtimeHarnessDomainCommandSchema
 >;
