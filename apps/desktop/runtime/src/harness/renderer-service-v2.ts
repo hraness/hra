@@ -204,7 +204,6 @@ function correlate(
         result.harnessRevision !== command.expectedHarnessRevision + 1 ||
         result.settings.revision !== command.expectedRevision + 1 ||
         result.settings.recursiveSessionsEnabled !== command.recursiveSessionsEnabled ||
-        result.settings.automaticFastMode !== command.automaticFastMode ||
         result.settings.contextQuotaBytes !== command.contextQuotaBytes ||
         result.settings.refinementMode !== command.refinementMode
       ) throw new HarnessRendererServiceError("authority_conflict");

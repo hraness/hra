@@ -3,7 +3,7 @@ type: plan
 area: desktop-routing
 status: in-progress
 title: Longitudinal routing evidence and shadow recommendations
-description: Build a per-pane, content-free evidence loop that recommends execution profiles without changing live routes.
+description: Route ordinary root prompts through a bounded deterministic policy while building per-pane, content-free evidence for later shadow recommendations.
 tags:
   - model-routing
   - evaluation
@@ -23,21 +23,34 @@ request.
 
 The recommendation must clear a conservative quality floor before latency or
 token use can affect its rank. Missing or inconclusive quality evidence causes
-an abstention. An explicit user choice always takes precedence.
+an abstention. HRA's active deterministic router remains authoritative unless
+a later, separately approved policy revision changes that router.
+
+Ordinary root turns now have a separate active deterministic policy. Automatic
+classification uses the current prompt plus the prior content-free route for
+an exact continuation. It selects one of Luna Max, Sol Max, or Sol Ultra and
+also requests Fast or Standard. Root panes expose no model, effort, tier, or
+routing preference. Recursive callers provide only a semantic work class; HRA
+maps it to the model, effort, and service tier. Neither active policy reads or
+activates the longitudinal shadow recommendation.
 
 ## Current implementation
 
 - Migration v24 gives each ordinary chat a durable `chat_panes.pane_id` and
   keeps the pane across process restarts and provider-thread or account
-  handoffs. `chat-service.ts` currently uses the pane's explicit Sol reasoning
-  effort and service tier, then ranks available accounts from fresh usage
-  state. It has no longitudinal model learner.
+  handoffs. Root routing classifies each admitted prompt before provider work,
+  ranks eligible accounts from fresh usage state, then resolves the exact
+  profile-and-tier candidate against the chosen account's current capability
+  evidence. It has no longitudinal model learner.
 - Harness actor rows already retain work class, requested execution profile,
   requested and realized service tier, lineage, and exact token facts. They do
   not prove observed provider-profile compliance.
   Migration v42 enforces that an actor's model and reasoning effort cannot
-  change within one incarnation. Ordinary chat turns do not yet have an
-  equivalent longitudinal routing ledger.
+  change within one incarnation. Migration v45 adds the ordinary root decision
+  receipt described below. Migration v46 derives every recursive logical
+  turn's immutable requested tier from its actor's work class and requires each
+  attempt to copy that exact tier. Exact ordinary-root token and
+  provider-reroute attribution remains outside the v1 longitudinal aggregate.
 - `optimizer-evidence-v1.ts` is a pure Phase 0 evaluator over frozen fixtures.
   Its results grant neither policy nor rollout authority.
 - `proposal-service.ts` can persist an immutable Suggest proposal. The v1
@@ -45,9 +58,9 @@ an abstention. An explicit user choice always takes precedence.
   records only a non-activating receipt. It cannot create a proposal, change a
   policy, call a provider, or write to Git.
 
-This plan adds an observation and advice layer. Live routing remains the
-current deterministic implementation until a later activation design is
-separately accepted and verified.
+The longitudinal portion of this plan adds an observation and advice layer.
+It remains unable to change the active deterministic prompt policy until a
+later activation design is separately accepted and verified.
 
 ### Implemented v1 slice
 
@@ -67,19 +80,47 @@ The lifecycle-owned local analyzer processes at most one dirty pane per idle
 timer tick, rotates its keyset cursor before inspection so one malformed pane
 cannot starve the rest, and writes an immutable, non-activating analysis
 receipt. A bounded content-free diagnostic reports failures while their
-evidence remains pending. Because no
-accepted quality source exists yet, it records either insufficient operational
-evidence or quality evidence required. It cannot recommend or activate a
-route. Existing model, effort, Fast, account, and work-class authorities are
-unchanged.
+evidence remains pending. Because no accepted quality source exists yet, it
+records either insufficient operational evidence or quality evidence required.
+It cannot recommend or activate a route, and it has no path into the active
+root or recursive router.
 
-Ordinary root Codex turns are deliberately absent from v1 totals. Their current
-lifecycle callback omits positioned cumulative cached/reasoning usage and
-provider reroute evidence, while terminal recovery clears the provider-turn
-binding. Treating pane settings or a lossy callback as realized usage would be
-false precision. Root capture remains a later receipt-backed migration with an
-early fact inbox, generation and stream-position watermark, accepted-turn
-binding, and restart laws.
+Ordinary root Codex turns remain deliberately absent from v1 longitudinal
+totals. Migration v45 records their content-free routing decision and
+operational lifecycle, including the accepted generation and stream position,
+but does not claim token or provider-reroute attribution. Treating pane
+settings or a lossy lifecycle callback as realized usage would still be false
+precision. Exact root spend remains a later receipt-backed fact-attribution
+slice with an early fact inbox and positioned token watermarks.
+
+### Implemented active root-routing slice
+
+Migration v45 gives every newly admitted ordinary chat turn one private
+`harness_root_turn_routing_receipts` row keyed by `pane_id` and durable chat
+turn ID. Chat admission writes its content-free classification in the same
+SQLite transaction as the bounded chat receipt and pane revision. The row does
+not reference `chat_turn_receipts`, so receipt pruning cannot make an old turn
+ID reusable or erase its routing history. An optional stable root actor turn
+binding is accepted only when the derived root turn belongs to the exact pane
+and chat turn; the root actor itself remains `standard`.
+
+The authority advances through `classified`, `resolved`, `effectStarted`,
+`accepted`, and one terminal state. Resolution records selected profile and
+service tier plus the closed `lunaUnavailable` and `fastUnavailable` fallback
+reasons. Acceptance records a positive process generation and nonnegative
+stream position, never a raw provider or account ID. Exact replays return the
+existing receipt, conflicting replays fail closed, and SQLite triggers mirror
+the API transition law. Restart settles `classified` or `resolved` as
+`notApplied`, `effectStarted` as `ambiguous`, and `accepted` as `interrupted`;
+no provider effect is replayed.
+
+Pane archive is the privacy-deletion boundary and deletes the complete root
+routing ledger for that pane. The pane-timeline, recovery-state, and
+work-class/profile indexes cover bounded operational queries. The renderer
+receives only the latest turn's lean requested and selected profile and tier,
+with closed fallback reasons. Lifecycle state, operational outcome, root
+identity, capability evidence, and timestamps stay private. Root spend remains
+explicitly excluded from `routing.inspect` in this slice.
 
 ## Scope
 
@@ -98,7 +139,8 @@ binding, and restart laws.
 
 ### Non-goals
 
-- Activating a recommendation or changing a live routing default.
+- Activating a longitudinal recommendation or letting it change the active
+  deterministic prompt route.
 - Using longitudinal evidence to select a live model, reasoning effort, Fast
   tier, account, subscription, or provider.
 - Reading prompts, transcripts, patches, filenames, repository paths, tool
@@ -127,16 +169,17 @@ history.
 
 ### Evidence boundary
 
-The ledger is content-free and append-only while a pane is retained. Normal
-operation may insert facts, but the routing authority does not update or
-selectively delete them. A later fact may supersede, invalidate, or settle an
-earlier fact by reference; it does not rewrite history. Pane privacy deletion
-is the deliberate exception: deleting the owning pane cascades its complete
-routing history and transactionally removes or recomputes the derived rows.
+The ledger is content-free while a pane is retained. Recursive longitudinal
+observations and analyses are immutable facts. The ordinary-root decision is
+one monotonic receipt whose identity, classification, resolution, effect cut,
+acceptance cursor, and terminal evidence become immutable as each phase is
+set. Pane privacy deletion is the deliberate exception: archiving or deleting
+the owning pane cascades its complete routing history and transactionally
+removes or recomputes the derived rows.
 
 Allowed evidence is a closed schema of HRA logical IDs, timestamps and bounded
 durations, sequence numbers, policy and schema versions, work class, requested
-and observed model profile, service tier, routing source, terminal class,
+and observed model profile, service tier, classification reason, terminal class,
 explicit quality classification, exact token counts, budget receipts, and
 typed abstention or fallback reasons. It excludes user and assistant content,
 content digests, account and provider identifiers, repository identity or
@@ -150,16 +193,19 @@ and cannot become optimizer evidence.
 
 The decision order is fixed:
 
-1. Apply explicit user constraints, including a manual model, effort, or Fast
-   choice.
-2. Apply current safety, capability, quota, and incarnation constraints.
-3. Calculate a shadow recommendation from the remaining eligible profiles.
-4. Execute the current manual or deterministic route unchanged.
-5. Record the shadow recommendation, actual route, and precedence reason as
-   separate immutable receipts.
+1. Classify the ordinary root prompt with the closed deterministic v1 policy,
+   or accept the recursive caller's semantic work class.
+2. Map that class to HRA's requested model, reasoning effort, and service tier.
+3. Apply current safety, capability, quota, account, and incarnation
+   constraints through the exact closed fallback chain.
+4. Calculate a longitudinal shadow assessment without giving it dispatch
+   authority.
+5. Execute HRA's resolved route and record its requested and selected values in
+   separate immutable evidence.
 
-A recommendation may disagree with a manual choice for research purposes, but
-it is marked `manual_precedence` and has no execution authority.
+No renderer or model-visible command can override the model, effort, or tier.
+Any future learned policy must enter through a separately approved policy
+revision, not a per-turn selection control.
 
 ### Quality-first objective
 
@@ -212,8 +258,8 @@ Implement the ledger as typed records rather than a mutable aggregate:
   minimum sample sizes, quality floor, confidence rule, latency/token score,
   and analyzer budget.
 - A **decision receipt** records the originating `pane_id`, HRA logical turn
-  lineage, current requested route, routing source, applicable user
-  constraints, and the policy revision observed at admission.
+  lineage, current requested route, classification reason, and the policy
+  revision observed at admission.
 - An **outcome fact** records the terminal class, bounded timing, requested and
   observed profile, service tier, exact token deltas when attribution is
   complete, and a reference to its decision receipt.
@@ -253,8 +299,9 @@ identifiers to an agent.
    agent-facing read-only summary that contains no content or custody IDs.
 4. **Produce shadow recommendations.** Run the frozen deterministic analyzer
    behind the local idle and resource-budget gate. Persist analysis receipts
-   and immutable advisory proposals. Record manual precedence and the actual
-   route, but do not pass a recommendation into dispatch configuration.
+   and immutable advisory proposals. Record the deterministic requested and
+   selected route, but do not pass a recommendation into dispatch
+   configuration.
 5. **Evaluate chronologically.** Replay frozen evidence with chronological
    train and holdout splits, compare against the current deterministic route,
    and report quality-floor pass rate, abstention and coverage, calibration,
@@ -265,9 +312,9 @@ identifiers to an agent.
    evidence supports and what remains unknown. Do not add activation authority
    as part of this milestone.
 7. **Design activation separately if the evidence warrants it.** A later
-   accepted plan must define an explicit user control, authorization custody,
-   canary scope, rollback, monitoring, and ordinary-turn versus successor-
-   incarnation admission. Manual intent must still win, and background work
+   accepted plan must define policy-revision authorization custody, canary
+   scope, rollback, monitoring, and ordinary-turn versus successor-incarnation
+   admission. HRA remains the sole per-turn dispatcher, and background work
    must remain unable to activate policy or provider effects.
 
 ## Verification
@@ -283,10 +330,11 @@ identifiers to an agent.
   repository data, tool payloads, paths, filenames, environment data, and Git
   metadata cannot enter the ledger or query projection.
 - Neutrality: deterministic provider-port tests produce the same provider
-  requests, account ranking, actor profile, and Fast decision with shadow
-  routing enabled or disabled.
-- Manual precedence: property tests show every explicit user constraint wins
-  and that a conflicting recommendation is recorded only as advisory.
+  requests, account ranking, root route, actor profile, and tier decision with
+  shadow routing enabled or disabled.
+- Router ownership: contract and model-visible schema tests reject model,
+  effort, tier, acceleration, and routing-mode controls while preserving only
+  the recursive caller's semantic work class.
 - Actor immutability: existing incarnation trigger and domain tests continue to
   reject model or effort changes; future recommendation tests target only a
   hypothetical successor incarnation.
@@ -366,3 +414,19 @@ identifiers to an agent.
   build. The first restricted-shell attempt had rejected the product's nested
   macOS `sandbox-exec`; the exact bundled-Git suite then passed 18 of 18 under
   the supported host boundary, and no source exception or test skip was added.
+- 2026-08-18: The active HRA-owned router removed every root-pane and recursive
+  model, effort, tier, acceleration, and routing-mode control. Root prompts now
+  classify into bounded leaf, standard, large-change, or wide-research routes;
+  capability resolution evaluates the complete fallback chain against one
+  generation-fenced catalog before the provider effect. Recursive callers
+  provide only an immutable semantic work class, and migration v46 derives the
+  logical-turn tier and enforces attempt equality. Independent hostile audits
+  approved the root, recursive, and migration boundaries with no P0 or P1
+  findings after passing 219, 219, and 189 focused tests respectively.
+- 2026-08-18: A final joined seam check added structural public, private, and
+  SQLite constraints for inherited work-class/tier combinations and removed
+  the retired Automatic Fast control from Direct's browser verifier. The
+  focused contract, policy, storage, Direct, and harness-settings run passed 72
+  tests with 3,358 expectations; desktop, task-protocol, and web type checks
+  passed. Repository-wide and browser verification remains pending on the
+  rebased delivery tree.

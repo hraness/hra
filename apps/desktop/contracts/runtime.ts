@@ -582,6 +582,167 @@ const chatPaneTitleSchema = z
 export const chatModelSchema = z.literal("gpt-5.6-sol");
 export const chatReasoningEffortSchema = z.enum(["ultra", "max"]);
 export const chatServiceTierSchema = z.enum(["standard", "fast"]);
+export const chatRootTurnWorkClassSchema = z.enum([
+  "boundedLeaf",
+  "standard",
+  "largeChange",
+  "wideResearch",
+]);
+export const chatRootTurnProfileSchema = z.enum([
+  "lunaMax",
+  "solMax",
+  "solUltra",
+]);
+export const chatRootTurnRoutingProfileFallbackReasonSchema =
+  z.literal("lunaUnavailable");
+export const chatRootTurnRoutingServiceTierSchema = chatServiceTierSchema;
+export const chatRootTurnRoutingServiceTierFallbackReasonSchema =
+  z.literal("fastUnavailable");
+export const chatRootTurnRoutingClassificationReasonSchema = z.enum([
+  "wideResearchCue",
+  "largeChangeCue",
+  "boundedLeafCue",
+  "continuationInherited",
+  "continuationOrAmbiguous",
+  "conservativeDefault",
+]);
+export const chatRootTurnRoutingProjectionSchema = z
+  .object({
+    policyVersion: z.literal(1),
+    classificationReason: chatRootTurnRoutingClassificationReasonSchema,
+    workClass: chatRootTurnWorkClassSchema,
+    requestedProfile: chatRootTurnProfileSchema,
+    selectedProfile: chatRootTurnProfileSchema.nullable(),
+    profileFallbackReason:
+      chatRootTurnRoutingProfileFallbackReasonSchema.nullable(),
+    requestedServiceTier: chatRootTurnRoutingServiceTierSchema,
+    selectedServiceTier: chatRootTurnRoutingServiceTierSchema.nullable(),
+    serviceTierFallbackReason:
+      chatRootTurnRoutingServiceTierFallbackReasonSchema.nullable(),
+  })
+  .strict()
+  .superRefine((routing, context) => {
+    if (
+      (routing.selectedProfile === null) !==
+        (routing.selectedServiceTier === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn profile and tier must resolve together",
+        path: routing.selectedProfile === null
+          ? ["selectedProfile"]
+          : ["selectedServiceTier"],
+      });
+    }
+    const expectedRequestedProfile = routing.workClass === "boundedLeaf"
+      ? "lunaMax"
+      : routing.workClass === "standard"
+        ? "solMax"
+        : "solUltra";
+    if (routing.requestedProfile !== expectedRequestedProfile) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn work class must map to its exact requested profile",
+        path: ["requestedProfile"],
+      });
+    }
+    const requestedTierMatchesWorkClass = routing.workClass === "boundedLeaf"
+      ? routing.requestedServiceTier === "fast"
+      : routing.workClass === "standard"
+        ? true
+        : routing.requestedServiceTier === "standard";
+    if (!requestedTierMatchesWorkClass) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn work class must map to an allowed requested tier",
+        path: ["requestedServiceTier"],
+      });
+    }
+    if (
+      routing.selectedProfile !== null &&
+      routing.selectedProfile !== routing.requestedProfile &&
+      !(
+        routing.requestedProfile === "lunaMax" &&
+        routing.selectedProfile === "solMax"
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn selected profile must be requested or the Luna fallback",
+        path: ["selectedProfile"],
+      });
+    }
+    const fellBack = routing.requestedProfile === "lunaMax" &&
+      routing.selectedProfile === "solMax";
+    if (fellBack !== (routing.profileFallbackReason === "lunaUnavailable")) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn fallback reason must exactly describe a Luna-to-Sol fallback",
+        path: ["profileFallbackReason"],
+      });
+    }
+    if (
+      routing.selectedServiceTier !== null &&
+      routing.selectedServiceTier !== routing.requestedServiceTier &&
+      !(
+        routing.requestedServiceTier === "fast" &&
+        routing.selectedServiceTier === "standard"
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn selected tier must be requested or the Fast fallback",
+        path: ["selectedServiceTier"],
+      });
+    }
+    const tierFellBack = routing.requestedServiceTier === "fast" &&
+      routing.selectedServiceTier === "standard";
+    if (
+      tierFellBack !==
+        (routing.serviceTierFallbackReason === "fastUnavailable")
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn tier fallback reason must exactly describe a Fast-to-Standard fallback",
+        path: ["serviceTierFallbackReason"],
+      });
+    }
+    const reasonWorkClass = routing.classificationReason === "wideResearchCue"
+      ? "wideResearch"
+      : routing.classificationReason === "largeChangeCue"
+        ? "largeChange"
+        : routing.classificationReason === "boundedLeafCue"
+          ? "boundedLeaf"
+          : routing.classificationReason === "continuationInherited"
+            ? null
+            : "standard";
+    if (
+      reasonWorkClass !== null &&
+      routing.workClass !== reasonWorkClass
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "automatic classification reason must agree with its work class",
+        path: ["classificationReason"],
+      });
+    }
+    const reasonServiceTier = routing.classificationReason === "boundedLeafCue" ||
+        routing.classificationReason === "continuationOrAmbiguous"
+      ? "fast"
+      : routing.classificationReason === "continuationInherited"
+        ? null
+        : "standard";
+    if (
+      reasonServiceTier !== null &&
+      routing.requestedServiceTier !== reasonServiceTier
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "root-turn classification reason must map to its requested service tier",
+        path: ["requestedServiceTier"],
+      });
+    }
+  });
 export const chatPaneInteractionModeSchema = z.enum(["chat", "harnessObserver"]);
 export const chatPaneActivityKindSchema = z.enum([
   "idle",
@@ -701,6 +862,7 @@ export const chatTurnProjectionSchema = z
     responseMarkdown: chatResponseMarkdownSchema,
     reasoningSummary: chatReasoningSummarySchema,
     tools: z.array(chatToolProjectionSchema).max(runtimeChatToolLimit),
+    routing: chatRootTurnRoutingProjectionSchema.nullable(),
   })
   .strict()
   .superRefine((turn, context) => {
@@ -751,7 +913,6 @@ export const chatAttentionSchema = z
   .strict();
 
 export const harnessRefinementModeSchema = z.enum(["off", "suggest"]);
-export const harnessAutomaticFastModeSchema = z.enum(["off", "criticalPath"]);
 export const harnessChildStateSchema = z.enum([
   "starting",
   "running",
@@ -766,7 +927,6 @@ export const harnessSettingsProjectionSchema = z
   .object({
     revision: revisionSchema,
     recursiveSessionsEnabled: z.boolean(),
-    automaticFastMode: harnessAutomaticFastModeSchema,
     contextQuotaBytes: z
       .number()
       .int()
@@ -996,9 +1156,6 @@ export const chatPaneProjectionSchema = z
       })
       .strict(),
     accountProfileId: accountProfileIdSchema.nullable(),
-    model: chatModelSchema,
-    reasoningEffort: chatReasoningEffortSchema,
-    serviceTier: chatServiceTierSchema,
     interactionMode: chatPaneInteractionModeSchema.default("chat"),
     state: chatPaneStateSchema,
     activity: chatPaneActivitySchema,
@@ -1020,18 +1177,14 @@ export const chatPaneProjectionSchema = z
         path: ["workspace"],
       });
     }
-    if (pane.interactionMode === "harnessObserver" && pane.reasoningEffort !== "ultra") {
+    if (
+      pane.turn !== null &&
+      ((pane.interactionMode === "chat") !== (pane.turn.routing !== null))
+    ) {
       context.addIssue({
         code: "custom",
-        message: "harness observer panes must use Ultra reasoning",
-        path: ["reasoningEffort"],
-      });
-    }
-    if (pane.interactionMode === "harnessObserver" && pane.serviceTier !== "standard") {
-      context.addIssue({
-        code: "custom",
-        message: "harness observer panes must use the Standard service tier",
-        path: ["serviceTier"],
+        message: "ordinary root turns require routing and harness observer turns forbid it",
+        path: ["turn", "routing"],
       });
     }
     if ((pane.state === "attention") !== (pane.attention !== null)) {
@@ -1088,8 +1241,6 @@ export const chatPaneStateProjectionSchema = z
     revision: revisionSchema,
     title: chatPaneTitleSchema,
     accountProfileId: accountProfileIdSchema.nullable(),
-    reasoningEffort: chatReasoningEffortSchema,
-    serviceTier: chatServiceTierSchema,
     interactionMode: chatPaneInteractionModeSchema.default("chat"),
     state: chatPaneStateSchema,
     activity: chatPaneActivitySchema,
@@ -1106,6 +1257,7 @@ export const chatPaneStateProjectionSchema = z
           .nonnegative()
           .max(runtimeChatContinuationLimit),
         tools: z.array(chatToolProjectionSchema).max(runtimeChatToolLimit),
+        routing: chatRootTurnRoutingProjectionSchema.nullable(),
       })
       .strict()
       .superRefine((turn, context) => {
@@ -1159,18 +1311,14 @@ export const chatPaneStateProjectionSchema = z
         path: ["workspace"],
       });
     }
-    if (pane.interactionMode === "harnessObserver" && pane.reasoningEffort !== "ultra") {
+    if (
+      pane.turn !== null &&
+      ((pane.interactionMode === "chat") !== (pane.turn.routing !== null))
+    ) {
       context.addIssue({
         code: "custom",
-        message: "harness observer panes must use Ultra reasoning",
-        path: ["reasoningEffort"],
-      });
-    }
-    if (pane.interactionMode === "harnessObserver" && pane.serviceTier !== "standard") {
-      context.addIssue({
-        code: "custom",
-        message: "harness observer panes must use the Standard service tier",
-        path: ["serviceTier"],
+        message: "ordinary root turns require routing and harness observer turns forbid it",
+        path: ["turn", "routing"],
       });
     }
     if ((pane.state === "attention") !== (pane.attention !== null)) {
@@ -1428,7 +1576,6 @@ export const remoteSessionSummaryProjectionSchema = z.object({
     isSafeSessionSyncDisplayText,
     "remote repository name contains a display control character",
   ).nullable(),
-  modelEffort: z.enum(["ultra", "max"]),
   state: z.enum([
     "ready",
     "working",
@@ -2004,8 +2151,6 @@ const runtimeChatPaneCreateCommandSchema = z
     type: z.literal("chat.pane.create"),
     paneId: chatPaneIdSchema,
     repositoryId: taskDomain.repositoryIdSchema,
-    reasoningEffort: chatReasoningEffortSchema,
-    serviceTier: chatServiceTierSchema.optional(),
   })
   .strict();
 
@@ -2018,13 +2163,11 @@ const runtimeChatPaneRenameCommandSchema = z
   })
   .strict();
 
-const runtimeChatPaneConfigureCommandSchema = z
+const runtimeChatPaneWorkspaceRecoverCommandSchema = z
   .object({
-    type: z.literal("chat.pane.configure"),
+    type: z.literal("chat.pane.workspace.recover"),
     paneId: chatPaneIdSchema,
     expectedRevision: revisionSchema,
-    reasoningEffort: chatReasoningEffortSchema,
-    serviceTier: chatServiceTierSchema.optional(),
   })
   .strict();
 
@@ -2092,7 +2235,10 @@ const runtimeChatTurnStartCommandSchema = z
     prompt: utf8StringSchema({
       minBytes: 1,
       maxBytes: runtimeChatTurnPromptUtf8ByteLimit,
-    }),
+    }).refine(
+      (prompt) => prompt.trim().length > 0,
+      "chat turn prompt must contain non-whitespace text",
+    ),
   })
   .strict();
 
@@ -2125,7 +2271,6 @@ const runtimeHarnessSettingsUpdateCommandSchema = z
     expectedHarnessRevision: revisionSchema,
     expectedRevision: revisionSchema,
     recursiveSessionsEnabled: z.boolean(),
-    automaticFastMode: harnessAutomaticFastModeSchema,
     contextQuotaBytes: harnessSettingsProjectionSchema.shape.contextQuotaBytes,
     refinementMode: harnessRefinementModeSchema,
   })
@@ -2154,7 +2299,7 @@ const runtimeHarnessChildStopCommandSchema = z
 export const runtimeChatDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
-  runtimeChatPaneConfigureCommandSchema,
+  runtimeChatPaneWorkspaceRecoverCommandSchema,
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
   runtimeChatPanesReorderCommandSchema,
@@ -2229,7 +2374,7 @@ export const runtimeSessionSyncDomainCommandSchema = z.discriminatedUnion(
 export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
-  runtimeChatPaneConfigureCommandSchema,
+  runtimeChatPaneWorkspaceRecoverCommandSchema,
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
   runtimeChatPanesReorderCommandSchema,
@@ -2990,6 +3135,23 @@ export type SessionSyncSnapshot = z.infer<typeof sessionSyncSnapshotSchema>;
 export type ChatModel = z.infer<typeof chatModelSchema>;
 export type ChatReasoningEffort = z.infer<typeof chatReasoningEffortSchema>;
 export type ChatServiceTier = z.infer<typeof chatServiceTierSchema>;
+export type ChatRootTurnWorkClass = z.infer<typeof chatRootTurnWorkClassSchema>;
+export type ChatRootTurnProfile = z.infer<typeof chatRootTurnProfileSchema>;
+export type ChatRootTurnRoutingProfileFallbackReason = z.infer<
+  typeof chatRootTurnRoutingProfileFallbackReasonSchema
+>;
+export type ChatRootTurnRoutingServiceTier = z.infer<
+  typeof chatRootTurnRoutingServiceTierSchema
+>;
+export type ChatRootTurnRoutingServiceTierFallbackReason = z.infer<
+  typeof chatRootTurnRoutingServiceTierFallbackReasonSchema
+>;
+export type ChatRootTurnRoutingClassificationReason = z.infer<
+  typeof chatRootTurnRoutingClassificationReasonSchema
+>;
+export type ChatRootTurnRoutingProjection = z.infer<
+  typeof chatRootTurnRoutingProjectionSchema
+>;
 export type ChatPaneActivityKind = z.infer<typeof chatPaneActivityKindSchema>;
 export type ChatPaneActivity = z.infer<typeof chatPaneActivitySchema>;
 export type ChatPaneState = z.infer<typeof chatPaneStateSchema>;
@@ -3007,9 +3169,6 @@ export type ChatPaneStateProjection = z.infer<typeof chatPaneStateProjectionSche
 export type ChatSnapshot = z.infer<typeof chatSnapshotSchema>;
 export type ChatPaneHarnessProjection = z.infer<typeof chatPaneHarnessProjectionSchema>;
 export type HarnessRefinementMode = z.infer<typeof harnessRefinementModeSchema>;
-export type HarnessAutomaticFastMode = z.infer<
-  typeof harnessAutomaticFastModeSchema
->;
 export type HarnessChildState = z.infer<typeof harnessChildStateSchema>;
 export type HarnessSettingsProjection = z.infer<typeof harnessSettingsProjectionSchema>;
 export type HarnessChildProjection = z.infer<typeof harnessChildProjectionSchema>;
@@ -3209,8 +3368,6 @@ export function parseRuntimeChatDispatchResponseForRequest(
         pane.id !== request.command.paneId ||
         pane.revision !== 1 ||
         pane.repository.id !== request.command.repositoryId ||
-        pane.reasoningEffort !== request.command.reasoningEffort ||
-        pane.serviceTier !== (request.command.serviceTier ?? "standard") ||
         pane.turn !== null
       ) {
         chatResponseMismatch("pane creation");
@@ -3229,19 +3386,14 @@ export function parseRuntimeChatDispatchResponseForRequest(
       }
       return response;
     }
-    case "chat.pane.configure": {
-      if (response.result.type !== "chatPane") chatResponseMismatch("pane configuration");
+    case "chat.pane.workspace.recover": {
+      if (response.result.type !== "chatPane") chatResponseMismatch("workspace recovery");
       const { pane } = response.result;
       if (
         pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1 ||
-        pane.reasoningEffort !== request.command.reasoningEffort ||
-        (
-          request.command.serviceTier !== undefined &&
-          pane.serviceTier !== request.command.serviceTier
-        )
+        pane.revision !== request.command.expectedRevision + 1
       ) {
-        chatResponseMismatch("pane configuration");
+        chatResponseMismatch("workspace recovery");
       }
       return response;
     }
@@ -3351,7 +3503,6 @@ export function parseRuntimeHarnessDispatchResponseForRequest(
         response.result.harnessRevision !== request.command.expectedHarnessRevision + 1 ||
         settings.revision !== request.command.expectedRevision + 1 ||
         settings.recursiveSessionsEnabled !== request.command.recursiveSessionsEnabled ||
-        settings.automaticFastMode !== request.command.automaticFastMode ||
         settings.contextQuotaBytes !== request.command.contextQuotaBytes ||
         settings.refinementMode !== request.command.refinementMode
       ) {

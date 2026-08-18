@@ -115,7 +115,6 @@ function fixture(path = ":memory:"): Readonly<{
       workingDirectory: "/tmp/root-session-v2",
     },
     accountProfileId,
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   const actors = new HarnessSQLiteAuthorityV2(database, {

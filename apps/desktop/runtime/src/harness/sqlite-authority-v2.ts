@@ -16,7 +16,6 @@ import {
   actorResultIdSchema,
   actorResultSchema,
   actorSchema,
-  actorTurnAccelerationSchema,
   actorTurnIdSchema,
   actorTurnSchema,
   persistedActorWorkClassSchema,
@@ -41,6 +40,7 @@ import {
   metaharnessFastFallbackReasonSchema,
   metaharnessProfileFallbackReasonSchema,
   metaharnessTierSchema,
+  requestedServiceTierForWorkClass,
   type RealizedActorProfile,
 } from "./metaharness-policy-v1";
 
@@ -92,12 +92,6 @@ const actorModelRerouteQuarantineReasonSchema = z.enum([
   "provider_identity_conflict",
   "fact_conflict",
 ]);
-const actorAccelerationBottleneckSchema = z.enum([
-  "none",
-  "reasoning",
-  "fileGeneration",
-]);
-
 export const actorDispatchPolicyRecordV2Schema = z.object({
   actorId: actorIdSchema,
   policyVersion: actorPolicyVersionSchema,
@@ -119,21 +113,30 @@ export type ActorDispatchPolicyRecordV2 = z.infer<
   typeof actorDispatchPolicyRecordV2Schema
 >;
 
-export const actorTurnAccelerationRecordV2Schema = z.discriminatedUnion(
-  "mode",
-  [
-    actorTurnAccelerationSchema.options[0].extend({
-      turnId: actorTurnIdSchema,
-    }).strict(),
-    actorTurnAccelerationSchema.options[1].extend({
-      turnId: actorTurnIdSchema,
-    }).strict(),
-  ],
-);
+export const actorTurnRequestedServiceTierRecordV2Schema = z.object({
+  turnId: actorTurnIdSchema,
+  requestedServiceTier: metaharnessTierSchema,
+}).strict();
 
-export type ActorTurnAccelerationRecordV2 = z.infer<
-  typeof actorTurnAccelerationRecordV2Schema
+export type ActorTurnRequestedServiceTierRecordV2 = z.infer<
+  typeof actorTurnRequestedServiceTierRecordV2Schema
 >;
+
+const ACTOR_TURN_SELECT_COLUMNS = `
+  turn_id, epoch_id, actor_id, ordinal, idempotency_key, input_value_id,
+  state, desired_state, revision, created_at, started_at, settled_at,
+  outcome_code, requested_service_tier
+`;
+const ACTOR_TURN_SELECT_COLUMNS_FROM_TURN = `
+  turn.turn_id AS turn_id, turn.epoch_id AS epoch_id,
+  turn.actor_id AS actor_id, turn.ordinal AS ordinal,
+  turn.idempotency_key AS idempotency_key,
+  turn.input_value_id AS input_value_id, turn.state AS state,
+  turn.desired_state AS desired_state, turn.revision AS revision,
+  turn.created_at AS created_at, turn.started_at AS started_at,
+  turn.settled_at AS settled_at, turn.outcome_code AS outcome_code,
+  turn.requested_service_tier AS requested_service_tier
+`;
 
 export type ActorReconciliationTargetV2 =
   | Readonly<{ kind: "actor"; actorId: string }>
@@ -2137,14 +2140,6 @@ export class HarnessSQLiteAuthorityV2 {
     actorId: string;
     idempotencyKey: string;
     inputValueId: string;
-    acceleration?: Readonly<
-      | { mode: "standard" }
-      | {
-          mode: "fast";
-          criticalPath: true;
-          bottleneck: "reasoning" | "fileGeneration";
-        }
-    >;
     createdAt?: string;
   }>): ActorTurn {
     const turnId = actorTurnIdSchema.parse(inputValue.turnId);
@@ -2153,10 +2148,10 @@ export class HarnessSQLiteAuthorityV2 {
     const idempotencyKey = requestIdentitySchema.parse(inputValue.idempotencyKey);
     const inputValueId = z.string().min(1).max(96).parse(inputValue.inputValueId);
     const createdAt = this.#timestamp(inputValue.createdAt);
-    const acceleration = parseActorTurnAccelerationInput(
-      turnId,
-      inputValue.acceleration,
-    );
+    const dispatchPolicy = this.readActorDispatchPolicy(actorId);
+    const requestedServiceTier = requestedServiceTierForWorkClass(
+      dispatchPolicy.workClass,
+    ) ?? "standard";
 
     return this.#database.transaction(() => {
       const byId = this.#readTurn(turnId);
@@ -2167,8 +2162,8 @@ export class HarnessSQLiteAuthorityV2 {
           byId.epochId === epochId && byId.actorId === actorId &&
           byId.idempotencyKey === idempotencyKey &&
           byId.inputValueId === inputValueId &&
-          exactJson(this.readActorTurnAcceleration(turnId)) ===
-            exactJson(acceleration)
+          this.readActorTurnRequestedServiceTier(turnId)
+              .requestedServiceTier === requestedServiceTier
         ) {
           return byId;
         }
@@ -2193,11 +2188,10 @@ export class HarnessSQLiteAuthorityV2 {
         INSERT INTO harness_actor_turns (
           turn_id, epoch_id, actor_id, ordinal, idempotency_key,
           input_value_id, state, desired_state, revision, created_at,
-          started_at, settled_at, outcome_code, acceleration_mode,
-          acceleration_critical_path, acceleration_bottleneck
+          started_at, settled_at, outcome_code, requested_service_tier
         ) VALUES (
           ?1, ?2, ?3, ?4, ?5, ?6, 'prepared', 'run', 1, ?7,
-          NULL, NULL, NULL, ?8, ?9, ?10
+          NULL, NULL, NULL, ?8
         )
       `).run(
         turnId,
@@ -2207,9 +2201,7 @@ export class HarnessSQLiteAuthorityV2 {
         idempotencyKey,
         inputValueId,
         createdAt,
-        acceleration.mode,
-        acceleration.mode === "fast" ? 1 : 0,
-        acceleration.mode === "fast" ? acceleration.bottleneck : "none",
+        requestedServiceTier,
       );
       return this.#requireTurn(turnId);
     })();
@@ -2219,32 +2211,23 @@ export class HarnessSQLiteAuthorityV2 {
     return this.#readTurn(actorTurnIdSchema.parse(turnId));
   }
 
-  readActorTurnAcceleration(
+  readActorTurnRequestedServiceTier(
     turnIdValue: string,
-  ): ActorTurnAccelerationRecordV2 {
+  ): ActorTurnRequestedServiceTierRecordV2 {
     const turnId = actorTurnIdSchema.parse(turnIdValue);
     const row: unknown = this.#database.query(`
-      SELECT turn_id, acceleration_mode, acceleration_critical_path,
-        acceleration_bottleneck
+      SELECT turn_id, requested_service_tier
       FROM harness_actor_turns WHERE turn_id = ?1
     `).get(turnId);
     if (row === null) notFound("actor turn does not exist");
     const parsed = z.object({
       turn_id: actorTurnIdSchema,
-      acceleration_mode: z.enum(["standard", "fast"]),
-      acceleration_critical_path: z.union([z.literal(0), z.literal(1)]),
-      acceleration_bottleneck: actorAccelerationBottleneckSchema,
+      requested_service_tier: metaharnessTierSchema,
     }).strict().parse(row);
-    return actorTurnAccelerationRecordV2Schema.parse(
-      parsed.acceleration_mode === "standard"
-        ? { turnId: parsed.turn_id, mode: "standard" }
-        : {
-            turnId: parsed.turn_id,
-            mode: "fast",
-            criticalPath: parsed.acceleration_critical_path === 1,
-            bottleneck: parsed.acceleration_bottleneck,
-          },
-    );
+    return actorTurnRequestedServiceTierRecordV2Schema.parse({
+      turnId: parsed.turn_id,
+      requestedServiceTier: parsed.requested_service_tier,
+    });
   }
 
   /**
@@ -2258,7 +2241,7 @@ export class HarnessSQLiteAuthorityV2 {
     if (current === null) notFound("actor turn does not exist");
     if (current.ordinal === 1) return null;
     const row: unknown = this.#database.query(`
-      SELECT * FROM harness_actor_turns
+      SELECT ${ACTOR_TURN_SELECT_COLUMNS} FROM harness_actor_turns
       WHERE actor_id = ?1 AND ordinal = ?2
       ORDER BY turn_id LIMIT 1
     `).get(current.actorId, current.ordinal - 1);
@@ -2615,7 +2598,8 @@ export class HarnessSQLiteAuthorityV2 {
       ORDER BY attempt.attempt_id LIMIT ?
     `).all(...attemptTarget.parameters, limit);
     const turnRows: unknown[] = this.#database.query(`
-      SELECT turn.* FROM harness_actor_turns AS turn
+      SELECT ${ACTOR_TURN_SELECT_COLUMNS_FROM_TURN}
+      FROM harness_actor_turns AS turn
       WHERE turn.state IN ('prepared', 'starting', 'running', 'reconciling')
         AND (${turnTarget.sql})
       ORDER BY turn.turn_id LIMIT ?
@@ -2949,15 +2933,6 @@ export class HarnessSQLiteAuthorityV2 {
     `).get(input.accountProfileId, input.processGeneration);
     return z.object({ active_load: z.number().int().nonnegative().safe() })
       .strict().parse(row).active_load;
-  }
-
-  readAutomaticFastMode(): "off" | "criticalPath" {
-    const row: unknown = this.#database.query(`
-      SELECT automatic_fast_mode FROM harness_settings WHERE singleton = 1
-    `).get();
-    return z.object({
-      automatic_fast_mode: z.enum(["off", "criticalPath"]),
-    }).strict().parse(row).automatic_fast_mode;
   }
 
   readActorAccountLease(leaseIdValue: string): ActorAccountLeaseRecordV2 | null {
@@ -3490,19 +3465,28 @@ export class HarnessSQLiteAuthorityV2 {
     const createdAt = this.#timestamp(inputValue.createdAt);
 
     return this.#database.transaction(() => {
+      const turn = this.#requireTurn(turnId);
+      const requestedServiceTier = this.readActorTurnRequestedServiceTier(
+        turnId,
+      ).requestedServiceTier;
       const existing = this.#readActorAttempt(attemptId);
       if (existing !== null) {
         if (
           existing.turnId === turnId && existing.incarnationId === incarnationId &&
           existing.accountProfileId === accountProfileId &&
           existing.processGeneration === processGeneration &&
-          existing.clientUserMessageId === clientUserMessageId
+          existing.clientUserMessageId === clientUserMessageId &&
+          existing.requestedServiceTier === requestedServiceTier
         ) return existing;
         conflict("actor attempt identity already names another request");
       }
-      const turn = this.#requireTurn(turnId);
       if (isTerminalActorTurnState(turn.state) || turn.desiredState === "stop") {
         invalidTransition("settled or stopped logical turns cannot start attempts");
+      }
+      if (requestedServiceTier === "fast") {
+        invalidTransition(
+          "Fast actor turns require claimed capability and reservation evidence",
+        );
       }
       const incarnation = this.#requireActorIncarnation(incarnationId);
       if (
@@ -3530,11 +3514,13 @@ export class HarnessSQLiteAuthorityV2 {
           token_usage_observation_generation,
           continuation_history_value_id,
           state, quota_proof_digest, input_tokens, output_tokens,
-          created_at, started_at, settled_at
+          created_at, started_at, settled_at, requested_service_tier,
+          realized_service_tier, tier_fallback_reason,
+          capability_evidence_digest, fast_reservation_id
         ) VALUES (
           ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, NULL, NULL, NULL,
           NULL, NULL, NULL, NULL, 'starting', NULL, NULL, NULL,
-          ?8, NULL, NULL
+          ?8, NULL, NULL, ?9, 'standard', NULL, NULL, NULL
         )
       `).run(
         attemptId,
@@ -3545,6 +3531,7 @@ export class HarnessSQLiteAuthorityV2 {
         processGeneration,
         clientUserMessageId,
         createdAt,
+        requestedServiceTier,
       );
       return this.#requireActorAttempt(attemptId);
     })();
@@ -3582,6 +3569,10 @@ export class HarnessSQLiteAuthorityV2 {
     }).strict().parse(inputValue);
     const createdAt = this.#timestamp(input.createdAt);
     return this.#database.transaction(() => {
+      const turn = this.#requireTurn(input.turnId);
+      const requestedServiceTier = this.readActorTurnRequestedServiceTier(
+        turn.id,
+      ).requestedServiceTier;
       const existing = this.#readActorAttempt(input.attemptId);
       if (existing !== null) {
         if (
@@ -3589,7 +3580,8 @@ export class HarnessSQLiteAuthorityV2 {
           existing.incarnationId !== input.incarnationId ||
           existing.accountProfileId !== input.accountProfileId ||
           existing.processGeneration !== input.processGeneration ||
-          existing.clientUserMessageId !== input.clientUserMessageId
+          existing.clientUserMessageId !== input.clientUserMessageId ||
+          existing.requestedServiceTier !== requestedServiceTier
         ) conflict("actor attempt identity already names another request");
         const existingIncarnation = this.#requireActorIncarnation(input.incarnationId);
         if (existingIncarnation.state !== "running") {
@@ -3602,7 +3594,6 @@ export class HarnessSQLiteAuthorityV2 {
         });
       }
 
-      const turn = this.#requireTurn(input.turnId);
       const incarnation = this.#requireActorIncarnation(input.incarnationId);
       if (
         (turn.state !== "starting" && turn.state !== "reconciling") ||
@@ -3630,7 +3621,6 @@ export class HarnessSQLiteAuthorityV2 {
       if (competing.length !== 0) {
         invalidTransition("actor incarnation already owns another unsettled turn");
       }
-      const acceleration = this.readActorTurnAcceleration(turn.id);
       const capabilityEvidenceDigest = input.dispatch?.capabilityEvidenceDigest ??
         null;
       if (
@@ -3639,14 +3629,11 @@ export class HarnessSQLiteAuthorityV2 {
         lineage("actor attempt capability evidence is not live for its session");
       }
       const effectGeneration = session.liveGeneration;
-      const requestedServiceTier = acceleration.mode;
       let realizedServiceTier: "standard" | "fast" = "standard";
       let tierFallbackReason: PersistedActorAttempt["tierFallbackReason"] = null;
       let fastReservationId: string | null = null;
-      if (acceleration.mode === "fast") {
-        if (this.readAutomaticFastMode() === "off") {
-          tierFallbackReason = "automaticFastDisabled";
-        } else if (session.liveSupportsFast !== true) {
+      if (requestedServiceTier === "fast") {
+        if (session.liveSupportsFast !== true) {
           tierFallbackReason = "fastUnsupported";
         } else {
           fastReservationId = actorFastReservationIdSchema.parse(
@@ -4043,7 +4030,7 @@ export class HarnessSQLiteAuthorityV2 {
       const actor = this.#requireActor(evidenceTurn.actorId);
       const epoch = this.#requireEpoch(evidenceTurn.epochId);
       const liveTurnRows: unknown[] = this.#database.query(`
-        SELECT * FROM harness_actor_turns
+        SELECT ${ACTOR_TURN_SELECT_COLUMNS} FROM harness_actor_turns
         WHERE actor_id = ?1
           AND state IN ('prepared', 'starting', 'running', 'reconciling')
         ORDER BY ordinal, turn_id LIMIT 2
@@ -5556,7 +5543,7 @@ export class HarnessSQLiteAuthorityV2 {
       .parse(inputValue.afterTurnId ?? null);
     const limit = z.number().int().min(1).max(128).parse(inputValue.limit);
     const rows: unknown[] = this.#database.query(`
-      SELECT * FROM harness_actor_turns
+      SELECT ${ACTOR_TURN_SELECT_COLUMNS} FROM harness_actor_turns
       WHERE turn_id > COALESCE(?1, '')
         AND state IN ('prepared', 'starting', 'running', 'reconciling')
       ORDER BY turn_id LIMIT ?2
@@ -6517,9 +6504,10 @@ export class HarnessSQLiteAuthorityV2 {
   }
 
   #readTurn(turnId: string): ActorTurn | null {
-    const row: unknown = this.#database.query(
-      "SELECT * FROM harness_actor_turns WHERE turn_id = ?1",
-    ).get(turnId);
+    const row: unknown = this.#database.query(`
+      SELECT ${ACTOR_TURN_SELECT_COLUMNS} FROM harness_actor_turns
+      WHERE turn_id = ?1
+    `).get(turnId);
     return row === null ? null : parseActorTurnRow(row);
   }
 
@@ -6528,7 +6516,7 @@ export class HarnessSQLiteAuthorityV2 {
     idempotencyKey: string,
   ): ActorTurn | null {
     const row: unknown = this.#database.query(`
-      SELECT * FROM harness_actor_turns
+      SELECT ${ACTOR_TURN_SELECT_COLUMNS} FROM harness_actor_turns
       WHERE actor_id = ?1 AND idempotency_key = ?2
     `).get(actorId, idempotencyKey);
     return row === null ? null : parseActorTurnRow(row);
@@ -7312,9 +7300,7 @@ const actorTurnRowSchema = z.object({
   started_at: isoTimestampSchema.nullable(),
   settled_at: isoTimestampSchema.nullable(),
   outcome_code: z.string().min(1).max(96).nullable(),
-  acceleration_mode: z.enum(["standard", "fast"]),
-  acceleration_critical_path: z.union([z.literal(0), z.literal(1)]),
-  acceleration_bottleneck: actorAccelerationBottleneckSchema,
+  requested_service_tier: metaharnessTierSchema,
 }).strict();
 
 const actorOperationRowSchema = z.object({
@@ -8247,23 +8233,6 @@ function parseActorDispatchPolicyInput(
     actorId,
     policyVersion: value?.policyVersion ?? 0,
     workClass: value?.workClass ?? "legacyUnclassified",
-  });
-}
-
-function parseActorTurnAccelerationInput(
-  turnId: string,
-  value: Readonly<
-    | { mode: "standard" }
-    | {
-        mode: "fast";
-        criticalPath: true;
-        bottleneck: "reasoning" | "fileGeneration";
-      }
-  > | undefined,
-): ActorTurnAccelerationRecordV2 {
-  return actorTurnAccelerationRecordV2Schema.parse({
-    turnId,
-    ...(value ?? { mode: "standard" as const }),
   });
 }
 

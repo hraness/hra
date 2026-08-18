@@ -1,22 +1,13 @@
 import { z } from "@hra-internal/schema";
 
 import {
-  harnessAutomaticFastModeSchema,
-  type HarnessAutomaticFastMode,
-} from "../../../contracts/runtime";
-
-import {
   HRA_METAHARNESS_POLICY_VERSION,
-  actorTurnAccelerationSchema,
   actorWorkClassSchema,
-  type ActorTurnAcceleration,
   type ActorWorkClass,
 } from "./actor-domain";
 
 export const workClassSchema = actorWorkClassSchema;
-export const turnAccelerationSchema = actorTurnAccelerationSchema;
 export type WorkClass = ActorWorkClass;
-export type TurnAcceleration = ActorTurnAcceleration;
 
 export const HRA_SOL_MODEL = "gpt-5.6-sol" as const;
 export const HRA_LUNA_MODEL = "gpt-5.6-luna" as const;
@@ -98,14 +89,10 @@ export type MetaharnessRouteDecision =
       acceptableProfiles: readonly MetaharnessProfile[];
     }>;
 
-export const automaticFastModeSchema = harnessAutomaticFastModeSchema;
-export type AutomaticFastMode = HarnessAutomaticFastMode;
-
 export const metaharnessTierSchema = z.enum(["standard", "fast"]);
 export type MetaharnessTier = z.infer<typeof metaharnessTierSchema>;
 
 export const metaharnessFastFallbackReasonSchema = z.enum([
-  "automaticFastDisabled",
   "fastUnsupported",
   "fastReservationUnavailable",
 ]);
@@ -115,7 +102,7 @@ export type MetaharnessFastFallbackReason = z.infer<
 
 export interface MetaharnessTierDecision {
   readonly policyVersion: typeof HRA_METAHARNESS_POLICY_VERSION;
-  readonly requestedAcceleration: ActorTurnAcceleration;
+  readonly requestedServiceTier: MetaharnessTier;
   readonly realizedTier: MetaharnessTier;
   readonly fallbackReason: MetaharnessFastFallbackReason | null;
 }
@@ -131,8 +118,7 @@ const routeInputSchema = z.object({
 }).strict();
 
 const tierInputSchema = z.object({
-  acceleration: actorTurnAccelerationSchema,
-  automaticFastMode: automaticFastModeSchema,
+  workClass: actorWorkClassSchema,
   selectedProfileSupportsFast: z.boolean(),
   fastReservationAvailable: z.boolean(),
 }).strict();
@@ -159,6 +145,18 @@ export function orderedProfilesForWorkClass(
 export function actorWorkClassMayDelegate(workClassValue: unknown): boolean {
   const parsed = actorWorkClassSchema.safeParse(workClassValue);
   return parsed.success && parsed.data !== "boundedLeaf";
+}
+
+/**
+ * HRA owns the recursive turn tier. Bounded leaf work is the only class whose
+ * latency/quality tradeoff requests Fast; every broader class stays Standard.
+ */
+export function requestedServiceTierForWorkClass(
+  workClassValue: unknown,
+): MetaharnessTier | null {
+  const parsed = actorWorkClassSchema.safeParse(workClassValue);
+  if (!parsed.success) return null;
+  return parsed.data === "boundedLeaf" ? "fast" : "standard";
 }
 
 /** Compile a complete, exact-generation catalog into one immutable route. */
@@ -207,37 +205,40 @@ export function compileMetaharnessTier(
   inputValue: unknown,
 ): MetaharnessTierDecision {
   const input = tierInputSchema.parse(inputValue);
-  if (input.acceleration.mode === "standard") {
-    return tierDecision(input.acceleration, "standard", null);
+  const requestedServiceTier = requestedServiceTierForWorkClass(
+    input.workClass,
+  );
+  if (requestedServiceTier === null) {
+    throw new Error("metaharness work class became invalid after parsing");
   }
-  if (input.automaticFastMode === "off") {
-    return tierDecision(
-      input.acceleration,
-      "standard",
-      "automaticFastDisabled",
-    );
+  if (requestedServiceTier === "standard") {
+    return tierDecision(requestedServiceTier, "standard", null);
   }
   if (!input.selectedProfileSupportsFast) {
-    return tierDecision(input.acceleration, "standard", "fastUnsupported");
+    return tierDecision(
+      requestedServiceTier,
+      "standard",
+      "fastUnsupported",
+    );
   }
   if (!input.fastReservationAvailable) {
     return tierDecision(
-      input.acceleration,
+      requestedServiceTier,
       "standard",
       "fastReservationUnavailable",
     );
   }
-  return tierDecision(input.acceleration, "fast", null);
+  return tierDecision(requestedServiceTier, "fast", null);
 }
 
 function tierDecision(
-  requestedAcceleration: ActorTurnAcceleration,
+  requestedServiceTier: MetaharnessTier,
   realizedTier: MetaharnessTier,
   fallbackReason: MetaharnessFastFallbackReason | null,
 ): MetaharnessTierDecision {
   return Object.freeze({
     policyVersion: HRA_METAHARNESS_POLICY_VERSION,
-    requestedAcceleration: Object.freeze({ ...requestedAcceleration }),
+    requestedServiceTier,
     realizedTier,
     fallbackReason,
   });

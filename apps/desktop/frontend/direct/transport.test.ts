@@ -700,7 +700,6 @@ describe("HRA deterministic native transport", () => {
           type: "chat.pane.create",
           paneId: `pane_sync_created_${index}`,
           repositoryId: project.repository.id,
-          reasoningEffort: "ultra",
         })).toMatchObject({ ok: true });
         expect(await shell.dispatch({
           type: "chat.turn.start",
@@ -975,7 +974,7 @@ describe("HRA deterministic native transport", () => {
     }
   });
 
-  test("renames and configures a long existing pane through bounded state events", async () => {
+  test("renames and recovers a long existing pane through bounded state events", async () => {
     const fixture = activation("chat-completed");
     const initial = fixture.world.gateway.snapshots[0];
     const sourcePane = initial?.chat.panes[0];
@@ -985,6 +984,12 @@ describe("HRA deterministic native transport", () => {
     const responseMarkdown = "Retained Direct response. ".repeat(400);
     const longPane = {
       ...sourcePane,
+      workspace: {
+        mode: "managedWorktree" as const,
+        state: "waitingCapacity" as const,
+        revision: sourcePane.workspace!.revision + 1,
+        recoveryKind: "capacityUnavailable" as const,
+      },
       turn: {
         ...sourcePane.turn,
         responseMarkdown: {
@@ -1024,11 +1029,9 @@ describe("HRA deterministic native transport", () => {
       title: "Retained response",
     });
     await shell.dispatch({
-      type: "chat.pane.configure",
+      type: "chat.pane.workspace.recover",
       paneId: longPane.id,
       expectedRevision: longPane.revision + 1,
-      reasoningEffort: "max",
-      serviceTier: "fast",
     });
 
     expect(new TextEncoder().encode(responseMarkdown).byteLength).toBeGreaterThan(7_168);
@@ -1055,8 +1058,7 @@ describe("HRA deterministic native transport", () => {
           panes: [{
             revision: longPane.revision + 2,
             title: "Retained response",
-            reasoningEffort: "max",
-            serviceTier: "fast",
+            workspace: { state: "preparing", recoveryKind: null },
             turn: { responseMarkdown: { tail: responseMarkdown } },
           }],
         },

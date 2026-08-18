@@ -159,7 +159,6 @@ const localPaneRowSchema = z.object({
   barrier: storedBooleanSchema,
   title: z.string(),
   repository_name: z.string(),
-  reasoning_effort: z.enum(["ultra", "max"]),
   state: z.enum(["ready", "starting", "streaming", "continuing", "attention"]),
   archived_at: z.string().nullable(),
 }).strict();
@@ -1908,7 +1907,7 @@ export class SessionSyncStore {
     const values: unknown[] = this.#database.query(`
       SELECT dirty.pane_id, binding.session_id, dirty.source_revision,
         dirty.event_kind, dirty.barrier, pane.title, pane.repository_name,
-        pane.reasoning_effort, pane.state, pane.archived_at
+        pane.state, pane.archived_at
       FROM session_sync_dirty_panes AS dirty
       JOIN session_sync_pane_bindings AS binding
         ON binding.pane_id = dirty.pane_id
@@ -1947,7 +1946,6 @@ export class SessionSyncStore {
         repositoryDisplayName: sanitizeRepositoryDisplayName(
           row.repository_name,
         ),
-        modelEffort: row.reasoning_effort,
         state,
         deleted: row.event_kind === "deleted",
         barrier: row.barrier === 1,

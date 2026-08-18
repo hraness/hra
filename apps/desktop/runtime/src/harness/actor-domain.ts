@@ -48,37 +48,9 @@ export type PersistedActorWorkClass = z.infer<
   typeof persistedActorWorkClassSchema
 >;
 
-export const actorTurnFastBottleneckSchema = z.enum([
-  "reasoning",
-  "fileGeneration",
-]);
-export const actorTurnAccelerationSchema = z.discriminatedUnion("mode", [
-  z.object({
-    mode: z.literal("standard"),
-  }).strict(),
-  z.object({
-    mode: z.literal("fast"),
-    criticalPath: z.literal(true),
-    bottleneck: actorTurnFastBottleneckSchema,
-  }).strict(),
-]);
-export type ActorTurnAcceleration = z.infer<
-  typeof actorTurnAccelerationSchema
->;
-
-export const STANDARD_ACTOR_TURN_ACCELERATION: ActorTurnAcceleration =
-  Object.freeze({ mode: "standard" });
-
 export function parseActorWorkClass(value: unknown): ActorWorkClass | null {
   const parsed = actorWorkClassSchema.safeParse(value);
   return parsed.success ? parsed.data : null;
-}
-
-export function parseActorTurnAcceleration(
-  value: unknown,
-): ActorTurnAcceleration | null {
-  const parsed = actorTurnAccelerationSchema.safeParse(value);
-  return parsed.success ? Object.freeze(parsed.data) : null;
 }
 
 export const actorEpochIdSchema = opaqueId("hepoch");

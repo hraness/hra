@@ -89,7 +89,6 @@ export interface HarnessRendererSettingsAuthorityPort {
     expectedHarnessRevision: number;
     expectedSettingsRevision: number;
     recursiveSessionsEnabled: boolean;
-    automaticFastMode: "off" | "criticalPath";
     contextQuotaBytes: number;
     refinementMode: "off" | "suggest";
   }>): MaybePromise<unknown>;
@@ -260,7 +259,6 @@ export class HarnessRendererAuthorityV2
       expectedHarnessRevision: command.expectedHarnessRevision,
       expectedSettingsRevision: command.expectedRevision,
       recursiveSessionsEnabled: command.recursiveSessionsEnabled,
-      automaticFastMode: command.automaticFastMode,
       contextQuotaBytes: command.contextQuotaBytes,
       refinementMode: command.refinementMode,
     }));
@@ -268,7 +266,6 @@ export class HarnessRendererAuthorityV2
       outcome.harnessRevision !== command.expectedHarnessRevision + 1 ||
       outcome.settings.revision !== command.expectedRevision + 1 ||
       outcome.settings.recursiveSessionsEnabled !== command.recursiveSessionsEnabled ||
-      outcome.settings.automaticFastMode !== command.automaticFastMode ||
       outcome.settings.contextQuotaBytes !== command.contextQuotaBytes ||
       outcome.settings.refinementMode !== command.refinementMode
     ) authorityConflict("settings authority returned an incoherent CAS result");

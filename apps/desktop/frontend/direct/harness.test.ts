@@ -29,7 +29,6 @@ describe("HRA Direct minimal recursive harness", () => {
         settings: {
           revision: 2,
           recursiveSessionsEnabled: true,
-          automaticFastMode: "criticalPath",
           contextQuotaBytes: 16 * 1024 * 1024,
           refinementMode: "suggest",
         },
@@ -45,7 +44,6 @@ describe("HRA Direct minimal recursive harness", () => {
         expectedHarnessRevision: 3,
         expectedRevision: 2,
         recursiveSessionsEnabled: true,
-        automaticFastMode: "off",
         contextQuotaBytes: 32 * 1024 * 1024,
         refinementMode: "off",
       });
@@ -67,7 +65,6 @@ describe("HRA Direct minimal recursive harness", () => {
         expectedHarnessRevision: 3,
         expectedRevision: 2,
         recursiveSessionsEnabled: false,
-        automaticFastMode: "criticalPath",
         contextQuotaBytes: 8 * 1024 * 1024,
         refinementMode: "suggest",
       });

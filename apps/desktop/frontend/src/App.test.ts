@@ -110,9 +110,8 @@ test("every visible product interactive retains a 24px floor at minimum UI scale
     /\.pane-menu,\s*\.pane-project,\s*\.pane-title-save\s*\{[^}]*min-height:\s*var\(--interactive-min-height\);/su,
   );
   expect(css).not.toContain(".subscription-select");
-  expect(css).toMatch(
-    /\.model-toggle__option\s*\{[^}]*min-height:\s*max\(1\.5rem,\s*var\(--interactive-min-height\)\);/su,
-  );
+  expect(css).not.toContain(".model-toggle");
+  expect(css).not.toContain(".fast-mode-toggle");
   expect(css).toMatch(
     /\.settings-note button,\s*\.subscription-actions button\s*\{[^}]*min-height:\s*var\(--interactive-min-height\);/su,
   );
@@ -165,8 +164,9 @@ test("the shell gates panes on signed-in subscriptions and reuses the last repos
   expect(app).toContain("if (!inheritedRepositoryIsUnavailable(response))");
   expect(app).not.toContain("subscribeChatSignals");
   expect(app).not.toContain("sessionAudioFactory");
-  expect(app.match(/reasoningEffort: "max"/gu)).toHaveLength(2);
-  expect(app).not.toContain('reasoningEffort: "ultra"');
+  expect(app).not.toContain("reasoningEffort");
+  expect(app).not.toContain("routingMode");
+  expect(app).not.toContain("serviceTier");
 });
 
 test("a stale inherited repository falls back to project selection", () => {

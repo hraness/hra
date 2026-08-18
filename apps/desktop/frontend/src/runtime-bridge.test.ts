@@ -62,9 +62,6 @@ const bridgeChatPane: ChatPaneProjection = {
   title: "HRA",
   repository: { id: "repo_00000000000000000000000000", name: "hra" },
   accountProfileId: null,
-  model: "gpt-5.6-sol",
-  reasoningEffort: "ultra",
-  serviceTier: "standard",
   interactionMode: "chat",
   state: "ready",
   activity: { ordinal: 0, kind: "idle" },
@@ -227,7 +224,6 @@ describe("runtime bridge", () => {
       expectedHarnessRevision: 4,
       expectedRevision: 3,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath" as const,
       contextQuotaBytes: 16 * 1024 * 1024,
       refinementMode: "suggest" as const,
     };
@@ -241,7 +237,6 @@ describe("runtime bridge", () => {
         settings: {
           revision: 4,
           recursiveSessionsEnabled: true,
-          automaticFastMode: "criticalPath",
           contextQuotaBytes: 16 * 1024 * 1024,
           refinementMode: "suggest",
         },
@@ -279,7 +274,6 @@ describe("runtime bridge", () => {
       type: "chat.pane.create",
       paneId: bridgeChatPane.id,
       repositoryId: bridgeChatPane.repository.id,
-      reasoningEffort: "ultra",
     } as const;
     const correlated = transportHarness(() => responseFor(bridgeChatPane));
     expect(await createRuntimeBridge(correlated.transport, {
@@ -347,6 +341,17 @@ describe("runtime bridge", () => {
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         tools: [],
+        routing: {
+          policyVersion: 1,
+          classificationReason: "conservativeDefault",
+          workClass: "standard",
+          requestedProfile: "solMax",
+          selectedProfile: "solMax",
+          profileFallbackReason: null,
+          requestedServiceTier: "standard",
+          selectedServiceTier: "standard",
+          serviceTierFallbackReason: null,
+        },
       },
     };
     const startCommand = {

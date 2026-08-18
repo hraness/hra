@@ -40,8 +40,6 @@ test("chat pane storage enforces CAS, one active turn, and private prompt custod
       interactionMode: "chat",
       revision: 1,
       state: "ready",
-      model: "gpt-5.6-sol",
-      reasoningEffort: "ultra",
       activity: { ordinal: 0, kind: "idle" },
     });
     const renamed = store.rename(PANE, created.revision, "Focused pane", NOW);
@@ -117,8 +115,6 @@ test("attached harness observers are deterministic, replayable, immutable, and o
         id: harnessObserverPaneId(actorId),
         interactionMode: "harnessObserver",
         accountProfileId: ACCOUNT,
-        model: "gpt-5.6-sol",
-        reasoningEffort: "ultra",
         title: "Research actor",
         state: "ready",
         turn: null,
@@ -136,10 +132,9 @@ test("attached harness observers are deterministic, replayable, immutable, and o
       store.createAttachedHarnessSession(input)
     )()).toEqual({ kind: "replayed", pane: created.pane });
 
-    expect(() => store.configure(
+    expect(() => store.recoverWorkspace(
       created.pane.id,
       created.pane.revision,
-      "max",
       NOW,
     )).toThrow(expect.objectContaining({ code: "invalid_state" }));
     expect(() => store.selectRepository(
@@ -390,7 +385,6 @@ test("attached actor session rebinding is exact, replayable, and mode-scoped", (
         workingDirectory: "/fixture/example",
       },
       accountProfileId: ACCOUNT,
-      reasoningEffort: "ultra",
       now: NOW,
     });
     expect(() => store.rebindAttachedHarnessSession({
@@ -415,7 +409,6 @@ test("pane order is exact, durable, contiguous, and normalized after removal", (
       paneId: `pane_slot${String(index).padStart(8, "0")}`,
       repository: { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" },
       accountProfileId: ACCOUNT,
-      reasoningEffort: "ultra",
       now: new Date(NOW.getTime() + index),
     }));
     const initialOrder = panes.map(({ id }) => id);
@@ -424,7 +417,6 @@ test("pane order is exact, durable, contiguous, and normalized after removal", (
       paneId: "pane_slotoverflow",
       repository: { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" },
       accountProfileId: ACCOUNT,
-      reasoningEffort: "ultra",
       now: new Date(NOW.getTime() + 65),
     })).toThrow(expect.objectContaining({ code: "limit" }));
 
@@ -453,7 +445,6 @@ test("pane order is exact, durable, contiguous, and normalized after removal", (
       paneId: "pane_slotreplacement",
       repository: { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" },
       accountProfileId: ACCOUNT,
-      reasoningEffort: "max",
       now: new Date(NOW.getTime() + 66),
     });
     const restarted = new ChatPaneStore(database);
@@ -512,49 +503,6 @@ test("activity ordinals advance across the pane lifetime", () => {
     expect(thinking?.activity).toEqual({
       ordinal: 6,
       kind: "thinkingCompleted",
-    });
-  });
-});
-
-test("pane configuration remains available while workspace preparation is pending", () => {
-  withStore((store) => {
-    const created = createPane(store);
-    expect(created.workspace).toEqual({
-      mode: "managedWorktree",
-      state: "preparing",
-      revision: 1,
-      recoveryKind: null,
-    });
-
-    const configured = store.configure(
-      PANE,
-      created.revision,
-      "max",
-      NOW,
-      "fast",
-    );
-    expect(configured).toMatchObject({
-      accountProfileId: ACCOUNT,
-      reasoningEffort: "max",
-      serviceTier: "fast",
-      revision: created.revision + 1,
-      workspace: {
-        mode: "managedWorktree",
-        state: "preparing",
-        revision: 1,
-        recoveryKind: null,
-      },
-    });
-    const preservedTier = store.configure(
-      PANE,
-      configured.revision,
-      "ultra",
-      NOW,
-    );
-    expect(preservedTier).toMatchObject({
-      reasoningEffort: "ultra",
-      serviceTier: "fast",
-      revision: configured.revision + 1,
     });
   });
 });
@@ -1210,7 +1158,8 @@ test("retry admission rejects stale, wrong, missing, and duplicate identities at
 test("arbitrary failure, retry, replacement, restart, completion, and removal lifecycles preserve prompt laws", () => {
   const character = fc.constantFrom(..."abcdefghijklmnopqrstuvwxyz0123456789 ", "é", "界", "🙂");
   const prompt = fc.array(character, { minLength: 1, maxLength: 48 })
-    .map((characters) => characters.join(""));
+    .map((characters) => characters.join(""))
+    .filter((value) => value.trim().length > 0);
   assertProperty(fc.property(
     fc.array(fc.record({
       prompt,
@@ -1385,7 +1334,6 @@ test("migration identifier checks match the contract and reject invalid suffix c
       paneId: "pane_1234567",
       repository: { id: REPOSITORY, name: "Shortest", workingDirectory: "/fixture" },
       accountProfileId: ACCOUNT,
-      reasoningEffort: "max",
       now: NOW,
     })).not.toThrow();
     expect(() => database.query(`
@@ -1407,7 +1355,6 @@ function createPane(store: ChatPaneStore, paneId = PANE): ChatPaneProjection {
       workingDirectory: "/fixture/example",
     },
     accountProfileId: ACCOUNT,
-    reasoningEffort: "ultra",
     now: NOW,
   });
 }

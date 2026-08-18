@@ -1161,7 +1161,6 @@ export class SessionSyncCoordinator {
             ...(localIntent.repositoryDisplayName === undefined
               ? {}
               : { repositoryDisplayName: localIntent.repositoryDisplayName }),
-            modelEffort: localIntent.modelEffort,
             state: localIntent.state,
             deleted: localIntent.deleted,
           }),
@@ -1513,7 +1512,6 @@ export class SessionSyncCoordinator {
         sourceRevision: Number(decodeSyncUint64(summary.sourceRevision)),
         title: summary.title,
         repositoryDisplayName: summary.repositoryDisplayName ?? null,
-        modelEffort: summary.modelEffort,
         state: member.status === "revoked"
           ? "revoked"
           : value.kind === "offline"

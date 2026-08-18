@@ -44,7 +44,6 @@ const settingsRowSchema = z.object({
   singleton: z.literal(1),
   revision: revisionSchema,
   recursive_sessions_enabled: storedBooleanSchema,
-  automatic_fast_mode: harnessSettingsProjectionSchema.shape.automaticFastMode,
   context_quota_bytes: harnessSettingsProjectionSchema.shape.contextQuotaBytes,
   refinement_mode: harnessSettingsProjectionSchema.shape.refinementMode,
   updated_at: timestampSchema,
@@ -76,7 +75,6 @@ const settingsUpdateSchema = z.object({
   expectedHarnessRevision: revisionSchema,
   expectedSettingsRevision: revisionSchema,
   recursiveSessionsEnabled: z.boolean(),
-  automaticFastMode: harnessSettingsProjectionSchema.shape.automaticFastMode,
   contextQuotaBytes: z.number().int().min(MIB).max(64 * MIB)
     .refine((value) => value % MIB === 0, "context quota must use whole MiB"),
   refinementMode: harnessSettingsProjectionSchema.shape.refinementMode,
@@ -206,7 +204,6 @@ export class HarnessRendererSQLiteAdapterV2 implements
     expectedHarnessRevision: number;
     expectedSettingsRevision: number;
     recursiveSessionsEnabled: boolean;
-    automaticFastMode: "off" | "criticalPath";
     contextQuotaBytes: number;
     refinementMode: "off" | "suggest";
   }>): Readonly<{
@@ -257,15 +254,13 @@ export class HarnessRendererSQLiteAdapterV2 implements
         UPDATE harness_settings SET
           revision = revision + 1,
           recursive_sessions_enabled = ?2,
-          automatic_fast_mode = ?3,
-          context_quota_bytes = ?4,
-          refinement_mode = ?5,
-          updated_at = ?6
+          context_quota_bytes = ?3,
+          refinement_mode = ?4,
+          updated_at = ?5
         WHERE singleton = 1 AND revision = ?1
       `).run(
         input.expectedSettingsRevision,
         input.recursiveSessionsEnabled ? 1 : 0,
-        input.automaticFastMode,
         input.contextQuotaBytes,
         input.refinementMode,
         updatedAt,
@@ -278,7 +273,6 @@ export class HarnessRendererSQLiteAdapterV2 implements
         next.harnessRevision !== input.expectedHarnessRevision + 1 ||
         next.settings.recursiveSessionsEnabled !==
           input.recursiveSessionsEnabled ||
-        next.settings.automaticFastMode !== input.automaticFastMode ||
         next.settings.contextQuotaBytes !== input.contextQuotaBytes ||
         next.settings.refinementMode !== input.refinementMode
       ) corrupt("settings CAS committed an incoherent projection");
@@ -524,7 +518,7 @@ export class HarnessRendererSQLiteAdapterV2 implements
   }> {
     const values: unknown[] = this.#database.query(`
       SELECT singleton, revision, recursive_sessions_enabled,
-        automatic_fast_mode, context_quota_bytes, refinement_mode, updated_at
+        context_quota_bytes, refinement_mode, updated_at
       FROM harness_settings
       WHERE singleton = 1
       LIMIT 2
@@ -536,7 +530,6 @@ export class HarnessRendererSQLiteAdapterV2 implements
       settings: harnessSettingsProjectionSchema.parse({
         revision: row.revision,
         recursiveSessionsEnabled: row.recursive_sessions_enabled === 1,
-        automaticFastMode: row.automatic_fast_mode,
         contextQuotaBytes: row.context_quota_bytes,
         refinementMode: row.refinement_mode,
       }),

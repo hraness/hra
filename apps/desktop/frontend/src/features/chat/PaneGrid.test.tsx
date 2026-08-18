@@ -41,7 +41,6 @@ test("remote sessions render bounded observation fields and only one metadata co
     sourceRevision: 2,
     title: "Review the release",
     repositoryDisplayName: "Example",
-    modelEffort: "max",
     state: "working",
     updatedAt: 1_735_689_600_000,
     });
@@ -81,7 +80,6 @@ test("remote summaries expose a collision line only when titles collide", () => 
     sourceRevision: 1,
     title: "Release",
     repositoryDisplayName: "Example",
-    modelEffort: "ultra",
     state: "ready",
     updatedAt: null,
   });
@@ -120,7 +118,6 @@ test("every remote state retains the readable title, device tooltip, and no muta
       sourceRevision: 1,
       title: "Last readable state",
       repositoryDisplayName: "Example",
-      modelEffort: "ultra",
       state,
       updatedAt: null,
     });
@@ -166,7 +163,6 @@ test("the 512-summary head mounts one stable bounded window", () => {
       sourceRevision: 1,
       title: `Summary ${index + 1}`,
       repositoryDisplayName: null,
-      modelEffort: "max",
       state: "ready",
       updatedAt: null,
     }).sessionId
@@ -220,7 +216,6 @@ test("local and bounded remote summaries share one stable grid order", () => {
     sourceRevision: 1,
     title: "A",
     repositoryDisplayName: null,
-    modelEffort: "max",
     state: "ready",
     updatedAt: null,
   });
@@ -285,7 +280,6 @@ test("a remote session stays ahead of a newly created unbound local pane", () =>
     sourceRevision: 1,
     title: "Remote first",
     repositoryDisplayName: null,
-    modelEffort: "max",
     state: "ready",
     updatedAt: null,
   });
@@ -309,7 +303,6 @@ test("persisted local slots survive restart and remote grid gaps", () => {
       sourceRevision: 1,
       title: `Remote ${character}`,
       repositoryDisplayName: null,
-      modelEffort: "max",
       state: "ready",
       updatedAt: null,
     });

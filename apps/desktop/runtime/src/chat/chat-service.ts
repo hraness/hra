@@ -1,4 +1,9 @@
-import { accountProfileIdSchema, chatPaneIdSchema } from "../../../contracts/runtime";
+import {
+  accountProfileIdSchema,
+  chatPaneIdSchema,
+  type ChatRootTurnProfile,
+} from "../../../contracts/runtime";
+import type { RootTurnRoutingAuthorityV1 } from "../harness/root-turn-routing-sqlite-v1";
 import { ChatPaneStoreError } from "../state/chat-pane-store";
 import type {
   ChatPaneDeltaBatchInput,
@@ -18,7 +23,6 @@ import {
   CHAT_MAX_DELTA_UTF8_BYTES,
   CHAT_MAX_ASSISTANT_RECONCILIATION_UTF8_BYTES,
   CHAT_MAX_RESPONSE_TAIL_UTF8_BYTES,
-  CHAT_MODEL,
   ChatProviderEffectError,
   type ChatAccountCandidate,
   type ChatAccountProfileId,
@@ -47,7 +51,6 @@ import {
 } from "./types";
 
 const providerConfiguration = Object.freeze({
-  model: CHAT_MODEL,
   approvalPolicy: "on-request",
   approvalsReviewer: "auto_review",
   sandbox: "workspace-write",
@@ -230,6 +233,7 @@ export interface ChatServiceOptions {
   readonly provider: ChatProviderPort;
   readonly repositories: ChatRepositoryPort;
   readonly runtimeRecovery: ChatRuntimeRecoveryPort;
+  readonly rootTurnRouting: RootTurnRoutingAuthorityV1;
   readonly store: ChatPaneStore;
   readonly workspaces: ChatWorkspacePort;
   readonly attachedHarnessRetryDelayMs?: (attempt: number) => number;
@@ -250,6 +254,7 @@ export class ChatService {
   readonly #provider: ChatProviderPort;
   readonly #repositories: ChatRepositoryPort;
   readonly #runtimeRecovery: ChatRuntimeRecoveryPort;
+  readonly #rootTurnRouting: RootTurnRoutingAuthorityV1;
   readonly #store: ChatPaneStore;
   readonly #workspaces: ChatWorkspacePort;
   readonly #attachedHarnessRetryDelayMs: (attempt: number) => number;
@@ -317,6 +322,7 @@ export class ChatService {
     this.#provider = options.provider;
     this.#repositories = options.repositories;
     this.#runtimeRecovery = options.runtimeRecovery;
+    this.#rootTurnRouting = options.rootTurnRouting;
     this.#store = options.store;
     this.#workspaces = options.workspaces;
     this.#attachedHarnessRetryDelayMs = options.attachedHarnessRetryDelayMs ??
@@ -388,6 +394,10 @@ export class ChatService {
       if (pane === null) return;
       if (pane.projection.turn !== null && activePane(pane.projection)) {
         if (pane.providerTurnId === null) {
+          this.#settleUnacceptedRootTurnRouting(
+            paneId,
+            pane.projection.turn.id,
+          );
           await this.#settleHarnessBeforeProvider(
             paneId,
             pane.projection.turn.id,
@@ -407,6 +417,11 @@ export class ChatService {
           // already accepted. Preserve its exact provider lineage until the
           // root authority consumes that proof; the pre-provider ambiguity
           // escape hatch is invalid after a provider turn exists.
+          this.#settleRootTurnRouting(
+            paneId,
+            pane.projection.turn.id,
+            "failed",
+          );
           await this.#observeHarnessTerminal(
             paneId,
             pane.projection.turn.id,
@@ -641,8 +656,6 @@ export class ChatService {
             paneId: command.paneId,
             repository,
             accountProfileId: null,
-            reasoningEffort: command.reasoningEffort,
-            serviceTier: command.serviceTier ?? "standard",
             now: this.#now(),
           });
           await this.#projection.paneChanged(pane);
@@ -662,14 +675,12 @@ export class ChatService {
           if (binding !== null) this.#bestEffortName(binding, pane.title);
           return { type: "pane", pane };
         });
-      case "chat.pane.configure":
+      case "chat.pane.workspace.recover":
         return this.#serialize(command.paneId, async () => {
-          const pane = this.#store.configure(
+          const pane = this.#store.recoverWorkspace(
             command.paneId,
             command.expectedRevision,
-            command.reasoningEffort,
             this.#now(),
-            command.serviceTier,
           );
           await this.#projection.paneStateChanged(pane);
           if (pane.workspace?.state !== "ready") {
@@ -765,15 +776,37 @@ export class ChatService {
               "Create or recover this pane's isolated workspace before sending a message.",
             );
           }
-          const admission = (attachedActor
-            ? this.#store.beginAttachedHarnessTurn.bind(this.#store)
-            : this.#store.beginTurn.bind(this.#store))({
-            paneId: command.paneId,
-            expectedRevision: command.expectedRevision,
-            turnId: command.turnId,
-            prompt: command.prompt,
-            now: this.#now(),
-          });
+          if (!attachedActor && activePane(current.projection)) {
+            if (
+              current.projection.turn?.id === command.turnId &&
+              current.activePrompt === command.prompt
+            ) {
+              throw new ChatPaneStoreError(
+                "conflict",
+                "This chat turn was already admitted.",
+              );
+            }
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "This chat pane already has an active turn.",
+            );
+          }
+          const now = this.#now();
+          const admission = attachedActor
+            ? this.#store.beginAttachedHarnessTurn({
+                paneId: command.paneId,
+                expectedRevision: command.expectedRevision,
+                turnId: command.turnId,
+                prompt: command.prompt,
+                now,
+              })
+            : this.#store.beginTurn({
+                paneId: command.paneId,
+                expectedRevision: command.expectedRevision,
+                turnId: command.turnId,
+                prompt: command.prompt,
+                now,
+              });
           if (admission.kind === "replayed") {
             throw new ChatPaneStoreError(
               "conflict",
@@ -825,6 +858,10 @@ export class ChatService {
               if (this.#poisonedTurns.get(command.paneId) === command.turnId) {
                 return;
               }
+              if (!this.#trySettleContainedRootTurnRouting(
+                command.paneId,
+                command.turnId,
+              )) return;
               try {
                 await this.#settleHarnessBeforeProvider(
                   command.paneId,
@@ -834,6 +871,9 @@ export class ChatService {
               } catch {
                 // The root transition already fenced this exact turn and
                 // requested Native recovery. Never publish a reusable state.
+                return;
+              }
+              if (this.#recoveryFencedTurns.get(command.paneId) === command.turnId) {
                 return;
               }
               await this.#publishAttention(command.paneId, command.turnId, {
@@ -877,12 +917,19 @@ export class ChatService {
               "Create or recover this pane's isolated workspace before retrying.",
             );
           }
+          if (current.activePrompt === null) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "The failed turn has no recoverable prompt.",
+            );
+          }
+          const now = this.#now();
           const admission = this.#store.retryTurn({
             paneId: command.paneId,
             expectedRevision: command.expectedRevision,
             priorFailedTurnId: command.priorFailedTurnId,
             turnId: command.turnId,
-            now: this.#now(),
+            now,
           });
           if (admission.kind === "replayed") {
             throw new ChatPaneStoreError(
@@ -905,6 +952,10 @@ export class ChatService {
               await this.#startLogicalTurn(command.paneId, command.turnId);
             } catch {
               if (this.#poisonedTurns.get(command.paneId) === command.turnId) return;
+              if (!this.#trySettleContainedRootTurnRouting(
+                command.paneId,
+                command.turnId,
+              )) return;
               try {
                 await this.#settleHarnessBeforeProvider(
                   command.paneId,
@@ -912,6 +963,9 @@ export class ChatService {
                   "provider_start_ambiguous",
                 );
               } catch {
+                return;
+              }
+              if (this.#recoveryFencedTurns.get(command.paneId) === command.turnId) {
                 return;
               }
               await this.#publishAttention(command.paneId, command.turnId, {
@@ -1498,6 +1552,21 @@ export class ChatService {
     try {
       await this.#applySessionEvent(target.paneId, event);
     } catch {
+      if (event.effect.type === "terminal") {
+        try {
+          this.#settleRootTurnRouting(
+            target.paneId,
+            target.turnId,
+            event.effect.quotaProof === "provider_rate_limit_reached"
+              ? "quotaRejected"
+              : event.effect.outcome === "completed"
+                ? "succeeded"
+                : event.effect.outcome,
+          );
+        } catch {
+          // Containment below owns fail-closed recovery when evidence remains unavailable.
+        }
+      }
       await this.#containProjectionBacklogLoss(
         target,
         event.effect.type !== "terminal",
@@ -1781,6 +1850,11 @@ export class ChatService {
           lifecycle: quotaLifecycle,
         }));
       }
+      this.#settleRootTurnRouting(
+        event.paneId,
+        event.turnId,
+        "quotaRejected",
+      );
       await this.#stopAfterProvenQuota(
         event.paneId,
         event.turnId,
@@ -1788,6 +1862,11 @@ export class ChatService {
       );
       return;
     }
+    this.#settleRootTurnRouting(
+      event.paneId,
+      event.turnId,
+      event.outcome === "completed" ? "succeeded" : event.outcome,
+    );
     if (lifecycle !== null) {
       await this.#observeHarnessTerminal(event.paneId, event.turnId, lifecycle);
     }
@@ -2268,10 +2347,17 @@ export class ChatService {
     try {
       if (priorQuotaLifecycle !== null) {
         this.#priorQuotaTerminals.delete(paneId);
+        this.#settleRootTurnRouting(paneId, request.turnId, "quotaRejected");
         await this.#observeHarnessTerminal(paneId, request.turnId, priorQuotaLifecycle);
       } else if (exactTerminalLifecycle !== null) {
+        this.#settleRootTurnRouting(
+          paneId,
+          request.turnId,
+          routingOutcomeForLifecycle(exactTerminalLifecycle),
+        );
         await this.#observeHarnessTerminal(paneId, request.turnId, exactTerminalLifecycle);
       } else if (target.binding !== null && target.providerTurnId !== null) {
+        this.#settleRootTurnRouting(paneId, request.turnId, "interrupted");
         await this.#observeHarnessTerminal(paneId, request.turnId, {
           accountProfileId: target.binding.accountProfileId,
           threadId: target.binding.threadId,
@@ -2279,6 +2365,7 @@ export class ChatService {
           status: "interrupted",
         });
       } else {
+        this.#settleUnacceptedRootTurnRouting(paneId, request.turnId);
         await this.#settleHarnessBeforeProvider(
           paneId,
           request.turnId,
@@ -2507,6 +2594,16 @@ export class ChatService {
       this.#pendingTurnContainments.delete(target.paneId);
       try {
         try {
+          const routing = this.#rootTurnRouting.readTurnRouting(
+            target.paneId,
+            target.turnId,
+          );
+          if (routing?.settledAt === null || routing === null) {
+            throw new ChatPaneStoreError(
+              "corrupt_state",
+              "Terminal provider evidence could not settle root routing.",
+            );
+          }
           await finalize();
         } catch {
           this.#poisonActiveTurnAndRequestRecovery(target.paneId, target.turnId);
@@ -2542,6 +2639,11 @@ export class ChatService {
             this.#priorQuotaTerminals.delete(target.paneId);
           }
           try {
+            this.#settleRootTurnRouting(
+              target.paneId,
+              target.turnId,
+              routingOutcomeForLifecycle(authoritativeLifecycle),
+            );
             await this.#observeHarnessTerminal(
               target.paneId,
               target.turnId,
@@ -2593,6 +2695,10 @@ export class ChatService {
           ) return;
           this.#poisonedTurns.set(target.paneId, target.turnId);
           try {
+            this.#settleContainedRootTurnRouting(
+              target.paneId,
+              target.turnId,
+            );
             await finalize();
           } catch {
             this.#poisonTurnAndRequestRecovery({
@@ -2630,6 +2736,10 @@ export class ChatService {
         ) return;
         this.#poisonedTurns.set(target.paneId, target.turnId);
         try {
+          this.#settleContainedRootTurnRouting(
+            target.paneId,
+            target.turnId,
+          );
           await finalize();
         } catch {
           this.#poisonTurnAndRequestRecovery({
@@ -2716,6 +2826,24 @@ export class ChatService {
     this.#discardEarlySessionEvents(input.paneId);
     this.#quotaProofFloors.delete(input.paneId);
     this.#priorQuotaTerminals.delete(input.paneId);
+    try {
+      const routing = this.#rootTurnRouting.readTurnRouting(
+        input.paneId,
+        input.turnId,
+      );
+      if (routing !== null && routing.settledAt === null) {
+        this.#rootTurnRouting.settle({
+          paneId: input.paneId,
+          chatTurnId: input.turnId,
+          outcome: routing.effectStartedAt === null
+            ? "notApplied"
+            : routing.acceptedAt === null ? "ambiguous" : "interrupted",
+          now: this.#now(),
+        });
+      }
+    } catch {
+      // Native rehydration remains mandatory when the routing ledger is unavailable.
+    }
     try {
       const poisoned = this.#store.poisonTurn(input.paneId, input.turnId, this.#now());
       if (poisoned !== null) {
@@ -2922,6 +3050,7 @@ export class ChatService {
       candidates = await this.#accounts.refreshCandidates();
     } catch {
       if (this.#turnStartupMustStop(paneId, turnId)) return;
+      this.#settleRootTurnRouting(paneId, turnId, "notApplied");
       await this.#settleHarnessBeforeProvider(
         paneId,
         turnId,
@@ -2944,6 +3073,7 @@ export class ChatService {
     const account = ranked[0];
     if (account === undefined) {
       if (this.#turnStartupMustStop(paneId, turnId)) return;
+      this.#settleRootTurnRouting(paneId, turnId, "notApplied");
       await this.#settleHarnessBeforeProvider(
         paneId,
         turnId,
@@ -2958,26 +3088,32 @@ export class ChatService {
     await this.#projection.paneStateChanged(reserved);
     if (this.#turnStartupMustStop(paneId, turnId)) return;
     pane = this.#store.require(paneId);
-    const configuration = configurationFor(pane);
     const plannedHandoff = previousBinding?.accountProfileId === account.id
       ? null
       : this.#store.handoffHistory(paneId, false);
     if (plannedHandoff !== null && !plannedHandoff.complete) {
+      this.#settleRootTurnRouting(paneId, turnId, "notApplied");
       await this.#publishContextReset(paneId, turnId);
       return;
     }
     const handoffRequired = plannedHandoff !== null && plannedHandoff.items.length > 0;
     let handoffConfirmed = !handoffRequired;
     let providerTurnAttempted = false;
+    let providerEffectStarted = false;
     try {
       if (this.#turnStartupMustStop(paneId, turnId)) return;
-      await this.#provider.validateConfiguration(
+      const configuration = await this.#resolveRootTurnConfiguration(
+        paneId,
+        turnId,
         account.id,
-        CHAT_MODEL,
-        pane.projection.reasoningEffort,
-        pane.projection.serviceTier,
       );
       if (this.#turnStartupMustStop(paneId, turnId)) return;
+      this.#rootTurnRouting.markEffectStarted({
+        paneId,
+        chatTurnId: turnId,
+        now: this.#now(),
+      });
+      providerEffectStarted = true;
       let binding: ChatThreadBinding;
       if (previousBinding?.accountProfileId === account.id) {
         binding = previousBinding;
@@ -3042,6 +3178,13 @@ export class ChatService {
       );
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       try {
+        this.#rootTurnRouting.accept({
+          paneId,
+          chatTurnId: turnId,
+          acceptedGeneration: accepted.quotaProofCursor.generation,
+          acceptedStreamPosition: accepted.quotaProofCursor.streamPosition,
+          now: this.#now(),
+        });
         this.#rememberQuotaFloor(paneId, turnId, binding.accountProfileId, accepted.quotaProofCursor);
         const streaming = this.#store.markTurnAccepted(paneId, turnId, accepted.turnId, this.#now());
         await this.#projection.paneStateChanged(streaming);
@@ -3062,6 +3205,12 @@ export class ChatService {
       }
     } catch (error: unknown) {
       if (error instanceof ChatContainmentFailure) {
+        if (
+          providerEffectStarted &&
+          !this.#trySettleContainedRootTurnRouting(paneId, turnId)
+        ) {
+          return;
+        }
         if (providerTurnAttempted) {
           try {
             await this.#settleHarnessBeforeProvider(
@@ -3077,9 +3226,34 @@ export class ChatService {
       }
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       if (provenQuotaRejection(error)) {
+        this.#settleRootTurnRouting(paneId, turnId, "quotaRejected");
         await this.#stopAfterProvenQuota(paneId, turnId, null);
         return;
       }
+      if (
+        providerEffectStarted && !providerTurnAttempted &&
+        ambiguousProviderEffect(error)
+      ) {
+        try {
+          await this.#containAccountGeneration(account.id);
+        } catch {
+          this.#trySettleRootTurnRouting(paneId, turnId, "ambiguous");
+          this.#poisonTurnAndRequestRecovery({
+            paneId,
+            turnId,
+            accountProfileId: account.id,
+          });
+          return;
+        }
+        void this.handleAccountUnavailable(account.id).catch(() => undefined);
+      }
+      this.#settleRootTurnRouting(
+        paneId,
+        turnId,
+        !providerEffectStarted
+          ? "notApplied"
+          : ambiguousProviderEffect(error) ? "ambiguous" : "failed",
+      );
       await this.#settleHarnessBeforeProvider(
         paneId,
         turnId,
@@ -3094,6 +3268,168 @@ export class ChatService {
         handoffRequired && !handoffConfirmed ? "continuation_failed" : "turn_failed",
       );
     }
+  }
+
+  async #resolveRootTurnConfiguration(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+    accountProfileId: ChatAccountProfileId,
+  ): Promise<ChatProviderConfiguration> {
+    const pane = this.#store.require(paneId);
+    if (
+      pane.projection.turn?.id !== turnId ||
+      !activePane(pane.projection)
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The root route no longer owns an active chat turn.",
+      );
+    }
+    const receipt = this.#rootTurnRouting.readTurnRouting(paneId, turnId);
+    if (receipt === null) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The active ordinary root turn has no durable routing classification.",
+      );
+    }
+    if (receipt.selectedProfile !== null) {
+      if (receipt.selectedServiceTier === null) {
+        throw new ChatPaneStoreError(
+          "corrupt_state",
+          "The resolved root route lost its selected service tier.",
+        );
+      }
+      return configurationFor(
+        receipt.selectedProfile,
+        receipt.selectedServiceTier,
+      );
+    }
+
+    const candidates = rootTurnResolutionCandidates(
+      receipt.requestedProfile,
+      receipt.requestedServiceTier,
+    ).map((candidate) => ({
+      ...candidate,
+      configuration: configurationFor(
+        candidate.profile,
+        candidate.serviceTier,
+      ),
+    }));
+    const configuration = await this.#provider.resolveConfiguration(
+      accountProfileId,
+      candidates.map((candidate) => candidate.configuration),
+    );
+    const selected = candidates.find((candidate) =>
+      sameConfiguration(candidate.configuration, configuration)
+    );
+    if (selected === undefined) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The provider resolved a configuration outside HRA's route.",
+      );
+    }
+    this.#rootTurnRouting.resolve({
+      paneId,
+      chatTurnId: turnId,
+      selectedProfile: selected.profile,
+      profileFallbackReason: selected.profile === receipt.requestedProfile
+        ? null
+        : "lunaUnavailable",
+      selectedServiceTier: selected.serviceTier,
+      serviceTierFallbackReason:
+        selected.serviceTier === receipt.requestedServiceTier
+          ? null
+          : "fastUnavailable",
+      now: this.#now(),
+    });
+    return configuration;
+  }
+
+  #settleRootTurnRouting(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+    outcome: Parameters<RootTurnRoutingAuthorityV1["settle"]>[0]["outcome"],
+  ): void {
+    if (this.#store.get(paneId)?.projection.interactionMode === "harnessObserver") {
+      return;
+    }
+    this.#rootTurnRouting.settle({
+      paneId,
+      chatTurnId: turnId,
+      outcome,
+      now: this.#now(),
+    });
+  }
+
+  #trySettleRootTurnRouting(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+    outcome: Parameters<RootTurnRoutingAuthorityV1["settle"]>[0]["outcome"],
+  ): void {
+    try {
+      this.#settleRootTurnRouting(paneId, turnId, outcome);
+    } catch {
+      this.#poisonActiveTurnAndRequestRecovery(paneId, turnId);
+    }
+  }
+
+  #trySettleContainedRootTurnRouting(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): boolean {
+    try {
+      this.#settleContainedRootTurnRouting(paneId, turnId);
+      return true;
+    } catch {
+      this.#poisonActiveTurnAndRequestRecovery(paneId, turnId);
+      return false;
+    }
+  }
+
+  #settleContainedRootTurnRouting(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): void {
+    if (this.#store.get(paneId)?.projection.interactionMode === "harnessObserver") {
+      return;
+    }
+    const receipt = this.#rootTurnRouting.readTurnRouting(paneId, turnId);
+    if (receipt === null) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The contained ordinary root turn has no durable route receipt.",
+      );
+    }
+    if (receipt.settledAt !== null) return;
+    this.#settleRootTurnRouting(
+      paneId,
+      turnId,
+      receipt.effectStartedAt === null
+        ? "notApplied"
+        : receipt.acceptedAt === null ? "ambiguous" : "interrupted",
+    );
+  }
+
+  #settleUnacceptedRootTurnRouting(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): void {
+    if (this.#store.get(paneId)?.projection.interactionMode === "harnessObserver") {
+      return;
+    }
+    const receipt = this.#rootTurnRouting.readTurnRouting(paneId, turnId);
+    if (receipt === null) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The unavailable ordinary root turn has no durable route receipt.",
+      );
+    }
+    if (receipt.settledAt !== null) return;
+    this.#settleRootTurnRouting(
+      paneId,
+      turnId,
+      receipt.effectStartedAt === null ? "notApplied" : "ambiguous",
+    );
   }
 
   async #stopAfterProvenQuota(
@@ -3166,6 +3502,7 @@ export class ChatService {
     } catch {
       // Project a provider-neutral unavailable state below.
     }
+    this.#settleRootTurnRouting(pane.projection.id, turnId, "notApplied");
     await this.#publishAttention(pane.projection.id, turnId, {
       code: "runtime_unavailable",
       message: "This repository is unavailable. Restore it, then send another message.",
@@ -3217,10 +3554,36 @@ export class ChatService {
         "Root harness admission returned an invalid logical turn identity.",
       );
     }
+    try {
+      this.#rootTurnRouting.bindRootTurn({
+        paneId: pane.projection.id,
+        chatTurnId: turnId,
+        rootTurnId: admitted.turnId,
+        now: this.#now(),
+      });
+    } catch {
+      try {
+        await this.#awaitHarnessRootTransition(roots.settleBeforeProvider({
+          turnId: admitted.turnId,
+          paneId: pane.projection.id,
+          failure: "provider_start_ambiguous",
+          settledAt: this.#now().toISOString(),
+        }));
+      } catch {
+        // Native recovery below owns both durable authorities.
+      }
+      this.#poisonActiveTurnAndRequestRecovery(pane.projection.id, turnId);
+      throw new ChatContainmentFailure();
+    }
     if (
       this.#admissionClosed ||
       this.#turnStartupMustStop(pane.projection.id, turnId)
     ) {
+      this.#settleRootTurnRouting(
+        pane.projection.id,
+        turnId,
+        "notApplied",
+      );
       try {
         await this.#awaitHarnessRootTransition(roots.settleBeforeProvider({
           turnId: admitted.turnId,
@@ -3242,6 +3605,11 @@ export class ChatService {
       current !== undefined &&
       (current.chatTurnId !== turnId || current.rootTurnId !== admitted.turnId)
     ) {
+      this.#settleRootTurnRouting(
+        pane.projection.id,
+        turnId,
+        "notApplied",
+      );
       try {
         await this.#awaitHarnessRootTransition(roots.settleBeforeProvider({
           turnId: admitted.turnId,
@@ -3425,7 +3793,8 @@ export class ChatService {
       return;
     }
     const ambiguous = !(error instanceof ChatProviderEffectError) || error.certainty === "ambiguous";
-    const configuration = error instanceof ChatProviderEffectError && error.code === "configuration";
+    const configuration = error instanceof ChatProviderEffectError &&
+      (error.code === "configuration" || error.code === "capability_unavailable");
     const authentication = error instanceof ChatProviderEffectError && error.code === "authentication";
     await this.#publishAttention(paneId, turnId, {
       code: configuration || authentication ? "account_unavailable" : fallbackCode,
@@ -3823,12 +4192,73 @@ function chatAccountBudgetRank(budget: ChatAccountCandidate["budget"]): number {
   }
 }
 
-function configurationFor(pane: ChatPanePrivateRecord): ChatProviderConfiguration {
+function configurationFor(
+  profile: ChatRootTurnProfile,
+  serviceTier: "standard" | "fast",
+): ChatProviderConfiguration {
+  const selected = configurationForProfile(profile);
   return {
     ...providerConfiguration,
-    reasoningEffort: pane.projection.reasoningEffort,
-    serviceTier: pane.projection.serviceTier,
+    ...selected,
+    serviceTier,
   };
+}
+
+function sameConfiguration(
+  left: ChatProviderConfiguration,
+  right: ChatProviderConfiguration,
+): boolean {
+  return left.model === right.model &&
+    left.reasoningEffort === right.reasoningEffort &&
+    (left.serviceTier ?? "standard") ===
+      (right.serviceTier ?? "standard") &&
+    left.approvalPolicy === right.approvalPolicy &&
+    left.approvalsReviewer === right.approvalsReviewer &&
+    left.sandbox === right.sandbox;
+}
+
+type RootTurnResolutionCandidate = Readonly<{
+  profile: ChatRootTurnProfile;
+  serviceTier: "standard" | "fast";
+}>;
+
+function rootTurnResolutionCandidates(
+  requestedProfile: ChatRootTurnProfile,
+  requestedServiceTier: "standard" | "fast",
+): readonly RootTurnResolutionCandidate[] {
+  if (requestedProfile === "lunaMax") {
+    return requestedServiceTier === "fast"
+      ? [
+          { profile: "lunaMax", serviceTier: "fast" },
+          { profile: "lunaMax", serviceTier: "standard" },
+          { profile: "solMax", serviceTier: "fast" },
+          { profile: "solMax", serviceTier: "standard" },
+        ]
+      : [
+          { profile: "lunaMax", serviceTier: "standard" },
+          { profile: "solMax", serviceTier: "standard" },
+        ];
+  }
+  if (requestedProfile === "solMax" && requestedServiceTier === "fast") {
+    return [
+      { profile: "solMax", serviceTier: "fast" },
+      { profile: "solMax", serviceTier: "standard" },
+    ];
+  }
+  return [{ profile: requestedProfile, serviceTier: requestedServiceTier }];
+}
+
+function configurationForProfile(
+  profile: ChatRootTurnProfile,
+): Pick<ChatProviderConfiguration, "model" | "reasoningEffort"> {
+  switch (profile) {
+    case "lunaMax":
+      return { model: "gpt-5.6-luna", reasoningEffort: "max" };
+    case "solMax":
+      return { model: "gpt-5.6-sol", reasoningEffort: "max" };
+    case "solUltra":
+      return { model: "gpt-5.6-sol", reasoningEffort: "ultra" };
+  }
 }
 
 function provenQuotaRejection(error: unknown): boolean {
@@ -3836,6 +4266,24 @@ function provenQuotaRejection(error: unknown): boolean {
     error.certainty === "not_applied" &&
     error.code === "quota_reached" &&
     error.quotaProof === "provider_rate_limit_reached";
+}
+
+function routingOutcomeForLifecycle(
+  lifecycle: SessionTurnLifecycle,
+): "succeeded" | "failed" | "interrupted" | "quotaRejected" {
+  if (lifecycle.quotaProof === "provider_usage_limit_exceeded") {
+    return "quotaRejected";
+  }
+  switch (lifecycle.status) {
+    case "completed": return "succeeded";
+    case "failed": return "failed";
+    case "interrupted": return "interrupted";
+    case "inProgress":
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "An in-progress provider lifecycle cannot settle root routing.",
+      );
+  }
 }
 
 function ambiguousProviderEffect(error: unknown): boolean {

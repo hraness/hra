@@ -443,7 +443,6 @@ describe("session sync Convex boundary", () => {
       directoryOrdinal: "1",
       sourceRevision: "1",
       title: "Compiler recovery",
-      modelEffort: "ultra",
       state: "working",
       deleted: false,
     }), sessionSyncHeaderSchema.parse({
@@ -626,7 +625,6 @@ describe("session sync Convex boundary", () => {
       directoryOrdinal: "2",
       sourceRevision: "1",
       title: "Second pane",
-      modelEffort: "max",
       state: "ready",
       deleted: false,
     }), sessionSyncHeaderSchema.parse({
@@ -998,7 +996,6 @@ describe("session sync Convex boundary", () => {
       directoryOrdinal: "1",
       sourceRevision: "1",
       title: "q",
-      modelEffort: "max",
       state: "ready",
       deleted: false,
     }), sessionSyncHeaderSchema.parse({
@@ -1125,7 +1122,6 @@ describe("session sync Convex boundary", () => {
       sourceRevision: "2",
       title: "L".repeat(256),
       repositoryDisplayName: "R".repeat(160),
-      modelEffort: "ultra",
       state: "working",
       originUpdatedAt: encodeSyncUint64(BigInt(Date.now())),
       deleted: false,
@@ -1969,7 +1965,6 @@ describe("session sync Convex boundary", () => {
       directoryOrdinal: "1",
       sourceRevision: "1",
       title: "Offline device work",
-      modelEffort: "max",
       state: "ready",
       deleted: false,
     }), sessionSyncHeaderSchema.parse({

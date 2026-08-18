@@ -21,14 +21,11 @@ import {
   MenuTrigger,
   TextAreaField,
   TextField,
-  ToggleButton,
 } from "../../ui";
 
 import {
   runtimeChatTurnPromptUtf8ByteLimit,
   type ChatPaneProjection,
-  type ChatReasoningEffort,
-  type ChatServiceTier,
   type ChatToolCategory,
   type HarnessChildProjection,
   type RuntimeChatDomainCommand,
@@ -43,7 +40,6 @@ import { MarkdownResponse } from "./MarkdownResponse";
 import { HRAIcon } from "./Icon";
 import {
   composerEnterAction,
-  configurePaneCommand,
   createTitleDebouncer,
   createTurnId,
   isRevisionConflict,
@@ -60,8 +56,10 @@ import {
   paneTitleErrorId,
   paneTitleUtf16CodeUnitLimit,
   reconcilePaneTitleCommit,
+  recoverPaneWorkspaceCommand,
   renamePaneCommand,
   resolvePaneRevisionConflict,
+  rootTurnRoutePresentation,
   runtimeAvailabilityEqual,
   selectRuntimeAvailability,
   selectPane,
@@ -521,57 +519,6 @@ function InlinePaneTitle({
   );
 }
 
-interface ModelToggleProps {
-  readonly disabled: boolean;
-  readonly onChange: (effort: ChatReasoningEffort) => void;
-  readonly value: ChatReasoningEffort;
-}
-
-function ModelToggle({ disabled, onChange, value }: ModelToggleProps) {
-  return (
-    <div aria-label="Sol reasoning effort" className="model-toggle" role="group">
-      {(["ultra", "max"] as const).map((effort) => (
-        <ToggleButton
-          className="model-toggle__option-shell"
-          controlClassName="model-toggle__option"
-          isDisabled={disabled}
-          isSelected={value === effort}
-          key={effort}
-          onPress={() => onChange(effort)}
-          size="compact"
-          variant="quiet"
-        >
-          {effort === "ultra" ? "Ultra" : "Max"}
-        </ToggleButton>
-      ))}
-    </div>
-  );
-}
-
-interface FastModeToggleProps {
-  readonly disabled: boolean;
-  readonly onChange: (tier: ChatServiceTier) => void;
-  readonly value: ChatServiceTier;
-}
-
-function FastModeToggle({ disabled, onChange, value }: FastModeToggleProps) {
-  const fast = value === "fast";
-  return (
-    <ToggleButton
-      aria-label={`${fast ? "Disable" : "Enable"} Fast mode; Fast uses more credits`}
-      className="fast-mode-toggle-shell"
-      controlClassName="fast-mode-toggle"
-      isDisabled={disabled}
-      isSelected={fast}
-      onPress={() => onChange(fast ? "standard" : "fast")}
-      size="compact"
-      variant="quiet"
-    >
-      Fast
-    </ToggleButton>
-  );
-}
-
 function toolCategoryIcon(category: ChatToolCategory) {
   switch (category) {
     case "command":
@@ -686,7 +633,7 @@ export function ChatPaneView({
   const workspaceStatus = paneWorkspaceStatus(pane);
   const [prompt, setPrompt] = useState("");
   const [pendingAction, setPendingAction] = useState<
-    "configure" | "harness" | "remove" | "repository" | "retry" | "send" | "stop" | null
+    "harness" | "remove" | "repository" | "retry" | "send" | "stop" | "workspace" | null
   >(null);
   const [harnessPanelOpen, setHarnessPanelOpen] = useState(false);
   const [pendingHarnessChildId, setPendingHarnessChildId] = useState<string | null>(null);
@@ -708,6 +655,7 @@ export function ChatPaneView({
     && paneCanRename(pane.state)
     && pendingAction === null;
   const turn = pane.turn;
+  const routePresentation = rootTurnRoutePresentation(turn?.routing ?? null);
   const canRetryRetainedPrompt = paneCanRetryRetainedPrompt(pane);
   const pristine = turn === null;
   const scrollKey = [
@@ -748,22 +696,19 @@ export function ChatPaneView({
     return committedPane;
   }, [pane, shell, titleEditable]);
 
-  const configure = useCallback(async (configuration: Readonly<{
-    reasoningEffort: ChatReasoningEffort;
-    serviceTier: ChatServiceTier;
-  }>) => {
+  const recoverWorkspace = useCallback(async () => {
+    if (workspaceStatus?.retryable !== true) return;
     if (!configurable) return;
-    setPendingAction("configure");
+    setPendingAction("workspace");
     setLocalError(null);
     try {
       await dispatchPaneMutationWithRetry(
         shell,
         pane.id,
         pane.revision,
-        (expectedRevision) => configurePaneCommand({
+        (expectedRevision) => recoverPaneWorkspaceCommand({
           paneId: pane.id,
           expectedRevision,
-          ...configuration,
         }),
       );
     } catch (reason: unknown) {
@@ -771,15 +716,7 @@ export function ChatPaneView({
     } finally {
       setPendingAction(null);
     }
-  }, [configurable, pane.id, pane.revision, shell]);
-
-  const recoverWorkspace = useCallback(() => {
-    if (workspaceStatus?.retryable !== true) return;
-    void configure({
-      reasoningEffort: pane.reasoningEffort,
-      serviceTier: pane.serviceTier,
-    });
-  }, [configure, pane.reasoningEffort, pane.serviceTier, workspaceStatus]);
+  }, [configurable, pane.id, pane.revision, shell, workspaceStatus]);
 
   const send = useCallback(async () => {
     if (
@@ -1039,8 +976,8 @@ export function ChatPaneView({
                 className="pane-project-shell"
                 controlClassName="pane-project"
                 isDisabled={!configurable}
-                isPending={pendingAction === "configure"}
-                onPress={recoverWorkspace}
+                isPending={pendingAction === "workspace"}
+                onPress={() => void recoverWorkspace()}
                 size="compact"
                 type="button"
                 variant="quiet"
@@ -1289,24 +1226,16 @@ export function ChatPaneView({
             <HRAIcon name="edit" />
             <span>Rename</span>
           </Button>
-          <div className="pane-model-controls">
-            <ModelToggle
-              disabled={!configurable}
-              onChange={(reasoningEffort) => void configure({
-                reasoningEffort,
-                serviceTier: pane.serviceTier,
-              })}
-              value={pane.reasoningEffort}
-            />
-            <FastModeToggle
-              disabled={!configurable}
-              onChange={(serviceTier) => void configure({
-                reasoningEffort: pane.reasoningEffort,
-                serviceTier,
-              })}
-              value={pane.serviceTier}
-            />
-          </div>
+          {routePresentation === null ? null : (
+            <>
+              <span aria-hidden="true" className="pane-route-label">
+                {routePresentation.label}
+              </span>
+              <span className="hra-visually-hidden pane-route-description">
+                {routePresentation.accessibleLabel}
+              </span>
+            </>
+          )}
         </div>
       </footer>}
     </section>

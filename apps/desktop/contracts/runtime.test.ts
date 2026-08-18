@@ -4,6 +4,7 @@ import { RUNNER_PRESENCE_LEASE_MS } from "@hraness/agent-tasks-protocol";
 import {
   chatPaneProjectionSchema,
   chatPaneStateProjectionSchema,
+  chatRootTurnRoutingProjectionSchema,
   parseRuntimeDispatchRequest,
   parseRuntimeDispatchResponse,
   parseRuntimeChatDispatchResponseForRequest,
@@ -1293,7 +1294,6 @@ describe("renderer runtime contracts", () => {
         type: "chat.pane.create",
         paneId,
         repositoryId,
-        reasoningEffort: "ultra",
       },
       {
         type: "chat.pane.rename",
@@ -1302,11 +1302,9 @@ describe("renderer runtime contracts", () => {
         title: "Renamed",
       },
       {
-        type: "chat.pane.configure",
+        type: "chat.pane.workspace.recover",
         paneId,
         expectedRevision: 2,
-        reasoningEffort: "max",
-        serviceTier: "fast",
       },
       {
         type: "chat.pane.repository.select",
@@ -1354,7 +1352,16 @@ describe("renderer runtime contracts", () => {
         paneId,
         repositoryId,
         accountProfileId: null,
-        reasoningEffort: "ultra",
+      },
+    })).toThrow();
+    expect(() => parseRuntimeDispatchRequest({
+      version: runtimeProtocolVersion,
+      operationId: "op_chatpreference01",
+      command: {
+        type: "chat.pane.create",
+        paneId,
+        repositoryId,
+        reasoningEffort: "max",
       },
     })).toThrow();
     expect(() => parseRuntimeDispatchRequest({
@@ -1364,8 +1371,6 @@ describe("renderer runtime contracts", () => {
         type: "chat.pane.configure",
         paneId,
         expectedRevision: 2,
-        accountProfileId: "acct_manualRouting01",
-        reasoningEffort: "max",
       },
     })).toThrow();
     for (const privateField of ["prompt", "provider", "threadId"] as const) {
@@ -1417,6 +1422,17 @@ describe("renderer runtime contracts", () => {
     })).toThrow();
     expect(() => parseRuntimeDispatchRequest({
       version: runtimeProtocolVersion,
+      operationId: "op_chatcontract02",
+      command: {
+        type: "chat.turn.start",
+        paneId,
+        expectedRevision: 1,
+        turnId,
+        prompt: " \n\t ",
+      },
+    })).toThrow();
+    expect(() => parseRuntimeDispatchRequest({
+      version: runtimeProtocolVersion,
       operationId: "op_chatprompt003",
       command: {
         type: "chat.turn.start",
@@ -1439,15 +1455,23 @@ describe("renderer runtime contracts", () => {
       })).toThrow();
     }
 
+    const automaticRoute = {
+      policyVersion: 1,
+      classificationReason: "boundedLeafCue",
+      workClass: "boundedLeaf",
+      requestedProfile: "lunaMax",
+      selectedProfile: "solMax",
+      profileFallbackReason: "lunaUnavailable",
+      requestedServiceTier: "fast",
+      selectedServiceTier: "standard",
+      serviceTierFallbackReason: "fastUnavailable",
+    } as const;
     const pane = {
       id: paneId,
       revision: 4,
       title: "Reducer",
       repository: { id: repositoryId, name: "example" },
       accountProfileId: account.id,
-      model: "gpt-5.6-sol",
-      reasoningEffort: "ultra",
-      serviceTier: "standard",
       interactionMode: "chat",
       state: "ready",
       activity: { ordinal: 4, kind: "responseCompleted" },
@@ -1474,6 +1498,7 @@ describe("renderer runtime contracts", () => {
           truncatedPrefix: false,
         },
         tools: [{ id: "chattool_contract01", category: "filesystem", status: "completed" }],
+        routing: automaticRoute,
       },
       attention: null,
       recoverablePrompt: false,
@@ -1497,14 +1522,57 @@ describe("renderer runtime contracts", () => {
       ...pane,
       interactionMode: "harnessObserver",
       workspace: null,
+      turn: { ...pane.turn, routing: null },
     }).workspace).toBeNull();
+    expect(chatRootTurnRoutingProjectionSchema.parse(automaticRoute))
+      .toEqual(automaticRoute);
+    expect(() => chatRootTurnRoutingProjectionSchema.parse({
+      ...automaticRoute,
+      selectedProfile: "solUltra",
+    })).toThrow("selected profile must be requested or the Luna fallback");
+    expect(() => chatRootTurnRoutingProjectionSchema.parse({
+      ...automaticRoute,
+      selectedProfile: "solMax",
+      profileFallbackReason: null,
+    })).toThrow("fallback reason must exactly describe");
+    expect(() => chatRootTurnRoutingProjectionSchema.parse({
+      ...automaticRoute,
+      selectedProfile: null,
+      profileFallbackReason: null,
+    })).toThrow("profile and tier must resolve together");
+    expect(() => chatRootTurnRoutingProjectionSchema.parse({
+      ...automaticRoute,
+      classificationReason: "continuationInherited",
+      requestedServiceTier: "standard",
+      selectedServiceTier: "standard",
+      serviceTierFallbackReason: null,
+    })).toThrow("work class must map to an allowed requested tier");
+    expect(() => chatRootTurnRoutingProjectionSchema.parse({
+      ...automaticRoute,
+      classificationReason: "continuationInherited",
+      workClass: "largeChange",
+      requestedProfile: "solUltra",
+      requestedServiceTier: "fast",
+      selectedProfile: "solUltra",
+      selectedServiceTier: "fast",
+      profileFallbackReason: null,
+      serviceTierFallbackReason: null,
+    })).toThrow("work class must map to an allowed requested tier");
+    expect(() => chatPaneProjectionSchema.parse({
+      ...pane,
+      interactionMode: "harnessObserver",
+      workspace: null,
+      turn: { ...pane.turn, routing: automaticRoute },
+    })).toThrow("harness observer turns forbid it");
+    expect(() => chatPaneProjectionSchema.parse({
+      ...pane,
+      turn: { ...pane.turn, routing: null },
+    })).toThrow("ordinary root turns require routing");
     const paneState = {
       id: pane.id,
       revision: pane.revision,
       title: pane.title,
       accountProfileId: pane.accountProfileId,
-      reasoningEffort: pane.reasoningEffort,
-      serviceTier: pane.serviceTier,
       interactionMode: pane.interactionMode,
       state: pane.state,
       activity: pane.activity,
@@ -1562,15 +1630,23 @@ describe("renderer runtime contracts", () => {
     const paneId = "pane_correlation01";
     const turnId = "chatturn_correlation01";
     const operationId = "op_chatcorrelation01";
+    const automaticRoute = {
+      policyVersion: 1,
+      classificationReason: "boundedLeafCue",
+      workClass: "boundedLeaf",
+      requestedProfile: "lunaMax",
+      selectedProfile: "lunaMax",
+      profileFallbackReason: null,
+      requestedServiceTier: "fast",
+      selectedServiceTier: "fast",
+      serviceTierFallbackReason: null,
+    } as const;
     const basePane = {
       id: paneId,
       revision: 1,
       title: "New chat",
       repository: { id: repositoryId, name: "example" },
       accountProfileId: account.id,
-      model: "gpt-5.6-sol",
-      reasoningEffort: "ultra",
-      serviceTier: "standard",
       interactionMode: "chat",
       state: "ready",
       activity: { ordinal: 0, kind: "idle" },
@@ -1592,7 +1668,6 @@ describe("renderer runtime contracts", () => {
         type: "chat.pane.create",
         paneId,
         repositoryId,
-        reasoningEffort: "ultra",
       },
     } satisfies RuntimeChatDispatchRequest;
     const response = (pane: unknown) => ({
@@ -1618,6 +1693,7 @@ describe("renderer runtime contracts", () => {
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         tools: [],
+        routing: automaticRoute,
       } },
     ]) {
       expect(() => parseRuntimeChatDispatchResponseForRequest(
@@ -1645,35 +1721,27 @@ describe("renderer runtime contracts", () => {
       renameRequest,
     )).toThrow("pane rename response does not match");
 
-    const configureRequest = {
+    const recoverRequest = {
       ...createRequest,
       command: {
-        type: "chat.pane.configure",
+        type: "chat.pane.workspace.recover",
         paneId,
         expectedRevision: 2,
-        reasoningEffort: "max",
-        serviceTier: "fast",
       },
     } satisfies RuntimeChatDispatchRequest;
-    const configured = {
+    const recovered = {
       ...basePane,
       revision: 3,
       accountProfileId: null,
-      reasoningEffort: "max",
-      serviceTier: "fast",
     } as const;
     expect(parseRuntimeChatDispatchResponseForRequest(
-      response(configured),
-      configureRequest,
+      response(recovered),
+      recoverRequest,
     )).toMatchObject({ result: { type: "chatPane" } });
     expect(() => parseRuntimeChatDispatchResponseForRequest(
-      response({ ...configured, reasoningEffort: "ultra" }),
-      configureRequest,
-    )).toThrow("pane configuration response does not match");
-    expect(() => parseRuntimeChatDispatchResponseForRequest(
-      response({ ...configured, serviceTier: "standard" }),
-      configureRequest,
-    )).toThrow("pane configuration response does not match");
+      response({ ...recovered, revision: 4 }),
+      recoverRequest,
+    )).toThrow("workspace recovery response does not match");
 
     const selectedRepositoryId = "repo_11111111111111111111111111";
     const repositoryRequest = {
@@ -1740,6 +1808,7 @@ describe("renderer runtime contracts", () => {
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         tools: [],
+        routing: automaticRoute,
       },
     } as const;
     expect(parseRuntimeChatDispatchResponseForRequest(

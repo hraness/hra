@@ -172,7 +172,7 @@ interface CoveragePolicyEntry {
   readonly scenarios: readonly string[];
 }
 type ScenarioAction =
-  | "configure-draft"
+  | "prepare-draft"
   | "create-pane"
   | "exercise-compact-controls"
   | "exercise-local-under-sync-fault"
@@ -228,19 +228,13 @@ interface ScenarioVerification {
 const scenarios = [
   {
     id: "chat-draft",
-    action: "configure-draft",
-    expectedBeforeAction: [
-      "HRA",
-      "Ultra",
-      "Max",
-    ],
+    action: "prepare-draft",
+    expectedBeforeAction: ["HRA"],
     expectedText: ["Direct pane", "hra"],
     expectedUiScale: "0.8",
     expectedVisibleControls: [
       "New pane",
       "Rename Direct pane",
-      "Ultra",
-      "Max",
     ],
     forbiddenText: ["Queue", "Steer", "Approval", "Tasks", "Accounts"],
     viewport: { width: 1_120, height: 780 },
@@ -290,17 +284,14 @@ const scenarios = [
     id: "chat-compact-320",
     action: "exercise-compact-controls",
     expectedText: [
-      "Compact 320",
-      "Ultra",
-      "Max",
+      "Compact routed response",
+      "Compact route complete.",
     ],
     expectedVisibleControls: [
       "New pane",
-      "Rename Compact 320",
-      "More actions for Compact 320",
+      "Rename Compact routed response",
+      "More actions for Compact routed response",
       "Send",
-      "Ultra",
-      "Max",
     ],
     forbiddenText: ["Queue", "Steer", "Tasks", "Accounts"],
     viewport: { width: 320, height: 720 },
@@ -308,19 +299,13 @@ const scenarios = [
   {
     id: "chat-compact-639",
     action: "scale-compact-120",
-    expectedText: [
-      "Compact 639",
-      "Ultra",
-      "Max",
-    ],
+    expectedText: ["Compact 639"],
     expectedUiScale: "1.2",
     expectedVisibleControls: [
       "New pane",
       "Rename Compact 639",
       "More actions for Compact 639",
       "Send",
-      "Ultra",
-      "Max",
     ],
     forbiddenText: ["Queue", "Steer", "Tasks", "Accounts"],
     viewport: { width: 639, height: 820 },
@@ -328,19 +313,13 @@ const scenarios = [
   {
     id: "chat-compact-415",
     action: "scale-compact-150",
-    expectedText: [
-      "Compact 415",
-      "Ultra",
-      "Max",
-    ],
+    expectedText: ["Compact 415"],
     expectedUiScale: "1.5",
     expectedVisibleControls: [
       "New pane",
       "Rename Compact 415",
       "More actions for Compact 415",
       "Send",
-      "Ultra",
-      "Max",
     ],
     forbiddenText: ["Queue", "Steer", "Tasks", "Accounts"],
     viewport: { width: 415, height: 780 },
@@ -413,8 +392,6 @@ const scenarios = [
       "Allow Codex to delegate work to persistent child sessions.",
       "Context quota",
       "16 MiB",
-      "Automatic Fast for recursive sessions",
-      "accelerate a critical-path recursive turn",
       "Refinement suggestions",
       "review-only improvement proposals",
       "never applies them automatically",
@@ -424,7 +401,6 @@ const scenarios = [
     expectedVisibleControls: [
       "Recursive sessions",
       "Context quota",
-      "Automatic Fast for recursive sessions",
     ],
     forbiddenText: [
       "providerId",
@@ -1141,12 +1117,9 @@ async function runAction(
   switch (action) {
     case "none":
       return;
-    case "configure-draft": {
+    case "prepare-draft": {
       await clickButton(browser, "Choose project for HRA");
       await browser.run(["wait", "--fn", "document.querySelector('.chat-pane__repository')?.textContent?.trim() === 'hra'"]);
-      await waitForStableProbe(browser);
-      await clickButton(browser, "Max");
-      await browser.run(["wait", "--fn", "document.querySelector('.model-toggle__option[aria-pressed=true]')?.textContent?.trim() === 'Max'"]);
       await waitForStableProbe(browser);
       await clickButton(browser, "Rename HRA");
       await browser.run(["wait", "--fn", "document.querySelector('.pane-title-input') !== null"]);
@@ -1188,15 +1161,11 @@ async function runAction(
       return;
     case "scale-compact-120":
       await setUiScale(browser, 2, "1.2");
-      await clickButton(browser, "Max");
-      await browser.run(["wait", "--fn", "document.querySelector('.model-toggle__option[aria-pressed=true]')?.textContent?.trim() === 'Max'"]);
       await waitForStableProbe(browser);
       await browser.run(["fill", "textarea", "Compact controls remain usable."]);
       return;
     case "scale-compact-150":
       await setUiScale(browser, 4, "1.5");
-      await clickButton(browser, "Max");
-      await browser.run(["wait", "--fn", "document.querySelector('.model-toggle__option[aria-pressed=true]')?.textContent?.trim() === 'Max'"]);
       await waitForStableProbe(browser);
       await browser.run(["fill", "textarea", "Compact controls remain usable."]);
       return;
@@ -1242,9 +1211,6 @@ async function runAction(
       return;
     }
     case "exercise-compact-controls":
-      await clickButton(browser, "Max");
-      await browser.run(["wait", "--fn", "document.querySelector('.model-toggle__option[aria-pressed=true]')?.textContent?.trim() === 'Max'"]);
-      await waitForStableProbe(browser);
       await browser.run(["fill", "textarea", "Compact controls remain usable."]);
       return;
     case "exercise-local-under-sync-fault": {
@@ -1767,7 +1733,7 @@ const scenarioUiStateSchema = z.object({
   remoteTriggerCount: z.number().int().nonnegative(),
   semanticBorderCount: z.number().int().nonnegative(),
   renameButtonCount: z.number().int().nonnegative(),
-  selectedEfforts: z.array(z.string()),
+  routeLabels: z.array(z.string()),
   settingsCount: z.number().int().nonnegative(),
   thinkingActivityLabels: z.array(z.string()),
   thinkingCount: z.number().int().nonnegative(),
@@ -1936,7 +1902,6 @@ async function verifyScenarioSemantics(
             'textarea',
             '.pane-rename',
             '.pane-send',
-            '.model-toggle__option',
           ].join(',')).length, 0),
         remotePaneCount: remotePanes.length,
         remoteTooltipCount: document.querySelectorAll('.remote-session-pane__device-tooltip[role=tooltip]').length,
@@ -1947,8 +1912,8 @@ async function verifyScenarioSemantics(
           return expected !== undefined && getComputedStyle(pane).borderColor === expected;
         }).length,
         renameButtonCount: document.querySelectorAll('.pane-rename').length,
-        selectedEfforts: [...document.querySelectorAll('.model-toggle__option[aria-pressed=true]')]
-          .map((control) => control.textContent?.trim() || ''),
+        routeLabels: [...document.querySelectorAll('.pane-route-description')]
+          .map((label) => label.textContent?.trim() || ''),
         settingsCount: document.querySelectorAll('.settings-page').length,
         thinkingActivityLabels: [...document.querySelectorAll('.pane-reasoning')]
           .map((activity) => activity.getAttribute('aria-label') || ''),
@@ -2008,7 +1973,7 @@ async function verifyScenarioSemantics(
   switch (scenarioId) {
     case "chat-draft":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("configured draft is not one ready pane");
-      if (state.selectedEfforts[0] !== "Max") failures.push("Max is not selected");
+      if (state.routeLabels.length !== 0) failures.push("draft without a turn exposes a route label");
       if (state.titleInputCount !== 0) failures.push("title editor did not close after explicit commit");
       if (state.disabledComposers !== 0) failures.push("draft composer is disabled");
       if (state.disabledRenameButtons !== 0 || state.renameButtonCount !== 1) failures.push("draft title rename is unavailable");
@@ -2052,11 +2017,21 @@ async function verifyScenarioSemantics(
     case "chat-compact-320":
     case "chat-compact-639":
     case "chat-compact-415":
+      if (
+        scenarioId === "chat-compact-320" &&
+        state.routeLabels[0] !== "HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch."
+      ) {
+        failures.push("compact routed fallback is not named truthfully");
+      }
+      if (scenarioId === "chat-compact-320" && state.routeLabels.length !== 1) {
+        failures.push("compact routed response does not expose exactly one route label");
+      }
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("compact journey is not one ready pane");
       if (state.gridColumnCount !== 1 || state.paneViewportEscapes !== 0) failures.push("compact pane is not contained in one grid column");
       if (state.disabledComposers !== 0 || state.disabledSendButtons !== 0) failures.push("compact controls are unexpectedly disabled");
       if (state.disabledRenameButtons !== 0) failures.push("compact title rename is disabled");
-      if (state.composerValues[0] !== "Compact controls remain usable." || state.selectedEfforts[0] !== "Max") failures.push("compact text or model controls did not accept input");
+      if (state.composerValues[0] !== "Compact controls remain usable.") failures.push("compact composer did not accept input");
+      if (scenarioId !== "chat-compact-320" && state.routeLabels.length !== 0) failures.push("compact draft without a turn exposes a route label");
       break;
     case "chat-many-panes":
       if (state.paneCount !== manyChatPaneCount) failures.push(`expected ${String(manyChatPaneCount)} panes, received ${String(state.paneCount)}`);
@@ -2130,7 +2105,6 @@ async function verifyScenarioSemantics(
       if (JSON.stringify(state.harnessSettingsControls) !== JSON.stringify([
         { label: "Recursive sessions", pressed: null, tag: "input", value: null },
         { label: "Context quota", pressed: null, tag: "select", value: "16777216" },
-        { label: "Automatic Fast for recursive sessions", pressed: null, tag: "input", value: null },
         { label: "Off", pressed: "false", tag: "button", value: null },
         { label: "Suggest", pressed: "true", tag: "button", value: null },
       ])) failures.push("Harness settings exposes controls outside the exact minimal surface");

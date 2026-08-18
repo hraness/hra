@@ -170,7 +170,6 @@ function createPane(value: Fixture, paneId: string) {
     paneId,
     repository: value.repository,
     accountProfileId: ACCOUNT,
-    reasoningEffort: "ultra",
     now: NOW,
   });
 }
@@ -294,10 +293,9 @@ describe.skipIf(gitBinary === null)("ordinary chat managed workspaces", () => {
       });
       expect(value.workspaceStore.activeBinding(PANE_ONE)).toBeNull();
 
-      const retrying = value.panes.configure(
+      const retrying = value.panes.recoverWorkspace(
         PANE_ONE,
         blocked.revision,
-        "ultra",
         NOW,
       );
       expect(retrying.workspace).toMatchObject({

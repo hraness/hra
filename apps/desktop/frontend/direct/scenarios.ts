@@ -10,6 +10,7 @@ import {
   remoteSessionSummaryProjectionSchema,
   runtimeSnapshotSchema,
   type ChatPaneProjection,
+  type ChatRootTurnRoutingProjection,
   type ChatUtf8Tail,
   type HarnessChildProjection,
   type HarnessChildState,
@@ -83,11 +84,23 @@ function chatTail(tail: string): ChatUtf8Tail {
   };
 }
 
+const directStandardRoute = {
+  policyVersion: 1,
+  classificationReason: "conservativeDefault",
+  workClass: "standard",
+  requestedProfile: "solMax",
+  selectedProfile: "solMax",
+  profileFallbackReason: null,
+  requestedServiceTier: "standard",
+  selectedServiceTier: "standard",
+  serviceTierFallbackReason: null,
+} as const satisfies ChatRootTurnRoutingProjection;
+
 function chatPane(
   id: string,
   overrides: Partial<ChatPaneProjection> = {},
 ): ChatPaneProjection {
-  return {
+  const pane: ChatPaneProjection = {
     id,
     revision: 1,
     title: "HRA",
@@ -96,8 +109,6 @@ function chatPane(
       name: "hra",
     },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
     interactionMode: "chat",
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },
@@ -107,8 +118,11 @@ function chatPane(
     recoverablePrompt: false,
     harness: null,
     ...overrides,
-    serviceTier: overrides.serviceTier ?? "standard",
   };
+  return pane.turn !== null && pane.interactionMode === "chat" &&
+      pane.turn.routing === null
+    ? { ...pane, turn: { ...pane.turn, routing: directStandardRoute } }
+    : pane;
 }
 
 function snapshotWithChat(
@@ -191,7 +205,6 @@ function directRemoteSummary(
     sourceRevision: 1,
     title: options.title ?? `Remote task ${Math.floor(index / 2) + 1}`,
     repositoryDisplayName: index % 3 === 0 ? "Example" : "HRA",
-    modelEffort: index % 2 === 0 ? "ultra" : "max",
     state: index % 11 === 0 ? "attention" : index % 3 === 0 ? "working" : "ready",
     updatedAt: HRA_DIRECT_TIME - index,
   });
@@ -324,7 +337,6 @@ const completedChatPane = chatPane("pane_completed001", {
   revision: 4,
   title: "Release HRA",
   accountProfileId: personal.id,
-  reasoningEffort: "max",
   turn: {
     id: "chatturn_completed001",
     status: "completed",
@@ -336,6 +348,7 @@ const completedChatPane = chatPane("pane_completed001", {
     ),
     reasoningSummary: chatTail(""),
     tools: [],
+    routing: null,
   },
 });
 
@@ -412,6 +425,7 @@ const attentionChatPanes = attentionPresentations.map((presentation, index) => c
       responseMarkdown: chatTail(`Preserved partial response for ${presentation.title.toLowerCase()}.`),
       reasoningSummary: chatTail(""),
       tools: [],
+      routing: null,
     },
     attention: {
       code: presentation.code,
@@ -435,6 +449,7 @@ const streamingInitialPane = chatPane("pane_streaming001", {
     responseMarkdown: chatTail(""),
     reasoningSummary: chatTail(""),
     tools: [],
+    routing: null,
   },
 });
 
@@ -492,11 +507,57 @@ export function manyChatPaneId(position: number): string {
   return `pane_grid${String(position).padStart(8, "0")}`;
 }
 
+const automaticRouteFixtures = Object.freeze([
+  {
+    policyVersion: 1,
+    classificationReason: "boundedLeafCue",
+    workClass: "boundedLeaf",
+    requestedProfile: "lunaMax",
+    selectedProfile: "lunaMax",
+    profileFallbackReason: null,
+    requestedServiceTier: "fast",
+    selectedServiceTier: "fast",
+    serviceTierFallbackReason: null,
+  },
+  {
+    policyVersion: 1,
+    classificationReason: "conservativeDefault",
+    workClass: "standard",
+    requestedProfile: "solMax",
+    selectedProfile: "solMax",
+    profileFallbackReason: null,
+    requestedServiceTier: "standard",
+    selectedServiceTier: "standard",
+    serviceTierFallbackReason: null,
+  },
+  {
+    policyVersion: 1,
+    classificationReason: "largeChangeCue",
+    workClass: "largeChange",
+    requestedProfile: "solUltra",
+    selectedProfile: "solUltra",
+    profileFallbackReason: null,
+    requestedServiceTier: "standard",
+    selectedServiceTier: "standard",
+    serviceTierFallbackReason: null,
+  },
+  {
+    policyVersion: 1,
+    classificationReason: "boundedLeafCue",
+    workClass: "boundedLeaf",
+    requestedProfile: "lunaMax",
+    selectedProfile: "solMax",
+    profileFallbackReason: "lunaUnavailable",
+    requestedServiceTier: "fast",
+    selectedServiceTier: "standard",
+    serviceTierFallbackReason: "fastUnavailable",
+  },
+] as const satisfies readonly ChatRootTurnRoutingProjection[]);
+
 const manyChatPanes = Array.from({ length: manyChatPaneCount }, (_, index) => chatPane(
   manyChatPaneId(index + 1),
   {
     title: `Parallel pane ${index + 1}`,
-    reasoningEffort: index % 2 === 0 ? "ultra" : "max",
     turn: {
       id: `chatturn_grid${String(index + 1).padStart(8, "0")}`,
       status: "completed",
@@ -506,6 +567,7 @@ const manyChatPanes = Array.from({ length: manyChatPaneCount }, (_, index) => ch
       responseMarkdown: chatTail(`Pane ${index + 1} is ready.`),
       reasoningSummary: chatTail(""),
       tools: [],
+      routing: automaticRouteFixtures[index] ?? null,
     },
   },
 ));
@@ -549,6 +611,7 @@ const parallelStreamPanes = Array.from({ length: parallelStreamPaneCount }, (_, 
         responseMarkdown: chatTail(""),
         reasoningSummary: chatTail(""),
         tools: [],
+        routing: null,
       },
     },
   );
@@ -590,7 +653,6 @@ const parallelStreamEvents: HRADirectWorld["gateway"]["events"] =
 const harnessSettings = {
   revision: 2,
   recursiveSessionsEnabled: true,
-  automaticFastMode: "criticalPath",
   contextQuotaBytes: 16 * 1024 * 1024,
   refinementMode: "suggest",
 } as const;
@@ -663,7 +725,7 @@ const scenarioInputs = [
   {
     id: "chat-draft",
     title: "New chat pane",
-    description: "A new pane exposes one minimal composer, a clear Rename affordance, automatic account routing, and separate Ultra/Max reasoning and Standard/Fast speed controls.",
+    description: "A new pane exposes one minimal composer, a clear Rename affordance, automatic account routing, and no user model or speed controls.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -804,7 +866,21 @@ const scenarioInputs = [
     route: "/",
     world: createHRADirectWorld({
       gateway: {
-        snapshots: [snapshotWithChat([chatPane("pane_compact_320", { title: "Compact 320" })])],
+        snapshots: [snapshotWithChat([chatPane("pane_compact_320", {
+          title: "Compact routed response",
+          activity: { ordinal: 1, kind: "responseCompleted" },
+          turn: {
+            id: "chatturn_compact_320",
+            status: "completed",
+            startedAt: HRA_DIRECT_TIMESTAMP,
+            completedAt: HRA_DIRECT_TIMESTAMP,
+            continuationCount: 0,
+            responseMarkdown: chatTail("Compact route complete."),
+            reasoningSummary: chatTail(""),
+            tools: [],
+            routing: automaticRouteFixtures[3],
+          },
+        })])],
         encoding: { kind: "chunked", chunkBytes: 257 },
         events: [],
       },
@@ -814,7 +890,7 @@ const scenarioInputs = [
   {
     id: "chat-compact-639",
     title: "Compact pane at 639 px",
-    description: "The real pane, navigation, composer, and configuration controls remain usable below the 640 px breakpoint at 120% text size.",
+    description: "The real pane, navigation, composer, and read-only route status remain usable below the 640 px breakpoint at 120% text size.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -988,7 +1064,7 @@ const scenarioInputs = [
   {
     id: "harness-settings",
     title: "Recursive harness settings",
-    description: "Settings controls recursive sessions, critical-path automatic Fast, bounded context quota, Off or Suggest refinement, and read-only proposal titles.",
+    description: "Settings controls recursive sessions, bounded context quota, Off or Suggest refinement, and read-only proposal titles.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -1438,20 +1514,20 @@ export const hraDirectDefinition = defineDirect({
   defaultScenario: "chat-draft",
   scenarios: scenarioInputs,
   coverage: [
-    { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, a clear Rename affordance, automatic account routing without a per-pane selector, and separate Ultra/Max reasoning and Standard/Fast speed controls.", scenarios: ["chat-draft"] },
+    { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, a clear Rename affordance, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
     { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning, provider-neutral tool state, and streaming response Markdown in one pane.", scenarios: ["chat-streaming"] },
     { key: "chat.pane.latest-response", mode: "fixture", claim: "A settled pane retains only the latest assistant Markdown response and re-enables its composer.", scenarios: ["chat-completed"] },
     { key: "chat.pane.attention-recovery", mode: "fixture", claim: "The rendered quota, continuation, approval, runtime, and turn attention presentations remain concise, expose no HITL answer controls, and each permit a later message.", scenarios: ["chat-attention"] },
     { key: "chat.pane.create", mode: "mixed", claim: "The real New pane control opens the pathless native chooser only for the first pane, then reuses the visually last local repository through the typed pane-create command.", scenarios: ["chat-create-pane", "chat-create-pane-inherit"] },
     { key: "chat.pane.order", mode: "mixed", claim: "Local panes reorder through both pointer drag and keyboard-accessible menu affordances, persist through the typed command/event boundary, and leave remote anchors fixed.", scenarios: ["chat-pane-order"] },
-    { key: "chat.pane.compact-responsive", mode: "fixture", claim: "The rendered pane, navigation, composer, and configuration controls remain horizontally contained at 320 px, at 639 px and 120% text size, and at 415 px and 150% text size.", scenarios: ["chat-compact-320", "chat-compact-639", "chat-compact-415"] },
+    { key: "chat.pane.compact-responsive", mode: "fixture", claim: "The rendered pane, navigation, composer, Rename action, and read-only route status remain horizontally contained at 320 px, at 639 px and 120% text size, and at 415 px and 150% text size.", scenarios: ["chat-compact-320", "chat-compact-639", "chat-compact-415"] },
     { key: "chat.pane.parallel-performance", mode: "fixture", claim: "Sixty-four simultaneous local streams receive deterministic interleaved deltas within explicit first-render and settlement budgets while a 448-summary remote directory preserves all 48 mounted DOM identities; sixty-four settled panes separately prove dense-grid containment.", scenarios: ["chat-parallel-streaming", "chat-many-panes"] },
-    { key: "chat.pane.configuration", mode: "fixture", claim: "Settled panes switch between Ultra or Max while account routing stays automatic and active panes disable configuration.", scenarios: ["chat-draft", "chat-streaming"] },
+    { key: "chat.turn.routing", mode: "fixture", claim: "Read-only turn facts distinguish HRA-selected Luna Max Fast, Sol Max Standard, Sol Ultra Standard, and independent Luna/Fast fallback without exposing a user preference.", scenarios: ["chat-many-panes", "chat-compact-320"] },
     { key: "chat.pane.inline-title", mode: "mixed", claim: "The footer Rename affordance opens the real revision-bound title editor; persistence conflict handling remains gateway integration evidence.", scenarios: ["chat-draft"] },
     { key: "chat.subscription-gate", mode: "fixture", claim: "Without a signed-in Codex subscription, the canonical route is Settings and no panes destination or creation affordance is rendered.", scenarios: ["settings-no-subscriptions"] },
     { key: "harness.ordinary-zero-chrome", mode: "fixture", claim: "An ordinary chat pane receives an explicit null harness projection and renders no recursive controls.", scenarios: ["chat-draft"] },
     { key: "harness.recursive-children", mode: "fixture", claim: "One bounded parent projection distinguishes all seven persistent actor states and exposes only per-child Open and Stop controls.", scenarios: ["harness-children-mixed"] },
-    { key: "harness.settings", mode: "fixture", claim: "Settings exposes only recursive sessions, critical-path automatic Fast, bounded context quota, Off or Suggest refinement, and read-only proposal titles.", scenarios: ["harness-settings"] },
+    { key: "harness.settings", mode: "fixture", claim: "Settings exposes only recursive sessions, bounded context quota, Off or Suggest refinement, and read-only proposal titles.", scenarios: ["harness-settings"] },
     { key: "harness.renderer-boundary", mode: "mixed", claim: "Strict harness projections contain only settings, proposal titles with identity/revision, and bounded child summaries without provider IDs, filesystem paths, transcripts, values, programs, trials, or arbitrary commands.", scenarios: ["harness-children-mixed", "harness-settings"] },
     { key: "settings.subscription-browser-login", mode: "mixed", claim: "The lean Settings surface shows bounded remaining capacity, creates and reconnects Codex subscriptions through browser sign-in, and keeps HRA Cloud attachment explicit and separate.", scenarios: ["settings-browser-login"] },
     { key: "settings.human-credential-recovery", mode: "mixed", claim: "The real Settings surface non-destructively retries credential inspection, fences stale revisions, requires explicit inline preservation consent, and returns retired human custody to browser sign-in; Keychain and SQLite transitions remain native integration evidence.", scenarios: ["settings-human-credential-recovery"] },

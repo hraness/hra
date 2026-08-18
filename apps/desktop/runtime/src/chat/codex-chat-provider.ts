@@ -2,14 +2,12 @@ import { AccountServiceError } from "../accounts/account-service";
 import { SessionServiceError } from "../sessions/session-service";
 import type { SessionService } from "../sessions/session-service";
 import type {
-  CHAT_MODEL,
   ChatHistoryItem,
+  ChatProviderConfiguration,
   ChatProviderPort,
   ChatProviderResumeRequest,
   ChatProviderThreadRequest,
   ChatProviderTurnRequest,
-  ChatReasoningEffort,
-  ChatServiceTier,
   ChatThreadBinding,
 } from "./types";
 import { ChatProviderEffectError } from "./types";
@@ -22,35 +20,39 @@ type ChatSessionRuntime = Pick<
   | "setChatThreadName"
   | "startChatThread"
   | "startChatTurn"
-  | "validateChatConfiguration"
+  | "resolveChatConfiguration"
 >;
 
 /** Session-aware Codex 0.144.6 implementation of the provider-neutral chat port. */
 export class CodexChatProvider implements ChatProviderPort {
   readonly #sessions: ChatSessionRuntime;
-  readonly #validatedConfigurations = new Set<string>();
 
   constructor(sessions: ChatSessionRuntime) {
     this.#sessions = sessions;
   }
 
-  async validateConfiguration(
+  async resolveConfiguration(
     accountProfileId: string,
-    model: typeof CHAT_MODEL,
-    reasoningEffort: ChatReasoningEffort,
-    serviceTier: ChatServiceTier = "standard",
-  ): Promise<void> {
-    const cacheKey = `${accountProfileId}\0${model}\0${reasoningEffort}\0${serviceTier}`;
-    const cacheable = serviceTier === "standard";
-    if (cacheable && this.#validatedConfigurations.has(cacheKey)) return;
+    candidates: readonly ChatProviderConfiguration[],
+  ): Promise<ChatProviderConfiguration> {
     try {
-      await this.#sessions.validateChatConfiguration(
+      const selected = await this.#sessions.resolveChatConfiguration(
         accountProfileId,
-        model,
-        reasoningEffort,
-        serviceTier,
+        candidates.map(({ model, reasoningEffort, serviceTier }) => ({
+          model,
+          reasoningEffort,
+          serviceTier: serviceTier ?? "standard",
+        })),
       );
-      if (cacheable) this.#validatedConfigurations.add(cacheKey);
+      const resolved = candidates.find((candidate) =>
+        candidate.model === selected.model &&
+        candidate.reasoningEffort === selected.reasoningEffort &&
+        (candidate.serviceTier ?? "standard") === selected.serviceTier
+      );
+      if (resolved === undefined) {
+        throw new Error("SessionService resolved a configuration outside HRA's candidate chain");
+      }
+      return resolved;
     } catch (error: unknown) {
       throw providerFailure(error, false, "configuration");
     }
@@ -63,6 +65,7 @@ export class CodexChatProvider implements ChatProviderPort {
     try {
       const started = await this.#sessions.startChatThread({
         accountProfileId: request.accountProfileId,
+        model: request.model,
         serviceTier: request.serviceTier ?? "standard",
         title: request.title,
         workspacePath: request.workingDirectory,
@@ -82,6 +85,7 @@ export class CodexChatProvider implements ChatProviderPort {
         accountProfileId: request.accountProfileId,
         threadId: request.threadId,
         restartThreadId: request.restartThreadId,
+        model: request.model,
         serviceTier: request.serviceTier ?? "standard",
         title: request.title,
         workspacePath: request.workingDirectory,
@@ -118,6 +122,7 @@ export class CodexChatProvider implements ChatProviderPort {
     try {
       const started = await this.#sessions.startChatTurn({
         clientUserMessageId: ownedClientMessageId(request.clientTurnId),
+        model: request.model,
         prompt: request.prompt,
         reasoningEffort: request.reasoningEffort,
         serviceTier: request.serviceTier ?? "standard",
@@ -182,7 +187,9 @@ function providerFailure(
     if (error.code === "capability_unavailable" || error.code === "not_found") {
       return new ChatProviderEffectError({
         certainty: "not_applied",
-        code: fallback === "configuration" ? "configuration" : "authentication",
+        code: error.code === "capability_unavailable"
+          ? "capability_unavailable"
+          : fallback === "configuration" ? "configuration" : "authentication",
       });
     }
   }

@@ -185,8 +185,8 @@ const RLM_V2_OPERATION_ARGUMENTS = [
   "context.materialize {snapshotId?,ordinals,format?};",
   "heap.put {name,value,format?}; heap.get {valueId} or {name};",
   "heap.list {afterValueId?,limit?};",
-  "agent.spawn {title,workClass:largeChange|wideResearch|standard|boundedLeaf,acceleration:{mode:standard}|{mode:fast,criticalPath:true,bottleneck:reasoning|fileGeneration},allocation:{tokenShareBps,byteShareBps,activeDescendantShareBps,durableDescendantShareBps},inputValueId};",
-  "agent.send {actorId,inputValueId,acceleration?}; omitted acceleration is Standard. agent.status {actorId};",
+  "agent.spawn {title,workClass:largeChange|wideResearch|standard|boundedLeaf,allocation:{tokenShareBps,byteShareBps,activeDescendantShareBps,durableDescendantShareBps},inputValueId}; HRA derives model, reasoning effort, and Fast or Standard from workClass;",
+  "agent.send {actorId,inputValueId}; HRA reuses the actor's durable workClass route. agent.status {actorId};",
   "agent.waitAny/agent.waitAll {turnIds,timeoutMs};",
   "agent.result/agent.cancel {turnId};",
   "routing.inspect {} returns bounded content-free shadow routing memory for the current durable caller; v1 includes recursive actor outcomes only, excludes ordinary root-turn spend, and reports requestedProfile as routing intent rather than observed provider compliance;",
@@ -231,12 +231,6 @@ const rlmV2ProgramExample = Object.freeze({
         workClass: Object.freeze({
           kind: "literal",
           value: "wideResearch",
-        }),
-        acceleration: Object.freeze({
-          kind: "object",
-          entries: Object.freeze({
-            mode: Object.freeze({ kind: "literal", value: "standard" }),
-          }),
         }),
         allocation: Object.freeze({
           kind: "object",
@@ -621,7 +615,7 @@ export const HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256 = sha256Canonical(
   HRA_RLM_DYNAMIC_TOOL_SPEC,
 );
 export const HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256 =
-  "2ce858c44c3278d21078bb0675508df731a5140d0a8a9932cd01638f813257d7" as const;
+  "3e98e085a6bd241f257e161de4c9486c8490dda2c9675bf6d951188c2dc77ed5" as const;
 
 if (HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256 !== HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256) {
   throw new Error("HRA RLM dynamic-tool v1 spec digest drifted");

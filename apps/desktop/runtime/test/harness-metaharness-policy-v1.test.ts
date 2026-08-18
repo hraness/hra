@@ -2,9 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { fc } from "@hra-internal/test";
 
 import {
-  actorTurnAccelerationSchema,
   actorWorkClassSchema,
-  parseActorTurnAcceleration,
   parseActorWorkClass,
 } from "../src/harness/actor-domain";
 import {
@@ -14,6 +12,7 @@ import {
   compileMetaharnessRoute,
   compileMetaharnessTier,
   orderedProfilesForWorkClass,
+  requestedServiceTierForWorkClass,
 } from "../src/harness/metaharness-policy-v1";
 
 const solCapability = {
@@ -28,7 +27,7 @@ const lunaCapability = {
 } as const;
 
 describe("metaharness policy v1", () => {
-  test("parses only the closed work classes and acceleration states", () => {
+  test("parses only the closed semantic work classes", () => {
     expect(actorWorkClassSchema.options).toEqual([
       "largeChange",
       "wideResearch",
@@ -37,32 +36,6 @@ describe("metaharness policy v1", () => {
     ]);
     expect(parseActorWorkClass("standard")).toBe("standard");
     expect(parseActorWorkClass("legacyUnclassified")).toBeNull();
-    expect(parseActorTurnAcceleration({ mode: "standard" })).toEqual({
-      mode: "standard",
-    });
-    expect(parseActorTurnAcceleration({
-      mode: "fast",
-      criticalPath: true,
-      bottleneck: "reasoning",
-    })).toEqual({
-      mode: "fast",
-      criticalPath: true,
-      bottleneck: "reasoning",
-    });
-    expect(actorTurnAccelerationSchema.safeParse({
-      mode: "fast",
-      criticalPath: false,
-      bottleneck: "reasoning",
-    }).success).toBeFalse();
-    expect(actorTurnAccelerationSchema.safeParse({
-      mode: "fast",
-      criticalPath: true,
-      bottleneck: "toolIo",
-    }).success).toBeFalse();
-    expect(actorTurnAccelerationSchema.safeParse({
-      mode: "standard",
-      bottleneck: "reasoning",
-    }).success).toBeFalse();
   });
 
   test("maps work classes to exact profiles without quality downgrades", () => {
@@ -116,59 +89,66 @@ describe("metaharness policy v1", () => {
     })).toThrow("catalog model IDs must be unique");
   });
 
-  test("makes Fast a sparse per-turn overlay with closed fallbacks", () => {
-    const acceleration = {
-      mode: "fast" as const,
-      criticalPath: true as const,
-      bottleneck: "reasoning" as const,
-    };
+  test("owns recursive tier selection by work class with closed fallbacks", () => {
+    expect(requestedServiceTierForWorkClass("boundedLeaf")).toBe("fast");
+    expect(requestedServiceTierForWorkClass("standard")).toBe("standard");
+    expect(requestedServiceTierForWorkClass("largeChange")).toBe("standard");
+    expect(requestedServiceTierForWorkClass("wideResearch")).toBe("standard");
+    expect(requestedServiceTierForWorkClass("legacyUnclassified")).toBeNull();
     expect(compileMetaharnessTier({
-      acceleration,
-      automaticFastMode: "criticalPath",
-      selectedProfileSupportsFast: true,
-      fastReservationAvailable: true,
-    })).toMatchObject({ realizedTier: "fast", fallbackReason: null });
-    expect(compileMetaharnessTier({
-      acceleration,
-      automaticFastMode: "off",
+      workClass: "boundedLeaf",
       selectedProfileSupportsFast: true,
       fastReservationAvailable: true,
     })).toMatchObject({
-      realizedTier: "standard",
-      fallbackReason: "automaticFastDisabled",
+      requestedServiceTier: "fast",
+      realizedTier: "fast",
+      fallbackReason: null,
     });
     expect(compileMetaharnessTier({
-      acceleration,
-      automaticFastMode: "criticalPath",
+      workClass: "boundedLeaf",
       selectedProfileSupportsFast: false,
       fastReservationAvailable: true,
     })).toMatchObject({
+      requestedServiceTier: "fast",
       realizedTier: "standard",
       fallbackReason: "fastUnsupported",
     });
     expect(compileMetaharnessTier({
-      acceleration,
-      automaticFastMode: "criticalPath",
+      workClass: "boundedLeaf",
       selectedProfileSupportsFast: true,
       fastReservationAvailable: false,
     })).toMatchObject({
+      requestedServiceTier: "fast",
       realizedTier: "standard",
       fallbackReason: "fastReservationUnavailable",
     });
+    expect(() => compileMetaharnessTier({
+      workClass: "boundedLeaf",
+      acceleration: { mode: "standard" },
+      selectedProfileSupportsFast: true,
+      fastReservationAvailable: true,
+    })).toThrow();
   });
 
-  test("property: Standard never acquires Fast regardless of capability state", () => {
+  test("property: broader work never acquires Fast", () => {
     fc.assert(fc.property(
       fc.boolean(),
       fc.boolean(),
-      fc.constantFrom("off" as const, "criticalPath" as const),
-      (selectedProfileSupportsFast, fastReservationAvailable, automaticFastMode) => {
+      fc.constantFrom(
+        "largeChange" as const,
+        "wideResearch" as const,
+        "standard" as const,
+      ),
+      (selectedProfileSupportsFast, fastReservationAvailable, workClass) => {
         expect(compileMetaharnessTier({
-          acceleration: { mode: "standard" },
-          automaticFastMode,
+          workClass,
           selectedProfileSupportsFast,
           fastReservationAvailable,
-        })).toMatchObject({ realizedTier: "standard", fallbackReason: null });
+        })).toMatchObject({
+          requestedServiceTier: "standard",
+          realizedTier: "standard",
+          fallbackReason: null,
+        });
       },
     ), { numRuns: 100 });
   });

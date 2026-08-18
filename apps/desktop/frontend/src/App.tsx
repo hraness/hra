@@ -148,7 +148,6 @@ export default function App({ runtimeShellFactory }: AppProps) {
         const response = await shell.dispatch(createPaneCommand({
           paneId,
           repositoryId: lastRepository.id,
-          reasoningEffort: "max",
         }));
         if (!inheritedRepositoryIsUnavailable(response)) {
           setCreationError(paneCreationError(response));
@@ -166,7 +165,6 @@ export default function App({ runtimeShellFactory }: AppProps) {
           const response = await shell.dispatch(createPaneCommand({
             paneId,
             repositoryId: project.repository.id,
-            reasoningEffort: "max",
           }));
           setCreationError(paneCreationError(response));
           return;

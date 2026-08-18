@@ -854,7 +854,6 @@ function spawnInput(
     inputValueId: `ctxval_input_${suffix}`,
     policyVersion: 1 as const,
     workClass: "largeChange" as const,
-    acceleration: { mode: "standard" as const },
   };
 }
 
@@ -1177,7 +1176,6 @@ function seedLegacyTurn(
     actorId: actor.id,
     idempotencyKey,
     inputValueId,
-    acceleration: { mode: "standard" },
     createdAt: at,
   });
   return Object.freeze({ turn, idempotencyKey, inputValueId });
@@ -1243,7 +1241,7 @@ function seedLegacyEffectStartedTurn(
     providerThreadId: incarnation.providerThreadId,
     modelId: "gpt-5.6-sol",
     reasoningEffort: "ultra",
-    requestedAcceleration: { mode: "standard" as const },
+    requestedServiceTier: "standard" as const,
     serviceTier: "standard",
     tierFallbackReason: null,
     capabilityEvidenceDigest: null,
@@ -1789,7 +1787,7 @@ async function seedLegacyStartedQuotaReplacement(
     providerThreadId: threadOutcome.providerThreadId,
     modelId: incarnation.requestedModel,
     reasoningEffort: incarnation.requestedReasoningEffort,
-    requestedAcceleration: { mode: "standard" as const },
+    requestedServiceTier: "standard" as const,
     serviceTier: "standard",
     tierFallbackReason: null,
     capabilityEvidenceDigest: target.capabilityEvidenceDigest,
@@ -2353,7 +2351,6 @@ describe("PersistentActorCoordinator", () => {
         inputValueId: "ctxval_bounded_leaf_recursive_01",
         policyVersion: 1,
         workClass: "standard",
-        acceleration: { mode: "standard" },
       }), "unauthorized");
 
       expect(snapshot()).toEqual(before);
@@ -3219,7 +3216,6 @@ describe("PersistentActorCoordinator", () => {
         ...spawnInput("tokenusage000001"),
         policyVersion: 1,
         workClass: "standard",
-        acceleration: { mode: "standard" },
       });
       const [attempt] = value.authority.listActorAttempts({
         turnId: spawned.turn.turn.id,
@@ -4597,26 +4593,21 @@ describe("PersistentActorCoordinator", () => {
       accountProfileId: "acct_fast_root_collision_01",
       processGeneration: 1,
       supportsFast: true,
-      selectedProfile: "solUltra",
+      selectedProfile: "lunaMax",
     }, {
       accountProfileId: "acct_fast_root_collision_02",
       processGeneration: 1,
       supportsFast: true,
-      selectedProfile: "solUltra",
+      selectedProfile: "lunaMax",
     }]);
     try {
-      const fastAcceleration = {
-        mode: "fast" as const,
-        criticalPath: true as const,
-        bottleneck: "reasoning" as const,
-      };
       await value.coordinator.spawn({
         ...spawnInput("fastrootcollision01"),
-        acceleration: fastAcceleration,
+        workClass: "boundedLeaf",
       });
       expect(value.provider.turnStarts[0]).toMatchObject({
         accountProfileId: value.accounts[0]!.accountProfileId,
-        requestedAcceleration: fastAcceleration,
+        requestedServiceTier: "fast",
         serviceTier: "fast",
         tierFallbackReason: null,
       });
@@ -4628,12 +4619,12 @@ describe("PersistentActorCoordinator", () => {
       );
       const secondInput = {
         ...spawnInput("fastrootcollision02"),
-        acceleration: fastAcceleration,
+        workClass: "boundedLeaf" as const,
       };
       const second = await value.coordinator.spawn(secondInput);
       expect(value.provider.turnStarts[1]).toMatchObject({
         accountProfileId: value.accounts[1]!.accountProfileId,
-        requestedAcceleration: fastAcceleration,
+        requestedServiceTier: "fast",
         serviceTier: "standard",
         tierFallbackReason: "fastReservationUnavailable",
         fastReservationId: null,
@@ -4684,26 +4675,56 @@ describe("PersistentActorCoordinator", () => {
     }
   });
 
+  test("records a bounded-leaf Fast fallback when the selected profile lacks Fast", async () => {
+    const value = fixture([{
+      accountProfileId: "acct_bounded_leaf_standard",
+      processGeneration: 1,
+      supportsFast: false,
+      selectedProfile: "lunaMax",
+    }]);
+    try {
+      const spawned = await value.coordinator.spawn({
+        ...spawnInput("boundedleaffallback1"),
+        workClass: "boundedLeaf",
+      });
+      expect(value.provider.turnStarts).toMatchObject([{
+        requestedServiceTier: "fast",
+        serviceTier: "standard",
+        tierFallbackReason: "fastUnsupported",
+        fastReservationId: null,
+      }]);
+      expect(value.authority.listActorAttempts({
+        turnId: spawned.turn.turn.id,
+        limit: 16,
+      })).toMatchObject([{
+        requestedServiceTier: "fast",
+        realizedServiceTier: "standard",
+        tierFallbackReason: "fastUnsupported",
+        fastReservationId: null,
+      }]);
+      expect(value.authority.listQuarantinedActorFastReservations({
+        limit: 16,
+      })).toEqual([]);
+    } finally {
+      value.database.close();
+    }
+  });
+
   test("falls back atomically when a second root requests Fast on one account", async () => {
     const value = fixture([{
       accountProfileId: "acct_fast_account_collision",
       processGeneration: 1,
       supportsFast: true,
-      selectedProfile: "solUltra",
+      selectedProfile: "lunaMax",
     }]);
     try {
-      const fastAcceleration = {
-        mode: "fast" as const,
-        criticalPath: true as const,
-        bottleneck: "fileGeneration" as const,
-      };
       await value.coordinator.spawn({
         ...spawnInput("fastaccountroot001"),
-        acceleration: fastAcceleration,
+        workClass: "boundedLeaf",
       });
       expect(value.provider.turnStarts[0]).toMatchObject({
         accountProfileId: value.accounts[0]!.accountProfileId,
-        requestedAcceleration: fastAcceleration,
+        requestedServiceTier: "fast",
         serviceTier: "fast",
         tierFallbackReason: null,
       });
@@ -4749,12 +4770,12 @@ describe("PersistentActorCoordinator", () => {
       const secondInput = {
         ...spawnInput("fastaccountroot002"),
         callerActorId: secondRootActorId,
-        acceleration: fastAcceleration,
+        workClass: "boundedLeaf" as const,
       };
       const second = await value.coordinator.spawn(secondInput);
       expect(value.provider.turnStarts[1]).toMatchObject({
         accountProfileId: value.accounts[0]!.accountProfileId,
-        requestedAcceleration: fastAcceleration,
+        requestedServiceTier: "fast",
         serviceTier: "standard",
         tierFallbackReason: "fastReservationUnavailable",
         fastReservationId: null,
@@ -4810,7 +4831,7 @@ describe("PersistentActorCoordinator", () => {
       accountProfileId: "acct_fast_capacity_0001",
       processGeneration: 7,
       supportsFast: true,
-      selectedProfile: "solUltra",
+      selectedProfile: "lunaMax",
     }]);
     try {
       const account = value.accounts[0]!;
@@ -4820,11 +4841,7 @@ describe("PersistentActorCoordinator", () => {
       });
       const firstInput = {
         ...spawnInput("fastcapacityfirst01"),
-        acceleration: {
-          mode: "fast" as const,
-          criticalPath: true as const,
-          bottleneck: "reasoning" as const,
-        },
+        workClass: "boundedLeaf" as const,
       };
       await expectPersistentActorError(
         value.coordinator.spawn(firstInput),
@@ -4908,18 +4925,14 @@ describe("PersistentActorCoordinator", () => {
 
       const secondInput = {
         ...spawnInput("fastcapacitysecond1"),
-        acceleration: {
-          mode: "fast" as const,
-          criticalPath: true as const,
-          bottleneck: "fileGeneration" as const,
-        },
+        workClass: "boundedLeaf" as const,
       };
       await expectPersistentActorError(
         value.coordinator.spawn(secondInput),
         "ambiguous_effect",
       );
       expect(value.provider.turnStarts.at(-1)).toMatchObject({
-        requestedAcceleration: secondInput.acceleration,
+        requestedServiceTier: "fast",
         serviceTier: "fast",
         tierFallbackReason: null,
       });
@@ -4973,7 +4986,7 @@ describe("PersistentActorCoordinator", () => {
         accountProfileId: `acct_fast_prefix_${String(index + 1).padStart(4, "0")}`,
         processGeneration: 7,
         supportsFast: true,
-        selectedProfile: "solUltra",
+        selectedProfile: "lunaMax",
       }]);
       try {
         const account = value.accounts[0]!;
@@ -4995,11 +5008,7 @@ describe("PersistentActorCoordinator", () => {
         }
         await expectRejectedMessage(value.coordinator.spawn({
           ...spawnInput(`fastprefix${String(index + 1).padStart(8, "0")}`),
-          acceleration: {
-            mode: "fast",
-            criticalPath: true,
-            bottleneck: "reasoning",
-          },
+          workClass: "boundedLeaf",
         }), "injected crash after legacy Fast");
         const reservation = value.authority
           .listQuarantinedActorFastReservations({ limit: 1 })[0];
@@ -5088,7 +5097,7 @@ describe("PersistentActorCoordinator", () => {
       accountProfileId: "acct_fast_capacity_held",
       processGeneration: 7,
       supportsFast: true,
-      selectedProfile: "solUltra",
+      selectedProfile: "lunaMax",
     }]);
     try {
       const account = value.accounts[0]!;
@@ -5098,11 +5107,7 @@ describe("PersistentActorCoordinator", () => {
       });
       await expectPersistentActorError(value.coordinator.spawn({
         ...spawnInput("fastcapacityheld001"),
-        acceleration: {
-          mode: "fast",
-          criticalPath: true,
-          bottleneck: "reasoning",
-        },
+        workClass: "boundedLeaf",
       }), "ambiguous_effect");
       const reservation = value.authority.listQuarantinedActorFastReservations({
         limit: 1,
@@ -5311,9 +5316,72 @@ describe("PersistentActorCoordinator", () => {
       expect(sent.turn).toMatchObject({ ordinal: 2, state: "running" });
       expect(value.provider.threadStarts).toHaveLength(1);
       expect(value.provider.turnStarts).toHaveLength(2);
+      expect(value.provider.turnStarts.map(({ requestedServiceTier }) =>
+        requestedServiceTier
+      )).toEqual(["standard", "standard"]);
       expect(value.authority.readActiveIncarnationForActor(spawned.actor.id)?.id)
         .toBe(incarnationBefore?.id);
       expect(value.authority.readActor(spawned.actor.id)?.state).toBe("active");
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("follow-up sends reuse the bounded leaf actor's HRA-owned Fast route", async () => {
+    const value = fixture([{
+      accountProfileId: "acct_bounded_leaf_followup",
+      processGeneration: 1,
+      selectedProfile: "lunaMax",
+      supportsFast: true,
+    }]);
+    try {
+      const spawned = await value.coordinator.spawn({
+        ...spawnInput("boundedleaffollow01"),
+        workClass: "boundedLeaf",
+      });
+      const firstRequest = value.provider.turnStarts[0]!;
+      const firstEvent = terminalEvent(
+        firstRequest,
+        "completed",
+        "bounded-leaf-follow-up",
+      );
+      firstEvent.providerTurnId = value.authority.listActorAttempts({
+        turnId: spawned.turn.turn.id,
+        limit: 16,
+      })[0]!.providerTurnId!;
+      await observeTerminalWithExactUsage(value, firstEvent);
+
+      const sent = await value.coordinator.send({
+        callerActorId: rootActorId,
+        actorId: spawned.actor.id,
+        idempotencyKey: "send-bounded-leaf-follow-up",
+        inputValueId: "ctxval_bounded_leaf_follow_up",
+      });
+
+      expect(value.provider.turnStarts).toHaveLength(2);
+      expect(value.provider.turnStarts.map((request) => ({
+        requestedServiceTier: request.requestedServiceTier,
+        serviceTier: request.serviceTier,
+        tierFallbackReason: request.tierFallbackReason,
+      }))).toEqual([
+        {
+          requestedServiceTier: "fast",
+          serviceTier: "fast",
+          tierFallbackReason: null,
+        },
+        {
+          requestedServiceTier: "fast",
+          serviceTier: "fast",
+          tierFallbackReason: null,
+        },
+      ]);
+      expect(value.authority.listActorAttempts({
+        turnId: sent.turn.id,
+        limit: 16,
+      })).toMatchObject([{
+        requestedServiceTier: "fast",
+        realizedServiceTier: "fast",
+      }]);
     } finally {
       value.database.close();
     }

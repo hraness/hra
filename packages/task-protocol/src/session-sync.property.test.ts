@@ -240,9 +240,8 @@ test("property: bounded observation summaries encrypt and round trip exactly", a
   ).map((characters) => characters.join(""));
   await fc.assert(fc.asyncProperty(
     titleArbitrary,
-    fc.constantFrom("ultra", "max"),
     fc.constantFrom("ready", "working", "attention", "error", "offline"),
-    async (title, modelEffort, state) => {
+    async (title, state) => {
       const value = sessionSummarySchema.parse({
         version: 1,
         sessionId,
@@ -250,7 +249,6 @@ test("property: bounded observation summaries encrypt and round trip exactly", a
         directoryOrdinal: "1",
         sourceRevision: "1",
         title,
-        modelEffort,
         state,
         deleted: false,
       });

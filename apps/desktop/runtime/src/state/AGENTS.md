@@ -20,6 +20,7 @@
 - `local-task-authority-command-store.ts` – entity-specific due-work revalidation and atomic portable system-command execution with post-commit invalidation hints.
 - `local-promotion-store.ts` – immutable local promotion snapshots, family digests, exact upload receipts, frozen authority phases, activation, and proven pre-activation aborts.
 - `longitudinal-routing-schema-v1.ts` – additive content-free recursive-routing observations, materialized sufficient statistics, dirty-pane revisions, and immutable non-activating analysis receipts.
+- `root-turn-routing-schema-v1.ts` – private content-free ordinary-root classification, resolution, effect, acceptance, terminal, recovery, and privacy-deletion receipt schema.
 
 # Guidelines
 
@@ -53,6 +54,7 @@
 - Freeze and validate the complete promotion snapshot before the first cloud write. Promotion storage may contain only strict portable entities and receipts, never local paths, credentials, commands, interaction answers, or live run internals.
 - Parse database rows from `unknown` before returning them from a repository boundary.
 - Keep longitudinal routing observations immutable and low-cardinality. Derived usage rows and arm statistics may change only through exact observation, late positioned-token, or privacy-deletion triggers; pane deletion must remove the complete derived history. Never persist content, provider or account identity, repository data, paths, filenames, or timestamps in the model-visible projection.
+- Admit one root-turn routing classification in the same transaction as each ordinary chat turn. Keep it independent of prunable `chat_turn_receipts`; reject a historical routing identity even after its bounded chat receipt is gone. Advance resolution, provider-effect, accepted generation/stream position, and terminal evidence monotonically through the narrow authority. Restart maps pre-effect work to `notApplied`, an unaccepted effect to `ambiguous`, and an accepted effect to `interrupted`. Pane archive or deletion removes the complete root-route ledger.
 - Bind a dispatch row to its repository, runner boot, claim ID, and fence before any side effect. Keep event sequence and outbox append in one SQLite transaction.
 - Persist only the explicitly public reasoning-summary and assistant-message display channels as bounded drafts. Materialize drafts into immutable ordered outbox events before later semantic events, and cap display events independently so terminal capacity cannot be consumed by streaming.
 - Advance boot generation only after a prior boot has an accepted heartbeat; replay an unacknowledged first heartbeat with the same identity.
