@@ -16,7 +16,7 @@ const PANE = "pane_contractledger1";
 const MESSAGE = "chatmsg_contractledger1";
 const TURN = "chatturn_contractledger1";
 
-test("Phase 1 message commands are strict, bounded, and separate from live dispatch", () => {
+test("message commands are strict, bounded, and are the live chat send authority", () => {
   const queued = runtimeChatMessageLedgerCommandSchema.parse({
     type: "chat.message.enqueue",
     paneId: PANE,
@@ -26,7 +26,7 @@ test("Phase 1 message commands are strict, bounded, and separate from live dispa
     delivery: { kind: "queue" },
   });
   expect(queued.type).toBe("chat.message.enqueue");
-  expect(runtimeChatDomainCommandSchema.safeParse(queued).success).toBe(false);
+  expect(runtimeChatDomainCommandSchema.safeParse(queued).success).toBe(true);
 
   expect(runtimeChatMessageLedgerCommandSchema.parse({
     ...queued,
@@ -63,6 +63,13 @@ test("Phase 1 message commands are strict, bounded, and separate from live dispa
       type: "chat.messageQueue.resume",
       paneId: PANE,
       expectedQueueRevision: 2,
+    },
+    {
+      type: "chat.message.discardAmbiguous",
+      paneId: PANE,
+      expectedQueueRevision: 2,
+      messageId: MESSAGE,
+      expectedMessageRevision: 3,
     },
     {
       type: "chat.message.steerHead",
@@ -105,6 +112,7 @@ test("queue projections preserve complete FIFO text under their byte ceiling", (
   const queue = chatMessageQueueProjectionSchema.parse({
     revision: 9,
     pauseReason: "runtimeRestart",
+    blockedMessage: null,
     messages: Array.from({ length: 4 }, (_, index) => ({
       id: `chatmsg_contract${String(index).padStart(8, "0")}`,
       ordinal: index + 1,
@@ -140,6 +148,7 @@ test("queue result and bounded invalidation expose only app-owned identities", (
   const queue = {
     revision: 2,
     pauseReason: null,
+    blockedMessage: null,
     messages: [{
       id: MESSAGE,
       ordinal: 1,

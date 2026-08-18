@@ -6,11 +6,15 @@ import { migrations } from "../src/state/migrations";
 
 const NOW = "2026-08-18T12:00:00.000Z";
 
-test("migration 47 backfills a populated pane and reopens with exact queue clocks", () => {
+test("message-ledger migrations backfill a pane and reopen with exact queue clocks", () => {
   const migration = migrations.find(({ version }) => version === 47);
+  const resolutionMigration = migrations.find(({ version }) => version === 48);
   if (migration === undefined) throw new Error("message ledger migration is missing");
+  if (resolutionMigration === undefined) {
+    throw new Error("ambiguous resolution migration is missing");
+  }
   expect(migration.name).toBe("durable-app-owned-chat-message-ledger");
-  expect(migrations.at(-1)?.version).toBe(47);
+  expect(migrations.at(-1)?.version).toBe(48);
 
   const legacy = new Database(":memory:", { strict: true });
   legacy.exec("PRAGMA foreign_keys = ON");
@@ -39,6 +43,7 @@ test("migration 47 backfills a populated pane and reopens with exact queue clock
   `).run(`repo_${"8".repeat(26)}`, NOW);
 
   legacy.transaction(() => legacy.exec(migration.sql))();
+  legacy.transaction(() => legacy.exec(resolutionMigration.sql))();
   expect(legacy.query(`
     SELECT message_queue_revision, next_message_ordinal,
       message_queue_pause_reason
@@ -49,7 +54,12 @@ test("migration 47 backfills a populated pane and reopens with exact queue clock
     message_queue_pause_reason: null,
   });
   expect(new ChatPaneStore(legacy).messageQueue("pane_migrationledger1"))
-    .toEqual({ revision: 1, pauseReason: null, messages: [] });
+    .toEqual({
+      revision: 1,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    });
   expect(legacy.query(`
     SELECT singleton, generation FROM chat_attachment_vault_state
   `).get()).toEqual({ singleton: 1, generation: 0 });

@@ -8,6 +8,8 @@ import {
   runtimeChatTurnPromptUtf8ByteLimit,
   type ChatAttention,
   type ChatAttentionCode,
+  type ChatMessageId,
+  type ChatMessageQueueProjection,
   type ChatPaneActivity,
   type ChatPaneInteractionMode,
   type ChatPaneProjection,
@@ -16,6 +18,7 @@ import {
   type ChatToolCategory,
   type ChatToolProjection,
   type ChatUtf8Tail,
+  type RuntimeChatMessageLedgerCommand,
 } from "../../../contracts/runtime";
 
 export type {
@@ -255,6 +258,18 @@ export interface ChatProviderTurnRequest extends ChatProviderConfiguration {
   readonly workingDirectory: string;
 }
 
+export interface ChatProviderSteerFence {
+  readonly generation: number;
+}
+
+export interface ChatProviderSteerRequest {
+  readonly binding: ChatThreadBinding;
+  readonly providerTurnId: string;
+  readonly messageId: ChatMessageId;
+  readonly prompt: string;
+  readonly fence: ChatProviderSteerFence;
+}
+
 export interface ChatProviderPort {
   /** Resolves the first HRA-ordered candidate from one exact provider catalog. */
   resolveConfiguration(
@@ -272,6 +287,10 @@ export interface ChatProviderPort {
     turnId: string;
     quotaProofCursor: ChatQuotaProofCursor;
   }>>;
+  verifySteerTarget(
+    input: ChatThreadBinding & Readonly<{ readonly turnId: string }>,
+  ): ChatProviderSteerFence | null;
+  steerTurn(request: ChatProviderSteerRequest): Promise<void>;
   interruptTurn(input: ChatThreadBinding & Readonly<{ readonly turnId: string }>): Promise<void>;
 }
 
@@ -354,10 +373,16 @@ export type ChatPaneCommand =
       readonly expectedRevision: number;
       readonly priorFailedTurnId: ChatTurnId;
       readonly turnId: ChatTurnId;
-    }>;
+    }>
+  | RuntimeChatMessageLedgerCommand;
 
 export type ChatCommandResult =
   | Readonly<{ readonly type: "pane"; readonly pane: ChatPaneProjection }>
+  | Readonly<{
+      readonly type: "messageQueue";
+      readonly paneId: ChatPaneId;
+      readonly queue: ChatMessageQueueProjection;
+    }>
   | Readonly<{ readonly type: "removed"; readonly paneId: ChatPaneId; readonly revision: number }>
   | Readonly<{ readonly type: "reordered"; readonly orderedPaneIds: readonly ChatPaneId[] }>;
 
@@ -380,6 +405,11 @@ export interface ChatProjectionSink {
   paneStateChanged(pane: ChatPaneProjection): void | Promise<void>;
   paneRemoved(paneId: ChatPaneId, revision: number): void | Promise<void>;
   panesReordered(orderedPaneIds: readonly ChatPaneId[]): void | Promise<void>;
+  /** Complete queue text is already installed in the authoritative snapshot. */
+  messageQueueChanged(
+    paneId: ChatPaneId,
+    queue: ChatMessageQueueProjection,
+  ): void | Promise<void>;
   delta(delta: ChatTurnDelta): void | Promise<void>;
 }
 

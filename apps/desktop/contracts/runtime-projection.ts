@@ -52,6 +52,11 @@ export function reduceRuntimeProjectionEvent(
       return reorderChatPanes(snapshot, event.orderedPaneIds);
     case "chat.turn.delta":
       return appendChatTurnDelta(snapshot, event);
+    case "chat.messageQueue.changed":
+      // The compact event is an invalidation marker. RuntimeProjection installs
+      // the complete queue into its authoritative snapshot before publishing
+      // it, and the renderer rehydrates instead of fabricating missing text.
+      return snapshot;
     case "accountLocalData.upserted":
       return {
         ...snapshot,

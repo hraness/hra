@@ -1,18 +1,18 @@
 import {
   runtimeAccountProfileLimit,
-  runtimeChatTurnPromptUtf8ByteLimit,
+  runtimeChatMessageUtf8ByteLimit,
   runtimeRetainedAccountLocalDataLimit,
   type AccountSummary,
+  type ChatMessageId,
   type ChatPaneProjection,
   type ChatPaneActivityKind,
   type ChatPaneState,
-  type ChatRootTurnRoutingProjection,
-  type ChatToolCategory,
   type HarnessSnapshot,
   type HumanAccountSnapshot,
   type LocalSessionGridSlotProjection,
   type RemoteSessionSummaryProjection,
   type RuntimeChatDomainCommand,
+  type RuntimeChatMessageLedgerCommand,
   type RuntimeError,
   type RuntimeHarnessDomainCommand,
 } from "../../../../contracts/runtime";
@@ -34,7 +34,7 @@ export function chatRouteHash(route: ChatRoute): `#${ChatRoute}` {
   return `#${route}`;
 }
 
-function opaqueId(prefix: "chatturn" | "pane", randomUuid: () => string): string {
+function opaqueId(prefix: "chatmsg" | "pane", randomUuid: () => string): string {
   return `${prefix}_${randomUuid().replaceAll("-", "")}`;
 }
 
@@ -44,10 +44,10 @@ export function createPaneId(
   return opaqueId("pane", randomUuid);
 }
 
-export function createTurnId(
+export function createMessageId(
   randomUuid: () => string = () => crypto.randomUUID(),
-): NonNullable<ChatPaneProjection["turn"]>["id"] {
-  return opaqueId("chatturn", randomUuid);
+): ChatMessageId {
+  return opaqueId("chatmsg", randomUuid);
 }
 
 export function normalizePaneTitle(value: string): string | null {
@@ -105,7 +105,7 @@ export function validatedPrompt(value: string):
   if (value.includes("\0")) {
     return { ok: false, message: "The message contains unsupported text." };
   }
-  if (new TextEncoder().encode(value).byteLength > runtimeChatTurnPromptUtf8ByteLimit) {
+  if (new TextEncoder().encode(value).byteLength > runtimeChatMessageUtf8ByteLimit) {
     return { ok: false, message: "The message is too large to send." };
   }
   return { ok: true, prompt: value };
@@ -132,14 +132,6 @@ export function paneCanCompose(state: ChatPaneState): boolean {
 
 export function paneCanRename(state: ChatPaneState): boolean {
   return state === "ready" || state === "attention";
-}
-
-export function paneCanRetryRetainedPrompt(pane: ChatPaneProjection): boolean {
-  return pane.interactionMode === "chat" &&
-    pane.state === "attention" &&
-    pane.attention?.retryable === true &&
-    pane.turn?.status === "failed" &&
-    pane.recoverablePrompt === true;
 }
 
 export type PaneWorkspaceStatus = Readonly<{
@@ -280,78 +272,6 @@ export function paneStatusLabel(state: ChatPaneState): string {
       return "Preparing account change";
     case "attention":
       return "Needs attention";
-  }
-}
-
-export interface RootTurnRoutePresentation {
-  readonly accessibleLabel: string;
-  readonly label: string;
-}
-
-function rootTurnProfileLabel(
-  profile: ChatRootTurnRoutingProjection["requestedProfile"],
-): string {
-  return profile === "lunaMax"
-    ? "Luna Max"
-    : profile === "solMax"
-      ? "Sol Max"
-      : "Sol Ultra";
-}
-
-function rootTurnServiceTierLabel(
-  tier: ChatRootTurnRoutingProjection["requestedServiceTier"],
-): string {
-  return tier === "fast" ? "Fast" : "Standard";
-}
-
-/** Renderer-safe presentation of HRA's active or latest pre-effect route. */
-export function rootTurnRoutePresentation(
-  routing: ChatRootTurnRoutingProjection | null,
-): RootTurnRoutePresentation | null {
-  if (routing === null) return null;
-  if (
-    routing.selectedProfile === null ||
-    routing.selectedServiceTier === null
-  ) {
-    return {
-      accessibleLabel: "HRA has not resolved this turn's dispatch route.",
-      label: "Route · Unresolved",
-    };
-  }
-  const requestedProfile = rootTurnProfileLabel(routing.requestedProfile);
-  const selectedProfile = rootTurnProfileLabel(routing.selectedProfile);
-  const requestedTier = rootTurnServiceTierLabel(routing.requestedServiceTier);
-  const selectedTier = rootTurnServiceTierLabel(routing.selectedServiceTier);
-  const fallbackExplanations = [
-    routing.profileFallbackReason === "lunaUnavailable"
-      ? "Luna configuration was unavailable on the selected subscription"
-      : null,
-    routing.serviceTierFallbackReason === "fastUnavailable"
-      ? "Fast service was unavailable on the selected subscription"
-      : null,
-  ].filter((value): value is string => value !== null);
-  const fallback = fallbackExplanations.length === 0
-    ? ""
-    : ` ${fallbackExplanations.join(" and ")}, so HRA used its fallback before dispatch.`;
-  return {
-    accessibleLabel:
-      `HRA requested ${requestedProfile} at ${requestedTier} and selected ${selectedProfile} at ${selectedTier} for dispatch.${fallback}`,
-    label: `Route · ${selectedProfile} · ${selectedTier}`,
-  };
-}
-
-export function toolCategoryLabel(category: ChatToolCategory): string {
-  switch (category) {
-    case "command":
-      return "Command";
-    case "filesystem":
-      return "Files";
-    case "network":
-      return "Network";
-    case "search":
-      return "Search";
-    case "other":
-      return "Tool";
   }
 }
 
@@ -905,22 +825,43 @@ export function selectPaneRepositoryCommand(input: Readonly<{
   return { type: "chat.pane.repository.select", ...input };
 }
 
-export function startTurnCommand(input: Readonly<{
-  paneId: ChatPaneProjection["id"];
-  expectedRevision: number;
-  turnId: NonNullable<ChatPaneProjection["turn"]>["id"];
-  prompt: string;
-}>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.turn.start" }> {
-  return { type: "chat.turn.start", ...input };
+type MessageLedgerCommand<Type extends RuntimeChatMessageLedgerCommand["type"]> =
+  Extract<RuntimeChatMessageLedgerCommand, { readonly type: Type }>;
+
+export function enqueueMessageCommand(
+  input: Omit<MessageLedgerCommand<"chat.message.enqueue">, "type">,
+): MessageLedgerCommand<"chat.message.enqueue"> {
+  return { type: "chat.message.enqueue", ...input };
 }
 
-export function retryTurnCommand(input: Readonly<{
-  paneId: ChatPaneProjection["id"];
-  expectedRevision: number;
-  priorFailedTurnId: NonNullable<ChatPaneProjection["turn"]>["id"];
-  turnId: NonNullable<ChatPaneProjection["turn"]>["id"];
-}>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.turn.retry" }> {
-  return { type: "chat.turn.retry", ...input };
+export function editQueuedMessageCommand(
+  input: Omit<MessageLedgerCommand<"chat.message.edit">, "type">,
+): MessageLedgerCommand<"chat.message.edit"> {
+  return { type: "chat.message.edit", ...input };
+}
+
+export function removeQueuedMessageCommand(
+  input: Omit<MessageLedgerCommand<"chat.message.remove">, "type">,
+): MessageLedgerCommand<"chat.message.remove"> {
+  return { type: "chat.message.remove", ...input };
+}
+
+export function resumeMessageQueueCommand(
+  input: Omit<MessageLedgerCommand<"chat.messageQueue.resume">, "type">,
+): MessageLedgerCommand<"chat.messageQueue.resume"> {
+  return { type: "chat.messageQueue.resume", ...input };
+}
+
+export function discardAmbiguousMessageCommand(
+  input: Omit<MessageLedgerCommand<"chat.message.discardAmbiguous">, "type">,
+): MessageLedgerCommand<"chat.message.discardAmbiguous"> {
+  return { type: "chat.message.discardAmbiguous", ...input };
+}
+
+export function steerQueuedMessageCommand(
+  input: Omit<MessageLedgerCommand<"chat.message.steerHead">, "type">,
+): MessageLedgerCommand<"chat.message.steerHead"> {
+  return { type: "chat.message.steerHead", ...input };
 }
 
 export function stopTurnCommand(input: Readonly<{

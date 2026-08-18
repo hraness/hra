@@ -4,6 +4,7 @@ import {
   runtimeProtocolVersion,
   type AccountSummary,
   type ChatPaneProjection,
+  type ChatMessageQueueProjection,
   type RuntimeEvent,
   type RuntimeSnapshot,
 } from "../../contracts/runtime";
@@ -110,6 +111,12 @@ function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
     },
     attention: null,
     recoverablePrompt: false,
+    messageQueue: {
+      revision: 1,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    },
     harness: null,
   };
 }
@@ -187,6 +194,41 @@ describe("renderer-safe gateway projection", () => {
       panes: [{ revision: 10, title: "Renamed" }],
     });
     next.release();
+  });
+
+  test("installs a complete queue before publishing its compact rehydration marker", () => {
+    const projection = new RuntimeProjection(emptySnapshot());
+    projection.installBootstrapChatState([chatPane()]);
+    const queue: ChatMessageQueueProjection = {
+      revision: 2,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [{
+        id: "chatmsg_projectionqueue1",
+        ordinal: 1,
+        revision: 1,
+        text: "complete private queued text",
+        attachmentRefs: [],
+      }],
+    };
+    projection.installChatMessageQueueState({
+      paneId: chatPane().id,
+      queue,
+    });
+
+    const [event] = projection.drainEvents();
+    expect(event).toMatchObject({
+      sequence: 1,
+      event: {
+        type: "chat.messageQueue.changed",
+        paneId: chatPane().id,
+        revision: 2,
+      },
+    });
+    expect(JSON.stringify(event)).not.toContain("complete private queued text");
+    const capture = projection.beginSnapshot();
+    expect(capture.response.snapshot.chat.panes[0]?.messageQueue).toEqual(queue);
+    capture.release();
   });
 
   test("bootstrap chat state can be installed only once", () => {

@@ -63,6 +63,12 @@ function pane(responseMarkdown = ""): ChatPaneProjection {
     },
     attention: null,
     recoverablePrompt: false,
+    messageQueue: {
+      revision: 1,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    },
     harness: null,
   };
 }
@@ -91,6 +97,7 @@ describe("renderer event delivery classes", () => {
       "chat.pane.removed": "state-recoverable",
       "chat.panes.reordered": "state-recoverable",
       "chat.turn.delta": "state-recoverable",
+      "chat.messageQueue.changed": "state-recoverable",
       "accountLocalData.upserted": "state-recoverable",
       "accountLocalData.removed": "state-recoverable",
       "humanAccount.changed": "state-recoverable",

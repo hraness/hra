@@ -116,6 +116,7 @@ function chatPane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness: null,
     ...overrides,
   };
@@ -485,6 +486,95 @@ const streamingToolPane: ChatPaneProjection = {
   },
 };
 
+const compactChatPane = chatPane("pane_compact_malleable", {
+  revision: 5,
+  title: "Malleable metaharness",
+  state: "streaming",
+  activity: { ordinal: 3, kind: "toolStarted" },
+  accountProfileId: personal.id,
+  harness: {
+    revision: 2,
+    descendants: {
+      count: 4,
+      truncated: false,
+      children: [{
+        id: "hactor_compactroute01",
+        revision: 2,
+        title: "Routing audit",
+        state: "running",
+        openedPaneId: null,
+        canOpen: false,
+        canMessage: false,
+        canStop: true,
+      }, {
+        id: "hactor_compactdirect1",
+        revision: 1,
+        title: "Direct verification",
+        state: "waiting",
+        openedPaneId: null,
+        canOpen: false,
+        canMessage: false,
+        canStop: true,
+      }, {
+        id: "hactor_compactreview1",
+        revision: 3,
+        title: "Accessibility review",
+        state: "idle",
+        openedPaneId: null,
+        canOpen: true,
+        canMessage: false,
+        canStop: true,
+      }, {
+        id: "hactor_compactstartup",
+        revision: 1,
+        title: "Attachment vault",
+        state: "starting",
+        openedPaneId: null,
+        canOpen: false,
+        canMessage: false,
+        canStop: true,
+      }],
+    },
+  },
+  messageQueue: {
+    revision: 4,
+    pauseReason: null,
+    blockedMessage: null,
+    messages: [{
+      id: "chatmsg_compactdirect01",
+      ordinal: 1,
+      revision: 2,
+      text: "Steer the active turn with the accessibility findings.",
+      attachmentRefs: [],
+    }, {
+      id: "chatmsg_compactdirect02",
+      ordinal: 2,
+      revision: 1,
+      text: "Then tighten the 26rem layout.",
+      attachmentRefs: [],
+    }],
+  },
+  turn: {
+    id: "chatturn_compactmalleable",
+    status: "streaming",
+    startedAt: HRA_DIRECT_TIMESTAMP,
+    completedAt: null,
+    continuationCount: 0,
+    reasoningSummary: chatTail(
+      "### Thinking\n\nChecking **queue order**, touch targets, and image custody.",
+    ),
+    responseMarkdown: chatTail(
+      "## Compact answer\n\nThe pane keeps a dense, readable surface.\n\n- Markdown stays safe\n- Tools stay hidden",
+    ),
+    tools: [{
+      id: "chattool_compacthidden1",
+      category: "filesystem",
+      status: "running",
+    }],
+    routing: null,
+  },
+});
+
 export const manyChatPaneCount = 64;
 export const denseRemoteSessionCount = 448;
 export const denseGridSessionCount = manyChatPaneCount + denseRemoteSessionCount;
@@ -768,7 +858,7 @@ const scenarioInputs = [
   {
     id: "chat-streaming",
     title: "Streaming chat pane",
-    description: "The real shell projects bounded reasoning, provider-neutral tools, and response Markdown deltas into one pane.",
+    description: "The real shell projects bounded active reasoning and response Markdown deltas while provider tool activity remains hidden.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -846,6 +936,32 @@ const scenarioInputs = [
     runtime: logicalRuntime,
   },
   {
+    id: "chat-compact-malleable",
+    title: "Malleable compact chat",
+    description: "The real chat pane composes Markdown thinking and answer, pinned subagents, FIFO queue controls, one image preview, duration, and touch-safe composer chrome.",
+    route: "/",
+    world: createHRADirectWorld({
+      surface: {
+        kind: "compactChat",
+        paneId: compactChatPane.id,
+        paletteIndex: 5,
+        nowUnixMilliseconds: HRA_DIRECT_TIME + 7_305_000,
+        attachments: [{
+          id: "attachment_compactdirect01",
+          name: "compact-layout.png",
+          mimeType: "image/png",
+          byteSize: 2_048,
+        }],
+      },
+      gateway: {
+        snapshots: [snapshotWithChat([compactChatPane])],
+        encoding: { kind: "chunked", chunkBytes: 257 },
+        events: [],
+      },
+    }),
+    runtime: logicalRuntime,
+  },
+  {
     id: "chat-attention",
     title: "Recoverable chat attention",
     description: "Quota, continuation, approval, runtime, and turn failures each stay concise and leave their composer enabled for a new message.",
@@ -890,7 +1006,7 @@ const scenarioInputs = [
   {
     id: "chat-compact-639",
     title: "Compact pane at 639 px",
-    description: "The real pane, navigation, composer, and read-only route status remain usable below the 640 px breakpoint at 120% text size.",
+    description: "The real pane, navigation, and compact composer remain usable below the 640 px breakpoint at 120% text size.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -1462,6 +1578,7 @@ export const hraScenarioMetadata = {
   "chat-draft": { group: "Panes", viewport: "wide" },
   "chat-streaming": { group: "Panes", viewport: "wide" },
   "chat-completed": { group: "Panes", viewport: "wide" },
+  "chat-compact-malleable": { group: "Panes", viewport: "compact" },
   "chat-attention": { group: "Recovery", viewport: "wide" },
   "chat-compact-320": { group: "Panes", viewport: "compact" },
   "chat-compact-639": { group: "Panes", viewport: "compact" },
@@ -1514,26 +1631,30 @@ export const hraDirectDefinition = defineDirect({
   defaultScenario: "chat-draft",
   scenarios: scenarioInputs,
   coverage: [
-    { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, a clear Rename affordance, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
-    { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning, provider-neutral tool state, and streaming response Markdown in one pane.", scenarios: ["chat-streaming"] },
+    { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, compact pane actions, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
+    { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning and response Markdown through one safe renderer while provider tool activity remains intentionally absent from chat UI.", scenarios: ["chat-streaming"] },
     { key: "chat.pane.latest-response", mode: "fixture", claim: "A settled pane retains only the latest assistant Markdown response and re-enables its composer.", scenarios: ["chat-completed"] },
     { key: "chat.pane.attention-recovery", mode: "fixture", claim: "The rendered quota, continuation, approval, runtime, and turn attention presentations remain concise, expose no HITL answer controls, and each permit a later message.", scenarios: ["chat-attention"] },
     { key: "chat.pane.create", mode: "mixed", claim: "The real New pane control opens the pathless native chooser only for the first pane, then reuses the visually last local repository through the typed pane-create command.", scenarios: ["chat-create-pane", "chat-create-pane-inherit"] },
     { key: "chat.pane.order", mode: "mixed", claim: "Local panes reorder through both pointer drag and keyboard-accessible menu affordances, persist through the typed command/event boundary, and leave remote anchors fixed.", scenarios: ["chat-pane-order"] },
-    { key: "chat.pane.compact-responsive", mode: "fixture", claim: "The rendered pane, navigation, composer, Rename action, and read-only route status remain horizontally contained at 320 px, at 639 px and 120% text size, and at 415 px and 150% text size.", scenarios: ["chat-compact-320", "chat-compact-639", "chat-compact-415"] },
+    { key: "chat.pane.compact-responsive", mode: "fixture", claim: "The rendered pane, navigation, Markdown, pinned stacks, attachment preview, and composer remain horizontally contained at 320 px, at 639 px and 120% text size, at 415 px and 150% text size, and at the 26rem/200% contract.", scenarios: ["chat-compact-malleable", "chat-compact-320", "chat-compact-639", "chat-compact-415"] },
     { key: "chat.pane.parallel-performance", mode: "fixture", claim: "Sixty-four simultaneous local streams receive deterministic interleaved deltas within explicit first-render and settlement budgets while a 448-summary remote directory preserves all 48 mounted DOM identities; sixty-four settled panes separately prove dense-grid containment.", scenarios: ["chat-parallel-streaming", "chat-many-panes"] },
-    { key: "chat.turn.routing", mode: "fixture", claim: "Read-only turn facts distinguish HRA-selected Luna Max Fast, Sol Max Standard, Sol Ultra Standard, and independent Luna/Fast fallback without exposing a user preference.", scenarios: ["chat-many-panes", "chat-compact-320"] },
-    { key: "chat.pane.inline-title", mode: "mixed", claim: "The footer Rename affordance opens the real revision-bound title editor; persistence conflict handling remains gateway integration evidence.", scenarios: ["chat-draft"] },
+    { key: "chat.turn.routing", mode: "fixture", claim: "Automatic routing remains absent from user configuration and chat chrome across Luna Max Fast, Sol Max Standard, Sol Ultra Standard, and fallback fixtures.", scenarios: ["chat-many-panes", "chat-compact-320"] },
+    { key: "chat.pane.inline-title", mode: "mixed", claim: "The compact pane actions menu opens the real revision-bound title editor; persistence conflict handling remains gateway integration evidence.", scenarios: ["chat-draft"] },
+    { key: "chat.pane.queue-steer", mode: "fixture", claim: "A complete FIFO queue projects editable and removable rows, exposes steering only on its head, and keeps the active composer available for ordinary queueing.", scenarios: ["chat-compact-malleable"] },
+    { key: "chat.pane.attachment-preview", mode: "fixture", claim: "The typed frontend attachment custody port renders one blob preview with remove and paste/chooser affordances; live gateway custody, vault persistence, and provider image delivery remain integration evidence.", scenarios: ["chat-compact-malleable"] },
+    { key: "chat.pane.elapsed", mode: "fixture", claim: "One logical HRA turn duration renders beside the submit and Stop controls outside every live region.", scenarios: ["chat-compact-malleable"] },
+    { key: "chat.pane.identity-status", mode: "fixture", claim: "The typed frontend palette port selects a golden-angle identity accent while text, glyphs, and semantic outlines retain status independently of hue; durable palette projection remains integration evidence.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.subscription-gate", mode: "fixture", claim: "Without a signed-in Codex subscription, the canonical route is Settings and no panes destination or creation affordance is rendered.", scenarios: ["settings-no-subscriptions"] },
     { key: "harness.ordinary-zero-chrome", mode: "fixture", claim: "An ordinary chat pane receives an explicit null harness projection and renders no recursive controls.", scenarios: ["chat-draft"] },
-    { key: "harness.recursive-children", mode: "fixture", claim: "One bounded parent projection distinguishes all seven persistent actor states and exposes only per-child Open and Stop controls.", scenarios: ["harness-children-mixed"] },
+    { key: "harness.recursive-children", mode: "fixture", claim: "One bounded parent projection distinguishes persistent actor states in a pinned compact list without prompts, provider identities, filesystem paths, or per-child action chrome.", scenarios: ["harness-children-mixed", "chat-compact-malleable"] },
     { key: "harness.settings", mode: "fixture", claim: "Settings exposes only recursive sessions, bounded context quota, Off or Suggest refinement, and read-only proposal titles.", scenarios: ["harness-settings"] },
     { key: "harness.renderer-boundary", mode: "mixed", claim: "Strict harness projections contain only settings, proposal titles with identity/revision, and bounded child summaries without provider IDs, filesystem paths, transcripts, values, programs, trials, or arbitrary commands.", scenarios: ["harness-children-mixed", "harness-settings"] },
     { key: "settings.subscription-browser-login", mode: "mixed", claim: "The lean Settings surface shows bounded remaining capacity, creates and reconnects Codex subscriptions through browser sign-in, and keeps HRA Cloud attachment explicit and separate.", scenarios: ["settings-browser-login"] },
     { key: "settings.human-credential-recovery", mode: "mixed", claim: "The real Settings surface non-destructively retries credential inspection, fences stale revisions, requires explicit inline preservation consent, and returns retired human custody to browser sign-in; Keychain and SQLite transitions remain native integration evidence.", scenarios: ["settings-human-credential-recovery"] },
     { key: "settings.session-sync-security", mode: "mixed", claim: "Encrypted remote observation is explicit opt-in; enrolling and active Settings project the six-digit comparison while unavailable approval and revocation stay fail-closed; active Settings reveal recovery material and disable sync; cloud, authentication, Keychain, or network faults cannot block local pane creation or message send.", scenarios: ["settings-session-sync-disabled", "settings-session-sync-enrolling", "settings-session-sync-active", "settings-session-sync-unavailable", "session-sync-fault-cloud", "session-sync-fault-auth", "session-sync-fault-keychain", "session-sync-fault-network"] },
     { key: "renderer.remote-summary-window", mode: "fixture", claim: "A 512-slot grid of 64 local panes plus 448 remote summaries stays title-first and collision-disambiguated; remote summary-v1 cells remain read-only and mount through a bounded 48-item window.", scenarios: ["remote-session-summaries-512"] },
-    { key: "renderer.chat-boundary", mode: "mixed", claim: "The strict renderer projection exposes bounded latest-turn text, provider-neutral tool categories, and only the derived subscription remaining percentage without prompts, raw protocol items, private paths, credentials, raw usage details, or transcripts.", scenarios: ["chat-completed", "chat-streaming"] },
+    { key: "renderer.chat-boundary", mode: "mixed", claim: "The strict renderer projection exposes bounded latest-turn text and derived subscription remaining percentage without rendering tool calls, prompts, raw protocol items, private paths, credentials, raw usage details, or transcripts.", scenarios: ["chat-completed", "chat-streaming"] },
     { key: "transport.chunked.snapshot", mode: "fixture", claim: "Chat scenarios traverse strict chunk parsing and UTF-8 assembly through the real bridge and shell.", scenarios: ["chat-draft", "chat-many-panes"] },
     { key: "transport.ordered-chat-deltas", mode: "fixture", claim: "Exact revision and UTF-8 offsets govern ordered reasoning and response deltas.", scenarios: ["chat-streaming"] },
     { key: "harness.provider-recursion.direct", mode: "direct", claim: "Real Codex subagent spawning, provider session continuity, and process supervision require packaged runtime evidence.", scenarios: [] },

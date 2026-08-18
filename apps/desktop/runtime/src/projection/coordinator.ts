@@ -124,6 +124,14 @@ export class ProjectionCommitCoordinator {
     }));
   }
 
+  installChatMessageQueueState(
+    input: Parameters<RuntimeProjection["installChatMessageQueueState"]>[0],
+  ): Promise<void> {
+    return this.#enqueue(() => this.#commitWhenCapacityAllows(() => {
+      this.#projection.installChatMessageQueueState(input);
+    }));
+  }
+
   /** Prevents new commits while allowing every already-admitted commit to drain. */
   closeAdmission(): void {
     this.#admissionClosed = true;

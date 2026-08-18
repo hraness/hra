@@ -211,6 +211,7 @@ describe("HRA deterministic native transport", () => {
           },
         },
       });
+      await waitForShellReady(shell);
       expect(await shell.dispatch(command)).toMatchObject({
         ok: true,
         result: stopped.ok ? stopped.result : undefined,
@@ -231,7 +232,7 @@ describe("HRA deterministic native transport", () => {
     }
   });
 
-  test("retries only the exact marked failed turn without exposing its retained prompt", async () => {
+  test("failed attention requires an explicit new queued message", async () => {
     const fixture = activation("chat-attention");
     const harness = createHRADirectTransport(fixture.world, fixture.runtime);
     const shell = createRuntimeShell(createRuntimeBridge(harness.transport, {
@@ -242,71 +243,68 @@ describe("HRA deterministic native transport", () => {
       const state = shell.getState();
       if (state.state !== "ready") throw new Error("Direct shell did not become ready.");
       const pane = state.snapshot.chat.panes.find(({ recoverablePrompt }) => recoverablePrompt);
-      if (pane?.turn === null || pane?.turn === undefined) {
-        throw new Error("Direct retry fixture requires one marked failed turn.");
-      }
-      const turnId = "chatturn_directretry000000000001";
+      if (pane === undefined) throw new Error("Direct attention fixture requires one failed turn.");
+      const messageId = "chatmsg_directretryexplicit01";
+      const prompt = "Retry failed turn as a new message.";
       expect(await shell.dispatch({
-        type: "chat.turn.retry",
+        type: "chat.message.enqueue",
         paneId: pane.id,
-        expectedRevision: pane.revision,
-        priorFailedTurnId: "chatturn_wrongretrytarget01",
-        turnId,
-      })).toMatchObject({ ok: false, error: { code: "invalid_state" } });
+        expectedQueueRevision: pane.messageQueue.revision + 1,
+        messageId,
+        content: { text: prompt, attachmentRefs: [] },
+        delivery: { kind: "queue" },
+      })).toMatchObject({ ok: false, error: { code: "stale_revision" } });
 
       const retried = await shell.dispatch({
-        type: "chat.turn.retry",
+        type: "chat.message.enqueue",
         paneId: pane.id,
-        expectedRevision: pane.revision,
-        priorFailedTurnId: pane.turn.id,
-        turnId,
+        expectedQueueRevision: pane.messageQueue.revision,
+        messageId,
+        content: { text: prompt, attachmentRefs: [] },
+        delivery: { kind: "queue" },
       });
       expect(retried).toMatchObject({
         ok: true,
         result: {
-          type: "chatPane",
-          pane: {
-            revision: pane.revision + 1,
-            state: "starting",
-            turn: { id: turnId, status: "starting" },
-            recoverablePrompt: false,
-          },
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: { revision: pane.messageQueue.revision + 1, messages: [] },
         },
       });
       const invocation = harness.getSnapshot().invocations.toReversed().find(({ payload }) =>
         typeof payload === "object" && payload !== null && "command" in payload &&
         typeof payload.command === "object" && payload.command !== null &&
-        "type" in payload.command && payload.command.type === "chat.turn.retry"
+        "type" in payload.command && payload.command.type === "chat.message.enqueue"
       );
       expect(invocation).toMatchObject({
         command: "hra.runtime.dispatch",
         payload: {
           command: {
-            type: "chat.turn.retry",
+            type: "chat.message.enqueue",
             paneId: pane.id,
-            expectedRevision: pane.revision,
-            priorFailedTurnId: pane.turn.id,
-            turnId,
+            expectedQueueRevision: pane.messageQueue.revision,
+            messageId,
+            content: { text: prompt, attachmentRefs: [] },
+            delivery: { kind: "queue" },
           },
         },
       });
-      const command = (invocation?.payload as { command?: unknown } | undefined)?.command;
-      expect(command !== null && typeof command === "object" && Object.hasOwn(command, "prompt"))
-        .toBeFalse();
-      expect(JSON.stringify(invocation)).not.toContain("Retry failed turn");
+      expect(JSON.stringify(invocation)).not.toContain("priorFailedTurnId");
+      expect(JSON.stringify(invocation)).not.toContain("chat.turn.retry");
 
+      await waitForShellReady(shell);
       const settled = shell.getState();
       if (settled.state !== "ready") throw new Error("Direct shell stopped being ready.");
       const completed = settled.snapshot.chat.panes.find(({ id }) => id === pane.id);
       expect(completed).toMatchObject({
         state: "ready",
         turn: {
-          id: turnId,
+          id: "chatturn_directretryexplicit01",
           status: "completed",
         },
         recoverablePrompt: false,
       });
-      expect(completed?.turn?.responseMarkdown.tail).toContain("Retried the retained message.");
+      expect(completed?.turn?.responseMarkdown.tail).toContain(prompt);
     } finally {
       shell.dispose();
       harness.dispose();
@@ -326,48 +324,145 @@ describe("HRA deterministic native transport", () => {
       const pane = state.snapshot.chat.panes.find(({ recoverablePrompt }) => recoverablePrompt);
       if (pane === undefined) throw new Error("Direct replacement fixture needs a retained prompt.");
       const replacement = "Use this deliberately different message.";
-      const turnId = "chatturn_directreplace0000000001";
+      const messageId = "chatmsg_directreplace0000000001";
       expect(await shell.dispatch({
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId: pane.id,
-        expectedRevision: pane.revision,
-        turnId,
-        prompt: replacement,
+        expectedQueueRevision: pane.messageQueue.revision,
+        messageId,
+        content: { text: replacement, attachmentRefs: [] },
+        delivery: { kind: "queue" },
       })).toMatchObject({
         ok: true,
         result: {
-          type: "chatPane",
-          pane: {
-            state: "starting",
-            turn: { id: turnId },
-            recoverablePrompt: false,
-          },
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: { revision: pane.messageQueue.revision + 1, messages: [] },
         },
       });
       const invocation = harness.getSnapshot().invocations.toReversed().find(({ payload }) =>
         typeof payload === "object" && payload !== null && "command" in payload &&
         typeof payload.command === "object" && payload.command !== null &&
-        "type" in payload.command && payload.command.type === "chat.turn.start"
+        "type" in payload.command && payload.command.type === "chat.message.enqueue"
       );
       expect(invocation).toMatchObject({
         payload: {
           command: {
-            type: "chat.turn.start",
+            type: "chat.message.enqueue",
             paneId: pane.id,
-            prompt: replacement,
+            expectedQueueRevision: pane.messageQueue.revision,
+            messageId,
+            content: { text: replacement, attachmentRefs: [] },
+            delivery: { kind: "queue" },
           },
         },
       });
       expect(JSON.stringify(invocation)).not.toContain("priorFailedTurnId");
+      await waitForShellReady(shell);
       const settled = shell.getState();
       if (settled.state !== "ready") throw new Error("Direct shell stopped being ready.");
       const completed = settled.snapshot.chat.panes.find(({ id }) => id === pane.id);
       expect(completed).toMatchObject({
         state: "ready",
         recoverablePrompt: false,
-        turn: { id: turnId },
+        turn: { id: "chatturn_directreplace0000000001" },
       });
       expect(completed?.turn?.responseMarkdown.tail).toContain(replacement);
+    } finally {
+      shell.dispose();
+      harness.dispose();
+    }
+  });
+
+  test("discards only the exact terminal unknown-delivery receipt", async () => {
+    const fixture = activation("chat-completed");
+    const initial = fixture.world.gateway.snapshots[0];
+    const target = initial?.chat.panes[0];
+    if (initial === undefined || target === undefined) {
+      throw new Error("Direct completed-chat fixture requires one pane.");
+    }
+    const blockedMessage = {
+      id: "chatmsg_directunknown0001",
+      ordinal: 1,
+      revision: 3,
+      text: "This may already have been delivered.",
+      attachmentRefs: [],
+      deliveryOutcome: "deliveryOutcomeUnknown" as const,
+    };
+    const messageQueue = {
+      revision: 9,
+      pauseReason: "ambiguousEffect" as const,
+      blockedMessage,
+      messages: [{
+        id: "chatmsg_directafterunknown1",
+        ordinal: 2,
+        revision: 1,
+        text: "Continue after containment.",
+        attachmentRefs: [],
+      }],
+    };
+    const world = {
+      ...fixture.world,
+      gateway: {
+        ...fixture.world.gateway,
+        snapshots: [{
+          ...initial,
+          chat: {
+            ...initial.chat,
+            panes: initial.chat.panes.map((pane) =>
+              pane.id === target.id ? { ...pane, messageQueue } : pane
+            ),
+          },
+        }, ...fixture.world.gateway.snapshots.slice(1)],
+      },
+    };
+    const harness = createHRADirectTransport(world, fixture.runtime);
+    const shell = createRuntimeShell(createRuntimeBridge(harness.transport));
+    try {
+      await shell.connect();
+      expect(await shell.dispatch({
+        type: "chat.messageQueue.resume",
+        paneId: target.id,
+        expectedQueueRevision: messageQueue.revision,
+      })).toMatchObject({ ok: false, error: { code: "invalid_state" } });
+      expect(await shell.dispatch({
+        type: "chat.message.discardAmbiguous",
+        paneId: target.id,
+        expectedQueueRevision: messageQueue.revision,
+        messageId: blockedMessage.id,
+        expectedMessageRevision: blockedMessage.revision + 1,
+      })).toMatchObject({ ok: false, error: { code: "conflict" } });
+
+      expect(await shell.dispatch({
+        type: "chat.message.discardAmbiguous",
+        paneId: target.id,
+        expectedQueueRevision: messageQueue.revision,
+        messageId: blockedMessage.id,
+        expectedMessageRevision: blockedMessage.revision,
+      })).toMatchObject({
+        ok: true,
+        result: {
+          type: "chatMessageQueue",
+          paneId: target.id,
+          queue: {
+            revision: messageQueue.revision + 2,
+            pauseReason: null,
+            blockedMessage: null,
+            messages: [],
+          },
+        },
+      });
+      await waitForShellReady(shell);
+      const state = shell.getState();
+      if (state.state !== "ready") throw new Error("Direct shell stopped being ready.");
+      expect(state.snapshot.chat.panes[0]?.messageQueue).toMatchObject({
+        revision: messageQueue.revision + 2,
+        pauseReason: null,
+        blockedMessage: null,
+        messages: [],
+      });
+      expect(state.snapshot.chat.panes[0]?.turn?.responseMarkdown.tail)
+        .toContain("Continue after containment.");
     } finally {
       shell.dispose();
       harness.dispose();
@@ -702,12 +797,14 @@ describe("HRA deterministic native transport", () => {
           repositoryId: project.repository.id,
         })).toMatchObject({ ok: true });
         expect(await shell.dispatch({
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: initialPane.id,
-          expectedRevision: initialPane.revision,
-          turnId: `chatturn_sync_fault_${index}`,
-          prompt: "Local send remains available.",
+          expectedQueueRevision: initialPane.messageQueue.revision,
+          messageId: `chatmsg_syncfault${index}0000000001`,
+          content: { text: "Local send remains available.", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         })).toMatchObject({ ok: true });
+        await waitForShellReady(shell);
         expect(shell.getState()).toMatchObject({
           state: "ready",
           snapshot: {
@@ -1121,15 +1218,16 @@ describe("HRA deterministic native transport", () => {
     rawEventTypes.length = 0;
 
     await shell.dispatch({
-      type: "chat.turn.start",
+      type: "chat.message.enqueue",
       paneId: initialPane.id,
-      expectedRevision: initialPane.revision + 1,
-      turnId: "chatturn_directchat01",
-      prompt: "Project this turn",
+      expectedQueueRevision: initialPane.messageQueue.revision,
+      messageId: "chatmsg_directchat0001",
+      content: { text: "Project this turn", attachmentRefs: [] },
+      delivery: { kind: "queue" },
     });
+    await waitForShellReady(shell);
     expect(rawEventTypes).toEqual([
-      "chat.pane.upserted",
-      "chat.pane.upserted",
+      "chat.messageQueue.changed",
     ]);
     shell.dispose();
   });

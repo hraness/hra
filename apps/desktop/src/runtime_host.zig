@@ -2139,6 +2139,7 @@ const state_recoverable_event_types = [_][]const u8{
     "chat.pane.removed",
     "chat.panes.reordered",
     "chat.turn.delta",
+    "chat.messageQueue.changed",
     "accountLocalData.upserted",
     "accountLocalData.removed",
     "humanAccount.changed",

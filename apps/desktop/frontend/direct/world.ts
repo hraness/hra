@@ -16,6 +16,8 @@ import {
 } from "@hraness/agent-tasks-protocol";
 
 import {
+  chatMessageAttachmentIdSchema,
+  chatPaneIdSchema,
   runtimeEventSchema,
   runtimeProtocolVersion,
   runtimeProjectAddResultSchema,
@@ -27,7 +29,7 @@ import {
   type RuntimeSnapshot,
 } from "../../contracts/runtime";
 
-export const HRA_DIRECT_WORLD_VERSION = 2 as const;
+export const HRA_DIRECT_WORLD_VERSION = 3 as const;
 export const HRA_DIRECT_TIME = Date.UTC(2026, 6, 19, 15, 0, 0);
 export const HRA_DIRECT_TIMESTAMP = new Date(HRA_DIRECT_TIME).toISOString();
 /**
@@ -83,6 +85,21 @@ const eventScriptEntrySchema = z.strictObject({
   delayMs: delaySchema,
   event: runtimeEventSchema,
 });
+const directSurfaceSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("app") }),
+  z.strictObject({
+    kind: z.literal("compactChat"),
+    paneId: chatPaneIdSchema,
+    paletteIndex: z.number().int().safe().nonnegative().max(4_095),
+    nowUnixMilliseconds: z.number().int().safe().nonnegative(),
+    attachments: z.array(z.strictObject({
+      id: chatMessageAttachmentIdSchema,
+      name: z.string().min(1).max(240),
+      mimeType: z.enum(["image/gif", "image/jpeg", "image/png", "image/webp"]),
+      byteSize: z.number().int().safe().positive().max(32 * 1_024 * 1_024),
+    })).max(8),
+  }),
+]);
 const taskPageFixtureSchema = z.strictObject({
   page: taskListPageSchema,
   requestCursor: z.string().min(1).max(8_192).nullable(),
@@ -117,6 +134,7 @@ const taskMutationTransitionSchema = z.strictObject({
 
 export const hraDirectWorldSchema = z.strictObject({
   version: z.literal(HRA_DIRECT_WORLD_VERSION),
+  surface: directSurfaceSchema,
   gateway: z.strictObject({
     snapshots: z.array(runtimeSnapshotSchema).min(1).max(8),
     encoding: snapshotEncodingSchema,
@@ -171,6 +189,18 @@ export function parseHRADirectWorld(input: unknown): HRADirectWorld {
   unique(world.task.states.map(({ id }) => id), "task projection state IDs");
   unique(world.task.mutationTransitions.map(({ id }) => id), "task mutation transition IDs");
   const stateIds = new Set(world.task.states.map(({ id }) => id));
+  const surface = world.surface;
+  if (surface.kind === "compactChat") {
+    unique(
+      surface.attachments.map(({ id }) => id),
+      "compact-chat attachment IDs",
+    );
+    if (!world.gateway.snapshots[0]?.chat.panes.some(
+      ({ id }) => id === surface.paneId,
+    )) {
+      throw new Error("compact-chat surface pane must exist in the initial snapshot.");
+    }
+  }
   if (!stateIds.has(world.task.initialStateId)) {
     throw new Error("initial task state must be present in task states.");
   }
@@ -468,6 +498,7 @@ export function createHRADirectWorld(
 ): HRADirectWorld {
   const base: HRADirectWorldInput = {
     version: HRA_DIRECT_WORLD_VERSION,
+    surface: { kind: "app" },
     gateway: {
       snapshots: [emptySnapshot()],
       encoding: { kind: "chunked", chunkBytes: 257 },

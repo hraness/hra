@@ -66,6 +66,7 @@ class FakeProvider implements ChatProviderPort {
   readonly resumedThreads: ChatProviderResumeRequest[] = [];
   readonly startedThreads: ChatProviderThreadRequest[] = [];
   readonly startedTurns: StartedTurn[] = [];
+  readonly steeredTurns: Parameters<ChatProviderPort["steerTurn"]>[0][] = [];
   readonly names: Array<Readonly<{ binding: ChatThreadBinding; name: string }>> = [];
   readonly validations: Array<Readonly<{
     accountProfileId: string;
@@ -82,6 +83,9 @@ class FakeProvider implements ChatProviderPort {
     restartThreadId: string;
   }>>) | null = null;
   onStartTurn: ((request: ChatProviderTurnRequest) => Promise<string>) | null = null;
+  onSteerTurn: (
+    (request: Parameters<ChatProviderPort["steerTurn"]>[0]) => Promise<void>
+  ) | null = null;
   #threadSequence = 0;
   #turnSequence = 0;
 
@@ -160,6 +164,17 @@ class FakeProvider implements ChatProviderPort {
   interruptTurn(input: ChatThreadBinding & Readonly<{ turnId: string }>): Promise<void> {
     this.interrupts.push(input);
     return this.onInterrupt?.() ?? Promise.resolve();
+  }
+
+  verifySteerTarget(): ReturnType<ChatProviderPort["verifySteerTarget"]> {
+    return { generation: 1 };
+  }
+
+  steerTurn(
+    request: Parameters<ChatProviderPort["steerTurn"]>[0],
+  ): ReturnType<ChatProviderPort["steerTurn"]> {
+    this.steeredTurns.push(structuredClone(request));
+    return this.onSteerTurn?.(request) ?? Promise.resolve();
   }
 }
 
@@ -289,6 +304,7 @@ function harness(
   const deltas: ChatTurnDelta[] = [];
   const reorderedPanes: (readonly string[])[] = [];
   const projection: ChatProjectionSink = {
+    messageQueueChanged: () => undefined,
     paneChanged: async (pane) => {
       await beforePaneChanged?.(pane);
       fullPanes.push(pane);
@@ -613,6 +629,80 @@ function attachObserver(
   )();
 }
 
+test("native steer failure after the effect cut pauses on a visible ambiguous receipt", async () => {
+  const value = harness();
+  try {
+    const ready = await createPane(value);
+    await startTurn(value, ready.revision);
+    await value.service.settled();
+    value.provider.onSteerTurn = () => Promise.reject(
+      new ChatProviderEffectError({ certainty: "ambiguous", code: "runtime" }),
+    );
+
+    const failure = await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_serviceambiguous1",
+      content: { text: "steer this active turn", attachmentRefs: [] },
+      delivery: { kind: "steerHead", expectedTurnId: TURN_ONE },
+    }).then(() => null, (error: unknown) => error);
+    expect(failure).toMatchObject({ code: "invalid_state" });
+    expect(value.provider.steeredTurns).toHaveLength(1);
+    expect(value.store.messageQueue(PANE)).toMatchObject({
+      pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: "chatmsg_serviceambiguous1",
+        text: "steer this active turn",
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
+      messages: [],
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("provider steer acknowledgement cannot escape a failed durable ledger acknowledgement", async () => {
+  const value = harness();
+  try {
+    const ready = await createPane(value);
+    await startTurn(value, ready.revision);
+    await value.service.settled();
+    Object.defineProperty(value.store, "acknowledgeMessageEffect", {
+      configurable: true,
+      value: () => {
+        throw new Error("fixture acknowledgement store failure");
+      },
+    });
+
+    const failure = await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_serviceackfail1",
+      content: { text: "provider accepts before store fails", attachmentRefs: [] },
+      delivery: { kind: "steerHead", expectedTurnId: TURN_ONE },
+    }).then(() => null, (error: unknown) => error);
+    expect(value.provider.steeredTurns).toHaveLength(1);
+    expect(failure).toMatchObject({ code: "invalid_state" });
+    expect(value.store.messageQueue(PANE)).toMatchObject({
+      pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: "chatmsg_serviceackfail1",
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
+    });
+    expect(value.runtimeRecoveries).toEqual([]);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
 test("root routing owns the profile and tier for every ordinary turn", async () => {
   const value = harness();
   try {
@@ -854,6 +944,7 @@ test("continuations inherit settled Ultra and Luna routes across reopen", async 
           ]),
         },
         projection: {
+          messageQueueChanged: () => undefined,
           paneChanged: () => undefined,
           paneStateChanged: () => undefined,
           paneRemoved: () => undefined,
@@ -1623,6 +1714,7 @@ test("settled includes an account-unavailable tail admitted after closeAdmission
       state: "attention",
       accountProfileId: null,
       attention: { code: "account_unavailable", retryable: true },
+      messageQueue: { pauseReason: "attention" },
     });
   } finally {
     projectionRelease.resolve();
@@ -1683,6 +1775,7 @@ test("restart rehydrates a durable repository-resolution recovery without waitin
         hasRateLimitProofSince: () => false,
       },
       projection: {
+        messageQueueChanged: () => undefined,
         paneChanged: () => undefined,
         paneStateChanged: () => undefined,
         paneRemoved: () => undefined,
@@ -4889,6 +4982,7 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
       },
       now: () => new Date(timestamp++),
       projection: {
+        messageQueueChanged() {},
         paneChanged(pane) {
           restartedProjections.push(pane);
         },
@@ -5579,6 +5673,7 @@ test("an unfenced ambiguous turn escalates once and only reopens after rehydrati
         hasRateLimitProofSince: () => false,
       },
       projection: {
+        messageQueueChanged: () => undefined,
         paneChanged: () => undefined,
         paneStateChanged: () => undefined,
         paneRemoved: () => undefined,
@@ -5797,6 +5892,7 @@ test("an unfenced ambiguous turn start requests one recovery without deadlocking
         hasRateLimitProofSince: () => false,
       },
       projection: {
+        messageQueueChanged: () => undefined,
         paneChanged: () => undefined,
         paneStateChanged: () => undefined,
         paneRemoved: () => undefined,

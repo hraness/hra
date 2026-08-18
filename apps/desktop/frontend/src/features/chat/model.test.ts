@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 
 import {
   runtimeChatDomainCommandSchema,
+  runtimeChatMessageUtf8ByteLimit,
   runtimeProtocolVersion,
-  runtimeChatTurnPromptUtf8ByteLimit,
   runtimeSnapshotSchema,
   remoteSessionSummaryProjectionSchema,
   type ChatPaneProjection,
@@ -20,17 +20,19 @@ import {
 } from "./ChatPane";
 import {
   composerEnterAction,
+  createMessageId,
   createPaneCommand,
   createPaneId,
   createTitleDebouncer,
-  createTurnId,
+  discardAmbiguousMessageCommand,
+  editQueuedMessageCommand,
+  enqueueMessageCommand,
   normalizePaneTitle,
   openHarnessChildCommand,
   paneAccessibleName,
   paneAccessibleNameUtf16CodeUnitLimit,
   paneCanCompose,
   paneCanRename,
-  paneCanRetryRetainedPrompt,
   paneIsActive,
   paneStatusLabel,
   paneWorkspaceStatus,
@@ -39,9 +41,9 @@ import {
   paneTitleErrorId,
   reconcilePaneTitleCommit,
   recoverPaneWorkspaceCommand,
+  removeQueuedMessageCommand,
   reorderPanesCommand,
   resolveLocalPaneGridSlots,
-  rootTurnRoutePresentation,
   remoteSessionIdsEqual,
   remoteSessionRowEqual,
   selectAccountCreationAvailable,
@@ -55,8 +57,8 @@ import {
   selectRemoteSessionRow,
   selectLastLocalPaneRepository,
   selectSubscriptionGate,
-  retryTurnCommand,
-  startTurnCommand,
+  resumeMessageQueueCommand,
+  steerQueuedMessageCommand,
   stopTurnCommand,
   stopHarnessChildCommand,
   titleCommitFailureShouldRefocus,
@@ -141,22 +143,11 @@ function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness: null,
     ...overrides,
   };
 }
-
-const resolvedStandardRoute = {
-  policyVersion: 1,
-  classificationReason: "conservativeDefault",
-  workClass: "standard",
-  requestedProfile: "solMax",
-  selectedProfile: "solMax",
-  profileFallbackReason: null,
-  requestedServiceTier: "standard",
-  selectedServiceTier: "standard",
-  serviceTierFallbackReason: null,
-} as const;
 
 function shellState(panes: ChatPaneProjection[]) {
   return {
@@ -191,10 +182,10 @@ function paneResponse(value: ChatPaneProjection): RuntimeDispatchResponse {
   };
 }
 
-test("renderer-owned pane and turn IDs stay opaque and canonical", () => {
+test("renderer-owned pane and queued-message IDs stay opaque and canonical", () => {
   const randomUuid = () => "12345678-1234-1234-1234-123456789abc";
   expect(createPaneId(randomUuid)).toBe("pane_12345678123412341234123456789abc");
-  expect(createTurnId(randomUuid)).toBe("chatturn_12345678123412341234123456789abc");
+  expect(createMessageId(randomUuid)).toBe("chatmsg_12345678123412341234123456789abc");
 });
 
 test("pane accessible identities are exact, collision-safe, bounded, and path-free", () => {
@@ -279,32 +270,63 @@ test("chat command builders expose no user model or speed preferences", () => {
     expectedRevision: 4,
     repositoryId: "repo_example0002",
   });
-  expect(startTurnCommand({
+  expect(enqueueMessageCommand({
     paneId: "pane_example0001",
-    expectedRevision: 4,
-    turnId: "chatturn_example0001",
-    prompt: "Ship it",
+    expectedQueueRevision: 4,
+    messageId: "chatmsg_example0001",
+    content: { text: "Ship it", attachmentRefs: [] },
+    delivery: { kind: "queue" },
   })).toEqual({
-    type: "chat.turn.start",
+    type: "chat.message.enqueue",
     paneId: "pane_example0001",
-    expectedRevision: 4,
-    turnId: "chatturn_example0001",
-    prompt: "Ship it",
+    expectedQueueRevision: 4,
+    messageId: "chatmsg_example0001",
+    content: { text: "Ship it", attachmentRefs: [] },
+    delivery: { kind: "queue" },
   });
-  const retry = retryTurnCommand({
+  expect(editQueuedMessageCommand({
     paneId: "pane_example0001",
-    expectedRevision: 5,
-    priorFailedTurnId: "chatturn_example0001",
-    turnId: "chatturn_example0002",
-  });
-  expect(retry).toEqual({
-    type: "chat.turn.retry",
+    expectedQueueRevision: 5,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 2,
+    content: { text: "Ship the compact UI", attachmentRefs: [] },
+  })).toEqual({
+    type: "chat.message.edit",
     paneId: "pane_example0001",
-    expectedRevision: 5,
-    priorFailedTurnId: "chatturn_example0001",
-    turnId: "chatturn_example0002",
+    expectedQueueRevision: 5,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 2,
+    content: { text: "Ship the compact UI", attachmentRefs: [] },
   });
-  expect(Object.hasOwn(retry, "prompt")).toBeFalse();
+  expect(removeQueuedMessageCommand({
+    paneId: "pane_example0001",
+    expectedQueueRevision: 6,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 3,
+  }).type).toBe("chat.message.remove");
+  expect(resumeMessageQueueCommand({
+    paneId: "pane_example0001",
+    expectedQueueRevision: 7,
+  }).type).toBe("chat.messageQueue.resume");
+  expect(discardAmbiguousMessageCommand({
+    paneId: "pane_example0001",
+    expectedQueueRevision: 8,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 3,
+  })).toEqual({
+    type: "chat.message.discardAmbiguous",
+    paneId: "pane_example0001",
+    expectedQueueRevision: 8,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 3,
+  });
+  expect(steerQueuedMessageCommand({
+    paneId: "pane_example0001",
+    expectedQueueRevision: 8,
+    messageId: "chatmsg_example0001",
+    expectedMessageRevision: 3,
+    expectedTurnId: "chatturn_example0001",
+  }).type).toBe("chat.message.steerHead");
   expect(stopTurnCommand({
     paneId: "pane_example0001",
     expectedRevision: 7,
@@ -322,54 +344,6 @@ test("chat command builders expose no user model or speed preferences", () => {
     type: "chat.panes.reorder",
     expectedOrderedPaneIds: ["pane_example0001", "pane_example0002"],
     orderedPaneIds: ["pane_example0002", "pane_example0001"],
-  });
-});
-
-test("route presentation stays content-free and names HRA dispatch fallbacks", () => {
-  expect(rootTurnRoutePresentation(null)).toBeNull();
-  expect(rootTurnRoutePresentation({
-    policyVersion: 1,
-    classificationReason: "boundedLeafCue",
-    workClass: "boundedLeaf",
-    requestedProfile: "lunaMax",
-    selectedProfile: "lunaMax",
-    profileFallbackReason: null,
-    requestedServiceTier: "fast",
-    selectedServiceTier: "fast",
-    serviceTierFallbackReason: null,
-  })).toEqual({
-    accessibleLabel:
-      "HRA requested Luna Max at Fast and selected Luna Max at Fast for dispatch.",
-    label: "Route · Luna Max · Fast",
-  });
-  expect(rootTurnRoutePresentation({
-    policyVersion: 1,
-    classificationReason: "boundedLeafCue",
-    workClass: "boundedLeaf",
-    requestedProfile: "lunaMax",
-    selectedProfile: null,
-    profileFallbackReason: null,
-    requestedServiceTier: "fast",
-    selectedServiceTier: null,
-    serviceTierFallbackReason: null,
-  })).toEqual({
-    accessibleLabel: "HRA has not resolved this turn's dispatch route.",
-    label: "Route · Unresolved",
-  });
-  expect(rootTurnRoutePresentation({
-    policyVersion: 1,
-    classificationReason: "boundedLeafCue",
-    workClass: "boundedLeaf",
-    requestedProfile: "lunaMax",
-    selectedProfile: "solMax",
-    profileFallbackReason: "lunaUnavailable",
-    requestedServiceTier: "fast",
-    selectedServiceTier: "standard",
-    serviceTierFallbackReason: "fastUnavailable",
-  })).toEqual({
-    accessibleLabel:
-      "HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch.",
-    label: "Route · Sol Max · Standard",
   });
 });
 
@@ -445,39 +419,6 @@ test("subscription gating waits for hydration and the new pane inherits the visu
     snapshot: { ...state.snapshot, accounts: [] },
   };
   expect(selectSubscriptionGate(missing)).toBe("missing");
-});
-
-test("retained prompt retry authority is exact, ordinary, failed, and renderer-safe", () => {
-  const failedTurn = {
-    id: "chatturn_example0001",
-    status: "failed" as const,
-    startedAt: "2026-08-03T12:00:00.000Z",
-    completedAt: "2026-08-03T12:00:01.000Z",
-    continuationCount: 0,
-    responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-    reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-    tools: [],
-    routing: resolvedStandardRoute,
-  };
-  const recoverable = pane({
-    state: "attention",
-    turn: failedTurn,
-    attention: { code: "turn_failed", message: "Retry.", retryable: true },
-    recoverablePrompt: true,
-  });
-  expect(paneCanRetryRetainedPrompt(recoverable)).toBeTrue();
-  expect(paneCanRetryRetainedPrompt({ ...recoverable, recoverablePrompt: false })).toBeFalse();
-  expect(paneCanRetryRetainedPrompt({
-    ...recoverable,
-    attention: { ...recoverable.attention!, retryable: false },
-    recoverablePrompt: false,
-  })).toBeFalse();
-  expect(paneCanRetryRetainedPrompt({
-    ...recoverable,
-    interactionMode: "harnessObserver",
-    workspace: null,
-    recoverablePrompt: false,
-  })).toBeFalse();
 });
 
 test("the three harness command builders preserve every renderer revision fence", () => {
@@ -1161,7 +1102,7 @@ test("sixty-four pane subscribers share one linear index build per pane array", 
   expect(paneReads).toBe(64);
 });
 
-test("attention is recoverable while active states disable unimplemented queueing", () => {
+test("attention remains configurable while active states retain a distinct lifecycle", () => {
   expect(paneCanCompose("attention")).toBeTrue();
   expect(paneCanCompose("ready")).toBeTrue();
   expect(paneCanRename("attention")).toBeTrue();
@@ -1184,10 +1125,10 @@ test("prompt and scroll guards retain intentional whitespace and reader position
     ok: true,
     prompt: "  keep formatting\n",
   });
-  expect(validatedPrompt("x".repeat(runtimeChatTurnPromptUtf8ByteLimit))).toMatchObject({
+  expect(validatedPrompt("x".repeat(runtimeChatMessageUtf8ByteLimit))).toMatchObject({
     ok: true,
   });
-  expect(validatedPrompt("x".repeat(runtimeChatTurnPromptUtf8ByteLimit + 1))).toEqual({
+  expect(validatedPrompt("x".repeat(runtimeChatMessageUtf8ByteLimit + 1))).toEqual({
     ok: false,
     message: "The message is too large to send.",
   });

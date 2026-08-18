@@ -11,7 +11,7 @@
 
 - Keep the projection pure and apply events in arrival order; never sort away a transport gap.
 - Treat snapshots as atomic replacements and event sequence numbers as the only delivery identity.
-- Treat `snapshot.invalidated` as a mandatory rehydration signal; never infer that an oversized snapshot-recoverable event was dropped from authoritative state.
+- Treat `snapshot.invalidated` and `chat.messageQueue.changed` as mandatory rehydration signals; never advance the local sequence while an authoritative queue or oversized recoverable state remains absent.
 - Parse transport values in the bridge before they reach this directory; do not import generated Codex protocol types.
 - Do not import gateway-internal contracts or add paths, worktrees, provider identifiers, private interactions/runs, usage, model catalogs, diagnostics, command output, full transcripts, task pages, or task details. The only session-like state admitted here is the strict HRA-owned bounded chat-pane projection.
 - Advance task invalidations on the shared Native sequence as account-snapshot no-ops; the task adapter consumes their portable workspace/scope/revision payload and refetches separately.

@@ -5,16 +5,15 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   runtimeProtocolVersion,
   type ChatPaneProjection,
-  type RuntimeChatDomainCommand,
+  type RuntimeChatMessageLedgerCommand,
   type RuntimeDispatchResponse,
 } from "../../../../contracts/runtime";
 import type { RuntimeShell } from "../../runtime";
 import { emptyRuntimeSnapshot } from "../../runtime/test-fixtures";
 import {
   ChatPaneView,
-  dispatchRetainedPromptRetry,
+  dispatchMessageQueueMutation,
   paneAcceptsUserInteraction,
-  type PaneRetryMutationPort,
 } from "./ChatPane";
 
 function pane(
@@ -41,6 +40,7 @@ function pane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness: null,
     ...overrides,
   };
@@ -130,14 +130,12 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(html).not.toContain("<textarea");
   expect(html).toContain("Choose project for Research actor");
   expect(html).toContain("More actions for Research actor");
-  expect(html).toContain("Rename Research actor");
   expect(html).not.toContain('aria-label="Model routing"');
   expect(html).not.toContain("Fast mode");
   const source = await Bun.file(new URL("./ChatPane.tsx", import.meta.url)).text();
   expect(source).toContain('pane.interactionMode !== "chat" ? null : <footer className="chat-pane__composer">');
-  expect(source).toContain("{!canMessage ? null : <form");
+  expect(source).toContain("{!showComposerForm ? null : <form");
   expect(source).toContain('label={`Message $' + '{pane.title}`}');
-  expect(source).toContain('aria-label={`Rename $' + '{pane.title}`}');
   expect(source).toContain('<MenuItem id="rename" textValue="Rename pane">');
   expect(source).not.toContain('label="Codex subscription"');
   expect(source).not.toContain('Automatic subscription');
@@ -151,7 +149,7 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(source).toContain("recoverPaneWorkspaceCommand");
 });
 
-test("ordinary panes show HRA's bounded dispatch route for their latest turn", () => {
+test("ordinary panes keep HRA's internal dispatch route out of compact chat chrome", () => {
   const routed = pane("chat", {
     turn: {
       id: "chatturn_autoroute001",
@@ -181,12 +179,80 @@ test("ordinary panes show HRA's bounded dispatch route for their latest turn", (
     shell: shellFor(routed),
   }));
 
-  expect(html).toContain("Route · Sol Max · Standard");
-  expect(html).toContain(
-    '<span class="hra-visually-hidden pane-route-description">HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch.</span>',
-  );
+  expect(html).toContain("Done");
+  expect(html).not.toContain("Route ·");
+  expect(html).not.toContain("HRA requested Luna Max");
   expect(html).not.toContain("boundedLeafCue");
   expect(html).not.toContain("lunaUnavailable");
+});
+
+test("active sanctioned thinking and answers share Markdown while tools stay invisible", () => {
+  const working = pane("chat", {
+    state: "streaming",
+    activity: { ordinal: 3, kind: "toolStarted" },
+    turn: {
+      id: "chatturn_markdownview01",
+      status: "streaming",
+      startedAt: "2026-08-03T12:00:00.000Z",
+      completedAt: null,
+      continuationCount: 0,
+      responseMarkdown: {
+        tail: "## Answer\n\n**Streaming** now.",
+        totalUtf8Bytes: 29,
+        truncatedPrefix: false,
+      },
+      reasoningSummary: {
+        tail: "Checking `current state`.",
+        totalUtf8Bytes: 25,
+        truncatedPrefix: false,
+      },
+      tools: [{ id: "chattool_hiddenview01", category: "filesystem", status: "running" }],
+      routing: resolvedStandardRoute,
+    },
+  });
+  const html = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: working,
+    shell: shellFor(working),
+  }));
+
+  expect(html).toContain('aria-label="Thinking"');
+  expect(html).toContain('data-markdown-kind="reasoning"');
+  expect(html).toContain('data-streamdown="inline-code">current state</code>');
+  expect(html).toContain('data-markdown-kind="response"');
+  expect(html).toContain('data-streamdown="strong">Streaming</span>');
+  expect(html).not.toContain("Latest tool");
+  expect(html).not.toContain("pane-tool");
+  expect(html).not.toContain("hiddenview01");
+});
+
+test("terminal turns withhold reasoning until a completion receipt exists", () => {
+  const completed = pane("chat", {
+    turn: {
+      id: "chatturn_terminalsummary",
+      status: "completed",
+      startedAt: "2026-08-03T12:00:00.000Z",
+      completedAt: "2026-08-03T12:00:04.000Z",
+      continuationCount: 0,
+      responseMarkdown: { tail: "Answer", totalUtf8Bytes: 6, truncatedPrefix: false },
+      reasoningSummary: {
+        tail: "This incomplete terminal tail must stay hidden.",
+        totalUtf8Bytes: 46,
+        truncatedPrefix: false,
+      },
+      tools: [],
+      routing: resolvedStandardRoute,
+    },
+  });
+  const html = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: completed,
+    shell: shellFor(completed),
+  }));
+
+  expect(html).toContain("Answer");
+  expect(html).not.toContain("incomplete terminal tail");
+  expect(html).not.toContain('aria-label="Thinking"');
 });
 
 test("only an active ordinary root chat exposes the compact Stop action", () => {
@@ -201,7 +267,23 @@ test("only an active ordinary root chat exposes the compact Stop action", () => 
     tools: [],
     routing: resolvedStandardRoute,
   };
-  const chat = pane("chat", { state: "streaming", turn: activeTurn });
+  const chat = pane("chat", {
+    state: "streaming",
+    turn: activeTurn,
+    messageQueue: {
+      revision: 4,
+      pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: "chatmsg_unknownactive01",
+        ordinal: 1,
+        revision: 2,
+        text: "Possibly delivered",
+        attachmentRefs: [],
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
+      messages: [],
+    },
+  });
   const chatHtml = renderToStaticMarkup(createElement(ChatPaneView, {
     gridPosition: 0,
     pane: chat,
@@ -218,180 +300,62 @@ test("only an active ordinary root chat exposes the compact Stop action", () => 
   }));
 
   expect(chatHtml).toContain('aria-label="Stop Research actor"');
+  expect(chatHtml).toContain('aria-label="Discard message with unknown delivery outcome"');
+  expect(chatHtml).toContain('class="pane-queue-discard" disabled=""');
   expect(chatHtml).not.toContain("Close Research actor");
   expect(chatHtml).toContain("More actions for Research actor");
   expect(observerHtml).not.toContain("Stop Research actor");
   expect(observerHtml).not.toContain("Close Research actor");
 });
 
-test("private prompt retry stays icon-only, exact-turn bound, and separately addressable", async () => {
+test("failed private prompts cannot bypass the durable queue", async () => {
   const source = await Bun.file(new URL("./ChatPane.tsx", import.meta.url)).text();
-  expect(source).toContain("paneCanRetryRetainedPrompt(pane)");
-  expect(source).toContain("priorFailedTurnId");
-  expect(source).toContain("retryTurnCommand({");
-  expect(source).toContain('`Retry failed message for $' + '{pane.title}`');
-  expect(source).toContain('controlClassName="pane-retry"');
-  expect(source).toContain('name="refresh"');
-  expect(source).toContain('pendingAction === "retry"');
-  expect(source).toContain('pane-retry__icon--pending');
-  expect(source).toContain('onPress={() => void retryRetainedPrompt()}');
-  expect(source).not.toContain("prompt: pane.activePrompt");
+  expect(source).toContain("enqueueMessageCommand({");
+  expect(source).not.toContain("chat.turn.start");
+  expect(source).not.toContain("chat.turn.retry");
+  expect(source).not.toContain('controlClassName="pane-retry"');
 });
 
-test("the Retry icon controller keeps one fresh ID across a benign revision refresh", async () => {
-  const failedTurn = {
-    id: "chatturn_retryview0001",
-    status: "failed" as const,
-    startedAt: "2026-08-03T12:00:00.000Z",
-    completedAt: "2026-08-03T12:00:01.000Z",
-    continuationCount: 0,
-    responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-    reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-    tools: [],
-    routing: resolvedStandardRoute,
+test("queue mutation dispatch accepts only the exact pane queue result", async () => {
+  const command: RuntimeChatMessageLedgerCommand = {
+    type: "chat.message.remove",
+    paneId: "pane_observerview01",
+    expectedQueueRevision: 3,
+    messageId: "chatmsg_queueview0001",
+    expectedMessageRevision: 2,
   };
-  let current = pane("chat", {
+  const queue: ChatPaneProjection["messageQueue"] = {
     revision: 4,
-    state: "attention",
-    turn: failedTurn,
-    attention: { code: "turn_failed", message: "Retry.", retryable: true },
-    recoverablePrompt: true,
-  });
-  const commands: RuntimeChatDomainCommand[] = [];
-  const response = (value: RuntimeDispatchResponse): Promise<RuntimeDispatchResponse> =>
-    Promise.resolve(value);
-  const port: PaneRetryMutationPort = {
-    dispatch: (command) => {
-      if (command.type !== "chat.turn.retry") {
-        throw new Error("Expected only a retained-prompt retry command.");
-      }
-      commands.push(command);
-      if (commands.length === 1) {
-        current = { ...current, revision: current.revision + 1 };
-        return response({
-          version: runtimeProtocolVersion,
-          operationId: "op_retryview000000000000000001",
-          ok: false,
-          error: {
-            code: "revision_conflict",
-            message: "The pane revision changed.",
-            retryable: true,
-            action: "retry",
-          },
-        });
-      }
-      const started: ChatPaneProjection = {
-        ...current,
-        revision: current.revision + 1,
-        state: "starting",
-        turn: {
-          ...failedTurn,
-          id: "chatturn_retryview0002",
-          status: "starting",
-          completedAt: null,
-        },
-        attention: null,
-        recoverablePrompt: false,
-      };
-      return response({
-        version: runtimeProtocolVersion,
-        operationId: "op_retryview000000000000000002",
-        ok: true,
-        result: { type: "chatPane", pane: started },
-      });
-    },
-    getState: () => ({
-      state: "ready",
-      snapshot: {
-        ...emptyRuntimeSnapshot(),
-        chat: { revision: 1, panes: [current] },
-      },
-    }),
+    pauseReason: null,
+    blockedMessage: null,
+    messages: [],
   };
-
-  const result = await dispatchRetainedPromptRetry(
-    port,
-    current,
-    "chatturn_retryview0002",
-  );
-  expect(result).toMatchObject({ state: "starting", recoverablePrompt: false });
-  expect(commands).toEqual([
-    {
-      type: "chat.turn.retry",
-      paneId: current.id,
-      expectedRevision: 4,
-      priorFailedTurnId: failedTurn.id,
-      turnId: "chatturn_retryview0002",
+  const response = {
+    version: runtimeProtocolVersion,
+    operationId: "op_queueview000000000000000001",
+    ok: true,
+    result: {
+      type: "chatMessageQueue",
+      paneId: command.paneId,
+      queue,
     },
-    {
-      type: "chat.turn.retry",
-      paneId: current.id,
-      expectedRevision: 5,
-      priorFailedTurnId: failedTurn.id,
-      turnId: "chatturn_retryview0002",
-    },
-  ]);
-  expect(commands.every((command) => !Object.hasOwn(command, "prompt"))).toBeTrue();
-});
-
-test("a revision refresh cannot redirect Retry to a lost private-prompt capability", async () => {
-  const failed = pane("chat", {
-    revision: 4,
-    state: "attention",
-    turn: {
-      id: "chatturn_retryview0001",
-      status: "failed",
-      startedAt: "2026-08-03T12:00:00.000Z",
-      completedAt: "2026-08-03T12:00:01.000Z",
-      continuationCount: 0,
-      responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-      reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
-      tools: [],
-      routing: resolvedStandardRoute,
-    },
-    attention: { code: "turn_failed", message: "Retry.", retryable: true },
-    recoverablePrompt: true,
-  });
-  const changed: ChatPaneProjection = {
-    ...failed,
-    revision: 5,
-    recoverablePrompt: false,
-  };
-  let dispatches = 0;
-  const port: PaneRetryMutationPort = {
-    dispatch: () => {
-      dispatches += 1;
-      return Promise.resolve({
-        version: runtimeProtocolVersion,
-        operationId: "op_retryview000000000000000003",
-        ok: false,
-        error: {
-          code: "revision_conflict",
-          message: "The pane revision changed.",
-          retryable: true,
-          action: "retry",
-        },
-      });
-    },
-    getState: () => ({
-      state: "ready",
-      snapshot: {
-        ...emptyRuntimeSnapshot(),
-        chat: { revision: 1, panes: [changed] },
-      },
-    }),
-  };
-  let rejected: unknown;
+  } satisfies RuntimeDispatchResponse;
+  expect(await dispatchMessageQueueMutation({
+    dispatch: () => Promise.resolve(response),
+  }, command)).toEqual(queue);
+  let rejection: unknown = null;
   try {
-    await dispatchRetainedPromptRetry(port, failed, "chatturn_retryview0002");
+    await dispatchMessageQueueMutation({
+      dispatch: () => Promise.resolve({
+        ...response,
+        result: { ...response.result, paneId: "pane_otherqueue01" },
+      }),
+    }, command);
   } catch (reason: unknown) {
-    rejected = reason;
+    rejection = reason;
   }
-  expect(rejected).toMatchObject({
-    name: "PaneCommandError",
-    message: "The failed turn changed before the retry could finish.",
-  });
-  expect(dispatches).toBe(1);
+  if (!(rejection instanceof Error)) throw new Error("Queue mismatch did not reject.");
+  expect(rejection.message).toContain("wrong message queue result");
 });
 
 test("only the explicitly activated pane exposes a live transcript", () => {

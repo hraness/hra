@@ -74,6 +74,7 @@ const bridgeChatPane: ChatPaneProjection = {
   turn: null,
   attention: null,
   recoverablePrompt: false,
+  messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
   harness: null,
 };
 
@@ -262,7 +263,7 @@ describe("runtime bridge", () => {
     });
   });
 
-  test("correlates chat pane, revision, and turn results with the exact request", async () => {
+  test("correlates chat pane, queue revision, and stop results with the exact request", async () => {
     const operationId = "op_bridgechat001";
     const responseFor = (pane: ChatPaneProjection) => ({
       version: runtimeProtocolVersion,
@@ -354,27 +355,40 @@ describe("runtime bridge", () => {
         },
       },
     };
-    const startCommand = {
-      type: "chat.turn.start",
+    const enqueueCommand = {
+      type: "chat.message.enqueue",
       paneId: bridgeChatPane.id,
-      expectedRevision: 1,
-      turnId: startedPane.turn!.id,
-      prompt: "Start",
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_bridgechat001",
+      content: { text: "Start", attachmentRefs: [] as string[] },
+      delivery: { kind: "queue" },
     } as const;
-    const correctStart = transportHarness(() => responseFor(startedPane));
-    expect(await createRuntimeBridge(correctStart.transport, {
+    const queueResponse = (revision: number, paneId = bridgeChatPane.id) => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true as const,
+      result: {
+        type: "chatMessageQueue" as const,
+        paneId,
+        queue: {
+          revision,
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
+        },
+      },
+    });
+    const correctEnqueue = transportHarness(() => queueResponse(2));
+    expect(await createRuntimeBridge(correctEnqueue.transport, {
       createOperationId: () => operationId,
-    }).dispatch(startCommand)).toMatchObject({
-      result: { type: "chatPane", pane: { revision: 2, state: "starting" } },
+    }).dispatch(enqueueCommand)).toMatchObject({
+      result: { type: "chatMessageQueue", paneId: bridgeChatPane.id },
     });
 
-    const wrongTurn = transportHarness(() => responseFor({
-      ...startedPane,
-      turn: { ...startedPane.turn!, id: "chatturn_bridgechat002" },
-    }));
-    expect(await rejectionOf(createRuntimeBridge(wrongTurn.transport, {
+    const staleQueue = transportHarness(() => queueResponse(1));
+    expect(await rejectionOf(createRuntimeBridge(staleQueue.transport, {
       createOperationId: () => operationId,
-    }).dispatch(startCommand))).toMatchObject({
+    }).dispatch(enqueueCommand))).toMatchObject({
       name: "RuntimeBridgeProtocolError",
       boundary: "dispatchResponse",
     });
@@ -424,43 +438,6 @@ describe("runtime bridge", () => {
       });
     }
 
-    const retryCommand = {
-      type: "chat.turn.retry",
-      paneId: bridgeChatPane.id,
-      expectedRevision: stoppedPane.revision,
-      priorFailedTurnId: stoppedPane.turn!.id,
-      turnId: "chatturn_bridgechat003",
-    } as const;
-    const retriedPane: ChatPaneProjection = {
-      ...startedPane,
-      revision: stoppedPane.revision + 1,
-      turn: { ...startedPane.turn!, id: retryCommand.turnId },
-      recoverablePrompt: false,
-    };
-    const correctRetry = transportHarness(() => responseFor(retriedPane));
-    expect(await createRuntimeBridge(correctRetry.transport, {
-      createOperationId: () => operationId,
-    }).dispatch(retryCommand)).toMatchObject({
-      result: {
-        type: "chatPane",
-        pane: { revision: stoppedPane.revision + 1, state: "starting" },
-      },
-    });
-    expect(correctRetry.invocations[0]).toMatchObject({
-      payload: { command: retryCommand },
-    });
-    expect(JSON.stringify(correctRetry.invocations[0])).not.toContain("prompt");
-
-    const wrongRetry = transportHarness(() => responseFor({
-      ...retriedPane,
-      recoverablePrompt: true,
-    }));
-    expect(await rejectionOf(createRuntimeBridge(wrongRetry.transport, {
-      createOperationId: () => operationId,
-    }).dispatch(retryCommand))).toMatchObject({
-      name: "RuntimeBridgeProtocolError",
-      boundary: "dispatchResponse",
-    });
   });
 
   test("invokes the pathless native project chooser and exposes only its safe outcome", async () => {

@@ -83,6 +83,7 @@ function streamingPane(id: string, turnId: string): ChatPaneProjection {
     },
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness: null,
   };
 }
@@ -116,6 +117,7 @@ function lifecyclePane(index: number, revision: number): ChatPaneProjection {
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness: null,
   };
 }

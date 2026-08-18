@@ -1,6 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  chatMessageQueueProjectionSchema,
+  chatPaneIdSchema,
+  chatPaneProjectionSchema,
   chatPaneHarnessProjectionSchema,
   chatSnapshotSchema,
   harnessSnapshotSchema,
@@ -8,6 +11,7 @@ import {
   runtimeProtocolVersion,
   runtimeSnapshotSchema,
   type RuntimeEvent,
+  type ChatMessageQueueProjection,
   type ChatPaneProjection,
   type ChatPaneHarnessProjection,
   type HarnessSnapshot,
@@ -264,6 +268,67 @@ export class RuntimeProjection {
     if (this.#captureToken === null) this.#onEventsAvailable();
   }
 
+  /**
+   * Installs complete private-local queue text before publishing only its tiny
+   * independent revision marker. The marker deliberately cannot reconstruct
+   * message text, so every renderer that observes it must rehydrate.
+   */
+  installChatMessageQueueState(input: Readonly<{
+    paneId: string;
+    queue: ChatMessageQueueProjection;
+  }>): void {
+    if (this.#captureToken !== null) {
+      throw new Error("Cannot install chat message queue state during snapshot capture");
+    }
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const queue = chatMessageQueueProjectionSchema.parse(
+      structuredClone(input.queue),
+    );
+    const index = this.#snapshot.chat.panes.findIndex(({ id }) => id === paneId);
+    if (index < 0) {
+      throw new RangeError(`Cannot install a queue for unknown chat pane ${paneId}`);
+    }
+    const current = this.#snapshot.chat.panes[index]!;
+    if (queue.revision < current.messageQueue.revision) {
+      throw new RangeError(`Chat message queue ${paneId} regressed`);
+    }
+    if (queue.revision === current.messageQueue.revision) {
+      if (!isDeepStrictEqual(queue, current.messageQueue)) {
+        throw new RangeError(
+          `Chat message queue ${paneId} changed without advancing its revision`,
+        );
+      }
+      return;
+    }
+    const pane = chatPaneProjectionSchema.parse({
+      ...current,
+      messageQueue: queue,
+    });
+    const panes = [...this.#snapshot.chat.panes];
+    panes[index] = pane;
+    const chat = chatSnapshotSchema.parse({
+      revision: incrementProjectionRevision(
+        this.#snapshot.chat.revision,
+        "chat projection revision",
+      ),
+      panes,
+    });
+    const installedSnapshot = runtimeSnapshotSchema.parse({
+      ...this.#snapshot,
+      chat,
+    });
+    const prepared = this.#prepareCommit(
+      { type: "chat.messageQueue.changed", paneId, revision: queue.revision },
+      installedSnapshot,
+      this.#events.length,
+      this.#queuedBytes,
+    );
+    this.#snapshot = prepared.snapshot;
+    this.#events.push(prepared.queuedEvent);
+    this.#queuedBytes = prepared.queuedBytes;
+    if (this.#captureToken === null) this.#onEventsAvailable();
+  }
+
   publish(event: ProjectionEvent): void {
     const validated = validateProjectionEvent(event);
     this.#commit(validated);
@@ -453,4 +518,14 @@ function validateProjectionEvent(event: ProjectionEvent): ProjectionEvent {
 
 function encodedBytes(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function incrementProjectionRevision(value: number, label: string): number {
+  if (
+    !Number.isSafeInteger(value) || value < 1 ||
+    value >= Number.MAX_SAFE_INTEGER
+  ) {
+    throw new RangeError(`${label} exhausted`);
+  }
+  return value + 1;
 }

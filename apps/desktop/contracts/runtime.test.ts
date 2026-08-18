@@ -19,7 +19,7 @@ import {
   parseRuntimeTransportLifecycle,
   parseRuntimeTransportRetryResponse,
   runtimeDispatchChunkByteLimit,
-  runtimeChatTurnPromptUtf8ByteLimit,
+  runtimeChatMessageUtf8ByteLimit,
   runtimeHumanCredentialReconnectConfirmation,
   runtimeProtocolVersion,
   runtimeSnapshotChunkBase64Limit,
@@ -1318,23 +1318,17 @@ describe("renderer runtime contracts", () => {
         expectedRevision: 3,
       },
       {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 3,
-        turnId,
-        prompt: "Explain the reducer.",
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractsend01",
+        content: { text: "Explain the reducer.", attachmentRefs: [] as string[] },
+        delivery: { kind: "queue" },
       },
       {
         type: "chat.turn.stop",
         paneId,
         expectedRevision: 4,
-        turnId,
-      },
-      {
-        type: "chat.turn.retry",
-        paneId,
-        expectedRevision: 5,
-        priorFailedTurnId: "chatturn_contractfailed01",
         turnId,
       },
     ] as const) {
@@ -1373,16 +1367,17 @@ describe("renderer runtime contracts", () => {
         expectedRevision: 2,
       },
     })).toThrow();
-    for (const privateField of ["prompt", "provider", "threadId"] as const) {
+    for (const privateField of ["provider", "threadId", "turnId"] as const) {
       expect(() => parseRuntimeDispatchRequest({
         version: runtimeProtocolVersion,
         operationId: "op_chatretryprivate01",
         command: {
-          type: "chat.turn.retry",
+          type: "chat.message.enqueue",
           paneId,
-          expectedRevision: 5,
-          priorFailedTurnId: "chatturn_contractfailed01",
-          turnId,
+          expectedQueueRevision: 1,
+          messageId: "chatmsg_contractsend02",
+          content: { text: "retry as a fresh message", attachmentRefs: [] },
+          delivery: { kind: "queue" },
           [privateField]: "must remain gateway-private",
         },
       })).toThrow();
@@ -1391,57 +1386,84 @@ describe("renderer runtime contracts", () => {
       version: runtimeProtocolVersion,
       operationId: "op_chatprompt001",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 1,
-        turnId,
-        prompt: "x".repeat(runtimeChatTurnPromptUtf8ByteLimit),
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractprompt1",
+        content: {
+          text: "x".repeat(runtimeChatMessageUtf8ByteLimit),
+          attachmentRefs: [],
+        },
+        delivery: { kind: "queue" },
       },
-    }).command.type).toBe("chat.turn.start");
+    }).command.type).toBe("chat.message.enqueue");
     expect(() => parseRuntimeDispatchRequest({
       version: runtimeProtocolVersion,
       operationId: "op_chatprompt002",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 1,
-        turnId,
-        prompt: "x".repeat(runtimeChatTurnPromptUtf8ByteLimit + 1),
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractprompt2",
+        content: {
+          text: "x".repeat(runtimeChatMessageUtf8ByteLimit + 1),
+          attachmentRefs: [],
+        },
+        delivery: { kind: "queue" },
       },
     })).toThrow();
     expect(() => parseRuntimeDispatchRequest({
       version: runtimeProtocolVersion,
       operationId: "op_chatcontract01",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 1,
-        turnId,
-        prompt: "",
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractprompt3",
+        content: { text: "", attachmentRefs: [] },
+        delivery: { kind: "queue" },
       },
     })).toThrow();
     expect(() => parseRuntimeDispatchRequest({
       version: runtimeProtocolVersion,
       operationId: "op_chatcontract02",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 1,
-        turnId,
-        prompt: " \n\t ",
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractprompt4",
+        content: { text: " \n\t ", attachmentRefs: [] },
+        delivery: { kind: "queue" },
       },
     })).toThrow();
     expect(() => parseRuntimeDispatchRequest({
       version: runtimeProtocolVersion,
       operationId: "op_chatprompt003",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId,
-        expectedRevision: 1,
-        turnId,
-        prompt: "unsafe\0prompt",
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_contractprompt5",
+        content: { text: "unsafe\0prompt", attachmentRefs: [] },
+        delivery: { kind: "queue" },
       },
     })).toThrow();
+    for (const rawCommand of [
+      { type: "chat.turn.start", paneId, expectedRevision: 1, turnId, prompt: "raw" },
+      {
+        type: "chat.turn.retry",
+        paneId,
+        expectedRevision: 1,
+        priorFailedTurnId: "chatturn_contractfailed01",
+        turnId,
+      },
+    ]) {
+      expect(() => parseRuntimeDispatchRequest({
+        version: runtimeProtocolVersion,
+        operationId: "op_chatrawdeny01",
+        command: rawCommand,
+      })).toThrow();
+    }
     for (const title of [" Renamed", "Renamed ", "unsafe\0title"]) {
       expect(() => parseRuntimeDispatchRequest({
         version: runtimeProtocolVersion,
@@ -1502,6 +1524,7 @@ describe("renderer runtime contracts", () => {
       },
       attention: null,
       recoverablePrompt: false,
+      messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
       harness: null,
     } as const;
     expect(parseRuntimeDispatchResponse({
@@ -1659,6 +1682,7 @@ describe("renderer runtime contracts", () => {
       turn: null,
       attention: null,
       recoverablePrompt: false,
+      messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
       harness: null,
     } as const;
     const createRequest = {
@@ -1784,16 +1808,6 @@ describe("renderer runtime contracts", () => {
       result: { type: "chatPaneRemoved", paneId: "pane_correlation02" },
     }, removeRequest)).toThrow("pane removal response does not match");
 
-    const turnRequest = {
-      ...createRequest,
-      command: {
-        type: "chat.turn.start",
-        paneId,
-        expectedRevision: 3,
-        turnId,
-        prompt: "Start",
-      },
-    } satisfies RuntimeChatDispatchRequest;
     const started = {
       ...basePane,
       revision: 4,
@@ -1811,20 +1825,45 @@ describe("renderer runtime contracts", () => {
         routing: automaticRoute,
       },
     } as const;
+
+    const queueRequest = {
+      ...createRequest,
+      command: {
+        type: "chat.message.enqueue",
+        paneId,
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_correlation01",
+        content: { text: "Start", attachmentRefs: [] },
+        delivery: { kind: "queue" },
+      },
+    } satisfies RuntimeChatDispatchRequest;
+    const queueResponse = (revision: number, responsePaneId = paneId) => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true as const,
+      result: {
+        type: "chatMessageQueue" as const,
+        paneId: responsePaneId,
+        queue: {
+          revision,
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
+        },
+      },
+    });
     expect(parseRuntimeChatDispatchResponseForRequest(
-      response(started),
-      turnRequest,
-    )).toMatchObject({ result: { type: "chatPane" } });
-    for (const pane of [
-      { ...started, revision: 5 },
-      { ...started, turn: { ...started.turn, id: "chatturn_correlation02" } },
-      { ...started, turn: { ...started.turn, continuationCount: 1 } },
-    ]) {
-      expect(() => parseRuntimeChatDispatchResponseForRequest(
-        response(pane),
-        turnRequest,
-      )).toThrow("turn start response does not match");
-    }
+      queueResponse(2),
+      queueRequest,
+    )).toMatchObject({ result: { type: "chatMessageQueue", paneId } });
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      queueResponse(1),
+      queueRequest,
+    )).toThrow("message queue mutation response does not match");
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      queueResponse(2, "pane_correlation02"),
+      queueRequest,
+    )).toThrow("message queue mutation response does not match");
 
     const stopRequest = {
       ...createRequest,
@@ -1883,52 +1922,9 @@ describe("renderer runtime contracts", () => {
       )).toThrow();
     }
 
-    const retryTurnId = "chatturn_correlation02";
-    const retryRequest = {
-      ...createRequest,
-      command: {
-        type: "chat.turn.retry",
-        paneId,
-        expectedRevision: stopped.revision,
-        priorFailedTurnId: turnId,
-        turnId: retryTurnId,
-      },
-    } satisfies RuntimeChatDispatchRequest;
-    const retried = {
-      ...stopped,
-      revision: stopped.revision + 1,
-      state: "starting",
-      activity: { ordinal: 2, kind: "messageSent" },
-      turn: {
-        ...started.turn,
-        id: retryTurnId,
-      },
-      attention: null,
-      recoverablePrompt: false,
-    } as const;
-    expect(parseRuntimeChatDispatchResponseForRequest(
-      response(retried),
-      retryRequest,
-    )).toMatchObject({
-      result: {
-        type: "chatPane",
-        pane: { revision: stopped.revision + 1, recoverablePrompt: false },
-      },
-    });
-    for (const pane of [
-      { ...retried, revision: retried.revision + 1 },
-      { ...retried, turn: { ...retried.turn, id: turnId } },
-      { ...retried, turn: { ...retried.turn, continuationCount: 1 } },
-      { ...retried, recoverablePrompt: true },
-    ]) {
-      expect(() => parseRuntimeChatDispatchResponseForRequest(
-        response(pane),
-        retryRequest,
-      )).toThrow();
-    }
     expect(() => parseRuntimeChatDispatchResponseForRequest(
-      { ...response(started), operationId: "op_chatcorrelation02" },
-      turnRequest,
+      { ...queueResponse(2), operationId: "op_chatcorrelation02" },
+      queueRequest,
     )).toThrow(`Expected native operation ${operationId}`);
   });
 

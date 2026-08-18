@@ -38,7 +38,9 @@ import {
   runtimeTransportHealthCommand,
   runtimeTransportRetryCommand,
   type AccountSummary,
+  type ChatMessageQueueProjection,
   type ChatPaneProjection,
+  type ChatQueuedMessageProjection,
   type ChatRootTurnRoutingProjection,
   type HarnessChildProjection,
   type HarnessSnapshot,
@@ -835,6 +837,12 @@ class DeterministicRuntimeTransport {
           turn: null,
           attention: null,
           recoverablePrompt: false,
+          messageQueue: {
+            revision: 1,
+            pauseReason: null,
+            blockedMessage: null,
+            messages: [],
+          },
           harness: null,
         };
         this.#upsertChatPane(pane);
@@ -974,161 +982,230 @@ class DeterministicRuntimeTransport {
         );
         return this.#accepted(request);
       }
-      case "chat.turn.start": {
+      case "chat.message.enqueue": {
         const pane = this.#requireChatPane(command.paneId);
-        if (pane.revision !== command.expectedRevision) {
-          return this.#staleRevision(request, pane.revision);
+        if (pane.messageQueue.revision !== command.expectedQueueRevision) {
+          return this.#staleRevision(request, pane.messageQueue.revision);
+        }
+        const active = pane.state === "starting" || pane.state === "streaming" ||
+          pane.state === "continuing";
+        if (
+          command.delivery.kind === "steerHead" &&
+          (
+            !active || pane.turn?.id !== command.delivery.expectedTurnId ||
+            pane.messageQueue.messages.length !== 0 ||
+            pane.messageQueue.pauseReason !== null
+          )
+        ) {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct can atomically steer only the exact active turn with an empty queue.",
+          );
+        }
+        const nextOrdinal = (
+          pane.messageQueue.messages.at(-1)?.ordinal ??
+          pane.messageQueue.blockedMessage?.ordinal ??
+          0
+        ) + 1;
+        const queuedMessage: ChatQueuedMessageProjection = {
+          id: command.messageId,
+          ordinal: nextOrdinal,
+          revision: 1,
+          text: command.content.text,
+          attachmentRefs: [...command.content.attachmentRefs],
+        };
+        if (active || pane.messageQueue.pauseReason !== null) {
+          const messageQueue = {
+            ...pane.messageQueue,
+            revision: pane.messageQueue.revision + 1,
+            messages: command.delivery.kind === "queue"
+              ? [...pane.messageQueue.messages, queuedMessage]
+              : pane.messageQueue.messages,
+          };
+          this.#changeChatMessageQueue({ ...pane, messageQueue });
+          return this.#success(request, {
+            type: "chatMessageQueue",
+            paneId: pane.id,
+            queue: messageQueue,
+          });
         }
         if (pane.state !== "ready" && pane.state !== "attention") {
           return this.#chatFailure(
             request,
             "invalid_state",
-            "Direct does not queue or steer active turns.",
+            "Direct can enqueue only an active, ready, or attention chat pane.",
           );
         }
-        const messageActivity = {
-          ordinal: pane.activity.ordinal + 1,
-          kind: "messageSent" as const,
+        const messageQueue = {
+          revision: pane.messageQueue.revision + 1,
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
         };
-        const begun: ChatPaneProjection = {
-          ...pane,
-          revision: pane.revision + 1,
-          state: "starting",
-          activity: messageActivity,
-          turn: {
-            id: command.turnId,
-            status: "starting",
-            startedAt: HRA_DIRECT_TIMESTAMP,
-            completedAt: null,
-            continuationCount: 0,
-            responseMarkdown: {
-              tail: "",
-              totalUtf8Bytes: 0,
-              truncatedPrefix: false,
-            },
-            reasoningSummary: {
-              tail: "",
-              totalUtf8Bytes: 0,
-              truncatedPrefix: false,
-            },
-            tools: [],
-            routing: directRootTurnRouting(command.prompt, pane.turn?.routing ?? null),
-          },
-          attention: null,
-          recoverablePrompt: false,
-        };
-        this.#upsertChatPane(begun);
-        const response = `## Direct response\n\nCompleted: ${command.prompt}`;
-        const updated: ChatPaneProjection = {
-          ...begun,
-          revision: begun.revision + 1,
-          state: "ready",
-          activity: {
-            ordinal: messageActivity.ordinal + 1,
-            kind: "responseCompleted",
-          },
-          turn: {
-            id: command.turnId,
-            status: "completed",
-            startedAt: HRA_DIRECT_TIMESTAMP,
-            completedAt: HRA_DIRECT_TIMESTAMP,
-            continuationCount: 0,
-            responseMarkdown: {
-              tail: response,
-              totalUtf8Bytes: new TextEncoder().encode(response).byteLength,
-              truncatedPrefix: false,
-            },
-            reasoningSummary: {
-              tail: "",
-              totalUtf8Bytes: 0,
-              truncatedPrefix: false,
-            },
-            tools: [],
-            routing: begun.turn!.routing,
-          },
-          attention: null,
-        };
-        this.#upsertChatPane(updated);
-        return this.#success(request, { type: "chatPane", pane: begun });
+        const updated = this.#completedQueuedMessagePane(
+          pane,
+          queuedMessage,
+          messageQueue,
+        );
+        this.#changeChatMessageQueue(updated);
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+        });
       }
-      case "chat.turn.retry": {
+      case "chat.message.edit": {
         const pane = this.#requireChatPane(command.paneId);
-        if (pane.revision !== command.expectedRevision) {
-          return this.#staleRevision(request, pane.revision);
+        if (pane.messageQueue.revision !== command.expectedQueueRevision) {
+          return this.#staleRevision(request, pane.messageQueue.revision);
+        }
+        const messageIndex = pane.messageQueue.messages.findIndex(
+          ({ id }) => id === command.messageId,
+        );
+        const message = pane.messageQueue.messages[messageIndex];
+        if (message === undefined || message.revision !== command.expectedMessageRevision) {
+          return this.#chatFailure(
+            request,
+            "conflict",
+            "Direct queued message changed before it could be edited.",
+          );
+        }
+        const messages = pane.messageQueue.messages.map((candidate, index) =>
+          index === messageIndex
+            ? { ...candidate, ...command.content, revision: candidate.revision + 1 }
+            : candidate
+        );
+        const messageQueue = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          messages,
+        };
+        this.#changeChatMessageQueue({ ...pane, messageQueue });
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+        });
+      }
+      case "chat.message.remove":
+      case "chat.message.steerHead": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (pane.messageQueue.revision !== command.expectedQueueRevision) {
+          return this.#staleRevision(request, pane.messageQueue.revision);
+        }
+        const message = pane.messageQueue.messages[0];
+        const targetIndex = command.type === "chat.message.steerHead"
+          ? 0
+          : pane.messageQueue.messages.findIndex(({ id }) => id === command.messageId);
+        const target = pane.messageQueue.messages[targetIndex];
+        if (
+          target === undefined || target.id !== command.messageId ||
+          target.revision !== command.expectedMessageRevision ||
+          (
+            command.type === "chat.message.steerHead" &&
+            (
+              message?.id !== target.id || pane.messageQueue.pauseReason !== null ||
+              pane.turn?.id !== command.expectedTurnId ||
+              (pane.state !== "starting" && pane.state !== "streaming" &&
+                pane.state !== "continuing")
+            )
+          )
+        ) {
+          return this.#chatFailure(
+            request,
+            "conflict",
+            "Direct queued message changed before it could be removed or steered.",
+          );
+        }
+        const messageQueue = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          messages: pane.messageQueue.messages.filter((_, index) => index !== targetIndex),
+        };
+        this.#changeChatMessageQueue({ ...pane, messageQueue });
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+        });
+      }
+      case "chat.messageQueue.resume": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (pane.messageQueue.revision !== command.expectedQueueRevision) {
+          return this.#staleRevision(request, pane.messageQueue.revision);
         }
         if (
-          pane.interactionMode !== "chat" || pane.state !== "attention" ||
-          pane.attention?.retryable !== true || pane.recoverablePrompt !== true ||
-          pane.turn?.status !== "failed" ||
-          pane.turn.id !== command.priorFailedTurnId ||
-          pane.turn.routing === null
+          pane.messageQueue.pauseReason === null ||
+          pane.messageQueue.pauseReason === "ambiguousEffect"
         ) {
           return this.#chatFailure(
             request,
             "invalid_state",
-            "Direct can retry only the exact retained prompt for a retryable failed turn.",
+            "Direct cannot resume an unpaused or ambiguous message queue.",
           );
         }
-        const messageActivity = {
-          ordinal: pane.activity.ordinal + 1,
-          kind: "messageSent" as const,
+        const messageQueue = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          pauseReason: null,
         };
-        const begun: ChatPaneProjection = {
-          ...pane,
-          revision: pane.revision + 1,
-          state: "starting",
-          activity: messageActivity,
-          turn: {
-            id: command.turnId,
-            status: "starting",
-            startedAt: HRA_DIRECT_TIMESTAMP,
-            completedAt: null,
-            continuationCount: 0,
-            responseMarkdown: {
-              tail: "",
-              totalUtf8Bytes: 0,
-              truncatedPrefix: false,
-            },
-            reasoningSummary: {
-              tail: "",
-              totalUtf8Bytes: 0,
-              truncatedPrefix: false,
-            },
-            tools: [],
-            routing: {
-              ...pane.turn.routing,
-              selectedProfile: pane.turn.routing.requestedProfile,
-              profileFallbackReason: null,
-              selectedServiceTier: pane.turn.routing.requestedServiceTier,
-              serviceTierFallbackReason: null,
-            },
-          },
-          attention: null,
-          recoverablePrompt: false,
+        this.#changeChatMessageQueue({ ...pane, messageQueue });
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+        });
+      }
+      case "chat.message.discardAmbiguous": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (pane.messageQueue.revision !== command.expectedQueueRevision) {
+          return this.#staleRevision(request, pane.messageQueue.revision);
+        }
+        const blocked = pane.messageQueue.blockedMessage;
+        if (
+          pane.messageQueue.pauseReason !== "ambiguousEffect" ||
+          blocked === null ||
+          blocked.id !== command.messageId ||
+          blocked.revision !== command.expectedMessageRevision
+        ) {
+          return this.#chatFailure(
+            request,
+            "conflict",
+            "Direct unknown-delivery message changed before it could be discarded.",
+          );
+        }
+        if (
+          pane.state === "starting" || pane.state === "streaming" ||
+          pane.state === "continuing"
+        ) {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct cannot discard an unknown-delivery message before its turn is contained.",
+          );
+        }
+        let messageQueue: ChatMessageQueueProjection = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          pauseReason: null,
+          blockedMessage: null,
         };
-        this.#upsertChatPane(begun);
-        const response = "## Direct response\n\nRetried the retained message.";
-        const completed: ChatPaneProjection = {
-          ...begun,
-          revision: begun.revision + 1,
-          state: "ready",
-          activity: {
-            ordinal: messageActivity.ordinal + 1,
-            kind: "responseCompleted",
-          },
-          turn: {
-            ...begun.turn!,
-            status: "completed",
-            completedAt: HRA_DIRECT_TIMESTAMP,
-            responseMarkdown: {
-              tail: response,
-              totalUtf8Bytes: new TextEncoder().encode(response).byteLength,
-              truncatedPrefix: false,
-            },
-          },
-        };
-        this.#upsertChatPane(completed);
-        return this.#success(request, { type: "chatPane", pane: begun });
+        const head = messageQueue.messages[0];
+        const updated = head === undefined
+          ? { ...pane, messageQueue }
+          : this.#completedQueuedMessagePane(pane, head, {
+              ...messageQueue,
+              revision: messageQueue.revision + 1,
+              messages: messageQueue.messages.slice(1),
+            });
+        messageQueue = updated.messageQueue;
+        this.#changeChatMessageQueue(updated);
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+        });
       }
       case "chat.turn.stop": {
         const pane = this.#requireChatPane(command.paneId);
@@ -1154,10 +1231,16 @@ class DeterministicRuntimeTransport {
             "Direct can stop only the exact active root chat turn.",
           );
         }
+        const messageQueue = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          pauseReason: "stop" as const,
+        };
         const stopped: ChatPaneProjection = {
           ...pane,
           revision: pane.revision + 1,
           state: "attention",
+          messageQueue,
           turn: {
             ...pane.turn,
             status: "failed",
@@ -1172,9 +1255,9 @@ class DeterministicRuntimeTransport {
             message: "You stopped this turn. You can send another message.",
             retryable: true,
           },
-          recoverablePrompt: true,
+          recoverablePrompt: false,
         };
-        this.#changeChatPaneState(stopped);
+        this.#changeChatMessageQueue(stopped);
         return this.#success(request, { type: "chatPane", pane: stopped });
       }
       case "harness.settings.update": {
@@ -1236,6 +1319,12 @@ class DeterministicRuntimeTransport {
           turn: null,
           attention: null,
           recoverablePrompt: false,
+          messageQueue: {
+            revision: 1,
+            pauseReason: null,
+            blockedMessage: null,
+            messages: [],
+          },
           harness: null,
         };
         const openedChild: HarnessChildProjection = {
@@ -2636,6 +2725,47 @@ class DeterministicRuntimeTransport {
     return harness;
   }
 
+  #completedQueuedMessagePane(
+    pane: ChatPaneProjection,
+    message: ChatQueuedMessageProjection,
+    messageQueue: ChatMessageQueueProjection,
+  ): ChatPaneProjection {
+    const prompt = message.text.trim() || "Attached file.";
+    const response = `## Direct response\n\nCompleted: ${prompt}`;
+    const turnId = `chatturn_${message.id.slice("chatmsg_".length)}`;
+    return {
+      ...pane,
+      revision: pane.revision + 2,
+      state: "ready",
+      activity: {
+        ordinal: pane.activity.ordinal + 2,
+        kind: "responseCompleted",
+      },
+      messageQueue,
+      turn: {
+        id: turnId,
+        status: "completed",
+        startedAt: HRA_DIRECT_TIMESTAMP,
+        completedAt: HRA_DIRECT_TIMESTAMP,
+        continuationCount: 0,
+        responseMarkdown: {
+          tail: response,
+          totalUtf8Bytes: new TextEncoder().encode(response).byteLength,
+          truncatedPrefix: false,
+        },
+        reasoningSummary: {
+          tail: "",
+          totalUtf8Bytes: 0,
+          truncatedPrefix: false,
+        },
+        tools: [],
+        routing: directRootTurnRouting(prompt, pane.turn?.routing ?? null),
+      },
+      attention: null,
+      recoverablePrompt: false,
+    };
+  }
+
   #setHarness(
     harness: HarnessSnapshot,
     panes: readonly ChatPaneProjection[] = this.#snapshot.chat.panes,
@@ -2681,6 +2811,26 @@ class DeterministicRuntimeTransport {
         chat: { revision: this.#snapshot.chat.revision + 1, panes },
       },
       event.type === "snapshot.invalidated",
+    );
+  }
+
+  #changeChatMessageQueue(pane: ChatPaneProjection): void {
+    const existing = this.#snapshot.chat.panes.findIndex(({ id }) => id === pane.id);
+    if (existing < 0) throw new Error(`Unknown fixture pane: ${pane.id}`);
+    const panes = this.#snapshot.chat.panes.map((candidate, index) =>
+      index === existing ? pane : candidate
+    );
+    this.#emitOwnedEvent(
+      {
+        type: "chat.messageQueue.changed",
+        paneId: pane.id,
+        revision: pane.messageQueue.revision,
+      },
+      {
+        ...this.#snapshot,
+        chat: { revision: this.#snapshot.chat.revision + 1, panes },
+      },
+      true,
     );
   }
 

@@ -14,6 +14,7 @@
 - Restore durable chat panes directly into the first atomic snapshot before the gateway initialization barrier opens; never replay persisted pane clocks as revision-one live upserts.
 - Re-sequence queued operation terminals and scoped task invalidations after a captured barrier because neither is represented by the global account snapshot.
 - Store oversized snapshot-recoverable account, retained-local-data, entity, item, and delta state in the gateway snapshot, then emit only the corresponding `snapshot.invalidated` marker; renderer delivery must remain transport-sized.
+- Install each complete message queue into the authoritative pane snapshot before publishing its compact revision marker. The marker is a mandatory renderer rehydration signal and must never advance a stale local queue.
 - Never discard operation terminals or scoped task invalidations. Signal backpressure before applying an event when the bounded queue cannot retain it.
 - Advance the one Native transport sequence for task invalidations while leaving task pages and details outside the global snapshot.
 - Redact compatibility diagnostics before they enter snapshots or renderer events.

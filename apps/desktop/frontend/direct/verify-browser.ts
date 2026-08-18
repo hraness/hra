@@ -174,11 +174,11 @@ interface CoveragePolicyEntry {
 type ScenarioAction =
   | "prepare-draft"
   | "create-pane"
+  | "exercise-malleable-chat"
   | "exercise-compact-controls"
   | "exercise-local-under-sync-fault"
   | "exercise-session-sync-recovery-disable"
   | "none"
-  | "open-harness-children"
   | "open-settings"
   | "open-settings-login"
   | "open-settings-sync"
@@ -234,7 +234,7 @@ const scenarios = [
     expectedUiScale: "0.8",
     expectedVisibleControls: [
       "New pane",
-      "Rename Direct pane",
+      "More actions for Direct pane",
     ],
     forbiddenText: ["Queue", "Steer", "Approval", "Tasks", "Accounts"],
     viewport: { width: 1_120, height: 780 },
@@ -250,6 +250,41 @@ const scenarios = [
     ],
     forbiddenText: ["Allow once", "Approve", "Queue", "Steer"],
     viewport: { width: 1_120, height: 780 },
+  },
+  {
+    id: "chat-compact-malleable",
+    action: "exercise-malleable-chat",
+    browserLane: "forced-touch-reduced",
+    expectedUiScale: "2",
+    expectedBeforeAction: [
+      "Steer the active turn with the accessibility findings.",
+      "Then tighten the 26rem layout.",
+    ],
+    expectedText: [
+      "Malleable metaharness",
+      "Thinking",
+      "Checking queue order, touch targets, and image custody.",
+      "Compact answer",
+      "Markdown stays safe",
+      "Routing audit",
+      "Direct verification",
+      "Attachment vault",
+      "Then tighten the compact layout.",
+      "compact-layout.png",
+      "2h 1m 45s",
+    ],
+    expectedVisibleControls: [
+      "More actions for Malleable metaharness",
+      "Attach files",
+      "Remove compact-layout.png",
+      "Edit queued message",
+      "Remove queued message",
+      "Send queued message now",
+      "Stop Malleable metaharness",
+      "Queue message for Malleable metaharness",
+    ],
+    forbiddenText: ["Latest tool", "Luna", "Sol Max", "providerId"],
+    viewport: { width: 390, height: 844 },
   },
   {
     id: "chat-completed",
@@ -274,8 +309,7 @@ const scenarios = [
     ],
     expectedText: [
       "Direct response",
-      ...attentionPresentations.map(({ prompt, recoverablePrompt }) =>
-        recoverablePrompt ? "Retried the retained message." : `Completed: ${prompt}`),
+      ...attentionPresentations.map(({ prompt }) => `Completed: ${prompt}`),
     ],
     forbiddenText: ["Allow once", "Approve", "Queue", "Steer", "Submit answer"],
     viewport: { width: 1_760, height: 900 },
@@ -289,7 +323,6 @@ const scenarios = [
     ],
     expectedVisibleControls: [
       "New pane",
-      "Rename Compact routed response",
       "More actions for Compact routed response",
       "Send",
     ],
@@ -303,7 +336,6 @@ const scenarios = [
     expectedUiScale: "1.2",
     expectedVisibleControls: [
       "New pane",
-      "Rename Compact 639",
       "More actions for Compact 639",
       "Send",
     ],
@@ -317,7 +349,6 @@ const scenarios = [
     expectedUiScale: "1.5",
     expectedVisibleControls: [
       "New pane",
-      "Rename Compact 415",
       "More actions for Compact 415",
       "Send",
     ],
@@ -415,18 +446,14 @@ const scenarios = [
   },
   {
     id: "harness-children-mixed",
-    action: "open-harness-children",
+    action: "none",
     expectedBeforeAction: ["Recursive session"],
     expectedText: [
       "Starting child",
       "Running child",
       "Waiting child",
-      "Idle child",
-      "Failed child",
-      "Stopped child",
-      "Quarantined child",
     ],
-    expectedVisibleControls: ["Hide 7 recursive sessions for Recursive session"],
+    expectedVisibleControls: ["More actions for Recursive session"],
     forbiddenText: [
       "providerId",
       "filesystemPath",
@@ -789,6 +816,8 @@ export function canAutomaticallyStartServer(baseUrl: string): boolean {
 export function responsiveLayoutFailures(
   measurement: ResponsiveLayoutMeasurement,
   expectedVisibleControls?: string | readonly string[],
+  requiredSurfaceLabels: readonly string[] = requiredResponsiveSurfaceLabels,
+  minimumControlHeight = 24,
 ): readonly string[] {
   const failures: string[] = [];
   if (measurement.scrollWidth > measurement.clientWidth + 1) {
@@ -800,7 +829,7 @@ export function responsiveLayoutFailures(
   for (const label of measurement.ariaHiddenFocusableControls) {
     failures.push(`${label} is focusable inside an aria-hidden subtree`);
   }
-  for (const label of requiredResponsiveSurfaceLabels) {
+  for (const label of requiredSurfaceLabels) {
     if (!measurement.surfaces.some((surface) => surface.label === label)) {
       failures.push(`${label} is missing from responsive evidence`);
     }
@@ -814,7 +843,7 @@ export function responsiveLayoutFailures(
     if (control.left < -0.5 || control.right > measurement.clientWidth + 0.5) {
       failures.push(`${control.label} leaves the horizontal viewport`);
     }
-    if (control.height + 0.5 < 24) {
+    if (control.height + 0.5 < minimumControlHeight) {
       failures.push(`${control.label} is only ${Math.round(control.height)}px tall`);
     }
   }
@@ -1121,7 +1150,8 @@ async function runAction(
       await clickButton(browser, "Choose project for HRA");
       await browser.run(["wait", "--fn", "document.querySelector('.chat-pane__repository')?.textContent?.trim() === 'hra'"]);
       await waitForStableProbe(browser);
-      await clickButton(browser, "Rename HRA");
+      await clickButton(browser, "More actions for HRA");
+      await clickMenuItem(browser, "Rename pane");
       await browser.run(["wait", "--fn", "document.querySelector('.pane-title-input') !== null"]);
       await browser.run(["fill", ".pane-title-input", "Direct pane"]);
       await clickButton(browser, "Save pane title");
@@ -1131,6 +1161,28 @@ async function runAction(
       await setUiScale(browser, -2, "0.8");
       return;
     }
+    case "exercise-malleable-chat":
+      await clickButton(browser, "Send queued message now");
+      await browser.run([
+        "wait",
+        "--fn",
+        "!document.body.innerText.includes('Steer the active turn with the accessibility findings.')",
+      ]);
+      await clickButton(browser, "Edit queued message");
+      await browser.run(["fill", ".pane-queue-row__editor", "Then tighten the compact layout."]);
+      await clickButton(browser, "Save queued message");
+      await waitForVisibleText(browser, "Then tighten the compact layout.");
+      await waitForStableProbe(browser);
+      await setUiScale(browser, 6, "1.5");
+      await browser.evaluate(
+        "document.documentElement.style.setProperty('--ui-scale', '2'); true",
+      );
+      await browser.run([
+        "wait",
+        "--fn",
+        "document.documentElement.style.getPropertyValue('--ui-scale') === '2'",
+      ]);
+      return;
     case "send-follow-up":
       await browser.run(["fill", "textarea", "Follow up after release"]);
       await browser.run(["press", "Enter"]);
@@ -1138,13 +1190,7 @@ async function runAction(
       await waitForStableProbe(browser);
       return;
     case "recover-attention":
-      for (const { paneId, prompt, recoverablePrompt, title } of attentionPresentations) {
-        if (recoverablePrompt) {
-          await clickButton(browser, `Retry failed message for ${title}`);
-          await waitForVisibleText(browser, "Retried the retained message.");
-          await waitForStableProbe(browser);
-          continue;
-        }
+      for (const { paneId, prompt, title } of attentionPresentations) {
         const selector = `#prompt-${paneId}`;
         await browser.run(["fill", selector, prompt]);
         const submitted = await browser.evaluate(`(() => {
@@ -1258,11 +1304,6 @@ async function runAction(
       await waitForStableProbe(browser);
       return;
     }
-    case "open-harness-children":
-      await clickButton(browser, "Show 7 recursive sessions for Recursive session");
-      await waitForVisibleText(browser, "Quarantined child");
-      await waitForStableProbe(browser);
-      return;
     case "open-settings-login": {
       const opened = await browser.evaluate(`(() => {
         const settings = document.querySelector('[href="#settings"]');
@@ -1515,6 +1556,7 @@ async function verifyResponsiveLayout(
     responsiveLayoutMeasurementSchema,
     await browser.evaluate(`(() => {
       const root = document.documentElement;
+      const compactChatSurface = document.querySelector('.direct-compact-chat') !== null;
       const surface = (label, selector, required = true) => {
         const element = document.querySelector(selector);
         if (!(element instanceof HTMLElement)) {
@@ -1657,9 +1699,10 @@ async function verifyResponsiveLayout(
         scrollWidth: root.scrollWidth,
         surfaces: [
           surface("outer Direct frame", ".direct-frame-only"),
-          surface("app frame", ".hra-app"),
-          surface("app header", ".hra-header"),
-          surface("main content", "#main-content"),
+          surface("app frame", ".hra-app", !compactChatSurface),
+          surface("app header", ".hra-header", !compactChatSurface),
+          surface("main content", "#main-content", !compactChatSurface),
+          surface("compact chat surface", ".direct-compact-chat", compactChatSurface),
           surface("pane grid", ".pane-grid", false),
           surface("settings", ".settings-page", false),
         ].filter(Boolean),
@@ -1667,7 +1710,14 @@ async function verifyResponsiveLayout(
     })()`),
     "responsive layout measurement",
   );
-  const failures = responsiveLayoutFailures(measurement, expectedVisibleControls);
+  const failures = responsiveLayoutFailures(
+    measurement,
+    expectedVisibleControls,
+    scenarioId === "chat-compact-malleable"
+      ? ["outer Direct frame", "compact chat surface"]
+      : requiredResponsiveSurfaceLabels,
+    scenarioId === "chat-compact-malleable" ? 44 : 24,
+  );
   if (failures.length > 0) {
     throw new Error(
       `${scenarioId} failed responsive layout checks: ${failures.join("; ")}; controls: ${JSON.stringify(measurement.controls)}; surfaces: ${JSON.stringify(measurement.surfaces)}`,
@@ -1677,6 +1727,8 @@ async function verifyResponsiveLayout(
 }
 
 const scenarioUiStateSchema = z.object({
+  attachmentBlobPreviewCount: z.number().int().nonnegative(),
+  attachmentPreviewCount: z.number().int().nonnegative(),
   autoContainedPanes: z.number().int().nonnegative(),
   containedPanes: z.number().int().nonnegative(),
   composerPlaceholders: z.array(z.string()),
@@ -1684,17 +1736,11 @@ const scenarioUiStateSchema = z.object({
   composerValues: z.array(z.string()),
   disabledComposers: z.number().int().nonnegative(),
   disabledSendButtons: z.number().int().nonnegative(),
-  disabledRenameButtons: z.number().int().nonnegative(),
   draggableHeaders: z.number().int().nonnegative(),
+  durationInsideLiveRegionCount: z.number().int().nonnegative(),
+  durationLabels: z.array(z.string()),
+  durationTexts: z.array(z.string()),
   gridColumnCount: z.number().int().nonnegative(),
-  harnessChildren: z.array(z.object({
-    actionLabels: z.array(z.string()),
-    openDisabled: z.boolean(),
-    state: z.string(),
-    stopDisabled: z.boolean(),
-    title: z.string(),
-  }).strict()),
-  harnessPanelCount: z.number().int().nonnegative(),
   harnessProposalInteractiveControls: z.number().int().nonnegative(),
   harnessProposalTitles: z.array(z.string()),
   harnessQuotaValues: z.array(z.string()),
@@ -1712,18 +1758,23 @@ const scenarioUiStateSchema = z.object({
   harnessSelectedSwitches: z.number().int().nonnegative(),
   hash: z.string(),
   humanReconnectConfirmationCount: z.number().int().nonnegative(),
+  identityAccentCount: z.number().int().nonnegative(),
   labelledPaneCount: z.number().int().nonnegative(),
   labelledTranscriptCount: z.number().int().nonnegative(),
   markdownHeadings: z.array(z.string()),
   navigationTargets: z.array(z.string()),
   paneActivities: z.array(z.string()),
-  paneBorderColors: z.array(z.string()),
   paneCount: z.number().int().nonnegative(),
   paneHeaderTopAligned: z.number().int().nonnegative(),
   paneOrder: z.array(z.string()),
   paneRepositories: z.array(z.string()),
   paneStates: z.array(z.string()),
   paneViewportEscapes: z.number().int().nonnegative(),
+  queueHeadCount: z.number().int().nonnegative(),
+  queueMessageCount: z.number().int().nonnegative(),
+  queueSteerCount: z.number().int().nonnegative(),
+  queueTexts: z.array(z.string()),
+  reasoningMarkdownHeadings: z.array(z.string()),
   responseCount: z.number().int().nonnegative(),
   remoteCapabilityCount: z.number().int().nonnegative(),
   remoteMounted: z.number().int().nonnegative(),
@@ -1731,18 +1782,23 @@ const scenarioUiStateSchema = z.object({
   remotePaneCount: z.number().int().nonnegative(),
   remoteTooltipCount: z.number().int().nonnegative(),
   remoteTriggerCount: z.number().int().nonnegative(),
+  routingChromeCount: z.number().int().nonnegative(),
   semanticBorderCount: z.number().int().nonnegative(),
-  renameButtonCount: z.number().int().nonnegative(),
-  routeLabels: z.array(z.string()),
   settingsCount: z.number().int().nonnegative(),
+  subagentControlCount: z.number().int().nonnegative(),
+  subagentRegionCount: z.number().int().nonnegative(),
+  subagents: z.array(z.object({
+    state: z.string(),
+    title: z.string(),
+  }).strict()),
   thinkingActivityLabels: z.array(z.string()),
   thinkingCount: z.number().int().nonnegative(),
   titleInputCount: z.number().int().nonnegative(),
   transcriptLogCount: z.number().int().nonnegative(),
   toolActivityCount: z.number().int().nonnegative(),
-  toolActivityLabels: z.array(z.string()),
   squarePaneCount: z.number().int().nonnegative(),
   subscriptionSelectorCount: z.number().int().nonnegative(),
+  viewportContent: z.string(),
 }).strict();
 
 async function verifyScenarioSemantics(
@@ -1797,6 +1853,9 @@ async function verifyScenarioSemantics(
         return control.textContent?.trim() || '';
       };
       return {
+        attachmentBlobPreviewCount: [...document.querySelectorAll('.pane-attachments img')]
+          .filter((image) => image.getAttribute('src')?.startsWith('blob:')).length,
+        attachmentPreviewCount: document.querySelectorAll('.pane-attachments img').length,
         autoContainedPanes: panes.filter((pane) => getComputedStyle(pane).contentVisibility === 'auto').length,
         containedPanes: panes.filter((pane) => {
           const containment = getComputedStyle(pane).contain;
@@ -1821,23 +1880,14 @@ async function verifyScenarioSemantics(
           .map((control) => control instanceof HTMLTextAreaElement ? control.value : ''),
         disabledComposers: [...document.querySelectorAll('.chat-pane__composer textarea:disabled')].length,
         disabledSendButtons: document.querySelectorAll('.pane-send:disabled').length,
-        disabledRenameButtons: document.querySelectorAll('.pane-rename:disabled').length,
         draggableHeaders: document.querySelectorAll('.chat-pane__header[draggable=true]').length,
+        durationInsideLiveRegionCount: [...document.querySelectorAll('.pane-turn-elapsed')]
+          .filter((duration) => duration.closest('[aria-live]') !== null).length,
+        durationLabels: [...document.querySelectorAll('.pane-turn-elapsed')]
+          .map((duration) => duration.getAttribute('aria-label') || ''),
+        durationTexts: [...document.querySelectorAll('.pane-turn-elapsed')]
+          .map((duration) => duration.textContent?.trim() || ''),
         gridColumnCount: gridColumns.length,
-        harnessChildren: [...document.querySelectorAll('.pane-harness-panel li')]
-          .map((child) => {
-            const actions = [...child.querySelectorAll('.pane-harness-child-actions button')];
-            const open = actions.find((control) => control.getAttribute('aria-label')?.startsWith('Open '));
-            const stop = actions.find((control) => control.getAttribute('aria-label')?.startsWith('Stop '));
-            return {
-              actionLabels: actions.map(controlLabel),
-              openDisabled: open instanceof HTMLButtonElement && open.disabled,
-              state: child.querySelector('.pane-harness-child-state')?.textContent?.trim() || '',
-              stopDisabled: stop instanceof HTMLButtonElement && stop.disabled,
-              title: child.querySelector('.pane-harness-child-title')?.textContent?.trim() || '',
-            };
-          }),
-        harnessPanelCount: document.querySelectorAll('.pane-harness-panel').length,
         harnessProposalInteractiveControls: document.querySelectorAll('.harness-proposal-list button, .harness-proposal-list a[href], .harness-proposal-list input, .harness-proposal-list select, .harness-proposal-list textarea, .harness-proposal-list [role=button], .harness-proposal-list [role=link]').length,
         harnessProposalTitles: [...document.querySelectorAll('.harness-proposal-list li')]
           .map((element) => element.textContent?.trim() || ''),
@@ -1861,6 +1911,9 @@ async function verifyScenarioSemantics(
         humanReconnectConfirmationCount: document.querySelectorAll(
           '[role="group"][aria-label="Confirm HRA Cloud reconnect"]',
         ).length,
+        identityAccentCount: panes.filter((pane) =>
+          pane instanceof HTMLElement && pane.style.getPropertyValue('--pane-identity-strong').trim().length > 0
+        ).length,
         labelledPaneCount: panes.filter(hasStableLabel).length,
         labelledTranscriptCount: [...document.querySelectorAll('.chat-pane__transcript[role=log]')]
           .filter(hasStableLabel).length,
@@ -1869,7 +1922,6 @@ async function verifyScenarioSemantics(
         navigationTargets: [...document.querySelectorAll('.hra-nav a')]
           .map((link) => link.getAttribute('href') || ''),
         paneActivities: panes.map((pane) => pane.getAttribute('data-pane-activity') || ''),
-        paneBorderColors: panes.map((pane) => getComputedStyle(pane).borderColor),
         paneCount: panes.length,
         paneHeaderTopAligned: panes.filter((pane) => {
           const header = pane.querySelector('.chat-pane__header');
@@ -1886,6 +1938,13 @@ async function verifyScenarioSemantics(
           const box = pane.getBoundingClientRect();
           return box.left < gridBox.left - 0.5 || box.right > gridBox.right + 0.5;
         }).length,
+        queueHeadCount: document.querySelectorAll('.pane-queue-row[data-queue-head]').length,
+        queueMessageCount: document.querySelectorAll('.pane-queue-row').length,
+        queueSteerCount: document.querySelectorAll('.pane-queue-action--steer').length,
+        queueTexts: [...document.querySelectorAll('.pane-queue-row__text')]
+          .map((row) => row.textContent?.trim() || ''),
+        reasoningMarkdownHeadings: [...document.querySelectorAll('.pane-reasoning h1, .pane-reasoning h2, .pane-reasoning h3')]
+          .map((heading) => heading.textContent?.trim() || ''),
         responseCount: document.querySelectorAll('.pane-response').length,
         remoteCapabilityCount: remotePanes.filter((pane) =>
           pane.getAttribute('data-observation-capability') === 'summary-v1'
@@ -1906,28 +1965,31 @@ async function verifyScenarioSemantics(
         remotePaneCount: remotePanes.length,
         remoteTooltipCount: document.querySelectorAll('.remote-session-pane__device-tooltip[role=tooltip]').length,
         remoteTriggerCount: document.querySelectorAll('button.remote-session-pane__device-trigger[aria-expanded]').length,
+        routingChromeCount: document.querySelectorAll('.pane-route, .pane-route-description').length,
         semanticBorderCount: panes.filter((pane) => {
           const activity = pane.getAttribute('data-pane-activity');
           const expected = activityColors[activity];
           return expected !== undefined && getComputedStyle(pane).borderColor === expected;
         }).length,
-        renameButtonCount: document.querySelectorAll('.pane-rename').length,
-        routeLabels: [...document.querySelectorAll('.pane-route-description')]
-          .map((label) => label.textContent?.trim() || ''),
         settingsCount: document.querySelectorAll('.settings-page').length,
+        subagentControlCount: document.querySelectorAll('.pane-subagents button, .pane-subagents a[href], .pane-subagents input, .pane-subagents textarea, .pane-subagents [role=button], .pane-subagents [role=link]').length,
+        subagentRegionCount: document.querySelectorAll('.pane-subagents[aria-label="Active subagents"]').length,
+        subagents: [...document.querySelectorAll('.pane-subagents li')].map((row) => ({
+          state: row.getAttribute('data-subagent-state') || '',
+          title: row.querySelector('.pane-subagent__title')?.textContent?.trim() || '',
+        })),
         thinkingActivityLabels: [...document.querySelectorAll('.pane-reasoning')]
           .map((activity) => activity.getAttribute('aria-label') || ''),
         thinkingCount: document.querySelectorAll('.pane-reasoning').length,
         titleInputCount: document.querySelectorAll('.pane-title-input').length,
         transcriptLogCount: document.querySelectorAll('.chat-pane__transcript[role=log]').length,
         toolActivityCount: document.querySelectorAll('.pane-tool').length,
-        toolActivityLabels: [...document.querySelectorAll('.pane-tool')]
-          .map((activity) => activity.getAttribute('aria-label') || ''),
         squarePaneCount: panes.filter((pane) => {
           const box = pane.getBoundingClientRect();
           return box.width > 0 && Math.abs(box.width - box.height) <= 1.5;
         }).length,
         subscriptionSelectorCount: document.querySelectorAll('.subscription-select').length,
+        viewportContent: document.querySelector('meta[name="viewport"]')?.getAttribute('content') || '',
       };
     })()`),
     `${scenarioId} semantic UI state`,
@@ -1949,7 +2011,11 @@ async function verifyScenarioSemantics(
   if (state.transcriptLogCount > 1) {
     failures.push(`${String(state.transcriptLogCount)} transcripts expose simultaneous live-log announcements`);
   }
-  if (state.paneCount > 0 && state.squarePaneCount !== state.paneCount) {
+  if (
+    scenarioId !== "chat-compact-malleable" &&
+    state.paneCount > 0 &&
+    state.squarePaneCount !== state.paneCount
+  ) {
     failures.push(`${String(state.squarePaneCount)} of ${String(state.paneCount)} panes are square`);
   }
   if (state.paneCount > 0 && state.semanticBorderCount !== state.paneCount) {
@@ -1964,6 +2030,21 @@ async function verifyScenarioSemantics(
   if (state.subscriptionSelectorCount !== 0) {
     failures.push(`${String(state.subscriptionSelectorCount)} per-pane subscription selectors remain`);
   }
+  if (state.routingChromeCount !== 0) {
+    failures.push(`${String(state.routingChromeCount)} user-facing routing controls remain`);
+  }
+  if (state.toolActivityCount !== 0) {
+    failures.push(`${String(state.toolActivityCount)} tool-call presentations remain`);
+  }
+  if (state.durationInsideLiveRegionCount !== 0) {
+    failures.push("turn duration is nested inside a live region");
+  }
+  if (state.durationLabels.some((label) => label !== "Turn elapsed")) {
+    failures.push("turn duration does not use the exact Turn elapsed accessible name");
+  }
+  if (!state.viewportContent.split(",").map((value) => value.trim()).includes("viewport-fit=cover")) {
+    failures.push("the Direct viewport does not opt into safe-area coverage");
+  }
   if (state.composerPlaceholders.some((placeholder) => placeholder !== "")) {
     failures.push("a pane composer still exposes placeholder copy");
   }
@@ -1973,29 +2054,50 @@ async function verifyScenarioSemantics(
   switch (scenarioId) {
     case "chat-draft":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("configured draft is not one ready pane");
-      if (state.routeLabels.length !== 0) failures.push("draft without a turn exposes a route label");
       if (state.titleInputCount !== 0) failures.push("title editor did not close after explicit commit");
       if (state.disabledComposers !== 0) failures.push("draft composer is disabled");
-      if (state.disabledRenameButtons !== 0 || state.renameButtonCount !== 1) failures.push("draft title rename is unavailable");
       if (state.paneActivities[0] !== "idle") failures.push("non-message configuration changed the neutral activity");
       break;
     case "chat-streaming":
       if (state.paneCount !== 1 || state.paneStates[0] !== "streaming") failures.push("streaming pane did not remain active");
-      if (state.disabledComposers !== 1) failures.push("active pane composer is not fenced");
-      if (state.disabledRenameButtons !== 1) failures.push("active pane title rename is not fenced");
-      if (state.thinkingCount !== 1 || state.toolActivityCount !== 1 || state.responseCount !== 1) failures.push("streaming activity is incomplete");
-      if (
-        state.thinkingActivityLabels[0] !== "Thinking" ||
-        state.toolActivityLabels[0] !== "Latest tool: Files, done"
-      ) failures.push("icon-only streaming activity is not named semantically");
+      if (state.disabledComposers !== 0) failures.push("active pane composer cannot accept an ordinary queued message");
+      if (state.thinkingCount !== 1 || state.responseCount !== 1) failures.push("streaming Markdown activity is incomplete");
+      if (state.thinkingActivityLabels[0] !== "Thinking") failures.push("streaming reasoning is not named semantically");
       if (!state.markdownHeadings.includes("In progress")) failures.push("streaming Markdown heading is not semantic");
       if (state.paneActivities[0] !== "toolStarted") failures.push("tool activity border is not current");
       break;
+    case "chat-compact-malleable": {
+      const expectedSubagents = [
+        { state: "running", title: "Routing audit" },
+        { state: "waiting", title: "Direct verification" },
+        { state: "starting", title: "Attachment vault" },
+      ];
+      if (state.paneCount !== 1 || state.paneStates[0] !== "streaming") failures.push("malleable fixture is not one active pane");
+      if (state.thinkingCount !== 1 || state.responseCount !== 1) failures.push("malleable Markdown thinking and answer are incomplete");
+      if (!state.reasoningMarkdownHeadings.includes("Thinking")) failures.push("reasoning Markdown heading is not semantic");
+      if (!state.markdownHeadings.includes("Compact answer")) failures.push("answer Markdown heading is not semantic");
+      if (
+        state.queueMessageCount !== 1 ||
+        state.queueHeadCount !== 1 ||
+        state.queueSteerCount !== 1 ||
+        state.queueTexts.join("") !== "Then tighten the compact layout."
+      ) failures.push("FIFO queue did not retain one editable, removable, steerable head");
+      if (
+        state.subagentRegionCount !== 1 ||
+        state.subagentControlCount !== 0 ||
+        JSON.stringify(state.subagents) !== JSON.stringify(expectedSubagents)
+      ) failures.push("pinned active subagents are not the exact action-free active projection");
+      if (state.attachmentPreviewCount !== 1 || state.attachmentBlobPreviewCount !== 1) failures.push("gateway-vended image preview is missing or unsafe");
+      if (state.durationTexts.join("") !== "2h 1m 45s") failures.push("logical turn duration is not deterministic");
+      if (state.identityAccentCount !== 1) failures.push("durable pane identity tokens are missing");
+      if (state.disabledComposers !== 0) failures.push("active composer cannot accept an ordinary queued message");
+      if (state.containedPanes !== 1 || state.autoContainedPanes !== 1) failures.push("malleable pane is not independently contained");
+      break;
+    }
     case "chat-completed":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("sent turn did not reach its terminal ready state");
       if (state.disabledComposers !== 0 || state.responseCount !== 1) failures.push("terminal pane did not expose one enabled latest response");
       if (state.thinkingCount !== 0 || state.toolActivityCount !== 0) failures.push("terminal pane retained transient activity");
-      if (state.disabledRenameButtons !== 0) failures.push("terminal title rename is disabled");
       if (!state.markdownHeadings.includes("Direct response")) failures.push("terminal Markdown response is not semantic");
       if (state.paneActivities[0] !== "responseCompleted") failures.push("response border did not replace the message reset");
       break;
@@ -2008,7 +2110,6 @@ async function verifyScenarioSemantics(
         state.disabledComposers !== 0 ||
         state.responseCount !== attentionPresentations.length
       ) failures.push("attention recovery did not expose one enabled latest response per pane");
-      if (state.disabledRenameButtons !== 0) failures.push("recovered attention titles are disabled");
       if (
         state.markdownHeadings.filter((heading) => heading === "Direct response").length !==
           attentionPresentations.length
@@ -2017,21 +2118,10 @@ async function verifyScenarioSemantics(
     case "chat-compact-320":
     case "chat-compact-639":
     case "chat-compact-415":
-      if (
-        scenarioId === "chat-compact-320" &&
-        state.routeLabels[0] !== "HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch."
-      ) {
-        failures.push("compact routed fallback is not named truthfully");
-      }
-      if (scenarioId === "chat-compact-320" && state.routeLabels.length !== 1) {
-        failures.push("compact routed response does not expose exactly one route label");
-      }
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("compact journey is not one ready pane");
       if (state.gridColumnCount !== 1 || state.paneViewportEscapes !== 0) failures.push("compact pane is not contained in one grid column");
       if (state.disabledComposers !== 0 || state.disabledSendButtons !== 0) failures.push("compact controls are unexpectedly disabled");
-      if (state.disabledRenameButtons !== 0) failures.push("compact title rename is disabled");
       if (state.composerValues[0] !== "Compact controls remain usable.") failures.push("compact composer did not accept input");
-      if (scenarioId !== "chat-compact-320" && state.routeLabels.length !== 0) failures.push("compact draft without a turn exposes a route label");
       break;
     case "chat-many-panes":
       if (state.paneCount !== manyChatPaneCount) failures.push(`expected ${String(manyChatPaneCount)} panes, received ${String(state.paneCount)}`);
@@ -2053,10 +2143,7 @@ async function verifyScenarioSemantics(
       ) {
         failures.push("parallel fixture does not retain 64 active local streams and the bounded 48-of-448 remote window");
       }
-      if (
-        state.disabledComposers !== parallelStreamPaneCount
-        || state.disabledRenameButtons !== parallelStreamPaneCount
-      ) failures.push("parallel active controls are not independently fenced");
+      if (state.disabledComposers !== parallelStreamPaneCount) failures.push("parallel active composers are not independently fenced");
       if (state.responseCount !== parallelStreamPaneCount) {
         failures.push("parallel deltas did not render one response per local stream");
       }
@@ -2072,7 +2159,6 @@ async function verifyScenarioSemantics(
       break;
     case "chat-create-pane":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("pathless project add did not create one ready pane");
-      if (state.renameButtonCount !== 1) failures.push("new pane cannot be renamed before its first message");
       break;
     case "chat-create-pane-inherit":
       if (state.paneCount !== 2 || state.paneStates.some((paneState) => paneState !== "ready")) {
@@ -2113,22 +2199,13 @@ async function verifyScenarioSemantics(
       break;
     case "harness-children-mixed": {
       const expectedChildren = [
-        ["Starting child", "starting", false],
-        ["Running child", "running", false],
-        ["Waiting child", "waiting", false],
-        ["Idle child", "idle", false],
-        ["Failed child", "failed", false],
-        ["Stopped child", "stopped", true],
-        ["Quarantined child", "quarantined", true],
-      ].map(([title, childState, stopDisabled]) => ({
-        actionLabels: [`Open ${title}`, `Stop ${title}`],
-        openDisabled: true,
-        state: childState,
-        stopDisabled,
-        title,
-      }));
-      if (state.paneCount !== 1 || state.harnessPanelCount !== 1) failures.push("Recursive child panel is not the sole expanded pane panel");
-      if (JSON.stringify(state.harnessChildren) !== JSON.stringify(expectedChildren)) failures.push("Recursive children do not expose exact ordered state-bound Open and Stop authority");
+        { state: "starting", title: "Starting child" },
+        { state: "running", title: "Running child" },
+        { state: "waiting", title: "Waiting child" },
+      ];
+      if (state.paneCount !== 1 || state.subagentRegionCount !== 1) failures.push("active subagent stack is not pinned to its sole pane");
+      if (state.subagentControlCount !== 0) failures.push("active subagent stack exposes per-child action authority");
+      if (JSON.stringify(state.subagents) !== JSON.stringify(expectedChildren)) failures.push("active subagent stack does not expose the exact ordered active states");
       break;
     }
     case "settings-browser-login":

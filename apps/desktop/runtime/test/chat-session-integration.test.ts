@@ -45,6 +45,8 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
     setChatThreadName: reject,
     startChatThread: reject,
     startChatTurn: reject,
+    steer: reject,
+    verifiedProductionExecutionPolicyForActiveTurn: () => null,
     resolveChatConfiguration: reject,
   });
 
@@ -246,6 +248,8 @@ test("every route resolution reads one current account catalog", async () => {
     setChatThreadName: reject,
     startChatThread: reject,
     startChatTurn: reject,
+    steer: reject,
+    verifiedProductionExecutionPolicyForActiveTurn: () => null,
     resolveChatConfiguration: (_account, candidates) => {
       const selected = candidates[0];
       if (selected === undefined) throw new Error("Expected a routing candidate");
@@ -285,6 +289,8 @@ test("Codex chat preserves definitive model absence for safe automatic fallback"
     setChatThreadName: reject,
     startChatThread: reject,
     startChatTurn: reject,
+    steer: reject,
+    verifiedProductionExecutionPolicyForActiveTurn: () => null,
     resolveChatConfiguration: () => Promise.reject(unavailable),
   });
 
@@ -366,6 +372,7 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
         ]),
       },
       projection: {
+        messageQueueChanged: () => undefined,
         paneChanged: () => undefined,
         paneStateChanged: () => undefined,
         paneRemoved: () => undefined,
@@ -836,6 +843,7 @@ function positionedAccounts(
 
 function quietProjection() {
   return {
+    messageQueueChanged: () => undefined,
     paneChanged: () => undefined,
     paneStateChanged: () => undefined,
     paneRemoved: () => undefined,

@@ -122,6 +122,11 @@ export interface ChatMessageAttachmentAuthority {
     turnId: ChatTurnId;
     now: string;
   }>): void;
+  restorePreparedDraftRefsInTransaction(input: Readonly<{
+    paneId: ChatPaneProjection["id"];
+    messageId: ChatMessageId;
+    now: string;
+  }>): boolean;
 }
 
 const attachmentRefRowSchema = z.object({
@@ -141,12 +146,13 @@ const attachmentLeaseCountSchema = z.object({
   count: z.number().int().nonnegative().safe(),
 }).strict();
 
-const attachmentIdRowSchema = z.object({
-  attachment_id: chatMessageAttachmentIdSchema,
-}).strict();
-
 const attachmentDraftLeaseRowSchema = z.object({
   expires_at: chatIsoDateTimeSchema,
+}).strict();
+
+const attachmentConsumedDraftRowSchema = z.object({
+  attachment_id: chatMessageAttachmentIdSchema,
+  consumed_draft_expires_at: chatIsoDateTimeSchema,
 }).strict();
 
 /** SQLite-backed ready/same-pane authority used until the upload vault owns it. */
@@ -176,7 +182,7 @@ export class SQLiteChatMessageAttachmentAuthority
     const messageId = chatMessageIdSchema.parse(input.messageId);
     const now = chatIsoDateTimeSchema.parse(input.now);
     const refs = this.#parseRefs(input.attachmentRefs);
-    const existing = new Set(this.#storedRefs(paneId, messageId));
+    const existing = this.#storedRefProvenance(paneId, messageId);
     this.#requireReady(paneId, refs);
     const draftLeases = this.#requireDraftLeases(
       paneId,
@@ -188,11 +194,22 @@ export class SQLiteChatMessageAttachmentAuthority
       WHERE message_id = ?1 AND pane_id = ?2
     `).run(messageId, paneId);
     for (const [position, attachmentId] of refs.entries()) {
+      const expiresAt = existing.get(attachmentId) ?? draftLeases.get(attachmentId);
+      if (expiresAt === undefined) {
+        throw new Error("chat message attachment lost its consumed draft lease");
+      }
       this.#database.query(`
         INSERT INTO chat_message_attachment_refs (
-          message_id, pane_id, position, attachment_id
-        ) VALUES (?1, ?2, ?3, ?4)
-      `).run(messageId, paneId, position, attachmentId);
+          message_id, pane_id, position, attachment_id,
+          consumed_draft_expires_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+      `).run(
+        messageId,
+        paneId,
+        position,
+        attachmentId,
+        expiresAt,
+      );
     }
     this.#consumeDraftLeases(paneId, draftLeases);
   }
@@ -290,6 +307,38 @@ export class SQLiteChatMessageAttachmentAuthority
     this.#requireLeaseCount(paneId, messageId, turnId, expected, "released");
   }
 
+  restorePreparedDraftRefsInTransaction(input: Readonly<{
+    paneId: ChatPaneProjection["id"];
+    messageId: ChatMessageId;
+    now: string;
+  }>): boolean {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const now = chatIsoDateTimeSchema.parse(input.now);
+    const provenance = this.#storedRefProvenance(paneId, messageId);
+    const nowEpoch = Date.parse(now);
+    let allRestored = true;
+    for (const [attachmentId, expiresAt] of provenance) {
+      if (Date.parse(expiresAt) <= nowEpoch) {
+        allRestored = false;
+        continue;
+      }
+      const restored = this.#database.query(`
+        INSERT INTO chat_attachment_draft_leases (
+          attachment_id, pane_id, expires_at, created_at
+        ) VALUES (?1, ?2, ?3, ?4)
+      `).run(attachmentId, paneId, expiresAt, now);
+      if (restored.changes !== 1) {
+        throw new Error("chat message attachment draft lease could not be restored");
+      }
+    }
+    this.#database.query(`
+      DELETE FROM chat_message_attachment_refs
+      WHERE message_id = ?1 AND pane_id = ?2
+    `).run(messageId, paneId);
+    return allRestored;
+  }
+
   #settleLeases(
     input: Readonly<{
       paneId: ChatPaneProjection["id"];
@@ -362,11 +411,16 @@ export class SQLiteChatMessageAttachmentAuthority
       now,
     );
     for (const [position, attachmentId] of refs.entries()) {
+      const expiresAt = draftLeases.get(attachmentId);
+      if (expiresAt === undefined) {
+        throw new Error("chat message attachment lost its consumed draft lease");
+      }
       this.#database.query(`
         INSERT INTO chat_message_attachment_refs (
-          message_id, pane_id, position, attachment_id
-        ) VALUES (?1, ?2, ?3, ?4)
-      `).run(messageId, paneId, position, attachmentId);
+          message_id, pane_id, position, attachment_id,
+          consumed_draft_expires_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+      `).run(messageId, paneId, position, attachmentId, expiresAt);
     }
     this.#consumeDraftLeases(paneId, draftLeases);
   }
@@ -407,12 +461,13 @@ export class SQLiteChatMessageAttachmentAuthority
     }
   }
 
-  #storedRefs(
+  #storedRefProvenance(
     paneId: ChatPaneProjection["id"],
     messageId: ChatMessageId,
-  ): readonly ChatMessageAttachmentId[] {
+  ): ReadonlyMap<ChatMessageAttachmentId, string> {
     const values: unknown[] = this.#database.query(`
-      SELECT attachment_id FROM chat_message_attachment_refs
+      SELECT attachment_id, consumed_draft_expires_at
+      FROM chat_message_attachment_refs
       WHERE message_id = ?1 AND pane_id = ?2
       ORDER BY position
       LIMIT ?3
@@ -420,9 +475,15 @@ export class SQLiteChatMessageAttachmentAuthority
     if (values.length > runtimeChatMessageAttachmentLimit) {
       throw new Error("stored chat message attachment reference limit exceeded");
     }
-    return this.#parseRefs(
-      values.map((value) => attachmentIdRowSchema.parse(value).attachment_id),
-    );
+    const rows = values.map((value) => attachmentConsumedDraftRowSchema.parse(value));
+    const refs = this.#parseRefs(rows.map(({ attachment_id }) => attachment_id));
+    return new Map(refs.map((attachmentId, index) => {
+      const row = rows[index];
+      if (row === undefined || row.attachment_id !== attachmentId) {
+        throw new Error("chat message attachment provenance order drifted");
+      }
+      return [attachmentId, row.consumed_draft_expires_at] as const;
+    }));
   }
 
   #messageRefCount(
@@ -514,6 +575,8 @@ export interface ChatMessageQueueResumeInput {
   readonly expectedQueueRevision: number;
   readonly now: Date;
 }
+
+export type ChatMessageDiscardAmbiguousInput = ChatMessageRowCasInput;
 
 export interface ChatMessageQueuePauseInput {
   readonly paneId: ChatPaneProjection["id"];
