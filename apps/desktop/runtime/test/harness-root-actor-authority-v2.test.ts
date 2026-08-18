@@ -80,7 +80,6 @@ function fixture(): Readonly<{
       workingDirectory: "/tmp/root-actor-v2",
     },
     accountProfileId: "acct_root_actor_v2",
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   const actors = new HarnessSQLiteAuthorityV2(database, {
@@ -942,7 +941,6 @@ describe("HarnessRootActorAuthorityV2", () => {
           workingDirectory: "/tmp/root-actor-v2-second",
         },
         accountProfileId: secondAccountId,
-        reasoningEffort: "ultra",
         now: new Date(at),
       });
       activateChatPane(database, {

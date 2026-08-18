@@ -38,20 +38,24 @@ remains subject to its own provider terms and limits. HRA does not combine
 subscriptions to evade a usage limit, and it makes no measured speed, quality,
 or token-cost claim before held-out evaluation.
 
-## Model and acceleration policy
+## Model and service-tier policy
 
-- **Sol Max is the default.** Ordinary panes and standard metaharness work use
-  Sol Max unless a durable work class selects another profile.
+- **Sol Max is the conservative root default.** HRA classifies each ordinary
+  prompt before provider work and records the exact requested and selected
+  route. A continuation inherits the pane's prior route.
 - **Sol Ultra is for wide work.** Large changesets and broad research can use
   Sol Ultra when parallelism or deeper planning makes that lane appropriate.
 - **Luna Max is for bounded leaves.** Clearly defined, trivial, or narrow work
   can use Luna Max. If Luna is unavailable, HRA records the closed fallback to
   Sol Max rather than silently changing an active actor.
-- **Fast is a sparse per-turn overlay.** Automatic Fast is limited to a root
-  task's critical-path turn when reasoning or file generation is the
-  bottleneck. It has one durable reservation, never changes the actor's model
-  or effort, and falls back to Standard when its capability or reservation is
-  unavailable. Manual Fast controls on ordinary panes remain separate.
+- **HRA owns Fast and Standard.** Bounded-leaf root and recursive work requests
+  Fast. Standard, large-change, and wide-research work requests Standard. A
+  Fast actor turn holds one durable reservation and falls back truthfully when
+  the selected profile or reservation cannot provide it. Neither the user nor
+  a recursive agent supplies a model, effort, or service tier. The logical
+  turn stores `requested_service_tier` derived from its actor's immutable
+  `work_class`, and every attempt must copy that exact request. Historical
+  acceleration columns remain migration history and have no runtime authority.
 - **Continuity is part of routing.** Actor lineage, bounded visible history,
   stable context references, and cache-compatible instruction prefixes are
   retained across turns where the provider supports them. HRA records the
@@ -80,11 +84,11 @@ work is idle, one unref'd timer tick materializes at most one dirty pane and
 writes an immutable receipt for that exact observation revision. Its keyset
 cursor advances before inspection, so one malformed pane cannot starve later
 panes. Faults leave evidence pending and emit only a fixed content-free
-diagnostic. It has no
-model, provider, proposal, account, filesystem, network, Git, or policy port.
+diagnostic. It has no model, provider, proposal, account, filesystem, network,
+Git, or policy port.
 An agent may consult the descriptive memory before choosing an existing work
-class or Fast intent, but current pane settings, account ranking, work-class
-routing, and Fast admission remain authoritative. User intent wins.
+class, but HRA alone maps that class to a model, effort, and service tier.
+Account ranking, work-class routing, and Fast admission remain authoritative.
 
 This evidence is not whole-pane spend. Ordinary root Codex turns do not yet
 have the positioned cumulative usage, reroute, and restart receipts needed for
@@ -97,13 +101,11 @@ later design with evaluation, explicit authorization, canary, and rollback.
 
 ## Accepted v1 behavior
 
-- Ordinary Codex panes start on GPT-5.6 Sol at Max reasoning. Recursive work may
-  select a narrower execution profile, while the actor's model and effort stay
-  fixed for its incarnation. Fast is a per-turn acceleration, never an actor
-  identity. The default `criticalPath` policy may request it only for recursive
-  turns that are both on the root task's critical path and bottlenecked by
-  inference or output generation. Turning automatic Fast Off leaves every
-  ordinary pane's manual Fast control unchanged.
+- Ordinary root turns and recursive actors are both policy-routed. Recursive
+  work supplies only a semantic work class; HRA fixes the actor's model and
+  effort for its incarnation and derives each turn's service tier from that
+  durable class. A bounded leaf requests Fast and every broader recursive class
+  requests Standard. `agent.send` reuses the actor's route.
 
 - A parsed, bounded lexical RLM v2 AST supplies variables, lexical bindings,
   conditionals, bounded iteration, bounded parallel branches, and only adopted

@@ -20,6 +20,18 @@ const managedWorkspace = {
   recoveryKind: null,
 } as const;
 
+const resolvedStandardRoute = {
+  policyVersion: 1,
+  classificationReason: "conservativeDefault",
+  workClass: "standard",
+  requestedProfile: "solMax",
+  selectedProfile: "solMax",
+  profileFallbackReason: null,
+  requestedServiceTier: "standard",
+  selectedServiceTier: "standard",
+  serviceTierFallbackReason: null,
+} as const;
+
 function pane(responseMarkdown = ""): ChatPaneProjection {
   return {
     id: "pane_delivery01",
@@ -30,9 +42,6 @@ function pane(responseMarkdown = ""): ChatPaneProjection {
       name: "example",
     },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
-    serviceTier: "standard",
     interactionMode: "chat",
     state: "ready",
     activity: { ordinal: 1, kind: "responseCompleted" },
@@ -50,6 +59,7 @@ function pane(responseMarkdown = ""): ChatPaneProjection {
       },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       tools: [],
+      routing: resolvedStandardRoute,
     },
     attention: null,
     recoverablePrompt: false,

@@ -138,7 +138,6 @@ function fixture(): Fixture {
       workingDirectory: "/tmp/renderer-sqlite",
     },
     accountProfileId: null,
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   actors.attachActorPane({
@@ -282,7 +281,7 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
     database.close();
   });
 
-  test("persists automatic Fast policy through the exact settings CAS", () => {
+  test("keeps the retired Fast setting column inert across settings CAS", () => {
     const database = new Database(":memory:", { strict: true });
     database.exec("PRAGMA foreign_keys = ON");
     applyMigrations(database);
@@ -292,26 +291,23 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       harnessRevision: 1,
       settings: {
         revision: 1,
-        automaticFastMode: "criticalPath",
       },
     });
     expect(adapter.update({
       expectedHarnessRevision: 1,
       expectedSettingsRevision: 1,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 64 * MIB,
       refinementMode: "off",
     })).toMatchObject({
       harnessRevision: 2,
       settings: {
         revision: 2,
-        automaticFastMode: "off",
       },
     });
     expect(database.query(`
       SELECT automatic_fast_mode FROM harness_settings WHERE singleton = 1
-    `).get()).toEqual({ automatic_fast_mode: "off" });
+    `).get()).toEqual({ automatic_fast_mode: "criticalPath" });
     database.close();
   });
 
@@ -332,7 +328,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       settings: {
         revision: 1,
         recursiveSessionsEnabled: false,
-        automaticFastMode: "criticalPath",
         contextQuotaBytes: 64 * MIB,
         refinementMode: "off",
       },
@@ -342,14 +337,12 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: 9,
       expectedSettingsRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "suggest",
     })).toEqual({
       settings: {
         revision: 2,
         recursiveSessionsEnabled: true,
-        automaticFastMode: "off",
         contextQuotaBytes: 8 * MIB,
         refinementMode: "suggest",
       },
@@ -359,7 +352,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: 9,
       expectedSettingsRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "suggest",
     })).toThrow(expect.objectContaining({ code: "revision_conflict" }));
@@ -372,7 +364,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: 1,
       expectedSettingsRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "suggest",
     });
@@ -387,7 +378,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: enabled.harnessRevision,
       expectedSettingsRevision: enabled.settings.revision,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "off",
     })).toThrow(expect.objectContaining({ code: "invalid_state" }));
@@ -406,7 +396,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: recovered.harnessRevision,
       expectedSettingsRevision: recovered.settings.revision,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "off",
     }).settings.refinementMode).toBe("off");
@@ -419,7 +408,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: 1,
       expectedSettingsRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "suggest",
     });
@@ -435,7 +423,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
       expectedHarnessRevision: before.harnessRevision,
       expectedSettingsRevision: before.settings.revision,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "off",
     });
@@ -459,7 +446,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
         workingDirectory: "/tmp/renderer-sqlite",
       },
       accountProfileId: null,
-      reasoningEffort: "max",
       now: new Date(later),
     });
     value.actors.attachActorPane({
@@ -535,7 +521,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
         workingDirectory: "/tmp/renderer-sqlite",
       },
       accountProfileId: null,
-      reasoningEffort: "ultra",
       now: new Date(later),
     });
     value.actors.attachActorPane({
@@ -586,7 +571,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
         workingDirectory: "/tmp/renderer-sqlite",
       },
       accountProfileId: null,
-      reasoningEffort: "ultra",
       now: new Date(later),
     });
     value.actors.attachActorPane({
@@ -652,7 +636,6 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
             workingDirectory: "/tmp/renderer-sqlite",
           },
           accountProfileId: null,
-          reasoningEffort: "ultra",
           now: new Date(later),
         });
         let opened = false;

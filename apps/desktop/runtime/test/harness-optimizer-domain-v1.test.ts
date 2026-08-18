@@ -50,7 +50,7 @@ describe("optimizer Phase 0 domain", () => {
       wideResearch: "solUltra",
       standard: "solMax",
       boundedLeaf: "lunaThenSol",
-      automaticFast: "inheritHarnessSetting",
+      serviceTierPolicy: "workClassDerived",
       nativeCollaboration: false,
     });
     expect(OPTIMIZER_CANDIDATE_POLICY_V1).toEqual({

@@ -94,7 +94,6 @@ function summary(overrides: Record<string, unknown> = {}) {
     sourceRevision: currentHeader.sourceRevision,
     title: "Harden gateway recovery",
     repositoryDisplayName: "example",
-    modelEffort: "ultra",
     state: "working",
     originUpdatedAt: "9007199254740993",
     deleted: false,

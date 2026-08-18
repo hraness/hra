@@ -87,10 +87,10 @@ describe("model-visible RLM v2 contract", () => {
       "workClass:largeChange|wideResearch|standard|boundedLeaf",
     );
     expect(operation.description).toContain(
-      "bottleneck:reasoning|fileGeneration",
+      "HRA derives model, reasoning effort, and Fast or Standard from workClass",
     );
     expect(operation.description).toContain(
-      "omitted acceleration is Standard",
+      "HRA reuses the actor's durable workClass route",
     );
     expect(operation.description).toContain("agent.result/agent.cancel {turnId}");
     expect(operation.description).toContain("routing.inspect {}");
@@ -107,10 +107,7 @@ describe("model-visible RLM v2 contract", () => {
       kind: "literal",
       value: "wideResearch",
     });
-    expect(spawn?.arguments.acceleration).toEqual({
-      kind: "object",
-      entries: { mode: { kind: "literal", value: "standard" } },
-    });
+    expect(containsObjectKey(example, "acceleration")).toBeFalse();
   });
 
   test("does not expose proposal enumeration or preview authority in recursive v1", () => {

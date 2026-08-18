@@ -12,7 +12,6 @@ import { HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256 } from
 
 import {
   HARNESS_MAX_DURABLE_DESCENDANTS,
-  STANDARD_ACTOR_TURN_ACCELERATION,
   actorPolicyVersionSchema,
   actorBudgetSchema,
   actorEpochIdSchema,
@@ -20,7 +19,6 @@ import {
   actorResultIdSchema,
   actorSchema,
   actorTurnIdSchema,
-  actorTurnAccelerationSchema,
   persistedActorWorkClassSchema,
   isTerminalActorAttemptState,
   isTerminalActorTurnState,
@@ -29,7 +27,6 @@ import {
   type ActorEpoch,
   type ActorResult,
   type ActorTurn,
-  type ActorTurnAcceleration,
   type ActorPolicyVersion,
   type PersistedActorWorkClass,
   type ActorTurnState,
@@ -351,10 +348,9 @@ export interface PersistentActorTurnRequest {
   readonly providerThreadId: string;
   readonly modelId: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly reasoningEffort: "ultra" | "max";
-  readonly requestedAcceleration: ActorTurnAcceleration;
+  readonly requestedServiceTier: "standard" | "fast";
   readonly serviceTier: "standard" | "fast";
   readonly tierFallbackReason:
-    | "automaticFastDisabled"
     | "fastUnsupported"
     | "fastReservationUnavailable"
     | null;
@@ -526,18 +522,13 @@ export interface PersistentActorAuthorityPort {
     actorId: string;
     idempotencyKey: string;
     inputValueId: string;
-    acceleration: ActorTurnAcceleration;
     createdAt?: string;
   }>): ActorTurn;
   readActorTurn(turnId: string): ActorTurn | null;
-  readActorTurnAcceleration(turnId: string): Readonly<
-    | ({ turnId: string } & { mode: "standard" })
-    | ({ turnId: string } & {
-        mode: "fast";
-        criticalPath: true;
-        bottleneck: "reasoning" | "fileGeneration";
-      })
-  >;
+  readActorTurnRequestedServiceTier(turnId: string): Readonly<{
+    turnId: string;
+    requestedServiceTier: "standard" | "fast";
+  }>;
   transitionActorTurn(input: Readonly<{
     turnId: string;
     expectedRevision: number;
@@ -1013,7 +1004,6 @@ const spawnInputSchema = z.object({
   inputValueId: valueIdSchema,
   policyVersion: actorPolicyVersionSchema,
   workClass: persistedActorWorkClassSchema,
-  acceleration: actorTurnAccelerationSchema,
 }).strict().superRefine((input, context) => {
   if (
     (input.policyVersion === 0) !== (input.workClass === "legacyUnclassified")
@@ -1031,8 +1021,6 @@ const sendInputSchema = z.object({
   actorId: actorIdSchema,
   idempotencyKey: requestIdentitySchema,
   inputValueId: valueIdSchema,
-  acceleration: actorTurnAccelerationSchema
-    .default(STANDARD_ACTOR_TURN_ACCELERATION),
 }).strict();
 
 const actorTargetSchema = z.object({
@@ -1465,7 +1453,6 @@ export class PersistentActorCoordinator {
         actor,
         idempotencyKey: input.idempotencyKey,
         inputValueId: input.inputValueId,
-        acceleration: input.acceleration,
       });
       return { actor: this.#requireActor(actor.id), turn };
     } catch (error: unknown) {
@@ -1506,7 +1493,6 @@ export class PersistentActorCoordinator {
       actor,
       idempotencyKey: input.idempotencyKey,
       inputValueId: input.inputValueId,
-      acceleration: input.acceleration,
     });
   }
 
@@ -2233,7 +2219,6 @@ export class PersistentActorCoordinator {
     actor: Actor;
     idempotencyKey: string;
     inputValueId: string;
-    acceleration: ActorTurnAcceleration;
   }>): Promise<PersistentActorTurnView> {
     const turnId = deriveOpaqueId("hturn", "turn", [
       input.actor.epochId,
@@ -2255,7 +2240,6 @@ export class PersistentActorCoordinator {
       actorId: input.actor.id,
       idempotencyKey: input.idempotencyKey,
       inputValueId: preparedInput.valueId,
-      acceleration: input.acceleration,
       createdAt: this.#timestamp(),
     });
     // A workspace acquisition can create or recover an external Git lane. Do
@@ -4251,14 +4235,14 @@ export class PersistentActorCoordinator {
       );
     }
     const continuation = this.#quotaContinuationForAttempt(turn, attempt);
-    const accelerationRecord = this.#authority.readActorTurnAcceleration(turn.id);
-    const requestedAcceleration: ActorTurnAcceleration = accelerationRecord.mode === "standard"
-      ? STANDARD_ACTOR_TURN_ACCELERATION
-      : Object.freeze({
-          mode: "fast" as const,
-          criticalPath: true as const,
-          bottleneck: accelerationRecord.bottleneck,
-        });
+    const requestedServiceTier = this.#authority
+      .readActorTurnRequestedServiceTier(turn.id).requestedServiceTier;
+    if (attempt.requestedServiceTier !== requestedServiceTier) {
+      throw new PersistentActorError(
+        "conflict",
+        "actor attempt requested tier differs from its logical turn authority",
+      );
+    }
     return Object.freeze({
       actorId: turn.actorId,
       epochId: turn.epochId,
@@ -4270,7 +4254,7 @@ export class PersistentActorCoordinator {
       providerThreadId: incarnation.providerThreadId,
       modelId: incarnation.requestedModel,
       reasoningEffort: incarnation.requestedReasoningEffort,
-      requestedAcceleration,
+      requestedServiceTier,
       serviceTier: attempt.realizedServiceTier,
       tierFallbackReason: attempt.tierFallbackReason,
       capabilityEvidenceDigest: attempt.capabilityEvidenceDigest,
@@ -4314,7 +4298,8 @@ export class PersistentActorCoordinator {
     capabilityEvidenceDigest: string | null;
     fastReservationId?: string;
   }> {
-    const acceleration = this.#authority.readActorTurnAcceleration(turn.id);
+    const requestedServiceTier = this.#authority
+      .readActorTurnRequestedServiceTier(turn.id).requestedServiceTier;
     const session = this.#authority.readActorSessionBinding(incarnation.id);
     if (
       session === null || session.state !== "bound" ||
@@ -4329,7 +4314,7 @@ export class PersistentActorCoordinator {
     }
     return Object.freeze({
       capabilityEvidenceDigest: session.liveCapabilityEvidenceDigest,
-      ...(acceleration.mode === "fast"
+      ...(requestedServiceTier === "fast"
         ? { fastReservationId: fastReservationIdFor(turn.id, incarnation.id) }
         : {}),
     });
@@ -4985,7 +4970,7 @@ export class PersistentActorCoordinator {
       request.providerThreadId !== incarnation.providerThreadId ||
       request.modelId !== incarnation.requestedModel ||
       request.reasoningEffort !== incarnation.requestedReasoningEffort ||
-      request.requestedAcceleration.mode !== "fast" ||
+      request.requestedServiceTier !== "fast" ||
       request.serviceTier !== "fast" ||
       request.tierFallbackReason !== null ||
       request.fastReservationId !== reservation.id ||
@@ -5524,8 +5509,7 @@ function parseTurnRequest(value: unknown): PersistentActorTurnRequest {
     modelId: z.enum(["gpt-5.6-sol", "gpt-5.6-luna"])
       .default("gpt-5.6-sol"),
     reasoningEffort: z.enum(["ultra", "max"]).default("ultra"),
-    requestedAcceleration: actorTurnAccelerationSchema
-      .default(STANDARD_ACTOR_TURN_ACCELERATION),
+    requestedServiceTier: metaharnessTierSchema.default("standard"),
     serviceTier: metaharnessTierSchema.default("standard"),
     tierFallbackReason: metaharnessFastFallbackReasonSchema.nullable()
       .default(null),
@@ -5617,7 +5601,7 @@ function turnRequestLineage(request: PersistentActorTurnRequest): object {
     providerThreadId: request.providerThreadId,
     modelId: request.modelId,
     reasoningEffort: request.reasoningEffort,
-    requestedAcceleration: request.requestedAcceleration,
+    requestedServiceTier: request.requestedServiceTier,
     serviceTier: request.serviceTier,
     tierFallbackReason: request.tierFallbackReason,
     capabilityEvidenceDigest: request.capabilityEvidenceDigest,
@@ -5643,7 +5627,7 @@ function samePreparedTurnIntent(
     providerThreadId: request.providerThreadId,
     modelId: request.modelId,
     reasoningEffort: request.reasoningEffort,
-    requestedAcceleration: request.requestedAcceleration,
+    requestedServiceTier: request.requestedServiceTier,
     toolsetDigest: request.toolsetDigest,
     clientUserMessageId: request.clientUserMessageId,
     inputValueId: request.inputValueId,

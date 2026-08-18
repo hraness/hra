@@ -293,7 +293,6 @@ async function sealDirty(
         ...(dirty.repositoryDisplayName === undefined
           ? {}
           : { repositoryDisplayName: dirty.repositoryDisplayName }),
-        modelEffort: dirty.modelEffort,
         state: dirty.state,
         deleted: dirty.deleted,
       },
@@ -354,7 +353,6 @@ async function acceptedRemoteHead(input: {
     sourceRevision: "1",
     title: "Remote summary",
     repositoryDisplayName: "Example",
-    modelEffort: "max",
     state: "ready",
     deleted: false,
   }), header, contentKey, allocation);
@@ -577,7 +575,6 @@ describe("encrypted session-sync SQLite store", () => {
           sourceRevision: created.dirty.sourceRevision,
           title: created.dirty.title,
           repositoryDisplayName: created.dirty.repositoryDisplayName,
-          modelEffort: created.dirty.modelEffort,
           state: created.dirty.state,
           deleted: false,
         }),

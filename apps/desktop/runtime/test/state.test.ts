@@ -114,6 +114,7 @@ describe("control-plane database", () => {
         "harness_program_operation_receipts",
         "harness_program_runs",
         "harness_proposals",
+        "harness_root_turn_routing_receipts",
         "harness_semantic_evidence_bundles",
         "harness_settings",
         "human_account_metadata",

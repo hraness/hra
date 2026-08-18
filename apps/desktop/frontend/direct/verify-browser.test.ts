@@ -125,8 +125,6 @@ describe("HRA browser verifier policy", () => {
       expectedVisibleControls: [
         "New pane",
         "Rename Direct pane",
-        "Ultra",
-        "Max",
       ],
       id: "chat-draft",
       viewport: { width: 1_120, height: 780 },
@@ -135,11 +133,9 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "1",
       expectedVisibleControls: [
         "New pane",
-        "Rename Compact 320",
-        "More actions for Compact 320",
+        "Rename Compact routed response",
+        "More actions for Compact routed response",
         "Send",
-        "Ultra",
-        "Max",
       ],
       id: "chat-compact-320",
       viewport: { width: 320, height: 720 },
@@ -151,8 +147,6 @@ describe("HRA browser verifier policy", () => {
         "Rename Compact 639",
         "More actions for Compact 639",
         "Send",
-        "Ultra",
-        "Max",
       ],
       id: "chat-compact-639",
       viewport: { width: 639, height: 820 },
@@ -164,8 +158,6 @@ describe("HRA browser verifier policy", () => {
         "Rename Compact 415",
         "More actions for Compact 415",
         "Send",
-        "Ultra",
-        "Max",
       ],
       id: "chat-compact-415",
       viewport: { width: 415, height: 780 },
@@ -297,14 +289,14 @@ describe("HRA browser verifier policy", () => {
         : surface),
       controls: [
         { label: "New account", left: 16, right: 464, top: 20, bottom: 64, height: 44 },
-        { label: "Max", left: 450, right: 494, top: 20, bottom: 40, height: 20 },
+        { label: "Tiny control", left: 450, right: 494, top: 20, bottom: 40, height: 20 },
       ],
     })).toEqual([
       "document is 40px wider than its viewport",
       "window is horizontally scrolled by 2px",
       "app header leaves the horizontal viewport",
-      "Max leaves the horizontal viewport",
-      "Max is only 20px tall",
+      "Tiny control leaves the horizontal viewport",
+      "Tiny control is only 20px tall",
     ]);
     expect(responsiveLayoutFailures({
       ariaHiddenFocusableControls: [],
@@ -374,11 +366,11 @@ describe("HRA browser verifier policy", () => {
     }, "Add subscription")).toEqual([]);
   });
 
-  test("measures static titles and effort buttons without padded wrappers", async () => {
+  test("measures static titles without padded wrappers or retired model controls", async () => {
     const source = await Bun.file(new URL("./verify-browser.ts", import.meta.url)).text();
 
     expect(source).not.toContain("element.closest('.chat-pane__identity')");
-    expect(source).not.toContain("element.closest('.model-toggle')");
+    expect(source).not.toContain(".model-toggle");
     expect(source).not.toContain("!element.matches('.hra-wordmark')");
     expect(source).not.toContain(".pane-title-button:disabled");
     expect(source).toContain(".pane-title");

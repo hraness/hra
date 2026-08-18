@@ -26,7 +26,6 @@ const remoteSession = remoteSessionSummaryProjectionSchema.parse({
   sourceRevision: 4,
   title: "Review the desktop build",
   repositoryDisplayName: "Example",
-  modelEffort: "max",
   state: "ready",
   updatedAt: 500,
 });

@@ -89,8 +89,6 @@ test("chat commands reject every unknown renderer field and arbitrary model", ()
           type: "chat.pane.create",
           paneId: "pane_property01",
           repositoryId: "repo_00000000000000000000000000",
-          accountProfileId: null,
-          reasoningEffort: "ultra",
           [key]: value,
         },
       })).toThrow();
@@ -199,7 +197,8 @@ test("every accepted prompt remains below the whole Native request ceiling", () 
       const unitUtf8Bytes = new TextEncoder().encode(unit).byteLength;
       const unitCount = Math.floor(requestedUtf8Bytes / unitUtf8Bytes);
       const remainder = requestedUtf8Bytes - unitCount * unitUtf8Bytes;
-      const prompt = `${unit.repeat(unitCount)}${"a".repeat(remainder)}`;
+      const candidate = `${unit.repeat(unitCount)}${"a".repeat(remainder)}`;
+      const prompt = candidate.trim().length === 0 ? "a" : candidate;
       expect(encodedOuterRequestBytes(prompt))
         .toBeLessThan(runtimeNativeBridgeRequestUtf8ByteLimit);
     },

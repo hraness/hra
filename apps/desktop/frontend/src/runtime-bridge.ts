@@ -109,7 +109,7 @@ function isRuntimeChatCommand(
 ): command is RuntimeChatDomainCommand {
   return command.type === "chat.pane.create" ||
     command.type === "chat.pane.rename" ||
-    command.type === "chat.pane.configure" ||
+    command.type === "chat.pane.workspace.recover" ||
     command.type === "chat.pane.repository.select" ||
     command.type === "chat.pane.remove" ||
     command.type === "chat.panes.reorder" ||

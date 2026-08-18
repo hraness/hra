@@ -4,16 +4,13 @@ import {
   HARNESS_MIN_CONTEXT_BYTES,
   HRA_METAHARNESS_LEGACY_POLICY_VERSION,
   HRA_METAHARNESS_POLICY_VERSION,
-  STANDARD_ACTOR_TURN_ACCELERATION,
   actorBudgetSchema,
   actorIdSchema,
   actorResultSchema,
-  actorTurnAccelerationSchema,
   actorTurnIdSchema,
   actorTurnSchema,
   actorWorkClassSchema,
   isTerminalActorTurnState,
-  type ActorTurnAcceleration,
   type ActorResult,
   type ActorTurn,
 } from "./actor-domain";
@@ -71,7 +68,6 @@ export type RlmV2ActorOperationContract = z.infer<
 const currentActorSpawnArgumentsSchema = z.object({
   title: actorTitleSchema,
   workClass: actorWorkClassSchema,
-  acceleration: actorTurnAccelerationSchema,
   allocation: actorAllocationSchema,
   inputValueId: valueIdSchema,
 }).strict();
@@ -83,8 +79,6 @@ const predecessorActorSpawnArgumentsSchema = z.object({
 const currentActorSendArgumentsSchema = z.object({
   actorId: actorIdSchema,
   inputValueId: valueIdSchema,
-  acceleration: actorTurnAccelerationSchema.optional()
-    .default(STANDARD_ACTOR_TURN_ACCELERATION),
 }).strict();
 const predecessorActorSendArgumentsSchema = z.object({
   actorId: actorIdSchema,
@@ -97,13 +91,11 @@ export type RlmV2ActorSpawnArguments = Readonly<{
   workClass:
     | z.infer<typeof actorWorkClassSchema>
     | "legacyUnclassified";
-  acceleration: ActorTurnAcceleration;
   allocation: z.infer<typeof actorAllocationSchema>;
   inputValueId: string;
 }>;
 
 export type RlmV2ActorSendArguments = Readonly<{
-  acceleration: ActorTurnAcceleration;
   actorId: string;
   inputValueId: string;
 }>;
@@ -300,7 +292,6 @@ export class RlmV2OperationRouter implements RlmV2OperationPort {
             title: input.title,
             policyVersion: input.policyVersion,
             workClass: input.workClass,
-            acceleration: input.acceleration,
             budget: deriveChildBudget(binding, context, input.allocation),
             inputValueId: input.inputValueId,
           })
@@ -317,7 +308,6 @@ export class RlmV2OperationRouter implements RlmV2OperationPort {
             callerActorId: binding.actorId,
             actorId: input.actorId,
             inputValueId: input.inputValueId,
-            acceleration: input.acceleration,
             idempotencyKey: context.receiptId,
           })
         ));
@@ -432,7 +422,6 @@ export function parseRlmV2ActorSpawnArguments(
     return Object.freeze({
       ...input,
       policyVersion: HRA_METAHARNESS_POLICY_VERSION,
-      acceleration: Object.freeze(input.acceleration),
     });
   }
   const input = predecessorActorSpawnArgumentsSchema.parse(value);
@@ -440,7 +429,6 @@ export function parseRlmV2ActorSpawnArguments(
     ...input,
     policyVersion: HRA_METAHARNESS_LEGACY_POLICY_VERSION,
     workClass: "legacyUnclassified",
-    acceleration: STANDARD_ACTOR_TURN_ACCELERATION,
   });
 }
 
@@ -451,16 +439,10 @@ export function parseRlmV2ActorSendArguments(
   const contract = rlmV2ActorOperationContractSchema.parse(contractValue);
   if (contract === "current") {
     const input = currentActorSendArgumentsSchema.parse(value);
-    return Object.freeze({
-      ...input,
-      acceleration: Object.freeze(input.acceleration),
-    });
+    return Object.freeze(input);
   }
   const input = predecessorActorSendArgumentsSchema.parse(value);
-  return Object.freeze({
-    ...input,
-    acceleration: STANDARD_ACTOR_TURN_ACCELERATION,
-  });
+  return Object.freeze(input);
 }
 
 function deriveChildBudget(

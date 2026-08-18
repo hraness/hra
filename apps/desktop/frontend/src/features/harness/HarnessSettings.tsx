@@ -2,10 +2,7 @@ import { useCallback, useState } from "react";
 
 import { NativeSelectField, SwitchField, ToggleButton } from "../../ui";
 
-import type {
-  HarnessAutomaticFastMode,
-  HarnessRefinementMode,
-} from "../../../../contracts/runtime";
+import type { HarnessRefinementMode } from "../../../../contracts/runtime";
 import { type RuntimeShell, useRuntimeShellSelector } from "../../runtime";
 import {
   harnessEqual,
@@ -46,7 +43,6 @@ export function HarnessSettings({ shell }: { readonly shell: RuntimeShell }) {
 
   const updateSettings = useCallback(async (patch: Readonly<Partial<{
     recursiveSessionsEnabled: boolean;
-    automaticFastMode: HarnessAutomaticFastMode;
     contextQuotaBytes: number;
     refinementMode: HarnessRefinementMode;
   }>>) => {
@@ -59,8 +55,6 @@ export function HarnessSettings({ shell }: { readonly shell: RuntimeShell }) {
         expectedRevision: harness.settings.revision,
         recursiveSessionsEnabled: patch.recursiveSessionsEnabled ??
           harness.settings.recursiveSessionsEnabled,
-        automaticFastMode: patch.automaticFastMode ??
-          harness.settings.automaticFastMode,
         contextQuotaBytes: patch.contextQuotaBytes ??
           harness.settings.contextQuotaBytes,
         refinementMode: patch.refinementMode ?? harness.settings.refinementMode,
@@ -102,19 +96,6 @@ export function HarnessSettings({ shell }: { readonly shell: RuntimeShell }) {
           size="compact"
           surface="pane"
           value={String(harness.settings.contextQuotaBytes)}
-        />
-      </div>
-      <div className="harness-refinement-row">
-        <SwitchField
-          description="Let HRA accelerate a critical-path recursive turn when faster inference can shorten the task. This never changes the manual Fast setting on ordinary panes."
-          isDisabled={
-            pending || !runtimeReady || !harness.settings.recursiveSessionsEnabled
-          }
-          isSelected={harness.settings.automaticFastMode === "criticalPath"}
-          label="Automatic Fast for recursive sessions"
-          onChange={(isSelected) => void updateSettings({
-            automaticFastMode: isSelected ? "criticalPath" : "off",
-          })}
         />
       </div>
       <div className="harness-refinement-row">

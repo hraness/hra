@@ -5,6 +5,10 @@ export {
 } from "./chat-service";
 export { CodexChatProvider } from "./codex-chat-provider";
 export {
+  ROOT_TURN_ROUTING_POLICY_VERSION,
+  classifyRootTurnRoutingV1,
+} from "./root-turn-routing-policy-v1";
+export {
   CHAT_MAX_CONTINUATIONS,
   CHAT_MAX_DELTA_UTF8_BYTES,
   CHAT_MAX_HANDOFF_HISTORY_ITEMS,
@@ -16,11 +20,13 @@ export {
   CHAT_MAX_RESPONSE_TAIL_UTF8_BYTES,
   CHAT_MAX_TOOLS_PER_TURN,
   CHAT_MODEL,
+  CHAT_MODELS,
   ChatProviderEffectError,
   type ChatAccountCandidate,
   type ChatAccountPort,
   type ChatAccountProfileId,
   type ChatActivityDelta,
+  type ChatModel,
   type ChatCommandResult,
   type ChatDeltaChannel,
   type ChatHandoffHistory,
@@ -41,6 +47,7 @@ export {
   type ChatProviderTurnRequest,
   type ChatRepository,
   type ChatRepositoryPort,
+  type ChatRootTurnRoutingProjection,
   type ChatRuntimeRecoveryPort,
   type ChatThreadBinding,
   type ChatToolActivity,

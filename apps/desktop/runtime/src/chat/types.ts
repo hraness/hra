@@ -18,9 +18,14 @@ import {
   type ChatUtf8Tail,
 } from "../../../contracts/runtime";
 
-export type { ChatServiceTier } from "../../../contracts/runtime";
+export type {
+  ChatRootTurnRoutingProjection,
+  ChatServiceTier,
+} from "../../../contracts/runtime";
 
 export const CHAT_MODEL = "gpt-5.6-sol" as const;
+export const CHAT_MODELS = [CHAT_MODEL, "gpt-5.6-luna"] as const;
+export type ChatModel = (typeof CHAT_MODELS)[number];
 export const CHAT_MAX_PANES = runtimeChatPaneLimit;
 export const CHAT_MAX_TOOLS_PER_TURN = runtimeChatToolLimit;
 export const CHAT_MAX_CONTINUATIONS = runtimeChatContinuationLimit;
@@ -223,7 +228,7 @@ export interface ChatHarnessActorTurnPort {
 }
 
 export interface ChatProviderConfiguration {
-  readonly model: typeof CHAT_MODEL;
+  readonly model: ChatModel;
   readonly reasoningEffort: ChatReasoningEffort;
   readonly serviceTier?: ChatServiceTier;
   readonly approvalPolicy: "on-request";
@@ -251,13 +256,11 @@ export interface ChatProviderTurnRequest extends ChatProviderConfiguration {
 }
 
 export interface ChatProviderPort {
-  /** Proves the fixed model, requested effort, and service tier are available. */
-  validateConfiguration(
+  /** Resolves the first HRA-ordered candidate from one exact provider catalog. */
+  resolveConfiguration(
     accountProfileId: ChatAccountProfileId,
-    model: typeof CHAT_MODEL,
-    reasoningEffort: ChatReasoningEffort,
-    serviceTier?: ChatServiceTier,
-  ): Promise<void>;
+    candidates: readonly ChatProviderConfiguration[],
+  ): Promise<ChatProviderConfiguration>;
   startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
@@ -267,7 +270,7 @@ export interface ChatProviderPort {
   injectHistory(binding: ChatThreadBinding, history: readonly ChatHistoryItem[]): Promise<void>;
   startTurn(request: ChatProviderTurnRequest): Promise<Readonly<{
     turnId: string;
-    quotaProofCursor?: ChatQuotaProofCursor;
+    quotaProofCursor: ChatQuotaProofCursor;
   }>>;
   interruptTurn(input: ChatThreadBinding & Readonly<{ readonly turnId: string }>): Promise<void>;
 }
@@ -275,6 +278,7 @@ export interface ChatProviderPort {
 export type ChatProviderFailureCode =
   | "quota_reached"
   | "authentication"
+  | "capability_unavailable"
   | "configuration"
   | "runtime"
   | "rejected"
@@ -303,8 +307,6 @@ export type ChatPaneCommand =
       readonly type: "chat.pane.create";
       readonly paneId: ChatPaneId;
       readonly repositoryId: ChatRepositoryId;
-      readonly reasoningEffort: ChatReasoningEffort;
-      readonly serviceTier?: ChatServiceTier | undefined;
     }>
   | Readonly<{
       readonly type: "chat.pane.rename";
@@ -313,11 +315,9 @@ export type ChatPaneCommand =
       readonly title: string;
     }>
   | Readonly<{
-      readonly type: "chat.pane.configure";
+      readonly type: "chat.pane.workspace.recover";
       readonly paneId: ChatPaneId;
       readonly expectedRevision: number;
-      readonly reasoningEffort: ChatReasoningEffort;
-      readonly serviceTier?: ChatServiceTier | undefined;
     }>
   | Readonly<{
       readonly type: "chat.pane.repository.select";

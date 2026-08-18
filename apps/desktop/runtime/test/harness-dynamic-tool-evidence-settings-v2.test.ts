@@ -92,7 +92,6 @@ function fixture(
       workingDirectory: "/tmp/evidence-settings-v2",
     },
     accountProfileId,
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   panes.beginTurn({

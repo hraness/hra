@@ -56,7 +56,6 @@ interface MutableFixture {
   settings: {
     revision: number;
     recursiveSessionsEnabled: boolean;
-    automaticFastMode: "off" | "criticalPath";
     contextQuotaBytes: number;
     refinementMode: "off" | "suggest";
   };
@@ -164,9 +163,6 @@ function openedPane(): ChatPaneProjection {
       name: "example",
     },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
-    serviceTier: "standard",
     interactionMode: "harnessObserver",
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },
@@ -239,7 +235,6 @@ function fixture(): MutableFixture {
     settings: {
       revision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 16 * MIB,
       refinementMode: "suggest",
     },
@@ -382,7 +377,6 @@ function options(value: MutableFixture): HarnessRendererAuthorityV2Options {
         value.settings = {
           revision: value.settings.revision + 1,
           recursiveSessionsEnabled: input.recursiveSessionsEnabled,
-          automaticFastMode: input.automaticFastMode,
           contextQuotaBytes: input.contextQuotaBytes,
           refinementMode: input.refinementMode,
         };
@@ -521,7 +515,6 @@ describe("minimal v2 renderer authority", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "off",
     }) as { result: { harnessRevision: number; settings: { revision: number } } };
@@ -537,7 +530,6 @@ describe("minimal v2 renderer authority", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * MIB,
       refinementMode: "off",
     }), "stale_revision");

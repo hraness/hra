@@ -1548,7 +1548,6 @@ describe("compiled gateway boundary", () => {
             workingDirectory: validRepository,
           },
           accountProfileId: null,
-          reasoningEffort: "ultra",
           now: new Date("2026-08-03T12:00:00.000Z"),
         });
       } finally {
@@ -1617,7 +1616,6 @@ describe("compiled gateway boundary", () => {
           type: "chat.pane.create",
           paneId: livePaneId,
           repositoryId: validRepositoryId,
-          reasoningEffort: "max",
         },
       ));
       await output.readUntil(
@@ -1635,7 +1633,7 @@ describe("compiled gateway boundary", () => {
         ok: true,
         result: {
           type: "chatPane",
-          pane: { id: livePaneId, revision: 1, reasoningEffort: "max" },
+          pane: { id: livePaneId, revision: 1 },
         },
       });
       await output.readUntil(
@@ -1683,7 +1681,6 @@ describe("compiled gateway boundary", () => {
           type: "chat.pane.create",
           paneId: rejectedPaneId,
           repositoryId: symlinkRepositoryId,
-          reasoningEffort: "ultra",
         },
       ));
       await child.stdin.write(dispatchRequest(
@@ -2094,7 +2091,6 @@ describe("compiled gateway boundary", () => {
             type: "chat.pane.create",
             paneId: affectedPaneId,
             repositoryId,
-            reasoningEffort: "ultra",
           },
         ),
         dispatchRequest(
@@ -2104,7 +2100,6 @@ describe("compiled gateway boundary", () => {
             type: "chat.pane.create",
             paneId: unrelatedPaneId,
             repositoryId,
-            reasoningEffort: "max",
           },
         ),
       ].join(""));

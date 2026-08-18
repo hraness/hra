@@ -791,7 +791,7 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
     this.#assertToolset(request.toolsetDigest, "recovery");
     assertMetaharnessTurnRequest(request);
     if (
-      request.requestedAcceleration.mode !== "fast" ||
+      request.requestedServiceTier !== "fast" ||
       request.serviceTier !== "fast" ||
       request.fastReservationId === null
     ) {
@@ -2695,16 +2695,16 @@ function assertMetaharnessTurnRequest(
       profile.modelId === request.modelId &&
       profile.reasoningEffort === request.reasoningEffort,
   );
-  const accelerationRequestsFast = request.requestedAcceleration.mode === "fast";
+  const policyRequestsFast = request.requestedServiceTier === "fast";
   const realizesFast = request.serviceTier === "fast";
   if (
     !profileIsValid ||
-    (realizesFast && !accelerationRequestsFast) ||
+    (realizesFast && !policyRequestsFast) ||
     (realizesFast !== (request.fastReservationId !== null)) ||
     (realizesFast && request.capabilityEvidenceDigest === null) ||
     (realizesFast !== (request.tierFallbackReason === null) &&
-      accelerationRequestsFast) ||
-    (!accelerationRequestsFast && request.tierFallbackReason !== null)
+      policyRequestsFast) ||
+    (!policyRequestsFast && request.tierFallbackReason !== null)
   ) {
     throw new Error("persistent actor turn profile or tier evidence is invalid");
   }

@@ -352,6 +352,7 @@ interface RegisteredHarnessActorThread {
 }
 
 export interface SessionChatTurnStartRequest extends SessionTurnStartRequest {
+  readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly reasoningEffort: "ultra" | "max";
   readonly serviceTier: ChatServiceTier;
 }
@@ -361,6 +362,12 @@ export interface SessionChatTurnStartResult {
   readonly turnId: string;
   readonly generation: number;
   readonly streamPosition: CodexStreamPosition;
+}
+
+export interface SessionChatConfigurationCandidate {
+  readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
+  readonly reasoningEffort: "ultra" | "max";
+  readonly serviceTier: ChatServiceTier;
 }
 
 export interface SessionThreadStartResult {
@@ -379,6 +386,7 @@ export interface SessionChatThreadResumeRequest {
   readonly threadId: ThreadSummary["id"];
   /** Raw Codex identity used only to rebuild the in-memory registry. */
   readonly restartThreadId: string;
+  readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly serviceTier: ChatServiceTier;
   readonly title: string;
   readonly workspacePath: string;
@@ -1965,6 +1973,7 @@ export class SessionService {
     const thread = await this.#startThread({
       accountProfileId: request.accountProfileId,
       laneMode: request.workspaceMode,
+      model: "gpt-5.6-sol",
       projectId: project.id,
       serviceTier: request.serviceTier ?? "standard",
       title: request.title,
@@ -1977,6 +1986,7 @@ export class SessionService {
     await this.#startTurn({
       clientUserMessageId: request.clientUserMessageId,
       input: { type: "text", text: request.prompt },
+      model: "gpt-5.6-sol",
       reasoningEffort: request.reasoningEffort ?? "max",
       serviceTier: request.serviceTier ?? "standard",
       threadId: request.threadId,
@@ -1986,48 +1996,73 @@ export class SessionService {
     return thread;
   }
 
-  async validateChatConfiguration(
+  async resolveChatConfiguration(
     accountProfileId: AccountSummary["id"],
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra" | "max",
-    serviceTier: ChatServiceTier,
-  ): Promise<void> {
+    candidates: readonly SessionChatConfigurationCandidate[],
+  ): Promise<SessionChatConfigurationCandidate> {
+    if (candidates.length === 0 || candidates.length > 8) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "HRA supplied an invalid root routing candidate chain.",
+        false,
+        "none",
+      );
+    }
+    const byModel = new Map<string, Readonly<{
+      reasoningEfforts: readonly string[];
+      serviceTiers: readonly string[];
+    }>>();
+    let expectedGeneration: number | null = null;
     let cursor: string | null = null;
     const seenCursors = new Set<string>();
-    for (let page = 0; page < 4; page += 1) {
+    let complete = false;
+    for (let page = 0; page < 8; page += 1) {
       const response = await this.#commands.modelList(accountProfileId, {
         cursor,
         limit: 256,
         includeHidden: true,
-      });
-      const candidate = response.output.data.find((entry) => entry.model === model);
-      if (candidate !== undefined) {
-        if (!candidate.supportedReasoningEfforts.some(
-          (entry) => entry.reasoningEffort === reasoningEffort,
-        )) {
-          throw new SessionServiceError(
-            "capability_unavailable",
-            "The selected reasoning effort is unavailable for this Codex account.",
-            false,
-            "none",
-          );
-        }
+      }, expectedGeneration ?? undefined);
+      if (expectedGeneration === null) {
+        expectedGeneration = response.generation;
+      } else if (response.generation !== expectedGeneration) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Codex changed generation while listing the model catalog.",
+          false,
+          "restartRuntime",
+        );
+      }
+      for (const entry of response.output.data) {
+        const normalized = Object.freeze({
+          reasoningEfforts: Object.freeze(
+            [...new Set(entry.supportedReasoningEfforts.map(
+              ({ reasoningEffort: effort }) => effort,
+            ))].toSorted(),
+          ),
+          serviceTiers: Object.freeze(
+            [...new Set(entry.serviceTiers.map(({ id }) => id))].toSorted(),
+          ),
+        });
+        const previous = byModel.get(entry.model);
         if (
-          serviceTier === "fast" &&
-          !candidate.serviceTiers.some((entry) => entry.id === "fast")
+          previous !== undefined &&
+          JSON.stringify(previous) !== JSON.stringify(normalized)
         ) {
           throw new SessionServiceError(
-            "capability_unavailable",
-            "Fast mode is unavailable for this Codex account.",
+            "protocol_error",
+            "Codex returned conflicting capability rows for one model.",
             false,
-            "none",
+            "restartRuntime",
           );
         }
-        return;
+        byModel.set(entry.model, normalized);
       }
-      cursor = response.output.nextCursor;
-      if (cursor === null) break;
-      if (seenCursors.has(cursor)) {
+      const nextCursor = response.output.nextCursor;
+      if (nextCursor === null) {
+        complete = true;
+        break;
+      }
+      if (seenCursors.has(nextCursor)) {
         throw new SessionServiceError(
           "protocol_error",
           "Codex returned a cyclic model catalog.",
@@ -2035,11 +2070,31 @@ export class SessionService {
           "restartRuntime",
         );
       }
-      seenCursors.add(cursor);
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    if (!complete) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex model catalog exceeded the bounded page limit.",
+        false,
+        "restartRuntime",
+      );
+    }
+    for (const candidate of candidates) {
+      const capability = byModel.get(candidate.model);
+      if (
+        capability !== undefined &&
+        capability.reasoningEfforts.includes(candidate.reasoningEffort) &&
+        (
+          candidate.serviceTier === "standard" ||
+          capability.serviceTiers.includes("fast")
+        )
+      ) return candidate;
     }
     throw new SessionServiceError(
       "capability_unavailable",
-      "The required Codex model is unavailable for this account.",
+      "No HRA root routing candidate is available for this account.",
       false,
       "none",
     );
@@ -2132,9 +2187,22 @@ export class SessionService {
 
   async startChatThread(
     request: Omit<SessionThreadStartRequest, "serviceTier" | "workspaceMode"> &
-      Readonly<{ readonly serviceTier: ChatServiceTier }>,
+      Readonly<{
+        readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
+        readonly serviceTier: ChatServiceTier;
+      }>,
   ): Promise<SessionChatThreadStartResult> {
-    const result = await this.startThread({ ...request, workspaceMode: "local" });
+    validateLaunchTitle(request.title);
+    const project = await this.#registerProject(request.workspacePath);
+    const thread = await this.#startThread({
+      accountProfileId: request.accountProfileId,
+      laneMode: "local",
+      model: request.model,
+      projectId: project.id,
+      serviceTier: request.serviceTier,
+      title: request.title,
+    });
+    const result = { project, thread };
     const binding = this.#registry.requireBinding(result.thread.id);
     return { ...result, restartThreadId: binding.codexThreadId };
   }
@@ -2174,7 +2242,7 @@ export class SessionService {
     }
     const positioned = await this.#commands.threadResume(request.accountProfileId, {
       threadId: request.restartThreadId,
-      model: "gpt-5.6-sol",
+      model: request.model,
       serviceTier: codexServiceTier(request.serviceTier),
       cwd: project.displayPath,
       approvalPolicy: "on-request",
@@ -2262,6 +2330,7 @@ export class SessionService {
     const positioned = await this.#startTurn({
       clientUserMessageId: request.clientUserMessageId,
       input: { type: "text", text: request.prompt },
+      model: request.model,
       reasoningEffort: request.reasoningEffort,
       serviceTier: request.serviceTier,
       threadId: request.threadId,
@@ -2909,6 +2978,7 @@ export class SessionService {
   async #startThread(command: {
     readonly accountProfileId: AccountSummary['id'];
     readonly laneMode: WorkspaceLaneSummary['mode'];
+    readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
     readonly projectId: ProjectSummary['id'];
     readonly serviceTier: ChatServiceTier;
     readonly title: string;
@@ -2920,7 +2990,7 @@ export class SessionService {
     const positioned = await this.#commands.threadStart(
       command.accountProfileId,
       {
-        model: "gpt-5.6-sol",
+        model: command.model,
         serviceTier: codexServiceTier(command.serviceTier),
         cwd: project.displayPath,
         approvalPolicy: "on-request",
@@ -3000,6 +3070,7 @@ export class SessionService {
   async #startTurn(command: {
     readonly clientUserMessageId: string;
     readonly input: Readonly<{ readonly type: "text"; readonly text: string }>;
+    readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
     readonly reasoningEffort: "ultra" | "max";
     readonly serviceTier: ChatServiceTier;
     readonly threadId: ThreadSummary['id'];
@@ -3021,7 +3092,7 @@ export class SessionService {
           excludeTmpdirEnvVar: false,
           excludeSlashTmp: false,
         },
-        model: "gpt-5.6-sol",
+        model: command.model,
         effort: command.reasoningEffort,
         serviceTier: codexServiceTier(command.serviceTier),
       },

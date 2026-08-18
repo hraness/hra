@@ -6,8 +6,7 @@ import {
   type ChatPaneProjection,
   type ChatPaneActivityKind,
   type ChatPaneState,
-  type ChatReasoningEffort,
-  type ChatServiceTier,
+  type ChatRootTurnRoutingProjection,
   type ChatToolCategory,
   type HarnessSnapshot,
   type HumanAccountSnapshot,
@@ -282,6 +281,63 @@ export function paneStatusLabel(state: ChatPaneState): string {
     case "attention":
       return "Needs attention";
   }
+}
+
+export interface RootTurnRoutePresentation {
+  readonly accessibleLabel: string;
+  readonly label: string;
+}
+
+function rootTurnProfileLabel(
+  profile: ChatRootTurnRoutingProjection["requestedProfile"],
+): string {
+  return profile === "lunaMax"
+    ? "Luna Max"
+    : profile === "solMax"
+      ? "Sol Max"
+      : "Sol Ultra";
+}
+
+function rootTurnServiceTierLabel(
+  tier: ChatRootTurnRoutingProjection["requestedServiceTier"],
+): string {
+  return tier === "fast" ? "Fast" : "Standard";
+}
+
+/** Renderer-safe presentation of HRA's active or latest pre-effect route. */
+export function rootTurnRoutePresentation(
+  routing: ChatRootTurnRoutingProjection | null,
+): RootTurnRoutePresentation | null {
+  if (routing === null) return null;
+  if (
+    routing.selectedProfile === null ||
+    routing.selectedServiceTier === null
+  ) {
+    return {
+      accessibleLabel: "HRA has not resolved this turn's dispatch route.",
+      label: "Route · Unresolved",
+    };
+  }
+  const requestedProfile = rootTurnProfileLabel(routing.requestedProfile);
+  const selectedProfile = rootTurnProfileLabel(routing.selectedProfile);
+  const requestedTier = rootTurnServiceTierLabel(routing.requestedServiceTier);
+  const selectedTier = rootTurnServiceTierLabel(routing.selectedServiceTier);
+  const fallbackExplanations = [
+    routing.profileFallbackReason === "lunaUnavailable"
+      ? "Luna configuration was unavailable on the selected subscription"
+      : null,
+    routing.serviceTierFallbackReason === "fastUnavailable"
+      ? "Fast service was unavailable on the selected subscription"
+      : null,
+  ].filter((value): value is string => value !== null);
+  const fallback = fallbackExplanations.length === 0
+    ? ""
+    : ` ${fallbackExplanations.join(" and ")}, so HRA used its fallback before dispatch.`;
+  return {
+    accessibleLabel:
+      `HRA requested ${requestedProfile} at ${requestedTier} and selected ${selectedProfile} at ${selectedTier} for dispatch.${fallback}`,
+    label: `Route · ${selectedProfile} · ${selectedTier}`,
+  };
 }
 
 export function toolCategoryLabel(category: ChatToolCategory): string {
@@ -805,18 +861,12 @@ export function runtimeAvailabilityEqual(
 export function createPaneCommand(input: Readonly<{
   paneId: ChatPaneProjection["id"];
   repositoryId: ChatPaneProjection["repository"]["id"];
-  reasoningEffort?: ChatReasoningEffort;
-  serviceTier?: ChatServiceTier;
 }>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.pane.create" }> {
-  const command = {
+  return {
     type: "chat.pane.create",
     paneId: input.paneId,
     repositoryId: input.repositoryId,
-    reasoningEffort: input.reasoningEffort ?? "max",
-  } as const;
-  return input.serviceTier === undefined
-    ? command
-    : { ...command, serviceTier: input.serviceTier };
+  };
 }
 
 export function reorderPanesCommand(
@@ -840,20 +890,11 @@ export function renamePaneCommand(input: Readonly<{
   return { type: "chat.pane.rename", ...input };
 }
 
-export function configurePaneCommand(input: Readonly<{
+export function recoverPaneWorkspaceCommand(input: Readonly<{
   paneId: ChatPaneProjection["id"];
   expectedRevision: number;
-  reasoningEffort: ChatReasoningEffort;
-  serviceTier?: ChatServiceTier;
-}>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.pane.configure" }> {
-  return input.serviceTier === undefined
-    ? {
-        type: "chat.pane.configure",
-        paneId: input.paneId,
-        expectedRevision: input.expectedRevision,
-        reasoningEffort: input.reasoningEffort,
-      }
-    : { type: "chat.pane.configure", ...input };
+}>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.pane.workspace.recover" }> {
+  return { type: "chat.pane.workspace.recover", ...input };
 }
 
 export function selectPaneRepositoryCommand(input: Readonly<{
@@ -894,7 +935,6 @@ export function updateHarnessSettingsCommand(input: Readonly<{
   expectedHarnessRevision: number;
   expectedRevision: number;
   recursiveSessionsEnabled: boolean;
-  automaticFastMode: HarnessSnapshot["settings"]["automaticFastMode"];
   contextQuotaBytes: number;
   refinementMode: HarnessSnapshot["settings"]["refinementMode"];
 }>): Extract<RuntimeHarnessDomainCommand, { readonly type: "harness.settings.update" }> {
