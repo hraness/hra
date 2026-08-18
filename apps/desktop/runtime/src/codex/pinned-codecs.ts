@@ -583,8 +583,6 @@ const threadItemSchema = rawThreadItemSchema.transform((item) => {
     case "hookPrompt":
     case "mcpToolCall":
     case "dynamicToolCall":
-    case "collabAgentToolCall":
-    case "subAgentActivity":
     case "webSearch":
     case "imageView":
     case "sleep":
@@ -593,6 +591,27 @@ const threadItemSchema = rawThreadItemSchema.transform((item) => {
     case "exitedReviewMode":
     case "contextCompaction":
       return { type: item.type, id: item.id };
+    case "collabAgentToolCall":
+      return {
+        type: item.type,
+        id: item.id,
+        tool: item.tool,
+        status: item.status,
+        receiverThreadIds: Object.freeze([...item.receiverThreadIds]),
+        agentsStates: Object.freeze(Object.fromEntries(
+          Object.entries(item.agentsStates).map(([agentThreadId, state]) => [
+            agentThreadId,
+            Object.freeze({ status: state!.status }),
+          ]),
+        )),
+      };
+    case "subAgentActivity":
+      return {
+        type: item.type,
+        id: item.id,
+        kind: item.kind,
+        agentThreadId: item.agentThreadId,
+      };
   }
 });
 
@@ -1512,7 +1531,7 @@ export const codexNotificationDispositions = Object.freeze({
   "externalAgentConfig/import/completed": "ignored",
   "fs/changed": "ignored",
   "item/reasoning/summaryTextDelta": "routed",
-  "item/reasoning/summaryPartAdded": "ignored",
+  "item/reasoning/summaryPartAdded": "routed",
   "item/reasoning/textDelta": "discarded",
   "thread/compacted": "ignored",
   "model/rerouted": "routed",
@@ -1667,6 +1686,10 @@ const deltaSchema = activityReferenceSchema.extend({
 const reasoningSummaryDeltaSchema = deltaSchema.extend({
   summaryIndex: safeNonNegativeIntegerSchema,
 });
+const reasoningSummaryPartAddedSchema = activityReferenceSchema.extend({
+  itemId: idSchema,
+  summaryIndex: safeNonNegativeIntegerSchema,
+});
 const discardedReasoningDeltaSchema = deltaSchema.extend({
   contentIndex: safeNonNegativeIntegerSchema,
 }).transform(() => undefined);
@@ -1698,6 +1721,9 @@ export type PinnedCodexItemLifecycle =
   | z.infer<typeof itemCompletedSchema>;
 export type PinnedCodexDelta = z.infer<typeof deltaSchema>;
 export type PinnedCodexReasoningSummaryDelta = z.infer<typeof reasoningSummaryDeltaSchema>;
+export type PinnedCodexReasoningSummaryPartAdded = z.infer<
+  typeof reasoningSummaryPartAddedSchema
+>;
 export type PinnedCodexServerRequestResolved = z.infer<typeof resolvedRequestSchema>;
 export type PinnedCodexThreadReference = z.infer<typeof threadReferenceSchema>;
 export type PinnedCodexThreadStatusChanged = z.infer<typeof threadStatusChangedSchema>;
@@ -1758,6 +1784,10 @@ export type ParsedCodexNotification =
       params: PinnedCodexReasoningSummaryDelta;
     }>
   | Readonly<{
+      method: "item/reasoning/summaryPartAdded";
+      params: PinnedCodexReasoningSummaryPartAdded;
+    }>
+  | Readonly<{
       method: "serverRequest/resolved";
       params: PinnedCodexServerRequestResolved;
     }>
@@ -1812,6 +1842,8 @@ export function parseCodexNotification(
         return { method, params: deltaSchema.parse(params) };
       case "item/reasoning/summaryTextDelta":
         return { method, params: reasoningSummaryDeltaSchema.parse(params) };
+      case "item/reasoning/summaryPartAdded":
+        return { method, params: reasoningSummaryPartAddedSchema.parse(params) };
       case "serverRequest/resolved":
         return { method, params: resolvedRequestSchema.parse(params) };
       case "model/rerouted":
@@ -2063,13 +2095,15 @@ type NotificationAssociationView<M extends AssociatedNotificationMethod> =
                       ? z.input<typeof deltaSchema>
                       : M extends "item/reasoning/summaryTextDelta"
                         ? z.input<typeof reasoningSummaryDeltaSchema>
-                        : M extends "item/reasoning/textDelta"
-                          ? z.input<typeof discardedReasoningDeltaSchema>
-                          : M extends "model/rerouted"
-                            ? z.input<typeof modelReroutedSchema>
-                          : M extends "serverRequest/resolved"
-                            ? PinnedCodexServerRequestResolved
-                            : never;
+                        : M extends "item/reasoning/summaryPartAdded"
+                          ? z.input<typeof reasoningSummaryPartAddedSchema>
+                          : M extends "item/reasoning/textDelta"
+                            ? z.input<typeof discardedReasoningDeltaSchema>
+                            : M extends "model/rerouted"
+                              ? z.input<typeof modelReroutedSchema>
+                            : M extends "serverRequest/resolved"
+                              ? PinnedCodexServerRequestResolved
+                              : never;
 type NotificationPayloadCompatibility = {
   readonly [M in AssociatedNotificationMethod]:
     WireShape<NormalizeGenerated<GeneratedNotificationParams<M>>> extends NotificationAssociationView<M>
@@ -2126,6 +2160,7 @@ export const pinnedCodexInboundAssociationWitness = Object.freeze({
     "account/updated": true,
     "account/rateLimits/updated": true,
     "item/reasoning/summaryTextDelta": true,
+    "item/reasoning/summaryPartAdded": true,
     "item/reasoning/textDelta": true,
     "model/rerouted": true,
     "account/login/completed": true,

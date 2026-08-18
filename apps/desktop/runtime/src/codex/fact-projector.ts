@@ -2,6 +2,7 @@ import type {
   CodexFact,
   CodexFactOrigin,
   CodexItemSnapshot,
+  CodexProviderAgentObservation,
   CodexThreadSnapshot,
   CodexToolActivity,
   CodexTurnSnapshot,
@@ -16,7 +17,10 @@ import type {
   PinnedCodexThreadItem,
   PinnedCodexTurn,
 } from "./pinned-protocol";
-import { boundedCodexDisplayText } from "./safe-display";
+import {
+  boundedCodexDisplayText,
+  MAX_CODEX_FACT_DISPLAY_TEXT_UTF8_BYTES,
+} from "./safe-display";
 
 export interface FactProjectionContext {
   readonly accountProfileId: string;
@@ -172,20 +176,28 @@ export function projectCodexNotificationFacts(
       }]);
     case "item/started": {
       const started = projectStartedItem(notification.params.item);
+      const providerAgents = projectProviderAgentObservations(
+        notification.params.item,
+      );
       return started === null
         ? Object.freeze([])
         : facts(context, [{
             type: "item.started",
             ...started,
+            ...(providerAgents.length === 0 ? {} : { providerAgents }),
             threadId: notification.params.threadId,
             turnId: notification.params.turnId,
           }]);
     }
     case "item/completed": {
       const item = projectCodexItemSnapshot(notification.params.item);
+      const providerAgents = projectProviderAgentObservations(
+        notification.params.item,
+      );
       return facts(context, [{
         type: "item.completed",
         item,
+        ...(providerAgents.length === 0 ? {} : { providerAgents }),
         threadId: notification.params.threadId,
         turnId: notification.params.turnId,
       }]);
@@ -211,11 +223,17 @@ export function projectCodexNotificationFacts(
         channel: "reasoning_summary",
         delta: display.text,
         itemId: notification.params.itemId,
+        summaryIndex: notification.params.summaryIndex,
         threadId: notification.params.threadId,
         truncated: display.truncated,
         turnId: notification.params.turnId,
       }]);
       }
+    case "item/reasoning/summaryPartAdded":
+      // The index-only marker is parsed so provider drift is fail-closed. The
+      // content-bearing summary delta and authoritative completion carry all
+      // state required by the ordered accumulator.
+      return Object.freeze([]);
     case "account/updated":
       return facts(context, [{
         type: "account.profile_updated",
@@ -272,7 +290,6 @@ export function projectCodexNotificationFacts(
     case "item/fileChange/outputDelta":
     case "item/mcpToolCall/progress":
     case "item/plan/delta":
-    case "item/reasoning/summaryPartAdded":
     case "item/reasoning/textDelta":
     case "mcpServer/oauthLogin/completed":
     case "mcpServer/startupStatus/updated":
@@ -362,12 +379,16 @@ export function projectCodexThreadSnapshot(
 }
 
 export function projectCodexTurnSnapshot(turn: PinnedCodexTurn): CodexTurnSnapshot {
+  const providerAgents = turn.itemsView === "full"
+    ? projectProviderAgentObservationsForItems(turn.items)
+    : Object.freeze([]);
   return {
     completedAt: timestamp(turn.completedAt),
     id: turn.id,
     items: turn.itemsView === "full"
       ? Object.freeze(turn.items.map(projectCodexItemSnapshot))
       : null,
+    ...(providerAgents.length === 0 ? {} : { providerAgents }),
     ...("quotaProof" in turn ? { quotaProof: turn.quotaProof } : {}),
     startedAt: timestamp(turn.startedAt),
     status: turnStatus(turn.status),
@@ -382,10 +403,15 @@ export function projectCodexItemSnapshot(item: PinnedCodexThreadItem): CodexItem
     }
     case "plan": {
       const display = boundedCodexDisplayText(item.text);
-      return { id: item.id, kind: "reasoning_summary", ...display };
+      return {
+        id: item.id,
+        kind: "reasoning_summary",
+        summaryParts: Object.freeze([display.text]),
+        ...display,
+      };
     }
     case "reasoning": {
-      const display = boundedCodexDisplayText(item.summary.join("\n"));
+      const display = boundedReasoningSummary(item.summary);
       return {
         ...display,
         id: item.id,
@@ -422,6 +448,100 @@ export function projectCodexItemSnapshot(item: PinnedCodexThreadItem): CodexItem
     case "contextCompaction":
       return toolSnapshot(item, "other", "completed");
   }
+}
+
+function projectProviderAgentObservations(
+  item: PinnedCodexThreadItem,
+): readonly CodexProviderAgentObservation[] {
+  if (item.type === "subAgentActivity") {
+    return [{
+      agentId: item.agentThreadId,
+      status: item.kind === "started"
+        ? "starting"
+        : item.kind === "interacted"
+          ? "running"
+          : "terminal",
+    }];
+  }
+  if (item.type !== "collabAgentToolCall") return Object.freeze([]);
+
+  const observations = new Map<string, "running" | "starting" | "terminal">();
+  const fallback = collabFallbackStatus(item);
+  if (fallback !== null) {
+    for (const agentId of item.receiverThreadIds) observations.set(agentId, fallback);
+  }
+  for (const [agentId, state] of Object.entries(item.agentsStates)) {
+    if (state === undefined) continue;
+    observations.set(agentId, collabAgentStatus(state.status));
+  }
+  return Object.freeze([...observations.entries()].map(([agentId, status]) =>
+    Object.freeze({ agentId, status })
+  ));
+}
+
+function projectProviderAgentObservationsForItems(
+  items: readonly PinnedCodexThreadItem[],
+): readonly CodexProviderAgentObservation[] {
+  const observations = new Map<string, CodexProviderAgentObservation["status"]>();
+  for (const item of items) {
+    for (const observation of projectProviderAgentObservations(item)) {
+      observations.set(observation.agentId, observation.status);
+    }
+  }
+  return Object.freeze([...observations.entries()].map(([agentId, status]) =>
+    Object.freeze({ agentId, status })
+  ));
+}
+
+function collabFallbackStatus(
+  item: Extract<PinnedCodexThreadItem, { type: "collabAgentToolCall" }>,
+): "running" | "starting" | "terminal" | null {
+  if (item.tool === "wait") return null;
+  if (item.status === "failed" || item.tool === "closeAgent") return "terminal";
+  if (item.tool === "spawnAgent" && item.status === "inProgress") return "starting";
+  return "running";
+}
+
+function collabAgentStatus(
+  status: Extract<PinnedCodexThreadItem, { type: "collabAgentToolCall" }>["agentsStates"][string]["status"],
+): "running" | "starting" | "terminal" {
+  return status === "pendingInit"
+    ? "starting"
+    : status === "running"
+      ? "running"
+      : "terminal";
+}
+
+function boundedReasoningSummary(parts: readonly string[]): Readonly<{
+  summaryParts: readonly string[];
+  text: string;
+  truncated: boolean;
+}> {
+  const retained: string[] = [];
+  let remaining = MAX_CODEX_FACT_DISPLAY_TEXT_UTF8_BYTES;
+  let truncated = false;
+  for (let index = 0; index < parts.length; index += 1) {
+    if (index > 0) {
+      if (remaining === 0) {
+        truncated = true;
+        break;
+      }
+      remaining -= 1;
+    }
+    const display = boundedCodexDisplayText(parts[index] ?? "", remaining);
+    retained.push(display.text);
+    remaining -= new TextEncoder().encode(display.text).byteLength;
+    if (display.truncated) {
+      truncated = true;
+      break;
+    }
+  }
+  if (retained.length < parts.length) truncated = true;
+  return Object.freeze({
+    summaryParts: Object.freeze(retained),
+    text: retained.join("\n"),
+    truncated,
+  });
 }
 
 function projectStartedItem(item: PinnedCodexThreadItem): Readonly<{

@@ -10,6 +10,8 @@
 - `session-registry.ts` – bounded gateway-only project, binding, active-turn, and legacy summary routing.
 - `fact-dispatch-adapter.ts` – exact owned-fact adaptation to gateway-only dispatch events.
 - `identity.ts` – stable account-scoped owned identifiers.
+- `reasoning-summary-accumulator.ts` – generation-scoped ordered summary-part accumulation, suffix-only completion reconciliation, terminal proof, and privacy cuts.
+- `provider-subagent-projection.ts` – bounded active provider-agent identity, semantic status, opaque renderer rows, lifecycle clearing, and privacy cuts.
 - `session-service.ts` – gateway-only orchestration of typed commands, exact-generation production-policy receipts, and the state, registry, hydration, interaction, tool-activity, and dispatch components.
 
 # Guidelines
@@ -25,9 +27,11 @@
 - Forget settled interactions and terminal operation rows after their positioned facts advance the cursor. Clear generation-scoped tombstones and auxiliary tool caches at replacement boundaries.
 - Purge semantic state, bindings, active authority, auxiliary caches, and path-bearing project indexes synchronously after the durable account service emits `account.removed`.
 - Project only the latest useful turn activity to trusted gateway consumers. Never expose raw reasoning; use concise reasoning-summary notifications and bounded status text.
+- Render a terminal reasoning summary only from a verified item-completion receipt. Preserve ordered `summaryIndex` identity, allow only an exact missing suffix to reconcile, and taint middle gaps, conflicting content, changed cursors, and late activity.
+- Keep provider collaboration identity generation- and parent-turn-scoped. Project only generation-local opaque bounded labels with starting or running status, make terminal and interrupted status absorbing, clear all rows at generation replacement, and keep these observational rows distinct from durable HRA descendants.
 - Derive cloud activity only from allowlisted method and item-type facts on the exact owned active turn. Copy only the bounded `delta` field from reasoning-summary and assistant-message notifications; never forward a raw notification object or server-request parameters.
 - Treat thread and turn mutations as ambiguous after a lost response. Do not automatically replay them.
 - Preflight managed execution requirements in the exact generation before every ordinary chat, actor, recovery, resume, thread-start, and turn-start mutation. Admit only the immutable `never`/`auto_review`/danger-full-access policy, verify returned thread settings, and retain an opaque receipt only for the exact active generation. Never retry with weaker settings.
 - Preserve each thread's admitted lane mode across positioned reads and turn reconciliation. Lane mode identifies workspace lifecycle and containment only; it never weakens or selects the production Codex sandbox.
-- Accept launch workspaces only through the trusted gateway seam after a coordinator has selected the account and resolved a Native-chosen repository. Never add provider launch, queue, or steer operations to the renderer command union; the renderer can name only an app-owned pane and turn.
+- Accept launch workspaces only through the trusted gateway seam after a coordinator has selected the account and resolved a Native-chosen repository. Renderer commands may mutate only the app-owned message ledger and name app-owned pane, message, and logical-turn fences. Session steering remains gateway-only, requires the exact verified production-policy generation, and never exposes a provider thread or turn.
 - Give each supported non-secret input request one exact local deadline and at most one JSON-RPC response. Reject every approval request before projection because production policy forbids approvals. Reject a persistence binding that changes the projected public request. Release all volatile authority when its process generation ends. Return synchronous application failure as one typed outcome to the sync owner; reserve expiry callbacks for asynchronous provider/deadline events.
