@@ -363,6 +363,10 @@ describe("local task SQLite migrations", () => {
             version: 46,
             name: "actor-turn-requested-service-tier-authority",
           },
+          {
+            version: 47,
+            name: "durable-app-owned-chat-message-ledger",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -375,6 +379,12 @@ describe("local task SQLite migrations", () => {
         "human_custody_pointer_quarantine",
         "cloud_invalidation_heads",
         "chat_assistant_item_receipts",
+        "chat_attachment_draft_leases",
+        "chat_attachment_turn_leases",
+        "chat_attachment_vault_state",
+        "chat_attachments",
+        "chat_message_attachment_refs",
+        "chat_message_ledger",
         "chat_pane_history",
         "chat_pane_workspace_bindings",
         "chat_panes",
@@ -867,6 +877,12 @@ describe("local task SQLite migrations", () => {
         ORDER BY name
       `).all().map(({ name }) => name)).toEqual([
         "chat_assistant_item_receipts",
+        "chat_attachment_draft_leases",
+        "chat_attachment_turn_leases",
+        "chat_attachment_vault_state",
+        "chat_attachments",
+        "chat_message_attachment_refs",
+        "chat_message_ledger",
         "chat_pane_history",
         "chat_pane_workspace_bindings",
         "chat_panes",

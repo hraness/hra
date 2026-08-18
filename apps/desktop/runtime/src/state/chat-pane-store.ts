@@ -4,6 +4,7 @@ import {
   accountProfileIdSchema,
   chatAttentionCodeSchema,
   chatIsoDateTimeSchema,
+  chatMessageIdSchema,
   chatPaneIdSchema,
   chatPaneActivitySchema,
   chatPaneActivityKindSchema,
@@ -24,10 +25,38 @@ import {
   chatTurnIdSchema,
   harnessActorIdSchema,
   type ChatAttention,
+  type ChatMessageQueueProjection,
   type ChatPaneProjection,
   type ChatToolCategory,
   type ChatToolProjection,
 } from "../../../contracts/runtime";
+import {
+  CHAT_MESSAGE_MAX_ACTIVE_PER_PANE,
+  CHAT_MESSAGE_MAX_UTF8_BYTES_PER_PANE,
+  CHAT_MESSAGE_MAX_UTF8_BYTES_TOTAL,
+  chatMessageLedgerRowSchema,
+  chatMessageQueueMetadataRowSchema,
+  SQLiteChatMessageAttachmentAuthority,
+  parseChatMessageContent,
+  parseChatMessageQueueProjection,
+  projectQueuePauseReason,
+  storeQueuePauseReason,
+  type ChatMessageAttachmentAuthority,
+  type ChatMessageClaim,
+  type ChatMessageClaimInput,
+  type ChatMessageClaimResult,
+  type ChatMessageEditInput,
+  type ChatMessageEnqueueAndSteerInput,
+  type ChatMessageEnqueueAndSteerResult,
+  type ChatMessageEnqueueInput,
+  type ChatMessageLedgerRow,
+  type ChatMessageQueueMetadataRow,
+  type ChatMessageQueuePauseInput,
+  type ChatMessageQueueResumeInput,
+  type ChatMessageRowCasInput,
+  type ChatMessageTransitionInput,
+  type StoredChatMessageState,
+} from "./chat-message-ledger";
 import {
   CHAT_MAX_CONTINUATIONS,
   CHAT_MAX_ASSISTANT_RECONCILIATION_UTF8_BYTES,
@@ -178,6 +207,14 @@ const paneRowSchema = z.object({
   attention_message: z.string().min(1).max(240).nullable(),
   attention_retryable: nullableStoredBooleanSchema,
   history_truncated: storedBooleanSchema,
+  message_queue_revision: z.number().int().positive().safe(),
+  next_message_ordinal: z.number().int().positive().safe(),
+  message_queue_pause_reason: z.enum([
+    "stop",
+    "runtime_restart",
+    "attention",
+    "ambiguous_effect",
+  ]).nullable(),
   created_at: isoDateTimeSchema,
   updated_at: isoDateTimeSchema,
   routing_policy_version: z.literal(1).nullable(),
@@ -227,6 +264,11 @@ const historyRowSchema = z.object({
 
 const countRowSchema = z.object({ count: z.number().int().nonnegative().safe() }).strict();
 const bytesRowSchema = z.object({ bytes: z.number().int().nonnegative().safe() }).strict();
+const chatMessagePayloadTotalsSchema = z.object({
+  active_count: z.number().int().nonnegative().safe(),
+  pane_bytes: z.number().int().nonnegative().safe(),
+  global_bytes: z.number().int().nonnegative().safe(),
+}).strict();
 const sequenceRowSchema = z.object({ sequence: z.number().int().positive().safe() }).strict();
 const assistantReceiptRowSchema = z.object({
   completion_sha256: z.string().length(64).regex(/^[0-9a-f]+$/u),
@@ -359,10 +401,18 @@ export type ChatAssistantCompletionResult =
 export class ChatPaneStore {
   readonly #database: Database;
   readonly #rootTurnRouting: RootTurnRoutingSQLiteAuthorityV1;
+  readonly #messageAttachmentAuthority: ChatMessageAttachmentAuthority;
 
-  constructor(database: Database) {
+  constructor(
+    database: Database,
+    options: Readonly<{
+      messageAttachmentAuthority?: ChatMessageAttachmentAuthority;
+    }> = {},
+  ) {
     this.#database = database;
     this.#rootTurnRouting = new RootTurnRoutingSQLiteAuthorityV1(database);
+    this.#messageAttachmentAuthority = options.messageAttachmentAuthority ??
+      new SQLiteChatMessageAttachmentAuthority(database);
   }
 
   list(): readonly ChatPaneProjection[] {
@@ -382,6 +432,499 @@ export class ChatPaneStore {
     const pane = this.get(paneId);
     if (pane === null) throw new ChatPaneStoreError("not_found", "This chat pane no longer exists.");
     return pane;
+  }
+
+  /** Complete, FIFO-ordered renderer projection of the currently queued rows. */
+  messageQueue(paneId: ChatPaneId): ChatMessageQueueProjection {
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      return this.#messageQueueProjection(metadata);
+    })();
+  }
+
+  enqueueMessage(input: ChatMessageEnqueueInput): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    validateRevision(input.expectedQueueRevision);
+    const content = parseChatMessageContent(input.content);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueRevision(
+        paneId,
+        input.expectedQueueRevision,
+      );
+      if (this.#messageRow(messageId) !== null) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "This app-owned chat message ID was already used.",
+        );
+      }
+      const textBytes = utf8ByteLength(content.text);
+      this.#assertMessagePayloadCapacity(paneId, {
+        addedRows: 1,
+        replacedBytes: 0,
+        nextBytes: textBytes,
+      });
+      try {
+        this.#database.query(`
+          INSERT INTO chat_message_ledger (
+            message_id, pane_id, ordinal, revision,
+            message_text, message_utf8_bytes,
+            state, created_at, updated_at
+          ) VALUES (?1, ?2, ?3, 1, ?4, ?5, 'queued', ?6, ?6)
+        `).run(
+          messageId,
+          paneId,
+          metadata.next_message_ordinal,
+          content.text,
+          textBytes,
+          now,
+        );
+        this.#bindReadyMessageAttachments(paneId, messageId, content, now);
+        const advanced = this.#database.query(`
+          UPDATE chat_panes SET
+            message_queue_revision = message_queue_revision + 1,
+            next_message_ordinal = next_message_ordinal + 1,
+            updated_at = ?3
+          WHERE pane_id = ?1 AND message_queue_revision = ?2
+            AND archived_at IS NULL
+        `).run(paneId, input.expectedQueueRevision, now);
+        if (advanced.changes !== 1) throw staleQueueRevision();
+      } catch (error: unknown) {
+        throw sqliteMessageConflict(error, "The chat message could not be queued.");
+      }
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  /**
+   * Atomically queues a composer message, then prepares that same row for
+   * steering only if it is now the FIFO head of the exact active turn. A
+   * paused queue, changed turn fence, or older head aborts the outer
+   * transaction so neither the row nor its draft attachment conversion lands.
+   */
+  enqueueMessageAndPrepareSteer(
+    input: ChatMessageEnqueueAndSteerInput,
+  ): ChatMessageEnqueueAndSteerResult {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    return this.#database.transaction(() => {
+      const queued = this.enqueueMessage(input);
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const head = queued.messages[0];
+      if (metadata.message_queue_pause_reason !== null) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "The steer was not queued because this message queue is paused.",
+        );
+      }
+      if (
+        metadata.active_turn_id !== turnId ||
+        !["starting", "streaming", "continuing"].includes(metadata.state)
+      ) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "The steer was not queued because its active chat turn changed.",
+        );
+      }
+      if (head?.id !== messageId) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "The steer was not queued because an older message is already ahead of it.",
+        );
+      }
+      return this.claimHeadMessage({
+        paneId,
+        expectedQueueRevision: queued.revision,
+        messageId,
+        expectedMessageRevision: head.revision,
+        turnId,
+        kind: "steer",
+        now: input.now,
+      });
+    })();
+  }
+
+  editQueuedMessage(input: ChatMessageEditInput): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    validateRevision(input.expectedQueueRevision);
+    validateRevision(input.expectedMessageRevision);
+    const content = parseChatMessageContent(input.content);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+
+    return this.#database.transaction(() => {
+      this.#requireMessageQueueRevision(paneId, input.expectedQueueRevision);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireQueuedMessageRevision(row, input.expectedMessageRevision);
+      const textBytes = utf8ByteLength(content.text);
+      this.#assertMessagePayloadCapacity(paneId, {
+        addedRows: 0,
+        replacedBytes: row.message_utf8_bytes,
+        nextBytes: textBytes,
+      });
+      try {
+        const edited = this.#database.query(`
+          UPDATE chat_message_ledger SET
+            message_text = ?4,
+            message_utf8_bytes = ?5,
+            revision = revision + 1,
+            updated_at = ?6
+          WHERE pane_id = ?1 AND message_id = ?2
+            AND revision = ?3 AND state = 'queued'
+        `).run(
+          paneId,
+          messageId,
+          input.expectedMessageRevision,
+          content.text,
+          textBytes,
+          now,
+        );
+        if (edited.changes !== 1) throw staleMessageRevision();
+        this.#replaceReadyMessageAttachments(paneId, messageId, content, now);
+        this.#advanceMessageQueueRevision(
+          paneId,
+          input.expectedQueueRevision,
+          now,
+        );
+      } catch (error: unknown) {
+        throw sqliteMessageConflict(error, "The queued chat message could not be edited.");
+      }
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  removeQueuedMessage(input: ChatMessageRowCasInput): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    validateRevision(input.expectedQueueRevision);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+
+    return this.#database.transaction(() => {
+      this.#requireMessageQueueRevision(paneId, input.expectedQueueRevision);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireQueuedMessageRevision(row, input.expectedMessageRevision);
+      const removed = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = 'cancelled',
+          revision = revision + 1,
+          terminal_at = ?4,
+          updated_at = ?4
+        WHERE pane_id = ?1 AND message_id = ?2
+          AND revision = ?3 AND state = 'queued'
+      `).run(
+        paneId,
+        messageId,
+        input.expectedMessageRevision,
+        now,
+      );
+      if (removed.changes !== 1) throw staleMessageRevision();
+      this.#clearMessageAttachments(paneId, messageId, now);
+      this.#advanceMessageQueueRevision(paneId, input.expectedQueueRevision, now);
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  pauseMessageQueue(input: ChatMessageQueuePauseInput): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const reason = storeQueuePauseReason(input.reason);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      if (metadata.message_queue_pause_reason === reason) {
+        return this.#messageQueueProjection(metadata);
+      }
+      const updated = this.#database.query(`
+        UPDATE chat_panes SET
+          message_queue_pause_reason = ?3,
+          message_queue_revision = message_queue_revision + 1,
+          updated_at = ?4
+        WHERE pane_id = ?1 AND message_queue_revision = ?2
+          AND archived_at IS NULL
+      `).run(paneId, metadata.message_queue_revision, reason, now);
+      if (updated.changes !== 1) throw staleQueueRevision();
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  resumeMessageQueue(input: ChatMessageQueueResumeInput): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    validateRevision(input.expectedQueueRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueRevision(
+        paneId,
+        input.expectedQueueRevision,
+      );
+      if (metadata.message_queue_pause_reason === null) {
+        throw new ChatPaneStoreError("invalid_state", "This message queue is already running.");
+      }
+      if (metadata.message_queue_pause_reason === "ambiguous_effect") {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Contain the ambiguous message effect before resuming this queue.",
+        );
+      }
+      const resumed = this.#database.query(`
+        UPDATE chat_panes SET
+          message_queue_pause_reason = NULL,
+          message_queue_revision = message_queue_revision + 1,
+          updated_at = ?3
+        WHERE pane_id = ?1 AND message_queue_revision = ?2
+          AND archived_at IS NULL
+      `).run(paneId, input.expectedQueueRevision, now);
+      if (resumed.changes !== 1) throw staleQueueRevision();
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  claimHeadMessage(input: ChatMessageClaimInput): ChatMessageClaimResult {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    validateRevision(input.expectedQueueRevision);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueRevision(
+        paneId,
+        input.expectedQueueRevision,
+      );
+      if (metadata.message_queue_pause_reason !== null) {
+        throw new ChatPaneStoreError("invalid_state", "This message queue is paused.");
+      }
+      if (
+        input.kind === "steer" &&
+        (
+          metadata.active_turn_id !== turnId ||
+          !["starting", "streaming", "continuing"].includes(metadata.state)
+        )
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "The exact active turn is no longer available for steering.",
+        );
+      }
+      if (
+        input.kind === "start" &&
+        metadata.state !== "ready" && metadata.state !== "attention"
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "A new chat turn cannot be claimed while another turn is active.",
+        );
+      }
+      const head = this.#queuedHead(paneId);
+      if (head === null || head.message_id !== messageId) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "Only the exact FIFO head can be claimed.",
+        );
+      }
+      this.#requireQueuedMessageRevision(head, input.expectedMessageRevision);
+      const content = this.#messageContent(head);
+      const nextState = input.kind === "start" ? "start_claimed" : "steer_prepared";
+      const claimed = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = ?4,
+          claimed_turn_id = ?5,
+          revision = revision + 1,
+          updated_at = ?6
+        WHERE pane_id = ?1 AND message_id = ?2
+          AND revision = ?3 AND state = 'queued'
+      `).run(
+        paneId,
+        messageId,
+        input.expectedMessageRevision,
+        nextState,
+        turnId,
+        now,
+      );
+      if (claimed.changes !== 1) throw staleMessageRevision();
+      this.#acquireMessageAttachmentLeases(paneId, messageId, turnId, now);
+      this.#advanceMessageQueueRevision(paneId, input.expectedQueueRevision, now);
+      const claim: ChatMessageClaim = {
+        messageId,
+        paneId,
+        ordinal: head.ordinal,
+        revision: input.expectedMessageRevision + 1,
+        turnId,
+        kind: input.kind,
+        content,
+      };
+      return { claim, queue: this.messageQueue(paneId) };
+    })();
+  }
+
+  returnClaimedMessageToQueue(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    return this.#transitionClaim(input, {
+      start: { from: "start_claimed", to: "queued" },
+      steer: { from: "steer_prepared", to: "queued" },
+    }, "return to the queue");
+  }
+
+  markMessageEffectStarted(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    return this.#transitionClaim(input, {
+      start: { from: "start_claimed", to: "start_effect_started" },
+      steer: { from: "steer_prepared", to: "steer_effect_started" },
+    }, "start its effect", { effectStartedAt: true });
+  }
+
+  acknowledgeMessageEffect(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    return this.#transitionClaim(input, {
+      start: { from: "start_effect_started", to: "start_acknowledged" },
+      steer: { from: "steer_effect_started", to: "steer_acknowledged" },
+    }, "acknowledge its effect", { acknowledgedAt: true });
+  }
+
+  completeClaimedMessage(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    return this.#transitionClaim(input, {
+      start: { from: "start_acknowledged", to: "completed" },
+      steer: { from: "steer_acknowledged", to: "completed" },
+    }, "complete", { terminalAt: true });
+  }
+
+  markMessageEffectAmbiguous(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    const from = input.kind === "start"
+      ? "start_effect_started"
+      : "steer_effect_started";
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireClaimTransition(row, input.expectedMessageRevision, turnId, from);
+      const updated = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = 'ambiguous',
+          revision = revision + 1,
+          terminal_at = ?6,
+          updated_at = ?6
+        WHERE pane_id = ?1 AND message_id = ?2 AND revision = ?3
+          AND claimed_turn_id = ?4 AND state = ?5
+      `).run(paneId, messageId, input.expectedMessageRevision, turnId, from, now);
+      if (updated.changes !== 1) throw staleMessageRevision();
+      this.#markMessageAttachmentLeasesAmbiguous(
+        paneId,
+        messageId,
+        turnId,
+        now,
+      );
+      const paused = this.#database.query(`
+        UPDATE chat_panes SET
+          message_queue_pause_reason = 'ambiguous_effect',
+          message_queue_revision = message_queue_revision + 1,
+          updated_at = ?3
+        WHERE pane_id = ?1 AND message_queue_revision = ?2
+          AND archived_at IS NULL
+      `).run(paneId, metadata.message_queue_revision, now);
+      if (paused.changes !== 1) throw staleQueueRevision();
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  /**
+   * Reconciles only app-owned ledger cuts. It never retries a provider effect:
+   * prepared rows return to FIFO, effect-started rows become ambiguous, and
+   * every restarted queue pauses before a later explicit resume.
+   */
+  reconcileMessageQueueAfterRestart(
+    paneIdInput: ChatPaneId,
+    nowInput: Date,
+  ): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(paneIdInput);
+    const now = isoDateTimeSchema.parse(nowInput.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const uncertain: unknown[] = this.#database.query(`
+        SELECT * FROM chat_message_ledger
+        WHERE pane_id = ?1 AND state IN (
+          'start_claimed', 'steer_prepared',
+          'start_effect_started', 'steer_effect_started'
+        )
+        ORDER BY ordinal, message_id
+      `).all(paneId);
+      const rows = uncertain.map((value) => this.#parseMessageRow(value));
+      const ambiguous = rows.some((row) =>
+        row.state === "start_effect_started" || row.state === "steer_effect_started"
+      );
+      for (const row of rows) {
+        if (row.state === "start_claimed" || row.state === "steer_prepared") {
+          const updated = this.#database.query(`
+            UPDATE chat_message_ledger SET
+              state = 'queued',
+              claimed_turn_id = NULL,
+              revision = revision + 1,
+              updated_at = ?3
+            WHERE message_id = ?1 AND revision = ?2
+          `).run(row.message_id, row.revision, now);
+          if (updated.changes !== 1 || row.claimed_turn_id === null) {
+            throw staleMessageRevision();
+          }
+          this.#releasePreparedMessageAttachmentLeases(
+            paneId,
+            row.message_id,
+            row.claimed_turn_id,
+            now,
+          );
+        } else {
+          const updated = this.#database.query(`
+            UPDATE chat_message_ledger SET
+              state = 'ambiguous',
+              terminal_at = ?3,
+              revision = revision + 1,
+              updated_at = ?3
+            WHERE message_id = ?1 AND revision = ?2
+          `).run(row.message_id, row.revision, now);
+          if (updated.changes !== 1 || row.claimed_turn_id === null) {
+            throw staleMessageRevision();
+          }
+          this.#markMessageAttachmentLeasesAmbiguous(
+            paneId,
+            row.message_id,
+            row.claimed_turn_id,
+            now,
+          );
+        }
+      }
+      const nextReason = ambiguous ? "ambiguous_effect" : "runtime_restart";
+      if (
+        rows.length === 0 &&
+        metadata.message_queue_pause_reason === nextReason
+      ) {
+        return this.#messageQueueProjection(metadata);
+      }
+      const paused = this.#database.query(`
+        UPDATE chat_panes SET
+          message_queue_pause_reason = ?3,
+          message_queue_revision = message_queue_revision + 1,
+          updated_at = ?4
+        WHERE pane_id = ?1 AND message_queue_revision = ?2
+          AND archived_at IS NULL
+      `).run(
+        paneId,
+        metadata.message_queue_revision,
+        nextReason,
+        now,
+      );
+      if (paused.changes !== 1) throw staleQueueRevision();
+      return this.messageQueue(paneId);
+    })();
   }
 
   findByProviderThread(
@@ -1047,6 +1590,7 @@ export class ChatPaneStore {
           "An attached actor pane is retained with its durable actor binding.",
         );
       }
+      this.#closeMessageQueueForPane(id, timestamp);
       if (current.projection.workspace !== null) {
         this.#preserveActiveWorkspace(id, timestamp);
       }
@@ -2619,6 +3163,540 @@ export class ChatPaneStore {
     `).run(paneId, CHAT_MAX_TURN_RECEIPTS_PER_PANE);
   }
 
+  #requireMessageQueueMetadata(
+    paneIdInput: ChatPaneId,
+  ): ChatMessageQueueMetadataRow {
+    const paneId = chatPaneIdSchema.parse(paneIdInput);
+    const value: unknown = this.#database.query(`
+      SELECT
+        pane_id, interaction_mode, state, active_turn_id, archived_at,
+        message_queue_revision, next_message_ordinal,
+        message_queue_pause_reason
+      FROM chat_panes
+      WHERE pane_id = ?1 AND archived_at IS NULL
+    `).get(paneId);
+    if (value === null) {
+      throw new ChatPaneStoreError("not_found", "This chat pane no longer exists.");
+    }
+    try {
+      return chatMessageQueueMetadataRowSchema.parse(value);
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Stored chat message queue metadata is invalid.",
+      );
+    }
+  }
+
+  #requireMessageQueueRevision(
+    paneId: ChatPaneId,
+    expectedRevision: number,
+  ): ChatMessageQueueMetadataRow {
+    validateRevision(expectedRevision);
+    const metadata = this.#requireMessageQueueMetadata(paneId);
+    if (metadata.message_queue_revision !== expectedRevision) {
+      throw staleQueueRevision();
+    }
+    return metadata;
+  }
+
+  #messageQueueProjection(
+    metadata: ChatMessageQueueMetadataRow,
+  ): ChatMessageQueueProjection {
+    const values: unknown[] = this.#database.query(`
+      SELECT * FROM chat_message_ledger
+        INDEXED BY chat_message_ledger_queued_head_idx
+      WHERE pane_id = ?1 AND state = 'queued'
+      ORDER BY ordinal, message_id
+      LIMIT ?2
+    `).all(metadata.pane_id, CHAT_MESSAGE_MAX_ACTIVE_PER_PANE + 1);
+    if (values.length > CHAT_MESSAGE_MAX_ACTIVE_PER_PANE) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Stored queued chat message count exceeded its projection limit.",
+      );
+    }
+    const messages = values.map((value) => {
+      const row = this.#parseMessageRow(value);
+      const content = this.#messageContent(row);
+      return {
+        id: row.message_id,
+        ordinal: row.ordinal,
+        revision: row.revision,
+        ...content,
+      };
+    });
+    try {
+      return parseChatMessageQueueProjection({
+        revision: metadata.message_queue_revision,
+        pauseReason: projectQueuePauseReason(
+          metadata.message_queue_pause_reason,
+        ),
+        messages,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Stored chat message queue projection is invalid.",
+      );
+    }
+  }
+
+  #parseMessageRow(value: unknown): ChatMessageLedgerRow {
+    try {
+      const row = chatMessageLedgerRowSchema.parse(value);
+      if (utf8ByteLength(row.message_text) !== row.message_utf8_bytes) {
+        throw new Error("message byte count drifted");
+      }
+      return row;
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Stored chat message ledger state is invalid.",
+      );
+    }
+  }
+
+  #messageRow(messageId: string): ChatMessageLedgerRow | null {
+    const value: unknown = this.#database.query(`
+      SELECT * FROM chat_message_ledger WHERE message_id = ?1
+    `).get(chatMessageIdSchema.parse(messageId));
+    return value === null ? null : this.#parseMessageRow(value);
+  }
+
+  #requireMessageRowForPane(
+    paneId: ChatPaneId,
+    messageId: string,
+  ): ChatMessageLedgerRow {
+    const row = this.#messageRow(messageId);
+    if (row === null || row.pane_id !== paneId) {
+      throw new ChatPaneStoreError(
+        "not_found",
+        "This queued chat message no longer exists.",
+      );
+    }
+    return row;
+  }
+
+  #messageContent(row: ChatMessageLedgerRow) {
+    let attachmentRefs;
+    try {
+      attachmentRefs = this.#messageAttachmentAuthority.messageRefsInTransaction({
+        paneId: row.pane_id,
+        messageId: row.message_id,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "A queued chat attachment is no longer ready for this pane.",
+      );
+    }
+    try {
+      return parseChatMessageContent({
+        text: row.message_text,
+        attachmentRefs,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Stored chat message content is invalid.",
+      );
+    }
+  }
+
+  #bindReadyMessageAttachments(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    content: ReturnType<typeof parseChatMessageContent>,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.bindReadyMessageRefsInTransaction({
+        paneId,
+        messageId,
+        attachmentRefs: content.attachmentRefs,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Every chat message attachment must be ready for this pane.",
+      );
+    }
+  }
+
+  #replaceReadyMessageAttachments(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    content: ReturnType<typeof parseChatMessageContent>,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.replaceReadyMessageRefsInTransaction({
+        paneId,
+        messageId,
+        attachmentRefs: content.attachmentRefs,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Every edited chat attachment must be ready for this pane.",
+      );
+    }
+  }
+
+  #clearMessageAttachments(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.replaceReadyMessageRefsInTransaction({
+        paneId,
+        messageId,
+        attachmentRefs: [],
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Cancelled chat attachment references could not be released.",
+      );
+    }
+  }
+
+  #acquireMessageAttachmentLeases(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    turnId: ChatTurnId,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.acquireTurnLeasesInTransaction({
+        paneId,
+        messageId,
+        turnId,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The chat attachment lease could not be acquired atomically.",
+      );
+    }
+  }
+
+  #releasePreparedMessageAttachmentLeases(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    turnId: ChatTurnId,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.releasePreparedTurnLeasesInTransaction({
+        paneId,
+        messageId,
+        turnId,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The prepared chat attachment lease set is incomplete.",
+      );
+    }
+  }
+
+  #markMessageAttachmentLeasesAmbiguous(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    turnId: ChatTurnId,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.markTurnLeasesAmbiguousInTransaction({
+        paneId,
+        messageId,
+        turnId,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The ambiguous chat attachment lease set is incomplete.",
+      );
+    }
+  }
+
+  #releaseMessageAttachmentLeases(
+    paneId: ChatPaneId,
+    messageId: ChatMessageLedgerRow["message_id"],
+    turnId: ChatTurnId,
+    now: string,
+  ): void {
+    try {
+      this.#messageAttachmentAuthority.releaseTurnLeasesInTransaction({
+        paneId,
+        messageId,
+        turnId,
+        now,
+      });
+    } catch {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The terminal chat attachment lease set is incomplete.",
+      );
+    }
+  }
+
+  #queuedHead(paneId: ChatPaneId): ChatMessageLedgerRow | null {
+    const value: unknown = this.#database.query(`
+      SELECT * FROM chat_message_ledger
+        INDEXED BY chat_message_ledger_queued_head_idx
+      WHERE pane_id = ?1 AND state = 'queued'
+      ORDER BY ordinal, message_id
+      LIMIT 1
+    `).get(paneId);
+    return value === null ? null : this.#parseMessageRow(value);
+  }
+
+  #requireQueuedMessageRevision(
+    row: ChatMessageLedgerRow,
+    expectedRevision: number,
+  ): void {
+    if (row.revision !== expectedRevision) throw staleMessageRevision();
+    if (row.state !== "queued") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Only an unclaimed queued message can be changed.",
+      );
+    }
+  }
+
+  #assertMessagePayloadCapacity(
+    paneId: ChatPaneId,
+    change: Readonly<{
+      addedRows: 0 | 1;
+      replacedBytes: number;
+      nextBytes: number;
+    }>,
+  ): void {
+    const value: unknown = this.#database.query(`
+      SELECT
+        (
+          SELECT COUNT(*) FROM chat_message_ledger
+          WHERE pane_id = ?1 AND state NOT IN ('completed', 'cancelled')
+        ) AS active_count,
+        (
+          SELECT COALESCE(SUM(message_utf8_bytes), 0)
+          FROM chat_message_ledger
+          WHERE pane_id = ?1 AND state NOT IN ('completed', 'cancelled')
+        ) AS pane_bytes,
+        (
+          SELECT COALESCE(SUM(message_utf8_bytes), 0)
+          FROM chat_message_ledger
+          WHERE state NOT IN ('completed', 'cancelled')
+        ) AS global_bytes
+    `).get(paneId);
+    const totals = chatMessagePayloadTotalsSchema.parse(value);
+    const activeCount = totals.active_count + change.addedRows;
+    const paneBytes = totals.pane_bytes - change.replacedBytes + change.nextBytes;
+    const globalBytes = totals.global_bytes - change.replacedBytes + change.nextBytes;
+    if (activeCount > CHAT_MESSAGE_MAX_ACTIVE_PER_PANE) {
+      throw new ChatPaneStoreError(
+        "limit",
+        "This chat pane already has the maximum number of pending messages.",
+      );
+    }
+    if (paneBytes > CHAT_MESSAGE_MAX_UTF8_BYTES_PER_PANE) {
+      throw new ChatPaneStoreError(
+        "limit",
+        "This chat pane's complete queued text exceeds its private local limit.",
+      );
+    }
+    if (globalBytes > CHAT_MESSAGE_MAX_UTF8_BYTES_TOTAL) {
+      throw new ChatPaneStoreError(
+        "limit",
+        "Queued chat text reached the private local database limit.",
+      );
+    }
+  }
+
+  #advanceMessageQueueRevision(
+    paneId: ChatPaneId,
+    expectedRevision: number,
+    now: string,
+  ): void {
+    const result = this.#database.query(`
+      UPDATE chat_panes SET
+        message_queue_revision = message_queue_revision + 1,
+        updated_at = ?3
+      WHERE pane_id = ?1 AND message_queue_revision = ?2
+        AND archived_at IS NULL
+    `).run(paneId, expectedRevision, now);
+    if (result.changes !== 1) throw staleQueueRevision();
+  }
+
+  #requireClaimTransition(
+    row: ChatMessageLedgerRow,
+    expectedRevision: number,
+    turnId: ChatTurnId,
+    expectedState: StoredChatMessageState,
+  ): void {
+    if (row.revision !== expectedRevision) throw staleMessageRevision();
+    if (row.state !== expectedState || row.claimed_turn_id !== turnId) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The claimed chat message is no longer at the expected lifecycle cut.",
+      );
+    }
+  }
+
+  #transitionClaim(
+    input: ChatMessageTransitionInput,
+    states: Readonly<Record<
+      "start" | "steer",
+      Readonly<{ from: StoredChatMessageState; to: StoredChatMessageState }>
+    >>,
+    action: string,
+    timestamps: Readonly<{
+      effectStartedAt?: boolean;
+      acknowledgedAt?: boolean;
+      terminalAt?: boolean;
+    }> = {},
+  ): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    const transition = states[input.kind];
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireClaimTransition(
+        row,
+        input.expectedMessageRevision,
+        turnId,
+        transition.from,
+      );
+      const updates = [
+        "state = ?5",
+        "revision = revision + 1",
+        "updated_at = ?6",
+      ];
+      if (transition.to === "queued") updates.push("claimed_turn_id = NULL");
+      if (timestamps.effectStartedAt) updates.push("effect_started_at = ?6");
+      if (timestamps.acknowledgedAt) updates.push("acknowledged_at = ?6");
+      if (timestamps.terminalAt) updates.push("terminal_at = ?6");
+      const updated = this.#database.query(`
+        UPDATE chat_message_ledger SET ${updates.join(", ")}
+        WHERE pane_id = ?1 AND message_id = ?2 AND revision = ?3
+          AND claimed_turn_id = ?4 AND state = '${transition.from}'
+      `).run(
+        paneId,
+        messageId,
+        input.expectedMessageRevision,
+        turnId,
+        transition.to,
+        now,
+      );
+      if (updated.changes !== 1) {
+        throw new ChatPaneStoreError(
+          "revision_conflict",
+          `The claimed chat message changed before HRA could ${action}.`,
+        );
+      }
+      if (transition.to === "queued") {
+        this.#releasePreparedMessageAttachmentLeases(
+          paneId,
+          messageId,
+          turnId,
+          now,
+        );
+      } else if (transition.to === "completed") {
+        this.#releaseMessageAttachmentLeases(
+          paneId,
+          messageId,
+          turnId,
+          now,
+        );
+      }
+      this.#advanceMessageQueueRevision(
+        paneId,
+        metadata.message_queue_revision,
+        now,
+      );
+      return this.messageQueue(paneId);
+    })();
+  }
+
+  #closeMessageQueueForPane(paneId: ChatPaneId, now: string): void {
+    const metadata = this.#requireMessageQueueMetadata(paneId);
+    const blocker = countRowSchema.parse(this.#database.query(`
+      SELECT COUNT(*) AS count FROM chat_message_ledger
+      WHERE pane_id = ?1 AND state IN (
+        'start_effect_started', 'steer_effect_started',
+        'start_acknowledged', 'steer_acknowledged', 'ambiguous'
+      )
+    `).get(paneId)).count;
+    if (blocker > 0) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Contain the in-flight or ambiguous message effect before closing this pane.",
+      );
+    }
+    const cancellable: unknown[] = this.#database.query(`
+      SELECT * FROM chat_message_ledger
+      WHERE pane_id = ?1 AND state IN (
+        'queued', 'start_claimed', 'steer_prepared'
+      )
+      ORDER BY ordinal, message_id
+    `).all(paneId);
+    const rows = cancellable.map((value) => this.#parseMessageRow(value));
+    for (const row of rows) {
+      if (row.state === "start_claimed" || row.state === "steer_prepared") {
+        if (row.claimed_turn_id === null) {
+          throw new ChatPaneStoreError(
+            "corrupt_state",
+            "A prepared chat message lost its claimed turn.",
+          );
+        }
+        this.#releasePreparedMessageAttachmentLeases(
+          paneId,
+          row.message_id,
+          row.claimed_turn_id,
+          now,
+        );
+      }
+      this.#clearMessageAttachments(paneId, row.message_id, now);
+    }
+    const cancelled = this.#database.query(`
+      UPDATE chat_message_ledger SET
+        state = 'cancelled',
+        revision = revision + 1,
+        terminal_at = ?2,
+        updated_at = ?2
+      WHERE pane_id = ?1 AND state IN (
+        'queued', 'start_claimed', 'steer_prepared'
+      )
+    `).run(paneId, now);
+    if (cancelled.changes !== rows.length) {
+      throw new ChatPaneStoreError(
+        "revision_conflict",
+        "The message queue changed before this pane could close.",
+      );
+    }
+    if (rows.length > 0) {
+      this.#advanceMessageQueueRevision(
+        paneId,
+        metadata.message_queue_revision,
+        now,
+      );
+    }
+  }
+
   #requireRevision(paneId: ChatPaneId, expectedRevision: number): ChatPanePrivateRecord {
     const pane = this.require(paneId);
     if (pane.projection.revision !== expectedRevision) throw staleRevision();
@@ -2950,7 +4028,26 @@ function staleRevision(): ChatPaneStoreError {
   );
 }
 
+function staleQueueRevision(): ChatPaneStoreError {
+  return new ChatPaneStoreError(
+    "revision_conflict",
+    "This chat message queue changed. Try again with its latest revision.",
+  );
+}
+
+function staleMessageRevision(): ChatPaneStoreError {
+  return new ChatPaneStoreError(
+    "revision_conflict",
+    "This queued chat message changed. Try again with its latest revision.",
+  );
+}
+
 function sqliteConflict(error: unknown, message: string): ChatPaneStoreError {
+  if (error instanceof ChatPaneStoreError) return error;
+  return new ChatPaneStoreError("conflict", message);
+}
+
+function sqliteMessageConflict(error: unknown, message: string): ChatPaneStoreError {
   if (error instanceof ChatPaneStoreError) return error;
   return new ChatPaneStoreError("conflict", message);
 }
