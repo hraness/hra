@@ -1,6 +1,6 @@
 {
   "name": "@hraness/hra",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "private": true,
   "type": "module",
   "description": "A local-first metaharness for durable Codex orchestration.",
@@ -44,7 +44,7 @@
     "verify:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --release-directory zig-out/release/macos/arm64",
     "verify:package:macos:adhoc": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-ad-hoc-package-verification -- bun run runtime/verify-macos-package.ts --core-release-directory zig-out/release/macos/arm64",
     "smoke:package:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-package-smoke -- bun run smoke:package:macos:uncoordinated",
-    "smoke:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --dmg zig-out/release/macos/arm64/HRA-0.1.10-11-macos-arm64.dmg --launch-smoke",
+    "smoke:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --dmg zig-out/release/macos/arm64/HRA-0.1.11-12-macos-arm64.dmg --launch-smoke",
     "doctor:macos": "native doctor --manifest app.zon --strict",
     "state:doctor": "bun run runtime/control-plane-maintenance.ts doctor",
     "state:backup": "bun run runtime/control-plane-maintenance.ts backup",

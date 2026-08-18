@@ -39,7 +39,7 @@ export function hraComparisonCitationVersion(
     version: string;
   }>,
 ): string {
-  return release.availability === "published" ? release.version : "0.1.9";
+  return release.availability === "published" ? release.version : "0.1.10";
 }
 
 const HRA_COMPARISON_CITATION_VERSION =

@@ -21,8 +21,8 @@ const tree = {
 
 function receipt(
   priorHraIdentity?: Readonly<{
-    build: "8" | "9" | "10";
-    version: "0.1.7" | "0.1.8" | "0.1.9";
+    build: "8" | "9" | "10" | "11";
+    version: "0.1.7" | "0.1.8" | "0.1.9" | "0.1.10";
   }>,
 ): Record<string, unknown> {
   return {
@@ -58,10 +58,10 @@ function receipt(
     },
     candidate: {
       identity: {
-        build: "11",
+        build: "12",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.10",
+        version: "0.1.11",
       },
       tree,
     },
@@ -81,18 +81,19 @@ function receipt(
 }
 
 describe("installation handoff receipt schema", () => {
-  test("accepts only the exact v0.1.10 build-11 evidence shape", () => {
+  test("accepts only the exact v0.1.11 build-12 evidence shape", () => {
     expect(parseInstallationHandoffJournal(receipt())).toMatchObject({
       phase: "committed",
       candidateCommit: "b".repeat(40),
     });
   });
 
-  test("retains exact v0.1.7, v0.1.8, and immutable v0.1.9 prior-HRA rollback evidence", () => {
+  test("retains exact v0.1.7 through v0.1.10 prior-HRA rollback evidence", () => {
     for (const priorHraIdentity of [
       { build: "8", version: "0.1.7" },
       { build: "9", version: "0.1.8" },
       { build: "10", version: "0.1.9" },
+      { build: "11", version: "0.1.10" },
     ] as const) {
       expect(parseInstallationHandoffJournal(receipt(priorHraIdentity)))
         .toMatchObject({
@@ -102,15 +103,15 @@ describe("installation handoff receipt schema", () => {
     }
   });
 
-  test("rejects the v0.1.10 candidate as prior-HRA rollback evidence", () => {
+  test("rejects the v0.1.11 candidate as prior-HRA rollback evidence", () => {
     const mutation = receipt();
     mutation["hadPriorHra"] = true;
     mutation["priorHra"] = {
       identity: {
-        build: "11",
+        build: "12",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.10",
+        version: "0.1.11",
       },
       tree,
     };
