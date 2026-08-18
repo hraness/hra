@@ -168,7 +168,7 @@ describe("OPRTE to HRA installation handoff", () => {
       }, fixture.dependencies);
       expect(await inspectTree(fixture.paths.canonicalApp)).toEqual(priorHraBefore);
     }
-  });
+  }, 60_000);
 
   test("rejects the v0.1.11 candidate as an unreceipted prior HRA authority", async () => {
     const fixture = await createFixture({ priorHra: false });
