@@ -240,6 +240,7 @@ export const CHAT_MESSAGE_LEDGER_SCHEMA_V1_SQL = `
     pane_id TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position BETWEEN 0 AND 7),
     attachment_id TEXT NOT NULL,
+    consumed_draft_expires_at TEXT NOT NULL,
     PRIMARY KEY (message_id, position),
     UNIQUE (message_id, pane_id, attachment_id),
     FOREIGN KEY (message_id, pane_id)
@@ -342,7 +343,6 @@ export const CHAT_MESSAGE_LEDGER_SCHEMA_V1_SQL = `
       'steer_acknowledged', 'ambiguous'
     ))
     OR (OLD.state = 'steer_acknowledged' AND NEW.state = 'completed')
-    OR (OLD.state = 'ambiguous' AND NEW.state IN ('completed', 'cancelled'))
   )
   BEGIN
     SELECT RAISE(ABORT, 'invalid chat message ledger transition');

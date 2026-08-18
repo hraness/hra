@@ -6,20 +6,46 @@ import type { ChatUtf8Tail } from "../../../../contracts/runtime";
 
 const disabledControls = false;
 const disallowedElements = ["img"] as const;
-const linkSafety = { enabled: true } as const;
+
+export function safeMarkdownUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+const linkSafety = {
+  enabled: true,
+  onLinkCheck: (url: string) => safeMarkdownUrl(url) !== null,
+} as const;
 
 export interface MarkdownResponseProps {
   readonly content: ChatUtf8Tail;
   readonly streaming: boolean;
+  readonly variant?: "reasoning" | "response";
 }
 
-function MarkdownResponseView({ content, streaming }: MarkdownResponseProps) {
+function MarkdownResponseView({
+  content,
+  streaming,
+  variant = "response",
+}: MarkdownResponseProps) {
   if (content.tail.length === 0) return null;
   return (
-    <div className="chat-markdown" data-streaming={streaming || undefined}>
+    <div
+      className="chat-markdown"
+      data-markdown-kind={variant}
+      data-streaming={streaming || undefined}
+    >
       {content.truncatedPrefix ? (
         <p className="chat-markdown__truncation" role="note">
-          Earlier response text was omitted to keep this pane fast.
+          {variant === "reasoning"
+            ? "Earlier thinking was omitted to keep this pane fast."
+            : "Earlier response text was omitted to keep this pane fast."}
         </p>
       ) : null}
       <Streamdown
@@ -31,6 +57,7 @@ function MarkdownResponseView({ content, streaming }: MarkdownResponseProps) {
         parseIncompleteMarkdown={streaming}
         skipHtml
         unwrapDisallowed
+        urlTransform={(url) => safeMarkdownUrl(url)}
       >
         {content.tail}
       </Streamdown>
@@ -42,6 +69,7 @@ export const MarkdownResponse = memo(
   MarkdownResponseView,
   (left, right) =>
     left.streaming === right.streaming &&
+    left.variant === right.variant &&
     left.content.tail === right.content.tail &&
     left.content.totalUtf8Bytes === right.content.totalUtf8Bytes &&
     left.content.truncatedPrefix === right.content.truncatedPrefix,

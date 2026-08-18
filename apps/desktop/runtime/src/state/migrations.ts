@@ -2,6 +2,8 @@ import { harnessV2Migrations } from "./harness-v2-migrations";
 import { LONGITUDINAL_ROUTING_SCHEMA_V1_SQL } from "./longitudinal-routing-schema-v1";
 import { ROOT_TURN_ROUTING_SCHEMA_V1_SQL } from "./root-turn-routing-schema-v1";
 import { CHAT_MESSAGE_LEDGER_SCHEMA_V1_SQL } from "./chat-message-ledger-schema-v1";
+import { CHAT_MESSAGE_AMBIGUOUS_RESOLUTION_SCHEMA_V1_SQL } from
+  "./chat-message-ambiguous-resolution-schema-v1";
 import {
   SESSION_SYNC_HARDENING_SCHEMA_SQL,
   SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL,
@@ -3406,5 +3408,10 @@ export const migrations = [
     version: 47,
     name: "durable-app-owned-chat-message-ledger",
     sql: CHAT_MESSAGE_LEDGER_SCHEMA_V1_SQL,
+  },
+  {
+    version: 48,
+    name: "explicit-ambiguous-chat-message-resolution",
+    sql: CHAT_MESSAGE_AMBIGUOUS_RESOLUTION_SCHEMA_V1_SQL,
   },
 ] as const satisfies readonly Migration[];

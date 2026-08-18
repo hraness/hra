@@ -433,6 +433,7 @@ interface SessionTurnReconciliationPosition {
 
 export interface SessionSteerRequest {
   readonly clientUserMessageId: string;
+  readonly expectedGeneration: number;
   readonly expectedTurnId: NonNullable<ThreadSummary['activeTurn']>['id'];
   readonly prompt: string;
   readonly threadId: ThreadSummary['id'];
@@ -2589,8 +2590,32 @@ export class SessionService {
 
   async steer(request: SessionSteerRequest): Promise<void> {
     validateLaunchText(request.clientUserMessageId, request.prompt);
+    if (
+      !Number.isSafeInteger(request.expectedGeneration) ||
+      request.expectedGeneration < 1
+    ) {
+      throw new SessionServiceError(
+        "policy_denied",
+        "The steering generation fence is invalid.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const policy = this.verifiedProductionExecutionPolicyForActiveTurn(
+      request.threadId,
+      request.expectedTurnId,
+    );
+    if (policy?.generation !== request.expectedGeneration) {
+      throw new SessionServiceError(
+        "policy_denied",
+        "The active turn no longer has HRA's verified execution policy.",
+        false,
+        "resolveAttention",
+      );
+    }
     await this.#steerTurn({
       clientUserMessageId: request.clientUserMessageId,
+      expectedGeneration: request.expectedGeneration,
       expectedTurnId: request.expectedTurnId,
       input: { type: "text", text: request.prompt },
       threadId: request.threadId,
@@ -3259,11 +3284,23 @@ export class SessionService {
 
   async #steerTurn(command: {
     readonly clientUserMessageId: string;
+    readonly expectedGeneration: number;
     readonly expectedTurnId: string;
     readonly input: Readonly<{ readonly type: "text"; readonly text: string }>;
     readonly threadId: ThreadSummary['id'];
   }): Promise<void> {
     const binding = this.#registry.requireBinding(command.threadId);
+    if (
+      this.#activeRuntimeGenerations.get(binding.accountProfileId) !==
+        command.expectedGeneration
+    ) {
+      throw new SessionServiceError(
+        "policy_denied",
+        "The steering generation changed before Codex admission.",
+        false,
+        "resolveAttention",
+      );
+    }
     const rawTurnId = this.#registry.rawTurnIdByOwnedId(command.expectedTurnId);
     if (rawTurnId === null) {
       throw new SessionServiceError("conflict", "The active turn changed. Resume the chat and try again.", true, "retry");
@@ -3277,6 +3314,14 @@ export class SessionService {
         input: [{ type: "text", text: command.input.text, text_elements: [] }],
       },
     );
+    if (positioned.generation !== command.expectedGeneration) {
+      throw new SessionServiceError(
+        "upstream_ambiguous",
+        "Codex acknowledged steering in another runtime generation.",
+        false,
+        "restartRuntime",
+      );
+    }
     if (positioned.output.turnId !== rawTurnId) {
       throw new SessionServiceError("protocol_error", "Codex acknowledged a different active turn.", false, "restartRuntime");
     }

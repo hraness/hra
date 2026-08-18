@@ -4,6 +4,13 @@ import {
   nextRuntimeProjectionSequence,
 } from "../../../contracts/runtime-projection";
 
+export type RuntimeProjectionInvalidationReason =
+  | Extract<
+      RuntimeEvent["event"],
+      { readonly type: "snapshot.invalidated" }
+    >["reason"]
+  | "chatMessageQueueChanged";
+
 export type RuntimeProjectionResult =
   | Readonly<{ readonly kind: "applied"; readonly snapshot: RuntimeSnapshot }>
   | Readonly<{
@@ -21,10 +28,7 @@ export type RuntimeProjectionResult =
       readonly kind: "invalidated";
       readonly snapshot: RuntimeSnapshot;
       readonly sequence: number;
-      readonly reason: Extract<
-        RuntimeEvent["event"],
-        { readonly type: "snapshot.invalidated" }
-      >["reason"];
+      readonly reason: RuntimeProjectionInvalidationReason;
     }>;
 
 export function applyRuntimeEvent(
@@ -40,6 +44,14 @@ export function applyRuntimeEvent(
       snapshot,
       sequence: message.sequence,
       reason: message.event.reason,
+    };
+  }
+  if (message.event.type === "chat.messageQueue.changed") {
+    return {
+      kind: "invalidated",
+      snapshot,
+      sequence: message.sequence,
+      reason: "chatMessageQueueChanged",
     };
   }
   const expectedSequence = nextRuntimeProjectionSequence(snapshot);

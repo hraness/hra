@@ -1,10 +1,16 @@
+import { randomBytes } from "node:crypto";
 import {
   accountProfileIdSchema,
   chatPaneIdSchema,
+  chatTurnIdSchema,
+  type ChatMessageQueueProjection,
   type ChatRootTurnProfile,
 } from "../../../contracts/runtime";
 import type { RootTurnRoutingAuthorityV1 } from "../harness/root-turn-routing-sqlite-v1";
 import { ChatPaneStoreError } from "../state/chat-pane-store";
+import type {
+  ChatMessageClaim,
+} from "../state/chat-message-ledger";
 import type {
   ChatPaneDeltaBatchInput,
   ChatPaneDeltaBatchResult,
@@ -163,6 +169,14 @@ interface PendingTurnStop {
   readonly reject: (error: unknown) => void;
 }
 
+interface ActiveStartMessageEffect {
+  readonly messageId: ChatMessageClaim["messageId"];
+  readonly paneId: ChatPaneId;
+  readonly turnId: ChatTurnId;
+  revision: number;
+  state: "claimed" | "effectStarted" | "acknowledged" | "ambiguous";
+}
+
 interface ExactProviderTerminalWaiter {
   readonly paneId: ChatPaneId;
   readonly logicalTurnId: ChatTurnId;
@@ -270,6 +284,7 @@ export class ChatService {
   readonly #pendingStreamPersistence: PendingStreamPersistence[] = [];
   readonly #pendingTurnStops = new Map<ChatPaneId, PendingTurnStop>();
   readonly #pendingTurnContainments = new Map<ChatPaneId, PendingTurnContainment>();
+  readonly #activeStartMessageEffects = new Map<ChatPaneId, ActiveStartMessageEffect>();
   readonly #exactProviderTerminalReceipts =
     new Map<ChatPaneId, ExactProviderTerminalReceipt>();
   readonly #exactProviderTerminalWaiters = new Map<ChatPaneId, ExactProviderTerminalWaiter>();
@@ -353,6 +368,17 @@ export class ChatService {
     this.#store.recoverInterrupted(this.#now(), {
       preserveAttachedHarness: this.#harnessActors !== null,
     });
+    for (const pane of this.#store.list()) {
+      if (pane.interactionMode !== "chat") continue;
+      if (pane.turn !== null && !activePane(pane)) {
+        this.#store.completeAcknowledgedMessagesForTurn(
+          pane.id,
+          pane.turn.id,
+          this.#now(),
+        );
+      }
+      this.#store.reconcileMessageQueueAfterRestart(pane.id, this.#now());
+    }
     const panes = this.#store.list();
     for (const pane of panes) {
       if (
@@ -392,6 +418,9 @@ export class ChatService {
       return this.#serialize(paneId, async () => {
       const pane = this.#store.get(paneId);
       if (pane === null) return;
+      const activeTurnId = activePane(pane.projection)
+        ? pane.projection.turn?.id ?? null
+        : null;
       if (pane.projection.turn !== null && activePane(pane.projection)) {
         if (pane.providerTurnId === null) {
           this.#settleUnacceptedRootTurnRouting(
@@ -441,7 +470,13 @@ export class ChatService {
       this.#observedSessionItemEvents.delete(paneId);
       this.#quotaProofFloors.delete(paneId);
       const detached = this.#store.detachUnavailableAccount(paneId, accountId, this.#now());
-      if (detached !== null) await this.#projection.paneStateChanged(detached);
+      if (detached !== null) {
+        if (activeTurnId !== null) await this.#pauseMessageQueue(paneId, "attention");
+        await this.#projection.paneStateChanged(detached);
+        if (activeTurnId !== null) {
+          await this.#settleMessageLedgerForTerminal(paneId, activeTurnId);
+        }
+      }
       });
     }));
   }
@@ -721,6 +756,7 @@ export class ChatService {
           this.#quotaProofFloors.delete(command.paneId);
           this.#priorQuotaTerminals.delete(command.paneId);
           this.#exactProviderTerminalReceipts.delete(command.paneId);
+          this.#activeStartMessageEffects.delete(command.paneId);
           this.#poisonedTurns.delete(command.paneId);
           this.#recoveryFencedTurns.delete(command.paneId);
           this.#attachedHarnessProjectionFences.delete(command.paneId);
@@ -738,6 +774,110 @@ export class ChatService {
           );
           await this.#projection.panesReordered(orderedPaneIds);
           return { type: "reordered" as const, orderedPaneIds };
+        });
+      case "chat.message.enqueue":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          if (command.delivery.kind === "steerHead") {
+            const prepared = this.#store.enqueueMessageAndPrepareSteer({
+              paneId: command.paneId,
+              expectedQueueRevision: command.expectedQueueRevision,
+              messageId: command.messageId,
+              content: command.content,
+              turnId: command.delivery.expectedTurnId,
+              now: this.#now(),
+            });
+            const queue = await this.#publishAndDeliverPreparedSteer(
+              prepared.claim,
+              prepared.queue,
+              "cancelNewMessage",
+            );
+            return { type: "messageQueue" as const, paneId: command.paneId, queue };
+          }
+          const queued = this.#store.enqueueMessage({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            messageId: command.messageId,
+            content: command.content,
+            now: this.#now(),
+          });
+          await this.#publishMessageQueue(command.paneId, queued);
+          const queue = await this.#admitNextQueuedMessage(command.paneId);
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+        });
+      case "chat.message.edit":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          const edited = this.#store.editQueuedMessage({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            messageId: command.messageId,
+            expectedMessageRevision: command.expectedMessageRevision,
+            content: command.content,
+            now: this.#now(),
+          });
+          await this.#publishMessageQueue(command.paneId, edited);
+          const queue = await this.#admitNextQueuedMessage(command.paneId);
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+        });
+      case "chat.message.remove":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          const removed = this.#store.removeQueuedMessage({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            messageId: command.messageId,
+            expectedMessageRevision: command.expectedMessageRevision,
+            now: this.#now(),
+          });
+          await this.#publishMessageQueue(command.paneId, removed);
+          const queue = await this.#admitNextQueuedMessage(command.paneId);
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+        });
+      case "chat.messageQueue.resume":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          const resumed = this.#store.resumeMessageQueue({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            now: this.#now(),
+          });
+          await this.#publishMessageQueue(command.paneId, resumed);
+          const queue = await this.#admitNextQueuedMessage(command.paneId);
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+        });
+      case "chat.message.discardAmbiguous":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          const discarded = this.#store.discardAmbiguousMessage({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            messageId: command.messageId,
+            expectedMessageRevision: command.expectedMessageRevision,
+            now: this.#now(),
+          });
+          await this.#publishMessageQueue(command.paneId, discarded);
+          const queue = await this.#admitNextQueuedMessage(command.paneId);
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+        });
+      case "chat.message.steerHead":
+        return this.#serialize(command.paneId, async () => {
+          this.#requireOrdinaryMessagePane(command.paneId);
+          const prepared = this.#store.claimHeadMessage({
+            paneId: command.paneId,
+            expectedQueueRevision: command.expectedQueueRevision,
+            messageId: command.messageId,
+            expectedMessageRevision: command.expectedMessageRevision,
+            turnId: command.expectedTurnId,
+            kind: "steer",
+            now: this.#now(),
+          });
+          const queue = await this.#publishAndDeliverPreparedSteer(
+            prepared.claim,
+            prepared.queue,
+            "returnExistingMessage",
+          );
+          return { type: "messageQueue" as const, paneId: command.paneId, queue };
         });
       case "chat.turn.start":
         return this.#serialize(command.paneId, async () => {
@@ -980,6 +1120,375 @@ export class ChatService {
           return { type: "pane", pane: begun };
         });
     }
+  }
+
+  #requireOrdinaryMessagePane(paneId: ChatPaneId): ChatPanePrivateRecord {
+    const pane = this.#store.require(paneId);
+    if (pane.projection.interactionMode !== "chat") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Persistent actor messages remain owned by their actor authority.",
+      );
+    }
+    return pane;
+  }
+
+  async #publishMessageQueue(
+    paneId: ChatPaneId,
+    queue: ChatMessageQueueProjection,
+  ): Promise<void> {
+    await this.#projection.messageQueueChanged(paneId, queue);
+  }
+
+  async #pauseMessageQueue(
+    paneId: ChatPaneId,
+    reason: "stop" | "attention",
+  ): Promise<ChatMessageQueueProjection> {
+    const current = this.#store.messageQueue(paneId);
+    if (
+      current.pauseReason === "ambiguousEffect" ||
+      current.pauseReason === reason
+    ) return current;
+    const paused = this.#store.pauseMessageQueue({
+      paneId,
+      reason,
+      now: this.#now(),
+    });
+    await this.#publishMessageQueue(paneId, paused);
+    return paused;
+  }
+
+  async #admitNextQueuedMessage(
+    paneId: ChatPaneId,
+  ): Promise<ChatMessageQueueProjection> {
+    const current = this.#requireOrdinaryMessagePane(paneId);
+    const queue = current.projection.messageQueue;
+    const head = queue.messages[0];
+    if (
+      queue.pauseReason !== null || head === undefined ||
+      activePane(current.projection) ||
+      current.projection.workspace?.state !== "ready" ||
+      this.#pendingTurnStops.has(paneId) ||
+      this.#pendingTurnContainments.has(paneId) ||
+      this.#recoveryFencedTurns.has(paneId) ||
+      head.text.trim().length === 0
+    ) return queue;
+    if (this.#activeStartMessageEffects.has(paneId)) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "A prior app-owned message effect still owns this pane.",
+      );
+    }
+    const turnId = newChatTurnId();
+    const begun = this.#store.claimHeadMessageAndBeginTurn({
+      paneId,
+      expectedQueueRevision: queue.revision,
+      messageId: head.id,
+      expectedMessageRevision: head.revision,
+      turnId,
+      now: this.#now(),
+    });
+    this.#activeStartMessageEffects.set(paneId, {
+      messageId: begun.claim.messageId,
+      paneId,
+      turnId,
+      revision: begun.claim.revision,
+      state: "claimed",
+    });
+    this.#attachedHarnessProjectionFences.delete(paneId);
+    this.#attachedHarnessRecoveryRequestedTurns.delete(paneId);
+    this.#discardSessionProjectionQueue(paneId);
+    this.#discardEarlySessionEvents(paneId);
+    this.#observedSessionItemEvents.delete(paneId);
+    this.#quotaProofFloors.delete(paneId);
+    this.#priorQuotaTerminals.delete(paneId);
+    this.#exactProviderTerminalReceipts.delete(paneId);
+    this.#poisonedTurns.delete(paneId);
+    await this.#publishMessageQueue(paneId, begun.queue);
+    await this.#projection.paneChanged(begun.pane);
+    this.#scheduleClaimedStart(paneId, turnId);
+    return begun.queue;
+  }
+
+  #scheduleClaimedStart(paneId: ChatPaneId, turnId: ChatTurnId): void {
+    void this.#serialize(paneId, async () => {
+      try {
+        await this.#startLogicalTurn(paneId, turnId);
+      } catch {
+        if (this.#poisonedTurns.get(paneId) !== turnId) {
+          if (this.#trySettleContainedRootTurnRouting(paneId, turnId)) {
+            try {
+              await this.#settleHarnessBeforeProvider(
+                paneId,
+                turnId,
+                "provider_start_ambiguous",
+              );
+            } catch {
+              return;
+            }
+            if (this.#recoveryFencedTurns.get(paneId) !== turnId) {
+              await this.#publishAttention(paneId, turnId, {
+                code: "runtime_unavailable",
+                message: "The message delivery outcome needs attention before this queue can continue.",
+                retryable: true,
+              }, true);
+            }
+          }
+        }
+      }
+      const settled = this.#store.get(paneId);
+      if (
+        settled !== null && settled.projection.turn?.id === turnId &&
+        !activePane(settled.projection)
+      ) {
+        await this.#settleMessageLedgerForTerminal(paneId, turnId);
+      }
+    }).catch(() => {
+      this.#poisonActiveTurnAndRequestRecovery(paneId, turnId);
+    });
+  }
+
+  async #markStartMessageEffectStarted(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): Promise<void> {
+    const tracked = this.#activeStartMessageEffects.get(paneId);
+    if (tracked === undefined) return;
+    if (tracked.turnId !== turnId || tracked.state !== "claimed") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The app-owned message no longer owns this provider attempt.",
+      );
+    }
+    const queue = this.#store.markMessageEffectStarted({
+      paneId,
+      messageId: tracked.messageId,
+      expectedMessageRevision: tracked.revision,
+      turnId,
+      kind: "start",
+      now: this.#now(),
+    });
+    tracked.revision += 1;
+    tracked.state = "effectStarted";
+    await this.#publishMessageQueue(paneId, queue);
+  }
+
+  async #acknowledgeStartMessageEffect(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): Promise<void> {
+    const tracked = this.#activeStartMessageEffects.get(paneId);
+    if (tracked === undefined) return;
+    if (tracked.turnId !== turnId || tracked.state !== "effectStarted") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The provider acknowledgement lost its app-owned message fence.",
+      );
+    }
+    const queue = this.#store.acknowledgeMessageEffect({
+      paneId,
+      messageId: tracked.messageId,
+      expectedMessageRevision: tracked.revision,
+      turnId,
+      kind: "start",
+      now: this.#now(),
+    });
+    tracked.revision += 1;
+    tracked.state = "acknowledged";
+    await this.#publishMessageQueue(paneId, queue);
+  }
+
+  async #publishAndDeliverPreparedSteer(
+    claim: ChatMessageClaim,
+    preparedQueue: ChatMessageQueueProjection,
+    preEffectFailure: "cancelNewMessage" | "returnExistingMessage",
+  ): Promise<ChatMessageQueueProjection> {
+    try {
+      await this.#publishMessageQueue(claim.paneId, preparedQueue);
+    } catch (error: unknown) {
+      const settled = this.#settlePreparedSteerBeforeEffect(claim, preEffectFailure);
+      try {
+        await this.#publishMessageQueue(claim.paneId, settled.queue);
+      } catch {
+        // The durable queue is authoritative on the next snapshot.
+      }
+      if (!settled.attachmentsRestored) throw attachmentCompensationExpired();
+      throw error;
+    }
+    return await this.#deliverPreparedSteer(claim, preEffectFailure);
+  }
+
+  #settlePreparedSteerBeforeEffect(
+    claim: ChatMessageClaim,
+    policy: "cancelNewMessage" | "returnExistingMessage",
+  ): Readonly<{
+    queue: ChatMessageQueueProjection;
+    attachmentsRestored: boolean;
+  }> {
+    if (policy === "cancelNewMessage") {
+      return this.#store.cancelPreparedSteerMessage({
+        paneId: claim.paneId,
+        messageId: claim.messageId,
+        expectedMessageRevision: claim.revision,
+        turnId: claim.turnId,
+        kind: "steer",
+        now: this.#now(),
+      });
+    }
+    return {
+      queue: this.#store.returnClaimedMessageToQueue({
+        paneId: claim.paneId,
+        messageId: claim.messageId,
+        expectedMessageRevision: claim.revision,
+        turnId: claim.turnId,
+        kind: "steer",
+        now: this.#now(),
+      }),
+      attachmentsRestored: true,
+    };
+  }
+
+  async #deliverPreparedSteer(
+    claim: ChatMessageClaim,
+    preEffectFailure: "cancelNewMessage" | "returnExistingMessage",
+  ): Promise<ChatMessageQueueProjection> {
+    if (claim.kind !== "steer") {
+      throw new ChatPaneStoreError("corrupt_state", "A steering claim changed kind.");
+    }
+    const pane = this.#store.require(claim.paneId);
+    if (
+      pane.projection.turn?.id !== claim.turnId ||
+      !activePane(pane.projection) || pane.binding === null ||
+      pane.providerTurnId === null ||
+      this.#pendingTurnStops.has(claim.paneId) ||
+      this.#pendingTurnContainments.has(claim.paneId) ||
+      this.#recoveryFencedTurns.has(claim.paneId) ||
+      claim.content.text.trim().length === 0
+    ) {
+      const settled = this.#settlePreparedSteerBeforeEffect(
+        claim,
+        preEffectFailure,
+      );
+      await this.#publishMessageQueue(claim.paneId, settled.queue);
+      if (!settled.attachmentsRestored) throw attachmentCompensationExpired();
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The exact active turn is no longer ready for steering.",
+      );
+    }
+    const fence = this.#provider.verifySteerTarget({
+      ...pane.binding,
+      turnId: pane.providerTurnId,
+    });
+    if (fence === null) {
+      const settled = this.#settlePreparedSteerBeforeEffect(
+        claim,
+        preEffectFailure,
+      );
+      await this.#publishMessageQueue(claim.paneId, settled.queue);
+      if (!settled.attachmentsRestored) throw attachmentCompensationExpired();
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The active turn no longer has HRA's verified execution policy.",
+      );
+    }
+    const effectStarted = this.#store.markMessageEffectStarted({
+      paneId: claim.paneId,
+      messageId: claim.messageId,
+      expectedMessageRevision: claim.revision,
+      turnId: claim.turnId,
+      kind: "steer",
+      now: this.#now(),
+    });
+    const effectRevision = claim.revision + 1;
+    let acknowledged: ChatMessageQueueProjection;
+    try {
+      await this.#publishMessageQueue(claim.paneId, effectStarted);
+      await this.#provider.steerTurn({
+        binding: pane.binding,
+        providerTurnId: pane.providerTurnId,
+        messageId: claim.messageId,
+        prompt: claim.content.text,
+        fence,
+      });
+      acknowledged = this.#store.acknowledgeMessageEffect({
+        paneId: claim.paneId,
+        messageId: claim.messageId,
+        expectedMessageRevision: effectRevision,
+        turnId: claim.turnId,
+        kind: "steer",
+        now: this.#now(),
+      });
+    } catch {
+      try {
+        const ambiguous = this.#store.markMessageEffectAmbiguous({
+          paneId: claim.paneId,
+          messageId: claim.messageId,
+          expectedMessageRevision: effectRevision,
+          turnId: claim.turnId,
+          kind: "steer",
+          now: this.#now(),
+        });
+        await this.#publishMessageQueue(claim.paneId, ambiguous);
+      } catch {
+        this.#poisonTurnAndRequestRecovery({
+          paneId: claim.paneId,
+          turnId: claim.turnId,
+          accountProfileId: pane.binding.accountProfileId,
+        });
+      }
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The steering delivery outcome needs attention before this queue can continue.",
+      );
+    }
+    await this.#publishMessageQueue(claim.paneId, acknowledged);
+    return acknowledged;
+  }
+
+  async #settleMessageLedgerForTerminal(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): Promise<ChatMessageQueueProjection> {
+    const tracked = this.#activeStartMessageEffects.get(paneId);
+    if (tracked?.turnId === turnId) {
+      if (tracked.state === "claimed") {
+        const queue = this.#store.returnClaimedMessageToQueue({
+          paneId,
+          messageId: tracked.messageId,
+          expectedMessageRevision: tracked.revision,
+          turnId,
+          kind: "start",
+          now: this.#now(),
+        });
+        this.#activeStartMessageEffects.delete(paneId);
+        await this.#publishMessageQueue(paneId, queue);
+      } else if (tracked.state === "effectStarted") {
+        const queue = this.#store.markMessageEffectAmbiguous({
+          paneId,
+          messageId: tracked.messageId,
+          expectedMessageRevision: tracked.revision,
+          turnId,
+          kind: "start",
+          now: this.#now(),
+        });
+        tracked.revision += 1;
+        tracked.state = "ambiguous";
+        this.#activeStartMessageEffects.delete(paneId);
+        await this.#publishMessageQueue(paneId, queue);
+        return queue;
+      }
+    }
+    const completed = this.#store.completeAcknowledgedMessagesForTurn(
+      paneId,
+      turnId,
+      this.#now(),
+    );
+    this.#activeStartMessageEffects.delete(paneId);
+    if (completed.completedCount > 0) {
+      await this.#publishMessageQueue(paneId, completed.queue);
+    }
+    return completed.queue;
   }
 
   handleDelta(activity: ChatActivityDelta): Promise<void> {
@@ -1879,6 +2388,13 @@ export class ChatService {
       const completed = this.#store.completeTurn(event.paneId, event.turnId, this.#now());
       if (completed !== null) {
         await this.#projection.paneStateChanged(completed);
+        const queue = await this.#settleMessageLedgerForTerminal(
+          event.paneId,
+          event.turnId,
+        );
+        if (queue.pauseReason === null) {
+          await this.#admitNextQueuedMessage(event.paneId);
+        }
       }
       return;
     }
@@ -2200,6 +2716,22 @@ export class ChatService {
       );
     }
 
+
+    const currentQueue = this.#store.messageQueue(command.paneId);
+    if (
+      currentQueue.pauseReason !== "ambiguousEffect" &&
+      currentQueue.pauseReason !== "stop"
+    ) {
+      const paused = this.#store.pauseMessageQueue({
+        paneId: command.paneId,
+        reason: "stop",
+        now: this.#now(),
+      });
+      void this.#publishMessageQueue(command.paneId, paused).catch(() => {
+        this.#poisonActiveTurnAndRequestRecovery(command.paneId, command.turnId);
+      });
+    }
+
     let resolve!: (projection: ChatPaneProjection) => void;
     let reject!: (error: unknown) => void;
     const promise = new Promise<ChatPaneProjection>((resolvePromise, rejectPromise) => {
@@ -2429,6 +2961,8 @@ export class ChatService {
     // remains fenced by the old logical turn ID and terminal pane state.
     this.#paneTails.delete(paneId);
     await this.#projection.paneStateChanged(stopped);
+    await this.#pauseMessageQueue(paneId, "stop");
+    await this.#settleMessageLedgerForTerminal(paneId, request.turnId);
     if (generationFenced && accountProfileId !== null) {
       try {
         await this.handleAccountUnavailable(accountProfileId);
@@ -3108,6 +3642,8 @@ export class ChatService {
         account.id,
       );
       if (this.#turnStartupMustStop(paneId, turnId)) return;
+      await this.#markStartMessageEffectStarted(paneId, turnId);
+      if (this.#turnStartupMustStop(paneId, turnId)) return;
       this.#rootTurnRouting.markEffectStarted({
         paneId,
         chatTurnId: turnId,
@@ -3185,6 +3721,7 @@ export class ChatService {
           acceptedStreamPosition: accepted.quotaProofCursor.streamPosition,
           now: this.#now(),
         });
+        await this.#acknowledgeStartMessageEffect(paneId, turnId);
         this.#rememberQuotaFloor(paneId, turnId, binding.accountProfileId, accepted.quotaProofCursor);
         const streaming = this.#store.markTurnAccepted(paneId, turnId, accepted.turnId, this.#now());
         await this.#projection.paneStateChanged(streaming);
@@ -3820,7 +4357,11 @@ export class ChatService {
       },
       now: this.#now(),
     });
-    if (pane !== null) await this.#projection.paneStateChanged(pane);
+    if (pane !== null) {
+      await this.#pauseMessageQueue(paneId, "attention");
+      await this.#projection.paneStateChanged(pane);
+      await this.#settleMessageLedgerForTerminal(paneId, turnId);
+    }
   }
 
   async #publishAttention(
@@ -3841,7 +4382,11 @@ export class ChatService {
     this.#discardEarlySessionEvents(paneId);
     this.#quotaProofFloors.delete(paneId);
     this.#priorQuotaTerminals.delete(paneId);
-    if (pane !== null) await this.#projection.paneStateChanged(pane);
+    if (pane !== null) {
+      await this.#pauseMessageQueue(paneId, "attention");
+      await this.#projection.paneStateChanged(pane);
+      await this.#settleMessageLedgerForTerminal(paneId, turnId);
+    }
   }
 
   #rememberQuotaFloor(
@@ -4144,6 +4689,12 @@ function attachedHarnessRetryDelay(attempt: number): number {
   );
 }
 
+function newChatTurnId(): ChatTurnId {
+  return chatTurnIdSchema.parse(
+    `chatturn_${randomBytes(24).toString("base64url")}`,
+  );
+}
+
 function workspaceResolutionRetryDelay(attempt: number): number {
   const exponent = Math.min(Math.max(attempt - 1, 0), 16);
   return Math.min(
@@ -4288,6 +4839,13 @@ function routingOutcomeForLifecycle(
 
 function ambiguousProviderEffect(error: unknown): boolean {
   return !(error instanceof ChatProviderEffectError) || error.certainty === "ambiguous";
+}
+
+function attachmentCompensationExpired(): ChatPaneStoreError {
+  return new ChatPaneStoreError(
+    "invalid_state",
+    "A prepared attachment expired before the atomic steer could be restored. Remove and reattach it before sending again.",
+  );
 }
 
 function activePane(pane: ChatPaneProjection): boolean {

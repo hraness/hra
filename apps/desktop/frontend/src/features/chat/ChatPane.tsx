@@ -14,7 +14,6 @@ import {
 } from "react";
 
 import {
-  Button,
   IconButton,
   Menu,
   MenuItem,
@@ -24,11 +23,13 @@ import {
 } from "../../ui";
 
 import {
-  runtimeChatTurnPromptUtf8ByteLimit,
+  runtimeChatMessageUtf8ByteLimit,
+  type ChatBlockedMessageProjection,
+  type ChatMessageContent,
   type ChatPaneProjection,
-  type ChatToolCategory,
-  type HarnessChildProjection,
+  type ChatQueuedMessageProjection,
   type RuntimeChatDomainCommand,
+  type RuntimeChatMessageLedgerCommand,
   type RuntimeDispatchResponse,
   type RuntimeError,
 } from "../../../../contracts/runtime";
@@ -39,16 +40,27 @@ import {
 import { MarkdownResponse } from "./MarkdownResponse";
 import { HRAIcon } from "./Icon";
 import {
+  ActiveSubagentStack,
+  capturePastedImages,
+  CompactComposerBar,
+  compactComposerDelivery,
+  paneIdentityStyle,
+  QueuedMessageStack,
+  TurnElapsed,
+  type CompactChatPaneSurface,
+} from "./CompactChatSurface";
+import {
   composerEnterAction,
   createTitleDebouncer,
-  createTurnId,
+  createMessageId,
+  discardAmbiguousMessageCommand,
+  editQueuedMessageCommand,
+  enqueueMessageCommand,
   isRevisionConflict,
   normalizePaneTitle,
-  openHarnessChildCommand,
   paneAccessibleName,
   paneCanCompose,
   paneCanRename,
-  paneCanRetryRetainedPrompt,
   paneIsActive,
   paneStatusLabel,
   paneWorkspaceStatus,
@@ -57,20 +69,18 @@ import {
   paneTitleUtf16CodeUnitLimit,
   reconcilePaneTitleCommit,
   recoverPaneWorkspaceCommand,
+  removeQueuedMessageCommand,
   renamePaneCommand,
   resolvePaneRevisionConflict,
-  rootTurnRoutePresentation,
   runtimeAvailabilityEqual,
   selectRuntimeAvailability,
   selectPane,
   selectPaneCanMessage,
   selectPaneRepositoryCommand,
-  retryTurnCommand,
-  stopHarnessChildCommand,
+  resumeMessageQueueCommand,
   stopTurnCommand,
-  startTurnCommand,
+  steerQueuedMessageCommand,
   titleCommitFailureShouldRefocus,
-  toolCategoryLabel,
   validatedPrompt,
   type ScheduledTitleCommit,
   type TitleDebouncer,
@@ -140,30 +150,16 @@ async function dispatchPaneMutationWithRetry(
   throw new PaneCommandError("The pane changed before the request could finish.");
 }
 
-export function dispatchRetainedPromptRetry(
-  shell: PaneRetryMutationPort,
-  pane: ChatPaneProjection,
-  turnId: NonNullable<ChatPaneProjection["turn"]>["id"],
-): Promise<ChatPaneProjection> {
-  const priorFailedTurnId = pane.turn?.id;
-  if (!paneCanRetryRetainedPrompt(pane) || priorFailedTurnId === undefined) {
-    return Promise.reject(new PaneCommandError(
-      "This pane no longer has the exact failed message available to retry.",
-    ));
+export async function dispatchMessageQueueMutation(
+  shell: Pick<RuntimeShell, "dispatch">,
+  command: RuntimeChatMessageLedgerCommand,
+): Promise<ChatPaneProjection["messageQueue"]> {
+  const response = await shell.dispatch(command);
+  if (!response.ok) throw new PaneCommandError(response.error.message, response.error);
+  if (response.result.type !== "chatMessageQueue" || response.result.paneId !== command.paneId) {
+    throw new PaneCommandError("The local runtime returned the wrong message queue result.");
   }
-  return dispatchPaneMutationWithRetry(
-    shell,
-    pane.id,
-    pane.revision,
-    (expectedRevision) => retryTurnCommand({
-      paneId: pane.id,
-      expectedRevision,
-      priorFailedTurnId,
-      turnId,
-    }),
-    (current) => paneCanRetryRetainedPrompt(current) &&
-      current.turn?.id === priorFailedTurnId,
-  );
+  return response.result.queue;
 }
 
 export interface PaneTitleMutationPort {
@@ -519,28 +515,12 @@ function InlinePaneTitle({
   );
 }
 
-function toolCategoryIcon(category: ChatToolCategory) {
-  switch (category) {
-    case "command":
-      return "command" as const;
-    case "filesystem":
-      return "folder" as const;
-    case "network":
-      return "network" as const;
-    case "search":
-      return "search" as const;
-    case "other":
-      return "sparkle" as const;
-  }
-}
-
 function TurnActivity({ pane }: { readonly pane: ChatPaneProjection }) {
   const turn = pane.turn;
   if (turn === null) return null;
   const active = paneIsActive(pane.state);
-  const latestTool = turn.tools.at(-1) ?? null;
-  const hasActivity = turn.reasoningSummary.tail.length > 0 ||
-    turn.tools.length > 0 || turn.responseMarkdown.tail.length > 0;
+  const hasVisibleActivity = turn.reasoningSummary.tail.length > 0 ||
+    turn.responseMarkdown.tail.length > 0;
 
   return (
     <>
@@ -549,28 +529,23 @@ function TurnActivity({ pane }: { readonly pane: ChatPaneProjection }) {
           <div aria-hidden="true" className="pane-activity-label">
             <span className="activity-pulse" aria-hidden="true" />
           </div>
-          {turn.reasoningSummary.truncatedPrefix ? (
-            <p className="pane-truncation">Earlier thinking was omitted.</p>
-          ) : null}
-          <p>{turn.reasoningSummary.tail}</p>
+          <MarkdownResponse
+            content={turn.reasoningSummary}
+            streaming
+            variant="reasoning"
+          />
         </section>
-      ) : null}
-      {active && latestTool !== null ? (
-        <div
-          aria-label={`Latest tool: ${toolCategoryLabel(latestTool.category)}, ${latestTool.status === "running" ? "running" : "done"}`}
-          className="pane-tool"
-          data-status={latestTool.status}
-        >
-          <HRAIcon name={toolCategoryIcon(latestTool.category)} />
-          <span aria-hidden="true" className="tool-status-spinner" />
-        </div>
       ) : null}
       {turn.responseMarkdown.tail.length > 0 ? (
         <article aria-label="Latest response" className="pane-response">
-          <MarkdownResponse content={turn.responseMarkdown} streaming={active} />
+          <MarkdownResponse
+            content={turn.responseMarkdown}
+            streaming={active}
+            variant="response"
+          />
         </article>
       ) : null}
-      {active && !hasActivity ? (
+      {active && !hasVisibleActivity ? (
         <p aria-label="Working" className="pane-working">
           <span aria-hidden="true" className="activity-pulse" />
         </p>
@@ -596,6 +571,7 @@ interface ChatPaneViewProps {
   readonly reorderPending?: boolean;
   readonly pane: ChatPaneProjection;
   readonly shell: RuntimeShell;
+  readonly surface?: CompactChatPaneSurface;
 }
 
 export function ChatPaneView({
@@ -615,6 +591,7 @@ export function ChatPaneView({
   reorderPending = false,
   pane,
   shell,
+  surface,
 }: ChatPaneViewProps) {
   const runtimeAvailability = useRuntimeShellSelector(
     shell,
@@ -633,15 +610,15 @@ export function ChatPaneView({
   const workspaceStatus = paneWorkspaceStatus(pane);
   const [prompt, setPrompt] = useState("");
   const [pendingAction, setPendingAction] = useState<
-    "harness" | "remove" | "repository" | "retry" | "send" | "stop" | "workspace" | null
+    "queue" | "remove" | "repository" | "send" | "stop" | "workspace" | null
   >(null);
-  const [harnessPanelOpen, setHarnessPanelOpen] = useState(false);
-  const [pendingHarnessChildId, setPendingHarnessChildId] = useState<string | null>(null);
   const [titlePending, setTitlePending] = useState(false);
   const [titleEditRequest, setTitleEditRequest] = useState(0);
   const titlePendingRef = useRef(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const active = paneIsActive(pane.state);
+  const composerCanDraft = canMessage && (paneCanCompose(pane.state) || active);
+  const showComposerForm = canMessage || active;
   const acceptsUserInteraction = paneAcceptsUserInteraction(pane);
   const paneHarness = pane.harness ?? null;
   const descendants = paneHarness?.descendants ?? null;
@@ -655,14 +632,11 @@ export function ChatPaneView({
     && paneCanRename(pane.state)
     && pendingAction === null;
   const turn = pane.turn;
-  const routePresentation = rootTurnRoutePresentation(turn?.routing ?? null);
-  const canRetryRetainedPrompt = paneCanRetryRetainedPrompt(pane);
   const pristine = turn === null;
   const scrollKey = [
     pane.state,
     turn?.reasoningSummary.totalUtf8Bytes ?? 0,
     turn?.responseMarkdown.totalUtf8Bytes ?? 0,
-    turn?.tools.map(({ id, status }) => `${id}:${status}`).join(",") ?? "",
   ].join(":");
   const { onScroll, transcriptRef } = usePaneAutoScroll(scrollKey);
   const paneLabelId = `chat-pane-label-${pane.id}`;
@@ -718,58 +692,123 @@ export function ChatPaneView({
     }
   }, [configurable, pane.id, pane.revision, shell, workspaceStatus]);
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (steerModifier = false) => {
     if (
       !runtimeReady
       || !canMessage
-      || !paneCanCompose(pane.state)
+      || (!paneCanCompose(pane.state) && !active)
       || pendingAction !== null
       || titlePending
     ) return;
+    const readyAttachments = surface?.attachments.filter(({ status }) => status === "ready") ?? [];
+    if (
+      surface !== undefined &&
+      readyAttachments.length !== surface.attachments.length
+    ) {
+      setLocalError("Wait for every attachment to finish processing.");
+      return;
+    }
     const validation = validatedPrompt(prompt);
-    if (!validation.ok) {
+    if (!validation.ok && readyAttachments.length === 0) {
       setLocalError(validation.message);
       return;
     }
-    const turnId = createTurnId();
     setPendingAction("send");
     setLocalError(null);
     try {
-      await dispatchPaneMutationWithRetry(
+      const attachmentRefs = readyAttachments.map(({ id }) => id);
+      const requestedDelivery = compactComposerDelivery({
+        active,
+        queueEmpty: pane.messageQueue.messages.length === 0 &&
+          pane.messageQueue.blockedMessage === null &&
+          pane.messageQueue.pauseReason === null,
+        steerModifier,
+      });
+      await dispatchMessageQueueMutation(
         shell,
-        pane.id,
-        pane.revision,
-        (expectedRevision) => startTurnCommand({
+        enqueueMessageCommand({
           paneId: pane.id,
-          expectedRevision,
-          turnId,
-          prompt: validation.prompt,
+          expectedQueueRevision: pane.messageQueue.revision,
+          messageId: createMessageId(),
+          content: {
+            text: validation.ok ? validation.prompt : "",
+            attachmentRefs,
+          },
+          delivery: requestedDelivery === "steerHead" && turn !== null
+            ? { kind: "steerHead", expectedTurnId: turn.id }
+            : { kind: "queue" },
         }),
       );
+      surface?.onAttachmentsEnqueued?.(attachmentRefs);
       setPrompt("");
     } catch (reason: unknown) {
       setLocalError(commandErrorMessage(reason));
     } finally {
       setPendingAction(null);
     }
-  }, [canMessage, pane.id, pane.revision, pane.state, pendingAction, prompt, runtimeReady, shell, titlePending]);
+  }, [active, canMessage, pane.id, pane.messageQueue, pane.state, pendingAction, prompt, runtimeReady, shell, surface, titlePending, turn]);
 
-  const retryRetainedPrompt = useCallback(async () => {
-    if (
-      !runtimeReady || !canMessage || !paneCanRetryRetainedPrompt(pane) ||
-      pendingAction !== null || titlePending
-    ) return;
-    const turnId = createTurnId();
-    setPendingAction("retry");
+  const mutateQueue = useCallback(async (command: RuntimeChatMessageLedgerCommand) => {
+    if (!runtimeReady || pendingAction !== null || titlePending) return;
+    setPendingAction("queue");
     setLocalError(null);
     try {
-      await dispatchRetainedPromptRetry(shell, pane, turnId);
+      await dispatchMessageQueueMutation(shell, command);
     } catch (reason: unknown) {
       setLocalError(commandErrorMessage(reason));
     } finally {
       setPendingAction(null);
     }
-  }, [canMessage, pane, pendingAction, runtimeReady, shell, titlePending]);
+  }, [pendingAction, runtimeReady, shell, titlePending]);
+
+  const editQueuedMessage = useCallback((
+    message: ChatQueuedMessageProjection,
+    content: ChatMessageContent,
+  ) => {
+    void mutateQueue(editQueuedMessageCommand({
+      paneId: pane.id,
+      expectedQueueRevision: pane.messageQueue.revision,
+      messageId: message.id,
+      expectedMessageRevision: message.revision,
+      content,
+    }));
+  }, [mutateQueue, pane.id, pane.messageQueue.revision]);
+
+  const removeQueuedMessage = useCallback((message: ChatQueuedMessageProjection) => {
+    void mutateQueue(removeQueuedMessageCommand({
+      paneId: pane.id,
+      expectedQueueRevision: pane.messageQueue.revision,
+      messageId: message.id,
+      expectedMessageRevision: message.revision,
+    }));
+  }, [mutateQueue, pane.id, pane.messageQueue.revision]);
+
+  const resumeMessageQueue = useCallback(() => {
+    void mutateQueue(resumeMessageQueueCommand({
+      paneId: pane.id,
+      expectedQueueRevision: pane.messageQueue.revision,
+    }));
+  }, [mutateQueue, pane.id, pane.messageQueue.revision]);
+
+  const discardAmbiguousMessage = useCallback((message: ChatBlockedMessageProjection) => {
+    void mutateQueue(discardAmbiguousMessageCommand({
+      paneId: pane.id,
+      expectedQueueRevision: pane.messageQueue.revision,
+      messageId: message.id,
+      expectedMessageRevision: message.revision,
+    }));
+  }, [mutateQueue, pane.id, pane.messageQueue.revision]);
+
+  const steerQueuedMessage = useCallback((message: ChatQueuedMessageProjection) => {
+    if (!active || turn === null) return;
+    void mutateQueue(steerQueuedMessageCommand({
+      paneId: pane.id,
+      expectedQueueRevision: pane.messageQueue.revision,
+      messageId: message.id,
+      expectedMessageRevision: message.revision,
+      expectedTurnId: turn.id,
+    }));
+  }, [active, mutateQueue, pane.id, pane.messageQueue.revision, turn]);
 
   const selectRepository = useCallback(async () => {
     if (!acceptsUserInteraction || !pristine || !configurable) return;
@@ -843,37 +882,6 @@ export function ChatPaneView({
     }
   }, [active, pane.id, pane.interactionMode, pane.revision, pane.turn, pendingAction, runtimeReady, shell, titlePending]);
 
-  const runChildAction = useCallback(async (
-    child: HarnessChildProjection,
-    action: "open" | "stop",
-  ) => {
-    if (!runtimeReady || pendingAction !== null || titlePending) return;
-    setPendingAction("harness");
-    setPendingHarnessChildId(child.id);
-    setLocalError(null);
-    try {
-      const response = await shell.dispatch(action === "open"
-        ? openHarnessChildCommand({
-            parentPaneId: pane.id,
-            childId: child.id,
-            expectedParentRevision: pane.revision,
-            expectedChildRevision: child.revision,
-          })
-        : stopHarnessChildCommand({
-            parentPaneId: pane.id,
-            childId: child.id,
-            expectedParentRevision: pane.revision,
-            expectedChildRevision: child.revision,
-          }));
-      if (!response.ok) throw new PaneCommandError(response.error.message, response.error);
-    } catch (reason: unknown) {
-      setLocalError(commandErrorMessage(reason));
-    } finally {
-      setPendingHarnessChildId(null);
-      setPendingAction(null);
-    }
-  }, [pane.id, pane.revision, pendingAction, runtimeReady, shell, titlePending]);
-
   const attentionMessage = pane.attention?.message ?? null;
   const composerError = localError ?? attentionMessage ?? workspaceStatus?.message ?? (
     runtimeAvailability.kind === "unavailable" ? runtimeAvailability.message : null
@@ -900,7 +908,6 @@ export function ChatPaneView({
       data-pane-error={composerError === null ? undefined : "true"}
       data-pane-id={pane.id}
       data-pane-harness={paneHarness === null ? undefined : "true"}
-      data-pane-harness-panel={harnessPanelOpen && paneHarness !== null ? "true" : undefined}
       data-pane-interaction-mode={pane.interactionMode}
       data-pane-state={pane.state}
       onChangeCapture={fenceTitlePendingInteraction}
@@ -913,6 +920,7 @@ export function ChatPaneView({
         fenceTitlePendingInteraction(event);
       }}
       onSubmitCapture={fenceTitlePendingInteraction}
+      style={paneIdentityStyle(surface?.paletteIndex ?? null)}
     >
       <span className="hra-visually-hidden" id={paneLabelId}>
         {accessibleName}
@@ -937,22 +945,6 @@ export function ChatPaneView({
               revision={pane.revision}
               title={pane.title}
             />
-            {descendants === null ? null : (
-              <IconButton
-                aria-label={`${harnessPanelOpen ? "Hide" : "Show"} ${descendants.count} recursive ${descendants.count === 1 ? "session" : "sessions"} for ${pane.title}`}
-                aria-expanded={harnessPanelOpen}
-                className="pane-harness-button-shell"
-                controlClassName="pane-harness-button"
-                isDisabled={titlePending}
-                onPress={() => setHarnessPanelOpen((open) => !open)}
-                size="compact"
-                type="button"
-                variant="quiet"
-              >
-                <HRAIcon name="branch" />
-                <span aria-hidden="true">{descendants.count}</span>
-              </IconButton>
-            )}
           </div>
           <div className="chat-pane__repository-row">
             {acceptsUserInteraction && pristine ? (
@@ -989,22 +981,6 @@ export function ChatPaneView({
           </div>
         </div>
         <div className="chat-pane__header-actions">
-          {pane.interactionMode === "chat" && active && turn !== null ? (
-            <IconButton
-              aria-label={`Stop ${pane.title}`}
-              className="pane-stop-shell"
-              controlClassName="pane-stop"
-              isDisabled={!runtimeReady || pendingAction !== null || titlePending}
-              isPending={pendingAction === "stop"}
-              onPress={() => void stop()}
-              size="compact"
-              tooltip={`Stop ${pane.title}`}
-              type="button"
-              variant="quiet"
-            >
-              <HRAIcon name="stop" />
-            </IconButton>
-          ) : null}
           <MenuTrigger>
               <IconButton
                 aria-label={`More actions for ${pane.title}`}
@@ -1021,26 +997,22 @@ export function ChatPaneView({
               <Menu
                 aria-label={`Actions for ${pane.title}`}
                 disabledKeys={[
-                  ...(pane.interactionMode === "harnessObserver" && !titleEditable
-                    ? ["rename"]
-                    : []),
+                  ...(!titleEditable ? ["rename"] : []),
                   ...(!canMoveEarlier || reorderPending ? ["move-earlier"] : []),
                   ...(!canMoveLater || reorderPending ? ["move-later"] : []),
                   ...(pane.interactionMode === "chat" && active ? ["close"] : []),
                 ]}
                 onAction={(key) => {
-                  if (key === "rename" && pane.interactionMode === "harnessObserver") {
+                  if (key === "rename") {
                     setTitleEditRequest((request) => request + 1);
                   } else if (key === "move-earlier") onMoveEarlier();
                   else if (key === "move-later") onMoveLater();
                   else if (key === "close" && pane.interactionMode === "chat") void remove();
                 }}
               >
-                {pane.interactionMode === "harnessObserver" ? (
-                  <MenuItem id="rename" textValue="Rename pane">
-                    Rename pane
-                  </MenuItem>
-                ) : null}
+                <MenuItem id="rename" textValue="Rename pane">
+                  Rename pane
+                </MenuItem>
                 <MenuItem id="move-earlier" textValue="Move earlier">
                   Move earlier
                 </MenuItem>
@@ -1057,52 +1029,6 @@ export function ChatPaneView({
         </div>
       </header>
 
-      {!harnessPanelOpen || paneHarness === null ? null : (
-        <div className="pane-harness-panel">
-          {descendants === null ? null : (
-            <ul aria-label={`Recursive sessions for ${pane.title}`}>
-              {descendants.children.map((child) => (
-                <li key={child.id}>
-                  <span className="pane-harness-child-title">{child.title}</span>
-                  <span className="pane-harness-child-state">{child.state}</span>
-                  <span className="pane-harness-child-actions">
-                    <IconButton
-                      aria-label={`Open ${child.title}`}
-                      controlClassName="pane-harness-icon-button"
-                      isDisabled={
-                        !runtimeReady || pendingAction !== null || titlePending ||
-                        !child.canOpen
-                      }
-                      isPending={pendingHarnessChildId === child.id && pendingAction === "harness"}
-                      onPress={() => void runChildAction(child, "open")}
-                      size="compact"
-                      type="button"
-                      variant="quiet"
-                    >
-                      <HRAIcon name="open" />
-                    </IconButton>
-                    <IconButton
-                      aria-label={`Stop ${child.title}`}
-                      controlClassName="pane-harness-icon-button"
-                      isDisabled={
-                        !runtimeReady || pendingAction !== null || titlePending || !child.canStop
-                      }
-                      isPending={pendingHarnessChildId === child.id && pendingAction === "harness"}
-                      onPress={() => void runChildAction(child, "stop")}
-                      size="compact"
-                      type="button"
-                      variant="quiet"
-                    >
-                      <HRAIcon name="stop" />
-                    </IconButton>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-
       <div
         aria-labelledby={transcriptLabelId}
         className="chat-pane__transcript"
@@ -1114,7 +1040,7 @@ export function ChatPaneView({
         {turn === null ? null : <TurnActivity pane={pane} />}
       </div>
 
-      {!canMessage && composerError !== null ? (
+      {!composerCanDraft && composerError !== null ? (
         <p
           aria-atomic="true"
           className="pane-error"
@@ -1125,7 +1051,22 @@ export function ChatPaneView({
         </p>
       ) : null}
       {pane.interactionMode !== "chat" ? null : <footer className="chat-pane__composer">
-        {!canMessage || composerError === null ? null : (
+        {descendants === null ? null : (
+          <ActiveSubagentStack
+            children={descendants.children}
+          />
+        )}
+        <QueuedMessageStack
+          discardAmbiguousDisabled={active}
+          disabled={pendingAction !== null || titlePending || !runtimeReady}
+          onDiscardAmbiguous={discardAmbiguousMessage}
+          onEdit={editQueuedMessage}
+          onRemove={removeQueuedMessage}
+          onResume={resumeMessageQueue}
+          {...(!active || turn === null ? {} : { onSteerHead: steerQueuedMessage })}
+          queue={pane.messageQueue}
+        />
+        {!composerCanDraft || composerError === null ? null : (
           <p
             aria-atomic="true"
             className="pane-error"
@@ -1135,108 +1076,105 @@ export function ChatPaneView({
             {composerError}
           </p>
         )}
-        {!canMessage ? null : <form
+        {!showComposerForm ? null : <form
           onSubmit={(event: FormEvent<HTMLFormElement>) => {
             event.preventDefault();
-            void send();
+            void send(false);
           }}
         >
-          <TextAreaField
-            className="pane-prompt-field"
-            isDisabled={!runtimeReady || active || pendingAction === "send" || pendingAction === "retry" || titlePending}
-            label={`Message ${pane.title}`}
-            onChange={(value) => {
-              setPrompt(value);
-              if (localError !== null) setLocalError(null);
-            }}
-            resize="none"
-            showLabel={false}
-            size="compact"
-            surface="pane"
-            textAreaClassName="pane-prompt"
-            textAreaProps={{
-              "aria-describedby": composerError === null ? undefined : composerErrorId,
-              "aria-invalid": localError === null ? undefined : true,
-              id: `prompt-${pane.id}`,
-              maxLength: runtimeChatTurnPromptUtf8ByteLimit,
-              onKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-                const action = composerEnterAction({
-                  isComposing: event.nativeEvent.isComposing,
-                  key: event.key,
-                  shiftKey: event.shiftKey,
-                });
-                if (action !== "submit") return;
-                event.preventDefault();
-                void send();
-              },
-              rows: 2,
-            }}
-            value={prompt}
-          />
-          {canRetryRetainedPrompt ? (
-            <IconButton
-              aria-label={pendingAction === "retry"
-                ? `Retrying failed message for ${pane.title}`
-                : `Retry failed message for ${pane.title}`}
-              className="pane-retry-shell"
-              controlClassName="pane-retry"
-              isDisabled={!runtimeReady || pendingAction !== null || titlePending}
-              onPress={() => void retryRetainedPrompt()}
+          <CompactComposerBar
+            attachments={surface?.attachments ?? []}
+            {...(surface?.onAttachFiles === undefined
+              ? {}
+              : { onAttachFiles: surface.onAttachFiles })}
+            {...(surface?.onRemoveAttachment === undefined
+              ? {}
+              : { onRemoveAttachment: surface.onRemoveAttachment })}
+            right={(
+              <>
+                <TurnElapsed
+                  {...(surface?.nowUnixMilliseconds === undefined
+                    ? {}
+                    : { nowUnixMilliseconds: surface.nowUnixMilliseconds })}
+                  turn={turn}
+                />
+                {active && turn !== null ? (
+                  <IconButton
+                    aria-label={`Stop ${pane.title}`}
+                    controlClassName="pane-stop"
+                    isDisabled={!runtimeReady || pendingAction !== null || titlePending}
+                    isPending={pendingAction === "stop"}
+                    onPress={() => void stop()}
+                    size="compact"
+                    type="button"
+                    variant="quiet"
+                  >
+                    <HRAIcon name="stop" />
+                  </IconButton>
+                ) : null}
+                <IconButton
+                  aria-label={pendingAction === "send"
+                    ? `${active ? "Queueing" : "Sending"} message for ${pane.title}`
+                    : `${active ? "Queue" : "Send"} message for ${pane.title}`}
+                  controlClassName="pane-send"
+                  isDisabled={
+                    !runtimeReady
+                    || !composerCanDraft
+                    || pendingAction !== null
+                    || titlePending
+                    || (
+                      prompt.trim().length === 0 &&
+                      (surface?.attachments.filter(({ status }) => status === "ready").length ?? 0) === 0
+                    )
+                  }
+                  size="compact"
+                  type="submit"
+                  variant="quiet"
+                >
+                  <HRAIcon name="send" />
+                </IconButton>
+              </>
+            )}
+          >
+            <TextAreaField
+              className="pane-prompt-field"
+              isDisabled={
+                !runtimeReady || !composerCanDraft || pendingAction !== null || titlePending
+              }
+              label={`Message ${pane.title}`}
+              onChange={(value) => {
+                setPrompt(value);
+                if (localError !== null) setLocalError(null);
+              }}
+              resize="none"
+              showLabel={false}
               size="compact"
-              type="button"
-              variant="quiet"
-            >
-              <HRAIcon
-                className={pendingAction === "retry"
-                  ? "hra-icon pane-retry__icon--pending"
-                  : "hra-icon"}
-                name="refresh"
-              />
-            </IconButton>
-          ) : null}
-          <IconButton
-            aria-label={pendingAction === "send" ? `Sending message to ${pane.title}` : `Send message to ${pane.title}`}
-            className="pane-send-shell"
-            controlClassName="pane-send"
-            isDisabled={
-              !runtimeReady
-              || active
-              || pendingAction !== null
-              || titlePending
-              || prompt.trim().length === 0
-            }
-            size="compact"
-            type="submit"
-            variant="quiet"
-          >
-            <HRAIcon name="send" />
-          </IconButton>
+              surface="pane"
+              textAreaClassName="pane-prompt"
+              textAreaProps={{
+                "aria-describedby": composerError === null ? undefined : composerErrorId,
+                "aria-invalid": localError === null ? undefined : true,
+                id: `prompt-${pane.id}`,
+                maxLength: runtimeChatMessageUtf8ByteLimit,
+                onKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                  const action = composerEnterAction({
+                    isComposing: event.nativeEvent.isComposing,
+                    key: event.key,
+                    shiftKey: event.shiftKey,
+                  });
+                  if (action !== "submit") return;
+                  event.preventDefault();
+                  void send(event.metaKey || event.ctrlKey);
+                },
+                onPaste: (event) => {
+                  capturePastedImages(event, surface?.onAttachFiles);
+                },
+                rows: 2,
+              }}
+              value={prompt}
+            />
+          </CompactComposerBar>
         </form>}
-        <div className="chat-pane__controls">
-          <Button
-            aria-label={`Rename ${pane.title}`}
-            className="pane-rename-shell"
-            controlClassName="pane-rename"
-            isDisabled={!titleEditable}
-            onPress={() => setTitleEditRequest((request) => request + 1)}
-            size="compact"
-            type="button"
-            variant="quiet"
-          >
-            <HRAIcon name="edit" />
-            <span>Rename</span>
-          </Button>
-          {routePresentation === null ? null : (
-            <>
-              <span aria-hidden="true" className="pane-route-label">
-                {routePresentation.label}
-              </span>
-              <span className="hra-visually-hidden pane-route-description">
-                {routePresentation.accessibleLabel}
-              </span>
-            </>
-          )}
-        </div>
       </footer>}
     </section>
   );
@@ -1259,6 +1197,7 @@ export interface ChatPaneProps {
   readonly paneId: string;
   readonly reorderPending?: boolean;
   readonly shell: RuntimeShell;
+  readonly surface?: CompactChatPaneSurface;
 }
 
 function ChatPaneContainer({
@@ -1278,6 +1217,7 @@ function ChatPaneContainer({
   paneId,
   reorderPending = false,
   shell,
+  surface,
 }: ChatPaneProps) {
   const selector = useMemo(
     () => (state: Parameters<typeof selectPane>[0]) => selectPane(state, paneId),
@@ -1303,6 +1243,7 @@ function ChatPaneContainer({
         pane={pane}
         reorderPending={reorderPending}
         shell={shell}
+        {...(surface === undefined ? {} : { surface })}
       />;
 }
 

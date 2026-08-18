@@ -721,9 +721,18 @@ test("gateway launch resumes through the owned latest-turn snapshot projection",
       requirementsPosition: 3,
       admissionPosition: 4,
     });
+    const staleGeneration = await service.steer({
+      threadId: active.id,
+      expectedTurnId: active.activeTurn.id,
+      expectedGeneration: 2,
+      clientUserMessageId: "message_primary_stale",
+      prompt: "Must not cross a restarted runtime",
+    }).then(() => null, (error: unknown) => error);
+    expect(staleGeneration).toMatchObject({ code: "policy_denied" });
     await service.steer({
       threadId: active.id,
       expectedTurnId: active.activeTurn.id,
+      expectedGeneration: 1,
       clientUserMessageId: "message_primary0002",
       prompt: "Also keep it responsive",
     });

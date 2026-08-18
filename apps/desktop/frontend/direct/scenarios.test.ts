@@ -31,6 +31,7 @@ const expectedScenarios = [
   "chat-compact-320",
   "chat-compact-415",
   "chat-compact-639",
+  "chat-compact-malleable",
   "chat-completed",
   "chat-create-pane",
   "chat-create-pane-inherit",
@@ -66,14 +67,18 @@ const expectedScenarios = [
 ] as const;
 
 const expectedCoverage = [
+  "chat.pane.attachment-preview",
   "chat.pane.attention-recovery",
   "chat.pane.compact-responsive",
   "chat.pane.create",
   "chat.pane.draft",
+  "chat.pane.elapsed",
+  "chat.pane.identity-status",
   "chat.pane.inline-title",
   "chat.pane.latest-response",
   "chat.pane.order",
   "chat.pane.parallel-performance",
+  "chat.pane.queue-steer",
   "chat.pane.streaming",
   "chat.subscription-gate",
   "chat.turn.routing",
@@ -470,6 +475,7 @@ describe("HRA Direct catalogs", () => {
     expect(hraScenarioMetadata["chat-compact-639"].viewport).toBe("compact");
     expect(hraScenarioMetadata["chat-compact-415"].viewport).toBe("compact");
     expect(hraScenarioMetadata["chat-compact-320"].viewport).toBe("compact");
+    expect(hraScenarioMetadata["chat-compact-malleable"].viewport).toBe("compact");
 
     const parallel = hraScenarioCatalog.resolve("chat-parallel-streaming");
     if (!parallel.ok) throw new Error(parallel.error.message);
@@ -522,5 +528,41 @@ describe("HRA Direct catalogs", () => {
       turn: { tools: [] },
     });
     expect(projected.sessionSync.remoteSessions[0]).toBe(settledSibling);
+  });
+
+  test("models only attachment, clock, and identity as a strict compact surface port", () => {
+    const compact = hraScenarioCatalog.resolve("chat-compact-malleable");
+    if (!compact.ok) throw new Error(compact.error.message);
+    expect(compact.value.world.surface).toEqual({
+      kind: "compactChat",
+      paneId: "pane_compact_malleable",
+      paletteIndex: 5,
+      nowUnixMilliseconds: 1_784_480_505_000,
+      attachments: [{
+        id: "attachment_compactdirect01",
+        name: "compact-layout.png",
+        mimeType: "image/png",
+        byteSize: 2_048,
+      }],
+    });
+    expect(compact.value.world.gateway.snapshots[0]?.chat.panes[0]?.messageQueue)
+      .toEqual({
+        revision: 4,
+        pauseReason: null,
+        blockedMessage: null,
+        messages: [{
+          id: "chatmsg_compactdirect01",
+          ordinal: 1,
+          revision: 2,
+          text: "Steer the active turn with the accessibility findings.",
+          attachmentRefs: [],
+        }, {
+          id: "chatmsg_compactdirect02",
+          ordinal: 2,
+          revision: 1,
+          text: "Then tighten the 26rem layout.",
+          attachmentRefs: [],
+        }],
+      });
   });
 });

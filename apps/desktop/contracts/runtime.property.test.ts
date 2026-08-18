@@ -5,7 +5,7 @@ import {
   parseRuntimeDispatchRequest,
   parseRuntimeSnapshotResponse,
   parseRuntimeTaskDispatchRequest,
-  runtimeChatTurnPromptUtf8ByteLimit,
+  runtimeChatMessageUtf8ByteLimit,
   runtimeDispatchCommand,
   runtimeNativeBridgeRequestUtf8ByteLimit,
   runtimeProtocolVersion,
@@ -122,20 +122,10 @@ test("turn stop carries only pane revision and logical-turn authority", () => {
   ));
 });
 
-test("turn Retry is prompt-free and binds distinct failed and fresh turn identities", () => {
+test("raw renderer retry authority is rejected for every fenced revision", () => {
   assertProperty(fc.property(
     fc.integer({ min: 1, max: Number.MAX_SAFE_INTEGER }),
-    fc.constantFrom(
-      "prompt",
-      "path",
-      "threadId",
-      "provider",
-      "providerTurnId",
-      "model",
-      "history",
-    ),
-    fc.jsonValue(),
-    (expectedRevision, key, value) => {
+    (expectedRevision) => {
       const command = {
         type: "chat.turn.retry",
         paneId: "pane_propertyretry01",
@@ -143,23 +133,10 @@ test("turn Retry is prompt-free and binds distinct failed and fresh turn identit
         priorFailedTurnId: "chatturn_propertyfailed01",
         turnId: "chatturn_propertyretry01",
       } as const;
-      expect(parseRuntimeDispatchRequest({
+      expect(() => parseRuntimeDispatchRequest({
         version: runtimeProtocolVersion,
         operationId: "op_propertyretry01",
         command,
-      }).command).toEqual(command);
-      expect(() => parseRuntimeDispatchRequest({
-        version: runtimeProtocolVersion,
-        operationId: "op_propertyretry02",
-        command: { ...command, [key]: value },
-      })).toThrow();
-      expect(() => parseRuntimeDispatchRequest({
-        version: runtimeProtocolVersion,
-        operationId: "op_propertyretry03",
-        command: {
-          ...command,
-          turnId: command.priorFailedTurnId,
-        },
       })).toThrow();
     },
   ));
@@ -171,11 +148,12 @@ test("every accepted prompt remains below the whole Native request ceiling", () 
       version: runtimeProtocolVersion,
       operationId: "op_promptbound01",
       command: {
-        type: "chat.turn.start",
+        type: "chat.message.enqueue",
         paneId: "pane_promptbound01",
-        expectedRevision: 1,
-        turnId: "chatturn_promptbound01",
-        prompt,
+        expectedQueueRevision: 1,
+        messageId: "chatmsg_promptbound01",
+        content: { text: prompt, attachmentRefs: [] },
+        delivery: { kind: "queue" },
       },
     });
     const outerRequest = `${JSON.stringify({
@@ -187,12 +165,12 @@ test("every accepted prompt remains below the whole Native request ceiling", () 
   };
 
   expect(encodedOuterRequestBytes(
-    "\u0001".repeat(runtimeChatTurnPromptUtf8ByteLimit),
+    "\u0001".repeat(runtimeChatMessageUtf8ByteLimit),
   )).toBeLessThan(runtimeNativeBridgeRequestUtf8ByteLimit);
 
   assertProperty(fc.property(
     fc.constantFrom("\u0001", "\n", "\"", "\\", "a", "🙂"),
-    fc.integer({ min: 1, max: runtimeChatTurnPromptUtf8ByteLimit }),
+    fc.integer({ min: 1, max: runtimeChatMessageUtf8ByteLimit }),
     (unit, requestedUtf8Bytes) => {
       const unitUtf8Bytes = new TextEncoder().encode(unit).byteLength;
       const unitCount = Math.floor(requestedUtf8Bytes / unitUtf8Bytes);

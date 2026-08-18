@@ -2297,6 +2297,12 @@ async function initializeGateway(): Promise<void> {
           orderedPaneIds: [...orderedPaneIds],
         });
       },
+      messageQueueChanged: async (
+        paneId: string,
+        queue: ChatPaneProjection["messageQueue"],
+      ) => {
+        await projectionCommits.installChatMessageQueueState({ paneId, queue });
+      },
       delta: publishChatDelta,
     });
     const chatRepositories = Object.freeze({
@@ -4831,7 +4837,13 @@ async function executeDomainCommand(
           ? { type: "chatPane", pane: result.pane }
           : result.type === "removed"
             ? { type: "chatPaneRemoved", paneId: result.paneId }
-            : { type: "accepted" },
+            : result.type === "messageQueue"
+              ? {
+                  type: "chatMessageQueue",
+                  paneId: result.paneId,
+                  queue: result.queue,
+                }
+              : { type: "accepted" },
       };
     } catch (error: unknown) {
       if (error instanceof ChatPaneStoreError) {
@@ -5257,9 +5269,13 @@ async function executeDomainCommand(
     case "chat.pane.repository.select":
     case "chat.pane.remove":
     case "chat.panes.reorder":
-    case "chat.turn.start":
     case "chat.turn.stop":
-    case "chat.turn.retry":
+    case "chat.message.enqueue":
+    case "chat.message.edit":
+    case "chat.message.remove":
+    case "chat.messageQueue.resume":
+    case "chat.message.discardAmbiguous":
+    case "chat.message.steerHead":
       throw new Error("A chat command escaped its dedicated service boundary.");
     case "sessionSync.enable":
     case "sessionSync.disable":

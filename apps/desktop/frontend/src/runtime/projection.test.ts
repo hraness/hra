@@ -89,6 +89,26 @@ describe("renderer runtime projection", () => {
     });
   });
 
+  test("does not advance stale renderer state for a compact queue marker", () => {
+    const initial = emptyRuntimeSnapshot(8);
+    const result = applyRuntimeEvent(initial, {
+      version: runtimeProtocolVersion,
+      sequence: 9,
+      event: {
+        type: "chat.messageQueue.changed",
+        paneId: "pane_projectionqueue1",
+        revision: 2,
+      },
+    });
+    expect(result).toEqual({
+      kind: "invalidated",
+      snapshot: initial,
+      sequence: 9,
+      reason: "chatMessageQueueChanged",
+    });
+    expect(result.snapshot.lastSequence).toBe(8);
+  });
+
   test("rejects exhausted snapshot revisions before applying an event", () => {
     const initial = {
       ...emptyRuntimeSnapshot(),

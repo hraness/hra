@@ -19,6 +19,7 @@ import {
 } from "react";
 
 import App from "../src/App";
+import { DirectCompactChatSurface } from "./compact-chat-surface";
 import {
   createHRADirectShellFactory,
   type HRADirectRuntime,
@@ -91,6 +92,25 @@ function IsolatedApp({
     [activationSource, onRuntime],
   );
   return <App runtimeShellFactory={runtimeShellFactory} />;
+}
+
+function IsolatedCompactChat({
+  activationSource,
+  onRuntime,
+  world,
+}: Readonly<{
+  activationSource: string;
+  onRuntime: (runtime: HRADirectRuntime) => void;
+  world: Extract<HRADirectWorld["surface"], { kind: "compactChat" }>;
+}>) {
+  const shellFactory = useMemo(
+    () => createHRADirectShellFactory({
+      kind: "query",
+      source: activationSource,
+    }, onRuntime),
+    [activationSource, onRuntime],
+  );
+  return <DirectCompactChatSurface shellFactory={shellFactory} world={world} />;
 }
 
 function Frame({
@@ -223,12 +243,21 @@ export function HRADirectWorkbench() {
   }
 
   const activation = activationResult.value;
+  const surface = activation.world.surface;
   return (
     <Frame activation={activation} runtime={runtime}>
-      <IsolatedApp
-        activationSource={activationSource}
-        onRuntime={onRuntime}
-      />
+      {surface.kind === "compactChat" ? (
+        <IsolatedCompactChat
+          activationSource={activationSource}
+          onRuntime={onRuntime}
+          world={surface}
+        />
+      ) : (
+        <IsolatedApp
+          activationSource={activationSource}
+          onRuntime={onRuntime}
+        />
+      )}
     </Frame>
   );
 }

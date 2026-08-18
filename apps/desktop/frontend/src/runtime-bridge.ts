@@ -113,9 +113,13 @@ function isRuntimeChatCommand(
     command.type === "chat.pane.repository.select" ||
     command.type === "chat.pane.remove" ||
     command.type === "chat.panes.reorder" ||
-    command.type === "chat.turn.start" ||
     command.type === "chat.turn.stop" ||
-    command.type === "chat.turn.retry";
+    command.type === "chat.message.enqueue" ||
+    command.type === "chat.message.edit" ||
+    command.type === "chat.message.remove" ||
+    command.type === "chat.messageQueue.resume" ||
+    command.type === "chat.message.discardAmbiguous" ||
+    command.type === "chat.message.steerHead";
 }
 
 function isRuntimeHarnessCommand(

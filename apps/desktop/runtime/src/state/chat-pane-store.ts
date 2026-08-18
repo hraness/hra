@@ -45,6 +45,7 @@ import {
   type ChatMessageClaim,
   type ChatMessageClaimInput,
   type ChatMessageClaimResult,
+  type ChatMessageDiscardAmbiguousInput,
   type ChatMessageEditInput,
   type ChatMessageEnqueueAndSteerInput,
   type ChatMessageEnqueueAndSteerResult,
@@ -416,16 +417,19 @@ export class ChatPaneStore {
   }
 
   list(): readonly ChatPaneProjection[] {
-    return this.#livePaneRows().map((row) => this.#projection(row));
+    return this.#database.transaction(() =>
+      this.#livePaneRows().map((row) => this.#projection(row)))();
   }
 
   get(paneId: ChatPaneId): ChatPanePrivateRecord | null {
     const id = chatPaneIdSchema.parse(paneId);
-    const value: unknown = this.#database.query(`
-      ${paneWithActiveRoutingSelect()}
-      WHERE pane.pane_id = ?1 AND pane.archived_at IS NULL
-    `).get(id);
-    return value === null ? null : this.#privateRecord(this.#parseRow(value));
+    return this.#database.transaction(() => {
+      const value: unknown = this.#database.query(`
+        ${paneWithActiveRoutingSelect()}
+        WHERE pane.pane_id = ?1 AND pane.archived_at IS NULL
+      `).get(id);
+      return value === null ? null : this.#privateRecord(this.#parseRow(value));
+    })();
   }
 
   require(paneId: ChatPaneId): ChatPanePrivateRecord {
@@ -680,6 +684,82 @@ export class ChatPaneStore {
     })();
   }
 
+  /**
+   * Appends a user discard receipt only after the ambiguous message's exact
+   * logical turn is terminal. The delivery evidence and payload row remain
+   * immutable; only its attachment lease and queue containment are released.
+   */
+  discardAmbiguousMessage(
+    input: ChatMessageDiscardAmbiguousInput,
+  ): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    validateRevision(input.expectedQueueRevision);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueRevision(
+        paneId,
+        input.expectedQueueRevision,
+      );
+      if (metadata.message_queue_pause_reason !== "ambiguous_effect") {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "This message queue has no unresolved delivery outcome.",
+        );
+      }
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      if (
+        row.revision !== input.expectedMessageRevision ||
+        row.state !== "ambiguous" || row.claimed_turn_id === null
+      ) {
+        throw new ChatPaneStoreError(
+          "revision_conflict",
+          "The blocked chat message changed before it could be discarded.",
+        );
+      }
+      const pane = this.require(paneId);
+      if (
+        pane.projection.turn?.id !== row.claimed_turn_id ||
+        isActive(pane.projection)
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Contain the blocked message's exact turn before discarding it.",
+        );
+      }
+      try {
+        const inserted = this.#database.query(`
+          INSERT INTO chat_message_ambiguous_resolutions (
+            message_id, pane_id, claimed_turn_id, resolution, resolved_at
+          ) VALUES (?1, ?2, ?3, 'discarded', ?4)
+        `).run(messageId, paneId, row.claimed_turn_id, now);
+        if (inserted.changes !== 1) throw staleMessageRevision();
+        this.#releaseMessageAttachmentLeases(
+          paneId,
+          messageId,
+          row.claimed_turn_id,
+          now,
+        );
+        const resumed = this.#database.query(`
+          UPDATE chat_panes SET
+            message_queue_pause_reason = NULL,
+            message_queue_revision = message_queue_revision + 1,
+            updated_at = ?3
+          WHERE pane_id = ?1 AND message_queue_revision = ?2
+            AND archived_at IS NULL
+        `).run(paneId, input.expectedQueueRevision, now);
+        if (resumed.changes !== 1) throw staleQueueRevision();
+      } catch (error: unknown) {
+        throw sqliteMessageConflict(
+          error,
+          "The blocked chat message could not be discarded.",
+        );
+      }
+      return this.messageQueue(paneId);
+    })();
+  }
+
   claimHeadMessage(input: ChatMessageClaimInput): ChatMessageClaimResult {
     const paneId = chatPaneIdSchema.parse(input.paneId);
     const messageId = chatMessageIdSchema.parse(input.messageId);
@@ -758,6 +838,44 @@ export class ChatPaneStore {
     })();
   }
 
+  /**
+   * Claims the exact FIFO head and admits its app-owned logical turn in one
+   * SQLite transaction. The renderer never supplies the logical turn ID, and
+   * no provider effect can observe a claim without its root-route receipt.
+   */
+  claimHeadMessageAndBeginTurn(
+    input: Omit<ChatMessageClaimInput, "kind">,
+  ): ChatMessageClaimResult & Readonly<{ pane: ChatPaneProjection }> {
+    return this.#database.transaction(() => {
+      const current = this.require(input.paneId);
+      const claimed = this.claimHeadMessage({ ...input, kind: "start" });
+      if (claimed.claim.content.text.trim().length === 0) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Image-only delivery is waiting for the attachment provider boundary.",
+        );
+      }
+      const admission = this.beginTurn({
+        paneId: input.paneId,
+        expectedRevision: current.projection.revision,
+        turnId: input.turnId,
+        prompt: claimed.claim.content.text,
+        now: input.now,
+      });
+      if (admission.kind !== "begun") {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "This queued message logical turn was already admitted.",
+        );
+      }
+      return {
+        claim: claimed.claim,
+        queue: this.messageQueue(input.paneId),
+        pane: admission.pane,
+      };
+    })();
+  }
+
   returnClaimedMessageToQueue(
     input: ChatMessageTransitionInput,
   ): ChatMessageQueueProjection {
@@ -765,6 +883,73 @@ export class ChatPaneStore {
       start: { from: "start_claimed", to: "queued" },
       steer: { from: "steer_prepared", to: "queued" },
     }, "return to the queue");
+  }
+
+  /** Compensates only a newly enqueued atomic steer before its effect cut. */
+  cancelPreparedSteerMessage(
+    input: ChatMessageTransitionInput,
+  ): Readonly<{
+    queue: ChatMessageQueueProjection;
+    attachmentsRestored: boolean;
+  }> {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    validateRevision(input.expectedMessageRevision);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireClaimTransition(
+        row,
+        input.expectedMessageRevision,
+        turnId,
+        "steer_prepared",
+      );
+      const cancelled = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = 'cancelled',
+          revision = revision + 1,
+          terminal_at = ?6,
+          updated_at = ?6
+        WHERE pane_id = ?1 AND message_id = ?2 AND revision = ?3
+          AND claimed_turn_id = ?4 AND state = ?5
+      `).run(
+        paneId,
+        messageId,
+        input.expectedMessageRevision,
+        turnId,
+        "steer_prepared",
+        now,
+      );
+      if (cancelled.changes !== 1) throw staleMessageRevision();
+      this.#releasePreparedMessageAttachmentLeases(
+        paneId,
+        messageId,
+        turnId,
+        now,
+      );
+      let attachmentsRestored: boolean;
+      try {
+        attachmentsRestored =
+          this.#messageAttachmentAuthority.restorePreparedDraftRefsInTransaction({
+            paneId,
+            messageId,
+            now,
+          });
+      } catch {
+        throw new ChatPaneStoreError(
+          "corrupt_state",
+          "The prepared steer's attachment authority could not be restored.",
+        );
+      }
+      this.#advanceMessageQueueRevision(
+        paneId,
+        metadata.message_queue_revision,
+        now,
+      );
+      return { queue: this.messageQueue(paneId), attachmentsRestored };
+    })();
   }
 
   markMessageEffectStarted(
@@ -792,6 +977,47 @@ export class ChatPaneStore {
       start: { from: "start_acknowledged", to: "completed" },
       steer: { from: "steer_acknowledged", to: "completed" },
     }, "complete", { terminalAt: true });
+  }
+
+  /**
+   * Settles every provider-acknowledged message only after its exact parent
+   * logical turn is durably terminal. This also repairs a crash between the
+   * pane terminal and message-ledger settlement.
+   */
+  completeAcknowledgedMessagesForTurn(
+    paneIdInput: ChatPaneId,
+    turnIdInput: ChatTurnId,
+    now: Date,
+  ): Readonly<{ queue: ChatMessageQueueProjection; completedCount: number }> {
+    const paneId = chatPaneIdSchema.parse(paneIdInput);
+    const turnId = chatTurnIdSchema.parse(turnIdInput);
+    return this.#database.transaction(() => {
+      const pane = this.require(paneId);
+      if (pane.projection.turn?.id !== turnId || isActive(pane.projection)) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Acknowledged chat messages require their exact terminal turn.",
+        );
+      }
+      const values: unknown[] = this.#database.query(`
+        SELECT * FROM chat_message_ledger
+        WHERE pane_id = ?1 AND claimed_turn_id = ?2
+          AND state IN ('start_acknowledged', 'steer_acknowledged')
+        ORDER BY ordinal, message_id
+      `).all(paneId, turnId);
+      const rows = values.map((value) => this.#parseMessageRow(value));
+      for (const row of rows) {
+        this.completeClaimedMessage({
+          paneId,
+          messageId: row.message_id,
+          expectedMessageRevision: row.revision,
+          turnId,
+          kind: row.state === "start_acknowledged" ? "start" : "steer",
+          now,
+        });
+      }
+      return { queue: this.messageQueue(paneId), completedCount: rows.length };
+    })();
   }
 
   markMessageEffectAmbiguous(
@@ -3226,12 +3452,40 @@ export class ChatPaneStore {
         ...content,
       };
     });
+    const blockedValues: unknown[] = this.#database.query(`
+      SELECT message.* FROM chat_message_ledger AS message
+      LEFT JOIN chat_message_ambiguous_resolutions AS resolution
+        ON resolution.message_id = message.message_id
+      WHERE message.pane_id = ?1 AND message.state = 'ambiguous'
+        AND resolution.message_id IS NULL
+      ORDER BY message.ordinal, message.message_id
+      LIMIT 2
+    `).all(metadata.pane_id);
+    if (blockedValues.length > 1) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "A message queue has more than one unresolved delivery outcome.",
+      );
+    }
+    const blockedRow = blockedValues[0] === undefined
+      ? null
+      : this.#parseMessageRow(blockedValues[0]);
+    const blockedMessage = blockedRow === null
+      ? null
+      : {
+          id: blockedRow.message_id,
+          ordinal: blockedRow.ordinal,
+          revision: blockedRow.revision,
+          ...this.#messageContent(blockedRow),
+          deliveryOutcome: "deliveryOutcomeUnknown" as const,
+        };
     try {
       return parseChatMessageQueueProjection({
         revision: metadata.message_queue_revision,
         pauseReason: projectQueuePauseReason(
           metadata.message_queue_pause_reason,
         ),
+        blockedMessage,
         messages,
       });
     } catch {
@@ -3487,16 +3741,28 @@ export class ChatPaneStore {
         (
           SELECT COUNT(*) FROM chat_message_ledger
           WHERE pane_id = ?1 AND state NOT IN ('completed', 'cancelled')
+            AND NOT (state = 'ambiguous' AND EXISTS (
+              SELECT 1 FROM chat_message_ambiguous_resolutions AS resolution
+              WHERE resolution.message_id = chat_message_ledger.message_id
+            ))
         ) AS active_count,
         (
           SELECT COALESCE(SUM(message_utf8_bytes), 0)
           FROM chat_message_ledger
           WHERE pane_id = ?1 AND state NOT IN ('completed', 'cancelled')
+            AND NOT (state = 'ambiguous' AND EXISTS (
+              SELECT 1 FROM chat_message_ambiguous_resolutions AS resolution
+              WHERE resolution.message_id = chat_message_ledger.message_id
+            ))
         ) AS pane_bytes,
         (
           SELECT COALESCE(SUM(message_utf8_bytes), 0)
           FROM chat_message_ledger
           WHERE state NOT IN ('completed', 'cancelled')
+            AND NOT (state = 'ambiguous' AND EXISTS (
+              SELECT 1 FROM chat_message_ambiguous_resolutions AS resolution
+              WHERE resolution.message_id = chat_message_ledger.message_id
+            ))
         ) AS global_bytes
     `).get(paneId);
     const totals = chatMessagePayloadTotalsSchema.parse(value);
@@ -3638,8 +3904,12 @@ export class ChatPaneStore {
       SELECT COUNT(*) AS count FROM chat_message_ledger
       WHERE pane_id = ?1 AND state IN (
         'start_effect_started', 'steer_effect_started',
-        'start_acknowledged', 'steer_acknowledged', 'ambiguous'
+        'start_acknowledged', 'steer_acknowledged'
       )
+        OR (pane_id = ?1 AND state = 'ambiguous' AND NOT EXISTS (
+          SELECT 1 FROM chat_message_ambiguous_resolutions AS resolution
+          WHERE resolution.message_id = chat_message_ledger.message_id
+        ))
     `).get(paneId)).count;
     if (blocker > 0) {
       throw new ChatPaneStoreError(
@@ -3873,6 +4143,18 @@ export class ChatPaneStore {
         recoverablePrompt: row.interaction_mode === "chat" &&
           row.state === "attention" && row.attention_retryable === 1 &&
           row.active_prompt !== null,
+        messageQueue: this.#messageQueueProjection(
+          chatMessageQueueMetadataRowSchema.parse({
+            pane_id: row.pane_id,
+            interaction_mode: row.interaction_mode,
+            state: row.state,
+            active_turn_id: row.active_turn_id,
+            archived_at: row.archived_at,
+            message_queue_revision: row.message_queue_revision,
+            next_message_ordinal: row.next_message_ordinal,
+            message_queue_pause_reason: row.message_queue_pause_reason,
+          }),
+        ),
       });
     } catch {
       throw new ChatPaneStoreError("corrupt_state", "Stored chat pane projection is invalid.");

@@ -58,6 +58,7 @@ function pane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     harness,
   };
 }

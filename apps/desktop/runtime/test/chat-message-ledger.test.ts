@@ -23,6 +23,7 @@ test("message ledger persists complete FIFO text under independent queue and row
     expect(store.messageQueue(PANE)).toEqual({
       revision: 1,
       pauseReason: null,
+      blockedMessage: null,
       messages: [],
     });
 
@@ -36,6 +37,7 @@ test("message ledger persists complete FIFO text under independent queue and row
     expect(first).toEqual({
       revision: 2,
       pauseReason: null,
+      blockedMessage: null,
       messages: [{
         id: "chatmsg_ledgerfirst1",
         ordinal: 1,
@@ -119,6 +121,7 @@ test("attachments remain opaque, ready-only, unique, and path-free", () => {
     expect(store.messageQueue(PANE)).toEqual({
       revision: 1,
       pauseReason: null,
+      blockedMessage: null,
       messages: [],
     });
     expect(database.query(`
@@ -158,6 +161,7 @@ test("attachments remain opaque, ready-only, unique, and path-free", () => {
     expect(() => chatMessageQueueProjectionSchema.parse({
       revision: 2,
       pauseReason: null,
+      blockedMessage: null,
       messages: [{
         ...queue.messages[0],
         attachmentRefs: [READY_ATTACHMENT, READY_ATTACHMENT],
@@ -614,6 +618,7 @@ test("composer Cmd+Enter can atomically enqueue and prepare only its own FIFO he
     expect(store.messageQueue(PANE)).toEqual({
       revision: 1,
       pauseReason: null,
+      blockedMessage: null,
       messages: [],
     });
   });
@@ -645,6 +650,120 @@ test("composer Cmd+Enter can atomically enqueue and prepare only its own FIFO he
     expect(pausedError.code).toBe("conflict");
     expect(pausedError.message).toContain("queue is paused");
     expect(store.messageQueue(PANE)).toEqual(paused);
+  });
+});
+
+test("atomic steer compensation cancels its row and restores exact attachment drafts", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    const expiresAt = later(3_600);
+    insertReadyAttachment(database, {
+      attachmentId: READY_ATTACHMENT,
+      paneId: PANE,
+      uploadId: "upload_compensaterace1",
+      expiresAt,
+    });
+    const prepared = store.enqueueMessageAndPrepareSteer({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_compensaterace1",
+      content: { text: "steer with image", attachmentRefs: [READY_ATTACHMENT] },
+      turnId: TURN,
+      now: NOW,
+    });
+
+    const compensated = store.cancelPreparedSteerMessage({
+      paneId: PANE,
+      messageId: prepared.claim.messageId,
+      expectedMessageRevision: prepared.claim.revision,
+      turnId: TURN,
+      kind: "steer",
+      now: later(1),
+    });
+    expect(compensated.attachmentsRestored).toBe(true);
+    expect(compensated.queue).toEqual({
+      revision: 4,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    });
+    expect(database.query(`
+      SELECT state, revision FROM chat_message_ledger
+      WHERE message_id = 'chatmsg_compensaterace1'
+    `).get()).toEqual({ state: "cancelled", revision: 3 });
+    expect(database.query(`
+      SELECT expires_at FROM chat_attachment_draft_leases
+      WHERE attachment_id = ?1
+    `).get(READY_ATTACHMENT)).toEqual({ expires_at: expiresAt.toISOString() });
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_message_attachment_refs
+      WHERE message_id = 'chatmsg_compensaterace1'
+    `).get()).toEqual({ count: 0 });
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_turn_leases
+      WHERE message_id = 'chatmsg_compensaterace1'
+    `).get()).toEqual({ count: 0 });
+
+    const reopened = new ChatPaneStore(database);
+    const retried = reopened.enqueueMessage({
+      paneId: PANE,
+      expectedQueueRevision: compensated.queue.revision,
+      messageId: "chatmsg_compensateretry",
+      content: { text: "retry unchanged", attachmentRefs: [READY_ATTACHMENT] },
+      now: later(2),
+    });
+    expect(retried.messages[0]?.attachmentRefs).toEqual([READY_ATTACHMENT]);
+  });
+});
+
+test("expired atomic-steer attachment compensation is explicit and terminal", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    insertReadyAttachment(database, {
+      attachmentId: READY_ATTACHMENT,
+      paneId: PANE,
+      uploadId: "upload_compensateexpired",
+      expiresAt: later(1),
+    });
+    const prepared = store.enqueueMessageAndPrepareSteer({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_compensateexpired",
+      content: { text: "expires", attachmentRefs: [READY_ATTACHMENT] },
+      turnId: TURN,
+      now: NOW,
+    });
+    const compensated = store.cancelPreparedSteerMessage({
+      paneId: PANE,
+      messageId: prepared.claim.messageId,
+      expectedMessageRevision: prepared.claim.revision,
+      turnId: TURN,
+      kind: "steer",
+      now: later(2),
+    });
+    expect(compensated.attachmentsRestored).toBe(false);
+    expect(database.query(`
+      SELECT state FROM chat_message_ledger
+      WHERE message_id = 'chatmsg_compensateexpired'
+    `).get()).toEqual({ state: "cancelled" });
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_draft_leases
+      WHERE attachment_id = ?1
+    `).get(READY_ATTACHMENT)).toEqual({ count: 0 });
   });
 });
 
@@ -694,6 +813,11 @@ test("restart returns prepared rows, fences effect-started rows, and pauses drai
     const ambiguous = reopened.reconcileMessageQueueAfterRestart(PANE, later(5));
     expect(ambiguous).toMatchObject({
       pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: "chatmsg_restartprepared",
+        text: "prepared",
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
       messages: [],
     });
     expect(() => reopened.resumeMessageQueue({
@@ -705,6 +829,108 @@ test("restart returns prepared rows, fences effect-started rows, and pauses drai
       SELECT state FROM chat_message_ledger
       WHERE message_id = 'chatmsg_restartprepared'
     `).get()).toEqual({ state: "ambiguous" });
+  });
+});
+
+test("an ambiguous message stays immutable until terminal discard releases containment", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    enqueue(store, 1, "chatmsg_ambiguousdiscard", "delivery unknown");
+    const claim = store.claimHeadMessage({
+      paneId: PANE,
+      expectedQueueRevision: 2,
+      messageId: "chatmsg_ambiguousdiscard",
+      expectedMessageRevision: 1,
+      turnId: TURN,
+      kind: "steer",
+      now: later(1),
+    }).claim;
+    store.markMessageEffectStarted({
+      paneId: PANE,
+      messageId: claim.messageId,
+      expectedMessageRevision: claim.revision,
+      turnId: TURN,
+      kind: "steer",
+      now: later(2),
+    });
+    const ambiguous = store.markMessageEffectAmbiguous({
+      paneId: PANE,
+      messageId: claim.messageId,
+      expectedMessageRevision: claim.revision + 1,
+      turnId: TURN,
+      kind: "steer",
+      now: later(3),
+    });
+    expect(ambiguous.blockedMessage).toMatchObject({
+      id: claim.messageId,
+      revision: claim.revision + 2,
+      text: "delivery unknown",
+      deliveryOutcome: "deliveryOutcomeUnknown",
+    });
+    expect(() => store.discardAmbiguousMessage({
+      paneId: PANE,
+      expectedQueueRevision: ambiguous.revision,
+      messageId: claim.messageId,
+      expectedMessageRevision: claim.revision + 2,
+      now: later(4),
+    })).toThrow(expect.objectContaining({ code: "invalid_state" }));
+
+    const terminal = store.enterAttention({
+      paneId: PANE,
+      turnId: TURN,
+      attention: {
+        code: "turn_failed",
+        message: "The provider effect was contained.",
+        retryable: true,
+      },
+      clearBinding: true,
+      now: later(5),
+    });
+    if (terminal === null) throw new Error("Expected the exact turn to terminalize");
+    const discarded = store.discardAmbiguousMessage({
+      paneId: PANE,
+      expectedQueueRevision: ambiguous.revision,
+      messageId: claim.messageId,
+      expectedMessageRevision: claim.revision + 2,
+      now: later(6),
+    });
+    expect(discarded).toEqual({
+      revision: ambiguous.revision + 1,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    });
+    expect(database.query(`
+      SELECT state, revision FROM chat_message_ledger
+      WHERE message_id = ?1
+    `).get(claim.messageId)).toEqual({
+      state: "ambiguous",
+      revision: claim.revision + 2,
+    });
+    expect(() => database.query(`
+      UPDATE chat_message_ledger SET state = 'cancelled', revision = revision + 1
+      WHERE message_id = ?1
+    `).run(claim.messageId)).toThrow("transition");
+    expect(() => database.query(`
+      UPDATE chat_message_ambiguous_resolutions SET resolution = 'discarded'
+      WHERE message_id = ?1
+    `).run(claim.messageId)).toThrow("immutable");
+
+    store.remove(PANE, terminal.revision, later(7));
+    database.query(`
+      DELETE FROM chat_message_ledger WHERE message_id = ?1
+    `).run(claim.messageId);
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_message_ambiguous_resolutions
+      WHERE message_id = ?1
+    `).get(claim.messageId)).toEqual({ count: 0 });
   });
 });
 

@@ -852,10 +852,16 @@ export const chatQueuedMessageProjectionSchema = chatMessageContentSchema
   })
   .strict();
 
+export const chatBlockedMessageProjectionSchema =
+  chatQueuedMessageProjectionSchema.extend({
+    deliveryOutcome: z.literal("deliveryOutcomeUnknown"),
+  }).strict();
+
 export const chatMessageQueueProjectionSchema = z
   .object({
     revision: revisionSchema,
     pauseReason: chatMessageQueuePauseReasonSchema.nullable(),
+    blockedMessage: chatBlockedMessageProjectionSchema.nullable(),
     messages: z
       .array(chatQueuedMessageProjectionSchema)
       .max(runtimeChatQueuedMessageLimit),
@@ -865,6 +871,18 @@ export const chatMessageQueueProjectionSchema = z
     const ids = new Set<string>();
     let previousOrdinal = 0;
     let totalUtf8Bytes = 0;
+    if ((queue.pauseReason === "ambiguousEffect") !== (queue.blockedMessage !== null)) {
+      context.addIssue({
+        code: "custom",
+        message: "an ambiguous queue pause requires exactly one blocked message receipt",
+        path: ["blockedMessage"],
+      });
+    }
+    if (queue.blockedMessage !== null) {
+      ids.add(queue.blockedMessage.id);
+      previousOrdinal = queue.blockedMessage.ordinal;
+      totalUtf8Bytes += utf8ByteLength(queue.blockedMessage.text);
+    }
     queue.messages.forEach((message, index) => {
       if (ids.has(message.id)) {
         context.addIssue({
@@ -1253,6 +1271,7 @@ export const chatPaneProjectionSchema = z
     turn: chatTurnProjectionSchema.nullable(),
     attention: chatAttentionSchema.nullable(),
     recoverablePrompt: z.boolean().default(false),
+    messageQueue: chatMessageQueueProjectionSchema,
     harness: chatPaneHarnessProjectionSchema.nullable().default(null),
   })
   .strict()
@@ -2313,22 +2332,6 @@ const runtimeChatPanesReorderCommandSchema = z
     }
   });
 
-const runtimeChatTurnStartCommandSchema = z
-  .object({
-    type: z.literal("chat.turn.start"),
-    paneId: chatPaneIdSchema,
-    expectedRevision: revisionSchema,
-    turnId: chatTurnIdSchema,
-    prompt: utf8StringSchema({
-      minBytes: 1,
-      maxBytes: runtimeChatTurnPromptUtf8ByteLimit,
-    }).refine(
-      (prompt) => prompt.trim().length > 0,
-      "chat turn prompt must contain non-whitespace text",
-    ),
-  })
-  .strict();
-
 const runtimeChatTurnStopCommandSchema = z
   .object({
     type: z.literal("chat.turn.stop"),
@@ -2337,20 +2340,6 @@ const runtimeChatTurnStopCommandSchema = z
     turnId: chatTurnIdSchema,
   })
   .strict();
-
-const runtimeChatTurnRetryCommandSchema = z
-  .object({
-    type: z.literal("chat.turn.retry"),
-    paneId: chatPaneIdSchema,
-    expectedRevision: revisionSchema,
-    priorFailedTurnId: chatTurnIdSchema,
-    turnId: chatTurnIdSchema,
-  })
-  .strict()
-  .refine(
-    ({ priorFailedTurnId, turnId }) => priorFailedTurnId !== turnId,
-    "chat retry requires a fresh logical turn ID",
-  );
 
 const runtimeChatMessageEnqueueCommandSchema = z
   .object({
@@ -2398,6 +2387,16 @@ const runtimeChatMessageQueueResumeCommandSchema = z
   })
   .strict();
 
+const runtimeChatMessageDiscardAmbiguousCommandSchema = z
+  .object({
+    type: z.literal("chat.message.discardAmbiguous"),
+    paneId: chatPaneIdSchema,
+    expectedQueueRevision: revisionSchema,
+    messageId: chatMessageIdSchema,
+    expectedMessageRevision: revisionSchema,
+  })
+  .strict();
+
 const runtimeChatMessageSteerHeadCommandSchema = z
   .object({
     type: z.literal("chat.message.steerHead"),
@@ -2409,10 +2408,7 @@ const runtimeChatMessageSteerHeadCommandSchema = z
   })
   .strict();
 
-/**
- * Frozen Phase 1 queue command surface. It remains separate from the live
- * runtime union until the gateway can exhaustively journal and drain it.
- */
+/** The renderer's complete durable message mutation surface. */
 export const runtimeChatMessageLedgerCommandSchema = z.discriminatedUnion(
   "type",
   [
@@ -2420,6 +2416,7 @@ export const runtimeChatMessageLedgerCommandSchema = z.discriminatedUnion(
     runtimeChatMessageEditCommandSchema,
     runtimeChatMessageRemoveCommandSchema,
     runtimeChatMessageQueueResumeCommandSchema,
+    runtimeChatMessageDiscardAmbiguousCommandSchema,
     runtimeChatMessageSteerHeadCommandSchema,
   ],
 );
@@ -2478,9 +2475,8 @@ export const runtimeChatDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
   runtimeChatPanesReorderCommandSchema,
-  runtimeChatTurnStartCommandSchema,
   runtimeChatTurnStopCommandSchema,
-  runtimeChatTurnRetryCommandSchema,
+  ...runtimeChatMessageLedgerCommandSchema.options,
 ]);
 
 export const runtimeHarnessDomainCommandSchema = z.discriminatedUnion("type", [
@@ -2553,9 +2549,8 @@ export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
   runtimeChatPanesReorderCommandSchema,
-  runtimeChatTurnStartCommandSchema,
   runtimeChatTurnStopCommandSchema,
-  runtimeChatTurnRetryCommandSchema,
+  ...runtimeChatMessageLedgerCommandSchema.options,
   runtimeHarnessSettingsUpdateCommandSchema,
   runtimeHarnessChildOpenCommandSchema,
   runtimeHarnessChildStopCommandSchema,
@@ -2784,6 +2779,7 @@ export const runtimeErrorSchema = z
 const runtimeCommandResultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted") }).strict(),
   z.object({ type: z.literal("chatPane"), pane: chatPaneProjectionSchema }).strict(),
+  runtimeChatMessageQueueResultSchema,
   z.object({ type: z.literal("chatPaneRemoved"), paneId: chatPaneIdSchema }).strict(),
   z.object({
     type: z.literal("sessionSyncRecoveryKit"),
@@ -3204,6 +3200,7 @@ export const runtimeDomainEventSchema = z.discriminatedUnion("type", [
       }),
     })
     .strict(),
+  runtimeChatMessageQueueChangedEventSchema,
   z
     .object({ type: z.literal("accountLocalData.upserted"), localData: retainedAccountLocalDataSchema })
     .strict(),
@@ -3337,6 +3334,9 @@ export type ChatMessageAttachmentId = z.infer<typeof chatMessageAttachmentIdSche
 export type ChatMessageContent = z.infer<typeof chatMessageContentSchema>;
 export type ChatQueuedMessageProjection = z.infer<
   typeof chatQueuedMessageProjectionSchema
+>;
+export type ChatBlockedMessageProjection = z.infer<
+  typeof chatBlockedMessageProjectionSchema
 >;
 export type ChatMessageQueuePauseReason = z.infer<
   typeof chatMessageQueuePauseReasonSchema
@@ -3621,19 +3621,6 @@ export function parseRuntimeChatDispatchResponseForRequest(
         chatResponseMismatch("pane reorder");
       }
       return response;
-    case "chat.turn.start": {
-      if (response.result.type !== "chatPane") chatResponseMismatch("turn start");
-      const { pane } = response.result;
-      if (
-        pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1 ||
-        pane.turn?.id !== request.command.turnId ||
-        pane.turn.continuationCount !== 0
-      ) {
-        chatResponseMismatch("turn start");
-      }
-      return response;
-    }
     case "chat.turn.stop": {
       if (response.result.type !== "chatPane") chatResponseMismatch("turn stop");
       const { pane } = response.result;
@@ -3653,19 +3640,18 @@ export function parseRuntimeChatDispatchResponseForRequest(
       }
       return response;
     }
-    case "chat.turn.retry": {
-      if (response.result.type !== "chatPane") chatResponseMismatch("turn retry");
-      const { pane } = response.result;
+    case "chat.message.enqueue":
+    case "chat.message.edit":
+    case "chat.message.remove":
+    case "chat.messageQueue.resume":
+    case "chat.message.discardAmbiguous":
+    case "chat.message.steerHead": {
       if (
-        pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1 ||
-        pane.interactionMode !== "chat" ||
-        pane.state !== "starting" ||
-        pane.turn?.id !== request.command.turnId ||
-        pane.turn.continuationCount !== 0 ||
-        pane.recoverablePrompt
+        response.result.type !== "chatMessageQueue" ||
+        response.result.paneId !== request.command.paneId ||
+        response.result.queue.revision <= request.command.expectedQueueRevision
       ) {
-        chatResponseMismatch("turn retry");
+        chatResponseMismatch("message queue mutation");
       }
       return response;
     }

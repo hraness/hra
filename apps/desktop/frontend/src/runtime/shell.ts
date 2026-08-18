@@ -17,7 +17,11 @@ import {
   type RendererRuntimeDomainCommand,
   type RendererTaskDomainCommand,
 } from "../runtime-bridge";
-import { applyRuntimeEvent, type RuntimeProjectionResult } from "./projection";
+import {
+  applyRuntimeEvent,
+  type RuntimeProjectionInvalidationReason,
+  type RuntimeProjectionResult,
+} from "./projection";
 
 export type RuntimeShellFailure =
   | {
@@ -34,10 +38,7 @@ export type RuntimeShellFailure =
   | {
       readonly kind: "persistentSnapshotInvalidation";
       readonly sequence: number;
-      readonly reason: Extract<
-        RuntimeEvent["event"],
-        { readonly type: "snapshot.invalidated" }
-      >["reason"];
+      readonly reason: RuntimeProjectionInvalidationReason;
       readonly message: string;
     }
   | {

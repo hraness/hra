@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { MarkdownResponse } from "./MarkdownResponse";
+import { MarkdownResponse, safeMarkdownUrl } from "./MarkdownResponse";
 
 test("latest responses render streaming-safe Markdown without raw HTML or images", async () => {
   const html = renderToStaticMarkup(createElement(MarkdownResponse, {
@@ -37,4 +37,29 @@ test("truncated response tails disclose the omitted prefix", () => {
   expect(html).toContain("Earlier response text was omitted");
   expect(html).toContain("Retained tail");
   expect(html).toContain('data-streaming="true"');
+});
+
+test("thinking uses the same Markdown boundary and discloses its own truncation", () => {
+  const html = renderToStaticMarkup(createElement(MarkdownResponse, {
+    content: {
+      tail: "**Checking** `state`",
+      totalUtf8Bytes: 4_096,
+      truncatedPrefix: true,
+    },
+    streaming: true,
+    variant: "reasoning",
+  }));
+
+  expect(html).toContain('data-markdown-kind="reasoning"');
+  expect(html).toContain('data-streamdown="strong">Checking</span>');
+  expect(html).toContain('data-streamdown="inline-code">state</code>');
+  expect(html).toContain("Earlier thinking was omitted");
+});
+
+test("Markdown links admit only absolute HTTP and HTTPS destinations", () => {
+  expect(safeMarkdownUrl("https://example.com/a?q=1")).toBe("https://example.com/a?q=1");
+  expect(safeMarkdownUrl("http://example.com")).toBe("http://example.com/");
+  expect(safeMarkdownUrl("javascript:alert(1)")).toBeNull();
+  expect(safeMarkdownUrl("file:///private/example")).toBeNull();
+  expect(safeMarkdownUrl("/relative")).toBeNull();
 });

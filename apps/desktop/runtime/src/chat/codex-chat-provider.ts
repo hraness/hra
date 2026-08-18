@@ -21,6 +21,8 @@ type ChatSessionRuntime = Pick<
   | "startChatThread"
   | "startChatTurn"
   | "resolveChatConfiguration"
+  | "steer"
+  | "verifiedProductionExecutionPolicyForActiveTurn"
 >;
 
 /** Session-aware Codex 0.144.6 implementation of the provider-neutral chat port. */
@@ -135,6 +137,32 @@ export class CodexChatProvider implements ChatProviderPort {
           streamPosition: started.streamPosition,
         },
       };
+    } catch (error: unknown) {
+      throw preserveOrMap(error, true);
+    }
+  }
+
+  verifySteerTarget(
+    input: ChatThreadBinding & Readonly<{ readonly turnId: string }>,
+  ): Readonly<{ generation: number }> | null {
+    const receipt = this.#sessions.verifiedProductionExecutionPolicyForActiveTurn(
+      input.threadId,
+      input.turnId,
+    );
+    return receipt === null ? null : Object.freeze({
+      generation: receipt.generation,
+    });
+  }
+
+  async steerTurn(request: Parameters<ChatProviderPort["steerTurn"]>[0]): Promise<void> {
+    try {
+      await this.#sessions.steer({
+        threadId: request.binding.threadId,
+        expectedTurnId: request.providerTurnId,
+        expectedGeneration: request.fence.generation,
+        clientUserMessageId: ownedClientMessageId(request.messageId),
+        prompt: request.prompt,
+      });
     } catch (error: unknown) {
       throw preserveOrMap(error, true);
     }

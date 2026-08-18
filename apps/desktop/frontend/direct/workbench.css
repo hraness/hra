@@ -158,6 +158,22 @@ body {
   overflow-x: clip;
 }
 
+.direct-compact-chat {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 100svh;
+  align-items: start;
+  padding: 0.25rem;
+  background: var(--background);
+}
+
+.direct-compact-chat .chat-pane {
+  width: min(100%, 24rem);
+  min-height: min(36rem, calc(100svh - 0.5rem));
+  aspect-ratio: auto;
+}
+
 .direct-error {
   align-content: center;
   background: #1b0f0f;

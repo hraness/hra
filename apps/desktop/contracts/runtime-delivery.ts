@@ -30,6 +30,7 @@ export const runtimeEventDeliveryClassByType = {
   "chat.pane.removed": "state-recoverable",
   "chat.panes.reordered": "state-recoverable",
   "chat.turn.delta": "state-recoverable",
+  "chat.messageQueue.changed": "state-recoverable",
   "accountLocalData.upserted": "state-recoverable",
   "accountLocalData.removed": "state-recoverable",
   "humanAccount.changed": "state-recoverable",

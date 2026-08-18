@@ -120,11 +120,14 @@ describe("HRA browser verifier policy", () => {
     const compact320 = browserJourneyScenarioRequirements.find(({ id }) => id === "chat-compact-320");
     const compact639 = browserJourneyScenarioRequirements.find(({ id }) => id === "chat-compact-639");
     const compact415 = browserJourneyScenarioRequirements.find(({ id }) => id === "chat-compact-415");
+    const malleable = browserJourneyScenarioRequirements.find(
+      ({ id }) => id === "chat-compact-malleable",
+    );
     expect(minimumScale).toEqual({
       expectedUiScale: "0.8",
       expectedVisibleControls: [
         "New pane",
-        "Rename Direct pane",
+        "More actions for Direct pane",
       ],
       id: "chat-draft",
       viewport: { width: 1_120, height: 780 },
@@ -133,7 +136,6 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "1",
       expectedVisibleControls: [
         "New pane",
-        "Rename Compact routed response",
         "More actions for Compact routed response",
         "Send",
       ],
@@ -144,7 +146,6 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "1.2",
       expectedVisibleControls: [
         "New pane",
-        "Rename Compact 639",
         "More actions for Compact 639",
         "Send",
       ],
@@ -155,12 +156,26 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "1.5",
       expectedVisibleControls: [
         "New pane",
-        "Rename Compact 415",
         "More actions for Compact 415",
         "Send",
       ],
       id: "chat-compact-415",
       viewport: { width: 415, height: 780 },
+    });
+    expect(malleable).toEqual({
+      expectedUiScale: "2",
+      expectedVisibleControls: [
+        "More actions for Malleable metaharness",
+        "Attach files",
+        "Remove compact-layout.png",
+        "Edit queued message",
+        "Remove queued message",
+        "Send queued message now",
+        "Stop Malleable metaharness",
+        "Queue message for Malleable metaharness",
+      ],
+      id: "chat-compact-malleable",
+      viewport: { width: 390, height: 844 },
     });
   });
 
@@ -317,6 +332,17 @@ describe("HRA browser verifier policy", () => {
       controls: [],
     })).toEqual([
       "Unexpected hidden action is focusable inside an aria-hidden subtree",
+    ]);
+    expect(responsiveLayoutFailures({
+      ariaHiddenFocusableControls: [],
+      clientHeight: 720,
+      clientWidth: 480,
+      scrollWidth: 480,
+      scrollX: 0,
+      surfaces: surfaces(480),
+      controls: [{ label: "Touch action", left: 16, right: 60, top: 20, bottom: 60, height: 40 }],
+    }, undefined, undefined, 44)).toEqual([
+      "Touch action is only 40px tall",
     ]);
   });
 

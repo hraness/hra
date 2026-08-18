@@ -1504,9 +1504,6 @@ describe("compiled gateway boundary", () => {
       const restoredPaneId = publicId("pane", 9_101);
       const livePaneId = publicId("pane", 9_102);
       const rejectedPaneId = publicId("pane", 9_103);
-      const completedTurnId = publicId("chatturn", 9_101);
-      const attentionTurnId = publicId("chatturn", 9_102);
-      const retargetedTurnId = publicId("chatturn", 9_103);
       const validRepository = join(root, "valid-repository");
       const symlinkTarget = join(root, "symlink-target");
       const symlinkRepository = join(root, "symlink-repository");
@@ -1647,6 +1644,10 @@ describe("compiled gateway boundary", () => {
       let workspaceProbe = 0;
       let restoredReadyRevision: number | null = null;
       let liveReadyRevision: number | null = null;
+      let restoredReadyQueueRevision: number | null = null;
+      let liveReadyQueueRevision: number | null = null;
+      let restoredQueuePaused = false;
+      let liveQueuePaused = false;
       do {
         workspaceProbe += 1;
         const bridgeId = `bridge-chat-workspace-${String(workspaceProbe)}`;
@@ -1666,12 +1667,52 @@ describe("compiled gateway boundary", () => {
         ) {
           restoredReadyRevision = restored.revision;
           liveReadyRevision = live.revision;
+          restoredReadyQueueRevision = restored.messageQueue.revision;
+          liveReadyQueueRevision = live.messageQueue.revision;
+          restoredQueuePaused = restored.messageQueue.pauseReason !== null;
+          liveQueuePaused = live.messageQueue.pauseReason !== null;
           break;
         }
         await Bun.sleep(10);
       } while (Date.now() < workspaceDeadline);
-      if (restoredReadyRevision === null || liveReadyRevision === null) {
+      if (
+        restoredReadyRevision === null || liveReadyRevision === null ||
+        restoredReadyQueueRevision === null || liveReadyQueueRevision === null
+      ) {
         throw new Error("Managed chat workspaces did not become ready");
+      }
+      for (const [suffix, paneId, paused] of [
+        ["restored", restoredPaneId, restoredQueuePaused],
+        ["live", livePaneId, liveQueuePaused],
+      ] as const) {
+        if (!paused) continue;
+        const bridgeId = `bridge-chat-resume-${suffix}`;
+        await child.stdin.write(dispatchRequest(
+          bridgeId,
+          `op_chat_resume_${suffix}`,
+          {
+            type: "chat.messageQueue.resume",
+            paneId,
+            expectedQueueRevision: paneId === restoredPaneId
+              ? restoredReadyQueueRevision
+              : liveReadyQueueRevision,
+          },
+        ));
+        await output.readUntil(
+          (lines) => hasBridgeResult(lines, bridgeId),
+          `the ${suffix} message queue resume`,
+        );
+        const result = parseRuntimeDispatchResponse(
+          bridgeResult(output.currentLines(), bridgeId),
+        );
+        if (!result.ok || result.result.type !== "chatMessageQueue") {
+          throw new Error(`The ${suffix} message queue did not resume`);
+        }
+        if (paneId === restoredPaneId) {
+          restoredReadyQueueRevision = result.result.queue.revision;
+        } else {
+          liveReadyQueueRevision = result.result.queue.revision;
+        }
       }
 
       await child.stdin.write(dispatchRequest(
@@ -1715,11 +1756,12 @@ describe("compiled gateway boundary", () => {
         "bridge-chat-turn-completed",
         "op_chat_turn_0001",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: restoredPaneId,
-          expectedRevision: restoredReadyRevision,
-          turnId: completedTurnId,
-          prompt: "stream a deterministic response",
+          expectedQueueRevision: restoredReadyQueueRevision,
+          messageId: "chatmsg_gatewaycompleted1",
+          content: { text: "stream a deterministic response", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         },
       ));
       await output.readUntil(
@@ -1730,11 +1772,12 @@ describe("compiled gateway boundary", () => {
         "bridge-chat-turn-attention",
         "op_chat_turn_0002",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: livePaneId,
-          expectedRevision: liveReadyRevision,
-          turnId: attentionTurnId,
-          prompt: "trigger interaction",
+          expectedQueueRevision: liveReadyQueueRevision,
+          messageId: "chatmsg_gatewayattention1",
+          content: { text: "trigger interaction", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         },
       ));
       await output.readUntil(
@@ -1748,12 +1791,8 @@ describe("compiled gateway boundary", () => {
       ))).toMatchObject({
         ok: true,
         result: {
-          type: "chatPane",
-          pane: {
-            id: restoredPaneId,
-            revision: restoredReadyRevision + 1,
-            state: "starting",
-          },
+          type: "chatMessageQueue",
+          paneId: restoredPaneId,
         },
       });
       expect(parseRuntimeDispatchResponse(bridgeResult(
@@ -1762,12 +1801,8 @@ describe("compiled gateway boundary", () => {
       ))).toMatchObject({
         ok: true,
         result: {
-          type: "chatPane",
-          pane: {
-            id: livePaneId,
-            revision: liveReadyRevision + 1,
-            state: "starting",
-          },
+          type: "chatMessageQueue",
+          paneId: livePaneId,
         },
       });
       const chatFixtureLog = join(
@@ -1825,7 +1860,6 @@ describe("compiled gateway boundary", () => {
       expect(completed).toMatchObject({
         state: "ready",
         turn: {
-          id: completedTurnId,
           status: "completed",
           reasoningSummary: {
             tail: "Thinking 🌿",
@@ -1843,7 +1877,7 @@ describe("compiled gateway boundary", () => {
       expect(attention).toMatchObject({
         state: "attention",
         attention: { code: "approval_required", retryable: true },
-        turn: { id: attentionTurnId, status: "failed" },
+        turn: { status: "failed" },
       });
       expect(panes.has(rejectedPaneId)).toBeFalse();
       const eventsBeforeShutdown = runtimeEvents(output.currentLines()).map(
@@ -1883,11 +1917,15 @@ describe("compiled gateway boundary", () => {
         "bridge-chat-turn-retargeted",
         "op_chat_turn_0003",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: restoredPaneId,
-          expectedRevision: completed.revision,
-          turnId: retargetedTurnId,
-          prompt: "must not reach the retargeted repository",
+          expectedQueueRevision: completed.messageQueue.revision,
+          messageId: "chatmsg_gatewayretarget1",
+          content: {
+            text: "must not reach the retargeted repository",
+            attachmentRefs: [],
+          },
+          delivery: { kind: "queue" },
         },
       ));
       await output.readUntil(
@@ -1900,8 +1938,8 @@ describe("compiled gateway boundary", () => {
       ))).toMatchObject({
         ok: true,
         result: {
-          type: "chatPane",
-          pane: { id: restoredPaneId, state: "starting" },
+          type: "chatMessageQueue",
+          paneId: restoredPaneId,
         },
       });
       const retargetDeadline = Date.now() + 5_000;
@@ -1922,7 +1960,7 @@ describe("compiled gateway boundary", () => {
         if (
           pane?.state === "attention"
           && pane.attention?.code === "runtime_unavailable"
-          && pane.turn?.id === retargetedTurnId
+          && pane.turn?.id !== completed.turn?.id
         ) {
           retargetRejected = true;
           break;
@@ -2010,9 +2048,6 @@ describe("compiled gateway boundary", () => {
       const repositoryId = publicId("repo", 9_201);
       const affectedPaneId = publicId("pane", 9_201);
       const unrelatedPaneId = publicId("pane", 9_202);
-      const heldTurnId = publicId("chatturn", 9_201);
-      const unrelatedTurnId = publicId("chatturn", 9_202);
-      const retriedTurnId = publicId("chatturn", 9_203);
       const repository = join(root, "repository");
       await mkdir(join(repository, ".git"), { recursive: true });
       const databasePath = controlPlanePath(root);
@@ -2161,13 +2196,25 @@ describe("compiled gateway boundary", () => {
         "bridge-chat-lifecycle-held-turn",
         "op_chat_lifecycle_held_turn",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: affectedPaneId,
-          expectedRevision: affectedReady.revision,
-          turnId: heldTurnId,
-          prompt: "hold active until the account stops",
+          expectedQueueRevision: affectedReady.messageQueue.revision,
+          messageId: "chatmsg_lifecycleheld01",
+          content: { text: "hold active until the account stops", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         },
       ));
+      await output.readUntil(
+        (lines) => hasBridgeResult(lines, "bridge-chat-lifecycle-held-turn"),
+        "the held message admission",
+      );
+      expect(parseRuntimeDispatchResponse(bridgeResult(
+        output.currentLines(),
+        "bridge-chat-lifecycle-held-turn",
+      ))).toMatchObject({
+        ok: true,
+        result: { type: "chatMessageQueue", paneId: affectedPaneId },
+      });
       const activeSnapshot = await waitForSnapshot(
         (snapshot) => snapshot.chat.panes.some((pane) =>
           pane.id === affectedPaneId &&
@@ -2176,6 +2223,10 @@ describe("compiled gateway boundary", () => {
         ),
         "the held turn to become active",
       );
+      const heldTurnId = activeSnapshot.chat.panes.find(
+        ({ id }) => id === affectedPaneId,
+      )?.turn?.id;
+      if (heldTurnId === undefined) throw new Error("Held turn identity was not projected");
 
       await child.stdin.write(dispatchRequest(
         "bridge-chat-lifecycle-select-healthy",
@@ -2212,13 +2263,25 @@ describe("compiled gateway boundary", () => {
         "bridge-chat-lifecycle-unrelated-turn",
         "op_chat_lifecycle_unrelated_turn",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: unrelatedPaneId,
-          expectedRevision: unrelatedReady.revision,
-          turnId: unrelatedTurnId,
-          prompt: "complete on the healthy account",
+          expectedQueueRevision: unrelatedReady.messageQueue.revision,
+          messageId: "chatmsg_lifecycleunrelated",
+          content: { text: "complete on the healthy account", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         },
       ));
+      await output.readUntil(
+        (lines) => hasBridgeResult(lines, "bridge-chat-lifecycle-unrelated-turn"),
+        "the healthy account message admission",
+      );
+      expect(parseRuntimeDispatchResponse(bridgeResult(
+        output.currentLines(),
+        "bridge-chat-lifecycle-unrelated-turn",
+      ))).toMatchObject({
+        ok: true,
+        result: { type: "chatMessageQueue", paneId: unrelatedPaneId },
+      });
       const unrelatedCompleted = await waitForSnapshot(
         (snapshot) => {
           const unrelated = snapshot.chat.panes.find(({ id }) => id === unrelatedPaneId);
@@ -2230,14 +2293,6 @@ describe("compiled gateway boundary", () => {
         },
         "the healthy account turn completion",
       );
-      expect(parseRuntimeDispatchResponse(bridgeResult(
-        output.currentLines(),
-        "bridge-chat-lifecycle-unrelated-turn",
-      ))).toMatchObject({
-        ok: true,
-        result: { type: "chatPane", pane: { state: "starting" } },
-      });
-
       const unrelatedBeforeLogout = unrelatedCompleted.chat.panes.find(
         (pane) => pane.id === unrelatedPaneId,
       );
@@ -2288,32 +2343,59 @@ describe("compiled gateway boundary", () => {
       if (detachedPane === undefined) throw new Error("Affected pane was not detached");
 
       await child.stdin.write(dispatchRequest(
+        "bridge-chat-lifecycle-resume",
+        "op_chat_lifecycle_resume",
+        {
+          type: "chat.messageQueue.resume",
+          paneId: affectedPaneId,
+          expectedQueueRevision: detachedPane.messageQueue.revision,
+        },
+      ));
+      await output.readUntil(
+        (lines) => hasBridgeResult(lines, "bridge-chat-lifecycle-resume"),
+        "the detached pane queue resume",
+      );
+      const resumed = parseRuntimeDispatchResponse(bridgeResult(
+        output.currentLines(),
+        "bridge-chat-lifecycle-resume",
+      ));
+      if (!resumed.ok || resumed.result.type !== "chatMessageQueue") {
+        throw new Error(`Detached pane queue did not resume: ${JSON.stringify(resumed)}`);
+      }
+
+      await child.stdin.write(dispatchRequest(
         "bridge-chat-lifecycle-retry",
         "op_chat_lifecycle_retry",
         {
-          type: "chat.turn.start",
+          type: "chat.message.enqueue",
           paneId: affectedPaneId,
-          expectedRevision: detachedPane.revision,
-          turnId: retriedTurnId,
-          prompt: "continue on the healthy account",
+          expectedQueueRevision: resumed.result.queue.revision,
+          messageId: "chatmsg_lifecycleretry1",
+          content: { text: "continue on the healthy account", attachmentRefs: [] },
+          delivery: { kind: "queue" },
         },
       ));
-      const retriedSnapshot = await waitForSnapshot(
-        (snapshot) => snapshot.chat.panes.some((pane) =>
-          pane.id === affectedPaneId &&
-          pane.accountProfileId === healthyAccountId &&
-          pane.turn?.id === retriedTurnId &&
-          pane.turn.status === "completed"
-        ),
-        "the detached pane retry on the healthy account",
+      await output.readUntil(
+        (lines) => hasBridgeResult(lines, "bridge-chat-lifecycle-retry"),
+        "the detached pane retry admission",
       );
       expect(parseRuntimeDispatchResponse(bridgeResult(
         output.currentLines(),
         "bridge-chat-lifecycle-retry",
       ))).toMatchObject({
         ok: true,
-        result: { type: "chatPane", pane: { state: "starting" } },
+        result: { type: "chatMessageQueue", paneId: affectedPaneId },
       });
+      const retriedSnapshot = await waitForSnapshot(
+        (snapshot) => snapshot.chat.panes.some((pane) =>
+          pane.id === affectedPaneId &&
+          pane.accountProfileId === healthyAccountId &&
+          pane.turn !== null &&
+          pane.turn.id !== heldTurnId &&
+          pane.turn.status === "completed"
+        ),
+        "the detached pane retry on the healthy account",
+      );
       expect(retriedSnapshot.chat.panes.find(
         (pane) => pane.id === unrelatedPaneId,
       )).toEqual(unrelatedBeforeLogout);
