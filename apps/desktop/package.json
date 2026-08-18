@@ -71,7 +71,7 @@
     "check:direct-boundary": "bun run frontend/direct/check-production-boundary.ts",
     "lint": "eslint frontend/src frontend/dev frontend/direct frontend/vite.config.ts contracts/runtime*.ts runtime",
     "typecheck": "tsc --noEmit",
-    "test": "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:gateway",
+    "test": "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' --path-ignore-patterns='**/*.macos.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:gateway",
     "test:application-support-migration": "bun test ./runtime/test/application-support-migration.test.ts",
     "test:feasibility": "bun test ./runtime/test/feasibility.test.ts",
     "test:gateway": "bun test ./runtime/test/gateway.integration.test.ts",
@@ -81,7 +81,7 @@
     "baseline:reactive": "bun run runtime/reactive-baseline.ts",
     "test:property": "bun test ./frontend/src/features/chat/model.property.test.ts ./frontend/src/runtime/*.property.test.ts ./frontend/direct/*.property.test.ts ./contracts/*.property.test.ts ./runtime/test/*.property.test.ts",
     "test:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-tests -- bun run test:macos:uncoordinated",
-    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos"
+    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts"
   },
   "dependencies": {
     "@hraness/agent-tasks-protocol": "workspace:*",

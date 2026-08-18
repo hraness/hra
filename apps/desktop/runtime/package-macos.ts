@@ -25,6 +25,7 @@ import { verifyPackagedFrontend } from "./frontend-package-integrity";
 import { loadGcmDependencyLicenseInventory } from "./gcm-dependency-licenses";
 import {
   hranessUiStylesheetInput,
+  imageNormalizerPackageContract,
   macosPackage,
   requiredLicenseFileNames,
   trustedThirdPartyTeams,
@@ -71,6 +72,10 @@ const gatewayEntitlements = join(
 );
 
 const ownedCode = Object.freeze([
+  {
+    identifier: imageNormalizerPackageContract.identifier,
+    path: join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+  },
   {
     identifier: "oprte-data-remover",
     path: join(binRoot, "oprte-data-remover"),
@@ -461,6 +466,10 @@ async function main(): Promise<void> {
   await mkdir(binRoot, { recursive: true, mode: 0o755 });
   await mkdir(licensesRoot, { recursive: true, mode: 0o755 });
   await Promise.all([
+    copyExclusive(
+      join(macosPackage.desktopRoot, imageNormalizerPackageContract.sourceRelativePath),
+      join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+    ),
     copyExclusive(join(macosPackage.desktopRoot, "runtime/dist/oprte-gateway"), join(binRoot, "oprte-gateway")),
     copyExclusive(join(macosPackage.desktopRoot, "zig-out/bin/oprte-data-remover"), join(binRoot, "oprte-data-remover")),
     copyExclusive(join(macosPackage.desktopRoot, "zig-out/bin/oprte-git-executor"), join(binRoot, "oprte-git-executor")),
@@ -476,7 +485,9 @@ async function main(): Promise<void> {
       verbatimSymlinks: true,
     }),
   ]);
-  await Promise.all(ownedCode.slice(0, 4).map((entry) => chmod(entry.path, 0o755)));
+  await Promise.all(ownedCode
+    .filter((entry) => dirname(entry.path) === binRoot)
+    .map((entry) => chmod(entry.path, 0o755)));
   const codexNativeInventory = await stageLicenseFiles({
     codexPackageRoot: pins.codexPackageRoot,
     codexPlatformPackageJson: pins.codexPlatformPackageJson,
@@ -518,6 +529,12 @@ async function main(): Promise<void> {
     "string",
     dataRemoverSignature.cdHash!,
   );
+  const imageNormalizerSignature = await codeSignature(
+    join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+  );
+  if (!/^[0-9a-f]{40,64}$/u.test(imageNormalizerSignature.cdHash ?? "")) {
+    throw new Error("The image normalizer has no valid CodeDirectory hash.");
+  }
 
   const runtimeTree = (await walkTree(runtimeRoot))
     .filter((entry) => entry.path !== "manifest.json");
@@ -585,6 +602,12 @@ async function main(): Promise<void> {
       },
       gitExecutor: {
         sha256: await sha256(join(binRoot, "oprte-git-executor")),
+      },
+      imageNormalizer: {
+        cdHash: imageNormalizerSignature.cdHash,
+        sha256: await sha256(
+          join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+        ),
       },
       keychainCustodian: {
         sha256: await sha256(join(binRoot, "oprte-keychain-custodian")),

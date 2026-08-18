@@ -161,6 +161,20 @@ pub fn build(b: *std.Build) void {
         );
     } else null;
 
+    const image_normalizer = if (selected_platform == .macos) helper: {
+        break :helper addImageNormalizer(
+            b,
+            target,
+            optimize,
+        );
+    } else null;
+    const package_image_normalizer = if (selected_platform == .macos) helper: {
+        break :helper if (package_optimize == optimize)
+            image_normalizer.?
+        else
+            addImageNormalizer(b, target, package_optimize);
+    } else null;
+
     // The package assembler copies these helpers from zig-out/bin. Merely
     // depending on the compile step produces a cache artifact, not that stable
     // install path, so retain the explicit install steps and join them into
@@ -177,6 +191,17 @@ pub fn build(b: *std.Build) void {
         b.addInstallArtifact(helper, .{})
     else
         null;
+    const image_normalizer_install = if (image_normalizer) |helper|
+        b.addInstallArtifact(helper, .{})
+    else
+        null;
+    const package_image_normalizer_install = if (package_image_normalizer) |helper|
+        if (image_normalizer.? == helper)
+            image_normalizer_install
+        else
+            b.addInstallArtifact(helper, .{})
+    else
+        null;
     if (data_remover_install) |install| {
         b.getInstallStep().dependOn(&install.step);
     }
@@ -184,6 +209,9 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install.step);
     }
     if (keychain_custodian_install) |install| {
+        b.getInstallStep().dependOn(&install.step);
+    }
+    if (image_normalizer_install) |install| {
         b.getInstallStep().dependOn(&install.step);
     }
 
@@ -320,6 +348,9 @@ pub fn build(b: *std.Build) void {
     if (keychain_custodian_install) |install| {
         package.step.dependOn(&install.step);
     }
+    if (package_image_normalizer_install) |install| {
+        package.step.dependOn(&install.step);
+    }
     if (prepare_macos_package) |prepare| {
         package.step.dependOn(&prepare.step);
     } else {
@@ -347,6 +378,9 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{ .root_module = app_mod });
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    if (image_normalizer_install) |install| {
+        test_step.dependOn(&install.step);
+    }
     const runtime_host_test_mod = localModule(
         b,
         target,
@@ -534,6 +568,43 @@ fn addKeychainCustodian(
         // compile-time parent policy, and package exclusion distinguish the
         // smoke artifact.
         .name = "oprte-keychain-custodian",
+        .root_module = helper_mod,
+    });
+}
+
+fn addImageNormalizer(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const helper_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    helper_mod.link_libc = true;
+    const sdk_include = if (b.sysroot) |sysroot|
+        b.fmt("-I{s}/usr/include", .{sysroot})
+    else
+        "";
+    const flags: []const []const u8 = if (b.sysroot) |sysroot|
+        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0", "-isysroot", sysroot, sdk_include }
+    else
+        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-Wno-nullability-completeness", "-Wno-availability", "-Wno-unguarded-availability-new", "-ObjC", "-mmacosx-version-min=13.0" };
+    helper_mod.addCSourceFile(.{
+        .file = b.path("src/macos_image_normalizer.m"),
+        .flags = flags,
+    });
+    if (b.sysroot) |sysroot| {
+        helper_mod.addFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }),
+        });
+    }
+    helper_mod.linkFramework("CoreGraphics", .{});
+    helper_mod.linkFramework("Foundation", .{});
+    helper_mod.linkFramework("ImageIO", .{});
+    helper_mod.linkSystemLibrary("c", .{});
+    return b.addExecutable(.{
+        .name = "hra-image-normalizer",
         .root_module = helper_mod,
     });
 }

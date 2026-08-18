@@ -37,6 +37,16 @@ export const hranessUiStylesheetInput = Object.freeze({
   version: "0.3.1",
 } as const);
 
+export const imageNormalizerPackageContract = Object.freeze({
+  canonicalFileName: "canonical.png",
+  identifier: "hra-image-normalizer",
+  previewFileName: "preview.png",
+  runtimeRelativePath: "bin/hra-image-normalizer",
+  sourceRelativePath: "zig-out/bin/hra-image-normalizer",
+  temporaryDirectoryPattern:
+    /^\.hra-image-normalizer-[0-9a-f]{32}\.tmp$/u,
+} as const);
+
 export const requiredLicenseFileNames = Object.freeze([
   "BUN-DEPENDENCY-LICENSES.json",
   "BUN-DEPENDENCY-LICENSES.txt",
@@ -86,4 +96,12 @@ export const requiredLicenseFileNames = Object.freeze([
   "SHIPPED-JAVASCRIPT-LICENSES.txt",
   "SPDX-MIT-LICENSE.txt",
   "embedded-git.json",
+] as const);
+
+export const requiredRuntimeBinFileNames = Object.freeze([
+  imageNormalizerPackageContract.identifier,
+  "oprte-data-remover",
+  "oprte-gateway",
+  "oprte-git-executor",
+  "oprte-keychain-custodian",
 ] as const);
