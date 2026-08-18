@@ -20,7 +20,10 @@ const tree = {
 };
 
 function receipt(
-  priorHraIdentity?: Readonly<{ build: "8" | "9"; version: "0.1.7" | "0.1.8" }>,
+  priorHraIdentity?: Readonly<{
+    build: "8" | "9" | "10";
+    version: "0.1.7" | "0.1.8" | "0.1.9";
+  }>,
 ): Record<string, unknown> {
   return {
     schemaVersion: 1,
@@ -55,10 +58,10 @@ function receipt(
     },
     candidate: {
       identity: {
-        build: "10",
+        build: "11",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.9",
+        version: "0.1.10",
       },
       tree,
     },
@@ -78,17 +81,18 @@ function receipt(
 }
 
 describe("installation handoff receipt schema", () => {
-  test("accepts only the exact v0.1.9 build-10 evidence shape", () => {
+  test("accepts only the exact v0.1.10 build-11 evidence shape", () => {
     expect(parseInstallationHandoffJournal(receipt())).toMatchObject({
       phase: "committed",
       candidateCommit: "b".repeat(40),
     });
   });
 
-  test("retains exact v0.1.7 and immutable v0.1.8 prior-HRA rollback evidence", () => {
+  test("retains exact v0.1.7, v0.1.8, and immutable v0.1.9 prior-HRA rollback evidence", () => {
     for (const priorHraIdentity of [
       { build: "8", version: "0.1.7" },
       { build: "9", version: "0.1.8" },
+      { build: "10", version: "0.1.9" },
     ] as const) {
       expect(parseInstallationHandoffJournal(receipt(priorHraIdentity)))
         .toMatchObject({
@@ -98,15 +102,15 @@ describe("installation handoff receipt schema", () => {
     }
   });
 
-  test("rejects the v0.1.9 candidate as prior-HRA rollback evidence", () => {
+  test("rejects the v0.1.10 candidate as prior-HRA rollback evidence", () => {
     const mutation = receipt();
     mutation["hadPriorHra"] = true;
     mutation["priorHra"] = {
       identity: {
-        build: "10",
+        build: "11",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.9",
+        version: "0.1.10",
       },
       tree,
     };

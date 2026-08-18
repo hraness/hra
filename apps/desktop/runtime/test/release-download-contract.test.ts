@@ -44,30 +44,30 @@ const candidateContractFixture = parseReleaseDownloadContract({
     artifacts: {
       checksum: {
         bytes: null,
-        name: "HRA-0.1.9-10-macos-arm64.dmg.sha256",
+        name: "HRA-0.1.10-11-macos-arm64.dmg.sha256",
         sha256: null,
       },
       dmg: {
         bytes: null,
-        name: "HRA-0.1.9-10-macos-arm64.dmg",
+        name: "HRA-0.1.10-11-macos-arm64.dmg",
         sha256: null,
       },
       manifest: {
         bytes: null,
-        name: "HRA-0.1.9-10-release-manifest.json",
+        name: "HRA-0.1.10-11-release-manifest.json",
         sha256: null,
       },
     },
     availability: "candidate",
-    build: 10,
+    build: 11,
     minimumMacOS: "13",
     source: {
       commit: null,
       runtimeTreeSha256: null,
       tagObject: null,
     },
-    tag: "v0.1.9",
-    version: "0.1.9",
+    tag: "v0.1.10",
+    version: "0.1.10",
   },
   repository: "https://github.com/hraness/hra",
   schemaVersion: 1,
@@ -82,7 +82,7 @@ afterEach(async () => {
 });
 
 describe("release and download convergence", () => {
-  test("verifies the v0.1.9 build 10 repository contract in either protocol state", async () => {
+  test("verifies the v0.1.10 build 11 repository contract in either protocol state", async () => {
     const contract = await readReleaseDownloadContract();
     expectReleaseIdentity(contract);
     expect(await verifyReleaseDownloadContract()).toEqual(contract);
@@ -626,14 +626,14 @@ function expectReleaseIdentity(contract: ReleaseDownloadContract): void {
     release: {
       architecture: "Apple Silicon",
       artifacts: {
-        checksum: { name: "HRA-0.1.9-10-macos-arm64.dmg.sha256" },
-        dmg: { name: "HRA-0.1.9-10-macos-arm64.dmg" },
-        manifest: { name: "HRA-0.1.9-10-release-manifest.json" },
+        checksum: { name: "HRA-0.1.10-11-macos-arm64.dmg.sha256" },
+        dmg: { name: "HRA-0.1.10-11-macos-arm64.dmg" },
+        manifest: { name: "HRA-0.1.10-11-release-manifest.json" },
       },
-      build: 10,
+      build: 11,
       minimumMacOS: "13",
-      tag: "v0.1.9",
-      version: "0.1.9",
+      tag: "v0.1.10",
+      version: "0.1.10",
     },
     repository: "https://github.com/hraness/hra",
     schemaVersion: 1,

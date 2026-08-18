@@ -36,6 +36,7 @@ const expectedCommit = "0123456789abcdef0123456789abcdef01234567";
 const supportedPriorHraIdentities = [
   { build: "8", version: "0.1.7" },
   { build: "9", version: "0.1.8" },
+  { build: "10", version: "0.1.9" },
 ] as const;
 const faultPoints: readonly InstallationHandoffFaultPoint[] = [
   "after_full_backup",
@@ -142,7 +143,7 @@ describe("OPRTE to HRA installation handoff", () => {
     expect(await inspectTree(fixture.paths.stateRoot, stateTreeOptions)).toEqual(stateBefore);
   }, 60_000);
 
-  test("accepts and restores both supported prior HRA release identities", async () => {
+  test("accepts and restores every supported prior HRA release identity", async () => {
     for (const priorHra of supportedPriorHraIdentities) {
       const fixture = await createFixture({ priorHra });
       const priorHraBefore = await inspectTree(fixture.paths.canonicalApp);
@@ -168,13 +169,13 @@ describe("OPRTE to HRA installation handoff", () => {
     }
   });
 
-  test("rejects the v0.1.9 candidate as an unreceipted prior HRA authority", async () => {
+  test("rejects the v0.1.10 candidate as an unreceipted prior HRA authority", async () => {
     const fixture = await createFixture({ priorHra: false });
     await createBundle(fixture.paths.canonicalApp, {
-      build: "10",
+      build: "11",
       executable: "hra",
       marker: "unreceipted-candidate",
-      version: "0.1.9",
+      version: "0.1.10",
     });
     expect(performInstallationHandoff({
       backupDirectory: fixture.backupDirectory,
@@ -408,7 +409,7 @@ async function createFixture(
     version: "0.1.4",
   });
   const priorHra = options.priorHra === undefined
-    ? supportedPriorHraIdentities[1]
+    ? supportedPriorHraIdentities[2]
     : options.priorHra;
   if (priorHra !== false) {
     await createBundle(join(applicationsDirectory, "HRA.app"), {
@@ -419,15 +420,15 @@ async function createFixture(
     });
   }
   await createBundle(candidateApp, {
-    build: "10",
+    build: "11",
     executable: "hra",
     marker: "candidate",
-    version: "0.1.9",
+    version: "0.1.10",
   });
   const controlPlanePath = join(stateRoot, "control-plane.sqlite");
   const database = openControlPlane(controlPlanePath, {
     releaseIdentity: priorHra === false
-      ? { version: "0.1.8", build: 9 }
+      ? { version: "0.1.9", build: 10 }
       : { version: priorHra.version, build: Number(priorHra.build) },
     now: () => 1_786_934_400_000,
   });
