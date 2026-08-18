@@ -38,9 +38,18 @@ import {
 } from "./pinned-codecs";
 import type { PinnedCodexDynamicToolProtocolCapability } from "./pinned-protocol";
 import {
+  HRA_PRODUCTION_EXECUTION_POLICY,
+  verifyProductionExecutionPolicyRequirements,
+  verifyProductionThreadAdmission,
+  verifyProductionTurnAdmission,
+  type ProductionExecutionPolicyProof,
+  type ProductionExecutionPolicyReceipt,
+} from "./production-execution-policy";
+import {
   CodexRpcCore,
   type CodexProtocolDiagnostic,
   type CodexServerRequest,
+  type CodexStreamPosition,
 } from "./rpc-core";
 import { CodexJsonlWriter } from "./writer";
 
@@ -524,6 +533,7 @@ class DirectProbeGeneration {
   readonly #core: CodexRpcCore;
   readonly #events: ProbeEvent[] = [];
   readonly #ledger = new PinnedCodexDynamicToolLedger();
+  readonly #threadPolicyReceipts = new Map<string, ProductionExecutionPolicyReceipt>();
   readonly #stderrTask: Promise<void>;
   readonly #stdoutTask: Promise<void>;
   readonly #waiters = new Set<ProbeWaiter>();
@@ -694,11 +704,12 @@ class DirectProbeGeneration {
   }
 
   async startThread(cwd: string): Promise<string> {
+    const proof = await this.#preflightProductionPolicy();
     const input = pinnedCodexCodecPairs.threadStart.input.parse({
       cwd,
-      approvalPolicy: "never",
-      approvalsReviewer: "auto_review",
-      sandbox: "read-only",
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
       developerInstructions:
         "This is an HRA protocol proof. For each user request, call " +
         "oprte/rlm_run exactly once with the exact JSON arguments provided, " +
@@ -707,7 +718,7 @@ class DirectProbeGeneration {
       historyMode: "paginated",
       threadSource: "appServer",
     });
-    const raw = await this.#core.request(
+    const raw = await this.#core.requestWithResponsePosition(
       pinnedCodexMethods.threadStart,
       {
         ...input,
@@ -715,19 +726,38 @@ class DirectProbeGeneration {
       },
       { intent: "ambiguousMutation", timeoutMs: PROBE_PROTOCOL_TIMEOUT_MS },
     );
-    return pinnedCodexCodecPairs.threadStart.output.parse(raw).thread.id;
+    const response = pinnedCodexCodecPairs.threadStart.output.parse(raw.result);
+    const receipt = verifyProductionThreadAdmission({
+      proof,
+      generation: raw.generation,
+      streamPosition: raw.streamPosition,
+      request: input,
+      response,
+    });
+    this.#threadPolicyReceipts.set(response.thread.id, receipt);
+    return response.thread.id;
   }
 
   async resumeThread(threadId: string, cwd: string): Promise<void> {
-    await this.#request("threadResume", {
+    const proof = await this.#preflightProductionPolicy();
+    const input = pinnedCodexCodecPairs.threadResume.input.parse({
       threadId,
       cwd,
-      approvalPolicy: "never",
-      approvalsReviewer: "auto_review",
-      sandbox: "read-only",
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
       developerInstructions:
         "This is an HRA protocol proof. Call oprte/rlm_run exactly as requested.",
     });
+    const positioned = await this.#requestWithResponsePosition("threadResume", input);
+    const receipt = verifyProductionThreadAdmission({
+      proof,
+      generation: positioned.generation,
+      streamPosition: positioned.streamPosition,
+      request: input,
+      response: positioned.output,
+    });
+    this.#threadPolicyReceipts.set(positioned.output.thread.id, receipt);
   }
 
   async startCall(
@@ -736,7 +766,12 @@ class DirectProbeGeneration {
     token: string,
   ): Promise<ProbeDynamicCall> {
     const afterOrdinal = this.eventOrdinal;
-    const result = await this.#request("turnStart", {
+    const threadReceipt = this.#threadPolicyReceipts.get(threadId);
+    if (threadReceipt === undefined) {
+      throw new Error("dynamic tool probe thread lacks a verified production policy");
+    }
+    const proof = await this.#preflightProductionPolicy();
+    const input = pinnedCodexCodecPairs.turnStart.input.parse({
       threadId,
       clientUserMessageId: `hra-dynamic-tool-probe-${token}`,
       input: [{
@@ -750,12 +785,23 @@ class DirectProbeGeneration {
           })} and wait for its result.`,
         text_elements: [],
       }],
+      approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+      approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+      sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
+    });
+    const result = await this.#requestWithResponsePosition("turnStart", input);
+    verifyProductionTurnAdmission({
+      proof,
+      threadReceipt,
+      generation: result.generation,
+      streamPosition: result.streamPosition,
+      request: input,
     });
     const event = await this.#waitFor(
       (candidate) =>
         candidate.kind === "call" &&
         candidate.value.call.threadId === threadId &&
-        candidate.value.call.turnId === result.turn.id,
+        candidate.value.call.turnId === result.output.turn.id,
       afterOrdinal,
       PROBE_TURN_TIMEOUT_MS,
     );
@@ -900,9 +946,20 @@ class DirectProbeGeneration {
     key: K,
     input: PinnedCodexRequestShapes[K]["input"],
   ): Promise<PinnedCodexRequestShapes[K]["output"]> {
+    return (await this.#requestWithResponsePosition(key, input)).output;
+  }
+
+  async #requestWithResponsePosition<K extends ProbeRequestKey>(
+    key: K,
+    input: PinnedCodexRequestShapes[K]["input"],
+  ): Promise<Readonly<{
+    readonly generation: number;
+    readonly output: PinnedCodexRequestShapes[K]["output"];
+    readonly streamPosition: CodexStreamPosition;
+  }>> {
     this.#throwIfFailed();
     const params = pinnedCodexCodecPairs[key].input.parse(input);
-    const result = await this.#core.request(
+    const result = await this.#core.requestWithResponsePosition(
       pinnedCodexMethods[key],
       params,
       {
@@ -915,7 +972,23 @@ class DirectProbeGeneration {
         timeoutMs: PROBE_PROTOCOL_TIMEOUT_MS,
       },
     );
-    return pinnedCodexCodecPairs[key].output.parse(result);
+    return {
+      generation: result.generation,
+      output: pinnedCodexCodecPairs[key].output.parse(result.result),
+      streamPosition: result.streamPosition,
+    };
+  }
+
+  async #preflightProductionPolicy(): Promise<ProductionExecutionPolicyProof> {
+    const positioned = await this.#requestWithResponsePosition(
+      "configRequirementsRead",
+      undefined,
+    );
+    return verifyProductionExecutionPolicyRequirements({
+      generation: positioned.generation,
+      streamPosition: positioned.streamPosition,
+      output: positioned.output,
+    });
   }
 
   #waitFor(

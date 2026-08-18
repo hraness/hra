@@ -182,6 +182,10 @@ async function handle(line: string): Promise<void> {
       });
       appendChatLog({ method: "model/list-sent", id: String(id) });
       return;
+    case "configRequirements/read":
+      appendChatLog({ method });
+      write({ id, result: { requirements: null } });
+      return;
     case "thread/start": {
       const cwd = stringField(message.params, "cwd");
       const model = stringField(message.params, "model");
@@ -212,6 +216,9 @@ async function handle(line: string): Promise<void> {
           model,
           reasoningEffort,
           serviceTier,
+          approvalPolicy: "never",
+          approvalsReviewer: "auto_review",
+          sandbox: { type: "dangerFullAccess" },
         },
       });
       return;

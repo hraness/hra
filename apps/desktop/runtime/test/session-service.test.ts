@@ -92,6 +92,7 @@ type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
   | "threadSetName"
   | "threadInjectItems"
   | "modelList"
+  | "configRequirementsRead"
   | "turnStart"
   | "turnSteer"
   | "turnInterrupt">;
@@ -133,11 +134,24 @@ function accountPort(
   }> = { generation: 1, streamPosition: 1 },
 ): SessionAccountRuntimePort {
   let nextResponsePosition = responsePosition.streamPosition;
+  const fixture = (request: RecordedRequest): unknown => {
+    if (request.key === "configRequirementsRead") return { requirements: null };
+    const value = respond(request);
+    return (request.key === "threadStart" || request.key === "threadResume") &&
+        typeof value === "object" && value !== null
+      ? {
+          approvalPolicy: "never",
+          approvalsReviewer: "auto_review",
+          sandbox: { type: "dangerFullAccess" },
+          ...value,
+        }
+      : value;
+  };
   return {
     requestSession<Key extends SessionCodexRequestKey>(accountProfileId: string, key: Key, input: PinnedCodexRequestInput<Key>) {
       const request: RecordedRequest<Key> = { accountProfileId, key, input };
       requests.push(request);
-      return Promise.resolve(respond(request) as PinnedCodexRequestOutput<Key>);
+      return Promise.resolve(fixture(request) as PinnedCodexRequestOutput<Key>);
     },
     requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
       accountProfileId: string,
@@ -148,7 +162,7 @@ function accountPort(
       requests.push(request);
       return Promise.resolve({
         generation: responsePosition.generation,
-        output: respond(request) as PinnedCodexRequestOutput<Key>,
+        output: fixture(request) as PinnedCodexRequestOutput<Key>,
         streamPosition: nextResponsePosition++,
       });
     },
@@ -683,6 +697,7 @@ test("gateway launch resumes through the owned latest-turn snapshot projection",
       emit: (event) => events.push(event),
       now: () => new Date("2026-07-20T12:00:00.000Z"),
     });
+    service.handleRuntimeState("acct_primary0001", { type: "starting", generation: 1 });
 
     const started = await service.startThread({
       accountProfileId: "acct_primary0001",
@@ -697,6 +712,15 @@ test("gateway launch resumes through the owned latest-turn snapshot projection",
     });
     const active = latestThread(events);
     if (active.activeTurn === null) throw new Error("Expected an active turn.");
+    expect(service.verifiedProductionExecutionPolicyForActiveTurn(
+      active.id,
+      active.activeTurn.id,
+    )).toMatchObject({
+      policyId: "hra.full-access.v1",
+      generation: 1,
+      requirementsPosition: 3,
+      admissionPosition: 4,
+    });
     await service.steer({
       threadId: active.id,
       expectedTurnId: active.activeTurn.id,
@@ -704,50 +728,51 @@ test("gateway launch resumes through the owned latest-turn snapshot projection",
       prompt: "Also keep it responsive",
     });
     await service.execute({ type: "thread.resume", threadId: active.id });
+    expect(service.verifiedProductionExecutionPolicyForActiveTurn(
+      active.id,
+      active.activeTurn.id,
+    )).toBeNull();
 
     expect(requests.map(({ key }) => key)).toEqual([
+      "configRequirementsRead",
       "threadStart",
+      "configRequirementsRead",
       "turnStart",
       "turnSteer",
+      "configRequirementsRead",
       "threadResume",
     ]);
-    expect(requests[0]).toMatchObject({
+    expect(requests[1]).toMatchObject({
       accountProfileId: "acct_primary0001",
       input: {
         cwd: started.project.displayPath,
         model: "gpt-5.6-sol",
-        approvalPolicy: "on-request",
+        approvalPolicy: "never",
         approvalsReviewer: "auto_review",
-        sandbox: "workspace-write",
+        sandbox: "danger-full-access",
         ephemeral: false,
         serviceTier: null,
       },
     });
-    expect(requests[1]?.input).toEqual({
+    expect(requests[3]?.input).toEqual({
       threadId: "provider-started",
       clientUserMessageId: "message_primary0001",
       input: [{ type: "text", text: "Build the compact view", text_elements: [] }],
       cwd: started.project.displayPath,
-      approvalPolicy: "on-request",
+      approvalPolicy: "never",
       approvalsReviewer: "auto_review",
-      sandboxPolicy: {
-        type: "workspaceWrite",
-        writableRoots: [started.project.displayPath],
-        networkAccess: false,
-        excludeTmpdirEnvVar: false,
-        excludeSlashTmp: false,
-      },
+      sandboxPolicy: { type: "dangerFullAccess" },
       model: "gpt-5.6-sol",
       effort: "max",
       serviceTier: null,
     });
-    expect(requests[2]?.input).toEqual({
+    expect(requests[4]?.input).toEqual({
       threadId: "provider-started",
       expectedTurnId: "provider-turn",
       clientUserMessageId: "message_primary0002",
       input: [{ type: "text", text: "Also keep it responsive", text_elements: [] }],
     });
-    expect(requests[3]?.input).toMatchObject({
+    expect(requests[6]?.input).toMatchObject({
       threadId: "provider-started",
       serviceTier: null,
     });
@@ -797,6 +822,53 @@ test("gateway-only launch inputs fail before any app-server request", async () =
   );
   expect(invalidTurn).toMatchObject({ code: "invalid_request" });
   expect(requests).toEqual([]);
+});
+
+test("managed requirements reject the immutable policy before any provider mutation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hra-policy-preflight-"));
+  const requests: SessionCodexRequestKey[] = [];
+  const service = new SessionService({
+    accounts: {
+      requestSession: () => Promise.reject(new Error("Expected positioned request")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+      ) {
+        requests.push(key);
+        if (key !== "configRequirementsRead") {
+          return Promise.reject(new Error(`Unexpected provider mutation: ${key}`));
+        }
+        const output = {
+          requirements: {
+            allowedApprovalPolicies: ["on-request"],
+            allowedApprovalsReviewers: ["auto_review"],
+            allowedSandboxModes: ["danger-full-access"],
+          },
+        };
+        return Promise.resolve({
+          generation: 4,
+          output: output as PinnedCodexRequestOutput<Key>,
+          streamPosition: 1,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+  try {
+    const error = await service.startThread({
+      accountProfileId: "acct_primary0001",
+      title: "Policy preflight",
+      workspaceMode: "managed",
+      workspacePath: directory,
+    }).then(() => null, (reason: unknown) => reason);
+    expect(error).toMatchObject({
+      code: "capability_unavailable",
+      action: "none",
+    });
+    expect(requests).toEqual(["configRequirementsRead"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("gateway revocation can interrupt an active owned turn without renderer authority", async () => {
@@ -1031,7 +1103,7 @@ test("unsafe interaction callbacks fail closed without projecting provider paylo
   expect(serialized).not.toContain("secret");
 });
 
-test("non-secret input and one-shot managed file approvals round-trip without persisting provider IDs", async () => {
+test("non-secret input round-trips while every approval request fails closed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oprte-hitl-"));
   const interactions: SessionInteractionRequest[] = [];
   const responses: unknown[] = [];
@@ -1079,6 +1151,7 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
         return Promise.resolve();
       },
     });
+    service.handleRuntimeState("acct_primary0001", { type: "starting", generation: 1 });
     const { thread } = await service.startThread({
       accountProfileId: "acct_primary0001",
       title: "Safe HITL",
@@ -1090,12 +1163,38 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
       prompt: "Make the safe change",
       threadId: thread.id,
     });
+    const providerInputRequest = (
+      id: string,
+      requestInstanceId: number,
+      streamPosition: number,
+      autoResolutionMs: number | null = null,
+    ) => ({
+      generation: 1,
+      id,
+      requestInstanceId,
+      streamPosition,
+      method: "item/tool/requestUserInput" as const,
+      params: {
+        threadId: "provider-hitl-thread",
+        turnId: "provider-hitl-turn",
+        itemId: `${id}-item`,
+        questions: [{
+          id: `${id}-question`,
+          header: "Direction",
+          question: "Continue?",
+          isOther: false,
+          isSecret: false,
+          options: [{ label: "Continue", description: "Continue once." }],
+        }],
+        autoResolutionMs,
+      },
+    });
 
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-input-request",
       requestInstanceId: 1,
-      streamPosition: 1,
+      streamPosition: 10,
       method: "item/tool/requestUserInput",
       params: {
         threadId: "provider-hitl-thread",
@@ -1126,10 +1225,10 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
     })).toEqual({ kind: "applied" });
 
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-file-request",
       requestInstanceId: 2,
-      streamPosition: 2,
+      streamPosition: 11,
       method: "item/fileChange/requestApproval",
       params: {
         threadId: "provider-hitl-thread",
@@ -1138,13 +1237,8 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
         startedAtMs: 1_721_390_400_000,
         grantRoot: sessionCwd,
       },
-    })).toBeTrue();
-    const file = interactions[1]?.request;
-    if (file?.kind !== "file_change_approval") throw new Error("Expected safe file approval");
-    expect(await service.resolveInteraction(file.id, {
-      kind: "file_change_approval",
-      decision: "approve_once",
-    })).toEqual({ kind: "applied" });
+    })).toBeFalse();
+    expect(interactions).toHaveLength(1);
 
     expect(responses).toEqual([
       {
@@ -1154,69 +1248,38 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
           result: { answers: { "provider-question-id": { answers: ["Broad"] } } },
         },
       },
-      {
-        id: "provider-file-request",
-        response: { type: "result", result: { decision: "accept" } },
-      },
     ]);
-    expect(activities.map(({ kind }) => kind)).toEqual([
-      "waiting_for_input",
-      "waiting_for_approval",
-    ]);
+    expect(activities.map(({ kind }) => kind)).toEqual(["waiting_for_input"]);
     const publicProjection = JSON.stringify(interactions);
     expect(publicProjection).not.toContain("provider-input-request");
     expect(publicProjection).not.toContain("provider-question-id");
     expect(publicProjection).not.toContain("provider-file-item");
     expect(publicProjection).not.toContain("private provider reason");
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-stale-authority-request",
-      requestInstanceId: 3,
-      streamPosition: 3,
-      method: "item/fileChange/requestApproval",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-stale-authority-item",
-        startedAtMs: nowMs,
-        grantRoot: sessionCwd,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-stale-authority-request", 3, 12),
+    )).toBeTrue();
     const staleAuthority = interactions.at(-1)?.request;
-    if (staleAuthority?.kind !== "file_change_approval") {
+    if (staleAuthority?.kind !== "user_input") {
       throw new Error("Expected stale-authority interaction");
     }
     const responsesBeforeStaleAuthority = responses.length;
     expect(await service.resolveInteraction(staleAuthority.id, {
-      kind: "file_change_approval",
-      decision: "approve_once",
+      kind: "user_input",
+      answers: [{
+        questionId: staleAuthority.questions[0]?.id ?? "missing",
+        selectedOptionIds: [staleAuthority.questions[0]?.options[0]?.id ?? "missing"],
+      }],
     }, () => Promise.resolve(false))).toEqual({ kind: "rejected" });
     expect(responses).toHaveLength(responsesBeforeStaleAuthority);
     expect(await service.expireInteraction(staleAuthority.id, "provider_expired"))
       .toBeTrue();
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-local-deadline-request",
-      requestInstanceId: 4,
-      streamPosition: 4,
-      method: "item/tool/requestUserInput",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-local-deadline-item",
-        questions: [{
-          id: "provider-local-deadline-question",
-          header: "Deadline",
-          question: "Continue before the local deadline?",
-          isOther: false,
-          isSecret: false,
-          options: [{ label: "Continue", description: "Continue once." }],
-        }],
-        autoResolutionMs: 1_000,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-local-deadline-request", 4, 13, 1_000),
+    )).toBeTrue();
     const localDeadline = interactions.at(-1)?.request;
     if (localDeadline?.kind !== "user_input") throw new Error("Expected deadline interaction");
     nowMs += 1_000;
@@ -1229,42 +1292,25 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
     })).toEqual({ kind: "expired", reason: "local_deadline" });
     expect(expirations).toEqual([]);
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-write-failed-request",
-      requestInstanceId: 5,
-      streamPosition: 5,
-      method: "item/fileChange/requestApproval",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-write-failed-item",
-        startedAtMs: nowMs,
-        grantRoot: sessionCwd,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-write-failed-request", 5, 14),
+    )).toBeTrue();
     const writeFailed = interactions.at(-1)?.request;
-    if (writeFailed?.kind !== "file_change_approval") throw new Error("Expected file interaction");
+    if (writeFailed?.kind !== "user_input") throw new Error("Expected input interaction");
     expect(await service.resolveInteraction(writeFailed.id, {
-      kind: "file_change_approval",
-      decision: "decline",
+      kind: "user_input",
+      answers: [{
+        questionId: writeFailed.questions[0]?.id ?? "missing",
+        selectedOptionIds: [writeFailed.questions[0]?.options[0]?.id ?? "missing"],
+      }],
     })).toEqual({ kind: "expired", reason: "provider_expired" });
     expect(expirations).toEqual([]);
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-timer-deadline-request",
-      requestInstanceId: 6,
-      streamPosition: 6,
-      method: "item/fileChange/requestApproval",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-timer-deadline-item",
-        startedAtMs: nowMs,
-        grantRoot: sessionCwd,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-timer-deadline-request", 6, 15),
+    )).toBeTrue();
     nowMs += 3_600_000;
     deadlines.fireLatest();
     await Bun.sleep(0);
@@ -1279,28 +1325,18 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
       "id" in value && value.id === "provider-timer-deadline-request");
     expect(deadlineAttempts).toHaveLength(1);
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-expired-request",
-      requestInstanceId: 7,
-      streamPosition: 7,
-      method: "item/fileChange/requestApproval",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-expired-item",
-        startedAtMs: nowMs,
-        grantRoot: sessionCwd,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-expired-request", 7, 16),
+    )).toBeTrue();
     const providerExpired = interactions.at(-1)?.request;
-    if (providerExpired?.kind !== "file_change_approval") {
+    if (providerExpired?.kind !== "user_input") {
       throw new Error("Expected provider-expired interaction");
     }
     const providerExpiryFault = {
       type: "server_request_expired" as const,
-      generation: 2,
-      method: "item/fileChange/requestApproval",
+      generation: 1,
+      method: "item/tool/requestUserInput",
       requestId: "provider-expired-request",
       reason: "resolved_elsewhere" as const,
     };
@@ -1311,35 +1347,31 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
       { interactionId: providerExpired.id, reason: "provider_expired" },
     ]);
     expect(await service.resolveInteraction(providerExpired.id, {
-      kind: "file_change_approval",
-      decision: "decline",
+      kind: "user_input",
+      answers: [{
+        questionId: providerExpired.questions[0]?.id ?? "missing",
+        selectedOptionIds: [providerExpired.questions[0]?.options[0]?.id ?? "missing"],
+      }],
     })).toEqual({ kind: "expired", reason: "provider_expired" });
 
-    expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
-      id: "provider-expiry-race-request",
-      requestInstanceId: 8,
-      streamPosition: 8,
-      method: "item/fileChange/requestApproval",
-      params: {
-        threadId: "provider-hitl-thread",
-        turnId: "provider-hitl-turn",
-        itemId: "provider-expiry-race-item",
-        startedAtMs: nowMs,
-        grantRoot: sessionCwd,
-      },
-    })).toBeTrue();
+    expect(await service.handleServerRequest(
+      "acct_primary0001",
+      providerInputRequest("provider-expiry-race-request", 8, 17),
+    )).toBeTrue();
     const racing = interactions.at(-1)?.request;
-    if (racing?.kind !== "file_change_approval") throw new Error("Expected racing interaction");
+    if (racing?.kind !== "user_input") throw new Error("Expected racing interaction");
     const racingResolution = service.resolveInteraction(racing.id, {
-      kind: "file_change_approval",
-      decision: "approve_once",
+      kind: "user_input",
+      answers: [{
+        questionId: racing.questions[0]?.id ?? "missing",
+        selectedOptionIds: [racing.questions[0]?.options[0]?.id ?? "missing"],
+      }],
     });
     while (!racingResponseStarted) await Bun.sleep(0);
     await service.handleServerRequestExpired("acct_primary0001", {
       type: "server_request_expired",
-      generation: 2,
-      method: "item/fileChange/requestApproval",
+      generation: 1,
+      method: "item/tool/requestUserInput",
       requestId: "provider-expiry-race-request",
       reason: "resolved_elsewhere",
     });
@@ -1348,10 +1380,10 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
     expect(expirations).toHaveLength(2);
 
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-secret-request",
       requestInstanceId: 9,
-      streamPosition: 9,
+      streamPosition: 18,
       method: "item/tool/requestUserInput",
       params: {
         threadId: "provider-hitl-thread",
@@ -1369,10 +1401,10 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
       },
     })).toBeFalse();
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-outside-file-request",
       requestInstanceId: 10,
-      streamPosition: 10,
+      streamPosition: 19,
       method: "item/fileChange/requestApproval",
       params: {
         threadId: "provider-hitl-thread",
@@ -1383,10 +1415,10 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
       },
     })).toBeFalse();
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-unbound-file-request",
       requestInstanceId: 11,
-      streamPosition: 11,
+      streamPosition: 20,
       method: "item/fileChange/requestApproval",
       params: {
         threadId: "provider-hitl-thread",
@@ -1397,10 +1429,10 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
     })).toBeFalse();
 
     expect(await service.handleServerRequest("acct_primary0001", {
-      generation: 2,
+      generation: 1,
       id: "provider-input-request",
       requestInstanceId: 12,
-      streamPosition: 12,
+      streamPosition: 21,
       method: "item/fileChange/requestApproval",
       params: {
         threadId: "provider-hitl-thread",
@@ -1409,20 +1441,8 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
         startedAtMs: nowMs,
         grantRoot: sessionCwd,
       },
-    })).toBeTrue();
-    const reusedProviderId = interactions.at(-1)?.request;
-    if (reusedProviderId?.kind !== "file_change_approval") {
-      throw new Error("Expected reused-provider-id interaction");
-    }
-    expect(reusedProviderId.id).not.toBe(input.id);
-    expect(await service.resolveInteraction(reusedProviderId.id, {
-      kind: "file_change_approval",
-      decision: "decline",
-    })).toEqual({ kind: "applied" });
-    expect(responses.at(-1)).toEqual({
-      id: "provider-input-request",
-      response: { type: "result", result: { decision: "decline" } },
-    });
+    })).toBeFalse();
+    expect(interactions.every(({ request }) => request.kind === "user_input")).toBeTrue();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1431,7 +1451,7 @@ test("non-secret input and one-shot managed file approvals round-trip without pe
 test("interaction lifecycle is folded at provider stream positions", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oprte-interaction-facts-"));
   const sessionCwd = await realpath(directory);
-  let responsePosition = 4;
+  let responsePosition = 11;
   let observedRequest: RunInteractionRequestPayload | undefined;
   const service = new SessionService({
     accounts: accountPort([], ({ key }) => {
@@ -1449,6 +1469,7 @@ test("interaction lifecycle is folded at provider stream positions", async () =>
     respondToServerRequest: () => Promise.resolve(responsePosition++),
   });
   try {
+    service.handleRuntimeState("acct_primary0001", { type: "starting", generation: 1 });
     const { thread } = await service.startThread({
       accountProfileId: "acct_primary0001",
       title: "Fact lifecycle",
@@ -1460,11 +1481,12 @@ test("interaction lifecycle is folded at provider stream positions", async () =>
       prompt: "Ask one question",
       threadId: thread.id,
     });
+    service.handleRuntimeState("acct_primary0001", { type: "idle", generation: 1 });
     const request = {
       generation: 1,
       id: "provider-fact-request",
       requestInstanceId: 1,
-      streamPosition: 3,
+      streamPosition: 10,
       method: "item/tool/requestUserInput" as const,
       params: {
         threadId: "provider-fact-thread",
@@ -1503,7 +1525,7 @@ test("interaction lifecycle is folded at provider stream positions", async () =>
       ...request,
       id: "provider-resolved-elsewhere",
       requestInstanceId: 2,
-      streamPosition: 5,
+      streamPosition: 12,
     };
     expect(await service.handleServerRequest(
       "acct_primary0001",
@@ -1518,7 +1540,7 @@ test("interaction lifecycle is folded at provider stream positions", async () =>
     });
     expect(service.consumeCodexFacts(projectCodexNotificationFacts("acct_primary0001", {
       generation: 1,
-      streamPosition: 6,
+      streamPosition: 13,
       method: "serverRequest/resolved",
       params: {
         threadId: "provider-fact-thread",
@@ -1565,6 +1587,7 @@ test("a replacement runtime generation releases pending interaction resources ex
         return Promise.resolve(4);
       },
     });
+    service.handleRuntimeState("acct_primary0001", { type: "starting", generation: 1 });
     const { thread } = await service.startThread({
       accountProfileId: "acct_primary0001",
       title: "Generation ownership",
@@ -1580,18 +1603,25 @@ test("a replacement runtime generation releases pending interaction resources ex
       generation: 1,
       id: "provider-generation-request",
       requestInstanceId: 1,
-      streamPosition: 3,
-      method: "item/fileChange/requestApproval",
+      streamPosition: 10,
+      method: "item/tool/requestUserInput",
       params: {
         threadId: "provider-generation-thread",
         turnId: "provider-generation-turn",
         itemId: "provider-generation-item",
-        startedAtMs: 1_721_390_400_000,
-        grantRoot: sessionCwd,
+        questions: [{
+          id: "provider-generation-question",
+          header: "Generation",
+          question: "Continue?",
+          isOther: false,
+          isSecret: false,
+          options: [{ label: "Continue", description: "Continue once." }],
+        }],
+        autoResolutionMs: null,
       },
     })).toBeTrue();
-    if (observedRequest?.kind !== "file_change_approval") {
-      throw new Error("Expected a pending file approval");
+    if (observedRequest?.kind !== "user_input") {
+      throw new Error("Expected a pending user-input request");
     }
     const deadline = deadlines.entries.at(-1);
     if (deadline === undefined) throw new Error("Expected an interaction deadline");
@@ -1606,8 +1636,11 @@ test("a replacement runtime generation releases pending interaction resources ex
       reason: "provider_expired",
     }]);
     expect(await service.resolveInteraction(observedRequest.id, {
-      kind: "file_change_approval",
-      decision: "approve_once",
+      kind: "user_input",
+      answers: [{
+        questionId: observedRequest.questions[0]?.id ?? "missing",
+        selectedOptionIds: [observedRequest.questions[0]?.options[0]?.id ?? "missing"],
+      }],
     })).toEqual({ kind: "expired", reason: "provider_expired" });
     deadlines.fireLatest();
     await Bun.sleep(0);
@@ -2273,6 +2306,7 @@ test("harness caller resolution fences account, generation, thread, and active t
     emit: () => undefined,
   });
   try {
+    service.handleRuntimeState(accountProfileId, { type: "starting", generation: 7 });
     const started = await service.startThread({
       accountProfileId,
       title: "Harness caller",
@@ -2285,8 +2319,6 @@ test("harness caller resolution fences account, generation, thread, and active t
       threadId: started.thread.id,
     });
     if (active.activeTurn === null) throw new Error("Expected active harness turn");
-    service.handleRuntimeState(accountProfileId, { type: "starting", generation: 7 });
-
     const resolved = service.resolveHarnessCaller(
       accountProfileId,
       7,
@@ -2512,7 +2544,7 @@ test("harness history proves a stable completed prefix before the active caller"
         };
       }
       if (key === "threadItemsList") {
-        const turnId = "turnId" in input && typeof input.turnId === "string"
+        const turnId = input !== undefined && "turnId" in input && typeof input.turnId === "string"
           ? input.turnId
           : null;
         return {
@@ -2545,19 +2577,39 @@ test("harness history proves a stable completed prefix before the active caller"
       coverage: "complete",
       throughTurnId: thread.activeTurn.id,
       sourceGeneration: 7,
-      sourceStreamPosition: 48,
+      sourceStreamPosition: 49,
       items: [
-        { ordinal: 0, itemClass: "userMessage", text: "First prompt" },
-        { ordinal: 3, itemClass: "assistantMessage", text: "First answer" },
-        { ordinal: 4, itemClass: "userMessage", text: "Second prompt" },
-        { ordinal: 6, itemClass: "assistantMessage", text: "Second answer" },
+        {
+          ordinal: 0,
+          itemClass: "userMessage",
+          text: "First prompt",
+          turnId: ownedCodexId("turn", accountProfileId, firstProviderTurnId),
+        },
+        {
+          ordinal: 3,
+          itemClass: "assistantMessage",
+          text: "First answer",
+          turnId: ownedCodexId("turn", accountProfileId, firstProviderTurnId),
+        },
+        {
+          ordinal: 4,
+          itemClass: "userMessage",
+          text: "Second prompt",
+          turnId: ownedCodexId("turn", accountProfileId, secondProviderTurnId),
+        },
+        {
+          ordinal: 6,
+          itemClass: "assistantMessage",
+          text: "Second answer",
+          turnId: ownedCodexId("turn", accountProfileId, secondProviderTurnId),
+        },
       ],
     });
     expect(first.coverageWitnessDigest).toMatch(/^[a-f0-9]{64}$/u);
     expect(JSON.stringify(first)).not.toContain("provider-harness");
     expect(JSON.stringify(first)).not.toContain("Intermediate commentary");
     expect(JSON.stringify(first)).not.toContain("Current input must stay separate");
-    const firstHistoryRequests = requests.slice(1);
+    const firstHistoryRequests = requests.slice(2);
     expect(firstHistoryRequests.map(({ key }) => key)).toEqual([
       "threadTurnsList",
       "threadItemsList",
@@ -2586,7 +2638,7 @@ test("harness history proves a stable completed prefix before the active caller"
     );
     expect(repeated.items).toEqual(first.items);
     expect(repeated.coverageWitnessDigest).toBe(first.coverageWitnessDigest);
-    expect(repeated.sourceStreamPosition).toBe(56);
+    expect(repeated.sourceStreamPosition).toBe(57);
     expect(requests.some(({ key }) => key === "threadRead")).toBeFalse();
 
     const admission = await service.readHarnessContextAdmission(
@@ -2599,7 +2651,7 @@ test("harness history proves a stable completed prefix before the active caller"
     expect(admission.currentInput).toMatchObject({
       turnId: thread.activeTurn.id,
       sourceGeneration: 7,
-      sourceStreamPosition: 64,
+      sourceStreamPosition: 65,
       text: "Current input must stay separate",
     });
     expect(admission.currentInput.coverageWitnessDigest)

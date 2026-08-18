@@ -53,13 +53,22 @@ function positionedAccountPort(
         key,
       };
       requests.push(request);
-      const fixture = respond(request);
+      const fixture = key === "configRequirementsRead"
+        ? {
+            generation: expectedGeneration ?? 1,
+            output: { requirements: null },
+            streamPosition: 1,
+          }
+        : respond(request);
       const output = (key === "threadStart" || key === "threadResume") &&
           typeof fixture.output === "object" && fixture.output !== null
         ? {
             model: "gpt-5.6-sol",
             reasoningEffort: "ultra",
             serviceTier: null,
+            approvalPolicy: "never",
+            approvalsReviewer: "auto_review",
+            sandbox: { type: "dangerFullAccess" },
             ...(fixture.output as Record<string, unknown>),
           }
         : fixture.output;
@@ -177,8 +186,14 @@ test("harness actor mutations install exact private routing and positioned ident
       streamPosition: 41,
       workspaceLaneId: started.workspaceLaneId,
     });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
     expect(requests[0]).toEqual({
+      accountProfileId,
+      expectedGeneration: 7,
+      key: "configRequirementsRead",
+      input: undefined,
+    });
+    expect(requests[1]).toEqual({
       accountProfileId,
       expectedGeneration: 7,
       key: "threadStart",
@@ -187,9 +202,9 @@ test("harness actor mutations install exact private routing and positioned ident
         allowProviderModelFallback: false,
         serviceTier: null,
         cwd: workspacePath,
-        approvalPolicy: "on-request",
+        approvalPolicy: "never",
         approvalsReviewer: "auto_review",
-        sandbox: "workspace-write",
+        sandbox: "danger-full-access",
         developerInstructions,
         ephemeral: false,
         historyMode: "paginated",
@@ -362,8 +377,14 @@ test("harness actor mutations install exact private routing and positioned ident
     }]) {
       expect(service.readHarnessActorChatEventAttachment(mismatch)).toBeNull();
     }
-    expect(requests).toHaveLength(2);
-    expect(requests[1]).toEqual({
+    expect(requests).toHaveLength(4);
+    expect(requests[2]).toEqual({
+      accountProfileId,
+      expectedGeneration: 7,
+      key: "configRequirementsRead",
+      input: undefined,
+    });
+    expect(requests[3]).toEqual({
       accountProfileId,
       expectedGeneration: 7,
       key: "turnStart",
@@ -372,21 +393,20 @@ test("harness actor mutations install exact private routing and positioned ident
         clientUserMessageId: "message_harness0001",
         input: [{ type: "text", text: prompt, text_elements: [] }],
         cwd: workspacePath,
-        approvalPolicy: "on-request",
+        approvalPolicy: "never",
         approvalsReviewer: "auto_review",
-        sandboxPolicy: {
-          type: "workspaceWrite",
-          writableRoots: [workspacePath],
-          networkAccess: false,
-          excludeTmpdirEnvVar: false,
-          excludeSlashTmp: false,
-        },
+        sandboxPolicy: { type: "dangerFullAccess" },
         model: "gpt-5.6-sol",
         effort: "ultra",
         serviceTier: null,
       },
     });
-    expect(requests.map(({ key }) => key)).toEqual(["threadStart", "turnStart"]);
+    expect(requests.map(({ key }) => key)).toEqual([
+      "configRequirementsRead",
+      "threadStart",
+      "configRequirementsRead",
+      "turnStart",
+    ]);
     expect(service.resolveHarnessCaller(
       accountProfileId,
       7,
@@ -713,7 +733,10 @@ test("harness actor thread registration rejects every observable response drift"
         workspacePath,
       });
       expect(await captureRejection(start)).toMatchObject({ code: "protocol_error" });
-      expect(requests).toHaveLength(1);
+      expect(requests.map(({ key }) => key)).toEqual([
+        "configRequirementsRead",
+        "threadStart",
+      ]);
       expect(events.some(({ type }) => type === "thread.upserted")).toBeFalse();
       expect(service.readHarnessActorChatAttachment({
         accountProfileId,
@@ -773,7 +796,12 @@ test("harness actor turn response generation drift never becomes routable", asyn
       code: "protocol_error",
       action: "restartRuntime",
     });
-    expect(requests.map(({ key }) => key)).toEqual(["threadStart", "turnStart"]);
+    expect(requests.map(({ key }) => key)).toEqual([
+      "configRequirementsRead",
+      "threadStart",
+      "configRequirementsRead",
+      "turnStart",
+    ]);
     expect(service.resolveHarnessCaller(
       accountProfileId,
       4,
@@ -787,7 +815,7 @@ test("harness actor turn response generation drift never becomes routable", asyn
   }
 });
 
-test("harness actor owned references preserve read-only sandboxing", async () => {
+test("read-only workspace identity never weakens the immutable execution policy", async () => {
   const directory = await mkdtemp(join(tmpdir(), "oprte-harness-read-only-"));
   const workspacePath = await realpath(directory);
   const accountProfileId = "acct_harness_readonly";
@@ -827,9 +855,13 @@ test("harness actor owned references preserve read-only sandboxing", async () =>
       serviceTier: "standard",
       thread: { kind: "gateway", threadId: started.threadId },
     });
-    expect(requests[0]?.input).toMatchObject({ sandbox: "read-only" });
     expect(requests[1]?.input).toMatchObject({
-      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+    expect(requests[3]?.input).toMatchObject({
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "dangerFullAccess" },
       effort: "ultra",
       approvalsReviewer: "auto_review",
     });
@@ -872,7 +904,10 @@ test("harness actor bindings fail closed on response drift and generation change
       code: "protocol_error",
       action: "restartRuntime",
     });
-    expect(driftRequests).toHaveLength(1);
+    expect(driftRequests.map(({ key }) => key)).toEqual([
+      "configRequirementsRead",
+      "threadStart",
+    ]);
     expect(driftEvents.some(({ type }) => type === "thread.upserted")).toBeFalse();
     expect(drifted.readHarnessActorChatAttachment({
       accountProfileId,
@@ -927,7 +962,7 @@ test("harness actor bindings fail closed on response drift and generation change
       thread: { kind: "gateway", threadId: started.threadId },
     });
     expect(await captureRejection(staleTurn)).toMatchObject({ code: "conflict" });
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -1201,7 +1236,10 @@ test("harness actor recovery rejects source tampering before registry installati
       expectedGeneration: 4,
       providerThreadId: "provider-actor-thread-resume-tamper",
     })).toBeNull();
-    expect(requests).toHaveLength(1);
+    expect(requests.map(({ key }) => key)).toEqual([
+      "configRequirementsRead",
+      "threadResume",
+    ]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

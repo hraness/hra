@@ -41,6 +41,9 @@ const threadAdmissionFixture = Object.freeze({
   model: "gpt-5.6-sol",
   reasoningEffort: "max",
   serviceTier: null,
+  approvalPolicy: "never",
+  approvalsReviewer: "user",
+  sandbox: Object.freeze({ type: "readOnly" as const, networkAccess: false }),
 });
 const v1ActorProgramFixture: PinnedCodexJsonValue = {
   version: 2,

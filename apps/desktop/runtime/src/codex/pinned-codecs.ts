@@ -7,6 +7,7 @@ import type { InitializeResponse as GeneratedInitializeResponse } from "../../..
 import type { ServerNotification as GeneratedServerNotification } from "../../../contracts/generated/codex/0.144.6/typescript/ServerNotification";
 import type { ServerRequest as GeneratedServerRequest } from "../../../contracts/generated/codex/0.144.6/typescript/ServerRequest";
 import type { CancelLoginAccountResponse as GeneratedCancelLoginAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/CancelLoginAccountResponse";
+import type { ConfigRequirementsReadResponse as GeneratedConfigRequirementsReadResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ConfigRequirementsReadResponse";
 import type { GetAccountRateLimitsResponse as GeneratedGetAccountRateLimitsResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/GetAccountRateLimitsResponse";
 import type { GetAccountResponse as GeneratedGetAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/GetAccountResponse";
 import type { GetAccountTokenUsageResponse as GeneratedGetAccountTokenUsageResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/GetAccountTokenUsageResponse";
@@ -685,9 +686,37 @@ const threadListOutputSchema = z.object({
   backwardsCursor: z.string().max(MAX_PATH_CHARACTERS).nullable(),
 });
 
+const granularApprovalPolicySchema = z.object({
+  granular: z.object({
+    sandbox_approval: z.boolean(),
+    rules: z.boolean(),
+    skill_approval: z.boolean(),
+    request_permissions: z.boolean(),
+    mcp_elicitations: z.boolean(),
+  }).strict(),
+}).strict();
 const approvalPolicySchema = z.enum(["untrusted", "on-request", "never"]);
+const returnedApprovalPolicySchema = z.union([
+  approvalPolicySchema,
+  granularApprovalPolicySchema,
+]);
 const approvalsReviewerSchema = z.enum(["user", "auto_review", "guardian_subagent"]);
 const sandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
+const sandboxPolicySchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("dangerFullAccess") }).strict(),
+  z.object({ type: z.literal("readOnly"), networkAccess: z.boolean() }).strict(),
+  z.object({
+    type: z.literal("externalSandbox"),
+    networkAccess: z.enum(["restricted", "enabled"]),
+  }).strict(),
+  z.object({
+    type: z.literal("workspaceWrite"),
+    writableRoots: z.array(absolutePathSchema).max(64),
+    networkAccess: z.boolean(),
+    excludeTmpdirEnvVar: z.boolean(),
+    excludeSlashTmp: z.boolean(),
+  }).strict(),
+]);
 const modelNameSchema = z.string().min(1).max(160);
 const reasoningEffortSchema = z.string().min(1).max(160);
 const serviceTierNameSchema = z.string().min(1).max(160);
@@ -737,6 +766,9 @@ const threadAdmissionResponseSchema = threadResponseSchema.extend({
   model: modelNameSchema,
   reasoningEffort: reasoningEffortSchema.nullable(),
   serviceTier: serviceTierNameSchema.nullable(),
+  approvalPolicy: returnedApprovalPolicySchema,
+  approvalsReviewer: approvalsReviewerSchema,
+  sandbox: sandboxPolicySchema,
 });
 const threadForkInputSchema = z.object({
   threadId: idSchema,
@@ -931,6 +963,14 @@ const modelListOutputSchema = z.object({
   nextCursor: z.string().max(MAX_PATH_CHARACTERS).nullable(),
 });
 
+const configRequirementsReadOutputSchema = z.object({
+  requirements: z.object({
+    allowedApprovalPolicies: z.array(returnedApprovalPolicySchema).max(64).nullable(),
+    allowedApprovalsReviewers: z.array(approvalsReviewerSchema).max(64).nullable(),
+    allowedSandboxModes: z.array(sandboxModeSchema).max(64).nullable(),
+  }).passthrough().nullable(),
+}).strict();
+
 const textInputSchema = z.object({
   type: z.literal("text"),
   text: z.string().min(1).max(MAX_TEXT_CHARACTERS),
@@ -943,21 +983,7 @@ const turnStartInputSchema = z.object({
   cwd: absolutePathSchema.nullable().optional(),
   approvalPolicy: approvalPolicySchema.nullable().optional(),
   approvalsReviewer: approvalsReviewerSchema.nullable().optional(),
-  sandboxPolicy: z.discriminatedUnion("type", [
-    z.object({ type: z.literal("dangerFullAccess") }).strict(),
-    z.object({ type: z.literal("readOnly"), networkAccess: z.boolean() }).strict(),
-    z.object({
-      type: z.literal("externalSandbox"),
-      networkAccess: z.enum(["restricted", "enabled"]),
-    }).strict(),
-    z.object({
-      type: z.literal("workspaceWrite"),
-      writableRoots: z.array(absolutePathSchema).max(64),
-      networkAccess: z.boolean(),
-      excludeTmpdirEnvVar: z.boolean(),
-      excludeSlashTmp: z.boolean(),
-    }).strict(),
-  ]).nullable().optional(),
+  sandboxPolicy: sandboxPolicySchema.nullable().optional(),
   model: modelNameSchema.nullable().optional(),
   effort: reasoningEffortSchema.nullable().optional(),
   serviceTier: serviceTierNameSchema.nullable().optional(),
@@ -1028,6 +1054,9 @@ export type PinnedCodexThreadSetNameInput = z.infer<typeof threadSetNameInputSch
 export type PinnedCodexThreadInjectItemsInput = z.infer<typeof threadInjectItemsInputSchema>;
 export type PinnedCodexModelListInput = z.infer<typeof modelListInputSchema>;
 export type PinnedCodexModelList = z.infer<typeof modelListOutputSchema>;
+export type PinnedCodexConfigRequirementsRead = z.infer<
+  typeof configRequirementsReadOutputSchema
+>;
 export type PinnedCodexTurnStartInput = z.infer<typeof turnStartInputSchema>;
 export type PinnedCodexTurnStart = z.infer<typeof turnStartOutputSchema>;
 export type PinnedCodexTurnSteerInput = z.infer<typeof turnSteerInputSchema>;
@@ -1116,6 +1145,10 @@ export interface PinnedCodexRequestShapes {
   readonly modelList: {
     readonly input: PinnedCodexModelListInput;
     readonly output: PinnedCodexModelList;
+  };
+  readonly configRequirementsRead: {
+    readonly input: undefined;
+    readonly output: PinnedCodexConfigRequirementsRead;
   };
   readonly turnStart: {
     readonly input: PinnedCodexTurnStartInput;
@@ -1213,6 +1246,10 @@ export const pinnedCodexCodecPairs = Object.freeze({
     input: codec(modelListInputSchema),
     output: codec(modelListOutputSchema),
   }),
+  configRequirementsRead: Object.freeze({
+    input: codec(undefinedSchema),
+    output: codec(configRequirementsReadOutputSchema),
+  }),
   turnStart: Object.freeze({
     input: codec(turnStartInputSchema),
     output: codec(turnStartOutputSchema),
@@ -1254,6 +1291,7 @@ export const pinnedCodexMethods = Object.freeze({
   threadSetName: "thread/name/set",
   threadInjectItems: "thread/inject_items",
   modelList: "model/list",
+  configRequirementsRead: "configRequirements/read",
   turnStart: "turn/start",
   turnSteer: "turn/steer",
   turnInterrupt: "turn/interrupt",
@@ -1289,6 +1327,7 @@ interface GeneratedResponses {
   readonly threadSetName: GeneratedThreadSetNameResponse;
   readonly threadInjectItems: GeneratedThreadInjectItemsResponse;
   readonly modelList: GeneratedModelListResponse;
+  readonly configRequirementsRead: GeneratedConfigRequirementsReadResponse;
   readonly turnStart: GeneratedTurnStartResponse;
   readonly turnSteer: GeneratedTurnSteerResponse;
   readonly turnInterrupt: GeneratedTurnInterruptResponse;
@@ -1349,6 +1388,8 @@ type OutputCodecInput<K extends GeneratedOperation> =
                             ? z.input<typeof threadGoalClearOutputSchema>
                     : K extends "modelList"
                       ? z.input<typeof modelListOutputSchema>
+                      : K extends "configRequirementsRead"
+                        ? z.input<typeof configRequirementsReadOutputSchema>
                       : K extends "turnStart"
                         ? z.input<typeof turnStartOutputSchema>
                         : K extends "turnSteer"
@@ -1391,6 +1432,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadSetName: true,
     threadInjectItems: true,
     modelList: true,
+    configRequirementsRead: true,
     turnStart: true,
     turnSteer: true,
     turnInterrupt: true,
@@ -1417,6 +1459,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadSetName: true,
     threadInjectItems: true,
     modelList: true,
+    configRequirementsRead: true,
     turnStart: true,
     turnSteer: true,
     turnInterrupt: true,
