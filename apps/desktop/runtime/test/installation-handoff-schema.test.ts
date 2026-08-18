@@ -19,14 +19,16 @@ const tree = {
   symlinks: 0,
 };
 
-function receipt(): Record<string, unknown> {
+function receipt(
+  priorHraIdentity?: Readonly<{ build: "8" | "9"; version: "0.1.7" | "0.1.8" }>,
+): Record<string, unknown> {
   return {
     schemaVersion: 1,
     createdAt: 1,
     operationId: `handoff_${"a".repeat(24)}`,
     phase: "committed",
     candidateCommit: "b".repeat(40),
-    hadPriorHra: false,
+    hadPriorHra: priorHraIdentity !== undefined,
     state: {
       accountHomes: 0,
       chatWorktreeLanes: 0,
@@ -53,23 +55,64 @@ function receipt(): Record<string, unknown> {
     },
     candidate: {
       identity: {
-        build: "9",
+        build: "10",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.8",
+        version: "0.1.9",
       },
       tree,
     },
+    ...(priorHraIdentity === undefined ? {} : {
+      priorHra: {
+        identity: {
+          build: priorHraIdentity.build,
+          bundleIdentifier: "kitchen.hraness",
+          executable: "hra",
+          version: priorHraIdentity.version,
+        },
+        tree,
+      },
+    }),
     keychainDescriptors: ["service\u0000name"],
   };
 }
 
 describe("installation handoff receipt schema", () => {
-  test("accepts only the exact v0.1.8 build-9 evidence shape", () => {
+  test("accepts only the exact v0.1.9 build-10 evidence shape", () => {
     expect(parseInstallationHandoffJournal(receipt())).toMatchObject({
       phase: "committed",
       candidateCommit: "b".repeat(40),
     });
+  });
+
+  test("retains exact v0.1.7 and immutable v0.1.8 prior-HRA rollback evidence", () => {
+    for (const priorHraIdentity of [
+      { build: "8", version: "0.1.7" },
+      { build: "9", version: "0.1.8" },
+    ] as const) {
+      expect(parseInstallationHandoffJournal(receipt(priorHraIdentity)))
+        .toMatchObject({
+          hadPriorHra: true,
+          priorHra: { identity: priorHraIdentity },
+        });
+    }
+  });
+
+  test("rejects the v0.1.9 candidate as prior-HRA rollback evidence", () => {
+    const mutation = receipt();
+    mutation["hadPriorHra"] = true;
+    mutation["priorHra"] = {
+      identity: {
+        build: "10",
+        bundleIdentifier: "kitchen.hraness",
+        executable: "hra",
+        version: "0.1.9",
+      },
+      tree,
+    };
+    expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
+      "Handoff receipt is invalid",
+    );
   });
 
   test("rejects unknown, stale, and inconsistent nested evidence", () => {

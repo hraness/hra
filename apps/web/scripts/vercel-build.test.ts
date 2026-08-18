@@ -50,6 +50,9 @@ const previewEnvironment = {
   VERCEL_URL: "hra-feature-hraness.vercel.app",
 } as const;
 
+const verifyExplicitCandidateReleaseSource = () =>
+  Promise.resolve({ state: "candidate" as const });
+
 describe("HRA Vercel Convex target plans", () => {
   test("allows only Production to deploy the exact shared backend", () => {
     expect(planVercelConvexBuild(productionEnvironment)).toEqual({
@@ -257,6 +260,7 @@ describe("provider process boundary", () => {
       environment: productionEnvironment,
       expectedProductionDeploymentName: deployment,
       launch: observed.launch,
+      verifyReleaseSource: verifyExplicitCandidateReleaseSource,
     })).toBe(0);
     expect(observed.calls[0]?.command).toEqual([
       process.execPath,
@@ -282,6 +286,7 @@ describe("provider process boundary", () => {
       environment: productionEnvironment,
       expectedProductionDeploymentName: deployment,
       launch: observed.launch,
+      verifyReleaseSource: verifyExplicitCandidateReleaseSource,
     })).toBe(0);
     expect(observed.calls[0]?.command).toEqual([
       process.execPath,
@@ -314,6 +319,7 @@ describe("provider process boundary", () => {
       environment: previewEnvironment,
       expectedProductionDeploymentName: deployment,
       launch: observed.launch,
+      verifyReleaseSource: verifyExplicitCandidateReleaseSource,
     })).toBe(0);
     expect(observed.calls[0]?.command).toEqual([
       process.execPath,

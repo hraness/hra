@@ -111,8 +111,8 @@ export class ControlPlaneReleaseCompatibilityError extends Error {
 }
 
 export const defaultAppReleaseIdentity: AppReleaseIdentity = Object.freeze({
-  version: "0.1.8",
-  build: 9,
+  version: "0.1.9",
+  build: 10,
 });
 
 export const currentControlPlaneMigrationVersion =

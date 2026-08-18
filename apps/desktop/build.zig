@@ -35,7 +35,7 @@ const PackageTarget = enum {
 const default_native_sdk_path = "node_modules/@native-sdk/cli";
 const app_exe_name = "hra";
 const app_bundle_name = "HRA";
-const release_build_number = 9;
+const release_build_number = 10;
 
 pub fn build(b: *std.Build) void {
     const target = nativeSdkTarget(b);

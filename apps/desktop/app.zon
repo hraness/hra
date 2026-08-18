@@ -3,7 +3,7 @@
     .id = "kitchen.hraness",
     .name = "hra",
     .display_name = "HRA",
-    .version = "0.1.8",
+    .version = "0.1.9",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{},
