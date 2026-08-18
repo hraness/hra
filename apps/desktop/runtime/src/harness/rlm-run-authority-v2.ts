@@ -258,6 +258,7 @@ export class RlmRunAuthorityV2Error extends Error {
 export class RlmRunAuthorityV2 {
   readonly #database: Database;
   readonly #now: () => Date;
+  readonly #hasSemanticOperationColumn: boolean;
 
   constructor(
     database: Database,
@@ -265,6 +266,13 @@ export class RlmRunAuthorityV2 {
   ) {
     this.#database = database;
     this.#now = options.now ?? (() => new Date());
+    const receiptColumns: unknown[] = database.query(
+      "PRAGMA table_info(harness_program_operation_receipts)",
+    ).all();
+    const columnSchema = z.object({ name: z.string() }).passthrough();
+    this.#hasSemanticOperationColumn = receiptColumns.some((row) =>
+      columnSchema.parse(row).name === "semantic_operation"
+    );
   }
 
   prepareRun(inputValue: Readonly<{
@@ -664,25 +672,53 @@ export class RlmRunAuthorityV2 {
       if (!run.capabilities.includes(requiredCapability)) {
         conflict("RLM operation exceeds the run's admitted capabilities");
       }
-      this.#database.query(`
-        INSERT INTO harness_program_operation_receipts (
-          receipt_id, run_id, canonical_node_path, operation,
-          request_digest, effect_key, replay_class, state,
-          result_value_id, error_json, created_at, updated_at, settled_at
-        ) VALUES (
-          ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared',
-          NULL, NULL, ?8, ?8, NULL
-        )
-      `).run(
-        proposed.id,
-        proposed.runId,
-        canonicalNodePath(proposed.nodePath),
-        proposed.operation,
-        proposed.requestDigest,
-        proposed.effectKey,
-        proposed.replayClass,
-        proposed.createdAt,
-      );
+      if (this.#hasSemanticOperationColumn) {
+        this.#database.query(`
+          INSERT INTO harness_program_operation_receipts (
+            receipt_id, run_id, canonical_node_path, operation,
+            semantic_operation, request_digest, effect_key, replay_class, state,
+            result_value_id, error_json, created_at, updated_at, settled_at
+          ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'prepared',
+            NULL, NULL, ?9, ?9, NULL
+          )
+        `).run(
+          proposed.id,
+          proposed.runId,
+          canonicalNodePath(proposed.nodePath),
+          proposed.operation === "routing.inspect"
+            ? "agent.status"
+            : proposed.operation,
+          proposed.operation === "routing.inspect" ? proposed.operation : null,
+          proposed.requestDigest,
+          proposed.effectKey,
+          proposed.replayClass,
+          proposed.createdAt,
+        );
+      } else {
+        if (proposed.operation === "routing.inspect") {
+          conflict("routing inspection requires longitudinal migration 44");
+        }
+        this.#database.query(`
+          INSERT INTO harness_program_operation_receipts (
+            receipt_id, run_id, canonical_node_path, operation,
+            request_digest, effect_key, replay_class, state,
+            result_value_id, error_json, created_at, updated_at, settled_at
+          ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared',
+            NULL, NULL, ?8, ?8, NULL
+          )
+        `).run(
+          proposed.id,
+          proposed.runId,
+          canonicalNodePath(proposed.nodePath),
+          proposed.operation,
+          proposed.requestDigest,
+          proposed.effectKey,
+          proposed.replayClass,
+          proposed.createdAt,
+        );
+      }
       return this.#requireReceipt(proposed.id);
     })();
   }
@@ -775,8 +811,15 @@ export class RlmRunAuthorityV2 {
     const after = receiptIdSchema.nullable()
       .parse(inputValue.afterReceiptId ?? null);
     const limit = z.number().int().min(1).max(128).parse(inputValue.limit);
+    const operationProjection = this.#hasSemanticOperationColumn
+      ? "COALESCE(semantic_operation, operation)"
+      : "operation";
     const rows: unknown[] = this.#database.query(`
-      SELECT * FROM harness_program_operation_receipts
+      SELECT receipt_id, run_id, canonical_node_path,
+        ${operationProjection} AS operation,
+        request_digest, effect_key, replay_class, state,
+        result_value_id, error_json, created_at, updated_at, settled_at
+      FROM harness_program_operation_receipts
       WHERE receipt_id > COALESCE(?1, '')
         AND state IN ('prepared', 'effectStarted', 'replayRequired', 'recoveryRequired')
       ORDER BY receipt_id LIMIT ?2
@@ -802,9 +845,16 @@ export class RlmRunAuthorityV2 {
   }
 
   #readReceipt(id: string): RlmReceiptRecord | null {
-    const row: unknown = this.#database.query(
-      "SELECT * FROM harness_program_operation_receipts WHERE receipt_id = ?1",
-    ).get(id);
+    const operationProjection = this.#hasSemanticOperationColumn
+      ? "COALESCE(semantic_operation, operation)"
+      : "operation";
+    const row: unknown = this.#database.query(`
+      SELECT receipt_id, run_id, canonical_node_path,
+        ${operationProjection} AS operation,
+        request_digest, effect_key, replay_class, state,
+        result_value_id, error_json, created_at, updated_at, settled_at
+      FROM harness_program_operation_receipts WHERE receipt_id = ?1
+    `).get(id);
     return row === null ? null : this.#parseReceiptRow(row);
   }
 
@@ -812,8 +862,15 @@ export class RlmRunAuthorityV2 {
     runId: string,
     nodePath: RlmV2NodePath,
   ): RlmReceiptRecord | null {
+    const operationProjection = this.#hasSemanticOperationColumn
+      ? "COALESCE(semantic_operation, operation)"
+      : "operation";
     const row: unknown = this.#database.query(`
-      SELECT * FROM harness_program_operation_receipts
+      SELECT receipt_id, run_id, canonical_node_path,
+        ${operationProjection} AS operation,
+        request_digest, effect_key, replay_class, state,
+        result_value_id, error_json, created_at, updated_at, settled_at
+      FROM harness_program_operation_receipts
       WHERE run_id = ?1 AND canonical_node_path = ?2
     `).get(runId, canonicalNodePath(nodePath));
     return row === null ? null : this.#parseReceiptRow(row);
@@ -1072,6 +1129,7 @@ export function replayClassForRlmOperation(
     case "heap.get":
     case "heap.list":
     case "agent.status":
+    case "routing.inspect":
       return "pureRead";
   }
 }

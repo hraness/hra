@@ -19,6 +19,10 @@ This vault keeps captured sources separate from maintained notes. Catalog links 
 
 - [[VISION|OPRTE vision]]
 
+### Plans
+
+- [[plans/hra-longitudinal-routing|Longitudinal routing evidence and shadow recommendations]] — Status: in-progress. Build a per-pane, content-free evidence loop that recommends execution profiles without changing live routes.
+
 ### Scopes
 
 - [[scopes/apps-web-convex--fc397b5fde8f|HRA Convex context]] — The Convex boundary owns multi-tenant task authority, authorization, dispatch, work graphs, quotas, reconciliation, and administrative projections. Public and internal functions…

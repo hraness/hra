@@ -117,6 +117,16 @@ export interface HarnessPersistentActorLivenessLifecyclePortV2 {
   close(): Promise<void>;
 }
 
+/**
+ * Owns the local, non-activating shadow-analysis timer. It starts only after
+ * durable recovery and must stop touching SQLite before providers may stop.
+ */
+export interface HarnessLongitudinalRoutingShadowAnalyzerLifecyclePortV1 {
+  startAfterRecovery(): void;
+  closeAdmission(): void;
+  settled(): Promise<void>;
+}
+
 export interface HarnessKeyCustodyLifecyclePortV2 {
   quiesceForExternalDeletion(): Promise<void>;
 }
@@ -190,6 +200,8 @@ export interface HarnessProductionLifecycleKernelV2Options {
   readonly renderer: HarnessRendererLifecyclePortV2;
   readonly dynamicTools: HarnessDynamicToolLifecyclePortV2;
   readonly rootSessions: HarnessRootSessionLifecyclePortV2;
+  readonly shadowRoutingAnalyzer:
+    HarnessLongitudinalRoutingShadowAnalyzerLifecyclePortV1;
   readonly liveness: HarnessPersistentActorLivenessLifecyclePortV2;
   readonly keyCustody: HarnessKeyCustodyLifecyclePortV2;
   readonly rlmQuiesceTimeoutMs?: number;
@@ -208,6 +220,8 @@ export class HarnessProductionLifecycleKernelV2 {
   readonly #renderer: HarnessRendererLifecyclePortV2;
   readonly #dynamicTools: HarnessDynamicToolLifecyclePortV2;
   readonly #rootSessions: HarnessRootSessionLifecyclePortV2;
+  readonly #shadowRoutingAnalyzer:
+    HarnessLongitudinalRoutingShadowAnalyzerLifecyclePortV1;
   readonly #liveness: HarnessPersistentActorLivenessLifecyclePortV2;
   readonly #keyCustody: HarnessKeyCustodyLifecyclePortV2;
   readonly #rlmQuiesceTimeoutMs: number;
@@ -238,6 +252,7 @@ export class HarnessProductionLifecycleKernelV2 {
     this.#renderer = options.renderer;
     this.#dynamicTools = options.dynamicTools;
     this.#rootSessions = options.rootSessions;
+    this.#shadowRoutingAnalyzer = options.shadowRoutingAnalyzer;
     this.#liveness = options.liveness;
     this.#keyCustody = options.keyCustody;
     this.#rlmQuiesceTimeoutMs = timeoutSchema.parse(
@@ -331,6 +346,10 @@ export class HarnessProductionLifecycleKernelV2 {
       () => this.#dynamicTools.closeAdmission(),
       this.#admissionCloseFailures,
     );
+    collectSynchronous(
+      () => this.#shadowRoutingAnalyzer.closeAdmission(),
+      this.#admissionCloseFailures,
+    );
   }
 
   async #boot(): Promise<HarnessProductionLifecycleBootReportV2> {
@@ -368,6 +387,8 @@ export class HarnessProductionLifecycleKernelV2 {
         rendererInitialized,
         rendererRefreshedByProjection: !rendererInitialized,
       });
+      this.#shadowRoutingAnalyzer.startAfterRecovery();
+      this.#requireBootMayContinue();
       this.#dynamicTools.openAdmissionAfterRecovery();
       this.#requireBootMayContinue();
       this.#state = "ready";
@@ -427,6 +448,9 @@ export class HarnessProductionLifecycleKernelV2 {
 
     const rootAdmissionDrain = invoke(() => this.#rootSessions.settled());
     const dynamicAdmissionDrain = invoke(() => this.#dynamicTools.settled());
+    const shadowAnalyzerDrain = invoke(
+      () => this.#shadowRoutingAnalyzer.settled(),
+    );
     await collect(actorSessionDrain, failures);
     await collect(
       bounded(
@@ -441,6 +465,14 @@ export class HarnessProductionLifecycleKernelV2 {
         dynamicAdmissionDrain,
         this.#rlmQuiesceTimeoutMs,
         "Dynamic-tool admission work did not settle before provider shutdown.",
+      ),
+      failures,
+    );
+    await collect(
+      bounded(
+        shadowAnalyzerDrain,
+        this.#rlmQuiesceTimeoutMs,
+        "Longitudinal routing shadow analysis did not settle before provider shutdown.",
       ),
       failures,
     );

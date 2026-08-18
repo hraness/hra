@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 
 import type { AccountRuntimeRouter } from "../src/accounts/runtime-router";
+import {
+  HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
+  HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
+} from "../src/codex";
 import { actorSchema } from "../src/harness/actor-domain";
 import {
   HarnessDynamicToolEvidenceSettingsAuthorityV2,
@@ -200,6 +204,7 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
         "agent.wait",
         "heap.read",
         "heap.write",
+        "routing.inspect",
       ]);
       expect(result.admittedFeatures).toEqual([
         "boundedPrograms",
@@ -344,7 +349,7 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
         startOperationId: operation.id,
         clientRequestId: "nested-evidence-client-request-0001",
         threadSource: "oprte:evidence:nested:0001",
-        toolsetDigest: "3".repeat(64),
+        toolsetDigest: HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
         createdAt: at,
       });
       incarnation = actors.transitionActorIncarnation({
@@ -391,17 +396,43 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
         },
         createdAt: at,
       });
-      expect(await value.service.readAcceptedSettings({
+      const currentSettings = await value.service.readAcceptedSettings({
         ...settingsInput(value.admitted),
         actorId: actor.id,
         turnId: turn.id,
-      })).toMatchObject({
+      }) as { capabilities: string[]; budget: Record<string, unknown> };
+      expect(currentSettings).toMatchObject({
         budget: {
           depthRemaining: 2,
           tokenBudget: 20_000,
           laneAuthority: "readOnly",
         },
       });
+      expect(currentSettings.capabilities).toContain("routing.inspect");
+
+      // Simulate a durable incarnation created under the immediately prior v1
+      // declaration. Its old operation set remains usable, but the newly added
+      // routing operation is never granted to that provider thread.
+      value.database.query(`
+        UPDATE harness_actor_incarnations SET toolset_digest = ?2
+        WHERE incarnation_id = ?1
+      `).run(
+        incarnation.id,
+        HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
+      );
+      const predecessorSettings = await value.service.readAcceptedSettings({
+        ...settingsInput(value.admitted),
+        actorId: actor.id,
+        turnId: turn.id,
+      }) as { capabilities: string[] };
+      expect(predecessorSettings.capabilities).toEqual([
+        "agent.cancel",
+        "agent.message",
+        "agent.spawn",
+        "agent.wait",
+        "heap.read",
+        "heap.write",
+      ]);
 
       value.database.query(`
         UPDATE account_profiles SET process_generation = 8, updated_at = ?2
@@ -435,15 +466,17 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
         actorId: actor.id,
         turnId: turn.id,
       })).rejects.toBeInstanceOf(HarnessDynamicToolEvidenceSettingsV2Error);
-      expect(await value.service.readAcceptedSettings({
+      const recoveredSettings = await value.service.readAcceptedSettings({
         ...settingsInput(value.admitted),
         actorId: actor.id,
         turnId: turn.id,
         accountGeneration: 8,
         processGeneration: 8,
-      })).toMatchObject({
+      }) as { capabilities: string[]; budget: Record<string, unknown> };
+      expect(recoveredSettings).toMatchObject({
         budget: { tokenBudget: 20_000 },
       });
+      expect(recoveredSettings.capabilities).not.toContain("routing.inspect");
 
       value.database.exec("SAVEPOINT retired_actor_session");
       actors.transitionActorIncarnation({

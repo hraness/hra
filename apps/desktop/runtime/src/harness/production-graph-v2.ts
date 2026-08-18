@@ -62,6 +62,10 @@ import { HarnessDynamicToolServiceV2 } from "./dynamic-tool-service-v2";
 import { HarnessDynamicToolStableCallerAuthorityV2 } from
   "./dynamic-tool-stable-caller-v2";
 import { HarnessInstallKeyCustody } from "./key-custody";
+import { HarnessLongitudinalRoutingShadowAnalyzerV1 } from
+  "./longitudinal-routing-shadow-analyzer-v1";
+import { LongitudinalRoutingSQLiteAuthorityV1 } from
+  "./longitudinal-routing-sqlite-v1";
 import { HarnessImmutableObjectStore } from "./object-store";
 import {
   PersistentActorCoordinator,
@@ -133,6 +137,8 @@ export interface HarnessProductionGraphV2Options {
   readonly repositories: ChatRepositoryPort;
   readonly runtimes: AccountRuntimeRouter;
   readonly sessions: SessionService;
+  readonly isForegroundIdle: () => boolean;
+  readonly onShadowRoutingAnalysisFault: (error: Error) => void;
   readonly onActorSessionRecoveryFatalFailure: (error: Error) => void;
   readonly createChat: (ports: Readonly<{
     harnessActors: ChatHarnessActorTurnPort;
@@ -347,12 +353,26 @@ export function createHarnessProductionGraphV2(
     values,
     names,
   });
+  const routing = new LongitudinalRoutingSQLiteAuthorityV1(options.database);
+  const shadowRoutingAnalyzer =
+    new HarnessLongitudinalRoutingShadowAnalyzerV1({
+      authority: routing,
+      idle: {
+        isIdle: () => !chat.hasUnsettledWork()
+          && !options.composition.hasUnsettledWork()
+          && options.isForegroundIdle(),
+      },
+      onFault: options.onShadowRoutingAnalysisFault,
+    });
   const operationRouter = new RlmV2OperationRouter({
     bindings: runCallers,
     context: contextOperations,
     actors: actorCoordinator,
     actorOperationContracts: {
       readForActor: ({ actorId }) => {
+        // Policy version selects only the actor argument shape. The admitted
+        // operation set is separately bound to the incarnation toolset digest
+        // by HarnessDynamicToolEvidenceSettingsAuthorityV2.
         const policy = actors.readActorDispatchPolicy(actorId);
         if (policy === null) {
           throw new Error("RLM actor operation contract lacks durable policy");
@@ -366,6 +386,7 @@ export function createHarnessProductionGraphV2(
       authority: actors,
       values,
     }),
+    routing,
     proposals,
   });
   const rlm = new RlmRuntimeV2({
@@ -419,6 +440,7 @@ export function createHarnessProductionGraphV2(
       settled: () => actorProjections.settled(),
     },
     renderer,
+    shadowRoutingAnalyzer,
     dynamicTools,
     liveness,
     keyCustody: keys,

@@ -179,6 +179,7 @@ const settings = Object.freeze({
     "agent.wait",
     "heap.read",
     "heap.write",
+    "routing.inspect",
   ] as const),
   admittedFeatures: Object.freeze([
     "boundedPrograms",
@@ -199,6 +200,7 @@ const contextualSettings = Object.freeze({
     "context.read",
     "heap.read",
     "heap.write",
+    "routing.inspect",
   ] as const),
   admittedFeatures: Object.freeze([
     "boundedPrograms",
@@ -540,6 +542,62 @@ describe("HarnessDynamicToolStableCallerAuthorityV2", () => {
     });
     expect(ports.contextReads).toHaveLength(0);
     expect(ports.materializations).toHaveLength(0);
+  });
+
+  test("keeps a pre-routing v1 caller on its exact old operation set", async () => {
+    const predecessorCapabilities = settings.capabilities.filter(
+      (capability) => capability !== "routing.inspect",
+    );
+    const predecessorContextualCapabilities =
+      contextualSettings.capabilities.filter(
+        (capability) => capability !== "routing.inspect",
+      );
+    const oldOperationProgram = parseRlmV2Program({
+      version: 2,
+      capabilities: ["heap.read"],
+      steps: [],
+      result: { kind: "literal", value: { accepted: true } },
+    });
+    const routingProgram = parseRlmV2Program({
+      version: 2,
+      capabilities: ["routing.inspect"],
+      steps: [],
+      result: { kind: "literal", value: { accepted: true } },
+    });
+
+    const live = new Ports();
+    live.settingsValue = {
+      ...settings,
+      capabilities: predecessorCapabilities,
+    };
+    const admitted = await authority(live).admit({
+      call: stableCall(),
+      program: oldOperationProgram,
+      programDigest: digestRlmV2Program(oldOperationProgram),
+    });
+    expect(admitted).toMatchObject({
+      caller: { capabilities: predecessorContextualCapabilities },
+    });
+    expect(await authority(live).admit({
+      call: stableCall(),
+      program: routingProgram,
+      programDigest: digestRlmV2Program(routingProgram),
+    })).toBeNull();
+
+    const recovered = new Ports();
+    setLaterRootCaller(recovered);
+    recovered.settingsValue = {
+      ...settings,
+      capabilities: predecessorCapabilities,
+    };
+    const oldRun = runRecord({
+      capabilities: predecessorContextualCapabilities,
+    });
+    recovered.runs.set(oldRun.id, oldRun);
+    expect(await authority(recovered).ownsRun({
+      call: stableCall(),
+      runId: oldRun.id,
+    })).toBe(true);
   });
 
   test("admits an exact nested attempt with its remaining depth budget", async () => {

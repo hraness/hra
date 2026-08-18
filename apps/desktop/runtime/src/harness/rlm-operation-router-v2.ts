@@ -18,6 +18,8 @@ import {
   type ActorTurn,
 } from "./actor-domain";
 import { contextSnapshotIdSchema } from "./domain";
+import { longitudinalRoutingInspectionSchema } from
+  "./longitudinal-routing-v1";
 import {
   PersistentActorError,
   type PersistentActorCoordinator,
@@ -50,6 +52,7 @@ const actorTitleSchema = z.string().min(1).max(160).refine(
   "actor title must be trimmed and NUL-free",
 );
 const operationArgumentsSchema = z.record(z.string(), z.unknown());
+const emptyOperationArgumentsSchema = z.object({}).strict();
 const allocationShareSchema = z.number().int().min(1).max(10_000);
 const actorAllocationSchema = z.object({
   tokenShareBps: allocationShareSchema,
@@ -110,6 +113,7 @@ const transferredActorResultSchema = z.object({
   utf8Bytes: z.number().int().nonnegative()
     .max(RLM_V2_MAX_VALUE_UTF8_BYTES),
 }).strict();
+type MaybePromise<Value> = Value | Promise<Value>;
 
 const actorBindingSchema = z.object({
   epochId: z.string().min(16).max(96).regex(/^hepoch_[A-Za-z0-9_-]+$/u),
@@ -179,11 +183,21 @@ export interface RlmV2ActorResultTransferPort {
   }>): Promise<unknown>;
 }
 
+/** Read-only, content-free longitudinal routing memory for one durable caller. */
+export interface RlmV2RoutingInspectionPort {
+  inspectForCaller(input: Readonly<{
+    epochId: string;
+    actorId: string;
+    turnId: string;
+  }>): MaybePromise<unknown>;
+}
+
 export interface RlmV2OperationRouterOptions {
   readonly bindings: RlmV2ActorBindingPort;
   readonly context: RlmV2ContextOperationPort;
   readonly actors: ActorCoordinatorPort;
   readonly actorResults: RlmV2ActorResultTransferPort;
+  readonly routing: RlmV2RoutingInspectionPort;
   readonly proposals: ProposalServicePort;
   /**
    * The predecessor reader is for an already durable v0 operation only. A
@@ -214,6 +228,7 @@ export class RlmV2OperationRouter implements RlmV2OperationPort {
   readonly #context: RlmV2ContextOperationPort;
   readonly #actors: ActorCoordinatorPort;
   readonly #actorResults: RlmV2ActorResultTransferPort;
+  readonly #routing: RlmV2RoutingInspectionPort;
   readonly #proposals: ProposalServicePort;
   readonly #actorOperationContract: RlmV2ActorOperationContract;
   readonly #actorOperationContracts:
@@ -225,6 +240,7 @@ export class RlmV2OperationRouter implements RlmV2OperationPort {
     this.#context = options.context;
     this.#actors = options.actors;
     this.#actorResults = options.actorResults;
+    this.#routing = options.routing;
     this.#proposals = options.proposals;
     if (
       options.actorOperationContract !== undefined &&
@@ -360,6 +376,17 @@ export class RlmV2OperationRouter implements RlmV2OperationPort {
           throw new RlmV2OperationReplayRequiredError();
         }
         result = turnView(cancelled);
+        break;
+      }
+      case "routing.inspect": {
+        emptyOperationArgumentsSchema.parse(argumentsRecord);
+        result = longitudinalRoutingInspectionSchema.parse(
+          await this.#routing.inspectForCaller({
+            epochId: binding.epochId,
+            actorId: binding.actorId,
+            turnId: binding.turnId,
+          }),
+        );
         break;
       }
       case "harness.propose": {

@@ -361,6 +361,7 @@ describe("RLM v2 durable caller authority", () => {
           cancel: unused,
         },
         actorResults: { transfer: unused },
+        routing: { inspectForCaller: unused },
         proposals: { propose: unused },
       });
       await expectAuthorityError(
@@ -407,6 +408,7 @@ describe("RLM v2 durable caller authority", () => {
           cancel: unused,
         },
         actorResults: { transfer: unused },
+        routing: { inspectForCaller: unused },
         proposals: { propose: unused },
       });
       await expectAuthorityError(

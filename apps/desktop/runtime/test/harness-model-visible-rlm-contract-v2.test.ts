@@ -52,6 +52,30 @@ describe("model-visible RLM v2 contract", () => {
     ]);
   });
 
+  test("exposes a parser-valid inspection-only program and its evidence boundary", () => {
+    const definitions = HRA_RLM_DYNAMIC_TOOL_SPEC.tools[0].inputSchema.$defs;
+    const example = definitions.rlmProgram.examples[1];
+    if (example === undefined) {
+      throw new Error("RLM v2 routing inspection example is missing");
+    }
+
+    expect(parseRlmV2Program(example)).toMatchObject({
+      capabilities: ["routing.inspect"],
+      steps: [{
+        kind: "call",
+        as: "routingMemory",
+        operation: "routing.inspect",
+        arguments: {},
+      }],
+      result: { kind: "variable", name: "routingMemory" },
+    });
+    const description = definitions.rlmStep.properties.operation.description;
+    expect(description).toContain("recursive actor outcomes only");
+    expect(description).toContain("excludes ordinary root-turn spend");
+    expect(description).toContain("requestedProfile as routing intent");
+    expect(description).toContain("observed provider compliance");
+  });
+
   test("enumerates the complete closed operation set and relative spawn allocation", () => {
     const definitions = HRA_RLM_DYNAMIC_TOOL_SPEC.tools[0].inputSchema.$defs;
     const operation = definitions.rlmStep.properties.operation;
@@ -69,6 +93,11 @@ describe("model-visible RLM v2 contract", () => {
       "omitted acceleration is Standard",
     );
     expect(operation.description).toContain("agent.result/agent.cancel {turnId}");
+    expect(operation.description).toContain("routing.inspect {}");
+    expect(operation.enum).toContain("routing.inspect");
+    expect(definitions.rlmProgram.properties.capabilities.items.enum).toContain(
+      "routing.inspect",
+    );
     const example = definitions.rlmProgram.examples[0];
     if (example === undefined) {
       throw new Error("RLM v2 schema example is missing");

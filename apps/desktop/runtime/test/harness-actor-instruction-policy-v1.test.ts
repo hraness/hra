@@ -23,6 +23,15 @@ describe("malleable persistent actor instruction policy", () => {
     expect(instructions).toContain("Durable work class: standard.");
     expect(instructions).toContain("gpt-5.6-sol with max reasoning");
     expect(instructions).toContain("oprte/rlm_run");
+    expect(instructions).toContain("routing.inspect {}");
+    expect(instructions).toContain("recursive actor outcomes only");
+    expect(instructions).toContain("excludes ordinary root-turn spend");
+    expect(instructions).toContain("requestedProfile is routing intent");
+    expect(instructions).toContain("observed provider compliance");
+    expect(instructions).toContain("descriptive and shadow-only");
+    expect(instructions).toContain("operational completion is not quality");
+    expect(instructions).toContain("misclassify work");
+    expect(instructions).toContain("override user intent");
     expect(instructions).not.toContain("hactor_");
   });
 
@@ -40,6 +49,7 @@ describe("malleable persistent actor instruction policy", () => {
       toolBoundary: "ok",
       schemaBoundary: "ok",
       handleGuidance: "ok",
+      routingGuidance: "ok",
       completionGuidance: "ok",
       execute: "fetch('https://example.com')",
     })).toThrow();

@@ -32,6 +32,10 @@ function fixture(input: Readonly<{
   rootSettled?: () => Promise<void>;
   dynamicOpenAdmission?: () => void;
   dynamicSettled?: () => Promise<unknown>;
+  shadowAnalyzerStart?: () => void;
+  shadowAnalyzerClose?: () => void;
+  shadowAnalyzerSettled?: () => Promise<void>;
+  recordShadowAnalyzerCalls?: boolean;
   livenessClose?: () => Promise<void>;
   keyCustodyQuiesce?: () => Promise<void>;
 }> = {}): Fixture {
@@ -153,6 +157,26 @@ function fixture(input: Readonly<{
       settled: () => {
         calls.push("rootSessions.settled");
         return input.rootSettled?.() ?? Promise.resolve();
+      },
+    },
+    shadowRoutingAnalyzer: {
+      startAfterRecovery: () => {
+        if (input.recordShadowAnalyzerCalls === true) {
+          calls.push("shadowRoutingAnalyzer.startAfterRecovery");
+        }
+        input.shadowAnalyzerStart?.();
+      },
+      closeAdmission: () => {
+        if (input.recordShadowAnalyzerCalls === true) {
+          calls.push("shadowRoutingAnalyzer.closeAdmission");
+        }
+        input.shadowAnalyzerClose?.();
+      },
+      settled: () => {
+        if (input.recordShadowAnalyzerCalls === true) {
+          calls.push("shadowRoutingAnalyzer.settled");
+        }
+        return input.shadowAnalyzerSettled?.() ?? Promise.resolve();
       },
     },
     liveness: {
@@ -722,6 +746,73 @@ describe("HarnessProductionLifecycleKernelV2", () => {
       "liveness.close",
       "rlm.quiesce:17",
     ]);
+  });
+
+  test("starts shadow analysis after recovery and joins it before provider stop", async () => {
+    const value = fixture({ recordShadowAnalyzerCalls: true });
+
+    await value.kernel.initialize();
+    expect(value.calls.slice(-2)).toEqual([
+      "shadowRoutingAnalyzer.startAfterRecovery",
+      "dynamicTools.openAdmissionAfterRecovery",
+    ]);
+
+    await value.kernel.preProviderStop();
+    const closeIndex = value.calls.indexOf(
+      "shadowRoutingAnalyzer.closeAdmission",
+    );
+    const settledIndex = value.calls.indexOf("shadowRoutingAnalyzer.settled");
+    const livenessIndex = value.calls.indexOf("liveness.close");
+    const providerBarrierIndex = value.calls.indexOf("rlm.quiesce:17");
+    expect(closeIndex).toBeGreaterThan(-1);
+    expect(settledIndex).toBeGreaterThan(closeIndex);
+    expect(livenessIndex).toBeGreaterThan(settledIndex);
+    expect(providerBarrierIndex).toBeGreaterThan(livenessIndex);
+
+    value.kernel.providerSourcesStopped();
+    await value.kernel.shutdown();
+  });
+
+  test("fails boot closed when shadow analysis cannot start", async () => {
+    const failure = new Error("shadow timer unavailable");
+    const value = fixture({
+      recordShadowAnalyzerCalls: true,
+      shadowAnalyzerStart: () => {
+        throw failure;
+      },
+    });
+
+    expect(await rejected(value.kernel.initialize())).toMatchObject({
+      code: "initialization_failed",
+      cause: failure,
+    });
+    expect(value.calls.slice(-4)).toEqual([
+      "shadowRoutingAnalyzer.startAfterRecovery",
+      "rootSessions.closeAdmission",
+      "dynamicTools.closeAdmission",
+      "shadowRoutingAnalyzer.closeAdmission",
+    ]);
+    expect(value.calls).not.toContain("dynamicTools.openAdmissionAfterRecovery");
+
+    await value.kernel.preProviderStop();
+    value.kernel.providerSourcesStopped();
+    await value.kernel.shutdown();
+  });
+
+  test("bounds a blocked shadow-analysis join before provider stop", async () => {
+    const value = fixture({
+      recordShadowAnalyzerCalls: true,
+      shadowAnalyzerSettled: () => new Promise<never>(() => undefined),
+    });
+
+    expect(await rejected(value.kernel.preProviderStop())).toMatchObject({
+      code: "shutdown_failed",
+    });
+    expect(value.calls).toContain("shadowRoutingAnalyzer.closeAdmission");
+    expect(value.calls).toContain("shadowRoutingAnalyzer.settled");
+    expect(value.calls).toContain("rlm.quiesce:17");
+    expect(() => value.kernel.providerSourcesStopped()).toThrow();
+    expect(value.kernel.databaseClosePermitted).toBeFalse();
   });
 
   test("joins effect producers before provider stop, then drains terminal sources", async () => {

@@ -45,6 +45,7 @@ function operationContext(signal = new AbortController().signal): RlmV2Operation
       "agent.message",
       "agent.wait",
       "agent.cancel",
+      "routing.inspect",
       "harness.propose",
     ],
     admittedFeatures: ["boundedPrograms"],
@@ -148,6 +149,7 @@ function fixture(overrides: Readonly<{
   sendError?: Error;
   cancelView?: PersistentActorTurnView;
   transferResult?: unknown;
+  routingResult?: unknown;
   actorOperationContract?: RlmV2ActorOperationContract;
   actorOperationContractForActor?: RlmV2ActorOperationContract;
 }> = {}) {
@@ -247,6 +249,26 @@ function fixture(overrides: Readonly<{
             kind: "text",
             utf8Bytes: 42,
           });
+        },
+      },
+      routing: {
+        inspectForCaller(input) {
+          calls.push(["routingInspect", input]);
+          return Promise.resolve(
+            Object.prototype.hasOwnProperty.call(overrides, "routingResult")
+              ? overrides.routingResult
+              : {
+                  kind: "unavailable",
+                  schemaVersion: 1,
+                  mode: "shadow",
+                  policyAuthorization: "none",
+                  coverage: {
+                    outcomes: "recursiveActorOutcomesOnly",
+                    ordinaryRootTurnSpend: "excluded",
+                  },
+                  reason: "paneLineageUnavailable",
+                },
+          );
         },
       },
       proposals,
@@ -634,6 +656,51 @@ describe("RLM v2 operation router", () => {
       body: { change: "one" },
       contextQuotaBytes: binding.contextQuotaBytes,
     });
+  });
+
+  test("inspects only the authenticated caller's bounded routing memory", async () => {
+    const { router, calls } = fixture();
+    expect(await router.invoke("routing.inspect", {}, operationContext())).toEqual({
+      kind: "unavailable",
+      schemaVersion: 1,
+      mode: "shadow",
+      policyAuthorization: "none",
+      coverage: {
+        outcomes: "recursiveActorOutcomesOnly",
+        ordinaryRootTurnSpend: "excluded",
+      },
+      reason: "paneLineageUnavailable",
+    });
+    expect(calls.find(([name]) => name === "routingInspect")?.[1]).toEqual({
+      epochId: binding.epochId,
+      actorId: binding.actorId,
+      turnId: binding.turnId,
+    });
+
+    expect(fixture().router.invoke(
+      "routing.inspect",
+      { actorId: "hactor_000000999" },
+      operationContext(),
+    )).rejects.toThrow();
+
+    expect(fixture({
+      routingResult: {
+        kind: "unavailable",
+        schemaVersion: 1,
+        mode: "shadow",
+        policyAuthorization: "none",
+        coverage: {
+          outcomes: "recursiveActorOutcomesOnly",
+          ordinaryRootTurnSpend: "excluded",
+        },
+        reason: "paneLineageUnavailable",
+        providerThreadId: "must-not-cross-the-routing-boundary",
+      },
+    }).router.invoke(
+      "routing.inspect",
+      {},
+      operationContext(),
+    )).rejects.toThrow();
   });
 
   test("rejects every model attempt to enumerate or read proposal data", async () => {

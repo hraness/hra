@@ -49,6 +49,7 @@ const capabilityForOperation: Readonly<Record<RlmV2Operation, RlmV2Capability>> 
   "agent.waitAll": "agent.wait",
   "agent.result": "agent.wait",
   "agent.cancel": "agent.cancel",
+  "routing.inspect": "routing.inspect",
   "harness.propose": "harness.propose",
 };
 

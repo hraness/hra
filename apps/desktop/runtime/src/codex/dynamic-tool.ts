@@ -16,6 +16,9 @@ export const HRA_RLM_DYNAMIC_TOOL_SEMANTIC_CONTRACT_VERSION = 1 as const;
 /** Exact v0 spec digest. It may reconcile stored effects, never start new work. */
 export const HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256 =
   "4f7fd56a5855c36761265fcf2665be96ae7ed3e3737d382427996b0c6c441a13" as const;
+/** Exact pre-routing.inspect v1 spec digest. Existing effects may only recover. */
+export const HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256 =
+  "c8233c335cf93d1e8a412a5bfe81d71246b99fa120a58d4c29763caf6aac8fb4" as const;
 export const MAX_CODEX_DYNAMIC_TOOL_ARGUMENT_BYTES = 256 * 1_024;
 export const MAX_CODEX_DYNAMIC_TOOL_OUTPUT_BYTES = 256 * 1_024;
 export const MAX_CODEX_DYNAMIC_TOOL_OUTPUT_ITEMS = 16;
@@ -152,6 +155,7 @@ const RLM_V2_CAPABILITIES = Object.freeze([
   "agent.message",
   "agent.wait",
   "agent.cancel",
+  "routing.inspect",
   "harness.propose",
 ] as const);
 
@@ -170,6 +174,7 @@ const RLM_V2_OPERATIONS = Object.freeze([
   "agent.waitAll",
   "agent.result",
   "agent.cancel",
+  "routing.inspect",
   "harness.propose",
 ] as const);
 
@@ -184,6 +189,7 @@ const RLM_V2_OPERATION_ARGUMENTS = [
   "agent.send {actorId,inputValueId,acceleration?}; omitted acceleration is Standard. agent.status {actorId};",
   "agent.waitAny/agent.waitAll {turnIds,timeoutMs};",
   "agent.result/agent.cancel {turnId};",
+  "routing.inspect {} returns bounded content-free shadow routing memory for the current durable caller; v1 includes recursive actor outcomes only, excludes ordinary root-turn spend, and reports requestedProfile as routing intent rather than observed provider compliance;",
   "harness.propose {title,body}.",
 ].join(" ");
 
@@ -288,6 +294,20 @@ const rlmV2ProgramExample = Object.freeze({
     }),
   ]),
   result: Object.freeze({ kind: "variable", name: "result" }),
+});
+
+const rlmV2RoutingInspectionExample = Object.freeze({
+  version: 2,
+  capabilities: Object.freeze(["routing.inspect"]),
+  steps: Object.freeze([
+    Object.freeze({
+      kind: "call",
+      as: "routingMemory",
+      operation: "routing.inspect",
+      arguments: Object.freeze({}),
+    }),
+  ]),
+  result: Object.freeze({ kind: "variable", name: "routingMemory" }),
 });
 
 const rlmV2JsonSchemaDefinitions = Object.freeze({
@@ -415,7 +435,10 @@ const rlmV2JsonSchemaDefinitions = Object.freeze({
       }),
       result: Object.freeze({ $ref: "#/$defs/rlmExpression" }),
     }),
-    examples: Object.freeze([rlmV2ProgramExample]),
+    examples: Object.freeze([
+      rlmV2ProgramExample,
+      rlmV2RoutingInspectionExample,
+    ]),
   }),
 });
 
@@ -598,7 +621,7 @@ export const HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256 = sha256Canonical(
   HRA_RLM_DYNAMIC_TOOL_SPEC,
 );
 export const HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256 =
-  "c8233c335cf93d1e8a412a5bfe81d71246b99fa120a58d4c29763caf6aac8fb4" as const;
+  "2ce858c44c3278d21078bb0675508df731a5140d0a8a9932cd01638f813257d7" as const;
 
 if (HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256 !== HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256) {
   throw new Error("HRA RLM dynamic-tool v1 spec digest drifted");
@@ -621,7 +644,10 @@ export function classifyHraRlmDynamicToolSpecDigest(
   if (digest === HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256) return "current";
   if (
     purpose === "recovery" &&
-    digest === HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256
+    (
+      digest === HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256 ||
+      digest === HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256
+    )
   ) {
     return "predecessorRecoveryOnly";
   }
