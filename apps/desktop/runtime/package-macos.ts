@@ -21,6 +21,15 @@ import {
   loadCodexNativeLicenseInventory,
   verifyInstalledCodexNativePayloads,
 } from "./codex-native-licenses";
+import {
+  codexSignatureNormalizationEntry,
+  codexSignatureNormalizationManifestEntries,
+  codexSignatureNormalizationPolicy,
+  createCodexSignatureSourceDelta,
+  verifyCodexSignatureNormalizationInventory,
+  verifyCodexSignatureNormalizationPackaged,
+  verifyCodexSignatureNormalizationSource,
+} from "./codex-signature-normalization";
 import { verifyPackagedFrontend } from "./frontend-package-integrity";
 import { loadGcmDependencyLicenseInventory } from "./gcm-dependency-licenses";
 import {
@@ -47,7 +56,9 @@ type CommandResult = Readonly<{
 
 type CodeSignature = Readonly<{
   cdHash: string | null;
+  flags: readonly string[];
   identifier: string | null;
+  signatureKind: string | null;
   teamIdentifier: string | null;
 }>;
 
@@ -229,6 +240,7 @@ async function stageLicenseFiles(options: Readonly<{
     ["CODEX-NATIVE-LICENSES.json", join(macosPackage.desktopRoot, "runtime/CODEX-NATIVE-LICENSES.json")],
     ["CODEX-NATIVE-LICENSES.txt", join(macosPackage.desktopRoot, "runtime/CODEX-NATIVE-LICENSES.txt")],
     ["CODEX-NOTICE.txt", join(macosPackage.desktopRoot, "runtime/CODEX-NOTICE.txt")],
+    ["CODEX-SIGNATURE-NORMALIZATION.md", join(macosPackage.desktopRoot, "runtime/CODEX-SIGNATURE-NORMALIZATION.md")],
     ["CODEX-package.json", join(options.codexPackageRoot, "package.json")],
     ["CODEX-platform-package.json", options.codexPlatformPackageJson],
     ["DESKTOP-THIRD-PARTY-NOTICES.md", join(macosPackage.desktopRoot, "runtime/THIRD_PARTY_NOTICES.md")],
@@ -351,9 +363,12 @@ async function codeSignature(path: string): Promise<CodeSignature> {
   const value = (pattern: RegExp): string | null =>
     pattern.exec(details)?.[1]?.trim() ?? null;
   const rawTeam = value(/^TeamIdentifier=(.+)$/mu);
+  const rawFlags = value(/^CodeDirectory .* flags=0x[0-9a-fA-F]+\(([^)]*)\)/mu);
   return {
     cdHash: value(/^CDHash=([0-9a-fA-F]+)$/mu)?.toLowerCase() ?? null,
+    flags: rawFlags === null || rawFlags.length === 0 ? [] : rawFlags.split(","),
     identifier: value(/^Identifier=(.+)$/mu),
+    signatureKind: value(/^Signature=(.+)$/mu),
     teamIdentifier: rawTeam === "not set" ? null : rawTeam,
   };
 }
@@ -377,6 +392,71 @@ async function signAdHoc(
       : ["--entitlements", options.entitlements]),
     path,
   ]);
+}
+
+async function normalizeCodexSignatures(
+  inventory: CodexNativeLicenseInventory,
+  sourceVendorRoot: string,
+): Promise<ReturnType<typeof codexSignatureNormalizationManifestEntries>> {
+  verifyCodexSignatureNormalizationInventory(inventory);
+  for (const entry of codexSignatureNormalizationPolicy.entries) {
+    const path = join(runtimeRoot, "codex", entry.payloadPath);
+    const status = await lstat(path);
+    if (!status.isFile() || status.isSymbolicLink() || status.nlink !== 1) {
+      throw new Error(
+        `Codex normalization source must be a regular single-link file: ${entry.payloadPath}`,
+      );
+    }
+    verifyCodexSignatureNormalizationSource(entry, {
+      sha256: await sha256(path),
+      signature: await codeSignature(path),
+      size: status.size,
+    });
+    const sourceStrict = await run([
+      "/usr/bin/codesign",
+      "--verify",
+      "--strict",
+      "--verbose=6",
+      path,
+    ], { allowFailure: true });
+    process.stdout.write(
+      `Codex source signature ${entry.payloadPath}: strict ${sourceStrict.exitCode === 0 ? "accepted" : "rejected"}; applying reviewed deterministic normalization.\n`,
+    );
+    await signAdHoc(path, { identifier: entry.source.identifier });
+    const packagedStatus = await lstat(path);
+    verifyCodexSignatureNormalizationPackaged(entry, {
+      sha256: await sha256(path),
+      signature: await codeSignature(path),
+      size: packagedStatus.size,
+    });
+    await run([
+      "/usr/bin/codesign",
+      "--verify",
+      "--strict",
+      "--verbose=6",
+      path,
+    ]);
+    const delta = await createCodexSignatureSourceDelta(
+      join(sourceVendorRoot, entry.payloadPath),
+      path,
+    );
+    const deltaSha256 = createHash("sha256").update(delta).digest("hex");
+    if (
+      delta.byteLength !== entry.sourceDelta.size
+      || deltaSha256 !== entry.sourceDelta.sha256
+    ) {
+      throw new Error(
+        `Codex signature source delta differs: ${entry.payloadPath}`,
+      );
+    }
+    const deltaPath = resolve(appRoot, entry.sourceDelta.path);
+    if (!inside(appRoot, deltaPath)) {
+      throw new Error(`Codex signature source delta escaped the app: ${entry.payloadPath}`);
+    }
+    await mkdir(dirname(deltaPath), { recursive: true, mode: 0o755 });
+    await writeFile(deltaPath, delta, { flag: "wx", mode: 0o644 });
+  }
+  return codexSignatureNormalizationManifestEntries();
 }
 
 async function signRuntimeTree(
@@ -508,6 +588,10 @@ async function main(): Promise<void> {
     codexNativeInventory.platformPackage.payloads.map((payload) =>
       join(runtimeRoot, "codex", payload.path)),
   );
+  const normalizedSignatures = await normalizeCodexSignatures(
+    codexNativeInventory,
+    pins.codexVendorRoot,
+  );
   const preservedSignatures = await signRuntimeTree(exactCodexPayloadPaths);
   const dataRemoverSignature = await codeSignature(join(binRoot, "oprte-data-remover"));
   if (!/^[0-9a-f]{40,64}$/u.test(dataRemoverSignature.cdHash ?? "")) {
@@ -541,6 +625,8 @@ async function main(): Promise<void> {
           runtimeVersions.codex.dependencyLicenseInventorySha256,
         dependencyLicenseNoticesSha256:
           runtimeVersions.codex.dependencyLicenseNoticesSha256,
+        sourceBinarySha256:
+          codexSignatureNormalizationEntry("bin/codex").source.sha256,
         sourceCommit: runtimeVersions.codex.sourceCommit,
         version: runtimeVersions.codex.version,
       },
@@ -595,6 +681,7 @@ async function main(): Promise<void> {
         sourceCommit: runtimeVersions.gitLfs.sourceCommit,
         version: runtimeVersions.gitLfs.version,
       },
+      normalizedSignatures,
       preservedSignatures,
       ripgrep: {
         binarySha256: await sha256(join(runtimeRoot, "codex/codex-path/rg")),
