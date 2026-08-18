@@ -36,6 +36,24 @@ MIT terms are retained in
 [`LICENSE`](packages/internal/codex-app-sdk/LICENSE). Packaged distributions
 that include the SDK include that license text.
 
+## Hraness shared packages
+
+HRA consumes three separately released Hraness packages under the MIT License:
+
+- `@hraness/direct` v0.7.0 at commit
+  `849f3413bc56df8f50c2446076ff90280916a908` supplies the development-only
+  deterministic runtime and its browser-verification and bundle-boundary
+  tooling.
+- `@hraness/web-discovery` v0.1.0 at commit
+  `1fc2cd22a62fcffffa826eededfd63c04d6522dd` supplies the web metadata,
+  crawler, sitemap, JSON-LD, and social-image primitives.
+- `@hraness/vercel-delivery` v0.1.2 at commit
+  `7a1a0da0cd9d52b8daca328537793c1b1bbd8176` supplies the source-bound Vercel
+  delivery proof and Preview response policy.
+
+Each immutable dependency includes its own `LICENSE` file. The checked tags
+and resolved commits are recorded in `package.json` and `bun.lock`.
+
 ## Desktop runtime components
 
 The compiled desktop gateway embeds Bun 1.3.14. Its upstream license inventory,

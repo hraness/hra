@@ -2,7 +2,7 @@ import {
   LinkButton,
   ThemeToggle,
 } from "@hra-internal/design-kit/react";
-import { createPublicSiteMetadata } from "@hra-internal/web-discovery";
+import { createPublicSiteMetadata } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 import Link from "next/link";
 import Image from "next/image";

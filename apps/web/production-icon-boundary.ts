@@ -4,7 +4,7 @@ import path from "node:path";
 import {
   checkBundleBoundary,
   type BundleBoundaryResult,
-} from "../../scripts/direct/bundle-boundary";
+} from "@hraness/direct/tooling/bundle-boundary";
 
 export const HRA_FORBIDDEN_ICON_OUTPUT_MARKERS = Object.freeze([
   "@hugeicons/",

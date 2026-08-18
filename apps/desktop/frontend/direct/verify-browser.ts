@@ -7,13 +7,10 @@ import { z } from "@hra-internal/schema";
 import {
   classifyCoverageEvidence,
   parseDirectProbeSnapshot,
-  parseDirectSessionManifest,
   parseDefinitionCoverageSnapshot,
   type DirectProbeSnapshot,
   type CoverageEntry,
 } from "@hraness/direct/testing";
-import { DIRECT_BROWSER_BRIDGE_SCHEMA } from "@hraness/direct/web";
-
 import {
   acquireVerificationServer,
   bindDirectBrowserContractEvidence,
@@ -21,9 +18,9 @@ import {
   canAutomaticallyStartLocalServer,
   createAgentBrowser,
   createArtifactRun,
-  createDirectBrowserContractReader,
   normalizeRootHttpOrigin,
   parseBaseUrlArguments,
+  readDirectBrowserContract,
   renderUnknown,
   spawnVerificationServer,
   stopVerificationServer,
@@ -31,7 +28,7 @@ import {
   type AgentBrowser,
   type BrowserVerificationArguments,
   type DirectBrowserContract,
-} from "../../../../scripts/direct/browser-verification";
+} from "@hraness/direct/tooling/browser-verification";
 import {
   attentionPresentations,
   denseRemoteSessionCount,
@@ -48,11 +45,6 @@ import {
 import { remoteSessionMountLimit } from "../src/features/chat/PaneGrid";
 import { legacyOprteUiScaleStorageKey } from "../src/ui-scale";
 
-const readDirectBrowserContract = createDirectBrowserContractReader({
-  bridgeSchema: DIRECT_BROWSER_BRIDGE_SCHEMA,
-  parseManifest: parseDirectSessionManifest,
-  parseProbe: parseDirectProbeSnapshot,
-});
 const DEFAULT_BASE_URL = "http://127.0.0.1:5174";
 const SERVER_START_TIMEOUT_MS = 30_000;
 const DIRECT_ROOT_ASSET_PATHS = new Set([
@@ -2391,12 +2383,22 @@ async function verifyScenario(options: {
   };
 }
 
+export function directServerCommand(workspaceRoot: string, port: string): readonly string[] {
+  return Object.freeze([
+    join(workspaceRoot, "node_modules/.bin/vite"),
+    "--config",
+    "frontend/direct/vite.config.ts",
+    "--port",
+    port,
+  ]);
+}
+
 function startServer(repositoryRoot: string, baseUrl: string) {
   const port = new URL(baseUrl).port || "80";
-  const desktop = join(repositoryRoot, "apps/desktop");
+  const workspaceRoot = join(repositoryRoot, "apps/desktop");
   return spawnVerificationServer({
-    command: [process.execPath, "run", "dev:direct", "--", "--port", port],
-    cwd: desktop,
+    command: directServerCommand(workspaceRoot, port),
+    cwd: workspaceRoot,
     env: { CI: "1" },
   });
 }

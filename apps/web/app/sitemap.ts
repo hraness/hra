@@ -1,4 +1,4 @@
-import { createSitemap } from "@hra-internal/web-discovery";
+import { createSitemap } from "@hraness/web-discovery";
 
 import { hraSearchSite } from "./site";
 import { hraComparisons } from "./alternatives/comparisons";

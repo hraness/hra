@@ -3,7 +3,7 @@
 
 - `apps/` – the HRA macOS desktop, web control plane, and `taskctl` CLI workspaces.
 - `packages/` – shared task, client, interface, and repository-support packages.
-- `scripts/` – public-boundary, standalone structure, agent-guide, asset, resource-scheduling, and Direct checks.
+- `scripts/` – public-boundary, standalone structure, agent-guide, asset, resource-scheduling, and Vercel deploy-selection checks.
 - `.agents/skills/` – portable repository orchestration and knowledge-base workflows.
 - `kb/` – the public-safe Git-backed Markdown vault for rationale, evidence, maintained synthesis, plans, and scoped agent context.
 - `.github/workflows/` – credential-free source, test, build, and ad-hoc package verification.

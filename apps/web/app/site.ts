@@ -1,5 +1,5 @@
 import { z } from "@hra-internal/schema";
-import type { SearchSite } from "@hra-internal/web-discovery";
+import type { SearchSite } from "@hraness/web-discovery";
 
 import releaseDownload from "../../../release-download.json";
 

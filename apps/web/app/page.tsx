@@ -4,7 +4,7 @@ import {
   serializeJsonLd,
   webApplicationJsonLd,
   websiteJsonLd,
-} from "@hra-internal/web-discovery";
+} from "@hraness/web-discovery";
 import Link from "next/link";
 import Image from "next/image";
 

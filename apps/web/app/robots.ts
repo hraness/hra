@@ -1,4 +1,4 @@
-import { createPublicRobots } from "@hra-internal/web-discovery";
+import { createPublicRobots } from "@hraness/web-discovery";
 
 import { hraSearchSite } from "./site";
 

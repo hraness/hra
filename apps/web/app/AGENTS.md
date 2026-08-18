@@ -28,6 +28,7 @@
 - Keep `/` public and indexable without mounting WorkOS or Convex. Keep `/app` behind the configured WorkOS proxy and preserve its server-rendered configuration failures before the authenticated control plane mounts.
 - Keep `/download` honest about prerelease status. Link only to the exact public GitHub release contract in `site.ts`, disclose ad-hoc signing and missing notarization before the action, and never embed signing credentials or publication authority in the web app.
 - Keep `/alternatives` and its exact static child routes public. Date each review, cite current first-party sources, distinguish “not documented” from “absent,” and write product-specific analysis rather than name-swapped SEO pages.
+- Build public and private discovery output with `@hraness/web-discovery`, while keeping HRA-owned origins, titles, descriptions, routes, dates, JSON-LD facts, and crawler choices in `site.ts` and the route that presents them.
 - Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex, WorkOS, and generated-API import in hosted adapters.
 - Use `@hra-internal/codex-app-sdk` for provider-neutral client and mutation-journal contracts. Keep Convex authority, tenant scoping, HMAC derivation, and browser lifecycle composition in this app.
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.
