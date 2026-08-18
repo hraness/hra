@@ -119,7 +119,6 @@ function settingsUpdate(
     expectedHarnessRevision: expectedRevision,
     expectedRevision,
     recursiveSessionsEnabled,
-    automaticFastMode: "criticalPath",
     contextQuotaBytes: 8 * 1024 * 1024,
     refinementMode: "off",
   };
@@ -164,7 +163,6 @@ function fixture(options: Readonly<{
             settings: {
               revision: command.expectedRevision + 1,
               recursiveSessionsEnabled: command.recursiveSessionsEnabled,
-              automaticFastMode: command.automaticFastMode,
               contextQuotaBytes: command.contextQuotaBytes,
               refinementMode: command.refinementMode,
             },

@@ -16,7 +16,6 @@ import {
 const settings = {
   revision: 3,
   recursiveSessionsEnabled: true,
-  automaticFastMode: "criticalPath",
   contextQuotaBytes: 16 * 1024 * 1024,
   refinementMode: "suggest",
 } as const;
@@ -52,9 +51,6 @@ function pane(
     title: "Recursive audit",
     repository: { id: "repo_00000000000000000000000000", name: "example" },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
-    serviceTier: "standard",
     interactionMode: "chat",
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },
@@ -224,7 +220,6 @@ describe("minimal recursive harness renderer contract", () => {
       expectedHarnessRevision: 4,
       expectedRevision: 3,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * 1024 * 1024,
       refinementMode: "off",
     }, {
@@ -269,7 +264,6 @@ describe("minimal recursive harness renderer contract", () => {
       expectedHarnessRevision: 4,
       expectedRevision: 3,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * 1024 * 1024,
       refinementMode: "off",
     });
@@ -283,7 +277,6 @@ describe("minimal recursive harness renderer contract", () => {
         settings: {
           revision: 4,
           recursiveSessionsEnabled: false,
-          automaticFastMode: "off",
           contextQuotaBytes: 8 * 1024 * 1024,
           refinementMode: "off",
         },
@@ -299,8 +292,7 @@ describe("minimal recursive harness renderer contract", () => {
         settings: {
           revision: 4,
           recursiveSessionsEnabled: false,
-          automaticFastMode: "criticalPath",
-          contextQuotaBytes: 8 * 1024 * 1024,
+          contextQuotaBytes: 16 * 1024 * 1024,
           refinementMode: "off",
         },
       },

@@ -11,6 +11,13 @@ import {
   chatPaneProjectionSchema,
   chatReasoningSummarySchema,
   chatReasoningEffortSchema,
+  chatRootTurnProfileSchema,
+  chatRootTurnRoutingClassificationReasonSchema,
+  chatRootTurnRoutingProfileFallbackReasonSchema,
+  chatRootTurnRoutingProjectionSchema,
+  chatRootTurnRoutingServiceTierFallbackReasonSchema,
+  chatRootTurnRoutingServiceTierSchema,
+  chatRootTurnWorkClassSchema,
   chatServiceTierSchema,
   chatResponseMarkdownSchema,
   chatToolProjectionSchema,
@@ -18,8 +25,6 @@ import {
   harnessActorIdSchema,
   type ChatAttention,
   type ChatPaneProjection,
-  type ChatReasoningEffort,
-  type ChatServiceTier,
   type ChatToolCategory,
   type ChatToolProjection,
 } from "../../../contracts/runtime";
@@ -48,6 +53,8 @@ import {
   type ChatTurnDelta,
   type ChatTurnId,
 } from "../chat/types";
+import { classifyRootTurnRoutingV1 } from
+  "../chat/root-turn-routing-policy-v1";
 import {
   appendUtf8Tail,
   assertBoundedUtf8,
@@ -55,6 +62,10 @@ import {
   utf8ByteLength,
   utf8Chunks,
 } from "../chat/text-bounds";
+import {
+  RootTurnRoutingSQLiteAuthorityV1,
+  type RootTurnRoutingClassificationAdmissionV1,
+} from "../harness/root-turn-routing-sqlite-v1";
 
 const isoDateTimeSchema = chatIsoDateTimeSchema;
 const providerIdSchema = z.string().min(1).max(512).refine(
@@ -169,7 +180,44 @@ const paneRowSchema = z.object({
   history_truncated: storedBooleanSchema,
   created_at: isoDateTimeSchema,
   updated_at: isoDateTimeSchema,
-}).strict();
+  routing_policy_version: z.literal(1).nullable(),
+  routing_classification_reason:
+    chatRootTurnRoutingClassificationReasonSchema.nullable(),
+  routing_work_class: chatRootTurnWorkClassSchema.nullable(),
+  routing_requested_profile: chatRootTurnProfileSchema.nullable(),
+  routing_selected_profile: chatRootTurnProfileSchema.nullable(),
+  routing_profile_fallback_reason:
+    chatRootTurnRoutingProfileFallbackReasonSchema.nullable(),
+  routing_requested_service_tier:
+    chatRootTurnRoutingServiceTierSchema.nullable(),
+  routing_selected_service_tier:
+    chatRootTurnRoutingServiceTierSchema.nullable(),
+  routing_service_tier_fallback_reason:
+    chatRootTurnRoutingServiceTierFallbackReasonSchema.nullable(),
+}).strict().superRefine((row, context) => {
+  const requiredRouting = [
+    row.routing_classification_reason,
+    row.routing_work_class,
+    row.routing_requested_profile,
+    row.routing_requested_service_tier,
+  ];
+  if (
+    row.routing_policy_version === null
+      ? requiredRouting.some((value) => value !== null) ||
+        row.routing_selected_profile !== null ||
+        row.routing_profile_fallback_reason !== null ||
+        row.routing_selected_service_tier !== null ||
+        row.routing_service_tier_fallback_reason !== null
+      : requiredRouting.some((value) => value === null) ||
+        row.active_turn_id === null || row.interaction_mode !== "chat"
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "active root routing projection is only partially joined",
+      path: ["routing_policy_version"],
+    });
+  }
+});
 
 const historyRowSchema = z.object({
   role: z.enum(["user", "assistant"]),
@@ -216,8 +264,6 @@ export interface ChatPaneCreateInput {
   readonly paneId: ChatPaneId;
   readonly repository: ChatRepository;
   readonly accountProfileId: ChatAccountProfileId | null;
-  readonly reasoningEffort: ChatReasoningEffort;
-  readonly serviceTier?: ChatServiceTier;
   readonly title?: string;
   readonly now: Date;
 }
@@ -312,9 +358,11 @@ export type ChatAssistantCompletionResult =
 
 export class ChatPaneStore {
   readonly #database: Database;
+  readonly #rootTurnRouting: RootTurnRoutingSQLiteAuthorityV1;
 
   constructor(database: Database) {
     this.#database = database;
+    this.#rootTurnRouting = new RootTurnRoutingSQLiteAuthorityV1(database);
   }
 
   list(): readonly ChatPaneProjection[] {
@@ -323,9 +371,10 @@ export class ChatPaneStore {
 
   get(paneId: ChatPaneId): ChatPanePrivateRecord | null {
     const id = chatPaneIdSchema.parse(paneId);
-    const value: unknown = this.#database.query(
-      "SELECT * FROM chat_panes WHERE pane_id = ?1 AND archived_at IS NULL",
-    ).get(id);
+    const value: unknown = this.#database.query(`
+      ${paneWithActiveRoutingSelect()}
+      WHERE pane.pane_id = ?1 AND pane.archived_at IS NULL
+    `).get(id);
     return value === null ? null : this.#privateRecord(this.#parseRow(value));
   }
 
@@ -342,10 +391,11 @@ export class ChatPaneStore {
     const accountId = accountProfileIdSchema.parse(accountProfileId);
     const threadId = providerIdSchema.parse(providerThreadId);
     const values: unknown[] = this.#database.query(`
-      SELECT * FROM chat_panes
-      WHERE provider_account_profile_id = ?1 AND provider_thread_id = ?2
-        AND archived_at IS NULL
-      ORDER BY updated_at DESC, pane_id
+      ${paneWithActiveRoutingSelect()}
+      WHERE pane.provider_account_profile_id = ?1
+        AND pane.provider_thread_id = ?2
+        AND pane.archived_at IS NULL
+      ORDER BY pane.updated_at DESC, pane.pane_id
       LIMIT 2
     `).all(accountId, threadId);
     if (values.length > 1) {
@@ -378,8 +428,6 @@ export class ChatPaneStore {
     const accountProfileId = input.accountProfileId === null
       ? null
       : accountProfileIdSchema.parse(input.accountProfileId);
-    const reasoningEffort = chatReasoningEffortSchema.parse(input.reasoningEffort);
-    const serviceTier = chatServiceTierSchema.parse(input.serviceTier ?? "standard");
     const title = boundedTitle(input.title ?? "New chat");
     const now = isoDateTimeSchema.parse(input.now.toISOString());
 
@@ -395,12 +443,13 @@ export class ChatPaneStore {
         this.#database.query(`
           INSERT INTO chat_panes (
             pane_id, display_order, repository_id, repository_name, revision, title,
-            account_profile_id, model, reasoning_effort, service_tier, interaction_mode, state,
+            account_profile_id, model, reasoning_effort, service_tier,
+            interaction_mode, state,
             workspace_mode, workspace_state, workspace_revision,
             workspace_recovery_reason, created_at, updated_at
           ) VALUES (
-            ?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, 'chat', 'ready',
-            'managed_worktree', 'preparing', 1, NULL, ?10, ?10
+            ?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, 'max', 'standard', 'chat', 'ready',
+            'managed_worktree', 'preparing', 1, NULL, ?8, ?8
           )
         `).run(
           paneId,
@@ -410,8 +459,6 @@ export class ChatPaneStore {
           title,
           accountProfileId,
           CHAT_MODEL,
-          reasoningEffort,
-          serviceTier,
           now,
         );
       } catch (error: unknown) {
@@ -832,64 +879,62 @@ export class ChatPaneStore {
     })();
   }
 
-  configure(
+  recoverWorkspace(
     paneId: ChatPaneId,
     expectedRevision: number,
-    reasoningEffort: ChatReasoningEffort,
     now: Date,
-    serviceTier?: ChatServiceTier,
   ): ChatPaneProjection {
     const id = chatPaneIdSchema.parse(paneId);
     validateRevision(expectedRevision);
-    const effort = chatReasoningEffortSchema.parse(reasoningEffort);
     const timestamp = isoDateTimeSchema.parse(now.toISOString());
     return this.#database.transaction(() => {
       const current = this.#requireRevision(id, expectedRevision);
-      const tier = chatServiceTierSchema.parse(
-        serviceTier ?? current.projection.serviceTier,
-      );
       if (current.projection.interactionMode !== "chat") {
         throw new ChatPaneStoreError(
           "invalid_state",
-          "Harness observer pane configuration is fixed by its actor attachment.",
+          "Harness observer panes do not own managed workspace recovery.",
         );
       }
       if (isActive(current.projection)) {
-        throw new ChatPaneStoreError("invalid_state", "Wait for this chat turn to finish before changing its settings.");
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Wait for this chat turn to finish before recovering its workspace.",
+        );
       }
       const workspace = ordinaryWorkspace(current.projection);
-      const prepareWorkspace = workspace.state !== "ready";
-      if (prepareWorkspace) this.#prepareWorkspaceRetry(id, timestamp);
+      if (workspace.state === "ready") {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "This chat pane workspace does not require recovery.",
+        );
+      }
+      this.#prepareWorkspaceRetry(id, timestamp);
       const clearProviderBinding = workspace.mode === "legacyUnbound";
       try {
-        this.#database.query(`
+        const result = this.#database.query(`
           UPDATE chat_panes
-          SET reasoning_effort = ?1,
-              service_tier = ?2,
-              provider_account_profile_id = CASE WHEN ?3 = 1 THEN NULL ELSE provider_account_profile_id END,
-              provider_thread_id = CASE WHEN ?3 = 1 THEN NULL ELSE provider_thread_id END,
-              provider_restart_thread_id = CASE WHEN ?3 = 1 THEN NULL ELSE provider_restart_thread_id END,
-              workspace_mode = CASE WHEN ?4 = 1 THEN 'managed_worktree' ELSE workspace_mode END,
-              workspace_state = CASE WHEN ?4 = 1 THEN 'preparing' ELSE workspace_state END,
-              workspace_recovery_reason = CASE WHEN ?4 = 1 THEN NULL ELSE workspace_recovery_reason END,
+          SET provider_account_profile_id = CASE WHEN ?1 = 1 THEN NULL ELSE provider_account_profile_id END,
+              provider_thread_id = CASE WHEN ?1 = 1 THEN NULL ELSE provider_thread_id END,
+              provider_restart_thread_id = CASE WHEN ?1 = 1 THEN NULL ELSE provider_restart_thread_id END,
+              workspace_mode = 'managed_worktree',
+              workspace_state = 'preparing',
+              workspace_recovery_reason = NULL,
               workspace_revision = workspace_revision + CASE
-                WHEN ?4 = 1 AND (
-                  workspace_state != 'preparing' OR workspace_recovery_reason IS NOT NULL
-                ) THEN 1 ELSE 0 END,
+                WHEN workspace_state != 'preparing'
+                  OR workspace_recovery_reason IS NOT NULL
+                THEN 1 ELSE 0 END,
               revision = revision + 1,
-              updated_at = ?5
-          WHERE pane_id = ?6 AND revision = ?7 AND archived_at IS NULL
+              updated_at = ?2
+          WHERE pane_id = ?3 AND revision = ?4 AND archived_at IS NULL
         `).run(
-          effort,
-          tier,
           clearProviderBinding ? 1 : 0,
-          prepareWorkspace ? 1 : 0,
           timestamp,
           id,
           expectedRevision,
         );
+        if (result.changes !== 1) throw staleRevision();
       } catch (error: unknown) {
-        throw sqliteConflict(error, "The pane configuration could not be saved.");
+        throw sqliteConflict(error, "The pane workspace could not be recovered.");
       }
       return this.require(id).projection;
     })();
@@ -1024,7 +1069,22 @@ export class ChatPaneStore {
           updated_at = ?3
         WHERE pane_id = ?1 AND revision = ?2 AND archived_at IS NULL
       `).run(id, expectedRevision, timestamp);
-      if (result.changes !== 1) throw staleRevision();
+      if (result.changes < 1) throw staleRevision();
+      const archived = z.object({
+        revision: z.number().int().positive().safe(),
+        archived_at: isoDateTimeSchema,
+      }).strict().parse(this.#database.query(`
+        SELECT revision, archived_at FROM chat_panes WHERE pane_id = ?1
+      `).get(id));
+      if (
+        archived.revision !== expectedRevision + 1 ||
+        archived.archived_at !== timestamp
+      ) {
+        throw new ChatPaneStoreError(
+          "corrupt_state",
+          "The chat pane archive did not advance exactly once.",
+        );
+      }
       this.#database.query(`
         UPDATE chat_panes
         SET display_order = display_order + ?1
@@ -1172,6 +1232,18 @@ export class ChatPaneStore {
       if (priorReceipt !== null) {
         throw new ChatPaneStoreError("conflict", "This chat turn identifier was already used.");
       }
+      if (this.#rootTurnRouting.readTurnRouting(paneId, turnId) !== null) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "This chat turn identifier has durable routing history.",
+        );
+      }
+      const routingClassification = this.#routingClassification(
+        paneId,
+        turnId,
+        current.activePrompt,
+        input.now,
+      );
       if (current.activeTurnPoisoned) {
         this.#database.query("DELETE FROM chat_pane_history WHERE pane_id = ?1")
           .run(paneId);
@@ -1179,6 +1251,9 @@ export class ChatPaneStore {
       this.#database.query(`
         INSERT INTO chat_turn_receipts(pane_id, turn_id, created_at) VALUES (?1, ?2, ?3)
       `).run(paneId, turnId, timestamp);
+      this.#rootTurnRouting.admitClassificationInTransaction(
+        routingClassification,
+      );
       this.#pruneReceipts(paneId);
       const begun = this.#database.query(`
         UPDATE chat_panes
@@ -1264,10 +1339,36 @@ export class ChatPaneStore {
       `).get(paneId, turnId);
       if (priorReceipt !== null) {
         if (current.projection.turn?.id === turnId && current.activePrompt === input.prompt) {
-          return { kind: "replayed", pane: current.projection } as const;
+          if (
+            interactionMode === "chat" &&
+            this.#rootTurnRouting.readTurnRouting(paneId, turnId) === null
+          ) {
+            corrupt("An ordinary replay lost its root routing receipt.");
+          }
+          return {
+            kind: "replayed",
+            pane: this.require(paneId).projection,
+          } as const;
         }
         throw new ChatPaneStoreError("conflict", "This chat turn identifier was already used.");
       }
+      if (
+        interactionMode === "chat" &&
+        this.#rootTurnRouting.readTurnRouting(paneId, turnId) !== null
+      ) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "This chat turn identifier has durable routing history.",
+        );
+      }
+      const routingClassification = interactionMode === "chat"
+        ? this.#routingClassification(
+            paneId,
+            turnId,
+            input.prompt,
+            input.now,
+          )
+        : null;
       if (isActive(current.projection)) {
         throw new ChatPaneStoreError("invalid_state", "This chat pane already has an active turn.");
       }
@@ -1278,6 +1379,11 @@ export class ChatPaneStore {
       this.#database.query(`
         INSERT INTO chat_turn_receipts(pane_id, turn_id, created_at) VALUES (?1, ?2, ?3)
       `).run(paneId, turnId, timestamp);
+      if (routingClassification !== null) {
+        this.#rootTurnRouting.admitClassificationInTransaction(
+          routingClassification,
+        );
+      }
       this.#pruneReceipts(paneId);
       const begun = this.#database.query(`
         UPDATE chat_panes
@@ -2229,10 +2335,10 @@ export class ChatPaneStore {
   ): readonly ChatPaneProjection[] {
     return this.#database.transaction(() => {
       const activeValues: unknown[] = this.#database.query(`
-        SELECT * FROM chat_panes
-        WHERE state IN ('starting', 'streaming', 'continuing')
-          AND archived_at IS NULL
-        ORDER BY created_at, pane_id
+        ${paneWithActiveRoutingSelect()}
+        WHERE pane.state IN ('starting', 'streaming', 'continuing')
+          AND pane.archived_at IS NULL
+        ORDER BY pane.created_at, pane.pane_id
       `).all();
       const active = activeValues.map((value) => this.#parseRow(value));
       const recoveredPaneIds: ChatPaneId[] = [];
@@ -2245,6 +2351,32 @@ export class ChatPaneStore {
           row.turn_started_at ?? corrupt("Active chat turn start time is missing."),
           now,
         );
+        const route = row.active_turn_id === null
+          ? null
+          : this.#rootTurnRouting.readTurnRouting(
+              row.pane_id,
+              row.active_turn_id,
+            );
+        if (
+          route !== null &&
+          (
+            route.state === "classified" || route.state === "resolved" ||
+            route.state === "effectStarted" || route.state === "accepted"
+          )
+        ) {
+          this.#rootTurnRouting.settleInTransaction({
+            paneId: row.pane_id,
+            chatTurnId: row.active_turn_id ?? corrupt(
+              "Active root routing evidence lost its chat turn.",
+            ),
+            outcome: route.state === "classified" || route.state === "resolved"
+              ? "notApplied"
+              : route.state === "effectStarted"
+                ? "ambiguous"
+                : "interrupted",
+            now: new Date(timestamp),
+          });
+        }
         const tools = completeAllTools(parseJson(row.tools_json, toolsSchema));
         this.#database.query(`
           UPDATE chat_panes
@@ -2509,11 +2641,46 @@ export class ChatPaneStore {
     }
   }
 
+  #routingClassification(
+    paneId: ChatPaneId,
+    chatTurnId: ChatTurnId,
+    prompt: string,
+    now: Date,
+  ): RootTurnRoutingClassificationAdmissionV1 {
+    const prior = this.#rootTurnRouting.readLatestTurnRouting(paneId);
+    const routing = classifyRootTurnRoutingV1({
+      prompt,
+      priorRouting: prior === null
+        ? null
+        : {
+            policyVersion: prior.policyVersion,
+            classificationReason: prior.classificationReason,
+            workClass: prior.workClass,
+            requestedProfile: prior.requestedProfile,
+            selectedProfile: prior.selectedProfile,
+            profileFallbackReason: prior.profileFallbackReason,
+            requestedServiceTier: prior.requestedServiceTier,
+            selectedServiceTier: prior.selectedServiceTier,
+            serviceTierFallbackReason: prior.serviceTierFallbackReason,
+          },
+    });
+    return {
+      paneId,
+      chatTurnId,
+      policyVersion: routing.policyVersion,
+      classificationReason: routing.classificationReason,
+      workClass: routing.workClass,
+      requestedProfile: routing.requestedProfile,
+      requestedServiceTier: routing.requestedServiceTier,
+      now,
+    };
+  }
+
   #livePaneRows(): readonly PaneRow[] {
     const values: unknown[] = this.#database.query(`
-      SELECT * FROM chat_panes
-      WHERE archived_at IS NULL
-      ORDER BY display_order, pane_id
+      ${paneWithActiveRoutingSelect()}
+      WHERE pane.archived_at IS NULL
+      ORDER BY pane.display_order, pane.pane_id
     `).all();
     if (values.length > CHAT_MAX_PANES) {
       throw new ChatPaneStoreError("corrupt_state", "Stored chat pane count exceeded its limit.");
@@ -2580,6 +2747,20 @@ export class ChatPaneStore {
           message: row.attention_message ?? corrupt("Chat attention message is missing."),
           retryable: row.attention_retryable === 1,
         };
+    const routing = row.routing_policy_version === null
+      ? null
+      : chatRootTurnRoutingProjectionSchema.parse({
+          policyVersion: row.routing_policy_version,
+          classificationReason: row.routing_classification_reason,
+          workClass: row.routing_work_class,
+          requestedProfile: row.routing_requested_profile,
+          selectedProfile: row.routing_selected_profile,
+          profileFallbackReason: row.routing_profile_fallback_reason,
+          requestedServiceTier: row.routing_requested_service_tier,
+          selectedServiceTier: row.routing_selected_service_tier,
+          serviceTierFallbackReason:
+            row.routing_service_tier_fallback_reason,
+        });
     const turn = row.active_turn_id === null
       ? null
       : {
@@ -2591,6 +2772,7 @@ export class ChatPaneStore {
           responseMarkdown: responseTail,
           reasoningSummary: reasoningTail,
           tools,
+          routing,
         };
     try {
       return chatPaneProjectionSchema.parse({
@@ -2599,9 +2781,6 @@ export class ChatPaneStore {
         title: row.title,
         repository: { id: row.repository_id, name: row.repository_name },
         accountProfileId: row.account_profile_id,
-        model: row.model,
-        reasoningEffort: row.reasoning_effort,
-        serviceTier: row.service_tier,
         interactionMode: row.interaction_mode,
         state: row.state,
         activity: chatPaneActivitySchema.parse({
@@ -2621,6 +2800,26 @@ export class ChatPaneStore {
       throw new ChatPaneStoreError("corrupt_state", "Stored chat pane projection is invalid.");
     }
   }
+}
+
+function paneWithActiveRoutingSelect(): string {
+  return `
+    SELECT pane.*,
+      route.policy_version AS routing_policy_version,
+      route.classification_reason AS routing_classification_reason,
+      route.work_class AS routing_work_class,
+      route.requested_profile AS routing_requested_profile,
+      route.selected_profile AS routing_selected_profile,
+      route.profile_fallback_reason AS routing_profile_fallback_reason,
+      route.requested_service_tier AS routing_requested_service_tier,
+      route.selected_service_tier AS routing_selected_service_tier,
+      route.service_tier_fallback_reason
+        AS routing_service_tier_fallback_reason
+    FROM chat_panes AS pane
+    LEFT JOIN harness_root_turn_routing_receipts AS route
+      ON route.pane_id = pane.pane_id
+      AND route.chat_turn_id = pane.active_turn_id
+  `;
 }
 
 function chatWorkspaceProjection(row: PaneRow): NonNullable<ChatPaneProjection["workspace"]> {
@@ -2721,9 +2920,6 @@ function attachedHarnessSessionMatches(
     pane.repository.id === expected.repositoryId &&
     pane.repository.name === expected.repositoryName &&
     pane.accountProfileId === expected.accountProfileId &&
-    pane.model === CHAT_MODEL &&
-    pane.reasoningEffort === "ultra" &&
-    pane.serviceTier === "standard" &&
     pane.state === "ready" &&
     pane.activity.ordinal === 0 &&
     pane.activity.kind === "idle" &&

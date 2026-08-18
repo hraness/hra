@@ -56,7 +56,6 @@ export const localSessionSyncIntentSchema = z.object({
     MAX_SYNC_REPOSITORY_DISPLAY_NAME_UTF8_BYTES,
     "repository display name",
   ).optional(),
-  modelEffort: z.enum(["ultra", "max"]),
   state: sessionSummaryStateSchema,
   deleted: z.boolean(),
 }).strict().superRefine((intent, context) => {
@@ -76,7 +75,6 @@ export interface LocalSessionSyncIntent {
   readonly eventKind: SessionSyncEventKind;
   readonly title: string;
   readonly repositoryDisplayName?: string;
-  readonly modelEffort: "ultra" | "max";
   readonly state: "ready" | "working" | "attention" | "error" | "offline";
   readonly deleted: boolean;
 }

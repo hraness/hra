@@ -79,7 +79,6 @@ test("context quota accepts only bounded whole MiB values", () => {
     const accepted = harnessSettingsProjectionSchema.safeParse({
       revision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: mib * 1024 * 1024,
       refinementMode: "suggest",
     }).success;
@@ -135,7 +134,6 @@ test("every harness projection layer rejects hidden authority fields", () => {
       const settings = {
         revision: 1,
         recursiveSessionsEnabled: true,
-        automaticFastMode: "criticalPath" as const,
         contextQuotaBytes: 8 * 1024 * 1024,
         refinementMode: "suggest" as const,
       };
@@ -211,7 +209,6 @@ test("only the three explicit harness commands ever parse", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 1024 * 1024,
       refinementMode: "suggest",
     } : type === "harness.child.open" || type === "harness.child.stop" ? {
@@ -298,7 +295,6 @@ test("settings result correlation requires both revisions and every requested va
           expectedHarnessRevision: revision,
           expectedRevision: revision,
           recursiveSessionsEnabled: true,
-          automaticFastMode: "criticalPath",
           contextQuotaBytes: 8 * 1024 * 1024,
           refinementMode: "suggest",
         },
@@ -313,7 +309,6 @@ test("settings result correlation requires both revisions and every requested va
           settings: {
             revision: revision + delta,
             recursiveSessionsEnabled: mutateValue ? false : true,
-            automaticFastMode: "criticalPath",
             contextQuotaBytes: 8 * 1024 * 1024,
             refinementMode: "suggest",
           },
@@ -374,9 +369,6 @@ test("child-open correlation requires both revision advances and the exact opene
             title: "Property child",
             repository: { id: "repo_00000000000000000000000000", name: "hra" },
             accountProfileId: null,
-            model: "gpt-5.6-sol",
-            reasoningEffort: "ultra",
-            serviceTier: "standard",
             interactionMode: "harnessObserver",
             state: "ready",
             activity: { ordinal: 0, kind: "idle" },

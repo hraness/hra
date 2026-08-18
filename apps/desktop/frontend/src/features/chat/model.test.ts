@@ -20,7 +20,6 @@ import {
 } from "./ChatPane";
 import {
   composerEnterAction,
-  configurePaneCommand,
   createPaneCommand,
   createPaneId,
   createTitleDebouncer,
@@ -39,8 +38,10 @@ import {
   paneTitleDebounceMs,
   paneTitleErrorId,
   reconcilePaneTitleCommit,
+  recoverPaneWorkspaceCommand,
   reorderPanesCommand,
   resolveLocalPaneGridSlots,
+  rootTurnRoutePresentation,
   remoteSessionIdsEqual,
   remoteSessionRowEqual,
   selectAccountCreationAvailable,
@@ -76,7 +77,6 @@ function remoteSession(
     sourceRevision: 1,
     title: `Summary ${index + 1}`,
     repositoryDisplayName: `Repo ${index % 5}`,
-    modelEffort: "ultra",
     state: "ready",
     updatedAt: 100 + index,
     ...overrides,
@@ -129,8 +129,6 @@ function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
     title: "HRA",
     repository: { id: "repo_example0001", name: "hra" },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
     interactionMode: "chat",
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },
@@ -145,9 +143,20 @@ function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
     recoverablePrompt: false,
     harness: null,
     ...overrides,
-    serviceTier: overrides.serviceTier ?? "standard",
   };
 }
+
+const resolvedStandardRoute = {
+  policyVersion: 1,
+  classificationReason: "conservativeDefault",
+  workClass: "standard",
+  requestedProfile: "solMax",
+  selectedProfile: "solMax",
+  profileFallbackReason: null,
+  requestedServiceTier: "standard",
+  selectedServiceTier: "standard",
+  serviceTierFallbackReason: null,
+} as const;
 
 function shellState(panes: ChatPaneProjection[]) {
   return {
@@ -243,7 +252,7 @@ test("pane accessible identities are exact, collision-safe, bounded, and path-fr
   expect(bounded).not.toContain("/Users/example/private");
 });
 
-test("chat command builders default to Sol Max and expose owned Fast choices", () => {
+test("chat command builders expose no user model or speed preferences", () => {
   expect(createPaneCommand({
     paneId: "pane_example0001",
     repositoryId: "repo_example0001",
@@ -251,29 +260,14 @@ test("chat command builders default to Sol Max and expose owned Fast choices", (
     type: "chat.pane.create",
     paneId: "pane_example0001",
     repositoryId: "repo_example0001",
-    reasoningEffort: "max",
   });
-  expect(configurePaneCommand({
+  expect(recoverPaneWorkspaceCommand({
     paneId: "pane_example0001",
     expectedRevision: 4,
-    reasoningEffort: "max",
   })).toEqual({
-    type: "chat.pane.configure",
+    type: "chat.pane.workspace.recover",
     paneId: "pane_example0001",
     expectedRevision: 4,
-    reasoningEffort: "max",
-  });
-  expect(configurePaneCommand({
-    paneId: "pane_example0001",
-    expectedRevision: 5,
-    reasoningEffort: "ultra",
-    serviceTier: "fast",
-  })).toEqual({
-    type: "chat.pane.configure",
-    paneId: "pane_example0001",
-    expectedRevision: 5,
-    reasoningEffort: "ultra",
-    serviceTier: "fast",
   });
   expect(selectPaneRepositoryCommand({
     paneId: "pane_example0001",
@@ -328,6 +322,54 @@ test("chat command builders default to Sol Max and expose owned Fast choices", (
     type: "chat.panes.reorder",
     expectedOrderedPaneIds: ["pane_example0001", "pane_example0002"],
     orderedPaneIds: ["pane_example0002", "pane_example0001"],
+  });
+});
+
+test("route presentation stays content-free and names HRA dispatch fallbacks", () => {
+  expect(rootTurnRoutePresentation(null)).toBeNull();
+  expect(rootTurnRoutePresentation({
+    policyVersion: 1,
+    classificationReason: "boundedLeafCue",
+    workClass: "boundedLeaf",
+    requestedProfile: "lunaMax",
+    selectedProfile: "lunaMax",
+    profileFallbackReason: null,
+    requestedServiceTier: "fast",
+    selectedServiceTier: "fast",
+    serviceTierFallbackReason: null,
+  })).toEqual({
+    accessibleLabel:
+      "HRA requested Luna Max at Fast and selected Luna Max at Fast for dispatch.",
+    label: "Route · Luna Max · Fast",
+  });
+  expect(rootTurnRoutePresentation({
+    policyVersion: 1,
+    classificationReason: "boundedLeafCue",
+    workClass: "boundedLeaf",
+    requestedProfile: "lunaMax",
+    selectedProfile: null,
+    profileFallbackReason: null,
+    requestedServiceTier: "fast",
+    selectedServiceTier: null,
+    serviceTierFallbackReason: null,
+  })).toEqual({
+    accessibleLabel: "HRA has not resolved this turn's dispatch route.",
+    label: "Route · Unresolved",
+  });
+  expect(rootTurnRoutePresentation({
+    policyVersion: 1,
+    classificationReason: "boundedLeafCue",
+    workClass: "boundedLeaf",
+    requestedProfile: "lunaMax",
+    selectedProfile: "solMax",
+    profileFallbackReason: "lunaUnavailable",
+    requestedServiceTier: "fast",
+    selectedServiceTier: "standard",
+    serviceTierFallbackReason: "fastUnavailable",
+  })).toEqual({
+    accessibleLabel:
+      "HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch.",
+    label: "Route · Sol Max · Standard",
   });
 });
 
@@ -415,6 +457,7 @@ test("retained prompt retry authority is exact, ordinary, failed, and renderer-s
     responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     tools: [],
+    routing: resolvedStandardRoute,
   };
   const recoverable = pane({
     state: "attention",
@@ -442,7 +485,6 @@ test("the three harness command builders preserve every renderer revision fence"
     expectedHarnessRevision: 4,
     expectedRevision: 3,
     recursiveSessionsEnabled: true,
-    automaticFastMode: "criticalPath",
     contextQuotaBytes: 32 * 1024 * 1024,
     refinementMode: "suggest",
   })).toEqual({
@@ -450,7 +492,6 @@ test("the three harness command builders preserve every renderer revision fence"
     expectedHarnessRevision: 4,
     expectedRevision: 3,
     recursiveSessionsEnabled: true,
-    automaticFastMode: "criticalPath",
     contextQuotaBytes: 32 * 1024 * 1024,
     refinementMode: "suggest",
   });
@@ -470,7 +511,6 @@ test("the global harness selector retains identity across unrelated pane updates
     settings: {
       revision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath" as const,
       contextQuotaBytes: 8 * 1024 * 1024,
       refinementMode: "suggest" as const,
     },

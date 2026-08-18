@@ -27,8 +27,6 @@ function pane(
     title: "Research actor",
     repository: { id: "repo_observerview00000000000000", name: "example" },
     accountProfileId: "acct_observerview01",
-    model: "gpt-5.6-sol",
-    reasoningEffort: "ultra",
     interactionMode,
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },
@@ -45,9 +43,20 @@ function pane(
     recoverablePrompt: false,
     harness: null,
     ...overrides,
-    serviceTier: overrides.serviceTier ?? "standard",
   };
 }
+
+const resolvedStandardRoute = {
+  policyVersion: 1,
+  classificationReason: "conservativeDefault",
+  workClass: "standard",
+  requestedProfile: "solMax",
+  selectedProfile: "solMax",
+  profileFallbackReason: null,
+  requestedServiceTier: "standard",
+  selectedServiceTier: "standard",
+  serviceTierFallbackReason: null,
+} as const;
 
 function shellFor(projectedPane: ChatPaneProjection): RuntimeShell {
   return {
@@ -81,6 +90,7 @@ test("harness observer panes retain transcript and rename chrome without user co
   expect(html).not.toContain("Message Codex");
   expect(html).not.toContain("Automatic subscription");
   expect(html).not.toContain("Sol reasoning effort");
+  expect(html).not.toContain("Model routing");
   expect(html).not.toContain("Choose project for Research actor");
   expect(html).not.toContain("Close Research actor");
 });
@@ -121,6 +131,8 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(html).toContain("Choose project for Research actor");
   expect(html).toContain("More actions for Research actor");
   expect(html).toContain("Rename Research actor");
+  expect(html).not.toContain('aria-label="Model routing"');
+  expect(html).not.toContain("Fast mode");
   const source = await Bun.file(new URL("./ChatPane.tsx", import.meta.url)).text();
   expect(source).toContain('pane.interactionMode !== "chat" ? null : <footer className="chat-pane__composer">');
   expect(source).toContain("{!canMessage ? null : <form");
@@ -133,9 +145,48 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(source).not.toContain("accountProfileId:");
   expect(source).toContain('className="hra-visually-hidden"');
   expect(source).not.toContain('className="example-visually-hidden"');
-  expect(source).toContain('aria-label="Sol reasoning effort"');
-  expect(source).toContain('Fast mode; Fast uses more credits`');
-  expect(source).toContain('value={pane.serviceTier}');
+  expect(source).not.toContain('aria-label="Model routing"');
+  expect(source).not.toContain("ModelRoutingToggle");
+  expect(source).not.toContain("FastModeToggle");
+  expect(source).toContain("recoverPaneWorkspaceCommand");
+});
+
+test("ordinary panes show HRA's bounded dispatch route for their latest turn", () => {
+  const routed = pane("chat", {
+    turn: {
+      id: "chatturn_autoroute001",
+      status: "completed",
+      startedAt: "2026-08-03T12:00:00.000Z",
+      completedAt: "2026-08-03T12:00:01.000Z",
+      continuationCount: 0,
+      responseMarkdown: { tail: "Done", totalUtf8Bytes: 4, truncatedPrefix: false },
+      reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+      tools: [],
+      routing: {
+        policyVersion: 1,
+        classificationReason: "boundedLeafCue",
+        workClass: "boundedLeaf",
+        requestedProfile: "lunaMax",
+        selectedProfile: "solMax",
+        profileFallbackReason: "lunaUnavailable",
+        requestedServiceTier: "fast",
+        selectedServiceTier: "standard",
+        serviceTierFallbackReason: "fastUnavailable",
+      },
+    },
+  });
+  const html = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: routed,
+    shell: shellFor(routed),
+  }));
+
+  expect(html).toContain("Route · Sol Max · Standard");
+  expect(html).toContain(
+    '<span class="hra-visually-hidden pane-route-description">HRA requested Luna Max at Fast and selected Sol Max at Standard for dispatch. Luna configuration was unavailable on the selected subscription and Fast service was unavailable on the selected subscription, so HRA used its fallback before dispatch.</span>',
+  );
+  expect(html).not.toContain("boundedLeafCue");
+  expect(html).not.toContain("lunaUnavailable");
 });
 
 test("only an active ordinary root chat exposes the compact Stop action", () => {
@@ -148,6 +199,7 @@ test("only an active ordinary root chat exposes the compact Stop action", () => 
     responseMarkdown: { tail: "Working", totalUtf8Bytes: 7, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     tools: [],
+    routing: resolvedStandardRoute,
   };
   const chat = pane("chat", { state: "streaming", turn: activeTurn });
   const chatHtml = renderToStaticMarkup(createElement(ChatPaneView, {
@@ -157,7 +209,7 @@ test("only an active ordinary root chat exposes the compact Stop action", () => 
   }));
   const observer = pane("harnessObserver", {
     state: "streaming",
-    turn: activeTurn,
+    turn: { ...activeTurn, routing: null },
   });
   const observerHtml = renderToStaticMarkup(createElement(ChatPaneView, {
     gridPosition: 1,
@@ -196,6 +248,7 @@ test("the Retry icon controller keeps one fresh ID across a benign revision refr
     responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     tools: [],
+    routing: resolvedStandardRoute,
   };
   let current = pane("chat", {
     revision: 4,
@@ -294,6 +347,7 @@ test("a revision refresh cannot redirect Retry to a lost private-prompt capabili
       responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       tools: [],
+      routing: resolvedStandardRoute,
     },
     attention: { code: "turn_failed", message: "Retry.", retryable: true },
     recoverablePrompt: true,

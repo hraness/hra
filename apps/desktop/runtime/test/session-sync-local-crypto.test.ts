@@ -44,7 +44,6 @@ const intent: LocalSessionSyncIntent = {
   eventKind: "activity",
   title: "Compile the desktop app",
   repositoryDisplayName: "Example",
-  modelEffort: "max",
   state: "working",
   deleted: false,
 };

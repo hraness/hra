@@ -190,7 +190,6 @@ export const sessionSummarySchema = z.object({
     MAX_SYNC_REPOSITORY_DISPLAY_NAME_UTF8_BYTES,
     "repository display name",
   ).optional(),
-  modelEffort: z.enum(["ultra", "max"]),
   state: sessionSummaryStateSchema,
   originUpdatedAt: syncUint64Schema.optional(),
   deleted: z.boolean(),

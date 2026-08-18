@@ -53,12 +53,6 @@ const v1ActorProgramFixture: PinnedCodexJsonValue = {
       arguments: {
         title: { kind: "literal", value: "Inspect the bounded leaf" },
         workClass: { kind: "literal", value: "boundedLeaf" },
-        acceleration: {
-          kind: "object",
-          entries: {
-            mode: { kind: "literal", value: "standard" },
-          },
-        },
         allocation: {
           kind: "object",
           entries: {
@@ -87,12 +81,6 @@ const v1ActorProgramFixture: PinnedCodexJsonValue = {
         inputValueId: {
           kind: "literal",
           value: "ctxval_followup_input",
-        },
-        acceleration: {
-          kind: "object",
-          entries: {
-            mode: { kind: "literal", value: "standard" },
-          },
         },
       },
     },
@@ -212,7 +200,7 @@ describe("pinned Codex dynamic tool codecs", () => {
   test("keeps predecessor digests recovery-only", () => {
     expect(HRA_RLM_DYNAMIC_TOOL_SEMANTIC_CONTRACT_VERSION).toBe(1);
     expect(HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256).toBe(
-      "2ce858c44c3278d21078bb0675508df731a5140d0a8a9932cd01638f813257d7",
+      "3e98e085a6bd241f257e161de4c9486c8490dda2c9675bf6d951188c2dc77ed5",
     );
     expect(HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256).toBe(
       HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256,
@@ -278,10 +266,13 @@ describe("pinned Codex dynamic tool codecs", () => {
     expect(schema.$defs.rlmProgram.properties.capabilities.items.enum)
       .toContain("routing.inspect");
     expect(schema.$defs.rlmStep.properties.arguments.description).toContain(
-      "agent.spawn {title,workClass:largeChange|wideResearch|standard|boundedLeaf,acceleration:",
+      "agent.spawn {title,workClass:largeChange|wideResearch|standard|boundedLeaf,allocation:",
     );
     expect(schema.$defs.rlmStep.properties.arguments.description).toContain(
-      "agent.send {actorId,inputValueId,acceleration?}",
+      "agent.send {actorId,inputValueId}",
+    );
+    expect(schema.$defs.rlmStep.properties.arguments.description).toContain(
+      "HRA derives model, reasoning effort, and Fast or Standard from workClass",
     );
     expect(schema.$defs.rlmStep.properties.arguments.description).toContain(
       "routing.inspect {}",

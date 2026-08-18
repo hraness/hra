@@ -61,7 +61,7 @@ const turnRequest: PersistentActorTurnRequest = {
   providerThreadId: "provider-thread-1",
   modelId: threadRequest.modelId,
   reasoningEffort: threadRequest.reasoningEffort,
-  requestedAcceleration: { mode: "standard" },
+  requestedServiceTier: "standard",
   serviceTier: "standard",
   tierFallbackReason: null,
   capabilityEvidenceDigest: threadRequest.capabilityEvidenceDigest,
@@ -75,11 +75,7 @@ const turnRequest: PersistentActorTurnRequest = {
 
 const quarantinedFastTurnRequest: PersistentActorTurnRequest = {
   ...turnRequest,
-  requestedAcceleration: {
-    mode: "fast",
-    criticalPath: true,
-    bottleneck: "reasoning",
-  },
+  requestedServiceTier: "fast",
   serviceTier: "fast",
   fastReservationId: "hfast_00000000000001",
 };
@@ -1195,15 +1191,11 @@ describe("Codex persistent actor provider", () => {
     });
   });
 
-  test("passes Fast only with exact durable critical-path reservation evidence", async () => {
+  test("passes Fast only with exact durable policy and reservation evidence", async () => {
     const { provider, calls } = fixture();
     const fastRequest: PersistentActorTurnRequest = {
       ...turnRequest,
-      requestedAcceleration: {
-        mode: "fast",
-        criticalPath: true,
-        bottleneck: "reasoning",
-      },
+      requestedServiceTier: "fast",
       serviceTier: "fast",
       fastReservationId: "hfast_00000000000001",
     };

@@ -17,7 +17,7 @@ function shellWith(snapshot = emptyRuntimeSnapshot()): RuntimeShell {
   } as unknown as RuntimeShell;
 }
 
-test("harness settings explains recursive work, bounded Fast, and review-only refinement", async () => {
+test("harness settings explains recursive work and review-only refinement", async () => {
   const source = await Bun.file(new URL("./HarnessSettings.tsx", import.meta.url)).text();
 
   expect(source).toContain("<SwitchField");
@@ -26,10 +26,8 @@ test("harness settings explains recursive work, bounded Fast, and review-only re
   expect(source).not.toContain('controlClassName="harness-switch"');
   expect(source).not.toContain("<button");
   expect(source).toContain('label="Context quota"');
-  expect(source).toContain('label="Automatic Fast for recursive sessions"');
-  expect(source).toContain("critical-path recursive turn");
-  expect(source).toContain("never changes the manual Fast setting on ordinary panes");
-  expect(source).toContain('automaticFastMode: isSelected ? "criticalPath" : "off"');
+  expect(source).not.toContain("automaticFastMode");
+  expect(source).not.toContain("Automatic Fast");
   expect(source).toContain("Array.from({ length: 64 }");
   expect(source).toContain("<strong>Refinement suggestions</strong>");
   expect(source).toContain("review-only improvement proposals");
@@ -72,7 +70,6 @@ test("retained harness state never authorizes mutation while the runtime is unav
       settings: {
         revision: 1,
         recursiveSessionsEnabled: true,
-        automaticFastMode: "criticalPath" as const,
         contextQuotaBytes: 8 * 1024 * 1024,
         refinementMode: "suggest" as const,
       },

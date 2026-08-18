@@ -355,6 +355,14 @@ describe("local task SQLite migrations", () => {
             version: 44,
             name: "longitudinal-routing-shadow-memory",
           },
+          {
+            version: 45,
+            name: "durable-root-turn-routing-receipts",
+          },
+          {
+            version: 46,
+            name: "actor-turn-requested-service-tier-authority",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -377,6 +385,7 @@ describe("local task SQLite migrations", () => {
         "harness_longitudinal_routing_observations",
         "harness_longitudinal_routing_pane_heads",
         "harness_longitudinal_routing_usage_current",
+        "harness_root_turn_routing_receipts",
         "harness_actor_epochs",
         "harness_actor_fast_reservations",
         "harness_actor_incarnations",

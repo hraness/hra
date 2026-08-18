@@ -766,10 +766,9 @@ describe.skipIf(gitBinary === null)("Application Support managed-worktree repair
         state: "recoveryRequired",
         recoveryKind: "provisionInterrupted",
       });
-      const preparing = panes.configure(
+      const preparing = panes.recoverWorkspace(
         "pane_migration0001",
         recovering.revision,
-        "ultra",
         retryAt,
       );
       expect(preparing.workspace).toMatchObject({

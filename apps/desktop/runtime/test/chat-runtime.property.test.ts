@@ -157,7 +157,6 @@ test("random pane allocation preserves contiguous creation order across restarts
                 workingDirectory: "/fixture/example",
               },
               accountProfileId: ACCOUNT,
-              reasoningEffort: "ultra",
               now: new Date(NOW.getTime() + step),
             })).toThrow(expect.objectContaining({ code: "limit" }));
           } else {
@@ -169,7 +168,6 @@ test("random pane allocation preserves contiguous creation order across restarts
                 workingDirectory: "/fixture/example",
               },
               accountProfileId: ACCOUNT,
-              reasoningEffort: step % 2 === 0 ? "ultra" : "max",
               now: new Date(NOW.getTime() + step),
             });
             expected.push(paneId);
@@ -320,7 +318,6 @@ test("harness observer replay stays exact at capacity and a 65th identity never 
             workingDirectory: "/fixture/example",
           },
           accountProfileId: ACCOUNT,
-          reasoningEffort: index % 2 === 0 ? "ultra" : "max",
           now: new Date(NOW.getTime() + index),
         });
       }
@@ -815,7 +812,6 @@ function createPane(store: ChatPaneStore, paneId: typeof PANE_A | typeof PANE_B)
     paneId,
     repository: { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" },
     accountProfileId: ACCOUNT,
-    reasoningEffort: "ultra",
     now: NOW,
   });
 }

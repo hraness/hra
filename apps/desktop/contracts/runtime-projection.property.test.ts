@@ -21,6 +21,18 @@ const managedWorkspace = {
   recoveryKind: null,
 } as const;
 
+const resolvedStandardRoute = {
+  policyVersion: 1,
+  classificationReason: "conservativeDefault",
+  workClass: "standard",
+  requestedProfile: "solMax",
+  selectedProfile: "solMax",
+  profileFallbackReason: null,
+  requestedServiceTier: "standard",
+  selectedServiceTier: "standard",
+  serviceTierFallbackReason: null,
+} as const;
+
 function emptySnapshot(): RuntimeSnapshot {
   return {
     revision: 1,
@@ -54,9 +66,6 @@ function streamingPane(id: string, turnId: string): ChatPaneProjection {
       name: "example",
     },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: "max",
-    serviceTier: "standard",
     interactionMode: "chat",
     state: "streaming",
     activity: { ordinal: 1, kind: "messageSent" },
@@ -70,6 +79,7 @@ function streamingPane(id: string, turnId: string): ChatPaneProjection {
       responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       tools: [],
+      routing: resolvedStandardRoute,
     },
     attention: null,
     recoverablePrompt: false,
@@ -99,9 +109,6 @@ function lifecyclePane(index: number, revision: number): ChatPaneProjection {
       name: "example",
     },
     accountProfileId: null,
-    model: "gpt-5.6-sol",
-    reasoningEffort: index % 2 === 0 ? "ultra" : "max",
-    serviceTier: "standard",
     interactionMode: "chat",
     state: "ready",
     activity: { ordinal: 0, kind: "idle" },

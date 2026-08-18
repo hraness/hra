@@ -21,6 +21,7 @@ import {
 import type { SessionCodexRequestKey } from "../src/sessions/command-executor";
 import { applyMigrations } from "../src/state/database";
 import { ChatPaneStore } from "../src/state/chat-pane-store";
+import { RootTurnRoutingSQLiteAuthorityV1 } from "../src/harness/root-turn-routing-sqlite-v1";
 
 const ACCOUNT = "acct_integration01";
 const PANE = "pane_integration01";
@@ -44,7 +45,7 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
     setChatThreadName: reject,
     startChatThread: reject,
     startChatTurn: reject,
-    validateChatConfiguration: reject,
+    resolveChatConfiguration: reject,
   });
 
   const error = await provider.startThread({
@@ -93,18 +94,149 @@ test("Fast mode fails closed before any provider mutation when the model omits t
     emit: () => undefined,
   });
 
-  const failure = await sessions.validateChatConfiguration(
+  const failure = await sessions.resolveChatConfiguration(
     ACCOUNT,
-    "gpt-5.6-sol",
-    "ultra",
-    "fast",
+    [{ model: "gpt-5.6-sol", reasoningEffort: "ultra", serviceTier: "fast" }],
   ).then(() => null, (reason: unknown) => reason);
   expect(failure).toBeInstanceOf(SessionServiceError);
   expect(failure).toMatchObject({ code: "capability_unavailable" });
   expect(requests).toEqual(["modelList"]);
 });
 
-test("Fast capability is revalidated while stable Standard configuration is cached", async () => {
+test("root routing proves model absence only from one complete generation-fenced catalog", async () => {
+  const expectedGenerations: Array<number | undefined> = [];
+  let page = 0;
+  const sessions = new SessionService({
+    accounts: {
+      requestSession: () => Promise.reject(new Error("Expected positioned session request")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+        _input: PinnedCodexRequestInput<Key>,
+        expectedGeneration?: number,
+      ) {
+        if (key !== "modelList") throw new Error(`Unexpected mutation: ${String(key)}`);
+        expectedGenerations.push(expectedGeneration);
+        page += 1;
+        const output: PinnedCodexRequestOutput<"modelList"> = {
+          data: page === 5
+            ? [{
+                model: "gpt-5.6-luna",
+                supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+                serviceTiers: [{
+                  id: "fast",
+                  name: "Fast",
+                  description: "Faster inference.",
+                }],
+              }]
+            : [],
+          nextCursor: page === 5 ? null : `cursor-${String(page)}`,
+        };
+        return Promise.resolve({
+          generation: 7,
+          streamPosition: page,
+          output: output as PinnedCodexRequestOutput<Key>,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+
+  await sessions.resolveChatConfiguration(
+    ACCOUNT,
+    [{ model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "fast" }],
+  );
+  expect(expectedGenerations).toEqual([undefined, 7, 7, 7, 7]);
+});
+
+test("one exact catalog resolves the first supported HRA candidate", async () => {
+  let modelListCalls = 0;
+  const sessions = new SessionService({
+    accounts: {
+      requestSession: () => Promise.reject(new Error("Expected positioned session request")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+      ) {
+        if (key !== "modelList") throw new Error(`Unexpected mutation: ${String(key)}`);
+        modelListCalls += 1;
+        const output: PinnedCodexRequestOutput<"modelList"> = {
+          data: [
+            {
+              model: "gpt-5.6-luna",
+              supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+              serviceTiers: [],
+            },
+            {
+              model: "gpt-5.6-sol",
+              supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+              serviceTiers: [{
+                id: "fast",
+                name: "Fast",
+                description: "Faster inference.",
+              }],
+            },
+          ],
+          nextCursor: null,
+        };
+        return Promise.resolve({
+          generation: 12,
+          streamPosition: 1,
+          output: output as PinnedCodexRequestOutput<Key>,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+
+  const selected = await sessions.resolveChatConfiguration(ACCOUNT, [
+    { model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "fast" },
+    { model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "standard" },
+    { model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: "fast" },
+  ]);
+  expect(selected).toEqual({
+    model: "gpt-5.6-luna",
+    reasoningEffort: "max",
+    serviceTier: "standard",
+  });
+  expect(modelListCalls).toBe(1);
+});
+
+test("an incomplete bounded root model catalog is protocol uncertainty, not absence", async () => {
+  let page = 0;
+  const sessions = new SessionService({
+    accounts: {
+      requestSession: () => Promise.reject(new Error("Expected positioned session request")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+      ) {
+        if (key !== "modelList") throw new Error(`Unexpected mutation: ${String(key)}`);
+        page += 1;
+        const output: PinnedCodexRequestOutput<"modelList"> = {
+          data: [],
+          nextCursor: `cursor-${String(page)}`,
+        };
+        return Promise.resolve({
+          generation: 9,
+          streamPosition: page,
+          output: output as PinnedCodexRequestOutput<Key>,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+
+  const failure = await sessions.resolveChatConfiguration(
+    ACCOUNT,
+    [{ model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "standard" }],
+  ).then(() => null, (reason: unknown) => reason);
+  expect(failure).toBeInstanceOf(SessionServiceError);
+  expect(failure).toMatchObject({ code: "protocol_error" });
+  expect(page).toBe(8);
+});
+
+test("every route resolution reads one current account catalog", async () => {
   const validations: string[] = [];
   const reject = () => Promise.reject(new Error("Unexpected provider mutation"));
   const provider = new CodexChatProvider({
@@ -114,17 +246,61 @@ test("Fast capability is revalidated while stable Standard configuration is cach
     setChatThreadName: reject,
     startChatThread: reject,
     startChatTurn: reject,
-    validateChatConfiguration: (_account, _model, _effort, tier) => {
-      validations.push(tier);
-      return Promise.resolve();
+    resolveChatConfiguration: (_account, candidates) => {
+      const selected = candidates[0];
+      if (selected === undefined) throw new Error("Expected a routing candidate");
+      validations.push(selected.serviceTier);
+      return Promise.resolve(selected);
     },
   });
 
-  await provider.validateConfiguration(ACCOUNT, "gpt-5.6-sol", "ultra", "fast");
-  await provider.validateConfiguration(ACCOUNT, "gpt-5.6-sol", "ultra", "fast");
-  await provider.validateConfiguration(ACCOUNT, "gpt-5.6-sol", "ultra", "standard");
-  await provider.validateConfiguration(ACCOUNT, "gpt-5.6-sol", "ultra", "standard");
-  expect(validations).toEqual(["fast", "fast", "standard"]);
+  const fast = {
+    model: "gpt-5.6-sol" as const,
+    reasoningEffort: "ultra" as const,
+    serviceTier: "fast" as const,
+    approvalPolicy: "on-request" as const,
+    approvalsReviewer: "auto_review" as const,
+    sandbox: "workspace-write" as const,
+  };
+  const standard = { ...fast, serviceTier: "standard" as const };
+  await provider.resolveConfiguration(ACCOUNT, [fast]);
+  await provider.resolveConfiguration(ACCOUNT, [fast]);
+  await provider.resolveConfiguration(ACCOUNT, [standard]);
+  await provider.resolveConfiguration(ACCOUNT, [standard]);
+  expect(validations).toEqual(["fast", "fast", "standard", "standard"]);
+});
+
+test("Codex chat preserves definitive model absence for safe automatic fallback", async () => {
+  const unavailable = new SessionServiceError(
+    "capability_unavailable",
+    "Luna is absent from this exact account catalog.",
+    false,
+    "none",
+  );
+  const reject = () => Promise.reject(new Error("Unexpected provider mutation"));
+  const provider = new CodexChatProvider({
+    injectChatHistory: reject,
+    interruptChatTurn: reject,
+    resumeChatThread: reject,
+    setChatThreadName: reject,
+    startChatThread: reject,
+    startChatTurn: reject,
+    resolveChatConfiguration: () => Promise.reject(unavailable),
+  });
+
+  const error = await provider.resolveConfiguration(ACCOUNT, [{
+    model: "gpt-5.6-luna",
+    reasoningEffort: "max",
+    serviceTier: "standard",
+    approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
+    sandbox: "workspace-write",
+  }]).then(() => null, (reason: unknown) => reason);
+  expect(error).toBeInstanceOf(ChatProviderEffectError);
+  expect(error).toMatchObject({
+    certainty: "not_applied",
+    code: "capability_unavailable",
+  });
 });
 
 test("SessionService dispatch stays fire-and-forget while ordered chat projection is blocked", async () => {
@@ -207,6 +383,7 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
           : null),
       },
       runtimeRecovery: { requestRecovery: () => undefined },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(database),
       store,
       workspaces: testWorkspaces(store, database),
     });
@@ -215,8 +392,6 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
       type: "chat.pane.create",
       paneId: PANE,
       repositoryId: REPOSITORY,
-      reasoningEffort: "ultra",
-      serviceTier: "fast",
     });
     if (created.type !== "pane") throw new Error("Expected pane");
     await chat.settled();
@@ -226,7 +401,7 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
       paneId: PANE,
       expectedRevision: ready.revision,
       turnId: LOGICAL_TURN,
-      prompt: "Exercise the exact seam",
+      prompt: "Fix the typo in the button label.",
     });
     expect(accepted.type === "pane" ? accepted.pane.revision : 0)
       .toBe(ready.revision + 1);
@@ -239,15 +414,15 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
       "turnStart",
     ]);
     expect(requests.find(({ key }) => key === "threadStart")?.input).toMatchObject({
-      model: "gpt-5.6-sol",
+      model: "gpt-5.6-luna",
       approvalPolicy: "on-request",
       approvalsReviewer: "auto_review",
       sandbox: "workspace-write",
       serviceTier: "fast",
     });
     expect(requests.find(({ key }) => key === "turnStart")?.input).toMatchObject({
-      model: "gpt-5.6-sol",
-      effort: "ultra",
+      model: "gpt-5.6-luna",
+      effort: "max",
       approvalPolicy: "on-request",
       approvalsReviewer: "auto_review",
       sandboxPolicy: { type: "workspaceWrite", networkAccess: false },
@@ -385,6 +560,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
           : null),
       },
       runtimeRecovery: { requestRecovery: () => undefined },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(database),
       store,
       workspaces: testWorkspaces(store, database),
     });
@@ -392,8 +568,6 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       type: "chat.pane.create",
       paneId: PANE,
       repositoryId: REPOSITORY,
-      reasoningEffort: "ultra",
-      serviceTier: "fast",
     });
     if (created.type !== "pane") throw new Error("Expected pane");
     await firstChat.settled();
@@ -482,6 +656,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
           : null),
       },
       runtimeRecovery: { requestRecovery: () => undefined },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(database),
       store,
       workspaces: testWorkspaces(store, database),
     });
@@ -506,7 +681,12 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       approvalPolicy: "on-request",
       approvalsReviewer: "auto_review",
       sandbox: "workspace-write",
-      serviceTier: "fast",
+      serviceTier: null,
+    });
+    expect(resumedRequests.find(({ key }) => key === "turnStart")?.input).toMatchObject({
+      model: "gpt-5.6-sol",
+      effort: "max",
+      serviceTier: null,
     });
     expect(store.require(PANE).binding).toEqual(persisted.binding);
 
@@ -575,8 +755,8 @@ function responseFor(key: unknown, cwd: string): unknown {
   switch (key) {
     case "modelList":
       return {
-        data: [{
-          model: "gpt-5.6-sol",
+        data: ["gpt-5.6-sol", "gpt-5.6-luna"].map((model) => ({
+          model,
           supportedReasoningEfforts: [
             { reasoningEffort: "ultra" },
             { reasoningEffort: "max" },
@@ -586,7 +766,7 @@ function responseFor(key: unknown, cwd: string): unknown {
             name: "Fast",
             description: "Faster model inference with higher credit use.",
           }],
-        }],
+        })),
         nextCursor: null,
       };
     case "threadStart":

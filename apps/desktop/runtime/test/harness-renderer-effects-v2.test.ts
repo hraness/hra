@@ -280,7 +280,6 @@ function fixture(input: Readonly<{
       workingDirectory: "/tmp/renderer-effects",
     },
     accountProfileId: null,
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   actors.attachActorPane({

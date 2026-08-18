@@ -15,7 +15,9 @@ import {
   type ChatHarnessRootPort,
   type ChatHistoryItem,
   type ChatProjectionSink,
+  type ChatProviderConfiguration,
   type ChatProviderPort,
+  type ChatProviderResumeRequest,
   type ChatProviderThreadRequest,
   type ChatProviderTurnRequest,
   type ChatRuntimeRecoveryPort,
@@ -35,6 +37,8 @@ import { applyMigrations } from "../src/state/database";
 import {
   ChatPaneStore,
 } from "../src/state/chat-pane-store";
+import { RootTurnRoutingSQLiteAuthorityV1 } from "../src/harness/root-turn-routing-sqlite-v1";
+import type { RootTurnRoutingAuthorityV1 } from "../src/harness/root-turn-routing-sqlite-v1";
 
 const ACCOUNT_ONE = "acct_chatprimary1";
 const ACCOUNT_TWO = "acct_chatsecond01";
@@ -59,10 +63,20 @@ class FakeProvider implements ChatProviderPort {
     history: readonly ChatHistoryItem[];
   }>> = [];
   readonly interrupts: Array<ChatThreadBinding & Readonly<{ turnId: string }>> = [];
+  readonly resumedThreads: ChatProviderResumeRequest[] = [];
   readonly startedThreads: ChatProviderThreadRequest[] = [];
   readonly startedTurns: StartedTurn[] = [];
   readonly names: Array<Readonly<{ binding: ChatThreadBinding; name: string }>> = [];
+  readonly validations: Array<Readonly<{
+    accountProfileId: string;
+    model: "gpt-5.6-sol" | "gpt-5.6-luna";
+    reasoningEffort: "ultra" | "max";
+    serviceTier: "standard" | "fast";
+  }>> = [];
+  readonly resolutionCandidates: ChatProviderConfiguration[][] = [];
+  events: string[] | null = null;
   onInterrupt: (() => Promise<void>) | null = null;
+  onResolveConfiguration: ChatProviderPort["resolveConfiguration"] | null = null;
   onStartThread: ((request: ChatProviderThreadRequest) => Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
@@ -71,25 +85,47 @@ class FakeProvider implements ChatProviderPort {
   #threadSequence = 0;
   #turnSequence = 0;
 
-  validateConfiguration(): Promise<void> {
-    return Promise.resolve();
+  async resolveConfiguration(
+    accountProfileId: string,
+    candidates: readonly ChatProviderConfiguration[],
+  ): Promise<ChatProviderConfiguration> {
+    this.resolutionCandidates.push([...candidates]);
+    const selected = this.onResolveConfiguration === null
+      ? candidates[0]
+      : await this.onResolveConfiguration(accountProfileId, candidates);
+    if (selected === undefined) throw new Error("Expected one routing candidate");
+    this.validations.push({
+      accountProfileId,
+      model: selected.model,
+      reasoningEffort: selected.reasoningEffort,
+      serviceTier: selected.serviceTier ?? "standard",
+    });
+    this.events?.push(
+      `provider.resolve:${selected.model}:${selected.reasoningEffort}:${selected.serviceTier ?? "standard"}`,
+    );
+    return selected;
   }
 
   async startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
   }>> {
+    this.events?.push("provider.startThread");
     this.startedThreads.push(request);
     if (this.onStartThread !== null) return await this.onStartThread(request);
     this.#threadSequence += 1;
     const sequence = String(this.#threadSequence);
-    return Promise.resolve({
+    const started = {
       threadId: `thread_chat_${sequence}`,
       restartThreadId: `raw_thread_chat_${sequence}`,
-    });
+    };
+    this.events?.push("provider.startThread.accepted");
+    return Promise.resolve(started);
   }
 
-  resumeThread(): Promise<void> {
+  resumeThread(request: ChatProviderResumeRequest): Promise<void> {
+    this.events?.push("provider.resumeThread");
+    this.resumedThreads.push(request);
     return Promise.resolve();
   }
 
@@ -99,6 +135,7 @@ class FakeProvider implements ChatProviderPort {
   }
 
   injectHistory(binding: ChatThreadBinding, history: readonly ChatHistoryItem[]): Promise<void> {
+    this.events?.push("provider.injectHistory");
     this.injected.push({ binding, history });
     return Promise.resolve();
   }
@@ -107,11 +144,13 @@ class FakeProvider implements ChatProviderPort {
     turnId: string;
     quotaProofCursor: Readonly<{ generation: number; streamPosition: number }>;
   }>> {
+    this.events?.push("provider.startTurn");
     this.#turnSequence += 1;
     const turnId = this.onStartTurn === null
       ? `turn_chat_${String(this.#turnSequence)}`
       : await this.onStartTurn(request);
     this.startedTurns.push({ request, turnId });
+    this.events?.push("provider.startTurn.accepted");
     return {
       turnId,
       quotaProofCursor: { generation: 1, streamPosition: this.#turnSequence },
@@ -207,6 +246,8 @@ interface Harness {
   readonly actors: FakeHarnessActors | null;
   readonly roots: FakeHarnessRoots | null;
   readonly runtimeRecoveries: Parameters<ChatRuntimeRecoveryPort["requestRecovery"]>[0][];
+  readonly routingEvents: string[];
+  readonly rootTurnRouting: RootTurnRoutingAuthorityV1;
   readonly reorderedPanes: (readonly string[])[];
   readonly service: ChatService;
   readonly store: ChatPaneStore;
@@ -267,7 +308,15 @@ function harness(
     },
   };
   const provider = new FakeProvider();
+  const routingEvents: string[] = [];
+  provider.events = routingEvents;
   const store = new ChatPaneStore(database);
+  const rootTurnRouting = recordingRootTurnRoutingAuthority(
+    new RootTurnRoutingSQLiteAuthorityV1(database),
+    database,
+    routingEvents,
+    roots !== null,
+  );
   let timestamp = Date.parse("2026-08-03T12:00:00.000Z");
   const workspaces: ChatWorkspacePort = {
     async provision(paneId) {
@@ -339,6 +388,7 @@ function harness(
         requestRuntimeRecovery(input);
       },
     },
+    rootTurnRouting,
     store,
     workspaces,
     interruptTerminalGraceMs,
@@ -362,9 +412,68 @@ function harness(
     roots,
     reorderedPanes,
     runtimeRecoveries,
+    routingEvents,
+    rootTurnRouting,
     service,
     store,
     workspaces,
+  };
+}
+
+function recordingRootTurnRoutingAuthority(
+  delegate: RootTurnRoutingAuthorityV1,
+  database: Database,
+  events: string[] | null,
+  allowSyntheticRootBinding: boolean,
+): RootTurnRoutingAuthorityV1 {
+  if (events === null) return delegate;
+  return {
+    admitClassification(input) {
+      events.push("routing.classified");
+      return delegate.admitClassification(input);
+    },
+    bindRootTurn(input) {
+      events.push("routing.rootBound");
+      if (allowSyntheticRootBinding) {
+        const receipt = delegate.readTurnRouting(input.paneId, input.chatTurnId);
+        if (receipt === null) throw new Error("Expected admitted route receipt");
+        return {
+          ...receipt,
+          rootTurnId: input.rootTurnId,
+          updatedAt: input.now.toISOString(),
+        };
+      }
+      return delegate.bindRootTurn(input);
+    },
+    resolve(input) {
+      events.push(`routing.resolved:${input.selectedProfile}`);
+      return delegate.resolve(input);
+    },
+    markEffectStarted(input) {
+      events.push("routing.effectStarted");
+      return delegate.markEffectStarted(input);
+    },
+    accept(input) {
+      const row = database.query<{
+        active_provider_turn_id: string | null;
+      }, [string]>(`
+        SELECT active_provider_turn_id FROM chat_panes WHERE pane_id = ?1
+      `).get(input.paneId);
+      events.push(row?.active_provider_turn_id === null
+        ? "routing.accepted:paneUnbound"
+        : "routing.accepted:paneAlreadyBound");
+      return delegate.accept(input);
+    },
+    settle(input) {
+      events.push(`routing.settled:${input.outcome}`);
+      return delegate.settle(input);
+    },
+    readTurnRouting(paneId, chatTurnId) {
+      return delegate.readTurnRouting(paneId, chatTurnId);
+    },
+    readLatestTurnRouting(paneId) {
+      return delegate.readLatestTurnRouting(paneId);
+    },
   };
 }
 
@@ -423,7 +532,6 @@ async function createPane(
     type: "chat.pane.create",
     paneId,
     repositoryId: REPOSITORY,
-    reasoningEffort: "ultra",
   });
   if (result.type !== "pane") throw new Error("Expected a pane response");
   await value.service.settled();
@@ -504,6 +612,634 @@ function attachObserver(
     }).pane
   )();
 }
+
+test("root routing owns the profile and tier for every ordinary turn", async () => {
+  const value = harness();
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    await startTurn(
+      value,
+      ready.revision,
+      TURN_ONE,
+      "Implement the new routing feature across the frontend and backend.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.startedTurns[0]?.request).toMatchObject({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+      serviceTier: "standard",
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      requestedProfile: "solUltra",
+      requestedServiceTier: "standard",
+      selectedProfile: "solUltra",
+      selectedServiceTier: "standard",
+      state: "accepted",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("bounded-leaf routing resolves Luna Fast before every provider effect", async () => {
+  const value = harness();
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    await startTurn(value, ready.revision, TURN_ONE, "Fix the typo in the button label.");
+    await value.service.settled();
+
+    expect(value.provider.validations).toEqual([{
+      accountProfileId: ACCOUNT_ONE,
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    }]);
+    expect(value.provider.startedThreads[0]).toMatchObject({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(value.provider.startedTurns[0]?.request).toMatchObject({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      requestedProfile: "lunaMax",
+      requestedServiceTier: "fast",
+      selectedProfile: "lunaMax",
+      selectedServiceTier: "fast",
+      state: "accepted",
+      acceptedGeneration: 1,
+      acceptedStreamPosition: 1,
+    });
+    expect(value.routingEvents).toEqual([
+      "provider.resolve:gpt-5.6-luna:max:fast",
+      "routing.resolved:lunaMax",
+      "routing.effectStarted",
+      "provider.startThread",
+      "provider.startThread.accepted",
+      "provider.startTurn",
+      "provider.startTurn.accepted",
+      "routing.accepted:paneUnbound",
+    ]);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("an existing thread resumes with the new selected route after effect evidence", async () => {
+  const value = harness();
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Review this function for a bug.");
+    await value.service.settled();
+    const first = value.provider.startedTurns[0];
+    if (first === undefined) throw new Error("Expected first provider turn");
+    await value.service.observeSessionAssistantCompletion(
+      completion(first.request, first.turnId, "The first answer."),
+    );
+    await value.service.observeSessionLifecycle(
+      lifecycle(first.request, first.turnId, "completed"),
+    );
+    await value.service.settled();
+    value.routingEvents.length = 0;
+
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_TWO,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.routingEvents).toEqual([
+      "provider.resolve:gpt-5.6-luna:max:fast",
+      "routing.resolved:lunaMax",
+      "routing.effectStarted",
+      "provider.resumeThread",
+      "provider.startTurn",
+      "provider.startTurn.accepted",
+      "routing.accepted:paneUnbound",
+    ]);
+    expect(value.provider.resumedThreads[0]).toMatchObject({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(value.provider.startedTurns[1]?.request).toMatchObject({
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("standard and broad prompts send their exact router-owned Sol profiles", async () => {
+  const cases = [
+    {
+      prompt: "Review this function for a possible bug.",
+      model: "gpt-5.6-sol" as const,
+      reasoningEffort: "max" as const,
+      selectedProfile: "solMax" as const,
+      serviceTier: "standard" as const,
+    },
+    {
+      prompt: "Implement the new routing feature across the frontend and backend.",
+      model: "gpt-5.6-sol" as const,
+      reasoningEffort: "ultra" as const,
+      selectedProfile: "solUltra" as const,
+      serviceTier: "standard" as const,
+    },
+  ];
+  for (const expected of cases) {
+    const value = harness();
+    try {
+      const created = await value.service.execute({
+        type: "chat.pane.create",
+        paneId: PANE,
+        repositoryId: REPOSITORY,
+      });
+      if (created.type !== "pane") throw new Error("Expected pane");
+      await value.service.settled();
+      await startTurn(
+        value,
+        value.store.require(PANE).projection.revision,
+        TURN_ONE,
+        expected.prompt,
+      );
+      await value.service.settled();
+      expect(value.provider.startedTurns[0]?.request).toMatchObject({
+        model: expected.model,
+        reasoningEffort: expected.reasoningEffort,
+        serviceTier: expected.serviceTier,
+      });
+      expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+        selectedProfile: expected.selectedProfile,
+        state: "accepted",
+      });
+    } finally {
+      value.service.closeAdmission();
+      await value.service.settled();
+      value.database.close();
+    }
+  }
+});
+
+test("continuations inherit settled Ultra and Luna routes across reopen", async () => {
+  const cases = [
+    {
+      prompt: "Implement the new routing feature across the frontend and backend.",
+      workClass: "largeChange" as const,
+      profile: "solUltra" as const,
+      model: "gpt-5.6-sol" as const,
+      effort: "ultra" as const,
+      tier: "standard" as const,
+    },
+    {
+      prompt: "Fix the typo in the button label.",
+      workClass: "boundedLeaf" as const,
+      profile: "lunaMax" as const,
+      model: "gpt-5.6-luna" as const,
+      effort: "max" as const,
+      tier: "fast" as const,
+    },
+  ];
+  for (const expected of cases) {
+    const value = harness();
+    let restarted: ChatService | null = null;
+    try {
+      const created = await createPane(value);
+      await startTurn(value, created.revision, TURN_ONE, expected.prompt);
+      await value.service.settled();
+      const first = value.provider.startedTurns[0];
+      if (first === undefined) throw new Error("Expected first provider turn");
+      await value.service.observeSessionLifecycle(
+        lifecycle(first.request, first.turnId, "completed"),
+      );
+      await value.service.settled();
+      value.service.closeAdmission();
+      await value.service.settled();
+
+      const restartedProvider = new FakeProvider();
+      const authority = new RootTurnRoutingSQLiteAuthorityV1(value.database);
+      restarted = new ChatService({
+        accounts: {
+          containAmbiguousEffect: () => Promise.resolve(),
+          refreshCandidates: () => Promise.resolve([
+            { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
+          ]),
+        },
+        projection: {
+          paneChanged: () => undefined,
+          paneStateChanged: () => undefined,
+          paneRemoved: () => undefined,
+          panesReordered: () => undefined,
+          delta: () => undefined,
+        },
+        provider: restartedProvider,
+        repositories: {
+          resolve: (repositoryId) => Promise.resolve(repositoryId === REPOSITORY
+            ? { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" }
+            : null),
+        },
+        rootTurnRouting: authority,
+        runtimeRecovery: { requestRecovery: () => undefined },
+        store: value.store,
+        workspaces: value.workspaces,
+      });
+      restarted.initialize();
+      await restarted.execute({
+        type: "chat.turn.start",
+        paneId: PANE,
+        expectedRevision: value.store.require(PANE).projection.revision,
+        turnId: TURN_TWO,
+        prompt: "continue",
+      });
+      await restarted.settled();
+
+      expect(restartedProvider.startedTurns[0]?.request).toMatchObject({
+        model: expected.model,
+        reasoningEffort: expected.effort,
+        serviceTier: expected.tier,
+      });
+      expect(authority.readTurnRouting(PANE, TURN_TWO)).toMatchObject({
+        classificationReason: "continuationInherited",
+        workClass: expected.workClass,
+        requestedProfile: expected.profile,
+        requestedServiceTier: expected.tier,
+        selectedProfile: expected.profile,
+        selectedServiceTier: expected.tier,
+        state: "accepted",
+      });
+    } finally {
+      restarted?.closeAdmission();
+      await restarted?.settled();
+      value.service.closeAdmission();
+      await value.service.settled();
+      value.database.close();
+    }
+  }
+});
+
+test("a continuation without prior route requests Sol Max Fast", async () => {
+  const value = harness();
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "continue it");
+    await value.service.settled();
+
+    expect(value.provider.startedTurns[0]?.request).toMatchObject({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      classificationReason: "continuationOrAmbiguous",
+      requestedProfile: "solMax",
+      requestedServiceTier: "fast",
+      selectedProfile: "solMax",
+      selectedServiceTier: "fast",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("Luna Fast fallback follows the exact capability-only candidate order", async () => {
+  const value = harness();
+  value.provider.onResolveConfiguration = (_account, candidates) => {
+    const selected = candidates.find(({ model, serviceTier }) =>
+      model === "gpt-5.6-sol" && serviceTier === "standard"
+    );
+    return selected === undefined
+      ? Promise.reject(new ChatProviderEffectError({
+          certainty: "not_applied",
+          code: "capability_unavailable",
+        }))
+      : Promise.resolve(selected);
+  };
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_ONE,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.resolutionCandidates[0]?.map(({ model, serviceTier }) => ({
+      model,
+      serviceTier,
+    }))).toEqual([
+      { model: "gpt-5.6-luna", serviceTier: "fast" },
+      { model: "gpt-5.6-luna", serviceTier: "standard" },
+      { model: "gpt-5.6-sol", serviceTier: "fast" },
+      { model: "gpt-5.6-sol", serviceTier: "standard" },
+    ]);
+    expect(value.provider.startedTurns[0]?.request).toMatchObject({
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max",
+      serviceTier: "standard",
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      requestedProfile: "lunaMax",
+      requestedServiceTier: "fast",
+      selectedProfile: "solMax",
+      profileFallbackReason: "lunaUnavailable",
+      selectedServiceTier: "standard",
+      serviceTierFallbackReason: "fastUnavailable",
+      state: "accepted",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("catalog uncertainty never masquerades as route capability absence", async () => {
+  const value = harness();
+  value.provider.onResolveConfiguration = () => Promise.reject(
+    new ChatProviderEffectError({ certainty: "not_applied", code: "runtime" }),
+  );
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_ONE,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.resolutionCandidates[0]?.[0]?.model)
+      .toBe("gpt-5.6-luna");
+    expect(value.provider.validations).toEqual([]);
+    expect(value.provider.startedThreads).toEqual([]);
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      requestedProfile: "lunaMax",
+      selectedProfile: null,
+      state: "notApplied",
+      operationalOutcome: "notApplied",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("an ambiguous provider effect is contained without model fallback", async () => {
+  const value = harness();
+  value.provider.onStartThread = () => Promise.reject(
+    new ChatProviderEffectError({ certainty: "ambiguous", code: "runtime" }),
+  );
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_ONE,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.validations.map(({ model }) => model)).toEqual([
+      "gpt-5.6-luna",
+    ]);
+    expect(value.containedAccounts).toEqual([ACCOUNT_ONE]);
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      selectedProfile: "lunaMax",
+      state: "ambiguous",
+      operationalOutcome: "ambiguous",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("a definitive turn-start rejection after thread creation settles failed, not notApplied", async () => {
+  const value = harness();
+  value.provider.onStartTurn = () => Promise.reject(
+    new ChatProviderEffectError({ certainty: "not_applied", code: "rejected" }),
+  );
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_ONE,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.startedThreads).toHaveLength(1);
+    expect(value.provider.validations.map(({ model }) => model)).toEqual([
+      "gpt-5.6-luna",
+    ]);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      selectedProfile: "lunaMax",
+      state: "terminal",
+      operationalOutcome: "failed",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("a turn-start rejection after history injection still settles the route failed", async () => {
+  let candidates: readonly ChatAccountCandidate[] = [
+    { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
+  ];
+  const value = harness(() => candidates);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Review this function for a bug.");
+    await value.service.settled();
+    const first = value.provider.startedTurns[0];
+    if (first === undefined) throw new Error("Expected first provider turn");
+    await value.service.observeSessionAssistantCompletion(
+      completion(first.request, first.turnId, "The first answer."),
+    );
+    await value.service.observeSessionLifecycle(
+      lifecycle(first.request, first.turnId, "completed"),
+    );
+    await value.service.settled();
+    value.routingEvents.length = 0;
+
+    candidates = [{ id: ACCOUNT_TWO, selected: true, budget: "healthy" }];
+    value.provider.onStartTurn = () => Promise.reject(
+      new ChatProviderEffectError({ certainty: "not_applied", code: "rejected" }),
+    );
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_TWO,
+      "Review this function for another bug.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.startedThreads).toHaveLength(2);
+    expect(value.provider.injected).toHaveLength(1);
+    expect(value.provider.injected[0]?.history).toEqual([
+      { role: "user", text: "Review this function for a bug." },
+      { role: "assistant", text: "The first answer." },
+    ]);
+    expect(value.routingEvents.indexOf("routing.effectStarted")).toBeLessThan(
+      value.routingEvents.indexOf("provider.startThread"),
+    );
+    expect(value.routingEvents.indexOf("provider.startThread")).toBeLessThan(
+      value.routingEvents.indexOf("provider.injectHistory"),
+    );
+    expect(value.routingEvents.indexOf("provider.injectHistory")).toBeLessThan(
+      value.routingEvents.indexOf("provider.startTurn"),
+    );
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_TWO)).toMatchObject({
+      selectedProfile: "solMax",
+      selectedServiceTier: "standard",
+      state: "terminal",
+      operationalOutcome: "failed",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("an unexpected post-effect routing evidence failure fences recovery", async () => {
+  const value = harness();
+  value.provider.onStartTurn = () => Promise.reject(
+    new ChatProviderEffectError({ certainty: "not_applied", code: "rejected" }),
+  );
+  value.rootTurnRouting.settle = () => {
+    throw new Error("fixture routing evidence failure");
+  };
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Review this function for a bug.");
+    await value.service.settled();
+
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      state: "effectStarted",
+      selectedProfile: "solMax",
+      selectedServiceTier: "standard",
+      operationalOutcome: null,
+    });
+    expect(value.store.require(PANE).activeTurnPoisoned).toBeTrue();
+    expect(value.runtimeRecoveries).toHaveLength(1);
+    expect(value.runtimeRecoveries[0]).toMatchObject({
+      paneId: PANE,
+      turnId: TURN_ONE,
+      reason: "ambiguous_provider_effect_unfenced",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("a definitive quota rejection terminalizes the selected route without fallback", async () => {
+  const value = harness();
+  value.provider.onStartTurn = () => Promise.reject(
+    new ChatProviderEffectError({
+      certainty: "not_applied",
+      code: "quota_reached",
+      quotaProof: "provider_rate_limit_reached",
+    }),
+  );
+  try {
+    const created = await value.service.execute({
+      type: "chat.pane.create",
+      paneId: PANE,
+      repositoryId: REPOSITORY,
+    });
+    if (created.type !== "pane") throw new Error("Expected pane");
+    await value.service.settled();
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      TURN_ONE,
+      "Fix the typo in the button label.",
+    );
+    await value.service.settled();
+
+    expect(value.provider.validations.map(({ model }) => model)).toEqual([
+      "gpt-5.6-luna",
+    ]);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      selectedProfile: "lunaMax",
+      state: "terminal",
+      operationalOutcome: "quotaRejected",
+    });
+    expect(value.store.require(PANE).projection).toMatchObject({
+      state: "attention",
+      attention: { code: "all_accounts_exhausted" },
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
 
 test("turn start responds at revision +1 while settled drains later pane-tail work", async () => {
   const value = harness();
@@ -667,10 +1403,9 @@ test("repository resolution leaves preparation durably and retries to readiness"
     `).run(PANE);
     const needsRetry = value.store.require(PANE).projection;
     await value.service.execute({
-      type: "chat.pane.configure",
+      type: "chat.pane.workspace.recover",
       paneId: PANE,
       expectedRevision: needsRetry.revision,
-      reasoningEffort: "ultra",
     });
     await value.service.settled();
 
@@ -763,10 +1498,9 @@ test("transient workspace execution capacity retries without durable recovery po
     capacityMode = true;
     const recovering = value.store.require(PANE).projection;
     await value.service.execute({
-      type: "chat.pane.configure",
+      type: "chat.pane.workspace.recover",
       paneId: PANE,
       expectedRevision: recovering.revision,
-      reasoningEffort: "ultra",
     });
     await value.service.settled();
 
@@ -829,10 +1563,9 @@ test("closeAdmission cancels an armed workspace retry before it can touch reposi
     `).run(PANE);
     const current = value.store.require(PANE).projection;
     await value.service.execute({
-      type: "chat.pane.configure",
+      type: "chat.pane.workspace.recover",
       paneId: PANE,
       expectedRevision: current.revision,
-      reasoningEffort: "ultra",
     });
     await value.service.settled();
     expect(value.store.require(PANE).projection.workspace?.state)
@@ -932,10 +1665,9 @@ test("restart rehydrates a durable repository-resolution recovery without waitin
     `).run(PANE);
     const current = value.store.require(PANE).projection;
     await value.service.execute({
-      type: "chat.pane.configure",
+      type: "chat.pane.workspace.recover",
       paneId: PANE,
       expectedRevision: current.revision,
-      reasoningEffort: "ultra",
     });
     await value.service.settled();
     expect(value.store.require(PANE).projection.workspace?.state)
@@ -966,6 +1698,7 @@ test("restart rehydrates a durable repository-resolution recovery without waitin
         }),
       },
       runtimeRecovery: { requestRecovery: () => undefined },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(value.database),
       store: value.store,
       workspaces: value.workspaces,
     });
@@ -4113,7 +4846,7 @@ test("hung pre-provider root settlement bounds prompt-free Retry recovery", asyn
 });
 
 test("prompt-free Retry survives restart, keeps prompt private, and sends exact bytes once", async () => {
-  const originalPrompt = "  preserve exact retry bytes\nwith unicode 🧭  ";
+  const originalPrompt = "  fix the typo in the button label 🧭  ";
   const replacementPrompt = "replacement prompt after retained failure";
   const value = harness();
   let restartedService: ChatService | null = null;
@@ -4132,6 +4865,14 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
     expect(value.store.require(PANE).activePrompt).toBe(originalPrompt);
     expect(JSON.stringify(failed)).not.toContain(originalPrompt);
     expect(JSON.stringify(value.store.list())).not.toContain(originalPrompt);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      classificationReason: "boundedLeafCue",
+      requestedProfile: "lunaMax",
+      requestedServiceTier: "fast",
+      selectedProfile: "lunaMax",
+      selectedServiceTier: "fast",
+      operationalOutcome: "failed",
+    });
 
     value.service.closeAdmission();
     await value.service.settled();
@@ -4167,6 +4908,7 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
         },
       },
       runtimeRecovery: { requestRecovery() {} },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(value.database),
       store: value.store,
       workspaces: value.workspaces,
     });
@@ -4213,6 +4955,17 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
     expect(restartedProvider.startedTurns[0]?.request).toMatchObject({
       clientTurnId: TURN_TWO,
       prompt: originalPrompt,
+      model: "gpt-5.6-luna",
+      reasoningEffort: "max",
+      serviceTier: "fast",
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_TWO)).toMatchObject({
+      classificationReason: "boundedLeafCue",
+      requestedProfile: "lunaMax",
+      requestedServiceTier: "fast",
+      selectedProfile: "lunaMax",
+      selectedServiceTier: "fast",
+      state: "accepted",
     });
 
     const duplicate = await restartedService.execute(retryCommand)
@@ -4681,6 +5434,10 @@ test("an accepted provider turn is interrupted when durable acceptance fails", a
         turn: { status: "failed" },
       },
     });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, TURN_ONE)).toMatchObject({
+      state: "terminal",
+      operationalOutcome: "interrupted",
+    });
     expect(value.runtimeRecoveries).toEqual([]);
   } finally {
     value.database.close();
@@ -4841,6 +5598,7 @@ test("an unfenced ambiguous turn escalates once and only reopens after rehydrati
           throw new Error("Rehydration must not request another recovery.");
         },
       },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(value.database),
       store: value.store,
       workspaces: {
         provision: (paneId) => Promise.resolve(value.store.require(paneId).projection),
@@ -5058,6 +5816,7 @@ test("an unfenced ambiguous turn start requests one recovery without deadlocking
           throw new Error("Rehydration must not request another recovery.");
         },
       },
+      rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(value.database),
       store: value.store,
       workspaces: value.workspaces,
     });

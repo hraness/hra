@@ -76,7 +76,6 @@ function fixture(): Readonly<{
       workingDirectory: "/tmp/root-lookup-v2",
     },
     accountProfileId: firstAccountId,
-    reasoningEffort: "ultra",
     now: new Date(at),
   });
   const actors = new HarnessSQLiteAuthorityV2(database, {
@@ -236,7 +235,6 @@ describe("HarnessRootSessionSQLiteLookupV2", () => {
           workingDirectory: "/tmp/root-lookup-v2-second",
         },
         accountProfileId: firstAccountId,
-        reasoningEffort: "ultra",
         now: new Date(at),
       });
       startFirstSession(value.store, secondPaneId);

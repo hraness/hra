@@ -39,6 +39,7 @@ import {
   runtimeTransportRetryCommand,
   type AccountSummary,
   type ChatPaneProjection,
+  type ChatRootTurnRoutingProjection,
   type HarnessChildProjection,
   type HarnessSnapshot,
   type RetainedAccountLocalData,
@@ -80,6 +81,70 @@ const managedChatWorkspace = {
   revision: 1,
   recoveryKind: null,
 } as const;
+
+function directRootTurnRouting(
+  prompt: string,
+  priorRouting: ChatRootTurnRoutingProjection | null,
+): ChatRootTurnRoutingProjection {
+  const normalized = prompt.trim().normalize("NFKC").toLowerCase();
+  const continuation = /^(?:please\s+)?(?:continue(?:\s+(?:it|that|this))?|keep going|go ahead|proceed|do it|ship it|finish(?:\s+(?:it|that|this))?|apply(?:\s+(?:it|that|this))?|fix(?:\s+(?:it|that|this))?|same|yes|yep|ok(?:ay)?)[.!?…]*$/u
+    .test(normalized);
+  if (continuation && priorRouting !== null) {
+    return {
+      policyVersion: 1,
+      classificationReason: "continuationInherited",
+      workClass: priorRouting.workClass,
+      requestedProfile: priorRouting.requestedProfile,
+      selectedProfile: priorRouting.requestedProfile,
+      profileFallbackReason: null,
+      requestedServiceTier: priorRouting.requestedServiceTier,
+      selectedServiceTier: priorRouting.requestedServiceTier,
+      serviceTierFallbackReason: null,
+    };
+  }
+  const wideResearch = /\b(?:research|survey|investigate)\b/u.test(normalized) &&
+    /\b(?:across|ecosystem|landscape|literature|sources)\b/u.test(normalized);
+  const largeChange = /\b(?:implement|refactor|rewrite|migrate|redesign)\b/u.test(normalized) &&
+    /\b(?:across|architecture|codebase|feature|repository|system|throughout|whole)\b/u
+      .test(normalized);
+  const boundedLeaf = /\b(?:fix|rename|tweak|update)\b/u.test(normalized) &&
+    /\b(?:button|copy|label|single file|string|text|tooltip|typo)\b/u.test(normalized);
+  const classificationReason = continuation
+    ? "continuationOrAmbiguous" as const
+    : wideResearch
+      ? "wideResearchCue" as const
+      : largeChange
+        ? "largeChangeCue" as const
+        : boundedLeaf
+          ? "boundedLeafCue" as const
+          : "conservativeDefault" as const;
+  const workClass = wideResearch
+    ? "wideResearch" as const
+    : largeChange
+      ? "largeChange" as const
+      : boundedLeaf
+        ? "boundedLeaf" as const
+        : "standard" as const;
+  const requestedProfile = workClass === "boundedLeaf"
+    ? "lunaMax" as const
+    : workClass === "standard"
+      ? "solMax" as const
+      : "solUltra" as const;
+  const requestedServiceTier = boundedLeaf || continuation
+    ? "fast" as const
+    : "standard" as const;
+  return {
+    policyVersion: 1,
+    classificationReason,
+    workClass,
+    requestedProfile,
+    selectedProfile: requestedProfile,
+    profileFallbackReason: null,
+    requestedServiceTier,
+    selectedServiceTier: requestedServiceTier,
+    serviceTierFallbackReason: null,
+  };
+}
 
 interface InvocationRecord {
   readonly command: string;
@@ -763,9 +828,6 @@ class DeterministicRuntimeTransport {
           title: repository.name,
           repository: { id: repository.id, name: repository.name },
           accountProfileId: null,
-          model: "gpt-5.6-sol",
-          reasoningEffort: command.reasoningEffort,
-          serviceTier: command.serviceTier ?? "standard",
           interactionMode: "chat",
           state: "ready",
           activity: { ordinal: 0, kind: "idle" },
@@ -791,23 +853,34 @@ class DeterministicRuntimeTransport {
         this.#changeChatPaneState(updated);
         return this.#success(request, { type: "chatPane", pane: updated });
       }
-      case "chat.pane.configure": {
+      case "chat.pane.workspace.recover": {
         const pane = this.#requireChatPane(command.paneId);
         if (pane.revision !== command.expectedRevision) {
           return this.#staleRevision(request, pane.revision);
         }
-        if (pane.state !== "ready" && pane.state !== "attention") {
+        if (
+          pane.interactionMode !== "chat" || pane.workspace === null ||
+          (pane.state !== "ready" && pane.state !== "attention") ||
+          (
+            pane.workspace.state !== "waitingCapacity" &&
+            pane.workspace.state !== "recoveryRequired"
+          )
+        ) {
           return this.#chatFailure(
             request,
             "invalid_state",
-            "Direct cannot configure an active pane.",
+            "Direct cannot recover an active pane workspace.",
           );
         }
         const updated: ChatPaneProjection = {
           ...pane,
           revision: pane.revision + 1,
-          reasoningEffort: command.reasoningEffort,
-          serviceTier: command.serviceTier ?? pane.serviceTier,
+          workspace: {
+            ...pane.workspace,
+            state: "preparing",
+            revision: pane.workspace.revision + 1,
+            recoveryKind: null,
+          },
         };
         this.#changeChatPaneState(updated);
         return this.#success(request, { type: "chatPane", pane: updated });
@@ -851,7 +924,10 @@ class DeterministicRuntimeTransport {
         if (pane.revision !== command.expectedRevision) {
           return this.#staleRevision(request, pane.revision);
         }
-        if (pane.state !== "ready" && pane.state !== "attention") {
+        if (
+          pane.interactionMode !== "chat" ||
+          (pane.state !== "ready" && pane.state !== "attention")
+        ) {
           return this.#chatFailure(
             request,
             "invalid_state",
@@ -936,6 +1012,7 @@ class DeterministicRuntimeTransport {
               truncatedPrefix: false,
             },
             tools: [],
+            routing: directRootTurnRouting(command.prompt, pane.turn?.routing ?? null),
           },
           attention: null,
           recoverablePrompt: false,
@@ -967,6 +1044,7 @@ class DeterministicRuntimeTransport {
               truncatedPrefix: false,
             },
             tools: [],
+            routing: begun.turn!.routing,
           },
           attention: null,
         };
@@ -982,7 +1060,8 @@ class DeterministicRuntimeTransport {
           pane.interactionMode !== "chat" || pane.state !== "attention" ||
           pane.attention?.retryable !== true || pane.recoverablePrompt !== true ||
           pane.turn?.status !== "failed" ||
-          pane.turn.id !== command.priorFailedTurnId
+          pane.turn.id !== command.priorFailedTurnId ||
+          pane.turn.routing === null
         ) {
           return this.#chatFailure(
             request,
@@ -1016,6 +1095,13 @@ class DeterministicRuntimeTransport {
               truncatedPrefix: false,
             },
             tools: [],
+            routing: {
+              ...pane.turn.routing,
+              selectedProfile: pane.turn.routing.requestedProfile,
+              profileFallbackReason: null,
+              selectedServiceTier: pane.turn.routing.requestedServiceTier,
+              serviceTierFallbackReason: null,
+            },
           },
           attention: null,
           recoverablePrompt: false,
@@ -1102,7 +1188,6 @@ class DeterministicRuntimeTransport {
         const settings = {
           revision: harness.settings.revision + 1,
           recursiveSessionsEnabled: command.recursiveSessionsEnabled,
-          automaticFastMode: command.automaticFastMode,
           contextQuotaBytes: command.contextQuotaBytes,
           refinementMode: command.refinementMode,
         } as const;
@@ -1144,9 +1229,6 @@ class DeterministicRuntimeTransport {
           title: child.title,
           repository: parent.repository,
           accountProfileId: parent.accountProfileId,
-          model: parent.model,
-          reasoningEffort: parent.reasoningEffort,
-          serviceTier: "standard",
           interactionMode: "harnessObserver",
           state: "ready",
           activity: { ordinal: 0, kind: "idle" },

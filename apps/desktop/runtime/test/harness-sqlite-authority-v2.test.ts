@@ -539,7 +539,7 @@ function prepareFastReservation(
   value.authority.createActorEpoch({
     epoch,
     rootActor,
-    dispatchPolicy: { policyVersion: 1, workClass: "standard" },
+    dispatchPolicy: { policyVersion: 1, workClass: "boundedLeaf" },
   });
   insertContextValue(value.database, {
     valueId: `ctxval_${input.suffix}`,
@@ -553,11 +553,6 @@ function prepareFastReservation(
     actorId: localRootActorId,
     idempotencyKey: `idempotency-${input.suffix}`,
     inputValueId: `ctxval_${input.suffix}`,
-    acceleration: {
-      mode: "fast",
-      criticalPath: true,
-      bottleneck: "reasoning",
-    },
     createdAt: at,
   });
   turn = value.authority.transitionActorTurn({
@@ -584,7 +579,7 @@ function prepareFastReservation(
       accountProfileId: localAccountId,
       processGeneration: 1,
       profile: {
-        modelId: "gpt-5.6-sol",
+        modelId: "gpt-5.6-luna",
         reasoningEffort: "max",
         profileFallbackReason: null,
         capabilityEvidenceDigest: digest("3"),
@@ -672,11 +667,27 @@ function prepareFastReservation(
 }
 
 describe("HarnessSQLiteAuthorityV2 actor authority", () => {
+  test("keeps historical acceleration columns outside current runtime authority", async () => {
+    const source = await Bun.file(new URL(
+      "../src/harness/sqlite-authority-v2.ts",
+      import.meta.url,
+    )).text();
+    expect(source).toContain("requested_service_tier");
+    expect(source).not.toContain("acceleration_mode");
+    expect(source).not.toContain("acceleration_critical_path");
+    expect(source).not.toContain("acceleration_bottleneck");
+    expect(source).not.toContain("automaticFastDisabled");
+  });
+
   test("binds explicit successor capability evidence without rewriting admission", () => {
     const value = fixture();
     try {
-      const { incarnation } = prepareStartingAttempt(value, {
+      const { attempt, incarnation } = prepareStartingAttempt(value, {
         withAccountLease: true,
+      });
+      expect(attempt).toMatchObject({
+        requestedServiceTier: "standard",
+        realizedServiceTier: "standard",
       });
       bindFixtureWorkspace(value, rootActorId, "initial_successor_catalog");
       value.database.query(`
@@ -749,12 +760,12 @@ describe("HarnessSQLiteAuthorityV2 actor authority", () => {
       value.authority.createActorEpoch({
         epoch,
         rootActor,
-        dispatchPolicy: { policyVersion: 1, workClass: "standard" },
+        dispatchPolicy: { policyVersion: 1, workClass: "boundedLeaf" },
       });
       expect(value.authority.readActorDispatchPolicy(rootActorId)).toEqual({
         actorId: rootActorId,
         policyVersion: 1,
-        workClass: "standard",
+        workClass: "boundedLeaf",
       });
       insertContextValue(value.database, {
         valueId: "ctxval_fastpolicyinput001",
@@ -767,13 +778,10 @@ describe("HarnessSQLiteAuthorityV2 actor authority", () => {
         actorId: rootActorId,
         idempotencyKey: "idempotency-fast-policy-001",
         inputValueId: "ctxval_fastpolicyinput001",
-        acceleration: {
-          mode: "fast",
-          criticalPath: true,
-          bottleneck: "reasoning",
-        },
         createdAt: at,
       });
+      expect(value.authority.readActorTurnRequestedServiceTier(turn.id))
+        .toEqual({ turnId: turn.id, requestedServiceTier: "fast" });
       turn = value.authority.transitionActorTurn({
         turnId: turn.id,
         expectedRevision: turn.revision,
@@ -823,7 +831,7 @@ describe("HarnessSQLiteAuthorityV2 actor authority", () => {
             accountProfileId: accountId,
             processGeneration: 1,
             profile: {
-              modelId: "gpt-5.6-sol",
+              modelId: "gpt-5.6-luna",
               reasoningEffort: "max",
               profileFallbackReason: null,
               capabilityEvidenceDigest: digest("3"),
@@ -888,10 +896,54 @@ describe("HarnessSQLiteAuthorityV2 actor authority", () => {
         createdAt: "2030-01-01T00:00:02.000Z",
       });
       expect(session).toMatchObject({
-        modelId: "gpt-5.6-sol",
+        modelId: "gpt-5.6-luna",
         reasoningEffort: "max",
         supportsFast: true,
       });
+      expect(() => value.database.query(`
+        INSERT INTO harness_actor_turn_attempts (
+          attempt_id, turn_id, incarnation_id, ordinal,
+          account_profile_id, process_generation, effect_generation,
+          client_user_message_id, provider_turn_id, state,
+          requested_service_tier, realized_service_tier,
+          tier_fallback_reason, capability_evidence_digest,
+          fast_reservation_id, created_at, started_at, settled_at
+        ) VALUES (
+          'hattempt_fastpolicymismatch1', 'hturn_fastpolicy00001',
+          'hincarnation_fastpolicy001', 1, ?1, 1, 1,
+          'client-message-fast-policy-mismatch', NULL, 'starting',
+          'standard', 'standard', NULL, ?2, NULL, ?3, NULL, NULL
+        )
+      `).run(accountId, digest("3"), "2030-01-01T00:00:03.000Z"))
+        .toThrow("invalid actor attempt dispatch evidence");
+      expect(() => value.database.query(`
+        INSERT INTO harness_actor_turn_attempts (
+          attempt_id, turn_id, incarnation_id, ordinal,
+          account_profile_id, process_generation, effect_generation,
+          client_user_message_id, provider_turn_id, state,
+          requested_service_tier, realized_service_tier,
+          tier_fallback_reason, capability_evidence_digest,
+          fast_reservation_id, created_at, started_at, settled_at
+        ) VALUES (
+          'hattempt_fastpolicylegacyfallback', 'hturn_fastpolicy00001',
+          'hincarnation_fastpolicy001', 1, ?1, 1, 1,
+          'client-message-fast-policy-legacy-fallback', NULL, 'starting',
+          'fast', 'standard', 'automaticFastDisabled', ?2, NULL,
+          ?3, NULL, NULL
+        )
+      `).run(accountId, digest("3"), "2030-01-01T00:00:03.000Z"))
+        .toThrow("invalid actor attempt dispatch evidence");
+      expect(() => value.authority.createActorAttempt({
+        attemptId: "hattempt_fastpolicylegacy01",
+        turnId: turn.id,
+        incarnationId: idle.id,
+        accountProfileId: accountId,
+        processGeneration: 1,
+        clientUserMessageId: "client-message-fast-policy-legacy",
+        createdAt: "2030-01-01T00:00:03.000Z",
+      })).toThrow(
+        "Fast actor turns require claimed capability and reservation evidence",
+      );
       const claimed = value.authority.claimActorAttempt({
         attemptId: "hattempt_fastpolicy0001",
         turnId: turn.id,

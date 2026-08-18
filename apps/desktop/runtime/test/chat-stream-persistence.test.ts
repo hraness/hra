@@ -67,7 +67,6 @@ function exercise(
           workingDirectory: "/fixture/stream-performance",
         },
         accountProfileId: ACCOUNT,
-        reasoningEffort: "ultra",
         now: NOW,
       });
       store.beginTurn({

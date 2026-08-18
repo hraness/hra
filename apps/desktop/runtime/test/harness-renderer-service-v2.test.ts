@@ -10,7 +10,6 @@ import type { RuntimeHarnessDomainCommand } from "../../contracts/runtime";
 const settings = {
   revision: 1,
   recursiveSessionsEnabled: true,
-  automaticFastMode: "criticalPath" as const,
   contextQuotaBytes: 16 * 1024 * 1024,
   refinementMode: "suggest" as const,
 };
@@ -84,7 +83,6 @@ describe("minimal harness renderer service", () => {
               settings: {
                 revision: 2,
                 recursiveSessionsEnabled: false,
-                automaticFastMode: "off",
                 contextQuotaBytes: 8 * 1024 * 1024,
                 refinementMode: "off",
               },
@@ -97,7 +95,6 @@ describe("minimal harness renderer service", () => {
                 settings: {
                   revision: 2,
                   recursiveSessionsEnabled: false,
-                  automaticFastMode: "off",
                   contextQuotaBytes: 8 * 1024 * 1024,
                   refinementMode: "off",
                 },
@@ -117,7 +114,6 @@ describe("minimal harness renderer service", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * 1024 * 1024,
       refinementMode: "off",
     } as const;
@@ -154,7 +150,6 @@ describe("minimal harness renderer service", () => {
               settings: {
                 revision: 2,
                 recursiveSessionsEnabled: false,
-                automaticFastMode: "off",
                 contextQuotaBytes: 8 * 1024 * 1024,
                 refinementMode: "off",
               },
@@ -182,7 +177,6 @@ describe("minimal harness renderer service", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: false,
-      automaticFastMode: "off",
       contextQuotaBytes: 8 * 1024 * 1024,
       refinementMode: "off",
     });
@@ -231,7 +225,6 @@ describe("minimal harness renderer service", () => {
       expectedHarnessRevision: 1,
       expectedRevision: 1,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 16 * 1024 * 1024,
       refinementMode: "suggest",
     }).then((value) => {

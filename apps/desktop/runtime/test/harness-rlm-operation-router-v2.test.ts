@@ -29,8 +29,6 @@ const binding: RlmV2ActorBinding = {
   currentUserInputValueId: "ctxval_0000000001",
   contextQuotaBytes: 16 * 1024 * 1024,
 };
-const standardAcceleration = { mode: "standard" as const };
-
 function operationContext(signal = new AbortController().signal): RlmV2OperationContext {
   return {
     epochId: binding.epochId,
@@ -326,7 +324,6 @@ describe("RLM v2 operation router", () => {
     expect(await router.invoke("agent.spawn", {
       title: "Research",
       workClass: "wideResearch",
-      acceleration: standardAcceleration,
       allocation,
       inputValueId: "ctxval_000000001",
     }, operationContext())).toEqual({
@@ -345,7 +342,6 @@ describe("RLM v2 operation router", () => {
       title: "Research",
       policyVersion: 1,
       workClass: "wideResearch",
-      acceleration: standardAcceleration,
       budget: {
         maxDepth: 3,
         maxActiveDescendants: 4,
@@ -366,7 +362,6 @@ describe("RLM v2 operation router", () => {
       callerActorId: binding.actorId,
       actorId: actor().id,
       inputValueId: "ctxval_000000001",
-      acceleration: standardAcceleration,
       idempotencyKey: "pop_000000000001",
     });
   });
@@ -394,12 +389,10 @@ describe("RLM v2 operation router", () => {
       ...predecessorSpawn,
       policyVersion: 0,
       workClass: "legacyUnclassified",
-      acceleration: standardAcceleration,
     });
     expect(() => parseRlmV2ActorSpawnArguments({
       ...predecessorSpawn,
       workClass: "standard",
-      acceleration: standardAcceleration,
     }, "predecessorRecoveryOnly")).toThrow();
 
     expect(parseRlmV2ActorSendArguments({
@@ -408,7 +401,6 @@ describe("RLM v2 operation router", () => {
     }, "current")).toEqual({
       actorId: actor().id,
       inputValueId: "ctxval_000000001",
-      acceleration: standardAcceleration,
     });
 
     const { router, calls } = fixture({
@@ -418,7 +410,6 @@ describe("RLM v2 operation router", () => {
     expect(calls.find(([name]) => name === "spawn")?.[1]).toMatchObject({
       policyVersion: 0,
       workClass: "legacyUnclassified",
-      acceleration: standardAcceleration,
     });
 
     const durable = fixture({
@@ -451,21 +442,29 @@ describe("RLM v2 operation router", () => {
     )).rejects.toThrow();
   });
 
-  test("preserves explicit Fast intent as turn data", async () => {
-    const acceleration = {
-      mode: "fast" as const,
-      criticalPath: true as const,
-      bottleneck: "fileGeneration" as const,
+  test("rejects agent-supplied model-tier authority", () => {
+    const allocation = {
+      tokenShareBps: 1,
+      byteShareBps: 1,
+      activeDescendantShareBps: 1,
+      durableDescendantShareBps: 1,
     };
-    const { router, calls } = fixture();
-    await router.invoke("agent.send", {
+    expect(fixture().router.invoke("agent.spawn", {
+      title: "Injected tier",
+      workClass: "boundedLeaf",
+      acceleration: { mode: "standard" },
+      allocation,
+      inputValueId: "ctxval_000000001",
+    }, operationContext())).rejects.toThrow();
+    expect(fixture().router.invoke("agent.send", {
       actorId: actor().id,
       inputValueId: "ctxval_000000001",
-      acceleration,
-    }, operationContext());
-    expect(calls.find(([name]) => name === "send")?.[1]).toMatchObject({
-      acceleration,
-    });
+      acceleration: {
+        mode: "fast",
+        criticalPath: true,
+        bottleneck: "reasoning",
+      },
+    }, operationContext())).rejects.toThrow();
   });
 
   test("returns content-free actor status, result, waits, and cancellation", async () => {
@@ -528,7 +527,6 @@ describe("RLM v2 operation router", () => {
       () => fixture({ spawnError: pending }).router.invoke("agent.spawn", {
         title: "Research",
         workClass: "standard",
-        acceleration: standardAcceleration,
         allocation,
         inputValueId: "ctxval_000000001",
       }, operationContext()),
@@ -567,7 +565,6 @@ describe("RLM v2 operation router", () => {
         await router.invoke("agent.spawn", {
           title: "Bounded child",
           workClass: "boundedLeaf",
-          acceleration: standardAcceleration,
           allocation,
           inputValueId: "ctxval_000000001",
         }, operationContext());
@@ -601,7 +598,6 @@ describe("RLM v2 operation router", () => {
       await fixture().router.invoke("agent.spawn", {
         title: "Too deep",
         workClass: "standard",
-        acceleration: standardAcceleration,
         allocation: {
           tokenShareBps: 1,
           byteShareBps: 1,

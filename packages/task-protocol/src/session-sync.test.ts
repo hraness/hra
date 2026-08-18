@@ -159,7 +159,6 @@ describe("observation-only session sync wire", () => {
       sourceRevision: "7",
       title: "Fix projection recovery",
       repositoryDisplayName: "example",
-      modelEffort: "ultra",
       state: "working",
       originUpdatedAt: "9007199254740993",
       deleted: false,

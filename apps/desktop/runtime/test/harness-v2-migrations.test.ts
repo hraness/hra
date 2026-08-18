@@ -707,6 +707,157 @@ describe("clean recursive harness migrations", () => {
     }
   });
 
+  test("migration 46 derives turn tier authority from immutable work class", () => {
+    const value = databaseThrough(45);
+    try {
+      seedEpochAndRoot(value);
+      const insertActor = value.query(`
+        INSERT INTO harness_actors (
+          actor_id, epoch_id, parent_actor_id, depth, title, state,
+          max_depth, max_active_descendants, max_durable_descendants,
+          token_budget, byte_budget, deadline, lane_authority,
+          revision, created_at, updated_at,
+          dispatch_policy_version, work_class
+        ) VALUES (
+          ?1, 'hepoch_fixture0001', 'hactor_rootfixture01', 1, ?2, 'active',
+          3, 2, 4, 1000, 1048576, ?3, 'readOnlySnapshot',
+          1, ?4, ?4, 1, ?5
+        )
+      `);
+      insertActor.run(
+        "hactor_policy46bounded01",
+        "Bounded leaf",
+        deadline,
+        now,
+        "boundedLeaf",
+      );
+      insertActor.run(
+        "hactor_policy46standard01",
+        "Standard work",
+        deadline,
+        now,
+        "standard",
+      );
+      insertValue(value, {
+        valueId: "ctxval_policy46bounded001",
+        operationId: "operation_policy46bounded001",
+        ownerActorId: "hactor_policy46bounded01",
+        purpose: "currentInput",
+      });
+      insertValue(value, {
+        valueId: "ctxval_policy46standard001",
+        operationId: "operation_policy46standard001",
+        ownerActorId: "hactor_policy46standard01",
+        purpose: "currentInput",
+      });
+      value.query(`
+        INSERT INTO harness_actor_turns (
+          turn_id, epoch_id, actor_id, ordinal, idempotency_key,
+          input_value_id, state, desired_state, revision, created_at,
+          started_at, settled_at, outcome_code
+        ) VALUES (
+          'hturn_policy46bounded001', 'hepoch_fixture0001',
+          'hactor_policy46bounded01', 1, 'idempotency-policy46-bounded',
+          'ctxval_policy46bounded001', 'prepared', 'run', 1, ?1,
+          NULL, NULL, NULL
+        )
+      `).run(now);
+      value.query(`
+        INSERT INTO harness_actor_turns (
+          turn_id, epoch_id, actor_id, ordinal, idempotency_key,
+          input_value_id, state, desired_state, revision, created_at,
+          started_at, settled_at, outcome_code, acceleration_mode,
+          acceleration_critical_path, acceleration_bottleneck
+        ) VALUES (
+          'hturn_policy46standard001', 'hepoch_fixture0001',
+          'hactor_policy46standard01', 1, 'idempotency-policy46-standard',
+          'ctxval_policy46standard001', 'prepared', 'run', 1, ?1,
+          NULL, NULL, NULL, 'fast', 1, 'reasoning'
+        )
+      `).run(now);
+
+      const migration = migrations.find((candidate) => candidate.version === 46);
+      if (migration === undefined) throw new Error("migration 46 is missing");
+      value.exec(migration.sql);
+
+      expect(value.query(`
+        SELECT actor_id, requested_service_tier FROM harness_actor_turns
+        WHERE turn_id IN (
+          'hturn_policy46bounded001', 'hturn_policy46standard001'
+        ) ORDER BY actor_id
+      `).all()).toEqual([
+        {
+          actor_id: "hactor_policy46bounded01",
+          requested_service_tier: "fast",
+        },
+        {
+          actor_id: "hactor_policy46standard01",
+          requested_service_tier: "standard",
+        },
+      ]);
+      expect(value.query(`
+        SELECT turn_id, acceleration_mode, acceleration_critical_path,
+          acceleration_bottleneck FROM harness_actor_turns
+        WHERE turn_id IN (
+          'hturn_policy46bounded001', 'hturn_policy46standard001'
+        ) ORDER BY turn_id
+      `).all()).toEqual([
+        {
+          turn_id: "hturn_policy46bounded001",
+          acceleration_mode: "standard",
+          acceleration_critical_path: 0,
+          acceleration_bottleneck: "none",
+        },
+        {
+          turn_id: "hturn_policy46standard001",
+          acceleration_mode: "fast",
+          acceleration_critical_path: 1,
+          acceleration_bottleneck: "reasoning",
+        },
+      ]);
+      expect(() => value.query(`
+        UPDATE harness_actor_turns SET requested_service_tier = 'standard'
+        WHERE turn_id = 'hturn_policy46bounded001'
+      `).run()).toThrow("requested service tier is immutable");
+
+      insertValue(value, {
+        valueId: "ctxval_policy46bounded002",
+        operationId: "operation_policy46bounded002",
+        ownerActorId: "hactor_policy46bounded01",
+        purpose: "currentInput",
+      });
+      expect(() => value.query(`
+        INSERT INTO harness_actor_turns (
+          turn_id, epoch_id, actor_id, ordinal, idempotency_key,
+          input_value_id, state, desired_state, revision, created_at,
+          started_at, settled_at, outcome_code
+        ) VALUES (
+          'hturn_policy46bounded002', 'hepoch_fixture0001',
+          'hactor_policy46bounded01', 2, 'idempotency-policy46-bounded-two',
+          'ctxval_policy46bounded002', 'prepared', 'run', 1, ?1,
+          NULL, NULL, NULL
+        )
+      `).run(now)).toThrow("does not match its work class");
+      value.query(`
+        INSERT INTO harness_actor_turns (
+          turn_id, epoch_id, actor_id, ordinal, idempotency_key,
+          input_value_id, state, desired_state, revision, created_at,
+          started_at, settled_at, outcome_code, requested_service_tier
+        ) VALUES (
+          'hturn_policy46bounded002', 'hepoch_fixture0001',
+          'hactor_policy46bounded01', 2, 'idempotency-policy46-bounded-two',
+          'ctxval_policy46bounded002', 'prepared', 'run', 1, ?1,
+          NULL, NULL, NULL, 'fast'
+        )
+      `).run(now);
+      expect(value.query("PRAGMA integrity_check").get()).toEqual({
+        integrity_check: "ok",
+      });
+    } finally {
+      value.close();
+    }
+  });
+
   test("binds new admission recovery evidence, materialization, and run expiry", () => {
     const value = database();
     try {

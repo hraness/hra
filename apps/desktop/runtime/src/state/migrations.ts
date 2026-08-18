@@ -1,5 +1,6 @@
 import { harnessV2Migrations } from "./harness-v2-migrations";
 import { LONGITUDINAL_ROUTING_SCHEMA_V1_SQL } from "./longitudinal-routing-schema-v1";
+import { ROOT_TURN_ROUTING_SCHEMA_V1_SQL } from "./root-turn-routing-schema-v1";
 import {
   SESSION_SYNC_HARDENING_SCHEMA_SQL,
   SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL,
@@ -3318,5 +3319,86 @@ export const migrations = [
     version: 44,
     name: "longitudinal-routing-shadow-memory",
     sql: LONGITUDINAL_ROUTING_SCHEMA_V1_SQL,
+  },
+  {
+    version: 45,
+    name: "durable-root-turn-routing-receipts",
+    sql: ROOT_TURN_ROUTING_SCHEMA_V1_SQL,
+  },
+  {
+    version: 46,
+    name: "actor-turn-requested-service-tier-authority",
+    sql: `
+      ALTER TABLE harness_actor_turns
+        ADD COLUMN requested_service_tier TEXT NOT NULL DEFAULT 'standard'
+          CHECK (requested_service_tier IN ('standard', 'fast'));
+
+      UPDATE harness_actor_turns
+      SET requested_service_tier = CASE
+        WHEN EXISTS (
+          SELECT 1 FROM harness_actors AS actor
+          WHERE actor.actor_id = harness_actor_turns.actor_id
+            AND actor.dispatch_policy_version = 1
+            AND actor.work_class = 'boundedLeaf'
+        ) THEN 'fast'
+        ELSE 'standard'
+      END;
+
+      CREATE TRIGGER harness_actor_turn_requested_service_tier_insert_guard
+      BEFORE INSERT ON harness_actor_turns
+      WHEN NOT EXISTS (
+        SELECT 1 FROM harness_actors AS actor
+        WHERE actor.actor_id = NEW.actor_id
+          AND NEW.requested_service_tier = CASE
+            WHEN actor.dispatch_policy_version = 1
+              AND actor.work_class = 'boundedLeaf'
+              THEN 'fast'
+            ELSE 'standard'
+          END
+      )
+      BEGIN
+        SELECT RAISE(
+          ABORT,
+          'actor turn requested service tier does not match its work class'
+        );
+      END;
+
+      CREATE TRIGGER harness_actor_turn_requested_service_tier_immutable
+      BEFORE UPDATE OF requested_service_tier ON harness_actor_turns
+      WHEN NEW.requested_service_tier != OLD.requested_service_tier
+      BEGIN
+        SELECT RAISE(ABORT, 'actor turn requested service tier is immutable');
+      END;
+
+      DROP TRIGGER harness_actor_attempt_dispatch_insert_guard;
+      CREATE TRIGGER harness_actor_attempt_dispatch_insert_guard
+      BEFORE INSERT ON harness_actor_turn_attempts
+      WHEN NOT (
+        EXISTS (
+          SELECT 1 FROM harness_actor_turns AS turn
+          WHERE turn.turn_id = NEW.turn_id
+            AND turn.requested_service_tier = NEW.requested_service_tier
+        )
+        AND (
+          (NEW.requested_service_tier = 'standard'
+            AND NEW.realized_service_tier = 'standard'
+            AND NEW.tier_fallback_reason IS NULL
+            AND NEW.fast_reservation_id IS NULL)
+          OR (NEW.requested_service_tier = 'fast'
+            AND NEW.realized_service_tier = 'standard'
+            AND NEW.tier_fallback_reason IN (
+              'fastUnsupported', 'fastReservationUnavailable'
+            )
+            AND NEW.fast_reservation_id IS NULL)
+          OR (NEW.requested_service_tier = 'fast'
+            AND NEW.realized_service_tier = 'fast'
+            AND NEW.tier_fallback_reason IS NULL
+            AND NEW.fast_reservation_id IS NOT NULL)
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid actor attempt dispatch evidence');
+      END;
+    `,
   },
 ] as const satisfies readonly Migration[];

@@ -68,7 +68,6 @@ const expectedScenarios = [
 const expectedCoverage = [
   "chat.pane.attention-recovery",
   "chat.pane.compact-responsive",
-  "chat.pane.configuration",
   "chat.pane.create",
   "chat.pane.draft",
   "chat.pane.inline-title",
@@ -77,6 +76,7 @@ const expectedCoverage = [
   "chat.pane.parallel-performance",
   "chat.pane.streaming",
   "chat.subscription-gate",
+  "chat.turn.routing",
   "harness.native-persistence.direct",
   "harness.ordinary-zero-chrome",
   "harness.provider-recursion.direct",
@@ -109,6 +109,54 @@ describe("HRA Direct catalogs", () => {
     for (const invalid of [-1, 0, 1.5, manyChatPaneCount + 1, Number.NaN]) {
       expect(() => manyChatPaneId(invalid)).toThrow();
     }
+  });
+
+  test("dense panes distinguish every HRA-selected route without provider claims", () => {
+    const scenario = hraScenarioCatalog.resolve("chat-many-panes");
+    if (!scenario.ok) throw new Error(scenario.error.message);
+    const panes = scenario.value.world.gateway.snapshots[0]?.chat.panes.slice(0, 4);
+    expect(panes?.map((pane) => ({
+      requested: pane.turn?.routing?.requestedProfile,
+      selected: pane.turn?.routing?.selectedProfile,
+      profileFallback: pane.turn?.routing?.profileFallbackReason,
+      requestedTier: pane.turn?.routing?.requestedServiceTier,
+      selectedTier: pane.turn?.routing?.selectedServiceTier,
+      tierFallback: pane.turn?.routing?.serviceTierFallbackReason,
+    }))).toEqual([
+      {
+        requested: "lunaMax",
+        selected: "lunaMax",
+        profileFallback: null,
+        requestedTier: "fast",
+        selectedTier: "fast",
+        tierFallback: null,
+      },
+      {
+        requested: "solMax",
+        selected: "solMax",
+        profileFallback: null,
+        requestedTier: "standard",
+        selectedTier: "standard",
+        tierFallback: null,
+      },
+      {
+        requested: "solUltra",
+        selected: "solUltra",
+        profileFallback: null,
+        requestedTier: "standard",
+        selectedTier: "standard",
+        tierFallback: null,
+      },
+      {
+        requested: "lunaMax",
+        selected: "solMax",
+        profileFallback: "lunaUnavailable",
+        requestedTier: "fast",
+        selectedTier: "standard",
+        tierFallback: "fastUnavailable",
+      },
+    ]);
+    expect(JSON.stringify(panes)).not.toContain("observedProfile");
   });
 
   test("declares the exact fixture/direct evidence boundary", () => {
@@ -245,7 +293,6 @@ describe("HRA Direct catalogs", () => {
     for (const session of maximum.remoteSessions) {
       expect(Object.keys(session).toSorted()).toEqual([
         "gridPosition",
-        "modelEffort",
         "originDeviceId",
         "originDeviceName",
         "repositoryDisplayName",
@@ -350,7 +397,6 @@ describe("HRA Direct catalogs", () => {
     expect(snapshot("harness-settings").harness?.settings).toEqual({
       revision: 2,
       recursiveSessionsEnabled: true,
-      automaticFastMode: "criticalPath",
       contextQuotaBytes: 16 * 1024 * 1024,
       refinementMode: "suggest",
     });

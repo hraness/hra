@@ -974,49 +974,14 @@ body,
   font-size: 0.7rem;
 }
 
-.model-toggle {
-  display: flex;
-  flex: 0 0 auto;
-  padding: 0.1rem;
-  border-radius: 0.4rem;
-  background: #1a1a19;
-}
-
-.pane-model-controls {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 0.3rem;
-}
-
-.model-toggle__option {
-  min-height: max(1.5rem, var(--interactive-min-height));
-  padding: 0.18rem 0.32rem;
-  border: 0;
-  border-radius: 0.28rem;
-  background: transparent;
+.pane-route-label {
+  min-width: 0;
+  max-width: 9rem;
+  overflow: hidden;
   color: var(--faint);
-  font: 0.6rem/1 var(--font-mono);
-}
-
-.model-toggle__option[aria-pressed="true"] {
-  background: var(--surface-raised);
-  color: var(--foreground);
-}
-
-.fast-mode-toggle {
-  min-height: max(1.7rem, var(--interactive-min-height));
-  padding: 0.18rem 0.38rem;
-  border: 0;
-  border-radius: 0.4rem;
-  background: #1a1a19;
-  color: var(--faint);
-  font: 0.6rem/1 var(--font-mono);
-}
-
-.fast-mode-toggle[aria-pressed="true"] {
-  background: var(--accent);
-  color: var(--accent-foreground);
+  font: 0.56rem/1.2 var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @keyframes hra-spin {
@@ -1459,9 +1424,6 @@ body,
   .harness-quota {
     grid-column: 1 / -1;
   }
-}
-
-@media (max-width: 26rem) {
 }
 
 @media (prefers-reduced-motion: reduce) {

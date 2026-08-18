@@ -53,7 +53,7 @@ export const optimizerPolicyRevisionSchema = z.object({
   wideResearch: z.literal("solUltra"),
   standard: z.literal("solMax"),
   boundedLeaf: optimizerPolicySchema,
-  automaticFast: z.literal("inheritHarnessSetting"),
+  serviceTierPolicy: z.literal("workClassDerived"),
   nativeCollaboration: z.literal(false),
 }).strict();
 export type OptimizerPolicyRevision = z.infer<
@@ -66,7 +66,7 @@ export const OPTIMIZER_CONTROL_POLICY_V1 = Object.freeze({
   wideResearch: "solUltra",
   standard: "solMax",
   boundedLeaf: "lunaThenSol",
-  automaticFast: "inheritHarnessSetting",
+  serviceTierPolicy: "workClassDerived",
   nativeCollaboration: false,
 } satisfies OptimizerPolicyRevision);
 

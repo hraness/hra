@@ -141,6 +141,8 @@ import {
 } from "./harness/production-composition-v2";
 import { createHarnessProductionGraphV2 } from
   "./harness/production-graph-v2";
+import { RootTurnRoutingSQLiteAuthorityV1 } from
+  "./harness/root-turn-routing-sqlite-v1";
 import {
   HarnessInstallKeyCustody,
   harnessInstallKeyDescriptor,
@@ -2374,6 +2376,7 @@ async function initializeGateway(): Promise<void> {
             ));
           },
         },
+        rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(chatControlPlane),
         store: initializingChatPaneStore,
         workspaces: initializingChatWorkspaces,
       }),
@@ -5250,7 +5253,7 @@ async function executeDomainCommand(
     }
     case "chat.pane.create":
     case "chat.pane.rename":
-    case "chat.pane.configure":
+    case "chat.pane.workspace.recover":
     case "chat.pane.repository.select":
     case "chat.pane.remove":
     case "chat.panes.reorder":

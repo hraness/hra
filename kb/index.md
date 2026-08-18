@@ -21,7 +21,7 @@ This vault keeps captured sources separate from maintained notes. Catalog links 
 
 ### Plans
 
-- [[plans/hra-longitudinal-routing|Longitudinal routing evidence and shadow recommendations]] — Status: in-progress. Build a per-pane, content-free evidence loop that recommends execution profiles without changing live routes.
+- [[plans/hra-longitudinal-routing|Longitudinal routing evidence and shadow recommendations]] — Status: in-progress. Route ordinary root prompts through a bounded deterministic policy while building per-pane, content-free evidence for later shadow recommendations.
 
 ### Scopes
 
