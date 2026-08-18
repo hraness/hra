@@ -16,9 +16,6 @@ export const HRA_RLM_DYNAMIC_TOOL_SEMANTIC_CONTRACT_VERSION = 1 as const;
 /** Exact v0 spec digest. It may reconcile stored effects, never start new work. */
 export const HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256 =
   "4f7fd56a5855c36761265fcf2665be96ae7ed3e3737d382427996b0c6c441a13" as const;
-/** Exact pre-routing.inspect v1 spec digest. Existing effects may only recover. */
-export const HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256 =
-  "c8233c335cf93d1e8a412a5bfe81d71246b99fa120a58d4c29763caf6aac8fb4" as const;
 export const MAX_CODEX_DYNAMIC_TOOL_ARGUMENT_BYTES = 256 * 1_024;
 export const MAX_CODEX_DYNAMIC_TOOL_OUTPUT_BYTES = 256 * 1_024;
 export const MAX_CODEX_DYNAMIC_TOOL_OUTPUT_ITEMS = 16;
@@ -638,10 +635,7 @@ export function classifyHraRlmDynamicToolSpecDigest(
   if (digest === HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256) return "current";
   if (
     purpose === "recovery" &&
-    (
-      digest === HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256 ||
-      digest === HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256
-    )
+    digest === HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256
   ) {
     return "predecessorRecoveryOnly";
   }

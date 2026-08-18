@@ -4,7 +4,6 @@ import { Database } from "bun:sqlite";
 import type { AccountRuntimeRouter } from "../src/accounts/runtime-router";
 import {
   HRA_RLM_DYNAMIC_TOOL_SPEC_SHA256,
-  HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
 } from "../src/codex";
 import { actorSchema } from "../src/harness/actor-domain";
 import {
@@ -409,30 +408,6 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
       });
       expect(currentSettings.capabilities).toContain("routing.inspect");
 
-      // Simulate a durable incarnation created under the immediately prior v1
-      // declaration. Its old operation set remains usable, but the newly added
-      // routing operation is never granted to that provider thread.
-      value.database.query(`
-        UPDATE harness_actor_incarnations SET toolset_digest = ?2
-        WHERE incarnation_id = ?1
-      `).run(
-        incarnation.id,
-        HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
-      );
-      const predecessorSettings = await value.service.readAcceptedSettings({
-        ...settingsInput(value.admitted),
-        actorId: actor.id,
-        turnId: turn.id,
-      }) as { capabilities: string[] };
-      expect(predecessorSettings.capabilities).toEqual([
-        "agent.cancel",
-        "agent.message",
-        "agent.spawn",
-        "agent.wait",
-        "heap.read",
-        "heap.write",
-      ]);
-
       value.database.query(`
         UPDATE account_profiles SET process_generation = 8, updated_at = ?2
         WHERE profile_id = ?1
@@ -475,7 +450,7 @@ describe("HarnessDynamicToolEvidenceSettingsAuthorityV2", () => {
       expect(recoveredSettings).toMatchObject({
         budget: { tokenBudget: 20_000 },
       });
-      expect(recoveredSettings.capabilities).not.toContain("routing.inspect");
+      expect(recoveredSettings.capabilities).toContain("routing.inspect");
 
       value.database.exec("SAVEPOINT retired_actor_session");
       actors.transitionActorIncarnation({

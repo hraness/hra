@@ -28,7 +28,6 @@ import type {
 import {
   HRA_RLM_DYNAMIC_TOOL_SEMANTIC_CONTRACT_VERSION,
   HRA_RLM_DYNAMIC_TOOL_V1_SPEC_SHA256,
-  HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
   HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256,
   classifyHraRlmDynamicToolSpecDigest,
 } from "../src/codex/dynamic-tool";
@@ -224,19 +223,6 @@ describe("pinned Codex dynamic tool codecs", () => {
       HRA_RLM_PREDECESSOR_DYNAMIC_TOOL_SPEC_SHA256,
       "recovery",
     )).toBe("predecessorRecoveryOnly");
-    expect(HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256).toBe(
-      "c8233c335cf93d1e8a412a5bfe81d71246b99fa120a58d4c29763caf6aac8fb4",
-    );
-    expect(classifyHraRlmDynamicToolSpecDigest(
-      HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
-      "fresh",
-    ))
-      .toBeNull();
-    expect(classifyHraRlmDynamicToolSpecDigest(
-      HRA_RLM_PRE_ROUTING_INSPECT_DYNAMIC_TOOL_SPEC_SHA256,
-      "recovery",
-    ))
-      .toBe("predecessorRecoveryOnly");
     expect(classifyHraRlmDynamicToolSpecDigest("0".repeat(64), "recovery"))
       .toBeNull();
   });
