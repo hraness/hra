@@ -9,8 +9,8 @@
 - `production-execution-policy.ts` – immutable full-access production policy, managed-requirements preflight proof, and exact-generation thread and turn admission receipts.
 - `dynamic-tool.ts` – the disabled-by-default, exact-`0.144.6`-probe-witnessed lexical RLM v2 callback contract, bounds, caller identity, and generation-local replay ledger.
 - `safe-display.ts` – terminal-safe, UTF-8-byte-bounded owned display prose.
-- `facts.ts` – the closed positioned HRA fact vocabulary and aggregate fact bound.
-- `fact-projector.ts` – the only strict parsed-notification and positioned-response projection into owned facts.
+- `facts.ts` – the closed positioned HRA fact vocabulary, reasoning-summary part identity, privacy-scrubbed provider-agent observations, and aggregate fact bound.
+- `fact-projector.ts` – the only strict parsed-notification and positioned-response projection into owned facts, including ordered summary parts and collaboration status with prompt, message, model, effort, and path fields removed.
 - `fact-router.ts` – one notification projection and explicit immutable fan-out to account and session consumers.
 - `compatibility-0-144-6.ts` – exact version-specific remote-error classification with bounded provider-text inspection.
 - `supervisor.ts` – bounded process restart sequencing, caller-supplied durable generation floors, and capped backoff.
@@ -33,5 +33,7 @@
 - Admit only witnessed v1 operations: completed-prefix/current-input context reads, `thread/start` actor incarnations, idle-boundary `turn/start` follow-ups, and receipt-backed status, waits, result, and cancellation. Reject `thread/fork`, `turn/steer`, goals, and all non-v1 harness operations.
 - Assign one safe monotonic stream position to each accepted current-generation envelope before dispatch and to each successfully written server-request response. Do not position stale, malformed, failed, or expired work.
 - Reject an owned fact before fan-out when its encoded form exceeds the shared eight-MiB aggregate bound. Keep each retained display field within its smaller semantic bound.
+- Preserve `itemId` and `summaryIndex` on sanctioned reasoning-summary deltas, retain ordered sanitized summary parts on completion, and continue discarding raw reasoning-content deltas before fact projection.
+- Reduce collaboration items to provider-private agent identity plus starting, running, or terminal status. Never copy collaboration prompts, messages, models, reasoning effort, agent paths, or sender identity into an owned fact.
 - Use the typed positioned-response API for hydration watermarks. Do not expose raw responses or transport request IDs.
 - Treat unsupported server requests as expired after returning JSON-RPC method-not-found; never leave app-server waiting on an unknown callback.

@@ -146,6 +146,126 @@ describe("Codex fact projection", () => {
     expect(projected[0]?.encodedBytes).toBeGreaterThan(0);
   });
 
+  test("retains reasoning item identity and part index while discarding raw reasoning", () => {
+    const summary = parseCodexNotification("item/reasoning/summaryTextDelta", {
+      threadId: "private-thread",
+      turnId: "private-turn",
+      itemId: "private-reasoning-item",
+      delta: "Checking the queue seam",
+      summaryIndex: 3,
+    });
+    if (summary === null) throw new Error("Expected parsed reasoning summary");
+    expect(projectCodexNotificationFacts("account_1", {
+      ...summary,
+      generation: 4,
+      streamPosition: 12,
+    })).toMatchObject([{
+      type: "item.delta",
+      channel: "reasoning_summary",
+      itemId: "private-reasoning-item",
+      summaryIndex: 3,
+      delta: "Checking the queue seam",
+    }]);
+
+    const part = parseCodexNotification("item/reasoning/summaryPartAdded", {
+      threadId: "private-thread",
+      turnId: "private-turn",
+      itemId: "private-reasoning-item",
+      summaryIndex: 4,
+    });
+    if (part === null) throw new Error("Expected parsed reasoning part");
+    expect(projectCodexNotificationFacts("account_1", {
+      ...part,
+      generation: 4,
+      streamPosition: 13,
+    })).toEqual([]);
+
+    const raw = parseCodexNotification("item/reasoning/textDelta", {
+      threadId: "private-thread",
+      turnId: "private-turn",
+      itemId: "private-reasoning-item",
+      delta: "PRIVATE RAW REASONING",
+      contentIndex: 0,
+    });
+    if (raw === null) throw new Error("Expected explicit raw-reasoning discard");
+    const discarded = projectCodexNotificationFacts("account_1", {
+      ...raw,
+      generation: 4,
+      streamPosition: 14,
+    });
+    expect(discarded).toEqual([]);
+    expect(JSON.stringify(discarded)).not.toContain("PRIVATE RAW REASONING");
+  });
+
+  test("projects ordered completion parts and only privacy-scrubbed agent activity", () => {
+    const reasoning = parseCodexNotification("item/completed", {
+      threadId: "private-thread",
+      turnId: "private-turn",
+      item: {
+        type: "reasoning",
+        id: "private-reasoning-item",
+        summary: ["First part", "Second part"],
+        content: ["PRIVATE RAW REASONING"],
+      },
+      completedAtMs: 1_700_000_000_000,
+    });
+    if (reasoning === null) throw new Error("Expected reasoning completion");
+    const reasoningFacts = projectCodexNotificationFacts("account_1", {
+      ...reasoning,
+      generation: 4,
+      streamPosition: 15,
+    });
+    expect(reasoningFacts).toMatchObject([{
+      type: "item.completed",
+      item: {
+        kind: "reasoning_summary",
+        summaryParts: ["First part", "Second part"],
+        text: "First part\nSecond part",
+      },
+    }]);
+    expect(JSON.stringify(reasoningFacts)).not.toContain("PRIVATE RAW REASONING");
+
+    const collaboration = parseCodexNotification("item/started", {
+      threadId: "private-root-thread",
+      turnId: "private-root-turn",
+      item: {
+        type: "collabAgentToolCall",
+        id: "private-tool-item",
+        tool: "spawnAgent",
+        status: "inProgress",
+        senderThreadId: "private-root-thread",
+        receiverThreadIds: ["private-agent-a", "private-agent-b"],
+        prompt: "PRIVATE PROMPT",
+        model: "PRIVATE MODEL",
+        reasoningEffort: "PRIVATE EFFORT",
+        agentsStates: {
+          "private-agent-a": { status: "running", message: "PRIVATE MESSAGE" },
+          "private-agent-b": { status: "pendingInit", message: null },
+        },
+      },
+      startedAtMs: 1_700_000_000_000,
+    });
+    if (collaboration === null) throw new Error("Expected collaboration item");
+    const collaborationFacts = projectCodexNotificationFacts("account_1", {
+      ...collaboration,
+      generation: 4,
+      streamPosition: 16,
+    });
+    expect(collaborationFacts.map(({ type, factIndex }) => [type, factIndex]))
+      .toEqual([["item.started", 0]]);
+    expect(collaborationFacts).toMatchObject([{
+      providerAgents: [
+        { agentId: "private-agent-a", status: "running" },
+        { agentId: "private-agent-b", status: "starting" },
+      ],
+    }]);
+    const encoded = JSON.stringify(collaborationFacts);
+    expect(encoded).not.toContain("PRIVATE PROMPT");
+    expect(encoded).not.toContain("PRIVATE MODEL");
+    expect(encoded).not.toContain("PRIVATE EFFORT");
+    expect(encoded).not.toContain("PRIVATE MESSAGE");
+  });
+
   test("projects cumulative turn usage separately from the latest interaction", () => {
     const projected = projectCodexNotificationFacts("account_1", {
       generation: 4,

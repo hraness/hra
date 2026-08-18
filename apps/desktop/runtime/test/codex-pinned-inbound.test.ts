@@ -170,6 +170,15 @@ const notificationFixtures = [
     },
   },
   {
+    method: "item/reasoning/summaryPartAdded",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+      summaryIndex: 1,
+    },
+  },
+  {
     method: "item/reasoning/textDelta",
     params: {
       threadId: "thread-1",
@@ -205,6 +214,7 @@ const invalidNotificationFixtures = [
   { method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "", delta: "a" } },
   { method: "item/commandExecution/outputDelta", params: { threadId: "thread-1", turnId: "", itemId: "item-1", delta: "a" } },
   { method: "item/reasoning/summaryTextDelta", params: { threadId: "", turnId: "turn-1", itemId: "item-1", delta: "a" } },
+  { method: "item/reasoning/summaryPartAdded", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", summaryIndex: -1 } },
   { method: "item/reasoning/textDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-1", delta: "secret", contentIndex: -1 } },
   { method: "serverRequest/resolved", params: { threadId: "thread-1", requestId: null } },
 ] as const;

@@ -101,6 +101,14 @@ export type CodexToolActivity =
   | "search"
   | "sleep";
 
+export type CodexProviderAgentStatus = "running" | "starting" | "terminal";
+
+export interface CodexProviderAgentObservation {
+  /** Provider-private identity. It must never cross a renderer adapter. */
+  readonly agentId: string;
+  readonly status: CodexProviderAgentStatus;
+}
+
 export type CodexItemSnapshot =
   | Readonly<{
       id: string;
@@ -118,6 +126,8 @@ export type CodexItemSnapshot =
   | Readonly<{
       id: string;
       kind: "reasoning_summary";
+      /** Sanitized, ordered summary parts retained for exact completion proof. */
+      summaryParts: readonly string[];
       text: string;
       truncated: boolean;
     }>
@@ -138,6 +148,8 @@ export interface CodexTurnSnapshot {
   readonly id: string;
   /** `null` preserves item history when the provider returns a partial view. */
   readonly items: readonly CodexItemSnapshot[] | null;
+  /** Private semantic collaboration state reconstructed from the item view. */
+  readonly providerAgents?: readonly CodexProviderAgentObservation[];
   readonly quotaProof?: "provider_usage_limit_exceeded";
   readonly startedAt: string | null;
   readonly status: CodexTurnStatus;
@@ -268,19 +280,31 @@ export type CodexFact =
       readonly activity: CodexToolActivity | null;
       readonly itemId: string;
       readonly kind: "assistant_text" | "reasoning_summary" | "tool";
+      readonly providerAgents?: readonly CodexProviderAgentObservation[];
       readonly threadId: string;
       readonly turnId: string;
     }>
   | Fact<"item.delta", {
-      readonly channel: "assistant_text" | "reasoning_summary";
+      readonly channel: "assistant_text";
       readonly delta: string;
       readonly itemId: string;
       readonly threadId: string;
       readonly truncated: boolean;
       readonly turnId: string;
     }>
+  | Fact<"item.delta", {
+      readonly channel: "reasoning_summary";
+      readonly delta: string;
+      readonly itemId: string;
+      readonly partAdded?: false;
+      readonly summaryIndex: number;
+      readonly threadId: string;
+      readonly truncated: boolean;
+      readonly turnId: string;
+    }>
   | Fact<"item.completed", {
       readonly item: CodexItemSnapshot;
+      readonly providerAgents?: readonly CodexProviderAgentObservation[];
       readonly threadId: string;
       readonly turnId: string;
     }>
