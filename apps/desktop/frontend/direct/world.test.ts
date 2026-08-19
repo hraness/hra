@@ -45,6 +45,7 @@ describe("HRA Direct world", () => {
   test("compact-chat surfaces are strict, bounded, and reference an initial pane", () => {
     const pane = {
       id: "pane_worldcompact01",
+      paletteIndex: 8,
       revision: 1,
       title: "Compact",
       repository: { id: hraDirectTaskIds.repository, name: "hra" },
@@ -68,7 +69,6 @@ describe("HRA Direct world", () => {
       surface: {
         kind: "compactChat",
         paneId: pane.id,
-        paletteIndex: 8,
         nowUnixMilliseconds: 123_000,
         attachments: [{
           id: "attachment_worldcompact01",
@@ -84,7 +84,7 @@ describe("HRA Direct world", () => {
       },
     });
 
-    expect(compact.surface).toMatchObject({ kind: "compactChat", paletteIndex: 8 });
+    expect(compact.surface).toMatchObject({ kind: "compactChat" });
     expect(() => parseHRADirectWorld({
       ...compact,
       surface: { ...compact.surface, paneId: "pane_missingcompact1" },

@@ -56,7 +56,9 @@ export function focusMainContent(
 
 function paneCreationError(response: RuntimeDispatchResponse): string | null {
   if (!response.ok) return response.error.message;
-  return response.result.type === "chatPane"
+  return response.result.type === "chatPane" ||
+      (response.result.type === "chatPaneReplay" &&
+        response.result.commandType === "chat.pane.create")
     ? null
     : "The local runtime returned the wrong pane result.";
 }

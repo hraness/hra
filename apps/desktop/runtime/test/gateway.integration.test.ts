@@ -70,7 +70,10 @@ import {
   operationReceiptKeyPath,
 } from "../src/state/operation-receipt-key";
 import { DispatchRunnerInstallationStore } from "../src/state/dispatch-runner-installation";
-import { ChatPaneStore } from "../src/state/chat-pane-store";
+import {
+  ChatPaneStore,
+  harnessObserverPaneId,
+} from "../src/state/chat-pane-store";
 import { LocalTaskStore } from "../src/state/local-task-store";
 
 const temporaryDirectories: string[] = [];
@@ -2580,6 +2583,212 @@ describe("compiled gateway boundary", () => {
     expect(disposedSnapshot.runtime.state).toBe("ready");
     expect(liveSnapshot.runtime.state).toBe("ready");
   });
+
+  test("rejects attachment custody for an exact harness observer pane", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-gateway-observer-attachment-"));
+    temporaryDirectories.push(root);
+    const paths = await installFakeGit(root);
+    const databasePath = controlPlanePath(root);
+    const accountProfileId = "acct_gateway_observer1";
+    const actorId = "hactor_gatewayobserver1";
+    const paneId = harnessObserverPaneId(actorId);
+    const state = openControlPlane(databasePath, {
+      releaseIdentity: hraReleaseIdentity,
+    });
+    try {
+      new AccountProfileStore(state, {
+        idFactory: () => accountProfileId,
+      }).create("Observer subscription");
+      new ChatPaneStore(state).createAttachedHarnessSession({
+        actorId,
+        repository: {
+          id: publicId("repo", 9_801),
+          name: "Observer repository",
+          workingDirectory: root,
+        },
+        binding: {
+          accountProfileId,
+          threadId: "thread_gateway_observer",
+          restartThreadId: "raw_thread_gateway_observer",
+        },
+        title: "Observer",
+        now: new Date("2026-08-18T12:00:00.000Z"),
+      });
+    } finally {
+      state.close();
+    }
+    collectClosedFixtureDatabaseReferences();
+
+    const child = spawnGateway({
+      cwd: join(import.meta.dir, "..", ".."),
+      env: {
+        HOME: root,
+        HRA_CODEX_BIN: process.execPath,
+        HRA_GIT_BIN: paths.gitBinary,
+        HRA_GIT_ROOT: paths.gitRoot,
+        PATH: "/usr/bin:/bin",
+        TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = new GatewayOutputReader(child.stdout);
+    await output.readUntil(
+      (lines) => hasRuntimeState(lines, "ready"),
+      "the observer attachment gateway became ready",
+    );
+    await child.stdin.write(dispatchRequest(
+      "bridge-observer-attachment-begin",
+      "op_observer_attachment_begin",
+      {
+        type: "chat.attachment.begin",
+        paneId,
+        attachmentId: "attachment_gatewayobserver1",
+        uploadId: "upload_gatewayobserver001",
+        kind: "image",
+        displayName: "observer.png",
+        declaredMediaType: "image/png",
+        expectedBytes: 3,
+      },
+    ));
+    await output.readUntil(
+      (lines) => hasBridgeResult(lines, "bridge-observer-attachment-begin"),
+      "the observer attachment rejection",
+    );
+    expect(parseRuntimeDispatchResponse(bridgeResult(
+      output.currentLines(),
+      "bridge-observer-attachment-begin",
+    ))).toMatchObject({
+      ok: false,
+      error: {
+        code: "policy_denied",
+        retryable: false,
+        message: "Attachments are available only in ordinary chat panes.",
+      },
+    });
+
+    await child.stdin.end();
+    const [stderr, exitCode] = await Promise.all([
+      new Response(child.stderr).text(),
+      child.exited,
+      output.readToEnd(),
+    ]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    const reopened = new Database(databasePath, { strict: true });
+    try {
+      expect(reopened.query(`
+        SELECT COUNT(*) AS count FROM chat_attachments WHERE pane_id = ?1
+      `).get(paneId)).toEqual({ count: 0 });
+      expect(reopened.query(`
+        SELECT COUNT(*) AS count FROM operation_receipts
+        WHERE operation_id = 'op_observer_attachment_begin'
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      reopened.close();
+    }
+  }, 90_000);
+
+  test("rejects crafted generic attachment custody before vault or receipt mutation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-gateway-generic-attachment-"));
+    temporaryDirectories.push(root);
+    const paths = await installFakeGit(root);
+    const databasePath = controlPlanePath(root);
+    const accountProfileId = "acct_gateway_generic01";
+    const paneId = "pane_gatewaygeneric01";
+    const state = openControlPlane(databasePath, {
+      releaseIdentity: hraReleaseIdentity,
+    });
+    try {
+      new AccountProfileStore(state, {
+        idFactory: () => accountProfileId,
+      }).create("Generic attachment denial");
+      new ChatPaneStore(state).create({
+        paneId,
+        repository: {
+          id: publicId("repo", 9_802),
+          name: "Generic attachment repository",
+          workingDirectory: root,
+        },
+        accountProfileId,
+        now: new Date("2026-08-18T12:00:00.000Z"),
+      });
+    } finally {
+      state.close();
+    }
+    collectClosedFixtureDatabaseReferences();
+
+    const child = spawnGateway({
+      cwd: join(import.meta.dir, "..", ".."),
+      env: {
+        HOME: root,
+        HRA_CODEX_BIN: process.execPath,
+        HRA_GIT_BIN: paths.gitBinary,
+        HRA_GIT_ROOT: paths.gitRoot,
+        PATH: "/usr/bin:/bin",
+        TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = new GatewayOutputReader(child.stdout);
+    await output.readUntil(
+      (lines) => hasRuntimeState(lines, "ready"),
+      "the generic attachment gateway became ready",
+    );
+    await child.stdin.write(dispatchRequest(
+      "bridge-generic-attachment-begin",
+      "op_generic_attachment_begin",
+      {
+        type: "chat.attachment.begin",
+        paneId,
+        attachmentId: "attachment_gatewaygeneric1",
+        uploadId: "upload_gatewaygeneric001",
+        kind: "file",
+        displayName: "private.txt",
+        declaredMediaType: "text/plain",
+        expectedBytes: 3,
+      },
+    ));
+    await output.readUntil(
+      (lines) => hasBridgeResult(lines, "bridge-generic-attachment-begin"),
+      "the generic attachment rejection",
+    );
+    expect(parseRuntimeDispatchResponse(bridgeResult(
+      output.currentLines(),
+      "bridge-generic-attachment-begin",
+    ))).toMatchObject({
+      ok: false,
+      error: {
+        code: "policy_denied",
+        retryable: false,
+        message: "HRA currently supports image attachments only.",
+      },
+    });
+
+    await child.stdin.end();
+    const [stderr, exitCode] = await Promise.all([
+      new Response(child.stderr).text(),
+      child.exited,
+      output.readToEnd(),
+    ]);
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    const reopened = new Database(databasePath, { strict: true });
+    try {
+      expect(reopened.query(`
+        SELECT COUNT(*) AS count FROM chat_attachments WHERE pane_id = ?1
+      `).get(paneId)).toEqual({ count: 0 });
+      expect(reopened.query(`
+        SELECT COUNT(*) AS count FROM operation_receipts
+        WHERE operation_id = 'op_generic_attachment_begin'
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      reopened.close();
+    }
+  }, 90_000);
 
   test(
     "quiesces every writer, emits only the private launch envelope, and rejects queued writes",

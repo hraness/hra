@@ -929,12 +929,7 @@ class DirectProbeGeneration {
   }
 
   async archiveThread(threadId: string): Promise<void> {
-    const value = await this.#core.request(
-      "thread/archive",
-      { threadId },
-      { intent: "ambiguousMutation", timeoutMs: PROBE_PROTOCOL_TIMEOUT_MS },
-    );
-    z.object({}).strict().parse(value);
+    await this.#request("threadArchive", { threadId });
   }
 
   close(): Promise<void> {
@@ -965,6 +960,7 @@ class DirectProbeGeneration {
       {
         intent: key === "threadStart" ||
             key === "threadResume" ||
+            key === "threadArchive" ||
             key === "turnStart" ||
             key === "turnInterrupt"
           ? "ambiguousMutation"

@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { chatAttachmentVaultRoot } from "./src/attachments/root";
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { hraReleaseIdentity } from "./release-identity";
@@ -6,6 +7,7 @@ import {
   ControlPlaneBackupError,
   createEncryptedControlPlaneBackup,
   inspectEncryptedControlPlaneBackup,
+  inspectControlPlaneAttachmentBackupReadiness,
   recoverPublishedCreateOnlyBackup,
   restoreEncryptedControlPlaneBackup,
   verifyEncryptedControlPlaneBackup,
@@ -92,6 +94,7 @@ export class ControlPlaneMaintenanceError extends Error {
     | "application_support_roots"
     | "application_support_unsafe"
     | "account_profile_capacity_quarantine"
+    | "attachment_vault_recovery"
     | "backup_input_invalid"
     | "restore_interrupted"
     | "state_path_unsafe";
@@ -289,6 +292,19 @@ function doctor(
           "account_profile_capacity_quarantine",
         );
       }
+      try {
+        inspectControlPlaneAttachmentBackupReadiness({
+          database,
+          attachmentVaultRoot: chatAttachmentVaultRoot(databasePath),
+        });
+      } catch (error: unknown) {
+        if (!(error instanceof ControlPlaneBackupError)) throw error;
+        throw new ControlPlaneMaintenanceError(
+          "state_unhealthy",
+          "review_state_recovery",
+          "attachment_vault_recovery",
+        );
+      }
       receiptKey = loadExistingOperationReceiptKey(
         operationReceiptKeyPath(databasePath),
       );
@@ -315,6 +331,7 @@ function inspect(archivePath: string): Readonly<Record<string, unknown>> {
     sourceRelease: manifest.sourceRelease,
     sourceMigrationVersion: manifest.sourceMigrationVersion,
     payloadByteLength: manifest.payloadByteLength,
+    attachmentVault: manifest.attachmentVault,
   };
 }
 
@@ -343,9 +360,12 @@ async function verify(
       command: "verify",
       status: "verified",
       archiveSha256: verified.archiveSha256,
+      peakResidentByteEstimate: verified.peakResidentByteEstimate,
+      maximumBufferedPlaintextBytes: verified.maximumBufferedPlaintextBytes,
       createdAt: verified.manifest.createdAt,
       sourceRelease: verified.manifest.sourceRelease,
       sourceMigrationVersion: verified.manifest.sourceMigrationVersion,
+      attachmentVault: verified.manifest.attachmentVault,
     };
   };
   // Verification is archive-only recovery evidence. When canonical local
@@ -378,6 +398,7 @@ async function restore(
       archiveSha256: restored.archiveSha256,
       sourceRelease: restored.manifest.sourceRelease,
       restoredMigrationVersion: restored.restoredMigrationVersion,
+      attachmentVault: restored.manifest.attachmentVault,
     };
   });
 }
@@ -429,10 +450,10 @@ async function backup(
       const created = createEncryptedControlPlaneBackup({
         database,
         destinationPath: archivePath,
+        attachmentVaultRoot: chatAttachmentVaultRoot(databasePath),
         operationReceiptKey: receiptKey,
         passphrase,
         releaseIdentity: hraReleaseIdentity,
-        replaceExisting: false,
       });
       return {
         schemaVersion: 1,
@@ -440,8 +461,11 @@ async function backup(
         status: "created",
         archiveByteLength: created.archiveByteLength,
         archiveSha256: created.archiveSha256,
+        peakResidentByteEstimate: created.peakResidentByteEstimate,
+        maximumBufferedPlaintextBytes: created.maximumBufferedPlaintextBytes,
         createdAt: created.manifest.createdAt,
         sourceMigrationVersion: created.manifest.sourceMigrationVersion,
+        attachmentVault: created.manifest.attachmentVault,
       };
     } finally {
       receiptKey?.fill(0);

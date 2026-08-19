@@ -166,6 +166,83 @@ describe("control-plane maintenance tool", () => {
     expect(readFileSync(operationReceiptKeyPath(databasePath)).byteLength).toBe(32);
   });
 
+  test("reports a missing attachment vault and durable storage quarantine", async () => {
+    for (const variant of ["missing_vault", "storage_quarantine"] as const) {
+      const home = temporaryHome();
+      const databasePath = createControlPlane(home);
+      if (variant === "missing_vault") {
+        rmSync(join(dirname(databasePath), "attachment-vault-v2"), {
+          recursive: true,
+        });
+      } else {
+        const database = new Database(databasePath, { strict: true });
+        try {
+          const now = "2026-08-18T12:00:00.000Z";
+          database.query(`
+            INSERT INTO account_profiles (
+              profile_id, label, auth_state, process_generation,
+              selected, created_at, updated_at
+            ) VALUES (
+              'acct_doctor_attachment_01', 'Attachment recovery',
+              'signed_in', 1, 1, ?1, ?1
+            )
+          `).run(now);
+          database.query(`
+            INSERT INTO chat_panes (
+              pane_id, palette_index, display_order, repository_id,
+              repository_name, revision, title, account_profile_id,
+              model, reasoning_effort, service_tier, interaction_mode, state,
+              workspace_mode, workspace_state, workspace_revision,
+              workspace_recovery_reason, created_at, updated_at
+            ) VALUES (
+              'pane_doctor_attachment_01', 0, 0,
+              'repo_doctor_attachment_000001', 'Attachment recovery', 1,
+              'Attachment recovery', 'acct_doctor_attachment_01',
+              'gpt-5.6-sol', 'max', 'standard', 'chat', 'ready',
+              'managed_worktree', 'preparing', 1, NULL, ?1, ?1
+            )
+          `).run(now);
+          database.query(`
+            INSERT INTO chat_attachments (
+              attachment_id, upload_id, pane_id, revision, state, kind,
+              display_name, declared_media_type, internal_suffix,
+              expected_input_bytes, received_input_bytes, source_retained,
+              next_chunk_ordinal, created_at, updated_at
+            ) VALUES (
+              'attachment_doctor_file01', 'upload_doctor_file01',
+              'pane_doctor_attachment_01', 1, 'receiving', 'file',
+              'doctor.txt', 'text/plain', 'txt', 1, 0, 1, 0, ?1, ?1
+            )
+          `).run(now);
+          database.query(`
+            INSERT INTO chat_attachment_storage_quarantines (
+              attachment_id, pane_id, reason, detected_at
+            ) VALUES (
+              'attachment_doctor_file01', 'pane_doctor_attachment_01',
+              'normalizer_cleanup', ?1
+            )
+          `).run(now);
+        } finally {
+          database.close();
+        }
+      }
+      const capture = capturedIO();
+      expect(await runControlPlaneMaintenance({
+        args: ["doctor"],
+        environment: { HOME: home },
+        io: capture.io,
+      })).toBe(1);
+      expect(capture.output()).toEqual([]);
+      expect(capture.errors()).toEqual([{
+        schemaVersion: 1,
+        status: "error",
+        code: "state_unhealthy",
+        action: "review_state_recovery",
+        reason: "attachment_vault_recovery",
+      }]);
+    }
+  });
+
   test("reports preserved legacy account overflow as an actionable recovery state", async () => {
     const home = temporaryHome();
     const databasePath = createControlPlane(home);
@@ -252,7 +329,22 @@ describe("control-plane maintenance tool", () => {
       command: "backup",
       status: "created",
       sourceMigrationVersion: currentControlPlaneMigrationVersion,
+      attachmentVault: {
+        blobCount: 0,
+        totalBytes: 0,
+        providerHomesIncluded: false,
+        rolloutStateIncluded: false,
+        restoredAttachmentProviderContext: "fresh_send_required",
+      },
     });
+    expect(numberField(
+      createCapture.output()[0],
+      "peakResidentByteEstimate",
+    )).toBeGreaterThan(0);
+    expect(numberField(
+      createCapture.output()[0],
+      "maximumBufferedPlaintextBytes",
+    )).toBeGreaterThan(0);
     expect(readFileSync(archivePath).toString("latin1")).not.toContain(passphrase);
     const archiveBytes = Buffer.from(readFileSync(archivePath));
 
@@ -268,11 +360,16 @@ describe("control-plane maintenance tool", () => {
       status: "headerReadable",
       sourceRelease: hraReleaseIdentity,
       sourceMigrationVersion: currentControlPlaneMigrationVersion,
+      attachmentVault: {
+        blobCount: 0,
+        totalBytes: 0,
+        restoredAttachmentProviderContext: "fresh_send_required",
+      },
     });
 
     const candidatePath = join(
       dirname(archivePath),
-      `.${basename(archivePath)}.hraness-backup-v1.tmp`,
+      `.${basename(archivePath)}.hraness-backup-v2.tmp`,
     );
     linkSync(archivePath, candidatePath);
     expect(lstatSync(archivePath).nlink).toBe(2);
@@ -286,11 +383,12 @@ describe("control-plane maintenance tool", () => {
     expect(repeatCapture.errors()).toEqual([{
       schemaVersion: 1,
       status: "error",
-      code: "archive_exists",
-      action: "choose_new_archive_path",
+      code: "tool_failure",
+      reason: "restore_interrupted",
+      action: "review_state_recovery",
     }]);
-    expect(existsSync(candidatePath)).toBe(false);
-    expect(lstatSync(archivePath).nlink).toBe(1);
+    expect(existsSync(candidatePath)).toBe(true);
+    expect(lstatSync(archivePath).nlink).toBe(2);
     expect(readFileSync(archivePath)).toEqual(archiveBytes);
   }, 60_000);
 
@@ -330,6 +428,14 @@ describe("control-plane maintenance tool", () => {
       backupCapture.output()[0],
       "archiveSha256",
     );
+    const peakResidentByteEstimate = numberField(
+      backupCapture.output()[0],
+      "peakResidentByteEstimate",
+    );
+    const maximumBufferedPlaintextBytes = numberField(
+      backupCapture.output()[0],
+      "maximumBufferedPlaintextBytes",
+    );
 
     replaceInstallation(home, "install_after_backup");
     const verifyCapture = capturedIO(`${passphrase}\n`);
@@ -343,8 +449,15 @@ describe("control-plane maintenance tool", () => {
       command: "verify",
       status: "verified",
       archiveSha256,
+      peakResidentByteEstimate,
+      maximumBufferedPlaintextBytes,
       sourceRelease: hraReleaseIdentity,
       sourceMigrationVersion: currentControlPlaneMigrationVersion,
+      attachmentVault: {
+        blobCount: 0,
+        totalBytes: 0,
+        restoredAttachmentProviderContext: "fresh_send_required",
+      },
     });
 
     const refused = capturedIO(`${passphrase}\nRESTORE ${"0".repeat(64)}\n`);
@@ -377,6 +490,11 @@ describe("control-plane maintenance tool", () => {
       archiveSha256,
       sourceRelease: hraReleaseIdentity,
       restoredMigrationVersion: currentControlPlaneMigrationVersion,
+      attachmentVault: {
+        blobCount: 0,
+        totalBytes: 0,
+        restoredAttachmentProviderContext: "fresh_send_required",
+      },
     });
     expect(readInstallationIds(home)).toEqual(["install_before_backup"]);
   }, 120_000);
@@ -618,6 +736,10 @@ describe("control-plane maintenance tool", () => {
 
 function createControlPlane(home: string, installationId?: string): string {
   const databasePath = defaultControlPlanePath({ HOME: home });
+  mkdirSync(join(dirname(databasePath), "attachment-vault-v2", "objects"), {
+    recursive: true,
+    mode: 0o700,
+  });
   const database = openControlPlane(databasePath, {
     releaseIdentity: hraReleaseIdentity,
     now: () => 1_786_000_000_000,
@@ -674,6 +796,16 @@ function stringField(value: unknown, field: string): string {
     || typeof Reflect.get(value, field) !== "string"
   ) throw new Error(`Expected ${field}`);
   return Reflect.get(value, field) as string;
+}
+
+function numberField(value: unknown, field: string): number {
+  if (
+    typeof value !== "object"
+    || value === null
+    || !(field in value)
+    || typeof Reflect.get(value, field) !== "number"
+  ) throw new Error(`Expected ${field}`);
+  return Reflect.get(value, field) as number;
 }
 
 function capturedIO(stdin = ""): Readonly<{

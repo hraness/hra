@@ -9,12 +9,36 @@ const NOW = "2026-08-18T12:00:00.000Z";
 test("message-ledger migrations backfill a pane and reopen with exact queue clocks", () => {
   const migration = migrations.find(({ version }) => version === 47);
   const resolutionMigration = migrations.find(({ version }) => version === 48);
+  const idempotencyMigration = migrations.find(({ version }) => version === 51);
+  const capabilityMigration = migrations.find(({ version }) => version === 52);
+  const historyFloorMigration = migrations.find(({ version }) => version === 53);
+  const contextResetMigration = migrations.find(({ version }) => version === 54);
+  const providerLineageMigration = migrations.find(({ version }) => version === 55);
+  const archiveIntentMigration = migrations.find(({ version }) => version === 56);
   if (migration === undefined) throw new Error("message ledger migration is missing");
   if (resolutionMigration === undefined) {
     throw new Error("ambiguous resolution migration is missing");
   }
+  if (idempotencyMigration === undefined) {
+    throw new Error("message idempotency migration is missing");
+  }
+  if (
+    capabilityMigration === undefined || historyFloorMigration === undefined ||
+    contextResetMigration === undefined || providerLineageMigration === undefined ||
+    archiveIntentMigration === undefined
+  ) throw new Error("live attachment routing migrations are missing");
   expect(migration.name).toBe("durable-app-owned-chat-message-ledger");
-  expect(migrations.at(-1)?.version).toBe(48);
+  expect(idempotencyMigration.name).toBe("immutable-chat-message-delivery-intent");
+  expect(capabilityMigration.name).toBe("generation-fenced-root-input-capabilities");
+  expect(historyFloorMigration.name).toBe("provider-history-handoff-floor");
+  expect(contextResetMigration.name).toBe("provider-context-reset-required");
+  expect(providerLineageMigration.name).toBe(
+    "one-live-provider-attachment-lineage-per-pane",
+  );
+  expect(archiveIntentMigration.name).toBe(
+    "durable-provider-thread-archive-intent",
+  );
+  expect(migrations.at(-1)?.version).toBe(57);
 
   const legacy = new Database(":memory:", { strict: true });
   legacy.exec("PRAGMA foreign_keys = ON");
@@ -42,8 +66,10 @@ test("message-ledger migrations backfill a pane and reopen with exact queue cloc
     )
   `).run(`repo_${"8".repeat(26)}`, NOW);
 
-  legacy.transaction(() => legacy.exec(migration.sql))();
-  legacy.transaction(() => legacy.exec(resolutionMigration.sql))();
+  for (const candidate of migrations) {
+    if (candidate.version < 47) continue;
+    legacy.transaction(() => legacy.exec(candidate.sql))();
+  }
   expect(legacy.query(`
     SELECT message_queue_revision, next_message_ordinal,
       message_queue_pause_reason
@@ -81,6 +107,22 @@ test("message-ledger migrations backfill a pane and reopen with exact queue cloc
       revision: 2,
       messages: [{ ordinal: 1, revision: 1, text: "survives reopen" }],
     });
+    const messageRow = reopened.query<{
+      request_delivery_kind: string;
+      request_steer_turn_id: string | null;
+      request_fingerprint_hmac: string;
+      request_delivery_outcome: string;
+    }, []>(`
+      SELECT request_delivery_kind, request_steer_turn_id,
+        request_fingerprint_hmac, request_delivery_outcome
+      FROM chat_message_ledger WHERE message_id = 'chatmsg_migrationledger1'
+    `).get();
+    expect(messageRow).toMatchObject({
+      request_delivery_kind: "queue",
+      request_steer_turn_id: null,
+      request_delivery_outcome: "accepted",
+    });
+    expect(messageRow?.request_fingerprint_hmac).toMatch(/^[a-f0-9]{64}$/u);
   } finally {
     reopened.close();
   }
@@ -99,13 +141,13 @@ test("migration 47 installs immutable identity, revision, and transition guards"
     `).run(NOW);
     database.query(`
       INSERT INTO chat_panes (
-        pane_id, display_order, repository_id, repository_name, revision, title,
+        pane_id, palette_index, display_order, repository_id, repository_name, revision, title,
         account_profile_id, model, reasoning_effort, service_tier,
         interaction_mode, state,
         workspace_mode, workspace_state, workspace_revision,
         workspace_recovery_reason, created_at, updated_at
       ) VALUES (
-        'pane_guardledger001', 0, ?1, 'Guard repository', 1, 'Guard pane',
+        'pane_guardledger001', 0, 0, ?1, 'Guard repository', 1, 'Guard pane',
         'acct_guardledger01', 'gpt-5.6-sol', 'max', 'standard',
         'chat', 'ready', 'managed_worktree', 'preparing', 1, NULL, ?2, ?2
       )
@@ -131,6 +173,55 @@ test("migration 47 installs immutable identity, revision, and transition guards"
         state = 'completed', revision = 2, terminal_at = ?1
       WHERE message_id = 'chatmsg_guardledger001'
     `).run(NOW)).toThrow("transition");
+    expect(() => database.query(`
+      UPDATE chat_message_ledger SET request_fingerprint_hmac = ?1
+      WHERE message_id = 'chatmsg_guardledger001'
+    `).run("f".repeat(64))).toThrow("immutable");
+  } finally {
+    database.close();
+  }
+});
+
+test("migration 55 permits only one live provider attachment lineage per pane", () => {
+  const database = new Database(":memory:", { strict: true });
+  try {
+    database.exec("PRAGMA foreign_keys = ON");
+    for (const migration of migrations) database.exec(migration.sql);
+    database.query(`
+      INSERT INTO chat_panes (
+        pane_id, palette_index, display_order, repository_id, repository_name,
+        revision, title, model, reasoning_effort, service_tier,
+        interaction_mode, state, workspace_mode, workspace_state,
+        workspace_revision, workspace_recovery_reason, created_at, updated_at
+      ) VALUES (
+        'pane_lineageguard01', 0, 0, ?1, 'Lineage repository', 1,
+        'Lineage pane', 'gpt-5.6-sol', 'max', 'standard', 'chat', 'ready',
+        'managed_worktree', 'preparing', 1, NULL, ?2, ?2
+      )
+    `).run(`repo_${"a".repeat(26)}`, NOW);
+    const insertBinding = database.query(`
+      INSERT INTO chat_provider_attachment_bindings (
+        binding_id, binding_key_digest, pane_id, revision, state,
+        acquired_at, updated_at
+      ) VALUES (?1, ?2, 'pane_lineageguard01', 1, 'active', ?3, ?3)
+    `);
+    insertBinding.run("attbinding_lineage001", "a".repeat(64), NOW);
+    expect(() => insertBinding.run(
+      "attbinding_lineage002",
+      "b".repeat(64),
+      NOW,
+    )).toThrow();
+    database.query(`
+      UPDATE chat_provider_attachment_bindings
+      SET state = 'released', revision = 2,
+        containment_receipt_digest = ?2, released_at = ?3, updated_at = ?3
+      WHERE binding_id = ?1
+    `).run("attbinding_lineage001", "c".repeat(64), NOW);
+    expect(() => insertBinding.run(
+      "attbinding_lineage002",
+      "b".repeat(64),
+      NOW,
+    )).not.toThrow();
   } finally {
     database.close();
   }

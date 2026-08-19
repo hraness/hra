@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { ChatPaneProjection } from "../../contracts/runtime";
 import { reduceRuntimeProjectionEvent } from "../../contracts/runtime-projection";
@@ -11,10 +13,12 @@ import {
   type ChatServiceOptions,
   type ChatAccountCandidate,
   type ChatAccountPort,
+  type ChatCommandResult,
   type ChatHarnessActorTurnPort,
   type ChatHarnessRootPort,
   type ChatHistoryItem,
   type ChatProjectionSink,
+  type ChatRepository,
   type ChatProviderConfiguration,
   type ChatProviderPort,
   type ChatProviderResumeRequest,
@@ -37,8 +41,18 @@ import { applyMigrations } from "../src/state/database";
 import {
   ChatPaneStore,
 } from "../src/state/chat-pane-store";
+import { ProviderThreadArchiveJournalV57 } from
+  "../src/state/provider-thread-archive-journal-v57";
 import { RootTurnRoutingSQLiteAuthorityV1 } from "../src/harness/root-turn-routing-sqlite-v1";
 import type { RootTurnRoutingAuthorityV1 } from "../src/harness/root-turn-routing-sqlite-v1";
+import type { ChatAttachmentVault } from "../src/attachments/contracts";
+import type {
+  ChatImageNormalizer,
+  NativeImageNormalizerReceipt,
+} from "../src/attachments/normalizer";
+import { SQLiteChatAttachmentVault } from "../src/attachments/vault";
+import { AccountRuntimeNotQuiescentError } from
+  "../src/accounts/runtime-router";
 
 const ACCOUNT_ONE = "acct_chatprimary1";
 const ACCOUNT_TWO = "acct_chatsecond01";
@@ -50,7 +64,12 @@ const REPOSITORY = `repo_${"0".repeat(26)}`;
 const REPOSITORY_TWO = `repo_${"1".repeat(26)}`;
 const TURN_ONE = "chatturn_primary01";
 const TURN_TWO = "chatturn_primary02";
+const TURN_THREE = "chatturn_primary03";
 const ASSISTANT_ITEM = "item_chatassistant01";
+const CHAT_SERVICE_ARCHIVE_RECEIPT_KEY_V57 = Uint8Array.from(
+  { length: 32 },
+  (_, index) => index + 1,
+);
 
 interface StartedTurn {
   readonly request: ChatProviderTurnRequest;
@@ -58,6 +77,20 @@ interface StartedTurn {
 }
 
 class FakeProvider implements ChatProviderPort {
+  readonly archiveCalls: Array<Readonly<{
+    readonly binding: ChatThreadBinding;
+    readonly expectedGeneration: number;
+    readonly archiveHandle: Parameters<ChatProviderPort["archiveThread"]>[2];
+  }>> = [];
+  readonly archiveExpectedGenerations: number[] = [];
+  readonly archivePreparations: ChatThreadBinding[] = [];
+  readonly archivedThreads: ChatThreadBinding[] = [];
+  readonly reconcileArchiveCalls: Array<Readonly<{
+    readonly binding: ChatThreadBinding;
+    readonly archiveHandle: Parameters<
+      ChatProviderPort["reconcileThreadArchive"]
+    >[1];
+  }>> = [];
   readonly injected: Array<Readonly<{
     binding: ChatThreadBinding;
     history: readonly ChatHistoryItem[];
@@ -77,7 +110,11 @@ class FakeProvider implements ChatProviderPort {
   readonly resolutionCandidates: ChatProviderConfiguration[][] = [];
   events: string[] | null = null;
   onInterrupt: (() => Promise<void>) | null = null;
-  onResolveConfiguration: ChatProviderPort["resolveConfiguration"] | null = null;
+  onResolveConfiguration: ((
+    accountProfileId: string,
+    candidates: readonly ChatProviderConfiguration[],
+    requiredInputClass: "text" | "image",
+  ) => Promise<ChatProviderConfiguration>) | null = null;
   onStartThread: ((request: ChatProviderThreadRequest) => Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
@@ -86,17 +123,34 @@ class FakeProvider implements ChatProviderPort {
   onSteerTurn: (
     (request: Parameters<ChatProviderPort["steerTurn"]>[0]) => Promise<void>
   ) | null = null;
+  onArchiveThread: ((
+    binding: ChatThreadBinding,
+    expectedGeneration: number,
+    archiveHandle: Parameters<ChatProviderPort["archiveThread"]>[2],
+  ) => Promise<Readonly<{
+    containmentReceipt: string;
+  }>>) | null = null;
+  archiveResponseGeneration: number | null = null;
+  archivePrepareGeneration = 1;
+  catalogGeneration = 1;
+  onReconcileThreadArchive: ((
+    binding: ChatThreadBinding,
+    archiveHandle: Parameters<
+      ChatProviderPort["reconcileThreadArchive"]
+    >[1],
+  ) => ReturnType<ChatProviderPort["reconcileThreadArchive"]>) | null = null;
   #threadSequence = 0;
   #turnSequence = 0;
 
   async resolveConfiguration(
     accountProfileId: string,
     candidates: readonly ChatProviderConfiguration[],
-  ): Promise<ChatProviderConfiguration> {
+    requiredInputClass: "text" | "image",
+  ): ReturnType<ChatProviderPort["resolveConfiguration"]> {
     this.resolutionCandidates.push([...candidates]);
     const selected = this.onResolveConfiguration === null
       ? candidates[0]
-      : await this.onResolveConfiguration(accountProfileId, candidates);
+      : await this.onResolveConfiguration(accountProfileId, candidates, requiredInputClass);
     if (selected === undefined) throw new Error("Expected one routing candidate");
     this.validations.push({
       accountProfileId,
@@ -107,7 +161,15 @@ class FakeProvider implements ChatProviderPort {
     this.events?.push(
       `provider.resolve:${selected.model}:${selected.reasoningEffort}:${selected.serviceTier ?? "standard"}`,
     );
-    return selected;
+    return Object.freeze({
+      ...selected,
+      requiredInputClass,
+      catalogGeneration: this.catalogGeneration,
+      catalogDigest: this.catalogGeneration === 1
+        ? "a".repeat(64)
+        : "b".repeat(64),
+      observedInputModalities: ["text", "image"] as const,
+    });
   }
 
   async startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
@@ -157,7 +219,10 @@ class FakeProvider implements ChatProviderPort {
     this.events?.push("provider.startTurn.accepted");
     return {
       turnId,
-      quotaProofCursor: { generation: 1, streamPosition: this.#turnSequence },
+      quotaProofCursor: {
+        generation: this.catalogGeneration,
+        streamPosition: this.#turnSequence,
+      },
     };
   }
 
@@ -167,7 +232,14 @@ class FakeProvider implements ChatProviderPort {
   }
 
   verifySteerTarget(): ReturnType<ChatProviderPort["verifySteerTarget"]> {
-    return { generation: 1 };
+    return {
+      generation: this.catalogGeneration,
+      catalogDigest: this.catalogGeneration === 1
+        ? "a".repeat(64)
+        : "b".repeat(64),
+      allowsImage: true,
+      observedInputModalities: ["text", "image"],
+    };
   }
 
   steerTurn(
@@ -176,6 +248,63 @@ class FakeProvider implements ChatProviderPort {
     this.steeredTurns.push(structuredClone(request));
     return this.onSteerTurn?.(request) ?? Promise.resolve();
   }
+
+  prepareThreadArchive(
+    binding: ChatThreadBinding,
+  ): ReturnType<ChatProviderPort["prepareThreadArchive"]> {
+    this.archivePreparations.push(structuredClone(binding));
+    return Promise.resolve({ generation: this.archivePrepareGeneration });
+  }
+
+  async archiveThread(
+    binding: ChatThreadBinding,
+    expectedGeneration: number,
+    archiveHandle: Parameters<ChatProviderPort["archiveThread"]>[2],
+  ): ReturnType<ChatProviderPort["archiveThread"]> {
+    this.archiveCalls.push(Object.freeze({
+      binding: structuredClone(binding),
+      expectedGeneration,
+      archiveHandle,
+    }));
+    this.archiveExpectedGenerations.push(expectedGeneration);
+    this.archivedThreads.push(structuredClone(binding));
+    const result = await (this.onArchiveThread?.(
+      binding,
+      expectedGeneration,
+      archiveHandle,
+    ) ??
+      Promise.resolve({ containmentReceipt: "archive_fixture_receipt" }));
+    return {
+      ...result,
+      generation: this.archiveResponseGeneration ?? expectedGeneration,
+      streamPosition: 1,
+    };
+  }
+
+  reconcileThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: Parameters<
+      ChatProviderPort["reconcileThreadArchive"]
+    >[1],
+  ): ReturnType<ChatProviderPort["reconcileThreadArchive"]> {
+    this.reconcileArchiveCalls.push(Object.freeze({
+      binding: structuredClone(binding),
+      archiveHandle,
+    }));
+    return this.onReconcileThreadArchive?.(binding, archiveHandle) ??
+      Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_scan_fixture_receipt",
+        generation: 1,
+        streamPosition: 2,
+        containmentReceipt: "archive_fixture_receipt",
+      });
+  }
+}
+
+function textInput(request: ChatProviderTurnRequest): string {
+  const text = request.input.find((item) => item.type === "text");
+  return text?.type === "text" ? text.text : "";
 }
 
 class FakeHarnessRoots implements ChatHarnessRootPort {
@@ -252,7 +381,11 @@ class FakeHarnessActors implements ChatHarnessActorTurnPort {
 }
 
 interface Harness {
+  readonly attachments: ChatAttachmentVault | null;
   readonly containedAccounts: string[];
+  readonly containedArchiveGenerations: Array<
+    Parameters<ChatAccountPort["containArchiveGeneration"]>[0]
+  >;
   readonly database: Database;
   readonly deltas: ChatTurnDelta[];
   readonly fullPanes: ChatPaneProjection[];
@@ -269,12 +402,290 @@ interface Harness {
   readonly workspaces: ChatWorkspacePort;
 }
 
+type ChatCandidateFactory = () =>
+  | readonly ChatAccountCandidate[]
+  | Promise<readonly ChatAccountCandidate[]>;
+
+interface HarnessSetup {
+  readonly attachmentFactory?: (database: Database) => ChatAttachmentVault;
+  readonly archiveTransitionV57?: Partial<Pick<
+    ChatAccountPort,
+    | "abortArchiveTransitionProvisional"
+    | "activateArchiveTransitionSuccessorV57"
+    | "archiveTransitionHandleV57"
+    | "beginArchiveTransitionProvisional"
+    | "containArchiveTransitionGenerationV57"
+    | "promoteArchiveTransitionEffectStarted"
+    | "refreshArchiveTransitionCutAuthoritiesV57"
+    | "releaseArchiveTransition"
+    | "replaceArchiveTransition"
+  >>;
+  readonly candidateFactory?: ChatCandidateFactory;
+  readonly databaseImage?: Uint8Array;
+  readonly containArchiveGeneration?: ChatAccountPort["containArchiveGeneration"];
+  readonly isGenerationCurrent?: ChatAccountPort["isGenerationCurrent"];
+  readonly onPaneRemoved?: (paneId: string, revision: number) => void | Promise<void>;
+  readonly providerThreadArchiveCoordinatorV57Enabled?: boolean;
+  readonly repositoryResolver?: ChatServiceOptions["repositories"]["resolve"];
+}
+
+const defaultCandidateFactory: ChatCandidateFactory = () => [
+  { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
+];
+
+const unavailableArchiveTransitionV57 = (): never => {
+  throw new Error("Unexpected v57 archive transition account request");
+};
+
+const fixtureArchiveAccountHoldMethods = {
+  abortArchiveTransitionProvisional: unavailableArchiveTransitionV57,
+  activateArchiveTransitionSuccessorV57: unavailableArchiveTransitionV57,
+  archiveTransitionHandleV57: unavailableArchiveTransitionV57,
+  beginArchiveTransitionProvisional: unavailableArchiveTransitionV57,
+  containArchiveTransitionGenerationV57: unavailableArchiveTransitionV57,
+  promoteArchiveTransitionEffectStarted: unavailableArchiveTransitionV57,
+  refreshArchiveTransitionCutAuthoritiesV57: unavailableArchiveTransitionV57,
+  releaseArchiveTransition: unavailableArchiveTransitionV57,
+  replaceArchiveTransition: unavailableArchiveTransitionV57,
+  retainArchiveGeneration: (
+    input: Parameters<ChatAccountPort["retainArchiveGeneration"]>[0],
+  ) => `chatarchivehold_fixture_${input.paneId}_${String(input.expectedGeneration)}`,
+  releaseArchiveGeneration: () => undefined,
+} satisfies Pick<
+  ChatAccountPort,
+  | "abortArchiveTransitionProvisional"
+  | "activateArchiveTransitionSuccessorV57"
+  | "archiveTransitionHandleV57"
+  | "beginArchiveTransitionProvisional"
+  | "containArchiveTransitionGenerationV57"
+  | "promoteArchiveTransitionEffectStarted"
+  | "refreshArchiveTransitionCutAuthoritiesV57"
+  | "releaseArchiveGeneration"
+  | "releaseArchiveTransition"
+  | "replaceArchiveTransition"
+  | "retainArchiveGeneration"
+>;
+
+function directArchiveTransitionV57Fixture(
+  events: string[] = [],
+  options: Readonly<{ cleanupCommittedComponents?: boolean }> = {},
+): Readonly<{
+  methods: NonNullable<HarnessSetup["archiveTransitionV57"]>;
+  activeTransitionIds: () => readonly string[];
+  attach: (database: Database) => void;
+  installTransitionIds: (transitionIds: readonly string[]) => void;
+}> {
+  type ProvisionalHandle = Awaited<ReturnType<
+    ChatAccountPort["beginArchiveTransitionProvisional"]
+  >>["handle"];
+  type ArchiveHandle = ReturnType<
+    ChatAccountPort["archiveTransitionHandleV57"]
+  >;
+  const provisionals = new Map<ProvisionalHandle, string>();
+  const handles = new Map<string, ArchiveHandle>();
+  let database: Database | null = null;
+  let journal: ProviderThreadArchiveJournalV57 | null = null;
+  const newProvisional = (): ProvisionalHandle =>
+    Object.freeze({}) as ProvisionalHandle;
+  const newHandle = (): ArchiveHandle => Object.freeze({}) as ArchiveHandle;
+  const methods: NonNullable<HarnessSetup["archiveTransitionV57"]> = {
+    beginArchiveTransitionProvisional: (input) => {
+      const handle = newProvisional();
+      provisionals.set(handle, input.transitionId);
+      events.push(`provisional:${input.transitionId}`);
+      return Promise.resolve({ generation: 1, handle });
+    },
+    abortArchiveTransitionProvisional: (handle) => {
+      if (!provisionals.delete(handle)) {
+        throw new Error("Unknown archive provisional handle");
+      }
+      events.push("provisional:aborted");
+      return Promise.resolve();
+    },
+    promoteArchiveTransitionEffectStarted: (provisional, transitionId) => {
+      if (provisionals.get(provisional) !== transitionId) {
+        throw new Error("Archive provisional promotion changed identity");
+      }
+      provisionals.delete(provisional);
+      const handle = newHandle();
+      handles.set(transitionId, handle);
+      events.push(`promoted:${transitionId}`);
+      return handle;
+    },
+    replaceArchiveTransition: (predecessor, transitionId) => {
+      if (handles.get(transitionId) !== predecessor) {
+        throw new Error("Archive replacement used a stale handle");
+      }
+      const handle = newHandle();
+      handles.set(transitionId, handle);
+      events.push(`replaced:${transitionId}`);
+      return handle;
+    },
+    releaseArchiveTransition: (transitionId, handle, expectedComponent) => {
+      if (handles.get(transitionId) !== handle) {
+        throw new Error("Archive release used a stale handle");
+      }
+      if (options.cleanupCommittedComponents === true) {
+        if (journal === null) {
+          throw new Error("Archive cleanup journal is unavailable");
+        }
+        const component = journal.terminalCleanupComponent(transitionId);
+        if (
+          component.accountProfileId !== expectedComponent.accountProfileId ||
+          component.allTargetsCommitted !==
+            expectedComponent.allTargetsCommitted ||
+          component.targetIds.length !== expectedComponent.targetIds.length ||
+          component.targetIds.some((targetId, index) =>
+            targetId !== expectedComponent.targetIds[index]
+          ) ||
+          component.cutIds.length !== expectedComponent.cutIds.length ||
+          component.cutIds.some((cutId, index) =>
+            cutId !== expectedComponent.cutIds[index]
+          )
+        ) {
+          throw new Error("Archive cleanup component changed before release");
+        }
+        if (component.allTargetsCommitted) {
+          const deleted = journal.deleteCommittedTargetSafely(
+            transitionId,
+            component,
+          );
+          for (const deletedTargetId of deleted.deletedTargetIds) {
+            handles.delete(deletedTargetId);
+          }
+          events.push(`released:${transitionId}`);
+          return deleted;
+        }
+      }
+      handles.delete(transitionId);
+      events.push(`released:${transitionId}`);
+      return expectedComponent.allTargetsCommitted
+        ? Object.freeze({
+            deletedTargetIds: expectedComponent.targetIds,
+            deletedCutIds: expectedComponent.cutIds,
+          })
+        : Object.freeze({
+            deletedTargetIds: Object.freeze([]),
+            deletedCutIds: Object.freeze([]),
+          });
+    },
+    archiveTransitionHandleV57: (transitionId) => {
+      const handle = handles.get(transitionId);
+      if (handle === undefined) throw new Error("Archive handle is unavailable");
+      return handle;
+    },
+    refreshArchiveTransitionCutAuthoritiesV57: (input) => {
+      if (handles.get(input.transitionId) !== input.archiveHandle) {
+        throw new Error("Archive refresh used a stale handle");
+      }
+      if (journal === null) throw new Error("Archive journal is unavailable");
+      const cutTargets = journal.recoveryTargets().filter((target) =>
+        target.currentAttempt.cutId === input.cutId
+      );
+      for (const target of cutTargets) {
+        handles.set(target.targetId, newHandle());
+      }
+      events.push(`refreshed:${input.cutId}`);
+      return handles.get(input.transitionId) ??
+        (() => { throw new Error("Archive refresh lost its transition"); })();
+    },
+    containArchiveTransitionGenerationV57: (input) => {
+      if (handles.get(input.transitionId) !== input.archiveHandle) {
+        return Promise.reject(new Error("Archive fence used a stale handle"));
+      }
+      if (database === null || journal === null) {
+        return Promise.reject(new Error("Archive fence fixture is unavailable"));
+      }
+      const currentJournal = journal;
+      const currentDatabase = database;
+      const cut = currentJournal.reopenCut(input.cutId);
+      const successorGeneration = cut.sourceGeneration + 1;
+      const profile = currentDatabase.transaction(() => {
+        currentDatabase.query(`
+          UPDATE account_profiles SET process_generation = ?2,
+            revision = revision + 1, updated_at = ?3
+          WHERE profile_id = ?1 AND process_generation = ?4
+        `).run(
+          input.accountProfileId,
+          successorGeneration,
+          "2026-08-03T12:00:10.000Z",
+          cut.sourceGeneration,
+        );
+        const row = currentDatabase.query(`
+          SELECT revision FROM account_profiles WHERE profile_id = ?1
+        `).get(input.accountProfileId) as { revision: number } | null;
+        if (row === null) throw new Error("Archive account profile is unavailable");
+        currentJournal.recordFence({
+          cutId: input.cutId,
+          successorGeneration,
+          successorAccountProfileRevision: row.revision,
+          fenceEvidenceDigest: "a".repeat(64),
+          fenceRevisionDigest: "b".repeat(64),
+          now: new Date("2026-08-03T12:00:10.000Z"),
+        });
+        return row;
+      })();
+      for (const target of currentJournal.recoveryTargets().filter((target) =>
+        target.currentAttempt.cutId === input.cutId
+      )) {
+        handles.set(target.targetId, newHandle());
+      }
+      const archiveHandle = handles.get(input.transitionId);
+      if (archiveHandle === undefined) {
+        return Promise.reject(new Error("Archive fence lost its transition"));
+      }
+      events.push(`contained:${input.cutId}`);
+      return Promise.resolve({
+        accountProfileRevision: profile.revision,
+        archiveHandle,
+        generation: successorGeneration,
+      });
+    },
+    activateArchiveTransitionSuccessorV57: (input) => {
+      if (handles.get(input.transitionId) !== input.archiveHandle) {
+        return Promise.reject(new Error("Archive activation used a stale handle"));
+      }
+      if (journal === null) {
+        return Promise.reject(new Error("Archive activation fixture is unavailable"));
+      }
+      const target = journal.reopenTarget(input.transitionId);
+      const priorCutId = target.currentAttempt.cutId;
+      if (priorCutId === null) {
+        return Promise.reject(new Error("Archive activation lost its cut"));
+      }
+      const generation = journal.reopenCut(priorCutId).successorGeneration;
+      if (generation === null) {
+        return Promise.reject(new Error("Archive activation lost its generation"));
+      }
+      const archiveHandle = newHandle();
+      handles.set(input.transitionId, archiveHandle);
+      events.push(`activated:${input.transitionId}`);
+      return Promise.resolve({ archiveHandle, generation });
+    },
+  };
+  return Object.freeze({
+    methods,
+    activeTransitionIds: () => Object.freeze([...handles.keys()].sort()),
+    attach: (value) => {
+      database = value;
+      journal = new ProviderThreadArchiveJournalV57(
+        value,
+        CHAT_SERVICE_ARCHIVE_RECEIPT_KEY_V57,
+      );
+    },
+    installTransitionIds: (transitionIds) => {
+      for (const transitionId of transitionIds) {
+        if (handles.has(transitionId)) {
+          throw new Error("Archive transition was already installed");
+        }
+        handles.set(transitionId, newHandle());
+      }
+    },
+  });
+}
+
 function harness(
-  candidateFactory: () =>
-    | readonly ChatAccountCandidate[]
-    | Promise<readonly ChatAccountCandidate[]> = () => [
-    { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
-  ],
+  setup: ChatCandidateFactory | HarnessSetup = defaultCandidateFactory,
   containAmbiguousEffect: (accountProfileId: string) => Promise<void> = () => Promise.resolve(),
   roots: FakeHarnessRoots | null = null,
   actors: FakeHarnessActors | null = null,
@@ -297,7 +708,38 @@ function harness(
   accountContainmentTimeoutMs = 5_000,
   harnessActorTransitionTimeoutMs = 5_000,
 ): Harness {
-  const database = Database.deserialize(pristineDatabase.slice(), { strict: true });
+  const candidateFactory = typeof setup === "function"
+    ? setup
+    : setup.candidateFactory ?? defaultCandidateFactory;
+  const attachmentFactory = typeof setup === "function"
+    ? null
+    : setup.attachmentFactory ?? null;
+  const archiveTransitionV57 = typeof setup === "function"
+    ? {}
+    : setup.archiveTransitionV57 ?? {};
+  const providerThreadArchiveCoordinatorV57Enabled = typeof setup === "function"
+    ? undefined
+    : setup.providerThreadArchiveCoordinatorV57Enabled;
+  const onPaneRemoved = typeof setup === "function"
+    ? null
+    : setup.onPaneRemoved ?? null;
+  const configuredRepositoryResolver = typeof setup === "function"
+    ? repositoryResolver
+    : setup.repositoryResolver ?? repositoryResolver;
+  const configuredContainArchiveGeneration:
+    ChatAccountPort["containArchiveGeneration"] | null =
+    typeof setup === "function"
+      ? null
+      : setup.containArchiveGeneration ?? null;
+  const isGenerationCurrent: ChatAccountPort["isGenerationCurrent"] =
+    typeof setup === "function"
+      ? (_accountProfileId, expectedGeneration) => expectedGeneration === 1
+      : setup.isGenerationCurrent
+        ?? ((_accountProfileId, expectedGeneration) => expectedGeneration === 1);
+  const databaseImage = typeof setup === "function"
+    ? pristineDatabase
+    : setup.databaseImage ?? pristineDatabase;
+  const database = Database.deserialize(databaseImage.slice(), { strict: true });
   database.exec("PRAGMA foreign_keys = ON");
   const panes: ChatPaneProjection[] = [];
   const fullPanes: ChatPaneProjection[] = [];
@@ -314,7 +756,9 @@ function harness(
       await beforePaneStateChanged?.(pane);
       panes.push(pane);
     },
-    paneRemoved: () => undefined,
+    paneRemoved: async (paneId, revision) => {
+      await onPaneRemoved?.(paneId, revision);
+    },
     panesReordered: (orderedPaneIds) => {
       reorderedPanes.push([...orderedPaneIds]);
     },
@@ -326,7 +770,11 @@ function harness(
   const provider = new FakeProvider();
   const routingEvents: string[] = [];
   provider.events = routingEvents;
-  const store = new ChatPaneStore(database);
+  const attachments = attachmentFactory?.(database) ?? null;
+  const store = new ChatPaneStore(database, {
+    messageRequestDigestKey: CHAT_SERVICE_ARCHIVE_RECEIPT_KEY_V57,
+    ...(attachments === null ? {} : { paneArchiveAuthority: attachments }),
+  });
   const rootTurnRouting = recordingRootTurnRoutingAuthority(
     new RootTurnRoutingSQLiteAuthorityV1(database),
     database,
@@ -374,23 +822,58 @@ function harness(
     release() {},
   };
   const containedAccounts: string[] = [];
+  const containedArchiveGenerations: Array<
+    Parameters<ChatAccountPort["containArchiveGeneration"]>[0]
+  > = [];
+  const archiveHolds = new Map<string, string>();
   const runtimeRecoveries: Parameters<ChatRuntimeRecoveryPort["requestRecovery"]>[0][] = [];
+  const serviceHolder: { current: ChatService | null } = { current: null };
   const service = new ChatService({
     accounts: {
-      containAmbiguousEffect: (accountProfileId) => {
+      ...fixtureArchiveAccountHoldMethods,
+      ...archiveTransitionV57,
+      containAmbiguousEffect: (accountProfileId, expectedGeneration) => {
         containedAccounts.push(accountProfileId);
-        return containAmbiguousEffect(accountProfileId);
+        return containAmbiguousEffect(accountProfileId)
+          .then(() => expectedGeneration);
+      },
+      containArchiveGeneration: (input) => {
+        containedArchiveGenerations.push({ ...input });
+        if (configuredContainArchiveGeneration !== null) {
+          return configuredContainArchiveGeneration(input);
+        }
+        const current = serviceHolder.current;
+        if (current === null) {
+          return Promise.reject(new Error("Chat service is not initialized"));
+        }
+        return current.joinProviderThreadArchiveGenerationContainment(input);
+      },
+      retainArchiveGeneration: (input) => {
+        const handle = `chatarchivehold_fixture_${input.paneId}_${String(input.expectedGeneration)}`;
+        archiveHolds.set(input.paneId, handle);
+        return handle;
+      },
+      releaseArchiveGeneration: (input) => {
+        if (archiveHolds.get(input.paneId) !== input.authorityHandle) {
+          throw new Error("fixture archive hold changed before release");
+        }
+        archiveHolds.delete(input.paneId);
       },
       refreshCandidates: async () => await candidateFactory(),
       hasRateLimitProofSince,
+      isGenerationCurrent,
     },
+    ...(attachments === null ? {} : { attachments }),
     now: () => new Date(timestamp++),
     ...(actors === null ? {} : { harnessActors: actors }),
     ...(roots === null ? {} : { harnessRoots: roots }),
     projection,
+    ...(providerThreadArchiveCoordinatorV57Enabled === undefined
+      ? {}
+      : { providerThreadArchiveCoordinatorV57Enabled }),
     provider,
     repositories: {
-      resolve: repositoryResolver ?? ((repositoryId) => Promise.resolve(
+      resolve: configuredRepositoryResolver ?? ((repositoryId) => Promise.resolve(
         repositoryId === REPOSITORY
           ? { id: REPOSITORY, name: "Example", workingDirectory: "/fixture/example" }
           : repositoryId === REPOSITORY_TWO
@@ -417,8 +900,11 @@ function harness(
       : { attachedHarnessRetryDelayMs }),
     ...(workspaceRetryDelayMs === undefined ? {} : { workspaceRetryDelayMs }),
   });
+  serviceHolder.current = service;
   return {
+    attachments,
     containedAccounts,
+    containedArchiveGenerations,
     database,
     deltas,
     fullPanes,
@@ -938,10 +1424,14 @@ test("continuations inherit settled Ultra and Luna routes across reopen", async 
       const authority = new RootTurnRoutingSQLiteAuthorityV1(value.database);
       restarted = new ChatService({
         accounts: {
-          containAmbiguousEffect: () => Promise.resolve(),
+          containAmbiguousEffect: () => Promise.resolve(1),
+          containArchiveGeneration: () => Promise.resolve(),
+          ...fixtureArchiveAccountHoldMethods,
           refreshCandidates: () => Promise.resolve([
             { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
           ]),
+          isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+            expectedGeneration === 1,
         },
         projection: {
           messageQueueChanged: () => undefined,
@@ -1699,7 +2189,9 @@ test("settled includes an account-unavailable tail admitted after closeAdmission
     blockDetachment = true;
     value.service.closeAdmission();
 
-    const handling = value.service.handleAccountUnavailable(ACCOUNT_ONE);
+    const handling = value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
     await projectionEntered.promise;
     let didSettle = false;
     const settling = value.service.settled().then(() => { didSettle = true; });
@@ -1768,11 +2260,15 @@ test("restart rehydrates a durable repository-resolution recovery without waitin
 
     const restarted = new ChatService({
       accounts: {
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
         ]),
         hasRateLimitProofSince: () => false,
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: {
         messageQueueChanged: () => undefined,
@@ -2223,7 +2719,7 @@ test("closing admission settles a late ordinary quota terminal without failover 
     await value.service.settled();
 
     expect(value.provider.startedThreads).toHaveLength(1);
-    expect(value.provider.startedTurns.map(({ request }) => request.prompt))
+    expect(value.provider.startedTurns.map(({ request }) => textInput(request)))
       .toEqual(["Finish before shutdown"]);
     expect(value.provider.injected).toEqual([]);
     expect(value.store.require(PANE).projection).toMatchObject({
@@ -3142,10 +3638,12 @@ test("exact item events advance durable activity and settle terminal success onc
     await value.service.observeSessionReasoningCompletion({
       ...exact,
       itemId: "item_reasoning01",
+      receipt: verifiedReasoningReceipt("1"),
     } satisfies SessionReasoningItemCompletion);
     await value.service.observeSessionReasoningCompletion({
       ...exact,
       itemId: "item_reasoning02",
+      receipt: verifiedReasoningReceipt("2"),
     });
     await value.service.observeSessionActivity(activity(
       first.request,
@@ -3397,7 +3895,7 @@ test("an exact quota proof terminalizes once without account selection, history 
       turn: { continuationCount: 0, status: "failed" },
     });
     expect(value.provider.startedThreads).toHaveLength(1);
-    expect(value.provider.startedTurns.map(({ request }) => request.prompt)).toEqual([
+    expect(value.provider.startedTurns.map(({ request }) => textInput(request))).toEqual([
       "Original request",
     ]);
     expect(value.provider.injected).toEqual([]);
@@ -3533,7 +4031,7 @@ test("pre-turn routing may select an unknown budget, but quota still stops that 
 
     expect(value.provider.startedTurns.map(({ request }) => ({
       accountProfileId: request.accountProfileId,
-      prompt: request.prompt,
+      prompt: textInput(request),
     }))).toEqual([
       { accountProfileId: ACCOUNT_ONE, prompt: "Keep working" },
     ]);
@@ -3659,7 +4157,7 @@ test("a retained thread stays incomplete after failed or interrupted work", asyn
         quotaProof: "provider_usage_limit_exceeded",
       });
 
-      expect(value.provider.startedTurns.map(({ request }) => request.prompt)).toEqual([
+      expect(value.provider.startedTurns.map(({ request }) => textInput(request))).toEqual([
         "Unfinished request",
         "Later request",
         "Quota request",
@@ -3813,7 +4311,8 @@ test("an exact logical-turn Stop is stale-revision tolerant, replay-safe, and re
     );
     expect(next).toMatchObject({ state: "starting", turn: { id: TURN_TWO } });
     await value.service.settled();
-    expect(value.provider.startedTurns.at(-1)?.request.prompt)
+    expect(value.provider.startedTurns.at(-1)?.request).toBeDefined();
+    expect(textInput(value.provider.startedTurns.at(-1)!.request))
       .toBe("Continue after the explicit stop");
   } finally {
     await value.service.settled();
@@ -4347,7 +4846,7 @@ test("awaited Stop clears its admission fence before immediate start or Retry", 
         : await retryTurn(value, stopped.revision, TURN_ONE, TURN_TWO);
       expect(admitted).toMatchObject({ state: "starting", turn: { id: TURN_TWO } });
       await value.service.settled();
-      expect(value.provider.startedTurns.at(-1)?.request.prompt).toBe(
+      expect(textInput(value.provider.startedTurns.at(-1)!.request)).toBe(
         mode === "start" ? "immediate replacement" : originalPrompt,
       );
     } finally {
@@ -4974,11 +5473,15 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
     let timestamp = Date.parse("2026-08-04T12:00:00.000Z");
     restartedService = new ChatService({
       accounts: {
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
         ]),
         hasRateLimitProofSince: () => false,
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       now: () => new Date(timestamp++),
       projection: {
@@ -5048,7 +5551,7 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
     expect(restartedProvider.startedTurns).toHaveLength(1);
     expect(restartedProvider.startedTurns[0]?.request).toMatchObject({
       clientTurnId: TURN_TWO,
-      prompt: originalPrompt,
+      input: [{ type: "text", text: originalPrompt }],
       model: "gpt-5.6-luna",
       reasoningEffort: "max",
       serviceTier: "fast",
@@ -5111,7 +5614,7 @@ test("prompt-free Retry survives restart, keeps prompt private, and sends exact 
     await restartedService.settled();
     expect(restartedProvider.startedTurns.at(-1)?.request).toMatchObject({
       clientTurnId: replacementTurnId,
-      prompt: replacementPrompt,
+      input: [{ type: "text", text: replacementPrompt }],
     });
     expect(value.store.require(PANE).activePrompt).toBe(replacementPrompt);
     expect(JSON.stringify(value.store.list())).not.toContain(replacementPrompt);
@@ -5495,7 +5998,7 @@ test("an ambiguous interrupt fences the account before any retry can overlap old
     );
     expect(retry.state).toBe("starting");
     await value.service.settled();
-    expect(value.provider.startedTurns.at(-1)?.request.prompt)
+    expect(textInput(value.provider.startedTurns.at(-1)!.request))
       .toBe("Safe after the generation fence");
     expect(value.runtimeRecoveries).toEqual([]);
   } finally {
@@ -5669,8 +6172,12 @@ test("an unfenced ambiguous turn escalates once and only reopens after rehydrati
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
         ]),
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         hasRateLimitProofSince: () => false,
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: {
         messageQueueChanged: () => undefined,
@@ -5727,7 +6234,7 @@ test("an unfenced ambiguous turn escalates once and only reopens after rehydrati
     expect(explicitRetry.type).toBe("pane");
     await restartedService.settled();
     expect(restartedProvider.startedTurns).toHaveLength(1);
-    expect(restartedProvider.startedTurns[0]?.request.prompt)
+    expect(textInput(restartedProvider.startedTurns[0]!.request))
       .toBe("Explicit retry after rehydration");
     expect(value.provider.startedTurns).toHaveLength(1);
   } finally {
@@ -5777,7 +6284,7 @@ test("an ambiguous turn start fences the account generation before the pane beco
     );
     expect(next.state).toBe("starting");
     await value.service.settled();
-    expect(value.provider.startedTurns.at(-1)?.request.prompt).toBe("Safe retry after containment");
+    expect(textInput(value.provider.startedTurns.at(-1)!.request)).toBe("Safe retry after containment");
   } finally {
     containmentRelease.resolve();
     await value.service.settled();
@@ -5814,7 +6321,7 @@ test("pre-dispatch runtime capacity leaves the pane reusable without containment
     );
     expect(retried.state).toBe("starting");
     await value.service.settled();
-    expect(value.provider.startedTurns.at(-1)?.request.prompt)
+    expect(textInput(value.provider.startedTurns.at(-1)!.request))
       .toBe("Retry after local capacity");
   } finally {
     await value.service.settled();
@@ -5888,8 +6395,12 @@ test("an unfenced ambiguous turn start requests one recovery without deadlocking
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
         ]),
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         hasRateLimitProofSince: () => false,
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: {
         messageQueueChanged: () => undefined,
@@ -5935,7 +6446,7 @@ test("an unfenced ambiguous turn start requests one recovery without deadlocking
     expect(retried.type).toBe("pane");
     await withinDeadline(restartedService.settled(), "post-recovery turn start");
     expect(restartedProvider.startedTurns).toHaveLength(1);
-    expect(restartedProvider.startedTurns[0]?.request.prompt)
+    expect(textInput(restartedProvider.startedTurns[0]!.request))
       .toBe("Safe retry after native recovery");
     expect(providerStartAttempts).toBe(1);
     expect(value.runtimeRecoveries).toHaveLength(1);
@@ -5995,7 +6506,7 @@ test("an incomplete cross-account handoff clears context once and the next promp
 
     await startTurn(value, reset.projection.revision, "chatturn_primary03", "Fresh prompt");
     await value.service.settled();
-    expect(value.provider.startedTurns.map(({ request }) => request.prompt)).toEqual([
+    expect(value.provider.startedTurns.map(({ request }) => textInput(request))).toEqual([
       "Original prompt",
       "Fresh prompt",
     ]);
@@ -6006,11 +6517,8 @@ test("an incomplete cross-account handoff clears context once and the next promp
   }
 });
 
-test("account unavailability detaches without a relaunch-capable provider interrupt", async () => {
-  let useSecondAccount = false;
-  const value = harness(() => useSecondAccount
-    ? [{ id: ACCOUNT_TWO, selected: true, budget: "healthy" }]
-    : [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]);
+test("generation cleanup preserves a settled provider thread without interrupting it", async () => {
+  const value = harness();
   try {
     const created = await createPane(value);
     await startTurn(value, created.revision, TURN_ONE, "Keep this history");
@@ -6034,45 +6542,273 @@ test("account unavailability detaches without a relaunch-capable provider interr
       "completed",
     ));
 
-    const beforeDetach = value.store.require(PANE).projection;
-    await value.service.handleAccountUnavailable(ACCOUNT_ONE);
-    const detached = value.store.require(PANE);
-    expect(detached.projection.revision).toBe(beforeDetach.revision + 1);
-    expect(detached).toMatchObject({
-      binding: null,
-      projection: { state: "ready", accountProfileId: null },
+    const beforeCleanup = value.store.require(PANE);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
     });
-    expect(value.store.handoffHistory(PANE, false)).toEqual({
-      complete: true,
-      items: [
-        { role: "user", text: "Keep this history" },
-        { role: "assistant", text: "Saved response" },
-      ],
+    await value.service.settled();
+    expect(value.store.require(PANE)).toEqual(beforeCleanup);
+    expect(value.provider.interrupts).toEqual([]);
+  } finally {
+    value.database.close();
+  }
+});
+
+test("delayed generation-N cleanup settles N and preserves an N+1 sibling", async () => {
+  const value = harness();
+  try {
+    const firstPane = await createPane(value);
+    await startTurn(value, firstPane.revision, TURN_ONE, "Generation N", PANE);
+    await value.service.settled();
+    const firstStarted = value.provider.startedTurns[0];
+    if (firstStarted === undefined) throw new Error("Expected generation-N turn");
+    await value.service.observeSessionLifecycle(lifecycle(
+      firstStarted.request,
+      firstStarted.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+
+    const secondPane = await createPane(value, PANE_TWO);
+    const begun = value.store.beginTurn({
+      paneId: PANE_TWO,
+      expectedRevision: secondPane.revision,
+      turnId: TURN_TWO,
+      prompt: "Generation N+1",
+      now: new Date("2026-08-03T12:01:00.000Z"),
+    });
+    if (begun.kind !== "begun") throw new Error("Expected N+1 turn admission");
+    value.rootTurnRouting.admitClassification({
+      paneId: PANE_TWO,
+      chatTurnId: TURN_TWO,
+      policyVersion: 1,
+      requiredInputClass: "text",
+      classificationReason: "conservativeDefault",
+      workClass: "standard",
+      requestedProfile: "solMax",
+      requestedServiceTier: "standard",
+      now: new Date("2026-08-03T12:01:00.001Z"),
+    });
+    value.store.reserveAccount(
+      PANE_TWO,
+      TURN_TWO,
+      ACCOUNT_ONE,
+      new Date("2026-08-03T12:01:00.002Z"),
+    );
+    value.rootTurnRouting.resolve({
+      paneId: PANE_TWO,
+      chatTurnId: TURN_TWO,
+      selectedProfile: "solMax",
+      profileFallbackReason: null,
+      selectedServiceTier: "standard",
+      serviceTierFallbackReason: null,
+      catalogGeneration: 2,
+      catalogDigest: "b".repeat(64),
+      now: new Date("2026-08-03T12:01:00.003Z"),
+    });
+    const successorBinding = {
+      accountProfileId: ACCOUNT_ONE,
+      threadId: "thread_generation_successor",
+      restartThreadId: "raw_thread_generation_successor",
+    };
+    value.store.prepareProviderThread(
+      PANE_TWO,
+      TURN_TWO,
+      successorBinding,
+      new Date("2026-08-03T12:01:00.004Z"),
+    );
+    value.rootTurnRouting.markEffectStarted({
+      paneId: PANE_TWO,
+      chatTurnId: TURN_TWO,
+      now: new Date("2026-08-03T12:01:00.005Z"),
+    });
+    value.rootTurnRouting.accept({
+      paneId: PANE_TWO,
+      chatTurnId: TURN_TWO,
+      acceptedGeneration: 2,
+      acceptedStreamPosition: 1,
+      now: new Date("2026-08-03T12:01:00.006Z"),
+    });
+    value.store.markTurnAccepted(
+      PANE_TWO,
+      TURN_TWO,
+      "turn_generation_successor",
+      new Date("2026-08-03T12:01:00.007Z"),
+    );
+    const successorBefore = value.store.require(PANE_TWO);
+
+    const sourceBefore = value.store.require(PANE);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
     });
 
-    useSecondAccount = true;
-    await startTurn(value, detached.projection.revision, TURN_TWO, "New request");
+    expect(value.store.require(PANE)).toEqual(sourceBefore);
+    expect(value.store.require(PANE_TWO)).toEqual(successorBefore);
+    expect(value.rootTurnRouting.readTurnRouting(PANE_TWO, TURN_TWO))
+      .toMatchObject({
+        acceptedGeneration: 2,
+        state: "accepted",
+      });
+  } finally {
+    value.service.closeAdmission();
     await value.service.settled();
-    expect(value.provider.injected.at(-1)?.history).toEqual([
-      { role: "user", text: "Keep this history" },
-      { role: "assistant", text: "Saved response" },
+    value.database.close();
+  }
+});
+
+test("generation-N cleanup preserves healthy completed panes with settled N history", async () => {
+  const value = harness();
+  try {
+    const firstPane = await createPane(value);
+    const secondPane = await createPane(value, PANE_TWO);
+    await startTurn(value, firstPane.revision, TURN_ONE, "First N pane", PANE);
+    await startTurn(value, secondPane.revision, TURN_TWO, "Healthy N sibling", PANE_TWO);
+    await value.service.settled();
+    const firstStarted = value.provider.startedTurns.find(
+      ({ request }) => request.clientTurnId === TURN_ONE,
+    );
+    const secondStarted = value.provider.startedTurns.find(
+      ({ request }) => request.clientTurnId === TURN_TWO,
+    );
+    if (firstStarted === undefined || secondStarted === undefined) {
+      throw new Error("Expected both generation-N turns");
+    }
+    await value.service.observeSessionLifecycle(lifecycle(
+      firstStarted.request,
+      firstStarted.turnId,
+      "completed",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      secondStarted.request,
+      secondStarted.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const beforeCleanup = new Map([
+      [PANE, value.store.require(PANE)],
+      [PANE_TWO, value.store.require(PANE_TWO)],
     ]);
 
-    const startedThreadCount = value.provider.startedThreads.length;
-    await value.service.handleAccountUnavailable(ACCOUNT_TWO);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
+
+    for (const paneId of [PANE, PANE_TWO]) {
+      const before = beforeCleanup.get(paneId);
+      if (before === undefined) throw new Error("Expected cleanup preimage");
+      expect(value.store.require(paneId)).toEqual(before);
+    }
+  } finally {
+    value.service.closeAdmission();
     await value.service.settled();
-    expect(value.provider.interrupts).toEqual([]);
-    expect(value.provider.startedThreads).toHaveLength(startedThreadCount);
-    expect(value.store.require(PANE)).toMatchObject({
-      binding: null,
-      providerTurnId: null,
-      projection: {
-        state: "attention",
-        accountProfileId: null,
-        attention: { code: "account_unavailable", retryable: true },
+    value.database.close();
+  }
+});
+
+test("stale account-A cleanup cannot touch a queued account-B turn at the same generation", async () => {
+  const value = harness();
+  const successorTurnId = "chatturn_sameaccountb01";
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Account A generation N");
+    await value.service.settled();
+    const firstStarted = value.provider.startedTurns[0];
+    if (firstStarted === undefined) throw new Error("Expected account-A turn");
+    await value.service.observeSessionLifecycle(lifecycle(
+      firstStarted.request,
+      firstStarted.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+
+    const paneIdsReferencingAccount =
+      value.store.paneIdsReferencingAccount.bind(value.store);
+    let successorBefore: ReturnType<ChatPaneStore["require"]> | null = null;
+    Object.defineProperty(value.store, "paneIdsReferencingAccount", {
+      configurable: true,
+      value: (accountProfileId: string) => {
+        const paneIds = paneIdsReferencingAccount(accountProfileId);
+        if (accountProfileId !== ACCOUNT_ONE || successorBefore !== null) {
+          return paneIds;
+        }
+        const current = value.store.require(PANE).projection;
+        const begun = value.store.beginTurn({
+          paneId: PANE,
+          expectedRevision: current.revision,
+          turnId: successorTurnId,
+          prompt: "Account B at the same numeric generation",
+          now: new Date("2026-08-03T12:02:00.000Z"),
+        });
+        if (begun.kind !== "begun") throw new Error("Expected account-B admission");
+        const classified = value.rootTurnRouting.readTurnRouting(
+          PANE,
+          successorTurnId,
+        );
+        if (classified === null) throw new Error("Expected account-B route");
+        value.store.reserveAccount(
+          PANE,
+          successorTurnId,
+          ACCOUNT_TWO,
+          new Date("2026-08-03T12:02:00.002Z"),
+        );
+        value.rootTurnRouting.resolve({
+          paneId: PANE,
+          chatTurnId: successorTurnId,
+          selectedProfile: classified.requestedProfile,
+          profileFallbackReason: null,
+          selectedServiceTier: classified.requestedServiceTier,
+          serviceTierFallbackReason: null,
+          catalogGeneration: 1,
+          catalogDigest: "c".repeat(64),
+          now: new Date("2026-08-03T12:02:00.003Z"),
+        });
+        const binding = {
+          accountProfileId: ACCOUNT_TWO,
+          threadId: "thread_same_generation_account_b",
+          restartThreadId: "raw_thread_same_generation_account_b",
+        };
+        value.store.prepareProviderThread(
+          PANE,
+          successorTurnId,
+          binding,
+          new Date("2026-08-03T12:02:00.004Z"),
+        );
+        value.rootTurnRouting.markEffectStarted({
+          paneId: PANE,
+          chatTurnId: successorTurnId,
+          now: new Date("2026-08-03T12:02:00.005Z"),
+        });
+        value.rootTurnRouting.accept({
+          paneId: PANE,
+          chatTurnId: successorTurnId,
+          acceptedGeneration: 1,
+          acceptedStreamPosition: 1,
+          now: new Date("2026-08-03T12:02:00.006Z"),
+        });
+        value.store.markTurnAccepted(
+          PANE,
+          successorTurnId,
+          "turn_same_generation_account_b",
+          new Date("2026-08-03T12:02:00.007Z"),
+        );
+        successorBefore = value.store.require(PANE);
+        return paneIds;
       },
     });
+
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
+
+    if (successorBefore === null) throw new Error("Expected account-B successor");
+    expect(value.store.require(PANE)).toEqual(successorBefore);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, successorTurnId)).toMatchObject({
+      acceptedGeneration: 1,
+      state: "accepted",
+    });
   } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
     value.database.close();
   }
 });
@@ -6200,7 +6936,7 @@ test("a missing-middle completion poisons the exact turn and can never send cont
     await value.service.settled();
 
     expect(value.provider.interrupts).toHaveLength(1);
-    expect(value.provider.startedTurns.map(({ request }) => request.prompt)).toEqual([
+    expect(value.provider.startedTurns.map(({ request }) => textInput(request))).toEqual([
       "Build the compact UI",
     ]);
     expect(value.store.require(PANE)).toMatchObject({
@@ -6217,7 +6953,7 @@ test("a missing-middle completion poisons the exact turn and can never send cont
       historyTruncated: false,
       projection: { state: "streaming" },
     });
-    expect(value.provider.startedTurns.at(-1)?.request.prompt)
+    expect(textInput(value.provider.startedTurns.at(-1)!.request))
       .toBe("Retry from a clean context");
   } finally {
     value.database.close();
@@ -7407,7 +8143,9 @@ test("account loss settles an accepted harness root with exact provider lineage"
     const started = value.provider.startedTurns[0];
     if (started === undefined) throw new Error("Expected provider turn");
 
-    await value.service.handleAccountUnavailable(ACCOUNT_ONE);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
     await value.service.settled();
 
     expect(roots.settlements).toEqual([]);
@@ -7427,6 +8165,4275 @@ test("account loss settles an accepted harness root with exact provider lineage"
     });
   } finally {
     value.database.close();
+  }
+});
+
+test("generic attachments reject before provider routing, leases, or path disclosure", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const fileId = "attachment_servicefile001";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId: fileId,
+      uploadId: "upload_servicefile0001",
+      kind: "file",
+      bytes: Buffer.from("private notes", "utf8"),
+      displayName: "../../notes.txt",
+      mediaType: "text/plain",
+    });
+    const rejected = await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_attachmentorder1",
+      content: {
+        text: "Inspect the attached evidence.",
+        attachmentRefs: [fileId],
+      },
+      delivery: { kind: "queue" },
+    }).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await value.service.settled();
+
+    expect(rejected).toMatchObject({
+      code: "invalid_state",
+      message: "HRA currently supports image attachments only.",
+    });
+    expect(value.provider.startedThreads).toEqual([]);
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.rootTurnRouting.readLatestTurnRouting(PANE)).toBeNull();
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_provider_attachment_bindings
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_provider_attachment_leases
+    `).get()).toEqual({ count: 0 });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("an image-only queued message routes conservatively and starts without synthetic text", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_imageonly001";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_imageonly0001",
+      kind: "image",
+      bytes: Buffer.from("image only", "utf8"),
+      displayName: "clipboard.png",
+      mediaType: "image/png",
+    });
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_imageonly0001",
+      content: { text: "", attachmentRefs: [attachmentId] },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected image-only provider turn");
+    expect(started.request.input).toEqual([
+      expect.objectContaining({ type: "localImage" }),
+    ]);
+    expect(value.rootTurnRouting.readTurnRouting(PANE, started.request.clientTurnId))
+      .toMatchObject({
+        requiredInputClass: "image",
+        classificationReason: "conservativeDefault",
+        requestedProfile: "solMax",
+        requestedServiceTier: "standard",
+      });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("the exact active model receipt admits a same-turn image steer without dropping it", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Start the active turn.");
+    await value.service.settled();
+    const attachmentId = "attachment_steerimage001";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_steerimage0001",
+      kind: "image",
+      bytes: Buffer.from("steering image", "utf8"),
+      displayName: "steer.png",
+      mediaType: "image/png",
+    });
+
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_steerimage0001",
+      content: { text: "", attachmentRefs: [attachmentId] },
+      delivery: { kind: "steerHead", expectedTurnId: TURN_ONE },
+    });
+
+    expect(value.provider.steeredTurns).toHaveLength(1);
+    expect(value.provider.steeredTurns[0]).toMatchObject({
+      messageId: "chatmsg_steerimage0001",
+      input: [expect.objectContaining({ type: "localImage" })],
+      fence: {
+        generation: 1,
+        catalogDigest: "a".repeat(64),
+        allowsImage: true,
+        observedInputModalities: ["text", "image"],
+      },
+    });
+    expect(value.store.messageQueue(PANE)).toMatchObject({
+      blockedMessage: null,
+      messages: [],
+      pauseReason: null,
+    });
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "active" }]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("lease and digest descriptor failures stop attachment delivery before the turn effect", async () => {
+  for (const failure of ["lease", "descriptor"] as const) {
+    const fixture = await createAttachmentHarness();
+    const { value, vault } = fixture;
+    try {
+      await createPane(value);
+      const attachmentId = failure === "lease"
+        ? "attachment_leasefailure01"
+        : "attachment_descriptorfail1";
+      await uploadReadyServiceAttachment(vault, {
+        paneId: PANE,
+        attachmentId,
+        uploadId: failure === "lease"
+          ? "upload_leasefailure001"
+          : "upload_descriptorfail01",
+        kind: "image",
+        bytes: Buffer.from(`${failure} failure`, "utf8"),
+        displayName: `${failure}.png`,
+        mediaType: "image/png",
+      });
+      Object.defineProperty(vault, failure === "lease"
+        ? "acquireProviderLease"
+        : "providerDescriptor", {
+        configurable: true,
+        value: () => {
+          throw new Error(`fixture ${failure} failure`);
+        },
+      });
+      await value.service.execute({
+        type: "chat.message.enqueue",
+        paneId: PANE,
+        expectedQueueRevision: 1,
+        messageId: failure === "lease"
+          ? "chatmsg_leasefailure001"
+          : "chatmsg_descriptorfail01",
+        content: {
+          text: "Read the attachment.",
+          attachmentRefs: [attachmentId],
+        },
+        delivery: { kind: "queue" },
+      });
+      await value.service.settled();
+
+      expect(value.provider.startedTurns).toEqual([]);
+      expect(value.store.require(PANE).projection).toMatchObject({
+        state: "attention",
+        attention: { code: "turn_failed" },
+      });
+      const bindingCount = value.database.query<{ count: number }, []>(`
+        SELECT COUNT(*) AS count FROM chat_provider_attachment_bindings
+      `).get()?.count;
+      expect(bindingCount).toBe(failure === "descriptor" ? 1 : 0);
+    } finally {
+      await closeAttachmentHarness(fixture);
+    }
+  }
+});
+
+test("an unfenced ambiguous attachment effect retains both provider and turn custody", async () => {
+  const fixture = await createAttachmentHarness(
+    undefined,
+    () => Promise.reject(new Error("fixture containment unavailable")),
+  );
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_ambiguouseffect1";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_ambiguouseffect01",
+      kind: "image",
+      bytes: Buffer.from("ambiguous payload", "utf8"),
+      displayName: "ambiguous.png",
+      mediaType: "image/png",
+    });
+    value.provider.onStartTurn = () => Promise.reject(
+      new ChatProviderEffectError({ certainty: "ambiguous", code: "runtime" }),
+    );
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_ambiguouseffect1",
+      content: {
+        text: "Use the retained attachment.",
+        attachmentRefs: [attachmentId],
+      },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "ambiguous" }]);
+    expect(value.database.query(`
+      SELECT state FROM chat_attachment_turn_leases WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "ambiguous" }]);
+    expect(value.runtimeRecoveries).toHaveLength(1);
+    expect(value.runtimeRecoveries[0]).toMatchObject({
+      paneId: PANE,
+      reason: "ambiguous_provider_effect_unfenced",
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("account-generation loss releases attachment custody before detaching the provider thread", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_accountloss001";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_accountloss0001",
+      kind: "image",
+      bytes: Buffer.from("account-bound", "utf8"),
+      displayName: "account.png",
+      mediaType: "image/png",
+    });
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_accountloss0001",
+      content: {
+        text: "Hold this attachment.",
+        attachmentRefs: [attachmentId],
+      },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "active" }]);
+
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
+    await value.service.settled();
+
+    expect(value.database.query(`
+      SELECT state, containment_receipt_digest IS NOT NULL AS contained
+      FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "released", contained: 1 }]);
+    expect(value.database.query(`
+      SELECT state FROM chat_attachment_turn_leases WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "released" }]);
+    expect(value.store.require(PANE)).toMatchObject({
+      binding: null,
+      providerContextResetRequired: true,
+      providerTurnId: null,
+      activePrompt: "Hold this attachment.",
+      projection: {
+        state: "attention",
+        attention: {
+          code: "runtime_unavailable",
+          retryable: false,
+        },
+        canStartFreshContext: true,
+        messageQueue: { pauseReason: "attention" },
+      },
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("explicit account removal rejects null pane identity with retained provider attachment custody", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_accountorphan01";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_accountorphan001",
+      kind: "image",
+      bytes: Buffer.from("orphan account image", "utf8"),
+      displayName: "orphan.png",
+      mediaType: "image/png",
+    });
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_accountorphan01",
+      content: { text: "Retain this image.", attachmentRefs: [attachmentId] },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Retained.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    value.database.query(`
+      UPDATE chat_panes SET
+        provider_account_profile_id = NULL,
+        provider_thread_id = NULL,
+        provider_restart_thread_id = NULL
+      WHERE pane_id = ?1
+    `).run(PANE);
+
+    const rejected = await value.service.handleAccountRemoval(ACCOUNT_ONE)
+      .then(() => null, (error: unknown) => error);
+    expect(rejected).toMatchObject({ code: "invalid_state" });
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).all(PANE)).toEqual([{ state: "active" }]);
+    expect(value.store.require(PANE)).toMatchObject({
+      binding: null,
+      providerContextResetRequired: false,
+      projection: { accountProfileId: ACCOUNT_ONE },
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("generic generation loss preserves a pending archive intent without attachments", async () => {
+  const value = harness();
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create provider context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE);
+    if (ready.binding === null) throw new Error("Expected persisted provider binding");
+    value.store.prepareProviderThreadArchiveIntent({
+      paneId: PANE,
+      purpose: "pane_archive",
+      expectedRevision: ready.projection.revision,
+      expectedQueueRevision: null,
+      binding: ready.binding,
+      generation: 1,
+      now: new Date("2026-08-03T12:00:01.000Z"),
+    });
+
+    const beforePane = value.store.require(PANE);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
+    await value.service.settled();
+
+    const pendingIntent = value.store.providerThreadArchiveIntent(PANE);
+    expect(pendingIntent).toMatchObject({
+      state: "prepared",
+      generation_contained: 0,
+      binding_id: null,
+    });
+    expect(pendingIntent?.generation_containment_receipt).toBeNull();
+    expect(value.store.require(PANE)).toEqual(beforePane);
+  } finally {
+    value.database.close();
+  }
+});
+
+test("account-contained archive authority closes without a provider call for either purpose", async () => {
+  const value = harness();
+  try {
+    for (const [index, purpose] of ([
+      "start_fresh",
+      "pane_archive",
+    ] as const).entries()) {
+      const suffix = String(index + 1).padStart(2, "0");
+      const paneId = `pane_servicecontained${suffix}`;
+      const binding = {
+        accountProfileId: ACCOUNT_ONE,
+        threadId: `thread_service_contained_${suffix}`,
+        restartThreadId: `raw_thread_service_contained_${suffix}`,
+      };
+      value.store.create({
+        paneId,
+        repository: {
+          id: REPOSITORY,
+          name: "Example",
+          workingDirectory: "/fixture/example",
+        },
+        accountProfileId: ACCOUNT_ONE,
+        now: new Date("2026-08-03T12:00:00.000Z"),
+      });
+      value.database.query(`
+        UPDATE chat_panes SET
+          provider_account_profile_id = ?1,
+          provider_thread_id = ?2,
+          provider_restart_thread_id = ?3
+        WHERE pane_id = ?4
+      `).run(
+        binding.accountProfileId,
+        binding.threadId,
+        binding.restartThreadId,
+        paneId,
+      );
+      if (purpose === "start_fresh") {
+        value.database.query(`
+          UPDATE chat_panes SET
+            state = 'attention',
+            attention_code = 'runtime_unavailable',
+            attention_message = 'Choose Start fresh to exclude prior provider context.',
+            attention_retryable = 0,
+            provider_context_reset_required = 1,
+            message_queue_pause_reason = 'attention',
+            message_queue_revision = message_queue_revision + 1,
+            revision = revision + 1
+          WHERE pane_id = ?1
+        `).run(paneId);
+      }
+      const prepared = value.store.require(paneId);
+      value.store.prepareProviderThreadArchiveIntent({
+        paneId,
+        purpose,
+        expectedRevision: prepared.projection.revision,
+        expectedQueueRevision: purpose === "start_fresh"
+          ? prepared.projection.messageQueue.revision
+          : null,
+        binding,
+        generation: 1,
+        now: new Date("2026-08-03T12:00:00.001Z"),
+      });
+      const containmentReceipt = `service_account_containment_receipt_${suffix}`;
+      const quarantined = value.store.detachUnavailableAccount(
+        paneId,
+        ACCOUNT_ONE,
+        new Date("2026-08-03T12:00:00.002Z"),
+        "quarantineAttachments",
+        null,
+        containmentReceipt,
+      );
+      if (quarantined === null) throw new Error("Expected account quarantine");
+
+      expect(await value.service.execute({
+        type: "chat.pane.remove",
+        paneId,
+        expectedRevision: quarantined.revision,
+      })).toEqual({
+        type: "removed",
+        paneId,
+        revision: quarantined.revision + 1,
+      });
+      expect(value.store.providerThreadArchiveIntent(paneId)).toBeNull();
+      expect(value.database.query(`
+        SELECT archived_at IS NOT NULL AS archived FROM chat_panes
+        WHERE pane_id = ?1
+      `).get(paneId)).toEqual({ archived: 1 });
+    }
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("portable reset boot fences an accepted attachment effect until explicit ambiguity resolution", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_restoreactive01";
+    const messageId = "chatmsg_restoreactive01";
+    const turnId = "chatturn_restoreactive01";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_restoreactive001",
+      kind: "image",
+      bytes: Buffer.from("portable reset image", "utf8"),
+      displayName: "restore.png",
+      mediaType: "image/png",
+    });
+    const enqueued = value.store.enqueueMessageIdempotently({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId,
+      content: { text: "Inspect before restore.", attachmentRefs: [attachmentId] },
+      delivery: { kind: "queue" },
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    const claimed = value.store.claimHeadMessageAndBeginTurn({
+      paneId: PANE,
+      expectedQueueRevision: enqueued.queue.revision,
+      messageId,
+      expectedMessageRevision: 1,
+      turnId,
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    value.rootTurnRouting.resolve({
+      paneId: PANE,
+      chatTurnId: turnId,
+      selectedProfile: "solMax",
+      profileFallbackReason: null,
+      selectedServiceTier: "standard",
+      serviceTierFallbackReason: null,
+      catalogGeneration: 1,
+      catalogDigest: "a".repeat(64),
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    value.store.markMessageEffectStarted({
+      paneId: PANE,
+      messageId,
+      expectedMessageRevision: claimed.claim.revision,
+      turnId,
+      kind: "start",
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    value.rootTurnRouting.markEffectStarted({
+      paneId: PANE,
+      chatTurnId: turnId,
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    value.rootTurnRouting.accept({
+      paneId: PANE,
+      chatTurnId: turnId,
+      acceptedGeneration: 1,
+      acceptedStreamPosition: 17,
+      now: new Date("2026-08-03T12:00:00.000Z"),
+    });
+    expect(value.database.query(`
+      SELECT state FROM chat_message_ledger WHERE message_id = ?1
+    `).get(messageId)).toEqual({ state: "start_effect_started" });
+    expect(value.database.query(`
+      SELECT state, released_at FROM chat_attachment_turn_leases
+      WHERE pane_id = ?1 AND message_id = ?2 AND attachment_id = ?3
+    `).get(PANE, messageId, attachmentId)).toEqual({
+      state: "active",
+      released_at: null,
+    });
+
+    // Portable restore projection deliberately removes resumable provider
+    // identity while retaining the active effect and its attachment custody.
+    value.database.query(`
+      UPDATE chat_panes SET
+        active_turn_poisoned = 1,
+        provider_context_reset_required = 1,
+        provider_account_profile_id = NULL,
+        provider_thread_id = NULL,
+        provider_restart_thread_id = NULL,
+        active_provider_turn_id = NULL
+      WHERE pane_id = ?1
+    `).run(PANE);
+
+    const initialized = value.service.initialize();
+    const recovered = initialized.find(({ id }) => id === PANE);
+    expect(recovered).toMatchObject({
+      state: "attention",
+      recoverablePrompt: false,
+      attention: {
+        code: "runtime_unavailable",
+        retryable: false,
+        message:
+          "Attachment context from the prior Codex session is quarantined. Choose Start fresh to continue without transferring it.",
+      },
+    });
+    expect(recovered?.attention?.message).not.toContain("Retry");
+    expect(value.store.require(PANE)).toMatchObject({
+      activePrompt: "Inspect before restore.",
+      providerContextResetRequired: true,
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE, turnId)).toMatchObject({
+      state: "terminal",
+      operationalOutcome: "interrupted",
+      acceptedGeneration: 1,
+      acceptedStreamPosition: 17,
+    });
+    const ambiguousQueue = value.store.messageQueue(PANE);
+    expect(ambiguousQueue).toMatchObject({
+      pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: messageId,
+        attachmentRefs: [attachmentId],
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
+      messages: [],
+    });
+    expect(value.database.query(`
+      SELECT state, released_at FROM chat_attachment_turn_leases
+      WHERE pane_id = ?1 AND message_id = ?2 AND attachment_id = ?3
+    `).get(PANE, messageId, attachmentId)).toEqual({
+      state: "ambiguous",
+      released_at: null,
+    });
+
+    const retry = await value.service.execute({
+      type: "chat.turn.retry",
+      paneId: PANE,
+      expectedRevision: value.store.require(PANE).projection.revision,
+      priorFailedTurnId: turnId,
+      turnId: "chatturn_restore_retry1",
+    }).then(() => null, (error: unknown) => error);
+    expect(retry).toBeInstanceOf(Error);
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.store.require(PANE).providerContextResetRequired).toBeTrue();
+
+    const blockedFresh = await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      "chatturn_restore_block1",
+      "must wait for explicit resolution",
+    ).then(() => null, (error: unknown) => error);
+    expect(blockedFresh).toBeInstanceOf(Error);
+    expect((blockedFresh as Error).message).toContain("ambiguous message effect");
+    expect(value.store.require(PANE).providerContextResetRequired).toBeTrue();
+
+    const discarded = await value.service.execute({
+      type: "chat.message.discardAmbiguous",
+      paneId: PANE,
+      expectedQueueRevision: ambiguousQueue.revision,
+      messageId,
+      expectedMessageRevision: ambiguousQueue.blockedMessage?.revision ?? -1,
+    });
+    if (discarded.type !== "messageQueue") {
+      throw new Error("Expected an explicitly resumed message queue");
+    }
+    expect(discarded.queue).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+    });
+    expect(value.database.query(`
+      SELECT state, released_at IS NOT NULL AS released
+      FROM chat_attachment_turn_leases
+      WHERE pane_id = ?1 AND message_id = ?2 AND attachment_id = ?3
+    `).get(PANE, messageId, attachmentId)).toEqual({
+      state: "released",
+      released: 1,
+    });
+    expect(value.store.require(PANE).providerContextResetRequired).toBeTrue();
+
+    const reset = await value.service.execute({
+      type: "chat.pane.startFreshContext",
+      paneId: PANE,
+      expectedRevision: value.store.require(PANE).projection.revision,
+      expectedQueueRevision: discarded.queue.revision,
+    });
+    if (reset.type !== "messageQueue") {
+      throw new Error("Expected the explicit fresh-context action to resume the queue");
+    }
+    expect(reset.queue.pauseReason).toBeNull();
+    expect(value.store.require(PANE)).toMatchObject({
+      activePrompt: null,
+      providerContextResetRequired: false,
+    });
+
+    await startTurn(
+      value,
+      value.store.require(PANE).projection.revision,
+      "chatturn_restore_fresh01",
+      "Fresh message after explicit resolution.",
+    );
+    await value.service.settled();
+    expect(value.provider.startedTurns).toHaveLength(1);
+    expect(value.provider.startedTurns[0]?.request.input).toEqual([{
+      type: "text",
+      text: "Fresh message after explicit resolution.",
+    }]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("Start fresh fails closed before provider archive access and preserves context", async () => {
+  const value = harness({
+    providerThreadArchiveCoordinatorV57Enabled: false,
+  });
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create retained provider context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    value.database.query(`
+      UPDATE chat_panes SET
+        state = 'attention',
+        attention_code = 'runtime_unavailable',
+        attention_message = 'Choose Start fresh to exclude prior provider context.',
+        attention_retryable = 0,
+        provider_context_reset_required = 1,
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1
+      WHERE pane_id = ?1
+    `).run(PANE);
+    const quarantined = value.store.require(PANE);
+
+    const rejected = await value.service.execute({
+      type: "chat.pane.startFreshContext",
+      paneId: PANE,
+      expectedRevision: quarantined.projection.revision,
+      expectedQueueRevision: quarantined.projection.messageQueue.revision,
+    }).then(() => null, (error: unknown) => error);
+
+    expect(rejected).toMatchObject({ code: "invalid_state" });
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+    expect(value.store.providerThreadArchiveIntent(PANE)).toBeNull();
+    expect(value.store.require(PANE)).toEqual(quarantined);
+  } finally {
+    value.database.close();
+  }
+});
+
+const REPLAYED_ARCHIVE_TARGETS_V57 = [
+  {
+    paneId: PANE,
+    targetId: `archtarget_${"a".repeat(32)}`,
+    attemptId: `archattempt_${"a".repeat(32)}`,
+  },
+  {
+    paneId: PANE_TWO,
+    targetId: `archtarget_${"b".repeat(32)}`,
+    attemptId: `archattempt_${"b".repeat(32)}`,
+  },
+] as const;
+
+const THREE_REPLAYED_ARCHIVE_TARGETS_V57 = [
+  ...REPLAYED_ARCHIVE_TARGETS_V57,
+  {
+    paneId: PANE_THREE,
+    targetId: `archtarget_${"c".repeat(32)}`,
+    attemptId: `archattempt_${"c".repeat(32)}`,
+  },
+] as const;
+
+async function prepareTwoBoundProviderPanesV57(value: Harness): Promise<void> {
+  const firstCreated = await createPane(value, PANE);
+  await startTurn(
+    value,
+    firstCreated.revision,
+    TURN_ONE,
+    "Create first recovery context.",
+    PANE,
+  );
+  await value.service.settled();
+  const firstTurn = value.provider.startedTurns[0];
+  if (firstTurn === undefined) throw new Error("Expected first provider turn");
+  await value.service.observeSessionAssistantCompletion(completion(
+    firstTurn.request,
+    firstTurn.turnId,
+    "First context ready.",
+  ));
+  await value.service.observeSessionLifecycle(lifecycle(
+    firstTurn.request,
+    firstTurn.turnId,
+    "completed",
+  ));
+  await value.service.settled();
+
+  const secondCreated = await createPane(value, PANE_TWO);
+  await startTurn(
+    value,
+    secondCreated.revision,
+    TURN_TWO,
+    "Create second recovery context.",
+    PANE_TWO,
+  );
+  await value.service.settled();
+  const secondTurn = value.provider.startedTurns[1];
+  if (secondTurn === undefined) throw new Error("Expected second provider turn");
+  await value.service.observeSessionAssistantCompletion(completion(
+    secondTurn.request,
+    secondTurn.turnId,
+    "Second context ready.",
+  ));
+  await value.service.observeSessionLifecycle(lifecycle(
+    secondTurn.request,
+    secondTurn.turnId,
+    "completed",
+  ));
+  await value.service.settled();
+}
+
+async function prepareTwoReplayedArchiveTargetsV57(
+  value: Harness,
+  archive: ReturnType<typeof directArchiveTransitionV57Fixture>,
+): Promise<void> {
+  await prepareTwoBoundProviderPanesV57(value);
+  prepareReplayedArchiveTargetsV57(
+    value,
+    archive,
+    REPLAYED_ARCHIVE_TARGETS_V57,
+  );
+}
+
+async function prepareThreeReplayedArchiveTargetsV57(
+  value: Harness,
+  archive: ReturnType<typeof directArchiveTransitionV57Fixture>,
+): Promise<void> {
+  await prepareTwoBoundProviderPanesV57(value);
+  const thirdCreated = await createPane(value, PANE_THREE);
+  await startTurn(
+    value,
+    thirdCreated.revision,
+    TURN_THREE,
+    "Create third recovery context.",
+    PANE_THREE,
+  );
+  await value.service.settled();
+  const thirdTurn = value.provider.startedTurns[2];
+  if (thirdTurn === undefined) throw new Error("Expected third provider turn");
+  await value.service.observeSessionAssistantCompletion(completion(
+    thirdTurn.request,
+    thirdTurn.turnId,
+    "Third context ready.",
+  ));
+  await value.service.observeSessionLifecycle(lifecycle(
+    thirdTurn.request,
+    thirdTurn.turnId,
+    "completed",
+  ));
+  await value.service.settled();
+  prepareReplayedArchiveTargetsV57(
+    value,
+    archive,
+    THREE_REPLAYED_ARCHIVE_TARGETS_V57,
+  );
+}
+
+function prepareReplayedArchiveTargetsV57(
+  value: Harness,
+  archive: ReturnType<typeof directArchiveTransitionV57Fixture>,
+  targets: readonly Readonly<{
+    paneId: string;
+    targetId: string;
+    attemptId: string;
+  }>[],
+): void {
+  for (const target of targets) {
+    const pane = value.store.require(target.paneId).projection;
+    value.store.prepareProviderThreadArchiveEffectStartedV57({
+      targetId: target.targetId,
+      attemptId: target.attemptId,
+      paneId: target.paneId,
+      purpose: "pane_archive",
+      expectedRevision: pane.revision,
+      expectedQueueRevision: null,
+      generation: 1,
+      now: new Date("2026-08-03T12:01:00.000Z"),
+    });
+  }
+  archive.installTransitionIds(
+    targets.map(({ targetId }) => targetId),
+  );
+}
+
+type ProviderArchiveStartupPhaseV57 =
+  | "fence_started"
+  | "fenced"
+  | "sealed_partial"
+  | "contained_ambiguous"
+  | "reconciled_applied"
+  | "reconciled_not_applied";
+
+async function seedProviderArchiveStartupPhaseV57(
+  value: Harness,
+  archive: ReturnType<typeof directArchiveTransitionV57Fixture>,
+  phase: ProviderArchiveStartupPhaseV57,
+): Promise<string> {
+  const phaseTargets = phase === "sealed_partial"
+    ? REPLAYED_ARCHIVE_TARGETS_V57.slice(0, 1)
+    : REPLAYED_ARCHIVE_TARGETS_V57;
+  await prepareTwoBoundProviderPanesV57(value);
+  prepareReplayedArchiveTargetsV57(value, archive, phaseTargets);
+  const transitionId = REPLAYED_ARCHIVE_TARGETS_V57[0].targetId;
+  const archiveHandle = (targetId: string) =>
+    archive.methods.archiveTransitionHandleV57?.(targetId) ?? (() => {
+      throw new Error("Startup phase lost its archive handle");
+    })();
+  const refresh = archive.methods.refreshArchiveTransitionCutAuthoritiesV57 ??
+    (() => { throw new Error("Startup phase refresh is unavailable"); });
+  const cutId = `archcut_${({
+    fence_started: "d",
+    fenced: "e",
+    sealed_partial: "f",
+    contained_ambiguous: "g",
+    reconciled_applied: "i",
+    reconciled_not_applied: "h",
+  } satisfies Record<ProviderArchiveStartupPhaseV57, string>)[phase].repeat(32)}`;
+  value.store.beginProviderThreadArchiveLostResponseCutV57({
+    targetId: transitionId,
+    cutId,
+    cause: "lost_response",
+    now: new Date("2026-08-03T12:05:00.000Z"),
+  });
+  refresh({
+    transitionId,
+    cutId,
+    archiveHandle: archiveHandle(transitionId),
+  });
+  if (phase === "fence_started") return cutId;
+
+  const contain = archive.methods.containArchiveTransitionGenerationV57 ??
+    (() => Promise.reject(new Error("Startup phase fence is unavailable")));
+  await contain({
+    accountProfileId: ACCOUNT_ONE,
+    transitionId,
+    cutId,
+    archiveHandle: archiveHandle(transitionId),
+  });
+  if (phase === "fenced") return cutId;
+
+  const sealed = value.store.sealProviderThreadArchiveSourceInventoryV57({
+    cutId,
+    now: new Date("2026-08-03T12:05:01.000Z"),
+  });
+  refresh({
+    transitionId,
+    cutId,
+    archiveHandle: archiveHandle(transitionId),
+  });
+  const members = [...sealed.members].sort((left, right) =>
+    left.ordinal - right.ordinal
+  );
+  if (phase === "sealed_partial") {
+    const first = members.find((member) => member.role === "target");
+    if (first === undefined) throw new Error("Startup phase lost its target member");
+    value.store.settleProviderThreadArchiveMemberV57({
+      memberId: first.memberId,
+      now: new Date("2026-08-03T12:05:02.000Z"),
+    });
+    refresh({
+      transitionId,
+      cutId,
+      archiveHandle: archiveHandle(transitionId),
+    });
+    return cutId;
+  }
+  for (const member of members) {
+    value.store.settleProviderThreadArchiveMemberV57({
+      memberId: member.memberId,
+      now: new Date("2026-08-03T12:05:02.000Z"),
+    });
+    refresh({
+      transitionId,
+      cutId,
+      archiveHandle: archiveHandle(transitionId),
+    });
+  }
+  value.store.markProviderThreadArchiveCutContainedV57({
+    cutId,
+    now: new Date("2026-08-03T12:05:03.000Z"),
+  });
+  refresh({
+    transitionId,
+    cutId,
+    archiveHandle: archiveHandle(transitionId),
+  });
+  if (phase === "contained_ambiguous") return cutId;
+
+  const replace = archive.methods.replaceArchiveTransition ??
+    (() => { throw new Error("Startup phase replacement is unavailable"); });
+  for (const target of phaseTargets) {
+    const prior = archiveHandle(target.targetId);
+    value.store.recordProviderThreadArchiveReconciliationV57({
+      targetId: target.targetId,
+      result: phase === "reconciled_applied"
+        ? {
+            disposition: "applied",
+            responseGeneration: 2,
+            responseStreamPosition: 79,
+            providerContainmentReceipt: "archive_startup_applied_receipt",
+          }
+        : {
+            disposition: "not_applied",
+            providerReconciliationReceipt:
+              "archive_startup_not_applied_receipt",
+          },
+      now: new Date("2026-08-03T12:05:04.000Z"),
+    });
+    replace(prior, target.targetId);
+  }
+  return cutId;
+}
+
+test("v57 directly archives a provider-bound pane and releases admission before handoff", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+      archiveTransitionV57: archive.methods,
+      onPaneRemoved: () => {
+        events.push(`projection:${String(archive.activeTransitionIds().length)}`);
+      },
+    });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create archive context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Ready to archive.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const readyRecord = value.store.require(PANE);
+    const ready = readyRecord.projection;
+    if (readyRecord.binding === null) throw new Error("Expected archive binding");
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    })).toEqual({
+      type: "removed",
+      paneId: PANE,
+      revision: ready.revision + 1,
+    });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.archiveCalls[0]).toMatchObject({
+      binding: {
+        accountProfileId: readyRecord.binding.accountProfileId,
+        threadId: readyRecord.binding.threadId,
+        restartThreadId: readyRecord.binding.restartThreadId,
+      },
+      expectedGeneration: 1,
+    });
+    expect(value.provider.reconcileArchiveCalls).toEqual([]);
+    expect(archive.activeTransitionIds()).toEqual([]);
+    const releaseIndex = events.findIndex((event) => event.startsWith("released:"));
+    const postReleaseProjection = events.findIndex(
+      (event, index) => index > releaseIndex && event === "projection:0",
+    );
+    expect(releaseIndex).toBeGreaterThanOrEqual(0);
+    expect(postReleaseProjection).toBeGreaterThan(releaseIndex);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 directly archives Start fresh context before resuming its queue", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+      archiveTransitionV57: archive.methods,
+    });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create restart context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    value.database.query(`
+      UPDATE chat_panes SET
+        state = 'attention',
+        attention_code = 'runtime_unavailable',
+        attention_message = 'Choose Start fresh to exclude prior provider context.',
+        attention_retryable = 0,
+        provider_context_reset_required = 1,
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1
+      WHERE pane_id = ?1
+    `).run(PANE);
+    const quarantined = value.store.require(PANE).projection;
+
+    const result = await value.service.execute({
+      type: "chat.pane.startFreshContext",
+      paneId: PANE,
+      expectedRevision: quarantined.revision,
+      expectedQueueRevision: quarantined.messageQueue.revision,
+    });
+    expect(result).toMatchObject({
+      type: "messageQueue",
+      paneId: PANE,
+      queue: { pauseReason: null },
+    });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.archiveCalls[0]?.expectedGeneration).toBe(1);
+    expect(value.store.require(PANE)).toMatchObject({
+      binding: null,
+      providerContextResetRequired: false,
+    });
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 stale pre-effect preparation awaits exact provisional containment before reuse", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const baseBegin = archive.methods.beginArchiveTransitionProvisional;
+  const baseAbort = archive.methods.abortArchiveTransitionProvisional;
+  if (baseBegin === undefined || baseAbort === undefined) {
+    throw new Error("Archive provisional fixture is unavailable");
+  }
+  const abortEntered = deferred<void>();
+  const terminalProof = deferred<void>();
+  let activeHarness: Harness | null = null;
+  let provisionalHeld = false;
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: {
+      ...archive.methods,
+      beginArchiveTransitionProvisional: async (input) => {
+        const provisional = await baseBegin(input);
+        provisionalHeld = true;
+        const current = activeHarness;
+        if (current === null) throw new Error("Archive harness is unavailable");
+        // Model a local pane mutation plus a foreign callback taint after the
+        // account hold lands and before Store promotion reaches its effect cut.
+        current.database.query(`
+          UPDATE chat_panes SET revision = revision + 1 WHERE pane_id = ?1
+        `).run(input.paneId);
+        events.push("provisional:tainted:1");
+        return provisional;
+      },
+      abortArchiveTransitionProvisional: async (handle) => {
+        events.push("provisional:fence:1");
+        abortEntered.resolve();
+        await terminalProof.promise;
+        events.push("provisional:terminal:1");
+        await baseAbort(handle);
+        provisionalHeld = false;
+      },
+    },
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  activeHarness = value;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Prepare stale archive.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Stale archive ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+
+    const removal = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    });
+    await withinDeadline(abortEntered.promise, "provisional exact fence");
+    let removalSettled = false;
+    void removal.then(
+      () => { removalSettled = true; },
+      () => { removalSettled = true; },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provisionalHeld).toBeTrue();
+    expect(removalSettled).toBeFalse();
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count
+      FROM chat_provider_thread_archive_targets_v57
+    `).get()).toEqual({ count: 0 });
+
+    terminalProof.resolve();
+    const failure = await removal.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(provisionalHeld).toBeFalse();
+    expect(events).toContain("provisional:tainted:1");
+    expect(events.indexOf("provisional:terminal:1"))
+      .toBeLessThan(events.indexOf("provisional:aborted"));
+    expect(value.provider.archiveCalls).toEqual([]);
+
+    const current = value.store.require(PANE).projection;
+    await startTurn(value, current.revision, TURN_TWO, "Reuse after fence.");
+    await value.service.settled();
+    expect(value.provider.startedTurns).toHaveLength(2);
+  } finally {
+    terminalProof.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 serializes concurrent same-account live archive effects", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+  });
+  const { value } = fixture;
+  const firstEntered = deferred<void>();
+  const secondEntered = deferred<void>();
+  const releaseFirst = deferred<void>();
+  const releaseSecond = deferred<void>();
+  let activeArchiveEffects = 0;
+  let maximumArchiveEffects = 0;
+  try {
+    await prepareTwoBoundProviderPanesV57(value);
+    value.provider.onArchiveThread = async () => {
+      const call = value.provider.archiveCalls.length;
+      activeArchiveEffects += 1;
+      maximumArchiveEffects = Math.max(
+        maximumArchiveEffects,
+        activeArchiveEffects,
+      );
+      try {
+        if (call === 1) {
+          firstEntered.resolve();
+          await releaseFirst.promise;
+        } else if (call === 2) {
+          secondEntered.resolve();
+          await releaseSecond.promise;
+        } else {
+          throw new Error("Unexpected concurrent archive effect");
+        }
+        return { containmentReceipt: `archive_serial_${String(call)}` };
+      } finally {
+        activeArchiveEffects -= 1;
+      }
+    };
+    const firstPane = value.store.require(PANE).projection;
+    const secondPane = value.store.require(PANE_TWO).projection;
+    const first = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: firstPane.revision,
+    });
+    const second = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE_TWO,
+      expectedRevision: secondPane.revision,
+    });
+
+    await withinDeadline(firstEntered.promise, "first serialized archive RPC");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(activeArchiveEffects).toBe(1);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+    expect(events.filter((event) => event.startsWith("provisional:")))
+      .toHaveLength(1);
+    expect(events.filter((event) => event.startsWith("promoted:")))
+      .toHaveLength(1);
+    expect(value.database.query(`
+      SELECT status FROM chat_provider_thread_archive_targets_v57
+    `).all()).toEqual([{ status: "open" }]);
+    expect(value.service.hasUnsettledWork()).toBe(true);
+
+    releaseFirst.resolve();
+    await withinDeadline(secondEntered.promise, "second serialized archive RPC");
+    expect(value.provider.archiveCalls).toHaveLength(2);
+    expect(activeArchiveEffects).toBe(1);
+    expect(maximumArchiveEffects).toBe(1);
+    releaseSecond.resolve();
+
+    expect(await Promise.all([first, second])).toEqual([
+      { type: "removed", paneId: PANE, revision: firstPane.revision + 1 },
+      {
+        type: "removed",
+        paneId: PANE_TWO,
+        revision: secondPane.revision + 1,
+      },
+    ]);
+    await value.service.settled();
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.database.query(`
+      SELECT status FROM chat_provider_thread_archive_targets_v57
+      ORDER BY target_id
+    `).all()).toEqual([{ status: "committed" }, { status: "committed" }]);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 shutdown joins an in-flight direct archive before releasing quarantine", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  const archiveEntered = deferred<void>();
+  const archiveGate = deferred<void>();
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Archive during shutdown.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Shutdown archive ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    value.provider.onArchiveThread = async () => {
+      archiveEntered.resolve();
+      await archiveGate.promise;
+      return { containmentReceipt: "archive_shutdown_direct_receipt" };
+    };
+    const ready = value.store.require(PANE).projection;
+    const removal = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    });
+    await withinDeadline(archiveEntered.promise, "in-flight direct archive RPC");
+
+    value.service.closeAdmission();
+    const settlement = value.service.settled();
+    let settled = false;
+    void settlement.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toHaveLength(1);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+
+    archiveGate.resolve();
+    expect(await removal).toEqual({
+      type: "removed",
+      paneId: PANE,
+      revision: ready.revision + 1,
+    });
+    await settlement;
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toEqual([]);
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toEqual([]);
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+    await Promise.resolve();
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toEqual([]);
+  } finally {
+    archiveGate.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 Start fresh queue admission remains joined after durable release", async () => {
+  const archive = directArchiveTransitionV57Fixture([], {
+    cleanupCommittedComponents: true,
+  });
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  const queueAdmissionEntered = deferred<void>();
+  const queueAdmissionGate = deferred<void>();
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create queued restart context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Queued restart context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    value.store.enqueueMessage({
+      paneId: PANE,
+      expectedQueueRevision: ready.messageQueue.revision,
+      messageId: "chatmsg_freshqueuejoin1",
+      content: { text: "Run after the reset.", attachmentRefs: [] },
+      now: new Date("2026-08-03T12:03:00.000Z"),
+    });
+    value.database.query(`
+      UPDATE chat_panes SET
+        state = 'attention',
+        attention_code = 'runtime_unavailable',
+        attention_message = 'Choose Start fresh to exclude prior provider context.',
+        attention_retryable = 0,
+        provider_context_reset_required = 1,
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1
+      WHERE pane_id = ?1
+    `).run(PANE);
+    value.provider.onStartThread = async () => {
+      queueAdmissionEntered.resolve();
+      await queueAdmissionGate.promise;
+      return {
+        threadId: "thread_fresh_queue_join",
+        restartThreadId: "raw_thread_fresh_queue_join",
+      };
+    };
+    const quarantined = value.store.require(PANE).projection;
+    const reset = value.service.execute({
+      type: "chat.pane.startFreshContext",
+      paneId: PANE,
+      expectedRevision: quarantined.revision,
+      expectedQueueRevision: quarantined.messageQueue.revision,
+    });
+    await withinDeadline(
+      queueAdmissionEntered.promise,
+      "postcommit Start fresh queue admission",
+    );
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.provider.archiveCalls).toHaveLength(1);
+
+    value.service.closeAdmission();
+    const settlement = value.service.settled();
+    let settled = false;
+    void settlement.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    queueAdmissionGate.resolve();
+    expect(await reset).toMatchObject({
+      type: "messageQueue",
+      paneId: PANE,
+    });
+    await settlement;
+    expect(value.provider.startedThreads).toHaveLength(2);
+    expect(value.provider.startedTurns).toHaveLength(2);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+  } finally {
+    queueAdmissionGate.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 terminal pane reservation keeps a command queued until archive release", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const archiveEntered = deferred<void>();
+  const archiveGate = deferred<void>();
+  const repositoryGate = deferred<ChatRepository>();
+  const repositoryEntered = deferred<void>();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+    repositoryResolver: async (repositoryId) => {
+      if (repositoryId === REPOSITORY) {
+        return {
+          id: REPOSITORY,
+          name: "Example",
+          workingDirectory: "/fixture/example",
+        };
+      }
+      if (repositoryId !== REPOSITORY_TWO) return null;
+      events.push("repository:waiting");
+      repositoryEntered.resolve();
+      const repository = await repositoryGate.promise;
+      events.push("repository:resolved");
+      return repository;
+    },
+  });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Queue behind archive.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Archive queue ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    let queuedPaneCommand: Promise<ChatCommandResult> | null = null;
+    value.provider.onArchiveThread = async () => {
+      queuedPaneCommand = value.service.execute({
+        type: "chat.pane.repository.select",
+        paneId: PANE,
+        expectedRevision: ready.revision,
+        repositoryId: REPOSITORY_TWO,
+      });
+      archiveEntered.resolve();
+      await archiveGate.promise;
+      return { containmentReceipt: "archive_fixture_receipt" };
+    };
+
+    const removal = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    });
+    await withinDeadline(archiveEntered.promise, "reserved archive RPC");
+    expect(events.some((event) => event.startsWith("released:"))).toBe(false);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+
+    archiveGate.resolve();
+    await withinDeadline(
+      repositoryEntered.promise,
+      "post-release queued pane command",
+    );
+    const releaseIndex = events.findIndex((event) => event.startsWith("released:"));
+    const waitingIndex = events.indexOf("repository:waiting");
+    expect(releaseIndex).toBeGreaterThanOrEqual(0);
+    expect(waitingIndex).toBeGreaterThan(releaseIndex);
+
+    repositoryGate.resolve({
+      id: REPOSITORY_TWO,
+      name: "Other",
+      workingDirectory: "/fixture/other",
+    });
+    const queuedFailure = await (queuedPaneCommand ??
+      Promise.reject(new Error("Queued pane command was not installed")))
+      .then(() => null, (error: unknown) => error);
+    expect(queuedFailure).toBeInstanceOf(Error);
+    expect(await removal).toMatchObject({ type: "removed", paneId: PANE });
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    archiveGate.resolve();
+    repositoryGate.resolve({
+      id: REPOSITORY_TWO,
+      name: "Other",
+      workingDirectory: "/fixture/other",
+    });
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 stable barrier drains a newly bound account sibling before effect start", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const predecessorGate = deferred<ChatRepository | null>();
+  const predecessorEntered = deferred<void>();
+  const siblingTailGate = deferred<ChatRepository | null>();
+  const siblingTailEntered = deferred<void>();
+  let delayedResolutionCount = 0;
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+    repositoryResolver: async (repositoryId) => {
+      if (repositoryId === REPOSITORY) {
+        return {
+          id: REPOSITORY,
+          name: "Example",
+          workingDirectory: "/fixture/example",
+        };
+      }
+      if (repositoryId !== REPOSITORY_TWO) return null;
+      delayedResolutionCount += 1;
+      if (delayedResolutionCount === 1) {
+        predecessorEntered.resolve();
+        return await predecessorGate.promise;
+      }
+      siblingTailEntered.resolve();
+      return await siblingTailGate.promise;
+    },
+  });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value, PANE);
+    await startTurn(value, created.revision, TURN_ONE, "Archive with sibling race.");
+    await value.service.settled();
+    const firstTurn = value.provider.startedTurns[0];
+    if (firstTurn === undefined) throw new Error("Expected first provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      firstTurn.request,
+      firstTurn.turnId,
+      "Primary context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      firstTurn.request,
+      firstTurn.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    const sibling = await createPane(value, PANE_TWO);
+    await startTurn(
+      value,
+      sibling.revision,
+      TURN_TWO,
+      "Create stable sibling authority.",
+      PANE_TWO,
+    );
+    await value.service.settled();
+    const siblingTurn = value.provider.startedTurns[1];
+    if (siblingTurn === undefined) throw new Error("Expected sibling provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      siblingTurn.request,
+      siblingTurn.turnId,
+      "Sibling authority ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      siblingTurn.request,
+      siblingTurn.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const siblingRecord = value.store.require(PANE_TWO);
+    const siblingBinding = siblingRecord.binding;
+    if (siblingBinding === null) throw new Error("Expected sibling binding");
+    value.database.query(`
+      UPDATE chat_panes SET provider_account_profile_id = NULL,
+        provider_thread_id = NULL, provider_restart_thread_id = NULL
+      WHERE pane_id = ?1
+    `).run(PANE_TWO);
+
+    const queuedPredecessor = value.service.execute({
+      type: "chat.pane.repository.select",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+      repositoryId: REPOSITORY_TWO,
+    });
+    await predecessorEntered.promise;
+    const queuedSibling = value.service.execute({
+      type: "chat.pane.repository.select",
+      paneId: PANE_TWO,
+      expectedRevision: siblingRecord.projection.revision,
+      repositoryId: REPOSITORY_TWO,
+    });
+    await siblingTailEntered.promise;
+    const removal = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(events.some((event) => event.startsWith("provisional:"))).toBe(true);
+
+    value.database.query(`
+      UPDATE chat_panes SET provider_account_profile_id = ?2,
+        provider_thread_id = ?3, provider_restart_thread_id = ?4
+      WHERE pane_id = ?1
+    `).run(
+      PANE_TWO,
+      siblingBinding.accountProfileId,
+      siblingBinding.threadId,
+      siblingBinding.restartThreadId,
+    );
+    predecessorGate.resolve(null);
+    expect(await queuedPredecessor.then(
+      () => null,
+      (error: unknown) => error,
+    )).toMatchObject({ code: "not_found" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count
+      FROM chat_provider_thread_archive_targets_v57
+    `).get()).toEqual({ count: 0 });
+
+    siblingTailGate.resolve(null);
+    expect(await queuedSibling.then(
+      () => null,
+      (error: unknown) => error,
+    )).toMatchObject({ code: "not_found" });
+    expect(await removal).toMatchObject({ type: "removed", paneId: PANE });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.store.require(PANE_TWO).binding).not.toBeNull();
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 durable success releases admission before a failing removal projection", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+    onPaneRemoved: () => {
+      events.push("projection:throw");
+      throw new Error("fixture removal projection failure");
+    },
+  });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Project archive removal.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Removal projection ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+
+    const failure = await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    }).then(() => null, (error: unknown) => error);
+    expect(String(failure)).toContain("fixture removal projection failure");
+    const releaseIndex = events.findIndex((event) => event.startsWith("released:"));
+    expect(releaseIndex).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("projection:throw")).toBeGreaterThan(releaseIndex);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+    await value.service.settled();
+    expect(value.service.hasUnsettledWork()).toBe(false);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 lost archive response fences, seals, settles, and reconciles exact N plus one", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create lost archive context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Ready for lost response.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    value.provider.onArchiveThread = () =>
+      Promise.reject(new Error("lost archive response"));
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_scan_fixture_receipt",
+      generation: 2,
+      streamPosition: 19,
+      containmentReceipt: "archive_containment_fixture_receipt",
+    });
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    })).toEqual({
+      type: "removed",
+      paneId: PANE,
+      revision: ready.revision + 1,
+    });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(value.provider.archiveCalls[0]?.expectedGeneration).toBe(1);
+    expect(events.filter((event) => event.startsWith("contained:"))).toHaveLength(1);
+    expect(events.filter((event) => event.startsWith("refreshed:"))).toHaveLength(4);
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.database.query(`
+      SELECT state, source_generation, successor_generation
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({
+      state: "contained",
+      source_generation: 1,
+      successor_generation: 2,
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 callback-tainted archive response enters an exact durable cut before release", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const baseContain = archive.methods.containArchiveTransitionGenerationV57;
+  if (baseContain === undefined) {
+    throw new Error("Archive containment fixture is unavailable");
+  }
+  const fenceEntered = deferred<void>();
+  const releaseFence = deferred<void>();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: {
+      ...archive.methods,
+      containArchiveTransitionGenerationV57: async (input) => {
+        fenceEntered.resolve();
+        await releaseFence.promise;
+        return await baseContain(input);
+      },
+    },
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Taint archive response.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Callback race ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    value.provider.onArchiveThread = () => Promise.reject(
+      new AccountRuntimeNotQuiescentError(),
+    );
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_callback_taint_scan_receipt",
+      generation: 2,
+      streamPosition: 83,
+      containmentReceipt: "archive_callback_taint_containment_receipt",
+    });
+
+    const removal = value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    });
+    await withinDeadline(fenceEntered.promise, "callback-tainted archive fence");
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toEqual([]);
+    expect(value.database.query(`
+      SELECT state, cause, source_generation
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({
+      state: "fence_started",
+      cause: "ambiguous_response",
+      source_generation: 1,
+    });
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toMatchObject([{
+        status: "open",
+        currentAttempt: { state: "ambiguous" },
+      }]);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+    expect(events.some((event) => event.startsWith("released:"))).toBeFalse();
+
+    releaseFence.resolve();
+    expect(await removal).toMatchObject({ type: "removed", paneId: PANE });
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(events.some((event) => event.startsWith("contained:"))).toBeTrue();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    releaseFence.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 lost archive containment detaches an exact same-generation sibling", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const primary = await createPane(value, PANE);
+    await startTurn(value, primary.revision, TURN_ONE, "Archive primary context.");
+    await value.service.settled();
+    const primaryTurn = value.provider.startedTurns[0];
+    if (primaryTurn === undefined) throw new Error("Expected primary provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      primaryTurn.request,
+      primaryTurn.turnId,
+      "Primary ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      primaryTurn.request,
+      primaryTurn.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+
+    const sibling = await createPane(value, PANE_TWO);
+    await startTurn(
+      value,
+      sibling.revision,
+      TURN_TWO,
+      "Retain sibling context.",
+      PANE_TWO,
+    );
+    await value.service.settled();
+    const siblingTurn = value.provider.startedTurns[1];
+    if (siblingTurn === undefined) throw new Error("Expected sibling provider turn");
+    // Recreate the crash cut where the pane terminalized locally but its
+    // accepted provider route did not settle. The immutable route is still
+    // live generation-N authority and must enter the containment cut.
+    const siblingAttention = value.store.enterAttention({
+      paneId: PANE_TWO,
+      turnId: TURN_TWO,
+      attention: {
+        code: "turn_failed",
+        message: "Fixture retained unresolved generation authority.",
+        retryable: true,
+      },
+      clearBinding: false,
+      now: new Date("2026-08-03T12:00:03.000Z"),
+    });
+    if (siblingAttention === null) throw new Error("Expected sibling attention");
+    value.store.completeAcknowledgedMessagesForTurn(
+      PANE_TWO,
+      TURN_TWO,
+      new Date("2026-08-03T12:00:03.001Z"),
+    );
+
+    const ready = value.store.require(PANE).projection;
+    value.provider.onArchiveThread = () =>
+      Promise.reject(new Error("fixture sibling containment loss"));
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_sibling_scan_receipt",
+      generation: 2,
+      streamPosition: 73,
+      containmentReceipt: "archive_sibling_containment_receipt",
+    });
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    })).toMatchObject({ type: "removed", paneId: PANE });
+    expect(value.store.require(PANE_TWO)).toMatchObject({
+      binding: null,
+      providerContextResetRequired: true,
+      projection: {
+        state: "attention",
+        attention: { code: "runtime_unavailable", retryable: false },
+      },
+    });
+    expect(value.database.query(`
+      SELECT role, action, state
+      FROM chat_provider_thread_archive_cut_members_v57
+      ORDER BY ordinal
+    `).all()).toEqual([
+      { role: "target", action: "preserved_target", state: "settled" },
+      { role: "sibling", action: "detach_binding_only", state: "settled" },
+    ]);
+    expect(value.database.query(`
+      SELECT target_count, member_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({ target_count: 1, member_count: 2, state: "contained" });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 lost archive preserves a settled sibling attachment binding for successor-generation resume", async () => {
+  let currentGeneration = 1;
+  const archive = directArchiveTransitionV57Fixture([], {
+    cleanupCommittedComponents: true,
+  });
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+      expectedGeneration === currentGeneration,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value, vault } = fixture;
+  archive.attach(value.database);
+  try {
+    const primary = await createPane(value, PANE);
+    await startTurn(value, primary.revision, TURN_ONE, "Archive primary context.");
+    await value.service.settled();
+    const primaryTurn = value.provider.startedTurns[0];
+    if (primaryTurn === undefined) throw new Error("Expected primary provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      primaryTurn.request,
+      primaryTurn.turnId,
+      "Primary ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      primaryTurn.request,
+      primaryTurn.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+
+    await createPane(value, PANE_TWO);
+    const attachmentId = "attachment_v57sibling01";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE_TWO,
+      attachmentId,
+      uploadId: "upload_v57sibling0001",
+      kind: "image",
+      bytes: Buffer.from("settled sibling image", "utf8"),
+      displayName: "sibling.png",
+      mediaType: "image/png",
+    });
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE_TWO,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_v57sibling001",
+      content: {
+        text: "Retain this attachment with the sibling context.",
+        attachmentRefs: [attachmentId],
+      },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+    const siblingTurn = value.provider.startedTurns[1];
+    if (siblingTurn === undefined) throw new Error("Expected sibling provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      siblingTurn.request,
+      siblingTurn.turnId,
+      "Sibling ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      siblingTurn.request,
+      siblingTurn.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+
+    const siblingBefore = value.store.require(PANE_TWO);
+    if (siblingBefore.binding === null) throw new Error("Expected sibling binding");
+    const attachmentBindingBefore = value.database.query(`
+      SELECT binding_id, binding_key_digest, revision, state,
+        containment_receipt_digest
+      FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).get(PANE_TWO);
+    expect(attachmentBindingBefore).toMatchObject({
+      state: "active",
+      containment_receipt_digest: null,
+    });
+
+    value.provider.onArchiveThread = () =>
+      Promise.reject(new Error("fixture primary archive response loss"));
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_settled_sibling_scan_receipt",
+      generation: 2,
+      streamPosition: 89,
+      containmentReceipt: "archive_settled_sibling_containment_receipt",
+    });
+    const primaryReady = value.store.require(PANE).projection;
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: primaryReady.revision,
+    })).toMatchObject({ type: "removed", paneId: PANE });
+
+    expect(value.store.require(PANE_TWO)).toEqual(siblingBefore);
+    expect(value.database.query(`
+      SELECT binding_id, binding_key_digest, revision, state,
+        containment_receipt_digest
+      FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).get(PANE_TWO)).toEqual(attachmentBindingBefore);
+    expect(value.database.query(`
+      SELECT (
+        SELECT COUNT(*) FROM chat_provider_thread_archive_targets_v57
+      ) + (
+        SELECT COUNT(*) FROM chat_provider_thread_archive_cuts_v57
+      ) AS count
+    `).get()).toEqual({ count: 0 });
+
+    currentGeneration = 2;
+    value.provider.catalogGeneration = 2;
+    await startTurn(
+      value,
+      siblingBefore.projection.revision,
+      TURN_THREE,
+      "Continue on the successor generation.",
+      PANE_TWO,
+    );
+    await value.service.settled();
+    expect(value.provider.startedThreads).toHaveLength(2);
+    expect(value.store.require(PANE_TWO)).toMatchObject({
+      binding: siblingBefore.binding,
+      projection: {
+        state: "streaming",
+        accountProfileId: ACCOUNT_ONE,
+        turn: { id: TURN_THREE, status: "streaming" },
+      },
+    });
+    expect(value.provider.resumedThreads.at(-1)).toMatchObject({
+      accountProfileId: ACCOUNT_ONE,
+      threadId: siblingBefore.binding.threadId,
+      restartThreadId: siblingBefore.binding.restartThreadId,
+      catalogGeneration: 2,
+      catalogDigest: "b".repeat(64),
+    });
+    const successorTurn = value.provider.startedTurns.at(-1);
+    if (successorTurn === undefined) throw new Error("Expected successor turn");
+    expect(successorTurn.request).toMatchObject({
+      accountProfileId: ACCOUNT_ONE,
+      threadId: siblingBefore.binding.threadId,
+      catalogGeneration: 2,
+    });
+    expect(value.rootTurnRouting.readTurnRouting(PANE_TWO, TURN_THREE))
+      .toMatchObject({
+        acceptedGeneration: 2,
+        state: "accepted",
+        settledAt: null,
+      });
+    expect(value.database.query(`
+      SELECT binding_id, binding_key_digest, revision, state,
+        containment_receipt_digest
+      FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).get(PANE_TWO)).toEqual(attachmentBindingBefore);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 direct outcome write failure immediately fences and reconciles the effect", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Persist an archive result.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Archive result ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    Object.defineProperty(
+      value.store,
+      "recordProviderThreadArchiveDirectAppliedV57",
+      {
+        configurable: true,
+        value: () => {
+          throw new Error("fixture direct outcome write failure");
+        },
+      },
+    );
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_scan_fixture_receipt",
+      generation: 2,
+      streamPosition: 23,
+      containmentReceipt: "archive_containment_fixture_receipt",
+    });
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    })).toEqual({
+      type: "removed",
+      paneId: PANE,
+      revision: ready.revision + 1,
+    });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(events.filter((event) => event.startsWith("contained:"))).toHaveLength(1);
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.database.query(`
+      SELECT state, source_generation, successor_generation
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({
+      state: "contained",
+      source_generation: 1,
+      successor_generation: 2,
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 malformed direct result enters exact containment before reconciliation", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Validate archive response.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Response validation ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    value.provider.archiveResponseGeneration = 2;
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "applied",
+      evidenceReceipt: "archive_scan_fixture_receipt",
+      generation: 2,
+      streamPosition: 29,
+      containmentReceipt: "archive_containment_fixture_receipt",
+    });
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    })).toMatchObject({ type: "removed", paneId: PANE });
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, state
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({
+      source_generation: 1,
+      successor_generation: 2,
+      state: "contained",
+    });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 ambiguous reconciliation retains quarantine without stranding settlement", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Retain ambiguous archive.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Ambiguous context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    value.provider.onArchiveThread = () =>
+      Promise.reject(new Error("fixture lost response"));
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "ambiguous",
+      evidenceReceipt: "archive_scan_ambiguous_receipt",
+      generation: 2,
+      streamPosition: 43,
+      containmentReceipt: null,
+    });
+
+    const failure = await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    }).then(() => null, (error: unknown) => error);
+    expect(failure).toMatchObject({ code: "invalid_state" });
+    await value.service.settled();
+    expect(value.service.hasUnsettledWork()).toBe(false);
+    expect(value.provider.archiveCalls).toHaveLength(1);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(value.store.get(PANE)).not.toBeNull();
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toMatchObject([{
+        status: "open",
+        currentAttempt: { state: "ambiguous" },
+      }]);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 durable binding drift fails closed before the archive RPC", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Freeze archive binding.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Binding frozen.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    const prepare = value.store
+      .prepareProviderThreadArchiveEffectStartedV57.bind(value.store);
+    Object.defineProperty(
+      value.store,
+      "prepareProviderThreadArchiveEffectStartedV57",
+      {
+        configurable: true,
+        value: (
+          input: Parameters<
+            ChatPaneStore["prepareProviderThreadArchiveEffectStartedV57"]
+          >[0],
+        ) => {
+          const descriptor = prepare(input);
+          value.database.query(`
+            UPDATE chat_panes SET provider_restart_thread_id = ?2
+            WHERE pane_id = ?1
+          `).run(PANE, "raw_thread_binding_drift");
+          return descriptor;
+        },
+      },
+    );
+
+    const failure = await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    }).then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).toContain(
+      "Provider-thread archive target preimage does not match",
+    );
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_thread_archive_attempts_v57
+    `).all()).toEqual([{ state: "effect_started" }]);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 startup groups replayed effects and launches one atomic successor wave", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+    value.provider.onReconcileThreadArchive = () => Promise.resolve({
+      disposition: "not_applied",
+      evidenceReceipt: "archive_scan_not_applied_receipt",
+      generation: 2,
+      streamPosition: 31,
+      containmentReceipt: null,
+    });
+
+    value.service.initialize();
+    value.service.closeAdmission();
+    await value.service.settled();
+
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(2);
+    expect(value.provider.archiveCalls).toHaveLength(2);
+    expect(value.provider.archiveExpectedGenerations).toEqual([2, 2]);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, state, target_count
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([{
+      source_generation: 1,
+      successor_generation: 2,
+      state: "contained",
+      target_count: 2,
+    }]);
+    expect(value.database.query(`
+      SELECT status FROM chat_provider_thread_archive_targets_v57
+      ORDER BY target_id
+    `).all()).toEqual([{ status: "committed" }, { status: "committed" }]);
+    expect(events.filter((event) => event.startsWith("activated:"))).toHaveLength(2);
+    expect(events.filter((event) => event.startsWith("released:"))).toHaveLength(2);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 buffers a reconciliation cohort before any partial authority release", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await seedProviderArchiveStartupPhaseV57(
+      value,
+      archive,
+      "contained_ambiguous",
+    );
+    let reconciliation = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliation += 1;
+      if (reconciliation === 1) {
+        return Promise.resolve({
+          disposition: "applied" as const,
+          evidenceReceipt: "archive_buffered_first_receipt",
+          generation: 2,
+          streamPosition: 91,
+          containmentReceipt: "archive_buffered_first_containment",
+        });
+      }
+      return Promise.reject(new AccountRuntimeNotQuiescentError());
+    };
+
+    value.service.initialize();
+    value.service.closeAdmission();
+    await value.service.settled();
+
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(2);
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toMatchObject([
+        { status: "open", currentAttempt: { state: "ambiguous" } },
+        { status: "open", currentAttempt: { state: "ambiguous" } },
+      ]);
+    expect(archive.activeTransitionIds()).toEqual(
+      REPLAYED_ARCHIVE_TARGETS_V57.map(({ targetId }) => targetId),
+    );
+    expect(events.some((event) => event.startsWith("released:"))).toBeFalse();
+    expect(value.database.query(`
+      SELECT status FROM chat_provider_thread_archive_targets_v57
+      ORDER BY target_id
+    `).all()).toEqual([{ status: "open" }, { status: "open" }]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 shutdown joins an in-flight reconciliation before releasing quarantine", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  const reconciliationEntered = deferred<void>();
+  const reconciliationGate = deferred<void>();
+  try {
+    await prepareTwoBoundProviderPanesV57(value);
+    prepareReplayedArchiveTargetsV57(
+      value,
+      archive,
+      REPLAYED_ARCHIVE_TARGETS_V57.slice(0, 1),
+    );
+    value.provider.onReconcileThreadArchive = async () => {
+      reconciliationEntered.resolve();
+      await reconciliationGate.promise;
+      return {
+        disposition: "applied",
+        evidenceReceipt: "archive_shutdown_applied_receipt",
+        generation: 2,
+        streamPosition: 71,
+        containmentReceipt: "archive_shutdown_containment_receipt",
+      };
+    };
+
+    value.service.initialize();
+    await withinDeadline(
+      reconciliationEntered.promise,
+      "in-flight archive reconciliation RPC",
+    );
+    value.service.closeAdmission();
+    const settlement = value.service.settled();
+    let settled = false;
+    void settlement.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(archive.activeTransitionIds()).toHaveLength(1);
+    const inFlight = value.store.verifyProviderThreadArchiveRecoveryV57();
+    expect(inFlight.targets).toHaveLength(1);
+    expect(inFlight.targets[0]?.currentAttempt).toMatchObject({
+      state: "ambiguous",
+    });
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_thread_archive_cuts_v57
+    `).all()).toEqual([{ state: "contained" }]);
+
+    reconciliationGate.resolve();
+    await settlement;
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toEqual([]);
+    expect(archive.activeTransitionIds()).toEqual([]);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+    await Promise.resolve();
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(1);
+    expect(value.provider.archiveCalls).toEqual([]);
+  } finally {
+    reconciliationGate.resolve();
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 explicit false gate retains pending startup effects without provider mutation", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: false,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+
+    value.service.initialize();
+    value.service.closeAdmission();
+    await value.service.settled();
+
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.provider.reconcileArchiveCalls).toEqual([]);
+    expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toMatchObject([
+        { status: "open", currentAttempt: { state: "effect_started" } },
+        { status: "open", currentAttempt: { state: "effect_started" } },
+      ]);
+    expect(archive.activeTransitionIds()).toHaveLength(2);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 startup resumes every durable containment and reconciliation phase", async () => {
+  const phases: readonly ProviderArchiveStartupPhaseV57[] = [
+    "fence_started",
+    "fenced",
+    "sealed_partial",
+    "contained_ambiguous",
+    "reconciled_applied",
+    "reconciled_not_applied",
+  ];
+  for (const phase of phases) {
+    const events: string[] = [];
+    const archive = directArchiveTransitionV57Fixture(events);
+    const fixture = await createAttachmentHarness(undefined, undefined, {
+      archiveTransitionV57: archive.methods,
+      providerThreadArchiveCoordinatorV57Enabled: true,
+    });
+    const { value } = fixture;
+    archive.attach(value.database);
+    try {
+      const targetCount = phase === "sealed_partial" ? 1 : 2;
+      const cutId = await seedProviderArchiveStartupPhaseV57(
+        value,
+        archive,
+        phase,
+      );
+      value.provider.onReconcileThreadArchive = () => Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_startup_applied_evidence",
+        generation: 2,
+        streamPosition: 71,
+        containmentReceipt: "archive_startup_applied_receipt",
+      });
+      const seeded = value.store.verifyProviderThreadArchiveRecoveryV57();
+      const seededCut = new ProviderThreadArchiveJournalV57(
+        value.database,
+        CHAT_SERVICE_ARCHIVE_RECEIPT_KEY_V57,
+      ).reopenCut(cutId);
+      expect(seededCut.state).toBe(
+        phase === "sealed_partial"
+          ? "sealed"
+          : phase === "contained_ambiguous" ||
+              phase === "reconciled_applied" ||
+              phase === "reconciled_not_applied"
+          ? "contained"
+          : phase,
+      );
+      if (phase === "sealed_partial") {
+        expect(seededCut.members.filter((member) => member.state === "settled"))
+          .toHaveLength(1);
+      }
+      if (phase === "reconciled_not_applied") {
+        expect(seeded.targets.map(({ currentAttempt }) =>
+          currentAttempt.state
+        )).toEqual(["reconciled_not_applied", "reconciled_not_applied"]);
+      }
+      if (phase === "reconciled_applied") {
+        expect(seeded.targets.map(({ currentAttempt }) =>
+          currentAttempt.state
+        )).toEqual(["reconciled_applied", "reconciled_applied"]);
+      }
+      const containmentCountBeforeStartup = events.filter((event) =>
+        event.startsWith("contained:")
+      ).length;
+
+      value.service.initialize();
+      value.service.closeAdmission();
+      await value.service.settled();
+
+      expect(value.store.verifyProviderThreadArchiveRecoveryV57().targets)
+        .toHaveLength(0);
+      expect(value.provider.reconcileArchiveCalls).toHaveLength(
+        phase === "reconciled_not_applied" || phase === "reconciled_applied"
+          ? 0
+          : targetCount,
+      );
+      expect(value.provider.archiveExpectedGenerations).toEqual(
+        phase === "reconciled_not_applied"
+          ? Array.from({ length: targetCount }, () => 2)
+          : [],
+      );
+      expect(archive.activeTransitionIds()).toEqual([]);
+      expect(
+        events.filter((event) => event.startsWith("contained:")).length -
+          containmentCountBeforeStartup,
+      ).toBe(phase === "fence_started" ? 1 : 0);
+      expect(events.filter((event) => event.startsWith("released:")))
+        .toHaveLength(targetCount);
+      if (phase === "sealed_partial") {
+        expect(value.store.require(PANE_TWO)).toMatchObject({
+          binding: {
+            accountProfileId: ACCOUNT_ONE,
+            threadId: "thread_chat_2",
+            restartThreadId: "raw_thread_chat_2",
+          },
+          providerContextResetRequired: false,
+          projection: {
+            state: "ready",
+            accountProfileId: ACCOUNT_ONE,
+            attention: null,
+          },
+        });
+      }
+      expect(value.database.query(`
+        SELECT state FROM chat_provider_thread_archive_cuts_v57
+        WHERE cut_id = ?1
+      `).get(cutId)).toEqual({ state: "contained" });
+    } finally {
+      await closeAttachmentHarness(fixture);
+    }
+  }
+}, 10_000);
+
+test("v57 reopens a serialized contained cut in a fresh service", async () => {
+  const seededArchive = directArchiveTransitionV57Fixture();
+  const seededFixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: seededArchive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const seeded = seededFixture.value;
+  seededArchive.attach(seeded.database);
+  let databaseImage: Uint8Array;
+  try {
+    await seedProviderArchiveStartupPhaseV57(
+      seeded,
+      seededArchive,
+      "contained_ambiguous",
+    );
+    databaseImage = seeded.database.serialize();
+  } finally {
+    await closeAttachmentHarness(seededFixture);
+  }
+
+  const recoveredArchive = directArchiveTransitionV57Fixture();
+  const recoveredFixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: recoveredArchive.methods,
+    databaseImage,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const recovered = recoveredFixture.value;
+  recoveredArchive.attach(recovered.database);
+  recoveredArchive.installTransitionIds(
+    REPLAYED_ARCHIVE_TARGETS_V57.map(({ targetId }) => targetId),
+  );
+  recovered.provider.onReconcileThreadArchive = () => Promise.resolve({
+    disposition: "applied",
+    evidenceReceipt: "archive_reopened_scan_receipt",
+    generation: 2,
+    streamPosition: 73,
+    containmentReceipt: "archive_reopened_containment_receipt",
+  });
+  try {
+    recovered.service.initialize();
+    await recovered.service.settled();
+
+    expect(recovered.provider.archiveCalls).toEqual([]);
+    expect(recovered.provider.reconcileArchiveCalls).toHaveLength(2);
+    expect(recovered.store.get(PANE)).toBeNull();
+    expect(recovered.store.get(PANE_TWO)).toBeNull();
+    expect(recovered.store.verifyProviderThreadArchiveRecoveryV57().targets)
+      .toEqual([]);
+    expect(recoveredArchive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(recoveredFixture);
+  }
+});
+
+test("v57 replays a buffered Start fresh sibling after mixed-component restart", async () => {
+  const seededArchive = directArchiveTransitionV57Fixture([], {
+    cleanupCommittedComponents: true,
+  });
+  const seededFixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: seededArchive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const seeded = seededFixture.value;
+  seededArchive.attach(seeded.database);
+  let databaseImage: Uint8Array;
+  try {
+    await prepareTwoBoundProviderPanesV57(seeded);
+    const readyFresh = seeded.store.require(PANE).projection;
+    seeded.store.enqueueMessage({
+      paneId: PANE,
+      expectedQueueRevision: readyFresh.messageQueue.revision,
+      messageId: "chatmsg_mixedrestart1",
+      content: { text: "Resume after mixed recovery.", attachmentRefs: [] },
+      now: new Date("2026-08-03T12:07:00.000Z"),
+    });
+    seeded.database.query(`
+      UPDATE chat_panes SET
+        state = 'attention',
+        attention_code = 'runtime_unavailable',
+        attention_message = 'Choose Start fresh to exclude prior provider context.',
+        attention_retryable = 0,
+        provider_context_reset_required = 1,
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1
+      WHERE pane_id = ?1
+    `).run(PANE);
+    const quarantinedFresh = seeded.store.require(PANE).projection;
+    const readyArchive = seeded.store.require(PANE_TWO).projection;
+    seeded.store.prepareProviderThreadArchiveEffectStartedV57({
+      targetId: REPLAYED_ARCHIVE_TARGETS_V57[0].targetId,
+      attemptId: REPLAYED_ARCHIVE_TARGETS_V57[0].attemptId,
+      paneId: PANE,
+      purpose: "start_fresh",
+      expectedRevision: quarantinedFresh.revision,
+      expectedQueueRevision: quarantinedFresh.messageQueue.revision,
+      generation: 1,
+      now: new Date("2026-08-03T12:07:01.000Z"),
+    });
+    seeded.store.prepareProviderThreadArchiveEffectStartedV57({
+      targetId: REPLAYED_ARCHIVE_TARGETS_V57[1].targetId,
+      attemptId: REPLAYED_ARCHIVE_TARGETS_V57[1].attemptId,
+      paneId: PANE_TWO,
+      purpose: "pane_archive",
+      expectedRevision: readyArchive.revision,
+      expectedQueueRevision: null,
+      generation: 1,
+      now: new Date("2026-08-03T12:07:01.000Z"),
+    });
+    seededArchive.installTransitionIds(
+      REPLAYED_ARCHIVE_TARGETS_V57.map(({ targetId }) => targetId),
+    );
+    let reconciliationCount = 0;
+    seeded.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount === 1) {
+        return Promise.resolve({
+          disposition: "applied",
+          evidenceReceipt: "archive_mixed_applied_receipt",
+          generation: 2,
+          streamPosition: 89,
+          containmentReceipt: "archive_mixed_containment_receipt",
+        });
+      }
+      return Promise.resolve({
+        disposition: "ambiguous",
+        evidenceReceipt: "archive_mixed_ambiguous_receipt",
+        generation: 2,
+        streamPosition: 97,
+        containmentReceipt: null,
+      });
+    };
+
+    seeded.service.initialize();
+    await seeded.service.settled();
+
+    expect(seeded.provider.archiveCalls).toEqual([]);
+    expect(seeded.provider.reconcileArchiveCalls).toHaveLength(2);
+    expect(seeded.provider.startedThreads).toHaveLength(2);
+    expect(seeded.database.query(`
+      SELECT target_id, status
+      FROM chat_provider_thread_archive_targets_v57
+      ORDER BY target_id
+    `).all()).toEqual([
+      {
+        target_id: REPLAYED_ARCHIVE_TARGETS_V57[0].targetId,
+        status: "open",
+      },
+      {
+        target_id: REPLAYED_ARCHIVE_TARGETS_V57[1].targetId,
+        status: "open",
+      },
+    ]);
+    expect(seeded.store.require(PANE)).toMatchObject({
+      providerContextResetRequired: true,
+      projection: {
+        messageQueue: {
+          pauseReason: "attention",
+          messages: [{ id: "chatmsg_mixedrestart1" }],
+        },
+      },
+    });
+    expect(seededArchive.activeTransitionIds()).toEqual(
+      REPLAYED_ARCHIVE_TARGETS_V57.map(({ targetId }) => targetId),
+    );
+    databaseImage = seeded.database.serialize();
+  } finally {
+    await closeAttachmentHarness(seededFixture);
+  }
+
+  const recoveredArchive = directArchiveTransitionV57Fixture([], {
+    cleanupCommittedComponents: true,
+  });
+  const recoveredFixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: recoveredArchive.methods,
+    databaseImage,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const recovered = recoveredFixture.value;
+  recoveredArchive.attach(recovered.database);
+  recoveredArchive.installTransitionIds(
+    REPLAYED_ARCHIVE_TARGETS_V57.map(({ targetId }) => targetId),
+  );
+  recovered.provider.onReconcileThreadArchive = () => Promise.resolve({
+    disposition: "applied",
+    evidenceReceipt: "archive_mixed_recovered_receipt",
+    generation: 2,
+    streamPosition: 101,
+    containmentReceipt: "archive_mixed_recovered_containment",
+  });
+  try {
+    recovered.service.initialize();
+    await recovered.service.settled();
+
+    expect(recovered.provider.archiveCalls).toEqual([]);
+    expect(recovered.provider.reconcileArchiveCalls).toHaveLength(2);
+    expect(recovered.provider.startedThreads).toHaveLength(1);
+    expect(recovered.provider.startedTurns).toHaveLength(1);
+    expect(recovered.store.get(PANE_TWO)).toBeNull();
+    expect(recovered.store.require(PANE)).toMatchObject({
+      providerContextResetRequired: false,
+      projection: {
+        messageQueue: { messages: [] },
+        turn: { status: "streaming" },
+      },
+    });
+    expect(recovered.database.query(`
+      SELECT COUNT(*) AS count
+      FROM chat_provider_thread_archive_targets_v57
+    `).get()).toEqual({ count: 0 });
+    expect(recovered.database.query(`
+      SELECT COUNT(*) AS count
+      FROM chat_provider_thread_archive_cuts_v57
+    `).get()).toEqual({ count: 0 });
+    expect(recoveredArchive.activeTransitionIds()).toEqual([]);
+    await Promise.resolve();
+    await recovered.service.settled();
+    expect(recovered.provider.startedThreads).toHaveLength(1);
+    expect(recovered.provider.startedTurns).toHaveLength(1);
+  } finally {
+    await closeAttachmentHarness(recoveredFixture);
+  }
+});
+
+test("v57 closeAdmission and settled join deferred startup postcommit projection", async () => {
+  const events: string[] = [];
+  const archive = directArchiveTransitionV57Fixture(events);
+  const projectionEntered = deferred<void>();
+  const projectionGate = deferred<void>();
+  let projectionCalls = 0;
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+    onPaneRemoved: async () => {
+      projectionCalls += 1;
+      projectionEntered.resolve();
+      await projectionGate.promise;
+    },
+  });
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Recover startup projection.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Startup projection ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const targetId = `archtarget_${"c".repeat(32)}`;
+    value.store.prepareProviderThreadArchiveEffectStartedV57({
+      targetId,
+      attemptId: `archattempt_${"c".repeat(32)}`,
+      paneId: PANE,
+      purpose: "pane_archive",
+      expectedRevision: value.store.require(PANE).projection.revision,
+      expectedQueueRevision: null,
+      generation: 1,
+      now: new Date("2026-08-03T12:04:00.000Z"),
+    });
+    value.store.recordProviderThreadArchiveDirectAppliedV57({
+      targetId,
+      responseGeneration: 1,
+      responseStreamPosition: 67,
+      providerContainmentReceipt: "archive_startup_projection_receipt",
+      now: new Date("2026-08-03T12:04:01.000Z"),
+    });
+    archive.installTransitionIds([targetId]);
+
+    value.service.initialize();
+    value.service.closeAdmission();
+    const settlement = value.service.settled();
+    await withinDeadline(
+      projectionEntered.promise,
+      "deferred startup archive projection",
+    );
+    let settled = false;
+    void settlement.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(events.some((event) => event.startsWith("released:"))).toBe(true);
+
+    projectionGate.resolve();
+    await settlement;
+    expect(settled).toBe(true);
+    expect(projectionCalls).toBe(1);
+    expect(value.service.hasUnsettledWork()).toBe(false);
+    await Promise.resolve();
+    expect(projectionCalls).toBe(1);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 recovery observes terminal state after finalizing the full 64-target cohort", async () => {
+  const targets = Array.from({ length: 64 }, (_, index) => Object.freeze({
+    targetId: `archtarget_bound${String(index + 1).padStart(2, "0")}${"a".repeat(20)}`,
+    paneId: `pane_v57bound${String(index + 1).padStart(2, "0")}`,
+    status: "open" as const,
+    currentAttempt: Object.freeze({
+      state: "direct_applied" as const,
+      cutId: null,
+    }),
+  }));
+  const remaining = [...targets];
+  const finalized: string[] = [];
+  const released: string[] = [];
+  const projected: string[] = [];
+  const finalizedResults = new Map<
+    string,
+    ReturnType<ChatPaneStore["finalizeProviderThreadArchiveTargetV57"]>
+  >();
+  const handles = new Map<
+    string,
+    ReturnType<ChatAccountPort["archiveTransitionHandleV57"]>
+  >(targets.map(({ targetId }) => [targetId, Object.freeze({}) as ReturnType<
+    ChatAccountPort["archiveTransitionHandleV57"]
+  >]));
+  const inventory = () => ({
+    targets: remaining,
+    activeCuts: [],
+    admissionDescriptors: remaining.map((target) => ({
+      transitionId: target.targetId,
+      accountProfileId: ACCOUNT_ONE,
+    })),
+  }) as unknown as ReturnType<
+    ChatPaneStore["verifyProviderThreadArchiveRecoveryV57"]
+  >;
+  const store = {
+    pendingProviderThreadArchivePaneIds: () => [],
+    providerThreadArchiveRecoveryPaneIdsV57: () =>
+      remaining.map(({ paneId }) => paneId),
+    clearVolatileProviderSubagents: () => undefined,
+    recoverInterrupted: () => undefined,
+    list: () => [],
+    verifyProviderThreadArchiveRecoveryV57: inventory,
+    finalizeProviderThreadArchiveTargetV57: (
+      input: Parameters<
+        ChatPaneStore["finalizeProviderThreadArchiveTargetV57"]
+      >[0],
+    ) => {
+      const index = remaining.findIndex(({ targetId }) =>
+        targetId === input.targetId
+      );
+      if (index < 0) throw new Error("Unknown bounded recovery target");
+      const [target] = remaining.splice(index, 1);
+      if (target === undefined) throw new Error("Lost bounded recovery target");
+      const result = {
+        kind: "pane_archive" as const,
+        containmentReceipt: "archive_bounded_containment_receipt",
+        removed: { paneId: target.paneId, revision: 2 },
+      };
+      finalized.push(target.targetId);
+      finalizedResults.set(target.targetId, result);
+      return result;
+    },
+    verifiedProviderThreadArchiveTerminalComponentV57: (targetId: string) => {
+      const target = targets.find((candidate) =>
+        candidate.targetId === targetId
+      );
+      const result = finalizedResults.get(targetId);
+      if (target === undefined) {
+        throw new Error("Unknown bounded terminal component");
+      }
+      return {
+        component: {
+          accountProfileId: ACCOUNT_ONE,
+          targetIds: [targetId],
+          cutIds: [],
+          allTargetsCommitted: result !== undefined,
+        },
+        targets: [{ targetId, paneId: target.paneId }],
+        finalizations: result === undefined
+          ? []
+          : [{ targetId, paneId: target.paneId, result }],
+      };
+    },
+  } as unknown as ChatPaneStore;
+  const provider = new FakeProvider();
+  const rootTurnRouting: RootTurnRoutingAuthorityV1 = {
+    admitClassification: () => {
+      throw new Error("Bounded recovery must not admit root routing");
+    },
+    bindRootTurn: () => {
+      throw new Error("Bounded recovery must not bind root routing");
+    },
+    resolve: () => {
+      throw new Error("Bounded recovery must not resolve root routing");
+    },
+    markEffectStarted: () => {
+      throw new Error("Bounded recovery must not start root routing");
+    },
+    accept: () => {
+      throw new Error("Bounded recovery must not accept root routing");
+    },
+    settle: () => {
+      throw new Error("Bounded recovery must not settle root routing");
+    },
+    readTurnRouting: () => null,
+    readLatestTurnRouting: () => null,
+  };
+  const service = new ChatService({
+    accounts: {
+      ...fixtureArchiveAccountHoldMethods,
+      archiveTransitionHandleV57: (
+        transitionId: Parameters<
+          ChatAccountPort["archiveTransitionHandleV57"]
+        >[0],
+      ) =>
+        handles.get(transitionId) ?? (() => {
+          throw new Error("Bounded recovery handle is unavailable");
+        })(),
+      releaseArchiveTransition: (
+        transitionId: Parameters<
+          ChatAccountPort["releaseArchiveTransition"]
+        >[0],
+        handle: Parameters<ChatAccountPort["releaseArchiveTransition"]>[1],
+        expectedComponent: Parameters<
+          ChatAccountPort["releaseArchiveTransition"]
+        >[2],
+      ) => {
+        if (handles.get(transitionId) !== handle) {
+          throw new Error("Bounded recovery released a stale handle");
+        }
+        handles.delete(transitionId);
+        released.push(transitionId);
+        return {
+          deletedTargetIds: expectedComponent.targetIds,
+          deletedCutIds: expectedComponent.cutIds,
+        };
+      },
+    } as unknown as ChatAccountPort,
+    now: () => new Date("2026-08-03T12:03:00.000Z"),
+    projection: {
+      paneChanged: () => undefined,
+      paneStateChanged: () => undefined,
+      paneRemoved: (paneId) => {
+        projected.push(paneId);
+      },
+      panesReordered: () => undefined,
+      messageQueueChanged: () => undefined,
+      delta: () => undefined,
+    },
+    providerThreadArchiveCoordinatorV57Enabled: true,
+    provider,
+    repositories: { resolve: () => Promise.resolve(null) },
+    runtimeRecovery: { requestRecovery: () => undefined },
+    rootTurnRouting,
+    store,
+    workspaces: { release: () => undefined } as unknown as ChatWorkspacePort,
+  });
+
+  service.initialize();
+  service.closeAdmission();
+  await service.settled();
+
+  expect(remaining).toEqual([]);
+  expect(finalized).toHaveLength(64);
+  expect(released).toHaveLength(64);
+  expect(projected).toHaveLength(64);
+  expect(handles.size).toBe(0);
+  expect(provider.archiveCalls).toEqual([]);
+  expect(provider.reconcileArchiveCalls).toEqual([]);
+  expect(service.hasUnsettledWork()).toBe(false);
+});
+
+test("v57 successor handle replacement failure cuts the whole wave before RPC", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const replace = archive.methods.replaceArchiveTransition ?? (() => {
+    throw new Error("Archive replacement fixture is unavailable");
+  });
+  let replacementCount = 0;
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: {
+      ...archive.methods,
+      replaceArchiveTransition: (prior, transitionId) => {
+        replacementCount += 1;
+        if (replacementCount === 4) {
+          throw new Error("fixture successor handle replacement failure");
+        }
+        return replace(prior, transitionId);
+      },
+    },
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+    let reconciliationCount = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount <= 2) {
+        return Promise.resolve({
+          disposition: "not_applied",
+          evidenceReceipt: "archive_replace_not_applied_receipt",
+          generation: 2,
+          streamPosition: 75,
+          containmentReceipt: null,
+        });
+      }
+      return Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_replace_applied_receipt",
+        generation: 3,
+        streamPosition: 77,
+        containmentReceipt: "archive_replace_containment_receipt",
+      });
+    };
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(replacementCount).toBeGreaterThanOrEqual(4);
+    expect(value.provider.archiveCalls).toEqual([]);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(4);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, target_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([
+      {
+        source_generation: 1,
+        successor_generation: 2,
+        target_count: 2,
+        state: "contained",
+      },
+      {
+        source_generation: 2,
+        successor_generation: 3,
+        target_count: 2,
+        state: "contained",
+      },
+    ]);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 three-target successor failure stops before the third RPC", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareThreeReplayedArchiveTargetsV57(value, archive);
+    let reconciliationCount = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount <= 3) {
+        return Promise.resolve({
+          disposition: "not_applied",
+          evidenceReceipt: "archive_three_not_applied_receipt",
+          generation: 2,
+          streamPosition: 79,
+          containmentReceipt: null,
+        });
+      }
+      return Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_three_applied_receipt",
+        generation: 3,
+        streamPosition: 83,
+        containmentReceipt: "archive_three_containment_receipt",
+      });
+    };
+    value.provider.onArchiveThread = () => {
+      if (value.provider.archiveCalls.length === 2) {
+        return Promise.reject(new ChatProviderEffectError({
+          certainty: "ambiguous",
+          code: "runtime",
+        }));
+      }
+      return Promise.resolve({ containmentReceipt: "archive_three_receipt" });
+    };
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(value.provider.archiveExpectedGenerations).toEqual([2, 2]);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(6);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, target_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([
+      {
+        source_generation: 1,
+        successor_generation: 2,
+        target_count: 3,
+        state: "contained",
+      },
+      {
+        source_generation: 2,
+        successor_generation: 3,
+        target_count: 3,
+        state: "contained",
+      },
+    ]);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(value.store.get(PANE_THREE)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 successor readiness loss after one RPC cuts the launched and unlaunched cohort", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+    let reconciliationCount = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount <= 2) {
+        return Promise.resolve({
+          disposition: "not_applied",
+          evidenceReceipt: "archive_scan_not_applied_receipt",
+          generation: 2,
+          streamPosition: 37,
+          containmentReceipt: null,
+        });
+      }
+      return Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_scan_applied_receipt",
+        generation: 3,
+        streamPosition: 41,
+        containmentReceipt: "archive_containment_fixture_receipt",
+      });
+    };
+    const assertReady = value.store
+      .assertProviderThreadArchiveSuccessorWaveReadyV57.bind(value.store);
+    let readinessCount = 0;
+    Object.defineProperty(
+      value.store,
+      "assertProviderThreadArchiveSuccessorWaveReadyV57",
+      {
+        configurable: true,
+        value: (
+          input: Parameters<
+            ChatPaneStore["assertProviderThreadArchiveSuccessorWaveReadyV57"]
+          >[0],
+        ) => {
+          readinessCount += 1;
+          if (readinessCount === 2) {
+            throw new Error("fixture successor readiness authority loss");
+          }
+          return assertReady(input);
+        },
+      },
+    );
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(value.provider.archiveExpectedGenerations).toEqual([2]);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, target_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([
+      {
+        source_generation: 1,
+        successor_generation: 2,
+        target_count: 2,
+        state: "contained",
+      },
+      {
+        source_generation: 2,
+        successor_generation: 3,
+        target_count: 2,
+        state: "contained",
+      },
+    ]);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(4);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 second successor RPC failure cuts the whole wave before any later effect", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+    let reconciliationCount = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount <= 2) {
+        return Promise.resolve({
+          disposition: "not_applied",
+          evidenceReceipt: "archive_scan_not_applied_receipt",
+          generation: 2,
+          streamPosition: 47,
+          containmentReceipt: null,
+        });
+      }
+      return Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_scan_applied_receipt",
+        generation: 3,
+        streamPosition: 53,
+        containmentReceipt: "archive_containment_fixture_receipt",
+      });
+    };
+    value.provider.onArchiveThread = () => {
+      if (value.provider.archiveCalls.length === 2) {
+        return Promise.reject(new ChatProviderEffectError({
+          certainty: "ambiguous",
+          code: "runtime",
+        }));
+      }
+      return Promise.resolve({ containmentReceipt: "archive_fixture_receipt" });
+    };
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(value.provider.archiveExpectedGenerations).toEqual([2, 2]);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(4);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, target_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([
+      {
+        source_generation: 1,
+        successor_generation: 2,
+        target_count: 2,
+        state: "contained",
+      },
+      {
+        source_generation: 2,
+        successor_generation: 3,
+        target_count: 2,
+        state: "contained",
+      },
+    ]);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("v57 successor cohort outcome write failure immediately cuts every buffered success", async () => {
+  const archive = directArchiveTransitionV57Fixture();
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    archiveTransitionV57: archive.methods,
+    providerThreadArchiveCoordinatorV57Enabled: true,
+  });
+  const { value } = fixture;
+  archive.attach(value.database);
+  try {
+    await prepareTwoReplayedArchiveTargetsV57(value, archive);
+    let reconciliationCount = 0;
+    value.provider.onReconcileThreadArchive = () => {
+      reconciliationCount += 1;
+      if (reconciliationCount <= 2) {
+        return Promise.resolve({
+          disposition: "not_applied",
+          evidenceReceipt: "archive_scan_not_applied_receipt",
+          generation: 2,
+          streamPosition: 59,
+          containmentReceipt: null,
+        });
+      }
+      return Promise.resolve({
+        disposition: "applied",
+        evidenceReceipt: "archive_scan_applied_receipt",
+        generation: 3,
+        streamPosition: 61,
+        containmentReceipt: "archive_containment_fixture_receipt",
+      });
+    };
+    Object.defineProperty(
+      value.store,
+      "recordProviderThreadArchiveDirectAppliedCohortV57",
+      {
+        configurable: true,
+        value: () => {
+          throw new Error("fixture cohort outcome write failure");
+        },
+      },
+    );
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(value.provider.archiveExpectedGenerations).toEqual([2, 2]);
+    expect(value.provider.reconcileArchiveCalls).toHaveLength(4);
+    expect(value.database.query(`
+      SELECT source_generation, successor_generation, target_count, state
+      FROM chat_provider_thread_archive_cuts_v57
+      ORDER BY source_generation
+    `).all()).toEqual([
+      {
+        source_generation: 1,
+        successor_generation: 2,
+        target_count: 2,
+        state: "contained",
+      },
+      {
+        source_generation: 2,
+        successor_generation: 3,
+        target_count: 2,
+        state: "contained",
+      },
+    ]);
+    expect(value.store.get(PANE)).toBeNull();
+    expect(value.store.get(PANE_TWO)).toBeNull();
+    expect(archive.activeTransitionIds()).toEqual([]);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("Start fresh preserves a prepared archive intent without provider access", async () => {
+  const value = harness({
+    providerThreadArchiveCoordinatorV57Enabled: false,
+  });
+  try {
+    const created = await createPane(value);
+    await startTurn(value, created.revision, TURN_ONE, "Create restart context.");
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Context ready.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    value.database.query(`
+      UPDATE chat_panes SET
+        state = 'attention',
+        attention_code = 'runtime_unavailable',
+        attention_message = 'Choose Start fresh to exclude prior provider context.',
+        attention_retryable = 0,
+        provider_context_reset_required = 1,
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1
+      WHERE pane_id = ?1
+    `).run(PANE);
+    const quarantined = value.store.require(PANE);
+    if (quarantined.binding === null) throw new Error("Expected retained provider binding");
+    value.store.prepareProviderThreadArchiveIntent({
+      paneId: PANE,
+      purpose: "start_fresh",
+      expectedRevision: quarantined.projection.revision,
+      expectedQueueRevision: quarantined.projection.messageQueue.revision,
+      binding: quarantined.binding,
+      generation: 1,
+      now: new Date("2026-08-03T12:00:01.000Z"),
+    });
+    const beforeIntent = value.store.providerThreadArchiveIntent(PANE);
+
+    const rejected = await value.service.execute({
+      type: "chat.pane.startFreshContext",
+      paneId: PANE,
+      expectedRevision: quarantined.projection.revision,
+      expectedQueueRevision: quarantined.projection.messageQueue.revision,
+    }).then(() => null, (error: unknown) => error);
+
+    expect(rejected).toMatchObject({ code: "invalid_state" });
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+    expect(value.store.providerThreadArchiveIntent(PANE)).toEqual(beforeIntent);
+    expect(value.store.require(PANE)).toEqual(quarantined);
+  } finally {
+    value.database.close();
+  }
+});
+
+test("bootstrap fails closed and preserves every pending provider-context intent byte-for-byte", async () => {
+  const value = harness();
+  let restarted: ChatService | null = null;
+  try {
+    const purposes = ["start_fresh", "pane_archive"] as const;
+    const states = [
+      "prepared",
+      "effect_started",
+      "ambiguous",
+      "succeeded",
+    ] as const;
+    const fixtures = purposes.flatMap((purpose, purposeIndex) =>
+      states.map((state, stateIndex) => {
+        const index = purposeIndex * states.length + stateIndex;
+        const suffix = String(index + 1).padStart(2, "0");
+        const paneId = `pane_bootintent${suffix}`;
+        const messageId = `chatmsg_bootintent${suffix}`;
+        const turnId = `chatturn_bootintent${suffix}`;
+        const binding = {
+          accountProfileId: ACCOUNT_ONE,
+          threadId: `thread_boot_intent_${suffix}`,
+          restartThreadId: `raw_thread_boot_intent_${suffix}`,
+        };
+        value.store.create({
+          paneId,
+          repository: {
+            id: REPOSITORY,
+            name: "Example",
+            workingDirectory: "/fixture/example",
+          },
+          accountProfileId: ACCOUNT_ONE,
+          now: new Date("2026-08-03T12:00:00.000Z"),
+        });
+        const queue = value.store.enqueueMessage({
+          paneId,
+          expectedQueueRevision: 1,
+          messageId,
+          content: { text: `Preserve pending intent ${suffix}.`, attachmentRefs: [] },
+          now: new Date("2026-08-03T12:00:00.001Z"),
+        });
+        const message = queue.messages[0];
+        if (message === undefined) throw new Error("Expected bootstrap fixture message");
+        value.store.claimHeadMessage({
+          paneId,
+          expectedQueueRevision: queue.revision,
+          expectedMessageRevision: message.revision,
+          messageId,
+          turnId,
+          kind: "start",
+          now: new Date("2026-08-03T12:00:00.002Z"),
+        });
+        value.database.query(`
+          UPDATE chat_panes SET
+            provider_account_profile_id = ?1,
+            provider_thread_id = ?2,
+            provider_restart_thread_id = ?3
+          WHERE pane_id = ?4
+        `).run(
+          binding.accountProfileId,
+          binding.threadId,
+          binding.restartThreadId,
+          paneId,
+        );
+        if (purpose === "start_fresh") {
+          value.database.query(`
+            UPDATE chat_panes SET
+              state = 'attention',
+              attention_code = 'runtime_unavailable',
+              attention_message = 'Choose Start fresh to exclude prior provider context.',
+              attention_retryable = 0,
+              provider_context_reset_required = 1,
+              message_queue_pause_reason = 'attention',
+              message_queue_revision = message_queue_revision + 1,
+              revision = revision + 1
+            WHERE pane_id = ?1
+          `).run(paneId);
+        }
+        const current = value.store.require(paneId).projection;
+        value.store.prepareProviderThreadArchiveIntent({
+          paneId,
+          purpose,
+          expectedRevision: current.revision,
+          expectedQueueRevision: purpose === "start_fresh"
+            ? current.messageQueue.revision
+            : null,
+          binding,
+          generation: 1,
+          now: new Date("2026-08-03T12:00:00.003Z"),
+        });
+        if (state !== "prepared") {
+          value.store.markProviderThreadArchiveEffectStarted({
+            paneId,
+            expectedGeneration: 1,
+            now: new Date("2026-08-03T12:00:00.004Z"),
+          });
+        }
+        if (state === "ambiguous") {
+          value.store.markProviderThreadArchiveAmbiguous({
+            paneId,
+            expectedGeneration: 1,
+            ambiguityReceipt: `bootstrap_archive_ambiguity_${suffix}`,
+            now: new Date("2026-08-03T12:00:00.005Z"),
+          });
+        } else if (state === "succeeded") {
+          value.store.recordProviderThreadArchiveSucceeded({
+            paneId,
+            containmentReceipt: `bootstrap_archive_contained_${suffix}`,
+            expectedIntentGeneration: 1,
+            responseGeneration: 1,
+            streamPosition: 1,
+            source: "direct",
+            now: new Date("2026-08-03T12:00:00.005Z"),
+          });
+        }
+        if (purpose === "pane_archive" && state === "prepared") {
+          value.database.query(`
+            UPDATE chat_panes SET
+              state = 'starting',
+              active_turn_id = ?2,
+              active_prompt = 'Persisted archive recovery cut.',
+              turn_status = 'starting',
+              turn_started_at = ?3,
+              activity_ordinal = activity_ordinal + 1,
+              activity_kind = 'messageSent',
+              provider_subagent_overflow_count = 1
+            WHERE pane_id = ?1
+          `).run(paneId, turnId, "2026-08-03T12:00:00.006Z");
+          value.rootTurnRouting.admitClassification({
+            paneId,
+            chatTurnId: turnId,
+            policyVersion: 1,
+            requiredInputClass: "text",
+            classificationReason: "conservativeDefault",
+            workClass: "standard",
+            requestedProfile: "solMax",
+            requestedServiceTier: "standard",
+            now: new Date("2026-08-03T12:00:00.006Z"),
+          });
+        } else if (purpose === "pane_archive" && state === "effect_started") {
+          value.database.query(`
+            UPDATE chat_panes SET
+              state = 'ready',
+              active_turn_id = ?2,
+              active_prompt = NULL,
+              turn_status = 'failed',
+              turn_started_at = ?3,
+              turn_completed_at = ?4
+            WHERE pane_id = ?1
+          `).run(
+            paneId,
+            turnId,
+            "2026-08-03T12:00:00.006Z",
+            "2026-08-03T12:00:00.007Z",
+          );
+          value.rootTurnRouting.admitClassification({
+            paneId,
+            chatTurnId: turnId,
+            policyVersion: 1,
+            requiredInputClass: "text",
+            classificationReason: "conservativeDefault",
+            workClass: "standard",
+            requestedProfile: "solMax",
+            requestedServiceTier: "standard",
+            now: new Date("2026-08-03T12:00:00.006Z"),
+          });
+        }
+        return { paneId, purpose, state };
+      })
+    );
+    const paneIds = fixtures.map(({ paneId }) => paneId);
+    const snapshot = () => fixtures.map(({ paneId }) => ({
+      pane: value.database.query(`
+        SELECT * FROM chat_panes WHERE pane_id = ?1
+      `).get(paneId),
+      messages: value.database.query(`
+        SELECT * FROM chat_message_ledger
+        WHERE pane_id = ?1 ORDER BY ordinal, message_id
+      `).all(paneId),
+      intent: value.database.query(`
+        SELECT * FROM chat_provider_thread_archive_intents WHERE pane_id = ?1
+      `).get(paneId),
+      routing: value.database.query(`
+        SELECT * FROM harness_root_turn_routing_receipts
+        WHERE pane_id = ?1 ORDER BY created_at, chat_turn_id
+      `).all(paneId),
+    }));
+    const beforeRows = snapshot();
+    value.service.closeAdmission();
+    await value.service.settled();
+
+    const reopenedStore = new ChatPaneStore(value.database);
+    const terminalLedgerRepairCalls: string[] = [];
+    const completeAcknowledgedMessagesForTurn =
+      reopenedStore.completeAcknowledgedMessagesForTurn.bind(reopenedStore);
+    Object.defineProperty(reopenedStore, "completeAcknowledgedMessagesForTurn", {
+      configurable: true,
+      value: (
+        ...args: Parameters<
+          ChatPaneStore["completeAcknowledgedMessagesForTurn"]
+        >
+      ) => {
+        terminalLedgerRepairCalls.push(args[0]);
+        return completeAcknowledgedMessagesForTurn(...args);
+      },
+    });
+    const restartedProvider = new FakeProvider();
+    const startupError = (() => {
+      try {
+        restarted = new ChatService({
+          accounts: {
+            containAmbiguousEffect: () => Promise.resolve(1),
+            containArchiveGeneration: () => Promise.resolve(),
+            ...fixtureArchiveAccountHoldMethods,
+            refreshCandidates: () => Promise.resolve([
+              { id: ACCOUNT_ONE, selected: true, budget: "healthy" },
+            ]),
+            isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+              expectedGeneration === 1,
+          },
+          projection: {
+            messageQueueChanged: () => undefined,
+            paneChanged: () => undefined,
+            paneStateChanged: () => undefined,
+            paneRemoved: () => undefined,
+            panesReordered: () => undefined,
+            delta: () => undefined,
+          },
+          provider: restartedProvider,
+          repositories: {
+            resolve: (repositoryId) => Promise.resolve({
+              id: repositoryId,
+              name: "Example",
+              workingDirectory: "/fixture/example",
+            }),
+          },
+          rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(value.database),
+          runtimeRecovery: { requestRecovery: () => undefined },
+          store: reopenedStore,
+          workspaces: value.workspaces,
+        });
+        return null;
+      } catch (error: unknown) {
+        return error;
+      }
+    })();
+
+    expect(reopenedStore.pendingProviderThreadArchivePaneIds())
+      .toEqual([...paneIds].sort());
+    expect(startupError).toMatchObject({ code: "invalid_state" });
+    expect(restarted).toBeNull();
+    expect(snapshot()).toEqual(beforeRows);
+    expect(terminalLedgerRepairCalls).toEqual([]);
+    expect(restartedProvider.archivePreparations).toEqual([]);
+    expect(restartedProvider.archivedThreads).toEqual([]);
+    expect(restartedProvider.startedTurns).toEqual([]);
+  } finally {
+    restarted?.closeAdmission();
+    await restarted?.settled();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("pane remove rejects unresolved queue effects before provider archive preparation", async () => {
+  const blockerStates = [
+    "steer_effect_started",
+    "steer_acknowledged",
+    "ambiguous",
+  ] as const;
+  for (const [index, blockerState] of blockerStates.entries()) {
+    const value = harness();
+    try {
+      const ready = await createPane(value);
+      await startTurn(
+        value,
+        ready.revision,
+        TURN_ONE,
+        `Establish provider context ${String(index + 1)}.`,
+      );
+      await value.service.settled();
+      const active = value.store.require(PANE).projection;
+      const messageId = `chatmsg_closepreflight${String(index + 1)}`;
+      const queued = value.store.enqueueMessage({
+        paneId: PANE,
+        expectedQueueRevision: active.messageQueue.revision,
+        messageId,
+        content: { text: "Unsettled provider effect.", attachmentRefs: [] },
+        now: new Date("2026-08-03T12:00:01.000Z"),
+      });
+      const message = queued.messages[0];
+      if (message === undefined) throw new Error("Expected close preflight message");
+      const claimed = value.store.claimHeadMessage({
+        paneId: PANE,
+        expectedQueueRevision: queued.revision,
+        expectedMessageRevision: message.revision,
+        messageId,
+        turnId: TURN_ONE,
+        kind: "steer",
+        now: new Date("2026-08-03T12:00:01.001Z"),
+      });
+      value.store.markMessageEffectStarted({
+        paneId: PANE,
+        messageId,
+        expectedMessageRevision: claimed.claim.revision,
+        turnId: TURN_ONE,
+        kind: "steer",
+        now: new Date("2026-08-03T12:00:01.002Z"),
+      });
+      if (blockerState === "steer_acknowledged") {
+        value.store.acknowledgeMessageEffect({
+          paneId: PANE,
+          messageId,
+          expectedMessageRevision: claimed.claim.revision + 1,
+          turnId: TURN_ONE,
+          kind: "steer",
+          now: new Date("2026-08-03T12:00:01.003Z"),
+        });
+      } else if (blockerState === "ambiguous") {
+        value.store.markMessageEffectAmbiguous({
+          paneId: PANE,
+          messageId,
+          expectedMessageRevision: claimed.claim.revision + 1,
+          turnId: TURN_ONE,
+          kind: "steer",
+          now: new Date("2026-08-03T12:00:01.003Z"),
+        });
+      }
+      const terminal = value.store.enterAttention({
+        paneId: PANE,
+        turnId: TURN_ONE,
+        attention: {
+          code: "turn_failed",
+          message: "Contain the exact queue effect before closing.",
+          retryable: false,
+        },
+        clearBinding: false,
+        now: new Date("2026-08-03T12:00:01.004Z"),
+      });
+      if (terminal === null) throw new Error("Expected terminal close fixture");
+      const beforePane = value.database.query(`
+        SELECT * FROM chat_panes WHERE pane_id = ?1
+      `).get(PANE);
+      const beforeMessage = value.database.query(`
+        SELECT * FROM chat_message_ledger WHERE message_id = ?1
+      `).get(messageId);
+
+      const rejected = await value.service.execute({
+        type: "chat.pane.remove",
+        paneId: PANE,
+        expectedRevision: terminal.revision,
+      }).then(() => null, (error: unknown) => error);
+      expect(rejected).toMatchObject({ code: "invalid_state" });
+      expect(value.provider.archivePreparations).toEqual([]);
+      expect(value.provider.archivedThreads).toEqual([]);
+      expect(value.store.providerThreadArchiveIntent(PANE)).toBeNull();
+      expect(value.database.query(`
+        SELECT * FROM chat_panes WHERE pane_id = ?1
+      `).get(PANE)).toEqual(beforePane);
+      expect(value.database.query(`
+        SELECT * FROM chat_message_ledger WHERE message_id = ?1
+      `).get(messageId)).toEqual(beforeMessage);
+    } finally {
+      value.service.closeAdmission();
+      await value.service.settled();
+      value.database.close();
+    }
+  }
+});
+
+test("provider-bound pane close fails closed before any archive preparation", async () => {
+  const fixture = await createAttachmentHarness(undefined, undefined, {
+    providerThreadArchiveCoordinatorV57Enabled: false,
+  });
+  const { value, vault } = fixture;
+  try {
+    await createPane(value);
+    const attachmentId = "attachment_archivejoin001";
+    await uploadReadyServiceAttachment(vault, {
+      paneId: PANE,
+      attachmentId,
+      uploadId: "upload_archivejoin0001",
+      kind: "image",
+      bytes: Buffer.from("archive custody", "utf8"),
+      displayName: "archive.png",
+      mediaType: "image/png",
+    });
+    await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_archivejoin0001",
+      content: {
+        text: "Finish before archive.",
+        attachmentRefs: [attachmentId],
+      },
+      delivery: { kind: "queue" },
+    });
+    await value.service.settled();
+    const started = value.provider.startedTurns[0];
+    if (started === undefined) throw new Error("Expected archive fixture provider turn");
+    await value.service.observeSessionAssistantCompletion(completion(
+      started.request,
+      started.turnId,
+      "Finished.",
+    ));
+    await value.service.observeSessionLifecycle(lifecycle(
+      started.request,
+      started.turnId,
+      "completed",
+    ));
+    await value.service.settled();
+    const ready = value.store.require(PANE).projection;
+    const rejected = await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: ready.revision,
+    }).then(() => null, (error: unknown) => error);
+    expect(rejected).toMatchObject({ code: "invalid_state" });
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+    expect(value.store.providerThreadArchiveIntent(PANE)).toBeNull();
+    expect(value.database.query(`
+      SELECT archived_at IS NOT NULL AS archived FROM chat_panes WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ archived: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_pane_archive_intents
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachments WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 1 });
+    expect(value.database.query(`
+      SELECT state FROM chat_provider_attachment_bindings WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ state: "active" });
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("pane close rejects an in-progress privacy deletion before provider preparation", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    await uploadReadyServiceAttachment(fixture.vault, {
+      paneId: PANE,
+      attachmentId: "attachment_privacypreflight1",
+      uploadId: "upload_privacypreflight01",
+      kind: "image",
+      bytes: Buffer.from("private preflight image", "utf8"),
+      displayName: "private.png",
+      mediaType: "image/png",
+    });
+    value.database.query(`
+      UPDATE chat_panes SET
+        provider_account_profile_id = ?1,
+        provider_thread_id = 'thread_privacy_preflight',
+        provider_restart_thread_id = 'raw_thread_privacy_preflight'
+      WHERE pane_id = ?2
+    `).run(ACCOUNT_ONE, PANE);
+    value.database.query(`
+      INSERT INTO chat_attachment_privacy_deletion_intents (
+        pane_id, authorization_receipt_digest,
+        containment_receipt_digest, contained_at, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?4)
+    `).run(
+      PANE,
+      "a".repeat(64),
+      "b".repeat(64),
+      "2026-08-03T12:00:01.000Z",
+    );
+    const beforePane = value.database.query(`
+      SELECT * FROM chat_panes WHERE pane_id = ?1
+    `).get(PANE);
+    const beforeAttachments = value.database.query(`
+      SELECT * FROM chat_attachments WHERE pane_id = ?1
+      ORDER BY attachment_id
+    `).all(PANE);
+
+    const rejected = await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: created.revision,
+    }).then(() => null, (error: unknown) => error);
+    expect(rejected).toMatchObject({
+      code: "invalid_state",
+      message: "Pane privacy deletion already owns attachment cleanup.",
+    });
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_provider_thread_archive_intents
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_pane_archive_intents
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT * FROM chat_panes WHERE pane_id = ?1
+    `).get(PANE)).toEqual(beforePane);
+    expect(value.database.query(`
+      SELECT * FROM chat_attachments WHERE pane_id = ?1
+      ORDER BY attachment_id
+    `).all(PANE)).toEqual(beforeAttachments);
+  } finally {
+    await closeAttachmentHarness(fixture);
+  }
+});
+
+test("completed privacy custody lets a binding-free pane close as an exact no-op", async () => {
+  const fixture = await createAttachmentHarness();
+  const { value } = fixture;
+  try {
+    const created = await createPane(value);
+    value.database.query(`
+      INSERT INTO chat_attachment_privacy_tombstones (pane_id, completed_at)
+      VALUES (?1, ?2)
+    `).run(PANE, "2026-08-03T12:00:01.000Z");
+
+    expect(await value.service.execute({
+      type: "chat.pane.remove",
+      paneId: PANE,
+      expectedRevision: created.revision,
+    })).toEqual({
+      type: "removed",
+      paneId: PANE,
+      revision: created.revision + 1,
+    });
+    expect(value.provider.archivePreparations).toEqual([]);
+    expect(value.provider.archivedThreads).toEqual([]);
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_provider_thread_archive_intents
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_pane_archive_intents
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 0 });
+    expect(value.database.query(`
+      SELECT COUNT(*) AS count FROM chat_attachment_privacy_tombstones
+      WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 1 });
+  } finally {
+    await closeAttachmentHarness(fixture);
   }
 });
 
@@ -7452,7 +12459,9 @@ test("account shutdown does not interrupt an already-contained poisoned turn twi
     ));
     expect(value.provider.interrupts).toHaveLength(1);
 
-    await value.service.handleAccountUnavailable(ACCOUNT_ONE);
+    await value.service.handleAccountUnavailable(ACCOUNT_ONE, {
+      expectedGeneration: 1,
+    });
     await value.service.settled();
 
     expect(value.provider.interrupts).toHaveLength(1);
@@ -7468,6 +12477,125 @@ test("account shutdown does not interrupt an already-contained poisoned turn twi
     value.database.close();
   }
 });
+
+interface AttachmentHarnessFixture {
+  readonly root: string;
+  readonly value: Harness;
+  readonly vault: SQLiteChatAttachmentVault;
+}
+
+async function createAttachmentHarness(
+  candidateFactory?: ChatCandidateFactory,
+  containAmbiguousEffect?: (accountProfileId: string) => Promise<void>,
+  setup: Omit<HarnessSetup, "attachmentFactory" | "candidateFactory"> = {},
+): Promise<AttachmentHarnessFixture> {
+  const root = await mkdtemp("/private/tmp/hra-chat-service-attachments-");
+  let vault: SQLiteChatAttachmentVault | null = null;
+  const value = harness(
+    {
+      ...setup,
+      ...(candidateFactory === undefined ? {} : { candidateFactory }),
+      attachmentFactory(database) {
+        vault = new SQLiteChatAttachmentVault({
+          database,
+          root,
+          normalizer: new ServiceFixtureImageNormalizer(),
+        });
+        return vault;
+      },
+    },
+    containAmbiguousEffect,
+  );
+  if (vault === null) throw new Error("Expected attachment vault fixture");
+  return { root, value, vault };
+}
+
+async function closeAttachmentHarness(fixture: AttachmentHarnessFixture): Promise<void> {
+  fixture.value.service.closeAdmission();
+  await fixture.value.service.settled();
+  fixture.value.database.close();
+  await rm(fixture.root, { recursive: true, force: true });
+}
+
+async function uploadReadyServiceAttachment(
+  vault: ChatAttachmentVault,
+  input: Readonly<{
+    paneId: string;
+    attachmentId: string;
+    uploadId: string;
+    kind: "image" | "file";
+    bytes: Uint8Array;
+    displayName: string;
+    mediaType: string;
+  }>,
+): Promise<void> {
+  const now = new Date("2026-08-03T12:00:01.000Z");
+  const begun = await vault.beginUpload({
+    paneId: input.paneId,
+    attachmentId: input.attachmentId,
+    uploadId: input.uploadId,
+    kind: input.kind,
+    displayName: input.displayName,
+    declaredMediaType: input.mediaType,
+    expectedBytes: input.bytes.byteLength,
+    now,
+  });
+  const appended = await vault.appendChunk({
+    paneId: input.paneId,
+    attachmentId: input.attachmentId,
+    uploadId: input.uploadId,
+    expectedRevision: begun.attachment.revision,
+    chunkOrdinal: 0,
+    base64: Buffer.from(input.bytes).toString("base64"),
+    now: new Date(now.getTime() + 1),
+  });
+  const finalized = await vault.finalizeUpload({
+    paneId: input.paneId,
+    attachmentId: input.attachmentId,
+    uploadId: input.uploadId,
+    expectedRevision: appended.attachment.revision,
+    inputSha256: attachmentSha256(input.bytes),
+    now: new Date(now.getTime() + 2),
+  });
+  expect(finalized.attachment.state).toBe("ready");
+}
+
+class ServiceFixtureImageNormalizer implements ChatImageNormalizer {
+  async normalize(
+    inputPath: string,
+    outputDirectory: string,
+  ): Promise<NativeImageNormalizerReceipt> {
+    const source = await readFile(inputPath);
+    const canonical = Buffer.concat([Buffer.from("canonical-image\0"), source]);
+    const preview = Buffer.from("preview-image", "utf8");
+    await mkdir(outputDirectory, { mode: 0o700 });
+    await writeFile(join(outputDirectory, "canonical.png"), canonical, { mode: 0o600 });
+    await writeFile(join(outputDirectory, "preview.png"), preview, { mode: 0o600 });
+    return {
+      schemaVersion: 1,
+      mediaType: "image/png",
+      sourceBytes: source.byteLength,
+      canonical: {
+        width: 8,
+        height: 4,
+        bytes: canonical.byteLength,
+        sha256: attachmentSha256(canonical),
+      },
+      preview: {
+        width: 4,
+        height: 2,
+        bytes: preview.byteLength,
+        sha256: attachmentSha256(preview),
+      },
+    };
+  }
+}
+
+function attachmentSha256(bytes: Uint8Array): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(bytes);
+  return hasher.digest("hex");
+}
 
 function activity(
   request: ChatProviderTurnRequest,
@@ -7489,8 +12617,29 @@ function activity(
     };
   }
   return kind === "reasoning_summary_delta"
-    ? { ...base, kind, displayText: displayText ?? "delta" }
+    ? {
+        ...base,
+        kind,
+        displayText: displayText ?? "delta",
+        reasoningItemId: "item_reasoningactivity01",
+      }
     : { ...base, kind };
+}
+
+function verifiedReasoningReceipt(suffix: string): SessionReasoningItemCompletion["receipt"] {
+  return {
+    state: "verified",
+    receiptId: `reasoning_${suffix.repeat(58)}`,
+    completionDigest: suffix.repeat(64),
+    completionFactIndex: 1,
+    completionGeneration: 1,
+    completionStreamPosition: 1,
+    overflowed: false,
+    reason: null,
+    repairedSuffix: false,
+    summary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+    terminalVisible: true,
+  };
 }
 
 function completion(

@@ -13,6 +13,7 @@ import type {
 } from "../src/features/chat/CompactChatSurface";
 import { isRasterImagePreviewMimeType } from "../src/features/chat/CompactChatSurface";
 import type { RuntimeShell } from "../src/runtime";
+import { useUiScale } from "../src/ui-scale";
 import type { HRADirectWorld } from "./world";
 
 type CompactSurfaceWorld = Extract<HRADirectWorld["surface"], { kind: "compactChat" }>;
@@ -38,6 +39,7 @@ export function DirectCompactChatSurface({
   shellFactory: () => RuntimeShell;
   world: CompactSurfaceWorld;
 }>) {
+  useUiScale();
   const [shell, setShell] = useState<RuntimeShell | null>(null);
   const [attachments, setAttachments] = useState<readonly CompactAttachmentPreview[]>([]);
   const attachmentOrdinal = useRef(world.attachments.length + 1);
@@ -126,7 +128,6 @@ export function DirectCompactChatSurface({
 
   const surface = useMemo<CompactChatPaneSurface>(() => ({
     attachments,
-    paletteIndex: world.paletteIndex,
     nowUnixMilliseconds: world.nowUnixMilliseconds,
     onAttachFiles: attachFiles,
     onAttachmentsEnqueued: consumeAttachments,
@@ -137,7 +138,6 @@ export function DirectCompactChatSurface({
     consumeAttachments,
     removeAttachment,
     world.nowUnixMilliseconds,
-    world.paletteIndex,
   ]);
 
   if (shell === null) {

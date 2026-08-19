@@ -118,8 +118,15 @@ function isRuntimeChatCommand(
     command.type === "chat.message.edit" ||
     command.type === "chat.message.remove" ||
     command.type === "chat.messageQueue.resume" ||
+    command.type === "chat.pane.startFreshContext" ||
     command.type === "chat.message.discardAmbiguous" ||
-    command.type === "chat.message.steerHead";
+    command.type === "chat.message.steerHead" ||
+    command.type === "chat.attachment.begin" ||
+    command.type === "chat.attachment.append" ||
+    command.type === "chat.attachment.finalize" ||
+    command.type === "chat.attachment.cancel" ||
+    command.type === "chat.attachment.remove" ||
+    command.type === "chat.attachment.preview";
 }
 
 function isRuntimeHarnessCommand(

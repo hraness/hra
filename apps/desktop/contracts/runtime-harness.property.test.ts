@@ -365,6 +365,7 @@ test("child-open correlation requires both revision advances and the exact opene
           },
           pane: {
             id: openedPaneId,
+            paletteIndex: 1,
             revision: 1,
             title: "Property child",
             repository: { id: "repo_00000000000000000000000000", name: "hra" },
@@ -375,6 +376,14 @@ test("child-open correlation requires both revision advances and the exact opene
             workspace: null,
             turn: null,
             attention: null,
+            recoverablePrompt: false,
+            messageQueue: {
+              revision: 1,
+              pauseReason: null,
+              blockedMessage: null,
+              messages: [],
+            },
+            attachments: { drafts: [], referenced: [] },
             harness: null,
           },
         },

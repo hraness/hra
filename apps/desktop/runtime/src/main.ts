@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import { userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   HRA_HUMAN_HTTP_VERSION,
   RUNNER_PRESENCE_LEASE_MS,
@@ -16,6 +17,7 @@ import { z } from "@hra-internal/schema";
 import {
   parseRuntimeDispatchRequest,
   parseRuntimeSnapshotRequest,
+  runtimeChatAttachmentCommandSchema,
   runtimeChatDomainCommandSchema,
   runtimeHarnessDomainCommandSchema,
   runtimeSessionSyncDomainCommandSchema,
@@ -24,6 +26,10 @@ import {
   runtimeSnapshotCommand,
   runtimeTaskDispatchRequestSchema,
   type ChatPaneProjection,
+  type ChatAttachmentPaneProjection as RendererChatAttachmentPaneProjection,
+  type ChatMessageAttachmentId,
+  type RuntimeChatAttachmentCommand,
+  type RuntimeChatDomainCommand,
   type RuntimeDispatchRequest,
   type RuntimeDispatchResponse,
   type RuntimeError,
@@ -36,6 +42,13 @@ import {
   type RuntimeTaskDispatchRequest,
   type RuntimeTaskDispatchResponse,
 } from "../../contracts/runtime";
+import {
+  ChatAttachmentVaultError,
+  type ChatAttachmentVault,
+} from "./attachments/contracts";
+import { NativeChatImageNormalizer } from "./attachments/normalizer";
+import { chatAttachmentVaultRoot } from "./attachments/root";
+import { SQLiteChatAttachmentVault } from "./attachments/vault";
 import {
   runtimeChatPaneStateChangedEvent,
   runtimeChatPaneStateProjection,
@@ -50,6 +63,7 @@ import {
 } from "./accounts/account-service";
 import { NativeAccountProfileFileSystem } from "./accounts/local-data-remover";
 import { AccountProfileStore } from "./accounts/profile-store";
+import { ArchiveAdmissionGate } from "./accounts/archive-admission-gate";
 import { AccountRuntimeRouter } from "./accounts/runtime-router";
 import {
   CodexFactRouter,
@@ -223,6 +237,7 @@ import {
 import {
   OperationReceiptConflict,
   OperationReceiptStore,
+  type StoredChatOperationReceiptResponse,
 } from "./state/operation-receipts";
 import {
   CloudHumanOperationConflict,
@@ -231,6 +246,8 @@ import {
 import { CloudInvalidationHeadStore } from "./state/cloud-invalidation-head-store";
 import { DispatchStore } from "./state/dispatch-store";
 import { ChatPaneStore, ChatPaneStoreError } from "./state/chat-pane-store";
+import { ProviderThreadArchiveJournalV57 } from
+  "./state/provider-thread-archive-journal-v57";
 import {
   ChatWorkspaceStore,
   ManagedChatWorkspaceService,
@@ -435,6 +452,7 @@ const dispatchTransfers = new DispatchTransferStore();
 
 let accountService: AccountService | null = null;
 let chatService: ChatService | null = null;
+let chatAttachmentVault: ChatAttachmentVault | null = null;
 let harnessProductionComposition: HarnessProductionCompositionV2 | null = null;
 let accountProfileFileSystem: NativeAccountProfileFileSystem | null = null;
 const nativeHarnessKeyCustody = new NativeHarnessKeyCustody({
@@ -511,6 +529,45 @@ let localCompletionRetryTimer: ReturnType<typeof setInterval> | null = null;
 let localClaimRenewalTimer: ReturnType<typeof setInterval> | null = null;
 let operationReceipts: OperationReceiptStore | null = null;
 let portableRuntimeAssets: PortableRuntimeAssets | null = null;
+
+function attachmentReferenceIds(
+  queue: ChatPaneProjection["messageQueue"],
+): readonly ChatMessageAttachmentId[] {
+  const ids = new Set<ChatMessageAttachmentId>();
+  const ordered = [
+    ...(queue.blockedMessage === null ? [] : [queue.blockedMessage]),
+    ...queue.messages,
+  ];
+  for (const message of ordered) {
+    for (const attachmentId of message.attachmentRefs) ids.add(attachmentId);
+  }
+  return [...ids];
+}
+
+function projectChatAttachments(
+  paneId: string,
+  queue: ChatPaneProjection["messageQueue"],
+  now = new Date(),
+): RendererChatAttachmentPaneProjection {
+  const vault = chatAttachmentVault;
+  if (vault === null) return { drafts: [], referenced: [] };
+  const projected = vault.projectPane({
+    paneId,
+    referencedAttachmentIds: attachmentReferenceIds(queue),
+    now,
+  });
+  return {
+    drafts: [...projected.drafts],
+    referenced: [...projected.referenced],
+  };
+}
+
+function projectChatPaneAttachments(pane: ChatPaneProjection): ChatPaneProjection {
+  return {
+    ...pane,
+    attachments: projectChatAttachments(pane.id, pane.messageQueue),
+  };
+}
 
 function bundledGitRunner(paths: RuntimePaths): BundledGitRunner {
   const sourceTestPathExecution = basename(process.execPath) === "bun"
@@ -1952,6 +2009,9 @@ async function initializeGateway(): Promise<void> {
     const operationReceiptKey = loadOrCreateOperationReceiptKey(
       operationReceiptKeyPath(databasePath),
     );
+    const archiveAdmissionGate = new ArchiveAdmissionGate();
+    const providerThreadArchiveJournalV57 =
+      new ProviderThreadArchiveJournalV57(database, operationReceiptKey);
     operationReceipts = new OperationReceiptStore(database, operationReceiptKey);
     operationReceipts.purgeTransientSecretReceipts();
     operationReceipts.recoverInterrupted();
@@ -2132,16 +2192,19 @@ async function initializeGateway(): Promise<void> {
       harness: () => initializingHarnessComposition.harnessFactConsumer,
     });
     const router = new AccountRuntimeRouter({
+      archiveAdmissionGate,
       dynamicToolCapability:
         initializingHarnessComposition.dynamicToolCapabilityResolver,
       callbacks: {
         onState: (accountProfileId, state, cause) => {
           if (
             (state.type === "stopped" || state.type === "failed") &&
-            cause !== "capacity_evicted" && cause !== "router_shutdown"
+            cause === "provider_lifecycle"
           ) {
             void initializingChatService
-              ?.handleAccountUnavailable(accountProfileId)
+              ?.handleAccountUnavailable(accountProfileId, {
+                expectedGeneration: state.generation,
+              })
               .catch(() => undefined);
           }
           initializingService?.handleRuntimeState(accountProfileId, state);
@@ -2183,18 +2246,32 @@ async function initializeGateway(): Promise<void> {
       });
     accountProfileFileSystem = initializingAccountProfileFileSystem;
     const initializedAccountService = new AccountService({
+      archiveAdmissionGate,
       assets,
+      containChatsBeforeRemoval: async (accountProfileId) => {
+        const service = initializingChatService;
+        if (service === null) {
+          throw new Error("Chat containment is unavailable during account removal.");
+        }
+        await service.handleAccountRemoval(accountProfileId);
+      },
+      joinChatArchiveGenerationContainment: async (input) => {
+        const service = initializingChatService;
+        if (service === null) {
+          throw new Error("Chat archive containment is unavailable during startup.");
+        }
+        await service.joinProviderThreadArchiveGenerationContainment(input);
+      },
       controlPlanePath: databasePath,
+      controlPlaneDatabase: database,
       emit: (event) => {
         if (event.type === "account.removed") {
-          void initializingChatService
-            ?.handleAccountUnavailable(event.accountProfileId)
-            .catch(() => undefined);
           initializingSessionService?.purgeAccount(event.accountProfileId);
         }
         publishWithDrainRetry(event);
       },
       profileFileSystem: initializingAccountProfileFileSystem,
+      providerThreadArchiveJournalV57,
       router,
       store: profileStore,
     });
@@ -2232,6 +2309,9 @@ async function initializeGateway(): Promise<void> {
       onReasoningItemCompletion: async (event) => {
         await initializingChatService?.observeSessionReasoningCompletion(event);
       },
+      onProviderSubagents: async (event) => {
+        await initializingChatService?.observeSessionProviderSubagents(event);
+      },
       onTurnLifecycle: (event) => {
         initializingHarnessComposition.observeActorLifecycle(event);
         void initializingChatService?.observeSessionLifecycle(event)
@@ -2262,8 +2342,53 @@ async function initializeGateway(): Promise<void> {
     });
     const initializedSessionService = initializingSessionService;
     const chatControlPlane = database;
-    const initializingChatPaneStore = new ChatPaneStore(database);
-    const initializingChatWorkspaceStore = new ChatWorkspaceStore(database);
+    const gatewayBinary = optionalRenamedEnvironmentValue(
+      process.env,
+      "HRA_GATEWAY_PATH",
+    );
+    const imageNormalizerBinary = gatewayBinary === undefined
+      ? join(import.meta.dir, "../../zig-out/bin/hra-image-normalizer")
+      : join(dirname(gatewayBinary), "hra-image-normalizer");
+    const initializingChatAttachmentVault = new SQLiteChatAttachmentVault({
+      database,
+      root: chatAttachmentVaultRoot(databasePath),
+      normalizer: new NativeChatImageNormalizer(imageNormalizerBinary),
+    });
+    const initializingChatPaneStore = new ChatPaneStore(database, {
+      messageRequestDigestKey: operationReceiptKey,
+      paneArchiveAuthority: initializingChatAttachmentVault,
+    });
+    const verifiedProviderThreadArchiveCommittedTargetIdsV57 =
+      initializingChatPaneStore.verifyProviderThreadArchiveTerminalAuthorityV57();
+    initializingChatAttachmentVault
+      .authorizeProviderThreadArchivePaneCleanupAfterStoreVerificationV57(
+        verifiedProviderThreadArchiveCommittedTargetIdsV57,
+      );
+    await initializingChatAttachmentVault.reconcile(new Date());
+    const providerThreadArchiveStartupSweepV57 =
+      initializingChatPaneStore.sweepProviderThreadArchiveTerminalAuthorityV57(
+        verifiedProviderThreadArchiveCommittedTargetIdsV57,
+      );
+    const verifiedProviderThreadArchiveRecoveryInventoryV57 =
+      providerThreadArchiveStartupSweepV57.recoveryInventory;
+    const installedProviderThreadArchiveRecoveryInventoryV57 =
+      initializedAccountService.installArchiveAdmissionReplayV57(
+        verifiedProviderThreadArchiveRecoveryInventoryV57,
+      );
+    if (
+      !isDeepStrictEqual(
+        installedProviderThreadArchiveRecoveryInventoryV57,
+        verifiedProviderThreadArchiveRecoveryInventoryV57,
+      )
+    ) {
+      throw new Error(
+        "Provider thread archive admission replay did not preserve the verified recovery inventory.",
+      );
+    }
+    chatAttachmentVault = initializingChatAttachmentVault;
+    const initializingChatWorkspaceStore = new ChatWorkspaceStore(database, {
+      panes: initializingChatPaneStore,
+    });
     const initializingChatWorkspaceBroker = new WorkspaceBroker({
       git: bundledGitRunner({
         ...assets,
@@ -2282,8 +2407,10 @@ async function initializeGateway(): Promise<void> {
       panes: initializingChatPaneStore,
     });
     const chatProjection = Object.freeze({
-      paneChanged: publishChatPane,
-      paneStateChanged: publishChatPaneState,
+      paneChanged: (pane: ChatPaneProjection) =>
+        publishChatPane(projectChatPaneAttachments(pane)),
+      paneStateChanged: (pane: ChatPaneProjection) =>
+        publishChatPaneState(projectChatPaneAttachments(pane)),
       paneRemoved: async (paneId: string, revision: number) => {
         await projectionCommits.publish({
           type: "chat.pane.removed",
@@ -2301,7 +2428,11 @@ async function initializeGateway(): Promise<void> {
         paneId: string,
         queue: ChatPaneProjection["messageQueue"],
       ) => {
-        await projectionCommits.installChatMessageQueueState({ paneId, queue });
+        await projectionCommits.installChatMessageQueueState({
+          paneId,
+          queue,
+          attachments: projectChatAttachments(paneId, queue),
+        });
       },
       delta: publishChatDelta,
     });
@@ -2352,6 +2483,70 @@ async function initializeGateway(): Promise<void> {
       onActorSessionRecoveryFatalFailure: requestGatewayGenerationRecovery,
       createChat: ({ harnessActors, harnessRoots }) => new ChatService({
         accounts: {
+          abortArchiveTransitionProvisional: (handle) =>
+            initializedAccountService.abortArchiveTransitionProvisional(handle),
+          activateArchiveTransitionSuccessorV57: (input) =>
+            initializedAccountService.activateArchiveTransitionSuccessorV57({
+              accountProfileId: input.accountProfileId,
+              archiveHandle: input.archiveHandle,
+              transitionId: input.transitionId,
+            }),
+          archiveTransitionHandleV57: (transitionId) =>
+            initializedAccountService.archiveTransitionHandleV57(transitionId),
+          beginArchiveTransitionProvisional: (input) =>
+            initializedAccountService.beginArchiveTransitionProvisional({
+              accountProfileId: input.accountProfileId,
+              paneId: input.paneId,
+              purpose: input.purpose,
+              transitionId: input.transitionId,
+            }),
+          containArchiveTransitionGenerationV57: (input) =>
+            initializedAccountService.containArchiveTransitionGenerationV57({
+              accountProfileId: input.accountProfileId,
+              archiveHandle: input.archiveHandle,
+              cutId: input.cutId,
+              transitionId: input.transitionId,
+            }),
+          promoteArchiveTransitionEffectStarted: (
+            provisionalHandle,
+            transitionId,
+          ) => initializedAccountService.promoteArchiveTransitionEffectStarted(
+            provisionalHandle,
+            transitionId,
+          ),
+          refreshArchiveTransitionCutAuthoritiesV57: (input) =>
+            initializedAccountService.refreshArchiveTransitionCutAuthoritiesV57(
+              {
+                archiveHandle: input.archiveHandle,
+                cutId: input.cutId,
+                transitionId: input.transitionId,
+              },
+            ),
+          releaseArchiveTransition: (
+            transitionId,
+            handle,
+            expectedComponent,
+          ) => {
+            const cleanup = initializedAccountService.releaseArchiveTransition(
+              transitionId,
+              handle,
+              {
+                accountProfileId: expectedComponent.accountProfileId,
+                targetIds: Object.freeze([...expectedComponent.targetIds]),
+                cutIds: Object.freeze([...expectedComponent.cutIds]),
+                allTargetsCommitted: expectedComponent.allTargetsCommitted,
+              },
+            );
+            return Object.freeze({
+              deletedTargetIds: Object.freeze([...cleanup.deletedTargetIds]),
+              deletedCutIds: Object.freeze([...cleanup.deletedCutIds]),
+            });
+          },
+          replaceArchiveTransition: (predecessor, transitionId) =>
+            initializedAccountService.replaceArchiveTransition(
+              predecessor,
+              transitionId,
+            ),
           refreshCandidates: async () =>
             await initializedAccountService.refreshChatAccountCandidates(),
           hasRateLimitProofSince: (accountProfileId, floor) =>
@@ -2359,11 +2554,24 @@ async function initializeGateway(): Promise<void> {
               accountProfileId,
               floor,
             ),
-          containAmbiguousEffect: (accountProfileId) =>
+          containAmbiguousEffect: (accountProfileId, expectedGeneration) =>
             initializedAccountService.containAmbiguousChatEffect(
               accountProfileId,
+              expectedGeneration,
+            ),
+          containArchiveGeneration: (input) =>
+            initializedAccountService.containChatArchiveGeneration(input),
+          retainArchiveGeneration: (input) =>
+            initializedAccountService.retainChatArchiveGeneration(input),
+          releaseArchiveGeneration: (input) =>
+            initializedAccountService.releaseChatArchiveGeneration(input),
+          isGenerationCurrent: (accountProfileId, expectedGeneration) =>
+            initializedAccountService.isChatRuntimeGenerationCurrent(
+              accountProfileId,
+              expectedGeneration,
             ),
         },
+        attachments: initializingChatAttachmentVault,
         harnessActors,
         harnessRoots,
         projection: chatProjection,
@@ -2383,6 +2591,7 @@ async function initializeGateway(): Promise<void> {
           },
         },
         rootTurnRouting: new RootTurnRoutingSQLiteAuthorityV1(chatControlPlane),
+        projectPane: projectChatPaneAttachments,
         store: initializingChatPaneStore,
         workspaces: initializingChatWorkspaces,
       }),
@@ -2390,6 +2599,7 @@ async function initializeGateway(): Promise<void> {
     initializingHarnessBound = true;
     harnessProductionComposition = initializingHarnessComposition;
     initializingChatService = harnessGraph.chat;
+    initializingChatService.assertProviderThreadArchiveQuarantinesInstalled();
     await initializedAccountService.initialize();
     await initializingHarnessComposition.initialize();
     chatService = harnessGraph.chat;
@@ -4718,6 +4928,189 @@ async function taskDispatch(
   }
 }
 
+async function installLiveAttachmentProjection(paneId: string): Promise<void> {
+  const service = chatService;
+  if (service === null) return;
+  const pane = service.list().find((candidate) => candidate.id === paneId);
+  if (pane === undefined) return;
+  await projectionCommits.installChatAttachmentState({
+    paneId,
+    attachments: pane.attachments,
+  });
+}
+
+function attachmentOperationFailure(
+  operationId: string,
+  error: ChatAttachmentVaultError,
+): RuntimeDispatchResponse {
+  const code: RuntimeError["code"] = error.code === "invalid_input"
+    ? "invalid_request"
+    : error.code === "revision_conflict"
+      ? "stale_revision"
+      : error.code === "quota_exceeded"
+        ? "capacity_full"
+        : error.code === "corrupt" || error.code === "unsafe_filesystem"
+          ? "operation_failed"
+          : error.code;
+  return operationFailure(operationId, code, error.message, false, "none");
+}
+
+async function executeChatAttachmentCommand(
+  request: RuntimeDispatchRequest,
+  command: RuntimeChatAttachmentCommand,
+): Promise<RuntimeDispatchResponse> {
+  const vault = chatAttachmentVault;
+  if (vault === null || chatService === null) {
+    return operationFailure(
+      request.operationId,
+      "runtime_unavailable",
+      "The local attachment vault is unavailable.",
+      true,
+      "restartRuntime",
+    );
+  }
+  const now = new Date();
+  try {
+    const pane = chatService.list().find(({ id }) => id === command.paneId);
+    if (pane === undefined) {
+      return operationFailure(
+        request.operationId,
+        "not_found",
+        "The chat pane is unavailable.",
+        false,
+        "none",
+      );
+    }
+    if (pane.interactionMode !== "chat") {
+      return operationFailure(
+        request.operationId,
+        "policy_denied",
+        "Attachments are available only in ordinary chat panes.",
+        false,
+        "none",
+      );
+    }
+    if (command.type === "chat.attachment.begin" && command.kind !== "image") {
+      return operationFailure(
+        request.operationId,
+        "policy_denied",
+        "HRA currently supports image attachments only.",
+        false,
+        "none",
+      );
+    }
+    switch (command.type) {
+      case "chat.attachment.begin": {
+        const result = await vault.beginUpload({
+          paneId: command.paneId,
+          attachmentId: command.attachmentId,
+          uploadId: command.uploadId,
+          kind: command.kind,
+          displayName: command.displayName,
+          declaredMediaType: command.declaredMediaType,
+          expectedBytes: command.expectedBytes,
+          now,
+        });
+        await installLiveAttachmentProjection(command.paneId);
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: {
+            type: "chatAttachment",
+            paneId: command.paneId,
+            uploadId: command.uploadId,
+            ...result,
+          },
+        };
+      }
+      case "chat.attachment.append": {
+        const result = await vault.appendChunk({ ...command, now });
+        await installLiveAttachmentProjection(command.paneId);
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: {
+            type: "chatAttachment",
+            paneId: command.paneId,
+            uploadId: command.uploadId,
+            ...result,
+          },
+        };
+      }
+      case "chat.attachment.finalize": {
+        const result = await vault.finalizeUpload({ ...command, now });
+        await installLiveAttachmentProjection(command.paneId);
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: {
+            type: "chatAttachment",
+            paneId: command.paneId,
+            uploadId: command.uploadId,
+            ...result,
+          },
+        };
+      }
+      case "chat.attachment.cancel": {
+        const result = await vault.cancelUpload({ ...command, now });
+        await installLiveAttachmentProjection(command.paneId);
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: { type: "chatAttachmentRemoved", paneId: command.paneId, ...result },
+        };
+      }
+      case "chat.attachment.remove": {
+        const result = await vault.removeAttachment({ ...command, now });
+        await installLiveAttachmentProjection(command.paneId);
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: { type: "chatAttachmentRemoved", paneId: command.paneId, ...result },
+        };
+      }
+      case "chat.attachment.preview": {
+        const preview = await vault.readPreview({ ...command, now });
+        return {
+          version: runtimeProtocolVersion,
+          operationId: request.operationId,
+          ok: true,
+          result: {
+            type: "chatAttachmentPreview",
+            paneId: command.paneId,
+            attachmentId: preview.attachmentId,
+            revision: preview.revision,
+            mediaType: preview.mediaType,
+            base64: Buffer.from(preview.bytes).toString("base64"),
+          },
+        };
+      }
+    }
+  } catch (error: unknown) {
+    if (error instanceof ChatAttachmentVaultError) {
+      return attachmentOperationFailure(request.operationId, error);
+    }
+    return operationFailure(
+      request.operationId,
+      "operation_failed",
+      "The attachment operation could not be completed.",
+      false,
+      "none",
+    );
+  }
+}
+
+function isRuntimeChatAttachmentCommand(
+  command: RuntimeChatDomainCommand,
+): command is RuntimeChatAttachmentCommand {
+  return runtimeChatAttachmentCommandSchema.safeParse(command).success;
+}
+
 async function executeDomainCommand(
   request: RuntimeDispatchRequest,
 ): Promise<RuntimeDispatchResponse> {
@@ -4817,6 +5210,9 @@ async function executeDomainCommand(
   }
   const chatCommand = runtimeChatDomainCommandSchema.safeParse(request.command);
   if (chatCommand.success) {
+    if (isRuntimeChatAttachmentCommand(chatCommand.data)) {
+      return await executeChatAttachmentCommand(request, chatCommand.data);
+    }
     const service = chatService;
     if (service === null) {
       return operationFailure(
@@ -4834,7 +5230,12 @@ async function executeDomainCommand(
         operationId: request.operationId,
         ok: true,
         result: result.type === "pane"
-          ? { type: "chatPane", pane: result.pane }
+          ? {
+              type: "chatPane",
+              pane: projectChatPaneAttachments(result.pane),
+              disposition: "applied",
+              appliedRevision: result.pane.revision,
+            }
           : result.type === "removed"
             ? { type: "chatPaneRemoved", paneId: result.paneId }
             : result.type === "messageQueue"
@@ -4842,6 +5243,19 @@ async function executeDomainCommand(
                   type: "chatMessageQueue",
                   paneId: result.paneId,
                   queue: result.queue,
+                  disposition: "disposition" in result && (
+                      result.disposition === "applied" ||
+                      result.disposition === "notApplied" ||
+                      result.disposition === "replayed"
+                    ) ? result.disposition : "applied",
+                  messageId: "messageId" in result && (
+                      typeof result.messageId === "string" ||
+                      result.messageId === null
+                    )
+                    ? result.messageId
+                    : "messageId" in chatCommand.data
+                      ? chatCommand.data.messageId
+                      : null,
                 }
               : { type: "accepted" },
       };
@@ -5274,8 +5688,15 @@ async function executeDomainCommand(
     case "chat.message.edit":
     case "chat.message.remove":
     case "chat.messageQueue.resume":
+    case "chat.pane.startFreshContext":
     case "chat.message.discardAmbiguous":
     case "chat.message.steerHead":
+    case "chat.attachment.begin":
+    case "chat.attachment.append":
+    case "chat.attachment.finalize":
+    case "chat.attachment.cancel":
+    case "chat.attachment.remove":
+    case "chat.attachment.preview":
       throw new Error("A chat command escaped its dedicated service boundary.");
     case "sessionSync.enable":
     case "sessionSync.disable":
@@ -5340,6 +5761,128 @@ async function executeDomainCommand(
   }
 }
 
+function rehydrateRecordedChatOperation(
+  recorded: StoredChatOperationReceiptResponse,
+  request: RuntimeDispatchRequest,
+): RuntimeDispatchResponse {
+  const service = chatService;
+  const command = runtimeChatDomainCommandSchema.safeParse(request.command);
+  if (service === null || !command.success) {
+    return operationFailure(
+      request.operationId,
+      "operation_failed",
+      "The recorded chat operation cannot be rehydrated.",
+      false,
+      "none",
+    );
+  }
+  const receipt = recorded.result;
+  const paneId = "paneId" in command.data ? command.data.paneId : null;
+  if (paneId === null || paneId !== receipt.paneId) {
+    return operationFailure(
+      request.operationId,
+      "operation_failed",
+      "The recorded chat operation lost its pane correlation.",
+      false,
+      "none",
+    );
+  }
+  const pane = service.list().find(({ id }) => id === paneId) ?? null;
+  if (receipt.type === "chatPaneReceipt") {
+    switch (command.data.type) {
+      case "chat.pane.create":
+      case "chat.pane.rename":
+      case "chat.pane.workspace.recover":
+      case "chat.pane.repository.select":
+      case "chat.turn.stop":
+        break;
+      case "chat.pane.remove":
+      case "chat.panes.reorder":
+      case "chat.message.enqueue":
+      case "chat.message.edit":
+      case "chat.message.remove":
+      case "chat.messageQueue.resume":
+      case "chat.pane.startFreshContext":
+      case "chat.message.discardAmbiguous":
+      case "chat.message.steerHead":
+      case "chat.attachment.begin":
+      case "chat.attachment.append":
+      case "chat.attachment.finalize":
+      case "chat.attachment.cancel":
+      case "chat.attachment.remove":
+      case "chat.attachment.preview":
+        return operationFailure(
+          request.operationId,
+          "operation_failed",
+          "The recorded chat pane command is invalid.",
+          false,
+          "none",
+        );
+    }
+    if (pane === null || pane.revision < receipt.revision) {
+      return operationFailure(
+        request.operationId,
+        "operation_failed",
+        "The recorded chat pane outcome is no longer available.",
+        false,
+        "none",
+      );
+    }
+    return {
+      version: runtimeProtocolVersion,
+      operationId: request.operationId,
+      ok: true,
+      result: {
+        type: "chatPaneReplay",
+        paneId,
+        commandType: command.data.type,
+        appliedRevision: receipt.revision,
+      },
+    };
+  }
+  const commandMessageId = "messageId" in command.data
+    ? command.data.messageId
+    : null;
+  if (
+    !(
+      command.data.type.startsWith("chat.message") ||
+      command.data.type === "chat.pane.startFreshContext"
+    ) ||
+    pane === null ||
+    pane.messageQueue.revision < receipt.revision ||
+    commandMessageId !== receipt.messageId
+  ) {
+    return operationFailure(
+      request.operationId,
+      "operation_failed",
+      "The recorded chat queue outcome is no longer available.",
+      false,
+      "none",
+    );
+  }
+  return {
+    version: runtimeProtocolVersion,
+    operationId: request.operationId,
+    ok: true,
+    result: {
+      type: "chatMessageQueue",
+      paneId,
+      queue: pane.messageQueue,
+      disposition: receipt.disposition,
+      messageId: receipt.messageId,
+    },
+  };
+}
+
+function isStoredChatOperationReceipt(
+  response: RuntimeDispatchResponse | StoredChatOperationReceiptResponse,
+): response is StoredChatOperationReceiptResponse {
+  return response.ok && (
+    response.result.type === "chatPaneReceipt" ||
+    response.result.type === "chatMessageQueueReceipt"
+  );
+}
+
 async function dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatchResponse> {
   if (request.command.type === "maintenance.localDataRemoval.preview") {
     return await previewLocalDataRemoval({
@@ -5376,6 +5919,18 @@ async function dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatc
     });
     return response;
   }
+  // Upload replay is owned by the vault's exact begin/chunk/finalize/removal
+  // receipts. Generic operation receipts must never retain attachment IDs or
+  // base64 payload bytes.
+  if (runtimeChatAttachmentCommandSchema.safeParse(request.command).success) {
+    const response = await executeDomainCommand(request);
+    publishWithDrainRetry({
+      type: "operation.completed",
+      operationId: request.operationId,
+      outcome: response.ok ? { ok: true } : { ok: false, error: response.error },
+    });
+    return response;
+  }
   const receipts = operationReceipts;
   if (receipts === null) {
     return operationFailure(
@@ -5403,7 +5958,9 @@ async function dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatc
 
   switch (receipt.state) {
     case "recorded":
-      return receipt.response;
+      return isStoredChatOperationReceipt(receipt.response)
+        ? rehydrateRecordedChatOperation(receipt.response, request)
+        : receipt.response;
     case "inFlight":
       return operationFailure(
         request.operationId,

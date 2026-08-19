@@ -76,16 +76,37 @@ const canonicalTimestampSchema = z.string().length(24).datetime().refine(
   (value) => new Date(Date.parse(value)).toISOString() === value,
   "timestamp must use canonical UTC milliseconds",
 );
+export const rootTurnRoutingRequiredInputClassSchema = z.enum(["text", "image"]);
+export type RootTurnRoutingRequiredInputClassV1 = z.infer<
+  typeof rootTurnRoutingRequiredInputClassSchema
+>;
+const catalogDigestSchema = z.string().length(64).regex(/^[0-9a-f]{64}$/u);
 
 export const rootTurnRoutingClassificationV1Schema = z.object({
   paneId: chatPaneIdSchema,
   chatTurnId: chatTurnIdSchema,
   policyVersion: z.literal(HRA_ROOT_TURN_ROUTING_POLICY_VERSION),
+  requiredInputClass: rootTurnRoutingRequiredInputClassSchema,
   classificationReason: rootTurnRoutingClassificationReasonSchema,
   workClass: rootTurnRoutingWorkClassSchema,
   requestedProfile: rootTurnRoutingProfileSchema,
   requestedServiceTier: rootTurnRoutingServiceTierSchema,
 }).strict().superRefine((value, context) => {
+  if (
+    value.requiredInputClass === "image" &&
+    (
+      value.classificationReason !== "conservativeDefault" ||
+      value.workClass !== "standard" ||
+      value.requestedProfile !== "solMax" ||
+      value.requestedServiceTier !== "standard"
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "image input must use the conservative Sol Max Standard route",
+      path: ["requiredInputClass"],
+    });
+  }
   const expectedProfile = value.workClass === "boundedLeaf"
     ? "lunaMax"
     : value.workClass === "standard"
@@ -147,6 +168,7 @@ export const rootTurnRoutingReceiptV1Schema = z.object({
   chatTurnId: chatTurnIdSchema,
   rootTurnId: z.string().min(16).max(96).nullable(),
   policyVersion: z.literal(HRA_ROOT_TURN_ROUTING_POLICY_VERSION),
+  requiredInputClass: rootTurnRoutingRequiredInputClassSchema,
   classificationReason: rootTurnRoutingClassificationReasonSchema,
   workClass: rootTurnRoutingWorkClassSchema,
   requestedProfile: rootTurnRoutingProfileSchema,
@@ -160,13 +182,43 @@ export const rootTurnRoutingReceiptV1Schema = z.object({
   operationalOutcome: rootTurnRoutingOperationalOutcomeSchema.nullable(),
   acceptedGeneration: z.number().int().positive().safe().nullable(),
   acceptedStreamPosition: z.number().int().nonnegative().safe().nullable(),
+  catalogGeneration: z.number().int().positive().safe().nullable(),
+  catalogDigest: catalogDigestSchema.nullable(),
   createdAt: canonicalTimestampSchema,
   updatedAt: canonicalTimestampSchema,
   resolvedAt: canonicalTimestampSchema.nullable(),
   effectStartedAt: canonicalTimestampSchema.nullable(),
   acceptedAt: canonicalTimestampSchema.nullable(),
   settledAt: canonicalTimestampSchema.nullable(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  if ((value.catalogGeneration === null) !== (value.catalogDigest === null)) {
+    context.addIssue({
+      code: "custom",
+      message: "catalog generation and digest must be present together",
+      path: ["catalogDigest"],
+    });
+  }
+  if (
+    ["resolved", "effectStarted", "accepted", "terminal", "ambiguous"].includes(value.state) &&
+    value.catalogGeneration === null
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "resolved provider work requires exact catalog evidence",
+      path: ["catalogGeneration"],
+    });
+  }
+  if (
+    value.acceptedGeneration !== null &&
+    value.acceptedGeneration !== value.catalogGeneration
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "accepted generation must match the exact catalog generation",
+      path: ["acceptedGeneration"],
+    });
+  }
+});
 export type RootTurnRoutingReceiptV1 = z.infer<
   typeof rootTurnRoutingReceiptV1Schema
 >;

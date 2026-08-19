@@ -127,6 +127,7 @@ function shellStateWithRemoteSessions(
 function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
   return {
     id: "pane_example0001",
+    paletteIndex: 0,
     revision: 1,
     title: "HRA",
     repository: { id: "repo_example0001", name: "hra" },
@@ -143,7 +144,9 @@ function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
     ...overrides,
   };
@@ -178,7 +181,28 @@ function paneResponse(value: ChatPaneProjection): RuntimeDispatchResponse {
     version: runtimeProtocolVersion,
     operationId: "op_00000000000000000000000000",
     ok: true,
-    result: { type: "chatPane", pane: value },
+    result: {
+      type: "chatPane",
+      pane: value,
+      disposition: "applied",
+      appliedRevision: value.revision,
+    },
+  };
+}
+
+function paneReplayResponse(input: Readonly<{
+  paneId: string;
+  commandType: "chat.pane.rename";
+  appliedRevision: number;
+}>): RuntimeDispatchResponse {
+  return {
+    version: runtimeProtocolVersion,
+    operationId: "op_00000000000000000000000000",
+    ok: true,
+    result: {
+      type: "chatPaneReplay",
+      ...input,
+    },
   };
 }
 
@@ -1046,6 +1070,30 @@ test("settled and attention title conflicts retry once from local authoritative 
     )).toEqual(renamed);
     expect(attemptedRevisions).toEqual([1, 2]);
   }
+});
+
+test("a recorded title replay returns current projected state without inventing historical pane truth", async () => {
+  const initial = pane();
+  const current = pane({
+    revision: 4,
+    title: "A later title",
+    state: "attention",
+  });
+  const port: PaneTitleMutationPort = {
+    dispatch: () => Promise.resolve(paneReplayResponse({
+      paneId: initial.id,
+      commandType: "chat.pane.rename",
+      appliedRevision: 2,
+    })),
+    getState: () => shellState([current]),
+  };
+
+  expect(await dispatchPaneTitleMutation(
+    port,
+    initial.id,
+    initial.revision,
+    "The original recorded title",
+  )).toEqual(current);
 });
 
 test("pane-local conflicts never reconnect streaming siblings", async () => {

@@ -37,6 +37,11 @@ function positionedAccountPort(
   respond: (request: CapturedRequest) => PositionedFixture,
 ): SessionAccountRuntimePort {
   return {
+    ensureArchiveRecoveryRuntime: () =>
+      Promise.reject(new Error("Unexpected archive recovery runtime request")),
+    ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
+    requestArchiveRecoveryWithResponsePosition: () =>
+      Promise.reject(new Error("Unexpected archive recovery provider request")),
     requestSession() {
       return Promise.reject(new Error("Only positioned session requests are allowed."));
     },

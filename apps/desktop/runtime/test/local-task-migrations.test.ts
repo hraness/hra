@@ -367,6 +367,46 @@ describe("local task SQLite migrations", () => {
             version: 47,
             name: "durable-app-owned-chat-message-ledger",
           },
+          {
+            version: 48,
+            name: "explicit-ambiguous-chat-message-resolution",
+          },
+          {
+            version: 49,
+            name: "verified-reasoning-provider-subagents-and-pane-palette",
+          },
+          {
+            version: 50,
+            name: "private-durable-chat-attachment-vault",
+          },
+          {
+            version: 51,
+            name: "immutable-chat-message-delivery-intent",
+          },
+          {
+            version: 52,
+            name: "generation-fenced-root-input-capabilities",
+          },
+          {
+            version: 53,
+            name: "provider-history-handoff-floor",
+          },
+          {
+            version: 54,
+            name: "provider-context-reset-required",
+          },
+          {
+            version: 55,
+            name: "one-live-provider-attachment-lineage-per-pane",
+          },
+          {
+            version: 56,
+            name: "durable-provider-thread-archive-intent",
+          },
+          {
+            version: 57,
+            name: "keyed-provider-thread-archive-containment-journal",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -379,15 +419,31 @@ describe("local task SQLite migrations", () => {
         "human_custody_pointer_quarantine",
         "cloud_invalidation_heads",
         "chat_assistant_item_receipts",
+        "chat_attachment_deletion_receipts",
         "chat_attachment_draft_leases",
+        "chat_attachment_pane_archive_intents",
+        "chat_attachment_privacy_deletion_intents",
+        "chat_attachment_privacy_tombstones",
+        "chat_attachment_storage_quarantines",
         "chat_attachment_turn_leases",
+        "chat_attachment_upload_chunks",
         "chat_attachment_vault_state",
         "chat_attachments",
+        "chat_message_ambiguous_resolutions",
         "chat_message_attachment_refs",
         "chat_message_ledger",
         "chat_pane_history",
+        "chat_pane_palette_sequence",
         "chat_pane_workspace_bindings",
         "chat_panes",
+        "chat_provider_attachment_bindings",
+        "chat_provider_attachment_leases",
+        "chat_provider_thread_archive_attempts_v57",
+        "chat_provider_thread_archive_cut_members_v57",
+        "chat_provider_thread_archive_cuts_v57",
+        "chat_provider_thread_archive_intents",
+        "chat_provider_thread_archive_targets_v57",
+        "chat_reasoning_item_receipts",
         "chat_turn_receipts",
         "harness_actor_account_leases",
         "harness_longitudinal_routing_analyses",
@@ -792,10 +848,12 @@ describe("local task SQLite migrations", () => {
       applyMigrations(database);
       database.query(`
         INSERT INTO chat_panes (
-          pane_id, repository_id, repository_name, revision, title,
+          pane_id, palette_index, repository_id, repository_name, revision, title,
           reasoning_effort, state, display_order, created_at, updated_at
         ) VALUES (
-          'pane_workspace_revision', 'repo_workspace_revision', 'Example', 1,
+          'pane_workspace_revision',
+          (SELECT next_palette_index FROM chat_pane_palette_sequence WHERE singleton = 1),
+          'repo_workspace_revision', 'Example', 1,
           'Workspace revision', 'ultra', 'ready', 0,
           '2026-08-03T12:00:00.000Z', '2026-08-03T12:00:00.000Z'
         )
@@ -877,15 +935,31 @@ describe("local task SQLite migrations", () => {
         ORDER BY name
       `).all().map(({ name }) => name)).toEqual([
         "chat_assistant_item_receipts",
+        "chat_attachment_deletion_receipts",
         "chat_attachment_draft_leases",
+        "chat_attachment_pane_archive_intents",
+        "chat_attachment_privacy_deletion_intents",
+        "chat_attachment_privacy_tombstones",
+        "chat_attachment_storage_quarantines",
         "chat_attachment_turn_leases",
+        "chat_attachment_upload_chunks",
         "chat_attachment_vault_state",
         "chat_attachments",
+        "chat_message_ambiguous_resolutions",
         "chat_message_attachment_refs",
         "chat_message_ledger",
         "chat_pane_history",
+        "chat_pane_palette_sequence",
         "chat_pane_workspace_bindings",
         "chat_panes",
+        "chat_provider_attachment_bindings",
+        "chat_provider_attachment_leases",
+        "chat_provider_thread_archive_attempts_v57",
+        "chat_provider_thread_archive_cut_members_v57",
+        "chat_provider_thread_archive_cuts_v57",
+        "chat_provider_thread_archive_intents",
+        "chat_provider_thread_archive_targets_v57",
+        "chat_reasoning_item_receipts",
         "chat_turn_receipts",
       ]);
 

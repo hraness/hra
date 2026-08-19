@@ -14,14 +14,21 @@ import {
   type CodexNotification,
   type PinnedCodexHistoryThreadItem,
   type PinnedCodexRequestInput,
-  type PinnedCodexRequestKey,
   type PinnedCodexRequestOutput,
   type PinnedCodexThreadItem,
 } from "../src/codex";
+import {
+  ArchiveAdmissionGate,
+  archiveRestartThreadDigest,
+  type ArchiveAdmissionHandle,
+} from "../src/accounts/archive-admission-gate";
 import { projectCodexNotificationFacts } from "../src/codex/fact-projector";
 import { parseCodexNotification } from "../src/codex/pinned-codecs";
 import type { GatewaySessionEvent, ThreadSummary } from "../src/internal-contracts";
 import { ownedCodexId } from "../src/sessions/identity";
+import type {
+  SessionCodexRequestKey as OrdinarySessionCodexRequestKey,
+} from "../src/sessions/command-executor";
 import {
   MAX_SESSION_ACTIVE_TOOL_ITEMS_PER_TURN,
   MAX_SESSION_TRACKED_TOOL_TURNS_PER_ACCOUNT,
@@ -77,30 +84,76 @@ function parseRawFailedTurnCompletion(
   };
 }
 
-type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
-  | "threadList"
-  | "threadStart"
-  | "threadResume"
-  | "threadRead"
-  | "threadHistoryRead"
-  | "threadTurnsList"
-  | "threadItemsList"
-  | "threadFork"
-  | "threadGoalSet"
-  | "threadGoalGet"
-  | "threadGoalClear"
-  | "threadSetName"
-  | "threadInjectItems"
-  | "modelList"
-  | "configRequirementsRead"
-  | "turnStart"
-  | "turnSteer"
-  | "turnInterrupt">;
+type SessionCodexRequestKey = OrdinarySessionCodexRequestKey;
 
 interface RecordedRequest<Key extends SessionCodexRequestKey = SessionCodexRequestKey> {
   readonly accountProfileId: string;
   readonly key: Key;
   readonly input: PinnedCodexRequestInput<Key>;
+}
+
+const unavailableArchiveRecoveryPort = {
+  ensureArchiveRecoveryRuntime: () =>
+    Promise.reject(new Error("Unexpected archive recovery runtime request")),
+  requestArchiveRecoveryWithResponsePosition: () =>
+    Promise.reject(new Error("Unexpected archive recovery provider request")),
+} satisfies Pick<
+  SessionAccountRuntimePort,
+  "ensureArchiveRecoveryRuntime" | "requestArchiveRecoveryWithResponsePosition"
+>;
+
+function archiveAdmissionFixture(input: Readonly<{
+  accountProfileId: string;
+  expectedGeneration: number;
+  restartThreadId: string;
+  successorGeneration?: number;
+}>): Readonly<{
+  gate: ArchiveAdmissionGate;
+  handle: ArchiveAdmissionHandle;
+}> {
+  const gate = new ArchiveAdmissionGate();
+  const base = {
+    accountProfileId: input.accountProfileId,
+    attemptAuthority: { hmac: "b".repeat(64), revision: 2 },
+    attemptOrdinal: 1,
+    cutAuthority: null,
+    expectedGeneration: input.expectedGeneration,
+    paneId: "pane-session-archive",
+    purpose: "pane_archive" as const,
+    restartThreadDigest: archiveRestartThreadDigest(input.restartThreadId),
+    successorGeneration: null,
+    targetAuthority: { hmac: "a".repeat(64), revision: 1 },
+    transitionId: "transition-session-archive",
+  };
+  if (input.successorGeneration !== undefined) {
+    return Object.freeze({
+      gate,
+      handle: gate.retain({
+        ...base,
+        attemptPhase: "ambiguous",
+        cutAuthority: { hmac: "c".repeat(64), revision: 3 },
+        successorGeneration: input.successorGeneration,
+      }),
+    });
+  }
+  const provisional = gate.retainProvisional({
+    accountProfileId: input.accountProfileId,
+    paneId: base.paneId,
+    purpose: base.purpose,
+    transitionId: base.transitionId,
+  });
+  const prepared = gate.promote(provisional, {
+    ...base,
+    attemptPhase: "prepared",
+  });
+  return Object.freeze({
+    gate,
+    handle: gate.replace(prepared, {
+      ...base,
+      attemptAuthority: { hmac: "d".repeat(64), revision: 3 },
+      attemptPhase: "effect_started",
+    }),
+  });
 }
 
 function bindInteractionRequest(request: RunInteractionRequestPayload): RunInteractionRequest {
@@ -148,6 +201,10 @@ function accountPort(
       : value;
   };
   return {
+    ...unavailableArchiveRecoveryPort,
+    ensureSessionRuntime: () => Promise.resolve({
+      generation: responsePosition.generation,
+    }),
     requestSession<Key extends SessionCodexRequestKey>(accountProfileId: string, key: Key, input: PinnedCodexRequestInput<Key>) {
       const request: RecordedRequest<Key> = { accountProfileId, key, input };
       requests.push(request);
@@ -225,6 +282,118 @@ function rawThread(
     name: null,
     turns,
   };
+}
+
+function rawListedThread(cwd: string, id: string) {
+  return {
+    ...rawThread(cwd, { id }),
+    ephemeral: false,
+    threadSource: null,
+  };
+}
+
+interface ArchiveReconciliationPageFixture {
+  readonly backwardsCursor?: string | null;
+  readonly nextCursor: string | null;
+  readonly threadIds: readonly string[];
+}
+
+interface ArchiveReconciliationPageRequest {
+  readonly archived: boolean;
+  readonly callOrdinal: number;
+  readonly cursor: string | null;
+}
+
+async function runArchiveReconciliationFixture(input: Readonly<{
+  accountProfileId: string;
+  page: (
+    request: ArchiveReconciliationPageRequest,
+  ) => ArchiveReconciliationPageFixture;
+  restartThreadId: string;
+}>) {
+  const expectedGeneration = 13;
+  const fixture = archiveAdmissionFixture({
+    accountProfileId: input.accountProfileId,
+    expectedGeneration: expectedGeneration - 1,
+    restartThreadId: input.restartThreadId,
+    successorGeneration: expectedGeneration,
+  });
+  let ordinaryRequests = 0;
+  let streamPosition = 100;
+  const calls: ArchiveReconciliationPageRequest[] = [];
+  const port: SessionAccountRuntimePort = {
+    ensureSessionRuntime: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary admission"));
+    },
+    requestSession: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary requests"));
+    },
+    requestSessionWithResponsePosition: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary positioned requests"));
+    },
+    ensureArchiveRecoveryRuntime: (_accountProfileId, handle) => {
+      expect(handle).toBe(fixture.handle);
+      return Promise.resolve({ generation: expectedGeneration });
+    },
+    requestArchiveRecoveryWithResponsePosition<
+      Key extends "threadArchive" | "threadList"
+    >(
+      _accountProfileId: string,
+      handle: ArchiveAdmissionHandle,
+      key: Key,
+      requestInput: PinnedCodexRequestInput<Key>,
+      generation: number,
+    ) {
+      if (key !== "threadList") {
+        return Promise.reject(new Error("Reconciliation cannot mutate provider state"));
+      }
+      expect(handle).toBe(fixture.handle);
+      expect(generation).toBe(expectedGeneration);
+      const threadListInput = requestInput as PinnedCodexRequestInput<"threadList">;
+      const request = Object.freeze({
+        archived: threadListInput.archived === true,
+        callOrdinal: calls.length,
+        cursor: threadListInput.cursor ?? null,
+      });
+      calls.push(request);
+      const page = input.page(request);
+      streamPosition += 1;
+      const output = pinnedCodexRequests.threadList.outputCodec.parse({
+        backwardsCursor: page.backwardsCursor ?? null,
+        data: page.threadIds.map((threadId) =>
+          rawListedThread("/fixture/archive-trace", threadId)
+        ),
+        nextCursor: page.nextCursor,
+      });
+      return Promise.resolve({
+        generation,
+        output: output as PinnedCodexRequestOutput<Key>,
+        streamPosition,
+      });
+    },
+  };
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+  try {
+    const result = await service.reconcileChatThreadArchive({
+      accountProfileId: input.accountProfileId,
+      threadId: ownedCodexId(
+        "thread",
+        input.accountProfileId,
+        input.restartThreadId,
+      ),
+      restartThreadId: input.restartThreadId,
+    }, fixture.handle);
+    return Object.freeze({
+      calls: Object.freeze(calls),
+      ordinaryRequests,
+      result,
+    });
+  } finally {
+    fixture.gate.release(fixture.handle);
+  }
 }
 
 function parsedHistoryItems(items: readonly unknown[]): readonly PinnedCodexHistoryThreadItem[] {
@@ -511,6 +680,8 @@ test("runtime restart hydration buffers live facts and gates unwatermarked activ
   });
   const expectedGenerations: Array<number | undefined> = [];
   const port: SessionAccountRuntimePort = {
+    ...unavailableArchiveRecoveryPort,
+    ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
     requestSession: () =>
       Promise.reject(new Error("Unpositioned session requests are not expected.")),
     requestSessionWithResponsePosition(
@@ -611,6 +782,8 @@ test("exhausted hydration reports safe account recovery without fabricating a fa
   });
   const failures: SessionHydrationFailure[] = [];
   const port: SessionAccountRuntimePort = {
+    ...unavailableArchiveRecoveryPort,
+    ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
     requestSession() {
       return Promise.reject(new Error("Unpositioned session requests are not expected."));
     },
@@ -802,6 +975,635 @@ test("gateway launch resumes through the owned latest-turn snapshot projection",
   }
 });
 
+test("a later same-account catalog cannot invalidate another pane's active capability receipt", async () => {
+  const firstDirectory = await mkdtemp(join(tmpdir(), "hra-chat-catalog-first-"));
+  const secondDirectory = await mkdtemp(join(tmpdir(), "hra-chat-catalog-second-"));
+  const accountProfileId = "acct_primary0001";
+  const requests: RecordedRequest[] = [];
+  let catalogCall = 0;
+  let threadCall = 0;
+  let turnCall = 0;
+  const port = accountPort(requests, ({ key, input }) => {
+    if (key === "modelList") {
+      catalogCall += 1;
+      return {
+        data: catalogCall === 1
+          ? [{
+              model: "gpt-5.6-sol",
+              inputModalities: ["text", "image"],
+              supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+              serviceTiers: [],
+            }]
+          : [{
+              model: "gpt-5.6-luna",
+              inputModalities: ["text", "image"],
+              supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+              serviceTiers: [],
+            }],
+        nextCursor: null,
+      };
+    }
+    if (key === "threadStart") {
+      threadCall += 1;
+      const cwd = (input as PinnedCodexRequestInput<"threadStart">).cwd;
+      if (typeof cwd !== "string") throw new Error("Expected chat thread cwd");
+      return { thread: rawThread(cwd, { id: `provider-catalog-thread-${String(threadCall)}` }) };
+    }
+    if (key === "turnStart") {
+      turnCall += 1;
+      return { turn: rawTurn(`provider-catalog-turn-${String(turnCall)}`, "inProgress") };
+    }
+    throw new Error(`Unexpected request key: ${key}`);
+  });
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+  service.handleRuntimeState(accountProfileId, { type: "starting", generation: 1 });
+  try {
+    const firstConfiguration = await service.resolveChatConfiguration(
+      accountProfileId,
+      [{ model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: "standard" }],
+      "image",
+    );
+    const firstThread = await service.startChatThread({
+      accountProfileId,
+      title: "First catalog pane",
+      workspacePath: firstDirectory,
+      ...firstConfiguration,
+    });
+    const firstTurn = await service.startChatTurn({
+      clientUserMessageId: "message_catalogfirst1",
+      input: [{ type: "text", text: "First active turn" }],
+      threadId: firstThread.thread.id,
+      ...firstConfiguration,
+    });
+    const firstReceipt = service.verifiedChatCapabilityForActiveTurn(
+      firstThread.thread.id,
+      firstTurn.turnId,
+    );
+    expect(firstReceipt).toMatchObject({
+      catalogDigest: firstConfiguration.catalogDigest,
+      generation: 1,
+      model: "gpt-5.6-sol",
+    });
+
+    const secondConfiguration = await service.resolveChatConfiguration(
+      accountProfileId,
+      [{ model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "standard" }],
+      "image",
+    );
+    expect(secondConfiguration.catalogDigest).not.toBe(firstConfiguration.catalogDigest);
+    const secondThread = await service.startChatThread({
+      accountProfileId,
+      title: "Second catalog pane",
+      workspacePath: secondDirectory,
+      ...secondConfiguration,
+    });
+    const secondTurn = await service.startChatTurn({
+      clientUserMessageId: "message_catalogsecond1",
+      input: [{ type: "text", text: "Second active turn" }],
+      threadId: secondThread.thread.id,
+      ...secondConfiguration,
+    });
+
+    expect(service.verifiedChatCapabilityForActiveTurn(
+      firstThread.thread.id,
+      firstTurn.turnId,
+    )).toEqual(firstReceipt);
+    expect(service.verifiedChatCapabilityForActiveTurn(
+      secondThread.thread.id,
+      secondTurn.turnId,
+    )).toMatchObject({
+      catalogDigest: secondConfiguration.catalogDigest,
+      generation: 1,
+      model: "gpt-5.6-luna",
+    });
+    const requestCountBeforeArchive = requests.length;
+    const archiveRejected = await service.archiveChatThread(
+      {
+        accountProfileId,
+        threadId: firstThread.thread.id,
+        restartThreadId: firstThread.restartThreadId,
+      },
+      1,
+      // @ts-expect-error Legacy string archive authority is not part of the API.
+      "chatarchivehold_missing_fixture",
+    ).then(() => null, (error: unknown) => error);
+    expect(archiveRejected).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+    });
+    expect(requests).toHaveLength(requestCountBeforeArchive);
+  } finally {
+    service.handleRuntimeState(accountProfileId, { type: "stopped", generation: 1 });
+    await rm(firstDirectory, { recursive: true, force: true });
+    await rm(secondDirectory, { recursive: true, force: true });
+  }
+});
+
+test("cold archive authority rejects without the exact recovery lane", async () => {
+  const requests: RecordedRequest[] = [];
+  const accountProfileId = "acct_coldarchive01";
+  const restartThreadId = "provider-cold-archive-thread";
+  const binding = {
+    accountProfileId,
+    threadId: ownedCodexId("thread", accountProfileId, restartThreadId),
+    restartThreadId,
+  };
+  const port = accountPort(requests, ({ key }) => {
+    throw new Error(`Unexpected cold archive request: ${key}`);
+  }, { generation: 9, streamPosition: 41 });
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+
+  const rejected = await service.prepareChatThreadArchive(
+    binding,
+    // @ts-expect-error Legacy string archive authority is not part of the API.
+    "chatarchivehold_missing_fixture",
+  )
+    .then(() => null, (error: unknown) => error);
+  expect(rejected).toMatchObject({
+    code: "invalid_request",
+    retryable: false,
+  });
+  expect(requests).toEqual([]);
+});
+
+test("archive reconciliation rejects without the exact recovery lane", async () => {
+  const requests: RecordedRequest[] = [];
+  const accountProfileId = "acct_archivescan01";
+  const restartThreadId = "provider-archived-thread";
+  const binding = {
+    accountProfileId,
+    threadId: ownedCodexId("thread", accountProfileId, restartThreadId),
+    restartThreadId,
+  };
+  const port = accountPort(requests, ({ key, input }) => {
+    if (key !== "threadList") throw new Error(`Unexpected scan request: ${key}`);
+    const archived = (input as PinnedCodexRequestInput<"threadList">).archived;
+    return {
+      data: archived
+        ? [rawThread("/fixture/archive-scan", { id: restartThreadId })]
+        : [],
+      nextCursor: null,
+    };
+  }, { generation: 11, streamPosition: 51 });
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+
+  const rejected = await service.reconcileChatThreadArchive(
+    binding,
+    // @ts-expect-error Legacy string archive authority is not part of the API.
+    "chatarchivehold_missing_fixture",
+  )
+    .then(() => null, (error: unknown) => error);
+  expect(rejected).toMatchObject({
+    code: "invalid_request",
+    retryable: false,
+  });
+  expect(requests).toEqual([]);
+});
+
+test("ordinary session command authority excludes provider thread archive", () => {
+  type ThreadArchiveIsOrdinary = "threadArchive" extends SessionCodexRequestKey
+    ? true
+    : false;
+  const threadArchiveIsOrdinary: ThreadArchiveIsOrdinary = false;
+  expect(threadArchiveIsOrdinary).toBeFalse();
+});
+
+test("opaque archive authority dispatches one exact live-generation mutation", async () => {
+  const accountProfileId = "acct_archive_direct";
+  const restartThreadId = "provider-archive-direct";
+  const expectedGeneration = 7;
+  const fixture = archiveAdmissionFixture({
+    accountProfileId,
+    expectedGeneration,
+    restartThreadId,
+  });
+  let ordinaryRequests = 0;
+  const recoveryRequests: Array<Readonly<{
+    expectedGeneration: number;
+    handle: ArchiveAdmissionHandle;
+    key: "threadArchive" | "threadList";
+  }>> = [];
+  const port: SessionAccountRuntimePort = {
+    ensureSessionRuntime: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary runtime admission"));
+    },
+    requestSession: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary requests"));
+    },
+    requestSessionWithResponsePosition: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Archive must not enter ordinary positioned requests"));
+    },
+    ensureArchiveRecoveryRuntime: (profileId, handle) => {
+      expect(profileId).toBe(accountProfileId);
+      expect(handle).toBe(fixture.handle);
+      return Promise.resolve({ generation: expectedGeneration });
+    },
+    requestArchiveRecoveryWithResponsePosition<Key extends "threadArchive" | "threadList">(
+      profileId: string,
+      handle: ArchiveAdmissionHandle,
+      key: Key,
+      input: PinnedCodexRequestInput<Key>,
+      generation: number,
+    ) {
+      expect(profileId).toBe(accountProfileId);
+      expect(handle).toBe(fixture.handle);
+      expect(String(key)).toBe("threadArchive");
+      expect(input).toEqual({ threadId: restartThreadId });
+      recoveryRequests.push({ expectedGeneration: generation, handle, key });
+      return Promise.resolve({
+        generation,
+        output: undefined as PinnedCodexRequestOutput<Key>,
+        streamPosition: 43,
+      });
+    },
+  };
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+  const binding = {
+    accountProfileId,
+    threadId: ownedCodexId("thread", accountProfileId, restartThreadId),
+    restartThreadId,
+  };
+
+  try {
+    expect(await service.prepareChatThreadArchive(binding, fixture.handle)).toEqual({
+      generation: expectedGeneration,
+    });
+    const stale = await service.archiveChatThread(
+      binding,
+      expectedGeneration - 1,
+      fixture.handle,
+    ).then(() => null, (error: unknown) => error);
+    expect(stale).toMatchObject({ code: "conflict", retryable: true });
+    expect(recoveryRequests).toEqual([]);
+
+    const result = await service.archiveChatThread(
+      binding,
+      expectedGeneration,
+      fixture.handle,
+    );
+    expect(result.containmentReceipt.startsWith("chatarchive_")).toBeTrue();
+    expect(result).toMatchObject({
+      generation: expectedGeneration,
+      streamPosition: 43,
+    });
+    expect(recoveryRequests).toEqual([{
+      expectedGeneration,
+      handle: fixture.handle,
+      key: "threadArchive",
+    }]);
+    expect(ordinaryRequests).toBe(0);
+  } finally {
+    fixture.gate.release(fixture.handle);
+  }
+});
+
+test("opaque reconciliation exhausts two stable successor catalogs in positioned order", async () => {
+  const accountProfileId = "acct_archive_reconcile";
+  const restartThreadId = "provider-archive-reconcile";
+  const expectedGeneration = 18;
+  const fixture = archiveAdmissionFixture({
+    accountProfileId,
+    expectedGeneration: expectedGeneration - 1,
+    restartThreadId,
+    successorGeneration: expectedGeneration,
+  });
+  let ordinaryRequests = 0;
+  let streamPosition = 90;
+  const recoveryRequests: Array<Readonly<{
+    archived: boolean;
+    cursor: string | null;
+    expectedGeneration: number;
+    handle: ArchiveAdmissionHandle;
+    streamPosition: number;
+  }>> = [];
+  const port: SessionAccountRuntimePort = {
+    ensureSessionRuntime: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Reconciliation must not enter ordinary admission"));
+    },
+    requestSession: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Reconciliation must not enter ordinary requests"));
+    },
+    requestSessionWithResponsePosition: () => {
+      ordinaryRequests += 1;
+      return Promise.reject(new Error("Reconciliation must not enter ordinary positioned requests"));
+    },
+    ensureArchiveRecoveryRuntime: (profileId, handle) => {
+      expect(profileId).toBe(accountProfileId);
+      expect(handle).toBe(fixture.handle);
+      return Promise.resolve({ generation: expectedGeneration });
+    },
+    requestArchiveRecoveryWithResponsePosition<Key extends "threadArchive" | "threadList">(
+      profileId: string,
+      handle: ArchiveAdmissionHandle,
+      key: Key,
+      input: PinnedCodexRequestInput<Key>,
+      generation: number,
+    ) {
+      if (key !== "threadList") {
+        return Promise.reject(new Error("Reconciliation cannot mutate provider state"));
+      }
+      expect(profileId).toBe(accountProfileId);
+      expect(handle).toBe(fixture.handle);
+      const scanInput = input as PinnedCodexRequestInput<"threadList">;
+      const archived = scanInput.archived === true;
+      const cursor = scanInput.cursor ?? null;
+      streamPosition += 1;
+      recoveryRequests.push({
+        archived,
+        cursor,
+        expectedGeneration: generation,
+        handle,
+        streamPosition,
+      });
+      const output = pinnedCodexRequests.threadList.outputCodec.parse(
+        archived
+          ? cursor === null
+            ? {
+              data: [rawListedThread("/fixture/archive-reconcile", restartThreadId)],
+              nextCursor: "archived-page-2",
+              backwardsCursor: null,
+            }
+            : {
+              data: [rawListedThread("/fixture/archive-reconcile", "archived-other")],
+              nextCursor: null,
+              backwardsCursor: null,
+            }
+          : cursor === null
+            ? {
+              data: [rawListedThread("/fixture/archive-reconcile", "active-first")],
+              nextCursor: "active-page-2",
+              backwardsCursor: null,
+            }
+            : {
+              data: [rawListedThread("/fixture/archive-reconcile", "active-second")],
+              nextCursor: null,
+              backwardsCursor: null,
+            },
+      );
+      return Promise.resolve({
+        generation,
+        output: output as PinnedCodexRequestOutput<Key>,
+        streamPosition,
+      });
+    },
+  };
+  const service = new SessionService({ accounts: port, emit: () => undefined });
+
+  try {
+    const result = await service.reconcileChatThreadArchive({
+      accountProfileId,
+      threadId: ownedCodexId("thread", accountProfileId, restartThreadId),
+      restartThreadId,
+    }, fixture.handle);
+    expect(result.containmentReceipt?.startsWith("chatarchive_")).toBeTrue();
+    expect(result.evidenceReceipt.startsWith("chatarchivescan_")).toBeTrue();
+    expect(result).toMatchObject({
+      disposition: "applied",
+      generation: expectedGeneration,
+      streamPosition: 98,
+    });
+    expect(recoveryRequests.map(({ archived, cursor }) => ({ archived, cursor }))).toEqual([
+      { archived: false, cursor: null },
+      { archived: false, cursor: "active-page-2" },
+      { archived: true, cursor: null },
+      { archived: true, cursor: "archived-page-2" },
+      { archived: false, cursor: null },
+      { archived: false, cursor: "active-page-2" },
+      { archived: true, cursor: null },
+      { archived: true, cursor: "archived-page-2" },
+    ]);
+    expect(recoveryRequests.every((request) =>
+      request.expectedGeneration === expectedGeneration &&
+      request.handle === fixture.handle
+    )).toBeTrue();
+    expect(recoveryRequests.map(({ streamPosition: position }) => position)).toEqual([
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+    ]);
+    expect(ordinaryRequests).toBe(0);
+  } finally {
+    fixture.gate.release(fixture.handle);
+  }
+});
+
+test("archive reconciliation classifies only stable exact target membership", async () => {
+  const restartThreadId = "provider-archive-classification";
+  for (const scenario of [
+    {
+      active: [[], []],
+      archived: [[restartThreadId], [restartThreadId]],
+      disposition: "applied",
+      suffix: "applied",
+    },
+    {
+      active: [[restartThreadId], [restartThreadId]],
+      archived: [[], []],
+      disposition: "not_applied",
+      suffix: "not-applied",
+    },
+    {
+      active: [[], []],
+      archived: [[], []],
+      disposition: "ambiguous",
+      suffix: "absent",
+    },
+    {
+      active: [[], [restartThreadId]],
+      archived: [[restartThreadId], []],
+      disposition: "ambiguous",
+      suffix: "unstable",
+    },
+  ] as const) {
+    const { calls, ordinaryRequests, result } = await runArchiveReconciliationFixture({
+      accountProfileId: `acct_archive_class_${scenario.suffix}`,
+      page: ({ archived, callOrdinal }) => {
+        const scanOrdinal = Math.floor(callOrdinal / 2);
+        return {
+          nextCursor: null,
+          threadIds: (archived ? scenario.archived : scenario.active)[scanOrdinal] ?? [],
+        };
+      },
+      restartThreadId,
+    });
+    expect(result.disposition).toBe(scenario.disposition);
+    expect(result.containmentReceipt === null).toBe(scenario.disposition !== "applied");
+    expect(result.evidenceReceipt.startsWith("chatarchivescan_")).toBeTrue();
+    expect(calls).toHaveLength(4);
+    expect(ordinaryRequests).toBe(0);
+  }
+});
+
+test("archive reconciliation treats ordered row drift as ambiguous", async () => {
+  const restartThreadId = "provider-archive-row-order";
+  const { ordinaryRequests, result } = await runArchiveReconciliationFixture({
+    accountProfileId: "acct_archive_row_order",
+    page: ({ archived, callOrdinal }) => ({
+      nextCursor: null,
+      threadIds: archived
+        ? [restartThreadId]
+        : callOrdinal < 2
+          ? ["active-row-a", "active-row-b"]
+          : ["active-row-b", "active-row-a"],
+    }),
+    restartThreadId,
+  });
+  expect(result.disposition).toBe("ambiguous");
+  expect(result.containmentReceipt).toBeNull();
+  expect(ordinaryRequests).toBe(0);
+});
+
+test("archive reconciliation treats cursor topology and page partition drift as ambiguous", async () => {
+  const restartThreadId = "provider-archive-page-topology";
+  for (const drift of ["cursor", "partition"] as const) {
+    let activeScanOrdinal = -1;
+    const { ordinaryRequests, result } = await runArchiveReconciliationFixture({
+      accountProfileId: `acct_archive_page_${drift}`,
+      page: ({ archived, cursor }) => {
+        if (archived) return { nextCursor: null, threadIds: [restartThreadId] };
+        if (cursor === null) {
+          activeScanOrdinal += 1;
+          if (drift === "partition" && activeScanOrdinal === 0) {
+            return { nextCursor: null, threadIds: ["active-page-a", "active-page-b"] };
+          }
+          return {
+            nextCursor: drift === "cursor"
+              ? `active-page-${String(activeScanOrdinal + 1)}`
+              : "active-page-more",
+            threadIds: ["active-page-a"],
+          };
+        }
+        return { nextCursor: null, threadIds: ["active-page-b"] };
+      },
+      restartThreadId,
+    });
+    expect(result.disposition).toBe("ambiguous");
+    expect(result.containmentReceipt).toBeNull();
+    expect(ordinaryRequests).toBe(0);
+  }
+});
+
+test("closed archive reconciliation rejects malformed and unpositioned scans", async () => {
+  for (const failure of [
+    "duplicate",
+    "overlap",
+    "cycle",
+    "incomplete",
+    "generation",
+    "non_increasing_position",
+  ] as const) {
+    const accountProfileId = `acct_archivescan_${failure}`;
+    const restartThreadId = `provider-archive-${failure}`;
+    const fixture = archiveAdmissionFixture({
+      accountProfileId,
+      expectedGeneration: 12,
+      restartThreadId,
+      successorGeneration: 13,
+    });
+    let ordinaryRequests = 0;
+    let streamPosition = 0;
+    let responseOrdinal = 0;
+    const port: SessionAccountRuntimePort = {
+      ensureSessionRuntime: () => {
+        ordinaryRequests += 1;
+        return Promise.reject(new Error("Archive must not enter ordinary admission"));
+      },
+      requestSession: () => {
+        ordinaryRequests += 1;
+        return Promise.reject(new Error("Archive must not enter ordinary requests"));
+      },
+      requestSessionWithResponsePosition: () => {
+        ordinaryRequests += 1;
+        return Promise.reject(new Error("Archive must not enter ordinary positioned requests"));
+      },
+      ensureArchiveRecoveryRuntime: (_accountProfileId, handle) => {
+        expect(handle).toBe(fixture.handle);
+        return Promise.resolve({ generation: 13 });
+      },
+      requestArchiveRecoveryWithResponsePosition<
+        Key extends "threadArchive" | "threadList"
+      >(
+        _accountProfileId: string,
+        handle: ArchiveAdmissionHandle,
+        key: Key,
+        input: PinnedCodexRequestInput<Key>,
+        expectedGeneration: number,
+      ) {
+        if (key !== "threadList") {
+          return Promise.reject(new Error(`Unexpected scan request: ${key}`));
+        }
+        expect(handle).toBe(fixture.handle);
+        expect(expectedGeneration).toBe(13);
+        responseOrdinal += 1;
+        streamPosition = failure === "non_increasing_position"
+          ? 1
+          : streamPosition + 1;
+        const threadListInput = input as PinnedCodexRequestInput<"threadList">;
+        const cursor = threadListInput.cursor;
+        const output = pinnedCodexRequests.threadList.outputCodec.parse(failure === "duplicate"
+          ? {
+              data: [
+                rawListedThread("/fixture/archive-scan", restartThreadId),
+                rawListedThread("/fixture/archive-scan", restartThreadId),
+              ],
+              nextCursor: null,
+              backwardsCursor: null,
+            }
+          : failure === "overlap"
+            ? {
+                data: [rawListedThread("/fixture/archive-scan", restartThreadId)],
+                nextCursor: null,
+                backwardsCursor: null,
+              }
+          : failure === "cycle"
+            ? { data: [], nextCursor: "archive-cycle", backwardsCursor: null }
+            : failure === "incomplete"
+              ? {
+                data: [],
+                nextCursor: `archive-page-${String(streamPosition)}-${cursor ?? "root"}`,
+                backwardsCursor: null,
+              }
+              : { data: [], nextCursor: null, backwardsCursor: null });
+        return Promise.resolve({
+          generation: failure === "generation" ? 14 : 13,
+          output,
+          streamPosition,
+        });
+      },
+    };
+    const service = new SessionService({ accounts: port, emit: () => undefined });
+    try {
+      const rejected = await service.reconcileChatThreadArchive(
+        {
+          accountProfileId,
+          threadId: ownedCodexId("thread", accountProfileId, restartThreadId),
+          restartThreadId,
+        },
+        fixture.handle,
+      ).then(() => null, (error: unknown) => error);
+      expect(rejected).toMatchObject({
+        code: "protocol_error",
+        retryable: false,
+      });
+      expect(streamPosition).toBeGreaterThan(0);
+      expect(responseOrdinal).toBeGreaterThan(0);
+      expect(ordinaryRequests).toBe(0);
+    } finally {
+      fixture.gate.release(fixture.handle);
+    }
+  }
+});
+
 test("gateway-only launch inputs fail before any app-server request", async () => {
   const requests: RecordedRequest[] = [];
   const service = new SessionService({
@@ -838,6 +1640,8 @@ test("managed requirements reject the immutable policy before any provider mutat
   const requests: SessionCodexRequestKey[] = [];
   const service = new SessionService({
     accounts: {
+      ...unavailableArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
       requestSession: () => Promise.reject(new Error("Expected positioned request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -899,6 +1703,7 @@ test("gateway revocation can interrupt an active owned turn without renderer aut
     }),
     emit: (event) => events.push(event),
   });
+  service.handleRuntimeState("acct_primary0001", { type: "starting", generation: 1 });
 
   await service.execute({ type: "thread.list", accountProfileId: "acct_primary0001" });
   const active = latestThread(events);
@@ -1898,6 +2703,65 @@ test("display streaming strips provider metadata and aggregates parallel anonymo
   expect(new Set(toolStarts.map(({ itemId }) => itemId)).size).toBe(2);
   expect(reasoningCompletions).toHaveLength(1);
   expect(JSON.stringify({ toolStarts, reasoningCompletions })).not.toContain("provider-");
+});
+
+test("a terminal full snapshot repairs one lost reasoning completion before cleanup", async () => {
+  const reasoningCompletions: SessionReasoningItemCompletion[] = [];
+  const accountProfileId = "acct_terminalreasoning1";
+  const threadId = "provider-terminal-reasoning-thread";
+  const turnId = "provider-terminal-reasoning-turn";
+  const service = new SessionService({
+    accounts: accountPort([], ({ key }) => {
+      if (key !== "threadList") throw new Error(`Unexpected request key: ${key}`);
+      return {
+        data: [rawThread("/fixture/private-terminal-reasoning", {
+          id: threadId,
+          turns: [rawTurn(turnId, "inProgress")],
+        })],
+        nextCursor: null,
+      };
+    }),
+    emit: () => undefined,
+    onReasoningItemCompletion: (event) => { reasoningCompletions.push(event); },
+  });
+  await service.execute({ type: "thread.list", accountProfileId });
+
+  const terminalSnapshot = createCodexFactsAtPosition({
+    accountProfileId,
+    generation: 1,
+    origin: "reconciled",
+    streamPosition: 2,
+  }, [{
+    type: "turn.snapshot",
+    threadId,
+    turn: {
+      id: turnId,
+      status: "completed",
+      startedAt: "2026-08-18T12:00:00.000Z",
+      completedAt: "2026-08-18T12:00:01.000Z",
+      items: [{
+        id: "provider-terminal-reasoning-item",
+        kind: "reasoning_summary",
+        summaryParts: ["Recovered from the terminal snapshot"],
+        text: "Recovered from the terminal snapshot",
+        truncated: false,
+      }],
+    },
+  }]);
+  expect(service.consumeCodexFacts(terminalSnapshot)).toBeTrue();
+  expect(reasoningCompletions).toHaveLength(1);
+  expect(reasoningCompletions[0]?.receipt).toMatchObject({
+    state: "verified",
+    completionGeneration: 1,
+    completionStreamPosition: 2,
+    completionFactIndex: 0,
+    summary: { tail: "Recovered from the terminal snapshot" },
+  });
+  expect(JSON.stringify(reasoningCompletions)).not.toContain(
+    "provider-terminal-reasoning-item",
+  );
+  expect(service.consumeCodexFacts(terminalSnapshot)).toBeFalse();
+  expect(reasoningCompletions).toHaveLength(1);
 });
 
 test("unowned tool notifications cannot poison a later owned lifecycle", async () => {

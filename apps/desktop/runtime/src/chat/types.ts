@@ -20,6 +20,11 @@ import {
   type ChatUtf8Tail,
   type RuntimeChatMessageLedgerCommand,
 } from "../../../contracts/runtime";
+import { createHash } from "node:crypto";
+import type {
+  ArchiveAdmissionHandle,
+  ArchiveAdmissionProvisionalHandle,
+} from "../accounts/archive-admission-gate";
 
 export type {
   ChatRootTurnRoutingProjection,
@@ -63,6 +68,33 @@ export interface ChatThreadBinding {
   readonly restartThreadId: string;
 }
 
+/** Stable private authority joining one pane/thread lineage to vault custody. */
+export function chatProviderAttachmentAuthority(
+  paneId: ChatPaneId,
+  binding: ChatThreadBinding,
+): Readonly<{ bindingId: string; bindingKeyDigest: string }> {
+  const digest = (domain: string, value: string): string => createHash("sha256")
+    .update(`${domain}\0`, "utf8")
+    .update(value, "utf8")
+    .digest("hex");
+  const bindingKeyDigest = digest(
+    "hra.chat.attachment-binding-key.v1",
+    JSON.stringify([
+      binding.accountProfileId,
+      binding.threadId,
+      binding.restartThreadId,
+    ]),
+  );
+  const bindingIdDigest = digest(
+    "hra.chat.attachment-binding-id.v1",
+    JSON.stringify([paneId, bindingKeyDigest]),
+  );
+  return Object.freeze({
+    bindingId: `attbinding_${bindingIdDigest.slice(0, 48)}`,
+    bindingKeyDigest,
+  });
+}
+
 export interface ChatHistoryItem {
   readonly role: "user" | "assistant";
   readonly text: string;
@@ -74,6 +106,17 @@ export interface ChatHandoffHistory {
   readonly complete: boolean;
 }
 
+/** Private fingerprint material for one durable provider-thread archive row. */
+export interface ChatArchiveRecoveryDescriptor {
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly expectedGeneration: number;
+  readonly expectedQueueRevision: number | null;
+  readonly expectedRevision: number;
+  readonly paneId: ChatPaneId;
+  readonly purpose: "pane_archive" | "start_fresh";
+  readonly restartThreadId: string;
+}
+
 export type ChatAccountBudget = "healthy" | "low" | "exhausted" | "unknown";
 
 /** Usage-free account routing material. It never crosses the renderer boundary. */
@@ -83,7 +126,91 @@ export interface ChatAccountCandidate {
   readonly budget: ChatAccountBudget;
 }
 
-export interface ChatAccountPort {
+/** Same-process, non-serializable authority for one exact v57 archive target. */
+export type ChatArchiveTransitionHandleV57 = ArchiveAdmissionHandle;
+
+/** Same-process quarantine held before the v57 target is durable. */
+export type ChatArchiveTransitionProvisionalHandleV57 =
+  ArchiveAdmissionProvisionalHandle;
+
+export interface ChatArchiveTransitionProvisionalInputV57 {
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly paneId: ChatPaneId;
+  readonly purpose: "pane_archive" | "start_fresh";
+  readonly transitionId: string;
+}
+
+/** Exact Store-verified journal component authorized for terminal release. */
+export interface ChatArchiveTransitionTerminalComponentV57 {
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly targetIds: readonly string[];
+  readonly cutIds: readonly string[];
+  readonly allTargetsCommitted: boolean;
+}
+
+/** Exact durable authority removed by one terminal release attempt. */
+export interface ChatArchiveTransitionTerminalCleanupV57 {
+  readonly deletedTargetIds: readonly string[];
+  readonly deletedCutIds: readonly string[];
+}
+
+/**
+ * Account-owned v57 archive lifecycle. Callers pass stable identities, opaque
+ * same-process handles, and an exact Store-verified terminal component; keyed
+ * HMAC journal descriptors never cross this port.
+ */
+export interface ChatAccountArchiveTransitionPortV57 {
+  beginArchiveTransitionProvisional(
+    input: ChatArchiveTransitionProvisionalInputV57,
+  ): Promise<Readonly<{
+    generation: number;
+    handle: ChatArchiveTransitionProvisionalHandleV57;
+  }>>;
+  abortArchiveTransitionProvisional(
+    handle: ChatArchiveTransitionProvisionalHandleV57,
+  ): Promise<void>;
+  promoteArchiveTransitionEffectStarted(
+    provisionalHandle: ChatArchiveTransitionProvisionalHandleV57,
+    transitionId: string,
+  ): ChatArchiveTransitionHandleV57;
+  replaceArchiveTransition(
+    predecessor: ChatArchiveTransitionHandleV57,
+    transitionId: string,
+  ): ChatArchiveTransitionHandleV57;
+  refreshArchiveTransitionCutAuthoritiesV57(input: Readonly<{
+    archiveHandle: ChatArchiveTransitionHandleV57;
+    cutId: string;
+    transitionId: string;
+  }>): ChatArchiveTransitionHandleV57;
+  activateArchiveTransitionSuccessorV57(input: Readonly<{
+    accountProfileId: ChatAccountProfileId;
+    archiveHandle: ChatArchiveTransitionHandleV57;
+    transitionId: string;
+  }>): Promise<Readonly<{
+    archiveHandle: ChatArchiveTransitionHandleV57;
+    generation: number;
+  }>>;
+  containArchiveTransitionGenerationV57(input: Readonly<{
+    accountProfileId: ChatAccountProfileId;
+    transitionId: string;
+    cutId: string;
+    archiveHandle: ChatArchiveTransitionHandleV57;
+  }>): Promise<Readonly<{
+    accountProfileRevision: number;
+    archiveHandle: ChatArchiveTransitionHandleV57;
+    generation: number;
+  }>>;
+  releaseArchiveTransition(
+    transitionId: string,
+    handle: ChatArchiveTransitionHandleV57,
+    expectedComponent: ChatArchiveTransitionTerminalComponentV57,
+  ): ChatArchiveTransitionTerminalCleanupV57;
+  archiveTransitionHandleV57(
+    transitionId: string,
+  ): ChatArchiveTransitionHandleV57;
+}
+
+export interface ChatAccountPort extends ChatAccountArchiveTransitionPortV57 {
   /** Refreshes stale provider capacity before returning conservative dispositions. */
   refreshCandidates(): Promise<readonly ChatAccountCandidate[]>;
   /**
@@ -91,7 +218,33 @@ export interface ChatAccountPort {
    * This settles only after the old generation can no longer perform work;
    * launching its replacement is best effort.
    */
-  containAmbiguousEffect(accountProfileId: ChatAccountProfileId): Promise<void>;
+  containAmbiguousEffect(
+    accountProfileId: ChatAccountProfileId,
+    expectedGeneration: number,
+  ): Promise<number>;
+  /**
+   * Fences one generation for a durable provider-thread archive and keeps
+   * account admission quarantined until the registered chat-state join has
+   * settled. A successor generation is never stopped.
+   */
+  containArchiveGeneration(input: ChatArchiveRecoveryDescriptor & Readonly<{
+    authorityHandle: string;
+  }>): Promise<void>;
+  /**
+   * Installs the account-wide admission hold represented by one durable
+   * provider-thread archive intent. This is synchronous so recovery can close
+   * admission before any provider request is admitted.
+   */
+  retainArchiveGeneration(input: ChatArchiveRecoveryDescriptor): string;
+  /** Releases only the exact durable archive hold after its pane commit. */
+  releaseArchiveGeneration(input: ChatArchiveRecoveryDescriptor & Readonly<{
+    authorityHandle: string;
+  }>): void;
+  /** Read-only stale-callback fence for provider lifecycle containment. */
+  isGenerationCurrent(
+    accountProfileId: ChatAccountProfileId,
+    expectedGeneration: number,
+  ): boolean;
   hasRateLimitProofSince?(
     accountProfileId: ChatAccountProfileId,
     floor: ChatQuotaProofCursor,
@@ -234,12 +387,23 @@ export interface ChatProviderConfiguration {
   readonly model: ChatModel;
   readonly reasoningEffort: ChatReasoningEffort;
   readonly serviceTier?: ChatServiceTier;
-  readonly approvalPolicy: "on-request";
-  readonly approvalsReviewer: "auto_review";
-  readonly sandbox: "workspace-write";
 }
 
-export interface ChatProviderThreadRequest extends ChatProviderConfiguration {
+export type ChatRequiredInputClass = "text" | "image";
+export type ChatProviderInput =
+  | Readonly<{ readonly type: "text"; readonly text: string }>
+  | Readonly<{ readonly type: "localImage"; readonly path: string }>;
+
+export interface ChatProviderResolvedConfiguration
+  extends ChatProviderConfiguration {
+  readonly requiredInputClass: ChatRequiredInputClass;
+  readonly catalogGeneration: number;
+  readonly catalogDigest: string;
+  /** Null means Codex omitted the field; it can authorize text only. */
+  readonly observedInputModalities: readonly ("text" | "image")[] | null;
+}
+
+export interface ChatProviderThreadRequest extends ChatProviderResolvedConfiguration {
   readonly accountProfileId: ChatAccountProfileId;
   readonly title: string;
   readonly workingDirectory: string;
@@ -250,23 +414,26 @@ export interface ChatProviderResumeRequest extends ChatProviderThreadRequest {
   readonly restartThreadId: string;
 }
 
-export interface ChatProviderTurnRequest extends ChatProviderConfiguration {
+export interface ChatProviderTurnRequest extends ChatProviderResolvedConfiguration {
   readonly accountProfileId: ChatAccountProfileId;
   readonly threadId: string;
   readonly clientTurnId: ChatTurnId;
-  readonly prompt: string;
+  readonly input: readonly ChatProviderInput[];
   readonly workingDirectory: string;
 }
 
 export interface ChatProviderSteerFence {
   readonly generation: number;
+  readonly catalogDigest: string;
+  readonly allowsImage: boolean;
+  readonly observedInputModalities: readonly ("text" | "image")[] | null;
 }
 
 export interface ChatProviderSteerRequest {
   readonly binding: ChatThreadBinding;
   readonly providerTurnId: string;
   readonly messageId: ChatMessageId;
-  readonly prompt: string;
+  readonly input: readonly ChatProviderInput[];
   readonly fence: ChatProviderSteerFence;
 }
 
@@ -275,7 +442,8 @@ export interface ChatProviderPort {
   resolveConfiguration(
     accountProfileId: ChatAccountProfileId,
     candidates: readonly ChatProviderConfiguration[],
-  ): Promise<ChatProviderConfiguration>;
+    requiredInputClass: ChatRequiredInputClass,
+  ): Promise<ChatProviderResolvedConfiguration>;
   startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
@@ -292,6 +460,34 @@ export interface ChatProviderPort {
   ): ChatProviderSteerFence | null;
   steerTurn(request: ChatProviderSteerRequest): Promise<void>;
   interruptTurn(input: ChatThreadBinding & Readonly<{ readonly turnId: string }>): Promise<void>;
+  /** Read-only active-generation fence captured before durable archive intent. */
+  prepareThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    generation: number;
+  }>>;
+  /** Exact native containment proof used before releasing durable attachment custody. */
+  archiveThread(
+    binding: ChatThreadBinding,
+    expectedGeneration: number,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    containmentReceipt: string;
+    generation: number;
+    streamPosition: number;
+  }>>;
+  /** Classifies a lost archive response from two complete stable scans. */
+  reconcileThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    disposition: "applied" | "not_applied" | "ambiguous";
+    evidenceReceipt: string;
+    generation: number;
+    streamPosition: number;
+    containmentReceipt: string | null;
+  }>>;
 }
 
 export type ChatProviderFailureCode =
@@ -426,7 +622,10 @@ export interface ChatPanePrivateRecord {
     readonly overflowed: boolean;
     readonly verified: boolean;
   }> | null;
+  readonly reasoningItemId: string | null;
   readonly activeTurnPoisoned: boolean;
+  /** Private fence requiring an explicit fresh-message admission. */
+  readonly providerContextResetRequired: boolean;
 }
 
 export interface ChatActivityDelta {

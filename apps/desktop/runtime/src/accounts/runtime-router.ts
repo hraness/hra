@@ -25,6 +25,15 @@ import {
   type SupervisedCodexGeneration,
 } from "../codex";
 import type { RuntimePaths } from "../runtime-paths";
+import {
+  ArchiveAdmissionAuthorityError,
+  ArchiveAdmissionGate,
+  type AccountRemovalAdmissionHandle,
+  type ArchiveAdmissionDescriptor,
+  type ArchiveAdmissionEffectClaim,
+  type ArchiveAdmissionHandle,
+  archiveRestartThreadDigest,
+} from "./archive-admission-gate";
 
 type Awaitable<T> = T | Promise<T>;
 export type AccountProfileId = AccountSummary["id"];
@@ -36,6 +45,35 @@ export type AccountRuntimeStateCause =
   | "router_shutdown";
 export type AccountRuntimeFenceResult = "already_fenced" | "fenced";
 export type AccountRuntimeRequestKey = Exclude<PinnedCodexRequestKey, "clientInitialize">;
+export type AccountRuntimeArchiveRecoveryRequestKey = Extract<
+  AccountRuntimeRequestKey,
+  "threadArchive" | "threadList"
+>;
+
+export type AccountRuntimeRouterBoundary =
+  | "archive_recovery_request"
+  | "callback_dispatch"
+  | "capacity_admission"
+  | "dynamic_tool_capability"
+  | "process_creation"
+  | "request"
+  | "request_with_position"
+  | "respond"
+  | "restart";
+
+export interface AccountRuntimeRouterBoundaryInput {
+  readonly accountProfileId: AccountProfileId;
+  readonly boundary: AccountRuntimeRouterBoundary;
+  readonly generation?: number;
+  readonly requestKey?: AccountRuntimeRequestKey;
+}
+
+export interface AccountRuntimeRouterTestHooks {
+  /** Deterministic race seam. Production compositions leave this undefined. */
+  readonly beforeBoundary?: (
+    input: AccountRuntimeRouterBoundaryInput,
+  ) => Awaitable<void>;
+}
 
 export interface AccountRuntimeProcessProtocol {
   request<K extends AccountRuntimeRequestKey>(
@@ -55,6 +93,11 @@ export interface AccountRuntimeProcessProtocol {
 export interface AccountRuntimeProcess extends SupervisedCodexGeneration {
   readonly protocol: AccountRuntimeProcessProtocol;
   readonly faulted: Promise<AccountRuntimeFaultReason>;
+}
+
+export interface AccountRuntimeObservation {
+  readonly generation: number;
+  readonly status: "running";
 }
 
 export interface AccountRuntimeCallbacks {
@@ -114,6 +157,7 @@ export type AccountRuntimeDynamicToolCapabilityResolver = (
 
 export interface AccountRuntimeRouterOptions {
   readonly admissionTimeoutMs?: number;
+  readonly archiveAdmissionGate: ArchiveAdmissionGate;
   readonly callbacks?: AccountRuntimeCallbacks;
   readonly createProcess?: AccountRuntimeProcessFactory;
   readonly dynamicToolCapability?: AccountRuntimeDynamicToolCapabilityResolver;
@@ -122,6 +166,7 @@ export interface AccountRuntimeRouterOptions {
   readonly policy?: CodexRestartPolicy;
   readonly restartBudgetResetMs?: number;
   readonly sleep?: (delayMs: number) => Promise<void>;
+  readonly testHooks?: AccountRuntimeRouterTestHooks;
 }
 
 export interface AccountRuntimeEnsureOptions {
@@ -130,13 +175,16 @@ export interface AccountRuntimeEnsureOptions {
 }
 
 interface AccountRoute {
+  activeCallbacks: number;
   activeOperations: number;
   readonly activeTurns: Set<string>;
   readonly accountProfileId: AccountProfileId;
+  archiveQuiescenceInvalidatedGeneration: number | null;
   readonly completedLoginIds: Set<string>;
   readonly completedTurns: Set<string>;
-  admission: Promise<void> | null;
+  readonly expectedThreadArchiveNotifications: Set<string>;
   readonly paths: RuntimePaths;
+  processStartAuthority: ProcessStartAuthority | null;
   readonly pendingServerRequests: Set<CodexRespondableServerRequest>;
   pendingLoginId: string | null;
   lastUsed: number;
@@ -146,11 +194,23 @@ interface AccountRoute {
   stopping: boolean;
   readonly supervisor: CodexRestartSupervisor<AccountRuntimeProcess>;
   dynamicToolCapability: PinnedCodexDynamicToolProtocolCapability | null;
+  releaseArchiveAdmissionSubscription: (() => void) | null;
+}
+
+interface ProcessStartAuthority {
+  readonly archiveHandle: ArchiveAdmissionHandle | null;
+  readonly generation: number;
+}
+
+interface ProcessCallbackAuthority {
+  readonly generation: number;
+  process: AccountRuntimeProcess | null;
 }
 
 interface RuntimeAdmissionWaiter {
+  readonly archiveHandle: ArchiveAdmissionHandle | null;
   readonly deadline: number;
-  readonly reject: (error: AccountRuntimeCapacityError) => void;
+  readonly reject: (error: Error) => void;
   readonly resolve: () => void;
   readonly route: AccountRoute;
   settled: boolean;
@@ -166,6 +226,7 @@ const defaultAdmissionTimeoutMs = 30_000;
 const defaultMaximumLiveProcesses = 32;
 const maximumCompletedTurnTombstones = 128;
 const maximumCompletedLoginTombstones = 8;
+const maximumExpectedThreadArchiveNotificationTombstones = 128;
 
 function samePaths(left: RuntimePaths, right: RuntimePaths): boolean {
   return left.codexBinary === right.codexBinary &&
@@ -219,6 +280,13 @@ export class AccountRuntimeStaleRequestError extends Error {
   }
 }
 
+export class AccountRuntimeNotQuiescentError extends Error {
+  constructor() {
+    super("The account runtime still owns active provider work.");
+    this.name = "AccountRuntimeNotQuiescentError";
+  }
+}
+
 export class AccountRuntimeCapacityError extends Error {
   constructor() {
     super("The account runtime is waiting for local process capacity.");
@@ -229,6 +297,7 @@ export class AccountRuntimeCapacityError extends Error {
 export class AccountRuntimeRouter {
   readonly #admissionTimeoutMs: number;
   readonly #admissionQueue: RuntimeAdmissionWaiter[] = [];
+  readonly #archiveAdmissionGate: ArchiveAdmissionGate;
   readonly #callbacks: AccountRuntimeCallbacks;
   readonly #createProcess: AccountRuntimeProcessFactory;
   readonly #dynamicToolCapability: AccountRuntimeDynamicToolCapabilityResolver | null;
@@ -239,9 +308,14 @@ export class AccountRuntimeRouter {
   readonly #routes = new Map<AccountProfileId, AccountRoute>();
   readonly #serverRequestOwners = new WeakMap<
     CodexRespondableServerRequest,
-    Readonly<{ accountProfileId: AccountProfileId; generation: number }>
+    Readonly<{
+      accountProfileId: AccountProfileId;
+      generation: number;
+      process: AccountRuntimeProcess;
+    }>
   >();
   readonly #sleep: ((delayMs: number) => Promise<void>) | undefined;
+  readonly #testHooks: AccountRuntimeRouterTestHooks;
   #admissionProcessing = false;
   #capacityGeneration = 0;
   #capacityWait: Readonly<{
@@ -251,7 +325,10 @@ export class AccountRuntimeRouter {
   #closed = false;
   #routeClock = 0;
 
-  constructor(options: AccountRuntimeRouterOptions = {}) {
+  constructor(options: AccountRuntimeRouterOptions) {
+    if (!(options.archiveAdmissionGate instanceof ArchiveAdmissionGate)) {
+      throw new Error("Account runtime routing requires one shared archive admission gate");
+    }
     this.#admissionTimeoutMs = positiveRouterLimit(
       options.admissionTimeoutMs,
       defaultAdmissionTimeoutMs,
@@ -259,6 +336,7 @@ export class AccountRuntimeRouter {
       "Account runtime admission timeout",
     );
     this.#callbacks = options.callbacks ?? {};
+    this.#archiveAdmissionGate = options.archiveAdmissionGate;
     this.#createProcess = options.createProcess ?? defaultProcessFactory;
     // Capability evidence and a response owner are one atomic configuration.
     // Never advertise a provider callback that the gateway cannot settle.
@@ -276,15 +354,71 @@ export class AccountRuntimeRouter {
     this.#policy = options.policy ?? defaultPolicy;
     this.#restartBudgetResetMs = options.restartBudgetResetMs;
     this.#sleep = options.sleep;
+    this.#testHooks = options.testHooks ?? {};
   }
 
   async ensure(
     accountProfileId: AccountProfileId,
     paths: RuntimePaths,
     options: AccountRuntimeEnsureOptions,
-  ): Promise<AccountRuntimeProcess> {
+  ): Promise<AccountRuntimeObservation> {
     const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
+    return runtimeObservation(await this.#ensure(profileId, paths, options, null));
+  }
+
+  /**
+   * Closed recovery admission for a durable archive authority. Any process
+   * generation created through this path is launched without dynamic tools.
+   */
+  async ensureArchiveRecovery(
+    accountProfileId: AccountProfileId,
+    paths: RuntimePaths,
+    options: AccountRuntimeEnsureOptions,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<AccountRuntimeObservation> {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    const descriptor = this.#archiveAdmissionGate.require(archiveHandle, profileId);
+    if (descriptor.cutAuthority !== null && descriptor.successorGeneration === null) {
+      throw new ArchiveAdmissionAuthorityError(
+        "Archive recovery cannot create a runtime before the cut binds its exact successor generation.",
+      );
+    }
+    const expectedRecoveryGeneration = archiveRecoveryRuntimeGeneration(descriptor);
+    const route = this.#routes.get(profileId);
+    if (
+      descriptor.attemptPhase === "effect_started" &&
+      route?.supervisor.current?.generation !== expectedRecoveryGeneration
+    ) {
+      throw new AccountRuntimeStaleRequestError();
+    }
+    if (route === undefined) {
+      if (options.initialGeneration !== expectedRecoveryGeneration - 1) {
+        throw new AccountRuntimeStaleRequestError();
+      }
+    } else if (route.supervisor.current === null) {
+      if (route.supervisor.generation !== expectedRecoveryGeneration - 1) {
+        throw new AccountRuntimeStaleRequestError();
+      }
+    } else if (route.supervisor.current.generation !== expectedRecoveryGeneration) {
+      throw new AccountRuntimeStaleRequestError();
+    }
+    const process = await this.#ensure(profileId, paths, options, archiveHandle);
+    this.#archiveAdmissionGate.require(archiveHandle, profileId);
+    if (process.generation !== expectedRecoveryGeneration) {
+      throw new AccountRuntimeStaleRequestError();
+    }
+    return runtimeObservation(process);
+  }
+
+  async #ensure(
+    profileId: AccountProfileId,
+    paths: RuntimePaths,
+    options: AccountRuntimeEnsureOptions,
+    archiveHandle: ArchiveAdmissionHandle | null,
+  ): Promise<AccountRuntimeProcess> {
     validateGenerationFloor(options.initialGeneration);
+    this.#assertAdmission(profileId, archiveHandle);
     let route = this.#routes.get(profileId);
     if (route !== undefined) {
       const existingRoute = route;
@@ -292,14 +426,29 @@ export class AccountRuntimeRouter {
       if (options.initialGeneration > route.supervisor.generation) {
         throw new AccountRuntimeGenerationFloorMismatchError();
       }
-      return await this.#withRouteActivity(existingRoute, async () =>
-        await this.#startRoute(existingRoute)
-      );
+      return await this.#withRouteActivity(existingRoute, async () => {
+        this.#assertAdmission(profileId, archiveHandle);
+        return await this.#startRoute(existingRoute, archiveHandle);
+      });
     }
 
     const routeReference: { current: AccountRoute | null } = { current: null };
     const supervisor = new CodexRestartSupervisor<AccountRuntimeProcess>({
-      beforeCreate: options.beforeCreate,
+      beforeCreate: async (generation) => {
+        const currentRoute = routeReference.current;
+        if (currentRoute === null) {
+          throw new Error("Account runtime route was not initialized");
+        }
+        this.#assertRouteOpen(currentRoute);
+        const processArchiveHandle = this.#processCreationArchiveHandle(
+          currentRoute,
+          generation,
+        );
+        this.#assertAdmission(profileId, processArchiveHandle);
+        await options.beforeCreate(generation);
+        this.#assertRouteOpen(currentRoute);
+        this.#assertAdmission(profileId, processArchiveHandle);
+      },
       create: async (generation) => {
         if (routeReference.current === null) {
           throw new Error("Account runtime route was not initialized");
@@ -308,11 +457,27 @@ export class AccountRuntimeRouter {
       },
       initialGeneration: options.initialGeneration,
       onState: (state) => {
-        if (routeReference.current !== null) {
-          this.#handleSupervisorState(routeReference.current, state);
+        const currentRoute = routeReference.current;
+        if (currentRoute !== null) {
+          this.#handleSupervisorState(currentRoute, state);
         }
-        this.#callbacks.onState?.(profileId, state, routeReference.current?.stateCause ??
-          "provider_lifecycle");
+        const isTerminalProof = state.type === "failed" || state.type === "stopped";
+        // Exact terminal lifecycle proof is the sole callback exemption during
+        // quarantine or teardown. Starting/running/backoff and every provider
+        // callback remain closed once the route is held, stopping, or closed.
+        if (
+          (
+            currentRoute !== null && this.#isRouteOpen(currentRoute) &&
+            !this.#archiveAdmissionGate.isHeld(profileId) &&
+            !this.#isArchiveQuiescenceInvalidated(currentRoute)
+          ) || isTerminalProof
+        ) {
+          this.#callbacks.onState?.(
+            profileId,
+            state,
+            currentRoute?.stateCause ?? "provider_lifecycle",
+          );
+        }
       },
       policy: this.#policy,
       ...(this.#restartBudgetResetMs === undefined
@@ -321,13 +486,16 @@ export class AccountRuntimeRouter {
       ...(this.#sleep === undefined ? {} : { sleep: this.#sleep }),
     });
     route = {
+      activeCallbacks: 0,
       activeOperations: 0,
       activeTurns: new Set(),
       accountProfileId: profileId,
+      archiveQuiescenceInvalidatedGeneration: null,
       completedLoginIds: new Set(),
       completedTurns: new Set(),
-      admission: null,
+      expectedThreadArchiveNotifications: new Set(),
       paths,
+      processStartAuthority: null,
       pendingServerRequests: new Set(),
       pendingLoginId: null,
       lastUsed: ++this.#routeClock,
@@ -337,12 +505,18 @@ export class AccountRuntimeRouter {
       stopping: false,
       supervisor,
       dynamicToolCapability: null,
+      releaseArchiveAdmissionSubscription: null,
     };
     routeReference.current = route;
-    this.#routes.set(profileId, route);
-    return await this.#withRouteActivity(route, async () =>
-      await this.#startRoute(route)
+    route.releaseArchiveAdmissionSubscription = this.#archiveAdmissionGate.subscribe(
+      profileId,
+      (held) => this.#handleArchiveAdmissionChange(route, held),
     );
+    this.#routes.set(profileId, route);
+    return await this.#withRouteActivity(route, async () => {
+      this.#assertAdmission(profileId, archiveHandle);
+      return await this.#startRoute(route, archiveHandle);
+    });
   }
 
   async request<K extends AccountRuntimeRequestKey>(
@@ -351,10 +525,25 @@ export class AccountRuntimeRouter {
     input: PinnedCodexRequestInput<K>,
     expectedGeneration?: number,
   ): Promise<PinnedCodexRequestOutput<K>> {
-    const route = this.#routeForRequest(accountProfileId);
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
+    const route = this.#routeForRequest(profileId);
     return await this.#withRouteActivity(route, async () => {
+      this.#assertOrdinaryAdmission(profileId);
       const process = await this.#processForRequest(route, expectedGeneration);
+      this.#assertRouteOpen(route);
+      await this.#beforeBoundary({
+        accountProfileId: profileId,
+        boundary: "request",
+        generation: process.generation,
+        requestKey: key,
+      });
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
+      this.#assertRouteOpen(route);
       const output = await process.protocol.request(key, input);
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
       this.#observeRequestOutput(route, key, input, output);
       return output;
     });
@@ -366,13 +555,193 @@ export class AccountRuntimeRouter {
     input: PinnedCodexRequestInput<K>,
     expectedGeneration?: number,
   ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<K>>> {
-    const route = this.#routeForRequest(accountProfileId);
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
+    const route = this.#routeForRequest(profileId);
     return await this.#withRouteActivity(route, async () => {
+      this.#assertOrdinaryAdmission(profileId);
       const process = await this.#processForRequest(route, expectedGeneration);
+      this.#assertRouteOpen(route);
+      await this.#beforeBoundary({
+        accountProfileId: profileId,
+        boundary: "request_with_position",
+        generation: process.generation,
+        requestKey: key,
+      });
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
+      this.#assertRouteOpen(route);
       const positioned = await process.protocol.requestWithResponsePosition(key, input);
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
       this.#observeRequestOutput(route, key, input, positioned.output);
       return positioned;
     });
+  }
+
+  /**
+   * Synchronous pre-quarantine seam for live provider-thread transitions.
+   * The caller must retain its provisional archive hold in the same JavaScript
+   * turn. Ordinary admission checks at every router entry then make the
+   * zero-activity observation stable without buffering provider callbacks.
+   */
+  assertArchiveTransitionQuiescent(
+    accountProfileId: AccountProfileId,
+    expectedGeneration: number,
+  ): void {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    validateGenerationFloor(expectedGeneration);
+    this.#assertOrdinaryAdmission(profileId);
+    const route = this.#routeForRequest(profileId);
+    this.#assertRouteOpen(route);
+    this.#assertArchiveRouteQuiescent(route, expectedGeneration, 0);
+    this.#assertOrdinaryAdmission(profileId);
+  }
+
+  /**
+   * Allows a provisional or durable archive hold to release only while its
+   * authorized runtime is still proven idle, or after that generation has
+   * terminally stopped. A callback suppressed by quarantine permanently
+   * invalidates the live generation's idle proof.
+   */
+  assertArchiveTransitionProvisionalReleaseSafe(
+    accountProfileId: AccountProfileId,
+    expectedGeneration: number,
+  ): void {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    validateGenerationFloor(expectedGeneration);
+    const route = this.#routes.get(profileId);
+    if (route === undefined) return;
+    if (route.supervisor.generation > expectedGeneration) return;
+    if (route.supervisor.generation < expectedGeneration) {
+      throw new AccountRuntimeNotQuiescentError();
+    }
+    if (
+      route.supervisor.current === null && !route.slotHeld &&
+      (route.supervisor.state.type === "failed" ||
+        route.supervisor.state.type === "stopped")
+    ) return;
+    this.#assertRouteOpen(route);
+    this.#assertArchiveRouteQuiescent(route, expectedGeneration, 0);
+  }
+
+  /**
+   * The entire archive-recovery provider surface. No unpositioned mutation,
+   * responder, or dynamic-tool operation is available to a held authority.
+   */
+  async requestArchiveRecoveryWithResponsePosition<
+    K extends AccountRuntimeArchiveRecoveryRequestKey,
+  >(
+    accountProfileId: AccountProfileId,
+    archiveHandle: ArchiveAdmissionHandle,
+    key: K,
+    input: PinnedCodexRequestInput<K>,
+    expectedGeneration: number,
+  ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<K>>> {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertArchiveRecoveryRequest(
+      profileId,
+      archiveHandle,
+      key,
+      input,
+      expectedGeneration,
+    );
+    const route = this.#routeForRequest(profileId);
+    const effectClaim: ArchiveAdmissionEffectClaim | null = key === "threadArchive"
+      ? this.#archiveAdmissionGate.claimThreadArchiveEffect(archiveHandle)
+      : null;
+    let effectBegun = false;
+    try {
+      return await this.#withRouteActivity(route, async () => {
+        this.#assertArchiveRecoveryRequest(
+          profileId,
+          archiveHandle,
+          key,
+          input,
+          expectedGeneration,
+        );
+        if (effectClaim !== null) {
+          this.#archiveAdmissionGate.requireThreadArchiveEffectClaim(effectClaim);
+        }
+        const process = await this.#processForArchiveRecoveryRequest(
+          route,
+          archiveHandle,
+          key,
+          expectedGeneration,
+        );
+        this.#assertRouteOpen(route);
+        await this.#beforeBoundary({
+          accountProfileId: profileId,
+          boundary: "archive_recovery_request",
+          generation: process.generation,
+          requestKey: key,
+        });
+        this.#assertRouteOpen(route);
+        this.#assertArchiveRecoveryRequest(
+          profileId,
+          archiveHandle,
+          key,
+          input,
+          expectedGeneration,
+        );
+        if (effectClaim !== null) {
+          this.#archiveAdmissionGate.requireThreadArchiveEffectClaim(effectClaim);
+        }
+        if (
+          process !== route.supervisor.current ||
+          process.generation !== expectedGeneration
+        ) throw new AccountRuntimeStaleRequestError();
+        this.#assertArchiveRouteQuiescent(route, expectedGeneration, 1);
+        if (effectClaim !== null) {
+          const threadId = (input as PinnedCodexRequestInput<"threadArchive">)
+            .threadId;
+          const notificationKey = this.#retainExpectedThreadArchiveNotification(
+            route,
+            expectedGeneration,
+            threadId,
+          );
+          try {
+            this.#archiveAdmissionGate.beginThreadArchiveEffect(effectClaim);
+            effectBegun = true;
+          } catch (error: unknown) {
+            route.expectedThreadArchiveNotifications.delete(notificationKey);
+            throw error;
+          }
+        }
+        this.#assertRouteOpen(route);
+        const positioned = await process.protocol.requestWithResponsePosition(key, input);
+        this.#assertRouteOpen(route);
+        if (effectClaim !== null) {
+          this.#archiveAdmissionGate.requireThreadArchiveEffectClaim(effectClaim);
+        }
+        this.#assertArchiveRecoveryRequest(
+          profileId,
+          archiveHandle,
+          key,
+          input,
+          expectedGeneration,
+        );
+        if (
+          process !== route.supervisor.current ||
+          process.generation !== expectedGeneration
+        ) throw new AccountRuntimeStaleRequestError();
+        // A non-authorized callback may arrive while the provider mutation is
+        // in flight. Its held-route rejection taints this generation; never
+        // report the archive response as a clean direct outcome in that case.
+        this.#assertArchiveRouteQuiescent(route, expectedGeneration, 1);
+        this.#observeRequestOutput(route, key, input, positioned.output);
+        return positioned;
+      });
+    } catch (error: unknown) {
+      if (effectClaim !== null && !effectBegun) {
+        try {
+          this.#archiveAdmissionGate.abortThreadArchiveEffectClaim(effectClaim);
+        } catch {
+          // Replacement or account removal already invalidated the claim.
+        }
+      }
+      throw error;
+    }
   }
 
   #routeForRequest(accountProfileId: AccountProfileId): AccountRoute {
@@ -386,14 +755,67 @@ export class AccountRuntimeRouter {
     route: AccountRoute,
     expectedGeneration: number | undefined,
   ): Promise<AccountRuntimeProcess> {
+    this.#assertRouteOpen(route);
     if (expectedGeneration !== undefined) {
       validateGenerationFloor(expectedGeneration);
       if (route.supervisor.generation !== expectedGeneration) {
         throw new AccountRuntimeStaleRequestError();
       }
     }
-    const process = await this.#startRoute(route);
+    const process = await this.#startRoute(route, null);
+    this.#assertRouteOpen(route);
     if (expectedGeneration !== undefined && process.generation !== expectedGeneration) {
+      throw new AccountRuntimeStaleRequestError();
+    }
+    return process;
+  }
+
+  async #processForArchiveRecoveryRequest(
+    route: AccountRoute,
+    archiveHandle: ArchiveAdmissionHandle,
+    key: AccountRuntimeArchiveRecoveryRequestKey,
+    expectedGeneration: number,
+  ): Promise<AccountRuntimeProcess> {
+    this.#assertRouteOpen(route);
+    validateGenerationFloor(expectedGeneration);
+    const current = route.supervisor.current;
+    if (key === "threadArchive") {
+      // Once the journal records effect_started, relaunch would move the
+      // mutation onto a different process generation. The exact source
+      // process must already be live; otherwise containment owns recovery.
+      if (
+        current === null ||
+        current.generation !== expectedGeneration ||
+        route.supervisor.generation !== expectedGeneration ||
+        route.supervisor.state.type !== "running" ||
+        !route.slotHeld
+      ) {
+        throw new AccountRuntimeStaleRequestError();
+      }
+      this.#archiveAdmissionGate.require(archiveHandle, route.accountProfileId);
+      return current;
+    }
+    if (current !== null) {
+      if (
+        current.generation !== expectedGeneration ||
+        route.supervisor.generation !== expectedGeneration ||
+        route.supervisor.state.type !== "running" ||
+        !route.slotHeld
+      ) {
+        throw new AccountRuntimeStaleRequestError();
+      }
+      this.#archiveAdmissionGate.require(archiveHandle, route.accountProfileId);
+      return current;
+    }
+    if (
+      expectedGeneration === 1 ||
+      route.supervisor.generation !== expectedGeneration - 1
+    ) {
+      throw new AccountRuntimeStaleRequestError();
+    }
+    const process = await this.#startRoute(route, archiveHandle);
+    this.#assertRouteOpen(route);
+    if (process.generation !== expectedGeneration) {
       throw new AccountRuntimeStaleRequestError();
     }
     return process;
@@ -401,11 +823,26 @@ export class AccountRuntimeRouter {
 
   async restart(
     accountProfileId: AccountProfileId,
-  ): Promise<AccountRuntimeProcess | null> {
-    const route = this.#routeForRequest(accountProfileId);
+  ): Promise<AccountRuntimeObservation | null> {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
+    const route = this.#routeForRequest(profileId);
     return await this.#withRouteActivity(route, async () => {
-      await this.#reserveRuntimeSlot(route);
-      return await route.supervisor.restart("restart_requested");
+      this.#assertOrdinaryAdmission(profileId);
+      await this.#reserveRuntimeSlot(route, null);
+      this.#assertRouteOpen(route);
+      await this.#beforeBoundary({
+        accountProfileId: profileId,
+        boundary: "restart",
+        generation: route.supervisor.generation,
+      });
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
+      this.#assertRouteOpen(route);
+      const restarted = await route.supervisor.restart("restart_requested");
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(profileId);
+      return restarted === null ? null : runtimeObservation(restarted);
     });
   }
 
@@ -414,24 +851,40 @@ export class AccountRuntimeRouter {
     request: CodexRespondableServerRequest,
     response: CodexServerResponse,
   ): Promise<CodexStreamPosition | void> {
-    const route = this.#routeForRequest(accountProfileId);
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
+    const route = this.#routeForRequest(profileId);
     return await this.#withRouteActivity(route, async () => {
-      const owner = this.#serverRequestOwners.get(request);
+      this.#assertOrdinaryAdmission(profileId);
       const process = route.supervisor.current;
       if (
-        owner === undefined ||
-        owner.accountProfileId !== route.accountProfileId ||
-        owner.generation !== request.generation ||
-        request.generation !== route.supervisor.generation ||
         process === null ||
+        !this.#ownsPendingServerRequest(route, request) ||
         process.generation !== request.generation
       ) {
         throw new AccountRuntimeStaleRequestError();
       }
-      this.#serverRequestOwners.delete(request);
       try {
-        return await process.protocol.respond(request, response);
+        await this.#beforeBoundary({
+          accountProfileId: profileId,
+          boundary: "respond",
+          generation: process.generation,
+        });
+        this.#assertRouteOpen(route);
+        this.#assertOrdinaryAdmission(profileId);
+        if (
+          route.supervisor.current !== process ||
+          !this.#ownsPendingServerRequest(route, request)
+        ) {
+          throw new AccountRuntimeStaleRequestError();
+        }
+        this.#assertRouteOpen(route);
+        const position = await process.protocol.respond(request, response);
+        this.#assertRouteOpen(route);
+        this.#assertOrdinaryAdmission(profileId);
+        return position;
       } finally {
+        this.#serverRequestOwners.delete(request);
         route.pendingServerRequests.delete(request);
         this.#touchRoute(route);
       }
@@ -440,6 +893,7 @@ export class AccountRuntimeRouter {
 
   async stop(accountProfileId: AccountProfileId): Promise<void> {
     const profileId = accountProfileIdSchema.parse(accountProfileId);
+    this.#assertOrdinaryAdmission(profileId);
     const route = this.#routes.get(profileId);
     if (route !== undefined) await this.#stopRoute(route);
   }
@@ -465,6 +919,24 @@ export class AccountRuntimeRouter {
     return "fenced";
   }
 
+  /** Exact targetless account-removal fence. No archive RPC authority leaks. */
+  async fenceAccountRemovalGeneration(
+    accountProfileId: AccountProfileId,
+    removalHandle: AccountRemovalAdmissionHandle,
+  ): Promise<AccountRuntimeFenceResult> {
+    const profileId = accountProfileIdSchema.parse(accountProfileId);
+    const descriptor = this.#archiveAdmissionGate.requireAccountRemoval(
+      removalHandle,
+      profileId,
+    );
+    const result = await this.fenceGeneration(
+      profileId,
+      descriptor.expectedGeneration,
+    );
+    this.#archiveAdmissionGate.requireAccountRemoval(removalHandle, profileId);
+    return result;
+  }
+
   async stopAll(): Promise<void> {
     this.#closed = true;
     for (const waiter of this.#admissionQueue) {
@@ -476,6 +948,10 @@ export class AccountRuntimeRouter {
         await this.#stopRoute(route, "router_shutdown")
       ),
     );
+    for (const route of this.#routes.values()) {
+      route.releaseArchiveAdmissionSubscription?.();
+      route.releaseArchiveAdmissionSubscription = null;
+    }
     const failures: unknown[] = [];
     for (const outcome of outcomes) {
       if (outcome.status === "rejected") {
@@ -517,6 +993,11 @@ export class AccountRuntimeRouter {
       (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1)
     ) return false;
     const route = this.#routes.get(parsed.data);
+    if (
+      route === undefined || !this.#isRouteOpen(route) ||
+      this.#archiveAdmissionGate.isHeld(parsed.data) ||
+      this.#isArchiveQuiescenceInvalidated(route)
+    ) return false;
     const process = route?.supervisor.current ?? null;
     const capability = route?.dynamicToolCapability ?? null;
     if (
@@ -547,6 +1028,8 @@ export class AccountRuntimeRouter {
       !profileId.success ||
       !Number.isSafeInteger(expectedGeneration) ||
       expectedGeneration < 1 ||
+      this.#closed ||
+      this.#archiveAdmissionGate.isHeld(profileId.data) ||
       !this.supportsDynamicTool(profileId.data, expectedGeneration)
     ) return null;
     const capability = this.#routes.get(profileId.data)?.dynamicToolCapability ?? null;
@@ -555,11 +1038,33 @@ export class AccountRuntimeRouter {
       : null;
   }
 
-  async #startRoute(route: AccountRoute): Promise<AccountRuntimeProcess> {
-    await this.#reserveRuntimeSlot(route);
+  async #startRoute(
+    route: AccountRoute,
+    archiveHandle: ArchiveAdmissionHandle | null,
+  ): Promise<AccountRuntimeProcess> {
+    this.#assertRouteOpen(route);
+    this.#assertAdmission(route.accountProfileId, archiveHandle);
+    await this.#reserveRuntimeSlot(route, archiveHandle);
+    this.#assertRouteOpen(route);
+    this.#assertAdmission(route.accountProfileId, archiveHandle);
+    const startAuthority = Object.freeze({
+      archiveHandle,
+      generation: archiveHandle === null
+        ? route.supervisor.current?.generation ?? route.supervisor.generation + 1
+        : archiveRecoveryRuntimeGeneration(this.#archiveAdmissionGate.require(
+            archiveHandle,
+            route.accountProfileId,
+          )),
+    });
+    const ownsStartAuthority = route.processStartAuthority === null;
+    if (ownsStartAuthority) route.processStartAuthority = startAuthority;
     try {
+      this.#assertRouteOpen(route);
+      this.#assertAdmission(route.accountProfileId, archiveHandle);
       const process = await route.supervisor.start();
-      if (!route.slotHeld || route.stopping || this.#closed) {
+      this.#assertRouteOpen(route);
+      this.#assertAdmission(route.accountProfileId, archiveHandle);
+      if (!route.slotHeld) {
         await route.supervisor.stop();
         throw new AccountRuntimeCapacityError();
       }
@@ -574,6 +1079,10 @@ export class AccountRuntimeRouter {
         this.#releaseRuntimeSlot(route);
       }
       throw error;
+    } finally {
+      if (ownsStartAuthority && route.processStartAuthority === startAuthority) {
+        route.processStartAuthority = null;
+      }
     }
   }
 
@@ -581,14 +1090,16 @@ export class AccountRuntimeRouter {
     route: AccountRoute,
     operation: () => Promise<T>,
   ): Promise<T> {
-    if (this.#closed || route.stopping) throw new AccountRuntimeCapacityError();
+    this.#assertRouteOpen(route);
     route.activeOperations += 1;
     this.#touchRoute(route);
     let outcome:
       | { readonly status: "fulfilled"; readonly value: T }
       | { readonly reason: unknown; readonly status: "rejected" };
     try {
-      outcome = { status: "fulfilled", value: await operation() };
+      const value = await operation();
+      this.#assertRouteOpen(route);
+      outcome = { status: "fulfilled", value };
     } catch (reason: unknown) {
       outcome = { status: "rejected", reason };
     }
@@ -602,12 +1113,23 @@ export class AccountRuntimeRouter {
     return outcome.value;
   }
 
-  async #reserveRuntimeSlot(route: AccountRoute): Promise<void> {
+  async #reserveRuntimeSlot(
+    route: AccountRoute,
+    archiveHandle: ArchiveAdmissionHandle | null,
+  ): Promise<void> {
+    this.#assertRouteOpen(route);
+    await this.#beforeBoundary({
+      accountProfileId: route.accountProfileId,
+      boundary: "capacity_admission",
+      generation: route.supervisor.generation,
+    });
+    this.#assertRouteOpen(route);
+    this.#assertAdmission(route.accountProfileId, archiveHandle);
     if (route.slotHeld) return;
-    if (this.#closed || route.stopping) throw new AccountRuntimeCapacityError();
-    if (route.admission !== null) return await route.admission;
+    this.#assertRouteOpen(route);
     const admission = new Promise<void>((resolve, reject) => {
       const waiter: RuntimeAdmissionWaiter = {
+        archiveHandle,
         deadline: performance.now() + this.#admissionTimeoutMs,
         reject,
         resolve,
@@ -623,12 +1145,9 @@ export class AccountRuntimeRouter {
       this.#admissionQueue.push(waiter);
       this.#scheduleAdmissionDrain();
     });
-    route.admission = admission;
-    try {
-      await admission;
-    } finally {
-      if (route.admission === admission) route.admission = null;
-    }
+    await admission;
+    this.#assertRouteOpen(route);
+    this.#assertAdmission(route.accountProfileId, archiveHandle);
   }
 
   #scheduleAdmissionDrain(): void {
@@ -655,6 +1174,20 @@ export class AccountRuntimeRouter {
         performance.now() >= waiter.deadline
       ) {
         this.#rejectAdmission(waiter);
+        continue;
+      }
+      try {
+        this.#assertAdmission(
+          waiter.route.accountProfileId,
+          waiter.archiveHandle,
+        );
+      } catch (error: unknown) {
+        this.#rejectAdmission(
+          waiter,
+          error instanceof Error
+            ? error
+            : new ArchiveAdmissionAuthorityError(),
+        );
         continue;
       }
       if (waiter.route.slotHeld) {
@@ -688,16 +1221,37 @@ export class AccountRuntimeRouter {
     waiter.resolve();
   }
 
-  #rejectAdmission(waiter: RuntimeAdmissionWaiter): void {
+  #rejectAdmission(
+    waiter: RuntimeAdmissionWaiter,
+    error: Error = new AccountRuntimeCapacityError(),
+  ): void {
     if (waiter.settled) return;
     waiter.settled = true;
     if (waiter.timer !== null) clearTimeout(waiter.timer);
-    waiter.reject(new AccountRuntimeCapacityError());
+    waiter.reject(error);
   }
 
   #cancelRouteAdmission(route: AccountRoute): void {
     for (const waiter of this.#admissionQueue) {
       if (waiter.route === route) this.#rejectAdmission(waiter);
+    }
+    this.#notifyCapacityChanged();
+  }
+
+  #cancelOrdinaryRouteAdmission(route: AccountRoute): void {
+    for (const waiter of this.#admissionQueue) {
+      if (waiter.route === route && waiter.archiveHandle === null) {
+        try {
+          this.#assertOrdinaryAdmission(
+            route.accountProfileId,
+          );
+        } catch (error: unknown) {
+          this.#rejectAdmission(
+            waiter,
+            error instanceof Error ? error : new ArchiveAdmissionAuthorityError(),
+          );
+        }
+      }
     }
     this.#notifyCapacityChanged();
   }
@@ -715,7 +1269,9 @@ export class AccountRuntimeRouter {
     for (const route of this.#routes.values()) {
       if (
         route === excluded || !route.slotHeld || route.stopping ||
-        route.activeOperations !== 0 || route.activeTurns.size !== 0 ||
+        this.#archiveAdmissionGate.isHeld(route.accountProfileId) ||
+        route.activeCallbacks !== 0 || route.activeOperations !== 0 ||
+        route.activeTurns.size !== 0 ||
         route.pendingServerRequests.size !== 0 || route.pendingLoginId !== null ||
         route.supervisor.current === null || route.supervisor.state.type !== "running"
       ) continue;
@@ -815,18 +1371,23 @@ export class AccountRuntimeRouter {
     route.activeTurns.clear();
     route.completedLoginIds.clear();
     route.completedTurns.clear();
+    route.expectedThreadArchiveNotifications.clear();
     route.pendingLoginId = null;
     for (const request of route.pendingServerRequests) {
       this.#serverRequestOwners.delete(request);
     }
     route.pendingServerRequests.clear();
+    if (route.activeCallbacks === 0) {
+      route.archiveQuiescenceInvalidatedGeneration = null;
+    }
     this.#touchRoute(route);
   }
 
   #touchRoute(route: AccountRoute): void {
     route.lastUsed = ++this.#routeClock;
     if (
-      route.activeOperations === 0 && route.activeTurns.size === 0 &&
+      route.activeCallbacks === 0 && route.activeOperations === 0 &&
+      route.activeTurns.size === 0 &&
       route.pendingServerRequests.size === 0 && route.pendingLoginId === null
     ) {
       this.#notifyCapacityChanged();
@@ -905,28 +1466,223 @@ export class AccountRuntimeRouter {
     }
   }
 
+  #forgetPendingServerRequest(
+    route: AccountRoute,
+    request: CodexRespondableServerRequest,
+  ): void {
+    this.#serverRequestOwners.delete(request);
+    route.pendingServerRequests.delete(request);
+    this.#touchRoute(route);
+  }
+
+  #ownsPendingServerRequest(
+    route: AccountRoute,
+    request: CodexRespondableServerRequest,
+  ): boolean {
+    const owner = this.#serverRequestOwners.get(request);
+    return this.#isRouteOpen(route) &&
+      !this.#archiveAdmissionGate.isHeld(route.accountProfileId) &&
+      !this.#isArchiveQuiescenceInvalidated(route) &&
+      this.#isCurrentGeneration(route.accountProfileId, request.generation) &&
+      route.pendingServerRequests.has(request) &&
+      owner?.accountProfileId === route.accountProfileId &&
+      owner.generation === request.generation &&
+      route.supervisor.current === owner.process &&
+      owner.process.generation === request.generation;
+  }
+
+  #acceptedCallbackProcess(
+    route: AccountRoute,
+    callbackAuthority: ProcessCallbackAuthority,
+    eventGeneration: number,
+  ): AccountRuntimeProcess | null {
+    const process = this.#currentCallbackProcess(
+      route,
+      callbackAuthority,
+      eventGeneration,
+    );
+    if (
+      process === null ||
+      this.#archiveAdmissionGate.isHeld(route.accountProfileId) ||
+      this.#isArchiveQuiescenceInvalidated(route)
+    ) return null;
+    return process;
+  }
+
+  #currentCallbackProcess(
+    route: AccountRoute,
+    callbackAuthority: ProcessCallbackAuthority,
+    eventGeneration: number,
+  ): AccountRuntimeProcess | null {
+    const process = callbackAuthority.process;
+    if (
+      process === null ||
+      !this.#isRouteOpen(route) ||
+      this.#routes.get(route.accountProfileId) !== route ||
+      route.supervisor.current !== process ||
+      route.supervisor.state.type !== "running" ||
+      route.supervisor.generation !== callbackAuthority.generation ||
+      process.generation !== callbackAuthority.generation ||
+      eventGeneration !== callbackAuthority.generation
+    ) return null;
+    return process;
+  }
+
+  #invalidateArchiveQuiescenceForHeldCallback(
+    route: AccountRoute,
+    callbackAuthority: ProcessCallbackAuthority,
+    eventGeneration: number,
+  ): void {
+    if (
+      !this.#archiveAdmissionGate.isHeld(route.accountProfileId) ||
+      this.#currentCallbackProcess(
+        route,
+        callbackAuthority,
+        eventGeneration,
+      ) === null
+    ) return;
+    route.archiveQuiescenceInvalidatedGeneration = eventGeneration;
+    this.#touchRoute(route);
+  }
+
+  #retainExpectedThreadArchiveNotification(
+    route: AccountRoute,
+    generation: number,
+    threadId: string,
+  ): string {
+    const key = expectedThreadArchiveNotificationKey(generation, threadId);
+    if (
+      !route.expectedThreadArchiveNotifications.has(key) &&
+      route.expectedThreadArchiveNotifications.size >=
+        maximumExpectedThreadArchiveNotificationTombstones
+    ) {
+      throw new AccountRuntimeNotQuiescentError();
+    }
+    route.expectedThreadArchiveNotifications.add(key);
+    return key;
+  }
+
+  #consumeExpectedThreadArchiveNotification(
+    route: AccountRoute,
+    callbackAuthority: ProcessCallbackAuthority,
+    notification: CodexNotification,
+  ): boolean {
+    if (
+      notification.method !== "thread/archived" ||
+      this.#currentCallbackProcess(
+        route,
+        callbackAuthority,
+        notification.generation,
+      ) === null
+    ) return false;
+    const key = expectedThreadArchiveNotificationKey(
+      notification.generation,
+      notification.params.threadId,
+    );
+    if (!route.expectedThreadArchiveNotifications.delete(key)) return false;
+    this.#touchRoute(route);
+    return true;
+  }
+
+  async #withProviderCallbackActivity<T>(
+    route: AccountRoute,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    route.activeCallbacks += 1;
+    this.#touchRoute(route);
+    let outcome:
+      | { readonly status: "fulfilled"; readonly value: T }
+      | { readonly reason: unknown; readonly status: "rejected" };
+    try {
+      outcome = { status: "fulfilled", value: await operation() };
+    } catch (reason: unknown) {
+      outcome = { reason, status: "rejected" };
+    }
+    route.activeCallbacks -= 1;
+    if (route.activeCallbacks < 0) {
+      route.activeCallbacks = 0;
+      throw new Error("Account runtime callback activity accounting underflowed");
+    }
+    this.#clearTerminalArchiveQuiescenceInvalidation(route);
+    this.#touchRoute(route);
+    if (outcome.status === "rejected") throw outcome.reason;
+    return outcome.value;
+  }
+
+  #clearTerminalArchiveQuiescenceInvalidation(route: AccountRoute): void {
+    const invalidatedGeneration = route.archiveQuiescenceInvalidatedGeneration;
+    if (invalidatedGeneration === null || route.activeCallbacks !== 0) return;
+    if (
+      route.supervisor.generation !== invalidatedGeneration ||
+      (
+        route.supervisor.current === null && !route.slotHeld &&
+        (route.supervisor.state.type === "failed" ||
+          route.supervisor.state.type === "stopped")
+      )
+    ) {
+      route.archiveQuiescenceInvalidatedGeneration = null;
+    }
+  }
+
   async #startProcess(
     route: AccountRoute,
     generation: number,
   ): Promise<AccountRuntimeProcess> {
-    if (!route.slotHeld || route.stopping || this.#closed) {
-      throw new AccountRuntimeCapacityError();
-    }
-    const dynamicToolCapability = await this.#resolveDynamicToolCapability(
-      route,
+    this.#assertRouteOpen(route);
+    if (!route.slotHeld) throw new AccountRuntimeCapacityError();
+    const archiveHandle = this.#processCreationArchiveHandle(route, generation);
+    const callbackAuthority: ProcessCallbackAuthority = {
       generation,
-    );
+      process: null,
+    };
+    let dynamicToolCapability: PinnedCodexDynamicToolProtocolCapability | null = null;
+    if (archiveHandle === null) {
+      this.#assertRouteOpen(route);
+      await this.#beforeBoundary({
+        accountProfileId: route.accountProfileId,
+        boundary: "dynamic_tool_capability",
+        generation,
+      });
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(route.accountProfileId);
+      this.#assertRouteOpen(route);
+      dynamicToolCapability = await this.#resolveDynamicToolCapability(
+        route,
+        generation,
+      );
+      this.#assertRouteOpen(route);
+      this.#assertOrdinaryAdmission(route.accountProfileId);
+    }
+    this.#assertRouteOpen(route);
+    await this.#beforeBoundary({
+      accountProfileId: route.accountProfileId,
+      boundary: "process_creation",
+      generation,
+    });
+    this.#assertRouteOpen(route);
+    this.#assertAdmission(route.accountProfileId, archiveHandle);
+    this.#assertRouteOpen(route);
     const process = await this.#createProcess({
       accountProfileId: route.accountProfileId,
-      callbacks: this.#scopedCallbacks(route),
+      callbacks: this.#scopedCallbacks(route, callbackAuthority),
       dynamicToolCapability,
       generation,
       paths: route.paths,
     });
+    try {
+      this.#assertRouteOpen(route);
+      this.#assertAdmission(route.accountProfileId, archiveHandle);
+    } catch (error: unknown) {
+      await process.expire("stopped");
+      throw error;
+    }
+    callbackAuthority.process = process;
     route.dynamicToolCapability = dynamicToolCapability;
     void process.faulted.then((reason) => {
       if (
         this.#closed || route.stopping || !route.slotHeld ||
+        this.#archiveAdmissionGate.isHeld(route.accountProfileId) ||
+        this.#isArchiveQuiescenceInvalidated(route) ||
         route.supervisor.current !== process ||
         !this.#isCurrentGeneration(route.accountProfileId, generation)
       ) return;
@@ -935,84 +1691,253 @@ export class AccountRuntimeRouter {
     return process;
   }
 
-  #scopedCallbacks(route: AccountRoute): CodexRpcCallbacks {
+  #scopedCallbacks(
+    route: AccountRoute,
+    callbackAuthority: ProcessCallbackAuthority,
+  ): CodexRpcCallbacks {
     const accountProfileId = route.accountProfileId;
     const onDynamicToolRequest = this.#callbacks.onDynamicToolRequest;
     return {
       onNotification: async (notification) => {
-        if (!this.#isCurrentGeneration(accountProfileId, notification.generation)) return;
-        this.#touchRoute(route);
-        const turnKey = notification.method === "turn/started" ||
-            notification.method === "turn/completed"
-          ? runtimeTurnKey(
-              notification.params.threadId,
-              notification.params.turn.id,
-            )
-          : null;
-        if (
-          notification.method === "turn/started" && turnKey !== null &&
-          !route.completedTurns.has(turnKey)
-        ) {
-          route.activeTurns.add(turnKey);
-        }
-        if (notification.method === "account/login/completed") {
-          if (notification.params.loginId !== null) {
-            retainBoundedIdentity(
-              route.completedLoginIds,
-              notification.params.loginId,
-              maximumCompletedLoginTombstones,
-            );
+        if (this.#consumeExpectedThreadArchiveNotification(
+          route,
+          callbackAuthority,
+          notification,
+        )) return;
+        this.#invalidateArchiveQuiescenceForHeldCallback(
+          route,
+          callbackAuthority,
+          notification.generation,
+        );
+        if (this.#acceptedCallbackProcess(
+          route,
+          callbackAuthority,
+          notification.generation,
+        ) === null) return;
+        await this.#withProviderCallbackActivity(route, async () => {
+          const turnKey = notification.method === "turn/started" ||
+              notification.method === "turn/completed"
+            ? runtimeTurnKey(
+                notification.params.threadId,
+                notification.params.turn.id,
+              )
+            : null;
+          if (
+            notification.method === "turn/started" && turnKey !== null &&
+            !route.completedTurns.has(turnKey)
+          ) {
+            route.activeTurns.add(turnKey);
           }
-          if (route.pendingLoginId === notification.params.loginId) {
-            route.pendingLoginId = null;
+          if (notification.method === "account/login/completed") {
+            if (notification.params.loginId !== null) {
+              retainBoundedIdentity(
+                route.completedLoginIds,
+                notification.params.loginId,
+                maximumCompletedLoginTombstones,
+              );
+            }
+            if (route.pendingLoginId === notification.params.loginId) {
+              route.pendingLoginId = null;
+            }
           }
-        }
-        if (notification.method === "turn/completed" && turnKey !== null) {
-          retainCompletedTurn(route.completedTurns, turnKey);
-        }
-        try {
-          await this.#callbacks.onNotification?.(accountProfileId, notification);
-        } finally {
           if (notification.method === "turn/completed" && turnKey !== null) {
-            route.activeTurns.delete(turnKey);
-            this.#touchRoute(route);
+            retainCompletedTurn(route.completedTurns, turnKey);
           }
-        }
+          try {
+            if (this.#acceptedCallbackProcess(
+              route,
+              callbackAuthority,
+              notification.generation,
+            ) === null) return;
+            await this.#callbacks.onNotification?.(accountProfileId, notification);
+            if (this.#acceptedCallbackProcess(
+              route,
+              callbackAuthority,
+              notification.generation,
+            ) === null) return;
+          } finally {
+            if (notification.method === "turn/completed" && turnKey !== null) {
+              route.activeTurns.delete(turnKey);
+              this.#touchRoute(route);
+            }
+          }
+        });
       },
       onServerRequest: async (request) => {
-        if (!this.#isCurrentGeneration(accountProfileId, request.generation)) return;
-        this.#serverRequestOwners.set(request, {
-          accountProfileId,
-          generation: request.generation,
+        this.#invalidateArchiveQuiescenceForHeldCallback(
+          route,
+          callbackAuthority,
+          request.generation,
+        );
+        const callbackProcess = this.#acceptedCallbackProcess(
+          route,
+          callbackAuthority,
+          request.generation,
+        );
+        if (callbackProcess === null) return;
+        await this.#withProviderCallbackActivity(route, async () => {
+          this.#serverRequestOwners.set(request, {
+            accountProfileId,
+            generation: request.generation,
+            process: callbackProcess,
+          });
+          route.pendingServerRequests.add(request);
+          this.#touchRoute(route);
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            request.generation,
+          ) !== callbackProcess) {
+            this.#forgetPendingServerRequest(route, request);
+            return;
+          }
+          await this.#beforeBoundary({
+            accountProfileId,
+            boundary: "callback_dispatch",
+            generation: request.generation,
+          });
+          if (
+            this.#acceptedCallbackProcess(
+              route,
+              callbackAuthority,
+              request.generation,
+            ) !== callbackProcess ||
+            !this.#ownsPendingServerRequest(route, request)
+          ) {
+            this.#forgetPendingServerRequest(route, request);
+            return;
+          }
+          if (
+            this.#acceptedCallbackProcess(
+              route,
+              callbackAuthority,
+              request.generation,
+            ) !== callbackProcess ||
+            !this.#ownsPendingServerRequest(route, request)
+          ) return;
+          await this.#callbacks.onServerRequest?.(accountProfileId, request);
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            request.generation,
+          ) !== callbackProcess) return;
         });
-        route.pendingServerRequests.add(request);
-        this.#touchRoute(route);
-        await this.#callbacks.onServerRequest?.(accountProfileId, request);
       },
       ...(onDynamicToolRequest === undefined
         ? {}
         : {
           onDynamicToolRequest: async (request: PinnedCodexDynamicToolRequest) => {
-            if (!this.#isCurrentGeneration(accountProfileId, request.generation)) return;
-            this.#serverRequestOwners.set(request, {
-              accountProfileId,
-              generation: request.generation,
+            this.#invalidateArchiveQuiescenceForHeldCallback(
+              route,
+              callbackAuthority,
+              request.generation,
+            );
+            const callbackProcess = this.#acceptedCallbackProcess(
+              route,
+              callbackAuthority,
+              request.generation,
+            );
+            if (callbackProcess === null) return;
+            await this.#withProviderCallbackActivity(route, async () => {
+              this.#serverRequestOwners.set(request, {
+                accountProfileId,
+                generation: request.generation,
+                process: callbackProcess,
+              });
+              route.pendingServerRequests.add(request);
+              this.#touchRoute(route);
+              if (this.#acceptedCallbackProcess(
+                route,
+                callbackAuthority,
+                request.generation,
+              ) !== callbackProcess) {
+                this.#forgetPendingServerRequest(route, request);
+                return;
+              }
+              await this.#beforeBoundary({
+                accountProfileId,
+                boundary: "callback_dispatch",
+                generation: request.generation,
+              });
+              if (
+                this.#acceptedCallbackProcess(
+                  route,
+                  callbackAuthority,
+                  request.generation,
+                ) !== callbackProcess ||
+                !this.#ownsPendingServerRequest(route, request)
+              ) {
+                this.#forgetPendingServerRequest(route, request);
+                return;
+              }
+              if (
+                this.#acceptedCallbackProcess(
+                  route,
+                  callbackAuthority,
+                  request.generation,
+                ) !== callbackProcess ||
+                !this.#ownsPendingServerRequest(route, request)
+              ) return;
+              await onDynamicToolRequest(accountProfileId, request);
+              if (this.#acceptedCallbackProcess(
+                route,
+                callbackAuthority,
+                request.generation,
+              ) !== callbackProcess) return;
             });
-            route.pendingServerRequests.add(request);
-            this.#touchRoute(route);
-            await onDynamicToolRequest(accountProfileId, request);
           },
         }),
       onDiagnostic: async (diagnostic) => {
-        if (!this.#isCurrentGeneration(accountProfileId, diagnostic.generation)) return;
-        this.#touchRoute(route);
-        await this.#callbacks.onDiagnostic?.(accountProfileId, diagnostic);
+        this.#invalidateArchiveQuiescenceForHeldCallback(
+          route,
+          callbackAuthority,
+          diagnostic.generation,
+        );
+        if (this.#acceptedCallbackProcess(
+          route,
+          callbackAuthority,
+          diagnostic.generation,
+        ) === null) return;
+        await this.#withProviderCallbackActivity(route, async () => {
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            diagnostic.generation,
+          ) === null) return;
+          await this.#callbacks.onDiagnostic?.(accountProfileId, diagnostic);
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            diagnostic.generation,
+          ) === null) return;
+        });
       },
       onServerRequestExpired: async (fault) => {
-        if (!this.#isCurrentGeneration(accountProfileId, fault.generation)) return;
-        this.#removeExpiredServerRequest(route, fault);
-        this.#touchRoute(route);
-        await this.#callbacks.onServerRequestExpired?.(accountProfileId, fault);
+        this.#invalidateArchiveQuiescenceForHeldCallback(
+          route,
+          callbackAuthority,
+          fault.generation,
+        );
+        if (this.#acceptedCallbackProcess(
+          route,
+          callbackAuthority,
+          fault.generation,
+        ) === null) return;
+        await this.#withProviderCallbackActivity(route, async () => {
+          this.#removeExpiredServerRequest(route, fault);
+          this.#touchRoute(route);
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            fault.generation,
+          ) === null) return;
+          await this.#callbacks.onServerRequestExpired?.(accountProfileId, fault);
+          if (this.#acceptedCallbackProcess(
+            route,
+            callbackAuthority,
+            fault.generation,
+          ) === null) return;
+        });
       },
     };
   }
@@ -1049,6 +1974,160 @@ export class AccountRuntimeRouter {
     return capability;
   }
 
+  #assertAdmission(
+    accountProfileId: AccountProfileId,
+    archiveHandle: ArchiveAdmissionHandle | null,
+  ): void {
+    if (archiveHandle === null) {
+      this.#assertOrdinaryAdmission(accountProfileId);
+      return;
+    }
+    this.#archiveAdmissionGate.require(archiveHandle, accountProfileId);
+  }
+
+  #assertOrdinaryAdmission(accountProfileId: AccountProfileId): void {
+    this.#archiveAdmissionGate.assertOrdinaryAdmission(accountProfileId);
+    const route = this.#routes.get(accountProfileId);
+    if (route !== undefined && this.#isArchiveQuiescenceInvalidated(route)) {
+      throw new AccountRuntimeNotQuiescentError();
+    }
+  }
+
+  #isArchiveQuiescenceInvalidated(route: AccountRoute): boolean {
+    return route.archiveQuiescenceInvalidatedGeneration !== null;
+  }
+
+  #assertArchiveRouteQuiescent(
+    route: AccountRoute,
+    expectedGeneration: number,
+    expectedActiveOperations: number,
+  ): void {
+    const process = route.supervisor.current;
+    if (
+      process === null ||
+      !route.slotHeld ||
+      route.supervisor.state.type !== "running" ||
+      route.supervisor.generation !== expectedGeneration ||
+      process.generation !== expectedGeneration ||
+      route.processStartAuthority !== null ||
+      route.activeCallbacks !== 0 ||
+      route.activeOperations !== expectedActiveOperations ||
+      route.activeTurns.size !== 0 ||
+      route.pendingServerRequests.size !== 0 ||
+      route.pendingLoginId !== null ||
+      route.archiveQuiescenceInvalidatedGeneration !== null
+    ) {
+      throw new AccountRuntimeNotQuiescentError();
+    }
+  }
+
+  #assertArchiveRecoveryRequest<K extends AccountRuntimeArchiveRecoveryRequestKey>(
+    accountProfileId: AccountProfileId,
+    archiveHandle: ArchiveAdmissionHandle,
+    key: K,
+    input: PinnedCodexRequestInput<K>,
+    expectedGeneration: number,
+  ): ArchiveAdmissionDescriptor {
+    const descriptor = this.#archiveAdmissionGate.require(
+      archiveHandle,
+      accountProfileId,
+    );
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+      throw new ArchiveAdmissionAuthorityError(
+        "The provider archive recovery generation is invalid.",
+      );
+    }
+    if (key === "threadArchive") {
+      const threadId = (input as PinnedCodexRequestInput<"threadArchive">).threadId;
+      if (
+        descriptor.attemptPhase !== "effect_started" ||
+        descriptor.cutAuthority !== null ||
+        expectedGeneration !== descriptor.expectedGeneration ||
+        archiveRestartThreadDigest(threadId) !== descriptor.restartThreadDigest
+      ) {
+        throw new ArchiveAdmissionAuthorityError(
+          "The provider archive mutation does not match its exact registered authority.",
+        );
+      }
+      return descriptor;
+    }
+    if (
+      key !== "threadList" ||
+      descriptor.attemptPhase !== "ambiguous" ||
+      descriptor.cutAuthority === null ||
+      descriptor.successorGeneration === null ||
+      descriptor.successorGeneration <= descriptor.expectedGeneration ||
+      expectedGeneration !== descriptor.successorGeneration
+    ) {
+      throw new ArchiveAdmissionAuthorityError(
+        "Provider archive reconciliation requires an exact cut and strict successor generation.",
+      );
+    }
+    return descriptor;
+  }
+
+  #processCreationArchiveHandle(
+    route: AccountRoute,
+    generation: number,
+  ): ArchiveAdmissionHandle | null {
+    const authority = route.processStartAuthority;
+    if (this.#archiveAdmissionGate.isHeld(route.accountProfileId)) {
+      const archiveHandle = authority?.archiveHandle ?? null;
+      if (archiveHandle !== null && authority?.generation === generation) {
+        const descriptor = this.#archiveAdmissionGate.require(
+          archiveHandle,
+          route.accountProfileId,
+        );
+        if (archiveRecoveryRuntimeGeneration(descriptor) === generation) {
+          return archiveHandle;
+        }
+      }
+      throw new ArchiveAdmissionAuthorityError(
+        "Process creation requires an exact active provider archive authority.",
+      );
+    }
+    if (authority !== null && authority.archiveHandle !== null) {
+      throw new ArchiveAdmissionAuthorityError(
+        "A released provider archive authority cannot create a process.",
+      );
+    }
+    return null;
+  }
+
+  #handleArchiveAdmissionChange(route: AccountRoute, held: boolean): void {
+    if (held) {
+      if (
+        route.activeCallbacks !== 0 || route.activeOperations !== 0 ||
+        route.activeTurns.size !== 0 ||
+        route.pendingServerRequests.size !== 0 ||
+        route.pendingLoginId !== null
+      ) {
+        route.archiveQuiescenceInvalidatedGeneration =
+          route.supervisor.generation;
+      }
+      this.#cancelOrdinaryRouteAdmission(route);
+      for (const request of route.pendingServerRequests) {
+        this.#serverRequestOwners.delete(request);
+      }
+      route.pendingServerRequests.clear();
+      this.#touchRoute(route);
+    }
+    this.#notifyCapacityChanged();
+    this.#scheduleAdmissionDrain();
+  }
+
+  async #beforeBoundary(input: AccountRuntimeRouterBoundaryInput): Promise<void> {
+    await this.#testHooks.beforeBoundary?.(Object.freeze(input));
+  }
+
+  #assertRouteOpen(route: AccountRoute): void {
+    if (!this.#isRouteOpen(route)) throw new AccountRuntimeCapacityError();
+  }
+
+  #isRouteOpen(route: AccountRoute): boolean {
+    return !this.#closed && !route.stopping;
+  }
+
   #isCurrentGeneration(
     accountProfileId: AccountProfileId,
     generation: number,
@@ -1075,6 +2154,25 @@ function positiveRouterLimit(
 
 function runtimeTurnKey(threadId: string, turnId: string): string {
   return `${String(threadId.length)}:${threadId}${turnId}`;
+}
+
+function expectedThreadArchiveNotificationKey(
+  generation: number,
+  threadId: string,
+): string {
+  return `${String(generation)}:${archiveRestartThreadDigest(threadId)}`;
+}
+
+function archiveRecoveryRuntimeGeneration(
+  descriptor: ArchiveAdmissionDescriptor,
+): number {
+  return descriptor.successorGeneration ?? descriptor.expectedGeneration;
+}
+
+function runtimeObservation(
+  process: AccountRuntimeProcess,
+): AccountRuntimeObservation {
+  return Object.freeze({ generation: process.generation, status: "running" });
 }
 
 function retainCompletedTurn(completed: Set<string>, turnKey: string): void {

@@ -15,6 +15,8 @@ import { join } from "node:path";
 
 import { applyMigrations } from "../src/state/database";
 import { ChatPaneStore } from "../src/state/chat-pane-store";
+import { ProviderThreadArchiveJournalV57 } from
+  "../src/state/provider-thread-archive-journal-v57";
 import {
   chatWorkspaceBindingId,
   chatWorkspaceLaneId,
@@ -40,6 +42,7 @@ const REPOSITORY_TWO = `repo_${"9".repeat(26)}`;
 const PANE_ONE = "pane_chatworkspace01";
 const PANE_TWO = "pane_chatworkspace02";
 const NOW = new Date("2026-08-08T12:00:00.000Z");
+const ARCHIVE_RECEIPT_KEY = new Uint8Array(32).fill(57);
 
 class TestGitRunner implements GitRunner {
   async run(
@@ -113,18 +116,24 @@ async function fixture(): Promise<Fixture> {
     inspected.canonicalGitCommonDir,
     NOW.getTime(),
   );
+  const panes = new ChatPaneStore(database, {
+    messageRequestDigestKey: ARCHIVE_RECEIPT_KEY,
+  });
   return {
     database,
     git,
     lanesRoot,
     root,
-    panes: new ChatPaneStore(database),
+    panes,
     repository: {
       id: REPOSITORY,
       name: "Example",
       workingDirectory: inspected.canonicalRepositoryPath,
     },
-    workspaceStore: new ChatWorkspaceStore(database, { now: () => NOW }),
+    workspaceStore: new ChatWorkspaceStore(database, {
+      now: () => NOW,
+      panes,
+    }),
   };
 }
 
@@ -170,6 +179,60 @@ function createPane(value: Fixture, paneId: string) {
     paneId,
     repository: value.repository,
     accountProfileId: ACCOUNT,
+    now: NOW,
+  });
+}
+
+function prepareWorkspaceArchiveTarget(value: Fixture, paneId: string): void {
+  value.database.query(`
+    UPDATE chat_panes SET provider_account_profile_id = ?2,
+      provider_thread_id = ?3, provider_restart_thread_id = ?4
+    WHERE pane_id = ?1
+  `).run(
+    paneId,
+    ACCOUNT,
+    "thread_workspaceguard01",
+    "restart_workspaceguard01",
+  );
+  const pane = value.panes.require(paneId);
+  const profile = value.database.query<{
+    process_generation: number;
+    revision: number;
+  }, [string]>(`
+    SELECT process_generation, revision
+    FROM account_profiles WHERE profile_id = ?1
+  `).get(ACCOUNT);
+  if (profile === null) throw new Error("workspace profile disappeared");
+  const journal = new ProviderThreadArchiveJournalV57(
+    value.database,
+    ARCHIVE_RECEIPT_KEY,
+  );
+  journal.prepareTarget({
+    targetId: "archtarget_workspaceguard01",
+    paneId,
+    purpose: "pane_archive",
+    paneRevision: pane.projection.revision,
+    queueRevision: null,
+    paneCasDigest: "1".repeat(64),
+    queueCasDigest: null,
+    accountProfileId: ACCOUNT,
+    accountProfileRevision: profile.revision,
+    threadId: "thread_workspaceguard01",
+    restartThreadId: "restart_workspaceguard01",
+    binding: { kind: "none" },
+    attempt: {
+      attemptId: "archattempt_workspaceguard01",
+      generation: profile.process_generation,
+      accountProfileRevision: profile.revision,
+      requestEvidenceDigest: "2".repeat(64),
+      requestRevisionDigest: "3".repeat(64),
+    },
+    now: NOW,
+  });
+  journal.markEffectStarted({
+    attemptId: "archattempt_workspaceguard01",
+    effectEvidenceDigest: "4".repeat(64),
+    effectRevisionDigest: "5".repeat(64),
     now: NOW,
   });
 }
@@ -221,6 +284,57 @@ describe.skipIf(gitBinary === null)("ordinary chat managed workspaces", () => {
         expect(bindings.every((binding) => binding.length === 39)).toBeTrue();
       },
     ));
+  });
+
+  test("v57 archive authority freezes every workspace admission and pane writer", async () => {
+    const value = await fixture();
+    try {
+      createPane(value, PANE_ONE);
+      prepareWorkspaceArchiveTarget(value, PANE_ONE);
+      const laneId = value.workspaceStore.expectedLaneId(PANE_ONE);
+      const identity = {
+        baseSha: "a".repeat(40),
+        branchName: `codex/oprte-${laneId}`,
+        canonicalCheckoutPath: join(value.lanesRoot, laneId),
+        canonicalGitCommonDir: join(value.repository.workingDirectory, ".git"),
+        canonicalRepositoryPath: value.repository.workingDirectory,
+        laneId,
+        recoveryManifestPath: join(value.lanesRoot, `${laneId}.json`),
+        runId: laneId,
+      };
+      const before = value.database.query(`
+        SELECT workspace_state, workspace_revision, revision
+        FROM chat_panes WHERE pane_id = ?1
+      `).get(PANE_ONE);
+
+      expect(() => value.workspaceStore.authorizeWorkspaceLaneRecovery(identity))
+        .toThrow("only its exact recovery may continue");
+      expect(() => value.workspaceStore.bindWorkspaceLane(identity))
+        .toThrow("only its exact recovery may continue");
+      expect(() => value.workspaceStore.markWorkspaceLaneReady(identity))
+        .toThrow("only its exact recovery may continue");
+      expect(() => value.workspaceStore.beginProvisioning(PANE_ONE))
+        .toThrow("only its exact recovery may continue");
+      expect(() => value.workspaceStore.markWaiting(
+        PANE_ONE,
+        "capacity_unavailable",
+      )).toThrow("only its exact recovery may continue");
+      expect(() => value.workspaceStore.markRecovery(PANE_ONE, "unknown"))
+        .toThrow("only its exact recovery may continue");
+
+      expect(value.database.query(`
+        SELECT workspace_state, workspace_revision, revision
+        FROM chat_panes WHERE pane_id = ?1
+      `).get(PANE_ONE)).toEqual(before);
+      expect(value.database.query(`
+        SELECT COUNT(*) AS count FROM chat_pane_workspace_bindings
+      `).get()).toEqual({ count: 0 });
+      expect(value.database.query(`
+        SELECT COUNT(*) AS count FROM workspace_leases
+      `).get()).toEqual({ count: 0 });
+    } finally {
+      value.database.close();
+    }
   });
 
   test("gives every pane a distinct restart-stable checkout and preserves it on close", async () => {

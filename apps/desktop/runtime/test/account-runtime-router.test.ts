@@ -23,15 +23,25 @@ import { parseCodexNotification } from "../src/codex/pinned-codecs";
 import {
   AccountRuntimeCapacityError,
   AccountRuntimeGenerationFloorMismatchError,
+  AccountRuntimeNotQuiescentError,
   AccountRuntimePathMismatchError,
-  AccountRuntimeRouter,
+  AccountRuntimeRouter as ProductionAccountRuntimeRouter,
   AccountRuntimeStaleRequestError,
   type AccountRuntimeFaultReason,
   type AccountRuntimeProcess,
   type AccountRuntimeProcessProtocol,
   type AccountRuntimeProcessFactoryInput,
   type AccountRuntimeRequestKey,
+  type AccountRuntimeRouterOptions,
 } from "../src/accounts/runtime-router";
+import {
+  ArchiveAdmissionAuthorityError,
+  ArchiveAdmissionGate,
+  ArchiveAdmissionHeldError,
+  type ArchiveAdmissionDescriptor,
+  type ArchiveAdmissionHandle,
+  archiveRestartThreadDigest,
+} from "../src/accounts/archive-admission-gate";
 import type { RuntimePaths } from "../src/runtime-paths";
 
 const accountA = "acct_account_a" as AccountSummary["id"];
@@ -123,6 +133,9 @@ class FakeProcess implements AccountRuntimeProcess {
   }>> = [];
   readonly #resolveFault: (reason: AccountRuntimeFaultReason) => void;
   #timeoutNextRequest = false;
+  #archiveResponseGate: Promise<void> | null = null;
+  #emitThreadArchivedOnNextArchive = false;
+  #expireHook: ((reason: CodexGenerationEndReason) => void | Promise<void>) | null = null;
   #turnStartResponseGate: Promise<void> | null = null;
 
   readonly protocol: AccountRuntimeProcessProtocol = {
@@ -159,11 +172,45 @@ class FakeProcess implements AccountRuntimeProcess {
           rateLimitResetCredits: null,
         }));
       }
+      if (key === "accountLoginStart") {
+        return Promise.resolve(fakePinnedOutput<K>({
+          type: "chatgpt",
+          loginId: "login-router-quiescence",
+          authUrl: "https://auth.openai.com/router-quiescence",
+        }));
+      }
+      if (key === "accountLoginCancel") {
+        return Promise.resolve(fakePinnedOutput<K>({ status: "canceled" }));
+      }
       if (key === "turnStart") {
         const gate = this.#turnStartResponseGate ?? Promise.resolve();
         this.#turnStartResponseGate = null;
         return gate.then(() => fakePinnedOutput<K>({
           turn: activeTurnFixture(),
+        }));
+      }
+      if (key === "threadArchive") {
+        const gate = this.#archiveResponseGate ?? Promise.resolve();
+        this.#archiveResponseGate = null;
+        return gate.then(async () => {
+          if (this.#emitThreadArchivedOnNextArchive) {
+            this.#emitThreadArchivedOnNextArchive = false;
+            const archive = input as PinnedCodexRequestInput<"threadArchive">;
+            await this.callbacks.onNotification?.({
+              generation: this.generation,
+              streamPosition: 2,
+              method: "thread/archived",
+              params: { threadId: archive.threadId },
+            });
+          }
+          return fakePinnedOutput<K>(undefined);
+        });
+      }
+      if (key === "threadList") {
+        return Promise.resolve(fakePinnedOutput<K>({
+          data: [],
+          nextCursor: null,
+          backwardsCursor: null,
         }));
       }
       throw new Error(`unexpected fake request key: ${key}`);
@@ -197,8 +244,9 @@ class FakeProcess implements AccountRuntimeProcess {
     this.#resolveFault = resolveFault;
   }
 
-  expire(reason: CodexGenerationEndReason): void {
+  expire(reason: CodexGenerationEndReason): void | Promise<void> {
     this.expired.push(reason);
+    return this.#expireHook?.(reason);
   }
 
   fault(reason: AccountRuntimeFaultReason): void {
@@ -211,6 +259,20 @@ class FakeProcess implements AccountRuntimeProcess {
 
   delayNextTurnStartResponse(gate: Promise<void>): void {
     this.#turnStartResponseGate = gate;
+  }
+
+  delayNextArchiveResponse(gate: Promise<void>): void {
+    this.#archiveResponseGate = gate;
+  }
+
+  emitThreadArchivedOnNextArchive(): void {
+    this.#emitThreadArchivedOnNextArchive = true;
+  }
+
+  onExpire(
+    hook: (reason: CodexGenerationEndReason) => void | Promise<void>,
+  ): void {
+    this.#expireHook = hook;
   }
 }
 
@@ -254,6 +316,41 @@ function rateLimit(id: string) {
   } as const;
 }
 
+function archiveDescriptor(
+  suffix: string,
+  overrides: Partial<ArchiveAdmissionDescriptor> = {},
+): ArchiveAdmissionDescriptor {
+  return {
+    accountProfileId: accountA,
+    attemptAuthority: { hmac: "b".repeat(64), revision: 4 },
+    attemptOrdinal: 1,
+    attemptPhase: "prepared",
+    cutAuthority: null,
+    expectedGeneration: 1,
+    paneId: `pane-${suffix}`,
+    purpose: "pane_archive",
+    restartThreadDigest: archiveRestartThreadDigest(`thread-${suffix}`),
+    successorGeneration: null,
+    targetAuthority: { hmac: "a".repeat(64), revision: 3 },
+    transitionId: `transition-${suffix}`,
+    ...overrides,
+  };
+}
+
+type TestAccountRuntimeRouterOptions =
+  & Omit<AccountRuntimeRouterOptions, "archiveAdmissionGate">
+  & { readonly archiveAdmissionGate?: ArchiveAdmissionGate };
+
+class AccountRuntimeRouter extends ProductionAccountRuntimeRouter {
+  constructor(options: TestAccountRuntimeRouterOptions = {}) {
+    super({
+      ...options,
+      archiveAdmissionGate: options.archiveAdmissionGate ??
+        new ArchiveAdmissionGate(),
+    });
+  }
+}
+
 function fakeRouter(
   callbackProfiles: AccountSummary["id"][] = [],
 ): Readonly<{
@@ -282,6 +379,15 @@ function fakeRouter(
   return { created, router };
 }
 
+function requireCreatedProcess(
+  created: readonly FakeProcess[],
+  index: number,
+): FakeProcess {
+  const process = created[index];
+  if (process === undefined) throw new Error("missing fake process");
+  return process;
+}
+
 async function waitForGeneration(
   router: AccountRuntimeRouter,
   profileId: AccountSummary["id"],
@@ -294,7 +400,27 @@ async function waitForGeneration(
   throw new Error("account runtime did not reach the expected generation");
 }
 
+async function waitForShutdown(shutdown: Promise<void> | null): Promise<void> {
+  if (shutdown === null) throw new Error("shutdown race did not start");
+  await shutdown;
+}
+
 describe("AccountRuntimeRouter", () => {
+  test("requires the one shared archive admission gate in production", () => {
+    type GateIsRequired = AccountRuntimeRouterOptions extends {
+      readonly archiveAdmissionGate: ArchiveAdmissionGate;
+    } ? true : false;
+    const gateIsRequired: GateIsRequired = true;
+
+    expect(gateIsRequired).toBeTrue();
+    expect(() => {
+      Reflect.construct(
+        ProductionAccountRuntimeRouter,
+        [Object.freeze({})],
+      );
+    }).toThrow("requires one shared archive admission gate");
+  });
+
   test("keeps fifty configured subscriptions within the default 32-runtime FD budget", async () => {
     const created: FakeProcess[] = [];
     const router = new AccountRuntimeRouter({
@@ -340,14 +466,13 @@ describe("AccountRuntimeRouter", () => {
       maximumLiveProcesses: 2,
     });
 
-    const firstA = await router.ensure(accountA, paths("a"), launchOptions());
-    const firstB = await router.ensure(accountB, paths("b"), launchOptions());
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const firstA = requireCreatedProcess(created, 0);
+    await router.ensure(accountB, paths("b"), launchOptions());
+    const firstB = requireCreatedProcess(created, 1);
     const accountC = "acct_account_c" as AccountSummary["id"];
-    const processC = await router.ensure(accountC, paths("c"), launchOptions());
-    if (
-      !(firstA instanceof FakeProcess) || !(firstB instanceof FakeProcess) ||
-      !(processC instanceof FakeProcess)
-    ) throw new Error("missing capacity fixture process");
+    await router.ensure(accountC, paths("c"), launchOptions());
+    const processC = requireCreatedProcess(created, 2);
 
     expect(created[0]).toBe(firstA);
     expect(created[1]).toBe(firstB);
@@ -384,14 +509,14 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const first = await router.ensure(accountA, paths("capacity-fence-a"), launchOptions());
-    if (!(first instanceof FakeProcess)) throw new Error("missing capacity-fence process");
+    await router.ensure(accountA, paths("capacity-fence-a"), launchOptions());
+    const first = requireCreatedProcess(created, 0);
 
     const admitted = router.ensure(accountB, paths("capacity-fence-b"), launchOptions());
     const fenced = router.fenceGeneration(accountA, first.generation);
     expect(await fenced).toBe("fenced");
-    const second = await admitted;
-    if (!(second instanceof FakeProcess)) throw new Error("missing admitted process");
+    await admitted;
+    requireCreatedProcess(created, 1);
 
     expect(first.expired).toEqual(["stopped"]);
     expect(created.map(({ profileId }) => profileId)).toEqual([accountA, accountB]);
@@ -413,8 +538,8 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const processA = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(processA instanceof FakeProcess)) throw new Error("missing active fixture process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const processA = requireCreatedProcess(created, 0);
     await processA.callbacks.onNotification?.(turnLifecycleNotification(
       "turn/started",
       processA.generation,
@@ -436,10 +561,9 @@ describe("AccountRuntimeRouter", () => {
       "thread-active-a",
       "turn-active-a",
     ));
-    const [processB, processC] = await Promise.all([second, third]);
-    if (!(processB instanceof FakeProcess) || !(processC instanceof FakeProcess)) {
-      throw new Error("missing queued fixture process");
-    }
+    await Promise.all([second, third]);
+    const processB = requireCreatedProcess(created, 1);
+    const processC = requireCreatedProcess(created, 2);
 
     expect(processB.profileId).toBe(accountB);
     expect(processC.profileId).toBe(accountC);
@@ -464,8 +588,8 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const processA = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(processA instanceof FakeProcess)) throw new Error("missing response fixture process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const processA = requireCreatedProcess(created, 0);
     await router.request(accountA, "turnStart", {
       threadId: "thread-response-active",
       clientUserMessageId: "message-response-active",
@@ -488,8 +612,8 @@ describe("AccountRuntimeRouter", () => {
       "thread-response-active",
       "turn-response-active",
     ));
-    const processB = await second;
-    if (!(processB instanceof FakeProcess)) throw new Error("missing replacement fixture process");
+    await second;
+    const processB = requireCreatedProcess(created, 1);
     expect(processB.profileId).toBe(accountB);
     expect(created).toHaveLength(2);
   });
@@ -505,8 +629,8 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const processA = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(processA instanceof FakeProcess)) throw new Error("missing race fixture process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const processA = requireCreatedProcess(created, 0);
     const responseGate = deferred<void>();
     processA.delayNextTurnStartResponse(responseGate.promise);
     const start = router.request(accountA, "turnStart", {
@@ -523,8 +647,8 @@ describe("AccountRuntimeRouter", () => {
     responseGate.resolve();
     await start;
 
-    const processB = await router.ensure(accountB, paths("b"), launchOptions());
-    if (!(processB instanceof FakeProcess)) throw new Error("missing race replacement process");
+    await router.ensure(accountB, paths("b"), launchOptions());
+    const processB = requireCreatedProcess(created, 1);
     expect(processB.profileId).toBe(accountB);
     expect(created).toHaveLength(2);
     expect(created[0]?.expired).toEqual(["stopped"]);
@@ -541,8 +665,8 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const processA = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(processA instanceof FakeProcess)) throw new Error("missing timeout fixture process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const processA = requireCreatedProcess(created, 0);
     await processA.callbacks.onNotification?.(turnLifecycleNotification(
       "turn/started",
       processA.generation,
@@ -574,8 +698,8 @@ describe("AccountRuntimeRouter", () => {
       },
       maximumLiveProcesses: 1,
     });
-    const processA = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(processA instanceof FakeProcess)) throw new Error("missing request fixture process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const processA = requireCreatedProcess(created, 0);
     const request: CodexServerRequest = {
       generation: processA.generation,
       id: 71,
@@ -606,8 +730,8 @@ describe("AccountRuntimeRouter", () => {
       code: -32_600,
       message: "Unsupported",
     });
-    const processB = await second;
-    if (!(processB instanceof FakeProcess)) throw new Error("missing admitted fixture process");
+    await second;
+    const processB = requireCreatedProcess(created, 1);
     expect(processB.profileId).toBe(accountB);
     expect(created).toHaveLength(2);
     expect(created[0]?.expired).toEqual(["stopped"]);
@@ -856,7 +980,8 @@ describe("AccountRuntimeRouter", () => {
       router.ensure(accountA, paths("a"), launchOptions()),
       router.ensure(accountA, paths("a"), launchOptions()),
     ]);
-    expect(first).toBe(second);
+    expect(first).toEqual(second);
+    expect("protocol" in first).toBeFalse();
     expect(created).toHaveLength(1);
     const [mismatch] = await Promise.allSettled([
       router.ensure(accountA, paths("b"), launchOptions()),
@@ -975,8 +1100,8 @@ describe("AccountRuntimeRouter", () => {
 
   test("routes the request after an ambiguous timeout only through a fresh generation", async () => {
     const { created, router } = fakeRouter();
-    const first = await router.ensure(accountA, paths("a"), launchOptions());
-    if (!(first instanceof FakeProcess)) throw new Error("missing first fake process");
+    await router.ensure(accountA, paths("a"), launchOptions());
+    const first = requireCreatedProcess(created, 0);
     first.timeoutNextRequest();
 
     const [timedOut] = await Promise.allSettled([
@@ -1178,10 +1303,13 @@ describe("AccountRuntimeRouter", () => {
     const options = launchOptions(0, (generation) => {
       persistedGenerations.push(generation);
     });
-    const first = await router.ensure(accountA, paths("exact-fence"), options);
-    if (!(first instanceof FakeProcess)) throw new Error("missing first fence process");
-    const second = await router.restart(accountA);
-    if (!(second instanceof FakeProcess)) throw new Error("missing second fence process");
+    const firstObservation = await router.ensure(accountA, paths("exact-fence"), options);
+    const first = requireCreatedProcess(created, 0);
+    const secondObservation = await router.restart(accountA);
+    const second = requireCreatedProcess(created, 1);
+    expect(firstObservation).toEqual({ generation: 1, status: "running" });
+    expect(secondObservation).toEqual({ generation: 2, status: "running" });
+    expect("protocol" in firstObservation).toBeFalse();
 
     expect(await router.fenceGeneration(accountA, first.generation)).toBe("already_fenced");
     expect(router.generation(accountA)).toBe(second.generation);
@@ -1202,6 +1330,1758 @@ describe("AccountRuntimeRouter", () => {
     });
     expect(persistedGenerations).toEqual([1, 2, 3]);
     expect(created.map(({ generation }) => generation)).toEqual([1, 2, 3]);
+  });
+
+  test("counts an accepted non-turn callback until its consumer joins", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const callbackEntered = deferred<void>();
+    const releaseCallback = deferred<void>();
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        async onNotification() {
+          callbackEntered.resolve();
+          await releaseCallback.promise;
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("archive-callback-flight"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    const callback = process.callbacks.onNotification?.({
+      generation: process.generation,
+      streamPosition: 2,
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await callbackEntered.promise;
+
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).toThrow(AccountRuntimeNotQuiescentError);
+    expect(gate.isHeld(accountA)).toBeFalse();
+
+    releaseCallback.resolve();
+    await callback;
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).not.toThrow();
+    await router.stopAll();
+  });
+
+  test("keeps a suppressed callback generation quarantined until exact teardown", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let callbackDispatches = 0;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onServerRequest() {
+          callbackDispatches += 1;
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("archive-callback-quarantine"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    router.assertArchiveTransitionQuiescent(accountA, process.generation);
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-callback-quarantine",
+      purpose: "pane_archive",
+      transitionId: "transition-callback-quarantine",
+    });
+    await process.callbacks.onServerRequest?.(
+      approvalServerRequest(process.generation, 799),
+    );
+    expect(callbackDispatches).toBe(0);
+    expect(() => router.assertArchiveTransitionProvisionalReleaseSafe(
+      accountA,
+      process.generation,
+    )).toThrow(AccountRuntimeNotQuiescentError);
+
+    gate.abortProvisional(provisional);
+    expect(router.request(
+      accountA,
+      "accountRead",
+      { refreshToken: false },
+      process.generation,
+    )).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(process.requests).toEqual([]);
+
+    expect(await router.fenceGeneration(accountA, process.generation)).toBe("fenced");
+    expect(router.request(
+      accountA,
+      "accountRead",
+      { refreshToken: false },
+    )).resolves.toMatchObject({ account: { type: "chatgpt" } });
+    expect(created).toHaveLength(2);
+    expect(created[1]?.generation).toBe(2);
+    await router.stopAll();
+  });
+
+  test("refuses archive quarantine while an exact provider turn remains active", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("archive-active-turn"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    await process.callbacks.onNotification?.(turnLifecycleNotification(
+      "turn/started",
+      process.generation,
+      "thread-archive-active",
+      "turn-archive-active",
+    ));
+
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).toThrow(AccountRuntimeNotQuiescentError);
+    expect(gate.isHeld(accountA)).toBeFalse();
+
+    await process.callbacks.onNotification?.(turnLifecycleNotification(
+      "turn/completed",
+      process.generation,
+      "thread-archive-active",
+      "turn-archive-active",
+    ));
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).not.toThrow();
+    await router.stopAll();
+  });
+
+  test("refuses archive quarantine while a provider server request awaits settlement", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: { onServerRequest: () => undefined },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("archive-pending-request"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    const request = approvalServerRequest(process.generation, 800);
+    await process.callbacks.onServerRequest?.(request);
+
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).toThrow(AccountRuntimeNotQuiescentError);
+    expect(gate.isHeld(accountA)).toBeFalse();
+
+    await router.respond(accountA, request, {
+      type: "error",
+      code: -32_600,
+      message: "Unsupported",
+    });
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).not.toThrow();
+    await router.stopAll();
+  });
+
+  test("refuses archive quarantine while provider login authority remains pending", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("archive-pending-login"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    await router.request(accountA, "accountLoginStart", { type: "chatgpt" });
+
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).toThrow(AccountRuntimeNotQuiescentError);
+
+    await router.request(accountA, "accountLoginCancel", {
+      loginId: "login-router-quiescence",
+    });
+    expect(() => router.assertArchiveTransitionQuiescent(
+      accountA,
+      process.generation,
+    )).not.toThrow();
+    await router.stopAll();
+  });
+
+  test("keeps every ordinary provider surface closed until the final archive hold releases", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const observation = await router.ensure(
+      accountA,
+      paths("archive-ordinary"),
+      launchOptions(),
+    );
+    const process = requireCreatedProcess(created, 0);
+    expect(observation).toEqual({ generation: 1, status: "running" });
+    expect("protocol" in observation).toBeFalse();
+    const first = gate.retain(archiveDescriptor("ordinary-first"));
+    const second = gate.retain(archiveDescriptor("ordinary-second"));
+    const requestCount = process.requests.length;
+
+    const outcomes = await Promise.allSettled([
+      router.ensure(accountA, paths("archive-ordinary"), launchOptions()),
+      router.request(accountA, "accountRead", { refreshToken: false }),
+      router.requestWithResponsePosition(
+        accountA,
+        "accountRead",
+        { refreshToken: false },
+      ),
+      router.restart(accountA),
+      router.stop(accountA),
+    ]);
+    expect(outcomes.every(({ status }) => status === "rejected")).toBeTrue();
+    for (const outcome of outcomes) {
+      if (outcome.status === "rejected") {
+        expect(outcome.reason).toBeInstanceOf(ArchiveAdmissionHeldError);
+      }
+    }
+    expect(process.requests).toHaveLength(requestCount);
+    expect(created).toHaveLength(1);
+    expect(router.isRunning(accountA)).toBeTrue();
+    expect(router.generation(accountA)).toBe(1);
+    expect(router.configuredAccountProfileIds()).toEqual([accountA]);
+
+    gate.release(first);
+    expect(
+      router.request(accountA, "accountRead", { refreshToken: false }),
+    ).rejects.toBeInstanceOf(ArchiveAdmissionHeldError);
+    gate.release(second);
+    expect(
+      router.request(accountA, "accountRead", { refreshToken: false }),
+    ).resolves.toMatchObject({ account: { type: "chatgpt" } });
+  });
+
+  test("suppresses capabilities, callbacks, eviction, and fault restart while held", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const serverRequests: CodexServerRequest[] = [];
+    const dynamicRequests: PinnedCodexDynamicToolRequest[] = [];
+    const providerEvents: string[] = [];
+    const stateEvents: string[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onDynamicToolRequest(_accountProfileId, request) {
+          dynamicRequests.push(request);
+        },
+        onServerRequest(_accountProfileId, request) {
+          serverRequests.push(request);
+        },
+        onDiagnostic() {
+          providerEvents.push("diagnostic");
+        },
+        onNotification() {
+          providerEvents.push("notification");
+        },
+        onServerRequestExpired() {
+          providerEvents.push("expired");
+        },
+        onState(_accountProfileId, state) {
+          stateEvents.push(state.type);
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      dynamicToolCapability: async ({ accountProfileId, generation }) =>
+        await dynamicToolCapability(accountProfileId, generation),
+      policy: {
+        initialDelayMs: 1,
+        maximumDelayMs: 1,
+        maximumRestartAttempts: 1,
+      },
+      sleep: () => Promise.resolve(),
+    });
+    await router.ensure(accountA, paths("archive-callbacks"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    expect(router.supportsDynamicTool(accountA, 1)).toBeTrue();
+    expect(router.readDynamicToolCapability(accountA, 1)).not.toBeNull();
+    stateEvents.length = 0;
+
+    const handle = gate.retain(archiveDescriptor("callbacks"));
+    expect(router.supportsDynamicTool(accountA, 1)).toBeFalse();
+    expect(router.readDynamicToolCapability(accountA, 1)).toBeNull();
+    const serverRequest = approvalServerRequest(process.generation, 801);
+    const dynamicRequest = archiveDynamicToolRequest(process.generation);
+    await process.callbacks.onServerRequest?.(serverRequest);
+    await process.callbacks.onDynamicToolRequest?.(dynamicRequest);
+    await process.callbacks.onNotification?.({
+      generation: 1,
+      streamPosition: 2,
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await process.callbacks.onDiagnostic?.({
+      type: "unknown_notification",
+      generation: 1,
+      method: "future/notification",
+    });
+    await process.callbacks.onServerRequestExpired?.({
+      type: "server_request_expired",
+      generation: 1,
+      method: "future/request",
+      reason: "unsupported_method",
+    });
+    expect(serverRequests).toEqual([]);
+    expect(dynamicRequests).toEqual([]);
+    expect(providerEvents).toEqual([]);
+
+    process.fault("process_exited");
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+    expect(created).toHaveLength(1);
+    expect(router.generation(accountA)).toBe(1);
+    expect(await router.fenceGeneration(accountA, 1)).toBe("fenced");
+    expect(process.expired).toEqual(["stopped"]);
+    expect(stateEvents).toEqual(["stopped"]);
+    gate.release(handle);
+    await router.stopAll();
+  });
+
+  test("rechecks ordinary admission at every asynchronous provider boundary", async () => {
+    {
+      const gate = new ArchiveAdmissionGate();
+      const created: FakeProcess[] = [];
+      let persisted = 0;
+      const router = new AccountRuntimeRouter({
+        archiveAdmissionGate: gate,
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        policy: {
+          initialDelayMs: 1,
+          maximumDelayMs: 1,
+          maximumRestartAttempts: 1,
+        },
+        sleep: () => Promise.resolve(),
+      });
+      expect(router.ensure(
+        accountA,
+        paths("race-before-create"),
+        launchOptions(0, () => {
+          persisted += 1;
+          gate.retain(archiveDescriptor("race-before-create"));
+        }),
+      )).rejects.toBeInstanceOf(Error);
+      expect(persisted).toBe(1);
+      expect(created).toEqual([]);
+      await router.stopAll();
+    }
+    const creationBoundaries = [
+      "capacity_admission",
+      "dynamic_tool_capability",
+      "process_creation",
+    ] as const;
+    for (const boundary of creationBoundaries) {
+      const gate = new ArchiveAdmissionGate();
+      const created: FakeProcess[] = [];
+      let retained: ArchiveAdmissionHandle | null = null;
+      let resolutions = 0;
+      const router = new AccountRuntimeRouter({
+        archiveAdmissionGate: gate,
+        callbacks: { onDynamicToolRequest: () => undefined },
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        dynamicToolCapability: async ({ accountProfileId, generation }) => {
+          resolutions += 1;
+          return await dynamicToolCapability(accountProfileId, generation);
+        },
+        policy: {
+          initialDelayMs: 1,
+          maximumDelayMs: 1,
+          maximumRestartAttempts: 1,
+        },
+        sleep: () => Promise.resolve(),
+        testHooks: {
+          beforeBoundary(input) {
+            if (input.boundary === boundary && retained === null) {
+              retained = gate.retain(archiveDescriptor(`race-${boundary}`));
+            }
+          },
+        },
+      });
+      expect(
+        router.ensure(accountA, paths(`race-${boundary}`), launchOptions()),
+      ).rejects.toBeInstanceOf(Error);
+      expect(retained).not.toBeNull();
+      expect(created).toHaveLength(0);
+      if (boundary === "dynamic_tool_capability") expect(resolutions).toBe(0);
+      if (boundary === "process_creation") expect(resolutions).toBe(1);
+      await router.stopAll();
+    }
+
+    const rpcBoundaries = [
+      "request",
+      "request_with_position",
+      "restart",
+      "respond",
+    ] as const;
+    for (const boundary of rpcBoundaries) {
+      const gate = new ArchiveAdmissionGate();
+      const created: FakeProcess[] = [];
+      let armed = false;
+      let retained: ArchiveAdmissionHandle | null = null;
+      const router = new AccountRuntimeRouter({
+        archiveAdmissionGate: gate,
+        callbacks: { onServerRequest: () => undefined },
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        testHooks: {
+          beforeBoundary(input) {
+            if (armed && input.boundary === boundary && retained === null) {
+              retained = gate.retain(archiveDescriptor(`race-${boundary}`));
+            }
+          },
+        },
+      });
+      await router.ensure(
+        accountA,
+        paths(`race-${boundary}`),
+        launchOptions(),
+      );
+      const process = requireCreatedProcess(created, 0);
+      const request = approvalServerRequest(process.generation, 900);
+      if (boundary === "respond") await process.callbacks.onServerRequest?.(request);
+      armed = true;
+      const operation = boundary === "request"
+        ? router.request(accountA, "accountRead", { refreshToken: false })
+        : boundary === "request_with_position"
+          ? router.requestWithResponsePosition(
+              accountA,
+              "accountRead",
+              { refreshToken: false },
+            )
+          : boundary === "restart"
+            ? router.restart(accountA)
+            : router.respond(accountA, request, {
+                type: "error",
+                code: -32_600,
+                message: "quarantined",
+              });
+      expect(operation).rejects.toBeInstanceOf(ArchiveAdmissionHeldError);
+      expect(retained).not.toBeNull();
+      expect(process.requests).toEqual([]);
+      expect(process.responses).toEqual([]);
+      expect(created).toHaveLength(1);
+      expect(process.expired).toEqual([]);
+      await router.stopAll();
+    }
+  });
+
+  test("admits only exact handle-bound archive and strict-cut reconciliation requests", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let capabilityResolutions = 0;
+    const stateEvents: string[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onDynamicToolRequest: () => undefined,
+        onState(_accountProfileId, state) {
+          stateEvents.push(state.type);
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      dynamicToolCapability: () => {
+        capabilityResolutions += 1;
+        return null;
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-recovery",
+      purpose: "pane_archive",
+      transitionId: "transition-recovery",
+    });
+    const preparedHandle = gate.promote(
+      provisional,
+      archiveDescriptor("recovery"),
+    );
+    const recoveryObservation = await router.ensureArchiveRecovery(
+      accountA,
+      paths("archive-recovery"),
+      launchOptions(),
+      preparedHandle,
+    );
+    const directProcess = requireCreatedProcess(created, 0);
+    expect(recoveryObservation).toEqual({ generation: 1, status: "running" });
+    expect("protocol" in recoveryObservation).toBeFalse();
+    expect(directProcess.dynamicToolCapability).toBeNull();
+    expect(directProcess.callbacks.onDynamicToolRequest).toBeDefined();
+    expect(capabilityResolutions).toBe(0);
+    expect(router.supportsDynamicTool(accountA, 1)).toBeFalse();
+    expect(stateEvents).toEqual([]);
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      preparedHandle,
+      "threadArchive",
+      { threadId: "thread-recovery" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    const directHandle = gate.replace(preparedHandle, archiveDescriptor("recovery", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "threadArchive",
+      { threadId: "thread-other" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "threadArchive",
+      { threadId: "thread-recovery" },
+      2,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountB,
+      directHandle,
+      "threadArchive",
+      { threadId: "thread-recovery" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "accountRead" as "threadArchive",
+      { threadId: "thread-recovery" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "threadList",
+      { archived: true },
+      2,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(directProcess.requests).toEqual([]);
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "threadArchive",
+      { threadId: "thread-recovery" },
+      1,
+    )).resolves.toEqual({ generation: 1, output: undefined, streamPosition: 1 });
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      directHandle,
+      "threadArchive",
+      { threadId: "thread-recovery" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(await router.fenceGeneration(accountA, 1)).toBe("fenced");
+    expect(stateEvents).toEqual(["stopped"]);
+
+    const cutHandle = gate.replace(directHandle, archiveDescriptor("recovery", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "ambiguous",
+      cutAuthority: { hmac: "d".repeat(64), revision: 6 },
+      successorGeneration: 2,
+    }));
+    expect(router.ensureArchiveRecovery(
+      accountA,
+      paths("archive-recovery"),
+      launchOptions(),
+      directHandle,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    const successor = await router.ensureArchiveRecovery(
+      accountA,
+      paths("archive-recovery"),
+      launchOptions(),
+      cutHandle,
+    );
+    expect(successor.generation).toBe(2);
+    expect(created[1]?.dynamicToolCapability).toBeNull();
+    expect(capabilityResolutions).toBe(0);
+    expect(stateEvents).toEqual(["stopped"]);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      cutHandle,
+      "threadList",
+      { archived: true },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      cutHandle,
+      "threadList",
+      { archived: true },
+      2,
+    )).resolves.toMatchObject({
+      generation: 2,
+      output: { data: [], nextCursor: null },
+    });
+    gate.release(cutHandle);
+    expect(
+      router.request(accountA, "accountRead", { refreshToken: false }, 2),
+    ).resolves.toMatchObject({ account: { type: "chatgpt" } });
+  });
+
+  test("consumes the exact authorized thread-archived notification without tainting reuse", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let notificationDispatches = 0;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onNotification() {
+          notificationDispatches += 1;
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(
+      accountA,
+      paths("archive-expected-notification"),
+      launchOptions(),
+    );
+    const process = requireCreatedProcess(created, 0);
+    router.assertArchiveTransitionQuiescent(accountA, process.generation);
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-expected-notification",
+      purpose: "pane_archive",
+      transitionId: "transition-expected-notification",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("expected-notification"),
+    );
+    const handle = gate.replace(
+      prepared,
+      archiveDescriptor("expected-notification", {
+        attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+        attemptPhase: "effect_started",
+      }),
+    );
+    process.emitThreadArchivedOnNextArchive();
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      handle,
+      "threadArchive",
+      { threadId: "thread-expected-notification" },
+      process.generation,
+    )).resolves.toEqual({
+      generation: process.generation,
+      output: undefined,
+      streamPosition: 1,
+    });
+    expect(notificationDispatches).toBe(0);
+
+    gate.release(handle);
+    expect(router.request(
+      accountA,
+      "accountRead",
+      { refreshToken: false },
+      process.generation,
+    )).resolves.toMatchObject({ account: { type: "chatgpt" } });
+
+    router.assertArchiveTransitionQuiescent(accountA, process.generation);
+    const lateProvisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-late-expected-notification",
+      purpose: "pane_archive",
+      transitionId: "transition-late-expected-notification",
+    });
+    const latePrepared = gate.promote(
+      lateProvisional,
+      archiveDescriptor("late-expected-notification"),
+    );
+    const lateHandle = gate.replace(
+      latePrepared,
+      archiveDescriptor("late-expected-notification", {
+        attemptAuthority: { hmac: "d".repeat(64), revision: 5 },
+        attemptPhase: "effect_started",
+      }),
+    );
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      lateHandle,
+      "threadArchive",
+      { threadId: "thread-late-expected-notification" },
+      process.generation,
+    )).resolves.toMatchObject({ generation: process.generation });
+    gate.release(lateHandle);
+    await process.callbacks.onNotification?.({
+      generation: process.generation,
+      streamPosition: 3,
+      method: "thread/archived",
+      params: { threadId: "thread-late-expected-notification" },
+    });
+    expect(notificationDispatches).toBe(0);
+    expect(router.request(
+      accountA,
+      "accountRead",
+      { refreshToken: false },
+      process.generation,
+    )).resolves.toMatchObject({ account: { type: "chatgpt" } });
+    await router.stopAll();
+  });
+
+  test("rechecks exclusive provider quiescence at the final archive dispatch boundary", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let armed = false;
+    let callbackDispatches = 0;
+    let processAtBoundary: FakeProcess | null = null;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onServerRequest() {
+          callbackDispatches += 1;
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      testHooks: {
+        async beforeBoundary(input) {
+          if (!armed || input.boundary !== "archive_recovery_request") return;
+          const process = processAtBoundary;
+          if (process === null) throw new Error("archive process missing");
+          await process.callbacks.onServerRequest?.(
+            approvalServerRequest(process.generation, 1_001),
+          );
+        },
+      },
+    });
+    await router.ensure(accountA, paths("archive-dispatch-race"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    processAtBoundary = process;
+
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-dispatch-race",
+      purpose: "pane_archive",
+      transitionId: "transition-dispatch-race",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("dispatch-race"),
+    );
+    const handle = gate.replace(
+      prepared,
+      archiveDescriptor("dispatch-race", {
+        attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+        attemptPhase: "effect_started",
+      }),
+    );
+    armed = true;
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      handle,
+      "threadArchive",
+      { threadId: "thread-dispatch-race" },
+      process.generation,
+    )).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(callbackDispatches).toBe(0);
+    expect(process.requests).toEqual([]);
+    gate.release(handle);
+    await router.stopAll();
+  });
+
+  test("rejects a clean archive response tainted by a foreign callback in flight", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let notificationDispatches = 0;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onNotification() {
+          notificationDispatches += 1;
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-response-callback-race",
+      purpose: "pane_archive",
+      transitionId: "transition-response-callback-race",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("response-callback-race"),
+    );
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("archive-response-callback-race"),
+      launchOptions(),
+      prepared,
+    );
+    const process = requireCreatedProcess(created, 0);
+    const handle = gate.replace(
+      prepared,
+      archiveDescriptor("response-callback-race", {
+        attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+        attemptPhase: "effect_started",
+      }),
+    );
+    const responseGate = deferred<void>();
+    process.delayNextArchiveResponse(responseGate.promise);
+    const request = router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      handle,
+      "threadArchive",
+      { threadId: "thread-response-callback-race" },
+      process.generation,
+    );
+    await Bun.sleep(0);
+    expect(process.requests).toHaveLength(1);
+
+    await process.callbacks.onNotification?.({
+      generation: process.generation,
+      streamPosition: 2,
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    expect(notificationDispatches).toBe(0);
+    responseGate.resolve();
+    expect(request).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(gate.isHeld(accountA)).toBeTrue();
+
+    gate.release(handle);
+    expect(router.request(
+      accountA,
+      "accountRead",
+      { refreshToken: false },
+      process.generation,
+    )).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(await router.fenceGeneration(accountA, process.generation))
+      .toBe("fenced");
+    await router.stopAll();
+  });
+
+  test("invalidates an archive response when its exact handle is replaced in flight", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-response-race",
+      purpose: "pane_archive",
+      transitionId: "transition-response-race",
+    });
+    const prepared = gate.promote(provisional, archiveDescriptor("response-race"));
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("archive-response-race"),
+      launchOptions(),
+      prepared,
+    );
+    const process = requireCreatedProcess(created, 0);
+    const handle = gate.replace(prepared, archiveDescriptor("response-race", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    const responseGate = deferred<void>();
+    process.delayNextArchiveResponse(responseGate.promise);
+    const request = router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      handle,
+      "threadArchive",
+      { threadId: "thread-response-race" },
+      1,
+    );
+    await Bun.sleep(0);
+    expect(process.requests).toEqual([{
+      key: "threadArchive",
+      input: { threadId: "thread-response-race" },
+    }]);
+    const successor = gate.replace(handle, archiveDescriptor("response-race", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "ambiguous",
+      cutAuthority: { hmac: "d".repeat(64), revision: 6 },
+      successorGeneration: 2,
+    }));
+    responseGate.resolve();
+    expect(request).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(process.requests).toHaveLength(1);
+    expect(gate.isHeld(accountA)).toBeTrue();
+    gate.release(successor);
+  });
+
+  test("never relaunches a stopped effect-started source generation", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-stopped-effect",
+      purpose: "pane_archive",
+      transitionId: "transition-stopped-effect",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("stopped-effect"),
+    );
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("stopped-effect"),
+      launchOptions(),
+      prepared,
+    );
+    const source = requireCreatedProcess(created, 0);
+    const effectStarted = gate.replace(prepared, archiveDescriptor("stopped-effect", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    expect(await router.fenceGeneration(accountA, 1)).toBe("fenced");
+
+    expect(router.ensureArchiveRecovery(
+      accountA,
+      paths("stopped-effect"),
+      launchOptions(),
+      effectStarted,
+    )).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      effectStarted,
+      "threadArchive",
+      { threadId: "thread-stopped-effect" },
+      1,
+    )).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(created).toHaveLength(1);
+    expect(source.requests).toEqual([]);
+  });
+
+  test("creates only the exact contained successor for thread-list reconciliation", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-successor-create",
+      purpose: "pane_archive",
+      transitionId: "transition-successor-create",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("successor-create"),
+    );
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("successor-create"),
+      launchOptions(),
+      prepared,
+    );
+    const source = requireCreatedProcess(created, 0);
+    const effectStarted = gate.replace(prepared, archiveDescriptor("successor-create", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    const ambiguous = gate.replace(effectStarted, archiveDescriptor("successor-create", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "ambiguous",
+      cutAuthority: { hmac: "d".repeat(64), revision: 6 },
+      successorGeneration: 2,
+    }));
+    expect(await router.fenceGeneration(accountA, 1)).toBe("fenced");
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      ambiguous,
+      "threadList",
+      { archived: true },
+      2,
+    )).resolves.toMatchObject({
+      generation: 2,
+      output: { data: [], nextCursor: null },
+    });
+    expect(created.map(({ generation }) => generation)).toEqual([1, 2]);
+    expect(source.requests).toEqual([]);
+    expect(requireCreatedProcess(created, 1).requests).toEqual([{
+      key: "threadList",
+      input: { archived: true },
+    }]);
+  });
+
+  test("gives replayed effect-started admission zero archive mutation authority", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(
+      accountA,
+      paths("replayed-effect"),
+      launchOptions(),
+    );
+    const process = requireCreatedProcess(created, 0);
+    const replayed = gate.retain(archiveDescriptor("replayed-effect", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("replayed-effect"),
+      launchOptions(),
+      replayed,
+    );
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      replayed,
+      "threadArchive",
+      { threadId: "thread-replayed-effect" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(process.requests).toEqual([]);
+  });
+
+  test("invalidates archive recovery after an account-removal hold wins in flight", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-removal-race",
+      purpose: "pane_archive",
+      transitionId: "transition-removal-race",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("removal-race"),
+    );
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("removal-race"),
+      launchOptions(),
+      prepared,
+    );
+    const process = requireCreatedProcess(created, 0);
+    const effectStarted = gate.replace(prepared, archiveDescriptor("removal-race", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    const responseGate = deferred<void>();
+    process.delayNextArchiveResponse(responseGate.promise);
+    const request = router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      effectStarted,
+      "threadArchive",
+      { threadId: "thread-removal-race" },
+      1,
+    );
+    await Bun.sleep(0);
+    const removalProvisional = gate.retainAccountRemovalProvisional({
+      accountProfileId: accountA,
+      expectedGeneration: 1,
+      transitionId: "account-removal-race",
+    });
+    const removal = gate.promoteAccountRemoval(removalProvisional, {
+      accountProfileId: accountA,
+      cutAuthority: { hmac: "9".repeat(64), revision: 1 },
+      expectedGeneration: 1,
+      transitionId: "account-removal-race",
+    });
+    responseGate.resolve();
+
+    expect(request).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(process.requests).toEqual([{
+      key: "threadArchive",
+      input: { threadId: "thread-removal-race" },
+    }]);
+    gate.releaseAccountRemoval(removal);
+  });
+
+  test("binds targetless account removal to its exact source-generation fence only", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    await router.ensure(accountA, paths("account-removal"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    const removal = gate.retainAccountRemoval({
+      accountProfileId: accountA,
+      cutAuthority: { hmac: "9".repeat(64), revision: 1 },
+      expectedGeneration: 1,
+      transitionId: "account-removal-router",
+    });
+
+    expect(router.stop(accountA)).rejects.toBeInstanceOf(
+      ArchiveAdmissionHeldError,
+    );
+    expect(router.ensureArchiveRecovery(
+      accountA,
+      paths("account-removal"),
+      launchOptions(),
+      removal as unknown as ArchiveAdmissionHandle,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.fenceAccountRemovalGeneration(accountB, removal))
+      .rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(await router.fenceAccountRemovalGeneration(accountA, removal)).toBe(
+      "fenced",
+    );
+    expect(process.expired).toEqual(["stopped"]);
+    expect(created).toHaveLength(1);
+    gate.releaseAccountRemoval(removal);
+    expect(router.fenceAccountRemovalGeneration(accountA, removal))
+      .rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+  });
+
+  test("rejects archive recovery generation floors not authorized by the handle", () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let persisted = 0;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const handle = gate.retain(archiveDescriptor("generation-floor"));
+    expect(router.ensureArchiveRecovery(
+      accountA,
+      paths("generation-floor"),
+      launchOptions(41, () => { persisted += 1; }),
+      handle,
+    )).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(persisted).toBe(0);
+    expect(created).toEqual([]);
+    expect(router.configuredAccountProfileIds()).toEqual([]);
+    gate.release(handle);
+  });
+
+  test("admits no recovery RPC while a cut lacks exact successor authority", () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const direct = gate.retain(archiveDescriptor("cut-intermediate"));
+    const cutStarted = gate.replace(direct, archiveDescriptor("cut-intermediate", {
+      cutAuthority: { hmac: "d".repeat(64), revision: 6 },
+    }));
+    expect(router.ensureArchiveRecovery(
+      accountA,
+      paths("cut-intermediate"),
+      launchOptions(),
+      cutStarted,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      cutStarted,
+      "threadArchive",
+      { threadId: "thread-cut-intermediate" },
+      1,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      cutStarted,
+      "threadList",
+      { archived: true },
+      2,
+    )).rejects.toBeInstanceOf(ArchiveAdmissionAuthorityError);
+    expect(created).toEqual([]);
+    expect(router.configuredAccountProfileIds()).toEqual([]);
+    gate.release(cutStarted);
+  });
+
+  test("cuts callback dispatch when quarantine arrives between ownership checks", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const dispatched: CodexServerRequest[] = [];
+    let armed = false;
+    let handle: ArchiveAdmissionHandle | null = null;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onServerRequest(_accountProfileId, request) {
+          dispatched.push(request);
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      testHooks: {
+        beforeBoundary(input) {
+          if (armed && input.boundary === "callback_dispatch" && handle === null) {
+            handle = gate.retain(archiveDescriptor("callback-race"));
+          }
+        },
+      },
+    });
+    await router.ensure(accountA, paths("callback-race"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    const request = approvalServerRequest(process.generation, 1_001);
+    armed = true;
+    await process.callbacks.onServerRequest?.(request);
+    expect(dispatched).toEqual([]);
+    expect(handle).not.toBeNull();
+    if (handle === null) throw new Error("callback race did not retain authority");
+    gate.release(handle);
+    expect(router.respond(accountA, request, {
+      type: "error",
+      code: -32_600,
+      message: "stale",
+    })).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(process.responses).toEqual([]);
+  });
+
+  test("does not restore callback ownership after a transient archive hold", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    const serverRequests: CodexServerRequest[] = [];
+    const dynamicRequests: PinnedCodexDynamicToolRequest[] = [];
+    let holdOrdinal = 0;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      callbacks: {
+        onDynamicToolRequest(_accountProfileId, request) {
+          dynamicRequests.push(request);
+        },
+        onServerRequest(_accountProfileId, request) {
+          serverRequests.push(request);
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      testHooks: {
+        beforeBoundary(input) {
+          if (input.boundary !== "callback_dispatch") return;
+          holdOrdinal += 1;
+          const handle = gate.retain(archiveDescriptor(
+            `transient-callback-${String(holdOrdinal)}`,
+          ));
+          gate.release(handle);
+        },
+      },
+    });
+    await router.ensure(accountA, paths("transient-callback"), launchOptions());
+    const process = requireCreatedProcess(created, 0);
+    const serverRequest = approvalServerRequest(process.generation, 1_002);
+
+    await process.callbacks.onServerRequest?.(serverRequest);
+    await process.callbacks.onDynamicToolRequest?.(
+      archiveDynamicToolRequest(process.generation),
+    );
+
+    expect(gate.isHeld(accountA)).toBeFalse();
+    expect(serverRequests).toEqual([]);
+    expect(dynamicRequests).toEqual([]);
+    expect(router.respond(accountA, serverRequest, {
+      type: "error",
+      code: -32_600,
+      message: "revoked",
+    })).rejects.toBeInstanceOf(AccountRuntimeNotQuiescentError);
+    expect(process.responses).toEqual([]);
+    await router.stopAll();
+  });
+
+  test("rejects every provider callback before its factory process is accepted", async () => {
+    const created: FakeProcess[] = [];
+    const dispatched: string[] = [];
+    const earlyServerRequest = approvalServerRequest(1, 1_010);
+    const router = new AccountRuntimeRouter({
+      admissionTimeoutMs: 25,
+      callbacks: {
+        onDiagnostic() {
+          dispatched.push("diagnostic");
+        },
+        onDynamicToolRequest() {
+          dispatched.push("dynamic");
+        },
+        onNotification() {
+          dispatched.push("notification");
+        },
+        onServerRequest() {
+          dispatched.push("server");
+        },
+        onServerRequestExpired() {
+          dispatched.push("expired");
+        },
+      },
+      async createProcess(input) {
+        const process = new FakeProcess(input);
+        if (input.accountProfileId === accountA) {
+          await invokeEveryProviderCallback(
+            input.callbacks,
+            input.generation,
+            earlyServerRequest,
+          );
+        }
+        created.push(process);
+        return process;
+      },
+      maximumLiveProcesses: 1,
+    });
+
+    await router.ensure(accountA, paths("factory-callback-a"), launchOptions());
+    const first = requireCreatedProcess(created, 0);
+    expect(dispatched).toEqual([]);
+    expect(router.respond(accountA, earlyServerRequest, {
+      type: "error",
+      code: -32_600,
+      message: "never-owned",
+    })).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(first.responses).toEqual([]);
+
+    await router.ensure(accountB, paths("factory-callback-b"), launchOptions());
+    expect(created).toHaveLength(2);
+    expect(first.expired).toEqual(["stopped"]);
+    expect(dispatched).toEqual([]);
+    await router.stopAll();
+  });
+
+  test("rejects every callback while restart expiration has no current process", async () => {
+    const created: FakeProcess[] = [];
+    const dispatched: string[] = [];
+    const expiringServerRequest = approvalServerRequest(1, 1_011);
+    const router = new AccountRuntimeRouter({
+      callbacks: {
+        onDiagnostic() {
+          dispatched.push("diagnostic");
+        },
+        onDynamicToolRequest() {
+          dispatched.push("dynamic");
+        },
+        onNotification() {
+          dispatched.push("notification");
+        },
+        onServerRequest() {
+          dispatched.push("server");
+        },
+        onServerRequestExpired() {
+          dispatched.push("expired");
+        },
+      },
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      policy: {
+        initialDelayMs: 1,
+        maximumDelayMs: 1,
+        maximumRestartAttempts: 1,
+      },
+      sleep: () => Promise.resolve(),
+    });
+    await router.ensure(accountA, paths("expiration-callback"), launchOptions());
+    const first = requireCreatedProcess(created, 0);
+    first.onExpire(async () => {
+      await invokeEveryProviderCallback(
+        first.callbacks,
+        first.generation,
+        expiringServerRequest,
+      );
+    });
+
+    expect(await router.restart(accountA)).toEqual({
+      generation: 2,
+      status: "running",
+    });
+    expect(dispatched).toEqual([]);
+    expect(created.map(({ generation }) => generation)).toEqual([1, 2]);
+    expect(router.respond(accountA, expiringServerRequest, {
+      type: "error",
+      code: -32_600,
+      message: "expired-owner",
+    })).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(first.responses).toEqual([]);
+    await router.stopAll();
+  });
+
+  test("cuts process creation and capability resolution when shutdown wins a yield", async () => {
+    {
+      const created: FakeProcess[] = [];
+      let shutdown: Promise<void> | null = null;
+      const router = new AccountRuntimeRouter({
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        testHooks: {
+          beforeBoundary(input) {
+            if (input.boundary === "process_creation" && shutdown === null) {
+              shutdown = router.stopAll();
+            }
+          },
+        },
+      });
+
+      expect(router.ensure(
+        accountA,
+        paths("shutdown-before-create"),
+        launchOptions(),
+      )).rejects.toBeInstanceOf(Error);
+      await waitForShutdown(shutdown);
+      expect(created).toEqual([]);
+      expect(router.supportsDynamicTool(accountA)).toBeFalse();
+      expect(router.readDynamicToolCapability(accountA, 1)).toBeNull();
+    }
+
+    {
+      const created: FakeProcess[] = [];
+      let resolutions = 0;
+      let shutdown: Promise<void> | null = null;
+      const router = new AccountRuntimeRouter({
+        callbacks: { onDynamicToolRequest: () => undefined },
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        dynamicToolCapability: async ({ accountProfileId, generation }) => {
+          resolutions += 1;
+          shutdown = router.stopAll();
+          await Promise.resolve();
+          return await dynamicToolCapability(accountProfileId, generation);
+        },
+      });
+
+      expect(router.ensure(
+        accountA,
+        paths("shutdown-in-capability"),
+        launchOptions(),
+      )).rejects.toBeInstanceOf(Error);
+      await waitForShutdown(shutdown);
+      expect(resolutions).toBe(1);
+      expect(created).toEqual([]);
+      expect(router.supportsDynamicTool(accountA)).toBeFalse();
+      expect(router.readDynamicToolCapability(accountA, 1)).toBeNull();
+    }
+  });
+
+  test("cuts every ordinary RPC boundary when shutdown starts during its hook", async () => {
+    const boundaries = [
+      "request",
+      "request_with_position",
+      "restart",
+      "respond",
+    ] as const;
+    for (const boundary of boundaries) {
+      const created: FakeProcess[] = [];
+      let armed = false;
+      let shutdown: Promise<void> | null = null;
+      const router = new AccountRuntimeRouter({
+        callbacks: { onServerRequest: () => undefined },
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        testHooks: {
+          beforeBoundary(input) {
+            if (armed && input.boundary === boundary && shutdown === null) {
+              shutdown = router.stopAll();
+            }
+          },
+        },
+      });
+      await router.ensure(
+        accountA,
+        paths(`shutdown-${boundary}`),
+        launchOptions(),
+      );
+      const process = requireCreatedProcess(created, 0);
+      const serverRequest = approvalServerRequest(process.generation, 1_100);
+      if (boundary === "respond") {
+        await process.callbacks.onServerRequest?.(serverRequest);
+      }
+      armed = true;
+      const operation = boundary === "request"
+        ? router.request(accountA, "accountRead", { refreshToken: false })
+        : boundary === "request_with_position"
+          ? router.requestWithResponsePosition(
+              accountA,
+              "accountRead",
+              { refreshToken: false },
+            )
+          : boundary === "restart"
+            ? router.restart(accountA)
+            : router.respond(accountA, serverRequest, {
+                type: "error",
+                code: -32_600,
+                message: "shutdown",
+              });
+
+      expect(operation).rejects.toBeInstanceOf(AccountRuntimeCapacityError);
+      await waitForShutdown(shutdown);
+      expect(process.requests).toEqual([]);
+      expect(process.responses).toEqual([]);
+      expect(created).toHaveLength(1);
+      expect(router.supportsDynamicTool(accountA)).toBeFalse();
+      expect(router.readDynamicToolCapability(accountA, process.generation)).toBeNull();
+    }
+  });
+
+  test("cuts archive RPC dispatch when shutdown starts at its final boundary", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let armed = false;
+    let shutdown: Promise<void> | null = null;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+      testHooks: {
+        beforeBoundary(input) {
+          if (
+            armed && input.boundary === "archive_recovery_request" &&
+            shutdown === null
+          ) {
+            shutdown = router.stopAll();
+          }
+        },
+      },
+    });
+    const provisional = gate.retainProvisional({
+      accountProfileId: accountA,
+      paneId: "pane-shutdown-archive",
+      purpose: "pane_archive",
+      transitionId: "transition-shutdown-archive",
+    });
+    const prepared = gate.promote(
+      provisional,
+      archiveDescriptor("shutdown-archive"),
+    );
+    await router.ensureArchiveRecovery(
+      accountA,
+      paths("shutdown-archive"),
+      launchOptions(),
+      prepared,
+    );
+    const process = requireCreatedProcess(created, 0);
+    const effect = gate.replace(prepared, archiveDescriptor("shutdown-archive", {
+      attemptAuthority: { hmac: "c".repeat(64), revision: 5 },
+      attemptPhase: "effect_started",
+    }));
+    armed = true;
+
+    expect(router.requestArchiveRecoveryWithResponsePosition(
+      accountA,
+      effect,
+      "threadArchive",
+      { threadId: "thread-shutdown-archive" },
+      process.generation,
+    )).rejects.toBeInstanceOf(AccountRuntimeCapacityError);
+    await waitForShutdown(shutdown);
+    expect(process.requests).toEqual([]);
+    gate.release(effect);
+  });
+
+  test("cuts server and dynamic callbacks when shutdown starts at dispatch", async () => {
+    for (const callbackKind of ["server", "dynamic"] as const) {
+      const created: FakeProcess[] = [];
+      const dispatched: string[] = [];
+      let armed = false;
+      let shutdown: Promise<void> | null = null;
+      const router = new AccountRuntimeRouter({
+        callbacks: {
+          onDynamicToolRequest() {
+            dispatched.push("dynamic");
+          },
+          onServerRequest() {
+            dispatched.push("server");
+          },
+        },
+        createProcess(input) {
+          const process = new FakeProcess(input);
+          created.push(process);
+          return Promise.resolve(process);
+        },
+        testHooks: {
+          beforeBoundary(input) {
+            if (
+              armed && input.boundary === "callback_dispatch" &&
+              shutdown === null
+            ) {
+              shutdown = router.stopAll();
+            }
+          },
+        },
+      });
+      await router.ensure(
+        accountA,
+        paths(`shutdown-callback-${callbackKind}`),
+        launchOptions(),
+      );
+      const process = requireCreatedProcess(created, 0);
+      armed = true;
+      if (callbackKind === "server") {
+        await process.callbacks.onServerRequest?.(
+          approvalServerRequest(process.generation, 1_200),
+        );
+      } else {
+        await process.callbacks.onDynamicToolRequest?.(
+          archiveDynamicToolRequest(process.generation),
+        );
+      }
+      await waitForShutdown(shutdown);
+      expect(dispatched).toEqual([]);
+      expect(router.supportsDynamicTool(accountA)).toBeFalse();
+      expect(router.readDynamicToolCapability(accountA, process.generation)).toBeNull();
+    }
+  });
+
+  test("does not let a sibling N+1 archive handle authorize the N start flight", async () => {
+    const gate = new ArchiveAdmissionGate();
+    const created: FakeProcess[] = [];
+    let siblingAttempt: Promise<unknown> | null = null;
+    const router = new AccountRuntimeRouter({
+      archiveAdmissionGate: gate,
+      createProcess(input) {
+        const process = new FakeProcess(input);
+        created.push(process);
+        return Promise.resolve(process);
+      },
+    });
+    const source = gate.retain(archiveDescriptor("start-flight-source"));
+    const sibling = gate.retain(archiveDescriptor("start-flight-sibling", {
+      expectedGeneration: 2,
+    }));
+    const sourceObservation = await router.ensureArchiveRecovery(
+      accountA,
+      paths("start-flight"),
+      launchOptions(0, async () => {
+        siblingAttempt = router.ensureArchiveRecovery(
+          accountA,
+          paths("start-flight"),
+          launchOptions(1),
+          sibling,
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      }),
+      source,
+    );
+
+    expect(sourceObservation).toEqual({ generation: 1, status: "running" });
+    if (siblingAttempt === null) throw new Error("missing sibling start attempt");
+    expect(siblingAttempt).rejects.toBeInstanceOf(AccountRuntimeStaleRequestError);
+    expect(created.map(({ generation }) => generation)).toEqual([1]);
+    gate.release(source);
+    gate.release(sibling);
+    await router.stopAll();
   });
 
   test("global shutdown ignores a process fault already queued for delivery", async () => {
@@ -1231,13 +3111,13 @@ describe("AccountRuntimeRouter", () => {
       },
       sleep: () => Promise.resolve(),
     });
-    const process = await router.ensure(accountA, paths("shutdown-race"), {
+    await router.ensure(accountA, paths("shutdown-race"), {
       initialGeneration: 0,
       beforeCreate(generation) {
         persistedGenerations.push(generation);
       },
     });
-    if (!(process instanceof FakeProcess)) throw new Error("missing shutdown-race process");
+    const process = requireCreatedProcess(created, 0);
 
     process.fault("process_exited");
     await router.stopAll();
@@ -1254,6 +3134,74 @@ describe("AccountRuntimeRouter", () => {
     }]);
   });
 });
+
+function approvalServerRequest(
+  generation: number,
+  id: number,
+): CodexServerRequest {
+  return {
+    generation,
+    id,
+    requestInstanceId: 1,
+    streamPosition: 1,
+    method: "item/commandExecution/requestApproval",
+    params: {
+      threadId: `thread-${String(id)}`,
+      turnId: `turn-${String(id)}`,
+      itemId: `item-${String(id)}`,
+      startedAtMs: 1,
+    },
+  };
+}
+
+function archiveDynamicToolRequest(
+  generation: number,
+): PinnedCodexDynamicToolRequest {
+  return {
+    method: "item/tool/call",
+    params: {
+      threadId: "thread-archive-dynamic",
+      turnId: "turn-archive-dynamic",
+      callId: "call-archive-dynamic",
+      namespace: "oprte",
+      tool: "rlm_run",
+      arguments: { schemaVersion: 1, action: "submit", program: {} },
+      argumentsSha256: "b".repeat(64),
+    },
+    generation,
+    id: "dynamic-archive-request",
+    requestInstanceId: 1,
+    streamPosition: 1,
+    accountProfileId: accountA,
+    accountGeneration: generation,
+  };
+}
+
+async function invokeEveryProviderCallback(
+  callbacks: CodexRpcCallbacks,
+  generation: number,
+  serverRequest: CodexServerRequest,
+): Promise<void> {
+  await callbacks.onNotification?.(turnLifecycleNotification(
+    "turn/started",
+    generation,
+    "thread-early-callback",
+    "turn-early-callback",
+  ));
+  await callbacks.onServerRequest?.(serverRequest);
+  await callbacks.onDynamicToolRequest?.(archiveDynamicToolRequest(generation));
+  await callbacks.onDiagnostic?.({
+    type: "unknown_notification",
+    generation,
+    method: "early/diagnostic",
+  });
+  await callbacks.onServerRequestExpired?.({
+    type: "server_request_expired",
+    generation,
+    method: "early/request",
+    reason: "unsupported_method",
+  });
+}
 
 function turnLifecycleNotification(
   method: "turn/started" | "turn/completed",

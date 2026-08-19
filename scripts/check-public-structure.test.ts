@@ -86,9 +86,10 @@ function completeFixture(): Readonly<{
         ...(directory === "apps/desktop"
           ? {
               scripts: {
-                test: "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:gateway",
+                test: "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' --path-ignore-patterns='**/provider-thread-archive-startup-v57.test.ts' --path-ignore-patterns='**/*.macos.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:provider-thread-archive-startup-v57 && bun run test:gateway",
                 "test:application-support-migration": "bun test ./runtime/test/application-support-migration.test.ts",
                 "test:feasibility": "bun test ./runtime/test/feasibility.test.ts",
+                "test:provider-thread-archive-startup-v57": "bun test ./runtime/test/provider-thread-archive-startup-v57.test.ts",
               },
             }
           : {}),

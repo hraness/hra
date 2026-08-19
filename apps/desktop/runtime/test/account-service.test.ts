@@ -35,6 +35,11 @@ import {
   type AccountRuntimeRequestKey,
 } from "../src/accounts/runtime-router";
 import {
+  ArchiveAdmissionGate,
+  type AccountRemovalAdmissionHandle,
+  type ArchiveAdmissionHandle,
+} from "../src/accounts/archive-admission-gate";
+import {
   type CodexGenerationEndReason,
   CodexRemoteResponseError,
   type CodexNotification,
@@ -46,6 +51,11 @@ import { projectCodexNotificationFacts } from "../src/codex/fact-projector";
 import type { RuntimePaths } from "../src/runtime-paths";
 import { applyMigrations } from "../src/state/database";
 import { OperationReceiptStore } from "../src/state/operation-receipts";
+import {
+  ProviderThreadArchiveJournalV57,
+  providerThreadArchiveCompleteInventoryDigestV57,
+} from "../src/state/provider-thread-archive-journal-v57";
+import { ChatPaneStore } from "../src/state/chat-pane-store";
 
 const temporaryDirectories: string[] = [];
 
@@ -134,6 +144,7 @@ class FakeUsageProjectionScheduler implements AccountUsageProjectionScheduler {
 }
 
 class FakeAccountProfileFileSystem implements AccountProfileFileSystem {
+  beforeEnsure: ((accountProfileId: string) => void | Promise<void>) | null = null;
   readonly calls: Array<Readonly<{
     action: "delete" | "ensure";
     accountProfileId: string;
@@ -160,6 +171,7 @@ class FakeAccountProfileFileSystem implements AccountProfileFileSystem {
   async ensureAccountProfile(accountProfileId: string): Promise<void> {
     this.calls.push({ action: "ensure", accountProfileId });
     if (this.failure !== null) throw this.failure;
+    await this.beforeEnsure?.(accountProfileId);
     const layout = accountProfileLayout(
       this.controlPlanePath,
       accountProfileId,
@@ -207,6 +219,18 @@ interface FakePinnedRequest {
 }
 
 class FakeRouter implements AccountRuntimeRouterPort {
+  readonly archiveAdmissionGate: ArchiveAdmissionGate;
+  readonly archiveQuiescenceCalls: Array<Readonly<{
+    accountProfileId: string;
+    expectedGeneration: number;
+  }>> = [];
+  archiveQuiescenceFailure: Error | null = null;
+  afterArchiveQuiescenceCheck: (() => void) | null = null;
+  readonly archiveProvisionalReleaseCalls: Array<Readonly<{
+    accountProfileId: string;
+    expectedGeneration: number;
+  }>> = [];
+  archiveProvisionalReleaseFailure: Error | null = null;
   afterPositionedResponse: ((request: FakePinnedRequest) => void | Promise<void>) | null = null;
   beforeFence: ((accountProfileId: string, expectedGeneration: number) =>
     void | Promise<void>) | null = null;
@@ -233,6 +257,41 @@ class FakeRouter implements AccountRuntimeRouterPort {
     (generation: number) => void | Promise<void>
   >();
 
+  constructor(archiveAdmissionGate: ArchiveAdmissionGate) {
+    this.archiveAdmissionGate = archiveAdmissionGate;
+  }
+
+  assertArchiveTransitionQuiescent(
+    accountProfileId: string,
+    expectedGeneration: number,
+  ): void {
+    this.archiveAdmissionGate.assertOrdinaryAdmission(accountProfileId);
+    this.archiveQuiescenceCalls.push({ accountProfileId, expectedGeneration });
+    if (this.archiveQuiescenceFailure !== null) {
+      throw this.archiveQuiescenceFailure;
+    }
+    if (
+      !this.running.has(accountProfileId) ||
+      this.generations.get(accountProfileId) !== expectedGeneration
+    ) {
+      throw new Error("the fake account runtime is not quiescent");
+    }
+    this.afterArchiveQuiescenceCheck?.();
+  }
+
+  assertArchiveTransitionProvisionalReleaseSafe(
+    accountProfileId: string,
+    expectedGeneration: number,
+  ): void {
+    this.archiveProvisionalReleaseCalls.push({
+      accountProfileId,
+      expectedGeneration,
+    });
+    if (this.archiveProvisionalReleaseFailure !== null) {
+      throw this.archiveProvisionalReleaseFailure;
+    }
+  }
+
   async ensure(
     accountProfileId: string,
     paths: RuntimePaths,
@@ -249,6 +308,21 @@ class FakeRouter implements AccountRuntimeRouterPort {
     this.running.add(accountProfileId);
     this.generations.set(accountProfileId, generation);
     return {};
+  }
+
+  async ensureArchiveRecovery(
+    accountProfileId: string,
+    paths: RuntimePaths,
+    options: {
+      readonly initialGeneration: number;
+      readonly beforeCreate: (generation: number) => void | Promise<void>;
+    },
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<unknown> {
+    this.archiveAdmissionGate.require(archiveHandle, accountProfileId);
+    const result = await this.ensure(accountProfileId, paths, options);
+    this.archiveAdmissionGate.require(archiveHandle, accountProfileId);
+    return result;
   }
 
   async request<K extends AccountRuntimeRequestKey>(
@@ -333,6 +407,7 @@ class FakeRouter implements AccountRuntimeRouterPort {
         }));
       case "threadStart":
       case "threadResume":
+      case "threadArchive":
       case "threadRead":
       case "threadHistoryRead":
       case "threadTurnsList":
@@ -343,6 +418,7 @@ class FakeRouter implements AccountRuntimeRouterPort {
       case "threadGoalClear":
       case "threadSetName":
       case "threadInjectItems":
+      case "configRequirementsRead":
       case "modelList":
       case "turnStart":
       case "turnSteer":
@@ -365,6 +441,26 @@ class FakeRouter implements AccountRuntimeRouterPort {
       streamPosition: 1,
     };
     await this.afterPositionedResponse?.({ accountProfileId, expectedGeneration, input, key });
+    return response;
+  }
+
+  async requestArchiveRecoveryWithResponsePosition<
+    K extends Extract<AccountRuntimeRequestKey, "threadArchive" | "threadList">,
+  >(
+    accountProfileId: string,
+    archiveHandle: ArchiveAdmissionHandle,
+    key: K,
+    input: PinnedCodexRequestInput<K>,
+    expectedGeneration: number,
+  ) {
+    this.archiveAdmissionGate.require(archiveHandle, accountProfileId);
+    const response = await this.requestWithResponsePosition(
+      accountProfileId,
+      key,
+      input,
+      expectedGeneration,
+    );
+    this.archiveAdmissionGate.require(archiveHandle, accountProfileId);
     return response;
   }
 
@@ -393,6 +489,25 @@ class FakeRouter implements AccountRuntimeRouterPort {
     ) return "already_fenced";
     this.running.delete(accountProfileId);
     return "fenced";
+  }
+
+  async fenceAccountRemovalGeneration(
+    accountProfileId: string,
+    removalHandle: AccountRemovalAdmissionHandle,
+  ): Promise<"already_fenced" | "fenced"> {
+    const descriptor = this.archiveAdmissionGate.requireAccountRemoval(
+      removalHandle,
+      accountProfileId,
+    );
+    const result = await this.fenceGeneration(
+      accountProfileId,
+      descriptor.expectedGeneration,
+    );
+    this.archiveAdmissionGate.requireAccountRemoval(
+      removalHandle,
+      accountProfileId,
+    );
+    return result;
   }
 
   stop(accountProfileId: string): Promise<void> {
@@ -460,6 +575,7 @@ function rateLimit(id: string, usedPercent: number) {
 
 async function fixture(
   options: Readonly<{
+    containChatsBeforeRemoval?: (accountProfileId: string) => Promise<void>;
     now?: () => Date;
     routingRefreshTimeoutMs?: number;
     usageProjectionScheduler?: AccountUsageProjectionScheduler;
@@ -479,47 +595,70 @@ async function fixture(
       return id;
     },
   });
-  const router = new FakeRouter();
+  const archiveAdmissionGate = new ArchiveAdmissionGate();
+  const providerThreadArchiveJournalV57 = new ProviderThreadArchiveJournalV57(
+    database,
+    new Uint8Array(32).fill(57),
+  );
+  const router = new FakeRouter(archiveAdmissionGate);
   const opener = new FakeOpener();
   const localDataRemover =
     new FakeAccountProfileFileSystem(controlPlanePath);
   const events: AccountEvent[] = [];
   let clock = 0;
-  const createService = () => new AccountService({
-    assets: {
-      codexBinary: "/fixture/codex",
-      gitBinary: "/fixture/git/bin/git",
-      gitRoot: "/fixture/git",
-    },
-    controlPlanePath,
-    emit: (event) => events.push(structuredClone(event)),
-    externalUrlOpener: opener,
-    profileFileSystem: localDataRemover,
-    now: options.now ?? (() => new Date(Date.UTC(2026, 6, 19, 12, 0, clock++))),
-    ...(options.routingRefreshTimeoutMs === undefined
-      ? {}
-      : { routingRefreshTimeoutMs: options.routingRefreshTimeoutMs }),
-    router,
-    store,
-    ...(options.usageProjectionScheduler === undefined
-      ? {}
-      : { usageProjectionScheduler: options.usageProjectionScheduler }),
-  });
+  const createService = (installArchiveReplay = true) => {
+    const created = new AccountService({
+      archiveAdmissionGate,
+      assets: {
+        codexBinary: "/fixture/codex",
+        gitBinary: "/fixture/git/bin/git",
+        gitRoot: "/fixture/git",
+      },
+      containChatsBeforeRemoval:
+        options.containChatsBeforeRemoval ?? (() => Promise.resolve()),
+      joinChatArchiveGenerationContainment: () => Promise.resolve(),
+      controlPlanePath,
+      controlPlaneDatabase: database,
+      emit: (event) => events.push(structuredClone(event)),
+      externalUrlOpener: opener,
+      profileFileSystem: localDataRemover,
+      providerThreadArchiveJournalV57,
+      now: options.now ?? (() => new Date(Date.UTC(2026, 6, 19, 12, 0, clock++))),
+      ...(options.routingRefreshTimeoutMs === undefined
+        ? {}
+        : { routingRefreshTimeoutMs: options.routingRefreshTimeoutMs }),
+      router,
+      store,
+      ...(options.usageProjectionScheduler === undefined
+        ? {}
+        : { usageProjectionScheduler: options.usageProjectionScheduler }),
+    });
+    if (installArchiveReplay) created.installArchiveAdmissionReplayV57();
+    return created;
+  };
   const service = createService();
   return {
+    archiveAdmissionGate,
     controlPlanePath,
     createService,
     database,
     events,
     localDataRemover,
     opener,
+    providerThreadArchiveJournalV57,
     router,
     service,
     store,
   };
 }
 
-async function generationRecoveryFixture() {
+async function generationRecoveryFixture(options: Readonly<{
+  beforeReplay?: (input: Readonly<{
+    database: Database;
+    journal: ProviderThreadArchiveJournalV57;
+    store: AccountProfileStore;
+  }>) => void;
+}> = {}) {
   const root = await mkdtemp(join(tmpdir(), "oprte-generation-recovery-"));
   temporaryDirectories.push(root);
   const controlPlanePath = join(root, "state", "control-plane.sqlite");
@@ -533,7 +672,18 @@ async function generationRecoveryFixture() {
   const processes: FakeGenerationProcess[] = [];
   const events: AccountEvent[] = [];
   let service: AccountService | null = null;
+  const archiveAdmissionGate = new ArchiveAdmissionGate();
+  const providerThreadArchiveJournalV57 = new ProviderThreadArchiveJournalV57(
+    database,
+    new Uint8Array(32).fill(57),
+  );
+  options.beforeReplay?.({
+    database,
+    journal: providerThreadArchiveJournalV57,
+    store,
+  });
   const router = new AccountRuntimeRouter({
+    archiveAdmissionGate,
     callbacks: {
       onNotification: (accountProfileId, notification) => {
         if (service !== null) consumeNotification(service, accountProfileId, notification);
@@ -556,20 +706,38 @@ async function generationRecoveryFixture() {
     sleep: () => Promise.resolve(),
   });
   let clock = 0;
+  const profileFileSystem = new FakeAccountProfileFileSystem(controlPlanePath);
   service = new AccountService({
+    archiveAdmissionGate,
     assets: {
       codexBinary: "/fixture/codex",
       gitBinary: "/fixture/git/bin/git",
       gitRoot: "/fixture/git",
     },
+    containChatsBeforeRemoval: () => Promise.resolve(),
+    joinChatArchiveGenerationContainment: () => Promise.resolve(),
     controlPlanePath,
+    controlPlaneDatabase: database,
     emit: (event) => events.push(structuredClone(event)),
-    profileFileSystem: new FakeAccountProfileFileSystem(controlPlanePath),
+    profileFileSystem,
+    providerThreadArchiveJournalV57,
     now: () => new Date(Date.UTC(2026, 6, 29, 12, 0, clock++)),
     router,
     store,
   });
-  return { callbackOwners, database, events, processes, router, service, store };
+  service.installArchiveAdmissionReplayV57();
+  return {
+    archiveAdmissionGate,
+    callbackOwners,
+    database,
+    events,
+    processes,
+    profileFileSystem,
+    providerThreadArchiveJournalV57,
+    router,
+    service,
+    store,
+  };
 }
 
 function accountResult(result: Awaited<ReturnType<AccountService['execute']>>): AccountSummary {
@@ -577,7 +745,1807 @@ function accountResult(result: Awaited<ReturnType<AccountService['execute']>>): 
   return result.account;
 }
 
+function prepareArchiveTarget(
+  input: Readonly<{
+    database: Database;
+    journal: ProviderThreadArchiveJournalV57;
+    store: AccountProfileStore;
+    accountProfileId: string;
+    paneId: string;
+    targetId: string;
+    attemptId: string;
+    now: Date;
+    effectStarted?: boolean;
+  }>,
+) {
+  const panes = new ChatPaneStore(input.database);
+  panes.create({
+    paneId: input.paneId,
+    repository: {
+      id: `repo_${"7".repeat(26)}`,
+      name: "Archive fence",
+      workingDirectory: "/fixture/archive-fence",
+    },
+    accountProfileId: input.accountProfileId,
+    now: input.now,
+  });
+  input.database.query(`
+    UPDATE chat_panes SET provider_account_profile_id = ?2,
+      provider_thread_id = ?3, provider_restart_thread_id = ?4
+    WHERE pane_id = ?1
+  `).run(
+    input.paneId,
+    input.accountProfileId,
+    `thread_${input.targetId}`,
+    `restart_${input.targetId}`,
+  );
+  const profile = input.store.find(input.accountProfileId);
+  if (profile === null) throw new Error("archive fixture profile disappeared");
+  input.journal.prepareTarget({
+    targetId: input.targetId,
+    paneId: input.paneId,
+    purpose: "pane_archive",
+    paneRevision: 1,
+    queueRevision: null,
+    paneCasDigest: "1".repeat(64),
+    queueCasDigest: null,
+    accountProfileId: input.accountProfileId,
+    accountProfileRevision: profile.revision,
+    threadId: `thread_${input.targetId}`,
+    restartThreadId: `restart_${input.targetId}`,
+    binding: { kind: "none" },
+    attempt: {
+      attemptId: input.attemptId,
+      generation: profile.processGeneration,
+      accountProfileRevision: profile.revision,
+      requestEvidenceDigest: "2".repeat(64),
+      requestRevisionDigest: "3".repeat(64),
+    },
+    now: input.now,
+  });
+  if (input.effectStarted === true) {
+    input.journal.markEffectStarted({
+      attemptId: input.attemptId,
+      effectEvidenceDigest: "4".repeat(64),
+      effectRevisionDigest: "5".repeat(64),
+      now: input.now,
+    });
+  }
+  return input.journal.admissionDescriptor(input.targetId);
+}
+
+function prepareAccountRemovalCut(
+  input: Readonly<{
+    journal: ProviderThreadArchiveJournalV57;
+    store: AccountProfileStore;
+    accountProfileId: string;
+    cutId: string;
+    now: Date;
+  }>,
+) {
+  const profile = input.store.find(input.accountProfileId);
+  if (profile === null) throw new Error("removal fixture profile disappeared");
+  input.journal.createCut({
+    cutId: input.cutId,
+    accountProfileId: input.accountProfileId,
+    accountProfileRevision: profile.revision,
+    sourceGeneration: profile.processGeneration,
+    cause: "account_removal",
+    initiatingAttemptId: null,
+    predecessorCutId: null,
+    identityEvidenceDigest: "6".repeat(64),
+    identityRevisionDigest: "7".repeat(64),
+    now: input.now,
+  });
+  const descriptor = input.journal.recoveryInventory()
+    .removalAdmissionDescriptors.find(({ transitionId }) =>
+      transitionId === input.cutId
+    );
+  if (descriptor === undefined) {
+    throw new Error("removal fixture authority disappeared");
+  }
+  return descriptor;
+}
+
+function prepareFencedArchiveSuccessor(input: Readonly<{
+  database: Database;
+  journal: ProviderThreadArchiveJournalV57;
+  store: AccountProfileStore;
+  corruptProfilePostimage?: boolean;
+}>) {
+  const account = input.store.create(
+    "Recovery",
+    new Date("2026-07-29T11:00:00.000Z"),
+  );
+  input.store.updateProcessGeneration(
+    account.id,
+    1,
+    new Date("2026-07-29T11:01:00.000Z"),
+  );
+  input.store.updateAuthState(
+    account.id,
+    "signedIn",
+    new Date("2026-07-29T11:02:00.000Z"),
+  );
+  const targetId = "archtarget_coldrecovery01";
+  const attemptId = "archattempt_coldrecovery01";
+  const cutId = "archcut_coldrecovery01";
+  prepareArchiveTarget({
+    database: input.database,
+    journal: input.journal,
+    store: input.store,
+    accountProfileId: account.id,
+    paneId: "pane_coldrecovery01",
+    targetId,
+    attemptId,
+    now: new Date("2026-07-29T11:03:00.000Z"),
+    effectStarted: true,
+  });
+  const sourceProfile = input.store.find(account.id);
+  if (sourceProfile === null) throw new Error("recovery fixture profile disappeared");
+  input.journal.createCut({
+    cutId,
+    accountProfileId: account.id,
+    accountProfileRevision: sourceProfile.revision,
+    sourceGeneration: 1,
+    cause: "lost_response",
+    initiatingAttemptId: attemptId,
+    predecessorCutId: null,
+    identityEvidenceDigest: "6".repeat(64),
+    identityRevisionDigest: "7".repeat(64),
+    now: new Date("2026-07-29T11:04:00.000Z"),
+  });
+  input.journal.bindAttemptToCut(attemptId, cutId);
+  input.journal.recordAmbiguous({
+    attemptId,
+    ambiguityEvidenceDigest: "8".repeat(64),
+    ambiguityRevisionDigest: "9".repeat(64),
+    now: new Date("2026-07-29T11:05:00.000Z"),
+  });
+  const successor = input.database.transaction(() => {
+    const updated = input.store.updateProcessGeneration(
+      account.id,
+      2,
+      new Date("2026-07-29T11:06:00.000Z"),
+    );
+    input.journal.recordFence({
+      cutId,
+      successorGeneration: 2,
+      successorAccountProfileRevision: updated.profile.revision,
+      fenceEvidenceDigest: "a".repeat(64),
+      fenceRevisionDigest: "b".repeat(64),
+      now: new Date("2026-07-29T11:06:00.000Z"),
+    });
+    return updated.profile;
+  }).immediate();
+  if (input.corruptProfilePostimage === true) {
+    input.database.query(`
+      UPDATE account_profiles
+      SET process_generation = 1, revision = ?2
+      WHERE profile_id = ?1
+    `).run(account.id, sourceProfile.revision);
+  }
+  return Object.freeze({
+    accountProfileId: account.id,
+    attemptId,
+    cutId,
+    paneId: "pane_coldrecovery01",
+    sourceProfileRevision: sourceProfile.revision,
+    successorProfileRevision: successor.revision,
+    targetId,
+  });
+}
+
+function prepareContainedNotAppliedArchiveSuccessor(input: Readonly<{
+  database: Database;
+  journal: ProviderThreadArchiveJournalV57;
+  store: AccountProfileStore;
+}>) {
+  const recovery = prepareFencedArchiveSuccessor(input);
+  const member = {
+    memberId: "archmember_coldrecovery01",
+    cutId: recovery.cutId,
+    paneId: recovery.paneId,
+    paneRevision: 1,
+    paneCasDigest: "1".repeat(64),
+    threadId: `thread_${recovery.targetId}`,
+    restartThreadId: `restart_${recovery.targetId}`,
+    role: "target" as const,
+    targetId: recovery.targetId,
+    attemptId: recovery.attemptId,
+    targetAttemptOrdinal: 1,
+    action: "preserved_target" as const,
+    binding: { kind: "none" as const },
+    identityEvidenceDigest: "c".repeat(64),
+    identityRevisionDigest: "d".repeat(64),
+    now: new Date("2026-07-29T11:07:00.000Z"),
+  };
+  input.journal.addCutMember(member);
+  input.journal.sealCutInventory({
+    cutId: recovery.cutId,
+    expectedMemberCount: 1,
+    expectedInventoryDigest:
+      providerThreadArchiveCompleteInventoryDigestV57([member]),
+    enumerationAuthorityDigest: "e".repeat(64),
+    sealRevisionDigest: "f".repeat(64),
+    now: new Date("2026-07-29T11:08:00.000Z"),
+  });
+  input.journal.settleMember({
+    memberId: member.memberId,
+    settlementEvidenceDigest: "0".repeat(64),
+    settlementRevisionDigest: "1".repeat(64),
+    now: new Date("2026-07-29T11:09:00.000Z"),
+  });
+  input.journal.markCutContained({
+    cutId: recovery.cutId,
+    containmentEvidenceDigest: "2".repeat(64),
+    containmentRevisionDigest: "3".repeat(64),
+    now: new Date("2026-07-29T11:10:00.000Z"),
+  });
+  input.journal.recordReconciledNotApplied({
+    attemptId: recovery.attemptId,
+    outcomeEvidenceDigest: "4".repeat(64),
+    outcomeRevisionDigest: "5".repeat(64),
+    now: new Date("2026-07-29T11:11:00.000Z"),
+  });
+  return recovery;
+}
+
 describe("AccountService", () => {
+  test("requires durable archive replay before startup can touch profiles or providers", async () => {
+    const {
+      createService,
+      database,
+      localDataRemover,
+      router,
+      service,
+      store,
+    } = await fixture();
+    const uninstalled = createService(false);
+    try {
+      const profile = store.create(
+        "Held",
+        new Date("2026-07-19T11:00:00.000Z"),
+      );
+      store.updateAuthState(
+        profile.id,
+        "signedIn",
+        new Date("2026-07-19T11:01:00.000Z"),
+      );
+
+      expect(() => uninstalled.initialize()).toThrow(
+        "Provider archive admission replay must complete before account initialization",
+      );
+      await Bun.sleep(0);
+      expect(localDataRemover.calls).toEqual([]);
+      expect(router.paths.size).toBe(0);
+      expect(router.requests).toEqual([]);
+    } finally {
+      await uninstalled.shutdown();
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("installs and returns the exact verified replay snapshot before held-account startup", async () => {
+    const {
+      archiveAdmissionGate,
+      createService,
+      database,
+      localDataRemover,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    const targetAccount = store.create(
+      "Target",
+      new Date("2026-07-19T11:00:00.000Z"),
+    );
+    const removalAccount = store.create(
+      "Removal",
+      new Date("2026-07-19T11:00:01.000Z"),
+    );
+    for (const account of [targetAccount, removalAccount]) {
+      store.updateProcessGeneration(
+        account.id,
+        1,
+        new Date("2026-07-19T11:01:00.000Z"),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T11:02:00.000Z"),
+      );
+    }
+    const targetDescriptor = prepareArchiveTarget({
+      database,
+      journal,
+      store,
+      accountProfileId: targetAccount.id,
+      paneId: "pane_replaytarget01",
+      targetId: "archtarget_replaytarget01",
+      attemptId: "archattempt_replaytarget01",
+      now: new Date("2026-07-19T11:03:00.000Z"),
+    });
+    const removalDescriptor = prepareAccountRemovalCut({
+      journal,
+      store,
+      accountProfileId: removalAccount.id,
+      cutId: "archcut_replayremoval01",
+      now: new Date("2026-07-19T11:04:00.000Z"),
+    });
+    const expected = journal.recoveryInventory();
+    const replayed = createService(false);
+    try {
+      const installed = replayed.installArchiveAdmissionReplayV57(expected);
+
+      expect(installed).toEqual(expected);
+      expect(installed).not.toBe(expected);
+      expect(await replayed.initialize()).toHaveLength(2);
+      await Bun.sleep(0);
+      const targetHandle = replayed.archiveTransitionHandleV57(
+        targetDescriptor.transitionId,
+      );
+      const removalHandle = replayed.accountRemovalHandleV57(
+        removalDescriptor.transitionId,
+      );
+      expect(archiveAdmissionGate.require(targetHandle)).toEqual(targetDescriptor);
+      expect(archiveAdmissionGate.requireAccountRemoval(removalHandle)).toEqual(
+        removalDescriptor,
+      );
+      expect(localDataRemover.calls).toEqual([]);
+      expect(router.paths.size).toBe(0);
+      expect(router.requests).toEqual([]);
+
+      archiveAdmissionGate.release(targetHandle);
+      archiveAdmissionGate.releaseAccountRemoval(removalHandle);
+      expect(archiveAdmissionGate.isHeld(targetAccount.id)).toBeFalse();
+      expect(archiveAdmissionGate.isHeld(removalAccount.id)).toBeFalse();
+    } finally {
+      await replayed.shutdown();
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("rejects a stale verified replay snapshot before retaining any authority and remains retryable", async () => {
+    const {
+      archiveAdmissionGate,
+      createService,
+      database,
+      localDataRemover,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    const account = store.create(
+      "Stale snapshot",
+      new Date("2026-07-19T11:00:00.000Z"),
+    );
+    store.updateProcessGeneration(
+      account.id,
+      1,
+      new Date("2026-07-19T11:01:00.000Z"),
+    );
+    store.updateAuthState(
+      account.id,
+      "signedIn",
+      new Date("2026-07-19T11:02:00.000Z"),
+    );
+    const first = prepareArchiveTarget({
+      database,
+      journal,
+      store,
+      accountProfileId: account.id,
+      paneId: "pane_replaystale01",
+      targetId: "archtarget_replaystale01",
+      attemptId: "archattempt_replaystale01",
+      now: new Date("2026-07-19T11:03:00.000Z"),
+    });
+    const stale = journal.recoveryInventory();
+    const second = prepareArchiveTarget({
+      database,
+      journal,
+      store,
+      accountProfileId: account.id,
+      paneId: "pane_replaystale02",
+      targetId: "archtarget_replaystale02",
+      attemptId: "archattempt_replaystale02",
+      now: new Date("2026-07-19T11:04:00.000Z"),
+    });
+    const holdEvents: boolean[] = [];
+    const unsubscribe = archiveAdmissionGate.subscribe(
+      account.id,
+      (held) => holdEvents.push(held),
+    );
+    const replayed = createService(false);
+    try {
+      expect(() => replayed.installArchiveAdmissionReplayV57(stale)).toThrow(
+        "Provider archive admission replay does not match the verified recovery inventory",
+      );
+      expect(holdEvents).toEqual([]);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+      expect(() => replayed.archiveTransitionHandleV57(first.transitionId))
+        .toThrow("The provider archive recovery authority is unavailable.");
+      expect(() => replayed.archiveTransitionHandleV57(second.transitionId))
+        .toThrow("The provider archive recovery authority is unavailable.");
+      expect(() => replayed.initialize()).toThrow(
+        "Provider archive admission replay must complete before account initialization",
+      );
+      expect(localDataRemover.calls).toEqual([]);
+      expect(router.paths.size).toBe(0);
+      expect(router.requests).toEqual([]);
+
+      const current = journal.recoveryInventory();
+      expect(replayed.installArchiveAdmissionReplayV57(current)).toEqual(current);
+      const firstHandle = replayed.archiveTransitionHandleV57(first.transitionId);
+      const secondHandle = replayed.archiveTransitionHandleV57(second.transitionId);
+      expect(holdEvents).toEqual([true]);
+      expect(() => replayed.installArchiveAdmissionReplayV57(current)).toThrow(
+        "Provider archive admission replay was already installed",
+      );
+      expect(replayed.archiveTransitionHandleV57(first.transitionId))
+        .toBe(firstHandle);
+      expect(replayed.archiveTransitionHandleV57(second.transitionId))
+        .toBe(secondHandle);
+
+      archiveAdmissionGate.release(firstHandle);
+      archiveAdmissionGate.release(secondHandle);
+    } finally {
+      unsubscribe();
+      await replayed.shutdown();
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("rolls prior holds back when keyed replay collides with a provisional", async () => {
+    const {
+      archiveAdmissionGate,
+      createService,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      service,
+      store,
+    } = await fixture();
+    const firstAccount = store.create("First", new Date("2026-07-19T11:00:00.000Z"));
+    const secondAccount = store.create("Second", new Date("2026-07-19T11:00:01.000Z"));
+    for (const account of [firstAccount, secondAccount]) {
+      store.updateProcessGeneration(
+        account.id,
+        1,
+        new Date("2026-07-19T11:01:00.000Z"),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T11:02:00.000Z"),
+      );
+    }
+    const first = prepareArchiveTarget({
+      database,
+      journal,
+      store,
+      accountProfileId: firstAccount.id,
+      paneId: "pane_replayfirst01",
+      targetId: "archtarget_replayfirst01",
+      attemptId: "archattempt_replayfirst01",
+      now: new Date("2026-07-19T11:03:00.000Z"),
+    });
+    const second = prepareArchiveTarget({
+      database,
+      journal,
+      store,
+      accountProfileId: secondAccount.id,
+      paneId: "pane_replaysecond01",
+      targetId: "archtarget_replaysecond01",
+      attemptId: "archattempt_replaysecond01",
+      now: new Date("2026-07-19T11:04:00.000Z"),
+    });
+    const conflicting = archiveAdmissionGate.retainProvisional({
+      accountProfileId: second.accountProfileId,
+      paneId: second.paneId,
+      purpose: second.purpose,
+      transitionId: second.transitionId,
+    });
+    const expected = journal.recoveryInventory();
+    const replayed = createService(false);
+    try {
+      expect(() => replayed.installArchiveAdmissionReplayV57(expected)).toThrow();
+      expect(archiveAdmissionGate.isHeld(firstAccount.id)).toBeFalse();
+      expect(archiveAdmissionGate.isHeld(secondAccount.id)).toBeTrue();
+      expect(() => replayed.archiveTransitionHandleV57(first.transitionId))
+        .toThrow("The provider archive recovery authority is unavailable.");
+
+      archiveAdmissionGate.abortProvisional(conflicting);
+      expect(replayed.installArchiveAdmissionReplayV57(expected)).toEqual(expected);
+      expect(archiveAdmissionGate.require(
+        replayed.archiveTransitionHandleV57(first.transitionId),
+      )).toEqual(first);
+      expect(archiveAdmissionGate.require(
+        replayed.archiveTransitionHandleV57(second.transitionId),
+      )).toEqual(second);
+      expect(() => replayed.installArchiveAdmissionReplayV57())
+        .toThrow("Provider archive admission replay was already installed");
+
+      archiveAdmissionGate.release(
+        replayed.archiveTransitionHandleV57(first.transitionId),
+      );
+      archiveAdmissionGate.release(
+        replayed.archiveTransitionHandleV57(second.transitionId),
+      );
+    } finally {
+      await replayed.shutdown();
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("retains provisional archive admission in the quiescence-check turn", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+
+      const notQuiescent = new Error("provider work is still active");
+      router.archiveQuiescenceFailure = notQuiescent;
+      expect(await rejection(service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId: "pane_quiescence01",
+        purpose: "pane_archive",
+        transitionId: "archtarget_quiescence01",
+      }))).toBe(notQuiescent);
+      expect(router.archiveQuiescenceCalls).toEqual([{
+        accountProfileId: account.id,
+        expectedGeneration: 1,
+      }]);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+      expect(journal.recoveryInventory().targets).toEqual([]);
+
+      router.archiveQuiescenceFailure = null;
+      let heldInNextMicrotask: boolean | null = null;
+      router.afterArchiveQuiescenceCheck = () => {
+        queueMicrotask(() => {
+          heldInNextMicrotask = archiveAdmissionGate.isHeld(account.id);
+        });
+      };
+      const provisional = await service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId: "pane_quiescence01",
+        purpose: "pane_archive",
+        transitionId: "archtarget_quiescence01",
+      });
+      await Bun.sleep(0);
+      expect(heldInNextMicrotask).toBeTrue();
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+
+      const invalidated = new Error("provider callback invalidated quiescence");
+      router.archiveProvisionalReleaseFailure = invalidated;
+      const fenceFailure = new Error("fixture exact fence failed");
+      router.fenceFailure = fenceFailure;
+      expect(await rejection(service.abortArchiveTransitionProvisional(
+        provisional.handle,
+      ))).toBe(fenceFailure);
+      expect(router.archiveProvisionalReleaseCalls).toEqual([{
+        accountProfileId: account.id,
+        expectedGeneration: 1,
+      }]);
+      expect(router.fenceCalls).toEqual([{
+        accountProfileId: account.id,
+        expectedGeneration: 1,
+      }]);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      expect(router.isRunning(account.id)).toBeTrue();
+
+      router.fenceFailure = null;
+      router.beforeFence = () => {
+        expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+        router.archiveProvisionalReleaseFailure = null;
+      };
+      await service.abortArchiveTransitionProvisional(provisional.handle);
+      expect(router.fenceCalls).toEqual([
+        { accountProfileId: account.id, expectedGeneration: 1 },
+        { accountProfileId: account.id, expectedGeneration: 1 },
+      ]);
+      expect(router.archiveProvisionalReleaseCalls).toEqual([
+        { accountProfileId: account.id, expectedGeneration: 1 },
+        { accountProfileId: account.id, expectedGeneration: 1 },
+        { accountProfileId: account.id, expectedGeneration: 1 },
+      ]);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+      expect(router.isRunning(account.id)).toBeFalse();
+      expect(router.requests).toEqual([]);
+
+      await service.requestSession(account.id, "threadList", {
+        cursor: null,
+        limit: 64,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        sourceKinds: ["appServer"],
+        archived: false,
+      });
+      expect(router.generation(account.id)).toBe(2);
+      expect(store.find(account.id)?.processGeneration).toBe(2);
+      expect(router.requests.filter(({ key }) => key === "threadList"))
+        .toHaveLength(1);
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("tracks gapless archive authority replacement and rejects stale release", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      const provisional = await service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId: "pane_livearchive01",
+        purpose: "pane_archive",
+        transitionId: "archtarget_livearchive01",
+      });
+      const descriptor = prepareArchiveTarget({
+        database,
+        journal,
+        store,
+        accountProfileId: account.id,
+        paneId: "pane_livearchive01",
+        targetId: "archtarget_livearchive01",
+        attemptId: "archattempt_livearchive01",
+        now: new Date("2026-07-19T12:01:00.000Z"),
+      });
+      const prepared = service.promoteArchiveTransition(
+        provisional.handle,
+        descriptor.transitionId,
+      );
+      journal.markEffectStarted({
+        attemptId: "archattempt_livearchive01",
+        effectEvidenceDigest: "4".repeat(64),
+        effectRevisionDigest: "5".repeat(64),
+        now: new Date("2026-07-19T12:02:00.000Z"),
+      });
+      const effectStarted = service.replaceArchiveTransition(
+        prepared,
+        descriptor.transitionId,
+      );
+      const pendingComponent = journal.terminalCleanupComponent(
+        descriptor.transitionId,
+      );
+
+      expect(service.archiveTransitionHandleV57(descriptor.transitionId))
+        .toBe(effectStarted);
+      expect(() => service.releaseArchiveTransition(
+        descriptor.transitionId,
+        prepared,
+        pendingComponent,
+      ))
+        .toThrow("A stale provider archive authority cannot release its successor.");
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      expect(() => service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        pendingComponent,
+      )).toThrow();
+
+      journal.recordDirectApplied({
+        attemptId: "archattempt_livearchive01",
+        responseGeneration: 1,
+        responseStreamPosition: 1,
+        outcomeEvidenceDigest: "6".repeat(64),
+        outcomeRevisionDigest: "7".repeat(64),
+        now: new Date("2026-07-19T12:03:00.000Z"),
+      });
+      const staleComponent = journal.terminalCleanupComponent(
+        descriptor.transitionId,
+      );
+      journal.markTargetCommitted({
+        targetId: descriptor.transitionId,
+        commitEvidenceDigest: "8".repeat(64),
+        commitRevisionDigest: "9".repeat(64),
+        now: new Date("2026-07-19T12:04:00.000Z"),
+      });
+      expect(() => service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        staleComponent,
+      )).toThrow("Provider archive terminal cleanup authority changed.");
+      expect(journal.reopenTarget(descriptor.transitionId).status)
+        .toBe("committed");
+      expect(service.archiveTransitionHandleV57(descriptor.transitionId))
+        .toBe(effectStarted);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      const committedComponent = journal.terminalCleanupComponent(
+        descriptor.transitionId,
+      );
+      expect(committedComponent).toEqual({
+        accountProfileId: account.id,
+        targetIds: [descriptor.transitionId],
+        cutIds: [],
+        allTargetsCommitted: true,
+      });
+      const releaseTaint = new Error(
+        "fixture callback tainted the final archive generation",
+      );
+      router.archiveProvisionalReleaseFailure = releaseTaint;
+      expect(() => service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        committedComponent,
+      )).toThrow(releaseTaint);
+      expect(router.archiveProvisionalReleaseCalls.at(-1)).toEqual({
+        accountProfileId: account.id,
+        expectedGeneration: 1,
+      });
+      expect(journal.reopenTarget(descriptor.transitionId).status)
+        .toBe("committed");
+      expect(service.archiveTransitionHandleV57(descriptor.transitionId))
+        .toBe(effectStarted);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      expect(router.requests).toEqual([]);
+      expect(await rejection(service.requestSession(account.id, "threadList", {
+        cursor: null,
+        limit: 64,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        sourceKinds: ["appServer"],
+        archived: false,
+      }))).toMatchObject({ code: "runtime_unavailable" });
+      expect(router.requests).toEqual([]);
+      router.archiveProvisionalReleaseFailure = null;
+      database.exec(`
+        CREATE TRIGGER fail_committed_archive_target_delete
+        BEFORE DELETE ON chat_provider_thread_archive_targets_v57
+        BEGIN SELECT RAISE(ABORT, 'fixture target delete failure'); END;
+      `);
+      expect(() => service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        committedComponent,
+      )).toThrow();
+      expect(journal.reopenTarget(descriptor.transitionId).status)
+        .toBe("committed");
+      expect(service.archiveTransitionHandleV57(descriptor.transitionId))
+        .toBe(effectStarted);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      expect(() => archiveAdmissionGate.assertOrdinaryAdmission(account.id))
+        .toThrow();
+
+      database.exec("DROP TRIGGER fail_committed_archive_target_delete");
+      expect(service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        committedComponent,
+      )).toEqual({
+        deletedTargetIds: [descriptor.transitionId],
+        deletedCutIds: [],
+      });
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+      expect(() => journal.reopenTarget(descriptor.transitionId)).toThrow();
+      expect(service.releaseArchiveTransition(
+        descriptor.transitionId,
+        effectStarted,
+        committedComponent,
+      )).toEqual({ deletedTargetIds: [], deletedCutIds: [] });
+    } finally {
+      database.exec("DROP TRIGGER IF EXISTS fail_committed_archive_target_delete");
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("releases incomplete peers independently and deletes the exact committed component", async () => {
+    const runOrder = async (releaseFirst: "first" | "second") => {
+      const {
+        archiveAdmissionGate,
+        createService,
+        database,
+        providerThreadArchiveJournalV57: journal,
+        service,
+        store,
+      } = await fixture();
+      let replayed: AccountService | null = null;
+      try {
+        const account = accountResult(
+          await service.execute({ type: "account.create", label: "Shared" }),
+        );
+        store.updateAuthState(
+          account.id,
+          "signedIn",
+          new Date("2026-07-19T13:00:00.000Z"),
+        );
+        expect(await service.ensureSessionRuntime(account.id)).toEqual({
+          generation: 1,
+        });
+        const targets = [
+          {
+            attemptId: "archattempt_sharedrelease01",
+            memberId: "archmember_sharedrelease01",
+            paneId: "pane_sharedrelease01",
+            targetId: "archtarget_sharedrelease01",
+          },
+          {
+            attemptId: "archattempt_sharedrelease02",
+            memberId: "archmember_sharedrelease02",
+            paneId: "pane_sharedrelease02",
+            targetId: "archtarget_sharedrelease02",
+          },
+        ] as const;
+        for (const [index, target] of targets.entries()) {
+          prepareArchiveTarget({
+            database,
+            journal,
+            store,
+            accountProfileId: account.id,
+            paneId: target.paneId,
+            targetId: target.targetId,
+            attemptId: target.attemptId,
+            now: new Date(`2026-07-19T13:0${index + 1}:00.000Z`),
+            effectStarted: true,
+          });
+        }
+        const sourceProfile = store.find(account.id);
+        if (sourceProfile === null) throw new Error("shared profile disappeared");
+        const cutId = "archcut_sharedrelease01";
+        journal.createCut({
+          cutId,
+          accountProfileId: account.id,
+          accountProfileRevision: sourceProfile.revision,
+          sourceGeneration: sourceProfile.processGeneration,
+          cause: "lost_response",
+          initiatingAttemptId: targets[0].attemptId,
+          predecessorCutId: null,
+          identityEvidenceDigest: "6".repeat(64),
+          identityRevisionDigest: "7".repeat(64),
+          now: new Date("2026-07-19T13:03:00.000Z"),
+        });
+        journal.bindAllAffectedTargets(cutId);
+        for (const [index, target] of targets.entries()) {
+          journal.recordAmbiguous({
+            attemptId: target.attemptId,
+            ambiguityEvidenceDigest: `${index + 8}`.repeat(64),
+            ambiguityRevisionDigest: `${index + 1}`.repeat(64),
+            now: new Date(`2026-07-19T13:0${index + 4}:00.000Z`),
+          });
+        }
+        database.transaction(() => {
+          const successor = store.updateProcessGeneration(
+            account.id,
+            sourceProfile.processGeneration + 1,
+            new Date("2026-07-19T13:06:00.000Z"),
+          ).profile;
+          journal.recordFence({
+            cutId,
+            successorGeneration: successor.processGeneration,
+            successorAccountProfileRevision: successor.revision,
+            fenceEvidenceDigest: "a".repeat(64),
+            fenceRevisionDigest: "b".repeat(64),
+            now: new Date("2026-07-19T13:06:00.000Z"),
+          });
+        }).immediate();
+        const members = targets.map((target, index) => ({
+          memberId: target.memberId,
+          cutId,
+          paneId: target.paneId,
+          paneRevision: 1,
+          paneCasDigest: "1".repeat(64),
+          threadId: `thread_${target.targetId}`,
+          restartThreadId: `restart_${target.targetId}`,
+          role: "target" as const,
+          targetId: target.targetId,
+          attemptId: target.attemptId,
+          targetAttemptOrdinal: 1,
+          action: "preserved_target" as const,
+          binding: { kind: "none" as const },
+          identityEvidenceDigest: `${index + 2}`.repeat(64),
+          identityRevisionDigest: `${index + 4}`.repeat(64),
+          now: new Date(`2026-07-19T13:0${index + 7}:00.000Z`),
+        }));
+        for (const member of members) journal.addCutMember(member);
+        journal.sealCutInventory({
+          cutId,
+          expectedMemberCount: members.length,
+          expectedInventoryDigest:
+            providerThreadArchiveCompleteInventoryDigestV57(members),
+          enumerationAuthorityDigest: "c".repeat(64),
+          sealRevisionDigest: "d".repeat(64),
+          now: new Date("2026-07-19T13:09:00.000Z"),
+        });
+        for (const [index, member] of members.entries()) {
+          journal.settleMember({
+            memberId: member.memberId,
+            settlementEvidenceDigest: `${index + 5}`.repeat(64),
+            settlementRevisionDigest: `${index + 7}`.repeat(64),
+            now: new Date(`2026-07-19T13:1${index}:00.000Z`),
+          });
+        }
+        journal.markCutContained({
+          cutId,
+          containmentEvidenceDigest: "e".repeat(64),
+          containmentRevisionDigest: "f".repeat(64),
+          now: new Date("2026-07-19T13:12:00.000Z"),
+        });
+        for (const [index, target] of targets.entries()) {
+          journal.recordReconciledApplied({
+            attemptId: target.attemptId,
+            responseGeneration: sourceProfile.processGeneration + 1,
+            responseStreamPosition: index + 1,
+            outcomeEvidenceDigest: `${index + 3}`.repeat(64),
+            outcomeRevisionDigest: `${index + 5}`.repeat(64),
+            now: new Date(`2026-07-19T13:1${index + 3}:00.000Z`),
+          });
+        }
+
+        replayed = createService(false);
+        replayed.installArchiveAdmissionReplayV57();
+        const committedHandles = new Map<string, ArchiveAdmissionHandle>();
+        for (const target of targets) {
+          committedHandles.set(
+            target.targetId,
+            replayed.archiveTransitionHandleV57(target.targetId),
+          );
+        }
+        const ordered = releaseFirst === "first"
+          ? targets
+          : [targets[1], targets[0]] as const;
+        const firstHandle = committedHandles.get(ordered[0].targetId);
+        const secondHandle = committedHandles.get(ordered[1].targetId);
+        if (firstHandle === undefined || secondHandle === undefined) {
+          throw new Error("shared release handle disappeared");
+        }
+        journal.markTargetCommitted({
+          targetId: ordered[0].targetId,
+          commitEvidenceDigest: "4".repeat(64),
+          commitRevisionDigest: "6".repeat(64),
+          now: new Date("2026-07-19T13:15:00.000Z"),
+        });
+        const incompleteComponent = journal.terminalCleanupComponent(
+          ordered[0].targetId,
+        );
+        expect(incompleteComponent).toEqual({
+          accountProfileId: account.id,
+          targetIds: targets.map(({ targetId }) => targetId),
+          cutIds: [cutId],
+          allTargetsCommitted: false,
+        });
+        for (const driftedComponent of [
+          { ...incompleteComponent, accountProfileId: "acct_component_drift" },
+          {
+            ...incompleteComponent,
+            targetIds: [...incompleteComponent.targetIds].reverse(),
+          },
+          { ...incompleteComponent, cutIds: [] },
+          { ...incompleteComponent, allTargetsCommitted: true },
+        ]) {
+          expect(() => replayed!.releaseArchiveTransition(
+            ordered[0].targetId,
+            firstHandle,
+            driftedComponent,
+          )).toThrow("Provider archive terminal cleanup authority changed.");
+        }
+        expect(replayed.archiveTransitionHandleV57(ordered[0].targetId))
+          .toBe(firstHandle);
+        expect(replayed.archiveTransitionHandleV57(ordered[1].targetId))
+          .toBe(secondHandle);
+        expect(journal.reopenTarget(ordered[0].targetId).status)
+          .toBe("committed");
+        expect(journal.reopenTarget(ordered[1].targetId).status)
+          .not.toBe("committed");
+        expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+        expect(replayed.releaseArchiveTransition(
+          ordered[0].targetId,
+          firstHandle,
+          incompleteComponent,
+        )).toEqual({ deletedTargetIds: [], deletedCutIds: [] });
+        expect(() => replayed!.archiveTransitionHandleV57(ordered[0].targetId))
+          .toThrow("The provider archive recovery authority is unavailable.");
+        expect(replayed.archiveTransitionHandleV57(ordered[1].targetId))
+          .toBe(secondHandle);
+        expect(journal.reopenTarget(ordered[0].targetId).status)
+          .toBe("committed");
+        expect(journal.reopenTarget(ordered[1].targetId).status)
+          .not.toBe("committed");
+        expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+        expect(replayed.releaseArchiveTransition(
+          ordered[0].targetId,
+          firstHandle,
+          incompleteComponent,
+        )).toEqual({ deletedTargetIds: [], deletedCutIds: [] });
+
+        journal.markTargetCommitted({
+          targetId: ordered[1].targetId,
+          commitEvidenceDigest: "5".repeat(64),
+          commitRevisionDigest: "7".repeat(64),
+          now: new Date("2026-07-19T13:16:00.000Z"),
+        });
+        const completeComponent = journal.terminalCleanupComponent(
+          ordered[1].targetId,
+        );
+        expect(completeComponent).toEqual({
+          ...incompleteComponent,
+          allTargetsCommitted: true,
+        });
+        database.exec(`
+          CREATE TRIGGER fail_shared_archive_component_delete
+          BEFORE DELETE ON chat_provider_thread_archive_targets_v57
+          BEGIN SELECT RAISE(ABORT, 'fixture shared target delete failure'); END;
+        `);
+        expect(() => replayed!.releaseArchiveTransition(
+          ordered[1].targetId,
+          secondHandle,
+          completeComponent,
+        )).toThrow();
+        expect(replayed.archiveTransitionHandleV57(ordered[1].targetId))
+          .toBe(secondHandle);
+        expect(journal.reopenTarget(ordered[0].targetId).status)
+          .toBe("committed");
+        expect(journal.reopenTarget(ordered[1].targetId).status)
+          .toBe("committed");
+        expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+        database.exec("DROP TRIGGER fail_shared_archive_component_delete");
+        expect(replayed.releaseArchiveTransition(
+          ordered[1].targetId,
+          secondHandle,
+          completeComponent,
+        )).toEqual({
+          deletedTargetIds: completeComponent.targetIds,
+          deletedCutIds: completeComponent.cutIds,
+        });
+        expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+        expect(() => journal.reopenTarget(targets[0].targetId)).toThrow();
+        expect(() => journal.reopenTarget(targets[1].targetId)).toThrow();
+        expect(() => journal.reopenCut(cutId)).toThrow();
+        expect(replayed.releaseArchiveTransition(
+          ordered[1].targetId,
+          secondHandle,
+          completeComponent,
+        )).toEqual({ deletedTargetIds: [], deletedCutIds: [] });
+      } finally {
+        database.exec(
+          "DROP TRIGGER IF EXISTS fail_shared_archive_component_delete",
+        );
+        await replayed?.shutdown();
+        await service.shutdown();
+        database.close();
+      }
+    };
+
+    await runOrder("first");
+    await runOrder("second");
+  });
+
+  test("promotes an atomically persisted effect-started transition without a prepared authority", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      service,
+      store,
+    } = await fixture();
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      const provisional = await service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId: "pane_atomiceffect01",
+        purpose: "pane_archive",
+        transitionId: "archtarget_atomiceffect01",
+      });
+      const descriptor = database.transaction(() => prepareArchiveTarget({
+        database,
+        journal,
+        store,
+        accountProfileId: account.id,
+        paneId: "pane_atomiceffect01",
+        targetId: "archtarget_atomiceffect01",
+        attemptId: "archattempt_atomiceffect01",
+        now: new Date("2026-07-19T12:01:00.000Z"),
+        effectStarted: true,
+      }))();
+      expect(await rejection(
+        service.abortArchiveTransitionProvisional(provisional.handle),
+      )).toHaveProperty(
+        "message",
+        "A durable provider archive target cannot release its provisional quarantine.",
+      );
+      expect(() => service.promoteArchiveTransitionEffectStarted(
+        provisional.handle,
+        "archtarget_foreigneffect01",
+      )).toThrow("The provider archive provisional authority is stale or foreign.");
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      const effectStarted = service.promoteArchiveTransitionEffectStarted(
+        provisional.handle,
+        descriptor.transitionId,
+      );
+
+      expect(service.archiveTransitionHandleV57(descriptor.transitionId))
+        .toBe(effectStarted);
+      expect(archiveAdmissionGate.require(effectStarted)).toEqual(descriptor);
+      expect(archiveAdmissionGate.claimThreadArchiveEffect(effectStarted))
+        .toBeDefined();
+      archiveAdmissionGate.release(effectStarted);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("derives account-removal authority from the journal and cannot abort after cut commit", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      service,
+      store,
+    } = await fixture();
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Removal" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      expect(await service.ensureSessionRuntime(account.id)).toEqual({ generation: 1 });
+      const provisional = await service.retainAccountRemovalProvisional(
+        account.id,
+        "archcut_removalservice01",
+        1,
+      );
+      const descriptor = prepareAccountRemovalCut({
+        journal,
+        store,
+        accountProfileId: account.id,
+        cutId: "archcut_removalservice01",
+        now: new Date("2026-07-19T12:01:00.000Z"),
+      });
+
+      expect(() => service.abortAccountRemovalProvisional(provisional))
+        .toThrow("A durable account-removal cut cannot release its provisional quarantine.");
+      const removal = service.promoteAccountRemoval(
+        provisional,
+        descriptor.transitionId,
+      );
+      expect(archiveAdmissionGate.requireAccountRemoval(removal)).toEqual(
+        descriptor,
+      );
+      expect(() => service.releaseAccountRemoval(descriptor.transitionId, removal))
+        .toThrow("Account-removal admission remains held until its exact tombstone is durable.");
+      archiveAdmissionGate.releaseAccountRemoval(removal);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeFalse();
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("joins an exact generation fence to the durable N+1 profile and cut", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    const paneId = "pane_archivefence01";
+    const targetId = "archtarget_archivefence01";
+    const attemptId = "archattempt_archivefence01";
+    const cutId = "archcut_archivefence01";
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      const panes = new ChatPaneStore(database);
+      panes.create({
+        paneId,
+        repository: {
+          id: `repo_${"7".repeat(26)}`,
+          name: "Archive fence",
+          workingDirectory: "/fixture/archive-fence",
+        },
+        accountProfileId: account.id,
+        now: new Date("2026-07-19T12:01:00.000Z"),
+      });
+      database.query(`
+        UPDATE chat_panes SET provider_account_profile_id = ?2,
+          provider_thread_id = ?3, provider_restart_thread_id = ?4
+        WHERE pane_id = ?1
+      `).run(
+        paneId,
+        account.id,
+        "thread_archivefence01",
+        "restart_archivefence01",
+      );
+
+      const provisional = await service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId,
+        purpose: "pane_archive",
+        transitionId: targetId,
+      });
+      expect(provisional.generation).toBe(1);
+      const sourceProfile = store.find(account.id);
+      if (sourceProfile === null) throw new Error("fixture account disappeared");
+      journal.prepareTarget({
+        targetId,
+        paneId,
+        purpose: "pane_archive",
+        paneRevision: 1,
+        queueRevision: null,
+        paneCasDigest: "1".repeat(64),
+        queueCasDigest: null,
+        accountProfileId: account.id,
+        accountProfileRevision: sourceProfile.revision,
+        threadId: "thread_archivefence01",
+        restartThreadId: "restart_archivefence01",
+        binding: { kind: "none" },
+        attempt: {
+          attemptId,
+          generation: 1,
+          accountProfileRevision: sourceProfile.revision,
+          requestEvidenceDigest: "2".repeat(64),
+          requestRevisionDigest: "3".repeat(64),
+        },
+        now: new Date("2026-07-19T12:02:00.000Z"),
+      });
+      const prepared = service.promoteArchiveTransition(
+        provisional.handle,
+        targetId,
+      );
+      journal.markEffectStarted({
+        attemptId,
+        effectEvidenceDigest: "4".repeat(64),
+        effectRevisionDigest: "5".repeat(64),
+        now: new Date("2026-07-19T12:03:00.000Z"),
+      });
+      const effectStarted = service.replaceArchiveTransition(
+        prepared,
+        targetId,
+      );
+      journal.createCut({
+        cutId,
+        accountProfileId: account.id,
+        accountProfileRevision: sourceProfile.revision,
+        sourceGeneration: 1,
+        cause: "lost_response",
+        initiatingAttemptId: attemptId,
+        predecessorCutId: null,
+        identityEvidenceDigest: "6".repeat(64),
+        identityRevisionDigest: "7".repeat(64),
+        now: new Date("2026-07-19T12:04:00.000Z"),
+      });
+      journal.bindAttemptToCut(attemptId, cutId);
+      journal.recordAmbiguous({
+        attemptId,
+        ambiguityEvidenceDigest: "8".repeat(64),
+        ambiguityRevisionDigest: "9".repeat(64),
+        now: new Date("2026-07-19T12:05:00.000Z"),
+      });
+      const ambiguous = service.replaceArchiveTransition(
+        effectStarted,
+        targetId,
+      );
+
+      const fenceCallsBeforeWrongCut = router.fenceCalls.length;
+      expect(await rejection(service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId: "archcut_wrongfence01",
+        archiveHandle: ambiguous,
+      }))).toBeInstanceOf(Error);
+      expect(router.fenceCalls).toHaveLength(fenceCallsBeforeWrongCut);
+      expect(store.find(account.id)?.processGeneration).toBe(1);
+
+      database.query(`
+        UPDATE account_profiles SET revision = revision + 1
+        WHERE profile_id = ?1
+      `).run(account.id);
+      const fenceCallsBeforeRevisionDrift = router.fenceCalls.length;
+      expect(await rejection(service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId,
+        archiveHandle: ambiguous,
+      }))).toMatchObject({ code: "conflict" });
+      expect(router.fenceCalls).toHaveLength(fenceCallsBeforeRevisionDrift);
+      database.query(`
+        UPDATE account_profiles SET revision = ?2
+        WHERE profile_id = ?1
+      `).run(account.id, sourceProfile.revision);
+
+      router.beforeFence = (fencedAccountProfileId, expectedGeneration) => {
+        expect(fencedAccountProfileId).toBe(account.id);
+        expect(expectedGeneration).toBe(1);
+        database.query(`
+          UPDATE account_profiles SET revision = revision + 1
+          WHERE profile_id = ?1
+        `).run(account.id);
+      };
+      expect(await rejection(service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId,
+        archiveHandle: ambiguous,
+      }))).toMatchObject({ code: "conflict" });
+      expect(store.find(account.id)).toMatchObject({
+        processGeneration: 1,
+        revision: sourceProfile.revision + 1,
+      });
+      expect(journal.reopenCut(cutId).state).toBe("fence_started");
+      expect(service.archiveTransitionHandleV57(targetId)).toBe(ambiguous);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+      router.beforeFence = null;
+      database.query(`
+        UPDATE account_profiles SET revision = ?2
+        WHERE profile_id = ?1
+      `).run(account.id, sourceProfile.revision);
+
+      router.fenceFailure = new Error("fixture router fence failure");
+      expect(await rejection(service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId,
+        archiveHandle: ambiguous,
+      }))).toEqual(router.fenceFailure);
+      expect(store.find(account.id)?.processGeneration).toBe(1);
+      expect(journal.reopenCut(cutId).state).toBe("fence_started");
+      expect(service.archiveTransitionHandleV57(targetId)).toBe(ambiguous);
+      router.fenceFailure = null;
+
+      database.exec(`
+        CREATE TRIGGER fail_archive_fence_commit
+        BEFORE UPDATE OF state ON chat_provider_thread_archive_cuts_v57
+        WHEN NEW.state = 'fenced'
+        BEGIN SELECT RAISE(ABORT, 'fixture fence commit failure'); END;
+      `);
+      expect(await rejection(service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId,
+        archiveHandle: ambiguous,
+      }))).toBeInstanceOf(Error);
+      expect(store.find(account.id)?.processGeneration).toBe(1);
+      expect(journal.reopenCut(cutId).state).toBe("fence_started");
+      expect(service.archiveTransitionHandleV57(targetId)).toBe(ambiguous);
+      expect(archiveAdmissionGate.isHeld(account.id)).toBeTrue();
+
+      database.exec("DROP TRIGGER fail_archive_fence_commit");
+      const contained = await service.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: targetId,
+        cutId,
+        archiveHandle: ambiguous,
+      });
+      expect(contained.generation).toBe(2);
+      expect(journal.reopenCut(cutId)).toMatchObject({
+        state: "fenced",
+        successorGeneration: 2,
+        successorAccountProfileRevision: contained.accountProfileRevision,
+      });
+      expect(journal.admissionDescriptor(targetId).successorGeneration).toBe(2);
+      expect(service.archiveTransitionHandleV57(targetId)).toBe(
+        contained.archiveHandle,
+      );
+      const reservedRevision = store.find(account.id)?.revision;
+      expect(await service.ensureArchiveRecoveryRuntime(
+        account.id,
+        contained.archiveHandle,
+      )).toEqual({ generation: 2 });
+      expect(store.find(account.id)).toMatchObject({
+        processGeneration: 2,
+        revision: reservedRevision,
+      });
+      expect(router.generation(account.id)).toBe(2);
+      archiveAdmissionGate.release(contained.archiveHandle);
+    } finally {
+      database.exec("DROP TRIGGER IF EXISTS fail_archive_fence_commit");
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("binds and advances every same-generation target before the external fence", async () => {
+    const {
+      archiveAdmissionGate,
+      createService,
+      database,
+      providerThreadArchiveJournalV57: journal,
+      router,
+      service,
+      store,
+    } = await fixture();
+    let replayed: AccountService | null = null;
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Multi" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      expect(await service.ensureSessionRuntime(account.id)).toEqual({ generation: 1 });
+      const first = prepareArchiveTarget({
+        database,
+        journal,
+        store,
+        accountProfileId: account.id,
+        paneId: "pane_multitarget01",
+        targetId: "archtarget_multitarget01",
+        attemptId: "archattempt_multitarget01",
+        now: new Date("2026-07-19T12:01:00.000Z"),
+        effectStarted: true,
+      });
+      const second = prepareArchiveTarget({
+        database,
+        journal,
+        store,
+        accountProfileId: account.id,
+        paneId: "pane_multitarget02",
+        targetId: "archtarget_multitarget02",
+        attemptId: "archattempt_multitarget02",
+        now: new Date("2026-07-19T12:02:00.000Z"),
+        effectStarted: true,
+      });
+      const sourceProfile = store.find(account.id);
+      if (sourceProfile === null) throw new Error("multi-target profile disappeared");
+      const cutId = "archcut_multitarget01";
+      expect(journal.createCut({
+        cutId,
+        accountProfileId: account.id,
+        accountProfileRevision: sourceProfile.revision,
+        sourceGeneration: 1,
+        cause: "lost_response",
+        initiatingAttemptId: "archattempt_multitarget01",
+        predecessorCutId: null,
+        identityEvidenceDigest: "6".repeat(64),
+        identityRevisionDigest: "7".repeat(64),
+        now: new Date("2026-07-19T12:03:00.000Z"),
+      })).toMatchObject({ targetCount: 2 });
+      journal.bindAttemptToCut("archattempt_multitarget01", cutId);
+      journal.recordAmbiguous({
+        attemptId: "archattempt_multitarget01",
+        ambiguityEvidenceDigest: "8".repeat(64),
+        ambiguityRevisionDigest: "9".repeat(64),
+        now: new Date("2026-07-19T12:04:00.000Z"),
+      });
+
+      replayed = createService(false);
+      replayed.installArchiveAdmissionReplayV57();
+      const firstBefore = replayed.archiveTransitionHandleV57(first.transitionId);
+      const secondBefore = replayed.archiveTransitionHandleV57(second.transitionId);
+      expect(archiveAdmissionGate.require(secondBefore).cutAuthority).toBeNull();
+
+      journal.bindAllAffectedTargets(cutId);
+      journal.recordAmbiguous({
+        attemptId: "archattempt_multitarget02",
+        ambiguityEvidenceDigest: "a".repeat(64),
+        ambiguityRevisionDigest: "b".repeat(64),
+        now: new Date("2026-07-19T12:04:01.000Z"),
+      });
+      const firstHandle = replayed.refreshArchiveTransitionCutAuthoritiesV57({
+        archiveHandle: firstBefore,
+        cutId,
+        transitionId: first.transitionId,
+      });
+      expect(firstHandle).toBe(firstBefore);
+      const secondAmbiguous = replayed.archiveTransitionHandleV57(
+        second.transitionId,
+      );
+      expect(secondAmbiguous).not.toBe(secondBefore);
+      expect(archiveAdmissionGate.require(secondAmbiguous)).toMatchObject({
+        attemptPhase: "ambiguous",
+        successorGeneration: null,
+      });
+
+      const contained = await replayed.containArchiveTransitionGenerationV57({
+        accountProfileId: account.id,
+        transitionId: first.transitionId,
+        cutId,
+        archiveHandle: firstHandle,
+      });
+      expect(router.fenceCalls).toEqual([{
+        accountProfileId: account.id,
+        expectedGeneration: 1,
+      }]);
+      expect(journal.reopenTarget(second.transitionId).currentAttempt.cutId)
+        .toBe(cutId);
+      const secondAfter = replayed.archiveTransitionHandleV57(second.transitionId);
+      expect(secondAfter).not.toBe(secondAmbiguous);
+      const secondDescriptor = archiveAdmissionGate.require(secondAfter);
+      expect(secondDescriptor.cutAuthority).not.toBeNull();
+      expect(secondDescriptor.expectedGeneration).toBe(1);
+      expect(secondDescriptor.successorGeneration).toBe(2);
+      expect(secondDescriptor.transitionId).toBe(second.transitionId);
+      expect(secondDescriptor).toEqual(
+        journal.admissionDescriptor(second.transitionId),
+      );
+      expect(contained.generation).toBe(2);
+    } finally {
+      if (replayed !== null) await replayed.shutdown();
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("cold boot launches only the exact journal-preclaimed successor without another profile bump", async () => {
+    const prepared: { value?: ReturnType<typeof prepareFencedArchiveSuccessor> } = {};
+    const fixtureResult = await generationRecoveryFixture({
+      beforeReplay: ({ database, journal, store }) => {
+        prepared.value = prepareFencedArchiveSuccessor({ database, journal, store });
+      },
+    });
+    const {
+      database,
+      processes,
+      service,
+      store,
+    } = fixtureResult;
+    try {
+      const recovery = prepared.value;
+      if (recovery === undefined) throw new Error("recovery fixture was not prepared");
+      const targetId = recovery.targetId;
+      const handle = service.archiveTransitionHandleV57(targetId);
+      const revisionBefore = store.find(recovery.accountProfileId)?.revision;
+
+      expect(await service.ensureArchiveRecoveryRuntime(
+        recovery.accountProfileId,
+        handle,
+      )).toEqual({ generation: 2 });
+      expect(processes.map(({ generation }) => generation)).toEqual([2]);
+      expect(store.find(recovery.accountProfileId)).toMatchObject({
+        processGeneration: 2,
+        revision: recovery.successorProfileRevision,
+      });
+      expect(store.find(recovery.accountProfileId)?.revision).toBe(revisionBefore);
+
+      expect(await service.ensureArchiveRecoveryRuntime(
+        recovery.accountProfileId,
+        handle,
+      )).toEqual({ generation: 2 });
+      expect(processes).toHaveLength(1);
+      expect(store.find(recovery.accountProfileId)?.revision).toBe(revisionBefore);
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("activates one crash-replayed contained successor before its atomic effect-started rebase", async () => {
+    const prepared: {
+      value?: ReturnType<typeof prepareContainedNotAppliedArchiveSuccessor>;
+    } = {};
+    const fixtureResult = await generationRecoveryFixture({
+      beforeReplay: ({ database, journal, store }) => {
+        prepared.value = prepareContainedNotAppliedArchiveSuccessor({
+          database,
+          journal,
+          store,
+        });
+      },
+    });
+    const {
+      archiveAdmissionGate,
+      database,
+      processes,
+      providerThreadArchiveJournalV57: journal,
+      service,
+      store,
+    } = fixtureResult;
+    try {
+      const recovery = prepared.value;
+      if (recovery === undefined) throw new Error("activation fixture was not prepared");
+      const replayed = service.archiveTransitionHandleV57(recovery.targetId);
+      expect(() => archiveAdmissionGate.claimThreadArchiveEffect(replayed))
+        .toThrow();
+
+      const activated = await service.activateArchiveTransitionSuccessorV57({
+        accountProfileId: recovery.accountProfileId,
+        transitionId: recovery.targetId,
+        archiveHandle: replayed,
+      });
+      expect(activated.generation).toBe(2);
+      expect(activated.archiveHandle).not.toBe(replayed);
+      expect(service.archiveTransitionHandleV57(recovery.targetId)).toBe(
+        activated.archiveHandle,
+      );
+      expect(() => archiveAdmissionGate.require(replayed)).toThrow();
+      expect(processes.map(({ generation }) => generation)).toEqual([2]);
+      expect(store.find(recovery.accountProfileId)).toMatchObject({
+        processGeneration: 2,
+        revision: recovery.successorProfileRevision,
+      });
+
+      const successorAttemptId = "archattempt_coldrecovery02";
+      journal.appendSuccessorAttempt({
+        targetId: recovery.targetId,
+        attemptId: successorAttemptId,
+        generation: 2,
+        accountProfileRevision: recovery.successorProfileRevision,
+        requestEvidenceDigest: "6".repeat(64),
+        requestRevisionDigest: "7".repeat(64),
+        now: new Date("2026-07-29T11:12:00.000Z"),
+      });
+      journal.markEffectStarted({
+        attemptId: successorAttemptId,
+        effectEvidenceDigest: "8".repeat(64),
+        effectRevisionDigest: "9".repeat(64),
+        now: new Date("2026-07-29T11:12:00.000Z"),
+      });
+      const effectStarted = service.replaceArchiveTransition(
+        activated.archiveHandle,
+        recovery.targetId,
+      );
+      const claim = archiveAdmissionGate.claimThreadArchiveEffect(effectStarted);
+      archiveAdmissionGate.beginThreadArchiveEffect(claim);
+      expect(() => archiveAdmissionGate.claimThreadArchiveEffect(effectStarted))
+        .toThrow();
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("keeps replay quarantine when the contained successor profile drifts during launch", async () => {
+    const prepared: {
+      value?: ReturnType<typeof prepareContainedNotAppliedArchiveSuccessor>;
+    } = {};
+    const fixtureResult = await generationRecoveryFixture({
+      beforeReplay: ({ database, journal, store }) => {
+        prepared.value = prepareContainedNotAppliedArchiveSuccessor({
+          database,
+          journal,
+          store,
+        });
+      },
+    });
+    const {
+      archiveAdmissionGate,
+      database,
+      processes,
+      profileFileSystem,
+      service,
+    } = fixtureResult;
+    try {
+      const recovery = prepared.value;
+      if (recovery === undefined) throw new Error("activation fixture was not prepared");
+      const replayed = service.archiveTransitionHandleV57(recovery.targetId);
+      profileFileSystem.beforeEnsure = (accountProfileId) => {
+        database.query(`
+          UPDATE account_profiles SET revision = revision + 1
+          WHERE profile_id = ?1
+        `).run(accountProfileId);
+      };
+      expect(await rejection(service.activateArchiveTransitionSuccessorV57({
+        accountProfileId: recovery.accountProfileId,
+        transitionId: recovery.targetId,
+        archiveHandle: replayed,
+      }))).toMatchObject({ code: "conflict" });
+      expect(processes).toEqual([]);
+      expect(service.archiveTransitionHandleV57(recovery.targetId)).toBe(replayed);
+      expect(archiveAdmissionGate.isHeld(recovery.accountProfileId)).toBeTrue();
+      expect(archiveAdmissionGate.require(replayed).attemptPhase)
+        .toBe("reconciled_not_applied");
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("cold boot rejects successor revision drift during profile preparation before process creation", async () => {
+    const prepared: { value?: ReturnType<typeof prepareFencedArchiveSuccessor> } = {};
+    const fixtureResult = await generationRecoveryFixture({
+      beforeReplay: ({ database, journal, store }) => {
+        prepared.value = prepareFencedArchiveSuccessor({ database, journal, store });
+      },
+    });
+    const {
+      database,
+      processes,
+      profileFileSystem,
+      service,
+      store,
+    } = fixtureResult;
+    try {
+      const recovery = prepared.value;
+      if (recovery === undefined) throw new Error("recovery fixture was not prepared");
+      profileFileSystem.beforeEnsure = (accountProfileId) => {
+        expect(accountProfileId).toBe(recovery.accountProfileId);
+        database.query(`
+          UPDATE account_profiles SET revision = revision + 1
+          WHERE profile_id = ?1
+        `).run(accountProfileId);
+      };
+      const handle = service.archiveTransitionHandleV57(recovery.targetId);
+      expect(await rejection(service.ensureArchiveRecoveryRuntime(
+        recovery.accountProfileId,
+        handle,
+      ))).toMatchObject({ code: "conflict" });
+      expect(processes).toEqual([]);
+      expect(store.find(recovery.accountProfileId)).toMatchObject({
+        processGeneration: 2,
+        revision: recovery.successorProfileRevision + 1,
+      });
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("cold boot rejects an incoherent successor profile before process creation", async () => {
+    const prepared: { value?: ReturnType<typeof prepareFencedArchiveSuccessor> } = {};
+    const fixtureResult = await generationRecoveryFixture({
+      beforeReplay: ({ database, journal, store }) => {
+        prepared.value = prepareFencedArchiveSuccessor({
+          database,
+          journal,
+          store,
+          corruptProfilePostimage: true,
+        });
+      },
+    });
+    const { database, processes, service, store } = fixtureResult;
+    try {
+      const recovery = prepared.value;
+      if (recovery === undefined) throw new Error("recovery fixture was not prepared");
+      const handle = service.archiveTransitionHandleV57(recovery.targetId);
+      expect(await rejection(service.ensureArchiveRecoveryRuntime(
+        recovery.accountProfileId,
+        handle,
+      ))).toMatchObject({ code: "conflict" });
+      expect(processes).toEqual([]);
+      expect(store.find(recovery.accountProfileId)).toMatchObject({
+        processGeneration: 1,
+        revision: recovery.sourceProfileRevision,
+      });
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
   test("a failed profile creation remains recoverable without exceeding snapshot capacity", async () => {
     const { database, events, localDataRemover, service, store } = await fixture();
     try {
@@ -618,7 +2586,7 @@ describe("AccountService", () => {
       const initialGeneration = router.generation(created.id);
       if (initialGeneration === null) throw new Error("fake runtime generation missing");
 
-      await service.containAmbiguousChatEffect(created.id);
+      await service.containAmbiguousChatEffect(created.id, initialGeneration);
       expect(router.fenceCalls).toEqual([{
         accountProfileId: created.id,
         expectedGeneration: initialGeneration,
@@ -650,9 +2618,14 @@ describe("AccountService", () => {
       const created = accountResult(await service.execute({ type: "account.create", label: "Work" }));
       store.updateAuthState(created.id, "signedIn", new Date("2026-07-19T12:00:00.000Z"));
       await service.refreshDispatchAccounts();
+      const initialGeneration = router.generation(created.id);
+      if (initialGeneration === null) throw new Error("fake runtime generation missing");
 
       const logout = service.execute({ type: "account.logout", accountProfileId: created.id });
-      const containment = service.containAmbiguousChatEffect(created.id);
+      const containment = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
       await Promise.all([logout, containment]);
 
       expect(store.find(created.id)).toBeNull();
@@ -744,6 +2717,8 @@ describe("AccountService", () => {
       const created = accountResult(await service.execute({ type: "account.create", label: "Work" }));
       store.updateAuthState(created.id, "signedIn", new Date("2026-07-19T12:00:00.000Z"));
       await service.refreshDispatchAccounts();
+      const initialGeneration = router.generation(created.id);
+      if (initialGeneration === null) throw new Error("fake runtime generation missing");
       const revision = store.find(created.id)?.revision;
       if (revision === undefined) throw new Error("fixture account disappeared");
 
@@ -752,7 +2727,10 @@ describe("AccountService", () => {
         accountProfileId: created.id,
         expectedRevision: revision,
       });
-      const containment = service.containAmbiguousChatEffect(created.id);
+      const containment = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
       await Promise.all([removal, containment]);
 
       expect(store.find(created.id)).toBeNull();
@@ -760,6 +2738,73 @@ describe("AccountService", () => {
       expect(router.restartCalls).toEqual([]);
       expect(router.isRunning(created.id)).toBeFalse();
     } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("account removal retries containment after a lost pre-tombstone response", async () => {
+    let containmentCalls = 0;
+    let contained = false;
+    let runtimeIsRunning: (accountProfileId: string) => boolean = () => true;
+    const value = await fixture({
+      containChatsBeforeRemoval: (accountProfileId) => {
+        expect(runtimeIsRunning(accountProfileId)).toBeFalse();
+        containmentCalls += 1;
+        contained = true;
+        return containmentCalls === 1
+          ? Promise.reject(new Error("fixture crash after durable containment"))
+          : Promise.resolve();
+      },
+    });
+    const { createService, database, events, router, service, store } = value;
+    runtimeIsRunning = (accountProfileId) => router.isRunning(accountProfileId);
+    let reopened: AccountService | null = null;
+    try {
+      const created = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      const expectedRevision = store.find(created.id)?.revision;
+      if (expectedRevision === undefined) throw new Error("fixture account disappeared");
+
+      const interrupted = await rejection(service.execute({
+        type: "account.remove",
+        accountProfileId: created.id,
+        expectedRevision,
+      }));
+      expect(interrupted).toMatchObject({
+        code: "operation_failed",
+        retryable: true,
+        action: "retry",
+      });
+      expect(contained).toBeTrue();
+      expect(containmentCalls).toBe(1);
+      expect(store.find(created.id)).toMatchObject({
+        id: created.id,
+        revision: expectedRevision,
+      });
+      expect(events.some((event) => event.type === "account.removed")).toBeFalse();
+      expect(router.isRunning(created.id)).toBeFalse();
+
+      await service.shutdown();
+      reopened = createService();
+      expect(await reopened.initialize()).toEqual([
+        expect.objectContaining({ id: created.id }),
+      ]);
+      expect(await reopened.execute({
+        type: "account.remove",
+        accountProfileId: created.id,
+        expectedRevision,
+      })).toEqual({ type: "accepted" });
+
+      expect(containmentCalls).toBe(2);
+      expect(store.find(created.id)).toBeNull();
+      expect(events.findLast((event) => event.type === "account.removed")).toEqual({
+        type: "account.removed",
+        accountProfileId: created.id,
+      });
+    } finally {
+      await reopened?.shutdown();
       await service.shutdown();
       database.close();
     }
@@ -780,7 +2825,7 @@ describe("AccountService", () => {
         router.generations.set(created.id, initialGeneration + 1);
         router.running.add(created.id);
       };
-      await service.containAmbiguousChatEffect(created.id);
+      await service.containAmbiguousChatEffect(created.id, initialGeneration);
 
       expect(router.fenceCalls).toEqual([{
         accountProfileId: created.id,
@@ -833,7 +2878,10 @@ describe("AccountService", () => {
       const first = service.requestSession(created.id, "turnStart", firstInput);
       const firstFailure = rejection(first);
       await firstEntered;
-      const containment = service.containAmbiguousChatEffect(created.id);
+      const containment = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
       const secondFailure = rejection(
         service.requestSession(created.id, "turnStart", secondInput),
       );
@@ -895,8 +2943,14 @@ describe("AccountService", () => {
         await fenceRelease;
       };
 
-      const first = service.containAmbiguousChatEffect(created.id);
-      const duplicate = service.containAmbiguousChatEffect(created.id);
+      const first = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
+      const duplicate = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
       expect(duplicate).toBe(first);
       await fenceEntered;
       expect(router.fenceCalls).toEqual([{
@@ -937,7 +2991,10 @@ describe("AccountService", () => {
       if (initialGeneration === null) throw new Error("fake runtime generation missing");
 
       router.fenceFailure = new Error("fixture fence failure");
-      expect(await rejection(service.containAmbiguousChatEffect(created.id))).toMatchObject({
+      expect(await rejection(service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      ))).toMatchObject({
         message: "fixture fence failure",
       });
       const blocked = service.requestSession(created.id, "threadList", {
@@ -955,7 +3012,7 @@ describe("AccountService", () => {
       expect(router.requests.filter(({ key }) => key === "threadList")).toHaveLength(0);
 
       router.fenceFailure = null;
-      await service.containAmbiguousChatEffect(created.id);
+      await service.containAmbiguousChatEffect(created.id, initialGeneration);
       expect(router.fenceCalls).toEqual([
         { accountProfileId: created.id, expectedGeneration: initialGeneration },
         { accountProfileId: created.id, expectedGeneration: initialGeneration },
@@ -983,6 +3040,8 @@ describe("AccountService", () => {
       const created = accountResult(await service.execute({ type: "account.create", label: "Work" }));
       store.updateAuthState(created.id, "signedIn", new Date("2026-07-19T12:00:00.000Z"));
       await service.refreshDispatchAccounts();
+      const initialGeneration = router.generation(created.id);
+      if (initialGeneration === null) throw new Error("fake runtime generation missing");
 
       let announceFence: () => void = () => undefined;
       const fenceEntered = new Promise<void>((resolve) => {
@@ -995,7 +3054,10 @@ describe("AccountService", () => {
         announceFence();
         await fenceRelease;
       };
-      const containment = service.containAmbiguousChatEffect(created.id);
+      const containment = service.containAmbiguousChatEffect(
+        created.id,
+        initialGeneration,
+      );
       await fenceEntered;
       await service.shutdown();
       expect(router.isRunning(created.id)).toBeFalse();
@@ -1770,6 +3832,61 @@ describe("AccountService", () => {
       await Promise.all([first, second]);
       expect(enteredRequests).toBe(2);
       expect(maximumActiveRequests).toBe(1);
+    } finally {
+      await service.shutdown();
+      database.close();
+    }
+  });
+
+  test("one shared archive hold closes every ordinary account admission path", async () => {
+    const {
+      archiveAdmissionGate,
+      database,
+      router,
+      service,
+      store,
+    } = await fixture();
+    try {
+      const account = accountResult(
+        await service.execute({ type: "account.create", label: "Work" }),
+      );
+      store.updateAuthState(
+        account.id,
+        "signedIn",
+        new Date("2026-07-19T12:00:00.000Z"),
+      );
+      const started = await service.beginArchiveTransitionProvisional({
+        accountProfileId: account.id,
+        paneId: "pane_archive_gate_0001",
+        purpose: "pane_archive",
+        transitionId: "archive_transition_0001",
+      });
+      expect(started.generation).toBe(1);
+      const input = {
+        cursor: null,
+        limit: 64,
+        sortKey: "updated_at",
+        sortDirection: "desc",
+        sourceKinds: ["appServer"],
+        archived: false,
+      } satisfies PinnedCodexRequestInput<"threadList">;
+
+      expect(await rejection(service.ensureSessionRuntime(account.id))).toMatchObject({
+        code: "runtime_unavailable",
+      });
+      expect(await rejection(
+        service.requestSession(account.id, "threadList", input),
+      )).toMatchObject({ code: "runtime_unavailable" });
+      expect(await rejection(service.execute({
+        type: "runtime.restartAccount",
+        accountProfileId: account.id,
+      }))).toMatchObject({ code: "runtime_unavailable" });
+      expect(service.dispatchAccounts()).toEqual([]);
+      expect(router.requests.filter(({ key }) => key === "threadList")).toEqual([]);
+
+      archiveAdmissionGate.abortProvisional(started.handle);
+      expect(await service.ensureSessionRuntime(account.id)).toEqual({ generation: 1 });
+      expect(service.dispatchAccounts()).toHaveLength(1);
     } finally {
       await service.shutdown();
       database.close();

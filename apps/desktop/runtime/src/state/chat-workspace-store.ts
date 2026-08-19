@@ -19,7 +19,10 @@ import {
   type WorkspaceLaneIdentityStore,
 } from "../workspaces/workspace-broker";
 import { GitExecutionError } from "../workspaces/git-runner";
-import { ChatPaneStore, ChatPaneStoreError } from "./chat-pane-store";
+import {
+  ChatPaneStoreError,
+  type ChatPaneStore,
+} from "./chat-pane-store";
 
 const timestampSchema = z.string().datetime({ offset: false, precision: 3 });
 const commitSchema = z.string().regex(/^[a-f0-9]{40,64}$/u);
@@ -132,10 +135,13 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
 
   constructor(
     database: Database,
-    options: Readonly<{ now?: () => Date }> = {},
+    options: Readonly<{
+      now?: () => Date;
+      panes: ChatPaneStore;
+    }>,
   ) {
     this.#database = database;
-    this.#panes = new ChatPaneStore(database);
+    this.#panes = options.panes;
     this.#now = options.now ?? (() => new Date());
   }
 
@@ -181,24 +187,31 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
     inputValue: WorkspaceLaneIdentity,
   ): WorkspaceLaneIdentity | null {
     const input = parseIdentity(inputValue);
-    const pane = this.#paneForLane(input.runId);
-    const binding = this.activeBinding(pane.pane_id);
-    // A legitimate interrupted provision always persisted this binding before
-    // the manifest or Git worktree could be created. Filesystem state without
-    // it is an orphan and must remain untouched for explicit recovery.
-    return binding === null ? null : identityFromBinding(binding);
+    return this.#database.transaction(() => {
+      const pane = this.#paneForLane(input.runId);
+      this.#panes.assertProviderThreadArchivePaneMutationAllowedV57(
+        pane.pane_id,
+      );
+      const binding = this.activeBinding(pane.pane_id);
+      // A legitimate interrupted provision always persisted this binding
+      // before the manifest or Git worktree could be created. Filesystem state
+      // without it is an orphan and must remain untouched for explicit recovery.
+      return binding === null ? null : identityFromBinding(binding);
+    })();
   }
 
   bindWorkspaceLane(inputValue: WorkspaceLaneIdentity): WorkspaceLaneIdentity {
     const input = parseIdentity(inputValue);
-    const pane = this.#paneForLane(input.runId);
-    const expectedLaneId = this.expectedLaneId(pane.pane_id);
-    if (
-      input.runId !== expectedLaneId || input.laneId !== expectedLaneId ||
-      input.branchName !== `codex/oprte-${expectedLaneId}`
-    ) conflict("Managed chat workspace identity is not pane-derived.");
-
     return this.#database.transaction(() => {
+      const pane = this.#paneForLane(input.runId);
+      this.#panes.assertProviderThreadArchivePaneMutationAllowedV57(
+        pane.pane_id,
+      );
+      const expectedLaneId = this.expectedLaneId(pane.pane_id);
+      if (
+        input.runId !== expectedLaneId || input.laneId !== expectedLaneId ||
+        input.branchName !== `codex/oprte-${expectedLaneId}`
+      ) conflict("Managed chat workspace identity is not pane-derived.");
       if (
         pane.interaction_mode !== "chat" || pane.archived_at !== null ||
         pane.workspace_mode !== "managed_worktree" ||
@@ -294,6 +307,9 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
       const observed = this.bindWorkspaceLane(input);
       if (!sameIdentity(observed, input)) conflict("Workspace readiness identity drifted.");
       const pane = this.#paneForLane(input.runId);
+      this.#panes.assertProviderThreadArchivePaneMutationAllowedV57(
+        pane.pane_id,
+      );
       const binding = this.activeBinding(pane.pane_id);
       if (binding === null) corrupt("Workspace binding disappeared before readiness.");
       if (binding.state === "ready") {
@@ -347,6 +363,7 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
     const paneId = chatPaneIdSchema.parse(paneIdValue);
     return this.#database.transaction(() => {
       const pane = this.#pane(paneId);
+      this.#panes.assertProviderThreadArchivePaneMutationAllowedV57(paneId);
       if (
         pane.archived_at !== null || pane.interaction_mode !== "chat" ||
         pane.workspace_mode !== "managed_worktree"
@@ -435,6 +452,7 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
     const reason = recoveryReasonSchema.parse(reasonValue);
     return this.#database.transaction(() => {
       const pane = this.#pane(paneId);
+      this.#panes.assertProviderThreadArchivePaneMutationAllowedV57(paneId);
       if (
         pane.archived_at !== null || pane.interaction_mode !== "chat" ||
         pane.workspace_mode !== "managed_worktree" || pane.workspace_state === "preserved"

@@ -12,18 +12,23 @@ export const ROOT_TURN_ROUTING_POLICY_VERSION = 1 as const;
 
 const utf8Encoder = new TextEncoder();
 const classifierInputSchema = z.object({
-  prompt: z.string().refine(
-    (prompt) => {
-      const byteLength = utf8Encoder.encode(prompt).byteLength;
-      return byteLength > 0 &&
-        byteLength <= runtimeChatTurnPromptUtf8ByteLimit &&
-        !prompt.includes("\0") &&
-        prompt.trim().length > 0;
-    },
-    "root-turn prompt must be bounded, nonempty, and NUL-free",
-  ),
+  prompt: z.string(),
+  requiredInputClass: z.enum(["text", "image"]).default("text"),
   priorRouting: chatRootTurnRoutingProjectionSchema.nullable().optional(),
-}).strict();
+}).strict().superRefine((input, context) => {
+  const byteLength = utf8Encoder.encode(input.prompt).byteLength;
+  if (
+    byteLength > runtimeChatTurnPromptUtf8ByteLimit ||
+    input.prompt.includes("\0") ||
+    (input.requiredInputClass === "text" && input.prompt.trim().length === 0)
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "root-turn input must be bounded, admissible, and NUL-free",
+      path: ["prompt"],
+    });
+  }
+});
 
 const exactContinuationPattern = /^(?:please\s+)?(?:continue(?:\s+(?:it|that|this))?|keep going|go ahead|proceed|do it|ship it|finish(?:\s+(?:it|that|this))?|apply(?:\s+(?:it|that|this))?|fix(?:\s+(?:it|that|this))?|same|yes|yep|ok(?:ay)?)[.!?…]*$/u;
 const continuationLeadPattern = /^(?:please\s+)?(?:continue\b|keep going\b|go ahead\b|proceed\b|carry on\b|pick up\b)/u;
@@ -176,9 +181,15 @@ export function classifyRootTurnRoutingV1(
   inputValue: unknown,
 ): ChatRootTurnRoutingProjection {
   const input = classifierInputSchema.parse(inputValue);
-  const classification = classifyPrompt(input.prompt);
+  const classification = input.requiredInputClass === "image"
+    ? {
+        classificationReason: "conservativeDefault" as const,
+        workClass: "standard" as const,
+      }
+    : classifyPrompt(input.prompt);
   const inherited = classification.classificationReason ===
-      "continuationOrAmbiguous" && input.priorRouting != null
+      "continuationOrAmbiguous" && input.requiredInputClass === "text" &&
+      input.priorRouting != null
     ? {
         classificationReason: "continuationInherited" as const,
         workClass: input.priorRouting.workClass,

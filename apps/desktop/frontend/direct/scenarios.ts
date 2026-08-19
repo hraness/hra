@@ -102,6 +102,7 @@ function chatPane(
 ): ChatPaneProjection {
   const pane: ChatPaneProjection = {
     id,
+    paletteIndex: 0,
     revision: 1,
     title: "HRA",
     repository: {
@@ -116,7 +117,9 @@ function chatPane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
     ...overrides,
   };
@@ -333,6 +336,8 @@ const recoverySnapshot = runtimeSnapshotSchema.parse({
   revision: 2,
   accounts: [recoveryAccount],
 });
+const completedReasoningMarkdown =
+  "### Verified reasoning\n\nCompletion reconciliation confirmed the exact provider summary.";
 const completedChatPane = chatPane("pane_completed001", {
   activity: { ordinal: 4, kind: "responseCompleted" },
   revision: 4,
@@ -347,8 +352,10 @@ const completedChatPane = chatPane("pane_completed001", {
     responseMarkdown: chatTail(
       "## Release ready\n\nThe **latest response** is rendered as Markdown.\n\n- Signed\n- Verified\n- Published",
     ),
-    reasoningSummary: chatTail(""),
+    reasoningSummary: chatTail(completedReasoningMarkdown),
+    reasoningSummaryVerified: true,
     tools: [],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: null,
   },
 });
@@ -425,7 +432,9 @@ const attentionChatPanes = attentionPresentations.map((presentation, index) => c
       continuationCount: index === 1 ? 1 : 0,
       responseMarkdown: chatTail(`Preserved partial response for ${presentation.title.toLowerCase()}.`),
       reasoningSummary: chatTail(""),
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: null,
     },
     attention: {
@@ -449,7 +458,9 @@ const streamingInitialPane = chatPane("pane_streaming001", {
     continuationCount: 0,
     responseMarkdown: chatTail(""),
     reasoningSummary: chatTail(""),
+    reasoningSummaryVerified: false,
     tools: [],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: null,
   },
 });
@@ -487,6 +498,7 @@ const streamingToolPane: ChatPaneProjection = {
 };
 
 const compactChatPane = chatPane("pane_compact_malleable", {
+  paletteIndex: 5,
   revision: 5,
   title: "Malleable metaharness",
   state: "streaming",
@@ -563,6 +575,7 @@ const compactChatPane = chatPane("pane_compact_malleable", {
     reasoningSummary: chatTail(
       "### Thinking\n\nChecking **queue order**, touch targets, and image custody.",
     ),
+    reasoningSummaryVerified: false,
     responseMarkdown: chatTail(
       "## Compact answer\n\nThe pane keeps a dense, readable surface.\n\n- Markdown stays safe\n- Tools stay hidden",
     ),
@@ -571,6 +584,7 @@ const compactChatPane = chatPane("pane_compact_malleable", {
       category: "filesystem",
       status: "running",
     }],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: null,
   },
 });
@@ -656,7 +670,9 @@ const manyChatPanes = Array.from({ length: manyChatPaneCount }, (_, index) => ch
       continuationCount: 0,
       responseMarkdown: chatTail(`Pane ${index + 1} is ready.`),
       reasoningSummary: chatTail(""),
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: automaticRouteFixtures[index] ?? null,
     },
   },
@@ -700,7 +716,9 @@ const parallelStreamPanes = Array.from({ length: parallelStreamPaneCount }, (_, 
         continuationCount: 0,
         responseMarkdown: chatTail(""),
         reasoningSummary: chatTail(""),
+        reasoningSummaryVerified: false,
         tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: null,
       },
     },
@@ -924,7 +942,7 @@ const scenarioInputs = [
   {
     id: "chat-completed",
     title: "Completed chat pane",
-    description: "A settled pane renders only the latest assistant Markdown response and an enabled composer.",
+    description: "A settled pane renders the latest response plus completion-verified Markdown reasoning while unverified terminal reasoning stays hidden.",
     route: "/",
     world: createHRADirectWorld({
       gateway: {
@@ -944,7 +962,6 @@ const scenarioInputs = [
       surface: {
         kind: "compactChat",
         paneId: compactChatPane.id,
-        paletteIndex: 5,
         nowUnixMilliseconds: HRA_DIRECT_TIME + 7_305_000,
         attachments: [{
           id: "attachment_compactdirect01",
@@ -993,7 +1010,9 @@ const scenarioInputs = [
             continuationCount: 0,
             responseMarkdown: chatTail("Compact route complete."),
             reasoningSummary: chatTail(""),
+            reasoningSummaryVerified: false,
             tools: [],
+            providerSubagents: { agents: [], overflowCount: 0 },
             routing: automaticRouteFixtures[3],
           },
         })])],
@@ -1633,7 +1652,7 @@ export const hraDirectDefinition = defineDirect({
   coverage: [
     { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, compact pane actions, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
     { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning and response Markdown through one safe renderer while provider tool activity remains intentionally absent from chat UI.", scenarios: ["chat-streaming"] },
-    { key: "chat.pane.latest-response", mode: "fixture", claim: "A settled pane retains only the latest assistant Markdown response and re-enables its composer.", scenarios: ["chat-completed"] },
+    { key: "chat.pane.latest-response", mode: "fixture", claim: "A settled pane renders the latest assistant Markdown response plus only completion-reconciled verified Markdown reasoning; raw or unverified terminal reasoning stays hidden and the composer re-enables.", scenarios: ["chat-completed"] },
     { key: "chat.pane.attention-recovery", mode: "fixture", claim: "The rendered quota, continuation, approval, runtime, and turn attention presentations remain concise, expose no HITL answer controls, and each permit a later message.", scenarios: ["chat-attention"] },
     { key: "chat.pane.create", mode: "mixed", claim: "The real New pane control opens the pathless native chooser only for the first pane, then reuses the visually last local repository through the typed pane-create command.", scenarios: ["chat-create-pane", "chat-create-pane-inherit"] },
     { key: "chat.pane.order", mode: "mixed", claim: "Local panes reorder through both pointer drag and keyboard-accessible menu affordances, persist through the typed command/event boundary, and leave remote anchors fixed.", scenarios: ["chat-pane-order"] },
@@ -1642,7 +1661,7 @@ export const hraDirectDefinition = defineDirect({
     { key: "chat.turn.routing", mode: "fixture", claim: "Automatic routing remains absent from user configuration and chat chrome across Luna Max Fast, Sol Max Standard, Sol Ultra Standard, and fallback fixtures.", scenarios: ["chat-many-panes", "chat-compact-320"] },
     { key: "chat.pane.inline-title", mode: "mixed", claim: "The compact pane actions menu opens the real revision-bound title editor; persistence conflict handling remains gateway integration evidence.", scenarios: ["chat-draft"] },
     { key: "chat.pane.queue-steer", mode: "fixture", claim: "A complete FIFO queue projects editable and removable rows, exposes steering only on its head, and keeps the active composer available for ordinary queueing.", scenarios: ["chat-compact-malleable"] },
-    { key: "chat.pane.attachment-preview", mode: "fixture", claim: "The typed frontend attachment custody port renders one blob preview with remove and paste/chooser affordances; live gateway custody, vault persistence, and provider image delivery remain integration evidence.", scenarios: ["chat-compact-malleable"] },
+    { key: "chat.pane.attachment-preview", mode: "mixed", claim: "The deterministic frontend fixture renders one blob preview with remove and paste/chooser affordances; focused live integration tests prove gateway custody, restart-safe vault persistence, exact leases, and ordered provider image delivery.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.pane.elapsed", mode: "fixture", claim: "One logical HRA turn duration renders beside the submit and Stop controls outside every live region.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.pane.identity-status", mode: "fixture", claim: "The typed frontend palette port selects a golden-angle identity accent while text, glyphs, and semantic outlines retain status independently of hue; durable palette projection remains integration evidence.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.subscription-gate", mode: "fixture", claim: "Without a signed-in Codex subscription, the canonical route is Settings and no panes destination or creation affordance is rendered.", scenarios: ["settings-no-subscriptions"] },

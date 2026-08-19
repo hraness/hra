@@ -20,11 +20,64 @@ describe("Main harness shutdown ordering", () => {
       "async function quiesceGatewayForLocalDataRemoval(): Promise<void>",
     );
     expect(initialization).toContain(
-      'cause !== "capacity_evicted" && cause !== "router_shutdown"',
+      'cause === "provider_lifecycle"',
     );
     expect(initialization).toContain(
-      "?.handleAccountUnavailable(accountProfileId)",
+      "?.handleAccountUnavailable(accountProfileId, {",
     );
+  });
+
+  test("sweeps verified terminal archive authority before exact admission replay", () => {
+    const initialization = sourceBetween(
+      "async function initializeGateway(): Promise<void>",
+      "async function quiesceGatewayForLocalDataRemoval(): Promise<void>",
+    );
+    expect(initialization).not.toContain(
+      "providerThreadArchiveJournalV57.recoveryInventory()",
+    );
+    expect(
+      initialization.match(/installArchiveAdmissionReplayV57\(/g) ?? [],
+    ).toHaveLength(1);
+    expect(
+      initialization.match(
+        /sweepProviderThreadArchiveTerminalAuthorityV57\(/g,
+      ) ?? [],
+    ).toHaveLength(1);
+    expect(initialization).not.toContain("deleteAllTerminalAuthoritySafely");
+    expect(initialization).not.toContain(
+      "deleteContainedZeroTargetRemovalCutSafely",
+    );
+    expect(initialization).toContain(
+      `initializedAccountService.installArchiveAdmissionReplayV57(
+        verifiedProviderThreadArchiveRecoveryInventoryV57,
+      )`,
+    );
+    expect(initialization).toContain(
+      `isDeepStrictEqual(
+        installedProviderThreadArchiveRecoveryInventoryV57,
+        verifiedProviderThreadArchiveRecoveryInventoryV57,
+      )`,
+    );
+    expectOrdered(initialization, [
+      "const initializedAccountService = new AccountService({",
+      "const verifiedProviderThreadArchiveCommittedTargetIdsV57 =",
+      "initializingChatPaneStore.verifyProviderThreadArchiveTerminalAuthorityV57();",
+      ".authorizeProviderThreadArchivePaneCleanupAfterStoreVerificationV57(",
+      "verifiedProviderThreadArchiveCommittedTargetIdsV57,",
+      "await initializingChatAttachmentVault.reconcile(new Date());",
+      "const providerThreadArchiveStartupSweepV57 =",
+      "initializingChatPaneStore.sweepProviderThreadArchiveTerminalAuthorityV57(",
+      "verifiedProviderThreadArchiveCommittedTargetIdsV57,",
+      "const verifiedProviderThreadArchiveRecoveryInventoryV57 =",
+      "providerThreadArchiveStartupSweepV57.recoveryInventory;",
+      "const installedProviderThreadArchiveRecoveryInventoryV57 =",
+      "initializedAccountService.installArchiveAdmissionReplayV57(",
+      "!isDeepStrictEqual(",
+      "chatAttachmentVault = initializingChatAttachmentVault;",
+      "initializingChatService.assertProviderThreadArchiveQuarantinesInstalled();",
+      "await initializedAccountService.initialize();",
+      "await initializingHarnessComposition.initialize();",
+    ]);
   });
 
   test("initialization failure never stops accounts before the producer barrier", () => {

@@ -108,6 +108,156 @@ test("message ledger persists complete FIFO text under independent queue and row
   });
 });
 
+test("exact message IDs replay one durable queue outcome without a second row", () => {
+  withStore((store, database) => {
+    createPane(store);
+    const first = store.enqueueMessageIdempotently({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_lostqueueresponse1",
+      content: { text: "private first", attachmentRefs: [] },
+      delivery: { kind: "queue" },
+      now: NOW,
+    });
+    expect(first.disposition).toBe("applied");
+    enqueue(store, first.queue.revision, "chatmsg_lostqueueother01", "other");
+
+    const rehydratedRevision = store.messageQueue(PANE).revision;
+    const replay = store.enqueueMessageIdempotently({
+      paneId: PANE,
+      expectedQueueRevision: rehydratedRevision,
+      messageId: "chatmsg_lostqueueresponse1",
+      content: { text: "private first", attachmentRefs: [] },
+      delivery: { kind: "queue" },
+      now: later(2),
+    });
+    expect(replay).toMatchObject({
+      disposition: "replayed",
+      queue: { revision: rehydratedRevision },
+    });
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_message_ledger WHERE pane_id = ?1
+    `).get(PANE)).toEqual({ count: 2 });
+
+    for (const changed of [
+      {
+        paneId: PANE,
+        content: { text: "changed", attachmentRefs: [] },
+        delivery: { kind: "queue" as const },
+      },
+      {
+        paneId: PANE,
+        content: { text: "private first", attachmentRefs: [] },
+        delivery: { kind: "steerHead" as const, expectedTurnId: TURN },
+      },
+    ]) {
+      expect(() => store.enqueueMessageIdempotently({
+        ...changed,
+        expectedQueueRevision: rehydratedRevision,
+        messageId: "chatmsg_lostqueueresponse1",
+        now: later(3),
+      })).toThrow(expect.objectContaining({ code: "conflict" }));
+    }
+
+    const otherPaneId = "pane_replayownership2";
+    store.create({
+      paneId: otherPaneId,
+      repository: {
+        id: `repo_${"8".repeat(26)}`,
+        name: "Replay owner",
+        workingDirectory: "/fixture/replay-owner",
+      },
+      accountProfileId: ACCOUNT,
+      now: later(4),
+    });
+    expect(() => store.enqueueMessageIdempotently({
+      paneId: otherPaneId,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_lostqueueresponse1",
+      content: { text: "private first", attachmentRefs: [] },
+      delivery: { kind: "queue" },
+      now: later(5),
+    })).toThrow(expect.objectContaining({ code: "conflict" }));
+  });
+});
+
+test("atomic steer replay distinguishes accepted, ambiguous, and not-applied outcomes", () => {
+  for (const outcome of ["accepted", "ambiguous", "notApplied"] as const) {
+    withStore((store, database) => {
+      const pane = createPane(store);
+      store.beginTurn({
+        paneId: PANE,
+        expectedRevision: pane.revision,
+        turnId: TURN,
+        prompt: "active",
+        now: NOW,
+      });
+      const messageId = `chatmsg_steerreplay${outcome.toLowerCase()}`;
+      const prepared = store.enqueueMessageAndPrepareSteer({
+        paneId: PANE,
+        expectedQueueRevision: 1,
+        messageId,
+        content: { text: "steer once", attachmentRefs: [] },
+        turnId: TURN,
+        now: later(1),
+      });
+      expect(prepared.kind).toBe("prepared");
+      if (prepared.kind !== "prepared") throw new Error("Expected prepared steer.");
+      if (outcome === "notApplied") {
+        store.cancelPreparedSteerMessage({
+          paneId: PANE,
+          messageId,
+          expectedMessageRevision: prepared.claim.revision,
+          turnId: TURN,
+          kind: "steer",
+          now: later(2),
+        });
+      } else {
+        store.markMessageEffectStarted({
+          paneId: PANE,
+          messageId,
+          expectedMessageRevision: prepared.claim.revision,
+          turnId: TURN,
+          kind: "steer",
+          now: later(2),
+        });
+        if (outcome === "accepted") {
+          store.acknowledgeMessageEffect({
+            paneId: PANE,
+            messageId,
+            expectedMessageRevision: prepared.claim.revision + 1,
+            turnId: TURN,
+            kind: "steer",
+            now: later(3),
+          });
+        } else {
+          store.markMessageEffectAmbiguous({
+            paneId: PANE,
+            messageId,
+            expectedMessageRevision: prepared.claim.revision + 1,
+            turnId: TURN,
+            kind: "steer",
+            now: later(3),
+          });
+        }
+      }
+
+      const replay = store.enqueueMessageAndPrepareSteer({
+        paneId: PANE,
+        expectedQueueRevision: store.messageQueue(PANE).revision,
+        messageId,
+        content: { text: "steer once", attachmentRefs: [] },
+        turnId: TURN,
+        now: later(4),
+      });
+      expect(replay.kind).toBe(outcome === "notApplied" ? "notApplied" : "replayed");
+      expect(database.query(`
+        SELECT COUNT(*) AS count FROM chat_message_ledger WHERE message_id = ?1
+      `).get(messageId)).toEqual({ count: 1 });
+    });
+  }
+});
+
 test("attachments remain opaque, ready-only, unique, and path-free", () => {
   withStore((store, database) => {
     createPane(store);
@@ -256,7 +406,7 @@ test("attachments remain opaque, ready-only, unique, and path-free", () => {
       UNION ALL SELECT name FROM pragma_table_info('chat_attachments')
       UNION ALL SELECT name FROM pragma_table_info('chat_message_attachment_refs')
     `).all().map(({ name }) => name);
-    expect(ledgerColumns.some((name) => /path|filename|provider/iu.test(name)))
+    expect(ledgerColumns.some((name) => /path|filename/iu.test(name)))
       .toBe(false);
   });
 });
@@ -678,6 +828,8 @@ test("atomic steer compensation cancels its row and restores exact attachment dr
       turnId: TURN,
       now: NOW,
     });
+    expect(prepared.kind).toBe("prepared");
+    if (prepared.kind !== "prepared") throw new Error("Expected a prepared steer.");
 
     const compensated = store.cancelPreparedSteerMessage({
       paneId: PANE,
@@ -747,6 +899,8 @@ test("expired atomic-steer attachment compensation is explicit and terminal", ()
       turnId: TURN,
       now: NOW,
     });
+    expect(prepared.kind).toBe("prepared");
+    if (prepared.kind !== "prepared") throw new Error("Expected a prepared steer.");
     const compensated = store.cancelPreparedSteerMessage({
       paneId: PANE,
       messageId: prepared.claim.messageId,
@@ -829,6 +983,180 @@ test("restart returns prepared rows, fences effect-started rows, and pauses drai
       SELECT state FROM chat_message_ledger
       WHERE message_id = 'chatmsg_restartprepared'
     `).get()).toEqual({ state: "ambiguous" });
+    const firstAmbiguousRevision = ambiguous.revision;
+    const reopenedAgain = new ChatPaneStore(database);
+    expect(
+      reopenedAgain.reconcileMessageQueueAfterRestart(PANE, later(7)),
+    ).toEqual(ambiguous);
+    expect(reopenedAgain.messageQueue(PANE).revision).toBe(firstAmbiguousRevision);
+  });
+});
+
+test("restart cancels atomic pre-effect steers and exact replay needs no live custody refs", () => {
+  for (const attachment of ["none", "restorable", "expired"] as const) {
+    withStore((store, database) => {
+      const pane = createPane(store);
+      store.beginTurn({
+        paneId: PANE,
+        expectedRevision: pane.revision,
+        turnId: TURN,
+        prompt: "active",
+        now: NOW,
+      });
+      const attachmentRefs = attachment === "none" ? [] : [READY_ATTACHMENT];
+      if (attachment !== "none") {
+        insertReadyAttachment(database, {
+          attachmentId: READY_ATTACHMENT,
+          paneId: PANE,
+          uploadId: `upload_restartatomic${attachment}`,
+          ...(attachment === "expired" ? { expiresAt: later(1) } : {}),
+        });
+      }
+      const messageId = `chatmsg_restartatomic${attachment}`;
+      const content = { text: "atomic before crash", attachmentRefs };
+      const prepared = store.enqueueMessageAndPrepareSteer({
+        paneId: PANE,
+        expectedQueueRevision: 1,
+        messageId,
+        content,
+        turnId: TURN,
+        now: NOW,
+      });
+      if (prepared.kind !== "prepared") throw new Error("Expected prepared steer.");
+
+      const reopened = new ChatPaneStore(database);
+      const recovered = reopened.reconcileMessageQueueAfterRestart(
+        PANE,
+        attachment === "expired" ? later(2) : later(1),
+      );
+      expect(recovered).toMatchObject({
+        pauseReason: "runtimeRestart",
+        blockedMessage: null,
+        messages: [],
+      });
+      expect(database.query(`
+        SELECT state, request_delivery_outcome FROM chat_message_ledger
+        WHERE message_id = ?1
+      `).get(messageId)).toEqual({
+        state: "cancelled",
+        request_delivery_outcome: "not_applied",
+      });
+      expect(database.query(`
+        SELECT COUNT(*) AS count FROM chat_message_attachment_refs
+        WHERE message_id = ?1
+      `).get(messageId)).toEqual({ count: 0 });
+      expect(database.query(`
+        SELECT COUNT(*) AS count FROM chat_attachment_turn_leases
+        WHERE message_id = ?1
+      `).get(messageId)).toEqual({ count: 0 });
+      if (attachment !== "none") {
+        expect(database.query(`
+          SELECT COUNT(*) AS count FROM chat_attachment_draft_leases
+          WHERE attachment_id = ?1
+        `).get(READY_ATTACHMENT)).toEqual({
+          count: attachment === "restorable" ? 1 : 0,
+        });
+      }
+
+      const replay = reopened.enqueueMessageAndPrepareSteer({
+        paneId: PANE,
+        expectedQueueRevision: recovered.revision,
+        messageId,
+        content,
+        turnId: TURN,
+        now: later(3),
+      });
+      expect(replay.kind).toBe("notApplied");
+      expect(database.query(`
+        SELECT COUNT(*) AS count FROM chat_message_ledger
+        WHERE message_id = ?1
+      `).get(messageId)).toEqual({ count: 1 });
+    });
+  }
+});
+
+test("accepted terminal atomic steer replays after attachment custody is released", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    insertReadyAttachment(database, {
+      attachmentId: READY_ATTACHMENT,
+      paneId: PANE,
+      uploadId: "upload_terminalreplay1",
+    });
+    const messageId = "chatmsg_terminalreplay01";
+    const content = {
+      text: "accepted with attachment",
+      attachmentRefs: [READY_ATTACHMENT],
+    };
+    const prepared = store.enqueueMessageAndPrepareSteer({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId,
+      content,
+      turnId: TURN,
+      now: NOW,
+    });
+    if (prepared.kind !== "prepared") throw new Error("Expected prepared steer.");
+    store.markMessageEffectStarted({
+      paneId: PANE,
+      messageId,
+      expectedMessageRevision: prepared.claim.revision,
+      turnId: TURN,
+      kind: "steer",
+      now: later(1),
+    });
+    store.acknowledgeMessageEffect({
+      paneId: PANE,
+      messageId,
+      expectedMessageRevision: prepared.claim.revision + 1,
+      turnId: TURN,
+      kind: "steer",
+      now: later(2),
+    });
+    const terminal = store.enterAttention({
+      paneId: PANE,
+      turnId: TURN,
+      attention: {
+        code: "turn_failed",
+        message: "Terminal after accepted steer.",
+        retryable: true,
+      },
+      clearBinding: true,
+      now: later(3),
+    });
+    if (terminal === null) throw new Error("Expected terminal pane.");
+    store.completeClaimedMessage({
+      paneId: PANE,
+      messageId,
+      expectedMessageRevision: prepared.claim.revision + 2,
+      turnId: TURN,
+      kind: "steer",
+      now: later(4),
+    });
+    database.query(`
+      DELETE FROM chat_message_attachment_refs WHERE message_id = ?1
+    `).run(messageId);
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_message_attachment_refs
+      WHERE message_id = ?1
+    `).get(messageId)).toEqual({ count: 0 });
+
+    const replay = new ChatPaneStore(database).enqueueMessageAndPrepareSteer({
+      paneId: PANE,
+      expectedQueueRevision: store.messageQueue(PANE).revision,
+      messageId,
+      content,
+      turnId: TURN,
+      now: later(5),
+    });
+    expect(replay.kind).toBe("replayed");
   });
 });
 
@@ -894,6 +1222,20 @@ test("an ambiguous message stays immutable until terminal discard releases conta
       now: later(5),
     });
     if (terminal === null) throw new Error("Expected the exact turn to terminalize");
+    expect(() => store.beginTurn({
+      paneId: PANE,
+      expectedRevision: terminal.revision,
+      turnId: "chatturn_ambiguousnew01",
+      prompt: "must stay fenced",
+      now: later(6),
+    })).toThrow(expect.objectContaining({ code: "invalid_state" }));
+    expect(() => store.retryTurn({
+      paneId: PANE,
+      expectedRevision: terminal.revision,
+      priorFailedTurnId: TURN,
+      turnId: "chatturn_ambiguousretry1",
+      now: later(6),
+    })).toThrow(expect.objectContaining({ code: "invalid_state" }));
     const discarded = store.discardAmbiguousMessage({
       paneId: PANE,
       expectedQueueRevision: ambiguous.revision,
@@ -931,6 +1273,149 @@ test("an ambiguous message stays immutable until terminal discard releases conta
       SELECT COUNT(*) AS count FROM chat_message_ambiguous_resolutions
       WHERE message_id = ?1
     `).get(claim.messageId)).toEqual({ count: 0 });
+  });
+});
+
+test("a late effect acknowledgement joins an already terminal exact turn", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    const prepared = store.enqueueMessageAndPrepareSteer({
+      paneId: PANE,
+      expectedQueueRevision: 1,
+      messageId: "chatmsg_lateackterminal1",
+      content: { text: "late provider acknowledgement", attachmentRefs: [] },
+      turnId: TURN,
+      now: later(1),
+    });
+    if (prepared.kind !== "prepared") throw new Error("Expected prepared steer.");
+    store.markMessageEffectStarted({
+      paneId: PANE,
+      messageId: prepared.claim.messageId,
+      expectedMessageRevision: prepared.claim.revision,
+      turnId: TURN,
+      kind: "steer",
+      now: later(2),
+    });
+    const terminal = store.enterAttention({
+      paneId: PANE,
+      turnId: TURN,
+      attention: {
+        code: "turn_failed",
+        message: "Stopped while steer was in flight.",
+        retryable: true,
+      },
+      clearBinding: true,
+      now: later(3),
+    });
+    if (terminal === null) throw new Error("Expected exact terminal pane.");
+
+    const queue = store.acknowledgeMessageEffect({
+      paneId: PANE,
+      messageId: prepared.claim.messageId,
+      expectedMessageRevision: prepared.claim.revision + 1,
+      turnId: TURN,
+      kind: "steer",
+      now: later(4),
+    });
+    expect(queue.messages).toEqual([]);
+    expect(database.query(`
+      SELECT state, request_delivery_outcome FROM chat_message_ledger
+      WHERE message_id = ?1
+    `).get(prepared.claim.messageId)).toEqual({
+      state: "completed",
+      request_delivery_outcome: "accepted",
+    });
+    store.remove(PANE, terminal.revision, later(5));
+    expect(store.get(PANE)).toBeNull();
+  });
+});
+
+test("terminal reasoning recovery is idempotent and a cursor conflict taints visibility", () => {
+  withStore((store, database) => {
+    const pane = createPane(store);
+    store.beginTurn({
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      turnId: TURN,
+      prompt: "active",
+      now: NOW,
+    });
+    const terminal = store.enterAttention({
+      paneId: PANE,
+      turnId: TURN,
+      attention: {
+        code: "turn_failed",
+        message: "The completion callback was lost.",
+        retryable: true,
+      },
+      clearBinding: true,
+      now: later(1),
+    });
+    if (terminal === null) throw new Error("Expected terminal pane.");
+    const receipt = {
+      state: "verified" as const,
+      receiptId: `reasoning_${"a".repeat(58)}`,
+      completionDigest: "b".repeat(64),
+      completionGeneration: 1,
+      completionStreamPosition: 9,
+      completionFactIndex: 0,
+      overflowed: false,
+      reason: null,
+      repairedSuffix: false,
+      summary: {
+        tail: "Recovered verified summary",
+        totalUtf8Bytes: 26,
+        truncatedPrefix: false,
+      },
+      terminalVisible: true as const,
+    };
+    const recovered = store.reconcileReasoningCompletion({
+      paneId: PANE,
+      turnId: TURN,
+      itemId: "item_terminalreasoning01",
+      receipt,
+      now: later(2),
+    });
+    expect(recovered?.turn).toMatchObject({
+      reasoningSummary: { tail: "Recovered verified summary" },
+      reasoningSummaryVerified: true,
+      status: "failed",
+    });
+    expect(recovered?.state).toBe("attention");
+
+    const reopened = new ChatPaneStore(database);
+    expect(reopened.reconcileReasoningCompletion({
+      paneId: PANE,
+      turnId: TURN,
+      itemId: "item_terminalreasoning01",
+      receipt,
+      now: later(3),
+    })).toBeNull();
+    expect(database.query(`
+      SELECT COUNT(*) AS count FROM chat_reasoning_item_receipts
+      WHERE pane_id = ?1 AND turn_id = ?2
+    `).get(PANE, TURN)).toEqual({ count: 1 });
+
+    const tainted = reopened.reconcileReasoningCompletion({
+      paneId: PANE,
+      turnId: TURN,
+      itemId: "item_terminalreasoning01",
+      receipt: { ...receipt, completionStreamPosition: 10 },
+      now: later(4),
+    });
+    expect(tainted?.turn).toMatchObject({
+      reasoningSummary: { tail: "", totalUtf8Bytes: 0 },
+      reasoningSummaryVerified: false,
+      status: "failed",
+    });
+    expect(tainted?.state).toBe("attention");
   });
 });
 
@@ -1217,17 +1702,22 @@ function insertReadyAttachment(
   const digest = "a".repeat(64);
   database.query(`
     INSERT INTO chat_attachments (
-      attachment_id, upload_id, pane_id, revision, state,
-      expected_input_bytes, received_input_bytes, next_chunk_ordinal,
-      input_sha256, source_media_type, width, height, pixel_count,
-      canonical_bytes, canonical_sha256, preview_bytes, preview_sha256,
-      ready_at, created_at, updated_at
+      attachment_id, upload_id, pane_id, revision, state, kind,
+      display_name, declared_media_type, effective_media_type,
+      internal_suffix, expected_input_bytes, received_input_bytes,
+      source_retained, next_chunk_ordinal, finalize_request_revision,
+      requested_input_sha256, input_sha256, source_media_type,
+      width, height, pixel_count, canonical_bytes, canonical_sha256,
+      preview_bytes, preview_width, preview_height, preview_sha256,
+      provider_bytes, provider_sha256, ready_at, created_at, updated_at
     ) VALUES (
-      ?1, ?2, ?3, 1, 'ready',
-      100, 100, 1,
-      ?4, 'image/png', 10, 10, 100,
-      100, ?4, 50, ?4,
-      ?5, ?5, ?5
+      ?1, ?2, ?3, 1, 'ready', 'image',
+      'image.png', 'image/png', 'image/png',
+      'png', 100, 100, 0, 1, 1,
+      ?4, ?4, 'image/png',
+      10, 10, 100, 100, ?4,
+      50, 10, 10, ?4,
+      100, ?4, ?5, ?5, ?5
     )
   `).run(
     input.attachmentId,

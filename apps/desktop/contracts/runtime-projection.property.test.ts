@@ -59,6 +59,7 @@ function emptySnapshot(): RuntimeSnapshot {
 function streamingPane(id: string, turnId: string): ChatPaneProjection {
   return {
     id,
+    paletteIndex: 0,
     revision: 1,
     title: "Chat",
     repository: {
@@ -78,12 +79,16 @@ function streamingPane(id: string, turnId: string): ChatPaneProjection {
       continuationCount: 0,
       responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: resolvedStandardRoute,
     },
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }
@@ -103,6 +108,7 @@ const PROPERTY_TIMEOUT = propertyParameters.interruptAfterTimeLimit + 5_000;
 function lifecyclePane(index: number, revision: number): ChatPaneProjection {
   return {
     id: lifecyclePaneId(index),
+    paletteIndex: index,
     revision,
     title: `Pane ${index}`,
     repository: {
@@ -117,7 +123,9 @@ function lifecyclePane(index: number, revision: number): ChatPaneProjection {
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }

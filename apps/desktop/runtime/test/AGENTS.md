@@ -5,6 +5,7 @@
 - `fixtures/in-memory-secrets-preload.ts` – process-test-only secret custody with exact seeded values, deletion-failure injection, and value-free traces.
 - `probes/` – standalone JSONL and app-server probes used by the pinned-runtime test boundary.
 - `image-normalizer.macos.test.ts` – explicit macOS helper coverage for allowlisted image containers, animation and polyglot rejection, raster bounds, deterministic outputs, filesystem authority, cleanup, and entitlement-free signing.
+- `chat-attachment-vault.test.ts`, `chat-attachment-vault-migration.test.ts`, and `chat-attachment-vault.property.test.ts` – upload/finalize idempotency, exact chunking, filesystem and digest custody, physical quotas, provider leases, crash/reopen reconciliation, archive/privacy journals, and bounded parser laws.
 - `shipped-javascript-licenses.test.ts` – production-closure, nested-document, hash, sentinel, missing-text, and byte-semantics regressions for packaged notices.
 
 # Guidelines

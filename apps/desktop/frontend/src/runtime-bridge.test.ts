@@ -58,6 +58,7 @@ const workspaceSummary = {
 
 const bridgeChatPane: ChatPaneProjection = {
   id: "pane_bridgechat001",
+  paletteIndex: 0,
   revision: 1,
   title: "HRA",
   repository: { id: "repo_00000000000000000000000000", name: "hra" },
@@ -74,7 +75,9 @@ const bridgeChatPane: ChatPaneProjection = {
   turn: null,
   attention: null,
   recoverablePrompt: false,
+  canStartFreshContext: false,
   messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+  attachments: { drafts: [], referenced: [] },
   harness: null,
 };
 
@@ -269,7 +272,12 @@ describe("runtime bridge", () => {
       version: runtimeProtocolVersion,
       operationId,
       ok: true,
-      result: { type: "chatPane", pane },
+      result: {
+        type: "chatPane",
+        pane,
+        disposition: "applied",
+        appliedRevision: pane.revision,
+      },
     } as const);
     const createCommand = {
       type: "chat.pane.create",
@@ -282,6 +290,23 @@ describe("runtime bridge", () => {
     }).dispatch(createCommand)).toMatchObject({
       ok: true,
       result: { type: "chatPane", pane: { id: bridgeChatPane.id, revision: 1 } },
+    });
+    const replayed = transportHarness(() => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true,
+      result: {
+        type: "chatPaneReplay",
+        paneId: bridgeChatPane.id,
+        commandType: "chat.pane.create",
+        appliedRevision: 1,
+      },
+    } as const));
+    expect(await createRuntimeBridge(replayed.transport, {
+      createOperationId: () => operationId,
+    }).dispatch(createCommand)).toMatchObject({
+      ok: true,
+      result: { type: "chatPaneReplay", paneId: bridgeChatPane.id },
     });
 
     for (const pane of [
@@ -341,7 +366,9 @@ describe("runtime bridge", () => {
         continuationCount: 0,
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+        reasoningSummaryVerified: false,
         tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: {
           policyVersion: 1,
           classificationReason: "conservativeDefault",
@@ -370,6 +397,8 @@ describe("runtime bridge", () => {
       result: {
         type: "chatMessageQueue" as const,
         paneId,
+        disposition: "applied" as const,
+        messageId: enqueueCommand.messageId,
         queue: {
           revision,
           pauseReason: null,
@@ -942,6 +971,88 @@ describe("runtime bridge", () => {
       { id: "another-app.ui-scale.increase" },
     ]) {
       expect(uiScaleCommandFromNativeShortcut(value)).toBeNull();
+    }
+  });
+
+  test("correlates attachment previews to the exact pane relationship", async () => {
+    const operationId = "op_bridgeattachment1";
+    const command = {
+      type: "chat.attachment.preview",
+      paneId: bridgeChatPane.id,
+      attachmentId: "attachment_bridgepreview01",
+      expectedRevision: 2,
+      relationship: { kind: "draft" },
+    } as const;
+    const response = (paneId: string) => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true as const,
+      result: {
+        type: "chatAttachmentPreview" as const,
+        paneId,
+        attachmentId: command.attachmentId,
+        revision: command.expectedRevision,
+        mediaType: "image/png" as const,
+        base64: "iVBORw==",
+      },
+    });
+    expect(await createRuntimeBridge(
+      transportHarness(() => response(command.paneId)).transport,
+      { createOperationId: () => operationId },
+    ).dispatch(command)).toMatchObject({
+      result: { type: "chatAttachmentPreview", paneId: command.paneId },
+    });
+    expect(await rejectionOf(createRuntimeBridge(
+      transportHarness(() => response("pane_bridgechat002")).transport,
+      { createOperationId: () => operationId },
+    ).dispatch(command))).toMatchObject({
+      name: "RuntimeBridgeProtocolError",
+      boundary: "dispatchResponse",
+    });
+  });
+
+  test("correlates Start fresh to the exact pane and advanced queue revision", async () => {
+    const operationId = "op_bridgefreshctx01";
+    const command = {
+      type: "chat.pane.startFreshContext",
+      paneId: bridgeChatPane.id,
+      expectedRevision: 4,
+      expectedQueueRevision: 7,
+    } as const;
+    const response = (paneId: string, queueRevision: number) => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true as const,
+      result: {
+        type: "chatMessageQueue" as const,
+        paneId,
+        messageId: null,
+        disposition: "applied" as const,
+        queue: {
+          revision: queueRevision,
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
+        },
+      },
+    });
+    expect(await createRuntimeBridge(
+      transportHarness(() => response(command.paneId, 8)).transport,
+      { createOperationId: () => operationId },
+    ).dispatch(command)).toMatchObject({
+      result: { type: "chatMessageQueue", paneId: command.paneId },
+    });
+    for (const invalid of [
+      response("pane_bridgechat002", 8),
+      response(command.paneId, 7),
+    ]) {
+      expect(await rejectionOf(createRuntimeBridge(
+        transportHarness(() => invalid).transport,
+        { createOperationId: () => operationId },
+      ).dispatch(command))).toMatchObject({
+        name: "RuntimeBridgeProtocolError",
+        boundary: "dispatchResponse",
+      });
     }
   });
 

@@ -19,6 +19,7 @@ import type {
   ChatMessageQueuePauseReason,
   ChatMessageQueueProjection,
   ChatQueuedMessageProjection,
+  ChatProviderSubagentsProjection,
   ChatTurnProjection,
   HarnessChildProjection,
 } from "../../../../contracts/runtime";
@@ -210,14 +211,16 @@ export const TurnElapsed = memo(function TurnElapsed({
   const coarseNow = useCoarseTurnNow(active && nowUnixMilliseconds === undefined);
   if (turn === null) return null;
   const now = nowUnixMilliseconds ?? coarseNow;
+  const formatted = formatTurnElapsed(turnElapsedMilliseconds(turn, now));
+  const durationContext = turn.completedAt === null ? "Current" : "Last";
   return (
     <time
-      aria-label="Turn elapsed"
+      aria-label={`${durationContext} turn duration ${formatted}`}
       className="pane-turn-elapsed"
       dateTime={`PT${Math.floor(turnElapsedMilliseconds(turn, now) / 1_000)}S`}
       title={turn.completedAt === null ? "Current turn duration" : "Last turn duration"}
     >
-      {formatTurnElapsed(turnElapsedMilliseconds(turn, now))}
+      {formatted}
     </time>
   );
 });
@@ -244,16 +247,44 @@ const subagentStateLabel: Readonly<Record<HarnessChildProjection["state"], strin
 
 export const ActiveSubagentStack = memo(function ActiveSubagentStack({
   children,
+  provider,
 }: Readonly<{
   children: readonly HarnessChildProjection[];
+  provider: ChatProviderSubagentsProjection;
 }>) {
   const visible = visibleSubagents(children);
-  if (visible.length === 0) return null;
+  if (
+    visible.length === 0 && provider.agents.length === 0 &&
+    provider.overflowCount === 0
+  ) return null;
   return (
     <section aria-label="Active subagents" className="pane-subagents">
       <ul>
+        {provider.agents.map((agent) => (
+          <li
+            data-subagent-source="provider"
+            data-subagent-state={agent.status}
+            key={agent.id}
+          >
+            <span aria-hidden="true" className="pane-subagent__status" />
+            <span className="pane-subagent__title">{agent.label}</span>
+            <span className="pane-subagent__state">{agent.status}</span>
+          </li>
+        ))}
+        {provider.overflowCount === 0 ? null : (
+          <li data-subagent-source="provider" data-subagent-state="running">
+            <span aria-hidden="true" className="pane-subagent__status" />
+            <span className="pane-subagent__title">
+              +{provider.overflowCount} active
+            </span>
+          </li>
+        )}
         {visible.map((child) => (
-          <li data-subagent-state={child.state} key={child.id}>
+          <li
+            data-subagent-source="hra"
+            data-subagent-state={child.state}
+            key={child.id}
+          >
             <span aria-hidden="true" className="pane-subagent__status" />
             <span className="pane-subagent__title">{child.title}</span>
             <span className="pane-subagent__state">{subagentStateLabel[child.state]}</span>
@@ -283,8 +314,7 @@ export function safeAttachmentPreviewUrl(value: string | null): string | null {
 }
 
 export function isRasterImagePreviewMimeType(value: string): boolean {
-  return value === "image/gif" || value === "image/jpeg" ||
-    value === "image/png" || value === "image/webp";
+  return value === "image/png";
 }
 
 function compactByteSize(byteSize: number): string {
@@ -391,9 +421,40 @@ interface QueuedMessageRowProps {
   readonly onEdit?: (
     message: ChatQueuedMessageProjection,
     content: ChatMessageContent,
-  ) => void;
+  ) => Promise<void>;
   readonly onRemove?: (message: ChatQueuedMessageProjection) => void;
   readonly onSteer?: (message: ChatQueuedMessageProjection) => void;
+}
+
+export function queuedMessageEditKeyAction(input: Readonly<{
+  isComposing: boolean;
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+}>): "cancel" | "save" | null {
+  if (input.isComposing) return null;
+  if (input.key === "Escape") return "cancel";
+  return input.key === "Enter" && (input.metaKey || input.ctrlKey)
+    ? "save"
+    : null;
+}
+
+export function queuedMessageEditSettlement(input: Readonly<{
+  draft: string;
+  outcome: "confirmed" | "failed";
+  errorMessage?: string;
+}>): Readonly<{
+  draft: string;
+  editing: boolean;
+  error: string | null;
+}> {
+  return input.outcome === "confirmed"
+    ? { draft: input.draft, editing: false, error: null }
+    : {
+        draft: input.draft,
+        editing: true,
+        error: input.errorMessage ?? "The queued message could not be saved.",
+      };
 }
 
 const QueuedMessageRow = memo(function QueuedMessageRow({
@@ -406,17 +467,44 @@ const QueuedMessageRow = memo(function QueuedMessageRow({
 }: QueuedMessageRowProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.text);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (editing) return;
     setDraft(message.text);
   }, [editing, message.text]);
-  const save = (): void => {
+  const save = async (): Promise<void> => {
     if (
       onEdit === undefined ||
+      saving ||
       (draft.trim().length === 0 && message.attachmentRefs.length === 0)
     ) return;
-    onEdit(message, { text: draft, attachmentRefs: message.attachmentRefs });
-    setEditing(false);
+    setSaving(true);
+    setError(null);
+    try {
+      await onEdit(message, {
+        text: draft,
+        attachmentRefs: message.attachmentRefs,
+      });
+      const settlement = queuedMessageEditSettlement({
+        draft,
+        outcome: "confirmed",
+      });
+      setDraft(settlement.draft);
+      setError(settlement.error);
+      setEditing(settlement.editing);
+    } catch (reason: unknown) {
+      const settlement = queuedMessageEditSettlement({
+        draft,
+        outcome: "failed",
+        ...(reason instanceof Error ? { errorMessage: reason.message } : {}),
+      });
+      setDraft(settlement.draft);
+      setError(settlement.error);
+      setEditing(settlement.editing);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -426,16 +514,23 @@ const QueuedMessageRow = memo(function QueuedMessageRow({
           aria-label="Edit queued message"
           autoFocus
           className="pane-queue-row__editor"
-          disabled={disabled}
+          disabled={disabled || saving}
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
-            if (event.key === "Escape") {
+            const action = queuedMessageEditKeyAction({
+              isComposing: event.nativeEvent.isComposing,
+              key: event.key,
+              metaKey: event.metaKey,
+              ctrlKey: event.ctrlKey,
+            });
+            if (action === "cancel") {
               event.preventDefault();
               setDraft(message.text);
+              setError(null);
               setEditing(false);
-            } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            } else if (action === "save") {
               event.preventDefault();
-              save();
+              void save();
             }
           }}
           rows={2}
@@ -455,8 +550,9 @@ const QueuedMessageRow = memo(function QueuedMessageRow({
             <IconButton
               aria-label="Save queued message"
               controlClassName="pane-queue-action"
-              isDisabled={disabled || (draft.trim().length === 0 && message.attachmentRefs.length === 0)}
-              onPress={save}
+              isDisabled={disabled || saving || (draft.trim().length === 0 && message.attachmentRefs.length === 0)}
+              isPending={saving}
+              onPress={() => void save()}
               size="compact"
               type="button"
               variant="quiet"
@@ -466,9 +562,10 @@ const QueuedMessageRow = memo(function QueuedMessageRow({
             <IconButton
               aria-label="Cancel queued message edit"
               controlClassName="pane-queue-action"
-              isDisabled={disabled}
+              isDisabled={disabled || saving}
               onPress={() => {
                 setDraft(message.text);
+                setError(null);
                 setEditing(false);
               }}
               size="compact"
@@ -522,6 +619,9 @@ const QueuedMessageRow = memo(function QueuedMessageRow({
           </>
         )}
       </span>
+      {error === null ? null : (
+        <span className="pane-queue-row__error" role="alert">{error}</span>
+      )}
     </li>
   );
 });
@@ -533,6 +633,7 @@ export const QueuedMessageStack = memo(function QueuedMessageStack({
   onEdit,
   onRemove,
   onResume,
+  onStartFresh,
   onSteerHead,
   queue,
 }: Readonly<{
@@ -542,6 +643,7 @@ export const QueuedMessageStack = memo(function QueuedMessageStack({
   onEdit?: QueuedMessageRowProps["onEdit"];
   onRemove?: QueuedMessageRowProps["onRemove"];
   onResume?: () => void;
+  onStartFresh?: () => void;
   onSteerHead?: QueuedMessageRowProps["onSteer"];
   queue: ChatMessageQueueProjection;
 }>) {
@@ -559,7 +661,13 @@ export const QueuedMessageStack = memo(function QueuedMessageStack({
       {queue.pauseReason === null ? null : (
         <div className="pane-queue__pause" role="status">
           <span>{queuePauseLabel(queue.pauseReason)}</span>
-          {onResume === undefined || queue.pauseReason === "ambiguousEffect" ? null : (
+          {onStartFresh === undefined ? null : (
+            <button disabled={disabled} onClick={onStartFresh} type="button">
+              Start fresh
+            </button>
+          )}
+          {onStartFresh !== undefined || onResume === undefined ||
+              queue.pauseReason === "ambiguousEffect" ? null : (
             <button disabled={disabled} onClick={onResume} type="button">Resume</button>
           )}
         </div>
@@ -572,7 +680,7 @@ export const QueuedMessageStack = memo(function QueuedMessageStack({
               : blockedMessage.text}
             {blockedMessage.attachmentRefs.length === 0
               ? null
-              : ` · ${blockedMessage.attachmentRefs.length} ${blockedMessage.attachmentRefs.length === 1 ? "file" : "files"}`}
+              : ` · ${blockedMessage.attachmentRefs.length} ${blockedMessage.attachmentRefs.length === 1 ? "image" : "images"}`}
           </span>
           {onDiscardAmbiguous === undefined ? null : (
             <button
@@ -614,7 +722,7 @@ export type CompactComposerDelivery = "queue" | "steerHead";
 
 export interface CompactChatPaneSurface {
   readonly attachments: readonly CompactAttachmentPreview[];
-  readonly paletteIndex: number | null;
+  readonly attachmentError?: string | null;
   readonly nowUnixMilliseconds?: number;
   readonly onAttachFiles?: (files: readonly File[]) => void;
   readonly onAttachmentsEnqueued?: (attachmentIds: readonly ChatMessageAttachmentId[]) => void;
@@ -637,6 +745,7 @@ export function CompactAttachmentButton({
   return (
     <>
       <input
+        accept="image/*"
         className="hra-visually-hidden pane-attachment-input"
         multiple
         onChange={(event) => {
@@ -648,7 +757,7 @@ export function CompactAttachmentButton({
         type="file"
       />
       <IconButton
-        aria-label="Attach files"
+        aria-label="Attach images"
         controlClassName="pane-attach"
         onPress={() => inputRef.current?.click()}
         size="compact"

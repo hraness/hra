@@ -3791,11 +3791,13 @@ describe("HarnessSQLiteAuthorityV2 actor authority", () => {
 
       value.database.query(`
         INSERT INTO chat_panes (
-          pane_id, display_order, repository_id, repository_name, revision,
+          pane_id, palette_index, display_order, repository_id, repository_name, revision,
           title, account_profile_id, model, reasoning_effort, state,
           created_at, updated_at
         ) VALUES (
-          'pane_harnessv20001', 1, ?1, 'Harness V2', 1,
+          'pane_harnessv20001',
+          (SELECT next_palette_index FROM chat_pane_palette_sequence WHERE singleton = 1),
+          1, ?1, 'Harness V2', 1,
           'Actor pane', ?2, 'gpt-5.6-sol', 'ultra', 'ready', ?3, ?3
         )
       `).run(projectId, accountId, at);

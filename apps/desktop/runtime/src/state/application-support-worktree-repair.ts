@@ -17,6 +17,12 @@ const commitPattern = /^[a-f0-9]{40,64}$/u;
 const movedCwdFailureCode = "application_support_root_moved";
 const chatProvisionInterruptedReason = "provision_interrupted";
 const terminalStages = new Set(["ambiguous", "cancelled", "completed", "failed", "lease_lost"]);
+const providerThreadArchiveAuthorityTablesV57 = [
+  "chat_provider_thread_archive_targets_v57",
+  "chat_provider_thread_archive_attempts_v57",
+  "chat_provider_thread_archive_cuts_v57",
+  "chat_provider_thread_archive_cut_members_v57",
+] as const;
 
 const managedWriteManifestSchema = z.object({
   version: z.literal(1),
@@ -303,6 +309,7 @@ export async function repairMovedApplicationSupportWorktrees(
   options: ApplicationSupportWorktreeRepairOptions,
 ): Promise<ApplicationSupportWorktreeRepairResult> {
   const roots = await validateRoots(options.legacyRoot, options.targetRoot);
+  assertNoProviderThreadArchiveAuthorityV57(options.database);
   let journal = await readJournal(roots.target);
   if (journal === null) {
     journal = await inventory(options.database, roots.legacy, roots.target, options.git);
@@ -418,6 +425,7 @@ export async function reverseMovedApplicationSupportWorktreeRepair(
   options: ApplicationSupportWorktreeRepairOptions,
 ): Promise<ApplicationSupportWorktreeRepairInspection> {
   const roots = await validateRoots(options.legacyRoot, options.targetRoot);
+  assertNoProviderThreadArchiveAuthorityV57(options.database);
   let journal = await readJournal(roots.target);
   const journalPath = worktreeRepairJournalPath(roots.target);
   if (journal === null) return { kind: "absent", journalPath, rollbackSafe: true };
@@ -430,9 +438,11 @@ export async function reverseMovedApplicationSupportWorktreeRepair(
     );
   }
 
+  assertNoProviderThreadArchiveAuthorityV57(options.database);
   journal = { ...journal, state: "reversing" };
   await writeJournal(roots.target, journal);
   checkpoint(options, "afterReversePreparedJournal", null);
+  assertNoProviderThreadArchiveAuthorityV57(options.database);
   for (let index = 0; index < journal.lanes.length; index += 1) {
     const lane = requiredLane(journal, index);
     if (lane.repairKind === "databaseOnly") continue;
@@ -477,6 +487,77 @@ export async function inspectApplicationSupportWorktreeRepair(
 
 export function worktreeRepairJournalPath(targetRoot: string): string {
   return join(normalizedPath(targetRoot, "target root"), journalName);
+}
+
+function assertNoProviderThreadArchiveAuthorityV57(database: Database): void {
+  const tableNameSchema = z.enum(providerThreadArchiveAuthorityTablesV57);
+  let rows: readonly { readonly name: string; readonly type: string }[];
+  try {
+    const values: unknown[] = database.query(`
+      SELECT name, type FROM main.sqlite_schema
+      WHERE name IN (
+        'chat_provider_thread_archive_targets_v57',
+        'chat_provider_thread_archive_attempts_v57',
+        'chat_provider_thread_archive_cuts_v57',
+        'chat_provider_thread_archive_cut_members_v57'
+      )
+      ORDER BY name
+    `).all();
+    rows = z.array(z.object({
+      name: tableNameSchema,
+      type: z.string(),
+    }).strict()).max(providerThreadArchiveAuthorityTablesV57.length).parse(values);
+  } catch (error: unknown) {
+    throw new ApplicationSupportWorktreeRepairError(
+      "invalid_database",
+      "Provider-thread archive authority schema could not be inspected",
+      { cause: error, rollbackSafe: true },
+    );
+  }
+
+  if (rows.length === 0) return;
+  if (rows.length !== providerThreadArchiveAuthorityTablesV57.length) {
+    throw invalidDatabase(
+      "Provider-thread archive authority relations form a partial v57 schema",
+    );
+  }
+  const objectTypes = new Map(rows.map((row) => [row.name, row.type] as const));
+  if (
+    providerThreadArchiveAuthorityTablesV57.some((name) =>
+      objectTypes.get(name) !== "table"
+    )
+  ) {
+    throw invalidDatabase(
+      "Provider-thread archive authority relations are not v57 tables",
+    );
+  }
+
+  let authoritySurvives: boolean;
+  try {
+    const value: unknown = database.query(`
+      SELECT CASE WHEN
+        EXISTS (SELECT 1 FROM main.chat_provider_thread_archive_targets_v57)
+        OR EXISTS (SELECT 1 FROM main.chat_provider_thread_archive_attempts_v57)
+        OR EXISTS (SELECT 1 FROM main.chat_provider_thread_archive_cuts_v57)
+        OR EXISTS (SELECT 1 FROM main.chat_provider_thread_archive_cut_members_v57)
+      THEN 1 ELSE 0 END AS authority_survives
+    `).get();
+    const parsed = z.object({
+      authority_survives: z.number().int().min(0).max(1),
+    }).strict().parse(value);
+    authoritySurvives = parsed.authority_survives === 1;
+  } catch (error: unknown) {
+    throw new ApplicationSupportWorktreeRepairError(
+      "invalid_database",
+      "Provider-thread archive authority relations could not be read",
+      { cause: error, rollbackSafe: true },
+    );
+  }
+  if (authoritySurvives) {
+    throw invalidDatabase(
+      "Provider-thread archive authority must reconcile exactly before Application Support repair",
+    );
+  }
 }
 
 function inspectDatabaseCapabilities(database: Database): DatabaseCapabilities {
@@ -949,6 +1030,7 @@ function applyForwardDatabase(database: Database, journal: Journal): void {
   assertDatabaseCapabilities(database, journal.databaseCapabilities);
   if (!journal.databaseCapabilities.foundation) return;
   database.transaction(() => {
+    assertNoProviderThreadArchiveAuthorityV57(database);
     assertLaneSet(database, journal);
     for (const lane of journal.lanes) {
       assertPathsKnown(database, lane);
@@ -1029,6 +1111,7 @@ function applyReverseDatabase(database: Database, journal: Journal): void {
   assertDatabaseCapabilities(database, journal.databaseCapabilities);
   if (!journal.databaseCapabilities.foundation) return;
   database.transaction(() => {
+    assertNoProviderThreadArchiveAuthorityV57(database);
     assertLaneSet(database, journal);
     for (const lane of journal.lanes) {
       assertPathsKnown(database, lane);

@@ -161,6 +161,8 @@ test("queue result and bounded invalidation expose only app-owned identities", (
     type: "chatMessageQueue",
     paneId: PANE,
     queue,
+    disposition: "applied",
+    messageId: MESSAGE,
   });
   const event = runtimeChatMessageQueueChangedEventSchema.parse({
     type: "chat.messageQueue.changed",

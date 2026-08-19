@@ -148,6 +148,7 @@ async function waitForFailed(shell: RuntimeShell): Promise<void> {
 
 const activeChatPane: ChatPaneProjection = {
   id: "pane_shellchat001",
+  paletteIndex: 0,
   revision: 1,
   title: "Shell chat",
   repository: { id: "repo_shellchat001", name: "hra" },
@@ -169,7 +170,9 @@ const activeChatPane: ChatPaneProjection = {
     continuationCount: 0,
     responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+    reasoningSummaryVerified: false,
     tools: [],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: {
       policyVersion: 1,
       classificationReason: "conservativeDefault",
@@ -184,7 +187,9 @@ const activeChatPane: ChatPaneProjection = {
   },
   attention: null,
   recoverablePrompt: false,
+  canStartFreshContext: false,
   messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+  attachments: { drafts: [], referenced: [] },
   harness: null,
 };
 
@@ -423,6 +428,7 @@ describe("runtime shell", () => {
         revision: 2,
         pane: {
           id: longPane.id,
+          paletteIndex: longPane.paletteIndex,
           revision: 2,
           title: longPane.title,
           accountProfileId: longPane.accountProfileId,
@@ -441,10 +447,12 @@ describe("runtime shell", () => {
               category: "filesystem",
               status: "completed",
             }],
+            providerSubagents: { agents: [], overflowCount: 0 },
             routing: longPane.turn!.routing,
           },
           attention: null,
           recoverablePrompt: false,
+          canStartFreshContext: false,
         },
       },
     });

@@ -52,6 +52,7 @@ export type ReasoningSummaryCompletionReceipt =
   | Readonly<{
       completionDigest: string;
       completionFactIndex: number;
+      completionGeneration: number;
       completionStreamPosition: number;
       overflowed: boolean;
       reason: null;
@@ -68,6 +69,7 @@ export type ReasoningSummaryCompletionReceipt =
   | Readonly<{
       completionDigest: null;
       completionFactIndex: number;
+      completionGeneration: number;
       completionStreamPosition: number;
       overflowed: boolean;
       reason: ReasoningSummaryTaintReason;
@@ -167,7 +169,10 @@ export class ReasoningSummaryAccumulator {
     if (state.completion !== null) {
       if (
         state.completion.state === "verified" &&
-        state.completion.completionDigest === completionDigest
+        state.completion.completionDigest === completionDigest &&
+        state.completion.completionGeneration === input.cursor.generation &&
+        state.completion.completionStreamPosition === input.cursor.streamPosition &&
+        state.completion.completionFactIndex === input.cursor.factIndex
       ) return state.completion;
       this.#taint(state, "completionConflict");
       state.completion = taintedReceipt(state, input.cursor);
@@ -198,12 +203,14 @@ export class ReasoningSummaryAccumulator {
       "hra-reasoning-summary-receipt-v1",
       scopeKey(input),
       completionDigest,
+      cursorKey(input.cursor),
     ).slice(0, 58);
     state.completion = Object.freeze({
       state: "verified",
       receiptId: `reasoning_${receiptId}`,
       completionDigest,
       completionFactIndex: input.cursor.factIndex,
+      completionGeneration: input.cursor.generation,
       completionStreamPosition: input.cursor.streamPosition,
       overflowed: state.overflowed || input.truncated || tail !== completionText,
       reason: null,
@@ -368,7 +375,7 @@ export class ReasoningSummaryAccumulator {
     if (state.completion !== null && state.completion.state === "verified") {
       state.completion = taintedReceipt(state, {
         factIndex: state.completion.completionFactIndex,
-        generation: state.scope.generation,
+        generation: state.completion.completionGeneration,
         streamPosition: state.completion.completionStreamPosition,
       });
     }
@@ -391,6 +398,7 @@ function taintedReceipt(
     "hra-reasoning-summary-tainted-v1",
     scopeKey(state.scope),
     reason,
+    String(cursor.generation),
     String(cursor.streamPosition),
     String(cursor.factIndex),
   ).slice(0, 58);
@@ -399,6 +407,7 @@ function taintedReceipt(
     receiptId: `reasoning_${receiptDigest}`,
     completionDigest: null,
     completionFactIndex: cursor.factIndex,
+    completionGeneration: cursor.generation,
     completionStreamPosition: cursor.streamPosition,
     overflowed: state.overflowed,
     reason,

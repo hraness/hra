@@ -88,6 +88,7 @@ export function runtimeChatPaneStateProjection(
   const pane = chatPaneProjectionSchema.parse(input);
   return chatPaneStateProjectionSchema.parse({
     id: pane.id,
+    paletteIndex: pane.paletteIndex,
     revision: pane.revision,
     title: pane.title,
     accountProfileId: pane.accountProfileId,
@@ -104,10 +105,12 @@ export function runtimeChatPaneStateProjection(
         completedAt: pane.turn.completedAt,
         continuationCount: pane.turn.continuationCount,
         tools: pane.turn.tools,
+        providerSubagents: pane.turn.providerSubagents,
         routing: pane.turn.routing,
     },
     attention: pane.attention,
     recoverablePrompt: pane.recoverablePrompt,
+    canStartFreshContext: pane.canStartFreshContext,
   });
 }
 

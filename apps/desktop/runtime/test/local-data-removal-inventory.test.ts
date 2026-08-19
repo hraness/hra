@@ -26,7 +26,10 @@ import {
   readLocalDataRemovalDatabaseInventory,
   reconcileGatewayManagedWorktreeInventory,
 } from "../src/maintenance/local-data-removal-inventory";
-import { createLocalDataRemovalPlan } from "../src/maintenance/local-data-removal";
+import {
+  controlPlaneRestoreRemovalArtifacts,
+  createLocalDataRemovalPlan,
+} from "../src/maintenance/local-data-removal";
 import {
   HRA_HARNESS_KEYCHAIN_NAME,
   HRA_HARNESS_LEGACY_KEYCHAIN_SERVICE,
@@ -128,6 +131,37 @@ function journal(input: {
 }
 
 describe("gateway local-data removal inventory", () => {
+  test("inventories every v2 vault restore artifact and exact legacy v1 file", () => {
+    const root = "/Users/example/Library/Application Support/OPRTE";
+    expect(controlPlaneRestoreRemovalArtifacts(root)).toEqual([
+      ...[
+        ".control-plane-restore-v2.json",
+        ".control-plane-restore-v2.json.tmp",
+        ".control-plane-restore-v2.stage.sqlite",
+        ".control-plane-restore-v2.rollback.sqlite",
+        ".control-plane-restore-v2.stage.hmac.key",
+        ".control-plane-restore-v2.rollback.hmac.key",
+        ".control-plane-restore-v1.json",
+        ".control-plane-restore-v1.json.tmp",
+        ".control-plane-restore-v1.stage.sqlite",
+        ".control-plane-restore-v1.rollback.sqlite",
+        ".control-plane-restore-v1.stage.hmac.key",
+        ".control-plane-restore-v1.rollback.hmac.key",
+      ].map((fileName) => ({
+        path: join(root, fileName),
+        kind: "file" as const,
+      })),
+      ...[
+        "attachment-vault-v2",
+        ".control-plane-restore-v2.stage.attachments",
+        ".control-plane-restore-v2.rollback.attachments",
+      ].map((directoryName) => ({
+        path: join(root, directoryName),
+        kind: "directory" as const,
+      })),
+    ]);
+  });
+
   test("derives only fixed effective-user removal paths", () => {
     const paths = fixedLocalDataRemovalPaths("/Users/example");
     expect(paths).toEqual({

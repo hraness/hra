@@ -1,11 +1,14 @@
 import { AccountServiceError } from "../accounts/account-service";
+import type { ArchiveAdmissionHandle } from "../accounts/archive-admission-gate";
 import { SessionServiceError } from "../sessions/session-service";
 import type { SessionService } from "../sessions/session-service";
 import type {
   ChatHistoryItem,
   ChatProviderConfiguration,
   ChatProviderPort,
+  ChatProviderResolvedConfiguration,
   ChatProviderResumeRequest,
+  ChatProviderSteerFence,
   ChatProviderThreadRequest,
   ChatProviderTurnRequest,
   ChatThreadBinding,
@@ -15,6 +18,9 @@ import { ChatProviderEffectError } from "./types";
 type ChatSessionRuntime = Pick<
   SessionService,
   | "injectChatHistory"
+  | "archiveChatThread"
+  | "prepareChatThreadArchive"
+  | "reconcileChatThreadArchive"
   | "interruptChatTurn"
   | "resumeChatThread"
   | "setChatThreadName"
@@ -23,6 +29,7 @@ type ChatSessionRuntime = Pick<
   | "resolveChatConfiguration"
   | "steer"
   | "verifiedProductionExecutionPolicyForActiveTurn"
+  | "verifiedChatCapabilityForActiveTurn"
 >;
 
 /** Session-aware Codex 0.144.6 implementation of the provider-neutral chat port. */
@@ -36,7 +43,8 @@ export class CodexChatProvider implements ChatProviderPort {
   async resolveConfiguration(
     accountProfileId: string,
     candidates: readonly ChatProviderConfiguration[],
-  ): Promise<ChatProviderConfiguration> {
+    requiredInputClass: "text" | "image",
+  ): Promise<ChatProviderResolvedConfiguration> {
     try {
       const selected = await this.#sessions.resolveChatConfiguration(
         accountProfileId,
@@ -45,6 +53,7 @@ export class CodexChatProvider implements ChatProviderPort {
           reasoningEffort,
           serviceTier: serviceTier ?? "standard",
         })),
+        requiredInputClass,
       );
       const resolved = candidates.find((candidate) =>
         candidate.model === selected.model &&
@@ -54,7 +63,13 @@ export class CodexChatProvider implements ChatProviderPort {
       if (resolved === undefined) {
         throw new Error("SessionService resolved a configuration outside HRA's candidate chain");
       }
-      return resolved;
+      return Object.freeze({
+        ...resolved,
+        requiredInputClass,
+        catalogGeneration: selected.catalogGeneration,
+        catalogDigest: selected.catalogDigest,
+        observedInputModalities: selected.observedInputModalities,
+      });
     } catch (error: unknown) {
       throw providerFailure(error, false, "configuration");
     }
@@ -69,6 +84,8 @@ export class CodexChatProvider implements ChatProviderPort {
         accountProfileId: request.accountProfileId,
         model: request.model,
         serviceTier: request.serviceTier ?? "standard",
+        catalogGeneration: request.catalogGeneration,
+        catalogDigest: request.catalogDigest,
         title: request.title,
         workspacePath: request.workingDirectory,
       });
@@ -89,6 +106,8 @@ export class CodexChatProvider implements ChatProviderPort {
         restartThreadId: request.restartThreadId,
         model: request.model,
         serviceTier: request.serviceTier ?? "standard",
+        catalogGeneration: request.catalogGeneration,
+        catalogDigest: request.catalogDigest,
         title: request.title,
         workspacePath: request.workingDirectory,
       });
@@ -125,10 +144,13 @@ export class CodexChatProvider implements ChatProviderPort {
       const started = await this.#sessions.startChatTurn({
         clientUserMessageId: ownedClientMessageId(request.clientTurnId),
         model: request.model,
-        prompt: request.prompt,
+        input: request.input,
         reasoningEffort: request.reasoningEffort,
         serviceTier: request.serviceTier ?? "standard",
         threadId: request.threadId,
+        catalogGeneration: request.catalogGeneration,
+        catalogDigest: request.catalogDigest,
+        observedInputModalities: request.observedInputModalities,
       });
       return {
         turnId: started.turnId,
@@ -144,14 +166,26 @@ export class CodexChatProvider implements ChatProviderPort {
 
   verifySteerTarget(
     input: ChatThreadBinding & Readonly<{ readonly turnId: string }>,
-  ): Readonly<{ generation: number }> | null {
+  ): ChatProviderSteerFence | null {
     const receipt = this.#sessions.verifiedProductionExecutionPolicyForActiveTurn(
       input.threadId,
       input.turnId,
     );
-    return receipt === null ? null : Object.freeze({
-      generation: receipt.generation,
-    });
+    const capability = this.#sessions.verifiedChatCapabilityForActiveTurn(
+      input.threadId,
+      input.turnId,
+    );
+    return receipt === null || capability === null ||
+        receipt.generation !== capability.generation
+      ? null
+      : Object.freeze({
+          generation: receipt.generation,
+          catalogDigest: capability.catalogDigest,
+          observedInputModalities: capability.observedInputModalities,
+          allowsImage: capability.observedInputModalities !== null &&
+            capability.observedInputModalities.includes("text") &&
+            capability.observedInputModalities.includes("image"),
+        });
   }
 
   async steerTurn(request: Parameters<ChatProviderPort["steerTurn"]>[0]): Promise<void> {
@@ -160,8 +194,10 @@ export class CodexChatProvider implements ChatProviderPort {
         threadId: request.binding.threadId,
         expectedTurnId: request.providerTurnId,
         expectedGeneration: request.fence.generation,
+        catalogDigest: request.fence.catalogDigest,
         clientUserMessageId: ownedClientMessageId(request.messageId),
-        prompt: request.prompt,
+        input: request.input,
+        observedInputModalities: request.fence.observedInputModalities,
       });
     } catch (error: unknown) {
       throw preserveOrMap(error, true);
@@ -173,6 +209,56 @@ export class CodexChatProvider implements ChatProviderPort {
       await this.#sessions.interruptChatTurn(input.threadId, input.turnId);
     } catch (error: unknown) {
       throw preserveOrMap(error, true);
+    }
+  }
+
+  async prepareThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    generation: number;
+  }>> {
+    try {
+      return await this.#sessions.prepareChatThreadArchive(
+        binding,
+        archiveHandle,
+      );
+    } catch (error: unknown) {
+      throw preserveOrMap(error, false);
+    }
+  }
+
+  async archiveThread(
+    binding: ChatThreadBinding,
+    expectedGeneration: number,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    containmentReceipt: string;
+    generation: number;
+    streamPosition: number;
+  }>> {
+    try {
+      return await this.#sessions.archiveChatThread(
+        binding,
+        expectedGeneration,
+        archiveHandle,
+      );
+    } catch (error: unknown) {
+      throw preserveOrMap(error, true);
+    }
+  }
+
+  async reconcileThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): ReturnType<ChatProviderPort["reconcileThreadArchive"]> {
+    try {
+      return await this.#sessions.reconcileChatThreadArchive(
+        binding,
+        archiveHandle,
+      );
+    } catch (error: unknown) {
+      throw preserveOrMap(error, false);
     }
   }
 }

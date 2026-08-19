@@ -1,9 +1,19 @@
 import { harnessV2Migrations } from "./harness-v2-migrations";
 import { LONGITUDINAL_ROUTING_SCHEMA_V1_SQL } from "./longitudinal-routing-schema-v1";
 import { ROOT_TURN_ROUTING_SCHEMA_V1_SQL } from "./root-turn-routing-schema-v1";
+import { ROOT_TURN_ROUTING_CAPABILITY_SCHEMA_V1_SQL } from
+  "./root-turn-routing-capability-schema-v1";
 import { CHAT_MESSAGE_LEDGER_SCHEMA_V1_SQL } from "./chat-message-ledger-schema-v1";
 import { CHAT_MESSAGE_AMBIGUOUS_RESOLUTION_SCHEMA_V1_SQL } from
   "./chat-message-ambiguous-resolution-schema-v1";
+import { CHAT_COMPACT_SEMANTIC_SCHEMA_V1_SQL } from
+  "./chat-pane-palette-schema-v1";
+import { CHAT_ATTACHMENT_VAULT_SCHEMA_V2_SQL } from
+  "./chat-attachment-vault-schema-v2";
+import { CHAT_MESSAGE_IDEMPOTENCY_SCHEMA_V1_SQL } from
+  "./chat-message-idempotency-schema-v1";
+import { PROVIDER_THREAD_ARCHIVE_JOURNAL_V57_SQL } from
+  "./provider-thread-archive-journal-v57";
 import {
   SESSION_SYNC_HARDENING_SCHEMA_SQL,
   SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL,
@@ -3413,5 +3423,232 @@ export const migrations = [
     version: 48,
     name: "explicit-ambiguous-chat-message-resolution",
     sql: CHAT_MESSAGE_AMBIGUOUS_RESOLUTION_SCHEMA_V1_SQL,
+  },
+  {
+    version: 49,
+    name: "verified-reasoning-provider-subagents-and-pane-palette",
+    sql: CHAT_COMPACT_SEMANTIC_SCHEMA_V1_SQL,
+  },
+  {
+    version: 50,
+    name: "private-durable-chat-attachment-vault",
+    sql: CHAT_ATTACHMENT_VAULT_SCHEMA_V2_SQL,
+  },
+  {
+    version: 51,
+    name: "immutable-chat-message-delivery-intent",
+    sql: CHAT_MESSAGE_IDEMPOTENCY_SCHEMA_V1_SQL,
+  },
+  {
+    version: 52,
+    name: "generation-fenced-root-input-capabilities",
+    sql: ROOT_TURN_ROUTING_CAPABILITY_SCHEMA_V1_SQL,
+  },
+  {
+    version: 53,
+    name: "provider-history-handoff-floor",
+    sql: `
+      ALTER TABLE chat_panes
+        ADD COLUMN provider_history_floor_sequence INTEGER NOT NULL DEFAULT 0
+          CHECK (
+            provider_history_floor_sequence BETWEEN 0 AND 9007199254740991
+          );
+
+      CREATE TRIGGER chat_panes_provider_history_floor_monotonic
+      BEFORE UPDATE OF provider_history_floor_sequence ON chat_panes
+      WHEN NEW.provider_history_floor_sequence < OLD.provider_history_floor_sequence
+      BEGIN
+        SELECT RAISE(ABORT, 'provider history handoff floor cannot move backwards');
+      END;
+    `,
+  },
+  {
+    version: 54,
+    name: "provider-context-reset-required",
+    sql: `
+      ALTER TABLE chat_panes
+        ADD COLUMN provider_context_reset_required INTEGER NOT NULL DEFAULT 0
+          CHECK (provider_context_reset_required IN (0, 1));
+    `,
+  },
+  {
+    version: 55,
+    name: "one-live-provider-attachment-lineage-per-pane",
+    sql: `
+      CREATE UNIQUE INDEX chat_provider_attachment_bindings_one_live_per_pane
+      ON chat_provider_attachment_bindings(pane_id)
+      WHERE state IN ('active', 'ambiguous');
+    `,
+  },
+  {
+    version: 56,
+    name: "durable-provider-thread-archive-intent",
+    sql: `
+      CREATE TABLE chat_provider_thread_archive_intents (
+        pane_id TEXT PRIMARY KEY
+          REFERENCES chat_panes(pane_id) ON DELETE RESTRICT,
+        purpose TEXT NOT NULL CHECK (purpose IN ('start_fresh', 'pane_archive')),
+        state TEXT NOT NULL CHECK (
+          state IN (
+            'prepared', 'effect_started', 'ambiguous', 'succeeded',
+            'account_contained'
+          )
+        ),
+        pane_revision INTEGER NOT NULL CHECK (pane_revision > 0),
+        queue_revision INTEGER CHECK (queue_revision IS NULL OR queue_revision > 0),
+        account_profile_id TEXT NOT NULL CHECK (
+          length(account_profile_id) BETWEEN 1 AND 128
+          AND instr(account_profile_id, char(0)) = 0
+        ),
+        thread_id TEXT NOT NULL CHECK (
+          length(thread_id) BETWEEN 1 AND 512
+          AND instr(thread_id, char(0)) = 0
+        ),
+        restart_thread_id TEXT NOT NULL CHECK (
+          length(restart_thread_id) BETWEEN 1 AND 512
+          AND instr(restart_thread_id, char(0)) = 0
+        ),
+        binding_id TEXT,
+        binding_key_digest TEXT CHECK (
+          binding_key_digest IS NULL OR (
+            length(binding_key_digest) = 64
+            AND binding_key_digest NOT GLOB '*[^0-9a-f]*'
+          )
+        ),
+        binding_revision INTEGER CHECK (
+          binding_revision IS NULL OR binding_revision > 0
+        ),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        generation_contained INTEGER NOT NULL DEFAULT 0
+          CHECK (generation_contained IN (0, 1)),
+        generation_containment_receipt TEXT CHECK (
+          generation_containment_receipt IS NULL OR
+          length(generation_containment_receipt) BETWEEN 16 AND 512
+        ),
+        effect_attempt INTEGER NOT NULL DEFAULT 0 CHECK (effect_attempt >= 0),
+        containment_receipt TEXT CHECK (
+          containment_receipt IS NULL OR length(containment_receipt) BETWEEN 16 AND 512
+        ),
+        response_generation INTEGER CHECK (
+          response_generation IS NULL OR response_generation > 0
+        ),
+        response_stream_position INTEGER CHECK (
+          response_stream_position IS NULL OR response_stream_position >= 0
+        ),
+        ambiguity_receipt TEXT CHECK (
+          ambiguity_receipt IS NULL OR length(ambiguity_receipt) BETWEEN 16 AND 512
+        ),
+        reconciliation_disposition TEXT CHECK (
+          reconciliation_disposition IS NULL OR
+          reconciliation_disposition IN ('applied', 'not_applied')
+        ),
+        reconciliation_receipt TEXT CHECK (
+          reconciliation_receipt IS NULL OR
+          length(reconciliation_receipt) BETWEEN 16 AND 512
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+          (purpose = 'start_fresh' AND queue_revision IS NOT NULL)
+          OR (purpose = 'pane_archive' AND queue_revision IS NULL)
+        ),
+        CHECK (
+          (binding_id IS NULL AND binding_key_digest IS NULL
+            AND binding_revision IS NULL)
+          OR (binding_id IS NOT NULL AND binding_key_digest IS NOT NULL
+            AND binding_revision IS NOT NULL)
+        ),
+        CHECK (
+          (state = 'succeeded' AND containment_receipt IS NOT NULL
+            AND response_generation IS NOT NULL
+            AND response_stream_position IS NOT NULL
+            AND (
+              response_generation = generation
+              OR (
+                response_generation > generation
+                AND generation_contained = 1
+                AND generation_containment_receipt IS NOT NULL
+                AND reconciliation_disposition = 'applied'
+                AND reconciliation_receipt IS NOT NULL
+              )
+            ))
+          OR (state != 'succeeded' AND containment_receipt IS NULL
+            AND response_generation IS NULL
+            AND response_stream_position IS NULL)
+        ),
+        CHECK (
+          (state = 'ambiguous' AND ambiguity_receipt IS NOT NULL)
+          OR (state != 'ambiguous' AND ambiguity_receipt IS NULL)
+        ),
+        CHECK (
+          (reconciliation_disposition IS NULL AND reconciliation_receipt IS NULL)
+          OR (reconciliation_disposition IS NOT NULL
+            AND reconciliation_receipt IS NOT NULL)
+        ),
+        CHECK (
+          (generation_contained = 0 AND generation_containment_receipt IS NULL)
+          OR (generation_contained = 1
+            AND generation_containment_receipt IS NOT NULL
+            AND state IN ('ambiguous', 'succeeded', 'account_contained'))
+        )
+      ) STRICT;
+
+      CREATE TRIGGER chat_provider_thread_archive_intent_identity_immutable
+      BEFORE UPDATE OF purpose, pane_revision, queue_revision,
+        account_profile_id, thread_id, restart_thread_id,
+        binding_id, binding_key_digest, binding_revision, created_at
+      ON chat_provider_thread_archive_intents
+      WHEN NEW.purpose IS NOT OLD.purpose
+        OR NEW.pane_revision IS NOT OLD.pane_revision
+        OR NEW.queue_revision IS NOT OLD.queue_revision
+        OR NEW.account_profile_id IS NOT OLD.account_profile_id
+        OR NEW.thread_id IS NOT OLD.thread_id
+        OR NEW.restart_thread_id IS NOT OLD.restart_thread_id
+        OR NEW.binding_id IS NOT OLD.binding_id
+        OR NEW.binding_key_digest IS NOT OLD.binding_key_digest
+        OR NEW.binding_revision IS NOT OLD.binding_revision
+        OR NEW.created_at IS NOT OLD.created_at
+      BEGIN
+        SELECT RAISE(ABORT, 'provider thread archive intent identity is immutable');
+      END;
+
+      CREATE TRIGGER chat_provider_thread_archive_intent_transition_guard
+      BEFORE UPDATE OF state ON chat_provider_thread_archive_intents
+      WHEN NOT (
+        (OLD.state = 'prepared' AND NEW.state = 'prepared')
+        OR
+        (OLD.state = 'prepared' AND NEW.state = 'effect_started')
+        OR (OLD.state = 'effect_started' AND NEW.state IN ('ambiguous', 'succeeded'))
+        OR (OLD.state = 'ambiguous' AND NEW.state IN ('prepared', 'succeeded'))
+        OR (NEW.state = 'account_contained'
+          AND OLD.state IN ('prepared', 'effect_started', 'ambiguous', 'succeeded'))
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid provider thread archive intent transition');
+      END;
+
+      CREATE TRIGGER chat_provider_thread_archive_intent_fence_guard
+      BEFORE UPDATE OF generation, effect_attempt
+      ON chat_provider_thread_archive_intents
+      WHEN NOT (
+        (OLD.state = 'prepared' AND NEW.state = 'effect_started'
+          AND NEW.generation = OLD.generation
+          AND NEW.effect_attempt = OLD.effect_attempt + 1)
+        OR (OLD.state = 'ambiguous' AND NEW.state = 'prepared'
+          AND NEW.effect_attempt = OLD.effect_attempt)
+        OR (OLD.state = 'prepared' AND NEW.state = 'prepared'
+          AND NEW.effect_attempt = OLD.effect_attempt)
+        OR (NEW.generation = OLD.generation
+          AND NEW.effect_attempt = OLD.effect_attempt)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid provider thread archive effect fence');
+      END;
+    `,
+  },
+  {
+    version: 57,
+    name: "keyed-provider-thread-archive-containment-journal",
+    sql: PROVIDER_THREAD_ARCHIVE_JOURNAL_V57_SQL,
   },
 ] as const satisfies readonly Migration[];

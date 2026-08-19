@@ -48,6 +48,7 @@ import { legacyOprteUiScaleStorageKey } from "../src/ui-scale";
 const DEFAULT_BASE_URL = "http://127.0.0.1:5174";
 const SERVER_START_TIMEOUT_MS = 30_000;
 const DIRECT_ROOT_ASSET_PATHS = new Set([
+  "/compact-chat-surface.tsx",
   "/main.tsx",
   "/runtime.ts",
   "/scenarios.ts",
@@ -93,6 +94,10 @@ const networkSchema = z.object({
     url: z.string(),
   })),
 });
+const uiScaleMeasurementSchema = z.object({
+  rootFontSizePx: z.number().finite(),
+  uiScale: z.string(),
+}).strict();
 const remainingWorkSchema = z.object({
   cancelledScriptedEvents: z.number().int().nonnegative(),
   disposed: z.boolean(),
@@ -164,6 +169,11 @@ type ProbeSnapshot = Omit<DirectProbeSnapshot, "remainingWork"> & {
 type NetworkRequest = z.infer<typeof networkSchema>["requests"][number];
 export type ResponsiveLayoutMeasurement = z.infer<typeof responsiveLayoutMeasurementSchema>;
 export type ParallelPerformanceMeasurement = z.infer<typeof parallelPerformanceMeasurementSchema>;
+export type ParallelComposerMeasurement = Readonly<{
+  composerCount: number;
+  disabledComposerCount: number;
+  disabledSendButtonCount: number;
+}>;
 type RemoteSummaryWindowEvidence = z.infer<typeof remoteSummaryWindowEvidenceSchema>;
 interface CoveragePolicyEntry {
   readonly claim: string;
@@ -275,7 +285,7 @@ const scenarios = [
     ],
     expectedVisibleControls: [
       "More actions for Malleable metaharness",
-      "Attach files",
+      "Attach images",
       "Remove compact-layout.png",
       "Edit queued message",
       "Remove queued message",
@@ -291,6 +301,8 @@ const scenarios = [
     action: "send-follow-up",
     expectedBeforeAction: [
       "Release HRA",
+      "Verified reasoning",
+      "Completion reconciliation confirmed the exact provider summary.",
       "Release ready",
       "The latest response is rendered as Markdown.",
       "Signed",
@@ -298,7 +310,12 @@ const scenarios = [
       "Published",
     ],
     expectedText: ["Direct response", "Completed: Follow up after release"],
-    forbiddenText: ["Queue", "Steer"],
+    forbiddenText: [
+      "Queue",
+      "Steer",
+      "Unverified provider reasoning",
+      "This must stay hidden.",
+    ],
     viewport: { width: 1_120, height: 780 },
   },
   {
@@ -613,16 +630,21 @@ export function externalOrFailedRequests(
     } catch {
       return true;
     }
-    const embedded = parsed.protocol === "data:";
-    const assetPath = embedded
-      || parsed.pathname === "/"
-      || DIRECT_ROOT_ASSET_PATHS.has(parsed.pathname)
-      || parsed.pathname.startsWith("/@fs/")
-      || parsed.pathname.startsWith("/@id/")
-      || parsed.pathname.startsWith("/@vite/")
-      || parsed.pathname === "/@react-refresh"
-      || parsed.pathname.startsWith("/node_modules/");
-    return (!embedded && parsed.origin !== origin)
+    const sameOriginBlob = parsed.protocol === "blob:" && parsed.origin === origin;
+    const sameOriginHttp = ["http:", "https:"].includes(parsed.protocol) &&
+      parsed.origin === origin;
+    const assetPath = sameOriginBlob || (
+      sameOriginHttp && (
+        parsed.pathname === "/"
+        || DIRECT_ROOT_ASSET_PATHS.has(parsed.pathname)
+        || parsed.pathname.startsWith("/@fs/")
+        || parsed.pathname.startsWith("/@id/")
+        || parsed.pathname.startsWith("/@vite/")
+        || parsed.pathname === "/@react-refresh"
+        || parsed.pathname.startsWith("/node_modules/")
+      )
+    );
+    return (!sameOriginBlob && !sameOriginHttp)
       || request.method !== "GET"
       || request.status === undefined
       || request.status < 200
@@ -941,6 +963,29 @@ export function parallelPerformanceFailures(
   return failures;
 }
 
+export function parallelComposerFailures(
+  measurement: ParallelComposerMeasurement,
+  expectedComposerCount = parallelStreamPaneCount,
+): readonly string[] {
+  const failures: string[] = [];
+  if (measurement.composerCount !== expectedComposerCount) {
+    failures.push(
+      `expected ${String(expectedComposerCount)} active composers, received ${String(measurement.composerCount)}`,
+    );
+  }
+  if (measurement.disabledComposerCount !== 0) {
+    failures.push(
+      `${String(measurement.disabledComposerCount)} of ${String(expectedComposerCount)} parallel active composers are disabled`,
+    );
+  }
+  if (measurement.disabledSendButtonCount !== expectedComposerCount) {
+    failures.push(
+      `expected ${String(expectedComposerCount)} disabled empty send controls, received ${String(measurement.disabledSendButtonCount)}`,
+    );
+  }
+  return failures;
+}
+
 function scenarioUrl(baseUrl: string, id: string): string {
   const url = new URL("/", `${normalizeRootHttpOrigin(baseUrl)}/`);
   url.searchParams.set("__direct_scenario", id);
@@ -1015,6 +1060,11 @@ async function setUiScale(
     "wait",
     "--fn",
     `(() => { try { return JSON.parse(localStorage.getItem(${JSON.stringify(legacyOprteUiScaleStorageKey)}) || 'null')?.scale === ${expectedScale}; } catch { return false; } })()`,
+  ]);
+  await browser.run([
+    "wait",
+    "--fn",
+    `Math.abs(Number.parseFloat(getComputedStyle(document.documentElement).fontSize) - 16 * Number(${JSON.stringify(expectedScale)})) <= 0.1`,
   ]);
 }
 
@@ -1180,7 +1230,8 @@ async function runAction(
       await browser.run([
         "wait",
         "--fn",
-        "document.documentElement.style.getPropertyValue('--ui-scale') === '2'",
+        `document.documentElement.style.getPropertyValue('--ui-scale') === '2'
+          && Math.abs(Number.parseFloat(getComputedStyle(document.documentElement).fontSize) - 32) <= 0.1`,
       ]);
       return;
     case "send-follow-up":
@@ -1580,6 +1631,7 @@ async function verifyResponsiveLayout(
         ) {
           if (candidate.getAttribute("aria-hidden") === "true") return true;
           if (candidate.hasAttribute("inert")) return true;
+          if (candidate.classList.contains("hra-visually-hidden")) return true;
           if (candidate.matches(".hra-skip-link:not(:focus)")) return true;
           const style = getComputedStyle(candidate);
           const rectangle = candidate.getBoundingClientRect();
@@ -2039,8 +2091,12 @@ async function verifyScenarioSemantics(
   if (state.durationInsideLiveRegionCount !== 0) {
     failures.push("turn duration is nested inside a live region");
   }
-  if (state.durationLabels.some((label) => label !== "Turn elapsed")) {
-    failures.push("turn duration does not use the exact Turn elapsed accessible name");
+  if (state.durationLabels.some((label, index) => {
+    const text = state.durationTexts[index] ?? "";
+    return label !== `Current turn duration ${text}` &&
+      label !== `Last turn duration ${text}`;
+  })) {
+    failures.push("turn duration accessible name omits its current or last value");
   }
   if (!state.viewportContent.split(",").map((value) => value.trim()).includes("viewport-fit=cover")) {
     failures.push("the Direct viewport does not opt into safe-area coverage");
@@ -2098,6 +2154,7 @@ async function verifyScenarioSemantics(
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("sent turn did not reach its terminal ready state");
       if (state.disabledComposers !== 0 || state.responseCount !== 1) failures.push("terminal pane did not expose one enabled latest response");
       if (state.thinkingCount !== 0 || state.toolActivityCount !== 0) failures.push("terminal pane retained transient activity");
+      if (state.reasoningMarkdownHeadings.length !== 0) failures.push("unverified terminal reasoning became visible");
       if (!state.markdownHeadings.includes("Direct response")) failures.push("terminal Markdown response is not semantic");
       if (state.paneActivities[0] !== "responseCompleted") failures.push("response border did not replace the message reset");
       break;
@@ -2143,7 +2200,11 @@ async function verifyScenarioSemantics(
       ) {
         failures.push("parallel fixture does not retain 64 active local streams and the bounded 48-of-448 remote window");
       }
-      if (state.disabledComposers !== parallelStreamPaneCount) failures.push("parallel active composers are not independently fenced");
+      failures.push(...parallelComposerFailures({
+        composerCount: state.composerPlaceholders.length,
+        disabledComposerCount: state.disabledComposers,
+        disabledSendButtonCount: state.disabledSendButtons,
+      }));
       if (state.responseCount !== parallelStreamPaneCount) {
         failures.push("parallel deltas did not render one response per local stream");
       }
@@ -2331,20 +2392,20 @@ async function verifyScenario(options: {
 
   await runAction(browser, definition.action);
 
-  const uiScale = await browser.evaluate(
-    "document.documentElement.style.getPropertyValue('--ui-scale') || '1'",
+  const { rootFontSizePx, uiScale } = parseData(
+    uiScaleMeasurementSchema,
+    await browser.evaluate(`(() => ({
+      rootFontSizePx: Number.parseFloat(
+        getComputedStyle(document.documentElement).fontSize,
+      ),
+      uiScale: document.documentElement.style.getPropertyValue('--ui-scale') || '1',
+    }))()`),
+    `${definition.id} text scale measurement`,
   );
-  if (typeof uiScale !== "string") throw new Error(`${definition.id} returned an invalid UI scale.`);
   if (definition.expectedUiScale !== undefined && uiScale !== definition.expectedUiScale) {
     throw new Error(
       `${definition.id} expected UI scale ${definition.expectedUiScale}, received ${uiScale}`,
     );
-  }
-  const rootFontSizePx = await browser.evaluate(
-    "Number.parseFloat(getComputedStyle(document.documentElement).fontSize)",
-  );
-  if (typeof rootFontSizePx !== "number" || !Number.isFinite(rootFontSizePx)) {
-    throw new Error(`${definition.id} returned an invalid rendered root font size.`);
   }
   if (
     definition.expectedUiScale !== undefined &&

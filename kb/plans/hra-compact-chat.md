@@ -1,7 +1,7 @@
 ---
 type: plan
 area: desktop-chat
-status: in-progress
+status: blocked
 title: Compact durable HRA chat
 description: Make the desktop chat a dense touch-safe work surface with durable queueing and steering, image custody, verified full-access Codex execution, Markdown, active subagents, elapsed time, and stable pane identity.
 tags:
@@ -42,8 +42,11 @@ support, and no hover-only action.
 - Chat starts currently hard-code on-request approvals and a workspace-write
   sandbox in several session paths. Steering inherits the active turn and
   cannot repair a weak start policy.
-- The generated provider input supports `text`, `image`, and `localImage`, but
-  HRA's outgoing codec and public chat contract currently accept text only.
+- The generated provider input supports `text`, `image`, and `localImage`.
+  Its `mention` variant is specifically an app or plugin selection, not a
+  generic filesystem attachment. HRA now uses native `localImage` for
+  normalized raster images. There is no provider-owned opaque input for a
+  generic file, so the live attachment boundary is deliberately image-only.
 - Logical turn timestamps already support the requested elapsed-time display.
   Provider duration is a different diagnostic and must not be presented as
   logical turn time.
@@ -53,8 +56,9 @@ support, and no hover-only action.
 - Provider collaboration events are decoded and then collapsed into generic
   tool activity. A new private, content-free projection is required for active
   subagents.
-- The attachment vault does not exist. The encrypted control-plane backup
-  currently covers SQLite state and the receipt key only.
+- The attachment vault, custody ledger, and streamed encrypted backup are now
+  implemented. The remaining work is to finish the provider-thread archive
+  transition joins and current-head delivery gates.
 
 ## Scope
 
@@ -63,8 +67,8 @@ support, and no hover-only action.
 - One application-owned durable message ledger for every ordinary send.
 - FIFO queue projection, editing, removal, pause, resume, and exact same-turn
   steering of the head item.
-- Image selection and clipboard paste, validated private storage, compact
-  preview, provider `localImage` delivery, retention, deletion, and backup.
+- Image selection and clipboard paste, validated private storage, compact image
+  previews, provider `localImage` delivery, retention, deletion, and backup.
 - One verified full-access, never-ask production execution policy for ordinary
   chat, recursive actors, recovery, capability probes, and steering.
 - Sanitized Markdown for assistant responses and bounded reasoning summaries.
@@ -78,8 +82,12 @@ support, and no hover-only action.
 
 ### Non-goals
 
-- Generic document or folder attachments. The pinned provider contract has no
-  generic-file input.
+- Generic files, directories, device files, filesystem links, remote URLs, and
+  executable attachment semantics. HRA does not overload the provider's
+  app/plugin `mention` protocol or expose a private vault path as model text.
+  Generic files remain out of scope until the pinned provider offers a
+  structured, opaque input capability or HRA owns a separately reviewed safe
+  extraction contract.
 - Rendering raw reasoning or provider paths, thread IDs, prompts, subagent
   messages, models, effort, or account identity.
 - Retrying an ambiguous provider start or steer.
@@ -130,11 +138,13 @@ action on the head row provides touch and keyboard parity.
 
 ### Attachments
 
-The browser sends bounded sequential chunks under an opaque upload ID. It
-never sends a filesystem path, data URL, or source filename. The gateway
-sniffs a closed raster MIME set, validates decoding, dimensions, frame count,
-decompression bounds, byte length, chunk order, and digests, then commits an
-immutable private blob with an opaque attachment ID.
+The browser sends bounded sequential image chunks under an opaque upload ID.
+It never sends a filesystem path or data URL. The browser and gateway reject
+generic files before vault custody or provider admission. The gateway verifies
+byte length, chunk order, and digests, then applies a closed raster MIME
+allowlist, structure checks, decode, dimensions, frame count, and
+decompression bounds before HRA commits a normalized immutable PNG
+generation.
 
 Temporary directories are mode 0700 and files are 0600. Writes use no-follow
 creation, fsync, and same-filesystem atomic rename. A `ready` database row is
@@ -172,13 +182,16 @@ backup, so restore does not promise exact continuation of image-bearing
 provider context. Missing or unportable bindings enter an explicit context
 reset instead of a text-only continuation.
 
-Image-only input is valid and uses the conservative standard/Sol Max route.
-Before any provider effect, route resolution uses one exact-generation model
-catalog and filters for image input support. Same-turn image steering is
-rejected unless the already active model has verified image capability.
-Image-bearing history is nonrepresentable in the provider's text-only handoff
-format, so cross-account replacement takes the explicit safe context-reset
-path instead of dropping the image silently.
+Attachment-only input is valid. Image-only input uses the conservative
+standard/Sol Max route. Before any image provider effect, route resolution
+uses one exact-generation model catalog and filters for image input support.
+Same-turn image steering is rejected unless the already active model has
+verified image capability. HRA delivers normalized images as `localImage`.
+Generic attachment kinds fail before a provider lease or effect. HRA never
+turns a private vault path into model-visible text. Attachment-bearing history
+is nonrepresentable in the provider's text-only handoff format, so
+cross-account replacement takes the explicit safe context-reset path instead
+of dropping attachments silently.
 
 ### Production execution policy
 
@@ -254,10 +267,58 @@ bottom safe-area padding, matches DOM and focus order to visual order, and
 keeps queue and agent stacks independently bounded. At 200% text and 26rem
 width, no horizontal overflow is permitted.
 
+## Current gate
+
+The live `pane_archive` and `start_fresh` transitions are implemented and
+production-default enabled. Migration v57 owns immutable targets, append-only
+attempts, account-generation cuts, and frozen cut members. Store-owned HMAC
+evidence binds pane, queue, provider thread, routing, message-ledger, attachment
+binding, and lease preimages and terminal postimages.
+
+One shared account admission gate closes every ordinary provider surface before
+the first journal write. The router additionally requires an exact quiescent
+generation: no active operation, turn, callback, server request, or login may
+overlap archive admission. A foreign callback observed under quarantine taints
+that generation until exact teardown. The expected one-shot `thread/archived`
+notification is authorized by generation and thread digest, consumed without
+being forwarded, and cannot reopen a wider callback exemption.
+
+Direct success records the provider outcome, finalizes the exact terminal
+component, deletes only the Store-verified all-committed authority, and releases
+the Gate without an intervening await. Lost or ambiguous responses create one
+durable cohort cut, fence the exact source generation, enumerate and seal every
+source owner, settle each member atomically, reconcile against a positioned
+successor catalog, and run any not-applied successor attempts as an all-target
+wave. Reconciliation buffers the complete cohort before replacing or releasing
+any authority. Source enumeration treats a settled route as historical
+provenance unless the pane still owns unresolved Store authority. Explicit
+archive targets and exact cleanup initiators remain contained, while unrelated
+settled panes keep their provider thread and attachment binding for an exact
+successor-generation resume.
+
+Startup performs Store terminal verification, exact Vault cleanup authorization
+and reconciliation, an atomic Store terminal sweep, and AccountService replay
+from the same returned recovery inventory before account, Session, Harness, or
+provider initialization. The sweep deletes only verified all-committed
+`pane_archive` and `start_fresh` components. Mixed open/committed components and
+every zero-target `account_removal` cut remain durable and quarantined. The v57
+account-removal coordinator is still deliberately dormant and must not be
+enabled without its separate Vault inverse-admission join.
+
+Hostile review approved the enabled transition with no P0/P1 finding. Focused
+runtime, startup, Session, Store, Vault, journal, portable projection, Direct,
+typecheck, lint, and diff gates are green. Repository delivery remains blocked
+by the inherited published-release source test: the current development branch
+is not the clean one-commit publication transition required by the v0.1.10
+release-provenance gate. No merge or release is claimed until the repository's
+release protocol returns to an admissible source state and `check:complete`
+passes there.
+
 ## Dependency-ordered work
 
 1. Freeze contracts, queue and attachment states, execution policy, provider
-   evidence, snapshot bounds, and migration v47.
+   evidence, snapshot bounds, and the additive migration sequence through the
+   provider-context and archive-intent fences.
 2. Implement the centralized full-access policy and exact-generation
    requirements proof across every session path.
 3. Implement the durable message ledger, atomic enqueue receipt, FIFO claim,
@@ -323,3 +384,95 @@ active turn for steer, HRA performs no provider effect and retains the local
 message. Removing the feature does not require weakening these receipts: the
 renderer can stop exposing enqueue and upload while the durable ledger remains
 inspectable and recoverable.
+
+## Execution evidence
+
+- 2026-08-18: The live attachment boundary is image-only. Browser, gateway,
+  store, and provider tests prove generic kinds fail before custody or provider
+  effects, while normalized images use ordered `localImage` input.
+- 2026-08-18: Attachment upload, preview lifecycle, queue projection,
+  capability evidence, provider leases, account-loss containment, and explicit
+  fresh-context recovery passed their focused desktop suites.
+- 2026-08-18: Streamed backup and Restore C passed 55 backup tests, 19
+  maintenance tests, and 9 local-data-removal tests. These cover authenticated
+  framing, bounded memory evidence, journal-before-stage custody, the
+  SQLite/key/vault generation swap, rollback, crash recovery, and privacy
+  inventory.
+- 2026-08-18: The safe provider-archive interim passed 213 focused store,
+  vault, and service tests plus desktop typecheck and focused lint. Pending
+  archive intents fence ordinary mutation and bootstrap recovery; privacy and
+  account-contained cleanup are atomic; provider-bound close fails before any
+  external effect.
+- 2026-08-18: The portable transition passed 61 projection and backup tests
+  with 542 assertions. It removes every five-state, two-purpose archive intent
+  only from the private copy, authenticates every removed field and count,
+  fences affected panes, preserves source DB/vault bytes, and restores zero
+  provider archive intents.
+- 2026-08-18: The post-approval safe live cut passed 255 focused store,
+  service, account, session, and integration tests plus a compiled-gateway
+  regression, typecheck, lint, and diff checks. Exact-generation cleanup
+  preserves account B and successor N+1 while deliberately containing every
+  pane context last owned by fenced generation N. Provider-bound archive
+  effects remain disabled pending the crash-persistent state machine above.
+- 2026-08-19: The normalized v57 journal, shared admission gate, exact router
+  recovery lane, AccountService authority, Session scans, ChatPane settlement,
+  attachment and repair fences, portable projection, and ChatService
+  coordinator passed independent hostile review. The coordinator covers every
+  durable restart phase, untargeted sibling containment, atomic successor
+  waves, postcommit pane handoff, and the 64-target recovery bound. Direct
+  Remove, direct Start fresh, and grouped startup recovery prove the
+  production-default enabled path; an explicit override retains the rollback
+  gate for tests.
+- 2026-08-19: Startup now verifies Store-owned terminal authority, authorizes
+  and reconciles Vault cleanup, atomically deletes only exact all-committed pane
+  components, and installs AccountService quarantine from the same returned
+  recovery inventory before account or Harness initialization. A real
+  file-backed close/reopen test proves exact connected-component deletion,
+  mixed-component retention, zero-target removal-cut preservation, idempotent
+  second startup, and zero provider construction or RPC before replay.
+- 2026-08-19: The final provider-quiescence cut counts every accepted callback,
+  turn, server request, login, and operation; retains generation taint until
+  teardown; consumes only the exact expected archive notification; and performs
+  synchronous outcome, finalization, release proof, journal cleanup, and Gate
+  release after the final provider await. Independent hostile re-audit found no
+  P0/P1. Router passed 52 tests, AccountService 58, the admission gate 16, Chat
+  v57 30, startup 2, and Session archive 8.
+- 2026-08-19: A final cross-surface audit found and closed an overbroad sibling
+  cleanup rule. Generic generation cleanup and v57 source enumeration now
+  exclude unrelated settled panes unless unresolved route, message-effect, or
+  turn-lease authority remains. Exact targets and cleanup initiators stay in
+  scope. A retained-attachment regression proves the sibling pane and binding
+  remain byte-identical through lost-response containment and resume the same
+  provider thread under generation N+1. Independent re-audit approved the cut;
+  ChatService and ChatPaneStore passed 236 tests with 7,659 assertions.
+- 2026-08-19: Desktop Direct passed every current scenario, including compact
+  widths, 200% text, coarse pointers, same-origin blob previews, hidden native
+  inputs, and the 64-pane streaming composition. The full ChatService suite
+  passed 170 tests with 1,134 assertions. Desktop typecheck, full lint, and diff
+  checks are green.
+- 2026-08-19: The repository source check passed public policy, generated
+  compatibility/public-tree manifests, root tests, every workspace typecheck,
+  every workspace lint, and 2,932 of 2,933 tests on the final frozen tree. All
+  nine actionable fixture/contract failures from the first run were repaired;
+  their combined focused rerun passed 87 tests with 3,467 assertions. The sole
+  remaining failure is the pre-existing v0.1.10 release-provenance requirement
+  described in Current gate. It rejects both dirty linked worktrees and
+  post-publication commits by design.
+
+## Review findings
+
+- The proposed generic-file text envelope would disclose a private local path
+  to the model and has no matching structured provider capability. It was
+  removed. Image-only admission is the current product contract.
+- Restored provider context cannot be resumed safely without the provider home
+  and rollout state. Portable copies therefore preserve transcript and image
+  bytes while removing resumable provider authority and requiring an explicit
+  fresh message.
+- A provider-thread archive outcome must be journaled before its effect and
+  reconciled after an ambiguous response. Pending archive intents fence normal
+  pane and queue mutation so uncertain provider context cannot be reused.
+- Holding an account only around the provider stop is insufficient. Admission
+  must remain closed through sibling containment, archive reconciliation, and
+  the local commit; the hold must also be reconstructed before any startup
+  account or Harness request. A crash between sibling detachment and ledger or
+  lease settlement requires durable inventory, not an in-memory callback.

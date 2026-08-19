@@ -54,6 +54,19 @@ describe("ProviderSubagentProjectionTracker", () => {
     expect(JSON.stringify(tracker.snapshot(scope))).not.toContain(scope.turnId);
   });
 
+  test("accepts multiple raw agents at one positioned parent fact", () => {
+    const tracker = new ProviderSubagentProjectionTracker();
+    expect(tracker.observe(observation("raw-agent-a", "starting", 1, 0))).toBeTrue();
+    expect(tracker.observe(observation("raw-agent-b", "running", 1, 0))).toBeTrue();
+    expect(tracker.snapshot(scope)).toMatchObject({
+      agents: [
+        { label: "Agent 1", status: "starting" },
+        { label: "Agent 2", status: "running" },
+      ],
+      overflowCount: 0,
+    });
+  });
+
   test("makes terminal status absorbing against late nonterminal observations", () => {
     const tracker = new ProviderSubagentProjectionTracker();
     tracker.observe(observation("raw-agent", "running", 1));

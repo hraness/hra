@@ -15,6 +15,7 @@ import type { LoginAccountResponse as GeneratedLoginAccountResponse } from "../.
 import type { LogoutAccountResponse as GeneratedLogoutAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/LogoutAccountResponse";
 import type { ModelListResponse as GeneratedModelListResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ModelListResponse";
 import type { ThreadInjectItemsResponse as GeneratedThreadInjectItemsResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadInjectItemsResponse";
+import type { ThreadArchiveResponse as GeneratedThreadArchiveResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadArchiveResponse";
 import type { ThreadItemsListResponse as GeneratedThreadItemsListResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadItemsListResponse";
 import type { ThreadForkResponse as GeneratedThreadForkResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadForkResponse";
 import type { ThreadGoalClearResponse as GeneratedThreadGoalClearResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadGoalClearResponse";
@@ -780,6 +781,7 @@ const threadReadInputSchema = z.object({
   threadId: idSchema,
   includeTurns: z.boolean(),
 }).strict();
+const threadArchiveInputSchema = z.object({ threadId: idSchema }).strict();
 const threadResponseSchema = z.object({ thread: threadSchema });
 const threadAdmissionResponseSchema = threadResponseSchema.extend({
   model: modelNameSchema,
@@ -962,6 +964,16 @@ const threadInjectItemsInputSchema = z.object({
   threadId: idSchema,
   items: z.array(injectedHistoryItemSchema).min(1).max(1_024),
 }).strict();
+const observedInputModalitiesSchema = z.unknown().optional().transform(
+  (value): readonly ("text" | "image")[] | null => {
+    if (
+      !Array.isArray(value) || value.length > 2 ||
+      value.some((entry) => entry !== "text" && entry !== "image") ||
+      new Set(value).size !== value.length
+    ) return null;
+    return Object.freeze(value.slice() as ("text" | "image")[]);
+  },
+);
 const modelListInputSchema = z.object({
   cursor: z.string().max(MAX_PATH_CHARACTERS).nullable().optional(),
   limit: z.number().int().safe().min(1).max(256).nullable().optional(),
@@ -970,6 +982,7 @@ const modelListInputSchema = z.object({
 const modelListOutputSchema = z.object({
   data: z.array(z.object({
     model: modelNameSchema,
+    inputModalities: observedInputModalitiesSchema,
     supportedReasoningEfforts: z.array(z.object({
       reasoningEffort: reasoningEffortSchema,
     }).passthrough()).max(32),
@@ -995,10 +1008,19 @@ const textInputSchema = z.object({
   text: z.string().min(1).max(MAX_TEXT_CHARACTERS),
   text_elements: z.array(z.never()).max(0),
 }).strict();
+const localImageInputSchema = z.object({
+  type: z.literal("localImage"),
+  path: absolutePathSchema,
+  detail: z.enum(["auto", "low", "high", "original"]).optional(),
+}).strict();
+const turnUserInputSchema = z.discriminatedUnion("type", [
+  textInputSchema,
+  localImageInputSchema,
+]);
 const turnStartInputSchema = z.object({
   threadId: idSchema,
   clientUserMessageId: idSchema,
-  input: z.array(textInputSchema).min(1).max(64),
+  input: z.array(turnUserInputSchema).min(1).max(64),
   cwd: absolutePathSchema.nullable().optional(),
   approvalPolicy: approvalPolicySchema.nullable().optional(),
   approvalsReviewer: approvalsReviewerSchema.nullable().optional(),
@@ -1011,7 +1033,7 @@ const turnStartOutputSchema = z.object({ turn: turnSchema });
 const turnSteerInputSchema = z.object({
   threadId: idSchema,
   clientUserMessageId: idSchema.nullable().optional(),
-  input: z.array(textInputSchema).min(1).max(64),
+  input: z.array(turnUserInputSchema).min(1).max(64),
   expectedTurnId: idSchema,
 }).strict();
 const turnSteerOutputSchema = z.object({ turnId: idSchema });
@@ -1053,6 +1075,7 @@ export type PinnedCodexThreadListInput = z.infer<typeof threadListInputSchema>;
 export type PinnedCodexThreadList = z.infer<typeof threadListOutputSchema>;
 export type PinnedCodexThreadStartInput = z.infer<typeof threadStartInputSchema>;
 export type PinnedCodexThreadResumeInput = z.infer<typeof threadResumeInputSchema>;
+export type PinnedCodexThreadArchiveInput = z.infer<typeof threadArchiveInputSchema>;
 export type PinnedCodexThreadReadInput = z.infer<typeof threadReadInputSchema>;
 export type PinnedCodexThreadResponse = z.infer<typeof threadResponseSchema>;
 export type PinnedCodexThreadAdmissionResponse = z.infer<
@@ -1120,6 +1143,10 @@ export interface PinnedCodexRequestShapes {
   readonly threadResume: {
     readonly input: PinnedCodexThreadResumeInput;
     readonly output: PinnedCodexThreadAdmissionResponse;
+  };
+  readonly threadArchive: {
+    readonly input: PinnedCodexThreadArchiveInput;
+    readonly output: undefined;
   };
   readonly threadRead: {
     readonly input: PinnedCodexThreadReadInput;
@@ -1221,6 +1248,10 @@ export const pinnedCodexCodecPairs = Object.freeze({
     input: codec(threadResumeInputSchema),
     output: codec(threadAdmissionResponseSchema),
   }),
+  threadArchive: Object.freeze({
+    input: codec(threadArchiveInputSchema),
+    output: codec(emptyObjectSchema),
+  }),
   threadRead: Object.freeze({
     input: codec(threadReadInputSchema),
     output: codec(threadResponseSchema),
@@ -1299,6 +1330,7 @@ export const pinnedCodexMethods = Object.freeze({
   threadList: "thread/list",
   threadStart: "thread/start",
   threadResume: "thread/resume",
+  threadArchive: "thread/archive",
   threadRead: "thread/read",
   threadHistoryRead: "thread/read",
   threadTurnsList: "thread/turns/list",
@@ -1335,6 +1367,7 @@ interface GeneratedResponses {
   readonly threadList: GeneratedThreadListResponse;
   readonly threadStart: GeneratedThreadStartResponse;
   readonly threadResume: GeneratedThreadResumeResponse;
+  readonly threadArchive: GeneratedThreadArchiveResponse;
   readonly threadRead: GeneratedThreadReadResponse;
   readonly threadHistoryRead: GeneratedThreadReadResponse;
   readonly threadTurnsList: GeneratedThreadTurnsListResponse;
@@ -1379,7 +1412,7 @@ type OutputCodecInput<K extends GeneratedOperation> =
       ? z.input<typeof loginStartOutputSchema>
       : K extends "accountLoginCancel"
         ? z.input<typeof loginCancelOutputSchema>
-        : K extends "accountLogout" | "turnInterrupt" | "threadSetName" | "threadInjectItems"
+        : K extends "accountLogout" | "turnInterrupt" | "threadArchive" | "threadSetName" | "threadInjectItems"
           ? z.input<typeof emptyObjectSchema>
           : K extends "accountRead"
             ? z.input<typeof accountReadOutputSchema>
@@ -1440,6 +1473,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadList: true,
     threadStart: true,
     threadResume: true,
+    threadArchive: true,
     threadRead: true,
     threadHistoryRead: true,
     threadTurnsList: true,
@@ -1467,6 +1501,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadList: true,
     threadStart: true,
     threadResume: true,
+    threadArchive: true,
     threadRead: true,
     threadHistoryRead: true,
     threadTurnsList: true,

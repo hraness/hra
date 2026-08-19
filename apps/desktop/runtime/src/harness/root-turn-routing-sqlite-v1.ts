@@ -14,6 +14,7 @@ import {
   rootTurnRoutingProfileFallbackReasonSchema,
   rootTurnRoutingProfileSchema,
   rootTurnRoutingReceiptV1Schema,
+  rootTurnRoutingRequiredInputClassSchema,
   rootTurnRoutingServiceTierFallbackReasonSchema,
   rootTurnRoutingServiceTierSchema,
   rootTurnRoutingStateSchema,
@@ -36,6 +37,7 @@ const timestampSchema = z.string().length(24).datetime().refine(
 );
 const generationSchema = z.number().int().positive().safe();
 const streamPositionSchema = z.number().int().nonnegative().safe();
+const catalogDigestSchema = z.string().length(64).regex(/^[0-9a-f]{64}$/u);
 const recoveryLimitSchema = z.number().int().positive().max(256);
 const rootLineageRowSchema = z.object({
   epoch_id: z.string().min(16).max(96),
@@ -49,6 +51,7 @@ const receiptRowSchema = z.object({
   chat_turn_id: chatTurnIdSchema,
   root_turn_id: actorTurnIdSchema.nullable(),
   policy_version: z.literal(HRA_ROOT_TURN_ROUTING_POLICY_VERSION),
+  required_input_class: rootTurnRoutingRequiredInputClassSchema,
   classification_reason: rootTurnRoutingClassificationReasonSchema,
   work_class: rootTurnRoutingWorkClassSchema,
   requested_profile: rootTurnRoutingProfileSchema,
@@ -63,6 +66,8 @@ const receiptRowSchema = z.object({
   operational_outcome: rootTurnRoutingOperationalOutcomeSchema.nullable(),
   accepted_generation: generationSchema.nullable(),
   accepted_stream_position: streamPositionSchema.nullable(),
+  catalog_generation: generationSchema.nullable(),
+  catalog_digest: catalogDigestSchema.nullable(),
   created_at: timestampSchema,
   updated_at: timestampSchema,
   resolved_at: timestampSchema.nullable(),
@@ -92,6 +97,8 @@ export interface RootTurnRoutingAuthorityV1 {
     selectedServiceTier: RootTurnRoutingServiceTierV1;
     serviceTierFallbackReason:
       RootTurnRoutingServiceTierFallbackReasonV1 | null;
+    catalogGeneration: number;
+    catalogDigest: string;
     now: Date;
   }>): RootTurnRoutingReceiptV1;
   markEffectStarted(input: Readonly<{
@@ -165,6 +172,7 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
       paneId: input.paneId,
       chatTurnId: input.chatTurnId,
       policyVersion: input.policyVersion,
+      requiredInputClass: input.requiredInputClass,
       classificationReason: input.classificationReason,
       workClass: input.workClass,
       requestedProfile: input.requestedProfile,
@@ -184,22 +192,24 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
     this.#database.query(`
       INSERT INTO harness_root_turn_routing_receipts (
         pane_id, chat_turn_id, root_turn_id, policy_version,
+        required_input_class,
         classification_reason, work_class, requested_profile,
         requested_service_tier, state, selected_profile,
         profile_fallback_reason, selected_service_tier,
         service_tier_fallback_reason,
         operational_outcome, accepted_generation, accepted_stream_position,
         created_at, updated_at, resolved_at, effect_started_at, accepted_at,
-        settled_at
+        settled_at, catalog_generation, catalog_digest
       ) VALUES (
-        ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7,
+        ?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8,
         'classified', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-        ?8, ?8, NULL, NULL, NULL, NULL
+        ?9, ?9, NULL, NULL, NULL, NULL, NULL, NULL
       )
     `).run(
       classification.paneId,
       classification.chatTurnId,
       classification.policyVersion,
+      classification.requiredInputClass,
       classification.classificationReason,
       classification.workClass,
       classification.requestedProfile,
@@ -284,6 +294,8 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
     selectedServiceTier: RootTurnRoutingServiceTierV1;
     serviceTierFallbackReason:
       RootTurnRoutingServiceTierFallbackReasonV1 | null;
+    catalogGeneration: number;
+    catalogDigest: string;
     now: Date;
   }>): RootTurnRoutingReceiptV1 {
     const paneId = chatPaneIdSchema.parse(input.paneId);
@@ -304,6 +316,8 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
       : rootTurnRoutingServiceTierFallbackReasonSchema.parse(
           input.serviceTierFallbackReason,
         );
+    const catalogGeneration = generationSchema.parse(input.catalogGeneration);
+    const catalogDigest = catalogDigestSchema.parse(input.catalogDigest);
     return this.#mutate("root route resolution conflicts with durable evidence", () => {
       const current = this.#require(paneId, chatTurnId);
       assertResolution(
@@ -318,7 +332,9 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
           current.selectedProfile !== selectedProfile ||
           current.profileFallbackReason !== profileFallbackReason ||
           current.selectedServiceTier !== selectedServiceTier ||
-          current.serviceTierFallbackReason !== serviceTierFallbackReason
+          current.serviceTierFallbackReason !== serviceTierFallbackReason ||
+          current.catalogGeneration !== catalogGeneration ||
+          current.catalogDigest !== catalogDigest
         ) conflict("the routing receipt has a different resolved route");
         return current;
       }
@@ -331,8 +347,9 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
         SET state = 'resolved', selected_profile = ?1,
             profile_fallback_reason = ?2, selected_service_tier = ?3,
             service_tier_fallback_reason = ?4,
-            resolved_at = ?5, updated_at = ?5
-        WHERE pane_id = ?6 AND chat_turn_id = ?7
+            catalog_generation = ?5, catalog_digest = ?6,
+            resolved_at = ?7, updated_at = ?7
+        WHERE pane_id = ?8 AND chat_turn_id = ?9
           AND state = 'classified' AND selected_profile IS NULL
           AND selected_service_tier IS NULL
       `).run(
@@ -340,6 +357,8 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
         profileFallbackReason,
         selectedServiceTier,
         serviceTierFallbackReason,
+        catalogGeneration,
+        catalogDigest,
         now,
         paneId,
         chatTurnId,
@@ -361,6 +380,9 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
       if (current.effectStartedAt !== null) return current;
       if (current.state !== "resolved") {
         invalidState("the provider effect requires a resolved root route");
+      }
+      if (current.catalogGeneration === null || current.catalogDigest === null) {
+        invalidState("the provider effect requires exact catalog evidence");
       }
       const now = advancingTimestamp(input.now, current.updatedAt);
       const result = this.#database.query(`
@@ -398,6 +420,9 @@ export class RootTurnRoutingSQLiteAuthorityV1 implements
       }
       if (current.state !== "effectStarted") {
         invalidState("the root route has no effect awaiting acceptance");
+      }
+      if (current.catalogGeneration !== generation) {
+        invalidState("the provider response generation differs from the resolved catalog");
       }
       const now = advancingTimestamp(input.now, current.updatedAt);
       const result = this.#database.query(`
@@ -538,6 +563,7 @@ function parseReceipt(value: unknown): RootTurnRoutingReceiptV1 {
       chatTurnId: row.chat_turn_id,
       rootTurnId: row.root_turn_id,
       policyVersion: row.policy_version,
+      requiredInputClass: row.required_input_class,
       classificationReason: row.classification_reason,
       workClass: row.work_class,
       requestedProfile: row.requested_profile,
@@ -550,6 +576,8 @@ function parseReceipt(value: unknown): RootTurnRoutingReceiptV1 {
       operationalOutcome: row.operational_outcome,
       acceptedGeneration: row.accepted_generation,
       acceptedStreamPosition: row.accepted_stream_position,
+      catalogGeneration: row.catalog_generation,
+      catalogDigest: row.catalog_digest,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       resolvedAt: row.resolved_at,
@@ -573,6 +601,7 @@ function classificationMatches(
   return receipt.paneId === classification.paneId &&
     receipt.chatTurnId === classification.chatTurnId &&
     receipt.policyVersion === classification.policyVersion &&
+    receipt.requiredInputClass === classification.requiredInputClass &&
     receipt.classificationReason === classification.classificationReason &&
     receipt.workClass === classification.workClass &&
     receipt.requestedProfile === classification.requestedProfile &&

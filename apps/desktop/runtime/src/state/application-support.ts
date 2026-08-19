@@ -27,7 +27,11 @@ import {
   assertBoundedControlPlaneIntegrity,
   ControlPlaneIntegrityError,
 } from "./control-plane-integrity";
-import { assertRecoverableMissingControlPlaneRestore } from "./control-plane-restore-state";
+import {
+  assertRecoverableMissingControlPlaneRestore,
+  controlPlaneRestoreJournalFileName,
+  legacyControlPlaneRestoreV1FileNames,
+} from "./control-plane-restore-state";
 
 /**
  * Opaque physical state authority retained for the first in-place HRA bridge.
@@ -1215,8 +1219,17 @@ function validateProtectedStateFiles(root: string): boolean {
   const sharedMemory = protectedFileMetadata(sharedMemoryPath);
   const key = protectedFileMetadata(keyPath);
   const keyCandidate = readMetadata(keyCandidatePath);
-  const restoreJournalPath = join(root, ".control-plane-restore-v1.json");
+  const restoreJournalPath = join(root, controlPlaneRestoreJournalFileName);
   const restoreJournal = readMetadata(restoreJournalPath);
+  if (legacyControlPlaneRestoreV1FileNames.some((fileName) =>
+    readMetadata(join(root, fileName)) !== null
+  )) {
+    throw new ApplicationSupportMigrationError(
+      "invalid_state",
+      "Legacy interrupted control-plane restore state requires manual recovery",
+      root,
+    );
+  }
 
   let interruptedRestore = false;
   if (database === null && restoreJournal !== null) {

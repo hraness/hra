@@ -30,6 +30,7 @@ import {
   type ChatQueuedMessageProjection,
   type RuntimeChatDomainCommand,
   type RuntimeChatMessageLedgerCommand,
+  type RuntimeChatMessageQueueResult,
   type RuntimeDispatchResponse,
   type RuntimeError,
 } from "../../../../contracts/runtime";
@@ -78,6 +79,7 @@ import {
   selectPaneCanMessage,
   selectPaneRepositoryCommand,
   resumeMessageQueueCommand,
+  startFreshProviderContextCommand,
   stopTurnCommand,
   steerQueuedMessageCommand,
   titleCommitFailureShouldRefocus,
@@ -85,6 +87,7 @@ import {
   type ScheduledTitleCommit,
   type TitleDebouncer,
 } from "./model";
+import { useLiveChatAttachments } from "./use-live-chat-attachments";
 
 class PaneCommandError extends Error {
   readonly runtimeError: RuntimeError | null;
@@ -96,6 +99,81 @@ class PaneCommandError extends Error {
   }
 }
 
+type ComposerEnqueueDelivery = Extract<
+  RuntimeChatMessageLedgerCommand,
+  { readonly type: "chat.message.enqueue" }
+>["delivery"];
+
+export interface FrozenComposerRequest {
+  readonly contentSignature: string;
+  readonly delivery: ComposerEnqueueDelivery;
+  readonly messageId: string;
+  readonly steerModifier: boolean;
+}
+
+export function freezeComposerRequest(input: Readonly<{
+  existing: FrozenComposerRequest | null;
+  currentMessageId: string;
+  contentSignature: string;
+  steerModifier: boolean;
+  delivery: FrozenComposerRequest["delivery"];
+  createMessageId: () => string;
+}>): Readonly<{ frozen: FrozenComposerRequest; currentMessageId: string }> {
+  if (
+    input.existing !== null &&
+    input.existing.contentSignature === input.contentSignature &&
+    input.existing.steerModifier === input.steerModifier
+  ) {
+    return { frozen: input.existing, currentMessageId: input.currentMessageId };
+  }
+  const currentMessageId = input.existing === null
+    ? input.currentMessageId
+    : input.createMessageId();
+  return {
+    currentMessageId,
+    frozen: {
+      contentSignature: input.contentSignature,
+      delivery: input.delivery,
+      messageId: currentMessageId,
+      steerModifier: input.steerModifier,
+    },
+  };
+}
+
+export function settleComposerRequest(
+  disposition: RuntimeChatMessageQueueResult["disposition"],
+  createMessageId: () => string,
+): Readonly<{ clearDraft: boolean; nextMessageId: string }> {
+  return {
+    clearDraft: disposition !== "notApplied",
+    nextMessageId: createMessageId(),
+  };
+}
+
+export function composerSubmissionAction(input: Readonly<{
+  isComposing: boolean;
+  key: string;
+  shiftKey: boolean;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  active: boolean;
+  hasQueuedHead: boolean;
+}>): "none" | "sendComposer" | "steerQueuedHead" {
+  if (composerEnterAction(input) !== "submit") return "none";
+  return (input.metaKey || input.ctrlKey) && input.active && input.hasQueuedHead
+    ? "steerQueuedHead"
+    : "sendComposer";
+}
+
+export function paneTitleKeyAction(input: Readonly<{
+  isComposing: boolean;
+  key: string;
+}>): "cancel" | "commit" | null {
+  if (input.isComposing) return null;
+  if (input.key === "Escape") return "cancel";
+  return input.key === "Enter" ? "commit" : null;
+}
+
 function commandErrorMessage(reason: unknown): string {
   if (reason instanceof PaneCommandError) return reason.message;
   return reason instanceof Error
@@ -103,12 +181,21 @@ function commandErrorMessage(reason: unknown): string {
     : "The local runtime did not complete the request.";
 }
 
-function paneFromResponse(response: RuntimeDispatchResponse): ChatPaneProjection {
+function paneFromResponse(
+  response: RuntimeDispatchResponse,
+  currentPane: ChatPaneProjection | null,
+): ChatPaneProjection {
   if (!response.ok) throw new PaneCommandError(response.error.message, response.error);
-  if (response.result.type !== "chatPane") {
-    throw new PaneCommandError("The local runtime returned the wrong pane result.");
+  if (response.result.type === "chatPane") return response.result.pane;
+  if (
+    response.result.type === "chatPaneReplay" &&
+    currentPane !== null &&
+    currentPane.id === response.result.paneId &&
+    currentPane.revision >= response.result.appliedRevision
+  ) {
+    return currentPane;
   }
-  return response.result.pane;
+  throw new PaneCommandError("The local runtime returned the wrong pane result.");
 }
 
 export interface PaneRetryMutationPort {
@@ -126,7 +213,9 @@ async function dispatchPaneMutationWithRetry(
   let revision = initialRevision;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const response = await shell.dispatch(commandForRevision(revision));
-    if (response.ok) return paneFromResponse(response);
+    if (response.ok) {
+      return paneFromResponse(response, selectPane(shell.getState(), paneId));
+    }
     if (attempt > 0 || !isRevisionConflict(response.error)) {
       throw new PaneCommandError(response.error.message, response.error);
     }
@@ -153,13 +242,13 @@ async function dispatchPaneMutationWithRetry(
 export async function dispatchMessageQueueMutation(
   shell: Pick<RuntimeShell, "dispatch">,
   command: RuntimeChatMessageLedgerCommand,
-): Promise<ChatPaneProjection["messageQueue"]> {
+): Promise<RuntimeChatMessageQueueResult> {
   const response = await shell.dispatch(command);
   if (!response.ok) throw new PaneCommandError(response.error.message, response.error);
   if (response.result.type !== "chatMessageQueue" || response.result.paneId !== command.paneId) {
     throw new PaneCommandError("The local runtime returned the wrong message queue result.");
   }
-  return response.result.queue;
+  return response.result;
 }
 
 export interface PaneTitleMutationPort {
@@ -180,7 +269,9 @@ export async function dispatchPaneTitleMutation(
       expectedRevision: revision,
       title,
     }));
-    if (response.ok) return paneFromResponse(response);
+    if (response.ok) {
+      return paneFromResponse(response, selectPane(shell.getState(), paneId));
+    }
     if (!isRevisionConflict(response.error)) {
       throw new PaneCommandError(response.error.message, response.error);
     }
@@ -465,10 +556,14 @@ function InlinePaneTitle({
           onFocus: (event) => event.currentTarget.select(),
           onKeyDown: (event) => {
             if (pendingRef.current) return;
-            if (event.key === "Escape") {
+            const action = paneTitleKeyAction({
+              isComposing: event.nativeEvent.isComposing,
+              key: event.key,
+            });
+            if (action === "cancel") {
               event.preventDefault();
               finishInvalidEdit();
-            } else if (event.key === "Enter") {
+            } else if (action === "commit") {
               event.preventDefault();
               finishEdit();
             }
@@ -519,19 +614,20 @@ function TurnActivity({ pane }: { readonly pane: ChatPaneProjection }) {
   const turn = pane.turn;
   if (turn === null) return null;
   const active = paneIsActive(pane.state);
-  const hasVisibleActivity = turn.reasoningSummary.tail.length > 0 ||
+  const reasoningVisible = active || turn.reasoningSummaryVerified === true;
+  const hasVisibleActivity = (reasoningVisible && turn.reasoningSummary.tail.length > 0) ||
     turn.responseMarkdown.tail.length > 0;
 
   return (
     <>
-      {active && turn.reasoningSummary.tail.length > 0 ? (
+      {reasoningVisible && turn.reasoningSummary.tail.length > 0 ? (
         <section className="pane-reasoning" aria-label="Thinking">
           <div aria-hidden="true" className="pane-activity-label">
             <span className="activity-pulse" aria-hidden="true" />
           </div>
           <MarkdownResponse
             content={turn.reasoningSummary}
-            streaming
+            streaming={active}
             variant="reasoning"
           />
         </section>
@@ -616,6 +712,11 @@ export function ChatPaneView({
   const [titleEditRequest, setTitleEditRequest] = useState(0);
   const titlePendingRef = useRef(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const draftMessageIdRef = useRef(createMessageId());
+  const frozenComposerRequestRef = useRef<FrozenComposerRequest | null>(null);
+  const attachmentIdentityRef = useRef(
+    surface?.attachments.map(({ id }) => id).join("\0") ?? "",
+  );
   const active = paneIsActive(pane.state);
   const composerCanDraft = canMessage && (paneCanCompose(pane.state) || active);
   const showComposerForm = canMessage || active;
@@ -638,6 +739,14 @@ export function ChatPaneView({
     turn?.reasoningSummary.totalUtf8Bytes ?? 0,
     turn?.responseMarkdown.totalUtf8Bytes ?? 0,
   ].join(":");
+
+  useEffect(() => {
+    const identity = surface?.attachments.map(({ id }) => id).join("\0") ?? "";
+    if (attachmentIdentityRef.current === identity) return;
+    attachmentIdentityRef.current = identity;
+    draftMessageIdRef.current = createMessageId();
+    frozenComposerRequestRef.current = null;
+  }, [surface?.attachments]);
   const { onScroll, transcriptRef } = usePaneAutoScroll(scrollKey);
   const paneLabelId = `chat-pane-label-${pane.id}`;
   const transcriptLabelId = `chat-pane-transcript-label-${pane.id}`;
@@ -701,6 +810,10 @@ export function ChatPaneView({
       || titlePending
     ) return;
     const readyAttachments = surface?.attachments.filter(({ status }) => status === "ready") ?? [];
+    if (surface?.attachments.some(({ status }) => status === "failed") === true) {
+      setLocalError("Remove the failed attachment before sending.");
+      return;
+    }
     if (
       surface !== undefined &&
       readyAttachments.length !== surface.attachments.length
@@ -717,6 +830,11 @@ export function ChatPaneView({
     setLocalError(null);
     try {
       const attachmentRefs = readyAttachments.map(({ id }) => id);
+      const content = {
+        text: validation.ok ? validation.prompt : "",
+        attachmentRefs,
+      };
+      const contentSignature = JSON.stringify(content);
       const requestedDelivery = compactComposerDelivery({
         active,
         queueEmpty: pane.messageQueue.messages.length === 0 &&
@@ -724,21 +842,36 @@ export function ChatPaneView({
           pane.messageQueue.pauseReason === null,
         steerModifier,
       });
-      await dispatchMessageQueueMutation(
+      const resolved = freezeComposerRequest({
+        existing: frozenComposerRequestRef.current,
+        currentMessageId: draftMessageIdRef.current,
+        contentSignature,
+        steerModifier,
+        delivery: requestedDelivery === "steerHead" && turn !== null
+          ? { kind: "steerHead", expectedTurnId: turn.id }
+          : { kind: "queue" },
+        createMessageId,
+      });
+      const frozen = resolved.frozen;
+      draftMessageIdRef.current = resolved.currentMessageId;
+      frozenComposerRequestRef.current = frozen;
+      const result = await dispatchMessageQueueMutation(
         shell,
         enqueueMessageCommand({
           paneId: pane.id,
           expectedQueueRevision: pane.messageQueue.revision,
-          messageId: createMessageId(),
-          content: {
-            text: validation.ok ? validation.prompt : "",
-            attachmentRefs,
-          },
-          delivery: requestedDelivery === "steerHead" && turn !== null
-            ? { kind: "steerHead", expectedTurnId: turn.id }
-            : { kind: "queue" },
+          messageId: frozen.messageId,
+          content,
+          delivery: frozen.delivery,
         }),
       );
+      const settlement = settleComposerRequest(result.disposition, createMessageId);
+      draftMessageIdRef.current = settlement.nextMessageId;
+      frozenComposerRequestRef.current = null;
+      if (!settlement.clearDraft) {
+        setLocalError("The steering request was not applied. Send again to retry.");
+        return;
+      }
       surface?.onAttachmentsEnqueued?.(attachmentRefs);
       setPrompt("");
     } catch (reason: unknown) {
@@ -749,23 +882,26 @@ export function ChatPaneView({
   }, [active, canMessage, pane.id, pane.messageQueue, pane.state, pendingAction, prompt, runtimeReady, shell, surface, titlePending, turn]);
 
   const mutateQueue = useCallback(async (command: RuntimeChatMessageLedgerCommand) => {
-    if (!runtimeReady || pendingAction !== null || titlePending) return;
+    if (!runtimeReady || pendingAction !== null || titlePending) {
+      throw new PaneCommandError("Wait for the current chat action to finish.");
+    }
     setPendingAction("queue");
     setLocalError(null);
     try {
       await dispatchMessageQueueMutation(shell, command);
     } catch (reason: unknown) {
       setLocalError(commandErrorMessage(reason));
+      throw reason;
     } finally {
       setPendingAction(null);
     }
   }, [pendingAction, runtimeReady, shell, titlePending]);
 
-  const editQueuedMessage = useCallback((
+  const editQueuedMessage = useCallback(async (
     message: ChatQueuedMessageProjection,
     content: ChatMessageContent,
   ) => {
-    void mutateQueue(editQueuedMessageCommand({
+    await mutateQueue(editQueuedMessageCommand({
       paneId: pane.id,
       expectedQueueRevision: pane.messageQueue.revision,
       messageId: message.id,
@@ -780,15 +916,23 @@ export function ChatPaneView({
       expectedQueueRevision: pane.messageQueue.revision,
       messageId: message.id,
       expectedMessageRevision: message.revision,
-    }));
+    })).catch(() => undefined);
   }, [mutateQueue, pane.id, pane.messageQueue.revision]);
 
   const resumeMessageQueue = useCallback(() => {
     void mutateQueue(resumeMessageQueueCommand({
       paneId: pane.id,
       expectedQueueRevision: pane.messageQueue.revision,
-    }));
+    })).catch(() => undefined);
   }, [mutateQueue, pane.id, pane.messageQueue.revision]);
+
+  const startFreshProviderContext = useCallback(() => {
+    void mutateQueue(startFreshProviderContextCommand({
+      paneId: pane.id,
+      expectedRevision: pane.revision,
+      expectedQueueRevision: pane.messageQueue.revision,
+    })).catch(() => undefined);
+  }, [mutateQueue, pane.id, pane.messageQueue.revision, pane.revision]);
 
   const discardAmbiguousMessage = useCallback((message: ChatBlockedMessageProjection) => {
     void mutateQueue(discardAmbiguousMessageCommand({
@@ -796,7 +940,7 @@ export function ChatPaneView({
       expectedQueueRevision: pane.messageQueue.revision,
       messageId: message.id,
       expectedMessageRevision: message.revision,
-    }));
+    })).catch(() => undefined);
   }, [mutateQueue, pane.id, pane.messageQueue.revision]);
 
   const steerQueuedMessage = useCallback((message: ChatQueuedMessageProjection) => {
@@ -807,7 +951,7 @@ export function ChatPaneView({
       messageId: message.id,
       expectedMessageRevision: message.revision,
       expectedTurnId: turn.id,
-    }));
+    })).catch(() => undefined);
   }, [active, mutateQueue, pane.id, pane.messageQueue.revision, turn]);
 
   const selectRepository = useCallback(async () => {
@@ -874,7 +1018,7 @@ export function ChatPaneView({
         expectedRevision: pane.revision,
         turnId: pane.turn.id,
       }));
-      paneFromResponse(response);
+      paneFromResponse(response, selectPane(shell.getState(), pane.id));
     } catch (reason: unknown) {
       setLocalError(commandErrorMessage(reason));
     } finally {
@@ -883,7 +1027,7 @@ export function ChatPaneView({
   }, [active, pane.id, pane.interactionMode, pane.revision, pane.turn, pendingAction, runtimeReady, shell, titlePending]);
 
   const attentionMessage = pane.attention?.message ?? null;
-  const composerError = localError ?? attentionMessage ?? workspaceStatus?.message ?? (
+  const composerError = localError ?? surface?.attachmentError ?? attentionMessage ?? workspaceStatus?.message ?? (
     runtimeAvailability.kind === "unavailable" ? runtimeAvailability.message : null
   );
   const accessibleStateLabel = composerError !== null && pane.state === "ready"
@@ -920,7 +1064,7 @@ export function ChatPaneView({
         fenceTitlePendingInteraction(event);
       }}
       onSubmitCapture={fenceTitlePendingInteraction}
-      style={paneIdentityStyle(surface?.paletteIndex ?? null)}
+      style={paneIdentityStyle(pane.paletteIndex)}
     >
       <span className="hra-visually-hidden" id={paneLabelId}>
         {accessibleName}
@@ -1051,9 +1195,11 @@ export function ChatPaneView({
         </p>
       ) : null}
       {pane.interactionMode !== "chat" ? null : <footer className="chat-pane__composer">
-        {descendants === null ? null : (
+        {descendants === null && turn?.providerSubagents.agents.length === 0 &&
+            turn.providerSubagents.overflowCount === 0 ? null : (
           <ActiveSubagentStack
-            children={descendants.children}
+            children={descendants?.children ?? []}
+            provider={turn?.providerSubagents ?? { agents: [], overflowCount: 0 }}
           />
         )}
         <QueuedMessageStack
@@ -1062,7 +1208,13 @@ export function ChatPaneView({
           onDiscardAmbiguous={discardAmbiguousMessage}
           onEdit={editQueuedMessage}
           onRemove={removeQueuedMessage}
-          onResume={resumeMessageQueue}
+          {...(pane.canStartFreshContext === true
+            ? { onStartFresh: startFreshProviderContext }
+            : pane.state === "attention" &&
+                pane.attention?.code === "runtime_unavailable" &&
+                pane.attention.retryable === false
+              ? {}
+              : { onResume: resumeMessageQueue })}
           {...(!active || turn === null ? {} : { onSteerHead: steerQueuedMessage })}
           queue={pane.messageQueue}
         />
@@ -1143,6 +1295,10 @@ export function ChatPaneView({
               }
               label={`Message ${pane.title}`}
               onChange={(value) => {
+                if (value !== prompt) {
+                  draftMessageIdRef.current = createMessageId();
+                  frozenComposerRequestRef.current = null;
+                }
                 setPrompt(value);
                 if (localError !== null) setLocalError(null);
               }}
@@ -1157,14 +1313,24 @@ export function ChatPaneView({
                 id: `prompt-${pane.id}`,
                 maxLength: runtimeChatMessageUtf8ByteLimit,
                 onKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-                  const action = composerEnterAction({
+                  const action = composerSubmissionAction({
                     isComposing: event.nativeEvent.isComposing,
                     key: event.key,
                     shiftKey: event.shiftKey,
+                    metaKey: event.metaKey,
+                    ctrlKey: event.ctrlKey,
+                    active,
+                    hasQueuedHead: pane.messageQueue.messages.length > 0,
                   });
-                  if (action !== "submit") return;
+                  if (action === "none") return;
                   event.preventDefault();
-                  void send(event.metaKey || event.ctrlKey);
+                  const steerModifier = event.metaKey || event.ctrlKey;
+                  const queuedHead = pane.messageQueue.messages[0];
+                  if (action === "steerQueuedHead" && queuedHead !== undefined) {
+                    steerQueuedMessage(queuedHead);
+                    return;
+                  }
+                  void send(steerModifier);
                 },
                 onPaste: (event) => {
                   capturePastedImages(event, surface?.onAttachFiles);
@@ -1224,6 +1390,12 @@ function ChatPaneContainer({
     [paneId],
   );
   const pane = useRuntimeShellSelector(shell, selector);
+  const liveAttachmentSurface = useLiveChatAttachments({
+    enabled: surface === undefined,
+    pane,
+    shell,
+  });
+  const resolvedSurface = surface ?? liveAttachmentSurface;
   return pane === null
     ? null
     : <ChatPaneView
@@ -1243,7 +1415,7 @@ function ChatPaneContainer({
         pane={pane}
         reorderPending={reorderPending}
         shell={shell}
-        {...(surface === undefined ? {} : { surface })}
+        {...(resolvedSurface === undefined ? {} : { surface: resolvedSurface })}
       />;
 }
 

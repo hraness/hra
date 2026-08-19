@@ -7,19 +7,33 @@ import {
   type ChatRootTurnProfile,
 } from "../../../contracts/runtime";
 import type { RootTurnRoutingAuthorityV1 } from "../harness/root-turn-routing-sqlite-v1";
+import type {
+  ChatAttachmentProviderDescriptor,
+  ChatAttachmentVault,
+} from "../attachments/contracts";
 import { ChatPaneStoreError } from "../state/chat-pane-store";
 import type {
   ChatMessageClaim,
 } from "../state/chat-message-ledger";
 import type {
+  ChatProviderThreadArchiveFinalizationV57Result,
+  ChatProviderThreadArchiveIntent,
+  ChatProviderThreadArchiveReconciliationV57,
+  ChatProviderThreadArchiveTerminalComponentV57,
   ChatPaneDeltaBatchInput,
   ChatPaneDeltaBatchResult,
   ChatPaneStore,
 } from "../state/chat-pane-store";
 import type {
+  ProviderThreadArchiveCutSnapshotV57,
+  ProviderThreadArchiveRecoveryInventoryV57,
+  ProviderThreadArchiveTargetSnapshotV57,
+} from "../state/provider-thread-archive-journal-v57";
+import type {
   SessionAssistantItemCompletion,
   SessionInteractionRequest,
   SessionReasoningItemCompletion,
+  SessionProviderSubagents,
   SessionToolItemStarted,
   SessionTurnActivity,
   SessionTurnLifecycle,
@@ -27,10 +41,14 @@ import type {
 import { utf8ByteLength, utf8Chunks } from "./text-bounds";
 import {
   CHAT_MAX_DELTA_UTF8_BYTES,
+  CHAT_MAX_PANES,
   CHAT_MAX_ASSISTANT_RECONCILIATION_UTF8_BYTES,
   CHAT_MAX_RESPONSE_TAIL_UTF8_BYTES,
   ChatProviderEffectError,
+  chatProviderAttachmentAuthority,
   type ChatAccountCandidate,
+  type ChatArchiveRecoveryDescriptor,
+  type ChatArchiveTransitionHandleV57,
   type ChatAccountProfileId,
   type ChatActivityDelta,
   type ChatCommandResult,
@@ -42,6 +60,8 @@ import {
   type ChatProjectionSink,
   type ChatQuotaProofCursor,
   type ChatProviderConfiguration,
+  type ChatProviderInput,
+  type ChatProviderResolvedConfiguration,
   type ChatProviderPort,
   type ChatRepository,
   type ChatRepositoryPort,
@@ -55,12 +75,6 @@ import {
   type ChatPaneProjection,
   type ChatWorkspacePort,
 } from "./types";
-
-const providerConfiguration = Object.freeze({
-  approvalPolicy: "on-request",
-  approvalsReviewer: "auto_review",
-  sandbox: "workspace-write",
-} as const);
 
 const MAX_EARLY_SESSION_EVENT_KEYS_PER_PANE = 8;
 const MAX_EARLY_SESSION_EVENTS_PER_PANE = 128;
@@ -83,6 +97,8 @@ const DEFAULT_INTERRUPT_ACK_TIMEOUT_MILLISECONDS = 2_000;
 const DEFAULT_HARNESS_ROOT_TRANSITION_TIMEOUT_MILLISECONDS = 5_000;
 const DEFAULT_ACCOUNT_CONTAINMENT_TIMEOUT_MILLISECONDS = 5_000;
 const DEFAULT_HARNESS_ACTOR_TRANSITION_TIMEOUT_MILLISECONDS = 5_000;
+// Tests retain an explicit false override for deterministic rollback coverage.
+const PROVIDER_THREAD_ARCHIVE_COORDINATOR_V57_ENABLED = true;
 
 type SessionEffect =
   | Readonly<{
@@ -90,6 +106,7 @@ type SessionEffect =
       readonly channel: "reasoningSummary" | "responseMarkdown";
       readonly deltas: readonly string[];
       readonly assistantMessageId?: string;
+      readonly reasoningItemId?: string;
     }>
   | Readonly<{
       readonly type: "assistant_completed";
@@ -101,6 +118,11 @@ type SessionEffect =
   | Readonly<{
       readonly type: "tool_item_started" | "reasoning_item_completed";
       readonly itemId: string;
+      readonly reasoningReceipt?: SessionReasoningItemCompletion["receipt"];
+    }>
+  | Readonly<{
+      readonly type: "provider_subagents";
+      readonly projection: SessionProviderSubagents["projection"];
     }>
   | Readonly<{ readonly type: "unexpected_interaction" }>
   | Readonly<{ readonly type: "protocol_failure" }>
@@ -170,11 +192,24 @@ interface PendingTurnStop {
 }
 
 interface ActiveStartMessageEffect {
+  readonly content: ChatMessageClaim["content"];
   readonly messageId: ChatMessageClaim["messageId"];
   readonly paneId: ChatPaneId;
   readonly turnId: ChatTurnId;
   revision: number;
   state: "claimed" | "effectStarted" | "acknowledged" | "ambiguous";
+}
+
+interface ProviderAttachmentEffect {
+  readonly bindingId: string;
+  readonly bindingKeyDigest: string;
+  readonly paneId: ChatPaneId;
+  readonly revision: number;
+}
+
+interface PreparedProviderAttachmentInput {
+  readonly input: readonly ChatProviderInput[];
+  readonly lease: ProviderAttachmentEffect | null;
 }
 
 interface ExactProviderTerminalWaiter {
@@ -222,6 +257,46 @@ interface AttachedHarnessStartupRetry {
   timer: ReturnType<typeof setTimeout> | null;
 }
 
+interface ProviderThreadArchiveHold {
+  readonly authorityHandle: string;
+  readonly descriptor: ChatArchiveRecoveryDescriptor;
+}
+
+interface ProviderThreadArchiveLiveCommand {
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly binding: ChatThreadBinding;
+  readonly expectedQueueRevision: number | null;
+  readonly expectedRevision: number;
+  readonly paneId: ChatPaneId;
+  readonly purpose: "pane_archive" | "start_fresh";
+}
+
+interface ProviderThreadArchiveReservedPane {
+  drained: boolean;
+  readonly paneId: ChatPaneId;
+  readonly prior: Promise<void>;
+  readonly release: () => void;
+  readonly tail: Promise<void>;
+}
+
+interface ProviderThreadArchiveFinalizedTarget {
+  readonly result: ChatProviderThreadArchiveFinalizationV57Result;
+  readonly targetId: string;
+}
+
+interface ProviderThreadArchiveDirectResponse {
+  readonly containmentReceipt: string;
+  readonly generation: number;
+  readonly streamPosition: number;
+}
+
+interface ProviderThreadArchiveRecoveryEffects {
+  readonly containedPaneIds: Set<ChatPaneId>;
+  readonly finalized: ProviderThreadArchiveFinalizedTarget[];
+  readonly paneReservations:
+    Map<ChatPaneId, ProviderThreadArchiveReservedPane>;
+}
+
 type AttachedHarnessAttemptResult = "recovering" | "resolved" | "stale";
 
 class ChatContainmentFailure extends Error {
@@ -240,10 +315,14 @@ class ChatHarnessActorTransitionTimeout extends Error {
 
 export interface ChatServiceOptions {
   readonly accounts: ChatAccountPort;
+  readonly attachments?: ChatAttachmentVault;
   readonly harnessActors?: ChatHarnessActorTurnPort;
   readonly harnessRoots?: ChatHarnessRootPort;
   readonly now?: () => Date;
   readonly projection: ChatProjectionSink;
+  readonly projectPane?: (pane: ChatPaneProjection) => ChatPaneProjection;
+  /** Internal proof seam; production remains fail-closed until v57 gates pass. */
+  readonly providerThreadArchiveCoordinatorV57Enabled?: boolean;
   readonly provider: ChatProviderPort;
   readonly repositories: ChatRepositoryPort;
   readonly runtimeRecovery: ChatRuntimeRecoveryPort;
@@ -261,10 +340,13 @@ export interface ChatServiceOptions {
 
 export class ChatService {
   readonly #accounts: ChatAccountPort;
+  readonly #attachments: ChatAttachmentVault | null;
   readonly #harnessActors: ChatHarnessActorTurnPort | null;
   readonly #harnessRoots: ChatHarnessRootPort | null;
   readonly #now: () => Date;
   readonly #projection: ChatProjectionSink;
+  readonly #projectPane: (pane: ChatPaneProjection) => ChatPaneProjection;
+  readonly #providerThreadArchiveCoordinatorV57Enabled: boolean;
   readonly #provider: ChatProviderPort;
   readonly #repositories: ChatRepositoryPort;
   readonly #runtimeRecovery: ChatRuntimeRecoveryPort;
@@ -278,8 +360,12 @@ export class ChatService {
   readonly #harnessRootTransitionTimeoutMs: number;
   readonly #accountContainmentTimeoutMs: number;
   readonly #harnessActorTransitionTimeoutMs: number;
+  readonly #accountArchiveTails =
+    new Map<ChatAccountProfileId, Promise<void>>();
   readonly #paneTails = new Map<ChatPaneId, Promise<void>>();
   readonly #providerEffects = new Set<Promise<void>>();
+  readonly #providerThreadArchiveHolds =
+    new Map<ChatPaneId, ProviderThreadArchiveHold>();
   readonly #sessionProjectionQueues = new Map<ChatPaneId, SessionProjectionQueue>();
   readonly #pendingStreamPersistence: PendingStreamPersistence[] = [];
   readonly #pendingTurnStops = new Map<ChatPaneId, PendingTurnStop>();
@@ -330,10 +416,15 @@ export class ChatService {
 
   constructor(options: ChatServiceOptions) {
     this.#accounts = options.accounts;
+    this.#attachments = options.attachments ?? null;
     this.#harnessActors = options.harnessActors ?? null;
     this.#harnessRoots = options.harnessRoots ?? null;
     this.#now = options.now ?? (() => new Date());
     this.#projection = options.projection;
+    this.#projectPane = options.projectPane ?? ((pane) => pane);
+    this.#providerThreadArchiveCoordinatorV57Enabled =
+      options.providerThreadArchiveCoordinatorV57Enabled ??
+        PROVIDER_THREAD_ARCHIVE_COORDINATOR_V57_ENABLED;
     this.#provider = options.provider;
     this.#repositories = options.repositories;
     this.#runtimeRecovery = options.runtimeRecovery;
@@ -362,13 +453,80 @@ export class ChatService {
       options.harnessActorTransitionTimeoutMs ??
         DEFAULT_HARNESS_ACTOR_TRANSITION_TIMEOUT_MILLISECONDS,
     );
+    this.installProviderThreadArchiveQuarantines();
+    this.assertProviderThreadArchiveQuarantinesInstalled();
+  }
+
+  /**
+   * Replays every durable v56 admission hold synchronously. Construction does
+   * this before AccountService startup can launch or refresh a provider; the
+   * explicit method is retained as a boot assertion seam.
+   */
+  installProviderThreadArchiveQuarantines(): void {
+    for (const paneId of this.#store.pendingProviderThreadArchivePaneIds()) {
+      const intent = this.#store.providerThreadArchiveIntent(paneId);
+      if (intent === null || intent.state === "account_contained") {
+        throw new ChatPaneStoreError(
+          "corrupt_state",
+          "The provider archive hold inventory changed during startup.",
+        );
+      }
+      this.#retainProviderThreadArchiveHold(intent);
+    }
+  }
+
+  assertProviderThreadArchiveQuarantinesInstalled(): void {
+    const pending = this.#store.pendingProviderThreadArchivePaneIds();
+    if (pending.length !== this.#providerThreadArchiveHolds.size) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Provider archive holds were not installed before account startup.",
+      );
+    }
+    for (const paneId of pending) {
+      const intent = this.#store.providerThreadArchiveIntent(paneId);
+      const installed = this.#providerThreadArchiveHolds.get(paneId);
+      if (
+        intent === null ||
+        installed === undefined ||
+        !sameArchiveDescriptor(
+          installed.descriptor,
+          providerThreadArchiveDescriptor(intent),
+        )
+      ) {
+        throw new ChatPaneStoreError(
+          "corrupt_state",
+          "Provider archive hold replay does not match durable v56 state.",
+        );
+      }
+    }
+    if (pending.length > 0) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Pending provider thread archives are quarantined before account startup until exact recovery is complete.",
+      );
+    }
   }
 
   initialize(): readonly ChatPaneProjection[] {
+    this.assertProviderThreadArchiveQuarantinesInstalled();
+    const pendingTransitionPaneIds = Object.freeze([
+      ...new Set([
+        ...this.#store.pendingProviderThreadArchivePaneIds(),
+        ...this.#store.providerThreadArchiveRecoveryPaneIdsV57(),
+      ]),
+    ].sort());
+    const pendingTransitionPanes = new Set(pendingTransitionPaneIds);
+    this.#store.clearVolatileProviderSubagents(
+      this.#now(),
+      pendingTransitionPaneIds,
+    );
     this.#store.recoverInterrupted(this.#now(), {
       preserveAttachedHarness: this.#harnessActors !== null,
+      excludePaneIds: pendingTransitionPaneIds,
     });
     for (const pane of this.#store.list()) {
+      if (pendingTransitionPanes.has(pane.id)) continue;
       if (pane.interactionMode !== "chat") continue;
       if (pane.turn !== null && !activePane(pane)) {
         this.#store.completeAcknowledgedMessagesForTurn(
@@ -381,6 +539,7 @@ export class ChatService {
     }
     const panes = this.#store.list();
     for (const pane of panes) {
+      if (pendingTransitionPanes.has(pane.id)) continue;
       if (
         pane.interactionMode === "chat" && pane.workspace !== null &&
         pane.workspace.mode === "managedWorktree" &&
@@ -389,6 +548,7 @@ export class ChatService {
     }
     if (this.#harnessActors !== null) {
       for (const pane of panes) {
+        if (pendingTransitionPanes.has(pane.id)) continue;
         if (
           pane.interactionMode !== "harnessObserver" ||
           !activePane(pane) || pane.turn === null
@@ -401,23 +561,167 @@ export class ChatService {
         );
       }
     }
-    return panes;
+    if (this.#providerThreadArchiveCoordinatorV57Enabled) {
+      this.#scheduleProviderThreadArchiveRecoveryV57(
+        this.#store.verifyProviderThreadArchiveRecoveryV57(),
+      );
+    }
+    return panes.map((pane) => this.#projectPane(pane));
   }
 
   list(): readonly ChatPaneProjection[] {
-    return this.#store.list();
+    return this.#store.list().map((pane) => this.#projectPane(pane));
   }
 
-  async handleAccountUnavailable(accountProfileId: ChatAccountProfileId): Promise<void> {
+  async handleAccountUnavailable(
+    accountProfileId: ChatAccountProfileId,
+    options: Readonly<{
+      readonly expectedGeneration?: number;
+    }> = {},
+  ): Promise<void> {
+    await this.#handleAccountUnavailable(
+      accountProfileId,
+      options,
+      "genericGenerationLoss",
+    );
+  }
+
+  async handleAccountRemoval(
+    accountProfileId: ChatAccountProfileId,
+  ): Promise<void> {
+    await this.#handleAccountUnavailable(
+      accountProfileId,
+      {},
+      "explicitAccountRemoval",
+    );
+  }
+
+  /**
+   * Closed callback registered with AccountService for one approved archive
+   * fence. Account admission is quarantined for the entire call. Sibling
+   * detachment is durable before the initiating v56 intent is marked
+   * generation-contained, so that bit is the final join rather than an
+   * optimistic promise.
+   */
+  async joinProviderThreadArchiveGenerationContainment(
+    input: ChatArchiveRecoveryDescriptor & Readonly<{ authorityHandle: string }>,
+  ): Promise<void> {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const accountId = accountProfileIdSchema.parse(input.accountProfileId);
+    if (
+      !Number.isSafeInteger(input.expectedGeneration) ||
+      input.expectedGeneration < 1
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The provider archive containment generation is invalid.",
+      );
+    }
+    const requireUncontainedIntent = (): ChatProviderThreadArchiveIntent => {
+      const intent = this.#store.providerThreadArchiveIntent(paneId);
+      const installed = this.#providerThreadArchiveHolds.get(paneId);
+      if (
+        intent === null ||
+        intent.state !== "ambiguous" ||
+        intent.account_profile_id !== accountId ||
+        intent.generation !== input.expectedGeneration ||
+        intent.generation_contained !== 0 ||
+        installed?.authorityHandle !== input.authorityHandle ||
+        !sameArchiveDescriptor(
+          providerThreadArchiveDescriptor(intent),
+          input,
+        )
+      ) {
+        throw new ChatPaneStoreError(
+          "revision_conflict",
+          "Provider archive containment no longer matches its durable intent.",
+        );
+      }
+      return intent;
+    };
+    requireUncontainedIntent();
+    await this.#handleAccountUnavailable(
+      accountId,
+      { expectedGeneration: input.expectedGeneration },
+      "archiveGenerationContained",
+    );
+    requireUncontainedIntent();
+    this.#store.markProviderThreadArchiveGenerationContained({
+      paneId,
+      expectedGeneration: input.expectedGeneration,
+      containmentReceipt: contentFreeReceipt(
+        "hra.chat.thread-archive-generation-contained.v1",
+        JSON.stringify([
+          accountId,
+          paneId,
+          input.expectedGeneration,
+        ]),
+      ),
+      now: this.#now(),
+    });
+  }
+
+  async #handleAccountUnavailable(
+    accountProfileId: ChatAccountProfileId,
+    options: Readonly<{
+      readonly expectedGeneration?: number;
+      readonly containmentTargetPaneIds?: readonly ChatPaneId[];
+    }>,
+    mode:
+      | "archiveGenerationContained"
+      | "explicitAccountRemoval"
+      | "genericGenerationLoss",
+  ): Promise<void> {
     const accountId = accountProfileIdSchema.parse(accountProfileId);
-    const paneIds = this.#store.paneIdsReferencingAccount(accountId);
+    const expectedGeneration = options.expectedGeneration;
+    const containmentTargetPaneIds = new Set(
+      (options.containmentTargetPaneIds ?? []).map((paneId) =>
+        chatPaneIdSchema.parse(paneId)
+      ),
+    );
+    if (
+      expectedGeneration !== undefined &&
+      (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1)
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The unavailable provider generation is invalid.",
+      );
+    }
+    if (mode === "genericGenerationLoss" && expectedGeneration === undefined) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Generic account cleanup requires the exact contained provider generation.",
+      );
+    }
+    const preservedPaneIds = new Set<ChatPaneId>();
+    if (mode !== "explicitAccountRemoval") {
+      for (const paneId of this.#store.pendingProviderThreadArchivePaneIds()) {
+        const intent = this.#store.providerThreadArchiveIntent(paneId);
+        if (intent?.account_profile_id === accountId) preservedPaneIds.add(paneId);
+      }
+    }
+    const paneIds = this.#store.paneIdsReferencingAccount(accountId)
+      .filter((paneId) => !preservedPaneIds.has(paneId));
     await Promise.all(paneIds.map((paneId) => {
-      this.#clearAttachedHarnessStartupRetry(paneId);
-      this.#attachedHarnessProjectionFences.delete(paneId);
-      this.#discardSessionProjectionQueue(paneId);
       return this.#serialize(paneId, async () => {
       const pane = this.#store.get(paneId);
       if (pane === null) return;
+      if (
+        mode !== "explicitAccountRemoval" &&
+        (
+          expectedGeneration === undefined ||
+          !this.#paneProviderEffectBelongsToGeneration(
+            paneId,
+            accountId,
+            expectedGeneration,
+            containmentTargetPaneIds.has(paneId),
+          )
+        )
+      ) return;
+      this.#clearAttachedHarnessStartupRetry(paneId);
+      this.#attachedHarnessProjectionFences.delete(paneId);
+      this.#discardSessionProjectionQueue(paneId);
       const activeTurnId = activePane(pane.projection)
         ? pane.projection.turn?.id ?? null
         : null;
@@ -466,13 +770,122 @@ export class ChatService {
       // Callers invoke this only after the account generation has stopped,
       // failed, or been removed. A provider request here could lazily relaunch
       // the unavailable account, so detachment is deliberately state-only.
+      let quarantineAttachmentContext = false;
+      let attachmentContainment: Readonly<{
+        readonly bindingId: string;
+        readonly bindingKeyDigest: string;
+        readonly expectedRevision: number;
+        readonly containmentReceipt: string;
+      }> | null = null;
+      const retainedClassification = this.#store
+        .classifyRetainedProviderAttachmentBinding(paneId, pane.binding);
+      const archiveIntent = this.#store.providerThreadArchiveIntent(paneId);
+      if (
+        archiveIntent !== null &&
+        archiveIntent.state !== "account_contained"
+      ) {
+        if (archiveIntent.account_profile_id !== accountId) {
+          throw new ChatPaneStoreError(
+            "corrupt_state",
+            "A pending provider archive intent belongs to another account.",
+          );
+        }
+        quarantineAttachmentContext = true;
+      }
+      if (retainedClassification.kind === "orphan") {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Attachment custody no longer matches this pane's provider lineage.",
+        );
+      }
+      if (
+        retainedClassification.kind === "exact" && this.#attachments === null
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "The attachment containment authority is unavailable.",
+        );
+      }
+      if (
+        pane.binding !== null &&
+        pane.binding.accountProfileId === accountId &&
+        this.#attachments !== null
+      ) {
+        const authority = chatProviderAttachmentAuthority(
+          paneId,
+          pane.binding,
+        );
+        const retained = this.#attachments.readProviderBinding({
+          ...authority,
+          paneId,
+        });
+        if (retained !== null) {
+          quarantineAttachmentContext = true;
+          if (retained.state !== "released") {
+            if (
+              retainedClassification.kind !== "exact" ||
+              retainedClassification.revision !== retained.revision
+            ) {
+              throw new ChatPaneStoreError(
+                "revision_conflict",
+                "Provider attachment custody changed during account containment.",
+              );
+            }
+            attachmentContainment = Object.freeze({
+              ...authority,
+              expectedRevision: retained.revision,
+              containmentReceipt: contentFreeReceipt(
+                "hra.chat.account-generation-contained.v1",
+                JSON.stringify([
+                  accountId,
+                  paneId,
+                  pane.binding.threadId,
+                  expectedGeneration ?? "account_unavailable",
+                ]),
+              ),
+            });
+          }
+        }
+      }
       this.#discardEarlySessionEvents(paneId);
       this.#observedSessionItemEvents.delete(paneId);
       this.#quotaProofFloors.delete(paneId);
-      const detached = this.#store.detachUnavailableAccount(paneId, accountId, this.#now());
+      const detached = this.#store.detachUnavailableAccount(
+        paneId,
+        accountId,
+        this.#now(),
+        quarantineAttachmentContext
+          ? "quarantineAttachments"
+          : "preserveHandoff",
+        attachmentContainment,
+        quarantineAttachmentContext
+          ? contentFreeReceipt(
+              "hra.chat.account-generation-contained.v1",
+              JSON.stringify([
+                accountId,
+                paneId,
+                pane.binding?.threadId ?? "detached",
+                expectedGeneration ?? "account_unavailable",
+              ]),
+            )
+          : null,
+      );
+      if (
+        mode === "explicitAccountRemoval" &&
+        archiveIntent !== null &&
+        archiveIntent.state !== "account_contained" &&
+        this.#store.providerThreadArchiveIntent(paneId)?.state ===
+          "account_contained"
+      ) {
+        this.#releaseProviderThreadArchiveHold(archiveIntent);
+      }
       if (detached !== null) {
-        if (activeTurnId !== null) await this.#pauseMessageQueue(paneId, "attention");
-        await this.#projection.paneStateChanged(detached);
+        if (activeTurnId !== null || quarantineAttachmentContext) {
+          await this.#pauseMessageQueue(paneId, "attention");
+        }
+        await this.#projection.paneStateChanged(
+          this.#store.require(paneId).projection,
+        );
         if (activeTurnId !== null) {
           await this.#settleMessageLedgerForTerminal(paneId, activeTurnId);
         }
@@ -490,7 +903,8 @@ export class ChatService {
 
   /** Reports whether any pane, provider, projection, or persistence task remains active. */
   hasUnsettledWork(): boolean {
-    return this.#paneTails.size > 0 ||
+    return this.#accountArchiveTails.size > 0 ||
+      this.#paneTails.size > 0 ||
       this.#providerEffects.size > 0 ||
       this.#sessionProjectionEventCount > 0 ||
       this.#pendingStreamPersistence.length > 0;
@@ -505,15 +919,18 @@ export class ChatService {
         }
       }
       this.#flushStreamPersistence();
+      const accountArchiveTails = [...this.#accountArchiveTails.values()];
       const tails = [...this.#paneTails.values()];
       const effects = [...this.#providerEffects];
       if (
+        accountArchiveTails.length === 0 &&
         tails.length === 0 &&
         effects.length === 0 &&
         this.#sessionProjectionEventCount === 0 &&
         this.#pendingStreamPersistence.length === 0
       ) return;
       await Promise.all([
+        ...accountArchiveTails.map((tail) => tail.catch(() => undefined)),
         ...tails.map((tail) => tail.catch(() => undefined)),
         ...effects.map((effect) => effect.catch(() => undefined)),
       ]);
@@ -551,7 +968,13 @@ export class ChatService {
     };
     switch (event.kind) {
       case "reasoning_summary_delta":
-        return this.#observeSessionDelta(base, "reasoningSummary", event.displayText);
+        return this.#observeSessionDelta(
+          base,
+          "reasoningSummary",
+          event.displayText,
+          undefined,
+          event.reasoningItemId,
+        );
       case "assistant_message_delta":
         return this.#observeSessionDelta(
           base,
@@ -609,7 +1032,20 @@ export class ChatService {
       accountProfileId: event.accountProfileId,
       providerThreadId: event.threadId,
       providerTurnId: event.turnId,
-      effect: { type: "reasoning_item_completed", itemId: event.itemId },
+      effect: {
+        type: "reasoning_item_completed",
+        itemId: event.itemId,
+        reasoningReceipt: event.receipt,
+      },
+    });
+  }
+
+  observeSessionProviderSubagents(event: SessionProviderSubagents): Promise<void> {
+    return this.#observeSessionEvent({
+      accountProfileId: event.accountProfileId,
+      providerThreadId: event.threadId,
+      providerTurnId: event.turnId,
+      effect: { type: "provider_subagents", projection: event.projection },
     });
   }
 
@@ -742,30 +1178,7 @@ export class ChatService {
           return { type: "pane", pane };
         });
       case "chat.pane.remove":
-        return this.#serialize(command.paneId, async () => {
-          const removed = this.#store.remove(
-            command.paneId,
-            command.expectedRevision,
-            this.#now(),
-          );
-          this.#workspaces.release(command.paneId);
-          this.#discardSessionProjectionQueue(command.paneId);
-          this.#discardEarlySessionEvents(command.paneId);
-          this.#observedSessionItemEvents.delete(command.paneId);
-          this.#harnessRootTurns.delete(command.paneId);
-          this.#quotaProofFloors.delete(command.paneId);
-          this.#priorQuotaTerminals.delete(command.paneId);
-          this.#exactProviderTerminalReceipts.delete(command.paneId);
-          this.#activeStartMessageEffects.delete(command.paneId);
-          this.#poisonedTurns.delete(command.paneId);
-          this.#recoveryFencedTurns.delete(command.paneId);
-          this.#attachedHarnessProjectionFences.delete(command.paneId);
-          this.#attachedHarnessRecoveryRequestedTurns.delete(command.paneId);
-          this.#clearAttachedHarnessStartupRetry(command.paneId);
-          this.#clearWorkspaceResolutionRetry(command.paneId);
-          await this.#projection.paneRemoved(removed.paneId, removed.revision);
-          return { type: "removed", ...removed };
-        });
+        return this.#executePaneRemove(command);
       case "chat.panes.reorder":
         return Promise.resolve().then(async () => {
           const orderedPaneIds = this.#store.reorder(
@@ -787,23 +1200,54 @@ export class ChatService {
               turnId: command.delivery.expectedTurnId,
               now: this.#now(),
             });
+            if (prepared.kind !== "prepared") {
+              return {
+                type: "messageQueue" as const,
+                paneId: command.paneId,
+                queue: prepared.queue,
+                disposition: prepared.kind,
+                messageId: command.messageId,
+              };
+            }
             const queue = await this.#publishAndDeliverPreparedSteer(
               prepared.claim,
               prepared.queue,
               "cancelNewMessage",
             );
-            return { type: "messageQueue" as const, paneId: command.paneId, queue };
+            return {
+              type: "messageQueue" as const,
+              paneId: command.paneId,
+              queue,
+              disposition: "applied" as const,
+              messageId: command.messageId,
+            };
           }
-          const queued = this.#store.enqueueMessage({
+          const enqueued = this.#store.enqueueMessageIdempotently({
             paneId: command.paneId,
             expectedQueueRevision: command.expectedQueueRevision,
             messageId: command.messageId,
             content: command.content,
+            delivery: { kind: "queue" },
             now: this.#now(),
           });
-          await this.#publishMessageQueue(command.paneId, queued);
+          if (enqueued.disposition === "replayed") {
+            return {
+              type: "messageQueue" as const,
+              paneId: command.paneId,
+              queue: enqueued.queue,
+              disposition: "replayed" as const,
+              messageId: command.messageId,
+            };
+          }
+          await this.#publishMessageQueue(command.paneId, enqueued.queue);
           const queue = await this.#admitNextQueuedMessage(command.paneId);
-          return { type: "messageQueue" as const, paneId: command.paneId, queue };
+          return {
+            type: "messageQueue" as const,
+            paneId: command.paneId,
+            queue,
+            disposition: "applied" as const,
+            messageId: command.messageId,
+          };
         });
       case "chat.message.edit":
         return this.#serialize(command.paneId, async () => {
@@ -846,6 +1290,8 @@ export class ChatService {
           const queue = await this.#admitNextQueuedMessage(command.paneId);
           return { type: "messageQueue" as const, paneId: command.paneId, queue };
         });
+      case "chat.pane.startFreshContext":
+        return this.#executeStartFreshProviderContext(command);
       case "chat.message.discardAmbiguous":
         return this.#serialize(command.paneId, async () => {
           this.#requireOrdinaryMessagePane(command.paneId);
@@ -856,6 +1302,9 @@ export class ChatService {
             expectedMessageRevision: command.expectedMessageRevision,
             now: this.#now(),
           });
+          await this.#projection.paneChanged(
+            this.#store.require(command.paneId).projection,
+          );
           await this.#publishMessageQueue(command.paneId, discarded);
           const queue = await this.#admitNextQueuedMessage(command.paneId);
           return { type: "messageQueue" as const, paneId: command.paneId, queue };
@@ -1171,7 +1620,7 @@ export class ChatService {
       this.#pendingTurnStops.has(paneId) ||
       this.#pendingTurnContainments.has(paneId) ||
       this.#recoveryFencedTurns.has(paneId) ||
-      head.text.trim().length === 0
+      (head.text.trim().length === 0 && head.attachmentRefs.length === 0)
     ) return queue;
     if (this.#activeStartMessageEffects.has(paneId)) {
       throw new ChatPaneStoreError(
@@ -1189,6 +1638,7 @@ export class ChatService {
       now: this.#now(),
     });
     this.#activeStartMessageEffects.set(paneId, {
+      content: begun.claim.content,
       messageId: begun.claim.messageId,
       paneId,
       turnId,
@@ -1363,7 +1813,10 @@ export class ChatService {
       this.#pendingTurnStops.has(claim.paneId) ||
       this.#pendingTurnContainments.has(claim.paneId) ||
       this.#recoveryFencedTurns.has(claim.paneId) ||
-      claim.content.text.trim().length === 0
+      (
+        claim.content.text.trim().length === 0 &&
+        claim.content.attachmentRefs.length === 0
+      )
     ) {
       const settled = this.#settlePreparedSteerBeforeEffect(
         claim,
@@ -1392,6 +1845,55 @@ export class ChatService {
         "The active turn no longer has HRA's verified execution policy.",
       );
     }
+    try {
+      if (claim.content.attachmentRefs.length > 0) {
+        const projected = this.#attachments?.projectPane({
+          paneId: claim.paneId,
+          referencedAttachmentIds: claim.content.attachmentRefs,
+          now: this.#now(),
+        });
+        if (projected === undefined) {
+          throw new Error("Attachment delivery is unavailable.");
+        }
+        const carriesImage = projected.referenced.some((attachment) =>
+          claim.content.attachmentRefs.includes(attachment.id) &&
+          attachment.kind === "image"
+        );
+        if (carriesImage && !fence.allowsImage) {
+          throw new Error("The active model receipt does not prove image input.");
+        }
+      }
+    } catch {
+      const settled = this.#settlePreparedSteerBeforeEffect(
+        claim,
+        preEffectFailure,
+      );
+      await this.#publishMessageQueue(claim.paneId, settled.queue);
+      if (!settled.attachmentsRestored) throw attachmentCompensationExpired();
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The exact active model cannot accept these attachments.",
+      );
+    }
+    let preparedInput: PreparedProviderAttachmentInput;
+    try {
+      preparedInput = await this.#prepareProviderAttachmentInput(
+        claim.paneId,
+        pane.binding,
+        claim.content,
+      );
+    } catch {
+      const settled = this.#settlePreparedSteerBeforeEffect(
+        claim,
+        preEffectFailure,
+      );
+      await this.#publishMessageQueue(claim.paneId, settled.queue);
+      if (!settled.attachmentsRestored) throw attachmentCompensationExpired();
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The attachments could not be verified before steering.",
+      );
+    }
     const effectStarted = this.#store.markMessageEffectStarted({
       paneId: claim.paneId,
       messageId: claim.messageId,
@@ -1402,13 +1904,15 @@ export class ChatService {
     });
     const effectRevision = claim.revision + 1;
     let acknowledged: ChatMessageQueueProjection;
+    let providerEffectAttempted = false;
     try {
       await this.#publishMessageQueue(claim.paneId, effectStarted);
+      providerEffectAttempted = true;
       await this.#provider.steerTurn({
         binding: pane.binding,
         providerTurnId: pane.providerTurnId,
         messageId: claim.messageId,
-        prompt: claim.content.text,
+        input: preparedInput.input,
         fence,
       });
       acknowledged = this.#store.acknowledgeMessageEffect({
@@ -1419,8 +1923,14 @@ export class ChatService {
         kind: "steer",
         now: this.#now(),
       });
-    } catch {
+    } catch (error: unknown) {
       try {
+        if (providerEffectAttempted && ambiguousProviderEffect(error)) {
+          this.#markProviderAttachmentEffectAmbiguous(
+            preparedInput.lease,
+            `${claim.paneId}:${claim.turnId}:${claim.messageId}:steer`,
+          );
+        }
         const ambiguous = this.#store.markMessageEffectAmbiguous({
           paneId: claim.paneId,
           messageId: claim.messageId,
@@ -1531,6 +2041,7 @@ export class ChatService {
     channel: "reasoningSummary" | "responseMarkdown",
     displayText: string,
     assistantMessageId?: string,
+    reasoningItemId?: string,
   ): Promise<void> {
     let chunks: readonly string[];
     try {
@@ -1546,6 +2057,7 @@ export class ChatService {
         channel,
         deltas: chunks,
         ...(assistantMessageId === undefined ? {} : { assistantMessageId }),
+        ...(reasoningItemId === undefined ? {} : { reasoningItemId }),
       },
     });
   }
@@ -1556,9 +2068,13 @@ export class ChatService {
       event.providerThreadId,
       event.providerTurnId,
     );
+    const exactTerminalReasoningRecovery =
+      event.effect.type === "reasoning_item_completed" &&
+      pane?.projection.turn?.status !== undefined &&
+      ["completed", "failed"].includes(pane.projection.turn.status);
     if (
       pane === null ||
-      !activePane(pane.projection) ||
+      (!activePane(pane.projection) && !exactTerminalReasoningRecovery) ||
       pane.projection.turn === null ||
       this.#poisonedTurns.get(pane.projection.id) === pane.projection.turn.id ||
       this.#pendingTurnStops.get(pane.projection.id)?.turnId === pane.projection.turn.id &&
@@ -2088,9 +2604,13 @@ export class ChatService {
     event: SessionEventEnvelope,
   ): Promise<void> {
     const pane = this.#store.get(paneId);
+    const exactTerminalReasoningRecovery =
+      event.effect.type === "reasoning_item_completed" &&
+      pane?.projection.turn?.status !== undefined &&
+      ["completed", "failed"].includes(pane.projection.turn.status);
     if (
       pane === null ||
-      !activePane(pane.projection) ||
+      (!activePane(pane.projection) && !exactTerminalReasoningRecovery) ||
       pane.binding?.accountProfileId !== event.accountProfileId ||
       pane.binding.threadId !== event.providerThreadId ||
       pane.providerTurnId !== event.providerTurnId ||
@@ -2107,6 +2627,9 @@ export class ChatService {
           ...(event.effect.assistantMessageId === undefined
             ? {}
             : { assistantMessageId: event.effect.assistantMessageId }),
+          ...(event.effect.reasoningItemId === undefined
+            ? {}
+            : { reasoningItemId: event.effect.reasoningItemId }),
         });
         return;
       case "assistant_completed": {
@@ -2145,10 +2668,32 @@ export class ChatService {
       }
       case "reasoning_item_completed": {
         if (!this.#rememberSessionItemEvent(paneId, event.effect)) return;
-        const changed = this.#store.recordThinkingCompleted(paneId, turnId, this.#now());
-        if (changed !== null) {
-          await this.#projection.paneStateChanged(changed);
+        if (event.effect.reasoningReceipt === undefined) {
+          throw new ChatPaneStoreError(
+            "conflict",
+            "The reasoning completion lost its verification receipt.",
+          );
         }
+        const changed = this.#store.reconcileReasoningCompletion({
+          paneId,
+          turnId,
+          itemId: event.effect.itemId,
+          receipt: event.effect.reasoningReceipt,
+          now: this.#now(),
+        });
+        if (changed !== null) {
+          await this.#projection.paneChanged(changed);
+        }
+        return;
+      }
+      case "provider_subagents": {
+        const changed = this.#store.replaceProviderSubagents({
+          paneId,
+          turnId,
+          projection: event.effect.projection,
+          now: this.#now(),
+        });
+        if (changed !== null) await this.#projection.paneStateChanged(changed);
         return;
       }
       case "unexpected_interaction":
@@ -2772,6 +3317,7 @@ export class ChatService {
 
     const target = containmentTarget(pane);
     let generationFenced = false;
+    let containedGeneration: number | null = null;
     // Reservation is committed before any provider mutation. During an
     // account handoff, the previous binding can therefore name A while an
     // unresolved startThread already belongs to B.
@@ -2856,7 +3402,10 @@ export class ChatService {
         );
       }
       try {
-        await this.#containAccountGeneration(accountProfileId);
+        containedGeneration = await this.#containAccountGeneration(
+          accountProfileId,
+          this.#providerGenerationForTurn(paneId, request.turnId),
+        );
       } catch {
         this.#poisonTurnAndRequestRecovery({
           paneId,
@@ -2965,7 +3514,16 @@ export class ChatService {
     await this.#settleMessageLedgerForTerminal(paneId, request.turnId);
     if (generationFenced && accountProfileId !== null) {
       try {
-        await this.handleAccountUnavailable(accountProfileId);
+        await this.#handleAccountUnavailable(
+          accountProfileId,
+          containedGeneration === null
+            ? {}
+            : {
+                expectedGeneration: containedGeneration,
+                containmentTargetPaneIds: [paneId],
+              },
+          "genericGenerationLoss",
+        );
       } catch {
         this.#poisonTurnAndRequestRecovery({
           paneId,
@@ -3061,7 +3619,7 @@ export class ChatService {
       try {
         this.#priorQuotaTerminals.delete(target.paneId);
         const poisoned = this.#store.poisonTurn(target.paneId, target.turnId, this.#now());
-        if (poisoned !== null) await this.#projection.paneStateChanged(poisoned);
+        if (poisoned !== null) await this.#projection.paneChanged(poisoned);
       } catch {
         // Memory fencing alone is not a recovery strategy. Ask the Native host
         // to rehydrate even when the fail-closed persistence write itself is
@@ -3244,8 +3802,12 @@ export class ChatService {
         });
         return;
       }
+      let containedGeneration: number;
       try {
-        await this.#containAccountGeneration(accountProfileId);
+        containedGeneration = await this.#containAccountGeneration(
+          accountProfileId,
+          this.#providerGenerationForTurn(target.paneId, target.turnId),
+        );
       } catch {
         pane = this.#store.get(target.paneId);
         if (
@@ -3287,7 +3849,14 @@ export class ChatService {
       // a broader account_unavailable transition over its authoritative
       // poison/attention reason. Peers are detached after the same fence.
       try {
-        await this.handleAccountUnavailable(accountProfileId);
+        await this.#handleAccountUnavailable(
+          accountProfileId,
+          {
+            expectedGeneration: containedGeneration,
+            containmentTargetPaneIds: [target.paneId],
+          },
+          "genericGenerationLoss",
+        );
       } catch {
         this.#poisonTurnAndRequestRecovery({
           paneId: target.paneId,
@@ -3485,7 +4054,7 @@ export class ChatService {
         this.#discardEarlySessionEvents(paneId);
         this.#observedSessionItemEvents.delete(paneId);
         if (completed !== null) {
-          await this.#projection.paneStateChanged(completed);
+          await this.#projection.paneChanged(completed);
         }
         return "resolved";
       }
@@ -3618,6 +4187,24 @@ export class ChatService {
     }
     if (this.#turnStartupMustStop(paneId, turnId)) return;
     const previousBinding = pane.binding;
+    if (
+      previousBinding !== null &&
+      previousBinding.accountProfileId !== account.id &&
+      this.#attachments?.paneHasRetainedProviderBindings(paneId)
+    ) {
+      this.#settleRootTurnRouting(paneId, turnId, "notApplied");
+      await this.#settleHarnessBeforeProvider(
+        paneId,
+        turnId,
+        "provider_unavailable",
+      );
+      await this.#publishAttention(paneId, turnId, {
+        code: "continuation_failed",
+        message: "This pane retains attachment context from another Codex account. Reset or close the pane before switching accounts.",
+        retryable: true,
+      }, false);
+      return;
+    }
     const reserved = this.#store.reserveAccount(paneId, turnId, account.id, this.#now());
     await this.#projection.paneStateChanged(reserved);
     if (this.#turnStartupMustStop(paneId, turnId)) return;
@@ -3700,18 +4287,47 @@ export class ChatService {
       const current = this.#store.require(paneId);
       const prompt = current.activePrompt;
       if (prompt === null) throw new ChatProviderEffectError({ certainty: "ambiguous", code: "unknown" });
+      const messageContent = this.#activeStartMessageEffects.get(paneId)?.content ?? {
+        text: prompt,
+        attachmentRefs: [],
+      };
+      const preparedInput = await this.#prepareProviderAttachmentInput(
+        paneId,
+        binding,
+        messageContent,
+      );
+      if (
+        configuration.requiredInputClass === "image" &&
+        !preparedInput.input.some((item) => item.type === "localImage")
+      ) {
+        throw new ChatProviderEffectError({
+          certainty: "not_applied",
+          code: "capability_unavailable",
+        });
+      }
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       providerTurnAttempted = true;
-      const accepted = await this.#startProviderTurn(
-        {
-          ...configuration,
-          ...binding,
-          clientTurnId: turnId,
-          prompt,
-          workingDirectory: repository.workingDirectory,
-        },
-        { paneId, turnId, binding, providerTurnId: null },
-      );
+      let accepted: Awaited<ReturnType<ChatProviderPort["startTurn"]>>;
+      try {
+        accepted = await this.#startProviderTurn(
+          {
+            ...configuration,
+            ...binding,
+            clientTurnId: turnId,
+            input: preparedInput.input,
+            workingDirectory: repository.workingDirectory,
+          },
+          { paneId, turnId, binding, providerTurnId: null },
+        );
+      } catch (error: unknown) {
+        if (ambiguousProviderEffect(error)) {
+          this.#markProviderAttachmentEffectAmbiguous(
+            preparedInput.lease,
+            `${paneId}:${turnId}:start`,
+          );
+        }
+        throw error;
+      }
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       try {
         this.#rootTurnRouting.accept({
@@ -3771,8 +4387,12 @@ export class ChatService {
         providerEffectStarted && !providerTurnAttempted &&
         ambiguousProviderEffect(error)
       ) {
+        let containedGeneration: number;
         try {
-          await this.#containAccountGeneration(account.id);
+          containedGeneration = await this.#containAccountGeneration(
+            account.id,
+            this.#providerGenerationForTurn(paneId, turnId),
+          );
         } catch {
           this.#trySettleRootTurnRouting(paneId, turnId, "ambiguous");
           this.#poisonTurnAndRequestRecovery({
@@ -3782,7 +4402,14 @@ export class ChatService {
           });
           return;
         }
-        void this.handleAccountUnavailable(account.id).catch(() => undefined);
+        void this.#handleAccountUnavailable(
+          account.id,
+          {
+            expectedGeneration: containedGeneration,
+            containmentTargetPaneIds: [paneId],
+          },
+          "genericGenerationLoss",
+        ).catch(() => undefined);
       }
       this.#settleRootTurnRouting(
         paneId,
@@ -3811,7 +4438,7 @@ export class ChatService {
     paneId: ChatPaneId,
     turnId: ChatTurnId,
     accountProfileId: ChatAccountProfileId,
-  ): Promise<ChatProviderConfiguration> {
+  ): Promise<ChatProviderResolvedConfiguration> {
     const pane = this.#store.require(paneId);
     if (
       pane.projection.turn?.id !== turnId ||
@@ -3829,19 +4456,6 @@ export class ChatService {
         "The active ordinary root turn has no durable routing classification.",
       );
     }
-    if (receipt.selectedProfile !== null) {
-      if (receipt.selectedServiceTier === null) {
-        throw new ChatPaneStoreError(
-          "corrupt_state",
-          "The resolved root route lost its selected service tier.",
-        );
-      }
-      return configurationFor(
-        receipt.selectedProfile,
-        receipt.selectedServiceTier,
-      );
-    }
-
     const candidates = rootTurnResolutionCandidates(
       receipt.requestedProfile,
       receipt.requestedServiceTier,
@@ -3855,6 +4469,7 @@ export class ChatService {
     const configuration = await this.#provider.resolveConfiguration(
       accountProfileId,
       candidates.map((candidate) => candidate.configuration),
+      receipt.requiredInputClass,
     );
     const selected = candidates.find((candidate) =>
       sameConfiguration(candidate.configuration, configuration)
@@ -3865,20 +4480,34 @@ export class ChatService {
         "The provider resolved a configuration outside HRA's route.",
       );
     }
-    this.#rootTurnRouting.resolve({
-      paneId,
-      chatTurnId: turnId,
-      selectedProfile: selected.profile,
-      profileFallbackReason: selected.profile === receipt.requestedProfile
-        ? null
-        : "lunaUnavailable",
-      selectedServiceTier: selected.serviceTier,
-      serviceTierFallbackReason:
-        selected.serviceTier === receipt.requestedServiceTier
+    if (receipt.selectedProfile === null) {
+      this.#rootTurnRouting.resolve({
+        paneId,
+        chatTurnId: turnId,
+        selectedProfile: selected.profile,
+        profileFallbackReason: selected.profile === receipt.requestedProfile
           ? null
-          : "fastUnavailable",
-      now: this.#now(),
-    });
+          : "lunaUnavailable",
+        selectedServiceTier: selected.serviceTier,
+        serviceTierFallbackReason:
+          selected.serviceTier === receipt.requestedServiceTier
+            ? null
+            : "fastUnavailable",
+        catalogGeneration: configuration.catalogGeneration,
+        catalogDigest: configuration.catalogDigest,
+        now: this.#now(),
+      });
+    } else if (
+      receipt.selectedProfile !== selected.profile ||
+      receipt.selectedServiceTier !== selected.serviceTier ||
+      receipt.catalogGeneration !== configuration.catalogGeneration ||
+      receipt.catalogDigest !== configuration.catalogDigest
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The exact provider catalog no longer proves the durable root route.",
+      );
+    }
     return configuration;
   }
 
@@ -4004,8 +4633,12 @@ export class ChatService {
       return await this.#provider.startTurn(request);
     } catch (error: unknown) {
       if (!ambiguousProviderEffect(error)) throw error;
+      let containedGeneration: number;
       try {
-        await this.#containAccountGeneration(request.accountProfileId);
+        containedGeneration = await this.#containAccountGeneration(
+          request.accountProfileId,
+          request.catalogGeneration,
+        );
       } catch {
         // This method runs inside the pane's serialization tail. Persist the
         // terminal poison and synchronously request Native recovery without
@@ -4016,9 +4649,1633 @@ export class ChatService {
       // The account-wide fence invalidates every concurrent provider turn on
       // that generation. Admit their pane detachments without recursively
       // awaiting this pane's own serialization tail.
-      void this.handleAccountUnavailable(request.accountProfileId).catch(() => undefined);
+      void this.#handleAccountUnavailable(
+        request.accountProfileId,
+        {
+          expectedGeneration: containedGeneration,
+          containmentTargetPaneIds: [target.paneId],
+        },
+        "genericGenerationLoss",
+      ).catch(() => undefined);
       throw error;
     }
+  }
+
+  async #executePaneRemove(
+    command: Extract<ChatPaneCommand, { readonly type: "chat.pane.remove" }>,
+  ): Promise<ChatCommandResult> {
+    const pane = this.#store.preflightPaneArchive({
+      paneId: command.paneId,
+      expectedRevision: command.expectedRevision,
+    });
+    let containmentReceipt: string;
+    if (pane.binding !== null) {
+      if (!this.#providerThreadArchiveCoordinatorV57Enabled) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Closing a provider-bound pane is quarantined before provider access until exact archive recovery is available.",
+        );
+      }
+      return await this.#executeLiveProviderThreadArchiveV57({
+        accountProfileId: pane.binding.accountProfileId,
+        binding: pane.binding,
+        expectedQueueRevision: null,
+        expectedRevision: command.expectedRevision,
+        paneId: command.paneId,
+        purpose: "pane_archive",
+      });
+    } else {
+      const archiveIntent = this.#store.providerThreadArchiveIntent(command.paneId);
+      if (archiveIntent?.state === "account_contained") {
+        if (archiveIntent.generation_containment_receipt === null) {
+          throw new ChatPaneStoreError(
+            "corrupt_state",
+            "Account-contained provider context lost its exact receipt.",
+          );
+        }
+        containmentReceipt = archiveIntent.generation_containment_receipt;
+      } else if (archiveIntent !== null) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Closing this pane requires its exact provider-containment recovery.",
+        );
+      } else if (this.#attachments?.paneHasRetainedProviderBindings(command.paneId)) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Attachment custody is retained by a provider thread whose containment is unknown.",
+        );
+      } else {
+        containmentReceipt = contentFreeReceipt(
+          "hra.chat.pane-without-provider-containment.v1",
+          command.paneId,
+        );
+      }
+    }
+
+    return await this.#serialize(command.paneId, async () => {
+      const now = this.#now();
+      const removed = this.#store.remove(
+        command.paneId,
+        command.expectedRevision,
+        now,
+        containmentReceipt,
+      );
+      if (this.#attachments !== null) {
+        try {
+          await this.#attachments.archivePaneAfterResumeContained({
+            paneId: command.paneId,
+            now,
+            containmentReceipt,
+          });
+        } catch {
+          // The atomic pane/archive intent is authoritative. Boot
+          // reconciliation resumes postcommit custody cleanup.
+        }
+      }
+      this.#workspaces.release(command.paneId);
+      this.#discardSessionProjectionQueue(command.paneId);
+      this.#discardEarlySessionEvents(command.paneId);
+      this.#observedSessionItemEvents.delete(command.paneId);
+      this.#harnessRootTurns.delete(command.paneId);
+      this.#quotaProofFloors.delete(command.paneId);
+      this.#priorQuotaTerminals.delete(command.paneId);
+      this.#exactProviderTerminalReceipts.delete(command.paneId);
+      this.#activeStartMessageEffects.delete(command.paneId);
+      this.#poisonedTurns.delete(command.paneId);
+      this.#recoveryFencedTurns.delete(command.paneId);
+      this.#attachedHarnessProjectionFences.delete(command.paneId);
+      this.#attachedHarnessRecoveryRequestedTurns.delete(command.paneId);
+      this.#clearAttachedHarnessStartupRetry(command.paneId);
+      this.#clearWorkspaceResolutionRetry(command.paneId);
+      await this.#projection.paneRemoved(removed.paneId, removed.revision);
+      return { type: "removed" as const, ...removed };
+    });
+  }
+
+  async #executeStartFreshProviderContext(
+    command: Extract<
+      ChatPaneCommand,
+      { readonly type: "chat.pane.startFreshContext" }
+    >,
+  ): Promise<ChatCommandResult> {
+    const current = this.#store.preflightStartFreshProviderContext({
+      paneId: command.paneId,
+      expectedRevision: command.expectedRevision,
+      expectedQueueRevision: command.expectedQueueRevision,
+    });
+    if (current.binding !== null) {
+      if (!this.#providerThreadArchiveCoordinatorV57Enabled) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Starting fresh from a provider-bound pane is quarantined before provider access until exact archive recovery is available.",
+        );
+      }
+      return await this.#executeLiveProviderThreadArchiveV57({
+        accountProfileId: current.binding.accountProfileId,
+        binding: current.binding,
+        expectedQueueRevision: command.expectedQueueRevision,
+        expectedRevision: command.expectedRevision,
+        paneId: command.paneId,
+        purpose: "start_fresh",
+      });
+    }
+    return await this.#serialize(command.paneId, async () => {
+      const fresh = this.#store.startFreshProviderContext({
+        paneId: command.paneId,
+        expectedRevision: command.expectedRevision,
+        expectedQueueRevision: command.expectedQueueRevision,
+        now: this.#now(),
+      });
+      await this.#projection.paneChanged(fresh.pane);
+      await this.#publishMessageQueue(command.paneId, fresh.queue);
+      const queue = await this.#admitNextQueuedMessage(command.paneId);
+      return {
+        type: "messageQueue" as const,
+        paneId: command.paneId,
+        queue,
+      };
+    });
+  }
+
+  #scheduleProviderThreadArchiveRecoveryV57(
+    inventory: ProviderThreadArchiveRecoveryInventoryV57,
+  ): void {
+    const accountIds = [...new Set(inventory.admissionDescriptors
+      .filter((descriptor) => {
+        const target = inventory.targets.find(({ targetId }) =>
+          targetId === descriptor.transitionId
+        );
+        return target?.status === "open";
+      })
+      .map(({ accountProfileId }) =>
+        accountProfileIdSchema.parse(accountProfileId)
+    ))].sort();
+    for (const accountProfileId of accountIds) {
+      const effects = newProviderThreadArchiveRecoveryEffects();
+      void this.#serializeArchiveAccountV57(accountProfileId, async () => {
+        try {
+          await this.#recoverProviderThreadArchiveAccountV57(
+            accountProfileId,
+            effects,
+          );
+        } finally {
+          await this.#drainProviderThreadArchiveEffectPanesV57(effects);
+        }
+      }).then(
+        async () => {
+          await this.#publishProviderThreadArchiveRecoveryEffectsV57(effects);
+        },
+        async () => {
+          await this.#publishProviderThreadArchiveRecoveryEffectsV57(effects);
+        },
+      ).catch(() => undefined);
+    }
+  }
+
+  async #executeLiveProviderThreadArchiveV57(
+    command: ProviderThreadArchiveLiveCommand,
+  ): Promise<ChatCommandResult> {
+    const targetId = newProviderThreadArchiveIdV57("archtarget_");
+    const attemptId = newProviderThreadArchiveIdV57("archattempt_");
+    const effects = newProviderThreadArchiveRecoveryEffects();
+    let operationError: Error | null = null;
+    try {
+      await this.#serializeArchiveAccountV57(
+        command.accountProfileId,
+        async () => {
+        try {
+        const provisional = await this.#accounts
+          .beginArchiveTransitionProvisional({
+            accountProfileId: command.accountProfileId,
+            paneId: command.paneId,
+            purpose: command.purpose,
+            transitionId: targetId,
+          });
+        let archiveHandle: ChatArchiveTransitionHandleV57;
+        try {
+          archiveHandle = await this.#withStableProviderArchivePaneBarrierV57(
+            command.accountProfileId,
+            [command.paneId],
+            () => {
+              this.#store.prepareProviderThreadArchiveEffectStartedV57({
+                targetId,
+                attemptId,
+                paneId: command.paneId,
+                expectedRevision: command.expectedRevision,
+                generation: provisional.generation,
+                now: this.#now(),
+                ...(command.purpose === "pane_archive"
+                  ? {
+                      purpose: "pane_archive" as const,
+                      expectedQueueRevision: null,
+                    }
+                  : {
+                      purpose: "start_fresh" as const,
+                      expectedQueueRevision:
+                        command.expectedQueueRevision ?? invalidArchiveState(
+                          "A start-fresh transition lost its queue revision.",
+                        ),
+                    }),
+              });
+              return this.#accounts.promoteArchiveTransitionEffectStarted(
+                provisional.handle,
+                targetId,
+              );
+            },
+            effects,
+          );
+        } catch (error: unknown) {
+          if (!this.#providerThreadArchiveTargetIsDurableV57(targetId)) {
+            await this.#accounts.abortArchiveTransitionProvisional(
+              provisional.handle,
+            );
+          }
+          throw error;
+        }
+
+        // Hold the exact terminal component's pane tails before any provider
+        // effect. These reservations stay drained through local finalization,
+        // so a clean response has no later async gap before admission release.
+        await this.#drainProviderThreadArchiveTerminalComponentPanesV57(
+          targetId,
+          effects,
+        );
+
+        let directApplied = false;
+        let lostCause: "ambiguous_response" | "lost_response" =
+          "lost_response";
+        try {
+          const response = validateProviderThreadArchiveDirectResponseV57(
+            await this.#provider.archiveThread(
+              this.#store.providerThreadArchiveTargetBindingV57(targetId),
+              provisional.generation,
+              archiveHandle,
+            ),
+            provisional.generation,
+          );
+          this.#store.recordProviderThreadArchiveDirectAppliedV57({
+            targetId,
+            responseGeneration: response.generation,
+            responseStreamPosition: response.streamPosition,
+            providerContainmentReceipt: response.containmentReceipt,
+            now: this.#now(),
+          });
+          directApplied = true;
+        } catch (error: unknown) {
+          lostCause = error instanceof ChatProviderEffectError
+            ? "lost_response"
+            : "ambiguous_response";
+          const target = this.#store.verifyProviderThreadArchiveRecoveryV57()
+            .targets.find((candidate) => candidate.targetId === targetId) ??
+              invalidArchiveState(
+                "A provider archive target disappeared across its effect boundary.",
+              );
+          if (target.currentAttempt.state === "direct_applied") {
+            directApplied = true;
+          } else if (
+            target.currentAttempt.state !== "effect_started" ||
+            target.currentAttempt.cutId !== null
+          ) {
+            throw error;
+          }
+        }
+
+        if (!directApplied) {
+          const begun = this.#store.beginProviderThreadArchiveLostResponseCutV57({
+            targetId,
+            cutId: newProviderThreadArchiveIdV57("archcut_"),
+            cause: lostCause,
+            now: this.#now(),
+          });
+          this.#refreshProviderThreadArchiveCutHandlesV57(
+            begun.cut.cutId,
+            begun.affectedTargetIds,
+            targetId,
+            archiveHandle,
+          );
+          await this.#advanceProviderThreadArchiveCutV57(
+            begun.cut,
+            begun.affectedTargetIds,
+            effects,
+          );
+        } else {
+          archiveHandle = this.#accounts.replaceArchiveTransition(
+            archiveHandle,
+            targetId,
+          );
+          this.#finalizeProviderThreadArchiveTargetV57(
+            targetId,
+            effects,
+            archiveHandle,
+          );
+        }
+        } finally {
+          await this.#drainProviderThreadArchiveEffectPanesV57(effects);
+        }
+        },
+      );
+    } catch (error: unknown) {
+      operationError = providerThreadArchiveErrorV57(error);
+    }
+    let commandResults = new Map<string, ChatCommandResult>();
+    let projectionError: Error | null = null;
+    try {
+      commandResults =
+        await this.#publishProviderThreadArchiveRecoveryEffectsV57(effects);
+    } catch (error: unknown) {
+      projectionError = providerThreadArchiveErrorV57(error);
+    }
+    if (operationError !== null) throw operationError;
+    if (projectionError !== null) throw projectionError;
+    return commandResults.get(targetId) ?? invalidArchiveState(
+      "The provider archive completed without its initiating local result.",
+    );
+  }
+
+  async #recoverProviderThreadArchiveAccountV57(
+    accountProfileId: ChatAccountProfileId,
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    for (let pass = 0; pass < CHAT_MAX_PANES + 1; pass += 1) {
+      const inventory = this.#store.verifyProviderThreadArchiveRecoveryV57();
+      const descriptors = new Map(inventory.admissionDescriptors.map(
+        (descriptor) => [descriptor.transitionId, descriptor] as const,
+      ));
+      const targets = inventory.targets.filter((target) =>
+        target.status === "open" &&
+        descriptors.get(target.targetId)?.accountProfileId === accountProfileId
+      );
+      if (targets.length === 0) return;
+
+      const activeCut = inventory.activeCuts
+        .filter((cut) =>
+          cut.accountProfileId === accountProfileId &&
+          cut.cause !== "account_removal"
+        )
+        .sort(compareProviderThreadArchiveCutsV57)[0];
+      if (activeCut !== undefined) {
+        await this.#advanceProviderThreadArchiveCutV57(
+          activeCut,
+          providerThreadArchiveTargetIdsForCutV57(targets, activeCut.cutId),
+          effects,
+        );
+        continue;
+      }
+
+      const applied = targets.find(({ currentAttempt }) =>
+        currentAttempt.state === "direct_applied" ||
+        currentAttempt.state === "reconciled_applied"
+      );
+      if (applied !== undefined) {
+        await this.#drainProviderThreadArchiveTerminalComponentPanesV57(
+          applied.targetId,
+          effects,
+        );
+        this.#finalizeProviderThreadArchiveTargetV57(
+          applied.targetId,
+          effects,
+        );
+        continue;
+      }
+
+      const effectStarted = targets.find(({ currentAttempt }) =>
+        currentAttempt.state === "effect_started"
+      );
+      if (effectStarted !== undefined) {
+        if (effectStarted.currentAttempt.cutId !== null) {
+          invalidArchiveState(
+            "A replayed provider archive effect retained an invalid cut binding.",
+          );
+        }
+        const archiveHandle = this.#accounts.archiveTransitionHandleV57(
+          effectStarted.targetId,
+        );
+        const begun = this.#store.beginProviderThreadArchiveLostResponseCutV57({
+          targetId: effectStarted.targetId,
+          cutId: newProviderThreadArchiveIdV57("archcut_"),
+          cause: "lost_response",
+          now: this.#now(),
+        });
+        this.#refreshProviderThreadArchiveCutHandlesV57(
+          begun.cut.cutId,
+          begun.affectedTargetIds,
+          effectStarted.targetId,
+          archiveHandle,
+        );
+        await this.#advanceProviderThreadArchiveCutV57(
+          begun.cut,
+          begun.affectedTargetIds,
+          effects,
+        );
+        continue;
+      }
+
+      const ambiguous = targets.find(({ currentAttempt }) =>
+        currentAttempt.state === "ambiguous" &&
+        currentAttempt.cutId !== null
+      );
+      if (ambiguous !== undefined) {
+        await this.#reconcileProviderThreadArchiveCutV57(
+          ambiguous.currentAttempt.cutId ?? invalidArchiveState(
+            "An ambiguous provider archive lost its containment cut.",
+          ),
+          effects,
+        );
+        continue;
+      }
+
+      const notApplied = targets.find(({ currentAttempt }) =>
+        currentAttempt.state === "reconciled_not_applied"
+      );
+      if (notApplied !== undefined) {
+        await this.#runProviderThreadArchiveSuccessorWaveV57(
+          notApplied.currentAttempt.cutId ?? invalidArchiveState(
+            "A not-applied provider archive lost its predecessor cut.",
+          ),
+          effects,
+        );
+        continue;
+      }
+
+      invalidArchiveState(
+        "The provider archive recovery inventory contains a pre-effect or incoherent target.",
+      );
+    }
+    invalidArchiveState(
+      "Provider archive recovery exceeded its bounded transition count.",
+    );
+  }
+
+  async #advanceProviderThreadArchiveCutV57(
+    initialCut: ProviderThreadArchiveCutSnapshotV57,
+    targetIdsValue: readonly string[],
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    let cut = initialCut;
+    const targetIds = [...new Set(targetIdsValue)].sort();
+    if (targetIds.length === 0) {
+      invalidArchiveState(
+        "A provider archive cut lost its exact target cohort.",
+      );
+    }
+    if (cut.cause === "account_removal") {
+      invalidArchiveState(
+        "ChatService cannot advance an account-removal archive cut.",
+      );
+    }
+    if (cut.state === "fence_started") {
+      const transitionId = targetIds[0] ?? invalidArchiveState(
+        "A provider archive cut lost its initiating transition.",
+      );
+      const contained = await this.#accounts
+        .containArchiveTransitionGenerationV57({
+          accountProfileId: accountProfileIdSchema.parse(cut.accountProfileId),
+          transitionId,
+          cutId: cut.cutId,
+          archiveHandle: this.#accounts.archiveTransitionHandleV57(
+            transitionId,
+          ),
+        });
+      if (contained.generation !== cut.sourceGeneration + 1) {
+        invalidArchiveState(
+          "The provider archive fence returned the wrong successor generation.",
+        );
+      }
+      for (const targetId of targetIds) {
+        this.#accounts.archiveTransitionHandleV57(targetId);
+      }
+      cut = this.#requireActiveProviderThreadArchiveCutV57(cut.cutId);
+    }
+    if (cut.state === "fenced") {
+      cut = await this.#withStableProviderArchivePaneBarrierV57(
+        accountProfileIdSchema.parse(cut.accountProfileId),
+        this.#providerThreadArchiveTargetPaneIdsV57(targetIds),
+        () => {
+          const sealed = this.#store
+            .sealProviderThreadArchiveSourceInventoryV57({
+              cutId: cut.cutId,
+              now: this.#now(),
+            });
+          this.#refreshProviderThreadArchiveCutHandlesV57(
+            cut.cutId,
+            targetIds,
+          );
+          return sealed;
+        },
+        effects,
+      );
+    }
+    if (cut.state === "sealed") {
+      for (const member of [...cut.members]
+        .sort((left, right) => left.ordinal - right.ordinal)) {
+        if (member.state === "settled") continue;
+        const settled = this.#store.settleProviderThreadArchiveMemberV57({
+          memberId: member.memberId,
+          now: this.#now(),
+        });
+        effects.containedPaneIds.add(chatPaneIdSchema.parse(member.paneId));
+        if (settled.pane !== null) {
+          effects.containedPaneIds.add(settled.pane.id);
+        }
+        this.#refreshProviderThreadArchiveCutHandlesV57(
+          cut.cutId,
+          targetIds,
+        );
+      }
+      cut = this.#store.markProviderThreadArchiveCutContainedV57({
+        cutId: cut.cutId,
+        now: this.#now(),
+      });
+      this.#refreshProviderThreadArchiveCutHandlesV57(
+        cut.cutId,
+        targetIds,
+      );
+    }
+    if (cut.state !== "contained") {
+      invalidArchiveState(
+        "The provider archive cut did not reach exact containment.",
+      );
+    }
+    await this.#reconcileProviderThreadArchiveCutV57(cut.cutId, effects);
+  }
+
+  async #reconcileProviderThreadArchiveCutV57(
+    cutId: string,
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    const initial = this.#store.verifyProviderThreadArchiveRecoveryV57();
+    const descriptors = new Map(initial.admissionDescriptors.map(
+      (descriptor) => [descriptor.transitionId, descriptor] as const,
+    ));
+    const targets = initial.targets.filter((target) =>
+      target.status === "open" && target.currentAttempt.cutId === cutId
+    ).sort(compareProviderThreadArchiveTargetsV57);
+    if (targets.length === 0) {
+      invalidArchiveState(
+        "A contained provider archive cut lost its open target cohort.",
+      );
+    }
+    await this.#drainProviderThreadArchiveTerminalComponentPanesV57(
+      targets[0]?.targetId ?? invalidArchiveState(
+        "A contained provider archive cut lost its terminal component.",
+      ),
+      effects,
+    );
+    const buffered = new Map<string, Readonly<{
+      archiveHandle: ChatArchiveTransitionHandleV57;
+      result: ReturnType<typeof validateProviderThreadArchiveReconciliationV57>;
+    }>>();
+    for (const target of targets) {
+      if (target.currentAttempt.state === "reconciled_applied") continue;
+      if (target.currentAttempt.state === "reconciled_not_applied") continue;
+      if (target.currentAttempt.state !== "ambiguous") {
+        invalidArchiveState(
+          "A contained provider archive target is not reconcilable.",
+        );
+      }
+      const descriptor = descriptors.get(target.targetId) ??
+        invalidArchiveState(
+          "A provider archive target lost its admission descriptor.",
+        );
+      const successorGeneration = descriptor.successorGeneration ??
+        invalidArchiveState(
+          "A contained provider archive target lost its successor generation.",
+        );
+      const archiveHandle = this.#accounts.archiveTransitionHandleV57(
+        target.targetId,
+      );
+      const response = await this.#provider.reconcileThreadArchive(
+        this.#store.providerThreadArchiveTargetBindingV57(target.targetId),
+        archiveHandle,
+      );
+      const result = validateProviderThreadArchiveReconciliationV57(
+        response,
+        successorGeneration,
+      );
+      if (result.disposition === "ambiguous") {
+        this.#store.recordProviderThreadArchiveReconciliationV57({
+          targetId: target.targetId,
+          result,
+          now: this.#now(),
+        });
+        invalidArchiveState(
+          "Provider archive reconciliation remained ambiguous.",
+        );
+      }
+      buffered.set(target.targetId, { archiveHandle, result });
+    }
+
+    // No target authority is replaced or released until every reconciliation
+    // response in this exact component is buffered. From here through all
+    // applied-target commits and releases there is no provider await.
+    const replacementHandles = new Map<
+      string,
+      ChatArchiveTransitionHandleV57
+    >();
+    for (const target of targets) {
+      const outcome = buffered.get(target.targetId);
+      if (outcome === undefined) continue;
+      this.#store.recordProviderThreadArchiveReconciliationV57({
+        targetId: target.targetId,
+        result: outcome.result,
+        now: this.#now(),
+      });
+      replacementHandles.set(
+        target.targetId,
+        this.#accounts.replaceArchiveTransition(
+          outcome.archiveHandle,
+          target.targetId,
+        ),
+      );
+    }
+    const afterOutcomes = this.#store.verifyProviderThreadArchiveRecoveryV57();
+    const appliedTargets = afterOutcomes.targets.filter((target) =>
+      target.status === "open" &&
+      target.currentAttempt.cutId === cutId &&
+      target.currentAttempt.state === "reconciled_applied"
+    ).sort(compareProviderThreadArchiveTargetsV57);
+    for (const target of appliedTargets) {
+      this.#finalizeProviderThreadArchiveTargetV57(
+        target.targetId,
+        effects,
+        replacementHandles.get(target.targetId),
+      );
+    }
+    const after = this.#store.verifyProviderThreadArchiveRecoveryV57();
+    const notApplied = after.targets.filter((target) =>
+      target.status === "open" &&
+      target.currentAttempt.cutId === cutId &&
+      target.currentAttempt.state === "reconciled_not_applied"
+    );
+    if (notApplied.length > 0) {
+      await this.#runProviderThreadArchiveSuccessorWaveV57(cutId, effects);
+    }
+  }
+
+  async #runProviderThreadArchiveSuccessorWaveV57(
+    cutId: string,
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    const inventory = this.#store.verifyProviderThreadArchiveRecoveryV57();
+    const descriptors = new Map(inventory.admissionDescriptors.map(
+      (descriptor) => [descriptor.transitionId, descriptor] as const,
+    ));
+    const cohort = inventory.targets.filter((target) =>
+      target.status === "open" &&
+      target.currentAttempt.cutId === cutId &&
+      target.currentAttempt.state === "reconciled_not_applied"
+    ).sort(compareProviderThreadArchiveTargetsV57);
+    if (cohort.length === 0) {
+      invalidArchiveState(
+        "The provider archive successor wave has no not-applied targets.",
+      );
+    }
+    const activated = new Map<string, Readonly<{
+      archiveHandle: ChatArchiveTransitionHandleV57;
+      generation: number;
+    }>>();
+    for (const target of cohort) {
+      const descriptor = descriptors.get(target.targetId) ??
+        invalidArchiveState(
+          "A provider archive successor lost its admission descriptor.",
+        );
+      const activation = await this.#accounts
+        .activateArchiveTransitionSuccessorV57({
+          accountProfileId: accountProfileIdSchema.parse(
+            descriptor.accountProfileId,
+          ),
+          transitionId: target.targetId,
+          archiveHandle: this.#accounts.archiveTransitionHandleV57(
+            target.targetId,
+          ),
+        });
+      if (activation.generation !== descriptor.successorGeneration) {
+        invalidArchiveState(
+          "A provider archive successor activated the wrong generation.",
+        );
+      }
+      activated.set(target.targetId, activation);
+    }
+    const attempts = cohort.map((target) => Object.freeze({
+      targetId: target.targetId,
+      attemptId: newProviderThreadArchiveIdV57("archattempt_"),
+    }));
+    this.#store.appendProviderThreadArchiveSuccessorWaveEffectStartedV57({
+      cutId,
+      attempts,
+      now: this.#now(),
+    });
+    await this.#drainProviderThreadArchiveTerminalComponentPanesV57(
+      cohort[0]?.targetId ?? invalidArchiveState(
+        "A provider archive successor wave lost its terminal component.",
+      ),
+      effects,
+    );
+    const handles = new Map<string, ChatArchiveTransitionHandleV57>();
+    const responses = new Map<string, ProviderThreadArchiveDirectResponse>();
+    let outcomesDurable = false;
+    try {
+      for (const target of cohort) {
+        const prior = activated.get(target.targetId) ?? invalidArchiveState(
+          "A provider archive successor lost its activated handle.",
+        );
+        handles.set(
+          target.targetId,
+          this.#accounts.replaceArchiveTransition(
+            prior.archiveHandle,
+            target.targetId,
+          ),
+        );
+      }
+      for (const target of cohort) {
+        this.#store.assertProviderThreadArchiveSuccessorWaveReadyV57({ cutId });
+        const generation = activated.get(target.targetId)?.generation ??
+          invalidArchiveState(
+            "A provider archive successor lost its exact generation.",
+          );
+        responses.set(
+          target.targetId,
+          validateProviderThreadArchiveDirectResponseV57(
+            await this.#provider.archiveThread(
+              this.#store.providerThreadArchiveTargetBindingV57(
+                target.targetId,
+              ),
+              generation,
+              handles.get(target.targetId) ?? invalidArchiveState(
+                "A provider archive successor lost its effect handle.",
+              ),
+            ),
+            generation,
+          ),
+        );
+      }
+      this.#store.recordProviderThreadArchiveDirectAppliedCohortV57({
+        cutId,
+        results: cohort.map((target) => {
+          const response = responses.get(target.targetId) ??
+            invalidArchiveState(
+              "A successful provider archive wave lost a buffered response.",
+            );
+          return Object.freeze({
+            targetId: target.targetId,
+            responseGeneration: response.generation,
+            responseStreamPosition: response.streamPosition,
+            providerContainmentReceipt: response.containmentReceipt,
+          });
+        }),
+        now: this.#now(),
+      });
+      outcomesDurable = true;
+    } catch (error: unknown) {
+      const afterFailure = this.#store.verifyProviderThreadArchiveRecoveryV57();
+      const current = cohort.map(({ targetId }) =>
+        afterFailure.targets.find((target) => target.targetId === targetId) ??
+          invalidArchiveState(
+            "A provider archive successor disappeared across its effect boundary.",
+          )
+      );
+      if (current.every(({ currentAttempt }) =>
+        currentAttempt.state === "direct_applied"
+      )) {
+        outcomesDurable = true;
+      } else {
+        if (current.some(({ currentAttempt }) =>
+          currentAttempt.state !== "effect_started" ||
+          currentAttempt.cutId !== null
+        )) {
+          throw error;
+        }
+        const initiating = current[0] ?? invalidArchiveState(
+          "A failed provider archive successor wave lost its cohort.",
+        );
+        const priorHandle = handles.get(initiating.targetId) ??
+          activated.get(initiating.targetId)?.archiveHandle ??
+          invalidArchiveState(
+            "A failed provider archive successor wave lost its handle.",
+          );
+        const begun = this.#store.beginProviderThreadArchiveLostResponseCutV57({
+          targetId: initiating.targetId,
+          cutId: newProviderThreadArchiveIdV57("archcut_"),
+          cause: error instanceof ChatProviderEffectError
+            ? "lost_response"
+            : "ambiguous_response",
+          now: this.#now(),
+        });
+        this.#refreshProviderThreadArchiveCutHandlesV57(
+          begun.cut.cutId,
+          begun.affectedTargetIds,
+          initiating.targetId,
+          priorHandle,
+        );
+        await this.#advanceProviderThreadArchiveCutV57(
+          begun.cut,
+          begun.affectedTargetIds,
+          effects,
+        );
+        return;
+      }
+    }
+    if (!outcomesDurable) {
+      invalidArchiveState(
+        "A provider archive successor wave lost its durable outcome.",
+      );
+    }
+    for (const target of cohort) {
+      handles.set(
+        target.targetId,
+        this.#accounts.replaceArchiveTransition(
+          handles.get(target.targetId) ?? invalidArchiveState(
+            "A successful provider archive wave lost its prior handle.",
+          ),
+          target.targetId,
+        ),
+      );
+    }
+    for (const target of cohort) {
+      this.#finalizeProviderThreadArchiveTargetV57(
+        target.targetId,
+        effects,
+        handles.get(target.targetId),
+      );
+    }
+  }
+
+  #finalizeProviderThreadArchiveTargetV57(
+    targetId: string,
+    effects: ProviderThreadArchiveRecoveryEffects,
+    knownHandle?: ChatArchiveTransitionHandleV57,
+  ): void {
+    const targetExists = this.#store.verifyProviderThreadArchiveRecoveryV57()
+      .targets.some((candidate) => candidate.targetId === targetId);
+    if (!targetExists) {
+      invalidArchiveState(
+        "A provider archive target disappeared before finalization.",
+      );
+    }
+    const reserved = this.#store
+      .verifiedProviderThreadArchiveTerminalComponentV57(targetId);
+    this.#assertProviderThreadArchiveTerminalComponentShapeV57(reserved);
+    this.#assertProviderThreadArchiveTerminalComponentPanesDrainedV57(
+      reserved,
+      effects,
+    );
+    const result = this.#store.finalizeProviderThreadArchiveTargetV57({
+      targetId,
+      now: this.#now(),
+    });
+    const handle = knownHandle ??
+      this.#accounts.archiveTransitionHandleV57(targetId);
+    const discovered = this.#store
+      .verifiedProviderThreadArchiveTerminalComponentV57(targetId);
+    this.#assertProviderThreadArchiveTerminalComponentShapeV57(discovered);
+    this.#assertProviderThreadArchiveTerminalComponentIdentityStableV57(
+      reserved,
+      discovered,
+    );
+    if (!discovered.component.allTargetsCommitted) {
+      this.#recordProviderThreadArchiveFinalizationV57(
+        effects,
+        targetId,
+        result,
+      );
+      const cleanup = this.#accounts.releaseArchiveTransition(
+        targetId,
+        handle,
+        discovered.component,
+      );
+      this.#assertProviderThreadArchiveTerminalCleanupV57(
+        discovered.component,
+        cleanup,
+      );
+      return;
+    }
+
+    const harvested = this.#store
+      .verifiedProviderThreadArchiveTerminalComponentV57(targetId);
+    this.#assertProviderThreadArchiveTerminalComponentStableV57(
+      discovered,
+      harvested,
+    );
+    for (const finalization of harvested.finalizations) {
+      this.#recordProviderThreadArchiveFinalizationV57(
+        effects,
+        finalization.targetId,
+        finalization.result,
+        finalization.paneId,
+      );
+    }
+    const cleanup = this.#accounts.releaseArchiveTransition(
+      targetId,
+      handle,
+      harvested.component,
+    );
+    this.#assertProviderThreadArchiveTerminalCleanupV57(
+      harvested.component,
+      cleanup,
+    );
+  }
+
+  #recordProviderThreadArchiveFinalizationV57(
+    effects: ProviderThreadArchiveRecoveryEffects,
+    targetId: string,
+    result: ChatProviderThreadArchiveFinalizationV57Result,
+    expectedPaneId?: string,
+  ): void {
+    const paneId = result.kind === "pane_archive"
+      ? result.removed.paneId
+      : result.pane.id;
+    if (
+      expectedPaneId !== undefined &&
+      paneId !== chatPaneIdSchema.parse(expectedPaneId)
+    ) {
+      invalidArchiveState(
+        "A provider archive terminal replay changed its target pane.",
+      );
+    }
+    const finalized = Object.freeze({ targetId, result });
+    const existing = effects.finalized.findIndex((candidate) =>
+      candidate.targetId === targetId
+    );
+    if (existing < 0) {
+      effects.finalized.push(finalized);
+    } else {
+      effects.finalized[existing] = finalized;
+    }
+  }
+
+  async #drainProviderThreadArchiveTerminalComponentPanesV57(
+    targetId: string,
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    const discovered = this.#store
+      .verifiedProviderThreadArchiveTerminalComponentV57(targetId);
+    this.#assertProviderThreadArchiveTerminalComponentShapeV57(discovered);
+    for (const target of discovered.targets) {
+      effects.containedPaneIds.add(chatPaneIdSchema.parse(target.paneId));
+    }
+    await this.#drainProviderThreadArchiveEffectPanesV57(effects);
+    const drained = this.#store
+      .verifiedProviderThreadArchiveTerminalComponentV57(targetId);
+    this.#assertProviderThreadArchiveTerminalComponentShapeV57(drained);
+    this.#assertProviderThreadArchiveTerminalComponentIdentityStableV57(
+      discovered,
+      drained,
+    );
+    if (
+      discovered.component.allTargetsCommitted !==
+        drained.component.allTargetsCommitted
+    ) {
+      invalidArchiveState(
+        "A provider archive terminal component committed while its panes drained.",
+      );
+    }
+    this.#assertProviderThreadArchiveTerminalComponentPanesDrainedV57(
+      drained,
+      effects,
+    );
+  }
+
+  #assertProviderThreadArchiveTerminalComponentPanesDrainedV57(
+    component: ChatProviderThreadArchiveTerminalComponentV57,
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): void {
+    for (const target of component.targets) {
+      const paneId = chatPaneIdSchema.parse(target.paneId);
+      const reservation = effects.paneReservations.get(paneId);
+      if (
+        !effects.containedPaneIds.has(paneId) ||
+        reservation === undefined || !reservation.drained
+      ) {
+        invalidArchiveState(
+          "A provider archive terminal pane was not drained before finalization.",
+        );
+      }
+    }
+  }
+
+  #assertProviderThreadArchiveTerminalComponentIdentityStableV57(
+    prior: ChatProviderThreadArchiveTerminalComponentV57,
+    current: ChatProviderThreadArchiveTerminalComponentV57,
+  ): void {
+    if (
+      prior.component.accountProfileId !== current.component.accountProfileId ||
+      !sameProviderThreadArchiveStringsV57(
+        prior.component.targetIds,
+        current.component.targetIds,
+      ) ||
+      !sameProviderThreadArchiveStringsV57(
+        prior.component.cutIds,
+        current.component.cutIds,
+      ) ||
+      prior.targets.length !== current.targets.length ||
+      prior.targets.some((target, index) => {
+        const observed = current.targets[index];
+        return observed === undefined || observed.targetId !== target.targetId ||
+          observed.paneId !== target.paneId;
+      })
+    ) {
+      invalidArchiveState(
+        "A provider archive terminal component changed identity before release.",
+      );
+    }
+  }
+
+  #assertProviderThreadArchiveTerminalComponentStableV57(
+    discovered: ChatProviderThreadArchiveTerminalComponentV57,
+    harvested: ChatProviderThreadArchiveTerminalComponentV57,
+  ): void {
+    this.#assertProviderThreadArchiveTerminalComponentShapeV57(harvested);
+    if (
+      !harvested.component.allTargetsCommitted ||
+      discovered.component.accountProfileId !==
+        harvested.component.accountProfileId ||
+      !sameProviderThreadArchiveStringsV57(
+        discovered.component.targetIds,
+        harvested.component.targetIds,
+      ) ||
+      !sameProviderThreadArchiveStringsV57(
+        discovered.component.cutIds,
+        harvested.component.cutIds,
+      ) ||
+      discovered.targets.length !== harvested.targets.length ||
+      discovered.targets.some((target, index) => {
+        const current = harvested.targets[index];
+        return current === undefined || current.targetId !== target.targetId ||
+          current.paneId !== target.paneId;
+      })
+    ) {
+      invalidArchiveState(
+        "A provider archive terminal component changed before exact release.",
+      );
+    }
+  }
+
+  #assertProviderThreadArchiveTerminalComponentShapeV57(
+    value: ChatProviderThreadArchiveTerminalComponentV57,
+  ): void {
+    if (
+      value.component.targetIds.length === 0 ||
+      value.targets.length !== value.component.targetIds.length ||
+      value.targets.some((target, index) =>
+        target.targetId !== value.component.targetIds[index] ||
+        chatPaneIdSchema.safeParse(target.paneId).success === false
+      ) ||
+      (value.component.allTargetsCommitted
+        ? value.finalizations.length !== value.targets.length ||
+          value.finalizations.some((finalization, index) => {
+            const target = value.targets[index];
+            return target === undefined ||
+              finalization.targetId !== target.targetId ||
+              finalization.paneId !== target.paneId;
+          })
+        : value.finalizations.length !== 0)
+    ) {
+      invalidArchiveState(
+        "A provider archive terminal component lost its canonical targets.",
+      );
+    }
+  }
+
+  #assertProviderThreadArchiveTerminalCleanupV57(
+    component: ChatProviderThreadArchiveTerminalComponentV57["component"],
+    cleanup: ReturnType<ChatAccountPort["releaseArchiveTransition"]>,
+  ): void {
+    const expectedTargetIds = component.allTargetsCommitted
+      ? component.targetIds
+      : [];
+    const expectedCutIds = component.allTargetsCommitted
+      ? component.cutIds
+      : [];
+    if (
+      !sameProviderThreadArchiveStringsV57(
+        cleanup.deletedTargetIds,
+        expectedTargetIds,
+      ) ||
+      !sameProviderThreadArchiveStringsV57(
+        cleanup.deletedCutIds,
+        expectedCutIds,
+      )
+    ) {
+      invalidArchiveState(
+        "Provider archive terminal cleanup changed its exact component.",
+      );
+    }
+  }
+
+  #refreshProviderThreadArchiveCutHandlesV57(
+    cutId: string,
+    targetIdsValue: readonly string[],
+    knownTransitionId?: string,
+    knownHandle?: ChatArchiveTransitionHandleV57,
+  ): void {
+    const targetIds = [...new Set(targetIdsValue)].sort();
+    const transitionId = knownTransitionId ?? targetIds[0] ??
+      invalidArchiveState("A provider archive cut has no target handle.");
+    const archiveHandle = knownHandle ??
+      this.#accounts.archiveTransitionHandleV57(transitionId);
+    this.#accounts.refreshArchiveTransitionCutAuthoritiesV57({
+      archiveHandle,
+      cutId,
+      transitionId,
+    });
+    for (const targetId of targetIds) {
+      this.#accounts.archiveTransitionHandleV57(targetId);
+    }
+  }
+
+  #requireActiveProviderThreadArchiveCutV57(
+    cutId: string,
+  ): ProviderThreadArchiveCutSnapshotV57 {
+    return this.#store.verifyProviderThreadArchiveRecoveryV57().activeCuts
+      .find((candidate) => candidate.cutId === cutId) ?? invalidArchiveState(
+        "The provider archive cut disappeared before containment completed.",
+      );
+  }
+
+  #providerThreadArchiveTargetPaneIdsV57(
+    targetIds: readonly string[],
+  ): readonly ChatPaneId[] {
+    const inventory = this.#store.verifyProviderThreadArchiveRecoveryV57();
+    const targets = new Map(inventory.targets.map(
+      (target) => [target.targetId, target] as const,
+    ));
+    return targetIds.map((targetId) =>
+      chatPaneIdSchema.parse(
+        targets.get(targetId)?.paneId ?? invalidArchiveState(
+          "A provider archive cut lost its target pane.",
+        ),
+      )
+    );
+  }
+
+  #providerThreadArchiveTargetIsDurableV57(targetId: string): boolean {
+    try {
+      return this.#store.verifyProviderThreadArchiveRecoveryV57().targets
+        .some((target) => target.targetId === targetId);
+    } catch {
+      // If durable authority cannot be disproved, retain the provisional hold.
+      return true;
+    }
+  }
+
+  async #publishProviderThreadArchiveRecoveryEffectsV57(
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<Map<string, ChatCommandResult>> {
+    const results = new Map<string, ChatCommandResult>();
+    const finalizedPaneIds = new Set(effects.finalized.map(({ result }) =>
+      result.kind === "pane_archive" ? result.removed.paneId : result.pane.id
+    ));
+    let firstError: Error | null = null;
+    for (const paneId of [...effects.containedPaneIds].sort()) {
+      if (finalizedPaneIds.has(paneId)) continue;
+      try {
+        await this.#runProviderThreadArchivePostcommitPaneV57(
+          effects,
+          paneId,
+          async () => {
+          const pane = this.#store.get(paneId);
+          if (pane !== null) {
+            await this.#projection.paneChanged(pane.projection);
+          }
+          },
+        );
+      } catch (error: unknown) {
+        firstError ??= providerThreadArchiveErrorV57(error);
+      }
+    }
+    for (const finalized of effects.finalized) {
+      const result = finalized.result;
+      if (result.kind === "pane_archive") {
+        const { containmentReceipt, removed } = result;
+        try {
+          await this.#runProviderThreadArchivePostcommitPaneV57(
+            effects,
+            removed.paneId,
+            async () => {
+            if (this.#attachments !== null) {
+              try {
+                await this.#attachments.archivePaneAfterResumeContained({
+                  paneId: removed.paneId,
+                  now: this.#now(),
+                  containmentReceipt,
+                });
+              } catch {
+                // The pane commit owns a durable cleanup intent; startup resumes it.
+              }
+            }
+            this.#workspaces.release(removed.paneId);
+            this.#discardProviderThreadArchivePaneStateV57(removed.paneId);
+            await this.#projection.paneRemoved(
+              removed.paneId,
+              removed.revision,
+            );
+            },
+          );
+        } catch (error: unknown) {
+          firstError ??= providerThreadArchiveErrorV57(error);
+        }
+        results.set(finalized.targetId, {
+          type: "removed",
+          ...removed,
+        });
+        continue;
+      }
+      const fresh = result;
+      try {
+        const queue = await this.#runProviderThreadArchivePostcommitPaneV57(
+          effects,
+          fresh.pane.id,
+          async () => {
+            await this.#projection.paneChanged(fresh.pane);
+            await this.#publishMessageQueue(
+              fresh.pane.id,
+              fresh.queue,
+            );
+            return await this.#admitNextQueuedMessage(
+              fresh.pane.id,
+            );
+          },
+        );
+        results.set(finalized.targetId, {
+          type: "messageQueue",
+          paneId: fresh.pane.id,
+          queue,
+        });
+      } catch (error: unknown) {
+        firstError ??= providerThreadArchiveErrorV57(error);
+        results.set(finalized.targetId, {
+          type: "messageQueue",
+          paneId: fresh.pane.id,
+          queue: fresh.queue,
+        });
+      }
+    }
+    if (firstError !== null) throw firstError;
+    return results;
+  }
+
+  #reserveProviderThreadArchiveEffectPanesV57(
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): void {
+    const paneIds = new Set<ChatPaneId>(effects.containedPaneIds);
+    for (const { result } of effects.finalized) {
+      paneIds.add(
+        result.kind === "pane_archive" ? result.removed.paneId : result.pane.id,
+      );
+    }
+    for (const paneId of [...paneIds].sort()) {
+      if (effects.paneReservations.has(paneId)) continue;
+      const prior = this.#paneTails.get(paneId) ?? Promise.resolve();
+      let release!: () => void;
+      const marker = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const tail = prior.catch(() => undefined).then(() => marker);
+      this.#paneTails.set(paneId, tail);
+      effects.paneReservations.set(paneId, {
+        drained: false,
+        paneId,
+        prior,
+        release,
+        tail,
+      });
+    }
+  }
+
+  async #drainProviderThreadArchiveEffectPanesV57(
+    effects: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<void> {
+    this.#reserveProviderThreadArchiveEffectPanesV57(effects);
+    await Promise.all([...effects.paneReservations.values()].map(
+      async (reservation) => {
+        if (reservation.drained) return;
+        await reservation.prior.catch(() => undefined);
+        reservation.drained = true;
+      },
+    ));
+  }
+
+  async #runProviderThreadArchivePostcommitPaneV57<T>(
+    effects: ProviderThreadArchiveRecoveryEffects,
+    paneIdValue: ChatPaneId,
+    operation: () => T | Promise<T>,
+  ): Promise<T> {
+    const paneId = chatPaneIdSchema.parse(paneIdValue);
+    const reservation = effects.paneReservations.get(paneId) ??
+      invalidArchiveState(
+        "A provider archive postcommit effect lost its pane reservation.",
+      );
+    if (!reservation.drained) {
+      invalidArchiveState(
+        "A provider archive postcommit pane was not drained before release.",
+      );
+    }
+    effects.paneReservations.delete(paneId);
+    await reservation.prior.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      reservation.release();
+      if (this.#paneTails.get(paneId) === reservation.tail) {
+        this.#paneTails.delete(paneId);
+      }
+    }
+  }
+
+  #discardProviderThreadArchivePaneStateV57(paneId: ChatPaneId): void {
+    this.#discardSessionProjectionQueue(paneId);
+    this.#discardEarlySessionEvents(paneId);
+    this.#observedSessionItemEvents.delete(paneId);
+    this.#harnessRootTurns.delete(paneId);
+    this.#quotaProofFloors.delete(paneId);
+    this.#priorQuotaTerminals.delete(paneId);
+    this.#exactProviderTerminalReceipts.delete(paneId);
+    this.#activeStartMessageEffects.delete(paneId);
+    this.#poisonedTurns.delete(paneId);
+    this.#recoveryFencedTurns.delete(paneId);
+    this.#attachedHarnessProjectionFences.delete(paneId);
+    this.#attachedHarnessRecoveryRequestedTurns.delete(paneId);
+    this.#clearAttachedHarnessStartupRetry(paneId);
+    this.#clearWorkspaceResolutionRetry(paneId);
+  }
+
+  async #withStableProviderArchivePaneBarrierV57<T>(
+    accountProfileId: ChatAccountProfileId,
+    requiredPaneIds: readonly ChatPaneId[],
+    operation: () => T,
+    effects?: ProviderThreadArchiveRecoveryEffects,
+  ): Promise<T> {
+    const accountId = accountProfileIdSchema.parse(accountProfileId);
+    const reserved = new Map<ChatPaneId, ProviderThreadArchiveReservedPane>();
+    const reserve = (paneIds: readonly ChatPaneId[]): void => {
+      for (const paneIdValue of [...paneIds].sort()) {
+        const paneId = chatPaneIdSchema.parse(paneIdValue);
+        if (reserved.has(paneId)) continue;
+        const postcommit = effects?.paneReservations.get(paneId);
+        if (postcommit !== undefined) {
+          if (!postcommit.drained) {
+            invalidArchiveState(
+              "A provider archive barrier reached an undrained postcommit pane.",
+            );
+          }
+          continue;
+        }
+        const prior = this.#paneTails.get(paneId) ?? Promise.resolve();
+        let release!: () => void;
+        const marker = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const tail = prior.catch(() => undefined).then(() => marker);
+        this.#paneTails.set(paneId, tail);
+        reserved.set(paneId, { drained: false, paneId, prior, release, tail });
+      }
+    };
+    reserve(requiredPaneIds);
+    try {
+      for (;;) {
+        reserve(this.#store.paneIdsReferencingAccount(accountId));
+        await Promise.all([...reserved.values()].map(({ prior }) =>
+          prior.catch(() => undefined)
+        ));
+        const before = providerThreadArchiveBarrierPaneCountV57(
+          reserved,
+          effects?.paneReservations,
+        );
+        reserve(this.#store.paneIdsReferencingAccount(accountId));
+        if (
+          providerThreadArchiveBarrierPaneCountV57(
+            reserved,
+            effects?.paneReservations,
+          ) === before
+        ) return operation();
+      }
+    } finally {
+      for (const reservation of reserved.values()) reservation.release();
+      for (const reservation of reserved.values()) {
+        if (this.#paneTails.get(reservation.paneId) === reservation.tail) {
+          this.#paneTails.delete(reservation.paneId);
+        }
+      }
+    }
+  }
+
+  #serializeArchiveAccountV57<T>(
+    accountProfileId: ChatAccountProfileId,
+    operation: () => T | Promise<T>,
+  ): Promise<T> {
+    const accountId = accountProfileIdSchema.parse(accountProfileId);
+    const prior = this.#accountArchiveTails.get(accountId) ??
+      Promise.resolve();
+    let release!: () => void;
+    const marker = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prior.catch(() => undefined).then(() => marker);
+    this.#accountArchiveTails.set(accountId, tail);
+    return prior.catch(() => undefined).then(operation).finally(() => {
+      release();
+      if (this.#accountArchiveTails.get(accountId) === tail) {
+        this.#accountArchiveTails.delete(accountId);
+      }
+    });
+  }
+
+  #retainProviderThreadArchiveHold(
+    intent: ChatProviderThreadArchiveIntent,
+  ): ProviderThreadArchiveHold {
+    if (intent.state === "account_contained") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Account-contained provider context cannot retain live admission.",
+      );
+    }
+    const descriptor = providerThreadArchiveDescriptor(intent);
+    const authorityHandle = this.#accounts.retainArchiveGeneration(descriptor);
+    if (
+      authorityHandle.length < 16 ||
+      authorityHandle.length > 512 ||
+      authorityHandle.includes("\0")
+    ) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "Provider archive admission returned an invalid authority handle.",
+      );
+    }
+    const hold = Object.freeze({ authorityHandle, descriptor });
+    this.#providerThreadArchiveHolds.set(intent.pane_id, hold);
+    return hold;
+  }
+
+  #releaseProviderThreadArchiveHold(
+    intent: ChatProviderThreadArchiveIntent,
+  ): void {
+    const hold = this.#providerThreadArchiveHolds.get(intent.pane_id);
+    if (
+      hold === undefined ||
+      !sameArchiveDescriptor(
+        hold.descriptor,
+        providerThreadArchiveDescriptor(intent),
+      )
+    ) {
+      throw new ChatPaneStoreError(
+        "corrupt_state",
+        "The provider archive admission hold no longer matches its durable row.",
+      );
+    }
+    this.#releaseProviderThreadArchiveHoldByAuthority(hold);
+  }
+
+  #releaseProviderThreadArchiveHoldByAuthority(
+    hold: ProviderThreadArchiveHold,
+  ): void {
+    this.#accounts.releaseArchiveGeneration({
+      ...hold.descriptor,
+      authorityHandle: hold.authorityHandle,
+    });
+    if (
+      this.#providerThreadArchiveHolds.get(hold.descriptor.paneId)
+        ?.authorityHandle === hold.authorityHandle
+    ) {
+      this.#providerThreadArchiveHolds.delete(hold.descriptor.paneId);
+    }
+  }
+
+  #paneProviderEffectBelongsToGeneration(
+    paneId: ChatPaneId,
+    accountProfileId: ChatAccountProfileId,
+    expectedGeneration: number,
+    includeSettledExactTarget = false,
+  ): boolean {
+    const pane = this.#store.get(paneId);
+    if (
+      pane === null ||
+      pane.projection.interactionMode !== "chat" ||
+      pane.projection.turn === null
+    ) return false;
+    if (
+      reservedContainmentAccount(pane, containmentTarget(pane)) !==
+        accountProfileId
+    ) return false;
+    const routing = this.#rootTurnRouting.readTurnRouting(
+      paneId,
+      pane.projection.turn.id,
+    );
+    if (
+      routing === null ||
+      (
+        routing.settledAt !== null && !includeSettledExactTarget &&
+        !this.#store.hasUnsettledProviderEffectAuthorityV57(paneId)
+      )
+    ) return false;
+    return routing.acceptedGeneration === expectedGeneration ||
+      (
+        routing.acceptedGeneration === null &&
+        routing.effectStartedAt !== null &&
+        routing.catalogGeneration === expectedGeneration
+      );
+  }
+
+  #providerGenerationForTurn(
+    paneId: ChatPaneId,
+    turnId: ChatTurnId,
+  ): number {
+    const routing = this.#rootTurnRouting.readTurnRouting(paneId, turnId);
+    const generation = routing?.acceptedGeneration ?? routing?.catalogGeneration;
+    if (
+      generation === null || generation === undefined ||
+      !Number.isSafeInteger(generation) || generation < 1
+    ) {
+      throw new ChatContainmentFailure();
+    }
+    return generation;
+  }
+
+  async #prepareProviderAttachmentInput(
+    paneId: ChatPaneId,
+    binding: ChatThreadBinding,
+    content: ChatMessageClaim["content"],
+  ): Promise<PreparedProviderAttachmentInput> {
+    const input: ChatProviderInput[] = [];
+    if (content.text.trim().length > 0) {
+      input.push({ type: "text", text: content.text });
+    }
+    if (content.attachmentRefs.length === 0) {
+      if (input.length === 0) {
+        throw new ChatProviderEffectError({
+          certainty: "not_applied",
+          code: "rejected",
+        });
+      }
+      return Object.freeze({ input: Object.freeze(input), lease: null });
+    }
+    const attachments = this.#attachments;
+    if (attachments === null) {
+      throw new ChatProviderEffectError({
+        certainty: "not_applied",
+        code: "capability_unavailable",
+      });
+    }
+    try {
+      if (
+        this.#store.requiredInputClassForAttachments(
+          paneId,
+          content.attachmentRefs,
+        ) !== "image"
+      ) {
+        throw new Error("Attachment input did not require image capability.");
+      }
+    } catch {
+      throw new ChatProviderEffectError({
+        certainty: "not_applied",
+        code: "capability_unavailable",
+      });
+    }
+    const authority = chatProviderAttachmentAuthority(paneId, binding);
+    let lease: ProviderAttachmentEffect;
+    try {
+      const acquired = attachments.acquireProviderLease({
+        ...authority,
+        paneId,
+        attachmentIds: content.attachmentRefs,
+        now: this.#now(),
+      });
+      lease = Object.freeze({
+        ...authority,
+        paneId,
+        revision: acquired.revision,
+      });
+      for (const attachmentId of content.attachmentRefs) {
+        const descriptor = await attachments.providerDescriptor({
+          ...authority,
+          paneId,
+          attachmentId,
+          now: this.#now(),
+        });
+        input.push(providerAttachmentInput(descriptor));
+      }
+    } catch {
+      throw new ChatProviderEffectError({
+        certainty: "not_applied",
+        code: "runtime",
+      });
+    }
+    return Object.freeze({ input: Object.freeze(input), lease });
+  }
+
+  #markProviderAttachmentEffectAmbiguous(
+    lease: ProviderAttachmentEffect | null,
+    effectIdentity: string,
+  ): void {
+    if (lease === null || this.#attachments === null) return;
+    this.#attachments.markProviderBindingAmbiguous({
+      ...lease,
+      expectedRevision: lease.revision,
+      ambiguityReceipt: contentFreeReceipt(
+        "hra.chat.attachment-effect-ambiguous.v1",
+        effectIdentity,
+      ),
+      now: this.#now(),
+    });
   }
 
   async #resolveActiveRepository(
@@ -4250,8 +6507,14 @@ export class ChatService {
     }
   }
 
-  async #containAccountGeneration(accountProfileId: ChatAccountProfileId): Promise<void> {
-    const operation = this.#accounts.containAmbiguousEffect(accountProfileId);
+  async #containAccountGeneration(
+    accountProfileId: ChatAccountProfileId,
+    expectedGeneration: number,
+  ): Promise<number> {
+    const operation = this.#accounts.containAmbiguousEffect(
+      accountProfileId,
+      expectedGeneration,
+    );
     let timer: ReturnType<typeof setTimeout> | null = null;
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(
@@ -4359,7 +6622,7 @@ export class ChatService {
     });
     if (pane !== null) {
       await this.#pauseMessageQueue(paneId, "attention");
-      await this.#projection.paneStateChanged(pane);
+      await this.#projection.paneChanged(pane);
       await this.#settleMessageLedgerForTerminal(paneId, turnId);
     }
   }
@@ -4384,7 +6647,7 @@ export class ChatService {
     this.#priorQuotaTerminals.delete(paneId);
     if (pane !== null) {
       await this.#pauseMessageQueue(paneId, "attention");
-      await this.#projection.paneStateChanged(pane);
+      await this.#projection.paneChanged(pane);
       await this.#settleMessageLedgerForTerminal(paneId, turnId);
     }
   }
@@ -4427,7 +6690,9 @@ export class ChatService {
       observed = new Set<string>();
       this.#observedSessionItemEvents.set(paneId, observed);
     }
-    const key = `${effect.type}:${effect.itemId}`;
+    const key = effect.type === "reasoning_item_completed"
+      ? `${effect.type}:${effect.itemId}:${effect.reasoningReceipt?.receiptId ?? "missing"}`
+      : `${effect.type}:${effect.itemId}`;
     if (observed.has(key)) return false;
     if (observed.size >= MAX_EXACT_SESSION_ITEMS_PER_TURN) {
       throw new ChatPaneStoreError("limit", "This chat turn produced too many exact item events.");
@@ -4679,6 +6944,154 @@ export class ChatService {
         if (this.#paneTails.get(id) === tail) this.#paneTails.delete(id);
       });
   }
+
+}
+
+function newProviderThreadArchiveRecoveryEffects():
+  ProviderThreadArchiveRecoveryEffects {
+  return {
+    containedPaneIds: new Set<ChatPaneId>(),
+    finalized: [],
+    paneReservations: new Map<ChatPaneId, ProviderThreadArchiveReservedPane>(),
+  };
+}
+
+function sameProviderThreadArchiveStringsV57(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return left.length === right.length && left.every((value, index) =>
+    value === right[index]
+  );
+}
+
+function newProviderThreadArchiveIdV57(
+  prefix: "archattempt_" | "archcut_" | "archtarget_",
+): string {
+  return `${prefix}${randomBytes(24).toString("base64url")}`;
+}
+
+function validateProviderThreadArchiveDirectResponseV57(
+  value: Readonly<{
+    readonly containmentReceipt: string;
+    readonly generation: number;
+    readonly streamPosition: number;
+  }>,
+  expectedGeneration: number,
+): ProviderThreadArchiveDirectResponse {
+  if (
+    value.generation !== expectedGeneration ||
+    !Number.isSafeInteger(value.streamPosition) || value.streamPosition < 0 ||
+    !validProviderThreadArchiveReceiptV57(value.containmentReceipt)
+  ) {
+    invalidArchiveState(
+      "The provider archive returned an invalid exact-generation result.",
+    );
+  }
+  return Object.freeze({
+    containmentReceipt: value.containmentReceipt,
+    generation: value.generation,
+    streamPosition: value.streamPosition,
+  });
+}
+
+function validateProviderThreadArchiveReconciliationV57(
+  value: Awaited<ReturnType<ChatProviderPort["reconcileThreadArchive"]>>,
+  expectedGeneration: number,
+): ChatProviderThreadArchiveReconciliationV57 {
+  if (
+    value.generation !== expectedGeneration ||
+    !Number.isSafeInteger(value.streamPosition) || value.streamPosition < 0 ||
+    !validProviderThreadArchiveReceiptV57(value.evidenceReceipt)
+  ) {
+    invalidArchiveState(
+      "The provider archive reconciliation returned invalid scan authority.",
+    );
+  }
+  switch (value.disposition) {
+    case "applied":
+      if (
+        value.containmentReceipt === null ||
+        !validProviderThreadArchiveReceiptV57(value.containmentReceipt)
+      ) {
+        invalidArchiveState(
+          "Applied provider archive reconciliation lacks containment authority.",
+        );
+      }
+      return Object.freeze({
+        disposition: "applied" as const,
+        responseGeneration: value.generation,
+        responseStreamPosition: value.streamPosition,
+        providerContainmentReceipt: value.containmentReceipt,
+      });
+    case "not_applied":
+      if (value.containmentReceipt !== null) {
+        invalidArchiveState(
+          "Not-applied provider archive reconciliation returned containment authority.",
+        );
+      }
+      return Object.freeze({
+        disposition: "not_applied" as const,
+        providerReconciliationReceipt: value.evidenceReceipt,
+      });
+    case "ambiguous":
+      if (value.containmentReceipt !== null) {
+        invalidArchiveState(
+          "Ambiguous provider archive reconciliation returned containment authority.",
+        );
+      }
+      return Object.freeze({ disposition: "ambiguous" as const });
+  }
+}
+
+function validProviderThreadArchiveReceiptV57(value: string): boolean {
+  return value.length >= 16 && value.length <= 512 && !value.includes("\0");
+}
+
+function providerThreadArchiveTargetIdsForCutV57(
+  targets: readonly ProviderThreadArchiveTargetSnapshotV57[],
+  cutId: string,
+): readonly string[] {
+  return targets.filter((target) =>
+    target.attempts.some((attempt) => attempt.cutId === cutId)
+  ).map(({ targetId }) => targetId).sort();
+}
+
+function providerThreadArchiveBarrierPaneCountV57(
+  reserved: ReadonlyMap<ChatPaneId, ProviderThreadArchiveReservedPane>,
+  postcommit:
+    | ReadonlyMap<ChatPaneId, ProviderThreadArchiveReservedPane>
+    | undefined,
+): number {
+  return new Set([
+    ...reserved.keys(),
+    ...(postcommit?.keys() ?? []),
+  ]).size;
+}
+
+function compareProviderThreadArchiveCutsV57(
+  left: ProviderThreadArchiveCutSnapshotV57,
+  right: ProviderThreadArchiveCutSnapshotV57,
+): number {
+  return left.sourceGeneration - right.sourceGeneration ||
+    left.cutId.localeCompare(right.cutId);
+}
+
+function compareProviderThreadArchiveTargetsV57(
+  left: ProviderThreadArchiveTargetSnapshotV57,
+  right: ProviderThreadArchiveTargetSnapshotV57,
+): number {
+  return left.targetId.localeCompare(right.targetId);
+}
+
+function invalidArchiveState(message: string): never {
+  throw new ChatPaneStoreError("invalid_state", message);
+}
+
+function providerThreadArchiveErrorV57(error: unknown): Error {
+  return error instanceof Error
+    ? error
+    : new Error("Provider archive recovery failed without an Error value.");
 }
 
 function attachedHarnessRetryDelay(attempt: number): number {
@@ -4749,7 +7162,6 @@ function configurationFor(
 ): ChatProviderConfiguration {
   const selected = configurationForProfile(profile);
   return {
-    ...providerConfiguration,
     ...selected,
     serviceTier,
   };
@@ -4762,10 +7174,7 @@ function sameConfiguration(
   return left.model === right.model &&
     left.reasoningEffort === right.reasoningEffort &&
     (left.serviceTier ?? "standard") ===
-      (right.serviceTier ?? "standard") &&
-    left.approvalPolicy === right.approvalPolicy &&
-    left.approvalsReviewer === right.approvalsReviewer &&
-    left.sandbox === right.sandbox;
+      (right.serviceTier ?? "standard");
 }
 
 type RootTurnResolutionCandidate = Readonly<{
@@ -4846,6 +7255,25 @@ function attachmentCompensationExpired(): ChatPaneStoreError {
     "invalid_state",
     "A prepared attachment expired before the atomic steer could be restored. Remove and reattach it before sending again.",
   );
+}
+
+function providerAttachmentInput(
+  descriptor: ChatAttachmentProviderDescriptor,
+): ChatProviderInput {
+  if (descriptor.kind === "image") {
+    return Object.freeze({ type: "localImage", path: descriptor.readPath });
+  }
+  throw new ChatProviderEffectError({
+    certainty: "not_applied",
+    code: "capability_unavailable",
+  });
+}
+
+function contentFreeReceipt(domain: string, value: string): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(`${domain}\0`);
+  hasher.update(value);
+  return hasher.digest("hex");
 }
 
 function activePane(pane: ChatPaneProjection): boolean {
@@ -4938,6 +7366,33 @@ function validateHarnessActorTransitionTimeout(value: number): number {
   return value;
 }
 
+function providerThreadArchiveDescriptor(
+  intent: ChatProviderThreadArchiveIntent,
+): ChatArchiveRecoveryDescriptor {
+  return Object.freeze({
+    accountProfileId: intent.account_profile_id,
+    expectedGeneration: intent.generation,
+    expectedQueueRevision: intent.queue_revision,
+    expectedRevision: intent.pane_revision,
+    paneId: intent.pane_id,
+    purpose: intent.purpose,
+    restartThreadId: intent.restart_thread_id,
+  });
+}
+
+function sameArchiveDescriptor(
+  left: ChatArchiveRecoveryDescriptor,
+  right: ChatArchiveRecoveryDescriptor,
+): boolean {
+  return left.accountProfileId === right.accountProfileId &&
+    left.expectedGeneration === right.expectedGeneration &&
+    left.expectedQueueRevision === right.expectedQueueRevision &&
+    left.expectedRevision === right.expectedRevision &&
+    left.paneId === right.paneId &&
+    left.purpose === right.purpose &&
+    left.restartThreadId === right.restartThreadId;
+}
+
 function deltaBatchBytes(
   effect: Extract<SessionEffect, { type: "delta_batch" }>,
 ): number {
@@ -4958,6 +7413,8 @@ function sessionEffectBytes(effect: SessionEffect): number {
     case "tool_item_started":
     case "unexpected_interaction":
       return 0;
+    case "provider_subagents":
+      return utf8ByteLength(JSON.stringify(effect.projection));
   }
 }
 

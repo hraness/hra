@@ -90,7 +90,6 @@ const directSurfaceSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("compactChat"),
     paneId: chatPaneIdSchema,
-    paletteIndex: z.number().int().safe().nonnegative().max(4_095),
     nowUnixMilliseconds: z.number().int().safe().nonnegative(),
     attachments: z.array(z.strictObject({
       id: chatMessageAttachmentIdSchema,

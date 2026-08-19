@@ -55,8 +55,25 @@ import {
   HRA_HARNESS_KEYCHAIN_SERVICE,
   HRA_HARNESS_LEGACY_KEYCHAIN_SERVICE,
 } from "../harness/key-custody";
+import { CHAT_ATTACHMENT_VAULT_DIRECTORY_NAME } from "../attachments/root";
 import { applicationSupportPaths } from "../state/application-support";
 import { controlPlaneLifetimeLockPath } from "../state/control-plane-lock";
+import {
+  controlPlaneRestoreDatabaseRollbackFileName,
+  controlPlaneRestoreDatabaseStageFileName,
+  controlPlaneRestoreJournalCandidateFileName,
+  controlPlaneRestoreJournalFileName,
+  controlPlaneRestoreKeyRollbackFileName,
+  controlPlaneRestoreKeyStageFileName,
+  controlPlaneRestoreVaultRollbackDirectoryName,
+  controlPlaneRestoreVaultStageDirectoryName,
+  legacyControlPlaneRestoreV1DatabaseRollbackFileName,
+  legacyControlPlaneRestoreV1DatabaseStageFileName,
+  legacyControlPlaneRestoreV1JournalCandidateFileName,
+  legacyControlPlaneRestoreV1JournalFileName,
+  legacyControlPlaneRestoreV1KeyRollbackFileName,
+  legacyControlPlaneRestoreV1KeyStageFileName,
+} from "../state/control-plane-restore-state";
 import {
   operationReceiptKeyCandidatePath,
   operationReceiptKeyPath,
@@ -433,6 +450,39 @@ export interface LocalDataRemovalArtifactCandidate {
   readonly kind: "file" | "directory";
 }
 
+export function controlPlaneRestoreRemovalArtifacts(
+  applicationSupportRoot: string,
+): readonly LocalDataRemovalArtifactCandidate[] {
+  const root = absoluteNormalizedPath(applicationSupportRoot);
+  return [
+    ...[
+      controlPlaneRestoreJournalFileName,
+      controlPlaneRestoreJournalCandidateFileName,
+      controlPlaneRestoreDatabaseStageFileName,
+      controlPlaneRestoreDatabaseRollbackFileName,
+      controlPlaneRestoreKeyStageFileName,
+      controlPlaneRestoreKeyRollbackFileName,
+      legacyControlPlaneRestoreV1JournalFileName,
+      legacyControlPlaneRestoreV1JournalCandidateFileName,
+      legacyControlPlaneRestoreV1DatabaseStageFileName,
+      legacyControlPlaneRestoreV1DatabaseRollbackFileName,
+      legacyControlPlaneRestoreV1KeyStageFileName,
+      legacyControlPlaneRestoreV1KeyRollbackFileName,
+    ].map((fileName) => ({
+      path: join(root, fileName),
+      kind: "file" as const,
+    })),
+    ...[
+      CHAT_ATTACHMENT_VAULT_DIRECTORY_NAME,
+      controlPlaneRestoreVaultStageDirectoryName,
+      controlPlaneRestoreVaultRollbackDirectoryName,
+    ].map((directoryName) => ({
+      path: join(root, directoryName),
+      kind: "directory" as const,
+    })),
+  ];
+}
+
 export type LocalDataRemovalMetadataKind =
   | "missing"
   | "file"
@@ -686,42 +736,7 @@ export async function discoverLocalDataRemovalInventory(
       path: `${controlPlaneReleaseFencePath(controlPlanePath)}.tmp`,
       kind: "file",
     },
-    {
-      path: join(applicationSupportRoot, ".control-plane-restore-v1.json"),
-      kind: "file",
-    },
-    {
-      path: join(applicationSupportRoot, ".control-plane-restore-v1.json.tmp"),
-      kind: "file",
-    },
-    {
-      path: join(
-        applicationSupportRoot,
-        ".control-plane-restore-v1.stage.sqlite",
-      ),
-      kind: "file",
-    },
-    {
-      path: join(
-        applicationSupportRoot,
-        ".control-plane-restore-v1.rollback.sqlite",
-      ),
-      kind: "file",
-    },
-    {
-      path: join(
-        applicationSupportRoot,
-        ".control-plane-restore-v1.stage.hmac.key",
-      ),
-      kind: "file",
-    },
-    {
-      path: join(
-        applicationSupportRoot,
-        ".control-plane-restore-v1.rollback.hmac.key",
-      ),
-      kind: "file",
-    },
+    ...controlPlaneRestoreRemovalArtifacts(applicationSupportRoot),
     {
       path: join(
         applicationSupportRoot,
