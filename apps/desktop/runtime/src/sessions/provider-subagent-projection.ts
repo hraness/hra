@@ -18,6 +18,11 @@ export interface ProviderSubagentObservation extends ProviderSubagentTurnScope {
   readonly streamPosition: number;
 }
 
+export interface ProviderSubagentSnapshotObservation {
+  readonly agentId: string;
+  readonly status: ProviderSubagentObservation["status"];
+}
+
 export interface ProviderSubagentProjectionRow {
   readonly id: string;
   readonly label: string;
@@ -81,7 +86,11 @@ export class ProviderSubagentProjectionTracker {
     validateObservation(input);
     if (!this.#admitGeneration(input.accountProfileId, input.generation)) return false;
     const turn = this.#turn(input);
-    const eventKey = `${input.streamPosition}:${input.factIndex}`;
+    const eventKey = [
+      String(input.streamPosition),
+      String(input.factIndex),
+      input.agentId,
+    ].map((value) => `${value.length}:${value}`).join("");
     const eventDigest = digestObservation(input);
     const priorDigest = turn.eventDigests.get(eventKey);
     if (priorDigest !== undefined) {
@@ -124,6 +133,31 @@ export class ProviderSubagentProjectionTracker {
     return true;
   }
 
+  reconcile(
+    scope: ProviderSubagentTurnScope,
+    observations: readonly ProviderSubagentSnapshotObservation[],
+    cursor: Readonly<{ factIndex: number; streamPosition: number }>,
+  ): boolean {
+    validateScope(scope);
+    const observedIds = new Set(observations.map(({ agentId }) => agentId));
+    let changed = false;
+    for (const observation of observations) {
+      changed = this.observe({ ...scope, ...cursor, ...observation }) || changed;
+    }
+    const turn = this.#turns.get(turnKey(scope));
+    if (turn === undefined) return changed;
+    for (const agentId of turn.agents.keys()) {
+      if (observedIds.has(agentId)) continue;
+      changed = this.observe({
+        ...scope,
+        ...cursor,
+        agentId,
+        status: "terminal",
+      }) || changed;
+    }
+    return changed;
+  }
+
   snapshot(scope: ProviderSubagentTurnScope): ProviderSubagentProjection {
     validateScope(scope);
     const turn = this.#turns.get(turnKey(scope));
@@ -163,6 +197,15 @@ export class ProviderSubagentProjectionTracker {
 
   get trackedTurnCount(): number {
     return this.#turns.size;
+  }
+
+  activeScopes(accountProfileId?: string): readonly ProviderSubagentTurnScope[] {
+    return Object.freeze([...this.#turns.values()]
+      .filter((turn) =>
+        accountProfileId === undefined ||
+        turn.scope.accountProfileId === accountProfileId
+      )
+      .map((turn) => Object.freeze({ ...turn.scope })));
   }
 
   #turn(scope: ProviderSubagentTurnScope): TurnState {

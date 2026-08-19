@@ -98,6 +98,9 @@ export const runtimeSessionSyncCapabilities: RuntimeSessionSyncCapabilities =
     vaultReset: false,
   });
 export const runtimeChatToolLimit = 32;
+export const runtimeChatProviderSubagentLimit = 8;
+export const runtimeChatProviderSubagentTrackedLimit = 128;
+export const runtimeChatPaletteIndexLimit = Number.MAX_SAFE_INTEGER - 1;
 export const runtimeChatContinuationLimit = 63;
 export const runtimeHarnessChildProjectionLimit = 8;
 export const runtimeHarnessProposalProjectionLimit = 32;
@@ -108,6 +111,13 @@ export const runtimeChatReasoningTailUtf8ByteLimit = 64 * 1024;
 export const runtimeChatTurnPromptUtf8ByteLimit = 128 * 1024;
 export const runtimeChatQueuedMessageLimit = 32;
 export const runtimeChatMessageAttachmentLimit = 8;
+export const runtimeChatAttachmentDraftLimit = 8;
+export const runtimeChatAttachmentReferencedLimit = 256;
+export const runtimeChatAttachmentDisplayNameUtf8ByteLimit = 160;
+export const runtimeChatAttachmentMediaTypeByteLimit = 127;
+export const runtimeChatAttachmentInputByteLimit = 24 * 1024 * 1024;
+export const runtimeChatAttachmentChunkByteLimit = 512 * 1024;
+export const runtimeChatAttachmentPreviewByteLimit = 512 * 1024;
 export const runtimeChatMessageUtf8ByteLimit = runtimeChatTurnPromptUtf8ByteLimit;
 export const runtimeChatQueueUtf8ByteLimit = 512 * 1024;
 export const runtimeNativeBridgeRequestUtf8ByteLimit = 1024 * 1024;
@@ -126,8 +136,10 @@ export const accountProfileIdSchema = opaqueId("acct");
 export const chatPaneIdSchema = opaqueId("pane");
 export const chatTurnIdSchema = opaqueId("chatturn");
 export const chatToolIdSchema = opaqueId("chattool");
+export const chatProviderSubagentIdSchema = opaqueId("provideragent");
 export const chatMessageIdSchema = opaqueId("chatmsg");
 export const chatMessageAttachmentIdSchema = opaqueId("attachment");
+export const chatAttachmentUploadIdSchema = opaqueId("upload");
 export const harnessActorIdSchema = opaqueId("hactor");
 export const harnessProposalIdSchema = opaqueId("hproposal");
 export const snapshotTransferIdSchema = opaqueId("snapshot");
@@ -844,6 +856,69 @@ export const chatMessageContentSchema = z
     }
   });
 
+export const chatAttachmentMetadataSchema = z
+  .object({
+    id: chatMessageAttachmentIdSchema,
+    revision: revisionSchema,
+    kind: z.enum(["image", "file"]),
+    displayName: utf8StringSchema({
+      minBytes: 1,
+      maxBytes: runtimeChatAttachmentDisplayNameUtf8ByteLimit,
+    }),
+    mediaType: z
+      .string()
+      .min(1)
+      .max(runtimeChatAttachmentMediaTypeByteLimit)
+      .regex(/^[\x21-\x7e]+$/u),
+    bytes: z.number().int().nonnegative().safe().max(runtimeChatAttachmentInputByteLimit),
+    state: z.enum(["uploading", "processing", "ready", "corrupt"]),
+    previewAvailable: z.boolean(),
+  })
+  .strict()
+  .superRefine((attachment, context) => {
+    if (attachment.previewAvailable && attachment.kind !== "image") {
+      context.addIssue({
+        code: "custom",
+        message: "only normalized image attachments can expose a preview",
+        path: ["previewAvailable"],
+      });
+    }
+    if (attachment.previewAvailable && attachment.mediaType !== "image/png") {
+      context.addIssue({
+        code: "custom",
+        message: "attachment previews must be normalized image/png",
+        path: ["mediaType"],
+      });
+    }
+  });
+
+export const chatAttachmentPaneProjectionSchema = z
+  .object({
+    drafts: z.array(chatAttachmentMetadataSchema).max(runtimeChatAttachmentDraftLimit),
+    referenced: z
+      .array(chatAttachmentMetadataSchema)
+      .max(runtimeChatAttachmentReferencedLimit),
+  })
+  .strict()
+  .superRefine((projection, context) => {
+    const ids = new Set<string>();
+    for (const [collection, attachments] of [
+      ["drafts", projection.drafts],
+      ["referenced", projection.referenced],
+    ] as const) {
+      attachments.forEach((attachment, index) => {
+        if (ids.has(attachment.id)) {
+          context.addIssue({
+            code: "custom",
+            message: "attachment projection IDs must be unique",
+            path: [collection, index, "id"],
+          });
+        }
+        ids.add(attachment.id);
+      });
+    }
+  });
+
 export const chatQueuedMessageProjectionSchema = chatMessageContentSchema
   .extend({
     id: chatMessageIdSchema,
@@ -953,6 +1028,44 @@ export const chatToolProjectionSchema = z
   })
   .strict();
 
+export const chatProviderSubagentProjectionSchema = z.object({
+  id: chatProviderSubagentIdSchema,
+  label: z.string().min(1).max(32).refine(
+    (value) => !value.includes("\0"),
+    "provider subagent label cannot contain NUL",
+  ),
+  status: z.enum(["starting", "running"]),
+}).strict();
+
+export const chatProviderSubagentsProjectionSchema = z.object({
+  agents: z.array(chatProviderSubagentProjectionSchema)
+    .max(runtimeChatProviderSubagentLimit),
+  overflowCount: z.number().int().nonnegative().max(
+    runtimeChatProviderSubagentTrackedLimit - runtimeChatProviderSubagentLimit,
+  ),
+}).strict().superRefine((projection, context) => {
+  const ids = new Set<string>();
+  const labels = new Set<string>();
+  projection.agents.forEach((agent, index) => {
+    if (ids.has(agent.id)) {
+      context.addIssue({
+        code: "custom",
+        message: "provider subagent IDs must be unique",
+        path: ["agents", index, "id"],
+      });
+    }
+    if (labels.has(agent.label)) {
+      context.addIssue({
+        code: "custom",
+        message: "provider subagent labels must be unique",
+        path: ["agents", index, "label"],
+      });
+    }
+    ids.add(agent.id);
+    labels.add(agent.label);
+  });
+});
+
 export const chatTurnProjectionSchema = z
   .object({
     id: chatTurnIdSchema,
@@ -966,7 +1079,9 @@ export const chatTurnProjectionSchema = z
       .max(runtimeChatContinuationLimit),
     responseMarkdown: chatResponseMarkdownSchema,
     reasoningSummary: chatReasoningSummarySchema,
+    reasoningSummaryVerified: z.boolean(),
     tools: z.array(chatToolProjectionSchema).max(runtimeChatToolLimit),
+    providerSubagents: chatProviderSubagentsProjectionSchema,
     routing: chatRootTurnRoutingProjectionSchema.nullable(),
   })
   .strict()
@@ -977,6 +1092,16 @@ export const chatTurnProjectionSchema = z
         code: "custom",
         message: "completedAt must exist exactly for a terminal chat turn",
         path: ["completedAt"],
+      });
+    }
+    if (
+      terminal && turn.reasoningSummary.totalUtf8Bytes > 0 &&
+      turn.reasoningSummaryVerified !== true
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "terminal reasoning requires an exact completion proof",
+        path: ["reasoningSummaryVerified"],
       });
     }
     if (
@@ -1007,6 +1132,17 @@ export const chatTurnProjectionSchema = z
       }
       toolIds.add(tool.id);
     });
+    if (
+      terminal &&
+      (turn.providerSubagents.agents.length > 0 ||
+        turn.providerSubagents.overflowCount > 0)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "terminal chat turns cannot retain active provider subagents",
+        path: ["providerSubagents"],
+      });
+    }
   });
 
 export const chatAttentionSchema = z
@@ -1252,6 +1388,7 @@ export const harnessSnapshotSchema = z
 export const chatPaneProjectionSchema = z
   .object({
     id: chatPaneIdSchema,
+    paletteIndex: z.number().int().nonnegative().max(runtimeChatPaletteIndexLimit),
     revision: revisionSchema,
     title: chatPaneTitleSchema,
     repository: z
@@ -1271,7 +1408,12 @@ export const chatPaneProjectionSchema = z
     turn: chatTurnProjectionSchema.nullable(),
     attention: chatAttentionSchema.nullable(),
     recoverablePrompt: z.boolean().default(false),
+    canStartFreshContext: z.boolean().default(false),
     messageQueue: chatMessageQueueProjectionSchema,
+    attachments: chatAttachmentPaneProjectionSchema.default({
+      drafts: [],
+      referenced: [],
+    }),
     harness: chatPaneHarnessProjectionSchema.nullable().default(null),
   })
   .strict()
@@ -1313,6 +1455,20 @@ export const chatPaneProjectionSchema = z
         path: ["recoverablePrompt"],
       });
     }
+    if (
+      pane.canStartFreshContext === true &&
+      (
+        pane.interactionMode !== "chat" || pane.state !== "attention" ||
+        pane.attention?.code !== "runtime_unavailable" ||
+        pane.attention.retryable
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "fresh provider context requires exact nonretryable runtime attention",
+        path: ["canStartFreshContext"],
+      });
+    }
 
     const activeState = pane.state === "starting" ||
       pane.state === "streaming" || pane.state === "continuing";
@@ -1344,6 +1500,7 @@ export const chatPaneProjectionSchema = z
 export const chatPaneStateProjectionSchema = z
   .object({
     id: chatPaneIdSchema,
+    paletteIndex: z.number().int().nonnegative().max(runtimeChatPaletteIndexLimit),
     revision: revisionSchema,
     title: chatPaneTitleSchema,
     accountProfileId: accountProfileIdSchema.nullable(),
@@ -1363,6 +1520,7 @@ export const chatPaneStateProjectionSchema = z
           .nonnegative()
           .max(runtimeChatContinuationLimit),
         tools: z.array(chatToolProjectionSchema).max(runtimeChatToolLimit),
+        providerSubagents: chatProviderSubagentsProjectionSchema,
         routing: chatRootTurnRoutingProjectionSchema.nullable(),
       })
       .strict()
@@ -1403,10 +1561,22 @@ export const chatPaneStateProjectionSchema = z
           }
           toolIds.add(tool.id);
         });
+        if (
+          terminal &&
+          (turn.providerSubagents.agents.length > 0 ||
+            turn.providerSubagents.overflowCount > 0)
+        ) {
+          context.addIssue({
+            code: "custom",
+            message: "terminal chat turns cannot retain active provider subagents",
+            path: ["providerSubagents"],
+          });
+        }
       })
       .nullable(),
     attention: chatAttentionSchema.nullable(),
     recoverablePrompt: z.boolean().default(false),
+    canStartFreshContext: z.boolean().default(false),
   })
   .strict()
   .superRefine((pane, context) => {
@@ -1445,6 +1615,20 @@ export const chatPaneStateProjectionSchema = z
         code: "custom",
         message: "recoverable prompt capability requires an exact retryable failed chat turn",
         path: ["recoverablePrompt"],
+      });
+    }
+    if (
+      pane.canStartFreshContext === true &&
+      (
+        pane.interactionMode !== "chat" || pane.state !== "attention" ||
+        pane.attention?.code !== "runtime_unavailable" ||
+        pane.attention.retryable
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "fresh provider context requires exact nonretryable runtime attention",
+        path: ["canStartFreshContext"],
       });
     }
     const activeState = pane.state === "starting" ||
@@ -2387,6 +2571,15 @@ const runtimeChatMessageQueueResumeCommandSchema = z
   })
   .strict();
 
+const runtimeChatPaneStartFreshContextCommandSchema = z
+  .object({
+    type: z.literal("chat.pane.startFreshContext"),
+    paneId: chatPaneIdSchema,
+    expectedRevision: revisionSchema,
+    expectedQueueRevision: revisionSchema,
+  })
+  .strict();
+
 const runtimeChatMessageDiscardAmbiguousCommandSchema = z
   .object({
     type: z.literal("chat.message.discardAmbiguous"),
@@ -2408,6 +2601,98 @@ const runtimeChatMessageSteerHeadCommandSchema = z
   })
   .strict();
 
+const chatAttachmentCommandBaseSchema = {
+  paneId: chatPaneIdSchema,
+  attachmentId: chatMessageAttachmentIdSchema,
+} as const;
+
+const runtimeChatAttachmentBeginCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.begin"),
+    ...chatAttachmentCommandBaseSchema,
+    uploadId: chatAttachmentUploadIdSchema,
+    kind: z.enum(["image", "file"]),
+    displayName: utf8StringSchema({
+      minBytes: 1,
+      maxBytes: runtimeChatAttachmentDisplayNameUtf8ByteLimit,
+    }),
+    declaredMediaType: z
+      .string()
+      .min(1)
+      .max(runtimeChatAttachmentMediaTypeByteLimit)
+      .regex(/^[\x21-\x7e]+$/u),
+    expectedBytes: z
+      .number()
+      .int()
+      .positive()
+      .safe()
+      .max(runtimeChatAttachmentInputByteLimit),
+  })
+  .strict();
+
+const runtimeChatAttachmentAppendCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.append"),
+    ...chatAttachmentCommandBaseSchema,
+    uploadId: chatAttachmentUploadIdSchema,
+    expectedRevision: revisionSchema,
+    chunkOrdinal: z.number().int().nonnegative().safe().max(47),
+    base64: z
+      .string()
+      .min(4)
+      .max(Math.ceil(runtimeChatAttachmentChunkByteLimit / 3) * 4)
+      .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u),
+  })
+  .strict();
+
+const runtimeChatAttachmentFinalizeCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.finalize"),
+    ...chatAttachmentCommandBaseSchema,
+    uploadId: chatAttachmentUploadIdSchema,
+    expectedRevision: revisionSchema,
+    inputSha256: z.string().length(64).regex(/^[0-9a-f]{64}$/u),
+  })
+  .strict();
+
+const runtimeChatAttachmentCancelCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.cancel"),
+    ...chatAttachmentCommandBaseSchema,
+    uploadId: chatAttachmentUploadIdSchema,
+    expectedRevision: revisionSchema,
+  })
+  .strict();
+
+const runtimeChatAttachmentRemoveCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.remove"),
+    ...chatAttachmentCommandBaseSchema,
+    expectedRevision: revisionSchema,
+  })
+  .strict();
+
+const runtimeChatAttachmentPreviewCommandSchema = z
+  .object({
+    type: z.literal("chat.attachment.preview"),
+    ...chatAttachmentCommandBaseSchema,
+    expectedRevision: revisionSchema,
+    relationship: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("draft") }).strict(),
+      z.object({ kind: z.literal("message"), messageId: chatMessageIdSchema }).strict(),
+    ]),
+  })
+  .strict();
+
+export const runtimeChatAttachmentCommandSchema = z.discriminatedUnion("type", [
+  runtimeChatAttachmentBeginCommandSchema,
+  runtimeChatAttachmentAppendCommandSchema,
+  runtimeChatAttachmentFinalizeCommandSchema,
+  runtimeChatAttachmentCancelCommandSchema,
+  runtimeChatAttachmentRemoveCommandSchema,
+  runtimeChatAttachmentPreviewCommandSchema,
+]);
+
 /** The renderer's complete durable message mutation surface. */
 export const runtimeChatMessageLedgerCommandSchema = z.discriminatedUnion(
   "type",
@@ -2416,6 +2701,7 @@ export const runtimeChatMessageLedgerCommandSchema = z.discriminatedUnion(
     runtimeChatMessageEditCommandSchema,
     runtimeChatMessageRemoveCommandSchema,
     runtimeChatMessageQueueResumeCommandSchema,
+    runtimeChatPaneStartFreshContextCommandSchema,
     runtimeChatMessageDiscardAmbiguousCommandSchema,
     runtimeChatMessageSteerHeadCommandSchema,
   ],
@@ -2426,8 +2712,55 @@ export const runtimeChatMessageQueueResultSchema = z
     type: z.literal("chatMessageQueue"),
     paneId: chatPaneIdSchema,
     queue: chatMessageQueueProjectionSchema,
+    disposition: z.enum(["applied", "notApplied", "replayed"]),
+    messageId: chatMessageIdSchema.nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((result, context) => {
+    if (result.disposition !== "applied" && result.messageId === null) {
+      context.addIssue({
+        code: "custom",
+        message: "a replayed queue outcome requires its exact message ID",
+        path: ["messageId"],
+      });
+    }
+  });
+
+export const runtimeChatPaneResultSchema = z.object({
+  type: z.literal("chatPane"),
+  pane: chatPaneProjectionSchema,
+  disposition: z.literal("applied"),
+  appliedRevision: revisionSchema,
+}).strict().superRefine((result, context) => {
+  if (result.pane.revision !== result.appliedRevision) {
+    context.addIssue({
+      code: "custom",
+      message: "an applied chat pane result must carry its exact revision",
+      path: ["appliedRevision"],
+    });
+  }
+});
+
+const runtimeChatPaneReplayCommandTypeSchema = z.enum([
+  "chat.pane.create",
+  "chat.pane.rename",
+  "chat.pane.workspace.recover",
+  "chat.pane.repository.select",
+  "chat.turn.stop",
+]);
+
+/**
+ * Content-free proof of an exact operation-receipt replay. The gateway emits
+ * this only after the operation ID, command type, and keyed command fingerprint
+ * match the durable receipt. Current pane state comes from the authoritative
+ * projection and is never misrepresented as the historical mutation result.
+ */
+export const runtimeChatPaneReplayResultSchema = z.object({
+  type: z.literal("chatPaneReplay"),
+  paneId: chatPaneIdSchema,
+  commandType: runtimeChatPaneReplayCommandTypeSchema,
+  appliedRevision: revisionSchema,
+}).strict();
 
 export const runtimeChatMessageQueueChangedEventSchema = z
   .object({
@@ -2477,6 +2810,7 @@ export const runtimeChatDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPanesReorderCommandSchema,
   runtimeChatTurnStopCommandSchema,
   ...runtimeChatMessageLedgerCommandSchema.options,
+  ...runtimeChatAttachmentCommandSchema.options,
 ]);
 
 export const runtimeHarnessDomainCommandSchema = z.discriminatedUnion("type", [
@@ -2551,6 +2885,7 @@ export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPanesReorderCommandSchema,
   runtimeChatTurnStopCommandSchema,
   ...runtimeChatMessageLedgerCommandSchema.options,
+  ...runtimeChatAttachmentCommandSchema.options,
   runtimeHarnessSettingsUpdateCommandSchema,
   runtimeHarnessChildOpenCommandSchema,
   runtimeHarnessChildStopCommandSchema,
@@ -2778,8 +3113,35 @@ export const runtimeErrorSchema = z
 
 const runtimeCommandResultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted") }).strict(),
-  z.object({ type: z.literal("chatPane"), pane: chatPaneProjectionSchema }).strict(),
+  runtimeChatPaneResultSchema,
+  runtimeChatPaneReplayResultSchema,
   runtimeChatMessageQueueResultSchema,
+  z.object({
+    type: z.literal("chatAttachment"),
+    paneId: chatPaneIdSchema,
+    uploadId: chatAttachmentUploadIdSchema,
+    attachment: chatAttachmentMetadataSchema,
+    changed: z.boolean(),
+  }).strict(),
+  z.object({
+    type: z.literal("chatAttachmentRemoved"),
+    paneId: chatPaneIdSchema,
+    attachmentId: chatMessageAttachmentIdSchema,
+    removed: z.literal(true),
+    changed: z.boolean(),
+  }).strict(),
+  z.object({
+    type: z.literal("chatAttachmentPreview"),
+    paneId: chatPaneIdSchema,
+    attachmentId: chatMessageAttachmentIdSchema,
+    revision: revisionSchema,
+    mediaType: z.literal("image/png"),
+    base64: z
+      .string()
+      .min(4)
+      .max(Math.ceil(runtimeChatAttachmentPreviewByteLimit / 3) * 4)
+      .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u),
+  }).strict(),
   z.object({ type: z.literal("chatPaneRemoved"), paneId: chatPaneIdSchema }).strict(),
   z.object({
     type: z.literal("sessionSyncRecoveryKit"),
@@ -3243,6 +3605,7 @@ export const runtimeDomainEventSchema = z.discriminatedUnion("type", [
         "projectionOverflow",
         "harnessChanged",
         "sessionSyncChanged",
+        "chatAttachmentsChanged",
       ]),
     })
     .strict(),
@@ -3331,6 +3694,11 @@ export type ChatPaneInteractionMode = z.infer<typeof chatPaneInteractionModeSche
 export type ChatTurnStatus = z.infer<typeof chatTurnStatusSchema>;
 export type ChatMessageId = z.infer<typeof chatMessageIdSchema>;
 export type ChatMessageAttachmentId = z.infer<typeof chatMessageAttachmentIdSchema>;
+export type ChatAttachmentUploadId = z.infer<typeof chatAttachmentUploadIdSchema>;
+export type ChatAttachmentMetadata = z.infer<typeof chatAttachmentMetadataSchema>;
+export type ChatAttachmentPaneProjection = z.infer<
+  typeof chatAttachmentPaneProjectionSchema
+>;
 export type ChatMessageContent = z.infer<typeof chatMessageContentSchema>;
 export type ChatQueuedMessageProjection = z.infer<
   typeof chatQueuedMessageProjectionSchema
@@ -3349,6 +3717,12 @@ export type ChatToolStatus = z.infer<typeof chatToolStatusSchema>;
 export type ChatAttentionCode = z.infer<typeof chatAttentionCodeSchema>;
 export type ChatUtf8Tail = z.infer<typeof chatResponseMarkdownSchema>;
 export type ChatToolProjection = z.infer<typeof chatToolProjectionSchema>;
+export type ChatProviderSubagentProjection = z.infer<
+  typeof chatProviderSubagentProjectionSchema
+>;
+export type ChatProviderSubagentsProjection = z.infer<
+  typeof chatProviderSubagentsProjectionSchema
+>;
 export type ChatTurnProjection = z.infer<typeof chatTurnProjectionSchema>;
 export type ChatAttention = z.infer<typeof chatAttentionSchema>;
 export type ChatPaneProjection = z.infer<typeof chatPaneProjectionSchema>;
@@ -3374,6 +3748,9 @@ export type RuntimeSnapshotChunkResponse = z.infer<typeof runtimeSnapshotChunkRe
 export type RuntimeSnapshotTransportResponse = z.infer<typeof runtimeSnapshotTransportResponseSchema>;
 export type RuntimeDomainCommand = z.infer<typeof runtimeDomainCommandSchema>;
 export type RuntimeChatDomainCommand = z.infer<typeof runtimeChatDomainCommandSchema>;
+export type RuntimeChatAttachmentCommand = z.infer<
+  typeof runtimeChatAttachmentCommandSchema
+>;
 export type RuntimeChatMessageLedgerCommand = z.infer<
   typeof runtimeChatMessageLedgerCommandSchema
 >;
@@ -3558,10 +3935,21 @@ export function parseRuntimeChatDispatchResponseForRequest(
 
   switch (request.command.type) {
     case "chat.pane.create": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== 1
+        ) {
+          chatResponseMismatch("pane creation replay");
+        }
+        return response;
+      }
       if (response.result.type !== "chatPane") chatResponseMismatch("pane creation");
-      const { pane } = response.result;
+      const { pane, appliedRevision } = response.result;
       if (
         pane.id !== request.command.paneId ||
+        appliedRevision !== 1 ||
         pane.revision !== 1 ||
         pane.repository.id !== request.command.repositoryId ||
         pane.turn !== null
@@ -3571,11 +3959,23 @@ export function parseRuntimeChatDispatchResponseForRequest(
       return response;
     }
     case "chat.pane.rename": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== request.command.expectedRevision + 1
+        ) {
+          chatResponseMismatch("pane rename replay");
+        }
+        return response;
+      }
       if (response.result.type !== "chatPane") chatResponseMismatch("pane rename");
-      const { pane } = response.result;
+      const { pane, appliedRevision } = response.result;
+      const expectedAppliedRevision = request.command.expectedRevision + 1;
       if (
         pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1 ||
+        appliedRevision !== expectedAppliedRevision ||
+        pane.revision !== expectedAppliedRevision ||
         pane.title !== request.command.title
       ) {
         chatResponseMismatch("pane rename");
@@ -3583,24 +3983,48 @@ export function parseRuntimeChatDispatchResponseForRequest(
       return response;
     }
     case "chat.pane.workspace.recover": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== request.command.expectedRevision + 1
+        ) {
+          chatResponseMismatch("workspace recovery replay");
+        }
+        return response;
+      }
       if (response.result.type !== "chatPane") chatResponseMismatch("workspace recovery");
-      const { pane } = response.result;
+      const { pane, appliedRevision } = response.result;
+      const expectedAppliedRevision = request.command.expectedRevision + 1;
       if (
         pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1
+        appliedRevision !== expectedAppliedRevision ||
+        pane.revision !== expectedAppliedRevision
       ) {
         chatResponseMismatch("workspace recovery");
       }
       return response;
     }
     case "chat.pane.repository.select": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== request.command.expectedRevision + 1
+        ) {
+          chatResponseMismatch("repository selection replay");
+        }
+        return response;
+      }
       if (response.result.type !== "chatPane") {
         chatResponseMismatch("repository selection");
       }
-      const { pane } = response.result;
+      const { pane, appliedRevision } = response.result;
+      const expectedAppliedRevision = request.command.expectedRevision + 1;
       if (
         pane.id !== request.command.paneId ||
-        pane.revision !== request.command.expectedRevision + 1 ||
+        appliedRevision !== expectedAppliedRevision ||
+        pane.revision !== expectedAppliedRevision ||
         pane.repository.id !== request.command.repositoryId ||
         pane.turn !== null
       ) {
@@ -3622,8 +4046,18 @@ export function parseRuntimeChatDispatchResponseForRequest(
       }
       return response;
     case "chat.turn.stop": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision <= request.command.expectedRevision
+        ) {
+          chatResponseMismatch("turn stop replay");
+        }
+        return response;
+      }
       if (response.result.type !== "chatPane") chatResponseMismatch("turn stop");
-      const { pane } = response.result;
+      const { pane, appliedRevision } = response.result;
       const reusableTerminal =
         (pane.state === "ready" && pane.turn?.status === "completed" &&
           pane.attention === null) ||
@@ -3631,7 +4065,8 @@ export function parseRuntimeChatDispatchResponseForRequest(
           pane.attention?.retryable === true);
       if (
         pane.id !== request.command.paneId ||
-        pane.revision <= request.command.expectedRevision ||
+        appliedRevision <= request.command.expectedRevision ||
+        pane.revision !== appliedRevision ||
         pane.interactionMode !== "chat" ||
         pane.turn?.id !== request.command.turnId ||
         !reusableTerminal
@@ -3644,14 +4079,74 @@ export function parseRuntimeChatDispatchResponseForRequest(
     case "chat.message.edit":
     case "chat.message.remove":
     case "chat.messageQueue.resume":
+    case "chat.pane.startFreshContext":
     case "chat.message.discardAmbiguous":
     case "chat.message.steerHead": {
+      const commandMessageId = "messageId" in request.command
+        ? request.command.messageId
+        : null;
+      const replayed = response.result.type === "chatMessageQueue" &&
+        response.result.disposition !== "applied";
       if (
         response.result.type !== "chatMessageQueue" ||
         response.result.paneId !== request.command.paneId ||
-        response.result.queue.revision <= request.command.expectedQueueRevision
+        response.result.messageId !== commandMessageId ||
+        (replayed
+          ? request.command.type !== "chat.message.enqueue" ||
+            response.result.queue.revision < request.command.expectedQueueRevision
+          : response.result.disposition !== "applied" ||
+            response.result.queue.revision <= request.command.expectedQueueRevision)
       ) {
         chatResponseMismatch("message queue mutation");
+      }
+      return response;
+    }
+    case "chat.attachment.begin":
+    case "chat.attachment.append":
+    case "chat.attachment.finalize": {
+      if (
+        response.result.type !== "chatAttachment" ||
+        response.result.paneId !== request.command.paneId ||
+        response.result.attachment.id !== request.command.attachmentId ||
+        response.result.uploadId !== request.command.uploadId
+      ) {
+        chatResponseMismatch("attachment mutation");
+      }
+      const expectedRevision = "expectedRevision" in request.command
+        ? request.command.expectedRevision
+        : 1;
+      const minimumRevision = request.command.type === "chat.attachment.append"
+        ? expectedRevision + 2
+        : expectedRevision + 1;
+      if (
+        response.result.attachment.revision < minimumRevision ||
+        (request.command.type === "chat.attachment.append" &&
+          response.result.changed &&
+          response.result.attachment.revision !== minimumRevision)
+      ) {
+        chatResponseMismatch("attachment revision");
+      }
+      return response;
+    }
+    case "chat.attachment.cancel":
+    case "chat.attachment.remove": {
+      if (
+        response.result.type !== "chatAttachmentRemoved" ||
+        response.result.paneId !== request.command.paneId ||
+        response.result.attachmentId !== request.command.attachmentId
+      ) {
+        chatResponseMismatch("attachment removal");
+      }
+      return response;
+    }
+    case "chat.attachment.preview": {
+      if (
+        response.result.type !== "chatAttachmentPreview" ||
+        response.result.paneId !== request.command.paneId ||
+        response.result.attachmentId !== request.command.attachmentId ||
+        response.result.revision !== request.command.expectedRevision
+      ) {
+        chatResponseMismatch("attachment preview");
       }
       return response;
     }

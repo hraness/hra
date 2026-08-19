@@ -212,6 +212,7 @@ function changeChatPaneState(
       ...structuredClone(state.turn),
       responseMarkdown: structuredClone(pane.turn!.responseMarkdown),
       reasoningSummary: structuredClone(pane.turn!.reasoningSummary),
+      reasoningSummaryVerified: pane.turn!.reasoningSummaryVerified,
     };
   const replacement: ChatPaneProjection = {
     ...pane,

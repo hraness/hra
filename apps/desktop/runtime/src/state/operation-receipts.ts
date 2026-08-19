@@ -2,7 +2,11 @@ import type { Database } from "bun:sqlite";
 import { z } from "@hra-internal/schema";
 import { createHmac } from "node:crypto";
 import {
+  chatMessageIdSchema,
+  chatPaneIdSchema,
+  operationIdSchema,
   parseRuntimeDispatchResponse,
+  runtimeProtocolVersion,
   type RuntimeDomainCommand,
   type RuntimeDispatchResponse,
 } from "../../../contracts/runtime";
@@ -22,7 +26,34 @@ export type OperationReceipt =
   | Readonly<{ state: "new" }>
   | Readonly<{ state: "inFlight" }>
   | Readonly<{ state: "ambiguous" }>
-  | Readonly<{ state: "recorded"; response: RuntimeDispatchResponse }>;
+  | Readonly<{
+      state: "recorded";
+      response: RuntimeDispatchResponse | StoredChatOperationReceiptResponse;
+    }>;
+
+const storedChatOperationReceiptResponseSchema = z.object({
+  version: z.literal(runtimeProtocolVersion),
+  operationId: operationIdSchema,
+  ok: z.literal(true),
+  result: z.discriminatedUnion("type", [
+    z.object({
+      type: z.literal("chatPaneReceipt"),
+      paneId: chatPaneIdSchema,
+      revision: z.number().int().positive().safe(),
+    }).strict(),
+    z.object({
+      type: z.literal("chatMessageQueueReceipt"),
+      paneId: chatPaneIdSchema,
+      revision: z.number().int().positive().safe(),
+      disposition: z.enum(["applied", "notApplied", "replayed"]),
+      messageId: chatMessageIdSchema.nullable(),
+    }).strict(),
+  ]),
+}).strict();
+
+export type StoredChatOperationReceiptResponse = z.infer<
+  typeof storedChatOperationReceiptResponseSchema
+>;
 
 export class OperationReceiptConflict extends Error {
   constructor() {
@@ -96,7 +127,7 @@ export class OperationReceiptStore {
         state,
         outcomeCode,
         entityId,
-        JSON.stringify(response),
+        JSON.stringify(storableOperationResponse(response)),
         now.toISOString(),
       );
     if (result.changes !== 1) throw new Error("Operation receipt is not in flight");
@@ -144,10 +175,52 @@ export class OperationReceiptStore {
         if (existing.response_json === null) throw new Error("Recorded operation is missing its response");
         return {
           state: "recorded",
-          response: parseRuntimeDispatchResponse(JSON.parse(existing.response_json) as unknown),
+          response: parseStoredOperationResponse(
+            JSON.parse(existing.response_json) as unknown,
+          ),
         };
     }
   }
+}
+
+function storableOperationResponse(
+  response: RuntimeDispatchResponse,
+): RuntimeDispatchResponse | StoredChatOperationReceiptResponse {
+  if (!response.ok) return response;
+  if (response.result.type === "chatPane") {
+    return storedChatOperationReceiptResponseSchema.parse({
+      version: response.version,
+      operationId: response.operationId,
+      ok: true,
+      result: {
+        type: "chatPaneReceipt",
+        paneId: response.result.pane.id,
+        revision: response.result.appliedRevision,
+      },
+    });
+  }
+  if (response.result.type === "chatMessageQueue") {
+    return storedChatOperationReceiptResponseSchema.parse({
+      version: response.version,
+      operationId: response.operationId,
+      ok: true,
+      result: {
+        type: "chatMessageQueueReceipt",
+        paneId: response.result.paneId,
+        revision: response.result.queue.revision,
+        disposition: response.result.disposition,
+        messageId: response.result.messageId,
+      },
+    });
+  }
+  return response;
+}
+
+function parseStoredOperationResponse(
+  value: unknown,
+): RuntimeDispatchResponse | StoredChatOperationReceiptResponse {
+  const chat = storedChatOperationReceiptResponseSchema.safeParse(value);
+  return chat.success ? chat.data : parseRuntimeDispatchResponse(value);
 }
 
 export function fingerprintRuntimeCommand(

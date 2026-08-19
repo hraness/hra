@@ -2,9 +2,11 @@ import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { assertProperty, fc } from "@hra-internal/test";
 import type {
+  ChatPaneProjection,
   RuntimeDispatchResponse,
   RuntimeDomainCommand,
 } from "../../contracts/runtime";
+import { runtimeProtocolVersion } from "../../contracts/runtime";
 import {
   OperationReceiptStore,
   fingerprintRuntimeCommand,
@@ -97,6 +99,187 @@ test("recovery reveals can neither be completed nor replayed through durable rec
       SELECT COUNT(*) AS count FROM operation_receipts
       WHERE operation_id = 'operation_normal'
     `).get()).toEqual({ count: 1 });
+  } finally {
+    database.close();
+  }
+});
+
+test("every successful chat receipt is compact and contains no chat content", () => {
+  const database = receiptDatabase();
+  try {
+    const store = new OperationReceiptStore(database, fingerprintKey);
+    const paneId = "pane_receiptprivacy01";
+    const messageId = "chatmsg_receiptprivacy01";
+    const attachmentId = "attachment_receiptprivacy01";
+    const privateNeedles = [
+      "private pane title",
+      "private repository",
+      "private response markdown",
+      "private verified reasoning",
+      "private queued prompt",
+      attachmentId,
+    ];
+    const pane: ChatPaneProjection = {
+      id: paneId,
+      paletteIndex: 3,
+      revision: 9,
+      title: "private pane title",
+      repository: {
+        id: `repo_${"a".repeat(26)}`,
+        name: "private repository",
+      },
+      accountProfileId: "acct_receiptprivacy1",
+      interactionMode: "chat",
+      state: "ready",
+      activity: { ordinal: 3, kind: "responseCompleted" },
+      workspace: {
+        mode: "managedWorktree",
+        state: "ready",
+        revision: 1,
+        recoveryKind: null,
+      },
+      turn: {
+        id: "chatturn_receiptprivacy1",
+        status: "completed",
+        startedAt: "2026-08-18T12:00:00.000Z",
+        completedAt: "2026-08-18T12:00:01.000Z",
+        continuationCount: 0,
+        responseMarkdown: {
+          tail: "private response markdown",
+          totalUtf8Bytes: 25,
+          truncatedPrefix: false,
+        },
+        reasoningSummary: {
+          tail: "private verified reasoning",
+          totalUtf8Bytes: 26,
+          truncatedPrefix: false,
+        },
+        reasoningSummaryVerified: true,
+        tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
+        routing: {
+          policyVersion: 1,
+          classificationReason: "conservativeDefault",
+          workClass: "standard",
+          requestedProfile: "solMax",
+          selectedProfile: "solMax",
+          profileFallbackReason: null,
+          requestedServiceTier: "standard",
+          selectedServiceTier: "standard",
+          serviceTierFallbackReason: null,
+        },
+      },
+      attention: null,
+      recoverablePrompt: false,
+      canStartFreshContext: false,
+      messageQueue: {
+        revision: 7,
+        pauseReason: null,
+        blockedMessage: null,
+        messages: [{
+          id: messageId,
+          ordinal: 1,
+          revision: 2,
+          text: "private queued prompt",
+          attachmentRefs: [attachmentId],
+        }],
+      },
+      attachments: { drafts: [], referenced: [] },
+      harness: null,
+    };
+    const paneCases: readonly RuntimeDomainCommand[] = [
+      {
+        type: "chat.pane.rename",
+        paneId,
+        expectedRevision: 8,
+        title: "private pane title",
+      },
+      {
+        type: "chat.turn.stop",
+        paneId,
+        expectedRevision: 8,
+        turnId: pane.turn!.id,
+      },
+    ];
+    const queueCases: readonly RuntimeDomainCommand[] = [
+      {
+        type: "chat.message.enqueue",
+        paneId,
+        expectedQueueRevision: 6,
+        messageId,
+        content: {
+          text: "private queued prompt",
+          attachmentRefs: [attachmentId],
+        },
+        delivery: { kind: "queue" },
+      },
+      {
+        type: "chat.message.edit",
+        paneId,
+        expectedQueueRevision: 6,
+        messageId,
+        expectedMessageRevision: 1,
+        content: {
+          text: "private queued prompt",
+          attachmentRefs: [attachmentId],
+        },
+      },
+      {
+        type: "chat.message.remove",
+        paneId,
+        expectedQueueRevision: 6,
+        messageId,
+        expectedMessageRevision: 1,
+      },
+    ];
+
+    let ordinal = 0;
+    for (const command of paneCases) {
+      ordinal += 1;
+      const operationId = `op_receiptpane${String(ordinal).padStart(16, "0")}`;
+      expect(store.begin(operationId, command)).toEqual({ state: "new" });
+      store.complete({
+        version: runtimeProtocolVersion,
+        operationId,
+        ok: true,
+        result: {
+          type: "chatPane",
+          pane,
+          disposition: "applied",
+          appliedRevision: pane.revision,
+        },
+      });
+    }
+    for (const command of queueCases) {
+      ordinal += 1;
+      const operationId = `op_receiptqueue${String(ordinal).padStart(16, "0")}`;
+      expect(store.begin(operationId, command)).toEqual({ state: "new" });
+      store.complete({
+        version: runtimeProtocolVersion,
+        operationId,
+        ok: true,
+        result: {
+          type: "chatMessageQueue",
+          paneId,
+          queue: pane.messageQueue,
+          disposition: "applied",
+          messageId,
+        },
+      });
+    }
+
+    const rows = database.query<{ response_json: string }, []>(`
+      SELECT response_json FROM operation_receipts
+      WHERE command_type LIKE 'chat.%' ORDER BY operation_id
+    `).all();
+    expect(rows).toHaveLength(paneCases.length + queueCases.length);
+    for (const { response_json: responseJson } of rows) {
+      expect(Buffer.byteLength(responseJson, "utf8")).toBeLessThan(320);
+      for (const needle of privateNeedles) expect(responseJson).not.toContain(needle);
+      expect(responseJson).not.toContain("messageQueue");
+      expect(responseJson).not.toContain("reasoningSummary");
+      expect(responseJson).not.toContain("responseMarkdown");
+    }
   } finally {
     database.close();
   }

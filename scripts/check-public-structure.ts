@@ -251,12 +251,13 @@ export function publicStructureErrors(options: Readonly<{
   const desktopScripts = isRecord(desktop) ? desktop["scripts"] : undefined;
   if (
     !isRecord(desktopScripts)
-    || desktopScripts["test"] !== "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:gateway"
+    || desktopScripts["test"] !== "bun test ./frontend/src ./frontend/dev ./frontend/direct ./contracts ./runtime/test --path-ignore-patterns='**/gateway.integration.test.ts' --path-ignore-patterns='**/application-support-migration.test.ts' --path-ignore-patterns='**/feasibility.test.ts' --path-ignore-patterns='**/provider-thread-archive-startup-v57.test.ts' --path-ignore-patterns='**/*.macos.test.ts' && bun run test:application-support-migration && bun run test:feasibility && bun run test:provider-thread-archive-startup-v57 && bun run test:gateway"
     || desktopScripts["test:application-support-migration"] !== "bun test ./runtime/test/application-support-migration.test.ts"
     || desktopScripts["test:feasibility"] !== "bun test ./runtime/test/feasibility.test.ts"
+    || desktopScripts["test:provider-thread-archive-startup-v57"] !== "bun test ./runtime/test/provider-thread-archive-startup-v57.test.ts"
   ) {
     errors.push(
-      "apps/desktop/package.json: process-sensitive migration and feasibility tests must run in isolated Bun processes",
+      "apps/desktop/package.json: process-sensitive migration, feasibility, and file-backed startup tests must run in isolated Bun processes",
     );
   }
   for (const path of requiredRootPaths) {

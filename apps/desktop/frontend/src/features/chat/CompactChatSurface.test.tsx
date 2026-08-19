@@ -17,6 +17,8 @@ import {
   paneIdentityHue,
   paneIdentityStyle,
   pastedImagesFromClipboard,
+  queuedMessageEditKeyAction,
+  queuedMessageEditSettlement,
   QueuedMessageStack,
   safeAttachmentPreviewUrl,
   TurnElapsed,
@@ -74,13 +76,15 @@ test("turn durations use the compact hours, minutes, seconds grammar", () => {
     continuationCount: 0,
     responseMarkdown: { tail: "Done", totalUtf8Bytes: 4, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+    reasoningSummaryVerified: false,
     tools: [],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: null,
   };
   const html = renderToStaticMarkup(createElement(TurnElapsed, { turn }));
   expect(html).toContain("2h 1m 45s");
   expect(html).toContain('dateTime="PT7305S"');
-  expect(html).toContain('aria-label="Turn elapsed"');
+  expect(html).toContain('aria-label="Last turn duration 2h 1m 45s"');
   expect(html).not.toContain("aria-live");
 });
 
@@ -173,6 +177,7 @@ test("the pinned subagent stack includes only active actors without inventing ov
   const visible = visibleSubagents(children);
   const html = renderToStaticMarkup(createElement(ActiveSubagentStack, {
     children,
+    provider: { agents: [], overflowCount: 0 },
   }));
 
   expect(visible.map(({ title }) => title)).toEqual([
@@ -195,7 +200,7 @@ test("the pinned subagent stack includes only active actors without inventing ov
 test("only the FIFO head exposes steering and ambiguous pause cannot resume", () => {
   const interactive = renderToStaticMarkup(createElement(QueuedMessageStack, {
     queue,
-    onEdit: () => undefined,
+    onEdit: () => Promise.resolve(),
     onRemove: () => undefined,
     onSteerHead: () => undefined,
   }));
@@ -218,7 +223,7 @@ test("only the FIFO head exposes steering and ambiguous pause cannot resume", ()
       messages: [],
     },
     onDiscardAmbiguous: () => undefined,
-    onEdit: () => undefined,
+    onEdit: () => Promise.resolve(),
     onRemove: () => undefined,
     onResume: () => undefined,
     onSteerHead: () => undefined,
@@ -232,8 +237,74 @@ test("only the FIFO head exposes steering and ambiguous pause cannot resume", ()
   expect(ambiguous).not.toContain("Retry");
 });
 
+test("quarantined context exposes one native Start fresh action and suppresses Resume", () => {
+  const html = renderToStaticMarkup(createElement(QueuedMessageStack, {
+    queue: {
+      revision: 4,
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [],
+    },
+    onEdit: () => Promise.resolve(),
+    onRemove: () => undefined,
+    onResume: () => undefined,
+    onStartFresh: () => undefined,
+    onSteerHead: () => undefined,
+  }));
+  expect(html).toContain('<button type="button">Start fresh</button>');
+  expect(html).not.toContain(">Resume<");
+  expect(html).toContain('role="status"');
+});
+
+test("queued-message edit shortcuts are IME-safe", () => {
+  expect(queuedMessageEditKeyAction({
+    isComposing: true,
+    key: "Escape",
+    metaKey: false,
+    ctrlKey: false,
+  })).toBeNull();
+  expect(queuedMessageEditKeyAction({
+    isComposing: true,
+    key: "Enter",
+    metaKey: true,
+    ctrlKey: false,
+  })).toBeNull();
+  expect(queuedMessageEditKeyAction({
+    isComposing: false,
+    key: "Escape",
+    metaKey: false,
+    ctrlKey: false,
+  })).toBe("cancel");
+  expect(queuedMessageEditKeyAction({
+    isComposing: false,
+    key: "Enter",
+    metaKey: false,
+    ctrlKey: true,
+  })).toBe("save");
+  expect(queuedMessageEditSettlement({
+    draft: "unsaved changed text",
+    outcome: "failed",
+    errorMessage: "The queue revision changed.",
+  })).toEqual({
+    draft: "unsaved changed text",
+    editing: true,
+    error: "The queue revision changed.",
+  });
+  expect(queuedMessageEditSettlement({
+    draft: "confirmed text",
+    outcome: "confirmed",
+  })).toEqual({
+    draft: "confirmed text",
+    editing: false,
+    error: null,
+  });
+});
+
 test("attachment previews render only gateway-vended blob URLs", () => {
   expect(isRasterImagePreviewMimeType("image/png")).toBeTrue();
+  expect(isRasterImagePreviewMimeType("image/gif")).toBeFalse();
+  expect(isRasterImagePreviewMimeType("image/jpeg")).toBeFalse();
+  expect(isRasterImagePreviewMimeType("image/webp")).toBeFalse();
   expect(isRasterImagePreviewMimeType("image/svg+xml")).toBeFalse();
   expect(safeAttachmentPreviewUrl("blob:https://hra.local/preview-1")).toBe(
     "blob:https://hra.local/preview-1",

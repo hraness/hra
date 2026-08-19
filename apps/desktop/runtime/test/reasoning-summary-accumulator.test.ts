@@ -59,10 +59,20 @@ describe("ReasoningSummaryAccumulator", () => {
     });
     expect(accumulator.complete({
       ...scope,
-      cursor: cursor(6),
+      cursor: cursor(5),
       summaryParts: ["Checking the seam", "Running focused tests"],
       truncated: false,
     })).toBe(receipt);
+    expect(accumulator.complete({
+      ...scope,
+      cursor: cursor(6),
+      summaryParts: ["Checking the seam", "Running focused tests"],
+      truncated: false,
+    })).toMatchObject({
+      state: "tainted",
+      reason: "completionConflict",
+      terminalVisible: false,
+    });
   });
 
   test("taints middle gaps, conflicts, cursor reuse, and late activity", () => {

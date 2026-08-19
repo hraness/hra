@@ -132,6 +132,14 @@ export class ProjectionCommitCoordinator {
     }));
   }
 
+  installChatAttachmentState(
+    input: Parameters<RuntimeProjection["installChatAttachmentState"]>[0],
+  ): Promise<void> {
+    return this.#enqueue(() => this.#commitWhenCapacityAllows(() => {
+      this.#projection.installChatAttachmentState(input);
+    }));
+  }
+
   /** Prevents new commits while allowing every already-admitted commit to drain. */
   closeAdmission(): void {
     this.#admissionClosed = true;

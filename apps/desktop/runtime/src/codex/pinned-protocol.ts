@@ -292,6 +292,16 @@ export const pinnedCodexRequests = Object.freeze({
     concurrency: "per-thread",
     reconciliation: { kind: "unsupported", strategy: "thread-read" },
   }),
+  threadArchive: descriptor("threadArchive", {
+    timeoutMs: 15_000,
+    effect: "non-idempotent-mutation",
+    lostResponse: "ambiguous",
+    concurrency: "per-thread",
+    reconciliation: {
+      kind: "automatic",
+      strategy: "exhaustive-stable-thread-archive-scan",
+    },
+  }),
   threadRead: descriptor("threadRead", {
     timeoutMs: 15_000,
     effect: "read",

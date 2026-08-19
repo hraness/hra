@@ -16,6 +16,7 @@
 - Persist the next process generation before creating a child, expire transient login authority when it changes, and reconcile account state after a restart instead of trusting persisted signing transitions.
 - Open authorization URLs only from the exact allowed HTTPS origins and never retain their query, fragment, or device-code authority in operation receipts.
 - Keep profile removal, process stop, workspace preservation, and full local `CODEX_HOME` deletion separately inspectable and revision-bound. Disclose credentials, sessions and history, configuration, and logs before deletion; never delete worktrees with an account.
+- Stop the exact account runtime, then await idempotent chat and attachment containment while the active profile row still exists. Tombstone and acknowledge removal only after containment succeeds; a crash or failed containment must leave the profile active so the same removal can safely retry.
 - Delegate full `CODEX_HOME` deletion to the Native-resolved helper. Keep its process environment closed, its deadline and output bounded, its errors pathless, and advance the durable deletion tombstone only after exit zero.
 - Preserve a snapshot-projected retained-local-data tombstone until full local data is actually deleted so renderer and app restarts cannot hide recoverable state.
 - Consume only pinned-protocol owned values. Let the pinned boundary brand approved provider authorization URLs, keep product projection here, and revalidate external-open sinks as defense in depth without reparsing raw app-server payloads.

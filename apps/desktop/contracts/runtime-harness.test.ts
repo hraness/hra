@@ -47,6 +47,7 @@ function pane(
 ): ChatPaneProjection {
   return {
     id,
+    paletteIndex: 0,
     revision: 7,
     title: "Recursive audit",
     repository: { id: "repo_00000000000000000000000000", name: "example" },
@@ -58,7 +59,9 @@ function pane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness,
   };
 }

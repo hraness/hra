@@ -21,6 +21,7 @@ This vault keeps captured sources separate from maintained notes. Catalog links 
 
 ### Plans
 
+- [[plans/hra-compact-chat|Compact durable HRA chat]] — Status: blocked. Make the desktop chat a dense touch-safe work surface with durable queueing and steering, image custody, verified full-access Codex execution, Markdown, active subagents, elapsed…
 - [[plans/hra-longitudinal-routing|Longitudinal routing evidence and shadow recommendations]] — Status: in-progress. Route ordinary root prompts through a bounded deterministic policy while building per-pane, content-free evidence for later shadow recommendations.
 
 ### Scopes

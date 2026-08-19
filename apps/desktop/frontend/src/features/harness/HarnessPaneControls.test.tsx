@@ -1,14 +1,23 @@
 import { expect, test } from "bun:test";
 
-test("pane harness chrome is bounded to descendants with Open and Stop icon buttons", async () => {
-  const source = await Bun.file(
+test("pane harness chrome is bounded to active subagent summaries", async () => {
+  const paneSource = await Bun.file(
     new URL("../chat/ChatPane.tsx", import.meta.url),
   ).text();
+  const compactSurfaceSource = await Bun.file(
+    new URL("../chat/CompactChatSurface.tsx", import.meta.url),
+  ).text();
 
-  expect(source).toContain("descendants.children.map((child)");
-  expect(source).toContain("<HRAIcon name=\"open\" />");
-  expect(source).toContain("<HRAIcon name=\"stop\" />");
-  expect(source).toContain("!child.canOpen");
-  expect(source).toContain("!child.canStop");
-  expect(source).not.toMatch(/harnessAttention|stopHarnessGoal|candidateId|treeRoot|history/iu);
+  expect(paneSource).toContain("<ActiveSubagentStack");
+  expect(paneSource).toContain("children={descendants?.children ?? []}");
+  expect(paneSource).toContain("provider={turn?.providerSubagents");
+  expect(compactSurfaceSource).toContain("const visible = visibleSubagents(children)");
+  expect(compactSurfaceSource).toContain("{visible.map((child)");
+  expect(compactSurfaceSource).toContain('data-subagent-source="hra"');
+  expect(compactSurfaceSource).not.toMatch(
+    /child\.canOpen|child\.canStop|HRAIcon name="open"/u,
+  );
+  expect(paneSource).not.toMatch(
+    /harnessAttention|stopHarnessGoal|candidateId|treeRoot|history/iu,
+  );
 });

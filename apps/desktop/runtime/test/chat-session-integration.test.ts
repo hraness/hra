@@ -5,11 +5,16 @@ import type {
   PinnedCodexRequestInput,
   PinnedCodexRequestOutput,
 } from "../src/codex";
+import {
+  ArchiveAdmissionGate,
+  archiveRestartThreadDigest,
+} from "../src/accounts/archive-admission-gate";
 import { projectCodexNotificationFacts } from "../src/codex/fact-projector";
 import {
   ChatService,
   CodexChatProvider,
   ChatProviderEffectError,
+  type ChatAccountPort,
   type ChatWorkspacePort,
 } from "../src/chat";
 import { AccountServiceError } from "../src/accounts/account-service";
@@ -29,6 +34,55 @@ const REPOSITORY = `repo_${"3".repeat(26)}`;
 const LOGICAL_TURN = "chatturn_integrat01";
 const PROVIDER_THREAD = "provider-chat-thread";
 const PROVIDER_TURN = "provider-chat-turn";
+const CATALOG_DIGEST = "a".repeat(64);
+
+const unavailableSessionArchiveRecoveryPort = {
+  ensureArchiveRecoveryRuntime: () =>
+    Promise.reject(new Error("Unexpected archive recovery runtime request")),
+  requestArchiveRecoveryWithResponsePosition: () =>
+    Promise.reject(new Error("Unexpected archive recovery provider request")),
+} satisfies Pick<
+  SessionAccountRuntimePort,
+  "ensureArchiveRecoveryRuntime" | "requestArchiveRecoveryWithResponsePosition"
+>;
+
+const unavailableArchiveTransitionV57 = (): never => {
+  throw new Error("Unexpected v57 archive transition account request");
+};
+
+const unavailableArchiveTransitionReleaseV57:
+  ChatAccountPort["releaseArchiveTransition"] = () => {
+    throw new Error("Unexpected v57 archive transition release request");
+  };
+
+const fixtureArchiveAccountHoldMethods = {
+  abortArchiveTransitionProvisional: unavailableArchiveTransitionV57,
+  activateArchiveTransitionSuccessorV57: unavailableArchiveTransitionV57,
+  archiveTransitionHandleV57: unavailableArchiveTransitionV57,
+  beginArchiveTransitionProvisional: unavailableArchiveTransitionV57,
+  containArchiveTransitionGenerationV57: unavailableArchiveTransitionV57,
+  promoteArchiveTransitionEffectStarted: unavailableArchiveTransitionV57,
+  refreshArchiveTransitionCutAuthoritiesV57: unavailableArchiveTransitionV57,
+  releaseArchiveTransition: unavailableArchiveTransitionReleaseV57,
+  replaceArchiveTransition: unavailableArchiveTransitionV57,
+  retainArchiveGeneration: (
+    input: Parameters<ChatAccountPort["retainArchiveGeneration"]>[0],
+  ) => `chatarchivehold_fixture_${input.paneId}_${String(input.expectedGeneration)}`,
+  releaseArchiveGeneration: () => undefined,
+} satisfies Pick<
+  ChatAccountPort,
+  | "abortArchiveTransitionProvisional"
+  | "activateArchiveTransitionSuccessorV57"
+  | "archiveTransitionHandleV57"
+  | "beginArchiveTransitionProvisional"
+  | "containArchiveTransitionGenerationV57"
+  | "promoteArchiveTransitionEffectStarted"
+  | "refreshArchiveTransitionCutAuthoritiesV57"
+  | "releaseArchiveGeneration"
+  | "releaseArchiveTransition"
+  | "replaceArchiveTransition"
+  | "retainArchiveGeneration"
+>;
 
 test("Codex chat preserves pre-dispatch runtime capacity as safely not applied", async () => {
   const unavailable = new AccountServiceError(
@@ -39,6 +93,9 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
   );
   const reject = () => Promise.reject(unavailable);
   const provider = new CodexChatProvider({
+    archiveChatThread: reject,
+    prepareChatThreadArchive: () => { throw unavailable; },
+    reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
@@ -47,6 +104,7 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
     startChatTurn: reject,
     steer: reject,
     verifiedProductionExecutionPolicyForActiveTurn: () => null,
+    verifiedChatCapabilityForActiveTurn: () => null,
     resolveChatConfiguration: reject,
   });
 
@@ -56,13 +114,119 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
     workingDirectory: process.cwd(),
     model: "gpt-5.6-sol",
     reasoningEffort: "ultra",
-    approvalPolicy: "on-request",
-    approvalsReviewer: "auto_review",
-    sandbox: "workspace-write",
+    requiredInputClass: "text",
+    catalogGeneration: 1,
+    catalogDigest: CATALOG_DIGEST,
+    observedInputModalities: ["text"],
   }).then(() => null, (reason: unknown) => reason);
 
   expect(error).toBeInstanceOf(ChatProviderEffectError);
   expect(error).toMatchObject({ certainty: "not_applied", code: "runtime" });
+});
+
+test("Codex chat forwards only opaque archive handles through the closed Session lane", async () => {
+  const restartThreadId = "provider-archive-forwarding";
+  const binding = {
+    accountProfileId: ACCOUNT,
+    restartThreadId,
+    threadId: "thread-archive-forwarding",
+  };
+  const calls: Array<Readonly<{
+    generation: number | null;
+    handle: object;
+    operation: "archive" | "prepare" | "reconcile";
+  }>> = [];
+  const reject = () => Promise.reject(new Error("Unexpected provider operation"));
+  const provider = new CodexChatProvider({
+    archiveChatThread: (observedBinding, generation, handle) => {
+      expect(observedBinding).toBe(binding);
+      calls.push({ generation, handle, operation: "archive" });
+      return Promise.resolve({
+        containmentReceipt: "chatarchive_forwarding",
+        generation,
+        streamPosition: 12,
+      });
+    },
+    prepareChatThreadArchive: (observedBinding, handle) => {
+      expect(observedBinding).toBe(binding);
+      calls.push({ generation: null, handle, operation: "prepare" });
+      return Promise.resolve({ generation: 7 });
+    },
+    reconcileChatThreadArchive: (observedBinding, handle) => {
+      expect(observedBinding).toBe(binding);
+      calls.push({ generation: null, handle, operation: "reconcile" });
+      return Promise.resolve({
+        containmentReceipt: "chatarchive_forwarding",
+        disposition: "applied" as const,
+        evidenceReceipt: "chatarchivescan_forwarding",
+        generation: 8,
+        streamPosition: 24,
+      });
+    },
+    injectChatHistory: reject,
+    interruptChatTurn: reject,
+    resumeChatThread: reject,
+    setChatThreadName: reject,
+    startChatThread: reject,
+    startChatTurn: reject,
+    steer: reject,
+    verifiedProductionExecutionPolicyForActiveTurn: () => null,
+    verifiedChatCapabilityForActiveTurn: () => null,
+    resolveChatConfiguration: reject,
+  });
+  const gate = new ArchiveAdmissionGate();
+  const descriptor = {
+    accountProfileId: ACCOUNT,
+    attemptAuthority: { hmac: "b".repeat(64), revision: 2 },
+    attemptOrdinal: 1,
+    cutAuthority: null,
+    expectedGeneration: 7,
+    paneId: PANE,
+    purpose: "pane_archive" as const,
+    restartThreadDigest: archiveRestartThreadDigest(restartThreadId),
+    successorGeneration: null,
+    targetAuthority: { hmac: "a".repeat(64), revision: 1 },
+    transitionId: "transition-provider-forwarding",
+  };
+  const provisional = gate.retainProvisional({
+    accountProfileId: ACCOUNT,
+    paneId: PANE,
+    purpose: "pane_archive",
+    transitionId: descriptor.transitionId,
+  });
+  const prepared = gate.promote(provisional, {
+    ...descriptor,
+    attemptPhase: "prepared",
+  });
+
+  expect(await provider.prepareThreadArchive(binding, prepared)).toEqual({ generation: 7 });
+  const effectStarted = gate.replace(prepared, {
+    ...descriptor,
+    attemptAuthority: { hmac: "c".repeat(64), revision: 3 },
+    attemptPhase: "effect_started",
+  });
+  expect(await provider.archiveThread(binding, 7, effectStarted)).toMatchObject({
+    generation: 7,
+    streamPosition: 12,
+  });
+  const ambiguous = gate.replace(effectStarted, {
+    ...descriptor,
+    attemptAuthority: { hmac: "c".repeat(64), revision: 3 },
+    attemptPhase: "ambiguous",
+    cutAuthority: { hmac: "d".repeat(64), revision: 4 },
+    successorGeneration: 8,
+  });
+  expect(await provider.reconcileThreadArchive(binding, ambiguous)).toMatchObject({
+    disposition: "applied",
+    generation: 8,
+    streamPosition: 24,
+  });
+  expect(calls).toEqual([
+    { generation: null, handle: prepared, operation: "prepare" },
+    { generation: 7, handle: effectStarted, operation: "archive" },
+    { generation: null, handle: ambiguous, operation: "reconcile" },
+  ]);
+  gate.release(ambiguous);
 });
 
 test("Fast mode fails closed before any provider mutation when the model omits the tier", async () => {
@@ -70,6 +234,8 @@ test("Fast mode fails closed before any provider mutation when the model omits t
   let position = 0;
   const sessions = new SessionService({
     accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
       requestSession: () => Promise.reject(new Error("Expected positioned session request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -81,6 +247,7 @@ test("Fast mode fails closed before any provider mutation when the model omits t
         const output: PinnedCodexRequestOutput<"modelList"> = {
           data: [{
             model: "gpt-5.6-sol",
+            inputModalities: ["text"],
             supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
             serviceTiers: [],
           }],
@@ -110,6 +277,8 @@ test("root routing proves model absence only from one complete generation-fenced
   let page = 0;
   const sessions = new SessionService({
     accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 7 }),
       requestSession: () => Promise.reject(new Error("Expected positioned session request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -124,6 +293,7 @@ test("root routing proves model absence only from one complete generation-fenced
           data: page === 5
             ? [{
                 model: "gpt-5.6-luna",
+                inputModalities: ["text"],
                 supportedReasoningEfforts: [{ reasoningEffort: "max" }],
                 serviceTiers: [{
                   id: "fast",
@@ -155,6 +325,8 @@ test("one exact catalog resolves the first supported HRA candidate", async () =>
   let modelListCalls = 0;
   const sessions = new SessionService({
     accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 12 }),
       requestSession: () => Promise.reject(new Error("Expected positioned session request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -166,11 +338,13 @@ test("one exact catalog resolves the first supported HRA candidate", async () =>
           data: [
             {
               model: "gpt-5.6-luna",
+              inputModalities: ["text"],
               supportedReasoningEfforts: [{ reasoningEffort: "max" }],
               serviceTiers: [],
             },
             {
               model: "gpt-5.6-sol",
+              inputModalities: ["text"],
               supportedReasoningEfforts: [{ reasoningEffort: "max" }],
               serviceTiers: [{
                 id: "fast",
@@ -196,18 +370,141 @@ test("one exact catalog resolves the first supported HRA candidate", async () =>
     { model: "gpt-5.6-luna", reasoningEffort: "max", serviceTier: "standard" },
     { model: "gpt-5.6-sol", reasoningEffort: "max", serviceTier: "fast" },
   ]);
-  expect(selected).toEqual({
+  expect(selected).toMatchObject({
     model: "gpt-5.6-luna",
     reasoningEffort: "max",
     serviceTier: "standard",
+    catalogGeneration: 12,
+    observedInputModalities: ["text"],
   });
+  expect(selected.catalogDigest).toHaveLength(64);
   expect(modelListCalls).toBe(1);
+});
+
+test("unproven model modalities keep text available but deny image admission", async () => {
+  const requests: string[] = [];
+  const sessions = new SessionService({
+    accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 4 }),
+      requestSession: () => Promise.reject(new Error("Expected positioned session request")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+      ) {
+        requests.push(String(key));
+        if (key !== "modelList") throw new Error(`Unexpected mutation: ${String(key)}`);
+        const output: PinnedCodexRequestOutput<"modelList"> = {
+          data: [{
+            model: "gpt-5.6-sol",
+            inputModalities: null,
+            supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+            serviceTiers: [],
+          }],
+          nextCursor: null,
+        };
+        return Promise.resolve({
+          generation: 4,
+          streamPosition: requests.length,
+          output: output as PinnedCodexRequestOutput<Key>,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+  const candidate = [{
+    model: "gpt-5.6-sol" as const,
+    reasoningEffort: "max" as const,
+    serviceTier: "standard" as const,
+  }];
+
+  const denied = await sessions.resolveChatConfiguration(
+    ACCOUNT,
+    candidate,
+    "image",
+  ).then(() => null, (reason: unknown) => reason);
+  expect(denied).toBeInstanceOf(SessionServiceError);
+  expect(denied).toMatchObject({ code: "capability_unavailable" });
+  const text = await sessions.resolveChatConfiguration(ACCOUNT, candidate, "text");
+  expect(text).toMatchObject({
+    catalogGeneration: 4,
+    observedInputModalities: null,
+  });
+  expect(text.catalogDigest).toHaveLength(64);
+  expect(requests).toEqual(["modelList", "modelList"]);
+});
+
+test("thread start and resume reject a model absent from the exact catalog before mutation", async () => {
+  const requests: string[] = [];
+  const sessions = new SessionService({
+    accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 3 }),
+      requestSession: () => Promise.reject(new Error("Unexpected unpositioned mutation")),
+      requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
+        _accountProfileId: string,
+        key: Key,
+      ) {
+        requests.push(String(key));
+        if (key !== "modelList") throw new Error(`Unexpected mutation: ${String(key)}`);
+        const output: PinnedCodexRequestOutput<"modelList"> = {
+          data: [{
+            model: "gpt-5.6-sol",
+            inputModalities: ["text"],
+            supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+            serviceTiers: [],
+          }],
+          nextCursor: null,
+        };
+        return Promise.resolve({
+          generation: 3,
+          streamPosition: 1,
+          output: output as PinnedCodexRequestOutput<Key>,
+        });
+      },
+    },
+    emit: () => undefined,
+  });
+  sessions.handleRuntimeState(ACCOUNT, { type: "starting", generation: 3 });
+  const accepted = await sessions.resolveChatConfiguration(ACCOUNT, [{
+    model: "gpt-5.6-sol",
+    reasoningEffort: "max",
+    serviceTier: "standard",
+  }]);
+  const forged = {
+    model: "gpt-5.6-luna" as const,
+    serviceTier: "standard" as const,
+    catalogGeneration: accepted.catalogGeneration,
+    catalogDigest: accepted.catalogDigest,
+  };
+
+  const startFailure = await sessions.startChatThread({
+    accountProfileId: ACCOUNT,
+    title: "Forged start",
+    workspacePath: "/fixture/forged-start",
+    ...forged,
+  }).then(() => null, (reason: unknown) => reason);
+  expect(startFailure).toMatchObject({ code: "capability_unavailable" });
+  const rawThreadId = "provider-forged-resume";
+  const resumeFailure = await sessions.resumeChatThread({
+    accountProfileId: ACCOUNT,
+    threadId: `thread_${"a".repeat(48)}`,
+    restartThreadId: rawThreadId,
+    title: "Forged resume",
+    workspacePath: "/fixture/forged-resume",
+    ...forged,
+  }).then(() => null, (reason: unknown) => reason);
+  expect(resumeFailure).toMatchObject({ code: "capability_unavailable" });
+  expect(requests).toEqual(["modelList"]);
+  sessions.handleRuntimeState(ACCOUNT, { type: "stopped", generation: 3 });
 });
 
 test("an incomplete bounded root model catalog is protocol uncertainty, not absence", async () => {
   let page = 0;
   const sessions = new SessionService({
     accounts: {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
       requestSession: () => Promise.reject(new Error("Expected positioned session request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -242,6 +539,9 @@ test("every route resolution reads one current account catalog", async () => {
   const validations: string[] = [];
   const reject = () => Promise.reject(new Error("Unexpected provider mutation"));
   const provider = new CodexChatProvider({
+    archiveChatThread: reject,
+    prepareChatThreadArchive: () => { throw new Error("Unexpected provider mutation"); },
+    reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
@@ -250,11 +550,18 @@ test("every route resolution reads one current account catalog", async () => {
     startChatTurn: reject,
     steer: reject,
     verifiedProductionExecutionPolicyForActiveTurn: () => null,
-    resolveChatConfiguration: (_account, candidates) => {
+    verifiedChatCapabilityForActiveTurn: () => null,
+    resolveChatConfiguration: (_account, candidates, requiredInputClass) => {
       const selected = candidates[0];
       if (selected === undefined) throw new Error("Expected a routing candidate");
       validations.push(selected.serviceTier);
-      return Promise.resolve(selected);
+      return Promise.resolve({
+        ...selected,
+        requiredInputClass,
+        catalogGeneration: 1,
+        catalogDigest: CATALOG_DIGEST,
+        observedInputModalities: ["text"] as const,
+      });
     },
   });
 
@@ -262,15 +569,12 @@ test("every route resolution reads one current account catalog", async () => {
     model: "gpt-5.6-sol" as const,
     reasoningEffort: "ultra" as const,
     serviceTier: "fast" as const,
-    approvalPolicy: "on-request" as const,
-    approvalsReviewer: "auto_review" as const,
-    sandbox: "workspace-write" as const,
   };
   const standard = { ...fast, serviceTier: "standard" as const };
-  await provider.resolveConfiguration(ACCOUNT, [fast]);
-  await provider.resolveConfiguration(ACCOUNT, [fast]);
-  await provider.resolveConfiguration(ACCOUNT, [standard]);
-  await provider.resolveConfiguration(ACCOUNT, [standard]);
+  await provider.resolveConfiguration(ACCOUNT, [fast], "text");
+  await provider.resolveConfiguration(ACCOUNT, [fast], "text");
+  await provider.resolveConfiguration(ACCOUNT, [standard], "text");
+  await provider.resolveConfiguration(ACCOUNT, [standard], "text");
   expect(validations).toEqual(["fast", "fast", "standard", "standard"]);
 });
 
@@ -283,6 +587,9 @@ test("Codex chat preserves definitive model absence for safe automatic fallback"
   );
   const reject = () => Promise.reject(new Error("Unexpected provider mutation"));
   const provider = new CodexChatProvider({
+    archiveChatThread: reject,
+    prepareChatThreadArchive: () => { throw new Error("Unexpected provider mutation"); },
+    reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
@@ -291,6 +598,7 @@ test("Codex chat preserves definitive model absence for safe automatic fallback"
     startChatTurn: reject,
     steer: reject,
     verifiedProductionExecutionPolicyForActiveTurn: () => null,
+    verifiedChatCapabilityForActiveTurn: () => null,
     resolveChatConfiguration: () => Promise.reject(unavailable),
   });
 
@@ -298,10 +606,7 @@ test("Codex chat preserves definitive model absence for safe automatic fallback"
     model: "gpt-5.6-luna",
     reasoningEffort: "max",
     serviceTier: "standard",
-    approvalPolicy: "on-request",
-    approvalsReviewer: "auto_review",
-    sandbox: "workspace-write",
-  }]).then(() => null, (reason: unknown) => reason);
+  }], "text").then(() => null, (reason: unknown) => reason);
   expect(error).toBeInstanceOf(ChatProviderEffectError);
   expect(error).toMatchObject({
     certainty: "not_applied",
@@ -327,6 +632,8 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
     const requests: Array<Readonly<{ key: string; input: unknown }>> = [];
     let responsePosition = 0;
     const accounts: SessionAccountRuntimePort = {
+      ...unavailableSessionArchiveRecoveryPort,
+      ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
       requestSession: () => Promise.reject(new Error("Expected positioned session request")),
       requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
         _accountProfileId: string,
@@ -352,6 +659,11 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
         callbackWork.push(work);
         return work;
       },
+      onReasoningItemCompletion: (event) => {
+        const work = chat?.observeSessionReasoningCompletion(event) ?? Promise.resolve();
+        callbackWork.push(work);
+        return work;
+      },
       onTurnActivity: (event) => {
         const work = chat?.observeSessionActivity(event) ?? Promise.resolve();
         callbackWork.push(work);
@@ -366,10 +678,14 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
     const store = new ChatPaneStore(database);
     chat = new ChatService({
       accounts: {
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT, selected: true, budget: "healthy" },
         ]),
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: {
         messageQueueChanged: () => undefined,
@@ -456,6 +772,21 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
     sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
       generation: 1,
       streamPosition: 101,
+      method: "item/completed",
+      params: {
+        threadId: PROVIDER_THREAD,
+        turnId: PROVIDER_TURN,
+        item: {
+          id: "provider-reasoning",
+          type: "reasoning",
+          summary: ["Checking the seam"],
+        },
+        completedAtMs: 1_775_217_600_001,
+      },
+    }));
+    sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
+      generation: 1,
+      streamPosition: 102,
       method: "item/agentMessage/delta",
       params: {
         threadId: PROVIDER_THREAD,
@@ -466,40 +797,40 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
     }));
     sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
       generation: 1,
-      streamPosition: 102,
+      streamPosition: 103,
       method: "item/completed",
       params: {
         threadId: PROVIDER_THREAD,
         turnId: PROVIDER_TURN,
         item: { id: "provider-answer", type: "agentMessage", text: "The seam is exact." },
-        completedAtMs: 1_775_217_600_001,
-      },
-    }));
-    sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
-      generation: 1,
-      streamPosition: 103,
-      method: "item/started",
-      params: {
-        threadId: PROVIDER_THREAD,
-        turnId: PROVIDER_TURN,
-        item: { id: "provider-tool", type: "fileChange", status: "inProgress", changes: [] },
-        startedAtMs: 1_775_217_600_002,
+        completedAtMs: 1_775_217_600_002,
       },
     }));
     sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
       generation: 1,
       streamPosition: 104,
-      method: "item/completed",
+      method: "item/started",
       params: {
         threadId: PROVIDER_THREAD,
         turnId: PROVIDER_TURN,
-        item: { id: "provider-tool", type: "fileChange", status: "completed", changes: [] },
-        completedAtMs: 1_775_217_600_003,
+        item: { id: "provider-tool", type: "fileChange", status: "inProgress", changes: [] },
+        startedAtMs: 1_775_217_600_003,
       },
     }));
     sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
       generation: 1,
       streamPosition: 105,
+      method: "item/completed",
+      params: {
+        threadId: PROVIDER_THREAD,
+        turnId: PROVIDER_TURN,
+        item: { id: "provider-tool", type: "fileChange", status: "completed", changes: [] },
+        completedAtMs: 1_775_217_600_004,
+      },
+    }));
+    sessions.consumeCodexFacts(projectCodexNotificationFacts(ACCOUNT, {
+      generation: 1,
+      streamPosition: 106,
       method: "turn/completed",
       params: {
         threadId: PROVIDER_THREAD,
@@ -559,10 +890,14 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
     const store = new ChatPaneStore(database);
     const firstChat = new ChatService({
       accounts: {
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT, selected: true, budget: "healthy" },
         ]),
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: quietProjection(),
       provider: new CodexChatProvider(firstSessions),
@@ -623,6 +958,8 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
     let resumedChat: ChatService | null = null;
     const resumedSessions = new SessionService({
       accounts: {
+        ...unavailableSessionArchiveRecoveryPort,
+        ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
         requestSession: () => Promise.reject(new Error("Expected positioned session request")),
         requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
           _accountProfileId: string,
@@ -657,10 +994,14 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
     resumedSessions.handleRuntimeState(ACCOUNT, { type: "starting", generation: 1 });
     resumedChat = new ChatService({
       accounts: {
-        containAmbiguousEffect: () => Promise.resolve(),
+        containAmbiguousEffect: () => Promise.resolve(1),
+        containArchiveGeneration: () => Promise.resolve(),
+        ...fixtureArchiveAccountHoldMethods,
         refreshCandidates: () => Promise.resolve([
           { id: ACCOUNT, selected: true, budget: "healthy" },
         ]),
+        isGenerationCurrent: (_accountProfileId, expectedGeneration) =>
+          expectedGeneration === 1,
       },
       projection: quietProjection(),
       provider: new CodexChatProvider(resumedSessions),
@@ -774,6 +1115,7 @@ function responseFor(key: unknown, cwd: string): unknown {
       return {
         data: ["gpt-5.6-sol", "gpt-5.6-luna"].map((model) => ({
           model,
+          inputModalities: ["text", "image"],
           supportedReasoningEfforts: [
             { reasoningEffort: "ultra" },
             { reasoningEffort: "max" },
@@ -824,6 +1166,8 @@ function positionedAccounts(
   nextPosition: () => number,
 ): SessionAccountRuntimePort {
   return {
+    ...unavailableSessionArchiveRecoveryPort,
+    ensureSessionRuntime: () => Promise.resolve({ generation: 1 }),
     requestSession: () => Promise.reject(new Error("Expected positioned session request")),
     requestSessionWithResponsePosition<Key extends SessionCodexRequestKey>(
       _accountProfileId: string,

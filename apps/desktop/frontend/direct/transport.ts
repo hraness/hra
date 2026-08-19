@@ -826,6 +826,10 @@ class DeterministicRuntimeTransport {
         }
         const pane: ChatPaneProjection = {
           id: command.paneId,
+          paletteIndex: Math.max(
+            -1,
+            ...this.#snapshot.chat.panes.map((candidate) => candidate.paletteIndex),
+          ) + 1,
           revision: 1,
           title: repository.name,
           repository: { id: repository.id, name: repository.name },
@@ -837,16 +841,23 @@ class DeterministicRuntimeTransport {
           turn: null,
           attention: null,
           recoverablePrompt: false,
+          canStartFreshContext: false,
           messageQueue: {
             revision: 1,
             pauseReason: null,
             blockedMessage: null,
             messages: [],
           },
+          attachments: { drafts: [], referenced: [] },
           harness: null,
         };
         this.#upsertChatPane(pane);
-        return this.#success(request, { type: "chatPane", pane });
+        return this.#success(request, {
+          type: "chatPane",
+          pane,
+          disposition: "applied",
+          appliedRevision: pane.revision,
+        });
       }
       case "chat.pane.rename": {
         const pane = this.#requireChatPane(command.paneId);
@@ -859,7 +870,12 @@ class DeterministicRuntimeTransport {
           title: command.title,
         };
         this.#changeChatPaneState(updated);
-        return this.#success(request, { type: "chatPane", pane: updated });
+        return this.#success(request, {
+          type: "chatPane",
+          pane: updated,
+          disposition: "applied",
+          appliedRevision: updated.revision,
+        });
       }
       case "chat.pane.workspace.recover": {
         const pane = this.#requireChatPane(command.paneId);
@@ -891,7 +907,12 @@ class DeterministicRuntimeTransport {
           },
         };
         this.#changeChatPaneState(updated);
-        return this.#success(request, { type: "chatPane", pane: updated });
+        return this.#success(request, {
+          type: "chatPane",
+          pane: updated,
+          disposition: "applied",
+          appliedRevision: updated.revision,
+        });
       }
       case "chat.pane.repository.select": {
         const pane = this.#requireChatPane(command.paneId);
@@ -925,7 +946,12 @@ class DeterministicRuntimeTransport {
           repository: { id: repository.id, name: repository.name },
         };
         this.#upsertChatPane(updated);
-        return this.#success(request, { type: "chatPane", pane: updated });
+        return this.#success(request, {
+          type: "chatPane",
+          pane: updated,
+          disposition: "applied",
+          appliedRevision: updated.revision,
+        });
       }
       case "chat.pane.remove": {
         const pane = this.#requireChatPane(command.paneId);
@@ -1028,6 +1054,8 @@ class DeterministicRuntimeTransport {
             type: "chatMessageQueue",
             paneId: pane.id,
             queue: messageQueue,
+            disposition: "applied",
+            messageId: command.messageId,
           });
         }
         if (pane.state !== "ready" && pane.state !== "attention") {
@@ -1053,6 +1081,8 @@ class DeterministicRuntimeTransport {
           type: "chatMessageQueue",
           paneId: pane.id,
           queue: messageQueue,
+          disposition: "applied",
+          messageId: command.messageId,
         });
       }
       case "chat.message.edit": {
@@ -1086,6 +1116,8 @@ class DeterministicRuntimeTransport {
           type: "chatMessageQueue",
           paneId: pane.id,
           queue: messageQueue,
+          disposition: "applied",
+          messageId: command.messageId,
         });
       }
       case "chat.message.remove":
@@ -1128,6 +1160,8 @@ class DeterministicRuntimeTransport {
           type: "chatMessageQueue",
           paneId: pane.id,
           queue: messageQueue,
+          disposition: "applied",
+          messageId: command.messageId,
         });
       }
       case "chat.messageQueue.resume": {
@@ -1155,6 +1189,56 @@ class DeterministicRuntimeTransport {
           type: "chatMessageQueue",
           paneId: pane.id,
           queue: messageQueue,
+          disposition: "applied",
+          messageId: null,
+        });
+      }
+      case "chat.pane.startFreshContext": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (
+          pane.revision !== command.expectedRevision ||
+          pane.messageQueue.revision !== command.expectedQueueRevision
+        ) {
+          return this.#staleRevision(
+            request,
+            Math.max(pane.revision, pane.messageQueue.revision),
+          );
+        }
+        if (
+          pane.state !== "attention" ||
+          pane.attention?.code !== "runtime_unavailable" ||
+          pane.attention.retryable ||
+          pane.canStartFreshContext !== true ||
+          pane.messageQueue.pauseReason === null ||
+          pane.messageQueue.pauseReason === "ambiguousEffect"
+        ) {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct has no quarantined provider context to start fresh from.",
+          );
+        }
+        const messageQueue = {
+          ...pane.messageQueue,
+          revision: pane.messageQueue.revision + 1,
+          pauseReason: null,
+        };
+        const updated: ChatPaneProjection = {
+          ...pane,
+          revision: pane.revision + 1,
+          state: "ready",
+          attention: null,
+          recoverablePrompt: false,
+          canStartFreshContext: false,
+          messageQueue,
+        };
+        this.#changeChatMessageQueue(updated);
+        return this.#success(request, {
+          type: "chatMessageQueue",
+          paneId: pane.id,
+          queue: messageQueue,
+          disposition: "applied",
+          messageId: null,
         });
       }
       case "chat.message.discardAmbiguous": {
@@ -1205,8 +1289,21 @@ class DeterministicRuntimeTransport {
           type: "chatMessageQueue",
           paneId: pane.id,
           queue: messageQueue,
+          disposition: "applied",
+          messageId: command.messageId,
         });
       }
+      case "chat.attachment.begin":
+      case "chat.attachment.append":
+      case "chat.attachment.finalize":
+      case "chat.attachment.cancel":
+      case "chat.attachment.remove":
+      case "chat.attachment.preview":
+        return this.#chatFailure(
+          request,
+          "capability_unavailable",
+          "Direct keeps attachment custody in its deterministic surface fixture.",
+        );
       case "chat.turn.stop": {
         const pane = this.#requireChatPane(command.paneId);
         if (command.expectedRevision > pane.revision) {
@@ -1217,7 +1314,12 @@ class DeterministicRuntimeTransport {
           command.expectedRevision < pane.revision &&
           (pane.state === "ready" || pane.state === "attention")
         ) {
-          return this.#success(request, { type: "chatPane", pane });
+          return this.#success(request, {
+            type: "chatPane",
+            pane,
+            disposition: "applied",
+            appliedRevision: pane.revision,
+          });
         }
         if (
           pane.interactionMode !== "chat" ||
@@ -1258,7 +1360,12 @@ class DeterministicRuntimeTransport {
           recoverablePrompt: false,
         };
         this.#changeChatMessageQueue(stopped);
-        return this.#success(request, { type: "chatPane", pane: stopped });
+        return this.#success(request, {
+          type: "chatPane",
+          pane: stopped,
+          disposition: "applied",
+          appliedRevision: stopped.revision,
+        });
       }
       case "harness.settings.update": {
         const harness = this.#requireHarness();
@@ -1308,6 +1415,10 @@ class DeterministicRuntimeTransport {
         const paneId = `pane_${child.id.slice("hactor_".length)}`;
         const pane: ChatPaneProjection = {
           id: paneId,
+          paletteIndex: Math.max(
+            -1,
+            ...this.#snapshot.chat.panes.map((candidate) => candidate.paletteIndex),
+          ) + 1,
           revision: 1,
           title: child.title,
           repository: parent.repository,
@@ -1319,12 +1430,14 @@ class DeterministicRuntimeTransport {
           turn: null,
           attention: null,
           recoverablePrompt: false,
+          canStartFreshContext: false,
           messageQueue: {
             revision: 1,
             pauseReason: null,
             blockedMessage: null,
             messages: [],
           },
+          attachments: { drafts: [], referenced: [] },
           harness: null,
         };
         const openedChild: HarnessChildProjection = {
@@ -2758,7 +2871,9 @@ class DeterministicRuntimeTransport {
           totalUtf8Bytes: 0,
           truncatedPrefix: false,
         },
+        reasoningSummaryVerified: false,
         tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: directRootTurnRouting(prompt, pane.turn?.routing ?? null),
       },
       attention: null,

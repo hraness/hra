@@ -64,6 +64,7 @@ function account(revision = 1): AccountSummary {
 function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
   return {
     id: "pane_projection01",
+    paletteIndex: 0,
     revision: 1,
     title: "Projection",
     repository: {
@@ -96,7 +97,9 @@ function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
         totalUtf8Bytes: 0,
         truncatedPrefix: false,
       },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: {
         policyVersion: 1,
         classificationReason: "conservativeDefault",
@@ -111,12 +114,14 @@ function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
     },
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: {
       revision: 1,
       pauseReason: null,
       blockedMessage: null,
       messages: [],
     },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }
@@ -214,6 +219,7 @@ describe("renderer-safe gateway projection", () => {
     projection.installChatMessageQueueState({
       paneId: chatPane().id,
       queue,
+      attachments: chatPane().attachments,
     });
 
     const [event] = projection.drainEvents();
@@ -229,6 +235,55 @@ describe("renderer-safe gateway projection", () => {
     const capture = projection.beginSnapshot();
     expect(capture.response.snapshot.chat.panes[0]?.messageQueue).toEqual(queue);
     capture.release();
+  });
+
+  test("retains a queue mutation that overlaps an atomic snapshot capture", () => {
+    let notifications = 0;
+    const projection = new RuntimeProjection(emptySnapshot(), {
+      onEventsAvailable: () => {
+        notifications += 1;
+      },
+    });
+    const initialPane = chatPane();
+    projection.installBootstrapChatState([initialPane]);
+    const capture = projection.beginSnapshot();
+    const queue: ChatMessageQueueProjection = {
+      revision: 2,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [{
+        id: "chatmsg_captureoverlap1",
+        ordinal: 1,
+        revision: 1,
+        text: "committed after capture began",
+        attachmentRefs: [],
+      }],
+    };
+
+    projection.installChatMessageQueueState({
+      paneId: initialPane.id,
+      queue,
+      attachments: initialPane.attachments,
+    });
+
+    expect(capture.response.snapshot.chat.panes[0]?.messageQueue).toEqual(
+      initialPane.messageQueue,
+    );
+    expect(projection.drainEvents()).toEqual([]);
+    expect(notifications).toBe(0);
+
+    capture.release();
+    expect(notifications).toBe(1);
+    expect(projection.drainEvents()).toMatchObject([{
+      event: {
+        type: "chat.messageQueue.changed",
+        paneId: initialPane.id,
+        revision: 2,
+      },
+    }]);
+    const next = projection.beginSnapshot();
+    expect(next.response.snapshot.chat.panes[0]?.messageQueue).toEqual(queue);
+    next.release();
   });
 
   test("bootstrap chat state can be installed only once", () => {
@@ -726,6 +781,7 @@ describe("renderer-safe gateway projection", () => {
       revision: 2,
       pane: {
         id: pane.id,
+        paletteIndex: pane.paletteIndex,
         revision: 2,
         title: "Settled projection",
         accountProfileId: pane.accountProfileId,
@@ -744,10 +800,12 @@ describe("renderer-safe gateway projection", () => {
             category: "command",
             status: "completed",
           }],
+          providerSubagents: { agents: [], overflowCount: 0 },
           routing: pane.turn!.routing,
           },
           attention: null,
           recoverablePrompt: false,
+          canStartFreshContext: false,
         },
     });
 

@@ -35,6 +35,7 @@ const resolvedStandardRoute = {
 function pane(responseMarkdown = ""): ChatPaneProjection {
   return {
     id: "pane_delivery01",
+    paletteIndex: 0,
     revision: 1,
     title: "Delivery",
     repository: {
@@ -58,17 +59,21 @@ function pane(responseMarkdown = ""): ChatPaneProjection {
         truncatedPrefix: false,
       },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: resolvedStandardRoute,
     },
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: {
       revision: 1,
       pauseReason: null,
       blockedMessage: null,
       messages: [],
     },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }

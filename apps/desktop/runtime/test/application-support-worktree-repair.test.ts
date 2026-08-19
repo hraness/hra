@@ -23,6 +23,8 @@ import {
 import { applyMigrations } from "../src/state/database";
 import { ChatPaneStore } from "../src/state/chat-pane-store";
 import { migrations } from "../src/state/migrations";
+import { ProviderThreadArchiveJournalV57 } from
+  "../src/state/provider-thread-archive-journal-v57";
 import type { GitResult, GitRunner } from "../src/workspaces/git-runner";
 import { requireGit } from "../src/workspaces/git-runner";
 import { WorkspaceBroker } from "../src/workspaces/workspace-broker";
@@ -33,6 +35,13 @@ const laneId = "run_migration0001";
 const chatBindingId = "chatws_migration0000000001";
 const timestamp = "2026-07-24T12:00:00.000Z";
 const futureMigrationVersion = (migrations.at(-1)?.version ?? 0) + 1;
+const archiveReceiptKey = new Uint8Array(32).fill(57);
+const archiveThreadId = "thread_worktree_repair_v57";
+const archiveRestartThreadId = "restart_worktree_repair_v57";
+const archiveTargetId = "archtarget_worktree_repair_v57";
+const archiveAttemptId = "archattempt_worktree_repair_v57";
+const archiveCutId = "archcut_worktree_repair_v57";
+const archiveMemberId = "archmember_worktree_repair_v57";
 
 class RealGitRunner implements GitRunner {
   readonly calls: { readonly cwd: string; readonly args: readonly string[] }[] = [];
@@ -254,12 +263,14 @@ async function fixture(
       `).run(repository, repositoryIdentity.canonicalGitCommonDir);
       database.query(`
         INSERT INTO chat_panes (
-          pane_id, repository_id, repository_name, revision, title,
+          pane_id, palette_index, repository_id, repository_name, revision, title,
           reasoning_effort, state, display_order, workspace_mode,
           workspace_state, workspace_revision, workspace_recovery_reason,
           created_at, updated_at
         ) VALUES (
-          'pane_migration0001', 'repo_00000000000000000000000001', 'Fixture', 1,
+          'pane_migration0001',
+          (SELECT next_palette_index FROM chat_pane_palette_sequence WHERE singleton = 1),
+          'repo_00000000000000000000000001', 'Fixture', 1,
           'Migration fixture', 'ultra', 'ready', 0, 'managed_worktree',
           'preparing', 1, NULL, ?1, ?1
         )
@@ -332,6 +343,230 @@ function options(
     legacyRoot: value.legacyRoot,
     targetRoot: value.targetRoot,
     ...(onCheckpoint === undefined ? {} : { onCheckpoint }),
+  };
+}
+
+function archiveDigest(character: string): string {
+  return character.repeat(64);
+}
+
+function archiveJournal(value: RepairFixture): ProviderThreadArchiveJournalV57 {
+  return new ProviderThreadArchiveJournalV57(value.database, archiveReceiptKey);
+}
+
+function configureArchivePane(value: RepairFixture): Readonly<{
+  accountProfileRevision: number;
+  generation: number;
+  paneRevision: number;
+}> {
+  const account = value.database.query<{
+    process_generation: number;
+    revision: number;
+  }, []>(`
+    SELECT process_generation, revision FROM account_profiles
+    WHERE profile_id = 'profile_migration01'
+  `).get();
+  const pane = value.database.query<{ revision: number }, []>(`
+    SELECT revision FROM chat_panes WHERE pane_id = 'pane_migration0001'
+  `).get();
+  if (account === null || pane === null) {
+    throw new Error("Archive repair fixture lacks its account or pane");
+  }
+  const updated = value.database.query(`
+    UPDATE chat_panes SET provider_account_profile_id = 'profile_migration01',
+      provider_thread_id = ?1, provider_restart_thread_id = ?2
+    WHERE pane_id = 'pane_migration0001'
+  `).run(archiveThreadId, archiveRestartThreadId);
+  if (updated.changes !== 1) {
+    throw new Error("Archive repair fixture pane could not be configured");
+  }
+  return {
+    accountProfileRevision: account.revision,
+    generation: account.process_generation,
+    paneRevision: pane.revision,
+  };
+}
+
+function seedPreparedArchiveTarget(
+  value: RepairFixture,
+): ProviderThreadArchiveJournalV57 {
+  const authority = configureArchivePane(value);
+  const journal = archiveJournal(value);
+  journal.prepareTarget({
+    targetId: archiveTargetId,
+    paneId: "pane_migration0001",
+    purpose: "pane_archive",
+    paneRevision: authority.paneRevision,
+    queueRevision: null,
+    paneCasDigest: archiveDigest("1"),
+    queueCasDigest: null,
+    accountProfileId: "profile_migration01",
+    accountProfileRevision: authority.accountProfileRevision,
+    threadId: archiveThreadId,
+    restartThreadId: archiveRestartThreadId,
+    binding: { kind: "none" },
+    attempt: {
+      attemptId: archiveAttemptId,
+      generation: authority.generation,
+      accountProfileRevision: authority.accountProfileRevision,
+      requestEvidenceDigest: archiveDigest("2"),
+      requestRevisionDigest: archiveDigest("3"),
+    },
+    now: new Date(timestamp),
+  });
+  return journal;
+}
+
+function seedCommittedArchiveTarget(value: RepairFixture): void {
+  const journal = seedPreparedArchiveTarget(value);
+  journal.markEffectStarted({
+    attemptId: archiveAttemptId,
+    effectEvidenceDigest: archiveDigest("4"),
+    effectRevisionDigest: archiveDigest("5"),
+    now: new Date("2026-07-24T12:00:01.000Z"),
+  });
+  journal.recordDirectApplied({
+    attemptId: archiveAttemptId,
+    responseGeneration: 1,
+    responseStreamPosition: 1,
+    outcomeEvidenceDigest: archiveDigest("6"),
+    outcomeRevisionDigest: archiveDigest("7"),
+    now: new Date("2026-07-24T12:00:02.000Z"),
+  });
+  journal.markTargetCommitted({
+    targetId: archiveTargetId,
+    commitEvidenceDigest: archiveDigest("8"),
+    commitRevisionDigest: archiveDigest("9"),
+    now: new Date("2026-07-24T12:00:03.000Z"),
+  });
+}
+
+function seedArchiveCut(
+  value: RepairFixture,
+  includeMember: boolean,
+): void {
+  const authority = configureArchivePane(value);
+  const journal = archiveJournal(value);
+  journal.createCut({
+    cutId: archiveCutId,
+    accountProfileId: "profile_migration01",
+    accountProfileRevision: authority.accountProfileRevision,
+    sourceGeneration: authority.generation,
+    cause: "account_removal",
+    initiatingAttemptId: null,
+    predecessorCutId: null,
+    identityEvidenceDigest: archiveDigest("a"),
+    identityRevisionDigest: archiveDigest("b"),
+    now: new Date(timestamp),
+  });
+  journal.recordFence({
+    cutId: archiveCutId,
+    successorGeneration: null,
+    successorAccountProfileRevision: null,
+    fenceEvidenceDigest: archiveDigest("c"),
+    fenceRevisionDigest: archiveDigest("d"),
+    now: new Date("2026-07-24T12:00:01.000Z"),
+  });
+  if (!includeMember) return;
+  journal.addCutMember({
+    memberId: archiveMemberId,
+    cutId: archiveCutId,
+    paneId: "pane_migration0001",
+    paneRevision: authority.paneRevision,
+    paneCasDigest: archiveDigest("1"),
+    threadId: archiveThreadId,
+    restartThreadId: archiveRestartThreadId,
+    role: "sibling",
+    targetId: null,
+    attemptId: null,
+    targetAttemptOrdinal: null,
+    action: "detach_binding_only",
+    binding: { kind: "none" },
+    identityEvidenceDigest: archiveDigest("e"),
+    identityRevisionDigest: archiveDigest("f"),
+    now: new Date("2026-07-24T12:00:02.000Z"),
+  });
+}
+
+async function optionalBytes(path: string): Promise<Buffer | null> {
+  try {
+    return Buffer.from(await readFile(path));
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function repairMutationSnapshot(value: RepairFixture): Promise<Readonly<{
+  checkoutTracked: Buffer;
+  checkoutUntracked: Buffer;
+  database: Buffer;
+  gitCalls: readonly { readonly args: readonly string[]; readonly cwd: string }[];
+  journal: Buffer | null;
+  manifest: Buffer;
+}>> {
+  return {
+    checkoutTracked: Buffer.from(await readFile(join(value.targetCheckout, "tracked.txt"))),
+    checkoutUntracked: Buffer.from(await readFile(join(value.targetCheckout, "untracked.txt"))),
+    database: Buffer.from(value.database.serialize()),
+    gitCalls: value.git.calls.map((call) => ({ cwd: call.cwd, args: [...call.args] })),
+    journal: await optionalBytes(join(
+      value.targetRoot,
+      ".hraness-kitchen-managed-worktree-repair-v1.json",
+    )),
+    manifest: Buffer.from(await readFile(value.targetManifest)),
+  };
+}
+
+function archiveAuthorityCounts(value: RepairFixture): Readonly<{
+  attempts: number;
+  cuts: number;
+  members: number;
+  targets: number;
+}> {
+  return value.database.query<{
+    attempts: number;
+    cuts: number;
+    members: number;
+    targets: number;
+  }, []>(`
+    SELECT
+      (SELECT COUNT(*) FROM chat_provider_thread_archive_targets_v57) AS targets,
+      (SELECT COUNT(*) FROM chat_provider_thread_archive_attempts_v57) AS attempts,
+      (SELECT COUNT(*) FROM chat_provider_thread_archive_cuts_v57) AS cuts,
+      (SELECT COUNT(*) FROM chat_provider_thread_archive_cut_members_v57) AS members
+  `).get()!;
+}
+
+function repairLogicalDatabaseSnapshot(value: RepairFixture): Readonly<{
+  chatBindings: readonly unknown[];
+  chatPanes: readonly unknown[];
+  dispatches: readonly unknown[];
+  schema: readonly unknown[];
+  threads: readonly unknown[];
+  workspaceLeases: readonly unknown[];
+}> {
+  return {
+    schema: value.database.query(`
+      SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name
+    `).all(),
+    workspaceLeases: value.database.query(`
+      SELECT * FROM workspace_leases ORDER BY lane_id
+    `).all(),
+    threads: value.database.query(`
+      SELECT * FROM thread_bindings ORDER BY thread_id
+    `).all(),
+    dispatches: value.database.query(`
+      SELECT * FROM dispatch_bindings ORDER BY run_id
+    `).all(),
+    chatPanes: value.database.query(`
+      SELECT * FROM chat_panes ORDER BY pane_id
+    `).all(),
+    chatBindings: value.database.query(`
+      SELECT * FROM chat_pane_workspace_bindings ORDER BY binding_id
+    `).all(),
   };
 }
 
@@ -506,6 +741,236 @@ describe.skipIf(gitBinary === null)("Application Support managed-worktree repair
         kind: "complete",
         rollbackSafe: true,
       });
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("allows a complete empty v57 archive schema to repair normally", async () => {
+    const value = await fixture();
+    try {
+      expect(archiveAuthorityCounts(value)).toEqual({
+        targets: 0,
+        attempts: 0,
+        cuts: 0,
+        members: 0,
+      });
+      expect(await repairMovedApplicationSupportWorktrees(options(value))).toMatchObject({
+        repairedLaneIds: [laneId],
+        irreversibleForward: true,
+      });
+    } finally {
+      value.database.close();
+    }
+  }, 30_000);
+
+  test("rejects a partial v57 archive schema before repair mutation", async () => {
+    const value = await fixture();
+    try {
+      value.database.exec("DROP TABLE chat_provider_thread_archive_cut_members_v57");
+      const before = await repairMutationSnapshot(value);
+      const databaseBefore = repairLogicalDatabaseSnapshot(value);
+      const error = await rejection(
+        repairMovedApplicationSupportWorktrees(options(value)),
+      );
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("partial v57 schema");
+      const after = await repairMutationSnapshot(value);
+      expect(repairLogicalDatabaseSnapshot(value)).toEqual(databaseBefore);
+      expect(after.journal).toEqual(before.journal);
+      expect(after.manifest).toEqual(before.manifest);
+      expect(after.checkoutTracked).toEqual(before.checkoutTracked);
+      expect(after.checkoutUntracked).toEqual(before.checkoutUntracked);
+      expect(after.gitCalls).toEqual(before.gitCalls);
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("preserves an open v57 target before the first forward repair write", async () => {
+    const value = await fixture();
+    try {
+      seedPreparedArchiveTarget(value);
+      expect(archiveAuthorityCounts(value)).toEqual({
+        targets: 1,
+        attempts: 1,
+        cuts: 0,
+        members: 0,
+      });
+      const before = await repairMutationSnapshot(value);
+      const error = await rejection(
+        repairMovedApplicationSupportWorktrees(options(value)),
+      );
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(await repairMutationSnapshot(value)).toEqual(before);
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("preserves a committed v57 target on a prepared forward retry", async () => {
+    const value = await fixture();
+    try {
+      await rejection(repairMovedApplicationSupportWorktrees(options(
+        value,
+        (point) => {
+          if (point === "afterPreparedJournal") throw new Error("prepared-cut");
+        },
+      )));
+      seedCommittedArchiveTarget(value);
+      expect(archiveAuthorityCounts(value)).toEqual({
+        targets: 1,
+        attempts: 1,
+        cuts: 0,
+        members: 0,
+      });
+      const before = await repairMutationSnapshot(value);
+      const error = await rejection(
+        repairMovedApplicationSupportWorktrees(options(value)),
+      );
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(await repairMutationSnapshot(value)).toEqual(before);
+      expect(await inspectApplicationSupportWorktreeRepair(value.targetRoot))
+        .toMatchObject({ kind: "prepared", rollbackSafe: true });
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("preserves cut-only v57 removal authority before forward repair", async () => {
+    const value = await fixture();
+    try {
+      seedArchiveCut(value, false);
+      expect(archiveAuthorityCounts(value)).toEqual({
+        targets: 0,
+        attempts: 0,
+        cuts: 1,
+        members: 0,
+      });
+      const before = await repairMutationSnapshot(value);
+      const error = await rejection(
+        repairMovedApplicationSupportWorktrees(options(value)),
+      );
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(await repairMutationSnapshot(value)).toEqual(before);
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("preserves v57 cut-member authority before prepared-journal reversal", async () => {
+    const value = await fixture();
+    try {
+      await rejection(repairMovedApplicationSupportWorktrees(options(
+        value,
+        (point) => {
+          if (point === "afterPreparedJournal") throw new Error("prepared-cut");
+        },
+      )));
+      seedArchiveCut(value, true);
+      expect(archiveAuthorityCounts(value)).toEqual({
+        targets: 0,
+        attempts: 0,
+        cuts: 1,
+        members: 1,
+      });
+      const before = await repairMutationSnapshot(value);
+      const error = await rejection(
+        reverseMovedApplicationSupportWorktreeRepair(options(value)),
+      );
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(await repairMutationSnapshot(value)).toEqual(before);
+      expect(await inspectApplicationSupportWorktreeRepair(value.targetRoot))
+        .toMatchObject({ kind: "prepared", rollbackSafe: true });
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("catches v57 authority injected between entry and forward DB apply", async () => {
+    const value = await fixture();
+    try {
+      const before = await repairMutationSnapshot(value);
+      const gitBefore = await requireGit(value.git, value.repository, [
+        "worktree",
+        "list",
+        "--porcelain",
+        "-z",
+      ]);
+      let injected = false;
+      let databaseAfterInjection: Buffer | null = null;
+      const error = await rejection(repairMovedApplicationSupportWorktrees(options(
+        value,
+        (point) => {
+          if (point !== "afterPreparedJournal") return;
+          injected = true;
+          seedPreparedArchiveTarget(value);
+          databaseAfterInjection = Buffer.from(value.database.serialize());
+        },
+      )));
+      expect(injected).toBeTrue();
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(databaseAfterInjection).not.toBeNull();
+      const after = await repairMutationSnapshot(value);
+      expect(after.database).toEqual(databaseAfterInjection!);
+      expect(after.manifest).toEqual(before.manifest);
+      expect(after.checkoutTracked).toEqual(before.checkoutTracked);
+      expect(after.checkoutUntracked).toEqual(before.checkoutUntracked);
+      expect(await requireGit(value.git, value.repository, [
+        "worktree",
+        "list",
+        "--porcelain",
+        "-z",
+      ])).toBe(gitBefore);
+      expect(gitRepairCount(value.git)).toBe(0);
+      expect(before.journal).toBeNull();
+      expect(after.journal).not.toBeNull();
+      expect(await inspectApplicationSupportWorktreeRepair(value.targetRoot))
+        .toMatchObject({ kind: "prepared", rollbackSafe: true });
+    } finally {
+      value.database.close();
+    }
+  });
+
+  test("catches v57 authority injected before reverse manifests or DB apply", async () => {
+    const value = await fixture();
+    try {
+      await rejection(repairMovedApplicationSupportWorktrees(options(
+        value,
+        (point) => {
+          if (point === "afterPreparedJournal") throw new Error("prepared-cut");
+        },
+      )));
+      const before = await repairMutationSnapshot(value);
+      let injected = false;
+      let databaseAfterInjection: Buffer | null = null;
+      const error = await rejection(reverseMovedApplicationSupportWorktreeRepair(options(
+        value,
+        (point) => {
+          if (point !== "afterReversePreparedJournal") return;
+          injected = true;
+          seedArchiveCut(value, false);
+          databaseAfterInjection = Buffer.from(value.database.serialize());
+        },
+      )));
+      expect(injected).toBeTrue();
+      expect(error).toMatchObject({ code: "invalid_database", rollbackSafe: true });
+      expect(error.message).toContain("reconcile exactly");
+      expect(databaseAfterInjection).not.toBeNull();
+      const after = await repairMutationSnapshot(value);
+      expect(after.database).toEqual(databaseAfterInjection!);
+      expect(after.manifest).toEqual(before.manifest);
+      expect(after.checkoutTracked).toEqual(before.checkoutTracked);
+      expect(after.checkoutUntracked).toEqual(before.checkoutUntracked);
+      expect(after.gitCalls).toEqual(before.gitCalls);
+      expect(after.journal).not.toEqual(before.journal);
+      expect(await inspectApplicationSupportWorktreeRepair(value.targetRoot))
+        .toMatchObject({ kind: "reversing", rollbackSafe: true });
     } finally {
       value.database.close();
     }

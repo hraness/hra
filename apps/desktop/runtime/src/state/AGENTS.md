@@ -19,6 +19,7 @@
 - `chat-message-ledger-schema-v1.ts` and `chat-message-ledger.ts` – the additive app-owned FIFO message ledger, independent queue and row CAS clocks, bounded complete text, opaque ready-only attachment authority, lifecycle cuts, pause reasons, and restart reconciliation primitives.
 - `chat-pane-palette-schema-v1.ts` – deterministic existing-pane backfill plus transactional, monotonic, immutable decorative palette identity.
 - `chat-message-ambiguous-resolution-schema-v1.ts` – append-only user discard receipts for terminally contained ambiguous message effects.
+- `chat-attachment-vault-schema-v2.ts` – additive v50 generic/image vault authority, exact chunk receipts, provider bindings, archive/privacy cleanup journals, and filesystem-custody tombstones.
 - `local-task-due-work-store.ts` – boot generations, due-work claims, retry/backoff, queued-run intent fencing, and crash-after-start recovery scheduling.
 - `local-task-authority-command-store.ts` – entity-specific due-work revalidation and atomic portable system-command execution with post-commit invalidation hints.
 - `local-promotion-store.ts` – immutable local promotion snapshots, family digests, exact upload receipts, frozen authority phases, activation, and proven pre-activation aborts.
@@ -35,6 +36,7 @@
 - Normalize attachment references under each ledger row and prove ready state, a live same-pane draft lease for each new binding, and same-pane authority inside the exact enqueue/edit transaction. Claim must recheck readiness and acquire the complete turn-lease set before returning provider-ready content; prepared rollback releases it, effect ambiguity retains an ambiguous lease, and exact terminal settlement releases it. Never admit a `localImage` provider effect until a separately wired provider-thread lease durably pins every delivered attachment across terminal queue cleanup, history pruning, pane archive, account privacy deletion, and ambiguity containment. Attachment IDs are opaque; no path, filename, provider value, byte payload, or stale preflight result belongs in the ledger or renderer projection.
 - Preserve the original consumed draft expiry on each normalized attachment reference. Atomic steer compensation restores every still-live draft lease exactly; an elapsed lease terminalizes the new row with an explicit reattach error instead of silently changing composer meaning.
 - Keep an ambiguous ledger row immutable. Resolution is a separate append-only discard receipt after its exact owning turn is terminal; only the authorized privacy cascade may delete that receipt. Clear the ambiguous pause and release its attachment leases in the same transaction, then allow FIFO draining and pane close.
+- Journal pane archive on both sides of the `archived_at` write in the same SQLite transaction. Filesystem cleanup may start only from a committed `pane_archived` intent and must converge at startup. Privacy deletion needs independent authorization and provider-containment receipts; its durable intent remains until bytes, bindings, and attachment tombstones are purged.
 - Preserve removed-profile tombstones and local-data state until the separate full-home deletion completes; never persist login authority or human-in-the-loop answers.
 - Append migrations instead of rewriting an applied migration, and reject checksum drift at startup.
 - Check release and migration compatibility through a read-only connection
@@ -44,13 +46,22 @@
   startup completes. Checkpoint its database copy before returning. Immutable
   preflight may ignore a crash WAL because future migration intent is already
   durable in the external fence.
-- Keep backup passphrases and decrypted archive payloads in memory. Persist only
-  the encrypted archive or the private destination database/key pair; restore
-  from fixed, path-free, bounded journals and roll back every partial publish.
+- Keep backup passphrases, receipt keys, and streaming plaintext buffers in
+  memory. After a complete authentication pass, restore may persist only the
+  fixed private database, receipt-key, and attachment-vault stages while they
+  remain under exact journal or retryable cleanup custody. Restore from fixed,
+  path-free, bounded journals and roll back every partial three-generation
+  publish.
 - Complete Application Support cutover, integrity checks, and path repair before accounts, Codex, or cloud dispatch can start. Never merge roots or follow a link or special file during migration.
 - Keep database and parent-directory permissions user-only. The authoritative connection must prove foreign keys, WAL, FULL synchronization, and `trusted_schema=OFF` before migrations or state access.
-- Bind operation receipts with the separate per-install HMAC key; never retain commands or unkeyed command digests.
+- Bind operation receipts with the separate per-install HMAC key; never retain commands or unkeyed command digests. Persist chat successes as bounded content-free receipts. A replay returns a sparse operation proof rather than a current pane or queue snapshot masquerading as historical state.
 - Acquire and retain the control-plane lifetime lock before opening SQLite; process metadata is diagnostic only and must never override the OS-released lock.
+- Hold that same OS lifetime lock across every production backup restore,
+  interrupted-restore recovery, and journal-authorized namespace cleanup. Tests
+  may call the core recovery API only against isolated quiescent roots. Under
+  this cooperative boundary, a custody-marked single-link inode may be scrubbed
+  and removed descriptor-relatively; any hard link or unmarked replacement is
+  preserved with its journal and requires explicit operator cleanup.
 - Keep local command projection changes, portable events, and HMAC-bound receipts in one SQLite transaction. Exact replay returns the stored receipt; digest drift is a conflict.
 - Prepare and CAS-start each renderer-originated local mutation before its effect. Recompute the prepared fingerprint from the complete materialized command, bind its exact keyed receipt digest during the start CAS, and require the same binding before execution. Persist only operation and workspace IDs, command kind, keyed fingerprints, state, revisions, and timestamps. Inspect a started attempt non-destructively against the exact local receipt from the serialized gateway queue. Settle receipt-linked evidence only through a later explicit reconciliation; receipt absence proves not-applied only in that queue. Terminally quarantine a legacy unbound attempt that already has a receipt as ambiguous so it cannot authorize success or strand the workspace. Never persist a command, prose, interaction answer, path, provider value, or unkeyed fingerprint, and never replay an ambiguous effect automatically.
 - Bind task-page cursors to workspace revision and filter scope. Bound workspace, repository, task, detail, event, due-work, and promotion reads before they cross a repository boundary.

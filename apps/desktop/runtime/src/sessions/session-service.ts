@@ -2,9 +2,12 @@ import { realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type {
   AccountSummary,
+  ChatProviderSubagentsProjection,
   ChatServiceTier,
   RuntimeError,
 } from "../../../contracts/runtime";
+import type { ArchiveAdmissionHandle } from "../accounts/archive-admission-gate";
+import type { ChatThreadBinding } from "../chat/types";
 import type {
   GatewaySessionEvent,
   ProjectSummary,
@@ -82,8 +85,32 @@ import {
 } from "./session-registry";
 import { createSessionSelectors } from "./selectors";
 import { SessionStore, type SessionStoreListener } from "./store";
+import {
+  ReasoningSummaryAccumulator,
+  type ReasoningSummaryCompletionReceipt,
+} from "./reasoning-summary-accumulator";
+import {
+  ProviderSubagentProjectionTracker,
+  type ProviderSubagentTurnScope,
+} from "./provider-subagent-projection";
 
 type SessionEvent = GatewaySessionEvent;
+
+interface ChatThreadArchiveScanPage {
+  readonly generation: number;
+  readonly pageOrdinal: number;
+  readonly requestCursor: string | null;
+  readonly responseBackwardsCursor: string | null;
+  readonly responseNextCursor: string | null;
+  readonly streamPosition: number;
+  readonly threadIds: readonly string[];
+}
+
+interface ChatThreadArchiveCatalogScan {
+  readonly ids: readonly string[];
+  readonly pages: readonly ChatThreadArchiveScanPage[];
+  readonly streamPosition: number;
+}
 
 export type SessionCommand =
   | Readonly<{
@@ -365,11 +392,52 @@ interface RegisteredProductionExecutionPolicy {
   readonly threadId: ThreadSummary["id"];
 }
 
-export interface SessionChatTurnStartRequest extends SessionTurnStartRequest {
+interface RegisteredChatCatalog {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly catalogDigest: string;
+  readonly generation: number;
+  readonly models: readonly Readonly<{
+    readonly model: string;
+    readonly observedInputModalities: readonly ("text" | "image")[] | null;
+    readonly reasoningEfforts: readonly string[];
+    readonly serviceTiers: readonly string[];
+  }>[];
+}
+
+export interface SessionChatCapabilityReceipt {
+  readonly catalogDigest: string;
+  readonly generation: number;
   readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
+  readonly observedInputModalities: readonly ("text" | "image")[] | null;
   readonly reasoningEffort: "ultra" | "max";
   readonly serviceTier: ChatServiceTier;
 }
+
+interface RegisteredChatTurnCapability {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly receipt: SessionChatCapabilityReceipt;
+  readonly threadId: ThreadSummary["id"];
+}
+
+export type SessionChatProviderInput =
+  | Readonly<{ readonly type: "text"; readonly text: string }>
+  | Readonly<{ readonly type: "localImage"; readonly path: string }>;
+
+interface SessionChatTurnStartBase {
+  readonly clientUserMessageId: string;
+  readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
+  readonly reasoningEffort: "ultra" | "max";
+  readonly serviceTier: ChatServiceTier;
+  readonly threadId: ThreadSummary["id"];
+  readonly catalogGeneration: number;
+  readonly catalogDigest: string;
+  readonly observedInputModalities: readonly ("text" | "image")[] | null;
+}
+
+export type SessionChatTurnStartRequest = SessionChatTurnStartBase & (
+  | Readonly<{ readonly prompt: string; readonly input?: never }>
+  | Readonly<{ readonly input: readonly SessionChatProviderInput[]; readonly prompt?: never }>
+);
 
 export interface SessionChatTurnStartResult {
   readonly threadId: ThreadSummary["id"];
@@ -382,6 +450,13 @@ export interface SessionChatConfigurationCandidate {
   readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly reasoningEffort: "ultra" | "max";
   readonly serviceTier: ChatServiceTier;
+}
+
+export interface SessionResolvedChatConfiguration
+  extends SessionChatConfigurationCandidate {
+  readonly catalogGeneration: number;
+  readonly catalogDigest: string;
+  readonly observedInputModalities: readonly ("text" | "image")[] | null;
 }
 
 export interface SessionThreadStartResult {
@@ -400,6 +475,8 @@ export interface SessionChatThreadResumeRequest {
   readonly threadId: ThreadSummary["id"];
   /** Raw Codex identity used only to rebuild the in-memory registry. */
   readonly restartThreadId: string;
+  readonly catalogGeneration: number;
+  readonly catalogDigest: string;
   readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
   readonly serviceTier: ChatServiceTier;
   readonly title: string;
@@ -431,13 +508,27 @@ interface SessionTurnReconciliationPosition {
   readonly responsePosition: CodexStreamPosition;
 }
 
-export interface SessionSteerRequest {
+interface SessionSteerBase {
   readonly clientUserMessageId: string;
   readonly expectedGeneration: number;
   readonly expectedTurnId: NonNullable<ThreadSummary['activeTurn']>['id'];
-  readonly prompt: string;
   readonly threadId: ThreadSummary['id'];
 }
+
+export type SessionSteerRequest = SessionSteerBase & (
+  | Readonly<{
+      readonly prompt: string;
+      readonly input?: never;
+      readonly catalogDigest?: never;
+      readonly observedInputModalities?: never;
+    }>
+  | Readonly<{
+      readonly input: readonly SessionChatProviderInput[];
+      readonly prompt?: never;
+      readonly catalogDigest: string;
+      readonly observedInputModalities: readonly ("text" | "image")[] | null;
+    }>
+);
 
 export type { SessionAccountRuntimePort } from "./command-executor";
 export type {
@@ -469,6 +560,9 @@ export interface SessionServiceOptions {
   ) => void | Promise<void>;
   readonly onReasoningItemCompletion?: (
     event: SessionReasoningItemCompletion,
+  ) => void | Promise<void>;
+  readonly onProviderSubagents?: (
+    event: SessionProviderSubagents,
   ) => void | Promise<void>;
   readonly onToolItemStarted?: (
     event: SessionToolItemStarted,
@@ -502,6 +596,7 @@ export type SessionTurnActivity =
   | (SessionTurnActivityBase & Readonly<{
       kind: "reasoning_summary_delta";
       displayText: string;
+      reasoningItemId: string;
     }>)
   | (SessionTurnActivityBase & Readonly<{
       kind: "assistant_message_delta";
@@ -520,6 +615,11 @@ export interface SessionAssistantItemCompletion extends SessionTurnActivityBase 
 /** Exact accepted completion of one provider reasoning-summary item. */
 export interface SessionReasoningItemCompletion extends SessionTurnActivityBase {
   readonly itemId: string;
+  readonly receipt: ReasoningSummaryCompletionReceipt;
+}
+
+export interface SessionProviderSubagents extends SessionTurnActivityBase {
+  readonly projection: ChatProviderSubagentsProjection;
 }
 
 /** Exact accepted start of one provider tool item, independent of aggregate activity. */
@@ -598,6 +698,7 @@ export class SessionService {
   readonly #activeToolItemsByTurn = new Map<string, Set<string>>();
   readonly #completedToolItemsByTurn = new Map<string, Set<string>>();
   readonly #commands: SessionCommandExecutor;
+  readonly #accounts: SessionAccountRuntimePort;
   readonly #factDispatch: SessionFactDispatchAdapter;
   readonly #hydration: SessionHydrationCoordinator;
   readonly #activeRuntimeGenerations = new Map<string, number>();
@@ -619,6 +720,9 @@ export class SessionService {
   readonly #onReasoningItemCompletion: (
     event: SessionReasoningItemCompletion,
   ) => void | Promise<void>;
+  readonly #onProviderSubagents: (
+    event: SessionProviderSubagents,
+  ) => void | Promise<void>;
   readonly #onToolItemStarted: (
     event: SessionToolItemStarted,
   ) => void | Promise<void>;
@@ -633,13 +737,19 @@ export class SessionService {
     string,
     RegisteredProductionExecutionPolicy
   >();
+  readonly #chatCatalogsByEvidence = new Map<string, RegisteredChatCatalog>();
+  readonly #chatCapabilityByTurn = new Map<string, RegisteredChatTurnCapability>();
+  readonly #chatThreadArchiveTails = new Map<string, Promise<void>>();
   readonly #registry: SessionRegistry;
   readonly #saturatedToolActivityAccounts = new Set<string>();
   readonly #store = new SessionStore();
   readonly #selectors = createSessionSelectors();
   readonly #toolItemOverflowTurns = new Set<string>();
+  readonly #reasoningSummaries = new ReasoningSummaryAccumulator();
+  readonly #providerSubagents = new ProviderSubagentProjectionTracker();
 
   constructor(options: SessionServiceOptions) {
+    this.#accounts = options.accounts;
     this.#commands = new SessionCommandExecutor(options.accounts);
     this.#onTurnLifecycle = options.onTurnLifecycle ?? (() => undefined);
     this.#registry = new SessionRegistry({
@@ -698,6 +808,7 @@ export class SessionService {
     this.#onInteractionRequest = options.onInteractionRequest ?? (() => null);
     this.#onAssistantItemCompletion = options.onAssistantItemCompletion ?? (() => undefined);
     this.#onReasoningItemCompletion = options.onReasoningItemCompletion ?? (() => undefined);
+    this.#onProviderSubagents = options.onProviderSubagents ?? (() => undefined);
     this.#onToolItemStarted = options.onToolItemStarted ?? (() => undefined);
     this.#onTurnActivity = options.onTurnActivity ?? (() => undefined);
     this.#interactions = new SessionInteractionCoordinator({
@@ -808,9 +919,12 @@ export class SessionService {
         this.#interactions.endGeneration(accountProfileId, state.generation);
         this.#hydration.endGeneration(accountProfileId, state.generation);
         if (this.#activeRuntimeGenerations.get(accountProfileId) === state.generation) {
+          this.#clearProviderSubagentsForAccount(accountProfileId);
+          this.#reasoningSummaries.purgeAccount(accountProfileId);
           this.#clearToolActivityForAccount(accountProfileId);
           this.#clearHarnessActorThreadsForAccount(accountProfileId);
           this.#clearProductionPolicyForAccount(accountProfileId);
+          this.#clearChatCapabilityForAccount(accountProfileId);
           this.#activeRuntimeGenerations.delete(accountProfileId);
           this.#reportedHydrationFailureGenerations.delete(accountProfileId);
         }
@@ -822,6 +936,8 @@ export class SessionService {
    * has confirmed removal. No provider observation can invoke this path.
    */
   purgeAccount(accountProfileId: string): void {
+    this.#clearProviderSubagentsForAccount(accountProfileId);
+    this.#reasoningSummaries.purgeAccount(accountProfileId);
     this.#interactions.purgeAccount(accountProfileId);
     this.#hydration.purgeAccount(accountProfileId);
     this.#store.purgeAccount(accountProfileId);
@@ -830,6 +946,7 @@ export class SessionService {
     this.#clearToolActivityForAccount(accountProfileId);
     this.#clearHarnessActorThreadsForAccount(accountProfileId);
     this.#clearProductionPolicyForAccount(accountProfileId);
+    this.#clearChatCapabilityForAccount(accountProfileId);
     this.#reportedHydrationFailureGenerations.delete(accountProfileId);
     this.#activeRuntimeGenerations.delete(accountProfileId);
   }
@@ -853,6 +970,28 @@ export class SessionService {
       registered.accountProfileId !== thread.accountProfileId ||
       this.#activeRuntimeGenerations.get(thread.accountProfileId) !==
         registered.receipt.generation
+    ) return null;
+    return registered.receipt;
+  }
+
+  verifiedChatCapabilityForActiveTurn(
+    threadId: ThreadSummary["id"],
+    turnId: string,
+  ): SessionChatCapabilityReceipt | null {
+    const policy = this.verifiedProductionExecutionPolicyForActiveTurn(
+      threadId,
+      turnId,
+    );
+    const registered = this.#chatCapabilityByTurn.get(turnId);
+    if (
+      policy === null || registered === undefined ||
+      registered.threadId !== threadId ||
+      registered.receipt.generation !== policy.generation ||
+      !this.#chatCatalogsByEvidence.has(chatCatalogEvidenceKey(
+        registered.accountProfileId,
+        registered.receipt.generation,
+        registered.receipt.catalogDigest,
+      ))
     ) return null;
     return registered.receipt;
   }
@@ -2059,7 +2198,7 @@ export class SessionService {
     validateLaunchText(request.clientUserMessageId, request.prompt);
     await this.#startTurn({
       clientUserMessageId: request.clientUserMessageId,
-      input: { type: "text", text: request.prompt },
+      input: [{ type: "text", text: request.prompt }],
       model: "gpt-5.6-sol",
       reasoningEffort: request.reasoningEffort ?? "max",
       serviceTier: request.serviceTier ?? "standard",
@@ -2073,7 +2212,8 @@ export class SessionService {
   async resolveChatConfiguration(
     accountProfileId: AccountSummary["id"],
     candidates: readonly SessionChatConfigurationCandidate[],
-  ): Promise<SessionChatConfigurationCandidate> {
+    requiredInputClass: "text" | "image" = "text",
+  ): Promise<SessionResolvedChatConfiguration> {
     if (candidates.length === 0 || candidates.length > 8) {
       throw new SessionServiceError(
         "protocol_error",
@@ -2082,7 +2222,16 @@ export class SessionService {
         "none",
       );
     }
+    if (requiredInputClass !== "text" && requiredInputClass !== "image") {
+      throw new SessionServiceError(
+        "protocol_error",
+        "HRA supplied an invalid required input class.",
+        false,
+        "none",
+      );
+    }
     const byModel = new Map<string, Readonly<{
+      observedInputModalities: readonly ("text" | "image")[] | null;
       reasoningEfforts: readonly string[];
       serviceTiers: readonly string[];
     }>>();
@@ -2108,6 +2257,9 @@ export class SessionService {
       }
       for (const entry of response.output.data) {
         const normalized = Object.freeze({
+          observedInputModalities: entry.inputModalities === null
+            ? null
+            : Object.freeze([...entry.inputModalities].toSorted()),
           reasoningEfforts: Object.freeze(
             [...new Set(entry.supportedReasoningEfforts.map(
               ({ reasoningEffort: effort }) => effort,
@@ -2155,16 +2307,49 @@ export class SessionService {
         "restartRuntime",
       );
     }
+    if (expectedGeneration === null) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex returned no model-catalog generation.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const models = Object.freeze([...byModel.entries()]
+      .map(([model, capability]) => Object.freeze({ model, ...capability }))
+      .toSorted((left, right) => left.model.localeCompare(right.model)));
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update("hra.chat.model-catalog.v2\0");
+    hasher.update(JSON.stringify({ generation: expectedGeneration, models }));
+    const catalogDigest = hasher.digest("hex");
+    const catalog = Object.freeze({
+      accountProfileId,
+      catalogDigest,
+      generation: expectedGeneration,
+      models,
+    });
+    this.#chatCatalogsByEvidence.set(
+      chatCatalogEvidenceKey(accountProfileId, expectedGeneration, catalogDigest),
+      catalog,
+    );
     for (const candidate of candidates) {
       const capability = byModel.get(candidate.model);
       if (
         capability !== undefined &&
         capability.reasoningEfforts.includes(candidate.reasoningEffort) &&
+        supportsRequiredInput(capability.observedInputModalities, requiredInputClass) &&
         (
           candidate.serviceTier === "standard" ||
           capability.serviceTiers.includes("fast")
         )
-      ) return candidate;
+      ) {
+        return Object.freeze({
+          ...candidate,
+          catalogGeneration: expectedGeneration,
+          catalogDigest,
+          observedInputModalities: capability.observedInputModalities,
+        });
+      }
     }
     throw new SessionServiceError(
       "capability_unavailable",
@@ -2259,14 +2444,68 @@ export class SessionService {
     );
   }
 
+  #requireChatCatalogEvidence(
+    accountProfileId: string,
+    generation: number,
+    catalogDigest: string,
+  ): RegisteredChatCatalog {
+    const catalog = this.#chatCatalogsByEvidence.get(chatCatalogEvidenceKey(
+      accountProfileId,
+      generation,
+      catalogDigest,
+    ));
+    if (
+      catalog === undefined || catalog.generation !== generation ||
+      catalog.catalogDigest !== catalogDigest ||
+      this.#activeRuntimeGenerations.get(accountProfileId) !== generation
+    ) {
+      throw new SessionServiceError(
+        "conflict",
+        "The exact chat model catalog is no longer active.",
+        true,
+        "retry",
+      );
+    }
+    return catalog;
+  }
+
+  #requireChatCatalogThreadSelection(
+    catalog: RegisteredChatCatalog,
+    request: Readonly<{
+      model: "gpt-5.6-sol" | "gpt-5.6-luna";
+      serviceTier: ChatServiceTier;
+    }>,
+  ): void {
+    const capability = catalog.models.find(({ model }) => model === request.model);
+    if (
+      capability === undefined ||
+      (request.serviceTier === "fast" && !capability.serviceTiers.includes("fast"))
+    ) {
+      throw new SessionServiceError(
+        "capability_unavailable",
+        "The chat thread configuration is absent from the exact model catalog.",
+        false,
+        "none",
+      );
+    }
+  }
+
   async startChatThread(
     request: Omit<SessionThreadStartRequest, "serviceTier" | "workspaceMode"> &
       Readonly<{
         readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
         readonly serviceTier: ChatServiceTier;
+        readonly catalogGeneration: number;
+        readonly catalogDigest: string;
       }>,
   ): Promise<SessionChatThreadStartResult> {
     validateLaunchTitle(request.title);
+    const catalog = this.#requireChatCatalogEvidence(
+      request.accountProfileId,
+      request.catalogGeneration,
+      request.catalogDigest,
+    );
+    this.#requireChatCatalogThreadSelection(catalog, request);
     const project = await this.#registerProject(request.workspacePath);
     const thread = await this.#startThread({
       accountProfileId: request.accountProfileId,
@@ -2275,6 +2514,7 @@ export class SessionService {
       projectId: project.id,
       serviceTier: request.serviceTier,
       title: request.title,
+      expectedGeneration: request.catalogGeneration,
     });
     const result = { project, thread };
     const binding = this.#registry.requireBinding(result.thread.id);
@@ -2283,6 +2523,12 @@ export class SessionService {
 
   async resumeChatThread(request: SessionChatThreadResumeRequest): Promise<ThreadSummary> {
     validateLaunchTitle(request.title);
+    const catalog = this.#requireChatCatalogEvidence(
+      request.accountProfileId,
+      request.catalogGeneration,
+      request.catalogDigest,
+    );
+    this.#requireChatCatalogThreadSelection(catalog, request);
     const project = await this.#registerProject(request.workspacePath);
     const expectedOwnedId = ownedCodexId(
       "thread",
@@ -2316,6 +2562,7 @@ export class SessionService {
     }
     const policyProof = await this.#preflightProductionExecutionPolicy(
       request.accountProfileId,
+      request.catalogGeneration,
     );
     const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
       threadId: request.restartThreadId,
@@ -2378,10 +2625,19 @@ export class SessionService {
   async setChatThreadName(threadId: ThreadSummary["id"], name: string): Promise<void> {
     validateLaunchTitle(name);
     const binding = this.#registry.requireBinding(threadId);
+    const policy = this.#productionPolicyByThread.get(threadId);
+    if (policy === undefined) {
+      throw new SessionServiceError(
+        "conflict",
+        "The chat lacks an active generation-fenced thread admission.",
+        true,
+        "retry",
+      );
+    }
     await this.#commands.threadSetName(binding.accountProfileId, {
       threadId: binding.codexThreadId,
       name,
-    });
+    }, policy.receipt.generation);
   }
 
   async injectChatHistory(
@@ -2397,6 +2653,15 @@ export class SessionService {
       );
     }
     const binding = this.#registry.requireBinding(threadId);
+    const policy = this.#productionPolicyByThread.get(threadId);
+    if (policy === undefined) {
+      throw new SessionServiceError(
+        "conflict",
+        "The chat lacks an active generation-fenced thread admission.",
+        true,
+        "retry",
+      );
+    }
     await this.#commands.threadInjectItems(binding.accountProfileId, {
       threadId: binding.codexThreadId,
       items: history.map((item) => item.role === "user"
@@ -2410,26 +2675,79 @@ export class SessionService {
             role: "assistant" as const,
             content: [{ type: "output_text" as const, text: item.text }],
           }),
-    });
+    }, policy.receipt.generation);
   }
 
   async startChatTurn(request: SessionChatTurnStartRequest): Promise<SessionChatTurnStartResult> {
-    validateLaunchText(request.clientUserMessageId, request.prompt);
+    const providerInput = "input" in request && request.input !== undefined
+      ? validateChatProviderInput(request.clientUserMessageId, request.input)
+      : (() => {
+          const prompt = "prompt" in request ? request.prompt : undefined;
+          if (prompt === undefined) {
+            throw new SessionServiceError(
+              "invalid_request",
+              "The chat provider input is unavailable.",
+              false,
+              "none",
+            );
+          }
+          validateLaunchText(request.clientUserMessageId, prompt);
+          return Object.freeze([{ type: "text" as const, text: prompt }]);
+        })();
+    const catalog = this.#requireChatCatalogEvidence(
+      this.#registry.requireBinding(request.threadId).accountProfileId,
+      request.catalogGeneration,
+      request.catalogDigest,
+    );
+    const capability = catalog.models.find((model) => model.model === request.model);
+    const requiresImage = providerInput.some((item) => item.type === "localImage");
+    if (
+      capability === undefined ||
+      capability.reasoningEfforts.includes(request.reasoningEffort) === false ||
+      (request.serviceTier === "fast" && !capability.serviceTiers.includes("fast")) ||
+      JSON.stringify(capability.observedInputModalities) !==
+        JSON.stringify(request.observedInputModalities) ||
+      !supportsRequiredInput(
+        capability.observedInputModalities,
+        requiresImage ? "image" : "text",
+      )
+    ) {
+      throw new SessionServiceError(
+        "capability_unavailable",
+        "The selected chat input is not supported by the exact model catalog.",
+        false,
+        "none",
+      );
+    }
     const positioned = await this.#startTurn({
       clientUserMessageId: request.clientUserMessageId,
-      input: { type: "text", text: request.prompt },
+      input: providerInput,
       model: request.model,
       reasoningEffort: request.reasoningEffort,
       serviceTier: request.serviceTier,
       threadId: request.threadId,
+      expectedGeneration: request.catalogGeneration,
     });
     const binding = this.#registry.requireBinding(request.threadId);
-    return {
+    const result = {
       threadId: request.threadId,
       turnId: ownedCodexId("turn", binding.accountProfileId, positioned.output.turn.id),
       generation: positioned.generation,
       streamPosition: positioned.streamPosition,
     };
+    this.#chatCapabilityByTurn.set(result.turnId, Object.freeze({
+      accountProfileId: binding.accountProfileId,
+      threadId: request.threadId,
+      receipt: Object.freeze({
+        catalogDigest: request.catalogDigest,
+        generation: positioned.generation,
+        model: request.model,
+        observedInputModalities: capability.observedInputModalities,
+        reasoningEffort: request.reasoningEffort,
+        serviceTier: request.serviceTier,
+      }),
+    }));
+    return result;
   }
 
   async interruptChatTurn(
@@ -2437,6 +2755,153 @@ export class SessionService {
     expectedTurnId: string,
   ): Promise<void> {
     await this.#interruptTurn({ threadId, expectedTurnId });
+  }
+
+  async prepareChatThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    generation: number;
+  }>> {
+    this.#validatePersistedChatThreadBinding(binding);
+    const generation = await this.#ensureArchiveRecoveryGeneration(
+      binding.accountProfileId,
+      archiveHandle,
+    );
+    return Object.freeze({ generation });
+  }
+
+  async archiveChatThread(
+    binding: ChatThreadBinding,
+    expectedGeneration: number,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    containmentReceipt: string;
+    generation: number;
+    streamPosition: number;
+  }>> {
+    if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+      throw new SessionServiceError(
+        "invalid_request",
+        "The provider archive generation is invalid.",
+        false,
+        "none",
+      );
+    }
+    this.#validatePersistedChatThreadBinding(binding);
+    this.#assertArchiveAdmissionHandle(archiveHandle);
+    return await this.#serializeChatThreadArchive(binding.threadId, async () => {
+      if (
+        this.#activeRuntimeGenerations.get(binding.accountProfileId) !==
+          expectedGeneration
+      ) {
+        throw new SessionServiceError(
+          "conflict",
+          "The provider thread archive generation changed before dispatch.",
+          true,
+          "retry",
+        );
+      }
+      const positioned = await this.#requestArchiveRecoveryWithResponsePosition(
+        binding.accountProfileId,
+        archiveHandle,
+        "threadArchive",
+        { threadId: binding.restartThreadId },
+        expectedGeneration,
+      );
+      if (positioned.generation !== expectedGeneration) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "The provider thread archive response changed generation.",
+          false,
+          "restartRuntime",
+        );
+      }
+      return Object.freeze({
+        containmentReceipt: chatThreadArchiveContainmentReceipt({
+          generation: positioned.generation,
+          streamPosition: positioned.streamPosition,
+          threadId: binding.threadId,
+        }),
+        generation: positioned.generation,
+        streamPosition: positioned.streamPosition,
+      });
+    });
+  }
+
+  async reconcileChatThreadArchive(
+    binding: ChatThreadBinding,
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{
+    disposition: "applied" | "not_applied" | "ambiguous";
+    evidenceReceipt: string;
+    generation: number;
+    streamPosition: number;
+    containmentReceipt: string | null;
+  }>> {
+    this.#validatePersistedChatThreadBinding(binding);
+    this.#assertArchiveAdmissionHandle(archiveHandle);
+    return await this.#serializeChatThreadArchive(binding.threadId, async () => {
+      const expectedGeneration = await this.#ensureArchiveRecoveryGeneration(
+        binding.accountProfileId,
+        archiveHandle,
+      );
+      const first = await this.#scanChatThreadArchiveState(
+        binding.accountProfileId,
+        archiveHandle,
+        expectedGeneration,
+        -1,
+      );
+      const second = await this.#scanChatThreadArchiveState(
+        binding.accountProfileId,
+        archiveHandle,
+        expectedGeneration,
+        first.streamPosition,
+      );
+      const generation = first.generation;
+      const stable = first.canonicalDigest === second.canonicalDigest;
+      const activeTargetCount = second.activeThreadIds.filter(
+        (threadId) => threadId === binding.restartThreadId,
+      ).length;
+      const archivedTargetCount = second.archivedThreadIds.filter(
+        (threadId) => threadId === binding.restartThreadId,
+      ).length;
+      const disposition = stable &&
+          activeTargetCount === 0 && archivedTargetCount === 1
+        ? "applied" as const
+        : stable && activeTargetCount === 1 && archivedTargetCount === 0
+          ? "not_applied" as const
+          : "ambiguous" as const;
+      const hasher = new Bun.CryptoHasher("sha256");
+      hasher.update("hra.chat.thread-archive-reconciliation.v2\0");
+      hasher.update(JSON.stringify({
+        disposition,
+        first: {
+          canonical: first.canonicalDigest,
+          positioned: first.positionedDigest,
+        },
+        generation,
+        second: {
+          canonical: second.canonicalDigest,
+          positioned: second.positionedDigest,
+        },
+        threadId: binding.threadId,
+      }));
+      const evidenceReceipt = `chatarchivescan_${hasher.digest("hex")}`;
+      return Object.freeze({
+        disposition,
+        evidenceReceipt,
+        generation,
+        streamPosition: second.streamPosition,
+        containmentReceipt: disposition === "applied"
+          ? chatThreadArchiveContainmentReceipt({
+            generation,
+            streamPosition: second.streamPosition,
+            threadId: binding.threadId,
+          })
+          : null,
+      });
+    });
   }
 
   async reconcileThread(input: {
@@ -2589,7 +3054,20 @@ export class SessionService {
   }
 
   async steer(request: SessionSteerRequest): Promise<void> {
-    validateLaunchText(request.clientUserMessageId, request.prompt);
+    const providerInput = request.input !== undefined
+      ? validateChatProviderInput(request.clientUserMessageId, request.input)
+      : (() => {
+          if (request.prompt === undefined) {
+            throw new SessionServiceError(
+              "invalid_request",
+              "The steering input is unavailable.",
+              false,
+              "none",
+            );
+          }
+          validateLaunchText(request.clientUserMessageId, request.prompt);
+          return Object.freeze([{ type: "text" as const, text: request.prompt }]);
+        })();
     if (
       !Number.isSafeInteger(request.expectedGeneration) ||
       request.expectedGeneration < 1
@@ -2613,11 +3091,33 @@ export class SessionService {
         "resolveAttention",
       );
     }
+    if (request.input !== undefined) {
+      const capability = this.verifiedChatCapabilityForActiveTurn(
+        request.threadId,
+        request.expectedTurnId,
+      );
+      if (
+        capability === null || capability.catalogDigest !== request.catalogDigest ||
+        JSON.stringify(capability.observedInputModalities) !==
+          JSON.stringify(request.observedInputModalities) ||
+        (
+          providerInput.some((item) => item.type === "localImage") &&
+          !supportsRequiredInput(capability.observedInputModalities, "image")
+        )
+      ) {
+        throw new SessionServiceError(
+          "capability_unavailable",
+          "The active turn has no exact image-capability receipt.",
+          false,
+          "resolveAttention",
+        );
+      }
+    }
     await this.#steerTurn({
       clientUserMessageId: request.clientUserMessageId,
       expectedGeneration: request.expectedGeneration,
       expectedTurnId: request.expectedTurnId,
-      input: { type: "text", text: request.prompt },
+      input: providerInput,
       threadId: request.threadId,
     });
   }
@@ -2644,6 +3144,34 @@ export class SessionService {
             ? {}
             : { preferredTitle: preferred.preferredTitle }),
         });
+        for (const turn of fact.thread.turns ?? []) {
+          const turnFact = {
+            ...fact,
+            type: "turn.snapshot" as const,
+            threadId: fact.thread.id,
+            turn,
+          };
+          if (turn.status === "active") {
+            this.#reconcileProviderSubagents(
+              turnFact,
+              turn.providerAgents ?? [],
+            );
+          }
+          for (const item of turn.items ?? []) {
+            if (item.kind === "reasoning_summary") {
+              this.#publishReasoningSnapshotCompletion(turnFact, item);
+            }
+          }
+          if (turn.status !== "active") {
+            this.#completeProviderSubagents(turnFact);
+            this.#reasoningSummaries.clearTurn({
+              accountProfileId: fact.accountProfileId,
+              generation: fact.generation,
+              threadId: fact.thread.id,
+              turnId: turn.id,
+            });
+          }
+        }
         this.#factDispatch.consume(fact);
         return true;
       }
@@ -2668,23 +3196,49 @@ export class SessionService {
               fact.turn.id,
             );
         if (fact.turn.status !== "active") {
-          this.#productionPolicyByTurn.delete(
-            ownedCodexId("turn", fact.accountProfileId, fact.turn.id),
-          );
+          const ownedTurnId = ownedCodexId("turn", fact.accountProfileId, fact.turn.id);
+          this.#productionPolicyByTurn.delete(ownedTurnId);
+          this.#chatCapabilityByTurn.delete(ownedTurnId);
         }
         this.#registry.observeTurn(binding, fact.turn.id);
+        if (fact.turn.items !== null) {
+          if (fact.turn.status === "active") {
+            this.#reconcileProviderSubagents(fact, fact.turn.providerAgents ?? []);
+          }
+          for (const item of fact.turn.items) {
+            if (item.kind === "reasoning_summary") {
+              this.#publishReasoningSnapshotCompletion(fact, item);
+            }
+          }
+        }
+        if (fact.turn.status !== "active") {
+          this.#completeProviderSubagents(fact);
+          this.#reasoningSummaries.clearTurn({
+            accountProfileId: fact.accountProfileId,
+            generation: fact.generation,
+            threadId: fact.threadId,
+            turnId: fact.turn.id,
+          });
+        }
         if (completion !== null) this.#publishTurnActivity(completion);
         return true;
       }
       case "turn.completed": {
-        this.#productionPolicyByTurn.delete(
-          ownedCodexId("turn", fact.accountProfileId, fact.turnId),
-        );
+        const ownedTurnId = ownedCodexId("turn", fact.accountProfileId, fact.turnId);
+        this.#productionPolicyByTurn.delete(ownedTurnId);
+        this.#chatCapabilityByTurn.delete(ownedTurnId);
         const completion = this.#closeActiveToolActivity(
           fact.accountProfileId,
           fact.threadId,
           fact.turnId,
         );
+        this.#completeProviderSubagents(fact);
+        this.#reasoningSummaries.clearTurn({
+          accountProfileId: fact.accountProfileId,
+          generation: fact.generation,
+          threadId: fact.threadId,
+          turnId: fact.turnId,
+        });
         if (completion !== null) this.#publishTurnActivity(completion);
         return completion !== null;
       }
@@ -2705,8 +3259,12 @@ export class SessionService {
       case "turn.activity":
         return this.#publishOwnedFactActivity(fact, fact.activity);
       case "item.started":
+        this.#observeProviderSubagents(fact, fact.providerAgents ?? []);
         return this.#consumeItemStartedFact(fact);
       case "item.delta": {
+        if (fact.channel === "reasoning_summary") {
+          return this.#consumeReasoningSummaryDelta(fact);
+        }
         const activity = fact.channel === "assistant_text"
           ? "assistant_message_delta"
           : "reasoning_summary_delta";
@@ -2719,6 +3277,7 @@ export class SessionService {
         return this.#factDispatch.consume(fact) || published;
       }
       case "item.completed": {
+        this.#observeProviderSubagents(fact, fact.providerAgents ?? []);
         const published = fact.item.kind === "tool"
           ? this.#consumeToolLifecycleFact(fact, "tool_activity_completed")
           : fact.item.kind === "assistant_text"
@@ -2820,6 +3379,7 @@ export class SessionService {
       "tool_activity_completed" | "tool_activity_started">,
     displayText?: string,
     providerItemId?: string,
+    summaryIndex?: number,
   ): boolean {
     if (
       (kind === "assistant_message_delta" || kind === "reasoning_summary_delta") &&
@@ -2837,6 +3397,8 @@ export class SessionService {
         ? {
             kind,
             displayText: displayText ?? "",
+            providerItemId: providerItemId ?? "",
+            summaryIndex: summaryIndex ?? -1,
             threadId: fact.threadId,
             turnId: fact.turnId,
           }
@@ -2845,6 +3407,40 @@ export class SessionService {
     if (owned === null) return false;
     this.#publishTurnActivity(owned);
     return true;
+  }
+
+  #consumeReasoningSummaryDelta(
+    fact: Extract<CodexFact, { type: "item.delta"; channel: "reasoning_summary" }>,
+  ): boolean {
+    let accepted = false;
+    try {
+      accepted = this.#reasoningSummaries.observeDelta({
+        accountProfileId: fact.accountProfileId,
+        generation: fact.generation,
+        threadId: fact.threadId,
+        turnId: fact.turnId,
+        itemId: fact.itemId,
+        cursor: {
+          generation: fact.generation,
+          streamPosition: fact.streamPosition,
+          factIndex: fact.factIndex,
+        },
+        delta: fact.delta,
+        summaryIndex: fact.summaryIndex,
+        truncated: fact.truncated,
+      });
+    } catch {
+      return false;
+    }
+    if (!accepted) return false;
+    const published = this.#publishOwnedFactActivity(
+      fact,
+      "reasoning_summary_delta",
+      fact.delta,
+      fact.itemId,
+      fact.summaryIndex,
+    );
+    return this.#factDispatch.consume(fact) || published;
   }
 
   #publishAssistantItemCompletion(
@@ -2902,17 +3498,33 @@ export class SessionService {
 
   #publishReasoningItemCompletion(
     fact: Extract<CodexFact, { type: "item.completed" }>,
+    requireActive = true,
   ): boolean {
     if (fact.item.kind !== "reasoning_summary") return false;
     const owned = this.#ownedActivity(fact.accountProfileId, {
       kind: "planning",
       threadId: fact.threadId,
       turnId: fact.turnId,
-    });
+    }, requireActive);
     if (owned === null) return false;
+    const receipt = this.#reasoningSummaries.complete({
+      accountProfileId: fact.accountProfileId,
+      generation: fact.generation,
+      threadId: fact.threadId,
+      turnId: fact.turnId,
+      itemId: fact.item.id,
+      cursor: {
+        generation: fact.generation,
+        streamPosition: fact.streamPosition,
+        factIndex: fact.factIndex,
+      },
+      summaryParts: fact.item.summaryParts,
+      truncated: fact.item.truncated,
+    });
     const event: SessionReasoningItemCompletion = {
       accountProfileId: owned.accountProfileId,
       itemId: ownedCodexId("item", fact.accountProfileId, fact.item.id),
+      receipt,
       threadId: owned.threadId,
       turnId: owned.turnId,
     };
@@ -2922,6 +3534,123 @@ export class SessionService {
       // Exact item observation cannot destabilize accepted session facts.
     }
     return true;
+  }
+
+  #publishReasoningSnapshotCompletion(
+    fact: Extract<CodexFact, { type: "turn.snapshot" }>,
+    item: Extract<NonNullable<typeof fact.turn.items>[number], {
+      kind: "reasoning_summary";
+    }>,
+  ): boolean {
+    const requireActive = fact.turn.status === "active" ||
+      !this.#isExactCurrentTerminalTurn(
+        fact.accountProfileId,
+        fact.threadId,
+        fact.turn.id,
+      );
+    return this.#publishReasoningItemCompletion({
+      ...fact,
+      type: "item.completed",
+      turnId: fact.turn.id,
+      item,
+    }, requireActive);
+  }
+
+  #providerScope(
+    fact: Readonly<{
+      accountProfileId: string;
+      generation: number;
+      threadId: string;
+      turnId: string;
+    }>,
+  ): ProviderSubagentTurnScope {
+    return {
+      accountProfileId: fact.accountProfileId,
+      generation: fact.generation,
+      threadId: fact.threadId,
+      turnId: fact.turnId,
+    };
+  }
+
+  #observeProviderSubagents(
+    fact: Extract<CodexFact, { type: "item.started" | "item.completed" }>,
+    observations: readonly NonNullable<typeof fact.providerAgents>[number][],
+  ): boolean {
+    if (observations.length === 0) return false;
+    const scope = this.#providerScope(fact);
+    let changed = false;
+    try {
+      for (const observation of observations) {
+        changed = this.#providerSubagents.observe({
+          ...scope,
+          ...observation,
+          streamPosition: fact.streamPosition,
+          factIndex: fact.factIndex,
+        }) || changed;
+      }
+    } catch {
+      return false;
+    }
+    if (changed) this.#publishProviderSubagents(scope);
+    return changed;
+  }
+
+  #reconcileProviderSubagents(
+    fact: Extract<CodexFact, { type: "turn.snapshot" }>,
+    observations: readonly NonNullable<typeof fact.turn.providerAgents>[number][],
+  ): boolean {
+    const scope = this.#providerScope({
+      ...fact,
+      turnId: fact.turn.id,
+    });
+    let changed = false;
+    try {
+      changed = this.#providerSubagents.reconcile(scope, observations, {
+        streamPosition: fact.streamPosition,
+        factIndex: fact.factIndex,
+      });
+    } catch {
+      return false;
+    }
+    if (changed) this.#publishProviderSubagents(scope);
+    return changed;
+  }
+
+  #completeProviderSubagents(
+    fact: Extract<CodexFact, { type: "turn.completed" | "turn.snapshot" }>,
+  ): void {
+    const scope = this.#providerScope(fact.type === "turn.snapshot"
+      ? { ...fact, turnId: fact.turn.id }
+      : fact);
+    const current = this.#providerSubagents.snapshot(scope);
+    this.#providerSubagents.completeTurn(scope);
+    if (current.agents.length > 0 || current.overflowCount > 0) {
+      this.#publishProviderSubagents(scope);
+    }
+  }
+
+  #publishProviderSubagents(scope: ProviderSubagentTurnScope): void {
+    const owned = this.#ownedActivity(scope.accountProfileId, {
+      kind: "planning",
+      threadId: scope.threadId,
+      turnId: scope.turnId,
+    }, false);
+    if (owned === null) return;
+    const snapshot = this.#providerSubagents.snapshot(scope);
+    const event: SessionProviderSubagents = {
+      accountProfileId: owned.accountProfileId,
+      threadId: owned.threadId,
+      turnId: owned.turnId,
+      projection: {
+        agents: snapshot.agents.map((agent) => ({ ...agent })),
+        overflowCount: snapshot.overflowCount,
+      },
+    };
+    try {
+      void Promise.resolve(this.#onProviderSubagents(event)).catch(() => undefined);
+    } catch {
+      // Collaboration projection is auxiliary to accepted provider facts.
+    }
   }
 
   async handleServerRequest(
@@ -3022,6 +3751,265 @@ export class SessionService {
     });
   }
 
+  async #ensureArchiveRecoveryGeneration(
+    accountProfileId: AccountSummary["id"],
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<number> {
+    this.#assertArchiveAdmissionHandle(archiveHandle);
+    const ensured = await this.#accounts.ensureArchiveRecoveryRuntime(
+      accountProfileId,
+      archiveHandle,
+    );
+    if (!Number.isSafeInteger(ensured.generation) || ensured.generation < 1) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "The recovered provider runtime generation is invalid.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const observed = this.#activeRuntimeGenerations.get(accountProfileId);
+    if (observed !== undefined && observed !== ensured.generation) {
+      throw new SessionServiceError(
+        "conflict",
+        "The provider runtime changed while archive authority was recovered.",
+        true,
+        "retry",
+      );
+    }
+    this.#activeRuntimeGenerations.set(accountProfileId, ensured.generation);
+    return ensured.generation;
+  }
+
+  #requestArchiveRecoveryWithResponsePosition<
+    Key extends "threadArchive" | "threadList"
+  >(
+    accountProfileId: AccountSummary["id"],
+    archiveHandle: ArchiveAdmissionHandle,
+    key: Key,
+    input: PinnedCodexRequestInput<Key>,
+    expectedGeneration: number,
+  ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<Key>>> {
+    this.#assertArchiveAdmissionHandle(archiveHandle);
+    return this.#accounts.requestArchiveRecoveryWithResponsePosition(
+      accountProfileId,
+      archiveHandle,
+      key,
+      input,
+      expectedGeneration,
+    );
+  }
+
+  async #scanChatThreadArchiveState(
+    accountProfileId: AccountSummary["id"],
+    archiveHandle: ArchiveAdmissionHandle,
+    expectedGeneration: number,
+    minimumStreamPosition: number,
+  ): Promise<Readonly<{
+    activeThreadIds: readonly string[];
+    archivedThreadIds: readonly string[];
+    canonicalDigest: string;
+    generation: number;
+    positionedDigest: string;
+    streamPosition: number;
+  }>> {
+    const scan = async (
+      archived: boolean,
+      afterStreamPosition: number,
+    ): Promise<ChatThreadArchiveCatalogScan> => {
+      const ids: string[] = [];
+      const pages: ChatThreadArchiveScanPage[] = [];
+      const seenIds = new Set<string>();
+      const seenCursors = new Set<string>();
+      let cursor: string | null = null;
+      let streamPosition = afterStreamPosition;
+      for (let pageOrdinal = 0; pageOrdinal < 64; pageOrdinal += 1) {
+        if (this.#activeRuntimeGenerations.get(accountProfileId) !== expectedGeneration) {
+          throw new SessionServiceError(
+            "conflict",
+            "The provider generation changed during archive reconciliation.",
+            true,
+            "retry",
+          );
+        }
+        const requestCursor = cursor;
+        const positioned: PinnedCodexResponseAtPosition<
+          PinnedCodexRequestOutput<"threadList">
+        > = await this.#requestArchiveRecoveryWithResponsePosition(
+          accountProfileId,
+          archiveHandle,
+          "threadList",
+          {
+            cursor,
+            limit: 256,
+            sortKey: "created_at",
+            sortDirection: "asc",
+            sourceKinds: ["appServer"],
+            archived,
+          },
+          expectedGeneration,
+        );
+        if (
+          positioned.generation !== expectedGeneration ||
+          positioned.streamPosition <= streamPosition
+        ) {
+          throw new SessionServiceError(
+            "protocol_error",
+            "Provider archive reconciliation response order changed.",
+            false,
+            "restartRuntime",
+          );
+        }
+        streamPosition = positioned.streamPosition;
+        const pageThreadIds: string[] = [];
+        for (const thread of positioned.output.data) {
+          if (seenIds.has(thread.id)) {
+            throw new SessionServiceError(
+              "protocol_error",
+              "Provider archive reconciliation returned a duplicate thread.",
+              false,
+              "restartRuntime",
+            );
+          }
+          seenIds.add(thread.id);
+          ids.push(thread.id);
+          pageThreadIds.push(thread.id);
+        }
+        const nextCursor: string | null = positioned.output.nextCursor;
+        pages.push(Object.freeze({
+          generation: positioned.generation,
+          pageOrdinal,
+          requestCursor,
+          responseBackwardsCursor: positioned.output.backwardsCursor,
+          responseNextCursor: nextCursor,
+          streamPosition,
+          threadIds: Object.freeze(pageThreadIds),
+        }));
+        if (nextCursor === null) {
+          return Object.freeze({
+            ids: Object.freeze(ids.toSorted()),
+            pages: Object.freeze(pages),
+            streamPosition,
+          });
+        }
+        if (seenCursors.has(nextCursor)) {
+          throw new SessionServiceError(
+            "protocol_error",
+            "Provider archive reconciliation returned a cyclic cursor.",
+            false,
+            "restartRuntime",
+          );
+        }
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      }
+      throw new SessionServiceError(
+        "protocol_error",
+        "Provider archive reconciliation exceeded its complete paging bound.",
+        false,
+        "restartRuntime",
+      );
+    };
+    const active = await scan(false, minimumStreamPosition);
+    const archived = await scan(true, active.streamPosition);
+    const archivedIds = new Set(archived.ids);
+    if (active.ids.some((id) => archivedIds.has(id))) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Provider archive reconciliation returned one thread in both catalogs.",
+        false,
+        "restartRuntime",
+      );
+    }
+    // Absolute stream positions must advance, so the second scan cannot equal
+    // the first byte-for-byte. Compare every stable page-shape field while
+    // binding both complete positioned traces into the final evidence receipt.
+    const canonicalTrace = {
+      active: active.pages.map(canonicalChatThreadArchiveScanPage),
+      archived: archived.pages.map(canonicalChatThreadArchiveScanPage),
+      generation: expectedGeneration,
+    };
+    const canonicalHasher = new Bun.CryptoHasher("sha256");
+    canonicalHasher.update("hra.chat.thread-archive-scan-canonical.v2\0");
+    canonicalHasher.update(JSON.stringify(canonicalTrace));
+    const positionedHasher = new Bun.CryptoHasher("sha256");
+    positionedHasher.update("hra.chat.thread-archive-scan-positioned.v2\0");
+    positionedHasher.update(JSON.stringify({
+      active: active.pages,
+      archived: archived.pages,
+      generation: expectedGeneration,
+    }));
+    return Object.freeze({
+      activeThreadIds: active.ids,
+      archivedThreadIds: archived.ids,
+      canonicalDigest: canonicalHasher.digest("hex"),
+      generation: expectedGeneration,
+      positionedDigest: positionedHasher.digest("hex"),
+      streamPosition: archived.streamPosition,
+    });
+  }
+
+  #validatePersistedChatThreadBinding(binding: ChatThreadBinding): void {
+    if (
+      binding.accountProfileId.length === 0 ||
+      binding.accountProfileId.length > 128 ||
+      binding.accountProfileId.includes("\0") ||
+      binding.restartThreadId.length === 0 ||
+      binding.restartThreadId.length > 512 ||
+      binding.restartThreadId.includes("\0") ||
+      ownedCodexId(
+        "thread",
+        binding.accountProfileId,
+        binding.restartThreadId,
+      ) !== binding.threadId
+    ) {
+      throw new SessionServiceError(
+        "invalid_request",
+        "The persisted chat archive identity does not match this Codex account.",
+        false,
+        "none",
+      );
+    }
+  }
+
+  #assertArchiveAdmissionHandle(
+    archiveHandle: ArchiveAdmissionHandle,
+  ): void {
+    if (
+      (typeof archiveHandle !== "object" && typeof archiveHandle !== "function") ||
+      archiveHandle === null
+    ) {
+      throw new SessionServiceError(
+        "invalid_request",
+        "Provider archive recovery requires an opaque admission handle.",
+        false,
+        "none",
+      );
+    }
+  }
+
+  async #serializeChatThreadArchive<T>(
+    threadId: ThreadSummary["id"],
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.#chatThreadArchiveTails.get(threadId) ??
+      Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#chatThreadArchiveTails.set(threadId, tail);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#chatThreadArchiveTails.get(threadId) === tail) {
+        this.#chatThreadArchiveTails.delete(threadId);
+      }
+    }
+  }
+
   async #registerProject(path: string): Promise<ProjectSummary> {
     if (!isAbsolute(path)) {
       throw new SessionServiceError(
@@ -3105,6 +4093,7 @@ export class SessionService {
     readonly projectId: ProjectSummary['id'];
     readonly serviceTier: ChatServiceTier;
     readonly title: string;
+    readonly expectedGeneration?: number;
   }): Promise<ThreadSummary> {
     const project = this.#registry.projectById(command.projectId);
     if (project === null) {
@@ -3112,6 +4101,7 @@ export class SessionService {
     }
     const policyProof = await this.#preflightProductionExecutionPolicy(
       command.accountProfileId,
+      command.expectedGeneration,
     );
     const threadStartInput: PinnedCodexRequestInput<"threadStart"> = {
       model: command.model,
@@ -3214,11 +4204,12 @@ export class SessionService {
 
   async #startTurn(command: {
     readonly clientUserMessageId: string;
-    readonly input: Readonly<{ readonly type: "text"; readonly text: string }>;
+    readonly input: readonly SessionChatProviderInput[];
     readonly model: "gpt-5.6-sol" | "gpt-5.6-luna";
     readonly reasoningEffort: "ultra" | "max";
     readonly serviceTier: ChatServiceTier;
     readonly threadId: ThreadSummary['id'];
+    readonly expectedGeneration?: number;
   }): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnStart">>> {
     const binding = this.#registry.requireBinding(command.threadId);
     const registeredThreadPolicy = this.#productionPolicyByThread.get(command.threadId);
@@ -3232,7 +4223,7 @@ export class SessionService {
     }
     const policyProof = await this.#preflightProductionExecutionPolicy(
       binding.accountProfileId,
-      registeredThreadPolicy.receipt.generation,
+      command.expectedGeneration ?? registeredThreadPolicy.receipt.generation,
     );
     const threadReceipt = this.#requireProductionThreadPolicy(
       command.threadId,
@@ -3241,7 +4232,9 @@ export class SessionService {
     const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
       threadId: binding.codexThreadId,
       clientUserMessageId: command.clientUserMessageId,
-      input: [{ type: "text", text: command.input.text, text_elements: [] }],
+      input: command.input.map((item) => item.type === "text"
+        ? { type: "text" as const, text: item.text, text_elements: [] }
+        : { type: "localImage" as const, path: item.path }),
       cwd: binding.cwd,
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
@@ -3286,7 +4279,7 @@ export class SessionService {
     readonly clientUserMessageId: string;
     readonly expectedGeneration: number;
     readonly expectedTurnId: string;
-    readonly input: Readonly<{ readonly type: "text"; readonly text: string }>;
+    readonly input: readonly SessionChatProviderInput[];
     readonly threadId: ThreadSummary['id'];
   }): Promise<void> {
     const binding = this.#registry.requireBinding(command.threadId);
@@ -3311,8 +4304,11 @@ export class SessionService {
         threadId: binding.codexThreadId,
         expectedTurnId: rawTurnId,
         clientUserMessageId: command.clientUserMessageId,
-        input: [{ type: "text", text: command.input.text, text_elements: [] }],
+        input: command.input.map((item) => item.type === "text"
+          ? { type: "text" as const, text: item.text, text_elements: [] }
+          : { type: "localImage" as const, path: item.path }),
       },
+      command.expectedGeneration,
     );
     if (positioned.generation !== command.expectedGeneration) {
       throw new SessionServiceError(
@@ -3339,6 +4335,22 @@ export class SessionService {
     readonly threadId: ThreadSummary['id'];
   }): Promise<void> {
     const binding = this.#registry.requireBinding(command.threadId);
+    const policy = this.#productionPolicyByTurn.get(command.expectedTurnId);
+    const activeGeneration = this.#activeRuntimeGenerations.get(binding.accountProfileId);
+    if (
+      activeGeneration === undefined ||
+      (policy !== undefined && (
+        policy.threadId !== command.threadId ||
+        activeGeneration !== policy.receipt.generation
+      ))
+    ) {
+      throw new SessionServiceError(
+        "conflict",
+        "The active turn lost its generation-fenced policy receipt.",
+        true,
+        "retry",
+      );
+    }
     const rawTurnId = this.#registry.rawTurnIdByOwnedId(command.expectedTurnId);
     if (rawTurnId === null) {
       throw new SessionServiceError("conflict", "The active turn changed.", true, "retry");
@@ -3346,6 +4358,7 @@ export class SessionService {
     const positioned = await this.#commands.turnInterrupt(
       binding.accountProfileId,
       { threadId: binding.codexThreadId, turnId: rawTurnId },
+      policy?.receipt.generation ?? activeGeneration,
     );
     this.#consumeCodexFacts(confirmedOperationFacts({
       accountProfileId: binding.accountProfileId,
@@ -3391,8 +4404,31 @@ export class SessionService {
           displayText: activity.displayText,
         }
       : activity.kind === "reasoning_summary_delta"
-      ? { ...base, kind: activity.kind, displayText: activity.displayText }
+      ? {
+          ...base,
+          kind: activity.kind,
+          displayText: activity.displayText,
+          reasoningItemId: ownedCodexId(
+            "item",
+            accountProfileId,
+            activity.providerItemId,
+          ),
+        }
       : { ...base, kind: activity.kind };
+  }
+
+  #isExactCurrentTerminalTurn(
+    accountProfileId: AccountSummary["id"],
+    rawThreadId: string,
+    rawTurnId: string,
+  ): boolean {
+    const state = this.#store.getSnapshot();
+    const threadKey = sessionEntityKey(accountProfileId, rawThreadId);
+    const turnKey = sessionEntityKey(accountProfileId, rawTurnId);
+    const thread = state.threads[threadKey];
+    const turn = state.turns[turnKey];
+    return thread !== undefined && turn?.threadKey === threadKey &&
+      thread.turnKeys.at(-1) === turnKey && turn.status !== "active";
   }
 
   #normalizeToolActivity(
@@ -3493,6 +4529,11 @@ export class SessionService {
         this.#productionPolicyByTurn.delete(turnId);
       }
     }
+    for (const [turnId, registered] of this.#chatCapabilityByTurn) {
+      if (registered.threadId === removed.thread.id) {
+        this.#chatCapabilityByTurn.delete(turnId);
+      }
+    }
     if (removed.binding !== null) {
       const binding = removed.binding;
       const prefix = activeToolThreadPrefix(accountProfileId, binding.codexThreadId);
@@ -3512,12 +4553,24 @@ export class SessionService {
 
   #beginRuntimeGeneration(accountProfileId: string, generation: number): void {
     if (this.#activeRuntimeGenerations.get(accountProfileId) !== generation) {
+      this.#clearProviderSubagentsForAccount(accountProfileId);
+      this.#reasoningSummaries.advanceGeneration(accountProfileId, generation);
       this.#clearToolActivityForAccount(accountProfileId);
       this.#clearHarnessActorThreadsForAccount(accountProfileId);
       this.#clearProductionPolicyForAccount(accountProfileId);
+      this.#clearChatCapabilityForAccount(accountProfileId);
       this.#reportedHydrationFailureGenerations.delete(accountProfileId);
     }
     this.#activeRuntimeGenerations.set(accountProfileId, generation);
+    this.#providerSubagents.advanceGeneration(accountProfileId, generation);
+  }
+
+  #clearProviderSubagentsForAccount(accountProfileId: string): void {
+    for (const scope of this.#providerSubagents.activeScopes(accountProfileId)) {
+      this.#providerSubagents.completeTurn(scope);
+      this.#publishProviderSubagents(scope);
+    }
+    this.#providerSubagents.purgeAccount(accountProfileId);
   }
 
   #admitToolTurn(accountProfileId: string): boolean {
@@ -3566,6 +4619,19 @@ export class SessionService {
     for (const [turnId, registered] of this.#productionPolicyByTurn) {
       if (registered.accountProfileId === accountProfileId) {
         this.#productionPolicyByTurn.delete(turnId);
+      }
+    }
+  }
+
+  #clearChatCapabilityForAccount(accountProfileId: string): void {
+    for (const [key, catalog] of this.#chatCatalogsByEvidence) {
+      if (catalog.accountProfileId === accountProfileId) {
+        this.#chatCatalogsByEvidence.delete(key);
+      }
+    }
+    for (const [turnId, registered] of this.#chatCapabilityByTurn) {
+      if (registered.accountProfileId === accountProfileId) {
+        this.#chatCapabilityByTurn.delete(turnId);
       }
     }
   }
@@ -4525,6 +5591,91 @@ function validateLaunchText(clientUserMessageId: string, prompt: string): void {
       "none",
     );
   }
+}
+
+function validateChatProviderInput(
+  clientUserMessageId: string,
+  input: readonly SessionChatProviderInput[],
+): readonly SessionChatProviderInput[] {
+  validateClientUserMessageId(clientUserMessageId);
+  if (input.length === 0 || input.length > 64) {
+    throw new SessionServiceError(
+      "invalid_request",
+      "The chat provider input is empty or too large.",
+      false,
+      "none",
+    );
+  }
+  let textBytes = 0;
+  for (const item of input) {
+    if (item.type === "text") {
+      if (item.text.length === 0 || item.text.includes("\0")) {
+        throw new SessionServiceError(
+          "invalid_request",
+          "The chat text input is invalid.",
+          false,
+          "none",
+        );
+      }
+      textBytes += new TextEncoder().encode(item.text).byteLength;
+    } else if (!isAbsolute(item.path) || item.path.includes("\0")) {
+      throw new SessionServiceError(
+        "invalid_request",
+        "The chat image input path is invalid.",
+        false,
+        "none",
+      );
+    }
+  }
+  if (textBytes > 1_000_000) {
+    throw new SessionServiceError(
+      "invalid_request",
+      "The chat text input is too large.",
+      false,
+      "none",
+    );
+  }
+  return input;
+}
+
+function supportsRequiredInput(
+  observed: readonly ("text" | "image")[] | null,
+  required: "text" | "image",
+): boolean {
+  if (required === "image") {
+    return observed !== null && observed.includes("text") && observed.includes("image");
+  }
+  return observed === null || observed.includes("text");
+}
+
+function chatCatalogEvidenceKey(
+  accountProfileId: string,
+  generation: number,
+  digest: string,
+): string {
+  return `${accountProfileId.length}:${accountProfileId}:${String(generation)}:${digest}`;
+}
+
+function canonicalChatThreadArchiveScanPage(page: ChatThreadArchiveScanPage) {
+  return Object.freeze({
+    generation: page.generation,
+    pageOrdinal: page.pageOrdinal,
+    requestCursor: page.requestCursor,
+    responseBackwardsCursor: page.responseBackwardsCursor,
+    responseNextCursor: page.responseNextCursor,
+    threadIds: page.threadIds,
+  });
+}
+
+function chatThreadArchiveContainmentReceipt(input: Readonly<{
+  readonly generation: number;
+  readonly streamPosition: number;
+  readonly threadId: string;
+}>): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update("hra.chat.thread-archive-containment.v1\0");
+  hasher.update(JSON.stringify(input));
+  return `chatarchive_${hasher.digest("hex")}`;
 }
 
 function validateLaunchTitle(title: string): void {

@@ -156,6 +156,7 @@ function incarnation(ownerActorId: string): ActorIncarnationRecord {
 function openedPane(): ChatPaneProjection {
   return {
     id: childPaneId,
+    paletteIndex: 0,
     revision: 1,
     title: "Inspect replay",
     repository: {
@@ -170,7 +171,9 @@ function openedPane(): ChatPaneProjection {
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }

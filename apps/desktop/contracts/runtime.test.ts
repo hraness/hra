@@ -1331,6 +1331,12 @@ describe("renderer runtime contracts", () => {
         expectedRevision: 4,
         turnId,
       },
+      {
+        type: "chat.pane.startFreshContext",
+        paneId,
+        expectedRevision: 4,
+        expectedQueueRevision: 1,
+      },
     ] as const) {
       expect(parseRuntimeDispatchRequest({
         version: runtimeProtocolVersion,
@@ -1490,6 +1496,7 @@ describe("renderer runtime contracts", () => {
     } as const;
     const pane = {
       id: paneId,
+      paletteIndex: 0,
       revision: 4,
       title: "Reducer",
       repository: { id: repositoryId, name: "example" },
@@ -1519,19 +1526,28 @@ describe("renderer runtime contracts", () => {
           totalUtf8Bytes: 8,
           truncatedPrefix: false,
         },
+        reasoningSummaryVerified: true,
         tools: [{ id: "chattool_contract01", category: "filesystem", status: "completed" }],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: automaticRoute,
       },
       attention: null,
       recoverablePrompt: false,
+      canStartFreshContext: false,
       messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+      attachments: { drafts: [], referenced: [] },
       harness: null,
     } as const;
     expect(parseRuntimeDispatchResponse({
       version: runtimeProtocolVersion,
       operationId: "op_chatcontract01",
       ok: true,
-      result: { type: "chatPane", pane },
+      result: {
+        type: "chatPane",
+        pane,
+        disposition: "applied",
+        appliedRevision: pane.revision,
+      },
     })).toMatchObject({ result: { type: "chatPane", pane } });
     expect(() => chatPaneProjectionSchema.parse({
       ...pane,
@@ -1593,6 +1609,7 @@ describe("renderer runtime contracts", () => {
     })).toThrow("ordinary root turns require routing");
     const paneState = {
       id: pane.id,
+      paletteIndex: pane.paletteIndex,
       revision: pane.revision,
       title: pane.title,
       accountProfileId: pane.accountProfileId,
@@ -1666,6 +1683,7 @@ describe("renderer runtime contracts", () => {
     } as const;
     const basePane = {
       id: paneId,
+      paletteIndex: 0,
       revision: 1,
       title: "New chat",
       repository: { id: repositoryId, name: "example" },
@@ -1694,11 +1712,16 @@ describe("renderer runtime contracts", () => {
         repositoryId,
       },
     } satisfies RuntimeChatDispatchRequest;
-    const response = (pane: unknown) => ({
+    const response = <Pane extends { readonly revision: number }>(pane: Pane) => ({
       version: runtimeProtocolVersion,
       operationId,
       ok: true,
-      result: { type: "chatPane", pane },
+      result: {
+        type: "chatPane",
+        pane,
+        disposition: "applied",
+        appliedRevision: pane.revision,
+      },
     });
     expect(parseRuntimeChatDispatchResponseForRequest(
       response(basePane),
@@ -1716,7 +1739,9 @@ describe("renderer runtime contracts", () => {
         continuationCount: 0,
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+        reasoningSummaryVerified: false,
         tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: automaticRoute,
       } },
     ]) {
@@ -1821,7 +1846,9 @@ describe("renderer runtime contracts", () => {
         continuationCount: 0,
         responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
         reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+        reasoningSummaryVerified: false,
         tools: [],
+        providerSubagents: { agents: [], overflowCount: 0 },
         routing: automaticRoute,
       },
     } as const;
@@ -1844,6 +1871,8 @@ describe("renderer runtime contracts", () => {
       result: {
         type: "chatMessageQueue" as const,
         paneId: responsePaneId,
+        disposition: "applied" as const,
+        messageId: "chatmsg_correlation01",
         queue: {
           revision,
           pauseReason: null,
@@ -1921,6 +1950,53 @@ describe("renderer runtime contracts", () => {
         stopRequest,
       )).toThrow();
     }
+
+    const replay = (
+      commandType:
+        | "chat.pane.create"
+        | "chat.pane.rename"
+        | "chat.pane.workspace.recover"
+        | "chat.pane.repository.select"
+        | "chat.turn.stop",
+      appliedRevision: number,
+      replayPaneId = paneId,
+    ) => ({
+      version: runtimeProtocolVersion,
+      operationId,
+      ok: true as const,
+      result: {
+        type: "chatPaneReplay" as const,
+        paneId: replayPaneId,
+        commandType,
+        appliedRevision,
+      },
+    });
+    for (const [request, commandType, appliedRevision] of [
+      [createRequest, "chat.pane.create", 1],
+      [renameRequest, "chat.pane.rename", 2],
+      [recoverRequest, "chat.pane.workspace.recover", 3],
+      [repositoryRequest, "chat.pane.repository.select", 2],
+      [stopRequest, "chat.turn.stop", 7],
+    ] as const) {
+      expect(parseRuntimeChatDispatchResponseForRequest(
+        replay(commandType, appliedRevision),
+        request,
+      )).toMatchObject({
+        result: { type: "chatPaneReplay", paneId, commandType, appliedRevision },
+      });
+    }
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      replay("chat.pane.rename", 1),
+      createRequest,
+    )).toThrow("pane creation replay response does not match");
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      replay("chat.pane.create", 1, "pane_correlation02"),
+      createRequest,
+    )).toThrow("pane creation replay response does not match");
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      replay("chat.turn.stop", 4),
+      stopRequest,
+    )).toThrow("turn stop replay response does not match");
 
     expect(() => parseRuntimeChatDispatchResponseForRequest(
       { ...queueResponse(2), operationId: "op_chatcorrelation02" },

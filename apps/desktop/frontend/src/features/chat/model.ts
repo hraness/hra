@@ -852,6 +852,12 @@ export function resumeMessageQueueCommand(
   return { type: "chat.messageQueue.resume", ...input };
 }
 
+export function startFreshProviderContextCommand(
+  input: Omit<MessageLedgerCommand<"chat.pane.startFreshContext">, "type">,
+): MessageLedgerCommand<"chat.pane.startFreshContext"> {
+  return { type: "chat.pane.startFreshContext", ...input };
+}
+
 export function discardAmbiguousMessageCommand(
   input: Omit<MessageLedgerCommand<"chat.message.discardAmbiguous">, "type">,
 ): MessageLedgerCommand<"chat.message.discardAmbiguous"> {

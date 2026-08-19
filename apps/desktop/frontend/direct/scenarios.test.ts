@@ -15,6 +15,7 @@ import {
 } from "./scenarios";
 import { applyRuntimeEvent } from "../src/runtime";
 import {
+  chatTurnProjectionSchema,
   runtimeProtocolVersion,
   runtimeSnapshotChunkCountLimit,
 } from "../../contracts/runtime";
@@ -536,7 +537,6 @@ describe("HRA Direct catalogs", () => {
     expect(compact.value.world.surface).toEqual({
       kind: "compactChat",
       paneId: "pane_compact_malleable",
-      paletteIndex: 5,
       nowUnixMilliseconds: 1_784_480_505_000,
       attachments: [{
         id: "attachment_compactdirect01",
@@ -564,5 +564,33 @@ describe("HRA Direct catalogs", () => {
           attachmentRefs: [],
         }],
       });
+    const attachmentCoverage = hraCoverageCatalog.list().find(
+      ({ key }) => key === "chat.pane.attachment-preview",
+    );
+    expect(attachmentCoverage?.mode).toBe("mixed");
+    expect(attachmentCoverage?.claim).toContain("focused live integration tests");
+  });
+
+  test("renders only completion-verified terminal reasoning", () => {
+    const completed = hraScenarioCatalog.resolve("chat-completed");
+    if (!completed.ok) throw new Error(completed.error.message);
+    const turn = completed.value.world.gateway.snapshots[0]?.chat.panes[0]?.turn;
+    if (turn === null || turn === undefined) {
+      throw new Error("Completed Direct fixture has no terminal turn");
+    }
+    expect(turn).toMatchObject({
+        status: "completed",
+        reasoningSummaryVerified: true,
+        reasoningSummary: {
+          tail: "### Verified reasoning\n\nCompletion reconciliation confirmed the exact provider summary.",
+        },
+      });
+    expect(chatTurnProjectionSchema.safeParse({
+      ...turn,
+      reasoningSummaryVerified: false,
+    }).success).toBeFalse();
+    expect(hraCoverageCatalog.list().find(
+      ({ key }) => key === "chat.pane.latest-response",
+    )?.claim).toContain("raw or unverified terminal reasoning stays hidden");
   });
 });

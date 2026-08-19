@@ -13,6 +13,7 @@ import {
   externalOrFailedRequests,
   parseArguments,
   parseHRADirectRemainingWork,
+  parallelComposerFailures,
   parallelPerformanceFailures,
   remainingWorkViolations,
   responsiveLayoutFailures,
@@ -70,7 +71,34 @@ describe("HRA browser verifier policy", () => {
   test("accepts only successful same-origin GET requests", () => {
     const requests = [
       { method: "GET", status: 200, url: "http://127.0.0.1:5174/main.tsx" },
+      {
+        method: "GET",
+        status: 200,
+        url: "http://127.0.0.1:5174/compact-chat-surface.tsx",
+      },
       { method: "GET", status: 399, url: "http://127.0.0.1:5174/@vite/client" },
+      {
+        method: "GET",
+        status: 200,
+        url: "blob:http://127.0.0.1:5174/fixture-preview",
+      },
+      {
+        method: "POST",
+        status: 200,
+        url: "blob:http://127.0.0.1:5174/non-get-preview",
+      },
+      {
+        method: "GET",
+        status: 404,
+        url: "blob:http://127.0.0.1:5174/missing-preview",
+      },
+      {
+        method: "GET",
+        status: 200,
+        url: "blob:https://fixtures.example/foreign-preview",
+      },
+      { method: "GET", status: 200, url: "blob:not-an-origin" },
+      { method: "GET", status: 200, url: "data:image/png;base64,AA==" },
       { method: "GET", status: 200, url: "http://127.0.0.1:5174/api/unmapped" },
       { method: "POST", status: 200, url: "http://127.0.0.1:5174/api" },
       { method: "GET", status: 404, url: "http://127.0.0.1:5174/missing" },
@@ -80,7 +108,7 @@ describe("HRA browser verifier policy", () => {
     ];
 
     expect(externalOrFailedRequests(requests, "http://127.0.0.1:5174")).toEqual(
-      requests.slice(2),
+      requests.slice(4),
     );
   });
 
@@ -166,7 +194,7 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "2",
       expectedVisibleControls: [
         "More actions for Malleable metaharness",
-        "Attach files",
+        "Attach images",
         "Remove compact-layout.png",
         "Edit queued message",
         "Remove queued message",
@@ -472,6 +500,26 @@ describe("HRA browser verifier policy", () => {
       "expected 48 mounted remote panes, received 47",
       "the mounted remote panes did not preserve their connected DOM identities",
       "the mounted remote panes changed during parallel streaming (2 mutations)",
+    ]);
+  });
+
+  test("keeps all parallel composers queueable while empty sends remain disabled", () => {
+    const passing = {
+      composerCount: parallelStreamPaneCount,
+      disabledComposerCount: 0,
+      disabledSendButtonCount: parallelStreamPaneCount,
+    };
+
+    expect(parallelComposerFailures(passing)).toEqual([]);
+    expect(parallelComposerFailures({
+      ...passing,
+      composerCount: parallelStreamPaneCount - 1,
+      disabledComposerCount: 1,
+      disabledSendButtonCount: parallelStreamPaneCount - 1,
+    })).toEqual([
+      `expected ${String(parallelStreamPaneCount)} active composers, received ${String(parallelStreamPaneCount - 1)}`,
+      `1 of ${String(parallelStreamPaneCount)} parallel active composers are disabled`,
+      `expected ${String(parallelStreamPaneCount)} disabled empty send controls, received ${String(parallelStreamPaneCount - 1)}`,
     ]);
   });
 });

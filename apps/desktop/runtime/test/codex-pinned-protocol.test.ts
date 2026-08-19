@@ -196,6 +196,13 @@ const codecCases: readonly CodecCase[] = [
     invalidOutput: { thread: { ...pinnedThreadFixture, cwd: "relative/worktree" } },
   },
   {
+    key: "threadArchive",
+    input: { threadId: "thread-1" },
+    invalidInput: { threadId: "" },
+    output: {},
+    invalidOutput: { archived: true },
+  },
+  {
     key: "threadRead",
     input: { threadId: "thread-1", includeTurns: true },
     invalidInput: { threadId: "thread-1" },
@@ -479,8 +486,8 @@ const codecCases: readonly CodecCase[] = [
 ];
 
 describe("pinned Codex request registry", () => {
-  test("closes all twenty-five operations with internally consistent policy", () => {
-    expect(Object.keys(pinnedCodexRequests)).toHaveLength(25);
+  test("closes all twenty-six operations with internally consistent policy", () => {
+    expect(Object.keys(pinnedCodexRequests)).toHaveLength(26);
     for (const { key } of codecCases) {
       const selected = pinnedCodexRequests[key];
       expect(selected.key).toBe(key);
@@ -720,6 +727,25 @@ describe("pinned Codex request registry", () => {
       }],
       nextCursor: null,
     })).toThrow("Pinned Codex payload validation failed");
+  });
+
+  test("normalizes missing or malformed input modalities to unproven capability", () => {
+    const parseModel = (inputModalities: unknown, includeField = true) =>
+      pinnedCodexRequests.modelList.outputCodec.parse({
+        data: [{
+          model: "gpt-5.6-sol",
+          ...(includeField ? { inputModalities } : {}),
+          supportedReasoningEfforts: [{ reasoningEffort: "max" }],
+          serviceTiers: [],
+        }],
+        nextCursor: null,
+      }).data[0]?.inputModalities;
+
+    expect(parseModel(["text", "image"])).toEqual(["text", "image"]);
+    expect(parseModel(undefined, false)).toBeNull();
+    expect(parseModel(["text", "text"])).toBeNull();
+    expect(parseModel(["text", "audio"])).toBeNull();
+    expect(parseModel("text,image")).toBeNull();
   });
 
   test("retains the exact thread admission profile and rejects incomplete evidence", () => {

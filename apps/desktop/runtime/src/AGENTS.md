@@ -11,6 +11,7 @@
 - `accounts/` – isolated profile persistence, private `CODEX_HOME` layouts, account/login/usage/model adaptation, durable generation routing, and retained-local-data lifecycle.
 - `sessions/` – immutable session state, pure folds and selectors, bounded restart hydration, gateway-only registry and command authority, interaction coordination, and compact dispatch projection.
 - `chat/` – durable app-owned pane state, renderer-safe projection, per-pane command admission, model capability checks, and pre-turn account routing.
+- `attachments/` – private chunked upload vault, native image normalization, provider-delivery leases, verified previews, crash reconciliation, and privacy cleanup.
 - `dispatch/` – outbound cloud presence, claims, fences, capacity, worktree/Codex coordination, semantic outbox, and revocation.
 - `cloud/` – optional WorkOS human-account custody, strict HRA HTTP transport, local/cloud authority routing, invalidation polling, and sealed interaction replies.
 - `promotion/` – frozen local-to-cloud snapshots, receipt-backed transfer and recovery, activation, cleanup, and post-activation runner pairing.

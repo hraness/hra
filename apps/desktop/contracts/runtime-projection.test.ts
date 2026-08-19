@@ -41,6 +41,7 @@ function chatPane(
 ): ChatPaneProjection {
   return {
     id,
+    paletteIndex: 0,
     revision: 1,
     title: "New chat",
     repository: {
@@ -60,12 +61,16 @@ function chatPane(
       continuationCount: 0,
       responseMarkdown: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: resolvedStandardRoute,
     },
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
   };
 }
@@ -357,6 +362,7 @@ describe("portable runtime projection", () => {
       revision: 2,
       pane: {
         id: first.id,
+        paletteIndex: first.paletteIndex,
         revision: 2,
         title: "Finished",
         accountProfileId: first.accountProfileId,
@@ -375,10 +381,12 @@ describe("portable runtime projection", () => {
             category: "command",
             status: "completed",
           }],
+          providerSubagents: { agents: [], overflowCount: 0 },
           routing: first.turn.routing,
         },
         attention: null,
         recoverablePrompt: false,
+        canStartFreshContext: false,
       },
     });
 
@@ -400,6 +408,7 @@ describe("portable runtime projection", () => {
       revision: 2,
       pane: {
         id: first.id,
+        paletteIndex: first.paletteIndex,
         revision: 2,
         title: first.title,
         accountProfileId: first.accountProfileId,
@@ -414,10 +423,12 @@ describe("portable runtime projection", () => {
           completedAt: first.turn.completedAt,
           continuationCount: first.turn.continuationCount,
           tools: first.turn.tools,
+          providerSubagents: first.turn.providerSubagents,
           routing: first.turn.routing,
         },
         attention: null,
         recoverablePrompt: false,
+        canStartFreshContext: false,
       },
     })).toThrow("cannot replace its latest turn");
   });
@@ -460,6 +471,7 @@ describe("portable runtime projection", () => {
       revision: 3,
       pane: {
         id: first.id,
+        paletteIndex: first.paletteIndex,
         revision: 3,
         title: "Finished",
         accountProfileId: first.accountProfileId,
@@ -474,10 +486,12 @@ describe("portable runtime projection", () => {
           completedAt: "2026-08-03T12:01:00.000Z",
           continuationCount: 0,
           tools: [],
+          providerSubagents: { agents: [], overflowCount: 0 },
           routing: first.turn!.routing,
         },
         attention: null,
         recoverablePrompt: false,
+        canStartFreshContext: false,
       },
     });
     expect(stateChanged.chat.panes[0]?.harness).toEqual(decoration);

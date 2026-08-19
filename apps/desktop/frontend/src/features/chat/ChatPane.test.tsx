@@ -12,8 +12,12 @@ import type { RuntimeShell } from "../../runtime";
 import { emptyRuntimeSnapshot } from "../../runtime/test-fixtures";
 import {
   ChatPaneView,
+  composerSubmissionAction,
   dispatchMessageQueueMutation,
+  freezeComposerRequest,
   paneAcceptsUserInteraction,
+  paneTitleKeyAction,
+  settleComposerRequest,
 } from "./ChatPane";
 
 function pane(
@@ -22,6 +26,7 @@ function pane(
 ): ChatPaneProjection {
   return {
     id: "pane_observerview01",
+    paletteIndex: 0,
     revision: 1,
     title: "Research actor",
     repository: { id: "repo_observerview00000000000000", name: "example" },
@@ -40,7 +45,9 @@ function pane(
     turn: null,
     attention: null,
     recoverablePrompt: false,
+    canStartFreshContext: false,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
+    attachments: { drafts: [], referenced: [] },
     harness: null,
     ...overrides,
   };
@@ -149,6 +156,43 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(source).toContain("recoverPaneWorkspaceCommand");
 });
 
+test("fresh-context quarantine renders the explicit action and orphan quarantine stays blocked", () => {
+  const attention = {
+    code: "runtime_unavailable" as const,
+    message: "Prior provider context is quarantined.",
+    retryable: false,
+  };
+  const queue = {
+    revision: 3,
+    pauseReason: "attention" as const,
+    blockedMessage: null,
+    messages: [],
+  };
+  const resettable = pane("chat", {
+    state: "attention",
+    attention,
+    canStartFreshContext: true,
+    messageQueue: queue,
+  });
+  const resettableHtml = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: resettable,
+    shell: shellFor(resettable),
+  }));
+  expect(resettableHtml).toContain(">Start fresh<");
+  expect(resettableHtml).not.toContain(">Resume<");
+
+  const orphan = { ...resettable, canStartFreshContext: false };
+  const orphanHtml = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: orphan,
+    shell: shellFor(orphan),
+  }));
+  expect(orphanHtml).not.toContain(">Start fresh<");
+  expect(orphanHtml).not.toContain(">Resume<");
+  expect(orphanHtml).toContain("Prior provider context is quarantined.");
+});
+
 test("ordinary panes keep HRA's internal dispatch route out of compact chat chrome", () => {
   const routed = pane("chat", {
     turn: {
@@ -159,7 +203,9 @@ test("ordinary panes keep HRA's internal dispatch route out of compact chat chro
       continuationCount: 0,
       responseMarkdown: { tail: "Done", totalUtf8Bytes: 4, truncatedPrefix: false },
       reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: {
         policyVersion: 1,
         classificationReason: "boundedLeafCue",
@@ -206,7 +252,9 @@ test("active sanctioned thinking and answers share Markdown while tools stay inv
         totalUtf8Bytes: 25,
         truncatedPrefix: false,
       },
+      reasoningSummaryVerified: false,
       tools: [{ id: "chattool_hiddenview01", category: "filesystem", status: "running" }],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: resolvedStandardRoute,
     },
   });
@@ -240,7 +288,9 @@ test("terminal turns withhold reasoning until a completion receipt exists", () =
         totalUtf8Bytes: 46,
         truncatedPrefix: false,
       },
+      reasoningSummaryVerified: false,
       tools: [],
+      providerSubagents: { agents: [], overflowCount: 0 },
       routing: resolvedStandardRoute,
     },
   });
@@ -253,6 +303,20 @@ test("terminal turns withhold reasoning until a completion receipt exists", () =
   expect(html).toContain("Answer");
   expect(html).not.toContain("incomplete terminal tail");
   expect(html).not.toContain('aria-label="Thinking"');
+
+  const verified = pane("chat", {
+    ...completed,
+    turn: completed.turn === null ? null : {
+      ...completed.turn,
+      reasoningSummaryVerified: true,
+    },
+  });
+  const verifiedHtml = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: verified,
+    shell: shellFor(verified),
+  }));
+  expect(verifiedHtml).toContain("incomplete terminal tail");
 });
 
 test("only an active ordinary root chat exposes the compact Stop action", () => {
@@ -264,7 +328,9 @@ test("only an active ordinary root chat exposes the compact Stop action", () => 
     continuationCount: 0,
     responseMarkdown: { tail: "Working", totalUtf8Bytes: 7, truncatedPrefix: false },
     reasoningSummary: { tail: "", totalUtf8Bytes: 0, truncatedPrefix: false },
+    reasoningSummaryVerified: false,
     tools: [],
+    providerSubagents: { agents: [], overflowCount: 0 },
     routing: resolvedStandardRoute,
   };
   const chat = pane("chat", {
@@ -316,6 +382,73 @@ test("failed private prompts cannot bypass the durable queue", async () => {
   expect(source).not.toContain('controlClassName="pane-retry"');
 });
 
+test("composer retries freeze exact delivery and rotate after a proved not-applied outcome", () => {
+  const ids = ["chatmsg_rotatedretry001", "chatmsg_freshretry00001"];
+  const createId = () => {
+    const next = ids.shift();
+    if (next === undefined) throw new Error("Unexpected message ID allocation.");
+    return next;
+  };
+  const initial = freezeComposerRequest({
+    existing: null,
+    currentMessageId: "chatmsg_originalretry01",
+    contentSignature: '{"text":"same","attachmentRefs":[]}',
+    steerModifier: true,
+    delivery: { kind: "steerHead", expectedTurnId: "chatturn_retrydelivery1" },
+    createMessageId: createId,
+  });
+  const afterTerminalHydration = freezeComposerRequest({
+    existing: initial.frozen,
+    currentMessageId: initial.currentMessageId,
+    contentSignature: initial.frozen.contentSignature,
+    steerModifier: true,
+    delivery: { kind: "queue" },
+    createMessageId: createId,
+  });
+  expect(afterTerminalHydration).toEqual(initial);
+
+  const notApplied = settleComposerRequest("notApplied", createId);
+  expect(notApplied).toEqual({
+    clearDraft: false,
+    nextMessageId: "chatmsg_rotatedretry001",
+  });
+  const fresh = freezeComposerRequest({
+    existing: null,
+    currentMessageId: notApplied.nextMessageId,
+    contentSignature: initial.frozen.contentSignature,
+    steerModifier: true,
+    delivery: { kind: "queue" },
+    createMessageId: createId,
+  });
+  expect(fresh.frozen).toMatchObject({
+    messageId: "chatmsg_rotatedretry001",
+    delivery: { kind: "queue" },
+  });
+});
+
+test("composer and title shortcuts preserve IME composition and steer only the FIFO head", () => {
+  const base = {
+    key: "Enter",
+    shiftKey: false,
+    metaKey: true,
+    ctrlKey: false,
+    active: true,
+    hasQueuedHead: true,
+  };
+  expect(composerSubmissionAction({ ...base, isComposing: true })).toBe("none");
+  expect(composerSubmissionAction({ ...base, isComposing: false }))
+    .toBe("steerQueuedHead");
+  expect(composerSubmissionAction({
+    ...base,
+    isComposing: false,
+    metaKey: false,
+  })).toBe("sendComposer");
+  expect(paneTitleKeyAction({ isComposing: true, key: "Enter" })).toBeNull();
+  expect(paneTitleKeyAction({ isComposing: true, key: "Escape" })).toBeNull();
+  expect(paneTitleKeyAction({ isComposing: false, key: "Enter" })).toBe("commit");
+  expect(paneTitleKeyAction({ isComposing: false, key: "Escape" })).toBe("cancel");
+});
+
 test("queue mutation dispatch accepts only the exact pane queue result", async () => {
   const command: RuntimeChatMessageLedgerCommand = {
     type: "chat.message.remove",
@@ -338,11 +471,13 @@ test("queue mutation dispatch accepts only the exact pane queue result", async (
       type: "chatMessageQueue",
       paneId: command.paneId,
       queue,
+      disposition: "applied",
+      messageId: command.messageId,
     },
   } satisfies RuntimeDispatchResponse;
   expect(await dispatchMessageQueueMutation({
     dispatch: () => Promise.resolve(response),
-  }, command)).toEqual(queue);
+  }, command)).toEqual(response.result);
   let rejection: unknown = null;
   try {
     await dispatchMessageQueueMutation({

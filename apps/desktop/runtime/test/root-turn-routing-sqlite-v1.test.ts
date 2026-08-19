@@ -26,6 +26,7 @@ const otherChatTurnId = "chatturn_root_route_receipt0002";
 const projectId = "project-root-route-receipt";
 const sourceSha = "a".repeat(40);
 const inputValueId = "ctxval_root_route_receipt01";
+const catalogDigest = "c".repeat(64);
 
 const repository = Object.freeze({
   id: `repo_${"1".repeat(26)}`,
@@ -77,6 +78,7 @@ function classification(
     paneId: id,
     chatTurnId: turnId,
     policyVersion: 1 as const,
+    requiredInputClass: "text" as const,
     classificationReason: "conservativeDefault" as const,
     workClass: "standard" as const,
     requestedProfile: "solMax" as const,
@@ -199,6 +201,8 @@ describe("RootTurnRoutingSQLiteAuthorityV1", () => {
         profileFallbackReason: null,
         selectedServiceTier: "standard",
         serviceTierFallbackReason: null,
+        catalogGeneration: 7,
+        catalogDigest,
         now: later,
       });
       authority.markEffectStarted({ paneId, chatTurnId, now: later });
@@ -306,7 +310,7 @@ describe("RootTurnRoutingSQLiteAuthorityV1", () => {
           settled_at = ?1, updated_at = ?1
         WHERE pane_id = ?2 AND chat_turn_id = ?3
       `).run(later.toISOString(), paneId, chatTurnId)).toThrow(
-        /invalid root routing transition/i,
+        /provider effect requires catalog evidence|invalid root routing transition/i,
       );
       expect(authority.settle({
         paneId,
@@ -378,6 +382,8 @@ describe("RootTurnRoutingSQLiteAuthorityV1", () => {
             profileFallbackReason: null,
             selectedServiceTier: "standard",
             serviceTierFallbackReason: null,
+            catalogGeneration: 1,
+            catalogDigest,
             now: later,
           });
         }

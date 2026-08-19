@@ -41,6 +41,8 @@ export type ParsedSessionTurnActivity =
   | (ParsedSessionTurnActivityBase & Readonly<{
       kind: "reasoning_summary_delta";
       displayText: string;
+      providerItemId: string;
+      summaryIndex: number;
     }>)
   | (ParsedSessionTurnActivityBase & Readonly<{
       kind: "assistant_message_delta";

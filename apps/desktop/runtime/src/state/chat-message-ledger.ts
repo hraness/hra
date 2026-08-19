@@ -55,6 +55,17 @@ export const chatMessageLedgerRowSchema = z.object({
   revision: z.number().int().positive().safe(),
   message_text: z.string(),
   message_utf8_bytes: z.number().int().nonnegative().safe(),
+  request_delivery_kind: z.enum(["legacy", "queue", "steer_head"]),
+  request_steer_turn_id: chatTurnIdSchema.nullable(),
+  request_fingerprint_hmac: z.string().regex(/^[a-f0-9]{64}$/u).nullable(),
+  request_delivery_outcome: z.enum([
+    "legacy",
+    "pending",
+    "accepted",
+    "effect_started",
+    "not_applied",
+    "ambiguous",
+  ]),
   state: storedChatMessageStateSchema,
   claimed_turn_id: chatTurnIdSchema.nullable(),
   effect_started_at: chatIsoDateTimeSchema.nullable(),
@@ -523,8 +534,25 @@ export interface ChatMessageEnqueueInput {
   readonly now: Date;
 }
 
+export interface ChatMessageIdempotentEnqueueInput
+  extends ChatMessageEnqueueInput {
+  readonly delivery:
+    | Readonly<{ readonly kind: "queue" }>
+    | Readonly<{
+        readonly kind: "steerHead";
+        readonly expectedTurnId: ChatTurnId;
+      }>;
+}
+
 export interface ChatMessageEnqueueAndSteerInput extends ChatMessageEnqueueInput {
   readonly turnId: ChatTurnId;
+}
+
+export type ChatMessageEnqueueDisposition = "applied" | "notApplied" | "replayed";
+
+export interface ChatMessageEnqueueResult {
+  readonly disposition: ChatMessageEnqueueDisposition;
+  readonly queue: ChatMessageQueueProjection;
 }
 
 export interface ChatMessageRowCasInput {
@@ -559,7 +587,20 @@ export interface ChatMessageClaimResult {
   readonly queue: ChatMessageQueueProjection;
 }
 
-export type ChatMessageEnqueueAndSteerResult = ChatMessageClaimResult;
+export type ChatMessageEnqueueAndSteerResult =
+  | Readonly<{
+      readonly kind: "prepared";
+      readonly claim: ChatMessageClaim;
+      readonly queue: ChatMessageQueueProjection;
+    }>
+  | Readonly<{
+      readonly kind: "replayed";
+      readonly queue: ChatMessageQueueProjection;
+    }>
+  | Readonly<{
+      readonly kind: "notApplied";
+      readonly queue: ChatMessageQueueProjection;
+    }>;
 
 export interface ChatMessageTransitionInput {
   readonly paneId: ChatPaneProjection["id"];

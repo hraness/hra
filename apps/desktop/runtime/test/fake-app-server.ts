@@ -247,6 +247,9 @@ class FakeAppServer {
         model,
         reasoningEffort,
         serviceTier,
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: { type: "dangerFullAccess" },
       });
       await writeMessage(USER_INPUT_REQUEST);
       return;

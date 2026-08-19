@@ -103,3 +103,75 @@ export const CHAT_PANE_NEXT_PALETTE_INDEX_SQL = `(
   FROM chat_pane_palette_sequence
   WHERE singleton = 1
 )`;
+
+/**
+ * Renderer-safe, restart-stable state for verified reasoning summaries and
+ * provider-native collaboration. Raw provider identities never enter these
+ * columns. Pre-migration reasoning bytes remain stored but are not copied into
+ * the proof-authorized fields, so they cannot become terminally visible.
+ */
+export const CHAT_COMPACT_SEMANTIC_SCHEMA_V1_SQL = `
+  ${CHAT_PANE_PALETTE_SCHEMA_V1_SQL}
+
+  ALTER TABLE chat_panes
+    ADD COLUMN provider_subagents_json TEXT NOT NULL DEFAULT '[]';
+  ALTER TABLE chat_panes
+    ADD COLUMN provider_subagent_overflow_count INTEGER NOT NULL DEFAULT 0
+      CHECK (provider_subagent_overflow_count BETWEEN 0 AND 120);
+  ALTER TABLE chat_panes
+    ADD COLUMN reasoning_verified_tail TEXT NOT NULL DEFAULT '';
+  ALTER TABLE chat_panes
+    ADD COLUMN reasoning_verified_total_utf8_bytes INTEGER NOT NULL DEFAULT 0
+      CHECK (reasoning_verified_total_utf8_bytes >= 0);
+  ALTER TABLE chat_panes
+    ADD COLUMN reasoning_active_item_id TEXT;
+  ALTER TABLE chat_panes
+    ADD COLUMN reasoning_proof_tainted INTEGER NOT NULL DEFAULT 0
+      CHECK (reasoning_proof_tainted IN (0, 1));
+
+  CREATE TABLE chat_reasoning_item_receipts (
+    pane_id TEXT NOT NULL REFERENCES chat_panes(pane_id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('verified', 'tainted')),
+    completion_digest TEXT,
+    completion_generation INTEGER NOT NULL CHECK (completion_generation >= 1),
+    completion_stream_position INTEGER NOT NULL CHECK (completion_stream_position >= 0),
+    completion_fact_index INTEGER NOT NULL CHECK (completion_fact_index >= 0),
+    overflowed INTEGER NOT NULL CHECK (overflowed IN (0, 1)),
+    repaired_suffix INTEGER NOT NULL CHECK (repaired_suffix IN (0, 1)),
+    taint_reason TEXT,
+    summary_tail TEXT,
+    summary_total_utf8_bytes INTEGER,
+    summary_truncated_prefix INTEGER CHECK (
+      summary_truncated_prefix IS NULL OR summary_truncated_prefix IN (0, 1)
+    ),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (pane_id, turn_id, item_id),
+    UNIQUE (receipt_id),
+    CHECK (
+      (state = 'verified'
+        AND completion_digest IS NOT NULL
+        AND taint_reason IS NULL
+        AND summary_tail IS NOT NULL
+        AND summary_total_utf8_bytes IS NOT NULL
+        AND summary_total_utf8_bytes >= 0
+        AND summary_truncated_prefix IS NOT NULL)
+      OR
+      (state = 'tainted'
+        AND completion_digest IS NULL
+        AND repaired_suffix = 0
+        AND taint_reason IS NOT NULL
+        AND summary_tail IS NULL
+        AND summary_total_utf8_bytes IS NULL
+        AND summary_truncated_prefix IS NULL)
+    )
+  ) STRICT;
+
+  CREATE TRIGGER chat_reasoning_item_receipt_immutable
+  BEFORE UPDATE ON chat_reasoning_item_receipts
+  BEGIN
+    SELECT RAISE(ABORT, 'reasoning completion receipts are immutable');
+  END;
+`;

@@ -1,4 +1,5 @@
 import type { AccountSummary } from "../../../contracts/runtime";
+import type { ArchiveAdmissionHandle } from "../accounts/archive-admission-gate";
 import type {
   PinnedCodexRequestInput,
   PinnedCodexRequestKey,
@@ -27,6 +28,9 @@ export type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
   | "turnInterrupt">;
 
 export interface SessionAccountRuntimePort {
+  ensureSessionRuntime(
+    accountProfileId: AccountSummary["id"],
+  ): Promise<Readonly<{ generation: number }>>;
   requestSession<Key extends SessionCodexRequestKey>(
     accountProfileId: AccountSummary["id"],
     key: Key,
@@ -38,6 +42,24 @@ export interface SessionAccountRuntimePort {
     key: Key,
     input: PinnedCodexRequestInput<Key>,
     expectedGeneration?: number,
+  ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<Key>>>;
+  /**
+   * Closed recovery lane for the provider-thread archive state machine. The
+   * production account authority keeps every other request quarantined while
+   * these two operations prove or complete the exact durable archive intent.
+   */
+  ensureArchiveRecoveryRuntime(
+    accountProfileId: AccountSummary["id"],
+    archiveHandle: ArchiveAdmissionHandle,
+  ): Promise<Readonly<{ generation: number }>>;
+  requestArchiveRecoveryWithResponsePosition<
+    Key extends "threadArchive" | "threadList"
+  >(
+    accountProfileId: AccountSummary["id"],
+    archiveHandle: ArchiveAdmissionHandle,
+    key: Key,
+    input: PinnedCodexRequestInput<Key>,
+    expectedGeneration: number,
   ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<Key>>>;
 }
 
@@ -149,8 +171,14 @@ export class SessionCommandExecutor {
   threadSetName(
     accountProfileId: AccountSummary["id"],
     input: PinnedCodexRequestInput<"threadSetName">,
+    expectedGeneration?: number,
   ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"threadSetName">>> {
-    return this.#positioned(accountProfileId, "threadSetName", input);
+    return this.#positioned(
+      accountProfileId,
+      "threadSetName",
+      input,
+      expectedGeneration,
+    );
   }
 
   threadInjectItems(
@@ -235,8 +263,14 @@ export class SessionCommandExecutor {
   turnSteer(
     accountProfileId: AccountSummary["id"],
     input: PinnedCodexRequestInput<"turnSteer">,
+    expectedGeneration: number,
   ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnSteer">>> {
-    return this.#positioned(accountProfileId, "turnSteer", input);
+    return this.#positioned(
+      accountProfileId,
+      "turnSteer",
+      input,
+      expectedGeneration,
+    );
   }
 
   turnInterrupt(

@@ -242,6 +242,9 @@ describe("fake app-server", () => {
         model: "gpt-5.6-sol",
         serviceTier: "fast",
         config: { model_reasoning_effort: "ultra" },
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: "danger-full-access",
       },
     });
     const resumeResponse = await nextMessage(harness);
@@ -264,6 +267,9 @@ describe("fake app-server", () => {
         model: "gpt-5.6-sol",
         reasoningEffort: "ultra",
         serviceTier: "fast",
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: { type: "dangerFullAccess" },
       },
     });
     if (!("result" in resumeResponse)) throw new Error("thread resume result missing");
@@ -274,6 +280,9 @@ describe("fake app-server", () => {
       model: "gpt-5.6-sol",
       reasoningEffort: "ultra",
       serviceTier: "fast",
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: { type: "dangerFullAccess" },
     });
     expect(await nextMessage(harness)).toEqual(USER_INPUT_REQUEST);
 

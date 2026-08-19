@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  chatAttachmentPaneProjectionSchema,
   chatMessageQueueProjectionSchema,
   chatPaneIdSchema,
   chatPaneProjectionSchema,
@@ -11,6 +12,7 @@ import {
   runtimeProtocolVersion,
   runtimeSnapshotSchema,
   type RuntimeEvent,
+  type ChatAttachmentPaneProjection,
   type ChatMessageQueueProjection,
   type ChatPaneProjection,
   type ChatPaneHarnessProjection,
@@ -276,13 +278,14 @@ export class RuntimeProjection {
   installChatMessageQueueState(input: Readonly<{
     paneId: string;
     queue: ChatMessageQueueProjection;
+    attachments: ChatAttachmentPaneProjection;
   }>): void {
-    if (this.#captureToken !== null) {
-      throw new Error("Cannot install chat message queue state during snapshot capture");
-    }
     const paneId = chatPaneIdSchema.parse(input.paneId);
     const queue = chatMessageQueueProjectionSchema.parse(
       structuredClone(input.queue),
+    );
+    const attachments = chatAttachmentPaneProjectionSchema.parse(
+      structuredClone(input.attachments),
     );
     const index = this.#snapshot.chat.panes.findIndex(({ id }) => id === paneId);
     if (index < 0) {
@@ -293,9 +296,12 @@ export class RuntimeProjection {
       throw new RangeError(`Chat message queue ${paneId} regressed`);
     }
     if (queue.revision === current.messageQueue.revision) {
-      if (!isDeepStrictEqual(queue, current.messageQueue)) {
+      if (
+        !isDeepStrictEqual(queue, current.messageQueue) ||
+        !isDeepStrictEqual(attachments, current.attachments)
+      ) {
         throw new RangeError(
-          `Chat message queue ${paneId} changed without advancing its revision`,
+          `Chat message queue or attachment custody ${paneId} changed without advancing its revision`,
         );
       }
       return;
@@ -303,6 +309,7 @@ export class RuntimeProjection {
     const pane = chatPaneProjectionSchema.parse({
       ...current,
       messageQueue: queue,
+      attachments,
     });
     const panes = [...this.#snapshot.chat.panes];
     panes[index] = pane;
@@ -319,6 +326,46 @@ export class RuntimeProjection {
     });
     const prepared = this.#prepareCommit(
       { type: "chat.messageQueue.changed", paneId, revision: queue.revision },
+      installedSnapshot,
+      this.#events.length,
+      this.#queuedBytes,
+    );
+    this.#snapshot = prepared.snapshot;
+    this.#events.push(prepared.queuedEvent);
+    this.#queuedBytes = prepared.queuedBytes;
+    if (this.#captureToken === null) this.#onEventsAvailable();
+  }
+
+  /** Install path-free attachment metadata before asking renderers to rehydrate. */
+  installChatAttachmentState(input: Readonly<{
+    paneId: string;
+    attachments: ChatAttachmentPaneProjection;
+  }>): void {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const attachments = chatAttachmentPaneProjectionSchema.parse(
+      structuredClone(input.attachments),
+    );
+    const index = this.#snapshot.chat.panes.findIndex(({ id }) => id === paneId);
+    if (index < 0) {
+      throw new RangeError(`Cannot install attachments for unknown chat pane ${paneId}`);
+    }
+    const current = this.#snapshot.chat.panes[index]!;
+    if (isDeepStrictEqual(attachments, current.attachments)) return;
+    const panes = [...this.#snapshot.chat.panes];
+    panes[index] = chatPaneProjectionSchema.parse({ ...current, attachments });
+    const chat = chatSnapshotSchema.parse({
+      revision: incrementProjectionRevision(
+        this.#snapshot.chat.revision,
+        "chat projection revision",
+      ),
+      panes,
+    });
+    const installedSnapshot = runtimeSnapshotSchema.parse({
+      ...this.#snapshot,
+      chat,
+    });
+    const prepared = this.#prepareCommit(
+      { type: "snapshot.invalidated", reason: "chatAttachmentsChanged" },
       installedSnapshot,
       this.#events.length,
       this.#queuedBytes,

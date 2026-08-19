@@ -704,7 +704,7 @@ test("account unavailability detaches every reachable pane state exactly once", 
   ), { numRuns: 100 });
 });
 
-test("context reset atomically forgets arbitrary prior history and permits one fresh turn", () => {
+test("context reset preserves displayed history while provider handoff starts at a fresh floor", () => {
   assertProperty(fc.property(
     boundedText,
     boundedText,
@@ -770,6 +770,13 @@ test("context reset atomically forgets arbitrary prior history and permits one f
         now: NOW,
       });
       expect(reset?.revision).toBe(before.projection.revision + 1);
+      expect(database.query(`
+        SELECT role, text FROM chat_pane_history
+        WHERE pane_id = ?1 ORDER BY sequence
+      `).all(PANE_A)).toEqual([
+        { role: "user", text: priorPrompt },
+        { role: "assistant", text: priorResponse },
+      ]);
       expect(store.require(PANE_A)).toMatchObject({
         activePrompt: "unsafe continuation",
         binding: null,
