@@ -8,6 +8,22 @@ import {
   previewForbiddenEnvironmentVariables,
 } from "./vercel-build";
 
+const productionEnvironment = {
+  CONVEX_PRODUCTION_DEPLOYMENT_NAME: "benevolent-akita-439",
+  CONVEX_PROVIDER_AUTHORITY:
+    "prod:benevolent-akita-439|provider-authority",
+  NEXT_PUBLIC_CONVEX_SITE_URL:
+    "https://benevolent-akita-439.convex.site",
+  NEXT_PUBLIC_CONVEX_URL:
+    "https://benevolent-akita-439.convex.cloud",
+  NEXT_PUBLIC_SITE_URL: "https://hra.sh",
+  SUITE_IDENTITY_RECEIPT_KEY_VERSION: "v1",
+  SUITE_OIDC_COOKIE_SECRET: "c".repeat(64),
+  VERCEL: "1",
+  VERCEL_ENV: "production",
+  VERCEL_TARGET_ENV: "production",
+} as const;
+
 test("foreign Preview host input is total and only a bare Vercel hostname succeeds", () => {
   assertProperty(fc.property(
     fc.option(fc.string(), { nil: undefined }),
@@ -70,6 +86,30 @@ test("Production never runs with Convex-only custody in Vercel", () => {
       });
     },
   ));
+});
+
+test("Production accepts exactly absent or complete public PostHog keys", () => {
+  const tokenCharacter = fc.constantFrom("a", "Z", "0", "_", "-");
+  const completePublicToken = fc.array(tokenCharacter, {
+    minLength: 10,
+    maxLength: 40,
+  }).map(suffix => `phc_${suffix.join("")}`);
+  assertProperty(fc.property(
+    fc.oneof(fc.string(), completePublicToken),
+    value => {
+      const valid = /^phc_[A-Za-z0-9_-]{10,512}$/u.test(value);
+      expect(planVercelConvexBuild({
+        ...productionEnvironment,
+        NEXT_PUBLIC_POSTHOG_KEY: value,
+      })).toEqual(valid
+        ? { environmentMode: "deploy-convex", kind: "run" }
+        : { kind: "refuse", reason: "invalid-production-posthog-key" });
+    },
+  ));
+  expect(planVercelConvexBuild(productionEnvironment)).toEqual({
+    environmentMode: "deploy-convex",
+    kind: "run",
+  });
 });
 
 test("a production key never authorizes any non-Production target", () => {

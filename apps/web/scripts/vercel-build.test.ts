@@ -32,6 +32,7 @@ const productionEnvironment = {
   ...marker,
   ...publicConvex,
   CONVEX_PROVIDER_AUTHORITY: `prod:${deployment}|secret`,
+  NEXT_PUBLIC_POSTHOG_KEY: "phc_hra_public",
   NEXT_PUBLIC_SITE_URL: "https://hra.sh",
   SUITE_IDENTITY_RECEIPT_KEY_VERSION: "v1",
   SUITE_OIDC_COOKIE_SECRET: "c".repeat(64),
@@ -86,6 +87,26 @@ describe("HRA Vercel Convex target plans", () => {
     }
   });
 
+  test("allows an absent PostHog key and refuses every configured near miss", () => {
+    expect(planVercelConvexBuild({
+      ...productionEnvironment,
+      NEXT_PUBLIC_POSTHOG_KEY: undefined,
+    })).toEqual({ environmentMode: "deploy-convex", kind: "run" });
+    for (const value of [
+      "",
+      "phx_hra_public",
+      "phc_short",
+      "phc_hra public",
+      "phc_hra_public!",
+      `phc_${"a".repeat(513)}`,
+    ]) {
+      expect(planVercelConvexBuild({
+        ...productionEnvironment,
+        NEXT_PUBLIC_POSTHOG_KEY: value,
+      })).toEqual({ kind: "refuse", reason: "invalid-production-posthog-key" });
+    }
+  });
+
   test("refuses Convex-only custody in Production Vercel, including empty records", () => {
     for (const variable of convexOnlyEnvironmentVariables) {
       for (const value of ["", "configured"]) {
@@ -113,6 +134,7 @@ describe("HRA Vercel Convex target plans", () => {
   });
 
   test("refuses every production capability in Preview, including empty records", () => {
+    expect(previewForbiddenEnvironmentVariables).toContain("NEXT_PUBLIC_POSTHOG_KEY");
     for (const variable of previewForbiddenEnvironmentVariables) {
       for (const value of ["", "configured"]) {
         expect(planVercelConvexBuild({
@@ -254,6 +276,25 @@ describe("provider process boundary", () => {
     }
   });
 
+  test("refuses a malformed Production PostHog key before launching Next", async () => {
+    for (const value of ["", "phx_hra_public", "phc_short", "phc_hra public"]) {
+      const observed = recorder();
+      const reasons: string[] = [];
+      expect(await runVercelAppBuild({
+        environment: {
+          ...productionEnvironment,
+          NEXT_PUBLIC_POSTHOG_KEY: value,
+        },
+        expectedProductionDeploymentName: deployment,
+        launch: observed.launch,
+        reportRefusal: reason => reasons.push(reason),
+        verifyReleaseSource: verifyExplicitCandidateReleaseSource,
+      })).toBe(1);
+      expect(observed.calls).toEqual([]);
+      expect(reasons).toEqual(["invalid-production-posthog-key"]);
+    }
+  });
+
   test("Production invokes Convex with fixed argv and no secret argument", async () => {
     const observed = recorder();
     expect(await runVercelConvexBuild({
@@ -306,6 +347,8 @@ describe("provider process boundary", () => {
       .toBe(publicConvex.NEXT_PUBLIC_CONVEX_SITE_URL);
     expect(observed.calls[0]?.environment.NEXT_PUBLIC_SITE_URL)
       .toBe("https://hra.sh");
+    expect(observed.calls[0]?.environment.NEXT_PUBLIC_POSTHOG_KEY)
+      .toBe("phc_hra_public");
     expect(observed.calls[0]?.environment.SUITE_IDENTITY_RECEIPT_KEY_VERSION)
       .toBe("v1");
     expect(

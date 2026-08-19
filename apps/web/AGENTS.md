@@ -12,7 +12,7 @@
 - `vercel.json` – production provider entry point pinned to the checked Convex deployment.
 - `production-icon-boundary.ts` – fail-closed resolved-module and emitted-output checks for the HRA-local production icon adapter.
 - `proxy.ts` – exact public/static exclusions from configured WorkOS authentication.
-- `.env.example` – separated public WorkOS/Convex/Accounts origins, server-only OIDC custody, and Convex-only key material.
+- `.env.example` – separated public WorkOS/Convex/Accounts origins, Production-only public analytics token, server-only OIDC custody, and Convex-only key material.
 - `tsconfig.json` – strict Next.js and Convex TypeScript coverage.
 
 # Guidelines
@@ -32,6 +32,7 @@
 - Keep the authenticated control plane inside the persistent shared app shell. Workspace and Tasks/Access route state belongs in the query-addressed rail, and only the changing main stage animates.
 - Keep `/` public and indexable without WorkOS or Convex client providers. Keep `/app` authenticated when WorkOS is configured, and send sign-in, sign-up, callback, organization-switch, and internal control-plane navigation back to that route.
 - Keep hosted-environment credentials and provider-write configuration out of source control. `hra.sh` is the canonical public origin, and the normal build must not mutate Convex or a hosting provider.
+- Send only anonymous, cookieless `$pageview` events from exact canonical public routes. Keep the public PostHog token Production-only, and leave Preview and every authenticated, account, task, and control-plane route without analytics ingestion capability.
 - Wrap the HRA Next.js configuration with `@hraness/vercel-delivery` using the registered `hra` project name. Preserve HRA security and private-cache headers ahead of the package-owned delivery and Preview response policy.
 - Permit remote Convex deployment only through the checked Vercel Production wrapper bound to `benevolent-akita-439`. Preview is an app-only client of its exact public endpoints and must reject every production credential, origin claim, or write capability.
 - Keep `/download` as an exact public prerelease/source-build page. Retain authentication on near misses, and keep signing, notarization, artifact hosting, and release mutation authority outside the web application.

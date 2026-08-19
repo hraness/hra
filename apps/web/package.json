@@ -56,6 +56,7 @@
     "convex": "catalog:",
     "jose": "catalog:",
     "next": "catalog:",
+    "posthog-js": "catalog:",
     "react": "catalog:",
     "react-dom": "catalog:"
   },
