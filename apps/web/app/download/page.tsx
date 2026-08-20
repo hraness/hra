@@ -14,13 +14,14 @@ import {
   HRA_RELEASE_MANIFEST_URL,
   HRA_RELEASE_URL,
   hraSearchSite,
+  hraSocialPageTitle,
 } from "../site";
 
 export const metadata = createPublicSiteMetadata({
   ...hraSearchSite,
   description:
     "Download the HRA Apple Silicon prerelease, verify its checksum, or build it from public source.",
-  socialTitle: "Download HRA for Apple Silicon",
+  socialTitle: hraSocialPageTitle("HRA for macOS"),
   title: "HRA for macOS",
 }, { canonicalPath: "/download" }) satisfies Metadata;
 

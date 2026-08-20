@@ -6,7 +6,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 
-import { HRA_BRAND_ICON_PATH, hraSearchSite } from "../../site";
+import { HRA_BRAND_ICON_PATH, hraSearchSite, hraSocialPageTitle } from "../../site";
 import {
   COMPARISON_REVIEW_DATE,
   COMPARISON_REVIEW_LABEL,
@@ -57,7 +57,7 @@ export async function generateMetadata({ params }: ComparisonPageProps): Promise
   return createPublicSiteMetadata({
     ...hraSearchSite,
     description: comparison.description,
-    socialTitle: `HRA vs ${comparison.shortName}`,
+    socialTitle: hraSocialPageTitle(`HRA vs ${comparison.shortName}`),
     title: `HRA vs ${comparison.shortName}`,
   }, { canonicalPath: `/alternatives/${comparison.slug}` });
 }

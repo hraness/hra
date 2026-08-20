@@ -5,14 +5,14 @@ import type { Metadata } from "next";
 import Image from "next/image";
 import Link from "next/link";
 
-import { HRA_BRAND_ICON_PATH, hraSearchSite } from "../site";
+import { HRA_BRAND_ICON_PATH, hraSearchSite, hraSocialPageTitle } from "../site";
 import { COMPARISON_REVIEW_LABEL, hraComparisons } from "./comparisons";
 
 export const metadata = createPublicSiteMetadata({
   ...hraSearchSite,
   description:
     "Compare HRA with Codex app, OpenCode Desktop, Paseo, Conductor, Superset, OpenChamber, and Happy Coder using current first-party sources.",
-  socialTitle: "HRA alternatives and comparisons",
+  socialTitle: hraSocialPageTitle("HRA alternatives"),
   title: "HRA alternatives",
 }, { canonicalPath: "/alternatives" }) satisfies Metadata;
 

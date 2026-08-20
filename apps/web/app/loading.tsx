@@ -1,5 +1,4 @@
 import {
-  PageIntro,
   Skeleton,
   Spinner,
   ThemeToggle,
@@ -10,13 +9,8 @@ export default function Loading() {
     <main className="state-page" id="main-content">
       <ThemeToggle className="standalone-theme-toggle" />
       <section className="state-card state-card--loading" role="status">
-        <PageIntro
-          description="Restoring the server-authorized organization and task subscriptions."
-          eyebrow="Human control plane"
-          title="Opening HRA…"
-        />
         <div className="state-loading-row">
-          <Spinner label="Opening HRA" />
+          <Spinner label="Loading" />
           <div>
             <Skeleton isText width="18rem" />
             <Skeleton isText width="11rem" />

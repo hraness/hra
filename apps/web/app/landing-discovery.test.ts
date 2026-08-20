@@ -6,15 +6,25 @@ import {
   websiteJsonLd,
 } from "@hraness/web-discovery";
 
+import { generateMetadata as comparisonMetadata } from "./alternatives/[slug]/page";
+import { metadata as alternativesMetadata } from "./alternatives/page";
 import { hraComparisons } from "./alternatives/comparisons";
+import { metadata as downloadMetadata } from "./download/page";
+import { metadata as notFoundMetadata } from "./not-found";
 import OpenGraphImage from "./opengraph-image";
+import { metadata as homepageMetadata } from "./page";
 import robots from "./robots";
-import { hraSearchSite } from "./site";
+import {
+  hraRootMetadata,
+  hraSearchSite,
+  hraSocialPageTitle,
+} from "./site";
 import sitemap from "./sitemap";
 
 describe("HRA public discovery contract", () => {
   test("publishes canonical social metadata for the public product", () => {
-    expect(createPublicSiteMetadata(hraSearchSite)).toMatchObject({
+    const product = createPublicSiteMetadata(hraSearchSite);
+    expect(product).toMatchObject({
       alternates: { canonical: "https://hra.sh/" },
       applicationName: "HRA",
       description: hraSearchSite.description,
@@ -26,12 +36,95 @@ describe("HRA public discovery contract", () => {
           width: 1200,
         }],
         siteName: "HRA",
+        title: hraSearchSite.title,
         type: "website",
         url: "https://hra.sh/",
       },
       robots: { follow: true, index: true },
-      twitter: { card: "summary_large_image" },
+      title: { default: hraSearchSite.title, template: hraSearchSite.titleTemplate },
+      twitter: { card: "summary_large_image", title: hraSearchSite.title },
     });
+    expect(product.openGraph?.title).toBe(hraSearchSite.title);
+    expect(product.twitter?.title).toBe(hraSearchSite.title);
+  });
+
+  test("keeps only inheritable site-wide defaults on the root layout", () => {
+    expect(hraRootMetadata).toMatchObject({
+      applicationName: "HRA",
+      creator: "Hraness",
+      publisher: "Hraness",
+      title: { default: "HRA", template: "%s · HRA" },
+      openGraph: { siteName: "HRA", type: "website" },
+    });
+    expect(hraRootMetadata).not.toHaveProperty("description");
+    expect(hraRootMetadata).not.toHaveProperty("robots");
+    expect(hraRootMetadata).not.toHaveProperty("keywords");
+    expect(hraRootMetadata).not.toHaveProperty("alternates");
+    expect(hraRootMetadata.openGraph).not.toHaveProperty("url");
+    expect(hraRootMetadata.openGraph).not.toHaveProperty("title");
+    expect(hraRootMetadata.openGraph).not.toHaveProperty("description");
+    expect(hraRootMetadata.twitter).not.toHaveProperty("title");
+    expect(hraRootMetadata.twitter).not.toHaveProperty("description");
+  });
+
+  test("lets the homepage own the indexable product identity", () => {
+    expect(homepageMetadata).toMatchObject({
+      alternates: { canonical: "https://hra.sh/" },
+      description: hraSearchSite.description,
+      robots: { follow: true, index: true },
+      title: { absolute: hraSearchSite.title },
+    });
+    expect(homepageMetadata.openGraph?.title).toBe(hraSearchSite.title);
+    expect(homepageMetadata.twitter?.title).toBe(hraSearchSite.title);
+    expect(homepageMetadata.openGraph?.url).toBe("https://hra.sh/");
+  });
+
+  test("keeps HTML titles aligned with Open Graph titles", () => {
+    expect(hraSocialPageTitle("HRA for macOS")).toBe("HRA for macOS · HRA");
+    expect(downloadMetadata.title).toEqual({
+      default: "HRA for macOS",
+      template: "%s · HRA",
+    });
+    expect(downloadMetadata.openGraph?.title).toBe("HRA for macOS · HRA");
+    expect(downloadMetadata.twitter?.title).toBe("HRA for macOS · HRA");
+    expect(alternativesMetadata.title).toEqual({
+      default: "HRA alternatives",
+      template: "%s · HRA",
+    });
+    expect(alternativesMetadata.openGraph?.title).toBe("HRA alternatives · HRA");
+    expect(alternativesMetadata.twitter?.title).toBe("HRA alternatives · HRA");
+  });
+
+  test("keeps comparison titles aligned with Open Graph titles", async () => {
+    const metadata = await comparisonMetadata({
+      params: Promise.resolve({ slug: "codex-app" }),
+    });
+    expect(metadata.title).toEqual({
+      default: "HRA vs Codex app",
+      template: "%s · HRA",
+    });
+    expect(metadata.openGraph?.title).toBe("HRA vs Codex app · HRA");
+    expect(metadata.twitter?.title).toBe("HRA vs Codex app · HRA");
+    expect(metadata.alternates?.canonical).toBe("https://hra.sh/alternatives/codex-app");
+  });
+
+  test("gives unmatched routes a distinct noindex page", () => {
+    expect(notFoundMetadata).toEqual({
+      description: "This page does not exist.",
+      robots: {
+        follow: false,
+        googleBot: {
+          follow: false,
+          index: false,
+          noarchive: true,
+          nosnippet: true,
+        },
+        index: false,
+      },
+      title: { absolute: "Not found · HRA" },
+    });
+    expect(notFoundMetadata).not.toHaveProperty("alternates");
+    expect(notFoundMetadata).not.toHaveProperty("openGraph");
   });
 
   test("indexes the public product, download, and sourced comparison surfaces", () => {

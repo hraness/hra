@@ -76,6 +76,10 @@ describe("HRA shared appearance and shell contract", () => {
     expect(error).toContain("<InlineAlert");
     expect(loading).toContain("<Spinner");
     expect(loading).toContain("<Skeleton");
+    expect(loading).not.toMatch(/<h1\b/u);
+    expect(loading).not.toContain("Opening HRA");
+    expect(loading).not.toContain("PageIntro");
+    expect(loading).not.toContain("Restoring the server-authorized organization");
     expect(notFound).toContain("<EmptyState");
     expect(globalError).toContain('import "./globals.css"');
     expect(globalError).toContain("GlobalErrorDocument");
