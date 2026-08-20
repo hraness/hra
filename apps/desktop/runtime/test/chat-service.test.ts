@@ -5662,6 +5662,130 @@ test("HITL containment followed by Stop shares one interrupt and one exact termi
   }
 });
 
+test("an interaction before the start response is rejected and contained on exact acceptance", async () => {
+  const roots = new FakeHarnessRoots();
+  const startEntered = deferred<ChatProviderTurnRequest>();
+  const startRelease = deferred<string>();
+  const value = harness(undefined, undefined, roots);
+  const providerTurnId = "turn_chat_early_interaction01";
+  try {
+    const created = await createPane(value);
+    value.provider.onStartTurn = async (request) => {
+      startEntered.resolve(request);
+      return await startRelease.promise;
+    };
+    await startTurn(value, created.revision);
+    const request = await startEntered.promise;
+    const binding = value.store.require(PANE).binding;
+    if (binding === null) throw new Error("Expected the prepared provider binding");
+    const earlyInteraction: SessionInteractionRequest = {
+      accountProfileId: request.accountProfileId,
+      threadId: request.threadId,
+      turnId: providerTurnId,
+      request: {
+        id: "interaction_chat_early01",
+        kind: "file_change_approval",
+        scope: "once",
+        createdAt: 1_000,
+        expiresAt: 61_000,
+      },
+    };
+
+    expect(await withinDeadline(
+      value.service.observeSessionInteractionRequest(earlyInteraction),
+      "early HITL rejection",
+      250,
+    )).toBeTrue();
+    expect(await value.service.observeSessionInteractionRequest({
+      ...earlyInteraction,
+      request: {
+        ...earlyInteraction.request,
+        id: "interaction_chat_early02",
+      },
+    })).toBeTrue();
+    expect(value.provider.interrupts).toEqual([]);
+
+    value.provider.onInterrupt = () => value.service.observeSessionLifecycle(
+      lifecycle(request, providerTurnId, "interrupted"),
+    );
+    startRelease.resolve(providerTurnId);
+    await withinDeadline(value.service.settled(), "early HITL containment", 250);
+
+    expect(value.provider.startedTurns).toHaveLength(1);
+    expect(value.provider.interrupts).toEqual([{
+      ...binding,
+      turnId: providerTurnId,
+    }]);
+    expect(roots.observations).toEqual([
+      lifecycle(request, providerTurnId, "interrupted"),
+    ]);
+    expect(value.containedAccounts).toEqual([]);
+    expect(value.store.require(PANE).projection).toMatchObject({
+      state: "attention",
+      attention: { code: "approval_required", retryable: true },
+      turn: { id: TURN_ONE, status: "failed" },
+    });
+  } finally {
+    startRelease.resolve(providerTurnId);
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("conflicting early interaction lineages force account-generation containment", async () => {
+  const startEntered = deferred<ChatProviderTurnRequest>();
+  const startRelease = deferred<string>();
+  const value = harness();
+  const acceptedProviderTurnId = "turn_chat_early_conflict01";
+  try {
+    const created = await createPane(value);
+    value.provider.onStartTurn = async (request) => {
+      startEntered.resolve(request);
+      return await startRelease.promise;
+    };
+    await startTurn(value, created.revision);
+    const request = await startEntered.promise;
+    const interaction: SessionInteractionRequest = {
+      accountProfileId: request.accountProfileId,
+      threadId: request.threadId,
+      turnId: acceptedProviderTurnId,
+      request: {
+        id: "interaction_chat_conflict01",
+        kind: "file_change_approval",
+        scope: "once",
+        createdAt: 1_000,
+        expiresAt: 61_000,
+      },
+    };
+
+    expect(await value.service.observeSessionInteractionRequest(interaction)).toBeTrue();
+    expect(await value.service.observeSessionInteractionRequest({
+      ...interaction,
+      turnId: "turn_chat_early_conflict02",
+      request: { ...interaction.request, id: "interaction_chat_conflict02" },
+    })).toBeTrue();
+    startRelease.resolve(acceptedProviderTurnId);
+    await withinDeadline(
+      value.service.settled(),
+      "conflicting early HITL generation containment",
+      250,
+    );
+
+    expect(value.provider.interrupts).toEqual([]);
+    expect(value.containedAccounts).toEqual([ACCOUNT_ONE]);
+    expect(value.store.require(PANE).projection).toMatchObject({
+      state: "attention",
+      accountProfileId: null,
+      attention: { code: "approval_required", retryable: true },
+      turn: { id: TURN_ONE, status: "failed" },
+    });
+  } finally {
+    startRelease.resolve(acceptedProviderTurnId);
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
 test("Stop followed by HITL rejection shares the existing interrupt authority", async () => {
   const roots = new FakeHarnessRoots();
   const interruptRelease = deferred<void>();
