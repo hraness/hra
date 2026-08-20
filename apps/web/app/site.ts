@@ -1,5 +1,10 @@
 import { z } from "@hra-internal/schema";
-import type { SearchSite } from "@hraness/web-discovery";
+import {
+  LARGE_SOCIAL_IMAGE,
+  absoluteWebUrl,
+  type SearchSite,
+} from "@hraness/web-discovery";
+import type { Metadata } from "next";
 
 import releaseDownload from "../../../release-download.json";
 
@@ -109,7 +114,50 @@ export const hraSearchSite = {
     alt: "HRA: a durable metaharness for Codex",
     path: "/opengraph-image",
   },
-  socialTitle: "Give Codex a team, a memory, and a budget",
   title: "HRA: a metaharness for Codex",
   titleTemplate: "%s · HRA",
 } as const satisfies SearchSite;
+
+const rootSocialImage = {
+  alt: hraSearchSite.socialImage.alt,
+  height: LARGE_SOCIAL_IMAGE.height,
+  url: absoluteWebUrl(hraSearchSite.origin, hraSearchSite.socialImage.path),
+  width: LARGE_SOCIAL_IMAGE.width,
+} as const;
+
+export const hraHomepageKeywords = [
+  "Codex metaharness",
+  "multiple Codex accounts",
+  "Codex orchestration",
+  "coding agents",
+  "parallel agents",
+  "human in the loop",
+  "AI task orchestration",
+  "local-first developer tools",
+] as const;
+
+export const hraRootMetadata = {
+  applicationName: hraSearchSite.applicationName,
+  category: hraSearchSite.category,
+  creator: hraSearchSite.creator,
+  metadataBase: new URL(hraSearchSite.origin),
+  openGraph: {
+    images: [rootSocialImage],
+    locale: "en_US",
+    siteName: hraSearchSite.name,
+    type: "website",
+  },
+  publisher: hraSearchSite.publisher,
+  title: {
+    default: hraSearchSite.applicationName,
+    template: hraSearchSite.titleTemplate,
+  },
+  twitter: {
+    card: "summary_large_image",
+    images: [{ alt: rootSocialImage.alt, url: rootSocialImage.url }],
+  },
+} as const satisfies Metadata;
+
+export function hraSocialPageTitle(pageTitle: string): string {
+  return hraSearchSite.titleTemplate.replaceAll("%s", pageTitle);
+}

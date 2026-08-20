@@ -1,12 +1,12 @@
 # Contents
 
 - `design/` – the shared static browser-component gallery mounted at `/design`.
-- `layout.tsx` – HRA document metadata and deterministic light-first document boundary.
+- `layout.tsx` – inheritable site-wide document defaults and the deterministic light-first document boundary.
 - `providers.tsx` – shared appearance/router composition around the optional WorkOS and Convex providers.
 - `analytics.ts` and `analytics-provider.tsx` – strict canonical-public-route classification and anonymous, cookieless PostHog pageview delivery.
 - `workos-configuration.ts` – one whitespace-safe WorkOS configuration predicate shared by proxy, auth routes, layout providers, and the `/app` configuration state.
-- `global-error.tsx`, `error.tsx`, `loading.tsx`, and `not-found.tsx` – shared, themed route-state boundaries, including the root-layout replacement.
-- `page.tsx` – canonical public landing page with product capabilities, boundaries, public-source entry points, and an honest analytics disclosure.
+- `global-error.tsx`, `error.tsx`, `loading.tsx`, and `not-found.tsx` – shared, themed route-state boundaries, including the root-layout replacement. `loading.tsx` stays heading-free so streamed public HTML cannot grow a second H1. `not-found.tsx` owns a distinct noindex title and must not inherit the homepage canonical.
+- `page.tsx` – canonical public landing page. It owns the homepage title, description, canonical `/`, indexable robots, matching social titles, product capabilities, boundaries, public-source entry points, and an honest analytics disclosure.
 - `alternatives/` – public, dated, first-party-sourced comparisons that explain HRA's fit without inventing competitor limitations.
 - `app/page.tsx` – authenticated WorkOS/Convex control-plane entry and exact local missing-configuration states.
 - `download/` – public macOS prerelease status and source-build guidance.
@@ -30,7 +30,7 @@
 - Keep `/download` honest about prerelease status. Link only to the exact public GitHub release contract in `site.ts`, disclose ad-hoc signing and missing notarization before the action, and never embed signing credentials or publication authority in the web app.
 - Keep `/alternatives` and its exact static child routes public. Date each review, cite current first-party sources, distinguish “not documented” from “absent,” and write product-specific analysis rather than name-swapped SEO pages.
 - Limit analytics to one personless, cookieless `$pageview` on `/`, `/download`, `/alternatives`, and the exact comparison routes accepted by `isHraPublicComparisonPath`. Require exact Production `https://hra.sh`, use only the slim no-external SDK entry, redact query, fragment, referrer, identity, account, task, command, and provider context, and keep every other event and route inert.
-- Build public and private discovery output with `@hraness/web-discovery`, while keeping HRA-owned origins, titles, descriptions, routes, dates, JSON-LD facts, and crawler choices in `site.ts` and the route that presents them.
+- Build public and private discovery output with `@hraness/web-discovery`, while keeping HRA-owned origins, titles, descriptions, routes, dates, JSON-LD facts, and crawler choices in `site.ts` and the route that presents them. Keep homepage identity off the root layout. Keep HTML titles aligned with Open Graph titles.
 - Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex, WorkOS, and generated-API import in hosted adapters.
 - Use `@hra-internal/codex-app-sdk` for provider-neutral client and mutation-journal contracts. Keep Convex authority, tenant scoping, HMAC derivation, and browser lifecycle composition in this app.
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.

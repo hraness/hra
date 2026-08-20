@@ -1,14 +1,26 @@
 import { HranessBrand } from "@hra-internal/brand-ui";
 import { ThemeToggle } from "@hra-internal/design-kit/react";
 import {
+  createPublicSiteMetadata,
   serializeJsonLd,
   webApplicationJsonLd,
   websiteJsonLd,
 } from "@hraness/web-discovery";
+import type { Metadata } from "next";
 import Link from "next/link";
 import Image from "next/image";
 
-import { HRA_BRAND_ICON_PATH, hraSearchSite } from "./site";
+import {
+  HRA_BRAND_ICON_PATH,
+  hraHomepageKeywords,
+  hraSearchSite,
+} from "./site";
+
+export const metadata = {
+  ...createPublicSiteMetadata(hraSearchSite),
+  keywords: [...hraHomepageKeywords],
+  title: { absolute: hraSearchSite.title },
+} satisfies Metadata;
 
 const capabilities = [
   {

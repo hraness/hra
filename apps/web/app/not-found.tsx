@@ -3,6 +3,14 @@ import {
   LinkButton,
   ThemeToggle,
 } from "@hra-internal/design-kit/react";
+import { NOINDEX_ROBOTS } from "@hraness/web-discovery";
+import type { Metadata } from "next";
+
+export const metadata = {
+  description: "This page does not exist.",
+  robots: NOINDEX_ROBOTS,
+  title: { absolute: "Not found · HRA" },
+} satisfies Metadata;
 
 export default function NotFound() {
   return (
