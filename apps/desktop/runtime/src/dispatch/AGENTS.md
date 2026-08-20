@@ -10,6 +10,7 @@
 - `revocation.ts` – fail-closed stop, interrupt, lease-loss, interaction-limit failure, and local-capacity release coordination.
 - `runner.ts` – supervised heartbeat, pull, lease, capacity, shutdown, and durable-outbox coordination.
 - `session-launcher.ts` – inspect-before-retry managed-worktree thread and turn adapter.
+- `task-workflow-prompt-v1.ts` – common deterministic initial prompt for local and cloud task dispatch.
 
 # Guidelines
 
@@ -25,3 +26,4 @@
 - Treat interaction-limit failure as terminal for only its owning run. Interrupt it, publish the durable failure, and release its capacity without halting the singleton runner.
 - Close any durable anonymous tool span before appending a terminal run event. Terminal lifecycle and activity callbacks may race, so correctness must not depend on callback timing.
 - Keep stable public event kinds mode-neutral in presentation. The `worktree.preparing` and `worktree.ready` summaries describe an execution workspace rather than exposing storage details.
+- Render every local and cloud task assignment through the versioned workflow-prompt module. Keep task text distinct from working instructions, keep repository changes in the managed worktree, and do not make prompt text an authority or capability boundary.
