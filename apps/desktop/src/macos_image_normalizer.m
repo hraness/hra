@@ -76,6 +76,62 @@ static bool HRAWriteAll(int descriptor, const uint8_t *bytes, size_t length) {
   return true;
 }
 
+// ImageIO and CoreGraphics may write host-driver diagnostics directly to the
+// inherited standard error descriptor. The helper protocol reserves stderr
+// for one exact, path-free HRA receipt, so keep a private receipt descriptor
+// and route framework-owned output to the system null device until exit.
+static int HRAIsolateFrameworkStandardError(void) {
+  if (fflush(stderr) != 0) return -1;
+
+  int receiptDescriptor;
+  do {
+    receiptDescriptor = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 3);
+  } while (receiptDescriptor < 0 && errno == EINTR);
+  if (receiptDescriptor < 0) return -1;
+
+  int sinkDescriptor;
+  do {
+    sinkDescriptor = open(
+        "/dev/null",
+        O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+  } while (sinkDescriptor < 0 && errno == EINTR);
+  if (sinkDescriptor < 0) {
+    close(receiptDescriptor);
+    return -1;
+  }
+
+  struct stat sinkIdentity;
+  if (fstat(sinkDescriptor, &sinkIdentity) != 0 ||
+      !S_ISCHR(sinkIdentity.st_mode)) {
+    close(sinkDescriptor);
+    close(receiptDescriptor);
+    return -1;
+  }
+
+  int redirected;
+  do {
+    redirected = dup2(sinkDescriptor, STDERR_FILENO);
+  } while (redirected < 0 && errno == EINTR);
+  close(sinkDescriptor);
+  if (redirected < 0) {
+    close(receiptDescriptor);
+    return -1;
+  }
+  clearerr(stderr);
+  return receiptDescriptor;
+}
+
+static void HRAWriteErrorReceipt(int descriptor, int status) {
+  char receipt[64];
+  int length = snprintf(
+      receipt,
+      sizeof(receipt),
+      "hra-image-normalizer:error:%d\n",
+      status);
+  if (length <= 0 || (size_t)length >= sizeof(receipt)) return;
+  HRAWriteAll(descriptor, (const uint8_t *)receipt, (size_t)length);
+}
+
 static bool HRAStatIdentityMatches(
     const struct stat *left,
     const struct stat *right) {
@@ -997,15 +1053,11 @@ int hra_image_normalizer_run(
     const char *output_directory_path,
     size_t output_directory_path_length) {
   @autoreleasepool {
-    int status = HRANormalizeImage(
+    return HRANormalizeImage(
         input_path,
         input_path_length,
         output_directory_path,
         output_directory_path_length);
-    if (status != HRAImageNormalizerSuccess) {
-      fprintf(stderr, "hra-image-normalizer:error:%d\n", status);
-    }
-    return status;
   }
 }
 
@@ -1028,9 +1080,22 @@ int main(int argc, const char *argv[]) {
         HRAImageNormalizerInvalidProtocol);
     return HRAImageNormalizerInvalidProtocol;
   }
-  return hra_image_normalizer_run(
+  int receiptDescriptor = HRAIsolateFrameworkStandardError();
+  if (receiptDescriptor < 0) {
+    fprintf(
+        stderr,
+        "hra-image-normalizer:error:%d\n",
+        HRAImageNormalizerUnsafeOutput);
+    return HRAImageNormalizerUnsafeOutput;
+  }
+  int status = hra_image_normalizer_run(
       argv[3],
       inputPathLength,
       argv[5],
       outputPathLength);
+  if (status != HRAImageNormalizerSuccess) {
+    HRAWriteErrorReceipt(receiptDescriptor, status);
+  }
+  close(receiptDescriptor);
+  return status;
 }
