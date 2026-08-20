@@ -3,7 +3,7 @@ title: One workflow prompt for local and cloud task dispatch
 description: Give local and cloud task dispatch the same deterministic built-in prompt without weakening HRA's durable authority or recovery model.
 type: plan
 area: task-orchestration
-status: in-progress
+status: completed
 tags:
   - orchestration
   - codex
@@ -221,8 +221,17 @@ passed in 3.1 seconds against its 5-second limit. An exclusive
 runtime tests, then reproduced the existing full-suite interference in seven
 bundled-Git cases and one session-sync case. Their untouched files passed
 18 of 18 and 2 of 2 immediately in isolation. The separate root production
-build passed for desktop, CLI, and web. Current-head required CI remains the
-authoritative repository-wide delivery gate.
+build passed for desktop, CLI, and web.
+
+GitHub Actions run
+[`32422524366`](https://github.com/hraness/hra/actions/runs/32422524366)
+then passed the full source, test, production-build, native macOS test, ad-hoc
+package, macOS 26 Codex signature, and aggregate `Required` gates on
+implementation commit `319fca3698eff1e1959bd5e20f9ca359003efe3d`. The
+signature job's first dependency fetch received a transient GitHub API 5xx;
+an isolated rerun installed the same exact dependency successfully and passed
+the contract. The terminalizing documentation commit remains subject to the
+same current-head `Required` gate before merge.
 
 ## Risks and recovery
 
@@ -276,6 +285,32 @@ and that this change copies no upstream code or assets.
 ## Review gates
 
 The proposal, implementation, and public boundary each received an independent
-review. Their findings are resolved. Final delivery still requires a clean
-current-head diff, required CI, no unresolved review thread, and a mergeable
-pull request.
+review. Their findings are resolved. A final complete-diff review found no
+actionable correctness, parity, durability, privacy, ownership, attribution,
+or test-coverage issue. Pull request
+[`#23`](https://github.com/hraness/hra/pull/23) is the delivery boundary; its
+terminalizing commit must retain a clean diff, a passing current-head
+`Required` check, no unresolved review thread, and mergeability before merge.
+
+## Result
+
+Local and cloud task dispatch now use the same deterministic, versioned prompt
+renderer. Local admission renders from transaction-current task facts, and
+cloud dispatch renders from the validated claim, so authority-path selection
+no longer changes the initial objective. The unused pre-admission local prompt
+was removed.
+
+The implementation adds no runtime dependency, mutable workflow file, schema,
+protocol field, public projection, prompt persistence, command authority, or
+retry behavior. It copies no Symphony source or assets. Exact unit and adapter
+evidence, independent reviews, focused checks, production builds, and the full
+repository CI gate support the result.
+
+## Durable memory
+
+The reusable control-plane boundary and the condition for introducing durable
+policy revisions are maintained in
+[[notes/durable-task-orchestration|durable task orchestration]]. Future prompt
+changes should evolve the owned versioned renderer and preserve local/cloud
+parity. Content-addressed last-known-good policy storage belongs in a separate
+proposal only if execution policy becomes mutable at runtime.
