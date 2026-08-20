@@ -17,6 +17,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { type ReactNode, useCallback, useMemo } from "react";
 
 import { isHraPublicComparisonPath } from "./alternatives/slugs";
+import { HraAnalyticsProvider } from "./analytics-provider";
 
 function useWorkOSConvexAuth() {
   const { loading, user } = useAuth();
@@ -80,9 +81,11 @@ export function Providers({
   return (
     <DesignThemeProvider>
       <ThemeColorSync />
-      <DesignKitRouterProvider navigate={navigate} prefetch={prefetch}>
-        {content}
-      </DesignKitRouterProvider>
+      <HraAnalyticsProvider pathname={pathname}>
+        <DesignKitRouterProvider navigate={navigate} prefetch={prefetch}>
+          {content}
+        </DesignKitRouterProvider>
+      </HraAnalyticsProvider>
     </DesignThemeProvider>
   );
 }

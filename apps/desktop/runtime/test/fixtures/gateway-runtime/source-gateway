@@ -1,0 +1,4 @@
+#!/bin/sh
+
+printf '%s\n' 'source gateway test fixture must not execute' >&2
+exit 70

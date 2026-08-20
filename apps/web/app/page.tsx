@@ -290,7 +290,7 @@ export default function LandingPage() {
         <details className="landing-disclosure">
           <summary>Privacy and analytics</summary>
           <p>
-            HRA adds no client-side analytics or advertising trackers to this page. Hosting providers may retain operational request logs under their own policies.
+            HRA uses cookieless, personless PostHog analytics on public pages to count visits. It records only the canonical public route, never query text, fragments, referrers, account or task data, commands, or provider sessions. Analytics do not run inside the authenticated control plane, and HRA adds no advertising trackers. Hosting providers may retain operational request logs under their own policies.
           </p>
         </details>
       </footer>

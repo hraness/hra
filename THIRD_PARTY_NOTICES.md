@@ -54,6 +54,13 @@ HRA consumes three separately released Hraness packages under the MIT License:
 Each immutable dependency includes its own `LICENSE` file. The checked tags
 and resolved commits are recorded in `package.json` and `bun.lock`.
 
+## PostHog browser SDK
+
+The public `hra.sh` site bundles `posthog-js` 1.412.1 under its declared Apache
+License 2.0 and MIT terms. Copyright 2020 Posthog / Hiberly, Inc., and copyright
+2015 Mixpanel, Inc. The upstream package retains its complete `LICENSE`; the
+exact version is recorded in `package.json` and `bun.lock`.
+
 ## Desktop runtime components
 
 The compiled desktop gateway embeds Bun 1.3.14. Its upstream license inventory,

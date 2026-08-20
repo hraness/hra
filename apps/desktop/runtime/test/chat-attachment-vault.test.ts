@@ -87,6 +87,45 @@ test("native normalizer output overflow is reaped before failure returns", async
   expect(settled).toBe(true);
 });
 
+test("native normalizer rejects foreign stderr beside a valid success receipt", async () => {
+  const encoder = new TextEncoder();
+  const stream = (value: string) => new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(value));
+      controller.close();
+    },
+  });
+  const receipt = `${JSON.stringify({
+    schemaVersion: 1,
+    mediaType: "image/png",
+    sourceBytes: 1,
+    canonical: {
+      width: 1,
+      height: 1,
+      bytes: 1,
+      sha256: "a".repeat(64),
+    },
+    preview: {
+      width: 1,
+      height: 1,
+      bytes: 1,
+      sha256: "b".repeat(64),
+    },
+  })}\n`;
+  const spawn: NativeImageNormalizerSpawn = (): NativeImageNormalizerProcess => ({
+    stdout: stream(receipt),
+    stderr: stream("IOServiceMatchingfailed for: AppleM2ScalerParavirtDriver\n"),
+    exited: Promise.resolve(0),
+    kill: () => undefined,
+  });
+  const normalizer = new NativeChatImageNormalizer("/usr/bin/true", 5_000, spawn);
+
+  expect(await rejectionOf(normalizer.normalize(
+    "/private/tmp/hra-normalizer-input",
+    "/private/tmp/hra-normalizer-output",
+  ))).toMatchObject({ code: "corrupt" });
+});
+
 test("generic files upload in bounded exact chunks and require a provider lease", async () => {
   await withVault(async ({ vault, root, database }) => {
     const bytes = Buffer.from("private generic file\n", "utf8");

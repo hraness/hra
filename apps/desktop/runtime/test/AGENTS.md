@@ -1,6 +1,7 @@
 # Contents
 
 - Deterministic multi-account app-server behavior, pre-turn account routing, quota terminalization, cloud-dispatch transport, local dispatch durability, promotion faults, protocol fixtures, gateway integration, generation recovery, local-data removal laws, and native feasibility probes.
+- `fixtures/gateway-runtime/` – fail-closed executable placement fixtures that keep source gateway integration independent of the Zig build order.
 - `fixtures/effective-user-home-preload.ts` – process-test-only effective-home override that preserves canonical path semantics.
 - `fixtures/in-memory-secrets-preload.ts` – process-test-only secret custody with exact seeded values, deletion-failure injection, and value-free traces.
 - `probes/` – standalone JSONL and app-server probes used by the pinned-runtime test boundary.
@@ -11,6 +12,7 @@
 # Guidelines
 
 - Keep fake-server scenarios deterministic and runnable without network access or user credentials.
+- Give source gateway integration its executable companion fixtures through the installed-runtime path seam. Do not make ordinary TypeScript tests depend on a prior native build.
 - Cover arbitrary JSONL chunking, delayed output, server requests, malformed messages, unexpected exit, and restart reconciliation.
 - Prove account isolation with distinct homes and generations, sparse usage updates, bounded projections, login recovery, retained-data tombstones, and transport-sized invalidation recovery.
 - Verify launch, resume, later-turn bounded history injection, and streaming projections at the exact app-server seam. Prove a usage-limit terminal never causes history capture, injection, replacement selection, or replay.

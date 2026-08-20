@@ -15,7 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   parseRuntimeEvent,
@@ -101,6 +101,12 @@ const startupRecoveryDelayPreload = fileURLToPath(
 const startupRecoverySeedFixture = fileURLToPath(
   new URL("./fixtures/startup-recovery-seed.ts", import.meta.url),
 );
+const gatewayRuntimeFixture = fileURLToPath(
+  new URL("./fixtures/gateway-runtime/source-gateway", import.meta.url),
+);
+const gatewayImageNormalizerFixture = fileURLToPath(
+  new URL("./fixtures/gateway-runtime/hra-image-normalizer", import.meta.url),
+);
 
 interface GatewaySpawnOptions {
   readonly cwd: string;
@@ -109,6 +115,20 @@ interface GatewaySpawnOptions {
   readonly stdin: "pipe";
   readonly stdout: "pipe";
   readonly stderr: "pipe";
+}
+
+function gatewayProcessEnvironment(
+  environment: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  return {
+    ...environment,
+    HRA_DATA_REMOVER_PATH:
+      environment.HRA_DATA_REMOVER_PATH ?? "/usr/bin/false",
+    HRA_GATEWAY_PATH:
+      environment.HRA_GATEWAY_PATH ?? gatewayRuntimeFixture,
+    HRA_GATEWAY_TEST_EFFECTIVE_HOME: environment.HOME,
+    HRA_SOURCE_TEST_ALLOW_PATH_GIT: "1",
+  };
 }
 
 function spawnGatewayProcess(options: GatewaySpawnOptions) {
@@ -124,13 +144,7 @@ function spawnGatewayProcess(options: GatewaySpawnOptions) {
     "runtime/src/main.ts",
   ], {
     ...spawnOptions,
-    env: {
-      ...options.env,
-      HRA_DATA_REMOVER_PATH:
-        options.env.HRA_DATA_REMOVER_PATH ?? "/usr/bin/false",
-      HRA_GATEWAY_TEST_EFFECTIVE_HOME: options.env.HOME,
-      HRA_SOURCE_TEST_ALLOW_PATH_GIT: "1",
-    },
+    env: gatewayProcessEnvironment(options.env),
   });
   gatewayHarnessCustodyResponders.set(
     child.stdout,
@@ -1313,6 +1327,42 @@ function readGatewayAuthorityState(root: string): GatewayAuthorityState {
 }
 
 describe("compiled gateway boundary", () => {
+  test("stages the source gateway image normalizer before gateway startup", async () => {
+    expect(gatewayProcessEnvironment({
+      HOME: "/unreachable/home",
+    }).HRA_GATEWAY_PATH).toBe(gatewayRuntimeFixture);
+    expect(
+      join(dirname(gatewayRuntimeFixture), "hra-image-normalizer"),
+    ).toBe(gatewayImageNormalizerFixture);
+    expect((await stat(gatewayRuntimeFixture)).mode & 0o111).not.toBe(0);
+    expect((await stat(gatewayImageNormalizerFixture)).mode & 0o111).not.toBe(0);
+
+    const fixture = trackTestProcess(Bun.spawn([
+      gatewayImageNormalizerFixture,
+      "normalize",
+      "--input",
+      "/unreachable/source",
+      "--output-directory",
+      "/unreachable/output",
+    ], {
+      cwd: "/",
+      env: { PATH: "/usr/bin:/bin" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    }));
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(fixture.stdout).text(),
+      new Response(fixture.stderr).text(),
+      fixture.exited,
+    ]);
+    expect({ exitCode, stderr, stdout }).toEqual({
+      exitCode: 64,
+      stderr: "hra-image-normalizer:error:64\n",
+      stdout: "",
+    });
+  });
+
   test(
     "exits a transiently failed initialization so Native can restart a fresh generation",
     async () => {
@@ -1869,6 +1919,7 @@ describe("compiled gateway boundary", () => {
             totalUtf8Bytes: 13,
             truncatedPrefix: false,
           },
+          reasoningSummaryVerified: true,
           responseMarkdown: {
             tail: expectedResponse,
             totalUtf8Bytes: 22_096,
@@ -1894,11 +1945,9 @@ describe("compiled gateway boundary", () => {
         event.type === "chat.turn.delta" &&
         event.delta === escapedResponsePrefix
       )).toBeFalse();
-      expect(eventsBeforeShutdown.some((event) =>
-        event.type === "chat.pane.stateChanged" &&
-        event.pane.id === livePaneId &&
-        event.pane.state === "attention"
-      )).toBeTrue();
+      // Snapshot capture may compact state-recoverable events after the
+      // projection-overflow marker. The authoritative snapshot above proves
+      // that the attention state survives that compaction boundary.
 
       if (completed === undefined) {
         throw new Error("Completed chat pane was not projected");
@@ -2304,6 +2353,17 @@ describe("compiled gateway boundary", () => {
       );
       expect(unrelatedBeforeLogout).toBeDefined();
       expect(healthyAccountBeforeLogout).toBeDefined();
+      expect(unrelatedBeforeLogout).toMatchObject({
+        turn: {
+          status: "completed",
+          reasoningSummary: {
+            tail: "Thinking 🌿",
+            totalUtf8Bytes: 13,
+            truncatedPrefix: false,
+          },
+          reasoningSummaryVerified: true,
+        },
+      });
 
       await child.stdin.write(dispatchRequest(
         "bridge-chat-lifecycle-logout",

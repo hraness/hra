@@ -1,0 +1,4 @@
+#!/bin/sh
+
+printf '%s\n' 'hra-image-normalizer:error:64' >&2
+exit 64

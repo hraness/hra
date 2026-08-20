@@ -83,7 +83,15 @@ Scope the public `NEXT_PUBLIC_CONVEX_URL` and
 `NEXT_PUBLIC_CONVEX_SITE_URL` records to Vercel Production and Preview, with
 the exact `benevolent-akita-439` URLs. Scope the Convex production deploy-key record,
 `SUITE_IDENTITY_RECEIPT_KEY_VERSION`, `SUITE_OIDC_COOKIE_SECRET`, and
-`NEXT_PUBLIC_SITE_URL` to Production only. The deploy key must name
+`NEXT_PUBLIC_SITE_URL` to Production only. Scope `NEXT_PUBLIC_POSTHOG_KEY` to
+Production only as well; it is a public project token, but it grants analytics
+ingestion capability. Use the token for shared PostHog project `543691`, and
+enable cookieless mode in that project. When present, the browser sends one anonymous,
+cookieless `$pageview` for exact canonical public routes to the fixed
+`https://us.i.posthog.com` host. It sends no analytics from Preview, `/app`,
+authentication, callbacks, APIs, account or task surfaces, or route near
+misses. A missing token leaves analytics inert; a configured malformed token
+refuses the Production build before Next.js can embed it. The deploy key must name
 `benevolent-akita-439`, the selector must be `v1`, and the site URL must be
 `https://hra.sh`. Create a fresh HRA-held deploy key for that deployment and a
 fresh independent HRA cookie secret. Do not copy or share the predecessor

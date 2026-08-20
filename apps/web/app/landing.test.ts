@@ -137,12 +137,14 @@ describe("HRA public landing", () => {
     expect(page).toContain("webApplicationJsonLd(hraSearchSite");
   });
 
-  test("makes the absence and residual boundary of analytics explicit", async () => {
+  test("discloses the bounded public analytics and residual hosting boundary", async () => {
     const page = await source("./page.tsx");
 
-    expect(page).toContain("HRA adds no client-side analytics or advertising trackers to this page.");
+    expect(page).toContain("HRA uses cookieless, personless PostHog analytics on public pages");
+    expect(page).toContain("only the canonical public route");
+    expect(page).toContain("Analytics do not run inside the authenticated control plane");
+    expect(page).toContain("HRA adds no advertising trackers");
     expect(page).toContain("Hosting providers may retain operational request logs");
-    expect(page).not.toMatch(/posthog|plausible|segment|google analytics|gtag\(/iu);
     expect(page).not.toContain("data-analytics-");
   });
 

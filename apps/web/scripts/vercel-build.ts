@@ -3,6 +3,7 @@ import {
   verifyReleaseSourceGate,
   verifyVercelReleaseSourceGate,
 } from "../../desktop/runtime/release-download-contract";
+import { isHraPublicProjectToken } from "../app/analytics";
 
 const convexDeployArguments = [
   "x",
@@ -69,6 +70,7 @@ export const releasePublicationCommitEnvironmentVariable =
  */
 export const previewForbiddenEnvironmentVariables = [
   ...convexOnlyEnvironmentVariables,
+  "NEXT_PUBLIC_POSTHOG_KEY",
   "NEXT_PUBLIC_SITE_URL",
   "NEXT_PUBLIC_WORKOS_REDIRECT_URI",
   "SUITE_IDENTITY_RECEIPT_KEY_VERSION",
@@ -93,6 +95,7 @@ export type VercelConvexBuildRefusal =
   | "invalid-production-convex-url"
   | "invalid-production-cookie-secret"
   | "invalid-production-deployment-name"
+  | "invalid-production-posthog-key"
   | "invalid-production-receipt-key-version"
   | "invalid-production-site-url"
   | "malformed-production-deploy-key"
@@ -245,6 +248,10 @@ function productionConfigurationRefusal(
     if (environment[variable] !== undefined) {
       return "convex-only-capability-in-production";
     }
+  }
+  const posthogKey = environment.NEXT_PUBLIC_POSTHOG_KEY;
+  if (posthogKey !== undefined && !isHraPublicProjectToken(posthogKey)) {
+    return "invalid-production-posthog-key";
   }
   const publicConvex = exactPublicConvexConfiguration(
     environment,
