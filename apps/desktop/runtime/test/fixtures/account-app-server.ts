@@ -234,6 +234,7 @@ async function handle(line: string): Promise<void> {
       }
       const turnId = `chat-turn-${String(++nextTurn)}`;
       const itemId = `chat-item-${String(nextTurn)}`;
+      const reasoningItemId = `chat-reasoning-${String(nextTurn)}`;
       const inputValues: readonly unknown[] =
         isJsonObject(message.params) && Array.isArray(message.params.input)
           ? message.params.input
@@ -290,7 +291,27 @@ async function handle(line: string): Promise<void> {
       const completedResponse = `${escapedResponsePrefix}${response}`;
       write({
         method: "item/reasoning/summaryTextDelta",
-        params: { threadId, turnId, itemId, delta: reasoning, summaryIndex: 0 },
+        params: {
+          threadId,
+          turnId,
+          itemId: reasoningItemId,
+          delta: reasoning,
+          summaryIndex: 0,
+        },
+      });
+      write({
+        method: "item/completed",
+        params: {
+          threadId,
+          turnId,
+          item: {
+            type: "reasoning",
+            id: reasoningItemId,
+            summary: [reasoning],
+            content: [],
+          },
+          completedAtMs: 1_800_000_000_998,
+        },
       });
       write({
         method: "item/started",

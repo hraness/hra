@@ -1618,6 +1618,8 @@
     "apps/desktop/runtime/test/fixtures/effective-user-home-preload.ts",
     "apps/desktop/runtime/test/fixtures/fault-app-server.ts",
     "apps/desktop/runtime/test/fixtures/gateway-fault-app-server.ts",
+    "apps/desktop/runtime/test/fixtures/gateway-runtime/hra-image-normalizer",
+    "apps/desktop/runtime/test/fixtures/gateway-runtime/source-gateway",
     "apps/desktop/runtime/test/fixtures/git-generation-fatal.ts",
     "apps/desktop/runtime/test/fixtures/in-memory-secrets-preload.ts",
     "apps/desktop/runtime/test/fixtures/reactive-baseline-queue-worker.ts",
