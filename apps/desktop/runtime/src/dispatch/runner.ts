@@ -34,6 +34,7 @@ import type {
   HRADispatchHttpClient,
 } from "./cloud-client";
 import type { DispatchInteractionSyncStatus } from "./interaction-adapter";
+import { renderTaskWorkflowPromptV1 } from "./task-workflow-prompt-v1";
 
 const DEFAULT_PULL_INTERVAL_MS = 2_000;
 const DEFAULT_PULL_JITTER_RATIO = 0.25;
@@ -712,7 +713,11 @@ export class HRADispatchRunner implements DispatchPublicationBarrier {
       repositoryPublicId: claim.repositoryId,
       accountProfileId: slot.accountProfileId,
       baseRef: claim.baseRef,
-      initialPrompt: dispatchPrompt(claim),
+      initialPrompt: renderTaskWorkflowPromptV1({
+        taskKey: claim.taskKey,
+        title: claim.taskTitle,
+        description: claim.taskDescription,
+      }),
       repositoryPath: slot.repositoryPath,
       title: claim.taskTitle,
     };
@@ -1040,15 +1045,6 @@ function eventsAreContiguous(events: readonly PendingDispatchEvent[]): boolean {
 
 function dispatchCandidateKey(candidate: DispatchCandidate): string {
   return `${candidate.repositoryId}\u0000${candidate.taskKey}`;
-}
-
-function dispatchPrompt(claim: ClaimedDispatch): string {
-  const description = claim.taskDescription.trim();
-  return [
-    `Task ${claim.taskKey}: ${claim.taskTitle}`,
-    description.length === 0 ? "No additional description was provided." : description,
-    "Work only in the current managed worktree. Implement the task, run relevant checks, and leave the worktree ready for human review.",
-  ].join("\n\n");
 }
 
 function isTerminalStage(stage: DispatchBinding["stage"]): boolean {

@@ -23,6 +23,7 @@ import type {
   DispatchFenceGuard,
   DispatchPublicationBarrier,
 } from "../dispatch/coordinator";
+import { renderTaskWorkflowPromptV1 } from "../dispatch/task-workflow-prompt-v1";
 import type {
   DispatchBinding,
   DispatchReservation,
@@ -117,7 +118,6 @@ const eventRowSchema = z.object({
 export interface LocalRunLaunchCandidate {
   readonly baseRef: "HEAD";
   readonly canonicalGitCommonDir: string;
-  readonly initialPrompt: string;
   readonly repositoryId: string;
   readonly repositoryPath: string;
   readonly runId: string;
@@ -295,7 +295,6 @@ export class LocalRunExecutionStore
     return {
       baseRef: "HEAD",
       canonicalGitCommonDir: row.canonical_git_common_dir,
-      initialPrompt: initialPrompt(row.task_key, row.title, row.description),
       repositoryId: row.repository_id,
       repositoryPath: row.canonical_repository_path,
       runId: row.run_id,
@@ -511,11 +510,11 @@ export class LocalRunExecutionStore
         baseRef: input.baseSha,
         claimFence: row.intent_fence,
         claimId,
-        initialPrompt: initialPrompt(
-          row.task_key,
-          row.title,
-          row.description,
-        ),
+        initialPrompt: renderTaskWorkflowPromptV1({
+          taskKey: row.task_key,
+          title: row.title,
+          description: row.description,
+        }),
         inputReviewRevision: row.review_revision,
         repositoryPath: row.canonical_repository_path,
         repositoryPublicId: row.repository_id,
@@ -2163,18 +2162,6 @@ export class LocalRunExecutionStore
       0,
     );
   }
-}
-
-function initialPrompt(
-  taskKey: string,
-  title: string,
-  description: string,
-): string {
-  const details = description.trim();
-  const task = details.length === 0
-    ? `Complete ${taskKey}: ${title}`
-    : `Complete ${taskKey}: ${title}\n\n${details}`;
-  return task;
 }
 
 function fromBinding(row: z.infer<typeof bindingRowSchema>): DispatchBinding {

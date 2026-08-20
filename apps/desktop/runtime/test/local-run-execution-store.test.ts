@@ -376,6 +376,14 @@ describe("durable local run execution", () => {
         work: value.work,
       });
       expect(admitted.kind).toBe("admitted");
+      expect(admitted).toMatchObject({
+        admission: {
+          assignment: {
+            initialPrompt: "Task key: EX-0000019\nTask title: Run local task\n\nTask description:\nMake the smallest safe change.\n\nWorking instructions:\nMake repository changes only in the current managed worktree. Use other explicitly admitted workspace roots only when the task requires them. Implement the task, run relevant checks, and leave the managed worktree ready for human review.",
+          },
+        },
+        kind: "admitted",
+      });
       expect(value.database.query<{ state: string }, [string]>(`
         SELECT state FROM local_due_work WHERE due_work_id = ?1
       `).get(value.work.id)).toEqual({ state: "done" });

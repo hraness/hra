@@ -790,7 +790,7 @@ describe("dispatch runner supervision", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(assignments).toEqual([
-      "account_primary1:/private/repository:Task OPS-0000001: Implement dispatch\n\nImplement the accepted task.\n\nWork only in the current managed worktree. Implement the task, run relevant checks, and leave the worktree ready for human review.",
+      "account_primary1:/private/repository:Task key: OPS-0000001\nTask title: Implement dispatch\n\nTask description:\nImplement the accepted task.\n\nWorking instructions:\nMake repository changes only in the current managed worktree. Use other explicitly admitted workspace roots only when the task requires them. Implement the task, run relevant checks, and leave the managed worktree ready for human review.",
     ]);
     expect(dispositions).toEqual([{ kind: "running", runId: claim.runId }]);
   });
