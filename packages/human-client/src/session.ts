@@ -131,6 +131,9 @@ export class HumanSessionCoordinator {
     key: string;
     promise: Promise<InternalRefresh>;
   }> | null = null;
+  #activeOperations = 0;
+  #admissionClosed = false;
+  readonly #settleWaiters = new Set<() => void>();
 
   constructor(options: HumanSessionCoordinatorOptions) {
     this.#store = options.store;
@@ -138,6 +141,26 @@ export class HumanSessionCoordinator {
     this.#isAuthenticationFailure =
       options.isAuthenticationFailure ??
       ((failure) => failure.code === "AUTHENTICATION_FAILED");
+  }
+
+  closeAdmission(): void {
+    this.#admissionClosed = true;
+  }
+
+  async settled(): Promise<void> {
+    while (this.#activeOperations > 0) {
+      await new Promise<void>((resolve) => {
+        this.#settleWaiters.add(resolve);
+      });
+    }
+  }
+
+  #completeOperation(): void {
+    this.#activeOperations -= 1;
+    if (this.#activeOperations !== 0) return;
+    const waiters = [...this.#settleWaiters];
+    this.#settleWaiters.clear();
+    for (const resolve of waiters) resolve();
   }
 
   async #readSnapshot(): Promise<HumanAuthenticationSnapshot | null> {
@@ -322,6 +345,15 @@ export class HumanSessionCoordinator {
       accessToken: string,
     ) => Promise<HumanOperationResult<Value, Failure>>,
   ): Promise<HumanSessionResult<Value, Failure>> {
+    if (this.#admissionClosed) {
+      return {
+        ok: false,
+        kind: "session",
+        error: sessionFailure("SERVICE_UNAVAILABLE").error,
+      };
+    }
+    this.#activeOperations += 1;
+    try {
     let snapshot: HumanAuthenticationSnapshot | null;
     try {
       snapshot = await this.#readSnapshot();
@@ -378,6 +410,9 @@ export class HumanSessionCoordinator {
         kind: "session",
         error: sessionFailure("SERVICE_UNAVAILABLE").error,
       };
+    }
+    } finally {
+      this.#completeOperation();
     }
   }
 }

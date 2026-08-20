@@ -23,6 +23,15 @@ crons.interval(
 );
 
 crons.interval(
+  "sweep due scheduled chats",
+  { minutes: 1 },
+  makeFunctionReference<"mutation">(
+    "sessionSyncScheduledChats:sweepDueScheduledChats",
+  ),
+  {},
+);
+
+crons.interval(
   "reconcile stale hosted mutation attempts",
   { hours: 24 },
   internal.hostedMutationAttempts.sweepStaleOpenAttempts,

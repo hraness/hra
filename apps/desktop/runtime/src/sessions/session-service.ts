@@ -1,5 +1,7 @@
-import { realpath, stat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
+import { z } from "@hra-internal/schema";
 import type {
   AccountSummary,
   ChatProviderSubagentsProjection,
@@ -29,10 +31,14 @@ import type {
   PinnedCodexThread,
   ProductionExecutionPolicyProof,
   ProductionExecutionPolicyReceipt,
+  ScheduleInterpreterExecutionPolicyProof,
+  ScheduleInterpreterExecutionPolicyReceipt,
 } from "../codex";
 import {
   HRA_PRODUCTION_EXECUTION_POLICY,
+  HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY,
   ProductionExecutionPolicyError,
+  ScheduleInterpreterExecutionPolicyError,
   createCodexFactsAtPosition,
   isProductionApprovalRequestMethod,
   pinnedCodexTurnScanEvidenceDigest,
@@ -40,11 +46,22 @@ import {
   projectCodexThreadResponseFacts,
   projectCodexTurnResponseFacts,
   scanPinnedCodexTurns,
+  scheduleInterpreterThreadConfig,
   verifyProductionExecutionPolicyRequirements,
   verifyProductionThreadAdmission,
   verifyProductionTurnAdmission,
+  verifyScheduleInterpreterExecutionPolicyRequirements,
+  verifyScheduleInterpreterThreadAdmission,
+  verifyScheduleInterpreterTurnAdmission,
+  requireComputerUseAdmissionReceipt,
+  verifyComputerUseServerStatus,
+  withComputerUseDeveloperInstructions,
+  withComputerUseThreadConfig,
+  type ComputerUseAdmissionReceipt,
+  type ComputerUseProvisioning,
 } from "../codex";
 import {
+  MAX_SCHEDULED_CHAT_PROMPT_UTF8_BYTES,
   type RunInteractionRequest,
   type RunInteractionRequestPayload,
   type RunInteractionResponse,
@@ -296,6 +313,15 @@ export interface SessionHarnessActorTurnStartResult {
   readonly turnId: string;
 }
 
+export interface SessionHarnessActorTurnWorkspaceReconciliation {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly clientUserMessageId: string;
+  readonly disposition: "active" | "notApplied" | "terminal";
+  readonly expectedGeneration: number;
+  readonly providerThreadId: string;
+  readonly providerTurnId?: string;
+}
+
 /** Content-free, generation-fenced model capability evidence for actor routing. */
 export interface SessionHarnessModelCatalog {
   readonly evidenceDigest: string;
@@ -388,8 +414,26 @@ interface RegisteredHarnessActorThread {
 
 interface RegisteredProductionExecutionPolicy {
   readonly accountProfileId: AccountSummary["id"];
+  readonly computerUseReceipt?: ComputerUseAdmissionReceipt;
   readonly receipt: ProductionExecutionPolicyReceipt;
   readonly threadId: ThreadSummary["id"];
+}
+
+interface RegisteredExecutionWorkspaceLease {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly release: () => void;
+  readonly threadId: ThreadSummary["id"];
+}
+
+interface RegisteredAmbiguousExecutionWorkspaceLease
+  extends RegisteredExecutionWorkspaceLease {
+  readonly clientUserMessageId: string;
+  readonly executionSettingsRevision: number;
+  readonly generation: number;
+  readonly proof: ProductionExecutionPolicyProof;
+  readonly providerThreadId: string;
+  readonly request: PinnedCodexRequestInput<"turnStart">;
+  readonly threadReceipt: ProductionExecutionPolicyReceipt;
 }
 
 interface RegisteredChatCatalog {
@@ -467,6 +511,19 @@ export interface SessionThreadStartResult {
 export interface SessionChatThreadStartResult extends SessionThreadStartResult {
   /** Raw Codex identity retained only by the gateway for restart recovery. */
   readonly restartThreadId: string;
+}
+
+export interface SessionChatScheduleInterpretationRequest {
+  readonly accountProfileId: AccountSummary["id"];
+  readonly workspacePath: string;
+  readonly instruction: string;
+  readonly timeZone: string;
+  readonly now: string;
+}
+
+export interface SessionChatScheduleInterpretation {
+  readonly prompt: string;
+  readonly rrule: string;
 }
 
 export interface SessionChatThreadResumeRequest {
@@ -550,6 +607,20 @@ export interface SessionHydrationFailure {
 export interface SessionServiceOptions {
   readonly accounts: SessionAccountRuntimePort;
   readonly emit: (event: SessionEvent) => void;
+  /** Required by production; optional only for isolated legacy unit fixtures. */
+  readonly execution?: Readonly<{
+    readonly computerUse: ComputerUseProvisioning;
+    readonly runtimeWorkspaceRoots: () => readonly [string];
+    readonly runtimeWorkspaceSnapshot?: () => Readonly<{
+      revision: number;
+      runtimeWorkspaceRoots: readonly [string];
+    }>;
+    readonly acquireRuntimeWorkspaceAdmission?: () => Promise<Readonly<{
+      revision: number;
+      runtimeWorkspaceRoots: readonly [string];
+      release(): void;
+    }>>;
+  }>;
   readonly now?: () => Date;
   readonly deadlines?: SessionInteractionDeadlineScheduler;
   readonly onHydrationFailure?: (
@@ -694,12 +765,46 @@ export const MAX_SESSION_HARNESS_HISTORY_ITEM_UTF8_BYTES = 1024 * 1024;
 export const MAX_SESSION_HARNESS_HISTORY_UTF8_BYTES = 16 * 1024 * 1024;
 export const MAX_SESSION_HARNESS_CONTINUATION_ITEMS = 1_024;
 
+const chatScheduleInterpretationSchema = z.object({
+  prompt: z.string().trim().min(1).max(MAX_SCHEDULED_CHAT_PROMPT_UTF8_BYTES)
+    .refine(
+      (prompt) => Buffer.byteLength(prompt, "utf8") <= MAX_SCHEDULED_CHAT_PROMPT_UTF8_BYTES,
+      "schedule prompt exceeds the UTF-8 byte bound",
+    ),
+  rrule: z.string().trim().min(1).max(2 * 1_024),
+}).strict();
+const chatScheduleOutputSchema: NonNullable<
+  PinnedCodexRequestInput<"turnStart">["outputSchema"]
+> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["prompt", "rrule"],
+  properties: {
+    prompt: {
+      type: "string",
+      minLength: 1,
+      maxLength: MAX_SCHEDULED_CHAT_PROMPT_UTF8_BYTES,
+    },
+    rrule: { type: "string", minLength: 1, maxLength: 2_048 },
+  },
+};
+const chatScheduleDeveloperInstructions = [
+  "Interpret one natural-language scheduling request for HRA.",
+  "Return exactly one JSON object matching the supplied schema.",
+  "The prompt must contain only the task to run, without timing language.",
+  "The rrule must be exactly two lines: DTSTART;TZID=<supplied-zone>:YYYYMMDDTHHMMSS followed by RRULE:FREQ=<MINUTELY|HOURLY|DAILY|WEEKLY|MONTHLY>;INTERVAL=<canonical-positive-integer>.",
+  "A WEEKLY rule must append ;BYDAY= with unique weekdays sorted MO,TU,WE,TH,FR,SA,SU and including DTSTART's weekday. A MONTHLY rule must append ;BYMONTHDAY= with unique ascending day numbers and including DTSTART's day. Other frequencies must not use BYDAY or BYMONTHDAY.",
+  "Do not create a Codex scheduled task, automation, reminder, or any external side effect.",
+  "If the request cannot be interpreted unambiguously as a recurring schedule, fail the turn instead of guessing.",
+].join("\n");
+
 export class SessionService {
   readonly #activeToolItemsByTurn = new Map<string, Set<string>>();
   readonly #completedToolItemsByTurn = new Map<string, Set<string>>();
   readonly #commands: SessionCommandExecutor;
   readonly #accounts: SessionAccountRuntimePort;
   readonly #factDispatch: SessionFactDispatchAdapter;
+  readonly #execution: SessionServiceOptions["execution"];
   readonly #hydration: SessionHydrationCoordinator;
   readonly #activeRuntimeGenerations = new Map<string, number>();
   readonly #harnessActorThreadsByOwnedId = new Map<
@@ -737,6 +842,14 @@ export class SessionService {
     string,
     RegisteredProductionExecutionPolicy
   >();
+  readonly #executionWorkspaceLeaseByTurn = new Map<
+    string,
+    RegisteredExecutionWorkspaceLease
+  >();
+  readonly #ambiguousExecutionWorkspaceLeaseByRequest = new Map<
+    string,
+    RegisteredAmbiguousExecutionWorkspaceLease
+  >();
   readonly #chatCatalogsByEvidence = new Map<string, RegisteredChatCatalog>();
   readonly #chatCapabilityByTurn = new Map<string, RegisteredChatTurnCapability>();
   readonly #chatThreadArchiveTails = new Map<string, Promise<void>>();
@@ -751,6 +864,7 @@ export class SessionService {
   constructor(options: SessionServiceOptions) {
     this.#accounts = options.accounts;
     this.#commands = new SessionCommandExecutor(options.accounts);
+    this.#execution = options.execution;
     this.#onTurnLifecycle = options.onTurnLifecycle ?? (() => undefined);
     this.#registry = new SessionRegistry({
       emit: options.emit,
@@ -961,13 +1075,17 @@ export class SessionService {
   ): ProductionExecutionPolicyReceipt | null {
     const thread = this.#registry.threadByOwnedId(threadId);
     const registered = this.#productionPolicyByTurn.get(turnId);
+    const workspaceLease = this.#executionWorkspaceLeaseByTurn.get(turnId);
     if (
       thread === null ||
       thread.activeTurn?.id !== turnId ||
       thread.activeTurn.status !== "active" ||
       registered === undefined ||
+      workspaceLease === undefined ||
       registered.threadId !== threadId ||
+      workspaceLease.threadId !== threadId ||
       registered.accountProfileId !== thread.accountProfileId ||
+      workspaceLease.accountProfileId !== thread.accountProfileId ||
       this.#activeRuntimeGenerations.get(thread.accountProfileId) !==
         registered.receipt.generation
     ) return null;
@@ -1015,16 +1133,22 @@ export class SessionService {
       request.accountProfileId,
       request.expectedGeneration,
     );
+    const executionWorkspace = this.#runtimeWorkspaceSnapshot(project.displayPath);
     const threadStartInput: PinnedCodexRequestInput<"threadStart"> = {
       model: request.model,
       allowProviderModelFallback: false,
       serviceTier: null,
       cwd: project.displayPath,
+      runtimeWorkspaceRoots: [...executionWorkspace.runtimeWorkspaceRoots],
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
-      config: harnessActorThreadConfig(request.reasoningEffort),
-      developerInstructions: request.developerInstructions,
+      config: this.#executionThreadConfig(
+        harnessActorThreadConfig(request.reasoningEffort),
+      ),
+      developerInstructions: this.#executionDeveloperInstructions(
+        request.developerInstructions,
+      ),
       ephemeral: false,
       historyMode: "paginated",
       threadSource: request.threadSource,
@@ -1055,11 +1179,12 @@ export class SessionService {
         "restartRuntime",
       );
     }
-    this.#registerProductionThreadPolicy({
+    await this.#registerProductionThreadPolicy({
       accountProfileId: request.accountProfileId,
       proof: policyProof,
       positioned,
       request: threadStartInput,
+      executionSettingsRevision: executionWorkspace.revision,
     });
 
     const threadId = ownedCodexId("thread", request.accountProfileId, raw.id);
@@ -1284,15 +1409,20 @@ export class SessionService {
       request.accountProfileId,
       request.expectedGeneration,
     );
+    const executionWorkspace = this.#runtimeWorkspaceSnapshot(project.displayPath);
     const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
       threadId: request.providerThreadId,
       model: request.model,
       serviceTier: null,
       cwd: project.displayPath,
+      runtimeWorkspaceRoots: [...executionWorkspace.runtimeWorkspaceRoots],
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
-      config: harnessActorThreadConfig(request.reasoningEffort),
+      config: this.#executionThreadConfig(
+        harnessActorThreadConfig(request.reasoningEffort),
+      ),
+      developerInstructions: this.#executionDeveloperInstructions(),
     };
     const positioned = await this.#commands.threadResume(
       request.accountProfileId,
@@ -1341,11 +1471,12 @@ export class SessionService {
         "Codex resumed an actor thread with incompatible persistence settings.",
       );
     }
-    this.#registerProductionThreadPolicy({
+    await this.#registerProductionThreadPolicy({
       accountProfileId: request.accountProfileId,
       proof: policyProof,
       positioned,
       request: threadResumeInput,
+      executionSettingsRevision: executionWorkspace.revision,
     });
     const recoveryProof = await this.#observeHarnessActorRecoveryProof({
       actorId: request.actorId,
@@ -1457,19 +1588,28 @@ export class SessionService {
         "none",
       );
     }
-    const policyProof = await this.#preflightProductionExecutionPolicy(
-      binding.accountProfileId,
-      request.expectedGeneration,
-    );
-    const threadReceipt = this.#requireProductionThreadPolicy(
-      registered.threadId,
-      policyProof.generation,
-    );
+    this.#assertNoAmbiguousExecutionWorkspaceLease({
+      accountProfileId: binding.accountProfileId,
+      clientUserMessageId: request.clientUserMessageId,
+      providerThreadId: binding.codexThreadId,
+    });
+    const admission = await this.#admitCurrentProductionThreadRoots({
+      accountProfileId: binding.accountProfileId,
+      expectedGeneration: request.expectedGeneration,
+      threadId: registered.threadId,
+      model: request.model,
+      serviceTier: null,
+      config: this.#executionThreadConfig(
+        harnessActorThreadConfig(request.reasoningEffort),
+      ),
+      developerInstructions: this.#executionDeveloperInstructions(),
+    });
     const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
       threadId: binding.codexThreadId,
       clientUserMessageId: request.clientUserMessageId,
       input: [{ type: "text", text: request.prompt, text_elements: [] }],
       cwd: binding.cwd,
+      runtimeWorkspaceRoots: admission.runtimeWorkspaceRoots,
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
@@ -1477,28 +1617,57 @@ export class SessionService {
       effort: request.reasoningEffort,
       serviceTier: codexServiceTier(request.serviceTier),
     };
-    const positioned = await this.#commands.turnStart(
-      binding.accountProfileId,
-      turnStartInput,
-      policyProof.generation,
-    );
-    this.#assertHarnessGeneration(binding.accountProfileId, request.expectedGeneration);
-    if (positioned.generation !== request.expectedGeneration) {
-      throw new SessionServiceError(
-        "protocol_error",
-        "Codex returned a harness actor turn from a different runtime generation.",
-        false,
-        "restartRuntime",
+    let positioned: PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnStart">>;
+    let workspaceLeaseTransferred = false;
+    try {
+      positioned = await this.#commands.turnStart(
+        binding.accountProfileId,
+        turnStartInput,
+        admission.proof.generation,
       );
+      this.#assertHarnessGeneration(binding.accountProfileId, request.expectedGeneration);
+      if (positioned.generation !== request.expectedGeneration) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Codex returned a harness actor turn from a different runtime generation.",
+          false,
+          "restartRuntime",
+        );
+      }
+      this.#registerProductionTurnPolicy({
+        accountProfileId: binding.accountProfileId,
+        proof: admission.proof,
+        positioned,
+        request: turnStartInput,
+        threadId: registered.threadId,
+        threadReceipt: admission.receipt,
+        executionSettingsRevision: admission.executionSettingsRevision,
+        releaseWorkspaceAdmission: admission.releaseWorkspaceAdmission,
+      });
+      workspaceLeaseTransferred = true;
+    } catch (error: unknown) {
+      if (
+        this.#activeRuntimeGenerations.get(binding.accountProfileId) ===
+          admission.proof.generation
+      ) {
+        this.#retainAmbiguousExecutionWorkspaceLease({
+          accountProfileId: binding.accountProfileId,
+          clientUserMessageId: request.clientUserMessageId,
+          executionSettingsRevision: admission.executionSettingsRevision,
+          generation: admission.proof.generation,
+          proof: admission.proof,
+          providerThreadId: binding.codexThreadId,
+          release: admission.releaseWorkspaceAdmission,
+          request: turnStartInput,
+          threadId: registered.threadId,
+          threadReceipt: admission.receipt,
+        });
+        workspaceLeaseTransferred = true;
+      }
+      throw error;
+    } finally {
+      if (!workspaceLeaseTransferred) admission.releaseWorkspaceAdmission();
     }
-    this.#registerProductionTurnPolicy({
-      accountProfileId: binding.accountProfileId,
-      proof: policyProof,
-      positioned,
-      request: turnStartInput,
-      threadId: registered.threadId,
-      threadReceipt,
-    });
 
     const providerTurnId = positioned.output.turn.id;
     const turnId = ownedCodexId("turn", binding.accountProfileId, providerTurnId);
@@ -1518,12 +1687,22 @@ export class SessionService {
         threadId: binding.codexThreadId,
       }, snapshotFacts.length),
     ]));
+    const turnAdmissionSuperseded =
+      this.#releaseProductionTurnAdmissionIfSuperseded({
+        accountProfileId: binding.accountProfileId,
+        generation: positioned.generation,
+        providerThreadId: binding.codexThreadId,
+        providerTurnId,
+        responseStreamPosition: positioned.streamPosition,
+      });
 
     const projected = this.#registry.threadByOwnedId(registered.threadId);
     if (
-      projected === null ||
-      projected.activeTurn?.id !== turnId ||
-      this.#registry.rawTurnIdByOwnedId(turnId) !== providerTurnId
+      !turnAdmissionSuperseded && (
+        projected === null ||
+        projected.activeTurn?.id !== turnId ||
+        this.#registry.rawTurnIdByOwnedId(turnId) !== providerTurnId
+      )
     ) {
       throw new SessionServiceError(
         "protocol_error",
@@ -1543,6 +1722,79 @@ export class SessionService {
       threadId: registered.threadId,
       turnId,
     });
+  }
+
+  /**
+   * Consumes only the stable, exhaustive actor-turn reconciliation result.
+   * Pending or ambiguous scans never call this boundary, so an old-root lease
+   * remains held until the provider effect is definitively absent, terminal,
+   * or attached to its exact active provider turn.
+   */
+  settleHarnessActorTurnWorkspaceAdmission(
+    input: SessionHarnessActorTurnWorkspaceReconciliation,
+  ): void {
+    validateClientUserMessageId(input.clientUserMessageId);
+    if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 1) {
+      throw new SessionServiceError(
+        "invalid_request",
+        "The actor turn reconciliation generation is invalid.",
+        false,
+        "none",
+      );
+    }
+    const key = ambiguousExecutionWorkspaceLeaseKey(input);
+    const lease = this.#ambiguousExecutionWorkspaceLeaseByRequest.get(key);
+    if (lease === undefined) return;
+    if (
+      lease.generation !== input.expectedGeneration ||
+      this.#activeRuntimeGenerations.get(input.accountProfileId) !==
+        input.expectedGeneration
+    ) {
+      throw new SessionServiceError(
+        "conflict",
+        "The actor turn reconciliation crossed a runtime generation.",
+        true,
+        "retry",
+      );
+    }
+    if (input.disposition === "notApplied" || input.disposition === "terminal") {
+      this.#releaseAmbiguousExecutionWorkspaceLease(key);
+      return;
+    }
+    const providerTurnId = input.providerTurnId;
+    if (providerTurnId === undefined || providerTurnId.length === 0) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Active actor reconciliation omitted its provider turn identity.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const turnId = ownedCodexId("turn", input.accountProfileId, providerTurnId);
+    if (this.#executionWorkspaceLeaseByTurn.has(turnId)) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Actor reconciliation duplicated a turn workspace admission.",
+        false,
+        "restartRuntime",
+      );
+    }
+    if (this.#exactProviderTurnIsTerminal({
+      accountProfileId: input.accountProfileId,
+      providerThreadId: lease.providerThreadId,
+      providerTurnId,
+    })) {
+      // A terminal notification won the race with reconciliation before the
+      // client-message identity could be attached to this lease.
+      this.#releaseAmbiguousExecutionWorkspaceLease(key);
+      return;
+    }
+    this.#ambiguousExecutionWorkspaceLeaseByRequest.delete(key);
+    this.#executionWorkspaceLeaseByTurn.set(turnId, Object.freeze({
+      accountProfileId: lease.accountProfileId,
+      release: lease.release,
+      threadId: lease.threadId,
+    }));
   }
 
   /**
@@ -2359,6 +2611,245 @@ export class SessionService {
     );
   }
 
+  async interpretChatSchedule(
+    request: SessionChatScheduleInterpretationRequest,
+  ): Promise<SessionChatScheduleInterpretation> {
+    validateScheduleInterpretationRequest(request);
+    const runtime = await this.#accounts.ensureSessionRuntime(
+      request.accountProfileId,
+    );
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "hra-schedule-interpreter-"));
+    const isolatedRoot = await realpath(temporaryRoot);
+    let rawThreadId: string | null = null;
+    try {
+      const policyProof = await this.#preflightScheduleInterpreterExecutionPolicy(
+        request.accountProfileId,
+        runtime.generation,
+      );
+      const disabledMcpServerNames = await this.#scheduleInterpreterMcpServerNames(
+        request.accountProfileId,
+        runtime.generation,
+      );
+      const threadStartInput: PinnedCodexRequestInput<
+        "scheduleInterpreterThreadStart"
+      > = {
+        model: "gpt-5.6-luna",
+        allowProviderModelFallback: false,
+        serviceTier: null,
+        cwd: isolatedRoot,
+        runtimeWorkspaceRoots: [isolatedRoot],
+        approvalPolicy: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.approvalPolicy,
+        approvalsReviewer: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.approvalsReviewer,
+        sandbox: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.threadSandbox,
+        config: scheduleInterpreterThreadConfig(disabledMcpServerNames),
+        developerInstructions: chatScheduleDeveloperInstructions,
+        ephemeral: true,
+        historyMode: "paginated",
+        threadSource: "appServer",
+        environments: [],
+        selectedCapabilityRoots: [],
+      };
+      const thread = await this.#commands.scheduleInterpreterThreadStart(
+        request.accountProfileId,
+        threadStartInput,
+        policyProof.generation,
+      );
+      rawThreadId = thread.output.thread.id;
+      let threadReceipt: ScheduleInterpreterExecutionPolicyReceipt;
+      try {
+        threadReceipt = verifyScheduleInterpreterThreadAdmission({
+          proof: policyProof,
+          generation: thread.generation,
+          streamPosition: thread.streamPosition,
+          isolatedRoot,
+          disabledMcpServerNames,
+          developerInstructions: chatScheduleDeveloperInstructions,
+          request: threadStartInput,
+          response: thread.output,
+        });
+      } catch {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Codex did not preserve HRA's no-tool schedule-interpreter policy.",
+          false,
+          "restartRuntime",
+        );
+      }
+      await this.#requireScheduleInterpreterHasNoMcpTools({
+        accountProfileId: request.accountProfileId,
+        generation: runtime.generation,
+        rawThreadId,
+        afterPosition: thread.streamPosition,
+      });
+      const turnProof = await this.#preflightScheduleInterpreterExecutionPolicy(
+        request.accountProfileId,
+        runtime.generation,
+      );
+      const clientUserMessageId = scheduleInterpreterMessageId(request);
+      const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
+        threadId: rawThreadId,
+        clientUserMessageId,
+        input: [{
+          type: "text",
+          text: JSON.stringify({
+            currentInstant: request.now,
+            instruction: request.instruction,
+            timeZone: request.timeZone,
+          }),
+          text_elements: [],
+        }],
+        environments: [],
+        cwd: isolatedRoot,
+        runtimeWorkspaceRoots: [isolatedRoot],
+        approvalPolicy: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.approvalPolicy,
+        approvalsReviewer: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.approvalsReviewer,
+        sandboxPolicy: HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY.turnSandboxPolicy,
+        model: "gpt-5.6-luna",
+        effort: "medium",
+        serviceTier: null,
+        outputSchema: chatScheduleOutputSchema,
+        collaborationMode: {
+          mode: "plan",
+          settings: {
+            model: "gpt-5.6-luna",
+            reasoning_effort: "medium",
+            developer_instructions: chatScheduleDeveloperInstructions,
+          },
+        },
+      };
+      const turn = await this.#commands.turnStart(
+        request.accountProfileId,
+        turnStartInput,
+        turnProof.generation,
+      );
+      try {
+        verifyScheduleInterpreterTurnAdmission({
+          proof: turnProof,
+          threadReceipt,
+          generation: turn.generation,
+          streamPosition: turn.streamPosition,
+          threadId: rawThreadId,
+          developerInstructions: chatScheduleDeveloperInstructions,
+          request: turnStartInput,
+        });
+      } catch {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Codex did not preserve HRA's no-tool schedule-interpreter turn policy.",
+          false,
+          "restartRuntime",
+        );
+      }
+      return await this.#readScheduleInterpretation({
+        accountProfileId: request.accountProfileId,
+        generation: runtime.generation,
+        rawThreadId,
+        rawTurnId: turn.output.turn.id,
+      });
+    } finally {
+      try {
+        if (rawThreadId !== null) {
+          await this.#commands.threadArchive(
+            request.accountProfileId,
+            { threadId: rawThreadId },
+            runtime.generation,
+          );
+        }
+      } finally {
+        await rm(isolatedRoot, { recursive: true, force: true });
+      }
+    }
+  }
+
+  async #readScheduleInterpretation(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    generation: number;
+    rawThreadId: string;
+    rawTurnId: string;
+  }>): Promise<SessionChatScheduleInterpretation> {
+    const deadline = Date.now() + 90_000;
+    let delayMilliseconds = 50;
+    for (let attempt = 0; attempt < 128 && Date.now() < deadline; attempt += 1) {
+      const observed = await this.#commands.threadHistoryRead(
+        input.accountProfileId,
+        { threadId: input.rawThreadId, includeTurns: true },
+        input.generation,
+      );
+      if (observed.generation !== input.generation) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "The schedule interpreter changed runtime generation.",
+          false,
+          "restartRuntime",
+        );
+      }
+      const turn = observed.output.thread.turns.find(
+        ({ id }) => id === input.rawTurnId,
+      );
+      if (turn !== undefined && turn.status !== "inProgress") {
+        if (turn.status !== "completed") {
+          throw new SessionServiceError(
+            "invalid_request",
+            "The prompt could not be interpreted as a recurring schedule.",
+            false,
+            "none",
+          );
+        }
+        const finalItems = turn.items.filter((item) =>
+          item.type === "agentMessage"
+          && item.phase === "final_answer"
+          && item.context.kind === "plainTextFinal"
+        );
+        const unexpectedItems = turn.items.filter((item) =>
+          item.type !== "userMessage" &&
+          item.type !== "reasoning" &&
+          !(
+            item.type === "agentMessage" &&
+            item.phase === "final_answer" &&
+            item.context.kind === "plainTextFinal"
+          )
+        );
+        if (finalItems.length !== 1 || unexpectedItems.length !== 0) {
+          throw new SessionServiceError(
+            "protocol_error",
+            "The schedule interpreter produced an unexpected tool or control item.",
+            false,
+            "restartRuntime",
+          );
+        }
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(finalItems[0]?.text ?? "") as unknown;
+        } catch {
+          throw new SessionServiceError(
+            "invalid_request",
+            "The prompt could not be interpreted as a recurring schedule.",
+            false,
+            "none",
+          );
+        }
+        const parsed = chatScheduleInterpretationSchema.safeParse(parsedJson);
+        if (!parsed.success) {
+          throw new SessionServiceError(
+            "invalid_request",
+            "The prompt could not be interpreted as a recurring schedule.",
+            false,
+            "none",
+          );
+        }
+        return Object.freeze(parsed.data);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMilliseconds));
+      delayMilliseconds = Math.min(delayMilliseconds * 2, 1_000);
+    }
+    throw new SessionServiceError(
+      "runtime_unavailable",
+      "The schedule interpreter did not finish in time.",
+      true,
+      "retry",
+    );
+  }
+
   /**
    * Reads one complete, exact-generation catalog for metaharness routing.
    * Catalog failure is never converted into proof that a profile is absent.
@@ -2564,14 +3055,18 @@ export class SessionService {
       request.accountProfileId,
       request.catalogGeneration,
     );
+    const executionWorkspace = this.#runtimeWorkspaceSnapshot(project.displayPath);
     const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
       threadId: request.restartThreadId,
       model: request.model,
       serviceTier: codexServiceTier(request.serviceTier),
       cwd: project.displayPath,
+      runtimeWorkspaceRoots: [...executionWorkspace.runtimeWorkspaceRoots],
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      config: this.#executionThreadConfig(),
+      developerInstructions: this.#executionDeveloperInstructions(),
     };
     const positioned = await this.#commands.threadResume(
       request.accountProfileId,
@@ -2591,11 +3086,12 @@ export class SessionService {
         "restartRuntime",
       );
     }
-    this.#registerProductionThreadPolicy({
+    await this.#registerProductionThreadPolicy({
       accountProfileId: request.accountProfileId,
       proof: policyProof,
       positioned,
       request: threadResumeInput,
+      executionSettingsRevision: executionWorkspace.revision,
     });
     const snapshotFacts = projectCodexThreadResponseFacts({
       accountProfileId: request.accountProfileId,
@@ -2735,18 +3231,23 @@ export class SessionService {
       generation: positioned.generation,
       streamPosition: positioned.streamPosition,
     };
-    this.#chatCapabilityByTurn.set(result.turnId, Object.freeze({
-      accountProfileId: binding.accountProfileId,
-      threadId: request.threadId,
-      receipt: Object.freeze({
-        catalogDigest: request.catalogDigest,
-        generation: positioned.generation,
-        model: request.model,
-        observedInputModalities: capability.observedInputModalities,
-        reasoningEffort: request.reasoningEffort,
-        serviceTier: request.serviceTier,
-      }),
-    }));
+    if (
+      this.#productionPolicyByTurn.has(result.turnId) &&
+      this.#executionWorkspaceLeaseByTurn.has(result.turnId)
+    ) {
+      this.#chatCapabilityByTurn.set(result.turnId, Object.freeze({
+        accountProfileId: binding.accountProfileId,
+        threadId: request.threadId,
+        receipt: Object.freeze({
+          catalogDigest: request.catalogDigest,
+          generation: positioned.generation,
+          model: request.model,
+          observedInputModalities: capability.observedInputModalities,
+          reasoningEffort: request.reasoningEffort,
+          serviceTier: request.serviceTier,
+        }),
+      }));
+    }
     return result;
   }
 
@@ -2952,6 +3453,11 @@ export class SessionService {
   ): Promise<SessionTurnReconciliation> {
     validateClientUserMessageId(clientUserMessageId);
     const binding = this.#registry.requireBinding(threadId);
+    const workspaceLeaseKey = ambiguousExecutionWorkspaceLeaseKey({
+      accountProfileId: binding.accountProfileId,
+      clientUserMessageId,
+      providerThreadId: binding.codexThreadId,
+    });
     const response = await this.#commands.threadRead(
       binding.accountProfileId,
       {
@@ -2995,6 +3501,14 @@ export class SessionService {
       generation: response.generation,
       responsePosition: response.streamPosition,
     };
+    const ambiguousWorkspaceLease =
+      this.#ambiguousExecutionWorkspaceLeaseByRequest.get(workspaceLeaseKey);
+    if (
+      ambiguousWorkspaceLease !== undefined &&
+      ambiguousWorkspaceLease.generation !== response.generation
+    ) {
+      this.#releaseAmbiguousExecutionWorkspaceLease(workspaceLeaseKey);
+    }
     if (raw.turns.some((turn) => turn.itemsView !== "full")) {
       return {
         ...position,
@@ -3018,7 +3532,34 @@ export class SessionService {
         reason: "duplicate_client_message_id",
       };
     }
-    if (matchingTurn === undefined) return { ...position, kind: "missing" };
+    if (matchingTurn === undefined) {
+      this.#releaseAmbiguousExecutionWorkspaceLease(workspaceLeaseKey);
+      return { ...position, kind: "missing" };
+    }
+    const retainedWorkspaceLease =
+      this.#ambiguousExecutionWorkspaceLeaseByRequest.get(workspaceLeaseKey);
+    if (retainedWorkspaceLease !== undefined) {
+      if (matchingTurn.status !== "inProgress") {
+        this.#releaseAmbiguousExecutionWorkspaceLease(workspaceLeaseKey);
+      } else {
+        this.#registerProductionTurnPolicy({
+          accountProfileId: binding.accountProfileId,
+          proof: retainedWorkspaceLease.proof,
+          positioned: {
+            generation: response.generation,
+            output: { turn: matchingTurn },
+            streamPosition: response.streamPosition,
+          },
+          request: retainedWorkspaceLease.request,
+          threadId,
+          threadReceipt: retainedWorkspaceLease.threadReceipt,
+          executionSettingsRevision:
+            retainedWorkspaceLease.executionSettingsRevision,
+          releaseWorkspaceAdmission: retainedWorkspaceLease.release,
+        });
+        this.#ambiguousExecutionWorkspaceLeaseByRequest.delete(workspaceLeaseKey);
+      }
+    }
     return {
       ...position,
       kind: "ready",
@@ -3163,6 +3704,14 @@ export class SessionService {
             }
           }
           if (turn.status !== "active") {
+            const ownedTurnId = ownedCodexId(
+              "turn",
+              fact.accountProfileId,
+              turn.id,
+            );
+            this.#releaseExecutionWorkspaceLease(ownedTurnId);
+            this.#productionPolicyByTurn.delete(ownedTurnId);
+            this.#chatCapabilityByTurn.delete(ownedTurnId);
             this.#completeProviderSubagents(turnFact);
             this.#reasoningSummaries.clearTurn({
               accountProfileId: fact.accountProfileId,
@@ -3176,6 +3725,9 @@ export class SessionService {
         return true;
       }
       case "thread.archived":
+        this.#releaseExecutionWorkspaceLeasesForThread(
+          ownedCodexId("thread", fact.accountProfileId, fact.threadId),
+        );
         return this.#registry.refreshThread(fact.accountProfileId, fact.threadId);
       case "thread.deleted":
         return this.#deleteOwnedThread(fact.accountProfileId, fact.threadId);
@@ -3197,6 +3749,7 @@ export class SessionService {
             );
         if (fact.turn.status !== "active") {
           const ownedTurnId = ownedCodexId("turn", fact.accountProfileId, fact.turn.id);
+          this.#releaseExecutionWorkspaceLease(ownedTurnId);
           this.#productionPolicyByTurn.delete(ownedTurnId);
           this.#chatCapabilityByTurn.delete(ownedTurnId);
         }
@@ -3225,6 +3778,7 @@ export class SessionService {
       }
       case "turn.completed": {
         const ownedTurnId = ownedCodexId("turn", fact.accountProfileId, fact.turnId);
+        this.#releaseExecutionWorkspaceLease(ownedTurnId);
         this.#productionPolicyByTurn.delete(ownedTurnId);
         this.#chatCapabilityByTurn.delete(ownedTurnId);
         const completion = this.#closeActiveToolActivity(
@@ -4103,13 +4657,17 @@ export class SessionService {
       command.accountProfileId,
       command.expectedGeneration,
     );
+    const executionWorkspace = this.#runtimeWorkspaceSnapshot(project.displayPath);
     const threadStartInput: PinnedCodexRequestInput<"threadStart"> = {
       model: command.model,
       serviceTier: codexServiceTier(command.serviceTier),
       cwd: project.displayPath,
+      runtimeWorkspaceRoots: [...executionWorkspace.runtimeWorkspaceRoots],
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      config: this.#executionThreadConfig(),
+      developerInstructions: this.#executionDeveloperInstructions(),
       ephemeral: false,
     };
     const positioned = await this.#commands.threadStart(
@@ -4118,11 +4676,12 @@ export class SessionService {
       policyProof.generation,
     );
     const { thread: raw } = positioned.output;
-    this.#registerProductionThreadPolicy({
+    await this.#registerProductionThreadPolicy({
       accountProfileId: command.accountProfileId,
       proof: policyProof,
       positioned,
       request: threadStartInput,
+      executionSettingsRevision: executionWorkspace.revision,
     });
     const snapshotFacts = projectCodexThreadResponseFacts({
       accountProfileId: command.accountProfileId,
@@ -4154,14 +4713,18 @@ export class SessionService {
     const policyProof = await this.#preflightProductionExecutionPolicy(
       binding.accountProfileId,
     );
+    const executionWorkspace = this.#runtimeWorkspaceSnapshot(binding.cwd);
     const threadResumeInput: PinnedCodexRequestInput<"threadResume"> = {
       threadId: binding.codexThreadId,
       model: "gpt-5.6-sol",
       serviceTier: null,
       cwd: binding.cwd,
+      runtimeWorkspaceRoots: [...executionWorkspace.runtimeWorkspaceRoots],
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+      config: this.#executionThreadConfig(),
+      developerInstructions: this.#executionDeveloperInstructions(),
     };
     const positioned = await this.#commands.threadResume(
       binding.accountProfileId,
@@ -4169,11 +4732,12 @@ export class SessionService {
       policyProof.generation,
     );
     const { thread: raw } = positioned.output;
-    this.#registerProductionThreadPolicy({
+    await this.#registerProductionThreadPolicy({
       accountProfileId: binding.accountProfileId,
       proof: policyProof,
       positioned,
       request: threadResumeInput,
+      executionSettingsRevision: executionWorkspace.revision,
     });
     const project = this.#registry.projectById(binding.projectId);
     const snapshotFacts = projectCodexThreadResponseFacts({
@@ -4221,14 +4785,21 @@ export class SessionService {
         "retry",
       );
     }
-    const policyProof = await this.#preflightProductionExecutionPolicy(
-      binding.accountProfileId,
-      command.expectedGeneration ?? registeredThreadPolicy.receipt.generation,
-    );
-    const threadReceipt = this.#requireProductionThreadPolicy(
-      command.threadId,
-      policyProof.generation,
-    );
+    this.#assertNoAmbiguousExecutionWorkspaceLease({
+      accountProfileId: binding.accountProfileId,
+      clientUserMessageId: command.clientUserMessageId,
+      providerThreadId: binding.codexThreadId,
+    });
+    const admission = await this.#admitCurrentProductionThreadRoots({
+      accountProfileId: binding.accountProfileId,
+      expectedGeneration: command.expectedGeneration ??
+        registeredThreadPolicy.receipt.generation,
+      threadId: command.threadId,
+      model: command.model,
+      serviceTier: codexServiceTier(command.serviceTier),
+      config: this.#executionThreadConfig(),
+      developerInstructions: this.#executionDeveloperInstructions(),
+    });
     const turnStartInput: PinnedCodexRequestInput<"turnStart"> = {
       threadId: binding.codexThreadId,
       clientUserMessageId: command.clientUserMessageId,
@@ -4236,6 +4807,7 @@ export class SessionService {
         ? { type: "text" as const, text: item.text, text_elements: [] }
         : { type: "localImage" as const, path: item.path }),
       cwd: binding.cwd,
+      runtimeWorkspaceRoots: admission.runtimeWorkspaceRoots,
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
@@ -4243,19 +4815,48 @@ export class SessionService {
       effort: command.reasoningEffort,
       serviceTier: codexServiceTier(command.serviceTier),
     };
-    const positioned = await this.#commands.turnStart(
-      binding.accountProfileId,
-      turnStartInput,
-      policyProof.generation,
-    );
-    this.#registerProductionTurnPolicy({
-      accountProfileId: binding.accountProfileId,
-      proof: policyProof,
-      positioned,
-      request: turnStartInput,
-      threadId: command.threadId,
-      threadReceipt,
-    });
+    let positioned: PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"turnStart">>;
+    let workspaceLeaseTransferred = false;
+    try {
+      positioned = await this.#commands.turnStart(
+        binding.accountProfileId,
+        turnStartInput,
+        admission.proof.generation,
+      );
+      this.#registerProductionTurnPolicy({
+        accountProfileId: binding.accountProfileId,
+        proof: admission.proof,
+        positioned,
+        request: turnStartInput,
+        threadId: command.threadId,
+        threadReceipt: admission.receipt,
+        executionSettingsRevision: admission.executionSettingsRevision,
+        releaseWorkspaceAdmission: admission.releaseWorkspaceAdmission,
+      });
+      workspaceLeaseTransferred = true;
+    } catch (error: unknown) {
+      if (
+        this.#activeRuntimeGenerations.get(binding.accountProfileId) ===
+          admission.proof.generation
+      ) {
+        this.#retainAmbiguousExecutionWorkspaceLease({
+          accountProfileId: binding.accountProfileId,
+          clientUserMessageId: command.clientUserMessageId,
+          executionSettingsRevision: admission.executionSettingsRevision,
+          generation: admission.proof.generation,
+          proof: admission.proof,
+          providerThreadId: binding.codexThreadId,
+          release: admission.releaseWorkspaceAdmission,
+          request: turnStartInput,
+          threadId: command.threadId,
+          threadReceipt: admission.receipt,
+        });
+        workspaceLeaseTransferred = true;
+      }
+      throw error;
+    } finally {
+      if (!workspaceLeaseTransferred) admission.releaseWorkspaceAdmission();
+    }
     const snapshotFacts = projectCodexTurnResponseFacts({
       accountProfileId: binding.accountProfileId,
       generation: positioned.generation,
@@ -4272,6 +4873,13 @@ export class SessionService {
         threadId: binding.codexThreadId,
       }, snapshotFacts.length),
     ]));
+    this.#releaseProductionTurnAdmissionIfSuperseded({
+      accountProfileId: binding.accountProfileId,
+      generation: positioned.generation,
+      providerThreadId: binding.codexThreadId,
+      providerTurnId: positioned.output.turn.id,
+      responseStreamPosition: positioned.streamPosition,
+    });
     return positioned;
   }
 
@@ -4524,8 +5132,10 @@ export class SessionService {
     if (removed === null) return false;
     this.#harnessActorThreadsByOwnedId.delete(removed.thread.id);
     this.#productionPolicyByThread.delete(removed.thread.id);
+    this.#releaseExecutionWorkspaceLeasesForThread(removed.thread.id);
     for (const [turnId, registered] of this.#productionPolicyByTurn) {
       if (registered.threadId === removed.thread.id) {
+        this.#releaseExecutionWorkspaceLease(turnId);
         this.#productionPolicyByTurn.delete(turnId);
       }
     }
@@ -4618,9 +5228,138 @@ export class SessionService {
     }
     for (const [turnId, registered] of this.#productionPolicyByTurn) {
       if (registered.accountProfileId === accountProfileId) {
+        this.#releaseExecutionWorkspaceLease(turnId);
         this.#productionPolicyByTurn.delete(turnId);
       }
     }
+    for (const [turnId, lease] of this.#executionWorkspaceLeaseByTurn) {
+      if (lease.accountProfileId === accountProfileId) {
+        this.#releaseExecutionWorkspaceLease(turnId);
+      }
+    }
+    for (const [key, lease] of this.#ambiguousExecutionWorkspaceLeaseByRequest) {
+      if (lease.accountProfileId === accountProfileId) {
+        this.#releaseAmbiguousExecutionWorkspaceLease(key);
+      }
+    }
+  }
+
+  #releaseExecutionWorkspaceLease(turnId: string): void {
+    const lease = this.#executionWorkspaceLeaseByTurn.get(turnId);
+    if (lease === undefined) return;
+    this.#executionWorkspaceLeaseByTurn.delete(turnId);
+    try {
+      lease.release();
+    } catch {
+      // Release is idempotent and must not weaken terminal containment.
+    }
+  }
+
+  #releaseExecutionWorkspaceLeasesForThread(threadId: ThreadSummary["id"]): void {
+    for (const [turnId, lease] of this.#executionWorkspaceLeaseByTurn) {
+      if (lease.threadId === threadId) this.#releaseExecutionWorkspaceLease(turnId);
+    }
+    for (const [key, lease] of this.#ambiguousExecutionWorkspaceLeaseByRequest) {
+      if (lease.threadId === threadId) {
+        this.#releaseAmbiguousExecutionWorkspaceLease(key);
+      }
+    }
+  }
+
+  #assertNoAmbiguousExecutionWorkspaceLease(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    clientUserMessageId: string;
+    providerThreadId: string;
+  }>): void {
+    if (!this.#ambiguousExecutionWorkspaceLeaseByRequest.has(
+      ambiguousExecutionWorkspaceLeaseKey(input),
+    )) return;
+    throw new SessionServiceError(
+      "upstream_ambiguous",
+      "The prior turn start still requires exact provider reconciliation.",
+      false,
+      "resolveAttention",
+    );
+  }
+
+  #retainAmbiguousExecutionWorkspaceLease(
+    lease: RegisteredAmbiguousExecutionWorkspaceLease,
+  ): void {
+    const key = ambiguousExecutionWorkspaceLeaseKey(lease);
+    if (this.#ambiguousExecutionWorkspaceLeaseByRequest.has(key)) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex repeated an unresolved turn mutation identity.",
+        false,
+        "restartRuntime",
+      );
+    }
+    this.#ambiguousExecutionWorkspaceLeaseByRequest.set(
+      key,
+      Object.freeze({ ...lease }),
+    );
+  }
+
+  #releaseAmbiguousExecutionWorkspaceLease(key: string): void {
+    const lease = this.#ambiguousExecutionWorkspaceLeaseByRequest.get(key);
+    if (lease === undefined) return;
+    this.#ambiguousExecutionWorkspaceLeaseByRequest.delete(key);
+    try {
+      lease.release();
+    } catch {
+      // Release is idempotent and cannot alter the reconciled disposition.
+    }
+  }
+
+  #exactProviderTurnIsTerminal(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    providerThreadId: string;
+    providerTurnId: string;
+  }>): boolean {
+    const turn = this.#store.getSnapshot().turns[sessionEntityKey(
+      input.accountProfileId,
+      input.providerTurnId,
+    )];
+    return turn !== undefined &&
+      turn.threadKey === sessionEntityKey(
+        input.accountProfileId,
+        input.providerThreadId,
+      ) &&
+      turn.status !== "active";
+  }
+
+  /**
+   * A positioned terminal notification can overtake a delayed lower-position
+   * `turn/start` response. The terminal fact cannot release a lease that has
+   * not been registered yet, while the later response facts are correctly
+   * rejected by the account cursor. Re-check the exact canonical turn after
+   * fact consumption so that ordering can never strand the old folder root.
+   */
+  #releaseProductionTurnAdmissionIfSuperseded(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    generation: number;
+    providerThreadId: string;
+    providerTurnId: string;
+    responseStreamPosition: CodexStreamPosition;
+  }>): boolean {
+    const cursor = this.#store.getSnapshot().cursors[
+      sessionAccountKey(input.accountProfileId)
+    ];
+    if (
+      cursor === undefined ||
+      cursor.generation !== input.generation ||
+      cursor.streamPosition <= input.responseStreamPosition ||
+      !this.#exactProviderTurnIsTerminal(input)
+    ) return false;
+    const turnId = ownedCodexId(
+      "turn",
+      input.accountProfileId,
+      input.providerTurnId,
+    );
+    this.#releaseExecutionWorkspaceLease(turnId);
+    this.#productionPolicyByTurn.delete(turnId);
+    this.#chatCapabilityByTurn.delete(turnId);
+    return true;
   }
 
   #clearChatCapabilityForAccount(accountProfileId: string): void {
@@ -4803,7 +5542,348 @@ export class SessionService {
     }
   }
 
-  #registerProductionThreadPolicy(input: Readonly<{
+  async #preflightScheduleInterpreterExecutionPolicy(
+    accountProfileId: AccountSummary["id"],
+    expectedGeneration: number,
+  ): Promise<ScheduleInterpreterExecutionPolicyProof> {
+    const positioned = await this.#commands.configRequirementsRead(
+      accountProfileId,
+      expectedGeneration,
+    );
+    if (positioned.generation !== expectedGeneration) {
+      throw new SessionServiceError(
+        "conflict",
+        "The Codex runtime generation changed before schedule interpretation.",
+        true,
+        "retry",
+      );
+    }
+    try {
+      return verifyScheduleInterpreterExecutionPolicyRequirements({
+        generation: positioned.generation,
+        streamPosition: positioned.streamPosition,
+        output: positioned.output,
+      });
+    } catch (error: unknown) {
+      if (
+        error instanceof ScheduleInterpreterExecutionPolicyError &&
+        error.reason === "managed_requirements_rejected_policy"
+      ) {
+        throw new SessionServiceError(
+          "capability_unavailable",
+          "This Codex profile cannot provide the required no-tool schedule interpreter.",
+          false,
+          "none",
+        );
+      }
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex returned invalid schedule-interpreter policy requirements.",
+        false,
+        "restartRuntime",
+      );
+    }
+  }
+
+  async #scheduleInterpreterMcpServerNames(
+    accountProfileId: AccountSummary["id"],
+    expectedGeneration: number,
+  ): Promise<readonly string[]> {
+    const names = new Set<string>();
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 8; page += 1) {
+      const positioned = await this.#commands.mcpServerStatusList(
+        accountProfileId,
+        { cursor, limit: 64, detail: "toolsAndAuthOnly", threadId: null },
+        expectedGeneration,
+      );
+      if (positioned.generation !== expectedGeneration) {
+        throw new SessionServiceError(
+          "conflict",
+          "The Codex runtime generation changed while fencing interpreter tools.",
+          true,
+          "retry",
+        );
+      }
+      for (const server of positioned.output.data) names.add(server.name);
+      const nextCursor = positioned.output.nextCursor;
+      if (nextCursor === null) return Object.freeze([...names].sort());
+      if (seenCursors.has(nextCursor)) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Codex returned a cyclic MCP server catalog.",
+          false,
+          "restartRuntime",
+        );
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    throw new SessionServiceError(
+      "capability_unavailable",
+      "The MCP server catalog is too large to fence schedule interpretation safely.",
+      false,
+      "none",
+    );
+  }
+
+  async #requireScheduleInterpreterHasNoMcpTools(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    generation: number;
+    rawThreadId: string;
+    afterPosition: CodexStreamPosition;
+  }>): Promise<void> {
+    const positioned = await this.#commands.mcpServerStatusList(
+      input.accountProfileId,
+      {
+        cursor: null,
+        limit: 64,
+        detail: "toolsAndAuthOnly",
+        threadId: input.rawThreadId,
+      },
+      input.generation,
+    );
+    if (
+      positioned.generation !== input.generation ||
+      positioned.streamPosition <= input.afterPosition
+    ) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "The interpreter MCP fence was observed outside its admission window.",
+        false,
+        "restartRuntime",
+      );
+    }
+    if (
+      positioned.output.data.length !== 0 ||
+      positioned.output.nextCursor !== null
+    ) {
+      throw new SessionServiceError(
+        "capability_unavailable",
+        "Schedule interpretation is unavailable because a tool server remained active.",
+        false,
+        "none",
+      );
+    }
+  }
+
+  #runtimeWorkspaceSnapshot(fallbackCwd: string): Readonly<{
+    revision: number;
+    runtimeWorkspaceRoots: readonly [string];
+  }> {
+    const snapshot = this.#execution?.runtimeWorkspaceSnapshot?.() ?? {
+      revision: 0,
+      runtimeWorkspaceRoots: this.#execution === undefined
+        ? [fallbackCwd] as const
+        : this.#execution.runtimeWorkspaceRoots(),
+    };
+    if (
+      !Number.isSafeInteger(snapshot.revision) ||
+      snapshot.revision < 0 ||
+      snapshot.runtimeWorkspaceRoots.length !== 1
+    ) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "HRA produced an invalid global folder capability snapshot.",
+        false,
+        "restartRuntime",
+      );
+    }
+    const runtimeWorkspaceRoots = Object.freeze<readonly [string]>([
+      snapshot.runtimeWorkspaceRoots[0],
+    ]);
+    return Object.freeze({
+      revision: snapshot.revision,
+      runtimeWorkspaceRoots,
+    });
+  }
+
+  async #acquireRuntimeWorkspaceAdmission(
+    fallbackCwd: string,
+  ): Promise<Readonly<{
+    revision: number;
+    runtimeWorkspaceRoots: readonly [string];
+    release(): void;
+  }>> {
+    const acquire = this.#execution?.acquireRuntimeWorkspaceAdmission;
+    if (acquire === undefined) {
+      const snapshot = this.#runtimeWorkspaceSnapshot(fallbackCwd);
+      return Object.freeze({ ...snapshot, release: () => undefined });
+    }
+    const admission = await acquire();
+    if (
+      !Number.isSafeInteger(admission.revision) ||
+      admission.revision < 0 ||
+      admission.runtimeWorkspaceRoots.length !== 1
+    ) {
+      admission.release();
+      throw new SessionServiceError(
+        "protocol_error",
+        "HRA acquired an invalid global folder admission.",
+        false,
+        "restartRuntime",
+      );
+    }
+    return admission;
+  }
+
+  #executionThreadConfig(
+    existing?: NonNullable<PinnedCodexRequestInput<"threadStart">["config"]>,
+  ): NonNullable<PinnedCodexRequestInput<"threadStart">["config"]> | undefined {
+    if (this.#execution === undefined) return existing;
+    return withComputerUseThreadConfig(
+      this.#execution.computerUse,
+      existing,
+    ) as NonNullable<PinnedCodexRequestInput<"threadStart">["config"]>;
+  }
+
+  #executionDeveloperInstructions(
+    existing?: string,
+  ): string | undefined {
+    if (this.#execution === undefined) return existing;
+    return withComputerUseDeveloperInstructions(
+      this.#execution.computerUse,
+      existing,
+    );
+  }
+
+  /**
+   * A folder-selection revision changes the capability roots, not the chat's
+   * cwd. Re-admit the existing provider thread under the newest root before a
+   * turn can be submitted, and repeat if the selection changes during either
+   * admission preflight.
+   */
+  async #admitCurrentProductionThreadRoots(input: Readonly<{
+    accountProfileId: AccountSummary["id"];
+    expectedGeneration: number;
+    threadId: ThreadSummary["id"];
+    model: "gpt-5.6-sol" | "gpt-5.6-luna";
+    serviceTier: string | null;
+    config: PinnedCodexRequestInput<"threadResume">["config"];
+    developerInstructions: string | undefined;
+  }>): Promise<Readonly<{
+    executionSettingsRevision: number;
+    proof: ProductionExecutionPolicyProof;
+    receipt: ProductionExecutionPolicyReceipt;
+    runtimeWorkspaceRoots: [string];
+    releaseWorkspaceAdmission(): void;
+  }>> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const binding = this.#registry.requireBinding(input.threadId);
+      if (
+        binding.accountProfileId !== input.accountProfileId ||
+        this.#activeRuntimeGenerations.get(input.accountProfileId) !==
+          input.expectedGeneration
+      ) {
+        throw new SessionServiceError(
+          "conflict",
+          "The chat runtime changed before folder admission.",
+          true,
+          "retry",
+        );
+      }
+      const proof = await this.#preflightProductionExecutionPolicy(
+        input.accountProfileId,
+        input.expectedGeneration,
+      );
+      const workspace = this.#runtimeWorkspaceSnapshot(binding.cwd);
+      const roots = [...workspace.runtimeWorkspaceRoots];
+      const current = this.#productionPolicyByThread.get(input.threadId);
+      if (
+        current === undefined ||
+        current.receipt.generation !== proof.generation ||
+        current.receipt.executionSettingsRevision !== workspace.revision ||
+        !sameOrderedStrings(current.receipt.runtimeWorkspaceRoots, roots)
+      ) {
+        const resumeInput: PinnedCodexRequestInput<"threadResume"> = {
+          threadId: binding.codexThreadId,
+          model: input.model,
+          serviceTier: input.serviceTier,
+          cwd: binding.cwd,
+          runtimeWorkspaceRoots: roots,
+          approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
+          approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
+          sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
+          config: input.config,
+          developerInstructions: input.developerInstructions,
+        };
+        const positioned = await this.#commands.threadResume(
+          input.accountProfileId,
+          resumeInput,
+          proof.generation,
+        );
+        if (
+          positioned.generation !== proof.generation ||
+          positioned.output.thread.id !== binding.codexThreadId ||
+          positioned.output.thread.cwd !== binding.cwd
+        ) {
+          throw new SessionServiceError(
+            "protocol_error",
+            "Codex resumed a different chat while updating folder access.",
+            false,
+            "restartRuntime",
+          );
+        }
+        await this.#registerProductionThreadPolicy({
+          accountProfileId: input.accountProfileId,
+          proof,
+          positioned,
+          request: resumeInput,
+          executionSettingsRevision: workspace.revision,
+        });
+      }
+
+      const workspaceAdmission = await this.#acquireRuntimeWorkspaceAdmission(binding.cwd);
+      if (
+        workspaceAdmission.revision !== workspace.revision ||
+        !sameOrderedStrings(workspaceAdmission.runtimeWorkspaceRoots, roots)
+      ) {
+        workspaceAdmission.release();
+        continue;
+      }
+      try {
+        const turnProof = await this.#preflightProductionExecutionPolicy(
+          input.accountProfileId,
+          input.expectedGeneration,
+        );
+        const receipt = this.#requireProductionThreadPolicy(
+          input.threadId,
+          turnProof.generation,
+        );
+        if (
+          receipt.executionSettingsRevision !== workspaceAdmission.revision ||
+          !sameOrderedStrings(
+            receipt.runtimeWorkspaceRoots,
+            workspaceAdmission.runtimeWorkspaceRoots,
+          )
+        ) {
+          workspaceAdmission.release();
+          continue;
+        }
+        return Object.freeze({
+          executionSettingsRevision: workspaceAdmission.revision,
+          proof: turnProof,
+          receipt,
+          runtimeWorkspaceRoots: [
+            workspaceAdmission.runtimeWorkspaceRoots[0],
+          ] as [string],
+          releaseWorkspaceAdmission: workspaceAdmission.release,
+        });
+      } catch (error: unknown) {
+        workspaceAdmission.release();
+        throw error;
+      }
+    }
+    throw new SessionServiceError(
+      "conflict",
+      "The global folder changed too often to admit this turn safely.",
+      true,
+      "retry",
+    );
+  }
+
+  async #registerProductionThreadPolicy(input: Readonly<{
     readonly accountProfileId: AccountSummary["id"];
     readonly proof: ProductionExecutionPolicyProof;
     readonly positioned: PinnedCodexResponseAtPosition<
@@ -4812,7 +5892,8 @@ export class SessionService {
     readonly request:
       | PinnedCodexRequestInput<"threadStart">
       | PinnedCodexRequestInput<"threadResume">;
-  }>): ProductionExecutionPolicyReceipt {
+    readonly executionSettingsRevision: number;
+  }>): Promise<ProductionExecutionPolicyReceipt> {
     let receipt: ProductionExecutionPolicyReceipt;
     try {
       receipt = verifyProductionThreadAdmission({
@@ -4821,6 +5902,7 @@ export class SessionService {
         streamPosition: input.positioned.streamPosition,
         request: input.request,
         response: input.positioned.output,
+        executionSettingsRevision: input.executionSettingsRevision,
       });
     } catch {
       throw new SessionServiceError(
@@ -4835,8 +5917,49 @@ export class SessionService {
       input.accountProfileId,
       input.positioned.output.thread.id,
     );
+    let computerUseReceipt: ComputerUseAdmissionReceipt | undefined;
+    if (this.#execution !== undefined) {
+      const status = await this.#commands.mcpServerStatusList(
+        input.accountProfileId,
+        {
+          cursor: null,
+          limit: 64,
+          detail: "toolsAndAuthOnly",
+          threadId: input.positioned.output.thread.id,
+        },
+        input.positioned.generation,
+      );
+      if (
+        status.generation !== input.positioned.generation
+        || status.streamPosition <= input.positioned.streamPosition
+      ) {
+        throw new SessionServiceError(
+          "protocol_error",
+          "Computer Use readiness was observed outside the thread admission fence.",
+          false,
+          "restartRuntime",
+        );
+      }
+      try {
+        computerUseReceipt = verifyComputerUseServerStatus({
+          provisioning: this.#execution.computerUse,
+          generation: status.generation,
+          threadId: input.positioned.output.thread.id,
+          streamPosition: status.streamPosition,
+          output: status.output,
+        });
+      } catch {
+        throw new SessionServiceError(
+          "capability_unavailable",
+          "Computer Use did not become ready. Update ChatGPT, open it once, then restart HRA.",
+          false,
+          "none",
+        );
+      }
+    }
     this.#productionPolicyByThread.set(threadId, Object.freeze({
       accountProfileId: input.accountProfileId,
+      ...(computerUseReceipt === undefined ? {} : { computerUseReceipt }),
       receipt,
       threadId,
     }));
@@ -4860,6 +5983,22 @@ export class SessionService {
         "retry",
       );
     }
+    if (this.#execution !== undefined) {
+      const computerUseReceipt = registered.computerUseReceipt;
+      if (computerUseReceipt === undefined) {
+        throw new SessionServiceError(
+          "capability_unavailable",
+          "The chat lacks verified Computer Use capability.",
+          false,
+          "none",
+        );
+      }
+      requireComputerUseAdmissionReceipt({
+        receipt: computerUseReceipt,
+        generation,
+        threadId: this.#registry.requireBinding(threadId).codexThreadId,
+      });
+    }
     return registered.receipt;
   }
 
@@ -4870,6 +6009,8 @@ export class SessionService {
     readonly request: PinnedCodexRequestInput<"turnStart">;
     readonly threadId: ThreadSummary["id"];
     readonly threadReceipt: ProductionExecutionPolicyReceipt;
+    readonly executionSettingsRevision: number;
+    readonly releaseWorkspaceAdmission: () => void;
   }>): ProductionExecutionPolicyReceipt {
     let receipt: ProductionExecutionPolicyReceipt;
     try {
@@ -4879,6 +6020,7 @@ export class SessionService {
         generation: input.positioned.generation,
         streamPosition: input.positioned.streamPosition,
         request: input.request,
+        executionSettingsRevision: input.executionSettingsRevision,
       });
     } catch {
       throw new SessionServiceError(
@@ -4893,6 +6035,19 @@ export class SessionService {
       input.accountProfileId,
       input.positioned.output.turn.id,
     );
+    if (this.#executionWorkspaceLeaseByTurn.has(turnId)) {
+      throw new SessionServiceError(
+        "protocol_error",
+        "Codex reused an active turn identity across folder admissions.",
+        false,
+        "restartRuntime",
+      );
+    }
+    this.#executionWorkspaceLeaseByTurn.set(turnId, Object.freeze({
+      accountProfileId: input.accountProfileId,
+      release: input.releaseWorkspaceAdmission,
+      threadId: input.threadId,
+    }));
     this.#productionPolicyByTurn.set(turnId, Object.freeze({
       accountProfileId: input.accountProfileId,
       receipt,
@@ -5687,6 +6842,85 @@ function validateLaunchTitle(title: string): void {
       "none",
     );
   }
+}
+
+function sameOrderedStrings(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return left.length === right.length &&
+    left.every((value, index) => value === right[index]);
+}
+
+function ambiguousExecutionWorkspaceLeaseKey(input: Readonly<{
+  accountProfileId: string;
+  clientUserMessageId: string;
+  providerThreadId: string;
+}>): string {
+  return JSON.stringify([
+    input.accountProfileId,
+    input.providerThreadId,
+    input.clientUserMessageId,
+  ]);
+}
+
+function validateScheduleInterpretationRequest(
+  request: SessionChatScheduleInterpretationRequest,
+): void {
+  if (
+    request.instruction.trim().length === 0
+    || request.instruction.includes("\0")
+    || Buffer.byteLength(request.instruction, "utf8") > 128 * 1_024
+  ) {
+    throw new SessionServiceError(
+      "invalid_request",
+      "The schedule instruction is empty or too large.",
+      false,
+      "none",
+    );
+  }
+  const parsedNow = Date.parse(request.now);
+  if (
+    !Number.isFinite(parsedNow)
+    || new Date(parsedNow).toISOString() !== request.now
+  ) {
+    throw new SessionServiceError(
+      "invalid_request",
+      "The schedule interpretation instant is invalid.",
+      false,
+      "none",
+    );
+  }
+  try {
+    if (
+      request.timeZone.length === 0
+      || request.timeZone.length > 128
+      || new Intl.DateTimeFormat("en-US", { timeZone: request.timeZone })
+        .resolvedOptions().timeZone !== request.timeZone
+    ) throw new Error("non-canonical time zone");
+  } catch {
+    throw new SessionServiceError(
+      "invalid_request",
+      "The schedule time zone is invalid.",
+      false,
+      "none",
+    );
+  }
+}
+
+function scheduleInterpreterMessageId(
+  request: SessionChatScheduleInterpretationRequest,
+): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update("hra.chat.schedule-interpreter-message.v1\0");
+  hasher.update(JSON.stringify([
+    request.accountProfileId,
+    request.workspacePath,
+    request.instruction,
+    request.timeZone,
+    request.now,
+  ]));
+  return `message_${hasher.digest("hex").slice(0, 48)}`;
 }
 
 function validateHarnessActorId(actorId: string): void {

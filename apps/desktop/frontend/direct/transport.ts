@@ -23,6 +23,7 @@ import {
 
 import {
   parseRuntimeDispatchRequest,
+  parseRuntimeFolderAccessSelectRequest,
   parseRuntimeProjectAddRequest,
   parseRuntimeSnapshotRequest,
   parseRuntimeTaskDispatchRequest,
@@ -30,6 +31,7 @@ import {
   parseRuntimeTransportLifecycle,
   runtimeDispatchCommand,
   runtimeEventName,
+  runtimeFolderAccessSelectCommand,
   runtimeProjectAddCommand,
   runtimeProtocolVersion,
   runtimeSnapshotCommand,
@@ -48,6 +50,7 @@ import {
   type RuntimeDispatchRequest,
   type RuntimeDispatchResponse,
   type RuntimeEvent,
+  type RuntimeFolderAccessSelectResult,
   type RuntimeHumanOrganization,
   type RuntimeHumanWorkspace,
   type RuntimeLocalPromotionProgress,
@@ -414,6 +417,9 @@ class DeterministicRuntimeTransport {
         this.#invocations.push({ command, payload: recordedInvocationPayload(command, payload) });
         if (command === runtimeSnapshotCommand) return this.#snapshotRequest(payload);
         if (command === runtimeDispatchCommand) return this.#dispatchRequest(payload);
+        if (command === runtimeFolderAccessSelectCommand) {
+          return this.#folderAccessSelect(payload);
+        }
         if (command === runtimeProjectAddCommand) return this.#projectAdd(payload);
         if (command === runtimeTransportHealthCommand) {
           return this.#confirmTransportHealth(payload);
@@ -842,6 +848,7 @@ class DeterministicRuntimeTransport {
           attention: null,
           recoverablePrompt: false,
           canStartFreshContext: false,
+          schedule: null,
           messageQueue: {
             revision: 1,
             pauseReason: null,
@@ -868,6 +875,74 @@ class DeterministicRuntimeTransport {
           ...pane,
           revision: pane.revision + 1,
           title: command.title,
+        };
+        this.#changeChatPaneState(updated);
+        return this.#success(request, {
+          type: "chatPane",
+          pane: updated,
+          disposition: "applied",
+          appliedRevision: updated.revision,
+        });
+      }
+      case "chat.pane.schedule.configure": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (pane.revision !== command.expectedRevision) {
+          return this.#staleRevision(request, pane.revision);
+        }
+        if (
+          pane.interactionMode !== "chat" ||
+          (pane.state !== "ready" && pane.state !== "attention")
+        ) {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct cannot configure a schedule while this pane is working.",
+          );
+        }
+        if (command.instruction.trim().toLowerCase() === "invalid schedule") {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct could not interpret that schedule.",
+          );
+        }
+        const updated: ChatPaneProjection = {
+          ...pane,
+          revision: pane.revision + 1,
+          schedule: {
+            revision: (pane.schedule?.revision ?? 0) + 1,
+            rrule: "DTSTART;TZID=America/Puerto_Rico:20260720T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+            timeZone: "America/Puerto_Rico",
+            nextRunAt: "2026-07-20T13:00:00.000Z",
+          },
+        };
+        this.#changeChatPaneState(updated);
+        return this.#success(request, {
+          type: "chatPane",
+          pane: updated,
+          disposition: "applied",
+          appliedRevision: updated.revision,
+        });
+      }
+      case "chat.pane.schedule.remove": {
+        const pane = this.#requireChatPane(command.paneId);
+        if (pane.revision !== command.expectedRevision) {
+          return this.#staleRevision(request, pane.revision);
+        }
+        if (
+          pane.interactionMode !== "chat" || pane.schedule === null ||
+          (pane.state !== "ready" && pane.state !== "attention")
+        ) {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct cannot remove a schedule from this pane.",
+          );
+        }
+        const updated: ChatPaneProjection = {
+          ...pane,
+          revision: pane.revision + 1,
+          schedule: null,
         };
         this.#changeChatPaneState(updated);
         return this.#success(request, {
@@ -1431,6 +1506,7 @@ class DeterministicRuntimeTransport {
           attention: null,
           recoverablePrompt: false,
           canStartFreshContext: false,
+          schedule: null,
           messageQueue: {
             revision: 1,
             pauseReason: null,
@@ -1820,6 +1896,7 @@ class DeterministicRuntimeTransport {
             connection: "online",
           }],
           pendingEnrollments: [],
+          scheduledChatRecovery: null,
         });
         this.#nextSessionSyncScopeGeneration += 1;
         return this.#accepted(request);
@@ -1852,6 +1929,44 @@ class DeterministicRuntimeTransport {
       }
       case "sessionSync.retry":
         return this.#accepted(request);
+      case "sessionSync.scheduledChat.orphan.clear": {
+        const status = this.#snapshot.sessionSync.status;
+        if (status.state !== "active") {
+          return this.#chatFailure(
+            request,
+            "invalid_state",
+            "Direct can clear orphaned schedules only while session sync is active.",
+          );
+        }
+        if (status.revision !== command.expectedRevision) {
+          return this.#staleRevision(request, status.revision);
+        }
+        const recovery = status.scheduledChatRecovery;
+        if (
+          recovery === null
+          || !recovery.orphans.some(({ orphanId }) => orphanId === command.orphanId)
+        ) {
+          return this.#chatFailure(
+            request,
+            "not_found",
+            "Direct has no matching orphaned scheduled chat.",
+          );
+        }
+        const orphans = recovery.orphans.filter(
+          ({ orphanId }) => orphanId !== command.orphanId,
+        );
+        this.#setSessionSyncStatus({
+          ...status,
+          health: orphans.length === 0 ? "current" : "attention",
+          notice: orphans.length === 0
+            ? null
+            : "Cloud schedules need recovery before scheduled messages can run.",
+          scheduledChatRecovery: orphans.length === 0
+            ? null
+            : { state: "clearRequired", orphans },
+        });
+        return this.#accepted(request);
+      }
       case "sessionSync.enrollment.approve": {
         const status = this.#snapshot.sessionSync.status;
         if (status.state !== "active") {
@@ -2587,6 +2702,25 @@ class DeterministicRuntimeTransport {
       }, this.#snapshot);
     }
     return result;
+  }
+
+  #folderAccessSelect(payload: unknown): RuntimeFolderAccessSelectResult {
+    parseRuntimeFolderAccessSelectRequest(payload);
+    const folderAccess = {
+      revision: this.#snapshot.execution.folderAccess.revision + 1,
+      displayName: "Documents",
+      availability: "ready" as const,
+    };
+    const execution = { ...this.#snapshot.execution, folderAccess };
+    this.#emitOwnedEvent(
+      { type: "execution.changed", execution },
+      { ...this.#snapshot, execution },
+    );
+    return {
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess,
+    };
   }
 
   #dispatchTaskMutation(request: RuntimeTaskDispatchRequest): RuntimeTaskDispatchResponse {

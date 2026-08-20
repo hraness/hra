@@ -67,6 +67,7 @@ function pane(responseMarkdown = ""): ChatPaneProjection {
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: {
       revision: 1,
       pauseReason: null,
@@ -95,6 +96,7 @@ describe("renderer event delivery classes", () => {
     expect(runtimeEventDeliveryClassByType).toEqual({
       "runtime.changed": "state-recoverable",
       "runner.changed": "state-recoverable",
+      "execution.changed": "state-recoverable",
       "account.upserted": "state-recoverable",
       "account.removed": "state-recoverable",
       "chat.pane.upserted": "state-recoverable",

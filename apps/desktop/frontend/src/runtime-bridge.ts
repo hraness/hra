@@ -8,6 +8,7 @@ import {
   parseRuntimeDispatchTransportRequest,
   parseRuntimeDispatchTransportResponse,
   parseRuntimeEvent,
+  parseRuntimeFolderAccessSelectResult,
   parseRuntimeProjectAddResult,
   parseRuntimeSnapshotResponse,
   parseRuntimeSnapshotTransportResponse,
@@ -17,6 +18,7 @@ import {
   parseRuntimeTransportRetryResponse,
   runtimeDispatchCommand,
   runtimeEventName,
+  runtimeFolderAccessSelectCommand,
   runtimeProjectAddCommand,
   runtimeProtocolVersion,
   runtimeSnapshotCommand,
@@ -33,6 +35,7 @@ import {
   type RuntimeHarnessDispatchRequest,
   type RuntimeHarnessDomainCommand,
   type RuntimeEvent,
+  type RuntimeFolderAccessSelectResult,
   type RuntimeProjectAddResult,
   type RuntimeSnapshot,
   type RuntimeSnapshotChunkResponse,
@@ -51,6 +54,7 @@ export interface RuntimeTransport {
 export type RuntimeBridgeBoundary =
   | "dispatchResponse"
   | "event"
+  | "folderAccessSelectResponse"
   | "projectAddResponse"
   | "snapshotResponse"
   | "taskDispatchResponse"
@@ -93,6 +97,7 @@ export interface RuntimeBridge {
   dispatch(command: RendererRuntimeDomainCommand): Promise<RuntimeDispatchResponse>;
   dispatchTask(command: RendererTaskDomainCommand): Promise<RuntimeTaskDispatchResponse>;
   addProject(): Promise<RuntimeProjectAddResult>;
+  selectFolderAccess(): Promise<RuntimeFolderAccessSelectResult>;
   retryTransport(): Promise<RuntimeTransportRetryResponse>;
   subscribe(listener: RuntimeBridgeListener): () => void;
 }
@@ -109,6 +114,8 @@ function isRuntimeChatCommand(
 ): command is RuntimeChatDomainCommand {
   return command.type === "chat.pane.create" ||
     command.type === "chat.pane.rename" ||
+    command.type === "chat.pane.schedule.configure" ||
+    command.type === "chat.pane.schedule.remove" ||
     command.type === "chat.pane.workspace.recover" ||
     command.type === "chat.pane.repository.select" ||
     command.type === "chat.pane.remove" ||
@@ -590,6 +597,17 @@ export function createRuntimeBridge(
         return parseRuntimeProjectAddResult(value);
       } catch (error: unknown) {
         throw new RuntimeBridgeProtocolError("projectAddResponse", error);
+      }
+    },
+    async selectFolderAccess() {
+      const value = await invoke(
+        runtimeFolderAccessSelectCommand,
+        toNativeSdkJson({ version: runtimeProtocolVersion }),
+      );
+      try {
+        return parseRuntimeFolderAccessSelectResult(value);
+      } catch (error: unknown) {
+        throw new RuntimeBridgeProtocolError("folderAccessSelectResponse", error);
       }
     },
     async retryTransport() {

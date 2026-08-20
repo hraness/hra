@@ -94,18 +94,39 @@ export function humanAccountDescription(account: HumanAccountSnapshot): string {
     case "recoveryRequired":
       return "Reconnect the protected credential before signing in to HRA Cloud.";
     case "error":
+      if (
+        account.code === "CONFIGURATION_UNAVAILABLE"
+        && account.profile !== null
+      ) {
+        return "Sign in to this build's configured cloud to replace the stored credential.";
+      }
+      return "Sign in to connect this Mac to HRA Cloud. Session sync remains off until you enable it below.";
     case "signedOut":
       return "Sign in to connect this Mac to HRA Cloud. Session sync remains off until you enable it below.";
   }
 }
 
-function canStartHumanSignIn(account: HumanAccountSnapshot): boolean {
+export function canStartHumanSignIn(account: HumanAccountSnapshot): boolean {
   return account.state === "signedOut" || (
     account.state === "error" && (
       account.code === "AUTHENTICATION_FAILED" ||
       account.code === "AUTH_REFRESH_INDETERMINATE" ||
-      account.code === "SIGNED_OUT"
+      account.code === "SIGNED_OUT" ||
+      (
+        account.code === "CONFIGURATION_UNAVAILABLE"
+        && account.profile !== null
+      )
     )
+  );
+}
+
+export function canClearHumanCredential(
+  account: HumanAccountSnapshot,
+): boolean {
+  return account.state === "signedIn" || (
+    account.state === "error"
+    && account.code === "CONFIGURATION_UNAVAILABLE"
+    && account.profile !== null
   );
 }
 
@@ -205,6 +226,7 @@ export function SubscriptionsSettings({
 
   const reconnectConsentActive = humanAccount.state === "recoveryRequired" &&
     reconnectConsentRevision === humanAccount.revision;
+  const storedCredentialRecovery = humanAccount.state === "error";
 
   const accountCommand = useCallback((
     account: AccountSummary,
@@ -374,20 +396,25 @@ export function SubscriptionsSettings({
               <span>{humanAccountStatus(humanAccount)}</span>
             </div>
             <div aria-label="HRA Cloud actions" className="subscription-actions" role="group">
-              {humanAccount.state === "signedIn" ? (
+              {canClearHumanCredential(humanAccount) ? (
                 <IconButton
-                  aria-label="Log out HRA Cloud"
+                  aria-label={storedCredentialRecovery
+                    ? "Remove stored HRA Cloud credential"
+                    : "Log out HRA Cloud"}
                   isDisabled={!runtimeReady || pending.has("human")}
                   isPending={pending.get("human") === "logout"}
                   onPress={() => void run("human", "logout", { type: "human.signOut" })}
                   size="compact"
-                  tooltip="Log out HRA Cloud"
+                  tooltip={storedCredentialRecovery
+                    ? "Remove stored credential and sign in again"
+                    : "Log out HRA Cloud"}
                   type="button"
                   variant="quiet"
                 >
                   <HRAIcon name="power" />
                 </IconButton>
-              ) : humanAccount.state === "signingIn" ? (
+              ) : null}
+              {humanAccount.state === "signingIn" ? (
                 <IconButton
                   aria-label="Cancel HRA Cloud sign-in"
                   isDisabled={!runtimeReady || pending.has("human")}

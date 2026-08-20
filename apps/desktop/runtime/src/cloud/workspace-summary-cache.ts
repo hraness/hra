@@ -13,11 +13,6 @@ export interface CloudWorkspaceSummaryScope {
 
 type CloudWorkspaceListClient = Pick<CloudWorkspaceClient, "listWorkspaces">;
 
-interface InFlightRefresh {
-  readonly scopeKey: string;
-  readonly task: Promise<void>;
-}
-
 function scopeKey(scope: CloudWorkspaceSummaryScope): string {
   return JSON.stringify([
     scope.credentialGeneration,
@@ -75,7 +70,9 @@ function replacementInvalidation(
  */
 export class CloudWorkspaceSummaryCache {
   readonly #onInvalidated: (invalidation: PortableInvalidation) => void;
-  #inFlight: InFlightRefresh | null = null;
+  readonly #activeRefreshes = new Set<Promise<void>>();
+  readonly #inFlightByScope = new Map<string, Promise<void>>();
+  #admissionClosed = false;
   #scope: CloudWorkspaceSummaryScope | null = null;
   #summaries = new Map<string, WorkspaceSummary>();
 
@@ -83,6 +80,20 @@ export class CloudWorkspaceSummaryCache {
     readonly onInvalidated: (invalidation: PortableInvalidation) => void;
   }) {
     this.#onInvalidated = options.onInvalidated;
+  }
+
+  closeAdmission(): void {
+    this.#admissionClosed = true;
+  }
+
+  async settled(): Promise<void> {
+    for (;;) {
+      const tasks = [...this.#activeRefreshes];
+      if (tasks.length === 0) return;
+      await Promise.allSettled(tasks);
+      // Registered finalizers clear task identities in a following microtask.
+      await Promise.resolve();
+    }
   }
 
   replaceScope(
@@ -161,15 +172,20 @@ export class CloudWorkspaceSummaryCache {
     scope: CloudWorkspaceSummaryScope,
     client: CloudWorkspaceListClient,
   ): Promise<void> {
-    if (!this.isCurrent(scope)) return Promise.resolve();
-    const requestedScopeKey = scopeKey(scope);
-    if (this.#inFlight?.scopeKey === requestedScopeKey) {
-      return this.#inFlight.task;
+    if (this.#admissionClosed || !this.isCurrent(scope)) {
+      return Promise.resolve();
     }
+    const requestedScopeKey = scopeKey(scope);
+    const existing = this.#inFlightByScope.get(requestedScopeKey);
+    if (existing !== undefined) return existing;
     const task = this.#refresh(scope, client);
-    this.#inFlight = { scopeKey: requestedScopeKey, task };
+    this.#inFlightByScope.set(requestedScopeKey, task);
+    this.#activeRefreshes.add(task);
     void task.finally(() => {
-      if (this.#inFlight?.task === task) this.#inFlight = null;
+      if (this.#inFlightByScope.get(requestedScopeKey) === task) {
+        this.#inFlightByScope.delete(requestedScopeKey);
+      }
+      this.#activeRefreshes.delete(task);
     }).catch(() => undefined);
     return task;
   }

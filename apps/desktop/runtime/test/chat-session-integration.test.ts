@@ -97,6 +97,7 @@ test("Codex chat preserves pre-dispatch runtime capacity as safely not applied",
     prepareChatThreadArchive: () => { throw unavailable; },
     reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
+    interpretChatSchedule: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
     setChatThreadName: reject,
@@ -164,6 +165,7 @@ test("Codex chat forwards only opaque archive handles through the closed Session
       });
     },
     injectChatHistory: reject,
+    interpretChatSchedule: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
     setChatThreadName: reject,
@@ -543,6 +545,7 @@ test("every route resolution reads one current account catalog", async () => {
     prepareChatThreadArchive: () => { throw new Error("Unexpected provider mutation"); },
     reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
+    interpretChatSchedule: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
     setChatThreadName: reject,
@@ -591,6 +594,7 @@ test("Codex chat preserves definitive model absence for safe automatic fallback"
     prepareChatThreadArchive: () => { throw new Error("Unexpected provider mutation"); },
     reconcileChatThreadArchive: reject,
     injectChatHistory: reject,
+    interpretChatSchedule: reject,
     interruptChatTurn: reject,
     resumeChatThread: reject,
     setChatThreadName: reject,
@@ -737,6 +741,7 @@ test("SessionService dispatch stays fire-and-forget while ordered chat projectio
       "configRequirementsRead",
       "threadStart",
       "threadSetName",
+      "configRequirementsRead",
       "configRequirementsRead",
       "turnStart",
     ]);
@@ -1031,6 +1036,7 @@ test("a durable binding reconstructs a fresh SessionService before the next turn
       "configRequirementsRead",
       "threadResume",
       "configRequirementsRead",
+      "configRequirementsRead",
       "turnStart",
     ]);
     expect(resumedRequests.find(({ key }) => key === "threadResume")?.input).toMatchObject({
@@ -1136,6 +1142,15 @@ function responseFor(key: unknown, cwd: string): unknown {
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandbox: { type: "dangerFullAccess" },
+        runtimeWorkspaceRoots: [cwd],
+      };
+    case "scheduleInterpreterThreadStart":
+      return {
+        thread: rawThread(cwd),
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: { type: "readOnly", networkAccess: false },
+        runtimeWorkspaceRoots: [cwd],
       };
     case "threadResume":
       return {
@@ -1143,6 +1158,7 @@ function responseFor(key: unknown, cwd: string): unknown {
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandbox: { type: "dangerFullAccess" },
+        runtimeWorkspaceRoots: [cwd],
       };
     case "threadSetName":
       return undefined;

@@ -353,6 +353,7 @@ function fixture(input: Readonly<{
   markContinueDispatchErrorOnce?: boolean;
 }> = {}) {
   const calls: Array<readonly [string, unknown]> = [];
+  const workspaceSettlements: unknown[] = [];
   const intents = new Map<string, PersistentActorContinuationIntent>();
   const capsules = new Map<string, ReturnType<typeof continuationCapsule>>();
   if (input.capsulePreseeded !== false) {
@@ -521,6 +522,9 @@ function fixture(input: Readonly<{
         threadId: "thread_owned0001",
         turnId: "turn_owned000001",
       });
+    },
+    settleHarnessActorTurnWorkspaceAdmission(request: unknown) {
+      workspaceSettlements.push(request);
     },
     observeHarnessActorSessionRecoveryProof(request: unknown) {
       calls.push(["observeHarnessActorSessionRecoveryProof", request]);
@@ -957,6 +961,7 @@ function fixture(input: Readonly<{
       left.targetProcessGeneration - right.targetProcessGeneration
     ),
     provider,
+    workspaceSettlements,
     setSourceHistoryAvailable(value: boolean) {
       sourceHistoryAvailable = value;
     },
@@ -1189,6 +1194,58 @@ describe("Codex persistent actor provider", () => {
       kind: "pending",
       proof: { definitive: false, phase: "observation" },
     });
+  });
+
+  test("settles root leases only from stable actor-turn reconciliation", async () => {
+    const active = fixture({
+      observedTurn: rawTurn("inProgress"),
+      items: [userItem()],
+    });
+    expect(await active.provider.reconcileTurn(turnRequest)).toMatchObject({
+      kind: "applied",
+      providerTurnId: "provider-turn-1",
+    });
+    expect(active.workspaceSettlements).toEqual([{
+      accountProfileId: turnRequest.accountProfileId,
+      clientUserMessageId: turnRequest.clientUserMessageId,
+      disposition: "active",
+      expectedGeneration: turnRequest.observationGeneration,
+      providerThreadId: turnRequest.providerThreadId,
+      providerTurnId: "provider-turn-1",
+    }]);
+
+    const terminal = fixture({
+      observedTurn: rawTurn("completed"),
+      items: [userItem()],
+    });
+    expect(await terminal.provider.reconcileTurn(turnRequest)).toMatchObject({
+      kind: "applied",
+      providerTurnId: "provider-turn-1",
+    });
+    expect(terminal.workspaceSettlements).toEqual([{
+      accountProfileId: turnRequest.accountProfileId,
+      clientUserMessageId: turnRequest.clientUserMessageId,
+      disposition: "terminal",
+      expectedGeneration: turnRequest.observationGeneration,
+      providerThreadId: turnRequest.providerThreadId,
+      providerTurnId: "provider-turn-1",
+    }]);
+
+    const absent = fixture({
+      turnScanTurns: [[], []],
+      fence: completeMutationFence,
+    });
+    expect(await absent.provider.reconcileTurn(turnRequest)).toMatchObject({
+      kind: "notApplied",
+      reason: "notFound",
+    });
+    expect(absent.workspaceSettlements).toEqual([{
+      accountProfileId: turnRequest.accountProfileId,
+      clientUserMessageId: turnRequest.clientUserMessageId,
+      disposition: "notApplied",
+      expectedGeneration: turnRequest.observationGeneration,
+      providerThreadId: turnRequest.providerThreadId,
+    }]);
   });
 
   test("passes Fast only with exact durable policy and reservation evidence", async () => {

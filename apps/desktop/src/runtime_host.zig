@@ -6,7 +6,10 @@ const build_options = @import("build_options");
 pub const snapshot_command = "hra.runtime.snapshot";
 pub const dispatch_command = "hra.runtime.dispatch";
 const private_project_onboarding_command = "hra.runtime.onboardProject";
+const private_folder_access_select_command =
+    "hra.runtime.selectFolderAccess";
 pub const native_project_add_command = "hra.project.add";
+pub const native_folder_access_select_command = "hra.folderAccess.select";
 pub const transport_retry_command = "hra.runtime.retryTransport";
 pub const transport_health_command = "hra.runtime.confirmTransportHealth";
 const private_development_reload_command =
@@ -326,6 +329,7 @@ const production_command_policies = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = snapshot_command, .origins = &production_origins },
     .{ .name = dispatch_command, .origins = &production_origins },
     .{ .name = native_project_add_command, .origins = &production_origins },
+    .{ .name = native_folder_access_select_command, .origins = &production_origins },
     .{ .name = transport_retry_command, .origins = &production_origins },
     .{ .name = transport_health_command, .origins = &production_origins },
 };
@@ -333,6 +337,7 @@ const development_command_policies = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = snapshot_command, .origins = &development_origins },
     .{ .name = dispatch_command, .origins = &development_origins },
     .{ .name = native_project_add_command, .origins = &development_origins },
+    .{ .name = native_folder_access_select_command, .origins = &development_origins },
     .{ .name = transport_retry_command, .origins = &development_origins },
     .{ .name = transport_health_command, .origins = &development_origins },
 };
@@ -340,6 +345,7 @@ const automation_command_policies = [_]native_sdk.bridge.CommandPolicy{
     .{ .name = snapshot_command, .origins = &automation_origins },
     .{ .name = dispatch_command, .origins = &automation_origins },
     .{ .name = native_project_add_command, .origins = &automation_origins },
+    .{ .name = native_folder_access_select_command, .origins = &automation_origins },
     .{ .name = transport_retry_command, .origins = &automation_origins },
     .{ .name = transport_health_command, .origins = &automation_origins },
 };
@@ -833,11 +839,12 @@ fn encodeRequestWithRemovalCapability(
     return output.toOwnedSlice();
 }
 
-/// This is the sole path-bearing request Native may submit. The renderer has
-/// no policy for this command and never receives its request or response.
-fn encodeNativeProjectOnboardingRequest(
+/// These are the only path-bearing chooser requests Native may submit. The
+/// renderer has no policy for either private gateway command.
+fn encodeNativeTrustedDirectoryRequest(
     allocator: std.mem.Allocator,
     id: []const u8,
+    command: []const u8,
     trusted_directory_path: []const u8,
 ) (CodecError || std.mem.Allocator.Error)![]u8 {
     if (trusted_directory_path.len == 0 or
@@ -850,7 +857,33 @@ fn encodeNativeProjectOnboardingRequest(
     payload.writer.writeAll("{\"version\":3,\"trustedDirectoryPath\":") catch return error.OutOfMemory;
     std.json.Stringify.value(trusted_directory_path, .{}, &payload.writer) catch return error.OutOfMemory;
     payload.writer.writeByte('}') catch return error.OutOfMemory;
-    return encodeRequest(allocator, id, private_project_onboarding_command, payload.writer.buffered());
+    return encodeRequest(allocator, id, command, payload.writer.buffered());
+}
+
+fn encodeNativeProjectOnboardingRequest(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    trusted_directory_path: []const u8,
+) (CodecError || std.mem.Allocator.Error)![]u8 {
+    return encodeNativeTrustedDirectoryRequest(
+        allocator,
+        id,
+        private_project_onboarding_command,
+        trusted_directory_path,
+    );
+}
+
+fn encodeNativeFolderAccessSelectRequest(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    trusted_directory_path: []const u8,
+) (CodecError || std.mem.Allocator.Error)![]u8 {
+    return encodeNativeTrustedDirectoryRequest(
+        allocator,
+        id,
+        private_folder_access_select_command,
+        trusted_directory_path,
+    );
 }
 
 fn encodeStartupRemovalRecoveryRequest(
@@ -1193,6 +1226,14 @@ fn validateProjectAddRequest(allocator: std.mem.Allocator, payload: []const u8) 
         else => return error.InvalidProjectAddRequest,
     };
     if (version != runtime_protocol_version) return error.InvalidProjectAddRequest;
+}
+
+fn validateFolderAccessSelectRequest(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+) !void {
+    validateProjectAddRequest(allocator, payload) catch
+        return error.InvalidFolderAccessSelectRequest;
 }
 
 const RemovalCorrelation = struct {
@@ -2131,6 +2172,7 @@ fn parseHarnessCustodyNativeRequest(
 
 const state_recoverable_event_types = [_][]const u8{
     "runtime.changed",
+    "execution.changed",
     "runner.changed",
     "account.upserted",
     "account.removed",
@@ -5343,7 +5385,7 @@ pub const RuntimeHost = struct {
     data_remover_path: ?[]u8 = null,
     keychain_custodian_path: ?[]u8 = null,
 
-    handlers: [5]native_sdk.bridge.AsyncHandler = undefined,
+    handlers: [6]native_sdk.bridge.AsyncHandler = undefined,
     pending: [max_pending_requests]?*Pending = .{null} ** max_pending_requests,
     pending_count: usize = 0,
     requests: [max_pending_requests]?*Pending = .{null} ** max_pending_requests,
@@ -5406,11 +5448,16 @@ pub const RuntimeHost = struct {
             .invoke_fn = invoke,
         };
         self.handlers[3] = .{
-            .name = transport_retry_command,
+            .name = native_folder_access_select_command,
             .context = self,
             .invoke_fn = invoke,
         };
         self.handlers[4] = .{
+            .name = transport_retry_command,
+            .context = self,
+            .invoke_fn = invoke,
+        };
+        self.handlers[5] = .{
             .name = transport_health_command,
             .context = self,
             .invoke_fn = invoke,
@@ -6470,6 +6517,10 @@ pub const RuntimeHost = struct {
             self.invokeProjectAdd(invocation, responder);
             return;
         }
+        if (std.mem.eql(u8, command, native_folder_access_select_command)) {
+            self.invokeFolderAccessSelect(invocation, responder);
+            return;
+        }
         const removal = if (std.mem.eql(
             u8,
             command,
@@ -6866,6 +6917,56 @@ pub const RuntimeHost = struct {
         }
     }
 
+    fn invokeFolderAccessSelect(
+        self: *RuntimeHost,
+        invocation: native_sdk.bridge.Invocation,
+        responder: native_sdk.bridge.AsyncResponder,
+    ) void {
+        validateFolderAccessSelectRequest(
+            self.allocator,
+            invocation.request.payload,
+        ) catch {
+            respondError(
+                responder,
+                invocation.request.id,
+                .invalid_request,
+                "Invalid folder-access request",
+            );
+            return;
+        };
+
+        var path_buffer: [max_trusted_directory_path_bytes]u8 = undefined;
+        switch (self.chooseDirectory(&path_buffer)) {
+            .cancelled => responder.success(
+                invocation.request.id,
+                "{\"version\":3,\"status\":\"cancelled\"}",
+            ) catch {},
+            .failed => respondError(
+                responder,
+                invocation.request.id,
+                .handler_failed,
+                "Directory selection failed",
+            ),
+            .selected => |path_len| self.enqueueNativeFolderAccessSelect(
+                invocation.request.id,
+                path_buffer[0..path_len],
+                .{ .renderer = .{ .responder = responder } },
+            ) catch |err| {
+                const code: native_sdk.bridge.ErrorCode = switch (err) {
+                    error.InvalidRequestId, error.InvalidTrustedDirectoryPath => .invalid_request,
+                    error.OutOfMemory => .internal_error,
+                    else => .handler_failed,
+                };
+                respondError(
+                    responder,
+                    invocation.request.id,
+                    code,
+                    @errorName(err),
+                );
+            },
+        }
+    }
+
     fn chooseDirectory(self: *RuntimeHost, output: []u8) DirectoryChoice {
         const choice: DirectoryChoice = if (self.options.directory_picker) |picker|
             picker.choose_fn(picker.context, output)
@@ -6913,6 +7014,46 @@ pub const RuntimeHost = struct {
         }
         self.insertPendingLocked(pending) catch unreachable;
         const request_index = (self.request_head + self.request_len) % self.requests.len;
+        self.requests[request_index] = pending;
+        self.request_len += 1;
+        self.request_ready.signal(self.io);
+    }
+
+    fn enqueueNativeFolderAccessSelect(
+        self: *RuntimeHost,
+        id: []const u8,
+        trusted_directory_path: []const u8,
+        destination: PendingDestination,
+    ) !void {
+        const request = try encodeNativeFolderAccessSelectRequest(
+            self.allocator,
+            id,
+            trusted_directory_path,
+        );
+        errdefer secureWipeAndFree(self.allocator, request);
+
+        const pending = try self.allocator.create(Pending);
+        errdefer self.allocator.destroy(pending);
+        pending.* = .{
+            .id = undefined,
+            .id_len = id.len,
+            .destination = destination,
+            .request = request,
+        };
+        @memcpy(pending.id[0..pending.id_len], id);
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.state != .running) return error.RuntimeHostUnavailable;
+        if (!self.resultCapacityAvailableLocked()) {
+            return error.PendingQueueFull;
+        }
+        if (!self.requestIdAvailableLocked(id)) {
+            return error.DuplicateNativeRequestId;
+        }
+        self.insertPendingLocked(pending) catch unreachable;
+        const request_index =
+            (self.request_head + self.request_len) % self.requests.len;
         self.requests[request_index] = pending;
         self.request_len += 1;
         self.request_ready.signal(self.io);
@@ -8517,9 +8658,7 @@ pub const RuntimeHost = struct {
 
             switch (next) {
                 .response => |response| {
-                    const development_reload_valid = switch (
-                        response.pending.destination
-                    ) {
+                    const development_reload_valid = switch (response.pending.destination) {
                         .development_reload => self.commitDevelopmentReloadDecision(
                             response.pending,
                         ),
@@ -10894,6 +11033,7 @@ test "bridge profiles isolate production development and automation origins" {
     try std.testing.expect(!production.allows(private_project_onboarding_command, "zero://app"));
     try std.testing.expect(!production.allows(private_removal_recovery_command, "zero://app"));
     try std.testing.expect(production.allows(native_project_add_command, "zero://app"));
+    try std.testing.expect(production.allows(native_folder_access_select_command, "zero://app"));
     try std.testing.expect(production.allows(transport_retry_command, "zero://app"));
     try std.testing.expect(production.allows(transport_health_command, "zero://app"));
 
@@ -10906,6 +11046,7 @@ test "bridge profiles isolate production development and automation origins" {
     try std.testing.expect(!development.allows(private_project_onboarding_command, "http://127.0.0.1:5173"));
     try std.testing.expect(!development.allows(private_removal_recovery_command, "http://127.0.0.1:5173"));
     try std.testing.expect(development.allows(native_project_add_command, "http://127.0.0.1:5173"));
+    try std.testing.expect(development.allows(native_folder_access_select_command, "http://127.0.0.1:5173"));
     try std.testing.expect(development.allows(transport_retry_command, "http://127.0.0.1:5173"));
     try std.testing.expect(development.allows(transport_health_command, "http://127.0.0.1:5173"));
 
@@ -10916,6 +11057,7 @@ test "bridge profiles isolate production development and automation origins" {
     try std.testing.expect(!automation.allows(private_project_onboarding_command, "zero://inline"));
     try std.testing.expect(!automation.allows(private_removal_recovery_command, "zero://inline"));
     try std.testing.expect(automation.allows(native_project_add_command, "zero://inline"));
+    try std.testing.expect(automation.allows(native_folder_access_select_command, "zero://inline"));
     try std.testing.expect(automation.allows(transport_retry_command, "zero://inline"));
     try std.testing.expect(automation.allows(transport_health_command, "zero://inline"));
 }
@@ -11823,6 +11965,38 @@ test "renderer project-add payload is pathless and version-bound" {
     try std.testing.expectError(
         error.InvalidProjectAddRequest,
         validateProjectAddRequest(std.testing.allocator, "{\"version\":1}"),
+    );
+}
+
+test "native folder access encodes a private path and renderer payload stays pathless" {
+    const path = "/tmp/Shared Documents";
+    const encoded = try encodeNativeFolderAccessSelectRequest(
+        std.testing.allocator,
+        "native-folder-access-1",
+        path,
+    );
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"command\":\"hra.runtime.selectFolderAccess\"",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded,
+        "\"trustedDirectoryPath\":\"/tmp/Shared Documents\"",
+    ) != null);
+    try validateFolderAccessSelectRequest(
+        std.testing.allocator,
+        "{\"version\":3}",
+    );
+    try std.testing.expectError(
+        error.InvalidFolderAccessSelectRequest,
+        validateFolderAccessSelectRequest(
+            std.testing.allocator,
+            "{\"version\":3,\"trustedDirectoryPath\":\"/not-allowed\"}",
+        ),
     );
 }
 

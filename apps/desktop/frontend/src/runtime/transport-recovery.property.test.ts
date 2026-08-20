@@ -42,6 +42,10 @@ class GenerationBridge implements RuntimeBridge {
     return Promise.resolve({ version: runtimeProtocolVersion, status: "cancelled" } as const);
   }
 
+  selectFolderAccess() {
+    return Promise.resolve({ version: runtimeProtocolVersion, status: "cancelled" } as const);
+  }
+
   retryTransport() {
     return Promise.resolve({ version: 1, status: "accepted" } as const);
   }

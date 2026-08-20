@@ -14,6 +14,7 @@ const chatFixtureLog = `${codexHome}/chat-fixture.jsonl`;
 let nextThread = 0;
 let nextTurn = 0;
 const interactionTurns = new Set<string>();
+const scheduleInterpreterThreads = new Set<string>();
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -186,6 +187,43 @@ async function handle(line: string): Promise<void> {
       appendChatLog({ method });
       write({ id, result: { requirements: null } });
       return;
+    case "mcpServerStatus/list": {
+      const threadId = stringField(message.params, "threadId");
+      if (threadId === null) {
+        write({ id, error: { code: -32_602, message: "missing thread" } });
+        return;
+      }
+      const scheduleInterpreter = scheduleInterpreterThreads.has(threadId);
+      appendChatLog({
+        method,
+        threadId,
+        scheduleInterpreter,
+        nodeReplJsReady: !scheduleInterpreter,
+      });
+      write({
+        id,
+        result: {
+          data: scheduleInterpreter
+            ? []
+            : [{
+                name: "node_repl",
+                serverInfo: null,
+                tools: {
+                  js: {
+                    name: "js",
+                    description: "Gateway fixture Computer Use JavaScript tool.",
+                    inputSchema: { type: "object" },
+                  },
+                },
+                resources: [],
+                resourceTemplates: [],
+                authStatus: "unsupported",
+              }],
+          nextCursor: null,
+        },
+      });
+      return;
+    }
     case "thread/start": {
       const cwd = stringField(message.params, "cwd");
       const model = stringField(message.params, "model");
@@ -196,12 +234,28 @@ async function handle(line: string): Promise<void> {
       const config = isJsonObject(message.params) && isJsonObject(message.params.config)
         ? message.params.config
         : null;
+      const runtimeWorkspaceRoots = isJsonObject(message.params) &&
+          Array.isArray(message.params.runtimeWorkspaceRoots) &&
+          message.params.runtimeWorkspaceRoots.every((value) => typeof value === "string")
+        ? message.params.runtimeWorkspaceRoots
+        : null;
+      if (runtimeWorkspaceRoots === null) {
+        write({ id, error: { code: -32_602, message: "missing workspace roots" } });
+        return;
+      }
       const reasoningEffort = stringField(config, "model_reasoning_effort") ?? "max";
       const serviceTier = stringField(message.params, "serviceTier");
       const threadId = `chat-thread-${String(++nextThread)}`;
+      const scheduleInterpreter = isJsonObject(message.params) &&
+        message.params.ephemeral === true &&
+        message.params.sandbox === "read-only" &&
+        Array.isArray(message.params.dynamicTools) &&
+        message.params.dynamicTools.length === 0;
+      if (scheduleInterpreter) scheduleInterpreterThreads.add(threadId);
       appendChatLog({
         method,
         threadId,
+        scheduleInterpreter,
         model,
         reasoningEffort,
         serviceTier,
@@ -219,6 +273,7 @@ async function handle(line: string): Promise<void> {
           approvalPolicy: "never",
           approvalsReviewer: "auto_review",
           sandbox: { type: "dangerFullAccess" },
+          runtimeWorkspaceRoots,
         },
       });
       return;

@@ -59,6 +59,7 @@ import {
 } from "../cloud/session-sync-local-crypto";
 import {
   SESSION_SYNC_HARDENING_SCHEMA_SQL,
+  SESSION_SYNC_HUMAN_ORIGIN_SCHEMA_SQL,
   SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL,
   SESSION_SYNC_OPERATION_SCHEMA_SQL,
   SESSION_SYNC_SCHEMA_SQL,
@@ -74,6 +75,7 @@ const storedBooleanSchema = z.union([z.literal(0), z.literal(1)]);
 const safeIntegerSchema = z.number().int().nonnegative().safe();
 const positiveSafeIntegerSchema = z.number().int().positive().safe();
 const sessionSyncHumanAuthoritySchema = z.object({
+  apiOrigin: z.string().min(1).max(2_048).refine((value) => !value.includes("\0")).nullable(),
   userId: z.string().min(1).max(256).refine((value) => !value.includes("\0")),
   organizationId: z.string().min(1).max(256).refine((value) => !value.includes("\0")),
 }).strict();
@@ -117,6 +119,7 @@ const vaultRowSchema = z.object({
   root_key_epoch: z.string(),
   human_user_id: z.string().min(1).max(256).nullable(),
   human_organization_id: z.string().min(1).max(256).nullable(),
+  human_api_origin: z.string().min(1).max(2_048).nullable(),
   updated_at: safeIntegerSchema,
 }).strict().superRefine((row, context) => {
   if ((row.human_user_id === null) !== (row.human_organization_id === null)) {
@@ -124,6 +127,13 @@ const vaultRowSchema = z.object({
       code: "custom",
       message: "session sync human authority is incomplete",
       path: ["human_user_id"],
+    });
+  }
+  if (row.human_api_origin !== null && row.human_user_id === null) {
+    context.addIssue({
+      code: "custom",
+      message: "session sync human origin has no bound scope",
+      path: ["human_api_origin"],
     });
   }
 });
@@ -314,6 +324,7 @@ export interface SessionSyncVaultState {
 }
 
 export interface SessionSyncHumanAuthority {
+  readonly apiOrigin: string | null;
   readonly userId: string;
   readonly organizationId: string;
 }
@@ -773,6 +784,7 @@ function vaultFromRow(row: z.infer<typeof vaultRowSchema>): SessionSyncVaultStat
     humanAuthority: row.human_user_id === null
       ? null
       : sessionSyncHumanAuthoritySchema.parse({
+          apiOrigin: row.human_api_origin,
           userId: row.human_user_id,
           organizationId: row.human_organization_id,
         }),
@@ -964,6 +976,7 @@ export function installSessionSyncSchema(database: Database): void {
   database.exec(SESSION_SYNC_OPERATION_SCHEMA_SQL);
   database.exec(SESSION_SYNC_HARDENING_SCHEMA_SQL);
   database.exec(SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL);
+  database.exec(SESSION_SYNC_HUMAN_ORIGIN_SCHEMA_SQL);
 }
 
 export class SessionSyncStore {
@@ -1092,7 +1105,7 @@ export class SessionSyncStore {
       SELECT revision, state, tenant_id, organization_id, owner_user_id,
         vault_id, vault_generation, membership_epoch, membership_digest,
         membership_head_json, wrapped_root_json, root_key_epoch,
-        human_user_id, human_organization_id, updated_at
+        human_user_id, human_organization_id, human_api_origin, updated_at
       FROM session_sync_vault_state WHERE singleton = 1
     `).get();
     return value === null ? null : vaultFromRow(vaultRowSchema.parse(value));
@@ -1204,10 +1217,11 @@ export class SessionSyncStore {
           singleton, revision, state, tenant_id, organization_id,
           owner_user_id, vault_id, vault_generation, membership_epoch,
           membership_digest, membership_head_json, wrapped_root_json,
-          root_key_epoch, human_user_id, human_organization_id, updated_at
+          root_key_epoch, human_user_id, human_organization_id,
+          human_api_origin, updated_at
         ) VALUES (
           1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-          ?13, ?14, ?15
+          ?13, ?14, ?15, ?16
         )
         ON CONFLICT(singleton) DO UPDATE SET
           revision = excluded.revision,
@@ -1224,6 +1238,7 @@ export class SessionSyncStore {
           root_key_epoch = excluded.root_key_epoch,
           human_user_id = excluded.human_user_id,
           human_organization_id = excluded.human_organization_id,
+          human_api_origin = excluded.human_api_origin,
           updated_at = excluded.updated_at
       `).run(
         nextRevision,
@@ -1243,6 +1258,7 @@ export class SessionSyncStore {
         wrappedRoot.context.rootKeyEpoch,
         humanAuthority.userId,
         humanAuthority.organizationId,
+        humanAuthority.apiOrigin,
         now,
       );
       if (
@@ -1261,6 +1277,72 @@ export class SessionSyncStore {
       );
     }
     return installed;
+  }
+
+  /**
+   * Installs a legacy vault's backend origin only after the coordinator has
+   * completed an authenticated read_membership exchange against that backend.
+   * Migration code must never call this or infer an origin from configuration.
+   */
+  adoptHumanApiOriginAfterAuthenticatedMembership(input: {
+    readonly expectedRevision: number;
+    readonly expectedMembershipDigest: SyncSha256Digest;
+    readonly expectedUserId: string;
+    readonly expectedOrganizationId: string;
+    readonly apiOrigin: string;
+    readonly now: number;
+  }): SessionSyncVaultState {
+    const authority = sessionSyncHumanAuthoritySchema.parse({
+      apiOrigin: input.apiOrigin,
+      userId: input.expectedUserId,
+      organizationId: input.expectedOrganizationId,
+    });
+    const membershipDigest = syncSha256DigestSchema.parse(
+      input.expectedMembershipDigest,
+    );
+    const now = nowValue(input.now);
+    const current = this.vault();
+    if (
+      current === null
+      || current.revision !== input.expectedRevision
+      || current.membershipDigest !== membershipDigest
+      || current.humanAuthority?.userId !== authority.userId
+      || current.humanAuthority.organizationId !== authority.organizationId
+    ) {
+      throw new SessionSyncStoreError(
+        "stale",
+        "Session sync human origin adoption lost its exact vault authority.",
+      );
+    }
+    if (current.humanAuthority.apiOrigin !== null) {
+      if (current.humanAuthority.apiOrigin === authority.apiOrigin) return current;
+      throw new SessionSyncStoreError(
+        "conflict",
+        "Session sync vault authority belongs to another cloud origin.",
+      );
+    }
+    const updated = this.#database.query(`
+      UPDATE session_sync_vault_state
+      SET human_api_origin = ?1, revision = revision + 1, updated_at = ?2
+      WHERE singleton = 1 AND revision = ?3
+        AND membership_digest = ?4
+        AND human_user_id = ?5 AND human_organization_id = ?6
+        AND human_api_origin IS NULL
+    `).run(
+      authority.apiOrigin,
+      now,
+      input.expectedRevision,
+      membershipDigest,
+      authority.userId,
+      authority.organizationId,
+    );
+    if (updated.changes !== 1) {
+      throw new SessionSyncStoreError(
+        "stale",
+        "Session sync human origin changed concurrently.",
+      );
+    }
+    return this.vault() as SessionSyncVaultState;
   }
 
   recordMembershipSignature(input: {
@@ -2368,13 +2450,28 @@ export class SessionSyncStore {
         SET acknowledged_sequence = ?1, acknowledged_digest = ?2,
           acknowledged_source_revision = ?3, sync_state = 'idle',
           updated_at = ?4
-        WHERE session_id = ?5 AND sync_state = 'publishing'
+        WHERE session_id = ?5 AND sync_state IN ('publishing', 'conflict')
+          AND mirror_epoch = ?6 AND writer_generation = ?7
+          AND boot_id = ?8 AND boot_generation = ?9
+          AND acknowledged_sequence = ?10
+          AND (
+            (acknowledged_digest IS NULL AND ?11 IS NULL)
+            OR acknowledged_digest = ?11
+          )
       `).run(
         accepted.envelope.header.syncSequence,
         accepted.envelope.ciphertextDigest,
         Number(decodeSyncUint64(accepted.envelope.header.sourceRevision)),
         nowValue(input.now),
         sessionId,
+        accepted.envelope.header.mirrorEpoch,
+        accepted.envelope.header.writerGeneration,
+        accepted.envelope.header.bootId,
+        accepted.envelope.header.bootGeneration,
+        syncUint64Schema.parse(
+          String(BigInt(accepted.envelope.header.syncSequence) - 1n),
+        ),
+        accepted.envelope.header.previousDigest ?? null,
       );
       if (changed.changes !== 1) {
         throw new SessionSyncStoreError(

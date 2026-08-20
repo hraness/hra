@@ -11,6 +11,8 @@ import {
   parseRuntimeDispatchTransportRequest,
   parseRuntimeDispatchTransportResponse,
   parseRuntimeEvent,
+  parseRuntimeFolderAccessSelectRequest,
+  parseRuntimeFolderAccessSelectResult,
   parseRuntimeProjectAddResult,
   parseRuntimeSnapshotResponse,
   parseRuntimeSnapshotTransportResponse,
@@ -49,6 +51,13 @@ const snapshot = {
   accounts: [account],
   retainedAccountLocalData: [],
   humanAccount: { state: "signedOut", revision: 0 },
+  execution: {
+    folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandbox: "danger-full-access",
+    computerUse: "required",
+  },
   chat: { revision: 1, panes: [] },
   sessionSync: {
     status: {
@@ -1286,6 +1295,34 @@ describe("renderer runtime contracts", () => {
     })).toThrow();
   });
 
+  test("keeps shared folder selection pathless and the execution policy exact", () => {
+    expect(parseRuntimeFolderAccessSelectRequest({ version: runtimeProtocolVersion }))
+      .toEqual({ version: runtimeProtocolVersion });
+    expect(parseRuntimeFolderAccessSelectResult({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: { revision: 2, displayName: "Documents", availability: "ready" },
+    })).toEqual({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: { revision: 2, displayName: "Documents", availability: "ready" },
+    });
+    expect(() => parseRuntimeFolderAccessSelectResult({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: {
+        revision: 2,
+        displayName: "Documents",
+        availability: "ready",
+        path: "/Users/example/Documents",
+      },
+    })).toThrow();
+    expect(() => parseRuntimeSnapshotResponse({
+      version: runtimeProtocolVersion,
+      snapshot: { ...snapshot, execution: { ...snapshot.execution, computerUse: false } },
+    })).toThrow();
+  });
+
   test("keeps chat commands app-owned, strict, and prompt-free on responses", () => {
     const paneId = "pane_contract01";
     const turnId = "chatturn_contract01";
@@ -1300,6 +1337,17 @@ describe("renderer runtime contracts", () => {
         paneId,
         expectedRevision: 1,
         title: "Renamed",
+      },
+      {
+        type: "chat.pane.schedule.configure",
+        paneId,
+        expectedRevision: 2,
+        instruction: "Every weekday at 9, summarize open pull requests",
+      },
+      {
+        type: "chat.pane.schedule.remove",
+        paneId,
+        expectedRevision: 3,
       },
       {
         type: "chat.pane.workspace.recover",
@@ -1534,6 +1582,7 @@ describe("renderer runtime contracts", () => {
       attention: null,
       recoverablePrompt: false,
       canStartFreshContext: false,
+      schedule: null,
       messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
       attachments: { drafts: [], referenced: [] },
       harness: null,
@@ -1557,6 +1606,36 @@ describe("renderer runtime contracts", () => {
       ...pane,
       interactionMode: "harnessObserver",
     })).toThrow("harness observers cannot own one");
+    expect(() => chatPaneProjectionSchema.parse({
+      ...pane,
+      interactionMode: "harnessObserver",
+      workspace: null,
+      turn: { ...pane.turn, routing: null },
+      schedule: {
+        revision: 1,
+        rrule: "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+        timeZone: "America/Puerto_Rico",
+        nextRunAt: "2026-08-20T13:00:00.000Z",
+      },
+    })).toThrow("only ordinary chat panes can own a schedule");
+    expect(() => chatPaneProjectionSchema.parse({
+      ...pane,
+      schedule: {
+        revision: 1,
+        rrule: "RRULE:FREQ=DAILY",
+        timeZone: "America/Puerto_Rico",
+        nextRunAt: "2026-08-20T13:00:00.000Z",
+      },
+    })).toThrow();
+    expect(() => chatPaneProjectionSchema.parse({
+      ...pane,
+      schedule: {
+        revision: 1,
+        rrule: "DTSTART;TZID=America/New_York:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+        timeZone: "America/Puerto_Rico",
+        nextRunAt: "2026-08-20T13:00:00.000Z",
+      },
+    })).toThrow("chat schedule RRULE and time zone must match");
     expect(chatPaneProjectionSchema.parse({
       ...pane,
       interactionMode: "harnessObserver",
@@ -1770,6 +1849,52 @@ describe("renderer runtime contracts", () => {
       renameRequest,
     )).toThrow("pane rename response does not match");
 
+    const configureScheduleRequest = {
+      ...createRequest,
+      command: {
+        type: "chat.pane.schedule.configure",
+        paneId,
+        expectedRevision: 1,
+        instruction: "Every weekday at 9, summarize open pull requests",
+      },
+    } satisfies RuntimeChatDispatchRequest;
+    const scheduled = {
+      ...basePane,
+      revision: 2,
+      schedule: {
+        revision: 1,
+        rrule: "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO,TU,WE,TH,FR",
+        timeZone: "America/Puerto_Rico",
+        nextRunAt: "2026-08-20T13:00:00.000Z",
+      },
+    } as const;
+    expect(parseRuntimeChatDispatchResponseForRequest(
+      response(scheduled),
+      configureScheduleRequest,
+    )).toMatchObject({ result: { type: "chatPane", pane: { schedule: scheduled.schedule } } });
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      response({ ...scheduled, schedule: null }),
+      configureScheduleRequest,
+    )).toThrow("schedule configuration response does not match");
+
+    const removeScheduleRequest = {
+      ...createRequest,
+      command: {
+        type: "chat.pane.schedule.remove",
+        paneId,
+        expectedRevision: 2,
+      },
+    } satisfies RuntimeChatDispatchRequest;
+    const unscheduled = { ...scheduled, revision: 3, schedule: null } as const;
+    expect(parseRuntimeChatDispatchResponseForRequest(
+      response(unscheduled),
+      removeScheduleRequest,
+    )).toMatchObject({ result: { type: "chatPane", pane: { schedule: null } } });
+    expect(() => parseRuntimeChatDispatchResponseForRequest(
+      response({ ...unscheduled, schedule: scheduled.schedule }),
+      removeScheduleRequest,
+    )).toThrow("schedule removal response does not match");
+
     const recoverRequest = {
       ...createRequest,
       command: {
@@ -1955,6 +2080,8 @@ describe("renderer runtime contracts", () => {
       commandType:
         | "chat.pane.create"
         | "chat.pane.rename"
+        | "chat.pane.schedule.configure"
+        | "chat.pane.schedule.remove"
         | "chat.pane.workspace.recover"
         | "chat.pane.repository.select"
         | "chat.turn.stop",
@@ -1974,6 +2101,8 @@ describe("renderer runtime contracts", () => {
     for (const [request, commandType, appliedRevision] of [
       [createRequest, "chat.pane.create", 1],
       [renameRequest, "chat.pane.rename", 2],
+      [configureScheduleRequest, "chat.pane.schedule.configure", 2],
+      [removeScheduleRequest, "chat.pane.schedule.remove", 3],
       [recoverRequest, "chat.pane.workspace.recover", 3],
       [repositoryRequest, "chat.pane.repository.select", 2],
       [stopRequest, "chat.turn.stop", 7],

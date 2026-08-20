@@ -99,6 +99,7 @@ function managedShell(base: RuntimeShell, session: HRADirectSession): RuntimeShe
     dispatch: (command) => base.dispatch(command),
     dispatchTask: (command) => base.dispatchTask(command),
     addProject: () => base.addProject(),
+    selectFolderAccess: () => base.selectFolderAccess(),
     retryTransport: () => base.retryTransport(),
     subscribeTaskInvalidations: (listener) => base.subscribeTaskInvalidations(listener),
     dispose: () => session.dispose(),

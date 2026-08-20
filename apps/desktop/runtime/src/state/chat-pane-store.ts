@@ -28,6 +28,7 @@ import {
   harnessActorIdSchema,
   type ChatAttention,
   type ChatMessageQueueProjection,
+  type ChatMessageId,
   type ChatPaneProjection,
   type ChatProviderSubagentsProjection,
   type ChatToolCategory,
@@ -123,6 +124,7 @@ import {
   type ProviderThreadArchiveTerminalCleanupV57,
   type ProviderThreadArchiveTerminalCleanupComponentV57,
 } from "./provider-thread-archive-journal-v57";
+import { ScheduledChatStore } from "./scheduled-chat-store";
 
 const isoDateTimeSchema = chatIsoDateTimeSchema;
 const freshProviderContextAttentionMessage =
@@ -893,6 +895,7 @@ export class ChatPaneStore {
   > | null;
   readonly #messageRequestDigestKey: Uint8Array;
   readonly #providerThreadArchiveJournalV57: ProviderThreadArchiveJournalV57;
+  readonly #scheduledChats: ScheduledChatStore;
 
   constructor(
     database: Database,
@@ -908,6 +911,7 @@ export class ChatPaneStore {
         | "markPaneArchivedInTransaction"
         | "releaseProviderBindingAfterResumeContainedInTransaction"
       >;
+      scheduledChatStore?: ScheduledChatStore;
     }> = {},
   ) {
     this.#database = database;
@@ -924,6 +928,16 @@ export class ChatPaneStore {
       database,
       this.#messageRequestDigestKey,
     );
+    this.#scheduledChats = options.scheduledChatStore ?? new ScheduledChatStore(database);
+    this.#scheduledChats.bindPaneMutationAuthority({
+      assertPaneMutationAllowed: (paneId) => {
+        this.assertProviderThreadArchivePaneMutationAllowedV57(paneId);
+      },
+      cancelUnclaimedScheduledMessage: (input) =>
+        this.cancelUnclaimedScheduledMessage(input),
+      settleScheduledClearQueue: (input) =>
+        this.settleScheduledClearQueue(input),
+    });
   }
 
   list(): readonly ChatPaneProjection[] {
@@ -954,6 +968,64 @@ export class ChatPaneStore {
       const metadata = this.#requireMessageQueueMetadata(paneId);
       return this.#messageQueueProjection(metadata);
     })();
+  }
+
+  cancelUnclaimedScheduledMessage(input: Readonly<{
+    paneId: ChatPaneId;
+    messageId: ChatMessageId;
+    now: Date;
+  }>): boolean {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      this.#assertNoPendingProviderThreadArchiveAuthorityV57(paneId);
+      const row = this.#messageRow(messageId);
+      if (row === null || row.pane_id !== paneId || row.state !== "queued") {
+        return false;
+      }
+      const cancelled = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = 'cancelled', revision = revision + 1,
+          terminal_at = ?3, updated_at = ?3
+        WHERE pane_id = ?1 AND message_id = ?2 AND state = 'queued'
+      `).run(paneId, messageId, now);
+      if (cancelled.changes !== 1) return false;
+      this.#clearMessageAttachments(paneId, messageId, now);
+      const advanced = this.#database.query(`
+        UPDATE chat_panes SET
+          message_queue_revision = message_queue_revision + 1,
+          updated_at = ?2
+        WHERE pane_id = ?1 AND archived_at IS NULL
+      `).run(paneId, now);
+      if (advanced.changes < 1) {
+        throw new ChatPaneStoreError(
+          "conflict",
+          "The scheduled message pane changed before cancellation.",
+        );
+      }
+      return true;
+    })();
+  }
+
+  settleScheduledClearQueue(input: Readonly<{
+    paneId: ChatPaneId;
+    now: Date;
+  }>): boolean {
+    const queue = this.messageQueue(input.paneId);
+    if (
+      queue.messages.length > 0
+      || queue.blockedMessage !== null
+      || (queue.pauseReason !== "stop"
+        && queue.pauseReason !== "runtimeRestart"
+        && queue.pauseReason !== "attention")
+    ) return false;
+    this.resumeMessageQueue({
+      paneId: input.paneId,
+      expectedQueueRevision: queue.revision,
+      now: input.now,
+    });
+    return true;
   }
 
   enqueueMessage(input: ChatMessageEnqueueInput): ChatMessageQueueProjection {
@@ -1654,6 +1726,15 @@ export class ChatPaneStore {
     }
     const now = new Date(isoDateTimeSchema.parse(input.now.toISOString()));
     return this.#database.transaction(() => {
+      if (
+        this.#scheduledChats.mutationForPane(paneId) !== null
+        || this.#scheduledChats.desiredOff(paneId) !== null
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "Wait for the pending schedule change before archiving this chat provider context.",
+        );
+      }
       const journal = this.#requireProviderThreadArchiveJournalV57();
       this.#assertNoConflictingLegacyArchiveV57(paneId);
       const openTargets = journal.recoveryTargets();
@@ -4278,6 +4359,106 @@ export class ChatPaneStore {
       effectStartedAt: true,
       steerRequestOutcome: "effect_started",
     });
+  }
+
+  /**
+   * Atomically records a provider-proven quota rejection and restores only
+   * the exact current scheduled start message to FIFO. The provider's
+   * not-applied proof permits retrying this same durable occurrence; every
+   * other effect-started message remains ambiguity-fenced.
+   */
+  settleProvenNotAppliedScheduledStart(
+    input: ChatMessageTransitionInput,
+  ): ChatMessageQueueProjection {
+    const paneId = chatPaneIdSchema.parse(input.paneId);
+    const messageId = chatMessageIdSchema.parse(input.messageId);
+    const turnId = chatTurnIdSchema.parse(input.turnId);
+    validateRevision(input.expectedMessageRevision);
+    if (input.kind !== "start") {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Only a scheduled start can settle from a proven quota rejection.",
+      );
+    }
+    const now = isoDateTimeSchema.parse(input.now.toISOString());
+    return this.#database.transaction(() => {
+      this.#assertNoPendingProviderThreadArchiveIntent(paneId);
+      const schedule = this.#scheduledChats.get(paneId);
+      const run = this.#scheduledChats.runForMessage(paneId, messageId);
+      if (
+        schedule === null
+        || run === null
+        || run.sessionId !== schedule.sessionId
+        || run.scheduleGeneration !== schedule.generation
+        || run.cancelledAt !== null
+        || this.#scheduledChats.mutationForPane(paneId) !== null
+        || this.#scheduledChats.desiredOff(paneId) !== null
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "The proven quota rejection no longer belongs to the active schedule.",
+        );
+      }
+      const metadata = this.#requireMessageQueueMetadata(paneId);
+      const row = this.#requireMessageRowForPane(paneId, messageId);
+      this.#requireClaimTransition(
+        row,
+        input.expectedMessageRevision,
+        turnId,
+        "start_effect_started",
+      );
+      if (row.request_delivery_kind !== "queue") {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "A scheduled start cannot carry renderer steering authority.",
+        );
+      }
+      const route = this.#rootTurnRouting.readTurnRouting(paneId, turnId);
+      if (
+        route === null
+        || route.state !== "effectStarted"
+        || route.acceptedAt !== null
+        || route.settledAt !== null
+      ) {
+        throw new ChatPaneStoreError(
+          "invalid_state",
+          "The scheduled quota proof lost its exact root-routing cut.",
+        );
+      }
+      this.#rootTurnRouting.settleInTransaction({
+        paneId,
+        chatTurnId: turnId,
+        outcome: "quotaRejected",
+        now: input.now,
+      });
+      const returned = this.#database.query(`
+        UPDATE chat_message_ledger SET
+          state = 'queued', claimed_turn_id = NULL,
+          effect_started_at = NULL, revision = revision + 1,
+          updated_at = ?5
+        WHERE pane_id = ?1 AND message_id = ?2 AND revision = ?3
+          AND claimed_turn_id = ?4 AND state = 'start_effect_started'
+      `).run(
+        paneId,
+        messageId,
+        input.expectedMessageRevision,
+        turnId,
+        now,
+      );
+      if (returned.changes !== 1) throw staleMessageRevision();
+      this.#releasePreparedMessageAttachmentLeases(
+        paneId,
+        messageId,
+        turnId,
+        now,
+      );
+      this.#advanceMessageQueueRevision(
+        paneId,
+        metadata.message_queue_revision,
+        now,
+      );
+      return this.messageQueue(paneId);
+    })();
   }
 
   acknowledgeMessageEffect(
@@ -11331,6 +11512,16 @@ export class ChatPaneStore {
         "An attached actor pane is retained with its durable actor binding.",
       );
     }
+    if (
+      this.#scheduledChats.get(paneId) !== null
+      || this.#scheduledChats.mutationForPane(paneId) !== null
+      || this.#scheduledChats.desiredOff(paneId) !== null
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Turn off this chat's schedule before closing its pane.",
+      );
+    }
     const pendingTransition = this.#pendingProviderThreadArchiveIntent(paneId);
     if (
       pendingTransition !== null && pendingTransition.purpose !== "pane_archive"
@@ -11639,6 +11830,7 @@ export class ChatPaneStore {
           row.attention_retryable === 0 &&
           row.message_queue_pause_reason !== null &&
           row.message_queue_pause_reason !== "ambiguous_effect",
+        schedule: this.#scheduledChats.projection(row.pane_id),
         messageQueue: this.#messageQueueProjection(
           chatMessageQueueMetadataRowSchema.parse({
             pane_id: row.pane_id,

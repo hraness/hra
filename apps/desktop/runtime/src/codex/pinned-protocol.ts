@@ -52,6 +52,8 @@ import {
   type PinnedCodexLoginStart,
   type PinnedCodexLoginStartInput,
   type PinnedCodexMcpElicitationReference,
+  type PinnedCodexMcpServerStatusList,
+  type PinnedCodexMcpServerStatusListInput,
   type PinnedCodexRateLimits,
   type PinnedCodexRateLimitsUpdated,
   type PinnedCodexReasoningSummaryDelta,
@@ -135,6 +137,8 @@ export type {
   PinnedCodexLoginStart,
   PinnedCodexLoginStartInput,
   PinnedCodexMcpElicitationReference,
+  PinnedCodexMcpServerStatusList,
+  PinnedCodexMcpServerStatusListInput,
   PinnedCodexRateLimits,
   PinnedCodexRateLimitsUpdated,
   PinnedCodexReasoningSummaryDelta,
@@ -285,6 +289,16 @@ export const pinnedCodexRequests = Object.freeze({
       strategy: "exhaustive-stable-thread-source-scan",
     },
   }),
+  scheduleInterpreterThreadStart: descriptor("scheduleInterpreterThreadStart", {
+    timeoutMs: 30_000,
+    effect: "non-idempotent-mutation",
+    lostResponse: "ambiguous",
+    concurrency: "per-source",
+    reconciliation: {
+      kind: "automatic",
+      strategy: "exhaustive-stable-thread-source-scan",
+    },
+  }),
   threadResume: descriptor("threadResume", {
     timeoutMs: 30_000,
     effect: "non-idempotent-mutation",
@@ -384,6 +398,13 @@ export const pinnedCodexRequests = Object.freeze({
     effect: "read",
     lostResponse: "safe-to-retry",
     concurrency: "parallel",
+    reconciliation: "not-required",
+  }),
+  mcpServerStatusList: descriptor("mcpServerStatusList", {
+    timeoutMs: 120_000,
+    effect: "read",
+    lostResponse: "safe-to-retry",
+    concurrency: "per-thread",
     reconciliation: "not-required",
   }),
   turnStart: descriptor("turnStart", {
@@ -569,9 +590,11 @@ export class PinnedCodexProtocol {
     } catch {
       throw new PinnedCodexPayloadError(key, "request_input");
     }
-    const wireParams = key === "threadStart" && this.#dynamicTool !== null
-      ? dynamicToolThreadStartParams(params)
-      : params;
+    const wireParams = key === "scheduleInterpreterThreadStart"
+      ? scheduleInterpreterThreadStartParams(params)
+      : key === "threadStart" && this.#dynamicTool !== null
+        ? dynamicToolThreadStartParams(params)
+        : params;
     const raw: RawCodexResponseAtPosition<unknown> =
       await this.#core.requestWithResponsePosition(selected.method, wireParams, {
         intent: selected.semantics.lostResponse === "ambiguous"
@@ -831,6 +854,26 @@ function dynamicToolThreadStartParams(
   return Object.freeze({
     ...params,
     dynamicTools: Object.freeze([HRA_RLM_DYNAMIC_TOOL_SPEC]),
+  });
+}
+
+/**
+ * The schedule interpreter parses untrusted control-plane text. Pinning the
+ * empty list here prevents a higher layer from accidentally inheriting HRA's
+ * production dynamic tool even when the process supports that capability.
+ */
+function scheduleInterpreterThreadStartParams(
+  params: unknown,
+): Readonly<Record<string, unknown>> {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) {
+    throw new Error("Parsed schedule-interpreter thread/start input was not an object");
+  }
+  if (Object.hasOwn(params, "dynamicTools")) {
+    throw new Error("Schedule-interpreter dynamic tool policy collided with input");
+  }
+  return Object.freeze({
+    ...params,
+    dynamicTools: Object.freeze([]),
   });
 }
 

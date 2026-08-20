@@ -5,17 +5,54 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   runtimeSessionSyncCapabilities,
   sessionSyncStatusProjectionSchema,
+  type SessionSyncStatusProjection,
 } from "../../../../contracts/runtime";
 import type { RuntimeShell } from "../../runtime";
 import {
   confirmationIdForSecurityBoundary,
   nextSessionSyncSecurityGeneration,
   recoverySecretsForSecurityBoundary,
+  scheduledChatOrphanClearCommand,
+  ScheduledChatRecoverySettings,
   SessionSyncSettings,
   sessionSyncSecurityScope,
   type ScopedRecoverySecrets,
   type ScopedConfirmationId,
 } from "./SessionSyncSettings";
+
+const ORPHAN_ONE = `syncscheduleorphan_${"a".repeat(32)}`;
+const ORPHAN_TWO = `syncscheduleorphan_${"b".repeat(32)}`;
+
+function activeStatus(
+  overrides: Partial<Extract<SessionSyncStatusProjection, { state: "active" }>> = {},
+): Extract<SessionSyncStatusProjection, { state: "active" }> {
+  const status = sessionSyncStatusProjectionSchema.parse({
+    state: "active",
+    revision: 17,
+    scopeGeneration: 3,
+    currentDeviceId: `syncdevice_${"a".repeat(32)}`,
+    deviceName: "This Mac",
+    health: "attention",
+    retryable: false,
+    notice: null,
+    recovery: "ready",
+    devices: [{
+      id: `syncdevice_${"a".repeat(32)}`,
+      name: "This Mac",
+      status: "active",
+      current: true,
+      connection: "online",
+    }],
+    pendingEnrollments: [],
+    scheduledChatRecovery: {
+      state: "clearRequired",
+      orphans: [{ orphanId: ORPHAN_ONE }],
+    },
+    ...overrides,
+  });
+  if (status.state !== "active") throw new Error("expected an active fixture");
+  return status;
+}
 
 test("session sync settings expose opt-in while incomplete administration stays unavailable", async () => {
   const shell = {
@@ -95,6 +132,7 @@ test("recovery plaintext is generation-fenced across every security scope transi
         connection: "online",
       }],
       pendingEnrollments: [],
+      scheduledChatRecovery: null,
     },
     {
       state: "active",
@@ -114,6 +152,7 @@ test("recovery plaintext is generation-fenced across every security scope transi
         connection: "online",
       }],
       pendingEnrollments: [],
+      scheduledChatRecovery: null,
     },
     {
       state: "active",
@@ -133,6 +172,7 @@ test("recovery plaintext is generation-fenced across every security scope transi
         connection: "online",
       }],
       pendingEnrollments: [],
+      scheduledChatRecovery: null,
     },
   ].map((status) => sessionSyncStatusProjectionSchema.parse(status));
   const scopes = statuses.map(sessionSyncSecurityScope);
@@ -216,4 +256,72 @@ test("sensitive async results are rejected after scope change or unmount", async
   expect(source).toContain('securityScopeRef.current = "unmounted"');
   expect(source).toContain('emptyRecoverySecrets(\n      "unmounted"');
   expect(source).toContain('if (action === "disable") clearRecoverySecrets()');
+});
+
+test("active sync exposes explicit recovery without rendering opaque orphan IDs", async () => {
+  const html = renderToStaticMarkup(createElement(ScheduledChatRecoverySettings, {
+    actions: new Map(),
+    isDisabled: false,
+    onRemove: () => undefined,
+    recovery: activeStatus().scheduledChatRecovery,
+  }));
+  const source = await Bun.file(new URL("./SessionSyncSettings.tsx", import.meta.url)).text();
+
+  expect(html).toContain("Scheduled chat recovery");
+  expect(html).toContain("This cloud schedule belongs to newer chat state");
+  expect(html).toContain("Remove it before session sync can continue");
+  expect(html).toContain("Remove schedule");
+  expect(html).not.toContain(ORPHAN_ONE);
+  expect(source).toContain("<ScheduledChatRecoverySettings");
+  expect(source).toContain("recovery={status.scheduledChatRecovery}");
+});
+
+test("scheduled-chat recovery dispatches the exact current revision and orphan", () => {
+  expect(scheduledChatOrphanClearCommand(activeStatus(), ORPHAN_ONE)).toEqual({
+    type: "sessionSync.scheduledChat.orphan.clear",
+    expectedRevision: 17,
+    orphanId: ORPHAN_ONE,
+  });
+  expect(() => scheduledChatOrphanClearCommand(activeStatus(), ORPHAN_TWO)).toThrow(
+    "no longer current",
+  );
+});
+
+test("scheduled-chat recovery scopes pending and failed presentation by orphan", () => {
+  const recovery = {
+    state: "clearRequired" as const,
+    orphans: [{ orphanId: ORPHAN_ONE }, { orphanId: ORPHAN_TWO }],
+  };
+  const pendingHtml = renderToStaticMarkup(createElement(ScheduledChatRecoverySettings, {
+    actions: new Map([[ORPHAN_ONE, { error: null, pending: true }]]),
+    isDisabled: false,
+    onRemove: () => undefined,
+    recovery,
+  }));
+  expect(pendingHtml.match(/Removing…/gu)).toHaveLength(1);
+  expect(pendingHtml.match(/Remove schedule/gu)).toHaveLength(1);
+  expect(pendingHtml).toContain('aria-busy="true"');
+
+  const failedHtml = renderToStaticMarkup(createElement(ScheduledChatRecoverySettings, {
+    actions: new Map([[ORPHAN_TWO, {
+      error: "The cloud schedule could not be removed.",
+      pending: false,
+    }]]),
+    isDisabled: false,
+    onRemove: () => undefined,
+    recovery,
+  }));
+  expect(failedHtml.match(/role="alert"/gu)).toHaveLength(1);
+  expect(failedHtml).toContain("The cloud schedule could not be removed.");
+  expect(failedHtml).not.toContain(ORPHAN_ONE);
+  expect(failedHtml).not.toContain(ORPHAN_TWO);
+});
+
+test("scheduled-chat recovery renders no surface without a recovery projection", () => {
+  expect(renderToStaticMarkup(createElement(ScheduledChatRecoverySettings, {
+    actions: new Map(),
+    isDisabled: false,
+    onRemove: () => undefined,
+    recovery: null,
+  }))).toBe("");
 });

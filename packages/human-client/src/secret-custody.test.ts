@@ -528,6 +528,66 @@ describe("generational secret custody", () => {
     expect(await recovered.read()).toBeNull();
   });
 
+  test("strict recovery requires and revalidates the exact inspected candidate", async () => {
+    const committedSlot = "strictcommitted01";
+    const pendingSlot = "strictpending0001";
+    const metadata = memoryMetadata({
+      version: 1,
+      revision: 4,
+      latestGeneration: 1,
+      service: descriptor.service,
+      name: descriptor.name,
+      committed: { generation: 0, slot: committedSlot },
+      pending: {
+        pointer: { generation: 1, slot: pendingSlot },
+        replacesGeneration: 0,
+      },
+    });
+    const secrets = memorySecrets();
+    for (const [slot, generation, value] of [
+      [committedSlot, 0, "credential-a"],
+      [pendingSlot, 1, "credential-b"],
+    ] as const) {
+      secrets.values.set(
+        `${descriptor.service}:${descriptor.name}:slot:${slot}`,
+        JSON.stringify({ version: 1, generation, value }),
+      );
+    }
+    const custody = new GenerationalSecretCustody({
+      descriptor,
+      metadata,
+      secrets,
+      nextSlot: slots("strictunusedslot"),
+      requireExplicitPendingRecovery: true,
+    });
+
+    expect(custody.read()).rejects.toMatchObject({
+      reason: "pending_secret_missing",
+    });
+    const candidate = await custody.inspectRecoveryCandidate();
+    if (candidate.state !== "valid") {
+      throw new Error("strict recovery candidate was not readable");
+    }
+
+    metadata.current = {
+      version: 1,
+      revision: 5,
+      latestGeneration: 1,
+      service: descriptor.service,
+      name: descriptor.name,
+      committed: { generation: 1, slot: pendingSlot },
+      deleting: [{ generation: 0, slot: committedSlot }],
+    };
+    expect(custody.recover({
+      abandonMissingPending: false,
+      candidate: candidate.token,
+    })).rejects.toMatchObject({ reason: "concurrent_update" });
+    expect(metadata.current.committed).toEqual({
+      generation: 1,
+      slot: pendingSlot,
+    });
+  });
+
   test("advances past an abandoned generation while preserving the prior credential", async () => {
     const metadata = memoryMetadata();
     const secrets = memorySecrets();

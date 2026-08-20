@@ -156,6 +156,7 @@ function shellFactory(): RuntimeShell {
     dispatchTask: (command: Parameters<RuntimeShell["dispatchTask"]>[0]) =>
       base.dispatchTask(command),
     addProject: () => base.addProject(),
+    selectFolderAccess: () => base.selectFolderAccess(),
     retryTransport: () => base.retryTransport(),
     subscribeTaskInvalidations: (
       listener: Parameters<RuntimeShell["subscribeTaskInvalidations"]>[0],

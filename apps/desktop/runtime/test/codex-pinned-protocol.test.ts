@@ -79,6 +79,7 @@ const pinnedThreadAdmissionProfile = Object.freeze({
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false,
   }),
+  runtimeWorkspaceRoots: Object.freeze(["/tmp/oprte-shared-documents"]),
 });
 
 const codecCases: readonly CodecCase[] = [
@@ -164,6 +165,7 @@ const codecCases: readonly CodecCase[] = [
     key: "threadStart",
     input: {
       cwd: "/tmp/oprte-worktree",
+      runtimeWorkspaceRoots: ["/tmp/oprte-shared-documents"],
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
       sandbox: "workspace-write",
@@ -182,10 +184,34 @@ const codecCases: readonly CodecCase[] = [
     },
   },
   {
+    key: "scheduleInterpreterThreadStart",
+    input: {
+      cwd: "/tmp/hra-schedule-interpreter",
+      runtimeWorkspaceRoots: ["/tmp/hra-schedule-interpreter"],
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "read-only",
+      ephemeral: true,
+      historyMode: "paginated",
+      threadSource: "appServer",
+      environments: [],
+      selectedCapabilityRoots: [],
+    },
+    invalidInput: { cwd: "relative/interpreter" },
+    output: { thread: pinnedThreadFixture, ...pinnedThreadAdmissionProfile },
+    invalidOutput: {
+      thread: {
+        ...pinnedThreadFixture,
+        turns: [{ ...pinnedTurnFixture, items: [{ type: "futureItem", id: "item-2" }] }],
+      },
+    },
+  },
+  {
     key: "threadResume",
     input: {
       threadId: "thread-1",
       cwd: "/tmp/oprte-worktree",
+      runtimeWorkspaceRoots: ["/tmp/oprte-shared-documents"],
       approvalPolicy: "on-request",
       approvalsReviewer: "user",
       sandbox: "workspace-write",
@@ -446,6 +472,51 @@ const codecCases: readonly CodecCase[] = [
     },
   },
   {
+    key: "mcpServerStatusList",
+    input: {
+      cursor: null,
+      limit: 64,
+      detail: "toolsAndAuthOnly",
+      threadId: "thread-1",
+    },
+    invalidInput: { limit: 65 },
+    output: {
+      data: [{
+        name: "node_repl",
+        serverInfo: {
+          name: "node_repl",
+          title: "Node REPL",
+          version: "1.0.0",
+          description: null,
+          icons: null,
+          websiteUrl: null,
+        },
+        tools: {
+          js: {
+            name: "js",
+            description: "Run JavaScript in the trusted Node REPL.",
+            inputSchema: { type: "object" },
+          },
+        },
+        resources: [],
+        resourceTemplates: [],
+        authStatus: "unsupported",
+      }],
+      nextCursor: null,
+    },
+    invalidOutput: {
+      data: [{
+        name: "node_repl",
+        serverInfo: null,
+        tools: { js: { name: "", inputSchema: {} } },
+        resources: [],
+        resourceTemplates: [],
+        authStatus: "unsupported",
+      }],
+      nextCursor: null,
+    },
+  },
+  {
     key: "turnStart",
     input: {
       threadId: "thread-1",
@@ -486,8 +557,8 @@ const codecCases: readonly CodecCase[] = [
 ];
 
 describe("pinned Codex request registry", () => {
-  test("closes all twenty-six operations with internally consistent policy", () => {
-    expect(Object.keys(pinnedCodexRequests)).toHaveLength(26);
+  test("closes all twenty-seven operations with internally consistent policy", () => {
+    expect(Object.keys(pinnedCodexRequests)).toHaveLength(28);
     for (const { key } of codecCases) {
       const selected = pinnedCodexRequests[key];
       expect(selected.key).toBe(key);
@@ -621,7 +692,11 @@ describe("pinned Codex request registry", () => {
       const selected = pinnedCodexRequests[fixture.key] as PinnedCodexRequestDescriptor<
         PinnedCodexRequestKey
       >;
-      expect(() => selected.inputCodec.parse(fixture.input)).not.toThrow();
+      try {
+        selected.inputCodec.parse(fixture.input);
+      } catch (error) {
+        throw new Error(`valid input rejected for ${fixture.key}`, { cause: error });
+      }
       expect(() => selected.inputCodec.parse(fixture.invalidInput)).toThrow(
         "Pinned Codex payload validation failed",
       );

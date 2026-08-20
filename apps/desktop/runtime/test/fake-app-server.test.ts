@@ -270,6 +270,7 @@ describe("fake app-server", () => {
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandbox: { type: "dangerFullAccess" },
+        runtimeWorkspaceRoots: ["/tmp/hra-fake-app-server"],
       },
     });
     if (!("result" in resumeResponse)) throw new Error("thread resume result missing");
@@ -283,6 +284,7 @@ describe("fake app-server", () => {
       approvalPolicy: "never",
       approvalsReviewer: "auto_review",
       sandbox: { type: "dangerFullAccess" },
+      runtimeWorkspaceRoots: ["/tmp/hra-fake-app-server"],
     });
     expect(await nextMessage(harness)).toEqual(USER_INPUT_REQUEST);
 

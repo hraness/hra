@@ -172,6 +172,7 @@ test("every successful chat receipt is compact and contains no chat content", ()
       attention: null,
       recoverablePrompt: false,
       canStartFreshContext: false,
+      schedule: null,
       messageQueue: {
         revision: 7,
         pauseReason: null,

@@ -92,6 +92,9 @@ const effectiveUserHomePreload = fileURLToPath(
 const inMemorySecretsPreload = fileURLToPath(
   new URL("./fixtures/in-memory-secrets-preload.ts", import.meta.url),
 );
+const computerUseProvisioningPreload = fileURLToPath(
+  new URL("./fixtures/computer-use-provisioning-preload.ts", import.meta.url),
+);
 const shutdownCleanupPreload = fileURLToPath(
   new URL("./fixtures/shutdown-cleanup-preload.ts", import.meta.url),
 );
@@ -140,6 +143,8 @@ function spawnGatewayProcess(options: GatewaySpawnOptions) {
     effectiveUserHomePreload,
     "--preload",
     inMemorySecretsPreload,
+    "--preload",
+    computerUseProvisioningPreload,
     ...(testPreload === undefined ? [] : ["--preload", testPreload]),
     "runtime/src/main.ts",
   ], {
@@ -1891,6 +1896,20 @@ describe("compiled gateway boundary", () => {
         await Bun.sleep(10);
       } while (Date.now() < fixtureDeadline);
       if (finalSnapshot === null) throw new Error("Chat settlement was not observed");
+      if (!settlementObserved) {
+        const fixtureLog = await readFile(chatFixtureLog, "utf8").catch(() => "");
+        throw new Error(
+          `Chat settlement stayed pending: ${JSON.stringify({
+            panes: finalSnapshot.chat.panes.map((pane) => ({
+              id: pane.id,
+              state: pane.state,
+              turn: pane.turn,
+              queue: pane.messageQueue,
+            })),
+            fixtureLog,
+          })}`,
+        );
+      }
       expect(settlementObserved).toBeTrue();
       const responseDeadline = Date.now() + 1_000;
       let observedFixtureLog = "";
@@ -1945,9 +1964,9 @@ describe("compiled gateway boundary", () => {
         event.type === "chat.turn.delta" &&
         event.delta === escapedResponsePrefix
       )).toBeFalse();
-      // Snapshot capture may compact state-recoverable events after the
-      // projection-overflow marker. The authoritative snapshot above proves
-      // that the attention state survives that compaction boundary.
+      // The global execution projection consumes one bounded event slot, and
+      // snapshot capture may compact state-recoverable events after overflow.
+      // The authoritative snapshot above proves that attention survives.
 
       if (completed === undefined) {
         throw new Error("Completed chat pane was not projected");

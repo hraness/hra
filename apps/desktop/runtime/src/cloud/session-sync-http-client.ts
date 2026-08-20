@@ -4,6 +4,8 @@ import {
   SESSION_SYNC_PROTOCOL,
   bootstrapSyncVaultRequestSchema,
   canonicalSessionSyncJson,
+  clearOrphanedScheduledChatAsHumanRequestSchema,
+  readScheduledChatRecoveryInventoryAsHumanRequestSchema,
   claimSyncEnrollmentRequestSchema,
   createSyncProofNonce,
   decodeSyncUint64,
@@ -28,6 +30,8 @@ import {
   syncMembershipCoordinateSchema,
   type BootstrapSyncVaultRequest,
   type ClaimSyncEnrollmentRequest,
+  type ClearOrphanedScheduledChatAsHumanRequest,
+  type ReadScheduledChatRecoveryInventoryAsHumanRequest,
   type RecoverSyncVaultRequest,
   type SessionSyncBackendErrorCode,
   type SessionSyncBackendRequest,
@@ -285,6 +289,10 @@ export function sessionSyncResponseMatchesRequest(
     ? request.membershipHead.statement
     : request.operation === "publish_session"
     ? request.envelope.header
+    : request.operation === "put_scheduled_chat"
+    ? request.definition.header
+    : request.operation === "clear_scheduled_chat"
+    ? request
     : null;
   if (
     requestScope !== null
@@ -370,6 +378,49 @@ export function sessionSyncResponseMatchesRequest(
         && sameVaultCoordinates(response.tombstone, expectedVault)
         && response.tombstone.sessionId === request.sessionId
         && response.tombstone.tombstoneDigest === request.tombstoneDigest;
+    case "put_scheduled_chat":
+      return response.kind === "scheduled_chat_put"
+        && response.sessionId === request.definition.header.sessionId
+        && response.schedule.generation === request.definition.header.generation
+        && response.schedule.rrule === request.definition.header.rrule
+        && response.schedule.timeZone === request.definition.header.timeZone
+        && response.ciphertextDigest === request.definition.ciphertextDigest;
+    case "clear_scheduled_chat":
+      return response.kind === "scheduled_chat_cleared"
+        && response.sessionId === request.sessionId
+        && response.generation === request.expectedGeneration;
+    case "clear_orphaned_scheduled_chat":
+      return response.kind === "scheduled_chat_cleared"
+        && response.sessionId === request.sessionId
+        && response.generation === request.expectedGeneration;
+    case "scheduled_chat_inventory":
+      return response.kind === "scheduled_chat_inventory"
+        && response.schedules.length <= request.pageSize
+        && response.hasMore === (response.nextAfterSessionId !== undefined)
+        && (!response.hasMore
+          || response.nextAfterSessionId
+            === response.schedules.at(-1)?.sessionId)
+        && response.schedules.every((schedule, index) =>
+          (request.afterSessionId === undefined
+            || schedule.sessionId > request.afterSessionId)
+          && (index === 0
+            || response.schedules[index - 1]!.sessionId < schedule.sessionId)
+          && (schedule.state === "cleared"
+            || sameVaultCoordinates(schedule.definition.header, expectedVault))
+        );
+    case "scheduled_run_page":
+      return response.kind === "scheduled_run_page"
+        && response.runs.length <= request.pageSize
+        && response.runs.every((run) =>
+          sameVaultCoordinates(run.definition.header, expectedVault)
+          && run.definition.header.sessionId === run.sessionId
+          && run.definition.header.generation === run.scheduleGeneration
+        );
+    case "ack_scheduled_run":
+      return response.kind === "scheduled_run_acknowledged"
+        && response.runId === request.runId
+        && response.sessionId === request.sessionId
+        && response.generation === request.scheduleGeneration;
     case "begin_snapshot":
       return response.kind === "snapshot_started"
         && sameVaultCoordinates(response.vault, expectedVault)
@@ -402,6 +453,8 @@ export function sessionSyncProofMethod(
     case "root_key_link_page":
     case "snapshot_page":
     case "change_page":
+    case "scheduled_chat_inventory":
+    case "scheduled_run_page":
       return "GET";
     case "admit_membership_proposal":
     case "update_membership":
@@ -412,6 +465,10 @@ export function sessionSyncProofMethod(
     case "acquire_writer":
     case "publish_session":
     case "delete_session":
+    case "put_scheduled_chat":
+    case "clear_scheduled_chat":
+    case "clear_orphaned_scheduled_chat":
+    case "ack_scheduled_run":
     case "begin_snapshot":
       return "POST";
     default:
@@ -621,6 +678,56 @@ export class SessionSyncHttpTransport {
         result.data.receipt.authorization,
         request.authorization,
       )
+    ) return failure();
+    return { ok: true, data: result.data };
+  }
+
+  async clearOrphanedScheduledChat(
+    accessToken: string,
+    requestValue: ClearOrphanedScheduledChatAsHumanRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionSyncOperationResult<Extract<
+    SessionSyncBackendResponse,
+    { readonly kind: "scheduled_chat_cleared" }
+  >>> {
+    const request = clearOrphanedScheduledChatAsHumanRequestSchema.parse(requestValue);
+    const result = await this.#invokeHuman(
+      accessToken,
+      sessionSyncHttpRoutes.orphanClear,
+      canonicalSessionSyncJson(request),
+      signal,
+    );
+    if (!result.ok) return result;
+    if (
+      result.data.kind !== "scheduled_chat_cleared"
+      || result.data.sessionId !== request.sessionId
+      || result.data.generation !== request.expectedGeneration
+    ) return failure();
+    return { ok: true, data: result.data };
+  }
+
+  async readScheduledChatRecoveryInventory(
+    accessToken: string,
+    requestValue: ReadScheduledChatRecoveryInventoryAsHumanRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionSyncOperationResult<Extract<
+    SessionSyncBackendResponse,
+    { readonly kind: "scheduled_chat_recovery_inventory" }
+  >>> {
+    const request = readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse(
+      requestValue,
+    );
+    const result = await this.#invokeHuman(
+      accessToken,
+      sessionSyncHttpRoutes.orphanInventory,
+      canonicalSessionSyncJson(request),
+      signal,
+    );
+    if (!result.ok) return result;
+    if (
+      result.data.kind !== "scheduled_chat_recovery_inventory"
+      || !sameVaultCoordinates(result.data.vault, request)
+      || result.data.originDeviceId !== request.originDeviceId
     ) return failure();
     return { ok: true, data: result.data };
   }
@@ -848,6 +955,42 @@ export class SessionSyncBearerClient {
     const request = recoverSyncVaultRequestSchema.parse(requestValue);
     return this.#session.execute(
       async (token) => await this.#transport.recover(token, request, signal),
+    );
+  }
+
+  clearOrphanedScheduledChat(
+    requestValue: ClearOrphanedScheduledChatAsHumanRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionSyncSessionResult<Extract<
+    SessionSyncBackendResponse,
+    { readonly kind: "scheduled_chat_cleared" }
+  >>> {
+    const request = clearOrphanedScheduledChatAsHumanRequestSchema.parse(requestValue);
+    return this.#session.execute(
+      async (token) => await this.#transport.clearOrphanedScheduledChat(
+        token,
+        request,
+        signal,
+      ),
+    );
+  }
+
+  readScheduledChatRecoveryInventory(
+    requestValue: ReadScheduledChatRecoveryInventoryAsHumanRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionSyncSessionResult<Extract<
+    SessionSyncBackendResponse,
+    { readonly kind: "scheduled_chat_recovery_inventory" }
+  >>> {
+    const request = readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse(
+      requestValue,
+    );
+    return this.#session.execute(
+      async (token) => await this.#transport.readScheduledChatRecoveryInventory(
+        token,
+        request,
+        signal,
+      ),
     );
   }
 

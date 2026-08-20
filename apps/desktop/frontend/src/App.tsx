@@ -6,7 +6,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 
-import { IconButton, IconLink } from "./ui";
+import { Button, IconButton, IconLink } from "./ui";
 
 import type {
   RuntimeDispatchResponse,
@@ -21,7 +21,9 @@ import {
   createPaneId,
   paneRepositoriesEqual,
   paneIdsEqual,
+  executionEqual,
   runtimeAvailabilityEqual,
+  selectExecution,
   selectLastLocalPaneRepository,
   selectPaneIds,
   selectRuntimeAvailability,
@@ -78,6 +80,8 @@ export default function App({ runtimeShellFactory }: AppProps) {
   const [route, setRoute] = useState<ChatRoute>(initialRoute);
   const [creatingPane, setCreatingPane] = useState(false);
   const [creationError, setCreationError] = useState<string | null>(null);
+  const [selectingFolder, setSelectingFolder] = useState(false);
+  const [folderAccessError, setFolderAccessError] = useState<string | null>(null);
   useUiScale();
   const paneIds = useRuntimeShellSelector(runtimeShell, selectPaneIds, paneIdsEqual);
   const lastRepository = useRuntimeShellSelector(
@@ -90,6 +94,11 @@ export default function App({ runtimeShellFactory }: AppProps) {
     runtimeShell,
     selectRuntimeAvailability,
     runtimeAvailabilityEqual,
+  );
+  const execution = useRuntimeShellSelector(
+    runtimeShell,
+    selectExecution,
+    executionEqual,
   );
 
   useEffect(() => {
@@ -183,6 +192,25 @@ export default function App({ runtimeShellFactory }: AppProps) {
     }
   }, [availability.kind, creatingPane, lastRepository, paneIds.length, subscriptionGate]);
 
+  const selectFolderAccess = useCallback(async () => {
+    const shell = shellRef.current;
+    if (shell === null || selectingFolder || availability.kind !== "ready") return;
+    setSelectingFolder(true);
+    setFolderAccessError(null);
+    try {
+      const result = await shell.selectFolderAccess();
+      if (result.status === "failed") setFolderAccessError(result.error.message);
+    } catch (reason: unknown) {
+      setFolderAccessError(
+        reason instanceof Error
+          ? reason.message
+          : "The shared folder could not be selected.",
+      );
+    } finally {
+      setSelectingFolder(false);
+    }
+  }, [availability.kind, selectingFolder]);
+
   const skipToMain = useCallback((event: ReactMouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
     focusMainContent(document);
@@ -237,6 +265,26 @@ export default function App({ runtimeShellFactory }: AppProps) {
             </IconLink>
           ) : null}
         </nav>
+        <Button
+          {...(folderAccessError === null
+            ? {}
+            : { "aria-describedby": "folder-access-error" })}
+          aria-label={`Shared folder access: ${execution.folderAccess.displayName}. Choose folder`}
+          className="hra-folder-access-shell"
+          controlClassName="hra-folder-access"
+          data-availability={execution.folderAccess.availability}
+          isDisabled={runtimeShell === null || availability.kind !== "ready" || selectingFolder}
+          isPending={selectingFolder}
+          leading={<HRAIcon name="folder" />}
+          onPress={() => void selectFolderAccess()}
+          size="compact"
+          type="button"
+          variant="quiet"
+        >
+          <span className="hra-folder-access__label">
+            Shared folder · {execution.folderAccess.displayName}
+          </span>
+        </Button>
         {effectiveRoute === "panes" ? (
           <IconButton
             aria-label={creatingPane ? "Choosing a project" : "New pane"}
@@ -260,6 +308,11 @@ export default function App({ runtimeShellFactory }: AppProps) {
         ) : <span className="hra-header__spacer" />}
       </header>
       <main id="main-content" tabIndex={-1}>
+        {folderAccessError === null ? null : (
+          <p className="creation-error" id="folder-access-error" role="alert">
+            {folderAccessError}
+          </p>
+        )}
         {creationError === null ? null : (
           <p className="creation-error" role="alert">{creationError}</p>
         )}

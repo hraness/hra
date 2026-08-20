@@ -10,7 +10,9 @@ import type {
 export type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
   | "threadList"
   | "threadStart"
+  | "scheduleInterpreterThreadStart"
   | "threadResume"
+  | "threadArchive"
   | "threadRead"
   | "threadHistoryRead"
   | "threadTurnsList"
@@ -23,6 +25,7 @@ export type SessionCodexRequestKey = Extract<PinnedCodexRequestKey,
   | "threadInjectItems"
   | "modelList"
   | "configRequirementsRead"
+  | "mcpServerStatusList"
   | "turnStart"
   | "turnSteer"
   | "turnInterrupt">;
@@ -221,6 +224,21 @@ export class SessionCommandExecutor {
     );
   }
 
+  mcpServerStatusList(
+    accountProfileId: AccountSummary["id"],
+    input: PinnedCodexRequestInput<"mcpServerStatusList">,
+    expectedGeneration?: number,
+  ): Promise<PinnedCodexResponseAtPosition<
+    PinnedCodexRequestOutput<"mcpServerStatusList">
+  >> {
+    return this.#positioned(
+      accountProfileId,
+      "mcpServerStatusList",
+      input,
+      expectedGeneration,
+    );
+  }
+
   threadStart(
     accountProfileId: AccountSummary["id"],
     input: PinnedCodexRequestInput<"threadStart">,
@@ -234,6 +252,21 @@ export class SessionCommandExecutor {
     );
   }
 
+  scheduleInterpreterThreadStart(
+    accountProfileId: AccountSummary["id"],
+    input: PinnedCodexRequestInput<"scheduleInterpreterThreadStart">,
+    expectedGeneration?: number,
+  ): Promise<PinnedCodexResponseAtPosition<
+    PinnedCodexRequestOutput<"scheduleInterpreterThreadStart">
+  >> {
+    return this.#positioned(
+      accountProfileId,
+      "scheduleInterpreterThreadStart",
+      input,
+      expectedGeneration,
+    );
+  }
+
   threadResume(
     accountProfileId: AccountSummary["id"],
     input: PinnedCodexRequestInput<"threadResume">,
@@ -242,6 +275,19 @@ export class SessionCommandExecutor {
     return this.#positioned(
       accountProfileId,
       "threadResume",
+      input,
+      expectedGeneration,
+    );
+  }
+
+  threadArchive(
+    accountProfileId: AccountSummary["id"],
+    input: PinnedCodexRequestInput<"threadArchive">,
+    expectedGeneration?: number,
+  ): Promise<PinnedCodexResponseAtPosition<PinnedCodexRequestOutput<"threadArchive">>> {
+    return this.#positioned(
+      accountProfileId,
+      "threadArchive",
       input,
       expectedGeneration,
     );

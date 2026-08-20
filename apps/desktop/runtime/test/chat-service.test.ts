@@ -2,6 +2,13 @@ import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  SESSION_SYNC_PROTOCOL,
+  positiveSyncUint64Schema,
+  sealedScheduledChatDefinitionSchema,
+  sessionPublicIdSchema,
+  syncSha256DigestSchema,
+} from "@hraness/agent-tasks-protocol";
 
 import type { ChatPaneProjection } from "../../contracts/runtime";
 import { reduceRuntimeProjectionEvent } from "../../contracts/runtime-projection";
@@ -25,6 +32,7 @@ import {
   type ChatProviderThreadRequest,
   type ChatProviderTurnRequest,
   type ChatRuntimeRecoveryPort,
+  type ChatScheduledChatPort,
   type ChatThreadBinding,
   type ChatTurnDelta,
   type ChatWorkspacePort,
@@ -53,6 +61,10 @@ import type {
 import { SQLiteChatAttachmentVault } from "../src/attachments/vault";
 import { AccountRuntimeNotQuiescentError } from
   "../src/accounts/runtime-router";
+import {
+  ScheduledChatStore,
+  scheduledChatMessageId,
+} from "../src/state/scheduled-chat-store";
 
 const ACCOUNT_ONE = "acct_chatprimary1";
 const ACCOUNT_TWO = "acct_chatsecond01";
@@ -108,8 +120,14 @@ class FakeProvider implements ChatProviderPort {
     serviceTier: "standard" | "fast";
   }>> = [];
   readonly resolutionCandidates: ChatProviderConfiguration[][] = [];
+  readonly scheduleInterpretations: Array<
+    Parameters<ChatProviderPort["interpretSchedule"]>[0]
+  > = [];
   events: string[] | null = null;
   onInterrupt: (() => Promise<void>) | null = null;
+  onInterpretSchedule: ((
+    request: Parameters<ChatProviderPort["interpretSchedule"]>[0],
+  ) => ReturnType<ChatProviderPort["interpretSchedule"]>) | null = null;
   onResolveConfiguration: ((
     accountProfileId: string,
     candidates: readonly ChatProviderConfiguration[],
@@ -170,6 +188,19 @@ class FakeProvider implements ChatProviderPort {
         : "b".repeat(64),
       observedInputModalities: ["text", "image"] as const,
     });
+  }
+
+  async interpretSchedule(
+    request: Parameters<ChatProviderPort["interpretSchedule"]>[0],
+  ): ReturnType<ChatProviderPort["interpretSchedule"]> {
+    this.scheduleInterpretations.push(request);
+    if (this.onInterpretSchedule !== null) {
+      return await this.onInterpretSchedule(request);
+    }
+    return {
+      prompt: "Review the current project and report what changed.",
+      rrule: `DTSTART;TZID=${request.timeZone}:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1`,
+    };
   }
 
   async startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
@@ -307,6 +338,152 @@ function textInput(request: ChatProviderTurnRequest): string {
   return text?.type === "text" ? text.text : "";
 }
 
+class FakeScheduledChats implements ChatScheduledChatPort {
+  readonly #database: Database;
+  readonly #store: ScheduledChatStore;
+  readonly configureCalls: Parameters<ChatScheduledChatPort["configure"]>[0][] = [];
+  readonly removeCalls: Parameters<ChatScheduledChatPort["remove"]>[0][] = [];
+  beforeConfigure: (() => Promise<void>) | null = null;
+  beforeRemove: (() => Promise<void>) | null = null;
+  #sequence = 0;
+
+  constructor(database: Database, store: ScheduledChatStore) {
+    this.#database = database;
+    this.#store = store;
+  }
+
+  isScheduled(paneId: string): boolean {
+    return this.#store.get(paneId) !== null;
+  }
+
+  async configure(
+    input: Parameters<ChatScheduledChatPort["configure"]>[0],
+  ): Promise<void> {
+    this.configureCalls.push(structuredClone(input));
+    await this.beforeConfigure?.();
+    const sessionId = sessionPublicIdSchema.parse(
+      `syncsession_${"q".repeat(32)}`,
+    );
+    const digest = syncSha256DigestSchema.parse(`sha256_${"a".repeat(64)}`);
+    this.#database.query(`
+      INSERT OR IGNORE INTO session_sync_grid_positions(
+        session_id, grid_position, origin, discovered_at
+      ) VALUES (?1, 0, 'local', ?2)
+    `).run(sessionId, input.now);
+    this.#database.query(`
+      INSERT OR IGNORE INTO session_sync_pane_bindings(
+        pane_id, session_id, tenant_id, organization_id, owner_user_id,
+        vault_id, vault_generation, origin_device_id, included,
+        binding_state, creation_grant_digest, reserved_at, created_at
+      ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, '1', ?7, 1,
+        'accepted', ?8, ?9, ?9
+      )
+    `).run(
+      input.paneId,
+      sessionId,
+      `synctenant_${"t".repeat(32)}`,
+      `syncorg_${"o".repeat(32)}`,
+      `syncuser_${"u".repeat(32)}`,
+      `syncvault_${"v".repeat(32)}`,
+      `syncdevice_${"d".repeat(32)}`,
+      digest,
+      input.now,
+    );
+    const current = this.#store.get(input.paneId);
+    const generation = positiveSyncUint64Schema.parse(
+      String(BigInt(current?.generation ?? "0") + 1n),
+    );
+    const definition = sealedScheduledChatDefinitionSchema.parse({
+      header: {
+        protocol: SESSION_SYNC_PROTOCOL,
+        payloadKind: "scheduled_chat_definition",
+        payloadVersion: 1,
+        tenantId: `synctenant_${"t".repeat(32)}`,
+        organizationId: `syncorg_${"o".repeat(32)}`,
+        ownerUserId: `syncuser_${"u".repeat(32)}`,
+        vaultId: `syncvault_${"v".repeat(32)}`,
+        vaultGeneration: "1",
+        membershipEpoch: "1",
+        originDeviceId: `syncdevice_${"d".repeat(32)}`,
+        sessionId,
+        mirrorEpoch: "1",
+        writerGeneration: "1",
+        bootId: `syncboot_${"b".repeat(32)}`,
+        bootGeneration: "1",
+        keyEpoch: "1",
+        previousGeneration: current?.generation ?? "0",
+        generation,
+        rrule: input.rrule,
+        timeZone: input.timeZone,
+      },
+      algorithm: "HKDF-SHA256-A256GCM",
+      nonce: "AAAAAAAAAAAAAAAA",
+      ciphertext: "AAAAAAAAAAAAAAAAAAAAAAA",
+      ciphertextBytes: 17,
+      ciphertextDigest: digest,
+    });
+    const prepared = this.#store.preparePut({
+      operationId: `syncop_${String(++this.#sequence).padStart(32, "0")}`,
+      paneId: input.paneId,
+      sessionId,
+      expectedPaneRevision: input.expectedRevision,
+      targetGeneration: generation,
+      request: { version: 1, operation: "put_scheduled_chat", definition },
+      definition,
+      nextRunAt: input.now + 60_000,
+      now: input.now,
+    });
+    this.#store.markEffectStarted(prepared.operationId, input.now);
+    this.#store.transaction(() => {
+      this.#store.completeMutationInTransaction(prepared.operationId, input.now, {
+        kind: "scheduled_chat_put",
+        sessionId,
+        schedule: {
+          generation,
+          rrule: input.rrule,
+          timeZone: input.timeZone,
+          nextRunAt: input.now + 60_000,
+        },
+        ciphertextDigest: digest,
+        replay: false,
+      });
+    });
+  }
+
+  async remove(
+    input: Parameters<ChatScheduledChatPort["remove"]>[0],
+  ): Promise<void> {
+    this.removeCalls.push(structuredClone(input));
+    await this.beforeRemove?.();
+    const current = this.#store.get(input.paneId);
+    if (current === null) return;
+    const prepared = this.#store.prepareClear({
+      operationId: `syncop_${String(++this.#sequence).padStart(32, "0")}`,
+      paneId: input.paneId,
+      sessionId: current.sessionId,
+      expectedPaneRevision: input.expectedRevision,
+      targetGeneration: current.generation,
+      request: {
+        version: 1,
+        operation: "clear_scheduled_chat",
+        sessionId: current.sessionId,
+        expectedGeneration: current.generation,
+      },
+      now: input.now,
+    });
+    this.#store.markEffectStarted(prepared.operationId, input.now);
+    this.#store.transaction(() => {
+      this.#store.completeMutationInTransaction(prepared.operationId, input.now, {
+        kind: "scheduled_chat_cleared",
+        sessionId: current.sessionId,
+        generation: current.generation,
+        replay: false,
+      });
+    });
+  }
+}
+
 class FakeHarnessRoots implements ChatHarnessRootPort {
   readonly admissions: Parameters<ChatHarnessRootPort["admit"]>[0][] = [];
   readonly observations: Parameters<ChatHarnessRootPort["observe"]>[0][] = [];
@@ -398,6 +575,8 @@ interface Harness {
   readonly rootTurnRouting: RootTurnRoutingAuthorityV1;
   readonly reorderedPanes: (readonly string[])[];
   readonly service: ChatService;
+  readonly scheduledChats: FakeScheduledChats | null;
+  readonly scheduledChatStore: ScheduledChatStore;
   readonly store: ChatPaneStore;
   readonly workspaces: ChatWorkspacePort;
 }
@@ -426,6 +605,8 @@ interface HarnessSetup {
   readonly isGenerationCurrent?: ChatAccountPort["isGenerationCurrent"];
   readonly onPaneRemoved?: (paneId: string, revision: number) => void | Promise<void>;
   readonly providerThreadArchiveCoordinatorV57Enabled?: boolean;
+  readonly scheduledChats?: boolean;
+  readonly scheduledAttentionRetryDelayMs?: ChatServiceOptions["scheduledAttentionRetryDelayMs"];
   readonly repositoryResolver?: ChatServiceOptions["repositories"]["resolve"];
 }
 
@@ -720,6 +901,9 @@ function harness(
   const providerThreadArchiveCoordinatorV57Enabled = typeof setup === "function"
     ? undefined
     : setup.providerThreadArchiveCoordinatorV57Enabled;
+  const scheduledAttentionRetryDelayMs = typeof setup === "function"
+    ? undefined
+    : setup.scheduledAttentionRetryDelayMs;
   const onPaneRemoved = typeof setup === "function"
     ? null
     : setup.onPaneRemoved ?? null;
@@ -771,10 +955,15 @@ function harness(
   const routingEvents: string[] = [];
   provider.events = routingEvents;
   const attachments = attachmentFactory?.(database) ?? null;
+  const scheduledChatStore = new ScheduledChatStore(database);
   const store = new ChatPaneStore(database, {
     messageRequestDigestKey: CHAT_SERVICE_ARCHIVE_RECEIPT_KEY_V57,
     ...(attachments === null ? {} : { paneArchiveAuthority: attachments }),
+    scheduledChatStore,
   });
+  const scheduledChats = typeof setup !== "function" && setup.scheduledChats === true
+    ? new FakeScheduledChats(database, scheduledChatStore)
+    : null;
   const rootTurnRouting = recordingRootTurnRoutingAuthority(
     new RootTurnRoutingSQLiteAuthorityV1(database),
     database,
@@ -872,6 +1061,8 @@ function harness(
       ? {}
       : { providerThreadArchiveCoordinatorV57Enabled }),
     provider,
+    ...(scheduledChats === null ? {} : { scheduledChats }),
+    scheduledChatStore,
     repositories: {
       resolve: configuredRepositoryResolver ?? ((repositoryId) => Promise.resolve(
         repositoryId === REPOSITORY
@@ -899,6 +1090,9 @@ function harness(
       ? {}
       : { attachedHarnessRetryDelayMs }),
     ...(workspaceRetryDelayMs === undefined ? {} : { workspaceRetryDelayMs }),
+    ...(scheduledAttentionRetryDelayMs === undefined
+      ? {}
+      : { scheduledAttentionRetryDelayMs }),
   });
   serviceHolder.current = service;
   return {
@@ -917,6 +1111,8 @@ function harness(
     routingEvents,
     rootTurnRouting,
     service,
+    scheduledChats,
+    scheduledChatStore,
     store,
     workspaces,
   };
@@ -1057,6 +1253,1186 @@ async function startTurn(
   if (result.type !== "pane") throw new Error("Expected a pane response");
   return result.pane;
 }
+
+test("scheduled chat configuration is atomic, blocks manual sends, and removes cleanly", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    value.provider.onInterpretSchedule = (request) => Promise.resolve({
+      prompt: "Summarize repository changes since the prior run.",
+      rrule: `DTSTART;TZID=${request.timeZone}:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1`,
+    });
+
+    const configured = await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    expect(configured).toMatchObject({
+      type: "pane",
+      pane: {
+        revision: pane.revision + 1,
+        schedule: {
+          revision: 1,
+        },
+      },
+    });
+    expect(value.provider.scheduleInterpretations).toHaveLength(1);
+    expect(
+      configured.type === "pane" ? configured.pane.schedule?.timeZone : null,
+    ).toBe(value.provider.scheduleInterpretations[0]?.timeZone);
+    expect(value.scheduledChats?.configureCalls).toHaveLength(1);
+
+    const manual = await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: value.store.messageQueue(PANE).revision,
+      messageId: "chatmsg_schedule_manual_01",
+      content: { text: "Run this now", attachmentRefs: [] },
+      delivery: { kind: "queue" },
+    }).then(() => null, (error: unknown) => error);
+    expect(manual).toMatchObject({ code: "invalid_state" });
+    expect(value.store.messageQueue(PANE).messages).toEqual([]);
+
+    const current = value.store.require(PANE).projection;
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: current.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: { revision: current.revision + 1, schedule: null },
+    });
+    expect(value.scheduledChats?.removeCalls).toHaveLength(1);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("desired-off authority alone rejects ordinary queue mutation before SQLite quarantine", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const current = value.store.require(PANE).projection;
+    value.scheduledChatStore.requestDesiredOff({
+      paneId: PANE,
+      expectedPaneRevision: current.revision,
+      now: Date.parse("2026-08-20T13:01:00.000Z"),
+    });
+    value.database.query(`
+      DELETE FROM chat_scheduled_chats WHERE pane_id = ?1
+    `).run(PANE);
+    expect(value.scheduledChatStore.get(PANE)).toBeNull();
+    expect(value.scheduledChatStore.mutationForPane(PANE)).toBeNull();
+    expect(value.scheduledChatStore.desiredOff(PANE)).not.toBeNull();
+    const before = value.store.messageQueue(PANE);
+
+    const rejected = await value.service.execute({
+      type: "chat.message.enqueue",
+      paneId: PANE,
+      expectedQueueRevision: before.revision,
+      messageId: "chatmsg_schedule_desired_off_01",
+      content: { text: "This manual message must remain fenced.", attachmentRefs: [] },
+      delivery: { kind: "queue" },
+    }).then(() => null, (error: unknown) => error);
+    expect(rejected).toMatchObject({ code: "invalid_state" });
+    expect(value.store.messageQueue(PANE)).toEqual(before);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled coordinator callbacks join a pane while schedule interpretation is suspended", async () => {
+  const value = harness({ scheduledChats: true });
+  const interpretationEntered = deferred<void>();
+  const releaseInterpretation = deferred<void>();
+  try {
+    const pane = await createPane(value);
+    value.provider.onInterpretSchedule = async (request) => {
+      interpretationEntered.resolve();
+      await releaseInterpretation.promise;
+      return {
+        prompt: "Summarize repository changes since the prior run.",
+        rrule: `DTSTART;TZID=${request.timeZone}:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1`,
+      };
+    };
+    const configuring = value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    await interpretationEntered.promise;
+    let postimageCommits = 0;
+    await withinDeadline(
+      value.service.commitScheduledChatPostimage(PANE, () => {
+        postimageCommits += 1;
+      }),
+      "coordinator postimage join during interpretation",
+    );
+    expect(postimageCommits).toBe(1);
+    releaseInterpretation.resolve();
+    await configuring;
+    expect(value.scheduledChats?.configureCalls).toHaveLength(1);
+  } finally {
+    releaseInterpretation.resolve();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled update reserves its predecessor cut before a coordinator callback queues", async () => {
+  const priorProjectionEntered = deferred<void>();
+  const releasePriorProjection = deferred<void>();
+  let blockNextPaneStateProjection = false;
+  const value = harness(
+    { scheduledChats: true },
+    () => Promise.resolve(),
+    null,
+    null,
+    null,
+    () => undefined,
+    async () => {
+      if (!blockNextPaneStateProjection) return;
+      blockNextPaneStateProjection = false;
+      priorProjectionEntered.resolve();
+      await releasePriorProjection.promise;
+    },
+  );
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const beforeRename = value.store.require(PANE).projection;
+    blockNextPaneStateProjection = true;
+    const renaming = value.service.execute({
+      type: "chat.pane.rename",
+      paneId: PANE,
+      expectedRevision: beforeRename.revision,
+      title: "Scheduled predecessor cut",
+    });
+    await priorProjectionEntered.promise;
+    const afterRename = value.store.require(PANE).projection;
+    const scheduledChats = value.scheduledChats;
+    if (scheduledChats === null) throw new Error("missing scheduled chat port");
+    const callbackReady = deferred<Promise<void>>();
+    scheduledChats.beforeConfigure = async () => await callbackReady.promise;
+    const updating = value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: afterRename.revision,
+      instruction: "Change the scheduled summary wording",
+    });
+    const callback = value.service.commitScheduledChatPostimage(
+      PANE,
+      () => undefined,
+    );
+    callbackReady.resolve(callback);
+
+    releasePriorProjection.resolve();
+    await renaming;
+    await withinDeadline(
+      Promise.all([updating, callback]),
+      "scheduled update predecessor-cut callback join",
+    );
+    expect(scheduledChats.configureCalls).toHaveLength(2);
+  } finally {
+    releasePriorProjection.resolve();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled removal reserves its predecessor cut before a coordinator callback queues", async () => {
+  const priorProjectionEntered = deferred<void>();
+  const releasePriorProjection = deferred<void>();
+  let blockNextPaneStateProjection = false;
+  const value = harness(
+    { scheduledChats: true },
+    () => Promise.resolve(),
+    null,
+    null,
+    null,
+    () => undefined,
+    async () => {
+      if (!blockNextPaneStateProjection) return;
+      blockNextPaneStateProjection = false;
+      priorProjectionEntered.resolve();
+      await releasePriorProjection.promise;
+    },
+  );
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const beforeRename = value.store.require(PANE).projection;
+    blockNextPaneStateProjection = true;
+    const renaming = value.service.execute({
+      type: "chat.pane.rename",
+      paneId: PANE,
+      expectedRevision: beforeRename.revision,
+      title: "Scheduled removal predecessor cut",
+    });
+    await priorProjectionEntered.promise;
+    const afterRename = value.store.require(PANE).projection;
+    const scheduledChats = value.scheduledChats;
+    if (scheduledChats === null) throw new Error("missing scheduled chat port");
+    const callbackReady = deferred<Promise<void>>();
+    scheduledChats.beforeRemove = async () => await callbackReady.promise;
+    const removing = value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: afterRename.revision,
+    });
+    const callback = value.service.commitScheduledChatPostimage(
+      PANE,
+      () => undefined,
+    );
+    callbackReady.resolve(callback);
+
+    releasePriorProjection.resolve();
+    await renaming;
+    const [removed] = await withinDeadline(
+      Promise.all([removing, callback]),
+      "scheduled removal predecessor-cut callback join",
+    );
+    expect(removed).toMatchObject({ type: "pane", pane: { schedule: null } });
+    expect(scheduledChats.removeCalls).toHaveLength(1);
+  } finally {
+    releasePriorProjection.resolve();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled due enqueue joins a suspended schedule update and invalidates it before cloud effect", async () => {
+  let accountsAvailable = true;
+  const value = harness({
+    scheduledChats: true,
+    candidateFactory: () => accountsAvailable
+      ? [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]
+      : [],
+  });
+  const interpretationEntered = deferred<void>();
+  const releaseInterpretation = deferred<void>();
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const current = value.store.require(PANE).projection;
+    value.provider.onInterpretSchedule = async (request) => {
+      interpretationEntered.resolve();
+      await releaseInterpretation.promise;
+      return {
+        prompt: "Summarize repository changes twice daily.",
+        rrule: `DTSTART;TZID=${request.timeZone}:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1`,
+      };
+    };
+    const updating = value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: current.revision,
+      instruction: "Change this to twice daily",
+    }).then(() => null, (error: unknown) => error);
+    await interpretationEntered.promise;
+    accountsAvailable = false;
+    const occurrence = {
+      runId: `syncrun_${"7".repeat(26)}`,
+      paneId: PANE,
+      sessionId: `syncsession_${"q".repeat(32)}`,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+      definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+      prompt: "Summarize repository changes since the prior run.",
+    } as const;
+    await withinDeadline(
+      value.service.enqueueScheduledOccurrence(occurrence),
+      "coordinator due enqueue during schedule interpretation",
+    );
+    expect(value.scheduledChatStore.run(occurrence.runId)).toMatchObject({
+      messageId: scheduledChatMessageId(occurrence.runId),
+    });
+    releaseInterpretation.resolve();
+    expect(await updating).toBeInstanceOf(Error);
+    expect(value.scheduledChats?.configureCalls).toHaveLength(1);
+  } finally {
+    releaseInterpretation.resolve();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled clear releases a reentrant postimage and loses stale CAS before effect", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const scheduledChats = value.scheduledChats;
+    if (scheduledChats === null) throw new Error("missing scheduled chat port");
+    let postimageCommits = 0;
+    scheduledChats.beforeRemove = async () => {
+      await value.service.commitScheduledChatPostimage(PANE, () => {
+        postimageCommits += 1;
+        value.database.query(`
+          UPDATE chat_panes SET revision = revision + 1, updated_at = ?2
+          WHERE pane_id = ?1 AND archived_at IS NULL
+        `).run(PANE, "2026-08-03T12:02:00.000Z");
+      });
+    };
+    const before = value.store.require(PANE).projection;
+    const stale = await withinDeadline(value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: before.revision,
+    }).then(() => null, (error: unknown) => error), "stale scheduled clear");
+    expect(stale).toMatchObject({ code: "conflict" });
+    expect(postimageCommits).toBe(1);
+    expect(value.scheduledChatStore.get(PANE)).not.toBeNull();
+    expect(value.scheduledChatStore.mutationForPane(PANE)).toBeNull();
+
+    scheduledChats.beforeRemove = null;
+    const current = value.store.require(PANE).projection;
+    const removed = await withinDeadline(value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: current.revision,
+    }), "fresh scheduled clear");
+    expect(removed).toMatchObject({ type: "pane", pane: { schedule: null } });
+    expect(scheduledChats.removeCalls).toHaveLength(2);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled chat removal remains available when its repository is unavailable", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    const configured = await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    if (configured.type !== "pane") throw new Error("Expected a pane response");
+    const unavailable = value.workspaces.markRepositoryUnavailable(PANE);
+    expect(unavailable.workspace?.state).toBe("recoveryRequired");
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: unavailable.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: { schedule: null },
+    });
+    expect(value.scheduledChats?.removeCalls).toHaveLength(1);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled chat removal cancels an exact unclaimed attention queue", async () => {
+  let accountsAvailable = true;
+  const value = harness({
+    scheduledChats: true,
+    candidateFactory: () => accountsAvailable
+      ? [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]
+      : [],
+  });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    accountsAvailable = false;
+    const occurrence = {
+      runId: `syncrun_${"9".repeat(26)}`,
+      paneId: PANE,
+      sessionId: `syncsession_${"q".repeat(32)}`,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+      definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+      prompt: "Summarize repository changes since the prior run.",
+    } as const;
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    const current = value.store.require(PANE).projection;
+    expect(current.messageQueue).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [{ text: occurrence.prompt }],
+    });
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: current.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: {
+        schedule: null,
+        messageQueue: {
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
+        },
+      },
+    });
+    expect(value.scheduledChatStore.run(occurrence.runId)?.cancelledAt)
+      .not.toBeNull();
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("durable schedule-off intent fences attention recovery until exact clear", async () => {
+  let accountsAvailable = true;
+  const value = harness({
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+    candidateFactory: () => accountsAvailable
+      ? [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]
+      : [],
+  });
+  const occurrence = {
+    runId: `syncrun_${"3".repeat(26)}`,
+    paneId: PANE,
+    sessionId: `syncsession_${"q".repeat(32)}`,
+    scheduleGeneration: "1",
+    occurrenceSequence: "1",
+    scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+    definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+    prompt: "This occurrence must remain fenced after scheduling is turned off.",
+  } as const;
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    accountsAvailable = false;
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    const attention = value.store.require(PANE).projection;
+    expect(attention.messageQueue).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [{ id: scheduledChatMessageId(occurrence.runId) }],
+    });
+    expect(value.scheduledChatStore.requestDesiredOff({
+      paneId: PANE,
+      expectedPaneRevision: attention.revision,
+      now: Date.parse("2026-08-20T13:01:00.000Z"),
+    })).toMatchObject({
+      paneId: PANE,
+      targetGeneration: occurrence.scheduleGeneration,
+    });
+
+    accountsAvailable = true;
+    await value.service.resumeEligibleScheduledOccurrences();
+    await value.service.settled();
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.store.messageQueue(PANE)).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [{ id: scheduledChatMessageId(occurrence.runId) }],
+    });
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: attention.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: {
+        schedule: null,
+        messageQueue: { pauseReason: null, messages: [] },
+      },
+    });
+    expect(value.scheduledChatStore.run(occurrence.runId)?.cancelledAt)
+      .not.toBeNull();
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled chat removal clears an empty terminal attention pause", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const configured = value.store.require(PANE).projection;
+    value.database.query(`
+      UPDATE chat_panes SET
+        message_queue_pause_reason = 'attention',
+        message_queue_revision = message_queue_revision + 1,
+        revision = revision + 1,
+        updated_at = ?2
+      WHERE pane_id = ?1 AND revision = ?3 AND archived_at IS NULL
+    `).run(PANE, "2026-08-03T12:01:00.000Z", configured.revision);
+    const terminal = value.store.require(PANE).projection;
+    expect(terminal.messageQueue).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [],
+    });
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: terminal.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: {
+        schedule: null,
+        messageQueue: {
+          pauseReason: null,
+          blockedMessage: null,
+          messages: [],
+        },
+      },
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled chat removal preserves an exact ambiguous occurrence for ordinary discard", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    value.provider.onStartTurn = () => Promise.reject(
+      new ChatProviderEffectError({ certainty: "ambiguous", code: "runtime" }),
+    );
+    const occurrence = {
+      runId: `syncrun_${"8".repeat(26)}`,
+      paneId: PANE,
+      sessionId: `syncsession_${"q".repeat(32)}`,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+      definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+      prompt: "Summarize repository changes since the prior run.",
+    } as const;
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    const ambiguous = value.store.require(PANE).projection;
+    expect(ambiguous.messageQueue).toMatchObject({
+      pauseReason: "ambiguousEffect",
+      blockedMessage: {
+        id: scheduledChatMessageId(occurrence.runId),
+        deliveryOutcome: "deliveryOutcomeUnknown",
+      },
+      messages: [],
+    });
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: ambiguous.revision,
+    });
+    if (removed.type !== "pane") throw new Error("Expected a pane response");
+    expect(removed.pane.schedule).toBeNull();
+    expect(removed.pane.messageQueue).toMatchObject({
+      pauseReason: "ambiguousEffect",
+      blockedMessage: { id: scheduledChatMessageId(occurrence.runId) },
+    });
+    expect(value.scheduledChatStore.run(occurrence.runId)?.cancelledAt).toBeNull();
+
+    const blocked = removed.pane.messageQueue.blockedMessage;
+    if (blocked === null) throw new Error("Expected an ambiguous scheduled message");
+    const discarded = await value.service.execute({
+      type: "chat.message.discardAmbiguous",
+      paneId: PANE,
+      expectedQueueRevision: removed.pane.messageQueue.revision,
+      messageId: blocked.id,
+      expectedMessageRevision: blocked.revision,
+    });
+    expect(discarded).toMatchObject({
+      type: "messageQueue",
+      queue: { blockedMessage: null },
+    });
+    expect(value.provider.startedTurns).toEqual([]);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("scheduled account eligibility recovery resumes the exact queued run once", async () => {
+  for (const unavailable of ["none", "quota"] as const) {
+    let eligible = true;
+    const value = harness({
+      scheduledChats: true,
+      scheduledAttentionRetryDelayMs: () => 0,
+      candidateFactory: () => eligible
+        ? [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]
+        : unavailable === "none"
+        ? []
+        : [{ id: ACCOUNT_ONE, selected: true, budget: "exhausted" }],
+    });
+    try {
+      const pane = await createPane(value);
+      await value.service.execute({
+        type: "chat.pane.schedule.configure",
+        paneId: PANE,
+        expectedRevision: pane.revision,
+        instruction: "Every day at 9, summarize repository changes",
+      });
+      eligible = false;
+      const occurrence = {
+        runId: `syncrun_${(unavailable === "none" ? "7" : "8").repeat(26)}`,
+        paneId: PANE,
+        sessionId: `syncsession_${"q".repeat(32)}`,
+        scheduleGeneration: "1",
+        occurrenceSequence: "1",
+        scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+        definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+        prompt: `Recover the ${unavailable} eligibility run.`,
+      } as const;
+      await value.service.enqueueScheduledOccurrence(occurrence);
+      await value.service.settled();
+      expect(value.store.messageQueue(PANE)).toMatchObject({
+        pauseReason: "attention",
+        messages: [{ text: occurrence.prompt }],
+      });
+
+      eligible = true;
+      await Promise.all([
+        value.service.resumeEligibleScheduledOccurrences(),
+        value.service.resumeEligibleScheduledOccurrences(),
+      ]);
+      await value.service.settled();
+      expect(value.provider.startedTurns).toHaveLength(1);
+      expect(value.provider.startedTurns[0]?.request.input).toEqual([
+        { type: "text", text: occurrence.prompt },
+      ]);
+      expect(value.scheduledChatStore.run(occurrence.runId)).toMatchObject({
+        state: "enqueued",
+        cancelledAt: null,
+      });
+    } finally {
+      value.service.closeAdmission();
+      await value.service.settled();
+      value.database.close();
+    }
+  }
+});
+
+test("scheduled account eligibility recovery survives a gateway restart", async () => {
+  let eligible = true;
+  const first = harness({
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+    candidateFactory: () => eligible
+      ? [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }]
+      : [],
+  });
+  let databaseImage: Uint8Array;
+  const occurrence = {
+    runId: `syncrun_${"6".repeat(26)}`,
+    paneId: PANE,
+    sessionId: `syncsession_${"q".repeat(32)}`,
+    scheduleGeneration: "1",
+    occurrenceSequence: "1",
+    scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+    definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+    prompt: "Recover this scheduled run after restart.",
+  } as const;
+  try {
+    const pane = await createPane(first);
+    await first.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    eligible = false;
+    await first.service.enqueueScheduledOccurrence(occurrence);
+    await first.service.settled();
+    expect(first.store.messageQueue(PANE).pauseReason).toBe("attention");
+    databaseImage = first.database.serialize();
+  } finally {
+    first.service.closeAdmission();
+    await first.service.settled();
+    first.database.close();
+  }
+
+  const restarted = harness({
+    databaseImage,
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+    candidateFactory: () => [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }],
+  });
+  try {
+    await restarted.service.resumeEligibleScheduledOccurrences();
+    await restarted.service.settled();
+    expect(restarted.provider.startedTurns).toHaveLength(1);
+    expect(restarted.provider.startedTurns[0]?.request.input).toEqual([
+      { type: "text", text: occurrence.prompt },
+    ]);
+    expect(restarted.scheduledChatStore.run(occurrence.runId)?.cancelledAt)
+      .toBeNull();
+  } finally {
+    restarted.service.closeAdmission();
+    await restarted.service.settled();
+    restarted.database.close();
+  }
+});
+
+test("scheduled account refresh failure preserves and later resumes the exact occurrence", async () => {
+  let refreshUnavailable = false;
+  const value = harness({
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+    candidateFactory: () => refreshUnavailable
+      ? Promise.reject(new Error("account refresh unavailable"))
+      : [{ id: ACCOUNT_ONE, selected: true, budget: "healthy" }],
+  });
+  const occurrence = {
+    runId: `syncrun_${"4".repeat(26)}`,
+    paneId: PANE,
+    sessionId: `syncsession_${"q".repeat(32)}`,
+    scheduleGeneration: "1",
+    occurrenceSequence: "1",
+    scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+    definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+    prompt: "Resume this occurrence after account refresh recovers.",
+  } as const;
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    refreshUnavailable = true;
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    expect(value.provider.startedTurns).toEqual([]);
+    expect(value.store.messageQueue(PANE)).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [{
+        id: scheduledChatMessageId(occurrence.runId),
+        text: occurrence.prompt,
+      }],
+    });
+
+    refreshUnavailable = false;
+    await Promise.all([
+      value.service.resumeEligibleScheduledOccurrences(),
+      value.service.resumeEligibleScheduledOccurrences(),
+    ]);
+    await value.service.settled();
+    expect(value.provider.startedTurns).toHaveLength(1);
+    expect(value.provider.startedTurns[0]?.request.input).toEqual([
+      { type: "text", text: occurrence.prompt },
+    ]);
+    expect(value.scheduledChatStore.run(occurrence.runId)).toMatchObject({
+      state: "enqueued",
+      cancelledAt: null,
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("a proven scheduled quota rejection retries the same run after restart", async () => {
+  let firstProviderAttempts = 0;
+  const first = harness({
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+  });
+  first.provider.onStartTurn = () => {
+    firstProviderAttempts += 1;
+    return Promise.reject(new ChatProviderEffectError({
+      certainty: "not_applied",
+      code: "quota_reached",
+      quotaProof: "provider_rate_limit_reached",
+    }));
+  };
+  const occurrence = {
+    runId: `syncrun_${"5".repeat(26)}`,
+    paneId: PANE,
+    sessionId: `syncsession_${"q".repeat(32)}`,
+    scheduleGeneration: "1",
+    occurrenceSequence: "1",
+    scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+    definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+    prompt: "Retry this exact scheduled quota run.",
+  } as const;
+  let databaseImage: Uint8Array;
+  try {
+    const pane = await createPane(first);
+    await first.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    await first.service.enqueueScheduledOccurrence(occurrence);
+    await first.service.settled();
+
+    expect(firstProviderAttempts).toBe(1);
+    expect(first.provider.startedTurns).toHaveLength(0);
+    expect(first.store.messageQueue(PANE)).toMatchObject({
+      pauseReason: "attention",
+      blockedMessage: null,
+      messages: [{
+        id: scheduledChatMessageId(occurrence.runId),
+        text: occurrence.prompt,
+      }],
+    });
+    expect(first.rootTurnRouting.readLatestTurnRouting(PANE)).toMatchObject({
+      state: "terminal",
+      operationalOutcome: "quotaRejected",
+    });
+    databaseImage = first.database.serialize();
+  } finally {
+    first.service.closeAdmission();
+    await first.service.settled();
+    first.database.close();
+  }
+
+  const restarted = harness({
+    databaseImage,
+    scheduledChats: true,
+    scheduledAttentionRetryDelayMs: () => 0,
+  });
+  try {
+    await Promise.all([
+      restarted.service.resumeEligibleScheduledOccurrences(),
+      restarted.service.resumeEligibleScheduledOccurrences(),
+    ]);
+    await restarted.service.settled();
+
+    expect(restarted.provider.startedTurns).toHaveLength(1);
+    expect(restarted.provider.startedTurns[0]?.request.input).toEqual([
+      { type: "text", text: occurrence.prompt },
+    ]);
+    expect(restarted.store.messageQueue(PANE).blockedMessage).toBeNull();
+    expect(restarted.scheduledChatStore.run(occurrence.runId)).toMatchObject({
+      messageId: scheduledChatMessageId(occurrence.runId),
+      cancelledAt: null,
+    });
+  } finally {
+    restarted.service.closeAdmission();
+    await restarted.service.settled();
+    restarted.database.close();
+  }
+});
+
+test("a restored scheduled head drains after its managed workspace becomes ready", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const configured = value.store.require(PANE).projection;
+    value.database.query(`
+      UPDATE chat_panes SET
+        workspace_state = 'recovery_required',
+        workspace_recovery_reason = 'unknown',
+        workspace_revision = workspace_revision + 1,
+        revision = revision + 1,
+        updated_at = ?2
+      WHERE pane_id = ?1 AND revision = ?3 AND archived_at IS NULL
+    `).run(PANE, "2026-08-03T12:01:00.000Z", configured.revision);
+    const occurrence = {
+      runId: `syncrun_${"6".repeat(26)}`,
+      paneId: PANE,
+      sessionId: `syncsession_${"q".repeat(32)}`,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+      definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+      prompt: "Summarize repository changes after restart.",
+    } as const;
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    expect(value.provider.startedTurns).toHaveLength(0);
+    expect(value.store.messageQueue(PANE).messages).toHaveLength(1);
+
+    value.service.initialize();
+    await value.service.settled();
+
+    expect(value.store.require(PANE).projection.workspace?.state).toBe("ready");
+    expect(value.provider.startedTurns).toHaveLength(1);
+    expect(textInput(value.provider.startedTurns[0]!.request)).toBe(occurrence.prompt);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("durable schedule-off intent fences in-flight workspace recovery and its queued run", async () => {
+  const provisionEntered = deferred<void>();
+  const releaseProvision = deferred<void>();
+  let blockProvision = false;
+  let fixture: Harness | null = null;
+  const value = harness(
+    { scheduledChats: true },
+    () => Promise.resolve(),
+    null,
+    null,
+    null,
+    () => undefined,
+    null,
+    undefined,
+    undefined,
+    undefined,
+    null,
+    async (paneId, current) => {
+      if (!blockProvision) return null;
+      provisionEntered.resolve();
+      await releaseProvision.promise;
+      if (fixture === null) throw new Error("missing chat service fixture");
+      fixture.database.query(`
+        UPDATE chat_panes SET
+          workspace_state = 'ready',
+          workspace_recovery_reason = NULL,
+          workspace_revision = workspace_revision + 1,
+          revision = revision + 1,
+          updated_at = ?2
+        WHERE pane_id = ?1 AND revision = ?3 AND archived_at IS NULL
+      `).run(paneId, "2026-08-03T12:02:00.000Z", current.revision);
+      return fixture.store.require(paneId).projection;
+    },
+  );
+  fixture = value;
+  const occurrence = {
+    runId: `syncrun_${"2".repeat(26)}`,
+    paneId: PANE,
+    sessionId: `syncsession_${"q".repeat(32)}`,
+    scheduleGeneration: "1",
+    occurrenceSequence: "1",
+    scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+    definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+    prompt: "Do not start this occurrence after scheduling is turned off.",
+  } as const;
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const configured = value.store.require(PANE).projection;
+    value.database.query(`
+      UPDATE chat_panes SET
+        workspace_state = 'recovery_required',
+        workspace_recovery_reason = 'unknown',
+        workspace_revision = workspace_revision + 1,
+        revision = revision + 1,
+        updated_at = ?2
+      WHERE pane_id = ?1 AND revision = ?3 AND archived_at IS NULL
+    `).run(PANE, "2026-08-03T12:01:00.000Z", configured.revision);
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+    const queued = value.store.require(PANE).projection;
+    expect(queued.messageQueue).toMatchObject({
+      pauseReason: null,
+      messages: [{ id: scheduledChatMessageId(occurrence.runId) }],
+    });
+    blockProvision = true;
+    value.service.initialize();
+    await provisionEntered.promise;
+    expect(value.scheduledChatStore.requestDesiredOff({
+      paneId: PANE,
+      expectedPaneRevision: queued.revision,
+      now: Date.parse("2026-08-20T13:01:00.000Z"),
+    })).toMatchObject({
+      paneId: PANE,
+      targetGeneration: occurrence.scheduleGeneration,
+    });
+
+    releaseProvision.resolve();
+    await value.service.settled();
+    const fenced = value.store.require(PANE).projection;
+    expect(fenced.workspace?.state).toBe("recoveryRequired");
+    expect(fenced.messageQueue.messages).toMatchObject([
+      { id: scheduledChatMessageId(occurrence.runId) },
+    ]);
+    expect(value.provider.startedTurns).toEqual([]);
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: fenced.revision,
+    });
+    expect(removed).toMatchObject({
+      type: "pane",
+      pane: { schedule: null, messageQueue: { messages: [] } },
+    });
+    expect(value.scheduledChatStore.run(occurrence.runId)?.cancelledAt)
+      .not.toBeNull();
+    blockProvision = false;
+    value.service.initialize();
+    await value.service.settled();
+    expect(value.store.require(PANE).projection.workspace?.state).toBe("ready");
+    expect(value.provider.startedTurns).toEqual([]);
+  } finally {
+    releaseProvision.resolve();
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("invalid schedule interpretation preserves the exact pane and prior schedule", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    value.provider.onInterpretSchedule = () => Promise.resolve({
+      prompt: "This must not be installed.",
+      rrule: "FREQ=SOMEDAY",
+    });
+    const before = value.database.serialize();
+    const failure = await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Maybe whenever it feels right",
+    }).then(() => null, (error: unknown) => error);
+    expect(failure).not.toBeNull();
+    expect(value.scheduledChats?.configureCalls).toEqual([]);
+    expect(value.store.require(PANE).projection).toEqual(pane);
+    expect(value.database.serialize()).toEqual(before);
+
+    const removed = await value.service.execute({
+      type: "chat.pane.schedule.remove",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+    });
+    expect(removed).toEqual({ type: "pane", pane });
+    expect(value.scheduledChats?.removeCalls).toMatchObject([{
+      paneId: PANE,
+      expectedRevision: pane.revision,
+    }]);
+    expect(value.database.serialize()).toEqual(before);
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
+
+test("one authenticated scheduled occurrence enqueues and starts exactly once", async () => {
+  const value = harness({ scheduledChats: true });
+  try {
+    const pane = await createPane(value);
+    await value.service.execute({
+      type: "chat.pane.schedule.configure",
+      paneId: PANE,
+      expectedRevision: pane.revision,
+      instruction: "Every day at 9, summarize repository changes",
+    });
+    const occurrence = {
+      runId: `syncrun_${"0".repeat(26)}`,
+      paneId: PANE,
+      sessionId: `syncsession_${"q".repeat(32)}`,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: Date.parse("2026-08-20T13:00:00.000Z"),
+      definitionCiphertextDigest: `sha256_${"a".repeat(64)}`,
+      prompt: "Summarize repository changes since the prior run.",
+    } as const;
+
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.enqueueScheduledOccurrence(occurrence);
+    await value.service.settled();
+
+    expect(value.provider.startedTurns).toHaveLength(1);
+    expect(value.provider.startedTurns[0]?.request.input).toEqual([
+      { type: "text", text: occurrence.prompt },
+    ]);
+    expect(value.scheduledChatStore.run(occurrence.runId)).toMatchObject({
+      state: "enqueued",
+      occurrenceSequence: "1",
+    });
+  } finally {
+    value.service.closeAdmission();
+    await value.service.settled();
+    value.database.close();
+  }
+});
 
 async function stopTurn(
   value: Harness,

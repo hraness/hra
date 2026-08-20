@@ -3,6 +3,7 @@ import type { SVGProps } from "react";
 export type HRAIconName =
   | "branch"
   | "check"
+  | "clock"
   | "close"
   | "command"
   | "edit"
@@ -27,6 +28,7 @@ export type HRAIconName =
 const paths: Readonly<Record<HRAIconName, readonly string[]>> = {
   branch: ["M5 3v7a4 4 0 0 0 4 4h6", "m12 11 3 3-3 3", "M5 7h5a3 3 0 0 0 3-3V3"],
   check: ["M4 10.25 8 14l8-8"],
+  clock: ["M10 2.75a7.25 7.25 0 1 0 0 14.5 7.25 7.25 0 0 0 0-14.5Z", "M10 6v4.25l2.75 1.75"],
   close: ["m5 5 10 10", "M15 5 5 15"],
   command: ["M4 5.25h12v9.5H4z", "m6.25 8-2 2 2 2", "M9.5 12h3"],
   edit: ["M4 14.75V17h2.25L16 7.25 12.75 4 4 12.75Z", "m11.25 5.5 3.25 3.25"],

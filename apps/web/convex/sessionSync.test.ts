@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   allocateSessionSyncNonce,
   canonicalSessionSyncJson,
+  clearOrphanedScheduledChatAsHumanRequestSchema,
+  readScheduledChatRecoveryInventoryAsHumanRequestSchema,
   createSessionSyncNonceState,
   createSyncRecoveryNonce,
   createSyncDeviceKeyPairs,
@@ -19,12 +21,16 @@ import {
   generateSyncDeviceKeyCustody,
   importSyncDeviceKeyPairs,
   openSyncRecoveryKit,
+  openScheduledChatDefinition,
   parseSessionSyncResponseJson,
   sealSessionSummary,
+  sealScheduledChatDefinition,
   sealedSessionSummarySchema,
   sessionContentKeyContextSchema,
   sessionSyncHttpRoutes,
   sessionSummarySchema,
+  scheduledChatDefinitionHeaderSchema,
+  scheduledChatDefinitionSchema,
   sessionSyncHeaderSchema,
   signSyncDeviceProof,
   signSyncEnrollmentPossessionProof,
@@ -78,6 +84,7 @@ const modules = {
   "./sessionSync.ts": async () => await import("./sessionSync"),
   "./sessionSyncHttp.ts": async () => await import("./sessionSyncHttp"),
   "./sessionSyncModel.ts": async () => await import("./sessionSyncModel"),
+  "./sessionSyncScheduledChats.ts": async () => await import("./sessionSyncScheduledChats"),
 };
 
 type SyncTest = TestConvex<typeof schema>;
@@ -111,6 +118,16 @@ const recoverVaultRef = makeFunctionReference<
   { requestJson: string },
   BackendResult
 >("sessionSync:recoverVault");
+const clearOrphanedScheduledChatRef = makeFunctionReference<
+  "action",
+  { requestJson: string },
+  BackendResult
+>("sessionSync:clearOrphanedScheduledChat");
+const readScheduledChatRecoveryInventoryRef = makeFunctionReference<
+  "action",
+  { requestJson: string },
+  BackendResult
+>("sessionSync:readScheduledChatRecoveryInventory");
 const retireExpiredRef = makeFunctionReference<
   "mutation",
   Record<string, never>,
@@ -127,6 +144,17 @@ const commitAuthenticatedRef = makeFunctionReference<
   { requestJson: string; proofJson: string; verifiedBodyDigest: string },
   BackendResult
 >("sessionSyncModel:commitAuthenticatedRequest");
+const wakeScheduledChatRef = makeFunctionReference<
+  "mutation",
+  {
+    scheduleId: Id<"syncScheduledChats">;
+    wakeId: Id<"syncScheduledChatWakes">;
+    generation: string;
+    occurrenceSequence: string;
+    expectedRunAt: number;
+  },
+  { status: "applied" | "rescheduled" | "stale" }
+>("sessionSyncScheduledChats:wakeScheduledChat");
 
 const originalClientId = process.env.WORKOS_CLIENT_ID;
 const originalSyncEnabled = process.env.HRA_SESSION_SYNC_ENABLED;
@@ -188,9 +216,12 @@ const vault = syncVaultCoordinateSchema.parse({
 function methodFor(request: SessionSyncBackendRequest): "GET" | "POST" {
   return [
     "read_membership",
+    "root_key_link_page",
     "list_enrollment_requests",
     "snapshot_page",
     "change_page",
+    "scheduled_chat_inventory",
+    "scheduled_run_page",
   ].includes(request.operation)
     ? "GET"
     : "POST";
@@ -944,6 +975,461 @@ describe("session sync Convex boundary", () => {
         ).collect()).length,
       };
     })).toEqual({ fences: 2, floorVersion: "4", retiredEvents: 0, retiredHeads: 0 });
+  }, 30_000);
+
+  test("durably delivers one encrypted scheduled occurrence and exactly replays schedule writes", async () => {
+    const t = convexTest(schema, modules);
+    await seedHumanScope(t);
+    const actor = t.withIdentity(identity());
+    const foreign = t.withIdentity(identity(FOREIGN_WORKOS_USER_ID));
+    const keys = await createSyncDeviceKeyPairs();
+    const rootKey = createSyncVaultRootKey();
+    expect(data(await bootstrap(actor, keys, rootKey))).toMatchObject({ kind: "vault_created" });
+
+    const deviceId = opaque("syncdevice", "d");
+    const bootId = opaque("syncboot", "b");
+    expect(data(await execute(actor, {
+      version: 1,
+      operation: "establish_boot",
+      bootId,
+      bootGeneration: "1",
+      heartbeatSequence: "1",
+    }, keys))).toMatchObject({ kind: "boot_current", bootGeneration: "1" });
+
+    const sessionId = opaque("syncsession", "z");
+    const currentDigest = `sha256_${"4".repeat(64)}`;
+    await t.run(async (ctx) => {
+      const storedVault = (await ctx.db.query("syncVaults").collect())[0];
+      const device = (await ctx.db.query("syncDevices").collect())[0];
+      if (storedVault === undefined || device === undefined) throw new Error("sync scope missing");
+      await ctx.db.insert("syncSessionEntries", {
+        vaultId: storedVault._id,
+        organizationId: storedVault.organizationId,
+        ownerUserId: storedVault.ownerUserId,
+        sessionId,
+        originDeviceId: device._id,
+        originDevicePublicId: deviceId,
+        directoryOrdinal: "1",
+        directoryOrdinalOrderKey: "00000000000000000001",
+        state: "active",
+        creationGrantDigest: `sha256_${"3".repeat(64)}`,
+        creationGrantExpiresAt: Date.now() + 60_000,
+        creationGrantConsumedAt: Date.now(),
+        createdDirectoryVersion: "1",
+        mirrorEpoch: "1",
+        writerGeneration: "1",
+        writerBootId: bootId,
+        writerBootGeneration: "1",
+        currentSequence: "1",
+        currentDigest,
+        currentSourceRevision: "1",
+        currentKeyEpoch: "1",
+        streamActive: false,
+        latestDirectoryVersion: "1",
+        latestDirectoryVersionOrderKey: "00000000000000000001",
+        retainedEventCount: 0,
+        retainedCiphertextBytes: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    });
+
+    const rrule = "DTSTART;TZID=UTC:20200101T120000\nRRULE:FREQ=DAILY;INTERVAL=1";
+    const header = scheduledChatDefinitionHeaderSchema.parse({
+      protocol: "oprte.session-sync/v1",
+      payloadKind: "scheduled_chat_definition",
+      payloadVersion: 1,
+      ...vault,
+      membershipEpoch: "1",
+      originDeviceId: deviceId,
+      sessionId,
+      mirrorEpoch: "1",
+      writerGeneration: "1",
+      bootId,
+      bootGeneration: "1",
+      keyEpoch: "1",
+      previousGeneration: "0",
+      generation: "1",
+      rrule,
+      timeZone: "UTC",
+    });
+    const definition = scheduledChatDefinitionSchema.parse({
+      version: 1,
+      sessionId,
+      generation: "1",
+      rrule,
+      timeZone: "UTC",
+      prompt: "Inspect the private nightly report and summarize only actionable regressions.",
+    });
+    const sealed = await sealScheduledChatDefinition({ definition, header, rootKey });
+    const putRequest = sessionSyncBackendRequestSchema.parse({
+      version: 1,
+      operation: "put_scheduled_chat",
+      definition: sealed,
+    });
+    const putProof = await proofFor(putRequest, keys);
+    const exactPut = async () => await actor.action(executeRef, {
+      requestJson: canonicalSessionSyncJson(putRequest),
+      proofJson: canonicalSessionSyncJson(putProof),
+    });
+    const initialPut = data(await exactPut());
+    expect(initialPut).toMatchObject({
+      kind: "scheduled_chat_put",
+      sessionId,
+      schedule: { generation: "1", rrule, timeZone: "UTC" },
+      ciphertextDigest: sealed.ciphertextDigest,
+      replay: false,
+    });
+    expect(data(await exactPut())).toMatchObject({ kind: "scheduled_chat_put", replay: true });
+    expect(data(await execute(actor, {
+      version: 1,
+      operation: "scheduled_chat_inventory",
+      pageSize: 8,
+    }, keys))).toMatchObject({
+      kind: "scheduled_chat_inventory",
+      hasMore: false,
+      schedules: [{
+        state: "active",
+        sessionId,
+        originDeviceId: deviceId,
+        generation: "1",
+        definition: { ciphertextDigest: sealed.ciphertextDigest },
+      }],
+    });
+    expect(await t.run(async (ctx) => {
+      const schedule = (await ctx.db.query("syncScheduledChats").collect())[0];
+      return schedule?.definitionEnvelopeJson;
+    })).not.toContain(definition.prompt);
+
+    const replacementBootId = opaque("syncboot", "c");
+    expect(data(await execute(actor, {
+      version: 1,
+      operation: "establish_boot",
+      bootId: replacementBootId,
+      bootGeneration: "2",
+      heartbeatSequence: "1",
+    }, keys))).toMatchObject({ kind: "boot_current", bootGeneration: "2" });
+    expect(data(await exactPut())).toMatchObject({ kind: "scheduled_chat_put", replay: true });
+
+    const due = await t.run(async (ctx) => {
+      const schedule = (await ctx.db.query("syncScheduledChats").collect())[0];
+      const wake = (await ctx.db.query("syncScheduledChatWakes").collect())[0];
+      if (schedule === undefined || wake === undefined) throw new Error("scheduled wake missing");
+      const expectedRunAt = Date.now() - 1;
+      await ctx.db.patch(schedule._id, { nextRunAt: expectedRunAt, updatedAt: Date.now() });
+      await ctx.db.patch(wake._id, { expectedRunAt, updatedAt: Date.now() });
+      return { scheduleId: schedule._id, wakeId: wake._id, expectedRunAt };
+    });
+    expect(await t.mutation(wakeScheduledChatRef, {
+      ...due,
+      generation: "1",
+      occurrenceSequence: "1",
+    })).toEqual({ status: "applied" });
+
+    const page = data(await execute(actor, {
+      version: 1,
+      operation: "scheduled_run_page",
+      bootId: replacementBootId,
+      bootGeneration: "2",
+      pageSize: 8,
+    }, keys));
+    expect(page).toMatchObject({
+      kind: "scheduled_run_page",
+      hasMore: false,
+      runs: [{
+        sessionId,
+        scheduleGeneration: "1",
+        occurrenceSequence: "1",
+        scheduledFor: due.expectedRunAt,
+        definition: { ciphertextDigest: sealed.ciphertextDigest },
+      }],
+    });
+    if (page.kind !== "scheduled_run_page" || page.runs[0] === undefined) {
+      throw new Error("scheduled run page missing occurrence");
+    }
+    expect(await openScheduledChatDefinition({
+      envelope: page.runs[0].definition,
+      expectedHeader: header,
+      rootKey,
+    })).toEqual(definition);
+
+    const run = page.runs[0];
+    const acknowledgeRequest = sessionSyncBackendRequestSchema.parse({
+      version: 1,
+      operation: "ack_scheduled_run",
+      bootId: replacementBootId,
+      bootGeneration: "2",
+      runId: run.runId,
+      sessionId,
+      scheduleGeneration: "1",
+      occurrenceSequence: "1",
+      scheduledFor: run.scheduledFor,
+    });
+    const acknowledgeProof = await proofFor(acknowledgeRequest, keys);
+    const exactAcknowledge = async () => await actor.action(executeRef, {
+      requestJson: canonicalSessionSyncJson(acknowledgeRequest),
+      proofJson: canonicalSessionSyncJson(acknowledgeProof),
+    });
+    const acknowledgement = data(await exactAcknowledge());
+    expect(acknowledgement).toMatchObject({
+      kind: "scheduled_run_acknowledged",
+      generation: "1",
+      replay: false,
+    });
+    expect(data(await exactAcknowledge())).toMatchObject({
+      kind: "scheduled_run_acknowledged",
+      generation: "1",
+      replay: true,
+    });
+    expect(await t.run(async (ctx) => ({
+      pendingRuns: (await ctx.db.query("syncScheduledChatRuns").collect())
+        .filter(({ state }) => state === "pending").length,
+      pendingWakes: (await ctx.db.query("syncScheduledChatWakes").collect())
+        .filter(({ state }) => state === "pending").length,
+    }))).toEqual({ pendingRuns: 0, pendingWakes: 1 });
+
+    const writer = data(await execute(actor, {
+      version: 1,
+      operation: "acquire_writer",
+      sessionId,
+      bootId: replacementBootId,
+      bootGeneration: "2",
+      acknowledgedMirrorEpoch: "1",
+      acknowledgedSequence: "1",
+      acknowledgedDigest: currentDigest,
+    }, keys));
+    expect(writer).toMatchObject({ kind: "writer_acquired", writerGeneration: "2" });
+    const clearRequest = sessionSyncBackendRequestSchema.parse({
+      version: 1,
+      operation: "clear_scheduled_chat",
+      ...vault,
+      membershipEpoch: "1",
+      originDeviceId: deviceId,
+      sessionId,
+      mirrorEpoch: "1",
+      writerGeneration: "2",
+      bootId: replacementBootId,
+      bootGeneration: "2",
+      keyEpoch: "1",
+      expectedGeneration: "1",
+    });
+    const clearProof = await proofFor(clearRequest, keys);
+    const exactClear = async () => await actor.action(executeRef, {
+      requestJson: canonicalSessionSyncJson(clearRequest),
+      proofJson: canonicalSessionSyncJson(clearProof),
+    });
+    expect(data(await exactClear())).toMatchObject({
+      kind: "scheduled_chat_cleared",
+      generation: "1",
+      replay: false,
+    });
+    const finalBootId = opaque("syncboot", "e");
+    expect(data(await execute(actor, {
+      version: 1,
+      operation: "establish_boot",
+      bootId: finalBootId,
+      bootGeneration: "3",
+      heartbeatSequence: "1",
+    }, keys))).toMatchObject({ kind: "boot_current", bootGeneration: "3" });
+    expect(data(await exactClear())).toMatchObject({
+      kind: "scheduled_chat_cleared",
+      replay: true,
+    });
+    expect(data(await execute(actor, {
+      version: 1,
+      operation: "scheduled_chat_inventory",
+      pageSize: 8,
+    }, keys))).toMatchObject({
+      kind: "scheduled_chat_inventory",
+      schedules: [{
+        state: "cleared",
+        sessionId,
+        originDeviceId: deviceId,
+        generation: "1",
+      }],
+    });
+    expect(await t.run(async (ctx) => ({
+      schedule: (await ctx.db.query("syncScheduledChats").collect())[0]?.state,
+      pendingRuns: (await ctx.db.query("syncScheduledChatRuns").collect())
+        .filter(({ state }) => state === "pending").length,
+      pendingWakes: (await ctx.db.query("syncScheduledChatWakes").collect())
+        .filter(({ state }) => state === "pending").length,
+    }))).toEqual({ schedule: "cleared", pendingRuns: 0, pendingWakes: 0 });
+
+    await t.run(async (ctx) => {
+      const schedule = (await ctx.db.query("syncScheduledChats").collect())[0];
+      const device = (await ctx.db.query("syncDevices").collect())[0];
+      if (schedule === undefined || device === undefined) {
+        throw new Error("scheduled chat authority missing");
+      }
+      const now = Date.now();
+      const expectedRunAt = now + 1_000;
+      await ctx.db.patch(schedule._id, {
+        state: "active",
+        nextRunAt: expectedRunAt,
+        clearedBy: undefined,
+        clearedAt: undefined,
+        updatedAt: now,
+      });
+      await ctx.db.insert("syncScheduledChatWakes", {
+        scheduleId: schedule._id,
+        vaultId: schedule.vaultId,
+        sessionEntryId: schedule.sessionEntryId,
+        originDeviceId: device._id,
+        generation: schedule.generation,
+        occurrenceSequence: "9",
+        expectedRunAt,
+        state: "pending",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("syncScheduledChatRuns", {
+        scheduleId: schedule._id,
+        vaultId: schedule.vaultId,
+        sessionEntryId: schedule.sessionEntryId,
+        sessionId,
+        originDeviceId: device._id,
+        runId: `syncrun_${"R".repeat(26)}`,
+        generation: schedule.generation,
+        occurrenceSequence: "8",
+        scheduledFor: expectedRunAt - 1,
+        definitionCiphertextDigest: schedule.definitionCiphertextDigest,
+        definitionEnvelopeJson: schedule.definitionEnvelopeJson,
+        state: "pending",
+        createdAt: now,
+        updatedAt: now,
+      });
+      await ctx.db.insert("syncDevices", {
+        vaultId: device.vaultId,
+        organizationId: device.organizationId,
+        ownerUserId: device.ownerUserId,
+        deviceId: opaque("syncdevice", "z"),
+        name: "Second healthy Mac",
+        status: "active",
+        signingKeyId: device.signingKeyId,
+        signingPublicKey: device.signingPublicKey,
+        signingPublicKeyDigest: device.signingPublicKeyDigest,
+        agreementKeyId: device.agreementKeyId,
+        agreementPublicKey: device.agreementPublicKey,
+        agreementPublicKeyDigest: device.agreementPublicKeyDigest,
+        membershipEpoch: device.membershipEpoch,
+        approvedAt: now,
+        updatedAt: now,
+      });
+    });
+    const secondDeviceRecoveryRequest =
+      readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse({
+        version: 1,
+        operation: "scheduled_chat_recovery_inventory_as_human",
+        ...vault,
+        originDeviceId: opaque("syncdevice", "z"),
+        pageSize: 8,
+      });
+    expect(data(await actor.action(
+      readScheduledChatRecoveryInventoryRef,
+      { requestJson: canonicalSessionSyncJson(secondDeviceRecoveryRequest) },
+    ))).toMatchObject({
+      kind: "scheduled_chat_recovery_inventory",
+      originDeviceId: opaque("syncdevice", "z"),
+      schedules: [],
+    });
+    const humanRecoveryInventoryRequest =
+      readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse({
+        version: 1,
+        operation: "scheduled_chat_recovery_inventory_as_human",
+        ...vault,
+        originDeviceId: deviceId,
+        pageSize: 8,
+      });
+    const humanRecoveryInventoryInvocation = {
+      requestJson: canonicalSessionSyncJson(humanRecoveryInventoryRequest),
+    };
+    expect((await foreign.action(
+      readScheduledChatRecoveryInventoryRef,
+      humanRecoveryInventoryInvocation,
+    )).ok).toBeFalse();
+    expect(data(await actor.action(
+      readScheduledChatRecoveryInventoryRef,
+      humanRecoveryInventoryInvocation,
+    ))).toMatchObject({
+      kind: "scheduled_chat_recovery_inventory",
+      vault,
+      originDeviceId: deviceId,
+      hasMore: false,
+      schedules: [{
+        state: "active",
+        sessionId,
+        originDeviceId: deviceId,
+        generation: "1",
+        ciphertextDigest: sealed.ciphertextDigest,
+      }],
+    });
+    const humanOrphanClearRequest = clearOrphanedScheduledChatAsHumanRequestSchema.parse({
+      version: 1,
+      operation: "clear_orphaned_scheduled_chat_as_human",
+      ...vault,
+      originDeviceId: deviceId,
+      sessionId,
+      expectedGeneration: "1",
+      expectedCiphertextDigest: sealed.ciphertextDigest,
+    });
+    const humanOrphanInvocation = {
+      requestJson: canonicalSessionSyncJson(humanOrphanClearRequest),
+    };
+    expect((await foreign.action(
+      clearOrphanedScheduledChatRef,
+      humanOrphanInvocation,
+    )).ok).toBeFalse();
+    expect(data(await actor.action(
+      clearOrphanedScheduledChatRef,
+      humanOrphanInvocation,
+    ))).toMatchObject({
+      kind: "scheduled_chat_cleared",
+      sessionId,
+      generation: "1",
+      replay: false,
+    });
+    expect(data(await actor.action(
+      clearOrphanedScheduledChatRef,
+      humanOrphanInvocation,
+    ))).toMatchObject({ kind: "scheduled_chat_cleared", replay: true });
+    expect(data(await actor.action(
+      readScheduledChatRecoveryInventoryRef,
+      humanRecoveryInventoryInvocation,
+    ))).toMatchObject({
+      kind: "scheduled_chat_recovery_inventory",
+      schedules: [{
+        state: "cleared",
+        sessionId,
+        generation: "1",
+        ciphertextDigest: sealed.ciphertextDigest,
+      }],
+    });
+
+    const orphanClearRequest = sessionSyncBackendRequestSchema.parse({
+      version: 1,
+      operation: "clear_orphaned_scheduled_chat",
+      originDeviceId: deviceId,
+      sessionId,
+      expectedGeneration: "1",
+      expectedCiphertextDigest: sealed.ciphertextDigest,
+    });
+    const orphanClearProof = await proofFor(orphanClearRequest, keys);
+    const exactOrphanClear = async () => await actor.action(executeRef, {
+      requestJson: canonicalSessionSyncJson(orphanClearRequest),
+      proofJson: canonicalSessionSyncJson(orphanClearProof),
+    });
+    expect(data(await exactOrphanClear())).toMatchObject({
+      kind: "scheduled_chat_cleared",
+      replay: true,
+    });
+    expect(await t.run(async (ctx) => ({
+      clearedBy: (await ctx.db.query("syncScheduledChats").collect())[0]?.clearedBy,
+      pendingRuns: (await ctx.db.query("syncScheduledChatRuns").collect())
+        .filter(({ state }) => state === "pending").length,
+      pendingWakes: (await ctx.db.query("syncScheduledChatWakes").collect())
+        .filter(({ state }) => state === "pending").length,
+    }))).toEqual({ clearedBy: "authority_lost", pendingRuns: 0, pendingWakes: 0 });
   }, 30_000);
 
   test("makes bounded ciphertext pruning retryable and never commits a later rejected plan", async () => {
@@ -2224,20 +2710,26 @@ describe("session sync Convex boundary", () => {
       if (vaultRow === null) throw new Error("vault missing after exact combined quota law");
       await ctx.db.patch(vaultRow._id, { compatibilityEvidenceCiphertextBytes: 96 });
     });
-    expect(data(await execute(
+    const epoch3Admission = data(await execute(
       actor,
       epoch3AdmissionRequest,
       joiningKeys,
       "2",
       joiningId,
-    ))).toMatchObject({
+    ));
+    expect(epoch3Admission).toMatchObject({
       kind: "membership_pending",
       proposal: {
         collectedVotes: 0,
         irrevocable: true,
-        signingIntentDeviceIds: expect.arrayContaining([ownerId, joiningId]),
       },
     });
+    if (epoch3Admission.kind !== "membership_pending") {
+      throw new Error("epoch 3 membership proposal was not pending");
+    }
+    expect([...epoch3Admission.proposal.signingIntentDeviceIds].sort().join(",")).toBe(
+      [ownerId, joiningId].sort().join(","),
+    );
     const epoch3UpdateRequest = sessionSyncBackendRequestSchema.parse({
       version: 1,
       operation: "update_membership",
@@ -2290,18 +2782,19 @@ describe("session sync Convex boundary", () => {
     });
     expect(await t.run(async (ctx) => {
       const vaultRow = (await ctx.db.query("syncVaults").collect())[0];
+      if (vaultRow === undefined) throw new Error("vault missing after epoch 3 rotation");
       const joined = await ctx.db.query("syncDevices").withIndex(
         "by_vault_and_device",
-        (query) => query.eq("vaultId", vaultRow!._id).eq("deviceId", joiningId),
+        (query) => query.eq("vaultId", vaultRow._id).eq("deviceId", joiningId),
       ).unique();
       const entry = await ctx.db.query("syncSessionEntries").withIndex(
         "by_vault_and_session",
-        (query) => query.eq("vaultId", vaultRow!._id).eq("sessionId", revokedOriginSessionId),
+        (query) => query.eq("vaultId", vaultRow._id).eq("sessionId", revokedOriginSessionId),
       ).unique();
       const wraps = await ctx.db.query("syncVaultRootWraps").withIndex(
         "by_vault_and_membership",
         (query) => query
-          .eq("vaultId", vaultRow!._id)
+          .eq("vaultId", vaultRow._id)
           .eq("membershipEpoch", "3"),
       ).filter((query) => query.eq(query.field("recipientDeviceId"), ownerId)).collect();
       const rootEvidence = await ctx.db.query("syncVaultRootWrapEvidence").collect();
@@ -2461,11 +2954,13 @@ describe("session sync Convex boundary", () => {
     }, ownerKeys, "3"))).toMatchObject({ kind: "membership_accepted", membershipEpoch: "4" });
     expect(await t.run(async (ctx) => {
       const devices = await ctx.db.query("syncDevices").collect();
+      const firstDevice = devices[0];
+      if (firstDevice === undefined) throw new Error("device missing after membership compaction");
       const head = (await ctx.db.query("syncMembershipHeads").withIndex(
         "by_vault_and_digest",
-        (query) => query.eq("vaultId", devices[0]!.vaultId).eq("statementDigest", compactedHead.statementDigest),
+        (query) => query.eq("vaultId", firstDevice.vaultId).eq("statementDigest", compactedHead.statementDigest),
       ).unique());
-      const vaultRow = await ctx.db.get(devices[0]!.vaultId);
+      const vaultRow = await ctx.db.get(firstDevice.vaultId);
       return {
         durableDeviceRows: devices.length,
         activeDevices: devices.filter((device) => device.status === "active").length,

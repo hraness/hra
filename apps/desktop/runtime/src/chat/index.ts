@@ -49,6 +49,8 @@ export {
   type ChatRepositoryPort,
   type ChatRootTurnRoutingProjection,
   type ChatRuntimeRecoveryPort,
+  type ChatScheduledChatPort,
+  type ChatScheduledOccurrence,
   type ChatThreadBinding,
   type ChatToolActivity,
   type ChatTurnDelta,

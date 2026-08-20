@@ -73,6 +73,63 @@ function memoryStore(
 }
 
 describe("human session coordinator", () => {
+  test("closed admission joins every bearer operation through credential settlement", async () => {
+    const store = memoryStore(snapshot(0));
+    let operationEntered = (): void => undefined;
+    const entered = new Promise<void>((resolve) => {
+      operationEntered = resolve;
+    });
+    let releaseOperation = (): void => undefined;
+    const released = new Promise<void>((resolve) => {
+      releaseOperation = resolve;
+    });
+    let operationCalls = 0;
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+    const active = coordinator.execute<string, OperationFailure>(async () => {
+      operationCalls += 1;
+      operationEntered();
+      await released;
+      return {
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      };
+    });
+    await entered;
+    coordinator.closeAdmission();
+    const settlement = coordinator.settled();
+    expect(await coordinator.execute<string, OperationFailure>(() => {
+      operationCalls += 1;
+      return Promise.resolve({ ok: true, data: "unexpected" });
+    })).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+    expect(await Promise.race([
+      settlement.then(() => "settled" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 5)),
+    ])).toBe("blocked");
+
+    releaseOperation();
+    expect(await active).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTHENTICATION_FAILED" },
+    });
+    await settlement;
+    expect(operationCalls).toBe(1);
+    expect(store.clearCalls).toBe(1);
+    expect(store.current).toBeNull();
+  });
+
   test("signed-out execution performs zero operation or refresh network work", async () => {
     const store = memoryStore(null);
     let operationCalls = 0;

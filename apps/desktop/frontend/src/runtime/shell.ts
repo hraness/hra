@@ -1,6 +1,7 @@
 import type {
   RuntimeDispatchResponse,
   RuntimeEvent,
+  RuntimeFolderAccessSelectResult,
   RuntimeProjectAddResult,
   RuntimeSnapshot,
   RuntimeTaskDispatchResponse,
@@ -83,6 +84,7 @@ export interface RuntimeShell {
   dispatch(command: RendererRuntimeDomainCommand): Promise<RuntimeDispatchResponse>;
   dispatchTask(command: RendererTaskDomainCommand): Promise<RuntimeTaskDispatchResponse>;
   addProject(): Promise<RuntimeProjectAddResult>;
+  selectFolderAccess(): Promise<RuntimeFolderAccessSelectResult>;
   retryTransport(): Promise<RuntimeTransportRetryResponse>;
   subscribeTaskInvalidations(
     listener: (invalidation: RuntimeTaskInvalidation) => void,
@@ -255,6 +257,16 @@ class DefaultRuntimeShell implements RuntimeShell {
     this.#assertActive();
     try {
       return await this.#bridge.addProject();
+    } catch (reason: unknown) {
+      if (failureRequiresShellRecovery(reason)) this.#fail(reason);
+      throw reason;
+    }
+  }
+
+  async selectFolderAccess(): Promise<RuntimeFolderAccessSelectResult> {
+    this.#assertActive();
+    try {
+      return await this.#bridge.selectFolderAccess();
     } catch (reason: unknown) {
       if (failureRequiresShellRecovery(reason)) this.#fail(reason);
       throw reason;

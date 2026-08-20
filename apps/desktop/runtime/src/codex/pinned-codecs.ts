@@ -12,6 +12,7 @@ import type { GetAccountRateLimitsResponse as GeneratedGetAccountRateLimitsRespo
 import type { GetAccountResponse as GeneratedGetAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/GetAccountResponse";
 import type { GetAccountTokenUsageResponse as GeneratedGetAccountTokenUsageResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/GetAccountTokenUsageResponse";
 import type { LoginAccountResponse as GeneratedLoginAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/LoginAccountResponse";
+import type { ListMcpServerStatusResponse as GeneratedListMcpServerStatusResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ListMcpServerStatusResponse";
 import type { LogoutAccountResponse as GeneratedLogoutAccountResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/LogoutAccountResponse";
 import type { ModelListResponse as GeneratedModelListResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ModelListResponse";
 import type { ThreadInjectItemsResponse as GeneratedThreadInjectItemsResponse } from "../../../contracts/generated/codex/0.144.6/typescript/v2/ThreadInjectItemsResponse";
@@ -301,6 +302,23 @@ const losslessJsonValueSchema: z.ZodType<LosslessJsonValue> = z.lazy(() => z.uni
   z.null(),
   z.array(losslessJsonValueSchema).max(MAX_THREAD_ITEMS),
   z.record(z.string().max(1_024), losslessJsonValueSchema.optional())
+    .refine((value) => Object.keys(value).length <= MAX_THREAD_ITEMS, "too many JSON keys"),
+]));
+
+type WireJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | WireJsonValue[]
+  | { readonly [key: string]: WireJsonValue | undefined };
+const wireJsonValueSchema: z.ZodType<WireJsonValue> = z.lazy(() => z.union([
+  protocolTextSchema,
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+  z.array(wireJsonValueSchema).max(MAX_THREAD_ITEMS),
+  z.record(z.string().max(1_024), wireJsonValueSchema.optional())
     .refine((value) => Object.keys(value).length <= MAX_THREAD_ITEMS, "too many JSON keys"),
 ]));
 
@@ -757,6 +775,7 @@ const threadStartInputSchema = z.object({
   allowProviderModelFallback: z.boolean().optional(),
   serviceTier: serviceTierNameSchema.nullable().optional(),
   cwd: absolutePathSchema.nullable().optional(),
+  runtimeWorkspaceRoots: z.array(absolutePathSchema).min(1).max(64).nullable().optional(),
   approvalPolicy: approvalPolicySchema.nullable().optional(),
   approvalsReviewer: approvalsReviewerSchema.nullable().optional(),
   sandbox: sandboxModeSchema.nullable().optional(),
@@ -765,12 +784,15 @@ const threadStartInputSchema = z.object({
   ephemeral: z.boolean().nullable().optional(),
   historyMode: z.enum(["legacy", "paginated"]).nullable().optional(),
   threadSource: threadSourceSchema.nullable().optional(),
+  environments: z.tuple([]).nullable().optional(),
+  selectedCapabilityRoots: z.tuple([]).nullable().optional(),
 }).strict();
 const threadResumeInputSchema = z.object({
   threadId: idSchema,
   model: modelNameSchema.nullable().optional(),
   serviceTier: serviceTierNameSchema.nullable().optional(),
   cwd: absolutePathSchema.nullable().optional(),
+  runtimeWorkspaceRoots: z.array(absolutePathSchema).min(1).max(64).nullable().optional(),
   approvalPolicy: approvalPolicySchema.nullable().optional(),
   approvalsReviewer: approvalsReviewerSchema.nullable().optional(),
   sandbox: sandboxModeSchema.nullable().optional(),
@@ -790,6 +812,7 @@ const threadAdmissionResponseSchema = threadResponseSchema.extend({
   approvalPolicy: returnedApprovalPolicySchema,
   approvalsReviewer: approvalsReviewerSchema,
   sandbox: sandboxPolicySchema,
+  runtimeWorkspaceRoots: z.array(absolutePathSchema).min(1).max(64),
 });
 const threadForkInputSchema = z.object({
   threadId: idSchema,
@@ -1000,7 +1023,56 @@ const configRequirementsReadOutputSchema = z.object({
     allowedApprovalPolicies: z.array(returnedApprovalPolicySchema).max(64).nullable(),
     allowedApprovalsReviewers: z.array(approvalsReviewerSchema).max(64).nullable(),
     allowedSandboxModes: z.array(sandboxModeSchema).max(64).nullable(),
+    allowedWebSearchModes: z.array(
+      z.enum(["disabled", "cached", "indexed", "live"]),
+    ).max(64).nullable().optional(),
+    featureRequirements: z.record(
+      z.string().min(1).max(256),
+      z.boolean().optional(),
+    ).refine(
+      (requirements) => Object.keys(requirements).length <= 256,
+      "too many managed feature requirements",
+    ).nullable().optional(),
+    // The exact managed-hook payload is irrelevant to HRA: the schedule
+    // interpreter rejects every non-null value before admission.
+    hooks: z.unknown().nullable().optional(),
   }).passthrough().nullable(),
+}).strict();
+
+const mcpServerStatusListInputSchema = z.object({
+  cursor: z.string().max(MAX_PATH_CHARACTERS).nullable().optional(),
+  limit: z.number().int().safe().min(1).max(64).nullable().optional(),
+  detail: z.enum(["full", "toolsAndAuthOnly"]).nullable().optional(),
+  threadId: idSchema.nullable().optional(),
+}).strict();
+const mcpToolSchema = z.object({
+  name: z.string().min(1).max(256),
+  title: z.string().max(1_024).optional(),
+  description: protocolTextSchema.optional(),
+  inputSchema: losslessJsonValueSchema,
+  outputSchema: losslessJsonValueSchema.optional(),
+  annotations: losslessJsonValueSchema.optional(),
+  icons: z.array(losslessJsonValueSchema).max(64).optional(),
+  _meta: losslessJsonValueSchema.optional(),
+}).strict();
+const mcpServerStatusListOutputSchema = z.object({
+  data: z.array(z.object({
+    name: z.string().min(1).max(256),
+    serverInfo: z.object({
+      name: z.string().min(1).max(256),
+      title: z.string().max(1_024).nullable(),
+      version: z.string().max(256),
+      description: protocolTextSchema.nullable(),
+      icons: z.array(losslessJsonValueSchema).max(64).nullable(),
+      websiteUrl: protocolTextSchema.nullable(),
+    }).strict().nullable(),
+    tools: z.record(z.string().min(1).max(256), mcpToolSchema.optional())
+      .refine((tools) => Object.keys(tools).length <= 256, "too many MCP tools"),
+    resources: z.array(losslessJsonValueSchema).max(MAX_THREAD_ITEMS),
+    resourceTemplates: z.array(losslessJsonValueSchema).max(MAX_THREAD_ITEMS),
+    authStatus: z.enum(["unsupported", "notLoggedIn", "bearerToken", "oAuth"]),
+  }).strict()).max(64),
+  nextCursor: z.string().max(MAX_PATH_CHARACTERS).nullable(),
 }).strict();
 
 const textInputSchema = z.object({
@@ -1021,13 +1093,24 @@ const turnStartInputSchema = z.object({
   threadId: idSchema,
   clientUserMessageId: idSchema,
   input: z.array(turnUserInputSchema).min(1).max(64),
+  environments: z.tuple([]).nullable().optional(),
   cwd: absolutePathSchema.nullable().optional(),
+  runtimeWorkspaceRoots: z.array(absolutePathSchema).min(1).max(64).nullable().optional(),
   approvalPolicy: approvalPolicySchema.nullable().optional(),
   approvalsReviewer: approvalsReviewerSchema.nullable().optional(),
   sandboxPolicy: sandboxPolicySchema.nullable().optional(),
   model: modelNameSchema.nullable().optional(),
   effort: reasoningEffortSchema.nullable().optional(),
   serviceTier: serviceTierNameSchema.nullable().optional(),
+  outputSchema: wireJsonValueSchema.nullable().optional(),
+  collaborationMode: z.object({
+    mode: z.literal("plan"),
+    settings: z.object({
+      model: modelNameSchema,
+      reasoning_effort: reasoningEffortSchema.nullable(),
+      developer_instructions: protocolTextSchema.nullable(),
+    }).strict(),
+  }).strict().nullable().optional(),
 }).strict();
 const turnStartOutputSchema = z.object({ turn: turnSchema });
 const turnSteerInputSchema = z.object({
@@ -1099,6 +1182,12 @@ export type PinnedCodexModelList = z.infer<typeof modelListOutputSchema>;
 export type PinnedCodexConfigRequirementsRead = z.infer<
   typeof configRequirementsReadOutputSchema
 >;
+export type PinnedCodexMcpServerStatusListInput = z.infer<
+  typeof mcpServerStatusListInputSchema
+>;
+export type PinnedCodexMcpServerStatusList = z.infer<
+  typeof mcpServerStatusListOutputSchema
+>;
 export type PinnedCodexTurnStartInput = z.infer<typeof turnStartInputSchema>;
 export type PinnedCodexTurnStart = z.infer<typeof turnStartOutputSchema>;
 export type PinnedCodexTurnSteerInput = z.infer<typeof turnSteerInputSchema>;
@@ -1137,6 +1226,14 @@ export interface PinnedCodexRequestShapes {
     readonly output: PinnedCodexThreadList;
   };
   readonly threadStart: {
+    readonly input: PinnedCodexThreadStartInput;
+    readonly output: PinnedCodexThreadAdmissionResponse;
+  };
+  /**
+   * Control-plane-only thread admission. The pinned transport replaces the
+   * wire-level dynamic tool list with an empty list for this operation.
+   */
+  readonly scheduleInterpreterThreadStart: {
     readonly input: PinnedCodexThreadStartInput;
     readonly output: PinnedCodexThreadAdmissionResponse;
   };
@@ -1196,6 +1293,10 @@ export interface PinnedCodexRequestShapes {
     readonly input: undefined;
     readonly output: PinnedCodexConfigRequirementsRead;
   };
+  readonly mcpServerStatusList: {
+    readonly input: PinnedCodexMcpServerStatusListInput;
+    readonly output: PinnedCodexMcpServerStatusList;
+  };
   readonly turnStart: {
     readonly input: PinnedCodexTurnStartInput;
     readonly output: PinnedCodexTurnStart;
@@ -1241,6 +1342,10 @@ export const pinnedCodexCodecPairs = Object.freeze({
     output: codec(threadListOutputSchema),
   }),
   threadStart: Object.freeze({
+    input: codec(threadStartInputSchema),
+    output: codec(threadAdmissionResponseSchema),
+  }),
+  scheduleInterpreterThreadStart: Object.freeze({
     input: codec(threadStartInputSchema),
     output: codec(threadAdmissionResponseSchema),
   }),
@@ -1300,6 +1405,10 @@ export const pinnedCodexCodecPairs = Object.freeze({
     input: codec(undefinedSchema),
     output: codec(configRequirementsReadOutputSchema),
   }),
+  mcpServerStatusList: Object.freeze({
+    input: codec(mcpServerStatusListInputSchema),
+    output: codec(mcpServerStatusListOutputSchema),
+  }),
   turnStart: Object.freeze({
     input: codec(turnStartInputSchema),
     output: codec(turnStartOutputSchema),
@@ -1329,6 +1438,7 @@ export const pinnedCodexMethods = Object.freeze({
   accountUsageRead: "account/usage/read",
   threadList: "thread/list",
   threadStart: "thread/start",
+  scheduleInterpreterThreadStart: "thread/start",
   threadResume: "thread/resume",
   threadArchive: "thread/archive",
   threadRead: "thread/read",
@@ -1343,6 +1453,7 @@ export const pinnedCodexMethods = Object.freeze({
   threadInjectItems: "thread/inject_items",
   modelList: "model/list",
   configRequirementsRead: "configRequirements/read",
+  mcpServerStatusList: "mcpServerStatus/list",
   turnStart: "turn/start",
   turnSteer: "turn/steer",
   turnInterrupt: "turn/interrupt",
@@ -1366,6 +1477,7 @@ interface GeneratedResponses {
   readonly accountUsageRead: GeneratedGetAccountTokenUsageResponse;
   readonly threadList: GeneratedThreadListResponse;
   readonly threadStart: GeneratedThreadStartResponse;
+  readonly scheduleInterpreterThreadStart: GeneratedThreadStartResponse;
   readonly threadResume: GeneratedThreadResumeResponse;
   readonly threadArchive: GeneratedThreadArchiveResponse;
   readonly threadRead: GeneratedThreadReadResponse;
@@ -1380,6 +1492,7 @@ interface GeneratedResponses {
   readonly threadInjectItems: GeneratedThreadInjectItemsResponse;
   readonly modelList: GeneratedModelListResponse;
   readonly configRequirementsRead: GeneratedConfigRequirementsReadResponse;
+  readonly mcpServerStatusList: GeneratedListMcpServerStatusResponse;
   readonly turnStart: GeneratedTurnStartResponse;
   readonly turnSteer: GeneratedTurnSteerResponse;
   readonly turnInterrupt: GeneratedTurnInterruptResponse;
@@ -1422,7 +1535,7 @@ type OutputCodecInput<K extends GeneratedOperation> =
                 ? z.input<typeof tokenUsageOutputSchema>
                 : K extends "threadList"
                   ? z.input<typeof threadListOutputSchema>
-                  : K extends "threadStart" | "threadResume"
+                  : K extends "threadStart" | "scheduleInterpreterThreadStart" | "threadResume"
                     ? z.input<typeof threadAdmissionResponseSchema>
                     : K extends "threadRead" | "threadFork"
                       ? z.input<typeof threadResponseSchema>
@@ -1440,8 +1553,10 @@ type OutputCodecInput<K extends GeneratedOperation> =
                             ? z.input<typeof threadGoalClearOutputSchema>
                     : K extends "modelList"
                       ? z.input<typeof modelListOutputSchema>
-                      : K extends "configRequirementsRead"
-                        ? z.input<typeof configRequirementsReadOutputSchema>
+                    : K extends "configRequirementsRead"
+                      ? z.input<typeof configRequirementsReadOutputSchema>
+                      : K extends "mcpServerStatusList"
+                        ? z.input<typeof mcpServerStatusListOutputSchema>
                       : K extends "turnStart"
                         ? z.input<typeof turnStartOutputSchema>
                         : K extends "turnSteer"
@@ -1472,6 +1587,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     accountUsageRead: true,
     threadList: true,
     threadStart: true,
+    scheduleInterpreterThreadStart: true,
     threadResume: true,
     threadArchive: true,
     threadRead: true,
@@ -1486,6 +1602,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadInjectItems: true,
     modelList: true,
     configRequirementsRead: true,
+    mcpServerStatusList: true,
     turnStart: true,
     turnSteer: true,
     turnInterrupt: true,
@@ -1500,6 +1617,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     accountUsageRead: true,
     threadList: true,
     threadStart: true,
+    scheduleInterpreterThreadStart: true,
     threadResume: true,
     threadArchive: true,
     threadRead: true,
@@ -1514,6 +1632,7 @@ export const pinnedCodexGeneratedAssociationWitness = Object.freeze({
     threadInjectItems: true,
     modelList: true,
     configRequirementsRead: true,
+    mcpServerStatusList: true,
     turnStart: true,
     turnSteer: true,
     turnInterrupt: true,

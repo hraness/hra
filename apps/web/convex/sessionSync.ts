@@ -1,6 +1,8 @@
 import {
   assertObservationOnlySyncValue,
   canonicalSessionSyncJson,
+  clearOrphanedScheduledChatAsHumanRequestSchema,
+  readScheduledChatRecoveryInventoryAsHumanRequestSchema,
   digestSyncMembershipStatement,
   digestSyncRecoveryRequestIntent,
   digestSyncRecoveryVaultRootWrap,
@@ -21,6 +23,7 @@ import {
   verifySyncEnrollmentPossessionProof,
   syncMembershipHeadSchema,
   syncNonceForSequence,
+  hasValidScheduledChatCiphertextDigest,
   syncRecoveryAuthoritySchema,
   verifySyncDeviceProof,
   verifySyncDevicePublicKeys,
@@ -103,12 +106,31 @@ const recoverVaultTransition = makeFunctionReference<
   Readonly<{ requestJson: string; requestDigest: string }>,
   SessionSyncBackendResult
 >("sessionSyncModel:recoverVaultTransition");
+const clearOrphanedScheduledChatAsHumanTransition = makeFunctionReference<
+  "mutation",
+  Readonly<{ requestJson: string }>,
+  SessionSyncBackendResult
+>("sessionSyncModel:clearOrphanedScheduledChatAsHumanTransition");
+const readScheduledChatRecoveryInventoryAsHumanTransition = makeFunctionReference<
+  "mutation",
+  Readonly<{ requestJson: string }>,
+  SessionSyncBackendResult
+>("sessionSyncModel:readScheduledChatRecoveryInventoryAsHumanTransition");
+type ProofContextResult =
+  | Readonly<{ ok: true; contextJson: string }>
+  | Readonly<{ ok: false; code: typeof sessionSyncBackendErrorCodes[number] }>;
 const proofContext = makeFunctionReference<
   "query",
-  Readonly<{ proofJson: string }>,
-  | Readonly<{ ok: true; contextJson: string }>
-  | Readonly<{ ok: false; code: typeof sessionSyncBackendErrorCodes[number] }>
+  Readonly<{
+    proofJson: string;
+    allowStaleMembershipRead: boolean;
+  }>,
+  ProofContextResult
 >("sessionSyncModel:readProofContext");
+type RecoveryContextResult =
+  | Readonly<{ ok: false; code: typeof sessionSyncBackendErrorCodes[number] }>
+  | Readonly<{ ok: true; kind: "current"; contextJson: string }>
+  | Readonly<{ ok: true; kind: "replay"; responseJson: string }>;
 const recoveryContext = makeFunctionReference<
   "query",
   Readonly<{
@@ -117,9 +139,7 @@ const recoveryContext = makeFunctionReference<
     recoveryNonce: string;
     requestDigest: string;
   }>,
-  | Readonly<{ ok: false; code: typeof sessionSyncBackendErrorCodes[number] }>
-  | Readonly<{ ok: true; kind: "current"; contextJson: string }>
-  | Readonly<{ ok: true; kind: "replay"; responseJson: string }>
+  RecoveryContextResult
 >("sessionSyncModel:readRecoveryContext");
 const recoveryPreparationTransition = makeFunctionReference<
   "mutation",
@@ -189,6 +209,8 @@ function proofMethod(request: SessionSyncBackendRequest): "GET" | "POST" {
     case "list_enrollment_requests":
     case "snapshot_page":
     case "change_page":
+    case "scheduled_chat_inventory":
+    case "scheduled_run_page":
       return "GET";
     case "admit_membership_proposal":
     case "update_membership":
@@ -199,6 +221,10 @@ function proofMethod(request: SessionSyncBackendRequest): "GET" | "POST" {
     case "acquire_writer":
     case "publish_session":
     case "delete_session":
+    case "put_scheduled_chat":
+    case "clear_scheduled_chat":
+    case "clear_orphaned_scheduled_chat":
+    case "ack_scheduled_run":
     case "begin_snapshot":
       return "POST";
   }
@@ -594,7 +620,7 @@ export async function recoverSessionSyncVault(
   } catch {
     return invalidRequest();
   }
-  let loaded: Awaited<ReturnType<ActionCtx["runQuery"]>>;
+  let loaded: RecoveryContextResult;
   try {
     loaded = await ctx.runQuery(recoveryContext, {
       vaultId: request.authorization.statement.vault.vaultId,
@@ -605,7 +631,12 @@ export async function recoverSessionSyncVault(
   } catch {
     return { ok: false, code: "SERVICE_UNAVAILABLE" };
   }
-  if (!loaded.ok) return loaded;
+  if (!loaded.ok) {
+    const code = loaded.code;
+    return code === "RATE_LIMITED"
+      ? { ok: false, code: "SERVICE_UNAVAILABLE" }
+      : { ok: false, code };
+  }
   if (loaded.kind === "replay") {
     try {
       const response = sessionSyncBackendResponseSchema.parse(parseBoundedJson(loaded.responseJson));
@@ -678,6 +709,65 @@ export const recoverVault = action({
   handler: recoverSessionSyncVault,
 });
 
+export async function clearOrphanedScheduledChatAsHuman(
+  ctx: ActionCtx,
+  args: Readonly<{ requestJson: string }>,
+): Promise<SessionSyncBackendResult> {
+  if (!sessionSyncEnabled()) return { ok: false, code: "AUTHORIZATION_DENIED" };
+  let request: ReturnType<typeof clearOrphanedScheduledChatAsHumanRequestSchema.parse>;
+  try {
+    const rawRequest = parseBoundedJson(args.requestJson);
+    assertObservationOnlySyncValue(rawRequest);
+    request = clearOrphanedScheduledChatAsHumanRequestSchema.parse(rawRequest);
+  } catch {
+    return invalidRequest();
+  }
+  try {
+    return await ctx.runMutation(clearOrphanedScheduledChatAsHumanTransition, {
+      requestJson: canonicalSessionSyncJson(request),
+    });
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  }
+}
+
+export const clearOrphanedScheduledChat = action({
+  args: { requestJson: v.string() },
+  returns: backendResultValidator,
+  handler: clearOrphanedScheduledChatAsHuman,
+});
+
+export async function readScheduledChatRecoveryInventoryAsHuman(
+  ctx: ActionCtx,
+  args: Readonly<{ requestJson: string }>,
+): Promise<SessionSyncBackendResult> {
+  if (!sessionSyncEnabled()) return { ok: false, code: "AUTHORIZATION_DENIED" };
+  let request: ReturnType<
+    typeof readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse
+  >;
+  try {
+    const rawRequest = parseBoundedJson(args.requestJson);
+    assertObservationOnlySyncValue(rawRequest);
+    request = readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse(rawRequest);
+  } catch {
+    return invalidRequest();
+  }
+  try {
+    return await ctx.runMutation(
+      readScheduledChatRecoveryInventoryAsHumanTransition,
+      { requestJson: canonicalSessionSyncJson(request) },
+    );
+  } catch {
+    return { ok: false, code: "SERVICE_UNAVAILABLE" };
+  }
+}
+
+export const readScheduledChatRecoveryInventory = action({
+  args: { requestJson: v.string() },
+  returns: backendResultValidator,
+  handler: readScheduledChatRecoveryInventoryAsHuman,
+});
+
 export async function executeSessionSyncRequest(
   ctx: ActionCtx,
   args: SessionSyncInvocation,
@@ -699,15 +789,22 @@ export async function executeSessionSyncRequest(
   } catch {
     return { ok: false, code: "PROOF_INVALID" };
   }
-  let loaded: Awaited<ReturnType<ActionCtx["runQuery"]>>;
+  let loaded: ProofContextResult;
   try {
     loaded = await ctx.runQuery(proofContext, {
       proofJson: canonicalSessionSyncJson(proof),
+      allowStaleMembershipRead: request.operation === "read_membership"
+        || request.operation === "root_key_link_page",
     });
   } catch {
     return { ok: false, code: "SERVICE_UNAVAILABLE" };
   }
-  if (!loaded.ok) return loaded;
+  if (!loaded.ok) {
+    const code = loaded.code;
+    return code === "RATE_LIMITED"
+      ? { ok: false, code: "SERVICE_UNAVAILABLE" }
+      : { ok: false, code };
+  }
   try {
     const context = proofContextSchema.parse(parseBoundedJson(loaded.contextJson));
     if (
@@ -722,6 +819,10 @@ export async function executeSessionSyncRequest(
       request.operation === "publish_session"
       && (request.envelope.nonce !== syncNonceForSequence(request.envelope.header.syncSequence)
         || !await hasValidCiphertextDigest(request.envelope))
+    ) return { ok: false, code: "PROOF_INVALID" };
+    if (
+      request.operation === "put_scheduled_chat"
+      && !await hasValidScheduledChatCiphertextDigest(request.definition)
     ) return { ok: false, code: "PROOF_INVALID" };
     if (
       (request.operation === "admit_membership_proposal"
@@ -760,6 +861,8 @@ export const execute = action({
 export const sessionSyncPublicSurface = {
   bootstrapVault,
   claimEnrollment,
+  clearOrphanedScheduledChat,
+  readScheduledChatRecoveryInventory,
   execute,
   recoverVault,
   readRecoveryContext,

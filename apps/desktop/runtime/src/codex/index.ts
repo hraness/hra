@@ -60,6 +60,8 @@ export {
   type PinnedCodexLoginStartInput,
   type PinnedCodexLostResponseOutcome,
   type PinnedCodexMcpElicitationReference,
+  type PinnedCodexMcpServerStatusList,
+  type PinnedCodexMcpServerStatusListInput,
   type PinnedCodexRateLimits,
   type PinnedCodexRateLimitsUpdated,
   type PinnedCodexReasoningSummaryDelta,
@@ -139,18 +141,35 @@ export {
 } from "./dynamic-tool";
 export {
   HRA_PRODUCTION_EXECUTION_POLICY,
+  HRA_SCHEDULE_INTERPRETER_EXECUTION_POLICY,
   ProductionExecutionPolicyError,
+  ScheduleInterpreterExecutionPolicyError,
   isProductionApprovalRequestMethod,
+  scheduleInterpreterThreadConfig,
   verifyProductionExecutionPolicyRequirements,
   verifyProductionThreadAdmission,
   verifyProductionTurnAdmission,
+  verifyScheduleInterpreterExecutionPolicyRequirements,
+  verifyScheduleInterpreterThreadAdmission,
+  verifyScheduleInterpreterTurnAdmission,
   type ProductionExecutionPolicyProof,
   type ProductionExecutionPolicyReceipt,
+  type ScheduleInterpreterExecutionPolicyProof,
+  type ScheduleInterpreterExecutionPolicyReceipt,
 } from "./production-execution-policy";
 export {
   createPinnedCodexDynamicToolCapabilityResolver,
   type PinnedCodexDynamicToolCapabilityResolverOptions,
 } from "./dynamic-tool-capability";
+export {
+  provisionOfficialComputerUse,
+  requireComputerUseAdmissionReceipt,
+  verifyComputerUseServerStatus,
+  withComputerUseDeveloperInstructions,
+  withComputerUseThreadConfig,
+  type ComputerUseAdmissionReceipt,
+  type ComputerUseProvisioning,
+} from "./computer-use-provisioning";
 export {
   reconcilePinnedCodexThreadStart,
   reconcilePinnedCodexTurnInterrupt,

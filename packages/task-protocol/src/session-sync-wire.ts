@@ -44,6 +44,15 @@ import {
   syncRecoveryReceiptSchema,
   wrappedSyncRecoveryVaultRootKeySchema,
 } from "./session-sync-recovery";
+import {
+  MAX_SCHEDULED_CHAT_INVENTORY_PAGE_SIZE,
+  MAX_SCHEDULED_CHAT_RUN_PAGE_SIZE,
+  sealedScheduledChatDefinitionSchema,
+  scheduledChatEpochMsSchema,
+  scheduledChatRunIdSchema,
+  scheduledChatRunSchema,
+  scheduledChatScheduleSchema,
+} from "./session-sync-scheduled-chat";
 
 export const SESSION_SYNC_BACKEND_REQUEST_VERSION = 1 as const;
 /** Fits the exact 8-device by 8-retained-epoch wrapped-root cross product. */
@@ -60,6 +69,8 @@ export const sessionSyncHttpRoutes = Object.freeze({
   enrollmentClaim: "/v1/hra/session-sync/enrollments/claim",
   recoveryContext: "/v1/hra/session-sync/recovery-context",
   recover: "/v1/hra/session-sync/recover",
+  orphanInventory: "/v1/hra/session-sync/scheduled-chat-recovery",
+  orphanClear: "/v1/hra/session-sync/scheduled-chat-recovery/clear",
   execute: "/v1/hra/session-sync/execute",
 });
 
@@ -71,6 +82,8 @@ export const legacyOprteSessionSyncHttpRoutes = Object.freeze({
   enrollmentClaim: "/v1/oprte/session-sync/enrollments/claim",
   recoveryContext: "/v1/oprte/session-sync/recovery-context",
   recover: "/v1/oprte/session-sync/recover",
+  orphanInventory: "/v1/oprte/session-sync/scheduled-chat-recovery",
+  orphanClear: "/v1/oprte/session-sync/scheduled-chat-recovery/clear",
   execute: "/v1/oprte/session-sync/execute",
 });
 
@@ -291,6 +304,114 @@ export const deleteSyncSessionRequestSchema = z.object({
   tombstoneDigest: syncSha256DigestSchema,
 }).strict();
 
+export const putScheduledChatRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("put_scheduled_chat"),
+  definition: sealedScheduledChatDefinitionSchema,
+}).strict();
+export type PutScheduledChatRequest = z.infer<typeof putScheduledChatRequestSchema>;
+
+export const clearScheduledChatRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("clear_scheduled_chat"),
+  tenantId: syncTenantIdSchema,
+  organizationId: syncOrganizationIdSchema,
+  ownerUserId: syncOwnerUserIdSchema,
+  vaultId: syncVaultIdSchema,
+  vaultGeneration: positiveSyncUint64Schema,
+  membershipEpoch: positiveSyncUint64Schema,
+  originDeviceId: syncDeviceIdSchema,
+  sessionId: sessionPublicIdSchema,
+  mirrorEpoch: positiveSyncUint64Schema,
+  writerGeneration: positiveSyncUint64Schema,
+  bootId: syncBootIdSchema,
+  bootGeneration: positiveSyncUint64Schema,
+  keyEpoch: positiveSyncUint64Schema,
+  expectedGeneration: positiveSyncUint64Schema,
+}).strict();
+export type ClearScheduledChatRequest = z.infer<typeof clearScheduledChatRequestSchema>;
+
+export const clearOrphanedScheduledChatRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("clear_orphaned_scheduled_chat"),
+  originDeviceId: syncDeviceIdSchema,
+  sessionId: sessionPublicIdSchema,
+  expectedGeneration: positiveSyncUint64Schema,
+  expectedCiphertextDigest: syncSha256DigestSchema,
+}).strict();
+export type ClearOrphanedScheduledChatRequest = z.infer<
+  typeof clearOrphanedScheduledChatRequestSchema
+>;
+
+export const clearOrphanedScheduledChatAsHumanRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("clear_orphaned_scheduled_chat_as_human"),
+  tenantId: syncTenantIdSchema,
+  organizationId: syncOrganizationIdSchema,
+  ownerUserId: syncOwnerUserIdSchema,
+  vaultId: syncVaultIdSchema,
+  vaultGeneration: positiveSyncUint64Schema,
+  originDeviceId: syncDeviceIdSchema,
+  sessionId: sessionPublicIdSchema,
+  expectedGeneration: positiveSyncUint64Schema,
+  expectedCiphertextDigest: syncSha256DigestSchema,
+}).strict();
+export type ClearOrphanedScheduledChatAsHumanRequest = z.infer<
+  typeof clearOrphanedScheduledChatAsHumanRequestSchema
+>;
+
+export const readScheduledChatRecoveryInventoryAsHumanRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("scheduled_chat_recovery_inventory_as_human"),
+  tenantId: syncTenantIdSchema,
+  organizationId: syncOrganizationIdSchema,
+  ownerUserId: syncOwnerUserIdSchema,
+  vaultId: syncVaultIdSchema,
+  vaultGeneration: positiveSyncUint64Schema,
+  originDeviceId: syncDeviceIdSchema,
+  afterSessionId: sessionPublicIdSchema.optional(),
+  pageSize: z.number().int().min(1).max(MAX_SCHEDULED_CHAT_INVENTORY_PAGE_SIZE),
+}).strict();
+export type ReadScheduledChatRecoveryInventoryAsHumanRequest = z.infer<
+  typeof readScheduledChatRecoveryInventoryAsHumanRequestSchema
+>;
+
+export const readScheduledChatRunPageRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("scheduled_run_page"),
+  bootId: syncBootIdSchema,
+  bootGeneration: positiveSyncUint64Schema,
+  pageSize: z.number().int().min(1).max(MAX_SCHEDULED_CHAT_RUN_PAGE_SIZE),
+}).strict();
+export type ReadScheduledChatRunPageRequest = z.infer<
+  typeof readScheduledChatRunPageRequestSchema
+>;
+
+export const readScheduledChatInventoryRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("scheduled_chat_inventory"),
+  afterSessionId: sessionPublicIdSchema.optional(),
+  pageSize: z.number().int().min(1).max(MAX_SCHEDULED_CHAT_INVENTORY_PAGE_SIZE),
+}).strict();
+export type ReadScheduledChatInventoryRequest = z.infer<
+  typeof readScheduledChatInventoryRequestSchema
+>;
+
+export const acknowledgeScheduledChatRunRequestSchema = z.object({
+  ...requestBase,
+  operation: z.literal("ack_scheduled_run"),
+  bootId: syncBootIdSchema,
+  bootGeneration: positiveSyncUint64Schema,
+  runId: scheduledChatRunIdSchema,
+  sessionId: sessionPublicIdSchema,
+  scheduleGeneration: positiveSyncUint64Schema,
+  occurrenceSequence: positiveSyncUint64Schema,
+  scheduledFor: scheduledChatEpochMsSchema,
+}).strict();
+export type AcknowledgeScheduledChatRunRequest = z.infer<
+  typeof acknowledgeScheduledChatRunRequestSchema
+>;
+
 export const beginSyncSnapshotRequestSchema = z.object({
   ...requestBase,
   operation: z.literal("begin_snapshot"),
@@ -325,6 +446,12 @@ export const sessionSyncBackendRequestSchema = z.discriminatedUnion("operation",
   acquireSyncWriterRequestSchema,
   publishSyncSessionRequestSchema,
   deleteSyncSessionRequestSchema,
+  putScheduledChatRequestSchema,
+  clearScheduledChatRequestSchema,
+  clearOrphanedScheduledChatRequestSchema,
+  readScheduledChatInventoryRequestSchema,
+  readScheduledChatRunPageRequestSchema,
+  acknowledgeScheduledChatRunRequestSchema,
   beginSyncSnapshotRequestSchema,
   readSyncSnapshotPageRequestSchema,
   readSyncChangePageRequestSchema,
@@ -576,6 +703,212 @@ const sessionDeletedResponseSchema = z.object({
   replay: z.boolean(),
   tombstone: sessionSyncTombstoneSchema,
 }).strict();
+export const scheduledChatPutResponseSchema = z.object({
+  kind: z.literal("scheduled_chat_put"),
+  sessionId: sessionPublicIdSchema,
+  schedule: scheduledChatScheduleSchema,
+  ciphertextDigest: syncSha256DigestSchema,
+  replay: z.boolean(),
+}).strict();
+export type ScheduledChatPutResponse = z.infer<typeof scheduledChatPutResponseSchema>;
+export const scheduledChatClearedResponseSchema = z.object({
+  kind: z.literal("scheduled_chat_cleared"),
+  sessionId: sessionPublicIdSchema,
+  generation: positiveSyncUint64Schema,
+  replay: z.boolean(),
+}).strict();
+export type ScheduledChatClearedResponse = z.infer<
+  typeof scheduledChatClearedResponseSchema
+>;
+export const scheduledChatInventoryEntrySchema = z.discriminatedUnion(
+  "state",
+  [
+    z.object({
+      state: z.literal("active"),
+      sessionId: sessionPublicIdSchema,
+      originDeviceId: syncDeviceIdSchema,
+      generation: positiveSyncUint64Schema,
+      nextRunAt: scheduledChatEpochMsSchema,
+      definition: sealedScheduledChatDefinitionSchema,
+    }).strict(),
+    z.object({
+      state: z.literal("cleared"),
+      sessionId: sessionPublicIdSchema,
+      originDeviceId: syncDeviceIdSchema,
+      generation: positiveSyncUint64Schema,
+    }).strict(),
+  ],
+).superRefine((entry, context) => {
+  if (
+    entry.state === "active"
+    && (
+      entry.definition.header.sessionId !== entry.sessionId
+      || entry.definition.header.originDeviceId !== entry.originDeviceId
+      || entry.definition.header.generation !== entry.generation
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat inventory entry does not match its sealed definition",
+      path: ["definition"],
+    });
+  }
+});
+export type ScheduledChatInventoryEntry = z.infer<
+  typeof scheduledChatInventoryEntrySchema
+>;
+export const scheduledChatInventoryResponseSchema = z.object({
+  kind: z.literal("scheduled_chat_inventory"),
+  schedules: z.array(scheduledChatInventoryEntrySchema)
+    .max(MAX_SCHEDULED_CHAT_INVENTORY_PAGE_SIZE),
+  hasMore: z.boolean(),
+  nextAfterSessionId: sessionPublicIdSchema.optional(),
+}).strict().superRefine((page, context) => {
+  if (page.hasMore !== (page.nextAfterSessionId !== undefined)) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat inventory continuation and hasMore must agree",
+      path: ["nextAfterSessionId"],
+    });
+  }
+  for (let index = 1; index < page.schedules.length; index += 1) {
+    const previous = page.schedules[index - 1];
+    const current = page.schedules[index];
+    if (previous === undefined || current === undefined
+      || previous.sessionId >= current.sessionId) {
+      context.addIssue({
+        code: "custom",
+        message: "scheduled chat inventory must be strictly ordered by session ID",
+        path: ["schedules", index],
+      });
+      break;
+    }
+  }
+  if (
+    page.hasMore
+    && page.nextAfterSessionId !== page.schedules.at(-1)?.sessionId
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat inventory cursor must equal the last returned session ID",
+      path: ["nextAfterSessionId"],
+    });
+  }
+});
+
+export const scheduledChatRecoveryInventoryEntrySchema = z.object({
+  state: z.enum(["active", "cleared"]),
+  sessionId: sessionPublicIdSchema,
+  originDeviceId: syncDeviceIdSchema,
+  generation: positiveSyncUint64Schema,
+  ciphertextDigest: syncSha256DigestSchema,
+}).strict();
+export type ScheduledChatRecoveryInventoryEntry = z.infer<
+  typeof scheduledChatRecoveryInventoryEntrySchema
+>;
+export const scheduledChatRecoveryInventoryResponseSchema = z.object({
+  kind: z.literal("scheduled_chat_recovery_inventory"),
+  vault: syncVaultCoordinateSchema,
+  originDeviceId: syncDeviceIdSchema,
+  schedules: z.array(scheduledChatRecoveryInventoryEntrySchema)
+    .max(MAX_SCHEDULED_CHAT_INVENTORY_PAGE_SIZE),
+  hasMore: z.boolean(),
+  nextAfterSessionId: sessionPublicIdSchema.optional(),
+}).strict().superRefine((page, context) => {
+  if (page.hasMore !== (page.nextAfterSessionId !== undefined)) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat recovery continuation and hasMore must agree",
+      path: ["nextAfterSessionId"],
+    });
+  }
+  for (let index = 0; index < page.schedules.length; index += 1) {
+    if (page.schedules[index]?.originDeviceId !== page.originDeviceId) {
+      context.addIssue({
+        code: "custom",
+        message: "scheduled chat recovery entries must match the page origin",
+        path: ["schedules", index, "originDeviceId"],
+      });
+    }
+  }
+  for (let index = 1; index < page.schedules.length; index += 1) {
+    const previous = page.schedules[index - 1];
+    const current = page.schedules[index];
+    if (previous === undefined || current === undefined
+      || previous.sessionId >= current.sessionId) {
+      context.addIssue({
+        code: "custom",
+        message: "scheduled chat recovery inventory must be strictly ordered by session ID",
+        path: ["schedules", index, "sessionId"],
+      });
+      break;
+    }
+  }
+  if (
+    page.hasMore
+    && page.nextAfterSessionId !== page.schedules.at(-1)?.sessionId
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat recovery cursor must equal the last returned session ID",
+      path: ["nextAfterSessionId"],
+    });
+  }
+});
+export type ScheduledChatRecoveryInventoryResponse = z.infer<
+  typeof scheduledChatRecoveryInventoryResponseSchema
+>;
+export type ScheduledChatInventoryResponse = z.infer<
+  typeof scheduledChatInventoryResponseSchema
+>;
+export const scheduledChatRunPageResponseSchema = z.object({
+  kind: z.literal("scheduled_run_page"),
+  runs: z.array(scheduledChatRunSchema).max(MAX_SCHEDULED_CHAT_RUN_PAGE_SIZE),
+  hasMore: z.boolean(),
+}).strict().superRefine((page, context) => {
+  const runIds = page.runs.map(({ runId }) => runId);
+  if (new Set(runIds).size !== runIds.length) {
+    context.addIssue({
+      code: "custom",
+      message: "scheduled chat run page IDs must be unique",
+      path: ["runs"],
+    });
+  }
+  for (let index = 1; index < page.runs.length; index += 1) {
+    const previous = page.runs[index - 1];
+    const current = page.runs[index];
+    if (
+      previous === undefined
+      || current === undefined
+      || previous.scheduledFor > current.scheduledFor
+      || (
+        previous.scheduledFor === current.scheduledFor
+        && previous.runId >= current.runId
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "scheduled chat runs must be strictly ordered",
+        path: ["runs", index],
+      });
+      break;
+    }
+  }
+});
+export type ScheduledChatRunPageResponse = z.infer<
+  typeof scheduledChatRunPageResponseSchema
+>;
+export const scheduledChatRunAcknowledgedResponseSchema = z.object({
+  kind: z.literal("scheduled_run_acknowledged"),
+  runId: scheduledChatRunIdSchema,
+  sessionId: sessionPublicIdSchema,
+  generation: positiveSyncUint64Schema,
+  nextRunAt: scheduledChatEpochMsSchema.nullable(),
+  replay: z.boolean(),
+}).strict();
+export type ScheduledChatRunAcknowledgedResponse = z.infer<
+  typeof scheduledChatRunAcknowledgedResponseSchema
+>;
 const snapshotStartedResponseSchema = z.object({
   kind: z.literal("snapshot_started"),
   vault: syncVaultCoordinateSchema,
@@ -665,6 +998,12 @@ export const sessionSyncBackendResponseSchema = z.discriminatedUnion("kind", [
   reconcileRequiredResponseSchema,
   sessionAcceptedResponseSchema,
   sessionDeletedResponseSchema,
+  scheduledChatPutResponseSchema,
+  scheduledChatClearedResponseSchema,
+  scheduledChatInventoryResponseSchema,
+  scheduledChatRecoveryInventoryResponseSchema,
+  scheduledChatRunPageResponseSchema,
+  scheduledChatRunAcknowledgedResponseSchema,
   snapshotStartedResponseSchema,
   snapshotPageResponseSchema,
   changePageResponseSchema,
@@ -766,6 +1105,12 @@ export function routeForSessionSyncRequest(request: SessionSyncBackendRequest): 
     case "acquire_writer":
     case "publish_session": return "sync.session.publish";
     case "delete_session": return "sync.session.delete";
+    case "put_scheduled_chat":
+    case "clear_scheduled_chat":
+    case "clear_orphaned_scheduled_chat": return "sync.schedule.write";
+    case "scheduled_chat_inventory":
+    case "scheduled_run_page": return "sync.schedule.read";
+    case "ack_scheduled_run": return "sync.schedule.ack";
     case "begin_snapshot":
     case "snapshot_page": return "sync.directory.snapshot";
     case "change_page": return "sync.directory.changes";

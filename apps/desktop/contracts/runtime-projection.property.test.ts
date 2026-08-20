@@ -42,6 +42,13 @@ function emptySnapshot(): RuntimeSnapshot {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
     sessionSync: {
       status: {
@@ -87,6 +94,7 @@ function streamingPane(id: string, turnId: string): ChatPaneProjection {
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,
@@ -124,6 +132,7 @@ function lifecyclePane(index: number, revision: number): ChatPaneProjection {
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,

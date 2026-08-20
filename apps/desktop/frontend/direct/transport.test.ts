@@ -992,6 +992,88 @@ describe("HRA deterministic native transport", () => {
     shell.dispose();
   });
 
+  test("configures, rejects, and removes schedules without queueing a message", async () => {
+    const fixture = activation("chat-draft");
+    const harness = createHRADirectTransport(fixture.world, fixture.runtime);
+    const shell = createRuntimeShell(createRuntimeBridge(harness.transport));
+    try {
+      await shell.connect();
+      const initial = shell.getState();
+      if (initial.state !== "ready") throw new Error("Direct chat fixture did not hydrate.");
+      const pane = initial.snapshot.chat.panes[0];
+      if (pane === undefined) throw new Error("Direct chat fixture has no pane.");
+
+      expect(await shell.selectFolderAccess()).toMatchObject({
+        status: "selected",
+        folderAccess: { revision: 2, displayName: "Documents", availability: "ready" },
+      });
+      expect(shell.getState()).toMatchObject({
+        state: "ready",
+        snapshot: { execution: { folderAccess: { revision: 2 } } },
+      });
+
+      expect(await shell.dispatch({
+        type: "chat.pane.schedule.configure",
+        paneId: pane.id,
+        expectedRevision: pane.revision,
+        instruction: "invalid schedule",
+      })).toMatchObject({
+        ok: false,
+        error: { message: "Direct could not interpret that schedule." },
+      });
+      expect(shell.getState()).toMatchObject({
+        state: "ready",
+        snapshot: { chat: { panes: [{ revision: pane.revision, schedule: null }] } },
+      });
+
+      expect(await shell.dispatch({
+        type: "chat.pane.schedule.configure",
+        paneId: pane.id,
+        expectedRevision: pane.revision,
+        instruction: "Every day at 9, summarize open pull requests",
+      })).toMatchObject({
+        ok: true,
+        result: {
+          type: "chatPane",
+          pane: {
+            revision: pane.revision + 1,
+            schedule: {
+              revision: 1,
+              rrule: "DTSTART;TZID=America/Puerto_Rico:20260720T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+              timeZone: "America/Puerto_Rico",
+            },
+          },
+        },
+      });
+      const scheduledState = shell.getState();
+      if (scheduledState.state !== "ready") throw new Error("Schedule event did not settle.");
+      const scheduled = scheduledState.snapshot.chat.panes[0];
+      if (scheduled === undefined || scheduled.schedule === null) {
+        throw new Error("Schedule projection is missing.");
+      }
+      expect(scheduled.messageQueue).toEqual(pane.messageQueue);
+
+      expect(await shell.dispatch({
+        type: "chat.pane.schedule.remove",
+        paneId: pane.id,
+        expectedRevision: scheduled.revision,
+      })).toMatchObject({
+        ok: true,
+        result: { type: "chatPane", pane: { schedule: null } },
+      });
+      expect(shell.getState()).toMatchObject({
+        state: "ready",
+        snapshot: { chat: { panes: [{ revision: scheduled.revision + 1, schedule: null }] } },
+      });
+      expect(harness.getSnapshot().invocations.map(({ command }) => command)).toContain(
+        "hra.folderAccess.select",
+      );
+    } finally {
+      shell.dispose();
+      harness.dispose();
+    }
+  });
+
   test("fences stale human recovery commands and settles retry, consent, and fresh sign-in", async () => {
     const fixture = activation("settings-human-credential-recovery");
     const harness = createHRADirectTransport(fixture.world, fixture.runtime);

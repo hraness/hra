@@ -32,6 +32,13 @@ function emptySnapshot(lastSequence = 0): RuntimeSnapshot {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
     sessionSync: {
       status: {
@@ -115,6 +122,7 @@ function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: {
       revision: 1,
       pauseReason: null,
@@ -806,6 +814,7 @@ describe("renderer-safe gateway projection", () => {
           attention: null,
           recoverablePrompt: false,
           canStartFreshContext: false,
+          schedule: pane.schedule,
         },
     });
 

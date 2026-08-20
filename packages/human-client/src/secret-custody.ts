@@ -306,6 +306,59 @@ export type SecretCustodyCommittedInspection =
       value: string;
     }>;
 
+export type SecretCustodyRecoveryCandidateInspection =
+  | Readonly<{ state: "empty" }>
+  | Readonly<{
+      state: "inaccessible" | "missing" | "invalid";
+      role: "committed" | "pending";
+      pointer: SecretPointer;
+      sourceRevision: number;
+    }>
+  | Readonly<{
+      state: "valid";
+      role: "committed" | "pending";
+      pointer: SecretPointer;
+      sourceRevision: number;
+      value: string;
+      token: SecretCustodyRecoveryToken;
+    }>;
+
+declare const secretCustodyRecoveryTokenBrand: unique symbol;
+
+/**
+ * Process-local proof that a caller inspected one exact recovery candidate.
+ * The custody instance revalidates the journal revision, pointer, and value
+ * before this token can authorize a pending-to-committed transition.
+ */
+export interface SecretCustodyRecoveryToken {
+  readonly [secretCustodyRecoveryTokenBrand]: true;
+}
+
+export type SecretCustodyLiveValueInspection =
+  | Readonly<{
+      role: "committed" | "pending";
+      pointer: SecretPointer;
+      state: "inaccessible" | "missing" | "invalid";
+    }>
+  | Readonly<{
+      role: "committed" | "pending";
+      pointer: SecretPointer;
+      state: "valid";
+      value: string;
+    }>;
+
+export interface SecretCustodyLiveInspection {
+  readonly sourceRevision: number | null;
+  readonly values: readonly SecretCustodyLiveValueInspection[];
+}
+
+interface SecretCustodyRecoveryAuthorization {
+  readonly role: "committed" | "pending";
+  readonly pointer: SecretPointer;
+  readonly sourceRevision: number;
+  readonly value: string;
+}
+
 interface SettledSecretCustody {
   readonly journal: SecretCustodyJournal | null;
   readonly abandonedPending: "missing" | "invalid" | null;
@@ -374,6 +427,11 @@ export class GenerationalSecretCustody {
   readonly #secrets: SecretStore;
   readonly #metadata: SecretCustodyMetadataStore;
   readonly #nextSlot: SecretSlotSource;
+  readonly #requireExplicitPendingRecovery: boolean;
+  readonly #recoveryAuthorizations = new WeakMap<
+    SecretCustodyRecoveryToken,
+    SecretCustodyRecoveryAuthorization
+  >();
   #tail: Promise<void> = Promise.resolve();
 
   constructor(options: {
@@ -381,11 +439,14 @@ export class GenerationalSecretCustody {
     readonly secrets: SecretStore;
     readonly metadata: SecretCustodyMetadataStore;
     readonly nextSlot: SecretSlotSource;
+    readonly requireExplicitPendingRecovery?: boolean;
   }) {
     this.#descriptor = secretCustodyDescriptorSchema.parse(options.descriptor);
     this.#secrets = options.secrets;
     this.#metadata = options.metadata;
     this.#nextSlot = options.nextSlot;
+    this.#requireExplicitPendingRecovery =
+      options.requireExplicitPendingRecovery ?? false;
   }
 
   async #exclusive<Value>(operation: () => Promise<Value>): Promise<Value> {
@@ -547,6 +608,71 @@ export class GenerationalSecretCustody {
     });
   }
 
+  /**
+   * Non-mutating inspection of the identity that ordinary recovery would make
+   * current. A valid pending write wins over the prior committed pointer.
+   */
+  async inspectRecoveryCandidate(): Promise<SecretCustodyRecoveryCandidateInspection> {
+    return await this.#exclusive(async () => {
+      const journal = await this.#readJournal();
+      if (journal === null) return { state: "empty" };
+      const candidate = journal.pending === undefined
+        ? journal.committed === undefined
+          ? null
+          : { role: "committed" as const, pointer: journal.committed }
+        : { role: "pending" as const, pointer: journal.pending.pointer };
+      if (candidate === null) return { state: "empty" };
+      const inspected = await this.#inspectCommitted(candidate.pointer);
+      if (inspected.state !== "valid") {
+        return {
+          ...inspected,
+          role: candidate.role,
+          pointer: candidate.pointer,
+          sourceRevision: journal.revision,
+        };
+      }
+      const token = Object.freeze({}) as SecretCustodyRecoveryToken;
+      this.#recoveryAuthorizations.set(token, {
+        role: candidate.role,
+        pointer: candidate.pointer,
+        sourceRevision: journal.revision,
+        value: inspected.value,
+      });
+      return {
+        ...inspected,
+        role: candidate.role,
+        pointer: candidate.pointer,
+        sourceRevision: journal.revision,
+        token,
+      };
+    });
+  }
+
+  /** Non-mutating inventory of every value that a clear would retire. */
+  async inspectLiveValues(): Promise<SecretCustodyLiveInspection> {
+    return await this.#exclusive(async () => {
+      const journal = await this.#readJournal();
+      if (journal === null) return { sourceRevision: null, values: [] };
+      const candidates = [
+        ...(journal.committed === undefined
+          ? []
+          : [{ role: "committed" as const, pointer: journal.committed }]),
+        ...(journal.pending === undefined
+          ? []
+          : [{ role: "pending" as const, pointer: journal.pending.pointer }]),
+      ];
+      const values: SecretCustodyLiveValueInspection[] = [];
+      for (const candidate of candidates) {
+        const inspected = await this.#inspectCommitted(candidate.pointer);
+        values.push({
+          ...candidate,
+          ...inspected,
+        });
+      }
+      return { sourceRevision: journal.revision, values };
+    });
+  }
+
   async #inspectPointers(
     journal: SecretCustodyJournal,
   ): Promise<readonly SecretPointerInspection[]> {
@@ -634,21 +760,28 @@ export class GenerationalSecretCustody {
    * never deleted or overwritten. Their exact opaque pointers move atomically
    * to durable quarantine evidence while the generation high-water remains.
    */
-  async quarantineLegacyIdentityPointers(): Promise<SecretCustodyReconnectRecovery> {
-    return await this.#quarantinePointerAnomalies(false);
+  async quarantineLegacyIdentityPointers(options: {
+    readonly candidate?: SecretCustodyRecoveryToken;
+  } = {}): Promise<SecretCustodyReconnectRecovery> {
+    return await this.#quarantinePointerAnomalies(false, options.candidate);
   }
 
   /** Explicit product-authorized recovery for missing or malformed pointers. */
-  async preservePointerAnomalies(): Promise<SecretCustodyReconnectRecovery> {
-    return await this.#quarantinePointerAnomalies(true);
+  async preservePointerAnomalies(options: {
+    readonly candidate?: SecretCustodyRecoveryToken;
+  } = {}): Promise<SecretCustodyReconnectRecovery> {
+    return await this.#quarantinePointerAnomalies(true, options.candidate);
   }
 
   async #quarantinePointerAnomalies(
     allowWithoutIdentityDenial: boolean,
+    candidate: SecretCustodyRecoveryToken | undefined,
   ): Promise<SecretCustodyReconnectRecovery> {
     return await this.#exclusive(async () => {
+      const authorization = this.#recoveryAuthorization(candidate);
       for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
         const journal = await this.#readJournal();
+        await this.#assertRecoveryCandidateAuthorized(journal, authorization);
         if (journal === null) return { state: "not_required" };
         const inspected = await this.#inspectPointers(journal);
         const inaccessible = this.#quarantineEvidence(journal, inspected);
@@ -706,6 +839,19 @@ export class GenerationalSecretCustody {
         if (!parsed.success) {
           throw new SecretCustodyError("invalid_metadata");
         }
+        if (promotePending) {
+          const staged = journal.pending === undefined
+            ? null
+            : await this.#readPointer(journal.pending.pointer);
+          if (staged === null) {
+            throw new SecretCustodyError("concurrent_update");
+          }
+          this.#assertPendingPromotionAuthorized(
+            journal,
+            staged,
+            authorization,
+          );
+        }
         if (await this.#swapWithQuarantine(journal, parsed.data, quarantined)) {
           return {
             state: "quarantined",
@@ -725,10 +871,15 @@ export class GenerationalSecretCustody {
   async preserveCommittedForRecovery(
     inspected: Exclude<SecretCustodyCommittedInspection, { state: "empty" }>,
     reason: "invalid_pointer_preserved" | "missing_pointer_abandoned",
+    options: {
+      readonly candidate?: SecretCustodyRecoveryToken;
+    } = {},
   ): Promise<SecretCustodyReconnectRecovery> {
     return await this.#exclusive(async () => {
+      const authorization = this.#recoveryAuthorization(options.candidate);
       for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
         const journal = await this.#readJournal();
+        await this.#assertRecoveryCandidateAuthorized(journal, authorization);
         if (journal?.committed === undefined) return { state: "not_required" };
         if (
           journal.revision !== inspected.sourceRevision ||
@@ -787,6 +938,19 @@ export class GenerationalSecretCustody {
             ),
           ),
         });
+        if (promotePending) {
+          const staged = journal.pending === undefined
+            ? null
+            : await this.#readPointer(journal.pending.pointer);
+          if (staged === null) {
+            throw new SecretCustodyError("concurrent_update");
+          }
+          this.#assertPendingPromotionAuthorized(
+            journal,
+            staged,
+            authorization,
+          );
+        }
         if (await this.#swapWithQuarantine(journal, next, evidence)) {
           return {
             state: "quarantined",
@@ -795,6 +959,48 @@ export class GenerationalSecretCustody {
         }
       }
       throw new SecretCustodyError("concurrent_update");
+    });
+  }
+
+  /**
+   * Quarantine one exact inspected pending value without ever making it
+   * current. Product validation can use this after rejecting an otherwise
+   * well-formed generic envelope.
+   */
+  async preserveInspectedPendingForRecovery(
+    token: SecretCustodyRecoveryToken,
+  ): Promise<SecretCustodyReconnectRecovery> {
+    return await this.#exclusive(async () => {
+      const authorization = this.#recoveryAuthorization(token);
+      if (authorization?.role !== "pending") {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      const journal = await this.#readJournal();
+      await this.#assertRecoveryCandidateAuthorized(journal, authorization);
+      if (journal?.pending === undefined) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      const next = parseOwnedJournal({
+        version: 1,
+        revision: nextRevision(journal),
+        latestGeneration: journal.latestGeneration,
+        service: journal.service,
+        name: journal.name,
+        ...(journal.committed === undefined
+          ? {}
+          : { committed: journal.committed }),
+        ...deletingJournalField(deletingPointers(journal)),
+      });
+      const evidence = secretCustodyQuarantinePointerSchema.parse({
+        kind: "pending",
+        pointer: journal.pending.pointer,
+        sourceRevision: journal.revision,
+        reason: "invalid_pointer_preserved",
+      });
+      if (!(await this.#swapWithQuarantine(journal, next, [evidence]))) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      return { state: "quarantined", quarantinedPointerCount: 1 };
     });
   }
 
@@ -809,6 +1015,68 @@ export class GenerationalSecretCustody {
     }
   }
 
+  #recoveryAuthorization(
+    token: SecretCustodyRecoveryToken | undefined,
+  ): SecretCustodyRecoveryAuthorization | undefined {
+    if (token === undefined) return undefined;
+    const authorization = this.#recoveryAuthorizations.get(token);
+    if (authorization === undefined) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    return authorization;
+  }
+
+  #assertPendingPromotionAuthorized(
+    journal: SecretCustodyJournal,
+    staged: SecretCustodyRead,
+    authorization: SecretCustodyRecoveryAuthorization | undefined,
+  ): void {
+    const pending = journal.pending;
+    if (pending === undefined) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    if (authorization === undefined) {
+      if (!this.#requireExplicitPendingRecovery) return;
+      throw new SecretCustodyError("pending_secret_missing");
+    }
+    if (
+      authorization.role !== "pending"
+      || authorization.sourceRevision !== journal.revision
+      || authorization.pointer.generation !== pending.pointer.generation
+      || authorization.pointer.slot !== pending.pointer.slot
+      || authorization.value !== staged.value
+      || staged.generation !== pending.pointer.generation
+    ) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+  }
+
+  async #assertRecoveryCandidateAuthorized(
+    journal: SecretCustodyJournal | null,
+    authorization: SecretCustodyRecoveryAuthorization | undefined,
+  ): Promise<void> {
+    if (authorization === undefined) return;
+    const candidate = journal?.pending === undefined
+      ? journal?.committed === undefined
+        ? null
+        : { role: "committed" as const, pointer: journal.committed }
+      : { role: "pending" as const, pointer: journal.pending.pointer };
+    if (
+      journal === null
+      || candidate === null
+      || journal.revision !== authorization.sourceRevision
+      || candidate.role !== authorization.role
+      || candidate.pointer.generation !== authorization.pointer.generation
+      || candidate.pointer.slot !== authorization.pointer.slot
+    ) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    const current = await this.#readPointer(candidate.pointer);
+    if (current === null || current.value !== authorization.value) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+  }
+
   /**
    * Resolve every journaled boundary. A superseded slot remains in `deleting`
    * until Keychain confirms deletion (including an already-absent result) and
@@ -816,11 +1084,14 @@ export class GenerationalSecretCustody {
    */
   async #settle(
     abandonMissingPending: boolean,
+    authorization?: SecretCustodyRecoveryAuthorization,
+    deferDeletingCleanup = false,
   ): Promise<SettledSecretCustody> {
     let abandonedPending: SettledSecretCustody["abandonedPending"] = null;
     let conflicts = 0;
     for (let step = 0; step < MAX_RECOVERY_STEPS; step += 1) {
       const journal = await this.#readJournal();
+      await this.#assertRecoveryCandidateAuthorized(journal, authorization);
       if (journal === null) {
         return { journal: null, abandonedPending };
       }
@@ -887,6 +1158,12 @@ export class GenerationalSecretCustody {
           continue;
         }
 
+        this.#assertPendingPromotionAuthorized(
+          journal,
+          staged,
+          authorization,
+        );
+
         const deleting = [
           ...deletingPointers(journal),
           ...(journal.committed === undefined ? [] : [journal.committed]),
@@ -905,12 +1182,25 @@ export class GenerationalSecretCustody {
           if (conflicts >= MAX_CAS_ATTEMPTS) break;
           continue;
         }
+        if (authorization !== undefined) {
+          authorization = {
+            ...authorization,
+            role: "committed",
+            sourceRevision: committed.revision,
+          };
+        }
+        if (deferDeletingCleanup) {
+          return { journal: committed, abandonedPending };
+        }
         conflicts = 0;
         continue;
       }
 
       const [deleting, ...remaining] = deletingPointers(journal);
       if (deleting === undefined) {
+        return { journal, abandonedPending };
+      }
+      if (deferDeletingCleanup) {
         return { journal, abandonedPending };
       }
       await this.#deletePointer(deleting);
@@ -929,6 +1219,12 @@ export class GenerationalSecretCustody {
         conflicts += 1;
         if (conflicts >= MAX_CAS_ATTEMPTS) break;
         continue;
+      }
+      if (authorization !== undefined) {
+        authorization = {
+          ...authorization,
+          sourceRevision: retired.revision,
+        };
       }
       conflicts = 0;
     }
@@ -1024,7 +1320,12 @@ export class GenerationalSecretCustody {
           throw new SecretCustodyError("custody_unavailable");
         }
 
-        const { journal: committed } = await this.#settle(false);
+        const { journal: committed } = await this.#settle(false, {
+          role: "pending",
+          pointer,
+          sourceRevision: pending.revision,
+          value,
+        });
         if (
           committed?.committed?.generation !== pointer.generation ||
           committed.committed.slot !== pointer.slot
@@ -1065,9 +1366,15 @@ export class GenerationalSecretCustody {
    */
   async recover(options: {
     readonly abandonMissingPending: boolean;
+    readonly candidate?: SecretCustodyRecoveryToken;
+    readonly deferDeletingCleanup?: boolean;
   }): Promise<SecretCustodyRecovery> {
     return await this.#exclusive(async () => {
-      const settled = await this.#settle(options.abandonMissingPending);
+      const settled = await this.#settle(
+        options.abandonMissingPending,
+        this.#recoveryAuthorization(options.candidate),
+        options.deferDeletingCleanup ?? false,
+      );
       const committed = settled.journal?.committed;
       if (settled.abandonedPending !== null) {
         return {
@@ -1091,10 +1398,18 @@ export class GenerationalSecretCustody {
   async #clear(
     expectedGeneration: number | undefined,
     onJournaled: (() => Promise<void>) | undefined,
+    expectedSourceRevision?: number | null,
   ): Promise<boolean> {
     return await this.#exclusive(async () => {
       for (let attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt += 1) {
-        const { journal } = await this.#settle(false);
+        const current = await this.#readJournal();
+        if (
+          expectedSourceRevision !== undefined
+          && (current?.revision ?? null) !== expectedSourceRevision
+        ) return false;
+        const journal = current?.pending === undefined
+          ? (await this.#settle(false)).journal
+          : current;
         if (journal === null) return expectedGeneration === undefined;
         if (
           expectedGeneration !== undefined &&
@@ -1102,14 +1417,47 @@ export class GenerationalSecretCustody {
         ) {
           return false;
         }
-        if (journal.committed === undefined) return true;
+        if (
+          journal.committed === undefined &&
+          journal.pending === undefined
+        ) return true;
+
+        const deleting = [
+          ...deletingPointers(journal),
+          ...(journal.committed === undefined ? [] : [journal.committed]),
+          ...(journal.pending === undefined ? [] : [journal.pending.pointer]),
+        ];
+        if (deleting.length > MAX_DELETING_POINTERS) {
+          const [retiring, ...remaining] = deletingPointers(journal);
+          if (retiring === undefined) {
+            throw new SecretCustodyError("invalid_metadata");
+          }
+          await this.#deletePointer(retiring);
+          const compacted = parseOwnedJournal({
+            version: 1,
+            revision: nextRevision(journal),
+            latestGeneration: journal.latestGeneration,
+            service: journal.service,
+            name: journal.name,
+            ...(journal.committed === undefined
+              ? {}
+              : { committed: journal.committed }),
+            ...(journal.pending === undefined
+              ? {}
+              : { pending: journal.pending }),
+            ...deletingJournalField(remaining),
+          });
+          if (!(await this.#swap(journal.revision, compacted))) continue;
+          attempt -= 1;
+          continue;
+        }
         const cleared = parseOwnedJournal({
           version: 1,
           revision: nextRevision(journal),
           latestGeneration: journal.latestGeneration,
           service: journal.service,
           name: journal.name,
-          deleting: [journal.committed],
+          ...deletingJournalField(deleting),
         });
         if (!(await this.#swap(journal.revision, cleared))) continue;
         await onJournaled?.();
@@ -1122,6 +1470,17 @@ export class GenerationalSecretCustody {
 
   async clear(): Promise<void> {
     await this.#clear(undefined, undefined);
+  }
+
+  /** Clear only the exact live-value inventory previously inspected. */
+  async clearIfSourceRevision(
+    expectedSourceRevision: number | null,
+  ): Promise<boolean> {
+    return await this.#clear(
+      undefined,
+      undefined,
+      expectedSourceRevision,
+    );
   }
 
   /** Clear only the exact generation previously read. */

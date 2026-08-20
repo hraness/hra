@@ -250,6 +250,7 @@ class FakeAppServer {
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandbox: { type: "dangerFullAccess" },
+        runtimeWorkspaceRoots: ["/tmp/hra-fake-app-server"],
       });
       await writeMessage(USER_INPUT_REQUEST);
       return;
