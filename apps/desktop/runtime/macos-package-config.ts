@@ -57,6 +57,7 @@ export const requiredLicenseFileNames = Object.freeze([
   "CODEX-NATIVE-LICENSES.json",
   "CODEX-NATIVE-LICENSES.txt",
   "CODEX-NOTICE.txt",
+  "CODEX-SIGNATURE-NORMALIZATION.md",
   "CODEX-package.json",
   "CODEX-platform-package.json",
   "DESKTOP-THIRD-PARTY-NOTICES.md",
