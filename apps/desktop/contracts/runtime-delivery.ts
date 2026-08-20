@@ -23,6 +23,7 @@ export type RuntimeEventDeliveryClass =
 export const runtimeEventDeliveryClassByType = {
   "runtime.changed": "state-recoverable",
   "runner.changed": "state-recoverable",
+  "execution.changed": "state-recoverable",
   "account.upserted": "state-recoverable",
   "account.removed": "state-recoverable",
   "chat.pane.upserted": "state-recoverable",
@@ -111,6 +112,7 @@ export function runtimeChatPaneStateProjection(
     attention: pane.attention,
     recoverablePrompt: pane.recoverablePrompt,
     canStartFreshContext: pane.canStartFreshContext,
+    schedule: pane.schedule,
   });
 }
 

@@ -24,6 +24,8 @@ const thread = {
   turns: [],
 };
 
+const runtimeWorkspaceRoots = ["/tmp/hra-shared-documents"] as const;
+
 test("production execution policy parses managed requirements and mints opaque receipts", () => {
   const requirements = pinnedCodexRequests.configRequirementsRead.outputCodec.parse({
     requirements: {
@@ -40,6 +42,7 @@ test("production execution policy parses managed requirements and mints opaque r
   });
   const threadRequest = pinnedCodexRequests.threadStart.inputCodec.parse({
     cwd: "/tmp/hra-policy",
+    runtimeWorkspaceRoots,
     approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
     approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
     sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
@@ -52,6 +55,7 @@ test("production execution policy parses managed requirements and mints opaque r
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandbox: { type: "dangerFullAccess" },
+    runtimeWorkspaceRoots,
   });
   const threadReceipt = verifyProductionThreadAdmission({
     proof,
@@ -67,6 +71,7 @@ test("production execution policy parses managed requirements and mints opaque r
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandboxPolicy: { type: "dangerFullAccess" },
+    runtimeWorkspaceRoots,
   });
   expect(verifyProductionTurnAdmission({
     proof,
@@ -115,6 +120,7 @@ test("production execution policy never downgrades managed or returned settings"
   });
   const request = pinnedCodexRequests.threadResume.inputCodec.parse({
     threadId: thread.id,
+    runtimeWorkspaceRoots,
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandbox: "danger-full-access",
@@ -129,6 +135,7 @@ test("production execution policy never downgrades managed or returned settings"
       model: "gpt-5.6-sol",
       reasoningEffort: "ultra",
       serviceTier: null,
+      runtimeWorkspaceRoots,
       ...responsePolicy,
     });
     expect(() => verifyProductionThreadAdmission({
@@ -148,6 +155,7 @@ test("production execution receipts reject a generation race", () => {
     output: { requirements: null },
   });
   const request = pinnedCodexRequests.threadStart.inputCodec.parse({
+    runtimeWorkspaceRoots,
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandbox: "danger-full-access",
@@ -160,6 +168,7 @@ test("production execution receipts reject a generation race", () => {
     approvalPolicy: "never",
     approvalsReviewer: "auto_review",
     sandbox: { type: "dangerFullAccess" },
+    runtimeWorkspaceRoots,
   });
   expect(() => verifyProductionThreadAdmission({
     proof,

@@ -26,6 +26,175 @@ afterEach(() => {
 });
 
 describe("portable provider-context projection", () => {
+  test("rejects an active scheduled chat without mutating the source snapshot", () => {
+    const database = fixtureDatabase();
+    try {
+      const paneId = "pane_portable_schedule001";
+      insertPane(database, {
+        paneId,
+        displayOrder: 0,
+        paletteIndex: 0,
+        state: "ready",
+      });
+      const sessionId = insertScheduledChatBinding(database, paneId);
+      insertScheduledChatActive(database, paneId, sessionId);
+      const sourceSnapshot = Buffer.from(database.serialize());
+
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "8".repeat(64),
+        attachmentVaultGenerationSha256: "9".repeat(64),
+      })).toThrow("Turn off scheduled chats first");
+      expect(Buffer.from(database.serialize())).toEqual(sourceSnapshot);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rejects every prepared or effect-started scheduled-chat mutation", () => {
+    for (const state of ["prepared", "effect_started"] as const) {
+      const database = fixtureDatabase();
+      try {
+        const paneId = `pane_portable_${state === "prepared" ? "prepared" : "effect"}001`;
+        insertPane(database, {
+          paneId,
+          displayOrder: 0,
+          paletteIndex: 0,
+          state: "ready",
+        });
+        const sessionId = insertScheduledChatBinding(database, paneId);
+        insertScheduledChatMutation(database, paneId, sessionId, state);
+        const sourceSnapshot = Buffer.from(database.serialize());
+
+        expect(() => projectFixture(database, {
+          sourceDatabaseSha256: "a".repeat(64),
+          attachmentVaultGenerationSha256: "b".repeat(64),
+        })).toThrow("Turn off scheduled chats first");
+        expect(Buffer.from(database.serialize())).toEqual(sourceSnapshot);
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("rejects a durable schedule-off recovery intent", () => {
+    const database = fixtureDatabase();
+    try {
+      const paneId = "pane_portable_offintent001";
+      insertPane(database, {
+        paneId,
+        displayOrder: 0,
+        paletteIndex: 0,
+        state: "ready",
+      });
+      const sessionId = insertScheduledChatBinding(database, paneId);
+      database.query(`
+        INSERT INTO chat_scheduled_chat_desired_off(
+          pane_id, session_id, target_generation, created_at, updated_at
+        ) VALUES (?1, ?2, '1', ?3, ?3)
+      `).run(paneId, sessionId, now.getTime());
+      const sourceSnapshot = Buffer.from(database.serialize());
+
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "e".repeat(64),
+        attachmentVaultGenerationSha256: "f".repeat(64),
+      })).toThrow("Turn off scheduled chats first");
+      expect(Buffer.from(database.serialize())).toEqual(sourceSnapshot);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("allows a cleared schedule's generation high-water without removing it", () => {
+    const database = fixtureDatabase();
+    let projected: Database | null = null;
+    try {
+      const paneId = "pane_portable_cleared0001";
+      insertPane(database, {
+        paneId,
+        displayOrder: 0,
+        paletteIndex: 0,
+        state: "ready",
+      });
+      const sessionId = insertScheduledChatBinding(database, paneId);
+      database.query(`
+        INSERT INTO chat_scheduled_chat_generation_high_water(
+          pane_id, session_id, generation, updated_at
+        ) VALUES (?1, ?2, '7', ?3)
+      `).run(paneId, sessionId, now.getTime());
+
+      const result = projectFixture(database, {
+        sourceDatabaseSha256: "c".repeat(64),
+        attachmentVaultGenerationSha256: "d".repeat(64),
+      });
+      projected = result.database;
+      expect(projected.query(`
+        SELECT pane_id, session_id, generation
+        FROM chat_scheduled_chat_generation_high_water
+      `).get()).toEqual({ pane_id: paneId, session_id: sessionId, generation: "7" });
+    } finally {
+      projected?.close();
+      database.close();
+    }
+  });
+
+  test("accepts a valid v61 cleared-schedule snapshot without the v62 off-intent table", () => {
+    const database = fixtureDatabase();
+    let projected: Database | null = null;
+    try {
+      const paneId = "pane_portable_v61clear01";
+      insertPane(database, {
+        paneId,
+        displayOrder: 0,
+        paletteIndex: 0,
+        state: "ready",
+      });
+      const sessionId = insertScheduledChatBinding(database, paneId);
+      database.query(`
+        INSERT INTO chat_scheduled_chat_generation_high_water(
+          pane_id, session_id, generation, updated_at
+        ) VALUES (?1, ?2, '7', ?3)
+      `).run(paneId, sessionId, now.getTime());
+      downgradeScheduledChatSchemaToV61(database);
+
+      const result = projectFixture(database, {
+        sourceDatabaseSha256: "6".repeat(64),
+        attachmentVaultGenerationSha256: "7".repeat(64),
+      });
+      projected = result.database;
+      expect(projected.query(`
+        SELECT generation FROM chat_scheduled_chat_generation_high_water
+        WHERE pane_id = ?1 AND session_id = ?2
+      `).get(paneId, sessionId)).toEqual({ generation: "7" });
+      expect(projected.query(`
+        SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND name = 'chat_scheduled_chat_desired_off'
+      `).get()).toBeNull();
+      expect(projected.query(`
+        SELECT MAX(version) AS version FROM schema_migrations
+      `).get()).toEqual({ version: 61 });
+    } finally {
+      projected?.close();
+      database.close();
+    }
+  });
+
+  test("rejects a v62 snapshot that omits its durable off-intent table", () => {
+    const database = fixtureDatabase();
+    try {
+      database.exec(`
+        DROP TRIGGER chat_scheduled_chat_desired_off_pane_update_quarantine;
+        DROP TRIGGER chat_scheduled_chat_desired_off_pane_delete_quarantine;
+        DROP TABLE chat_scheduled_chat_desired_off;
+      `);
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "4".repeat(64),
+        attachmentVaultGenerationSha256: "5".repeat(64),
+      })).toThrow("Scheduled-chat portability state is incomplete");
+    } finally {
+      database.close();
+    }
+  });
+
   test("removes provider binding metadata while retaining display history and bytes authority", () => {
     const database = fixtureDatabase();
     let projected: Database | null = null;
@@ -1171,6 +1340,105 @@ function fixtureDatabase(): Database {
     )
   `).run(now.toISOString());
   return database;
+}
+
+function downgradeScheduledChatSchemaToV61(database: Database): void {
+  database.exec(`
+    DROP TRIGGER chat_scheduled_chat_desired_off_pane_update_quarantine;
+    DROP TRIGGER chat_scheduled_chat_desired_off_pane_delete_quarantine;
+    DROP TABLE chat_scheduled_chat_desired_off;
+    DELETE FROM schema_migrations WHERE version = 62;
+    UPDATE app_release_state SET migration_version = 61;
+  `);
+}
+
+function insertScheduledChatBinding(database: Database, paneId: string): string {
+  const sessionId = `syncsession_${"s".repeat(32)}`;
+  database.query(`
+    INSERT INTO session_sync_grid_positions(
+      session_id, grid_position, origin, discovered_at
+    ) VALUES (?1, 0, 'local', ?2)
+  `).run(sessionId, now.getTime());
+  database.query(`
+    INSERT INTO session_sync_pane_bindings(
+      pane_id, session_id, tenant_id, organization_id, owner_user_id,
+      vault_id, vault_generation, origin_device_id, included,
+      binding_state, creation_grant_digest, reserved_at, created_at
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5,
+      ?6, '1', ?7, 1,
+      'accepted', ?8, ?9, ?9
+    )
+  `).run(
+    paneId,
+    sessionId,
+    `synctenant_${"t".repeat(32)}`,
+    `syncorg_${"o".repeat(32)}`,
+    `syncuser_${"u".repeat(32)}`,
+    `syncvault_${"v".repeat(32)}`,
+    `syncdevice_${"d".repeat(32)}`,
+    `sha256_${"e".repeat(64)}`,
+    now.getTime(),
+  );
+  return sessionId;
+}
+
+function insertScheduledChatActive(
+  database: Database,
+  paneId: string,
+  sessionId: string,
+): void {
+  database.query(`
+    INSERT INTO chat_scheduled_chats(
+      pane_id, session_id, revision, generation, key_epoch,
+      rrule, time_zone, next_run_at, definition_ciphertext_digest,
+      created_at, updated_at
+    ) VALUES (
+      ?1, ?2, 1, '1', '1',
+      ?3, 'America/Puerto_Rico', ?4, ?5,
+      ?6, ?6
+    )
+  `).run(
+    paneId,
+    sessionId,
+    "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+    now.getTime() + 60_000,
+    `sha256_${"f".repeat(64)}`,
+    now.getTime(),
+  );
+}
+
+function insertScheduledChatMutation(
+  database: Database,
+  paneId: string,
+  sessionId: string,
+  state: "prepared" | "effect_started",
+): void {
+  database.query(`
+    INSERT INTO chat_scheduled_chat_mutations(
+      operation_id, pane_id, session_id, kind, state,
+      expected_pane_revision, expected_schedule_revision,
+      target_schedule_revision, target_generation, request_json,
+      request_digest, rrule, time_zone, next_run_at,
+      definition_ciphertext_digest, created_at, updated_at
+    ) VALUES (
+      ?1, ?2, ?3, 'put', ?4,
+      1, NULL,
+      1, '1', '{}',
+      ?5, ?6, 'America/Puerto_Rico', ?7,
+      ?8, ?9, ?9
+    )
+  `).run(
+    `syncop_${state === "prepared" ? "p".repeat(32) : "e".repeat(32)}`,
+    paneId,
+    sessionId,
+    state,
+    `sha256_${"1".repeat(64)}`,
+    "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+    now.getTime() + 60_000,
+    `sha256_${"2".repeat(64)}`,
+    now.getTime(),
+  );
 }
 
 function insertPane(

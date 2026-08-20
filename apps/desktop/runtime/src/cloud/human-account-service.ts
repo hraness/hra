@@ -10,9 +10,11 @@ import {
   type DeviceVerification,
   type FetchLike,
   type HumanAuthenticationSnapshot,
+  type HumanAuthentication,
   type HumanAuthenticationStore,
   type HumanProfile,
   type HumanRefreshDriver,
+  type SecretCustodyRecoveryToken,
 } from "@hraness/hra-human-client";
 import {
   organizationIdSchema,
@@ -41,10 +43,41 @@ import {
 import {
   HumanCredentialCustody,
   reconcileHumanAccountMetadata,
+  type HumanCredentialClearAuthority,
+  type HumanCredentialRecoveryCandidateInspection,
   type HumanAccountMetadataPort,
 } from "./keychain-custody";
 
 const MAX_SELECTION_PAGES = 1_000;
+
+class RejectedPendingCredentialError extends Error {
+  readonly token: SecretCustodyRecoveryToken;
+
+  constructor(token: SecretCustodyRecoveryToken) {
+    super("The pending human credential requires explicit recovery.");
+    this.name = "RejectedPendingCredentialError";
+    this.token = token;
+  }
+}
+
+class HumanCredentialConfigurationError extends Error {
+  readonly authentication: HumanAuthentication;
+
+  constructor(authentication: HumanAuthentication) {
+    super("The human credential belongs to another cloud configuration.");
+    this.name = "HumanCredentialConfigurationError";
+    this.authentication = authentication;
+  }
+}
+
+function sameHumanAuthenticationSnapshot(
+  left: HumanAuthenticationSnapshot,
+  right: HumanAuthenticationSnapshot,
+): boolean {
+  return left.generation === right.generation
+    && JSON.stringify(left.authentication) ===
+      JSON.stringify(right.authentication);
+}
 
 export interface SafeDeviceVerification {
   readonly userCode: string;
@@ -142,6 +175,25 @@ export interface HumanAccountServiceOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>;
   readonly openBrowser?: (url: string) => Promise<void>;
   readonly transport?: HRAHumanHttpTransport;
+  readonly acceptAuthentication?: (
+    authentication: HumanAuthentication,
+  ) => void | Promise<void>;
+  readonly withAuthenticationCommit?: <Value>(
+    authentication: HumanAuthentication,
+    commit: () => Promise<Value>,
+  ) => Promise<Value>;
+  readonly withAuthenticationAuthority?: <Value>(
+    authority: Readonly<{
+      apiUrl: string;
+      userId: string;
+      organizationId?: string;
+    }>,
+    operation: () => Promise<Value>,
+  ) => Promise<Value>;
+  readonly withSignOutCommit?: <Value>(
+    authority: HumanCredentialClearAuthority,
+    commit: () => Promise<Value>,
+  ) => Promise<Value>;
 }
 
 function safeError(
@@ -329,6 +381,13 @@ export class HumanAccountService {
   readonly #sleep: (milliseconds: number) => Promise<void>;
   readonly #transport: HRAHumanHttpTransport | null;
   readonly #workspaceClient: CloudWorkspaceClient | null;
+  readonly #acceptAuthentication:
+    ((authentication: HumanAuthentication) => void | Promise<void>) | undefined;
+  readonly #withAuthenticationCommit:
+    HumanAccountServiceOptions["withAuthenticationCommit"];
+  readonly #withAuthenticationAuthority:
+    HumanAccountServiceOptions["withAuthenticationAuthority"];
+  readonly #withSignOutCommit: HumanAccountServiceOptions["withSignOutCommit"];
   #loginAbort: AbortController | null = null;
   #loginGeneration = 0;
   #loginTask: Promise<void> | null = null;
@@ -343,6 +402,10 @@ export class HumanAccountService {
 
   constructor(options: HumanAccountServiceOptions) {
     this.#availability = cloudAttachmentAvailability(options.configuration);
+    this.#acceptAuthentication = options.acceptAuthentication;
+    this.#withAuthenticationAuthority = options.withAuthenticationAuthority;
+    this.#withAuthenticationCommit = options.withAuthenticationCommit;
+    this.#withSignOutCommit = options.withSignOutCommit;
     this.#credentials = options.credentials ??
       new HumanCredentialCustody({ metadata: options.metadata });
     this.#emit = options.emit ?? (() => undefined);
@@ -395,6 +458,30 @@ export class HumanAccountService {
   /** Closes new sign-in, mutation, and refresh admission without cancelling work. */
   closeAdmission(): void {
     this.#admissionClosed = true;
+    this.#session?.closeAdmission();
+  }
+
+  /** Joins every operation admitted before `closeAdmission()`. */
+  async settled(): Promise<void> {
+    for (;;) {
+      const login = this.#loginTask;
+      const mutations = this.#mutationTail;
+      const refreshes = this.#refreshTail;
+      await Promise.allSettled([
+        login ?? Promise.resolve(),
+        mutations,
+        refreshes,
+      ]);
+      if (
+        login === this.#loginTask
+        && mutations === this.#mutationTail
+        && refreshes === this.#refreshTail
+        && !this.hasActiveOperation()
+      ) {
+        await this.#session?.settled();
+        return;
+      }
+    }
   }
 
   availability(): CloudAttachmentAvailability {
@@ -426,29 +513,79 @@ export class HumanAccountService {
           reason: "credential_reconnect_required",
         });
       }
-      await this.#credentials.recover({ abandonMissingPending: false });
-      const snapshot = await this.#credentials.read();
-      if (
-        snapshot !== null &&
-        (
-          this.#availability.state === "disabled" ||
-          snapshot.authentication.apiUrl !== this.#availability.apiOrigin
-        )
-      ) {
-        const profile = profileFromHumanAuthentication(
-          snapshot.authentication,
-          "keychain",
+      try {
+        return await this.#withRecoveryCandidateAuthority(
+          async (candidate) => {
+          await this.#credentials.recover({
+            abandonMissingPending: false,
+            ...(candidate === null ? {} : { candidate: candidate.token }),
+          });
+          const snapshot = await this.#credentials.read();
+          if (
+            snapshot !== null &&
+            (
+              this.#availability.state === "disabled" ||
+              snapshot.authentication.apiUrl !== this.#availability.apiOrigin
+            )
+          ) {
+            const profile = profileFromHumanAuthentication(
+              snapshot.authentication,
+              "keychain",
+            );
+            return this.#update({
+              state: "error",
+              error: safeError("CONFIGURATION_UNAVAILABLE"),
+              profile,
+            });
+          }
+          if (snapshot === null) {
+            await reconcileHumanAccountMetadata(this.#metadata, null);
+            return this.#update({ state: "signed_out" });
+          }
+          if (
+            candidate !== null &&
+            !sameHumanAuthenticationSnapshot(candidate.snapshot, snapshot)
+          ) {
+            throw new SecretCustodyError("concurrent_update");
+          }
+          const commit = async (): Promise<HumanAccountSnapshot> => {
+            await reconcileHumanAccountMetadata(this.#metadata, snapshot);
+            return this.#signedIn(snapshot);
+          };
+          return candidate === null
+            ? await this.#commitAcceptedAuthentication(
+              snapshot.authentication,
+              commit,
+            )
+            : await commit();
+          },
+        );
+      } catch (error: unknown) {
+        if (error instanceof RejectedPendingCredentialError) {
+          return this.#update({
+            state: "recovery_required",
+            reason: "credential_reconnect_required",
+          });
+        }
+        if (error instanceof HumanCredentialConfigurationError) {
+          return this.#update({
+            state: "error",
+            error: safeError("CONFIGURATION_UNAVAILABLE"),
+            profile: profileFromHumanAuthentication(
+              error.authentication,
+              "keychain",
+            ),
+          });
+        }
+        if (error instanceof SecretCustodyError) throw error;
+        await reconcileHumanAccountMetadata(this.#metadata, null).catch(
+          () => undefined,
         );
         return this.#update({
           state: "error",
-          error: safeError("CONFIGURATION_UNAVAILABLE"),
-          profile,
+          error: safeError("AUTHENTICATION_FAILED"),
         });
       }
-      await reconcileHumanAccountMetadata(this.#metadata, snapshot);
-      return snapshot === null
-        ? this.#update({ state: "signed_out" })
-        : this.#signedIn(snapshot);
     } catch (error: unknown) {
       if (
         error instanceof SecretCustodyError &&
@@ -555,22 +692,25 @@ export class HumanAccountService {
   async signOut(): Promise<HumanAccountSnapshot> {
     await this.cancelSignIn();
     return await this.#serialized(async () => {
+      let clearAuthority: HumanCredentialClearAuthority;
       try {
-        // User-authorized sign-out is also the explicit recovery authority for
-        // a crash after the pending journal CAS but before Keychain persistence.
-        const recovered = await this.#credentials.recover({
-          abandonMissingPending: true,
+        clearAuthority = await this.#credentials.inspectClearAuthority();
+      } catch {
+        return this.#update({
+          state: "error",
+          error: safeError("SERVICE_UNAVAILABLE"),
         });
-        if (recovered.generation !== undefined) {
-          const cleared = await this.#credentials.clear({
-            expectedGeneration: recovered.generation,
+      }
+      return await this.#commitSignOut(clearAuthority, async () => {
+      try {
+        // Sign-out removes interrupted pending state without ever installing it.
+        if (!(await this.#credentials.clearAllIfSourceRevision(
+          clearAuthority.sourceRevision,
+        ))) {
+          return this.#update({
+            state: "error",
+            error: safeError("SERVICE_UNAVAILABLE"),
           });
-          if (!cleared) {
-            return this.#update({
-              state: "error",
-              error: safeError("SERVICE_UNAVAILABLE"),
-            });
-          }
         }
         await reconcileHumanAccountMetadata(this.#metadata, null);
         return this.#update({ state: "signed_out" });
@@ -580,6 +720,7 @@ export class HumanAccountService {
           error: safeError("SERVICE_UNAVAILABLE"),
         });
       }
+      });
     });
   }
 
@@ -604,17 +745,76 @@ export class HumanAccountService {
         };
       }
       try {
-        await beforeQuarantine();
-        await this.#credentials.quarantineLegacyIdentityPointers();
-        const retained = await this.#credentials.read();
-        await reconcileHumanAccountMetadata(this.#metadata, retained);
-        return {
-          ok: true,
-          snapshot: retained === null
-            ? this.#update({ state: "signed_out" })
-            : this.#signedIn(retained),
-        };
-      } catch {
+        return await this.#withRecoveryCandidateAuthority(
+          async (candidate) => {
+            await beforeQuarantine();
+            if (candidate !== null) {
+              await this.#credentials.recover({
+                abandonMissingPending: false,
+                candidate: candidate.token,
+                deferDeletingCleanup: true,
+              });
+            }
+            await this.#credentials.quarantineLegacyIdentityPointers();
+            const retained = await this.#credentials.read();
+            if (retained === null) {
+              await reconcileHumanAccountMetadata(this.#metadata, null);
+              return {
+                ok: true as const,
+                snapshot: this.#update({ state: "signed_out" }),
+              };
+            }
+            if (
+              candidate !== null &&
+              !sameHumanAuthenticationSnapshot(candidate.snapshot, retained)
+            ) {
+              throw new SecretCustodyError("concurrent_update");
+            }
+            const commit = async (): Promise<HumanCredentialReconnectResult> => {
+            await reconcileHumanAccountMetadata(this.#metadata, retained);
+            return {
+              ok: true as const,
+              snapshot: this.#signedIn(retained),
+            };
+            };
+            return candidate === null
+              ? await this.#commitAcceptedAuthentication(
+                retained.authentication,
+                commit,
+              )
+              : await commit();
+          },
+        );
+      } catch (error: unknown) {
+        if (error instanceof RejectedPendingCredentialError) {
+          try {
+            await beforeQuarantine();
+            await this.#credentials.preserveRejectedPendingCandidate(
+              error.token,
+            );
+            await this.#credentials.quarantineLegacyIdentityPointers();
+            const retained = await this.#credentials.read();
+            if (retained === null) {
+              await reconcileHumanAccountMetadata(this.#metadata, null);
+              return {
+                ok: true,
+                snapshot: this.#update({ state: "signed_out" }),
+              };
+            }
+            return await this.#commitAcceptedAuthentication(
+              retained.authentication,
+              async () => {
+                await reconcileHumanAccountMetadata(this.#metadata, retained);
+                return {
+                  ok: true,
+                  snapshot: this.#signedIn(retained),
+                };
+              },
+            );
+          } catch {
+            // The exact pending pointer remains recoverable on the next retry.
+          }
+        }
         return {
           ok: false,
           kind: "failed",
@@ -789,15 +989,17 @@ export class HumanAccountService {
               workosOrganizationId: authenticated.workosOrganizationId,
             }),
       });
-      const snapshot = await this.#credentials.write(authentication);
-      if (signal.aborted || generation !== this.#loginGeneration) {
-        await this.#credentials
-          .clear({ expectedGeneration: snapshot.generation })
-          .catch(() => false);
-        return;
-      }
-      await reconcileHumanAccountMetadata(this.#metadata, snapshot);
-      this.#signedIn(snapshot);
+      await this.#commitAcceptedAuthentication(authentication, async () => {
+        const snapshot = await this.#credentials.write(authentication);
+        if (signal.aborted || generation !== this.#loginGeneration) {
+          await this.#credentials
+            .clear({ expectedGeneration: snapshot.generation })
+            .catch(() => false);
+          return;
+        }
+        await reconcileHumanAccountMetadata(this.#metadata, snapshot);
+        this.#signedIn(snapshot);
+      });
     } catch (error) {
       if (signal.aborted || generation !== this.#loginGeneration) return;
       const code = error instanceof HumanClientError &&
@@ -909,13 +1111,30 @@ export class HumanAccountService {
       readonly workosOrganizationId: string;
     },
   ): Promise<HumanAccountResult<HumanProfile>> {
-    return await this.#serializedRefresh(async () => {
-      if (this.#transport === null) {
-        return {
-          ok: false,
-          error: safeError("CONFIGURATION_UNAVAILABLE"),
-        };
-      }
+    const transport = this.#transport;
+    if (transport === null) {
+      return {
+        ok: false,
+        error: safeError("CONFIGURATION_UNAVAILABLE"),
+      };
+    }
+    let authority: HumanAuthenticationSnapshot | null;
+    try {
+      authority = await this.#credentials.read();
+    } catch {
+      return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+    }
+    if (authority === null) {
+      return { ok: false, error: safeError("SIGNED_OUT") };
+    }
+    try {
+      return await this.#withAcceptedAuthenticationAuthority(
+        {
+          apiUrl: authority.authentication.apiUrl,
+          userId: authority.authentication.user.id,
+          organizationId: organization.id,
+        },
+        async () => await this.#serializedRefresh(async () => {
       let current: HumanAuthenticationSnapshot | null;
       try {
         current = await this.#credentials.read();
@@ -925,7 +1144,13 @@ export class HumanAccountService {
       if (current === null) {
         return { ok: false, error: safeError("SIGNED_OUT") };
       }
-      const refreshed = await this.#transport.refresh(
+      if (
+        current.generation !== authority.generation
+        || current.authentication.user.id !== authority.authentication.user.id
+      ) {
+        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+      }
+      const refreshed = await transport.refresh(
         current.authentication.refreshToken,
         organization.workosOrganizationId,
       );
@@ -963,26 +1188,36 @@ export class HumanAccountService {
         authentication: nextAuthentication.authentication,
       });
       try {
-        const replaced = await this.#credentials.compareAndSwap({
-          expectedGeneration: current.generation,
-          next,
-        });
-        if (replaced === null) {
-          return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-        }
-        await reconcileHumanAccountMetadata(this.#metadata, replaced);
-        this.#signedIn(replaced);
-        return {
-          ok: true,
-          data: profileFromHumanAuthentication(
-            replaced.authentication,
-            "keychain",
-          ),
-        };
+        return await this.#commitAcceptedAuthentication(
+          next.authentication,
+          async () => {
+            const replaced = await this.#credentials.compareAndSwap({
+              expectedGeneration: current.generation,
+              next,
+            });
+            if (replaced === null) {
+              return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+            }
+            await reconcileHumanAccountMetadata(this.#metadata, replaced);
+            this.#signedIn(replaced);
+            return {
+              ok: true,
+              data: profileFromHumanAuthentication(
+                replaced.authentication,
+                "keychain",
+              ),
+            };
+          },
+          true,
+        );
       } catch {
         return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
       }
-    });
+        }),
+      );
+    } catch {
+      return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+    }
   }
 
   async #refreshForSession(
@@ -1036,24 +1271,47 @@ export class HumanAccountService {
     ) {
       return;
     }
-    await reconcileHumanAccountMetadata(this.#metadata, snapshot).catch(
-      () => undefined,
-    );
-    if (
-      fence !== this.#credentialProjectionFence ||
-      this.snapshot().state === "recovery_required"
-    ) {
-      if (this.#snapshot.state === "signed_out") {
+    if (snapshot === null) {
+      await reconcileHumanAccountMetadata(this.#metadata, null).catch(
+        () => undefined,
+      );
+      if (
+        fence !== this.#credentialProjectionFence ||
+        this.snapshot().state === "recovery_required"
+      ) return;
+      this.#update({ state: "signed_out" });
+    } else {
+      try {
+        // Session coordinator refreshes can arrive while a session-sync cloud
+        // request already owns its exclusive transition. They preserve the
+        // authenticated principal, so validate synchronously without trying
+        // to reacquire the authority-transition lease.
+        await this.#acceptAuthentication?.(snapshot.authentication);
+        await reconcileHumanAccountMetadata(this.#metadata, snapshot).catch(
+          () => undefined,
+        );
+        if (
+          fence !== this.#credentialProjectionFence ||
+          this.snapshot().state === "recovery_required"
+        ) {
+          if (this.#snapshot.state === "signed_out") {
+            await reconcileHumanAccountMetadata(this.#metadata, null).catch(
+              () => undefined,
+            );
+          }
+          return;
+        }
+        this.#signedIn(snapshot);
+      } catch {
         await reconcileHumanAccountMetadata(this.#metadata, null).catch(
           () => undefined,
         );
+        this.#update({
+          state: "error",
+          error: safeError("AUTHENTICATION_FAILED"),
+        });
+        return;
       }
-      return;
-    }
-    if (snapshot === null) {
-      this.#update({ state: "signed_out" });
-    } else {
-      this.#signedIn(snapshot);
     }
   }
 
@@ -1095,6 +1353,87 @@ export class HumanAccountService {
     };
     this.#emit(this.#snapshot);
     return this.#snapshot;
+  }
+
+  async #commitAcceptedAuthentication<Value>(
+    authentication: HumanAuthentication,
+    commit: () => Promise<Value>,
+    authorityAlreadyHeld = false,
+  ): Promise<Value> {
+    await this.#acceptAuthentication?.(authentication);
+    if (authorityAlreadyHeld) return await commit();
+    const withCommit = this.#withAuthenticationCommit;
+    return withCommit === undefined
+      ? await commit()
+      : await withCommit(authentication, commit);
+  }
+
+  async #withRecoveryCandidateAuthority<Value>(
+    operation: (
+      candidate: Extract<
+        HumanCredentialRecoveryCandidateInspection,
+        { state: "valid" }
+      > | null,
+    ) => Promise<Value>,
+  ): Promise<Value> {
+    const candidate = await this.#credentials
+      .inspectRecoveryAuthenticationCandidate();
+    if (candidate.state === "product_invalid") {
+      if (candidate.role === "pending") {
+        throw new RejectedPendingCredentialError(candidate.token);
+      }
+      return await operation(null);
+    }
+    if (candidate.state !== "valid") return await operation(null);
+    const authentication = candidate.snapshot.authentication;
+    if (this.#availability.state === "disabled") {
+      throw new HumanCredentialConfigurationError(authentication);
+    }
+    if (authentication.apiUrl !== this.#availability.apiOrigin) {
+      if (candidate.role === "pending") {
+        throw new RejectedPendingCredentialError(candidate.token);
+      }
+      throw new HumanCredentialConfigurationError(authentication);
+    }
+    let operationStarted = false;
+    try {
+      return await this.#commitAcceptedAuthentication(
+        authentication,
+        async () => {
+          operationStarted = true;
+          return await operation(candidate);
+        },
+      );
+    } catch (error: unknown) {
+      if (!operationStarted && candidate.role === "pending") {
+        throw new RejectedPendingCredentialError(candidate.token);
+      }
+      throw error;
+    }
+  }
+
+  async #withAcceptedAuthenticationAuthority<Value>(
+    authority: Readonly<{
+      apiUrl: string;
+      userId: string;
+      organizationId?: string;
+    }>,
+    operation: () => Promise<Value>,
+  ): Promise<Value> {
+    const withAuthority = this.#withAuthenticationAuthority;
+    return withAuthority === undefined
+      ? await operation()
+      : await withAuthority(authority, operation);
+  }
+
+  async #commitSignOut<Value>(
+    authority: HumanCredentialClearAuthority,
+    commit: () => Promise<Value>,
+  ): Promise<Value> {
+    const withCommit = this.#withSignOutCommit;
+    return withCommit === undefined
+      ? await commit()
+      : await withCommit(authority, commit);
   }
 
   async #serialized<Value>(operation: () => Promise<Value> | Value): Promise<Value> {

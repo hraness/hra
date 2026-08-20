@@ -1,4 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { AccountSummary } from "../../contracts/runtime";
 import {
@@ -12,12 +21,25 @@ import {
   type PinnedCodexDynamicToolLifecycleProbe,
   type PinnedCodexDynamicToolLifecycleProbeInput,
 } from "../src/codex/dynamic-tool-capability";
+import type { ComputerUseProvisioning } from
+  "../src/codex/computer-use-provisioning";
 import type { RuntimePaths } from "../src/runtime-paths";
+import { applyMigrations } from "../src/state/database";
+import { ChatExecutionSettingsStore } from
+  "../src/state/chat-execution-settings";
 
 const nowMs = Date.parse("2026-08-06T12:00:00.000Z");
 const binarySha256 = "a".repeat(64);
 const accountA = "acct_capability_a" as AccountSummary["id"];
 const accountB = "acct_capability_b" as AccountSummary["id"];
+const computerUseProvisioning: ComputerUseProvisioning = Object.freeze({
+  serverName: "node_repl",
+  requiredToolName: "js",
+  threadConfig: Object.freeze({
+    "mcp_servers.node_repl": Object.freeze({ command: "/signed/node_repl" }),
+  }),
+  developerInstructions: "Use node_repl + @oai/sky through the signed service.",
+});
 
 function paths(account: "a" | "b" = "a"): RuntimePaths {
   return {
@@ -214,6 +236,79 @@ describe("pinned Codex dynamic-tool capability resolver", () => {
     });
     expect(sibling?.caller.accountProfileId).toBe(accountB);
     expect(probe.calls).toHaveLength(3);
+  });
+
+  test("holds one revisioned global-folder admission across the complete provider probe", async () => {
+    const home = realpathSync.native(
+      mkdtempSync(join(tmpdir(), "hra-dynamic-probe-root-race-")),
+    );
+    const documents = join(home, "Documents");
+    const selected = join(home, "Selected Root");
+    mkdirSync(documents);
+    mkdirSync(selected);
+    const database = new Database(":memory:", { strict: true });
+    applyMigrations(database);
+    const settings = new ChatExecutionSettingsStore({
+      database,
+      homeDirectory: home,
+    });
+    let markProbeStarted!: () => void;
+    const probeStarted = new Promise<void>((resolve) => {
+      markProbeStarted = resolve;
+    });
+    let finishProbe!: () => void;
+    const probeMayFinish = new Promise<void>((resolve) => {
+      finishProbe = resolve;
+    });
+    const probe = new RecordingProbe(async (input) => {
+      markProbeStarted();
+      await probeMayFinish;
+      return receipt(input);
+    });
+    const subject = new PinnedCodexDynamicToolCapabilityResolver({
+      probe,
+      execution: {
+        computerUse: computerUseProvisioning,
+        acquireRuntimeWorkspaceAdmission: () =>
+          settings.acquireRuntimeWorkspaceAdmission(),
+      },
+      hashBinary: () => Promise.resolve(binarySha256),
+      now: () => nowMs,
+      readVersion: () => Promise.resolve(PINNED_CODEX_DYNAMIC_TOOL_VERSION),
+    });
+
+    try {
+      const resolving = subject.resolve({
+        accountProfileId: accountA,
+        generation: 17,
+        paths: paths("a"),
+      });
+      await probeStarted;
+      expect(probe.calls[0]?.executionWorkspace).toEqual({
+        revision: 1,
+        runtimeWorkspaceRoots: [documents],
+      });
+
+      let selectionSettled = false;
+      const selection = settings.select(selected).finally(() => {
+        selectionSettled = true;
+      });
+      await Promise.resolve();
+      expect(selectionSettled).toBe(false);
+      expect(settings.read()).toMatchObject({ revision: 1, folderPath: documents });
+
+      finishProbe();
+      expect(await resolving).not.toBeNull();
+      expect(await selection).toMatchObject({
+        revision: 2,
+        folderPath: realpathSync.native(selected),
+      });
+      expect(selectionSettled).toBe(true);
+    } finally {
+      finishProbe();
+      database.close();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("caches a failed decision instead of repeatedly consuming a signed-in model", async () => {

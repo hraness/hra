@@ -82,6 +82,28 @@ export const sessionSyncWireOperationPolicies = {
     replay: "deterministic_reconcile",
     scope: "session",
   },
+  put_scheduled_chat: {
+    access: "mutation",
+    replay: "exact_replay",
+    scope: "session",
+  },
+  clear_scheduled_chat: {
+    access: "mutation",
+    replay: "exact_replay",
+    scope: "session",
+  },
+  clear_orphaned_scheduled_chat: {
+    access: "mutation",
+    replay: "deterministic_reconcile",
+    scope: "session",
+  },
+  scheduled_chat_inventory: { access: "read", replay: "fresh_retry" },
+  scheduled_run_page: { access: "read", replay: "fresh_retry" },
+  ack_scheduled_run: {
+    access: "mutation",
+    replay: "exact_replay",
+    scope: "session",
+  },
   begin_snapshot: {
     access: "mutation",
     replay: "deterministic_reconcile",
@@ -631,6 +653,26 @@ export class SessionSyncOperationJournal {
       WHERE operation_id = ?1 AND state != 'terminal'
     `).run(operationId, responseDigest, outcomeJson, now);
     return this.get(operationId) as SessionSyncOperationJournalEntry;
+  }
+
+  /**
+   * Commits a terminal remote result and its same-database local postimage as
+   * one SQLite unit. This is required for encrypted schedule writes: a crash
+   * may leave the exact cloud request replayable, but it must never leave a
+   * terminal journal row without the corresponding local pane state.
+   */
+  settleAtomically<Value>(
+    input: Parameters<SessionSyncOperationJournal["settle"]>[0],
+    applyLocalPostimage: () => Value,
+  ): Readonly<{
+    entry: SessionSyncOperationJournalEntry;
+    value: Value;
+  }> {
+    return this.#database.transaction(() => {
+      const entry = this.settle(input);
+      const value = applyLocalPostimage();
+      return { entry, value };
+    })();
   }
 
   /**

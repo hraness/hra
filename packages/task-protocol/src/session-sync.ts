@@ -456,6 +456,9 @@ export const syncRouteValues = [
   "sync.directory.changes",
   "sync.session.publish",
   "sync.session.delete",
+  "sync.schedule.write",
+  "sync.schedule.read",
+  "sync.schedule.ack",
   "sync.vault.delete",
 ] as const;
 export const syncRouteSchema = z.enum(syncRouteValues);

@@ -27,6 +27,8 @@ export function reduceRuntimeProjectionEvent(
       return { ...snapshot, runtime: structuredClone(event.runtime) };
     case "runner.changed":
       return { ...snapshot, runner: structuredClone(event.runner) };
+    case "execution.changed":
+      return { ...snapshot, execution: structuredClone(event.execution) };
     case "account.upserted":
       return {
         ...snapshot,

@@ -69,6 +69,7 @@ function chatPane(
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,
@@ -104,6 +105,13 @@ function snapshot(overrides: Partial<RuntimeSnapshot> = {}): RuntimeSnapshot {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
     harness: null,
     ...overrides,
@@ -387,6 +395,12 @@ describe("portable runtime projection", () => {
         attention: null,
         recoverablePrompt: false,
         canStartFreshContext: false,
+        schedule: {
+          revision: 1,
+          rrule: "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+          timeZone: "America/Puerto_Rico",
+          nextRunAt: "2026-08-20T13:00:00.000Z",
+        },
       },
     });
 
@@ -399,6 +413,7 @@ describe("portable runtime projection", () => {
         responseMarkdown: { tail: longResponse },
         tools: [{ status: "completed" }],
       },
+      schedule: { revision: 1, nextRunAt: "2026-08-20T13:00:00.000Z" },
     });
     expect(updated.chat.panes[0]!.turn!.responseMarkdown)
       .toEqual(first.turn.responseMarkdown);
@@ -429,6 +444,7 @@ describe("portable runtime projection", () => {
         attention: null,
         recoverablePrompt: false,
         canStartFreshContext: false,
+        schedule: first.schedule,
       },
     })).toThrow("cannot replace its latest turn");
   });
@@ -492,6 +508,7 @@ describe("portable runtime projection", () => {
         attention: null,
         recoverablePrompt: false,
         canStartFreshContext: false,
+        schedule: first.schedule,
       },
     });
     expect(stateChanged.chat.panes[0]?.harness).toEqual(decoration);

@@ -76,6 +76,78 @@ function success(workspaces: WorkspaceSummary[]) {
 }
 
 describe("cloud workspace summary cache", () => {
+  test("closed admission joins a detached refresh and rejects later refreshes", async () => {
+    const scope = SCOPE_A;
+    let refreshEntered = (): void => undefined;
+    const entered = new Promise<void>((resolve) => {
+      refreshEntered = resolve;
+    });
+    let releaseRefresh = (): void => undefined;
+    const released = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    let calls = 0;
+    const client = {
+      listWorkspaces: async () => {
+        calls += 1;
+        refreshEntered();
+        await released;
+        return success([workspace("joined", "Joined cloud", 1)]);
+      },
+    };
+    const cache = new CloudWorkspaceSummaryCache({
+      onInvalidated: () => undefined,
+    });
+    cache.replaceScope(scope);
+    const refresh = cache.refresh(scope, client);
+    await entered;
+    cache.closeAdmission();
+    const settlement = cache.settled();
+    expect(await Promise.race([
+      settlement.then(() => "settled" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 5)),
+    ])).toBe("blocked");
+
+    releaseRefresh();
+    await Promise.all([refresh, settlement]);
+    expect(calls).toBe(1);
+    await cache.refresh(scope, client);
+    expect(calls).toBe(1);
+  });
+
+  test("settlement joins every refresh admitted across scope replacement", async () => {
+    const first = deferred<ReturnType<typeof success>>();
+    const second = deferred<ReturnType<typeof success>>();
+    const cache = new CloudWorkspaceSummaryCache({
+      onInvalidated: () => undefined,
+    });
+    cache.replaceScope(SCOPE_A);
+    const firstRefresh = cache.refresh(SCOPE_A, {
+      listWorkspaces: () => first.promise,
+    });
+    cache.replaceScope(SCOPE_B);
+    const secondRefresh = cache.refresh(SCOPE_B, {
+      listWorkspaces: () => second.promise,
+    });
+
+    cache.closeAdmission();
+    const settlement = cache.settled();
+    first.resolve(success([workspace("first", "First scope", 1)]));
+    await firstRefresh;
+    expect(await Promise.race([
+      settlement.then(() => "settled" as const),
+      new Promise<"blocked">((resolve) =>
+        setTimeout(() => resolve("blocked"), 5)
+      ),
+    ])).toBe("blocked");
+
+    second.resolve(success([workspace("second", "Second scope", 2)]));
+    await Promise.all([secondRefresh, settlement]);
+    expect(cache.summaries(SCOPE_B).map(({ name }) => name)).toEqual([
+      "Second scope",
+    ]);
+  });
+
   test("a delayed cloud refresh leaves cached and local composition synchronous", async () => {
     const pending = deferred<ReturnType<typeof success>>();
     const cache = new CloudWorkspaceSummaryCache({

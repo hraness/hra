@@ -1,6 +1,7 @@
 import { mock } from "bun:test";
-import { realpathSync } from "node:fs";
+import { mkdirSync, realpathSync } from "node:fs";
 import * as nodeOs from "node:os";
+import { join } from "node:path";
 
 const configuredEffectiveHome =
   process.env.HRA_GATEWAY_TEST_EFFECTIVE_HOME;
@@ -8,6 +9,7 @@ if (configuredEffectiveHome === undefined) {
   throw new Error("Gateway test effective-user home is required.");
 }
 const effectiveHome = realpathSync(configuredEffectiveHome);
+mkdirSync(join(effectiveHome, "Documents"), { recursive: true });
 const originalUserInfo = nodeOs.userInfo;
 
 await mock.module("node:os", () => ({

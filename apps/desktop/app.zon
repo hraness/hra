@@ -23,6 +23,10 @@
                 .origins = .{"zero://app"},
             },
             .{
+                .name = "hra.folderAccess.select",
+                .origins = .{"zero://app"},
+            },
+            .{
                 .name = "hra.runtime.retryTransport",
                 .origins = .{"zero://app"},
             },

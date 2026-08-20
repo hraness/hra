@@ -185,6 +185,7 @@ type ScenarioAction =
   | "prepare-draft"
   | "create-pane"
   | "exercise-malleable-chat"
+  | "exercise-scheduled-chat"
   | "exercise-compact-controls"
   | "exercise-local-under-sync-fault"
   | "exercise-session-sync-recovery-disable"
@@ -259,6 +260,29 @@ const scenarios = [
       "The signed artifact is being verified",
     ],
     forbiddenText: ["Allow once", "Approve", "Queue", "Steer"],
+    viewport: { width: 1_120, height: 780 },
+  },
+  {
+    id: "chat-scheduled",
+    action: "exercise-scheduled-chat",
+    expectedBeforeAction: [
+      "Scheduled release audit",
+      "Scheduled · due now",
+      "Shared folder · Documents",
+    ],
+    expectedText: [
+      "Scheduled release audit",
+      "Scheduled · due now",
+      "Direct could not interpret that schedule.",
+      "Shared folder · Documents",
+    ],
+    expectedVisibleControls: [
+      "Shared folder access: Documents. Choose folder",
+      "Turn off scheduling",
+      "Update schedule for Scheduled release audit",
+      "More actions for Scheduled release audit",
+    ],
+    forbiddenText: ["FREQ=DAILY", "Attach images", "Queue", "Steer"],
     viewport: { width: 1_120, height: 780 },
   },
   {
@@ -1234,6 +1258,29 @@ async function runAction(
           && Math.abs(Number.parseFloat(getComputedStyle(document.documentElement).fontSize) - 32) <= 0.1`,
       ]);
       return;
+    case "exercise-scheduled-chat": {
+      await clickButton(browser, "Shared folder access: Documents. Choose folder");
+      await waitForStableProbe(browser);
+      await clickButton(browser, "Turn off scheduling");
+      await browser.run([
+        "wait",
+        "--fn",
+        "document.querySelector('.chat-pane[data-pane-scheduled=true]') === null",
+      ]);
+      await clickButton(browser, "Schedule this chat");
+      await browser.run(["fill", "textarea", "Every day at 9, summarize open pull requests"]);
+      await browser.run(["press", "Enter"]);
+      await browser.run([
+        "wait",
+        "--fn",
+        "document.querySelector('.chat-pane[data-pane-scheduled=true]') !== null && document.querySelector('textarea')?.value === ''",
+      ]);
+      await browser.run(["fill", "textarea", "invalid schedule"]);
+      await browser.run(["press", "Enter"]);
+      await waitForVisibleText(browser, "Direct could not interpret that schedule.");
+      await waitForStableProbe(browser);
+      return;
+    }
     case "send-follow-up":
       await browser.run(["fill", "textarea", "Follow up after release"]);
       await browser.run(["press", "Enter"]);
@@ -1779,6 +1826,7 @@ async function verifyResponsiveLayout(
 }
 
 const scenarioUiStateSchema = z.object({
+  attachmentActionCount: z.number().int().nonnegative(),
   attachmentBlobPreviewCount: z.number().int().nonnegative(),
   attachmentPreviewCount: z.number().int().nonnegative(),
   autoContainedPanes: z.number().int().nonnegative(),
@@ -1835,6 +1883,11 @@ const scenarioUiStateSchema = z.object({
   remoteTooltipCount: z.number().int().nonnegative(),
   remoteTriggerCount: z.number().int().nonnegative(),
   routingChromeCount: z.number().int().nonnegative(),
+  scheduleStatusCount: z.number().int().nonnegative(),
+  scheduleStatusTexts: z.array(z.string()),
+  scheduleToggleCount: z.number().int().nonnegative(),
+  scheduledPaneCount: z.number().int().nonnegative(),
+  selectedScheduleToggleCount: z.number().int().nonnegative(),
   semanticBorderCount: z.number().int().nonnegative(),
   settingsCount: z.number().int().nonnegative(),
   subagentControlCount: z.number().int().nonnegative(),
@@ -1905,6 +1958,7 @@ async function verifyScenarioSemantics(
         return control.textContent?.trim() || '';
       };
       return {
+        attachmentActionCount: document.querySelectorAll('.pane-attach').length,
         attachmentBlobPreviewCount: [...document.querySelectorAll('.pane-attachments img')]
           .filter((image) => image.getAttribute('src')?.startsWith('blob:')).length,
         attachmentPreviewCount: document.querySelectorAll('.pane-attachments img').length,
@@ -2018,9 +2072,19 @@ async function verifyScenarioSemantics(
         remoteTooltipCount: document.querySelectorAll('.remote-session-pane__device-tooltip[role=tooltip]').length,
         remoteTriggerCount: document.querySelectorAll('button.remote-session-pane__device-trigger[aria-expanded]').length,
         routingChromeCount: document.querySelectorAll('.pane-route, .pane-route-description').length,
+        scheduleStatusCount: document.querySelectorAll('.pane-schedule-status').length,
+        scheduleStatusTexts: [...document.querySelectorAll('.pane-schedule-status')]
+          .map((status) => status.textContent?.trim() || ''),
+        scheduleToggleCount: document.querySelectorAll('.pane-schedule-toggle').length,
+        scheduledPaneCount: document.querySelectorAll('.chat-pane[data-pane-scheduled=true]').length,
+        selectedScheduleToggleCount: document.querySelectorAll(
+          '.pane-schedule-toggle[aria-pressed=true]',
+        ).length,
         semanticBorderCount: panes.filter((pane) => {
           const activity = pane.getAttribute('data-pane-activity');
-          const expected = activityColors[activity];
+          const expected = pane.getAttribute('data-pane-error') === 'true'
+            ? resolvedToken('--danger')
+            : activityColors[activity];
           return expected !== undefined && getComputedStyle(pane).borderColor === expected;
         }).length,
         settingsCount: document.querySelectorAll('.settings-page').length,
@@ -2121,6 +2185,24 @@ async function verifyScenarioSemantics(
       if (state.thinkingActivityLabels[0] !== "Thinking") failures.push("streaming reasoning is not named semantically");
       if (!state.markdownHeadings.includes("In progress")) failures.push("streaming Markdown heading is not semantic");
       if (state.paneActivities[0] !== "toolStarted") failures.push("tool activity border is not current");
+      break;
+    case "chat-scheduled":
+      if (state.paneCount !== 1 || state.paneStates[0] !== "ready") {
+        failures.push("scheduled journey is not one ready pane");
+      }
+      if (
+        state.scheduledPaneCount !== 1 ||
+        state.scheduleStatusCount !== 1 ||
+        state.scheduleStatusTexts[0] !== "Scheduled · due now" ||
+        state.scheduleToggleCount !== 1 ||
+        state.selectedScheduleToggleCount !== 1
+      ) failures.push("scheduled chat state is not durably selected with one concise next run");
+      if (state.attachmentActionCount !== 0) {
+        failures.push("schedule mode exposed the attachment path");
+      }
+      if (state.queueMessageCount !== 0 || state.composerValues[0] !== "invalid schedule") {
+        failures.push("schedule interpretation failure changed the editable draft or message queue");
+      }
       break;
     case "chat-compact-malleable": {
       const expectedSubagents = [

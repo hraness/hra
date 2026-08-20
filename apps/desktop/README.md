@@ -34,6 +34,18 @@ flowchart LR
 
 The gateway also contains the recursive-session v2 graph described in [`HARNESS.md`](HARNESS.md). It adds a closed lexical RLM program, encrypted completed-prefix and current-input context, persistent recursive actors, durable receipts, and bounded recovery while keeping Codex as the only model and transcript runtime.
 
+## Scheduled chats
+
+The clock control in a chat composer switches that chat into scheduling mode. Submit a natural-language instruction such as “Summarize today’s work every weekday at 5 PM.” HRA interprets it into a bounded prompt and a canonical RRULE. An instruction that cannot be interpreted leaves the draft and any existing schedule unchanged. Submit another instruction to replace the schedule, or turn the clock control off to remove it and return to an ordinary chat.
+
+The pane header shows the next run as a concise relative time. HRA owns scheduling and sends each due occurrence through the chat’s normal durable message queue. It does not use a Codex app-server scheduled-task feature. Schedule definitions are encrypted before cloud sync; the relay stores the recurrence metadata it needs to wake the origin device but never receives the plaintext execution prompt. The origin HRA device executes occurrences while it is online, and missed intervals do not produce an unbounded catch-up burst.
+
+## Shared execution access
+
+The header contains one shared-folder control for every chat. It defaults to the user’s Documents directory. The selected folder is admitted as an additional runtime workspace root for every Codex turn, while each pane’s managed Git worktree remains its working directory and repository identity. The renderer receives only the folder’s display name, never its full path.
+
+HRA applies one immutable execution policy: `danger-full-access`, approval policy `never`, and automatic approval review. Computer use is required and verified for each provider thread. It depends on the official signed Computer Use helper installed with the supported OpenAI application and the required macOS permissions. HRA does not copy or redistribute that helper, and it refuses the provider thread when the capability cannot be proven.
+
 ## Local state and account isolation
 
 The current application-state root is:
@@ -128,6 +140,8 @@ Backup and restore passphrases are accepted only through standard input. Backup 
 The plaintext outer manifest exposes the backup timestamp, source release and migration, checkpoint proof, aggregate attachment count and bytes, payload length, KDF and cipher parameters, database, schema, vault, and portable-projection digests, the receipt-binding HMAC, and portable-projection counts. Those stable values can correlate archives. Attachment, pane, account, thread, and binding IDs; paths and filenames; transcript text; the attachment inventory; and per-blob hashes remain encrypted.
 
 Backups authenticate the checkpointed SQLite snapshot, its bound receipt key, and a complete manifest plus byte-for-byte generation of the private attachment vault. The archive streams encrypted chunks so a valid full-size vault does not require a second in-memory copy. Backup and verification output report the conservative peak-resident estimate and maximum simultaneously buffered plaintext, while inspection and verification report the bounded attachment count and byte total. Account provider homes and rollout state are excluded, so restored attachment-bearing panes cannot resume their former provider context; they require an explicit fresh-context send, never a text-only retry of the old attachment turn. Backups also exclude Keychain items, managed worktrees, user repositories, and cloud session-sync ciphertext.
+
+Turn off every scheduled chat before creating or restoring a portable backup. A schedule is bound to cloud and origin-device authority that the archive intentionally does not carry. Backup creation refuses active or pending schedule authority, and restore refuses to overwrite an installation that currently owns it. Cleared generation fences and terminal run history remain portable.
 
 ## OPRTE installation handoff
 

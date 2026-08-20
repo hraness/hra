@@ -20,6 +20,8 @@ import {
   queuedMessageEditKeyAction,
   queuedMessageEditSettlement,
   QueuedMessageStack,
+  ScheduledChatStatus,
+  ScheduleModeToggle,
   safeAttachmentPreviewUrl,
   TurnElapsed,
   visibleSubagents,
@@ -86,6 +88,30 @@ test("turn durations use the compact hours, minutes, seconds grammar", () => {
   expect(html).toContain('dateTime="PT7305S"');
   expect(html).toContain('aria-label="Last turn duration 2h 1m 45s"');
   expect(html).not.toContain("aria-live");
+});
+
+test("scheduled chat chrome names the next run without exposing RRULE internals", () => {
+  const schedule = {
+    revision: 1,
+    rrule: "DTSTART;TZID=America/Puerto_Rico:20260819T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+    timeZone: "America/Puerto_Rico",
+    nextRunAt: "2026-08-19T13:00:00.000Z",
+  } as const;
+  const status = renderToStaticMarkup(createElement(ScheduledChatStatus, {
+    nowUnixMilliseconds: Date.parse("2026-08-19T12:00:00.000Z"),
+    schedule,
+  }));
+  expect(status).toContain("Scheduled · in 1h");
+  expect(status).toContain('dateTime="2026-08-19T13:00:00.000Z"');
+  expect(status).not.toContain("FREQ=DAILY");
+
+  const toggle = renderToStaticMarkup(createElement(ScheduleModeToggle, {
+    disabled: false,
+    onChange: () => undefined,
+    selected: true,
+  }));
+  expect(toggle).toContain('aria-label="Turn off scheduling"');
+  expect(toggle).toContain('aria-pressed="true"');
 });
 
 test("the shared coarse clock sleeps while hidden and restarts for visible subscribers", () => {

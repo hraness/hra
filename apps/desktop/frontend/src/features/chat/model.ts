@@ -7,6 +7,8 @@ import {
   type ChatPaneProjection,
   type ChatPaneActivityKind,
   type ChatPaneState,
+  type ChatScheduleProjection,
+  type ExecutionProjection,
   type HarnessSnapshot,
   type HumanAccountSnapshot,
   type LocalSessionGridSlotProjection,
@@ -109,6 +111,32 @@ export function validatedPrompt(value: string):
     return { ok: false, message: "The message is too large to send." };
   }
   return { ok: true, prompt: value };
+}
+
+export type ComposerMode = "chat" | "schedule";
+
+export function composerMode(
+  schedule: ChatScheduleProjection | null,
+  scheduleDraftMode: boolean,
+): ComposerMode {
+  return schedule !== null || scheduleDraftMode ? "schedule" : "chat";
+}
+
+export function formatNextRunRelative(
+  nextRunAt: string,
+  nowUnixMilliseconds: number,
+): string {
+  const next = Date.parse(nextRunAt);
+  if (!Number.isFinite(next) || !Number.isFinite(nowUnixMilliseconds)) return "time unavailable";
+  const remainingMilliseconds = next - nowUnixMilliseconds;
+  if (remainingMilliseconds <= 0) return "due now";
+  const seconds = Math.max(1, Math.ceil(remainingMilliseconds / 1_000));
+  if (seconds < 60) return `in ${seconds}s`;
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) return `in ${minutes}m`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `in ${hours}h`;
+  return `in ${Math.ceil(hours / 24)}d`;
 }
 
 export type ComposerEnterAction = "ignore" | "newline" | "submit";
@@ -778,6 +806,38 @@ export function runtimeAvailabilityEqual(
   );
 }
 
+const unavailableExecution: ExecutionProjection = {
+  folderAccess: {
+    revision: 1,
+    displayName: "Documents",
+    availability: "missing",
+  },
+  approvalPolicy: "never",
+  approvalsReviewer: "auto_review",
+  sandbox: "danger-full-access",
+  computerUse: "required",
+};
+
+export function selectExecution(state: RuntimeShellState): ExecutionProjection {
+  if (state.state === "connecting") return unavailableExecution;
+  return state.snapshot?.execution ?? unavailableExecution;
+}
+
+export function executionEqual(
+  left: ExecutionProjection,
+  right: ExecutionProjection,
+): boolean {
+  return left === right || (
+    left.folderAccess.revision === right.folderAccess.revision &&
+    left.folderAccess.displayName === right.folderAccess.displayName &&
+    left.folderAccess.availability === right.folderAccess.availability &&
+    left.approvalPolicy === right.approvalPolicy &&
+    left.approvalsReviewer === right.approvalsReviewer &&
+    left.sandbox === right.sandbox &&
+    left.computerUse === right.computerUse
+  );
+}
+
 export function createPaneCommand(input: Readonly<{
   paneId: ChatPaneProjection["id"];
   repositoryId: ChatPaneProjection["repository"]["id"];
@@ -808,6 +868,27 @@ export function renamePaneCommand(input: Readonly<{
   title: string;
 }>): Extract<RuntimeChatDomainCommand, { readonly type: "chat.pane.rename" }> {
   return { type: "chat.pane.rename", ...input };
+}
+
+export function configurePaneScheduleCommand(input: Readonly<{
+  paneId: ChatPaneProjection["id"];
+  expectedRevision: number;
+  instruction: string;
+}>): Extract<
+  RuntimeChatDomainCommand,
+  { readonly type: "chat.pane.schedule.configure" }
+> {
+  return { type: "chat.pane.schedule.configure", ...input };
+}
+
+export function removePaneScheduleCommand(input: Readonly<{
+  paneId: ChatPaneProjection["id"];
+  expectedRevision: number;
+}>): Extract<
+  RuntimeChatDomainCommand,
+  { readonly type: "chat.pane.schedule.remove" }
+> {
+  return { type: "chat.pane.schedule.remove", ...input };
 }
 
 export function recoverPaneWorkspaceCommand(input: Readonly<{

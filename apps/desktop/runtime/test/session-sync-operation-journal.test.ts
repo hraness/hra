@@ -53,19 +53,25 @@ function digest(character: string) {
 describe("session sync shared operation journal", () => {
   test("classifies every current wire and human operation with explicit crash semantics", () => {
     expect(Object.keys(sessionSyncWireOperationPolicies).toSorted()).toEqual([
+      "ack_scheduled_run",
       "acquire_writer",
       "admit_membership_proposal",
       "approve_enrollment",
       "begin_snapshot",
       "change_page",
+      "clear_orphaned_scheduled_chat",
+      "clear_scheduled_chat",
       "delete_session",
       "establish_boot",
       "heartbeat",
       "list_enrollment_requests",
       "publish_session",
+      "put_scheduled_chat",
       "read_membership",
       "reserve_session",
       "root_key_link_page",
+      "scheduled_chat_inventory",
+      "scheduled_run_page",
       "snapshot_page",
       "update_membership",
     ]);
@@ -79,6 +85,31 @@ describe("session sync shared operation journal", () => {
     ]);
     expect(sessionSyncWireOperationPolicies.publish_session.replay)
       .toBe("exact_replay");
+    expect(sessionSyncWireOperationPolicies.put_scheduled_chat).toEqual({
+      access: "mutation",
+      replay: "exact_replay",
+      scope: "session",
+    });
+    expect(sessionSyncWireOperationPolicies.clear_scheduled_chat).toEqual({
+      access: "mutation",
+      replay: "exact_replay",
+      scope: "session",
+    });
+    expect(sessionSyncWireOperationPolicies.ack_scheduled_run).toEqual({
+      access: "mutation",
+      replay: "exact_replay",
+      scope: "session",
+    });
+    expect(sessionSyncWireOperationPolicies.clear_orphaned_scheduled_chat)
+      .toEqual({
+        access: "mutation",
+        replay: "deterministic_reconcile",
+        scope: "session",
+      });
+    expect(sessionSyncWireOperationPolicies.scheduled_chat_inventory)
+      .toEqual({ access: "read", replay: "fresh_retry" });
+    expect(sessionSyncWireOperationPolicies.scheduled_run_page)
+      .toEqual({ access: "read", replay: "fresh_retry" });
     expect(sessionSyncWireOperationPolicies.reserve_session.replay)
       .toBe("deterministic_reconcile");
     expect(sessionSyncWireOperationPolicies.snapshot_page.access).toBe("read");

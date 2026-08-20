@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +19,9 @@ import {
   SessionService,
   type SessionAccountRuntimePort,
 } from "../src/sessions/session-service";
+import { applyMigrations } from "../src/state/database";
+import { ChatExecutionSettingsStore } from
+  "../src/state/chat-execution-settings";
 
 interface CapturedRequest<Key extends PinnedCodexRequestKey = PinnedCodexRequestKey> {
   readonly accountProfileId: string;
@@ -74,6 +78,10 @@ function positionedAccountPort(
             approvalPolicy: "never",
             approvalsReviewer: "auto_review",
             sandbox: { type: "dangerFullAccess" },
+            runtimeWorkspaceRoots: (
+              input as PinnedCodexRequestInput<"threadStart"> |
+                PinnedCodexRequestInput<"threadResume">
+            ).runtimeWorkspaceRoots,
             ...(fixture.output as Record<string, unknown>),
           }
         : fixture.output;
@@ -207,6 +215,7 @@ test("harness actor mutations install exact private routing and positioned ident
         allowProviderModelFallback: false,
         serviceTier: null,
         cwd: workspacePath,
+        runtimeWorkspaceRoots: [workspacePath],
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandbox: "danger-full-access",
@@ -382,14 +391,14 @@ test("harness actor mutations install exact private routing and positioned ident
     }]) {
       expect(service.readHarnessActorChatEventAttachment(mismatch)).toBeNull();
     }
-    expect(requests).toHaveLength(4);
+    expect(requests).toHaveLength(5);
     expect(requests[2]).toEqual({
       accountProfileId,
       expectedGeneration: 7,
       key: "configRequirementsRead",
       input: undefined,
     });
-    expect(requests[3]).toEqual({
+    expect(requests[4]).toEqual({
       accountProfileId,
       expectedGeneration: 7,
       key: "turnStart",
@@ -398,6 +407,7 @@ test("harness actor mutations install exact private routing and positioned ident
         clientUserMessageId: "message_harness0001",
         input: [{ type: "text", text: prompt, text_elements: [] }],
         cwd: workspacePath,
+        runtimeWorkspaceRoots: [workspacePath],
         approvalPolicy: "never",
         approvalsReviewer: "auto_review",
         sandboxPolicy: { type: "dangerFullAccess" },
@@ -409,6 +419,7 @@ test("harness actor mutations install exact private routing and positioned ident
     expect(requests.map(({ key }) => key)).toEqual([
       "configRequirementsRead",
       "threadStart",
+      "configRequirementsRead",
       "configRequirementsRead",
       "turnStart",
     ]);
@@ -761,6 +772,7 @@ test("harness actor turn response generation drift never becomes routable", asyn
   const threadSource = "oprte:actor:hactor_000000005:incarnation_0001";
   const requests: CapturedRequest[] = [];
   const events: GatewaySessionEvent[] = [];
+  let workspaceLeaseReleases = 0;
   const rawThread = actorThread(workspacePath, threadSource, {
     id: "provider-actor-thread-0005",
   });
@@ -768,8 +780,51 @@ test("harness actor turn response generation drift never becomes routable", asyn
   const service = new SessionService({
     accounts: positionedAccountPort(requests, ({ key }) => key === "threadStart"
       ? { generation: 4, output: { thread: rawThread }, streamPosition: 50 }
-      : { generation: 5, output: { turn: rawTurn }, streamPosition: 51 }),
+      : key === "mcpServerStatusList"
+      ? {
+          generation: 4,
+          streamPosition: 51,
+          output: {
+            data: [{
+              name: "node_repl",
+              serverInfo: null,
+              tools: {
+                js: {
+                  name: "js",
+                  description: "Trusted JavaScript execution.",
+                  inputSchema: { type: "object" },
+                },
+              },
+              resources: [],
+              resourceTemplates: [],
+              authStatus: "unsupported",
+            }],
+            nextCursor: null,
+          },
+        }
+      : { generation: 5, output: { turn: rawTurn }, streamPosition: 52 }),
     emit: (event) => events.push(event),
+    execution: {
+      computerUse: {
+        serverName: "node_repl",
+        requiredToolName: "js",
+        threadConfig: { "mcp_servers.node_repl": { command: "/signed/node_repl" } },
+        developerInstructions:
+          "Use node_repl + @oai/sky through the signed service.",
+      },
+      runtimeWorkspaceRoots: () => [workspacePath],
+      runtimeWorkspaceSnapshot: () => ({
+        revision: 1,
+        runtimeWorkspaceRoots: [workspacePath],
+      }),
+      acquireRuntimeWorkspaceAdmission: () => Promise.resolve({
+        revision: 1,
+        runtimeWorkspaceRoots: [workspacePath],
+        release: () => {
+          workspaceLeaseReleases += 1;
+        },
+      }),
+    },
   });
 
   try {
@@ -804,9 +859,12 @@ test("harness actor turn response generation drift never becomes routable", asyn
     expect(requests.map(({ key }) => key)).toEqual([
       "configRequirementsRead",
       "threadStart",
+      "mcpServerStatusList",
+      "configRequirementsRead",
       "configRequirementsRead",
       "turnStart",
     ]);
+    expect(workspaceLeaseReleases).toBe(0);
     expect(service.resolveHarnessCaller(
       accountProfileId,
       4,
@@ -815,8 +873,282 @@ test("harness actor turn response generation drift never becomes routable", asyn
     )).toBeNull();
     expect(JSON.stringify(events)).not.toContain(prompt);
     expect(JSON.stringify(events)).not.toContain(rawTurn.id);
+    service.handleRuntimeState(accountProfileId, { type: "stopped", generation: 4 });
+    expect(workspaceLeaseReleases).toBe(1);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a lost accepted actor turn holds its root through active reconciliation and terminal", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hra-harness-root-ambiguous-"));
+  const workspacePath = await realpath(directory);
+  const executionHome = await realpath(
+    await mkdtemp(join(tmpdir(), "hra-harness-root-home-")),
+  );
+  const documents = join(executionHome, "Documents");
+  const selectedRoot = join(executionHome, "Selected Root");
+  await mkdir(documents);
+  await mkdir(selectedRoot);
+  const database = new Database(":memory:", { strict: true });
+  applyMigrations(database);
+  const settings = new ChatExecutionSettingsStore({
+    database,
+    homeDirectory: executionHome,
+  });
+  const accountProfileId = "acct_harness_root_ambiguous";
+  const threadSource = "hra:actor:hactor_rootambig01:incarnation_0001";
+  const providerThread = actorThread(workspacePath, threadSource, {
+    id: "provider-actor-root-ambiguous",
+  });
+  const providerTurnId = "provider-actor-root-turn-ambiguous";
+  const requests: CapturedRequest[] = [];
+  const computerUse = {
+    serverName: "node_repl" as const,
+    requiredToolName: "js" as const,
+    threadConfig: { "mcp_servers.node_repl": { command: "/signed/node_repl" } },
+    developerInstructions: "Use node_repl + @oai/sky through the signed service.",
+  };
+  const service = new SessionService({
+    accounts: positionedAccountPort(requests, ({ key }) => {
+      if (key === "threadStart") {
+        return { generation: 7, output: { thread: providerThread }, streamPosition: 41 };
+      }
+      if (key === "mcpServerStatusList") {
+        return {
+          generation: 7,
+          streamPosition: 42,
+          output: {
+            data: [{
+              name: "node_repl",
+              serverInfo: null,
+              tools: {
+                js: {
+                  name: "js",
+                  description: "Trusted JavaScript execution.",
+                  inputSchema: { type: "object" },
+                },
+              },
+              resources: [],
+              resourceTemplates: [],
+              authStatus: "unsupported",
+            }],
+            nextCursor: null,
+          },
+        };
+      }
+      if (key === "turnStart") {
+        throw Object.assign(new Error("actor turn response lost"), {
+          code: "upstream_ambiguous",
+        });
+      }
+      throw new Error(`Unexpected actor root request: ${key}`);
+    }),
+    emit: () => undefined,
+    execution: {
+      computerUse,
+      runtimeWorkspaceRoots: () => settings.requireRuntimeWorkspaceRoots(),
+      runtimeWorkspaceSnapshot: () => settings.requireRuntimeWorkspaceSnapshot(),
+      acquireRuntimeWorkspaceAdmission: () =>
+        settings.acquireRuntimeWorkspaceAdmission(),
+    },
+  });
+  let selection: Promise<unknown> | null = null;
+  service.handleRuntimeState(accountProfileId, { type: "starting", generation: 7 });
+
+  try {
+    await service.startHarnessActorThread({
+      accountProfileId,
+      actorId: "hactor_rootambig01",
+      developerInstructions: "Operate as the exact bounded actor.",
+      expectedGeneration: 7,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+      threadSource,
+      title: "Root-fenced actor",
+      workspaceMode: "managed",
+      workspacePath,
+    });
+    expect(await captureRejection(service.startHarnessActorTurn({
+      actorId: "hactor_rootambig01",
+      clientUserMessageId: "message_actorrootambig1",
+      expectedGeneration: 7,
+      model: "gpt-5.6-sol",
+      prompt: "Run while the response is lost",
+      reasoningEffort: "ultra",
+      serviceTier: "standard",
+      thread: {
+        accountProfileId,
+        kind: "provider",
+        providerThreadId: providerThread.id,
+      },
+    }))).toMatchObject({ code: "upstream_ambiguous" });
+
+    let selectionSettled = false;
+    selection = settings.select(selectedRoot).finally(() => {
+      selectionSettled = true;
+    });
+    await Promise.resolve();
+    expect(selectionSettled).toBe(false);
+    service.settleHarnessActorTurnWorkspaceAdmission({
+      accountProfileId,
+      clientUserMessageId: "message_actorrootambig1",
+      disposition: "active",
+      expectedGeneration: 7,
+      providerThreadId: providerThread.id,
+      providerTurnId,
+    });
+    await Promise.resolve();
+    expect(selectionSettled).toBe(false);
+
+    service.consumeCodexFacts(projectCodexTurnResponseFacts({
+      accountProfileId,
+      generation: 7,
+      origin: "reconciled",
+      streamPosition: 50,
+    }, providerThread.id, actorTurn(providerTurnId, "completed")));
+    expect(await selection).toMatchObject({ revision: 2, folderPath: selectedRoot });
+  } finally {
+    service.handleRuntimeState(accountProfileId, { type: "stopped", generation: 7 });
+    await selection?.catch(() => undefined);
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(executionHome, { recursive: true, force: true });
+  }
+});
+
+test("a higher terminal fact releases a delayed actor turn admission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "hra-harness-terminal-race-"));
+  const workspacePath = await realpath(directory);
+  const executionHome = await realpath(
+    await mkdtemp(join(tmpdir(), "hra-harness-terminal-race-home-")),
+  );
+  const documents = join(executionHome, "Documents");
+  const selectedRoot = join(executionHome, "Selected Root");
+  await mkdir(documents);
+  await mkdir(selectedRoot);
+  const database = new Database(":memory:", { strict: true });
+  applyMigrations(database);
+  const settings = new ChatExecutionSettingsStore({
+    database,
+    homeDirectory: executionHome,
+  });
+  const accountProfileId = "acct_harness_terminal_race";
+  const threadSource = "hra:actor:hactor_terminalrace1:incarnation_0001";
+  const providerThread = actorThread(workspacePath, threadSource, {
+    id: "provider-actor-terminal-race",
+  });
+  const providerTurnId = "provider-actor-terminal-race-turn";
+  const requests: CapturedRequest[] = [];
+  let selection: Promise<unknown> | null = null;
+  let workspaceLeaseReleases = 0;
+  const service = new SessionService({
+    accounts: positionedAccountPort(requests, ({ key }) => {
+      if (key === "threadStart") {
+        return { generation: 7, output: { thread: providerThread }, streamPosition: 41 };
+      }
+      if (key === "mcpServerStatusList") {
+        return {
+          generation: 7,
+          streamPosition: 42,
+          output: {
+            data: [{
+              name: "node_repl",
+              serverInfo: null,
+              tools: {
+                js: {
+                  name: "js",
+                  description: "Trusted JavaScript execution.",
+                  inputSchema: { type: "object" },
+                },
+              },
+              resources: [],
+              resourceTemplates: [],
+              authStatus: "unsupported",
+            }],
+            nextCursor: null,
+          },
+        };
+      }
+      if (key === "turnStart") {
+        selection = settings.select(selectedRoot);
+        service.consumeCodexFacts(projectCodexTurnResponseFacts({
+          accountProfileId,
+          generation: 7,
+          origin: "reconciled",
+          streamPosition: 80,
+        }, providerThread.id, actorTurn(providerTurnId, "completed")));
+        return {
+          generation: 7,
+          output: { turn: actorTurn(providerTurnId) },
+          streamPosition: 50,
+        };
+      }
+      throw new Error(`Unexpected actor terminal-race request: ${key}`);
+    }),
+    emit: () => undefined,
+    execution: {
+      computerUse: {
+        serverName: "node_repl",
+        requiredToolName: "js",
+        threadConfig: { "mcp_servers.node_repl": { command: "/signed/node_repl" } },
+        developerInstructions:
+          "Use node_repl + @oai/sky through the signed service.",
+      },
+      runtimeWorkspaceRoots: () => settings.requireRuntimeWorkspaceRoots(),
+      runtimeWorkspaceSnapshot: () => settings.requireRuntimeWorkspaceSnapshot(),
+      acquireRuntimeWorkspaceAdmission: async () => {
+        const admission = await settings.acquireRuntimeWorkspaceAdmission();
+        return {
+          ...admission,
+          release: () => {
+            workspaceLeaseReleases += 1;
+            admission.release();
+          },
+        };
+      },
+    },
+  });
+  service.handleRuntimeState(accountProfileId, { type: "starting", generation: 7 });
+
+  try {
+    const started = await service.startHarnessActorThread({
+      accountProfileId,
+      actorId: "hactor_terminalrace1",
+      developerInstructions: "Operate as the exact bounded actor.",
+      expectedGeneration: 7,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "ultra",
+      threadSource,
+      title: "Terminal-raced actor",
+      workspaceMode: "managed",
+      workspacePath,
+    });
+    const result = await service.startHarnessActorTurn({
+      actorId: "hactor_terminalrace1",
+      clientUserMessageId: "message_actorterminalrace1",
+      expectedGeneration: 7,
+      model: "gpt-5.6-sol",
+      prompt: "Complete before the response arrives",
+      reasoningEffort: "ultra",
+      serviceTier: "standard",
+      thread: { kind: "gateway", threadId: started.threadId },
+    });
+    expect(result.providerTurnId).toBe(providerTurnId);
+    expect(workspaceLeaseReleases).toBe(1);
+    const pendingSelection = selection as Promise<unknown> | null;
+    if (pendingSelection === null) throw new Error("Folder selection was not requested");
+    const selected = await Promise.race([
+      pendingSelection,
+      Bun.sleep(250).then(() => null),
+    ]);
+    expect(selected).toMatchObject({ revision: 2, folderPath: selectedRoot });
+  } finally {
+    service.handleRuntimeState(accountProfileId, { type: "stopped", generation: 7 });
+    await (selection as Promise<unknown> | null)?.catch(() => undefined);
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+    await rm(executionHome, { recursive: true, force: true });
   }
 });
 
@@ -864,7 +1196,7 @@ test("read-only workspace identity never weakens the immutable execution policy"
       approvalPolicy: "never",
       sandbox: "danger-full-access",
     });
-    expect(requests[3]?.input).toMatchObject({
+    expect(requests[4]?.input).toMatchObject({
       approvalPolicy: "never",
       sandboxPolicy: { type: "dangerFullAccess" },
       effort: "ultra",

@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 
 import {
   runtimeProtocolVersion,
+  runtimeFolderAccessSelectCommand,
   runtimeProjectAddCommand,
   runtimeEventName,
   runtimeTransportHealthCommand,
@@ -76,6 +77,7 @@ const bridgeChatPane: ChatPaneProjection = {
   attention: null,
   recoverablePrompt: false,
   canStartFreshContext: false,
+  schedule: null,
   messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
   attachments: { drafts: [], referenced: [] },
   harness: null,
@@ -124,6 +126,45 @@ describe("runtime bridge", () => {
     expect(harness.invocations).toEqual([
       { command: "hra.runtime.snapshot", payload: { version: runtimeProtocolVersion } },
     ]);
+  });
+
+  test("selects shared folder access through the pathless native boundary", async () => {
+    const harness = transportHarness(() => ({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: {
+        revision: 2,
+        displayName: "Documents",
+        availability: "ready",
+      },
+    }));
+
+    expect(await createRuntimeBridge(harness.transport).selectFolderAccess()).toEqual({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: {
+        revision: 2,
+        displayName: "Documents",
+        availability: "ready",
+      },
+    });
+    expect(harness.invocations).toEqual([{
+      command: runtimeFolderAccessSelectCommand,
+      payload: { version: runtimeProtocolVersion },
+    }]);
+  });
+
+  test("fails closed on malformed shared-folder chooser responses", async () => {
+    const harness = transportHarness(() => ({
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: { path: "/Users/example/Documents" },
+    }));
+    expect(await rejectionOf(createRuntimeBridge(harness.transport).selectFolderAccess()))
+      .toMatchObject({
+        name: "RuntimeBridgeProtocolError",
+        boundary: "folderAccessSelectResponse",
+      });
   });
 
   test("assembles a paged snapshot before exposing it", async () => {

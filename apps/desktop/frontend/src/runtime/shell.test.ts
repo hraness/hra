@@ -63,6 +63,10 @@ class FakeRuntimeBridge implements RuntimeBridge {
     return Promise.resolve({ version: runtimeProtocolVersion, status: "cancelled" } as const);
   }
 
+  selectFolderAccess() {
+    return Promise.resolve({ version: runtimeProtocolVersion, status: "cancelled" } as const);
+  }
+
   retryTransport(): Promise<RuntimeTransportRetryResponse> {
     this.retryCalls.push(this.retryCalls.length + 1);
     return Promise.resolve(this.retryResponse);
@@ -188,6 +192,7 @@ const activeChatPane: ChatPaneProjection = {
   attention: null,
   recoverablePrompt: false,
   canStartFreshContext: false,
+  schedule: null,
   messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
   attachments: { drafts: [], referenced: [] },
   harness: null,
@@ -453,6 +458,7 @@ describe("runtime shell", () => {
           attention: null,
           recoverablePrompt: false,
           canStartFreshContext: false,
+          schedule: longPane.schedule,
         },
       },
     });

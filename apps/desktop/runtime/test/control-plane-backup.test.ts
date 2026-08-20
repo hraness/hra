@@ -634,6 +634,177 @@ describe("encrypted control-plane backup and restore", () => {
     })).toThrow(expect.objectContaining({ code: "invalid_input" }));
   });
 
+  test("refuses to publish a portable backup while a scheduled chat is active", () => {
+    const root = privateTemporaryDirectory("hra-backup-active-schedule-");
+    const source = createControlPlane(root, "source", release100, sourceInstallation);
+    seedPortableScheduledChatState(source.database, "active");
+    const archivePath = join(root, "control-plane.hkb");
+
+    const failure = captureControlPlaneBackupError(() => {
+      createBackup(source, archivePath, release100);
+    });
+    expect(failure.code).toBe("invalid_input");
+    expect(failure.message).toContain("Turn off scheduled chats first");
+    expect(existsSync(archivePath)).toBe(false);
+    expect(existsSync(backupCandidatePath(archivePath))).toBe(false);
+    expect(source.database.query(`
+      SELECT COUNT(*) AS count FROM chat_scheduled_chats
+    `).get()).toEqual({ count: 1 });
+    source.database.close();
+  });
+
+  test("refuses to publish while a scheduled-chat mutation may have reached cloud", () => {
+    for (const state of ["prepared", "effect_started"] as const) {
+      const root = privateTemporaryDirectory(`hra-backup-schedule-${state}-`);
+      const source = createControlPlane(
+        root,
+        "source",
+        release100,
+        sourceInstallation,
+      );
+      seedPortableScheduledChatState(source.database, state);
+      const archivePath = join(root, "control-plane.hkb");
+
+      const failure = captureControlPlaneBackupError(() => {
+        createBackup(source, archivePath, release100);
+      });
+      expect(failure.code).toBe("invalid_input");
+      expect(failure.message).toContain("Turn off scheduled chats first");
+      expect(existsSync(archivePath)).toBe(false);
+      expect(existsSync(backupCandidatePath(archivePath))).toBe(false);
+      expect(source.database.query(`
+        SELECT state FROM chat_scheduled_chat_mutations
+      `).get()).toEqual({ state });
+      source.database.close();
+    }
+  });
+
+  test("allows a cleared scheduled-chat high-water and terminal run in a portable backup", () => {
+    const root = privateTemporaryDirectory("hra-backup-cleared-schedule-");
+    const source = createControlPlane(root, "source", release100, sourceInstallation);
+    seedPortableScheduledChatState(source.database, "cleared");
+    const archivePath = join(root, "control-plane.hkb");
+
+    const backup = createBackup(source, archivePath, release100);
+    expect(verifyEncryptedControlPlaneBackup({
+      archivePath,
+      passphrase,
+      releaseIdentity: release100,
+    })).toMatchObject({ archiveSha256: backup.archiveSha256 });
+    expect(source.database.query(`
+      SELECT generation FROM chat_scheduled_chat_generation_high_water
+    `).get()).toEqual({ generation: "7" });
+    source.database.close();
+  }, 60_000);
+
+  test("verifies and restores a valid v61 portable schedule snapshot", () => {
+    const root = privateTemporaryDirectory("hra-backup-v61-schedule-");
+    const source = createControlPlane(root, "source", release100, sourceInstallation);
+    seedPortableScheduledChatState(source.database, "cleared");
+    downgradeScheduledChatSchemaToV61(source.database);
+    const archivePath = join(root, "control-plane.hkb");
+
+    const backup = createBackup(source, archivePath, release100);
+    source.database.close();
+    expect(backup.manifest.sourceMigrationVersion).toBe(61);
+    expect(verifyEncryptedControlPlaneBackup({
+      archivePath,
+      passphrase,
+      releaseIdentity: release100,
+    })).toMatchObject({
+      archiveSha256: backup.archiveSha256,
+      verifiedMigrationVersion: 61,
+    });
+
+    const target = createControlPlane(root, "target", release100, oldInstallation);
+    checkpointAndClose(target.database);
+    expect(restoreEncryptedControlPlaneBackup({
+      archivePath,
+      databasePath: target.databasePath,
+      passphrase,
+      releaseIdentity: release100,
+      confirmedArchiveSha256: backup.archiveSha256,
+    })).toMatchObject({
+      archiveSha256: backup.archiveSha256,
+      restoredMigrationVersion: 61,
+    });
+    const restored = openControlPlane(target.databasePath, {
+      releaseIdentity: release100,
+      now: () => 2,
+    });
+    try {
+      expect(restored.query(`
+        SELECT MAX(version) AS version FROM schema_migrations
+      `).get()).toEqual({ version: currentControlPlaneMigrationVersion });
+      expect(restored.query(`
+        SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND name = 'chat_scheduled_chat_desired_off'
+      `).get()).toEqual({ name: "chat_scheduled_chat_desired_off" });
+      expect(restored.query(`
+        SELECT generation FROM chat_scheduled_chat_generation_high_water
+      `).get()).toEqual({ generation: "7" });
+    } finally {
+      restored.close();
+    }
+  }, 60_000);
+
+  test("refuses an older restore before mutating a destination with an active scheduled chat", () => {
+    const root = privateTemporaryDirectory("hra-restore-active-schedule-");
+    const source = createControlPlane(root, "source", release100, sourceInstallation);
+    const archivePath = join(root, "older-control-plane.hkb");
+    const backup = createBackup(source, archivePath, release100);
+    source.database.close();
+
+    const target = createControlPlane(root, "target", release100, oldInstallation);
+    seedPortableScheduledChatState(target.database, "active");
+    checkpointAndClose(target.database);
+    const before = snapshotControlPlanePair(target.databasePath);
+    const vaultBefore = inspectControlPlaneAttachmentVault(
+      target.attachmentVaultRoot,
+    );
+
+    const failure = captureControlPlaneBackupError(() => {
+      restoreEncryptedControlPlaneBackup({
+        archivePath,
+        databasePath: target.databasePath,
+        passphrase,
+        releaseIdentity: release100,
+        confirmedArchiveSha256: backup.archiveSha256,
+      });
+    });
+    expect(failure.code).toBe("invalid_input");
+    expect(failure.message).toContain("Turn off scheduled chats first");
+    expect(snapshotControlPlanePair(target.databasePath)).toEqual(before);
+    expect(inspectControlPlaneAttachmentVault(target.attachmentVaultRoot))
+      .toEqual(vaultBefore);
+    for (const restoreArtifact of [
+      ".control-plane-restore-v2.json",
+      ".control-plane-restore-v2.json.tmp",
+      ".control-plane-restore-v2.stage.sqlite",
+      ".control-plane-restore-v2.rollback.sqlite",
+      ".control-plane-restore-v2.stage.hmac.key",
+      ".control-plane-restore-v2.rollback.hmac.key",
+      ".control-plane-restore-v2.stage.attachments",
+      ".control-plane-restore-v2.rollback.attachments",
+    ]) {
+      expect(existsSync(join(target.parent, restoreArtifact))).toBe(false);
+    }
+    const restored = new Database(target.databasePath, {
+      readonly: true,
+      strict: true,
+    });
+    try {
+      expect(restored.query(`
+        SELECT COUNT(*) AS count FROM chat_scheduled_chats
+      `).get()).toEqual({ count: 1 });
+      expect(restored.query(`
+        SELECT installation_id FROM local_installations
+      `).all()).toEqual([{ installation_id: oldInstallation }]);
+    } finally {
+      restored.close();
+    }
+  }, 60_000);
+
   test("round-trips SQLite control-plane state and its non-credential receipt key", () => {
     const root = privateTemporaryDirectory("oprte-backup-roundtrip-");
     const source = createControlPlane(root, "source", release100, sourceInstallation);
@@ -3248,6 +3419,153 @@ function createControlPlane(
   return { parent, databasePath, attachmentVaultRoot, database, receiptKey };
 }
 
+function seedPortableScheduledChatState(
+  database: Database,
+  state: "active" | "cleared" | "prepared" | "effect_started",
+): void {
+  const scheduleNow = Date.parse("2026-08-19T12:00:00.000Z");
+  const accountId = "acct_backup_schedule_0001";
+  const paneId = "pane_backup_schedule_0001";
+  const sessionId = `syncsession_${"s".repeat(32)}`;
+  database.query(`
+    INSERT INTO account_profiles(
+      profile_id, label, auth_state, process_generation,
+      selected, created_at, updated_at
+    ) VALUES (?1, 'Backup schedule', 'signed_in', 1, 1, ?2, ?2)
+  `).run(accountId, new Date(scheduleNow).toISOString());
+  database.query(`
+    INSERT INTO chat_panes(
+      pane_id, palette_index, display_order,
+      repository_id, repository_name, revision, title,
+      account_profile_id, model, reasoning_effort, service_tier,
+      interaction_mode, state,
+      workspace_mode, workspace_state, workspace_revision,
+      workspace_recovery_reason, created_at, updated_at
+    ) VALUES (
+      ?1, 0, 0,
+      ?2, 'Backup schedule fixture', 1, 'Backup schedule fixture',
+      ?3, 'gpt-5.6-sol', 'max', 'standard',
+      'chat', 'ready',
+      'managed_worktree', 'preparing', 1,
+      NULL, ?4, ?4
+    )
+  `).run(
+    paneId,
+    `repo_${"7".repeat(26)}`,
+    accountId,
+    new Date(scheduleNow).toISOString(),
+  );
+  database.query(`
+    INSERT INTO session_sync_grid_positions(
+      session_id, grid_position, origin, discovered_at
+    ) VALUES (?1, 0, 'local', ?2)
+  `).run(sessionId, scheduleNow);
+  database.query(`
+    INSERT INTO session_sync_pane_bindings(
+      pane_id, session_id, tenant_id, organization_id, owner_user_id,
+      vault_id, vault_generation, origin_device_id, included,
+      binding_state, creation_grant_digest, reserved_at, created_at
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5,
+      ?6, '1', ?7, 1,
+      'accepted', ?8, ?9, ?9
+    )
+  `).run(
+    paneId,
+    sessionId,
+    `synctenant_${"t".repeat(32)}`,
+    `syncorg_${"o".repeat(32)}`,
+    `syncuser_${"u".repeat(32)}`,
+    `syncvault_${"v".repeat(32)}`,
+    `syncdevice_${"d".repeat(32)}`,
+    `sha256_${"e".repeat(64)}`,
+    scheduleNow,
+  );
+  const rrule = "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1";
+  if (state === "active") {
+    database.query(`
+      INSERT INTO chat_scheduled_chats(
+        pane_id, session_id, revision, generation, key_epoch,
+        rrule, time_zone, next_run_at, definition_ciphertext_digest,
+        created_at, updated_at
+      ) VALUES (
+        ?1, ?2, 1, '1', '1',
+        ?3, 'America/Puerto_Rico', ?4, ?5,
+        ?6, ?6
+      )
+    `).run(
+      paneId,
+      sessionId,
+      rrule,
+      scheduleNow + 60_000,
+      `sha256_${"f".repeat(64)}`,
+      scheduleNow,
+    );
+    return;
+  }
+  if (state === "prepared" || state === "effect_started") {
+    database.query(`
+      INSERT INTO chat_scheduled_chat_mutations(
+        operation_id, pane_id, session_id, kind, state,
+        expected_pane_revision, expected_schedule_revision,
+        target_schedule_revision, target_generation, request_json,
+        request_digest, rrule, time_zone, next_run_at,
+        definition_ciphertext_digest, created_at, updated_at
+      ) VALUES (
+        ?1, ?2, ?3, 'put', ?4,
+        1, NULL,
+        1, '1', '{}',
+        ?5, ?6, 'America/Puerto_Rico', ?7,
+        ?8, ?9, ?9
+      )
+    `).run(
+      `syncop_${state === "prepared" ? "p".repeat(32) : "e".repeat(32)}`,
+      paneId,
+      sessionId,
+      state,
+      `sha256_${"1".repeat(64)}`,
+      rrule,
+      scheduleNow + 60_000,
+      `sha256_${"2".repeat(64)}`,
+      scheduleNow,
+    );
+    return;
+  }
+  database.query(`
+    INSERT INTO chat_scheduled_chat_generation_high_water(
+      pane_id, session_id, generation, updated_at
+    ) VALUES (?1, ?2, '7', ?3)
+  `).run(paneId, sessionId, scheduleNow);
+  database.query(`
+    INSERT INTO chat_scheduled_chat_runs(
+      run_id, pane_id, session_id, schedule_generation,
+      occurrence_sequence, scheduled_for, message_id, state,
+      enqueued_at, acknowledged_at, cancelled_at
+    ) VALUES (
+      ?1, ?2, ?3, '7',
+      '3', ?4, ?5, 'acknowledged',
+      ?6, ?6, ?6
+    )
+  `).run(
+    `syncrun_${"A".repeat(26)}`,
+    paneId,
+    sessionId,
+    scheduleNow - 60_000,
+    `chatmsg_${"c".repeat(24)}`,
+    scheduleNow,
+  );
+}
+
+function downgradeScheduledChatSchemaToV61(database: Database): void {
+  database.exec(`
+    DROP TRIGGER chat_scheduled_chat_desired_off_pane_update_quarantine;
+    DROP TRIGGER chat_scheduled_chat_desired_off_pane_delete_quarantine;
+    DROP TABLE chat_scheduled_chat_desired_off;
+    DELETE FROM schema_migrations WHERE version = 62;
+    UPDATE app_release_state SET migration_version = 61;
+  `);
+}
+
 function createCanonicalInterruptedRestore(
   prefix: string,
 ): Readonly<{
@@ -3343,6 +3661,18 @@ function snapshotControlPlanePair(databasePath: string): Readonly<{
 
 function fileSha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function captureControlPlaneBackupError(
+  operation: () => unknown,
+): ControlPlaneBackupError {
+  try {
+    operation();
+  } catch (error: unknown) {
+    if (error instanceof ControlPlaneBackupError) return error;
+    throw error;
+  }
+  throw new Error("Expected a control-plane backup error");
 }
 
 function makeFifo(path: string): void {

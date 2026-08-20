@@ -406,6 +406,7 @@ class FakeRouter implements AccountRuntimeRouterPort {
           backwardsCursor: null,
         }));
       case "threadStart":
+      case "scheduleInterpreterThreadStart":
       case "threadResume":
       case "threadArchive":
       case "threadRead":
@@ -419,6 +420,7 @@ class FakeRouter implements AccountRuntimeRouterPort {
       case "threadSetName":
       case "threadInjectItems":
       case "configRequirementsRead":
+      case "mcpServerStatusList":
       case "modelList":
       case "turnStart":
       case "turnSteer":

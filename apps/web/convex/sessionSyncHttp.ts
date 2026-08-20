@@ -11,16 +11,18 @@ import {
   type SessionSyncBackendResult,
 } from "@hraness/agent-tasks-protocol";
 
-import { httpAction } from "./_generated/server";
+import { httpAction, type ActionCtx } from "./_generated/server";
 import { parseBoundedJsonBody } from "./boundedJsonBody";
 import {
   authorizeSessionSyncNegotiation,
   bootstrapSessionSyncVault,
   claimSessionSyncEnrollment,
+  clearOrphanedScheduledChatAsHuman,
   executeSessionSyncRequest,
   negotiateSessionSync,
   recoverSessionSyncVault,
   readSessionSyncRecoveryContext,
+  readScheduledChatRecoveryInventoryAsHuman,
   submitSessionSyncEnrollment,
 } from "./sessionSync";
 
@@ -119,7 +121,7 @@ function invalidRequestResponse(): Response {
   return sessionSyncResultResponse({ ok: false, code: "INVALID_REQUEST" });
 }
 
-export const sessionSyncHttp = httpAction(async (ctx, request) => {
+export const sessionSyncHttp = httpAction(async (ctx: ActionCtx, request: Request) => {
   if (!hasBearerCredential(request)) {
     return sessionSyncResultResponse({ ok: false, code: "AUTHENTICATION_FAILED" });
   }
@@ -150,6 +152,8 @@ export const sessionSyncHttp = httpAction(async (ctx, request) => {
     || operation === "enrollmentClaim"
     || operation === "recoveryContext"
     || operation === "recover"
+    || operation === "orphanInventory"
+    || operation === "orphanClear"
   ) {
     const invocation = sessionSyncHumanInvocationSchema.safeParse(body);
     if (!invocation.success) return invalidRequestResponse();
@@ -161,6 +165,16 @@ export const sessionSyncHttp = httpAction(async (ctx, request) => {
     }
     if (operation === "recoveryContext") {
       return sessionSyncResultResponse(await readSessionSyncRecoveryContext(ctx, invocation.data));
+    }
+    if (operation === "orphanClear") {
+      return sessionSyncResultResponse(
+        await clearOrphanedScheduledChatAsHuman(ctx, invocation.data),
+      );
+    }
+    if (operation === "orphanInventory") {
+      return sessionSyncResultResponse(
+        await readScheduledChatRecoveryInventoryAsHuman(ctx, invocation.data),
+      );
     }
     return sessionSyncResultResponse(await recoverSessionSyncVault(ctx, invocation.data));
   }

@@ -199,7 +199,9 @@ export interface AccountRuntimeRouterPort {
 export type SessionPinnedCodexRequestKey = Extract<AccountRuntimeRequestKey,
   | "threadList"
   | "threadStart"
+  | "scheduleInterpreterThreadStart"
   | "threadResume"
+  | "threadArchive"
   | "threadRead"
   | "threadHistoryRead"
   | "threadTurnsList"
@@ -212,6 +214,7 @@ export type SessionPinnedCodexRequestKey = Extract<AccountRuntimeRequestKey,
   | "threadInjectItems"
   | "modelList"
   | "configRequirementsRead"
+  | "mcpServerStatusList"
   | "turnStart"
   | "turnSteer"
   | "turnInterrupt">;

@@ -29,7 +29,7 @@ import {
   type RuntimeSnapshot,
 } from "../../contracts/runtime";
 
-export const HRA_DIRECT_WORLD_VERSION = 3 as const;
+export const HRA_DIRECT_WORLD_VERSION = 4 as const;
 export const HRA_DIRECT_TIME = Date.UTC(2026, 6, 19, 15, 0, 0);
 export const HRA_DIRECT_TIMESTAMP = new Date(HRA_DIRECT_TIME).toISOString();
 /**
@@ -320,6 +320,17 @@ export function emptySnapshot(
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: {
+        revision: 1,
+        displayName: "Documents",
+        availability: "ready",
+      },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
   });
 }

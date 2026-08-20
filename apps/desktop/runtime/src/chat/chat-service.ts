@@ -1,8 +1,16 @@
 import { randomBytes } from "node:crypto";
 import {
+  canonicalScheduledChatRRuleSchema,
+  nextScheduledChatOccurrence,
+  positiveSyncUint64Schema,
+  scheduledChatTimeZoneSchema,
+  syncSha256DigestSchema,
+} from "@hraness/agent-tasks-protocol";
+import {
   accountProfileIdSchema,
   chatPaneIdSchema,
   chatTurnIdSchema,
+  type ChatMessageId,
   type ChatMessageQueueProjection,
   type ChatRootTurnProfile,
 } from "../../../contracts/runtime";
@@ -12,6 +20,7 @@ import type {
   ChatAttachmentVault,
 } from "../attachments/contracts";
 import { ChatPaneStoreError } from "../state/chat-pane-store";
+import type { ScheduledChatStore } from "../state/scheduled-chat-store";
 import type {
   ChatMessageClaim,
 } from "../state/chat-message-ledger";
@@ -66,6 +75,8 @@ import {
   type ChatRepository,
   type ChatRepositoryPort,
   type ChatRuntimeRecoveryPort,
+  type ChatScheduledChatPort,
+  type ChatScheduledOccurrence,
   type ChatAccountPort,
   type ChatThreadBinding,
   type ChatToolActivity,
@@ -97,6 +108,7 @@ const DEFAULT_INTERRUPT_ACK_TIMEOUT_MILLISECONDS = 2_000;
 const DEFAULT_HARNESS_ROOT_TRANSITION_TIMEOUT_MILLISECONDS = 5_000;
 const DEFAULT_ACCOUNT_CONTAINMENT_TIMEOUT_MILLISECONDS = 5_000;
 const DEFAULT_HARNESS_ACTOR_TRANSITION_TIMEOUT_MILLISECONDS = 5_000;
+const MAX_SCHEDULED_ATTENTION_RETRY_MILLISECONDS = 5 * 60_000;
 // Tests retain an explicit false override for deterministic rollback coverage.
 const PROVIDER_THREAD_ARCHIVE_COORDINATOR_V57_ENABLED = true;
 
@@ -288,6 +300,14 @@ interface ProviderThreadArchiveReservedPane {
   readonly tail: Promise<void>;
 }
 
+interface ScheduledChatCoordinatorPaneReservation {
+  readonly callbacks: Set<Promise<void>>;
+  readonly paneId: ChatPaneId;
+  readonly prior: Promise<void>;
+  readonly release: () => void;
+  readonly tail: Promise<void>;
+}
+
 interface ProviderThreadArchiveFinalizedTarget {
   readonly result: ChatProviderThreadArchiveFinalizationV57Result;
   readonly targetId: string;
@@ -333,6 +353,8 @@ export interface ChatServiceOptions {
   /** Internal proof seam; production remains fail-closed until v57 gates pass. */
   readonly providerThreadArchiveCoordinatorV57Enabled?: boolean;
   readonly provider: ChatProviderPort;
+  readonly scheduledChats?: ChatScheduledChatPort;
+  readonly scheduledChatStore?: ScheduledChatStore;
   readonly repositories: ChatRepositoryPort;
   readonly runtimeRecovery: ChatRuntimeRecoveryPort;
   readonly rootTurnRouting: RootTurnRoutingAuthorityV1;
@@ -340,6 +362,7 @@ export interface ChatServiceOptions {
   readonly workspaces: ChatWorkspacePort;
   readonly attachedHarnessRetryDelayMs?: (attempt: number) => number;
   readonly workspaceRetryDelayMs?: (attempt: number) => number;
+  readonly scheduledAttentionRetryDelayMs?: (attempt: number) => number;
   readonly interruptTerminalGraceMs?: number;
   readonly interruptAckTimeoutMs?: number;
   readonly harnessRootTransitionTimeoutMs?: number;
@@ -357,6 +380,8 @@ export class ChatService {
   readonly #projectPane: (pane: ChatPaneProjection) => ChatPaneProjection;
   readonly #providerThreadArchiveCoordinatorV57Enabled: boolean;
   readonly #provider: ChatProviderPort;
+  readonly #scheduledChats: ChatScheduledChatPort | null;
+  readonly #scheduledChatStore: ScheduledChatStore | null;
   readonly #repositories: ChatRepositoryPort;
   readonly #runtimeRecovery: ChatRuntimeRecoveryPort;
   readonly #rootTurnRouting: RootTurnRoutingAuthorityV1;
@@ -364,6 +389,7 @@ export class ChatService {
   readonly #workspaces: ChatWorkspacePort;
   readonly #attachedHarnessRetryDelayMs: (attempt: number) => number;
   readonly #workspaceRetryDelayMs: (attempt: number) => number;
+  readonly #scheduledAttentionRetryDelayMs: (attempt: number) => number;
   readonly #interruptTerminalGraceMs: number;
   readonly #interruptAckTimeoutMs: number;
   readonly #harnessRootTransitionTimeoutMs: number;
@@ -372,6 +398,8 @@ export class ChatService {
   readonly #accountArchiveTails =
     new Map<ChatAccountProfileId, Promise<void>>();
   readonly #paneTails = new Map<ChatPaneId, Promise<void>>();
+  readonly #scheduledChatCoordinatorReservations =
+    new Map<ChatPaneId, ScheduledChatCoordinatorPaneReservation>();
   readonly #providerEffects = new Set<Promise<void>>();
   readonly #providerThreadArchiveHolds =
     new Map<ChatPaneId, ProviderThreadArchiveHold>();
@@ -412,6 +440,10 @@ export class ChatService {
     ChatPaneId,
     ReturnType<typeof setTimeout>
   >();
+  readonly #scheduledAttentionRetries = new Map<ChatPaneId, Readonly<{
+    attempt: number;
+    notBefore: number;
+  }>>();
   readonly #attachedHarnessStartupRetries = new Map<
     ChatPaneId,
     AttachedHarnessStartupRetry
@@ -437,6 +469,8 @@ export class ChatService {
       options.providerThreadArchiveCoordinatorV57Enabled ??
         PROVIDER_THREAD_ARCHIVE_COORDINATOR_V57_ENABLED;
     this.#provider = options.provider;
+    this.#scheduledChats = options.scheduledChats ?? null;
+    this.#scheduledChatStore = options.scheduledChatStore ?? null;
     this.#repositories = options.repositories;
     this.#runtimeRecovery = options.runtimeRecovery;
     this.#rootTurnRouting = options.rootTurnRouting;
@@ -446,6 +480,12 @@ export class ChatService {
       attachedHarnessRetryDelay;
     this.#workspaceRetryDelayMs = options.workspaceRetryDelayMs ??
       workspaceResolutionRetryDelay;
+    this.#scheduledAttentionRetryDelayMs =
+      options.scheduledAttentionRetryDelayMs
+      ?? ((attempt) => Math.min(
+        5_000 * (2 ** Math.min(attempt, 6)),
+        MAX_SCHEDULED_ATTENTION_RETRY_MILLISECONDS,
+      ));
     this.#interruptTerminalGraceMs = validateInterruptTerminalGrace(
       options.interruptTerminalGraceMs ?? DEFAULT_INTERRUPT_TERMINAL_GRACE_MILLISECONDS,
     );
@@ -525,9 +565,16 @@ export class ChatService {
       ...new Set([
         ...this.#store.pendingProviderThreadArchivePaneIds(),
         ...this.#store.providerThreadArchiveRecoveryPaneIdsV57(),
+        ...(this.#scheduledChatStore?.pendingMutations().map(
+          (mutation) => mutation.paneId,
+        ) ?? []),
+        ...(this.#scheduledChatStore?.desiredOffIntents().map(
+          (intent) => intent.paneId,
+        ) ?? []),
       ]),
     ].sort());
     const pendingTransitionPanes = new Set(pendingTransitionPaneIds);
+    const scheduledStartupDrainPanes = new Set<ChatPaneId>();
     this.#store.clearVolatileProviderSubagents(
       this.#now(),
       pendingTransitionPaneIds,
@@ -546,7 +593,31 @@ export class ChatService {
           this.#now(),
         );
       }
-      this.#store.reconcileMessageQueueAfterRestart(pane.id, this.#now());
+      let queue = this.#store.reconcileMessageQueueAfterRestart(
+        pane.id,
+        this.#now(),
+      );
+      const schedule = this.#scheduledChatStore?.get(pane.id) ?? null;
+      const head = queue.messages[0];
+      const run = head === undefined
+        ? null
+        : this.#scheduledChatStore?.runForMessage(pane.id, head.id) ?? null;
+      if (
+        queue.pauseReason === "runtimeRestart"
+        && schedule !== null
+        && this.#scheduledChatStore?.mutationForPane(pane.id) === null
+        && run !== null
+        && run.sessionId === schedule.sessionId
+        && run.scheduleGeneration === schedule.generation
+        && run.cancelledAt === null
+      ) {
+        queue = this.#store.resumeMessageQueue({
+          paneId: pane.id,
+          expectedQueueRevision: queue.revision,
+          now: this.#now(),
+        });
+        scheduledStartupDrainPanes.add(pane.id);
+      }
     }
     const panes = this.#store.list();
     for (const pane of panes) {
@@ -576,6 +647,11 @@ export class ChatService {
       this.#scheduleProviderThreadArchiveRecoveryV57(
         this.#store.verifyProviderThreadArchiveRecoveryV57(),
       );
+    }
+    for (const paneId of scheduledStartupDrainPanes) {
+      void this.#serialize(paneId, async () => {
+        await this.#admitNextQueuedMessage(paneId);
+      }).catch(() => undefined);
     }
     return panes.map((pane) => this.#projectPane(pane));
   }
@@ -1174,8 +1250,117 @@ export class ChatService {
           if (binding !== null) this.#bestEffortName(binding, pane.title);
           return { type: "pane", pane };
         });
+      case "chat.pane.schedule.configure":
+        return this.#serializeScheduledChatCommand(command.paneId, async () => {
+          const scheduledChats = this.#requireScheduledChats();
+          const current = this.#requireScheduleConfigurationPane(
+            command.paneId,
+            command.expectedRevision,
+          );
+          const repository = await this.#resolveScheduledRepository(current);
+          const candidates = await this.#accounts.refreshCandidates();
+          const account = rankChatAccountCandidates(
+            candidates,
+            current.projection.accountProfileId,
+            [],
+          )[0];
+          if (account === undefined) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "No Codex account is currently available to interpret this schedule.",
+            );
+          }
+          const timeZone = scheduledChatTimeZoneSchema.parse(
+            Intl.DateTimeFormat().resolvedOptions().timeZone,
+          );
+          const now = this.#now();
+          const interpreted = await this.#provider.interpretSchedule({
+            accountProfileId: account.id,
+            workingDirectory: repository.workingDirectory,
+            instruction: command.instruction,
+            timeZone,
+            now: now.toISOString(),
+          });
+          const rrule = canonicalScheduledChatRRuleSchema.parse(
+            interpreted.rrule,
+          );
+          const nextRunAt = nextScheduledChatOccurrence({
+            rrule,
+            timeZone,
+            after: now.getTime(),
+          });
+          if (nextRunAt === null) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "That instruction did not produce a future supported schedule.",
+            );
+          }
+          this.#requireScheduleConfigurationPane(
+            command.paneId,
+            command.expectedRevision,
+          );
+          await scheduledChats.configure({
+            paneId: command.paneId,
+            expectedRevision: command.expectedRevision,
+            prompt: interpreted.prompt,
+            rrule,
+            timeZone,
+            now: now.getTime(),
+          });
+          const pane = this.#store.require(command.paneId).projection;
+          await this.#projection.paneStateChanged(pane);
+          return { type: "pane", pane };
+        });
+      case "chat.pane.schedule.remove":
+        return this.#serializeScheduledChatCommand(command.paneId, async () => {
+          const scheduledChats = this.#requireScheduledChats();
+          const current = this.#store.require(command.paneId);
+          const queue = current.projection.messageQueue;
+          const scheduledBlockedMessage = queue.blockedMessage !== null
+            && this.#isCurrentScheduledMessage(
+              command.paneId,
+              queue.blockedMessage.id,
+            );
+          if (
+            current.projection.interactionMode !== "chat"
+            || current.projection.revision !== command.expectedRevision
+            || activePane(current.projection)
+            || (queue.blockedMessage !== null && !scheduledBlockedMessage)
+            || (queue.pauseReason !== null
+              && queue.pauseReason !== "stop"
+              && queue.pauseReason !== "runtimeRestart"
+              && queue.pauseReason !== "attention"
+              && !(
+                queue.pauseReason === "ambiguousEffect"
+                && scheduledBlockedMessage
+              ))
+            || queue.messages.some((message) =>
+              !this.#isCurrentScheduledMessage(command.paneId, message.id)
+            )
+          ) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "Stop the active occurrence and wait for any ambiguous provider effect before turning off this schedule.",
+            );
+          }
+          await scheduledChats.remove({
+            paneId: command.paneId,
+            expectedRevision: command.expectedRevision,
+            now: this.#now().getTime(),
+          });
+          const pane = this.#store.require(command.paneId).projection;
+          if (
+            pane.messageQueue.revision
+              !== current.projection.messageQueue.revision
+          ) {
+            await this.#publishMessageQueue(command.paneId, pane.messageQueue);
+          }
+          await this.#projection.paneStateChanged(pane);
+          return { type: "pane", pane };
+        });
       case "chat.pane.workspace.recover":
         return this.#serialize(command.paneId, async () => {
+          this.#assertScheduleAuthorityStable(command.paneId);
           const pane = this.#store.recoverWorkspace(
             command.paneId,
             command.expectedRevision,
@@ -1189,6 +1374,7 @@ export class ChatService {
         });
       case "chat.pane.repository.select":
         return this.#serialize(command.paneId, async () => {
+          this.#assertScheduleAuthorityStable(command.paneId);
           const repository = await this.#repositories.resolve(command.repositoryId);
           if (repository === null || repository.id !== command.repositoryId) {
             throw new ChatPaneStoreError("not_found", "This repository is unavailable.");
@@ -1308,7 +1494,25 @@ export class ChatService {
         });
       case "chat.messageQueue.resume":
         return this.#serialize(command.paneId, async () => {
-          this.#requireOrdinaryMessagePane(command.paneId);
+          const current = this.#store.require(command.paneId);
+          const scheduled = this.#scheduleAuthorityState(command.paneId);
+          if (scheduled.pending || (
+            scheduled.active
+            && !this.#isScheduledMessage(
+              command.paneId,
+              current.projection.messageQueue.messages[0]?.id,
+            )
+            && !this.#isScheduledTurn(
+              command.paneId,
+              current.projection.turn?.id,
+            )
+          )) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "Wait for the schedule change or its next scheduled message before resuming.",
+            );
+          }
+          this.#requireOrdinaryMessagePane(command.paneId, scheduled.active);
           const resumed = this.#store.resumeMessageQueue({
             paneId: command.paneId,
             expectedQueueRevision: command.expectedQueueRevision,
@@ -1377,6 +1581,19 @@ export class ChatService {
             );
           }
           const current = this.#store.require(command.paneId);
+          if (
+            current.projection.interactionMode === "chat"
+            && this.#scheduledChatStore !== null
+            && (
+              this.#scheduledChatStore.get(command.paneId) !== null
+              || this.#scheduledChatStore.mutationForPane(command.paneId) !== null
+            )
+          ) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "This chat is scheduled. Turn off scheduling before sending manually.",
+            );
+          }
           const attachedActor = current.projection.interactionMode === "harnessObserver";
           if (attachedActor && this.#harnessActors === null) {
             throw new ChatPaneStoreError(
@@ -1525,6 +1742,19 @@ export class ChatService {
             );
           }
           const current = this.#store.require(command.paneId);
+          const scheduled = this.#scheduleAuthorityState(command.paneId);
+          if (scheduled.pending || (
+            scheduled.active
+            && !this.#isCurrentScheduledTurn(
+              command.paneId,
+              command.priorFailedTurnId,
+            )
+          )) {
+            throw new ChatPaneStoreError(
+              "invalid_state",
+              "Only the exact failed scheduled occurrence can be retried while scheduling is on.",
+            );
+          }
           if (
             current.projection.interactionMode !== "chat" ||
             current.projection.workspace?.state !== "ready"
@@ -1599,7 +1829,219 @@ export class ChatService {
     }
   }
 
-  #requireOrdinaryMessagePane(paneId: ChatPaneId): ChatPanePrivateRecord {
+  async enqueueScheduledOccurrence(
+    occurrence: ChatScheduledOccurrence,
+  ): Promise<void> {
+    if (this.#admissionClosed) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Chat command admission is closed.",
+      );
+    }
+    const scheduledStore = this.#scheduledChatStore;
+    if (scheduledStore === null) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Scheduled chats are unavailable.",
+      );
+    }
+    await this.#serializeCoordinatorScheduledPaneCallback(
+      occurrence.paneId,
+      async () => {
+      const current = this.#requireOrdinaryMessagePane(
+        occurrence.paneId,
+        true,
+      );
+      const enqueued = scheduledStore.transaction(() =>
+        scheduledStore.enqueueRunInTransaction<ChatMessageQueueProjection>({
+          runId: occurrence.runId,
+          paneId: occurrence.paneId,
+          scheduleGeneration: positiveSyncUint64Schema.parse(
+            occurrence.scheduleGeneration,
+          ),
+          occurrenceSequence: positiveSyncUint64Schema.parse(
+            occurrence.occurrenceSequence,
+          ),
+          scheduledFor: occurrence.scheduledFor,
+          definitionCiphertextDigest: syncSha256DigestSchema.parse(
+            occurrence.definitionCiphertextDigest,
+          ),
+          now: this.#now().getTime(),
+          enqueue: (messageId) => this.#store.enqueueMessageIdempotently({
+            paneId: occurrence.paneId,
+            expectedQueueRevision: current.projection.messageQueue.revision,
+            messageId,
+            content: { text: occurrence.prompt, attachmentRefs: [] },
+            delivery: { kind: "queue" },
+            now: this.#now(),
+          }).queue,
+        })
+      );
+      const queue = enqueued.value
+        ?? this.#store.messageQueue(occurrence.paneId);
+      await this.#publishMessageQueue(occurrence.paneId, queue);
+      await this.#admitNextQueuedMessage(occurrence.paneId);
+      },
+    );
+  }
+
+  async commitScheduledChatPostimage(
+    paneId: ChatPaneId,
+    commit: () => void,
+  ): Promise<void> {
+    if (this.#admissionClosed) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Chat command admission is closed.",
+      );
+    }
+    await this.#serializeCoordinatorScheduledPaneCallback(paneId, async () => {
+      const recoveringTransition = this.#scheduledChatStore !== null
+        && (
+          this.#scheduledChatStore.mutationForPane(paneId) !== null
+          || this.#scheduledChatStore.desiredOff(paneId) !== null
+        );
+      const beforeQueueRevision = this.#store.messageQueue(paneId).revision;
+      commit();
+      const pane = this.#store.require(paneId).projection;
+      if (pane.messageQueue.revision !== beforeQueueRevision) {
+        await this.#publishMessageQueue(paneId, pane.messageQueue);
+      }
+      await this.#projection.paneStateChanged(
+        pane,
+      );
+      if (
+        recoveringTransition
+        && pane.workspace?.mode === "managedWorktree"
+        && pane.workspace.state !== "preserved"
+        && pane.workspace.state !== "ready"
+      ) this.#scheduleWorkspaceProvision(paneId);
+      if (recoveringTransition && pane.messageQueue.pauseReason === null) {
+        await this.#admitNextQueuedMessage(paneId);
+      }
+    });
+  }
+
+  async resumeEligibleScheduledOccurrences(): Promise<void> {
+    if (this.#admissionClosed) return;
+    const scheduledStore = this.#scheduledChatStore;
+    if (scheduledStore === null) return;
+    const active = scheduledStore.activeSchedules();
+    const activePaneIds = new Set(active.map(({ paneId }) => paneId));
+    for (const paneId of this.#scheduledAttentionRetries.keys()) {
+      if (!activePaneIds.has(paneId)) {
+        this.#scheduledAttentionRetries.delete(paneId);
+      }
+    }
+    for (const schedule of active) {
+      const now = this.#now().getTime();
+      const retry = this.#scheduledAttentionRetries.get(schedule.paneId);
+      if (retry !== undefined && retry.notBefore > now) continue;
+      await this.#serializeCoordinatorScheduledPaneCallback(
+        schedule.paneId,
+        async () => {
+        const current = this.#store.get(schedule.paneId);
+        const queue = current?.projection.messageQueue;
+        if (
+          current === null
+          || queue === undefined
+          || queue.pauseReason !== "attention"
+          || queue.blockedMessage !== null
+          || queue.messages.length === 0
+          || queue.messages.some((message) =>
+            !this.#isCurrentScheduledMessage(schedule.paneId, message.id)
+          )
+          || activePane(current.projection)
+          || current.projection.workspace?.state !== "ready"
+          || this.#scheduleAuthorityState(schedule.paneId).pending
+        ) {
+          if (queue?.pauseReason !== "attention") {
+            this.#scheduledAttentionRetries.delete(schedule.paneId);
+          }
+          return;
+        }
+        const attempt = (retry?.attempt ?? 0) + 1;
+        const delayMs = this.#scheduledAttentionRetryDelayMs(attempt);
+        if (
+          !Number.isSafeInteger(delayMs)
+          || delayMs < 0
+          || delayMs > MAX_SCHEDULED_ATTENTION_RETRY_MILLISECONDS
+        ) {
+          throw new ChatPaneStoreError(
+            "corrupt_state",
+            "The scheduled chat attention retry delay is invalid.",
+          );
+        }
+        this.#scheduledAttentionRetries.set(schedule.paneId, {
+          attempt,
+          notBefore: now + delayMs,
+        });
+        const resumed = this.#store.resumeMessageQueue({
+          paneId: schedule.paneId,
+          expectedQueueRevision: queue.revision,
+          now: this.#now(),
+        });
+        await this.#publishMessageQueue(schedule.paneId, resumed);
+        await this.#admitNextQueuedMessage(schedule.paneId);
+        },
+      );
+    }
+  }
+
+  #requireScheduledChats(): ChatScheduledChatPort {
+    if (this.#scheduledChats === null || this.#scheduledChatStore === null) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Scheduled chats require encrypted session sync.",
+      );
+    }
+    return this.#scheduledChats;
+  }
+
+  #requireScheduleConfigurationPane(
+    paneId: ChatPaneId,
+    expectedRevision: number,
+  ): ChatPanePrivateRecord {
+    const pane = this.#store.require(paneId);
+    if (
+      pane.projection.revision !== expectedRevision
+      || pane.projection.interactionMode !== "chat"
+      || pane.projection.workspace?.state !== "ready"
+      || activePane(pane.projection)
+      || pane.projection.messageQueue.messages.length !== 0
+      || pane.projection.messageQueue.pauseReason !== null
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Finish current chat work before changing its schedule.",
+      );
+    }
+    return pane;
+  }
+
+  async #resolveScheduledRepository(
+    pane: ChatPanePrivateRecord,
+  ): Promise<ChatRepository> {
+    const source = await this.#repositories.resolve(
+      pane.projection.repository.id,
+    );
+    if (source !== null && source.id === pane.projection.repository.id) {
+      const repository = await this.#workspaces.resolve(
+        pane.projection.id,
+        source,
+      );
+      if (repository !== null && repository.id === source.id) return repository;
+    }
+    throw new ChatPaneStoreError(
+      "invalid_state",
+      "Restore this chat's workspace before changing its schedule.",
+    );
+  }
+
+  #requireOrdinaryMessagePane(
+    paneId: ChatPaneId,
+    allowScheduled = false,
+  ): ChatPanePrivateRecord {
     const pane = this.#store.require(paneId);
     if (pane.projection.interactionMode !== "chat") {
       throw new ChatPaneStoreError(
@@ -1607,7 +2049,84 @@ export class ChatService {
         "Persistent actor messages remain owned by their actor authority.",
       );
     }
+    const scheduled = this.#scheduleAuthorityState(paneId);
+    if (!allowScheduled && (scheduled.active || scheduled.pending)) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "This chat is scheduled. Turn off scheduling before editing its message queue.",
+      );
+    }
     return pane;
+  }
+
+  #scheduleAuthorityState(paneId: ChatPaneId): Readonly<{
+    active: boolean;
+    pending: boolean;
+  }> {
+    const store = this.#scheduledChatStore;
+    return {
+      active: store !== null && store.get(paneId) !== null,
+      pending: store !== null && (
+        store.mutationForPane(paneId) !== null
+        || store.desiredOff(paneId) !== null
+      ),
+    };
+  }
+
+  #assertScheduleAuthorityStable(paneId: ChatPaneId): void {
+    const state = this.#scheduleAuthorityState(paneId);
+    if (state.active || state.pending) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Turn off scheduling before changing this chat's repository or workspace.",
+      );
+    }
+  }
+
+  #isScheduledMessage(
+    paneId: ChatPaneId,
+    messageId: ChatMessageId | undefined,
+  ): boolean {
+    return messageId !== undefined
+      && this.#scheduledChatStore !== null
+      && this.#scheduledChatStore.runForMessage(paneId, messageId) !== null;
+  }
+
+  #isCurrentScheduledMessage(
+    paneId: ChatPaneId,
+    messageId: ChatMessageId,
+  ): boolean {
+    const store = this.#scheduledChatStore;
+    const schedule = store?.get(paneId) ?? null;
+    const run = store?.runForMessage(paneId, messageId) ?? null;
+    return schedule !== null
+      && run !== null
+      && run.sessionId === schedule.sessionId
+      && run.scheduleGeneration === schedule.generation
+      && run.cancelledAt === null;
+  }
+
+  #isScheduledTurn(
+    paneId: ChatPaneId,
+    turnId: string | undefined,
+  ): boolean {
+    return turnId !== undefined
+      && this.#scheduledChatStore !== null
+      && this.#scheduledChatStore.runForTurn(paneId, turnId) !== null;
+  }
+
+  #isCurrentScheduledTurn(
+    paneId: ChatPaneId,
+    turnId: string,
+  ): boolean {
+    const store = this.#scheduledChatStore;
+    const schedule = store?.get(paneId) ?? null;
+    const run = store?.runForTurn(paneId, turnId) ?? null;
+    return schedule !== null
+      && run !== null
+      && run.sessionId === schedule.sessionId
+      && run.scheduleGeneration === schedule.generation
+      && run.cancelledAt === null;
   }
 
   async #publishMessageQueue(
@@ -1638,11 +2157,14 @@ export class ChatService {
   async #admitNextQueuedMessage(
     paneId: ChatPaneId,
   ): Promise<ChatMessageQueueProjection> {
-    const current = this.#requireOrdinaryMessagePane(paneId);
+    const current = this.#requireOrdinaryMessagePane(paneId, true);
     const queue = current.projection.messageQueue;
     const head = queue.messages[0];
+    const scheduled = this.#scheduleAuthorityState(paneId);
     if (
       queue.pauseReason !== null || head === undefined ||
+      scheduled.pending
+      || (scheduled.active && !this.#isScheduledMessage(paneId, head.id)) ||
       activePane(current.projection) ||
       current.projection.workspace?.state !== "ready" ||
       this.#pendingTurnStops.has(paneId) ||
@@ -4477,7 +4999,26 @@ export class ChatService {
       }
       if (this.#turnStartupMustStop(paneId, turnId)) return;
       if (provenQuotaRejection(error)) {
-        this.#settleRootTurnRouting(paneId, turnId, "quotaRejected");
+        const tracked = this.#activeStartMessageEffects.get(paneId);
+        if (
+          tracked !== undefined
+          && tracked.turnId === turnId
+          && tracked.state === "effectStarted"
+          && this.#isCurrentScheduledMessage(paneId, tracked.messageId)
+        ) {
+          const queue = this.#store.settleProvenNotAppliedScheduledStart({
+            paneId,
+            messageId: tracked.messageId,
+            expectedMessageRevision: tracked.revision,
+            turnId,
+            kind: "start",
+            now: this.#now(),
+          });
+          this.#activeStartMessageEffects.delete(paneId);
+          await this.#publishMessageQueue(paneId, queue);
+        } else {
+          this.#settleRootTurnRouting(paneId, turnId, "quotaRejected");
+        }
         await this.#stopAfterProvenQuota(paneId, turnId, null);
         return;
       }
@@ -6983,6 +7524,9 @@ export class ChatService {
         projected.revision !== before.revision ||
         projected.workspace?.revision !== beforeWorkspaceRevision
       ) await this.#projection.paneChanged(projected);
+      if (projected.workspace?.state === "ready") {
+        await this.#admitNextQueuedMessage(paneId);
+      }
     }).catch(() => undefined);
   }
 
@@ -7023,6 +7567,68 @@ export class ChatService {
     const timer = this.#workspaceResolutionRetryTimers.get(paneId);
     if (timer !== undefined) clearTimeout(timer);
     this.#workspaceResolutionRetryTimers.delete(paneId);
+  }
+
+  async #serializeScheduledChatCommand<Value>(
+    paneId: ChatPaneId,
+    operation: () => Promise<Value>,
+  ): Promise<Value> {
+    const id = chatPaneIdSchema.parse(paneId);
+    if (this.#scheduledChatCoordinatorReservations.has(id)) {
+      throw new ChatPaneStoreError(
+        "conflict",
+        "Another scheduled-chat command already owns this pane.",
+      );
+    }
+    const prior = this.#paneTails.get(id) ?? Promise.resolve();
+    let release!: () => void;
+    const marker = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = prior.catch(() => undefined).then(() => marker);
+    const reservation: ScheduledChatCoordinatorPaneReservation = {
+      callbacks: new Set(),
+      paneId: id,
+      prior,
+      release,
+      tail,
+    };
+    this.#scheduledChatCoordinatorReservations.set(id, reservation);
+    this.#paneTails.set(id, tail);
+    try {
+      await prior.catch(() => undefined);
+      return await operation();
+    } finally {
+      while (reservation.callbacks.size > 0) {
+        await Promise.all([...reservation.callbacks]);
+      }
+      if (this.#scheduledChatCoordinatorReservations.get(id) === reservation) {
+        this.#scheduledChatCoordinatorReservations.delete(id);
+      }
+      release();
+      if (this.#paneTails.get(id) === tail) this.#paneTails.delete(id);
+    }
+  }
+
+  #serializeCoordinatorScheduledPaneCallback<Value>(
+    paneId: ChatPaneId,
+    operation: () => Value | Promise<Value>,
+  ): Promise<Value> {
+    const id = chatPaneIdSchema.parse(paneId);
+    const reservation = this.#scheduledChatCoordinatorReservations.get(id);
+    if (reservation !== undefined) {
+      const result = reservation.prior.catch(() => undefined).then(operation);
+      const tracked = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      reservation.callbacks.add(tracked);
+      void tracked.then(() => {
+        reservation.callbacks.delete(tracked);
+      });
+      return result;
+    }
+    return this.#serialize(id, operation);
   }
 
   #serialize<T>(paneId: ChatPaneId, operation: () => T | Promise<T>): Promise<T> {

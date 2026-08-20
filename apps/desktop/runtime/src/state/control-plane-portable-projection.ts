@@ -7,6 +7,7 @@ import {
   PROVIDER_THREAD_ARCHIVE_JOURNAL_V57_SQL,
   ProviderThreadArchiveJournalV57,
 } from "./provider-thread-archive-journal-v57";
+import { validateSupportedMigrationPrefix } from "./release-compatibility";
 
 export const PORTABLE_PROVIDER_CONTEXT_PROJECTION_VERSION = 3 as const;
 
@@ -93,6 +94,18 @@ const completeAuthorityRowSchema = z.record(
   z.string(),
   z.union([z.string(), z.number().safe(), z.null()]),
 );
+const portableScheduleAuthorityTableRowSchema = z.object({
+  name: z.enum([
+    "chat_scheduled_chat_desired_off",
+    "chat_scheduled_chat_mutations",
+    "chat_scheduled_chats",
+  ]),
+}).strict();
+const portableScheduleAuthorityPresenceSchema = z.object({
+  active_schedule_present: z.union([z.literal(0), z.literal(1)]),
+  desired_off_present: z.union([z.literal(0), z.literal(1)]),
+  pending_mutation_present: z.union([z.literal(0), z.literal(1)]),
+}).strict();
 
 type BindingRow = z.infer<typeof bindingRowSchema>;
 type PaneEvidenceRow = z.infer<typeof paneEvidenceRowSchema>;
@@ -155,6 +168,84 @@ export class PortableProviderContextProjectionError extends Error {
 }
 
 /**
+ * A portable database cannot carry origin-device schedule authority. A
+ * cleared schedule may leave generation high-water and terminal run history,
+ * but every active definition, prepared/effect-started cloud mutation, and
+ * durable turn-off recovery intent must settle before backup or restore.
+ */
+export function assertPortableScheduledChatTransferReady(
+  database: Database,
+): void {
+  let migrationVersion: number;
+  let tableRows: readonly unknown[];
+  try {
+    migrationVersion = validateSupportedMigrationPrefix(database);
+    tableRows = database.query(`
+      SELECT name
+      FROM sqlite_schema
+      WHERE type = 'table'
+        AND name IN (
+          'chat_scheduled_chat_desired_off',
+          'chat_scheduled_chat_mutations',
+          'chat_scheduled_chats'
+        )
+      ORDER BY name COLLATE BINARY
+    `).all();
+  } catch (error: unknown) {
+    throw new PortableProviderContextProjectionError(
+      `Scheduled-chat portability state could not be inspected: ${errorMessage(error)}`,
+    );
+  }
+  const tables = tableRows.map((row) =>
+    portableScheduleAuthorityTableRowSchema.parse(row).name
+  );
+  const expectedTables = migrationVersion < 59
+    ? []
+    : migrationVersion < 62
+    ? ["chat_scheduled_chat_mutations", "chat_scheduled_chats"]
+    : [
+        "chat_scheduled_chat_desired_off",
+        "chat_scheduled_chat_mutations",
+        "chat_scheduled_chats",
+      ];
+  if (
+    tables.length !== expectedTables.length
+    || tables.some((table, index) => table !== expectedTables[index])
+  ) {
+    throw new PortableProviderContextProjectionError(
+      "Scheduled-chat portability state is incomplete.",
+    );
+  }
+  if (migrationVersion < 59) return;
+  let presence: z.infer<typeof portableScheduleAuthorityPresenceSchema>;
+  try {
+    presence = portableScheduleAuthorityPresenceSchema.parse(database.query(`
+      SELECT
+        EXISTS(SELECT 1 FROM chat_scheduled_chats) AS active_schedule_present,
+        ${migrationVersion >= 62
+          ? "EXISTS(SELECT 1 FROM chat_scheduled_chat_desired_off)"
+          : "0"} AS desired_off_present,
+        EXISTS(SELECT 1 FROM chat_scheduled_chat_mutations)
+          AS pending_mutation_present
+    `).get());
+  } catch (error: unknown) {
+    if (error instanceof PortableProviderContextProjectionError) throw error;
+    throw new PortableProviderContextProjectionError(
+      `Scheduled-chat portability state could not be inspected: ${errorMessage(error)}`,
+    );
+  }
+  if (
+    presence.active_schedule_present === 1
+    || presence.desired_off_present === 1
+    || presence.pending_mutation_present === 1
+  ) {
+    throw new PortableProviderContextProjectionError(
+      "Turn off scheduled chats first before creating or restoring a portable backup.",
+    );
+  }
+}
+
+/**
  * Removes resumable attachment-provider authority only from the deserialized
  * backup copy. Display history and attachment bytes remain intact. Affected
  * panes retain a monotonic provider-history floor so a later fresh send cannot
@@ -178,6 +269,7 @@ export function projectPortableProviderContext(
     configureProjectionDatabase(projectionDatabase);
     let proof: PortableProviderContextProjectionAttestation | null = null;
     projectionDatabase.transaction(() => {
+      assertPortableScheduledChatTransferReady(projectionDatabase);
       const bindings = readBindings(projectionDatabase);
       const leases = readProviderLeases(projectionDatabase);
       const providerThreadArchiveIntents = readProviderThreadArchiveIntents(
@@ -409,6 +501,7 @@ export function inspectPortableProviderContext(
         "The portable provider-context proof is not bound to this receipt key.",
       );
     }
+    assertPortableScheduledChatTransferReady(database);
     const bindings = readBindings(database);
     const leases = readProviderLeases(database);
     const providerThreadArchiveIntents = readProviderThreadArchiveIntents(database);

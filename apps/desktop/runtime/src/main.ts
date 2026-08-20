@@ -33,6 +33,7 @@ import {
   type RuntimeDispatchRequest,
   type RuntimeDispatchResponse,
   type RuntimeError,
+  type RuntimeFolderAccessSelectResult,
   type HumanAccountSnapshot as RendererHumanAccountSnapshot,
   type RuntimeHumanOrganization,
   type RuntimeHumanWorkspace,
@@ -68,6 +69,7 @@ import { AccountRuntimeRouter } from "./accounts/runtime-router";
 import {
   CodexFactRouter,
   CodexJsonlWriter,
+  provisionOfficialComputerUse,
   type CodexServerRequest,
 } from "./codex";
 import { DispatchTransferStore } from "./dispatch-transfer";
@@ -78,6 +80,7 @@ import {
   hostAccountProfileNativeResultCommand,
   hostHarnessCustodyNativeResultCommand,
   hostProjectOnboardingCommand,
+  hostFolderAccessSelectCommand,
   hostFailure,
   hostSuccess,
   parseHostDispatchPayload,
@@ -87,6 +90,7 @@ import {
   parseHostLocalDataRemovalRecoveryPayload,
   parseHostNativeRemovalCapability,
   parseHostProjectOnboardingPayload,
+  parseHostFolderAccessSelectPayload,
   parseHostRequest,
   type HostLocalDataRemovalNativeLaunch,
   type HostLocalDataRemovalNativeTerminationRequired,
@@ -229,6 +233,7 @@ import { HumanAccountMetadataStore } from "./state/human-account-metadata-store"
 import { SessionSyncOperationJournal } from
   "./state/session-sync-operation-journal";
 import { SessionSyncStore } from "./state/session-sync-store";
+import { ScheduledChatStore } from "./state/scheduled-chat-store";
 import {
   HumanOrganizationOperationConflict,
   HumanOrganizationOperationStore,
@@ -246,6 +251,10 @@ import {
 import { CloudInvalidationHeadStore } from "./state/cloud-invalidation-head-store";
 import { DispatchStore } from "./state/dispatch-store";
 import { ChatPaneStore, ChatPaneStoreError } from "./state/chat-pane-store";
+import {
+  ChatExecutionFolderUnavailableError,
+  ChatExecutionSettingsStore,
+} from "./state/chat-execution-settings";
 import { ProviderThreadArchiveJournalV57 } from
   "./state/provider-thread-archive-journal-v57";
 import {
@@ -313,6 +322,17 @@ const initialSnapshot: RuntimeSnapshot = {
   accounts: [],
   retainedAccountLocalData: [],
   humanAccount: { state: "signedOut", revision: 0 },
+  execution: {
+    folderAccess: {
+      revision: 1,
+      displayName: "Documents",
+      availability: "missing",
+    },
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandbox: "danger-full-access",
+    computerUse: "required",
+  },
   chat: { revision: 1, panes: [] },
   sessionSync: {
     status: {
@@ -384,7 +404,26 @@ let projectionCommitAdmissionClosing = false;
 const developmentReloadAdmission = new DevelopmentReloadAdmission();
 let gatewayReadyForDevelopmentReload = false;
 let ordinaryHostRequestsInFlight = 0;
+const ordinaryHostRequestDrainWaiters = new Set<() => void>();
+let localDataRemovalHostAdmissionClosing = false;
 let developmentReloadInternalAdmissionsClosed = false;
+
+async function waitForOrdinaryHostRequestsAtMost(limit: number): Promise<void> {
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new TypeError("Host request drain limit is invalid.");
+  }
+  while (ordinaryHostRequestsInFlight > limit) {
+    await new Promise<void>((resolve) => {
+      ordinaryHostRequestDrainWaiters.add(resolve);
+    });
+  }
+}
+
+function notifyOrdinaryHostRequestDrain(): void {
+  const waiters = [...ordinaryHostRequestDrainWaiters];
+  ordinaryHostRequestDrainWaiters.clear();
+  for (const resolve of waiters) resolve();
+}
 
 function developmentReloadHasInMemoryWork(): boolean {
   const human = humanAccountService;
@@ -413,6 +452,7 @@ function developmentReloadHasInMemoryWork(): boolean {
 function sealInternalDevelopmentReloadAdmissions(): void {
   developmentReloadInternalAdmissionsClosed = true;
   humanAccountService?.closeAdmission();
+  cloudWorkspaceSummaries.closeAdmission();
   for (const { coordinator } of cloudInvalidationCoordinators.values()) {
     coordinator.closeAdmission();
   }
@@ -505,10 +545,12 @@ const cloudInvalidationCoordinators = new Map<
     coordinator: CloudInvalidationCoordinator;
   }>
 >();
+const retiringCloudInvalidationStops = new Set<Promise<void>>();
 let currentHumanCredentialGeneration: number | null = null;
 let currentHumanOrganizationId: string | null = null;
 let currentHumanUserId: string | null = null;
 let database: ReturnType<typeof openControlPlane> | null = null;
+let chatExecutionSettings: ChatExecutionSettingsStore | null = null;
 let lifetimeLock: ControlPlaneLifetimeLock | null = null;
 let localProjectOnboardingService: ProjectOnboardingService | null = null;
 let localProjectOnboardingInstallationId: string | null = null;
@@ -801,12 +843,26 @@ function publishHumanAccountSnapshot(
   }
 }
 
+function retireCloudInvalidation(
+  coordinator: CloudInvalidationCoordinator,
+): Promise<void> {
+  const task = coordinator.stop();
+  retiringCloudInvalidationStops.add(task);
+  void task.finally(() => {
+    retiringCloudInvalidationStops.delete(task);
+  }).catch(() => undefined);
+  return task;
+}
+
 async function stopCloudInvalidations(): Promise<void> {
   const active = [...cloudInvalidationCoordinators.values()];
   cloudInvalidationCoordinators.clear();
-  await Promise.allSettled(
-    active.map(async ({ coordinator }) => await coordinator.stop()),
-  );
+  for (const { coordinator } of active) void retireCloudInvalidation(coordinator);
+  for (;;) {
+    const retiring = [...retiringCloudInvalidationStops];
+    if (retiring.length === 0) return;
+    await Promise.allSettled(retiring);
+  }
 }
 
 function ensureCloudInvalidations(workspaceId: string): void {
@@ -834,14 +890,14 @@ function ensureCloudInvalidations(workspaceId: string): void {
   }
   if (existing !== undefined) {
     cloudInvalidationCoordinators.delete(workspaceId);
-    void existing.coordinator.stop();
+    void retireCloudInvalidation(existing.coordinator);
   }
   while (cloudInvalidationCoordinators.size >= 8) {
     const oldest = cloudInvalidationCoordinators.entries().next().value;
     if (oldest === undefined) break;
     const [oldestWorkspaceId, oldestEntry] = oldest;
     cloudInvalidationCoordinators.delete(oldestWorkspaceId);
-    void oldestEntry.coordinator.stop();
+    void retireCloudInvalidation(oldestEntry.coordinator);
   }
   const coordinator = new CloudInvalidationCoordinator({
     client,
@@ -1686,9 +1742,12 @@ async function shutdownLocalPromotions(): Promise<void> {
   }
 }
 
-async function shutdownSessionSync(): Promise<void> {
+async function shutdownSessionSync(options: {
+  readonly retainAuthorityFence?: boolean;
+} = {}): Promise<void> {
   const coordinator = sessionSyncCoordinator;
-  sessionSyncCoordinator = null;
+  if (options.retainAuthorityFence !== true) sessionSyncCoordinator = null;
+  coordinator?.closeAdmission();
   await coordinator?.stop();
 }
 
@@ -1930,6 +1989,9 @@ async function initializeGateway(): Promise<void> {
       secrets: nativeHarnessKeyCustody,
     });
     const effectiveHome = userInfo().homedir;
+    const computerUse = provisionOfficialComputerUse({
+      homeDirectory: effectiveHome,
+    });
     const expectedDatabasePath = defaultControlPlanePath();
     preflightControlPlaneRelease(
       expectedDatabasePath,
@@ -2004,6 +2066,21 @@ async function initializeGateway(): Promise<void> {
     database = openControlPlane(databasePath, {
       releaseIdentity: hraReleaseIdentity,
     });
+    const initializingChatExecutionSettings = new ChatExecutionSettingsStore({
+      database,
+      homeDirectory: effectiveHome,
+    });
+    chatExecutionSettings = initializingChatExecutionSettings;
+    await projectionCommits.publish({
+      type: "execution.changed",
+      execution: {
+        folderAccess: initializingChatExecutionSettings.read().projection,
+        approvalPolicy: "never",
+        approvalsReviewer: "auto_review",
+        sandbox: "danger-full-access",
+        computerUse: "required",
+      },
+    });
     const accountFileSystemAuthority =
       lifetimeLock.bindControlPlane();
     const operationReceiptKey = loadOrCreateOperationReceiptKey(
@@ -2023,9 +2100,133 @@ async function initializeGateway(): Promise<void> {
     humanOrganizationOperations = new HumanOrganizationOperationStore(database);
     humanOrganizationProvisioningStopping = false;
     const humanMetadata = new HumanAccountMetadataStore({ database });
+    const initializingScheduledChatStore = new ScheduledChatStore(database);
+    const syncStore = new SessionSyncStore(database);
+    const humanCloudConfiguration = parseHRACloudConfiguration(process.env);
+    const storedHumanAuthorityIsDurable = (): boolean => {
+      const vault = syncStore.vault();
+      return initializingScheduledChatStore.hasAuthorityBearingState()
+        || (vault !== null && vault.state !== "retired");
+    };
+    const assertStoredHumanAuthentication = (
+      input: Readonly<{
+        apiUrl: string;
+        userId: string;
+        organizationId?: string;
+      }>,
+    ): void => {
+      if (!storedHumanAuthorityIsDurable()) return;
+      const bound = syncStore.vault()?.humanAuthority ?? null;
+      if (
+        bound === null
+        || input.userId !== bound.userId
+        || (
+          input.organizationId !== undefined
+          && input.organizationId !== bound.organizationId
+        )
+        || (
+          bound.apiOrigin !== null
+          && input.apiUrl !== bound.apiOrigin
+        )
+      ) {
+        throw new SessionSyncCoordinatorError(
+          "authority_mismatch",
+          "Turn off scheduled chats before signing in as another cloud principal.",
+        );
+      }
+    };
+    const assertStoredCredentialClear = (
+      authority: Readonly<{
+        identities: readonly Readonly<{
+          apiUrl: string;
+          userId: string;
+          organizationId?: string;
+        }>[];
+        hasUnrecognizedValue: boolean;
+      }>,
+    ): void => {
+      if (!storedHumanAuthorityIsDurable()) return;
+      const bound = syncStore.vault()?.humanAuthority ?? null;
+      if (
+        bound === null
+        || authority.hasUnrecognizedValue
+        || authority.identities.some((identity) =>
+          identity.userId === bound.userId
+          && (
+            identity.organizationId === undefined
+            || identity.organizationId === bound.organizationId
+          )
+          && (
+            bound.apiOrigin === null
+            || identity.apiUrl === bound.apiOrigin
+          )
+        )
+      ) {
+        throw new SessionSyncCoordinatorError(
+          "invalid_state",
+          "Turn off scheduled chats before clearing their cloud credential.",
+        );
+      }
+    };
     const humanRuntime = createHumanAccountRuntime({
-      configuration: parseHRACloudConfiguration(process.env),
+      configuration: humanCloudConfiguration,
       metadata: humanMetadata,
+      acceptAuthentication: (authentication) => {
+        const organizationId = authentication.organization?.id;
+        if (sessionSyncCoordinator !== null) {
+          sessionSyncCoordinator.assertScheduledChatsCanAcceptAuthentication({
+            apiUrl: authentication.apiUrl,
+            userId: authentication.user.id,
+            ...(organizationId === undefined ? {} : { organizationId }),
+          });
+          return;
+        }
+        assertStoredHumanAuthentication({
+          apiUrl: authentication.apiUrl,
+          userId: authentication.user.id,
+          ...(organizationId === undefined ? {} : { organizationId }),
+        });
+      },
+      withAuthenticationAuthority: async (authority, operation) => {
+        if (sessionSyncCoordinator !== null) {
+          return await sessionSyncCoordinator
+            .withScheduledChatAuthenticationAuthority(authority, operation);
+        }
+        assertStoredHumanAuthentication(authority);
+        return await operation();
+      },
+      withAuthenticationCommit: async (authentication, commit) => {
+        const organizationId = authentication.organization?.id;
+        if (sessionSyncCoordinator !== null) {
+          return await sessionSyncCoordinator
+            .withScheduledChatAuthenticationAuthority(
+              {
+                apiUrl: authentication.apiUrl,
+                userId: authentication.user.id,
+                ...(organizationId === undefined ? {} : { organizationId }),
+              },
+              commit,
+            );
+        }
+        assertStoredHumanAuthentication({
+          apiUrl: authentication.apiUrl,
+          userId: authentication.user.id,
+          ...(organizationId === undefined ? {} : { organizationId }),
+        });
+        return await commit();
+      },
+      withSignOutCommit: async (authority, commit) => {
+        const coordinator = sessionSyncCoordinator;
+        if (coordinator === null) {
+          assertStoredCredentialClear(authority);
+          return await commit();
+        }
+        return await coordinator
+          .withScheduledChatSignOutAuthority(async () => {
+            coordinator.assertScheduledChatsCanClearAuthentication(authority);
+            return await commit();
+          });
+      },
       emit: (snapshot) => {
         const availability = cloudAttachmentAvailability;
         if (availability !== null) {
@@ -2043,9 +2244,31 @@ async function initializeGateway(): Promise<void> {
       humanRuntime.availability.state === "enabled"
       && humanRuntime.session !== null
     ) {
-      const syncStore = new SessionSyncStore(database);
+      const humanApiOrigin = humanRuntime.availability.apiOrigin;
       const syncCoordinator = new SessionSyncCoordinator({
         store: syncStore,
+        scheduledChatStore: initializingScheduledChatStore,
+        enqueueScheduledOccurrence: async (occurrence) => {
+          const service = chatService;
+          if (service === null) {
+            throw new Error("Scheduled chat execution is not initialized.");
+          }
+          await service.enqueueScheduledOccurrence(occurrence);
+        },
+        commitScheduledChatPostimage: async (paneId, commit) => {
+          const service = chatService;
+          if (service === null) {
+            throw new Error("Scheduled chat projection is not initialized.");
+          }
+          await service.commitScheduledChatPostimage(paneId, commit);
+        },
+        resumeScheduledOccurrences: async () => {
+          const service = chatService;
+          if (service === null) {
+            throw new Error("Scheduled chat execution is not initialized.");
+          }
+          await service.resumeEligibleScheduledOccurrences();
+        },
         journal: new SessionSyncOperationJournal(database),
         keyCustody: new SessionSyncKeyCustody(),
         recoveryCustody: new SessionSyncRecoveryKeyCustody(),
@@ -2084,6 +2307,9 @@ async function initializeGateway(): Promise<void> {
         },
         cloudConfigured: true,
         humanScope: () => ({
+          apiOrigin: currentHumanCredentialGeneration === null
+            ? null
+            : humanApiOrigin,
           credentialGeneration: currentHumanCredentialGeneration ?? 0,
           signedIn: currentHumanCredentialGeneration !== null,
           userId: currentHumanUserId,
@@ -2174,7 +2400,13 @@ async function initializeGateway(): Promise<void> {
         new LocalTaskStoreProjectOnboardingAdapter(initializingLocalTaskStore),
     });
     const initializingHarnessComposition =
-      createHarnessProductionCompositionV2();
+      createHarnessProductionCompositionV2({
+        execution: {
+          computerUse,
+          acquireRuntimeWorkspaceAdmission: () =>
+            initializingChatExecutionSettings.acquireRuntimeWorkspaceAdmission(),
+        },
+      });
     initializingHarness = initializingHarnessComposition;
     let responseRouter: AccountRuntimeRouter | null = null;
     const sessionFactConsumer = {
@@ -2290,6 +2522,15 @@ async function initializeGateway(): Promise<void> {
     });
     initializingSessionService = new SessionService({
       accounts: initializedAccountService,
+      execution: {
+        computerUse,
+        runtimeWorkspaceRoots: () =>
+          initializingChatExecutionSettings.requireRuntimeWorkspaceRoots(),
+        runtimeWorkspaceSnapshot: () =>
+          initializingChatExecutionSettings.requireRuntimeWorkspaceSnapshot(),
+        acquireRuntimeWorkspaceAdmission: () =>
+          initializingChatExecutionSettings.acquireRuntimeWorkspaceAdmission(),
+      },
       // Session/worktree/transcript state is gateway-internal. Its semantic
       // dispatch hooks remain live, but no session event enters the renderer
       // projection or native event transport.
@@ -2357,6 +2598,7 @@ async function initializeGateway(): Promise<void> {
     const initializingChatPaneStore = new ChatPaneStore(database, {
       messageRequestDigestKey: operationReceiptKey,
       paneArchiveAuthority: initializingChatAttachmentVault,
+      scheduledChatStore: initializingScheduledChatStore,
     });
     const verifiedProviderThreadArchiveCommittedTargetIdsV57 =
       initializingChatPaneStore.verifyProviderThreadArchiveTerminalAuthorityV57();
@@ -2576,6 +2818,10 @@ async function initializeGateway(): Promise<void> {
         harnessRoots,
         projection: chatProjection,
         provider: new CodexChatProvider(initializedSessionService),
+        ...(sessionSyncCoordinator === null
+          ? {}
+          : { scheduledChats: sessionSyncCoordinator }),
+        scheduledChatStore: initializingScheduledChatStore,
         repositories: chatRepositories,
         runtimeRecovery: {
           requestRecovery: () => {
@@ -2832,14 +3078,27 @@ async function initializeGateway(): Promise<void> {
       // never guess at authority after cleanup itself fails.
     }
 
-    await shutdownSessionSync();
+    const failedHumanAccountService = humanAccountService;
+    const failedSessionSyncCoordinator = sessionSyncCoordinator;
+    failedHumanAccountService?.closeAdmission();
+    cloudWorkspaceSummaries.closeAdmission();
+    await shutdownSessionSync({ retainAuthorityFence: true });
     await shutdownHRARunnerPairing();
     await shutdownDispatchRunner();
     await shutdownLocalPromotions();
     await shutdownLocalTaskAuthority();
     await stopCloudInvalidations();
     await stopHumanOrganizationProvisioning();
-    await humanAccountService?.cancelSignIn();
+    await failedHumanAccountService?.cancelSignIn();
+    await cloudWorkspaceSummaries.settled();
+    await failedHumanAccountService?.settled();
+    // A final credential callback can enqueue authenticationChanged after the
+    // initial coordinator stop. Admission is already closed; join that exact
+    // rejected/no-op callback generation before releasing the retained fence.
+    await failedSessionSyncCoordinator?.settled();
+    if (sessionSyncCoordinator === failedSessionSyncCoordinator) {
+      sessionSyncCoordinator = null;
+    }
     humanAccountService = null;
     humanOrganizationOperations = null;
     cloudAttachmentAvailability = null;
@@ -2908,6 +3167,7 @@ async function initializeGateway(): Promise<void> {
     if (harnessDatabaseClosePermitted) {
       database?.close();
       database = null;
+      chatExecutionSettings = null;
       lifetimeLock?.release();
       lifetimeLock = null;
     }
@@ -2927,15 +3187,43 @@ async function quiesceGatewayForLocalDataRemoval(): Promise<void> {
     throw new Error("HRA removal maintenance is already starting.");
   }
   localDataRemovalMaintenanceState = "quiescing";
-  await shutdownSessionSync();
+  const quiescingChatService = chatService;
+  const quiescingSessionSync = sessionSyncCoordinator;
+  const quiescingHumanAccount = humanAccountService;
+  quiescingChatService?.closeAdmission();
+  quiescingSessionSync?.closeAdmission();
+  quiescingHumanAccount?.closeAdmission();
+  cloudWorkspaceSummaries.closeAdmission();
+  const cancellingHumanSignIn = quiescingHumanAccount?.cancelSignIn();
+  await Promise.all([
+    quiescingChatService?.settled(),
+    quiescingSessionSync?.stop(),
+    quiescingSessionSync?.settled(),
+  ]);
   await shutdownHRARunnerPairing();
   await shutdownDispatchRunner();
   await shutdownLocalPromotions();
   await shutdownLocalTaskAuthority();
   await stopCloudInvalidations();
   await stopHumanOrganizationProvisioning();
-  await humanAccountService?.cancelSignIn();
-  humanAccountService = null;
+  await cancellingHumanSignIn;
+  // Direct CloudWorkspaceClient requests can own the shared human session
+  // beyond HumanAccountService's refresh callback. The removal request is the
+  // sole request allowed to remain while its destructive maintenance lease is
+  // held, so drain every other renderer/native request before joining custody.
+  await waitForOrdinaryHostRequestsAtMost(1);
+  await cloudWorkspaceSummaries.settled();
+  await quiescingHumanAccount?.settled();
+  // HumanSession custody callbacks admitted before quiescing can publish one
+  // final authenticationChanged notification. Keep and join the closed
+  // coordinator authority fence until those callbacks have settled.
+  await quiescingSessionSync?.settled();
+  if (sessionSyncCoordinator === quiescingSessionSync) {
+    sessionSyncCoordinator = null;
+  }
+  if (humanAccountService === quiescingHumanAccount) {
+    humanAccountService = null;
+  }
   humanOrganizationOperations = null;
   cloudAttachmentAvailability = null;
   cloudWorkspaceClient = null;
@@ -2947,8 +3235,6 @@ async function quiesceGatewayForLocalDataRemoval(): Promise<void> {
   currentHumanCredentialGeneration = null;
   currentHumanOrganizationId = null;
   currentHumanUserId = null;
-  const quiescingChatService = chatService;
-  quiescingChatService?.closeAdmission();
   const harness = harnessProductionComposition;
   await harness?.preProviderStop();
   await quiescingChatService?.settled();
@@ -3156,12 +3442,58 @@ async function removeLocalData(
       "retry",
     );
   }
+  let scheduledRecoveryInventoryWasCurrent = false;
+  try {
+    const coordinator = sessionSyncCoordinator;
+    if (coordinator !== null) {
+      coordinator.assertScheduledChatsCanLoseSyncAuthority();
+      scheduledRecoveryInventoryWasCurrent = true;
+    } else if (database !== null) {
+      const vault = new SessionSyncStore(database).vault();
+      if (
+        new ScheduledChatStore(database).hasAuthorityBearingState()
+        || (vault !== null && vault.state !== "retired")
+      ) {
+        throw new SessionSyncCoordinatorError(
+          "invalid_state",
+          "Restore session sync recovery before removing local HRA data.",
+        );
+      }
+    }
+  } catch (error) {
+    if (error instanceof SessionSyncCoordinatorError) {
+      return operationFailure(
+        request.operationId,
+        "invalid_state",
+        error.message,
+        false,
+        "none",
+      );
+    }
+    throw error;
+  }
   try {
     await verifiedLocalDataRemoverPath(
       optionalRenamedEnvironmentValue(process.env, "HRA_DATA_REMOVER_PATH"),
     );
     await quiesceGatewayForLocalDataRemoval();
     const context = currentRemovalInventoryContext();
+    if (database !== null) {
+      const scheduledChats = new ScheduledChatStore(database);
+      const vault = new SessionSyncStore(database).vault();
+      if (
+        scheduledChats.hasAuthorityBearingState()
+        || (
+          !scheduledRecoveryInventoryWasCurrent
+          && vault !== null
+          && vault.state !== "retired"
+        )
+      ) {
+        throw new Error(
+          "Turn off scheduled chats or restore session sync recovery before removing local HRA data.",
+        );
+      }
+    }
     const launch = await prepareLocalDataRemovalHelperLaunch({
       plan,
       command: request.command,
@@ -3281,6 +3613,51 @@ async function onboardLocalProject(
     });
   }
   return outcome;
+}
+
+async function selectChatExecutionFolder(
+  trustedDirectoryPath: string,
+): Promise<RuntimeFolderAccessSelectResult> {
+  const store = chatExecutionSettings;
+  if (store === null) {
+    return {
+      version: runtimeProtocolVersion,
+      status: "failed",
+      error: {
+        code: "runtime_unavailable",
+        message: "The shared chat folder setting is unavailable.",
+      },
+    };
+  }
+  try {
+    const selected = await store.select(trustedDirectoryPath);
+    const execution = {
+      folderAccess: selected.projection,
+      approvalPolicy: "never" as const,
+      approvalsReviewer: "auto_review" as const,
+      sandbox: "danger-full-access" as const,
+      computerUse: "required" as const,
+    };
+    await projectionCommits.publish({ type: "execution.changed", execution });
+    return {
+      version: runtimeProtocolVersion,
+      status: "selected",
+      folderAccess: selected.projection,
+    };
+  } catch (error: unknown) {
+    return {
+      version: runtimeProtocolVersion,
+      status: "failed",
+      error: {
+        code: error instanceof ChatExecutionFolderUnavailableError
+          ? "invalid_directory"
+          : "persistence_failed",
+        message: error instanceof ChatExecutionFolderUnavailableError
+          ? error.message
+          : "The selected shared chat folder could not be saved.",
+      },
+    };
+  }
 }
 
 type CloudFailureResult = Exclude<
@@ -5380,7 +5757,21 @@ async function executeDomainCommand(
           "retry",
         );
       }
-      const snapshot = await human.signOut();
+      let snapshot: ReturnType<typeof human.snapshot>;
+      try {
+        snapshot = await human.signOut();
+      } catch (error) {
+        if (error instanceof SessionSyncCoordinatorError) {
+          return operationFailure(
+            request.operationId,
+            "invalid_state",
+            error.message,
+            false,
+            "none",
+          );
+        }
+        throw error;
+      }
       if (snapshot.state === "error") {
         return humanAccountFailure(request.operationId, snapshot.error);
       }
@@ -5613,6 +6004,22 @@ async function executeDomainCommand(
           "retry",
         );
       }
+      try {
+        sessionSyncCoordinator?.assertScheduledChatsCanSelectOrganization(
+          request.command.organizationId,
+        );
+      } catch (error) {
+        if (error instanceof SessionSyncCoordinatorError) {
+          return operationFailure(
+            request.operationId,
+            "invalid_state",
+            error.message,
+            false,
+            "none",
+          );
+        }
+        throw error;
+      }
       const result = await human.selectOrganization(
         request.command.organizationId,
       );
@@ -5679,6 +6086,8 @@ async function executeDomainCommand(
     }
     case "chat.pane.create":
     case "chat.pane.rename":
+    case "chat.pane.schedule.configure":
+    case "chat.pane.schedule.remove":
     case "chat.pane.workspace.recover":
     case "chat.pane.repository.select":
     case "chat.pane.remove":
@@ -5701,6 +6110,7 @@ async function executeDomainCommand(
     case "sessionSync.enable":
     case "sessionSync.disable":
     case "sessionSync.retry":
+    case "sessionSync.scheduledChat.orphan.clear":
     case "sessionSync.enrollment.approve":
     case "sessionSync.device.revoke":
     case "sessionSync.recovery.reveal":
@@ -5792,6 +6202,8 @@ function rehydrateRecordedChatOperation(
     switch (command.data.type) {
       case "chat.pane.create":
       case "chat.pane.rename":
+      case "chat.pane.schedule.configure":
+      case "chat.pane.schedule.remove":
       case "chat.pane.workspace.recover":
       case "chat.pane.repository.select":
       case "chat.turn.stop":
@@ -6054,8 +6466,65 @@ function isIndependentChatMutationRequest(
   }
 }
 
+function isLocalDataRemovalMutationRequest(
+  request: ReturnType<typeof parseHostRequest>,
+): boolean {
+  if (request.command !== runtimeDispatchCommand) return false;
+  try {
+    const payload = parseHostDispatchPayload(request);
+    return !("transferId" in payload)
+      && parseRuntimeDispatchRequest(payload).command.type ===
+        "maintenance.localDataRemoval.remove";
+  } catch {
+    return false;
+  }
+}
+
 const startupRemovalRecovery =
   startupLocalDataRemovalRecoveryRequested();
+
+async function rejectRuntimeDispatchDuringLocalDataRemoval(
+  request: ReturnType<typeof parseHostRequest>,
+): Promise<boolean> {
+  if (request.command !== runtimeDispatchCommand) return false;
+  let response: RuntimeDispatchResponse | RuntimeTaskDispatchResponse;
+  try {
+    const payload = parseHostDispatchPayload(request);
+    if ("transferId" in payload) {
+      response = operationFailure(
+        payload.operationId,
+        "runtime_unavailable",
+        "HRA is preparing to remove local data.",
+        false,
+        "none",
+      );
+    } else {
+      const taskRequest = runtimeTaskDispatchRequestSchema.safeParse(payload);
+      response = taskRequest.success
+        ? taskOperationFailure(
+          taskRequest.data.operationId,
+          "runtime_unavailable",
+          "HRA is preparing to remove local data.",
+          false,
+          "none",
+        )
+        : operationFailure(
+          parseRuntimeDispatchRequest(payload).operationId,
+          "runtime_unavailable",
+          "HRA is preparing to remove local data.",
+          false,
+          "none",
+        );
+    }
+  } catch {
+    return false;
+  }
+  // This is a bounded, writer-free rejection. In particular, it does not run
+  // taskDispatch or dispatch, and therefore cannot enqueue behind the removal
+  // request or mutate an operation receipt after destructive admission closes.
+  await writeHost(hostSuccess(request.id, response));
+  return true;
+}
 
 async function respondToMutationRequest(
   request: ReturnType<typeof parseHostRequest>,
@@ -6109,6 +6578,17 @@ async function respondToMutationRequest(
     await writeHost(hostSuccess(
       request.id,
       await onboardLocalProject(parseHostProjectOnboardingPayload(request)),
+    ));
+    return;
+  }
+  if (request.command === hostFolderAccessSelectCommand) {
+    if (localDataRemovalMaintenanceState !== "open") {
+      throw new TypeError("HRA removal maintenance is active.");
+    }
+    const payload = parseHostFolderAccessSelectPayload(request);
+    await writeHost(hostSuccess(
+      request.id,
+      await selectChatExecutionFolder(payload.trustedDirectoryPath),
     ));
     return;
   }
@@ -6209,7 +6689,41 @@ async function respondToHost(line: string): Promise<void> {
     return;
   }
 
-  if (!developmentReloadAdmission.allowsOrdinaryRequests) {
+  const nativeReconciliationResult =
+    request.command === hostAccountProfileNativeResultCommand
+    || request.command === hostHarnessCustodyNativeResultCommand;
+  const localDataRemovalRequest = isLocalDataRemovalMutationRequest(request);
+  if (
+    !nativeReconciliationResult
+    && localDataRemovalHostAdmissionClosing
+  ) {
+    if (await rejectRuntimeDispatchDuringLocalDataRemoval(request)) return;
+    await writeHost(
+      hostFailure(request.id, "invalid_request", "Runtime admission is closed"),
+    );
+    return;
+  }
+  if (
+    !nativeReconciliationResult
+    && !developmentReloadAdmission.allowsOrdinaryRequests
+  ) {
+    await writeHost(
+      hostFailure(request.id, "invalid_request", "Runtime admission is closed"),
+    );
+    return;
+  }
+  if (localDataRemovalRequest) {
+    // Close host admission synchronously when the private removal request is
+    // parsed. Requests already ahead of it on the mutation tail complete
+    // first; none can queue behind it and deadlock its in-flight drain.
+    localDataRemovalHostAdmissionClosing = true;
+  }
+  if (
+    !nativeReconciliationResult
+    && localDataRemovalMaintenanceState !== "open"
+  ) {
+    if (localDataRemovalRequest) localDataRemovalHostAdmissionClosing = false;
+    if (await rejectRuntimeDispatchDuringLocalDataRemoval(request)) return;
     await writeHost(
       hostFailure(request.id, "invalid_request", "Runtime admission is closed"),
     );
@@ -6218,13 +6732,10 @@ async function respondToHost(line: string): Promise<void> {
   ordinaryHostRequestsInFlight += 1;
 
   try {
-    if (
-      request.command === hostAccountProfileNativeResultCommand
-      || request.command === hostHarnessCustodyNativeResultCommand
-    ) {
+    if (nativeReconciliationResult) {
       // Both native reconciliation lanes participate in initialization. Their
-      // exact private acknowledgements must bypass the barrier or startup can
-      // deadlock waiting for a result that the gateway refuses to consume.
+      // exact private acknowledgements must bypass admission and maintenance
+      // barriers or quiescence can deadlock waiting for its own native result.
       await respondToMutationRequest(request);
       return;
     }
@@ -6251,6 +6762,13 @@ async function respondToHost(line: string): Promise<void> {
     );
   } finally {
     ordinaryHostRequestsInFlight -= 1;
+    notifyOrdinaryHostRequestDrain();
+    if (
+      localDataRemovalRequest
+      && localDataRemovalMaintenanceState === "open"
+    ) {
+      localDataRemovalHostAdmissionClosing = false;
+    }
   }
 }
 
@@ -6320,6 +6838,10 @@ function currentHumanAccountService(): HumanAccountService | null {
   return humanAccountService;
 }
 
+function currentSessionSyncCoordinator(): SessionSyncCoordinator | null {
+  return sessionSyncCoordinator;
+}
+
 function currentDatabase(): ReturnType<typeof openControlPlane> | null {
   return database;
 }
@@ -6346,7 +6868,20 @@ async function attemptTerminalCleanup(
 }
 
 const terminalCleanupFailures: unknown[] = [];
-await attemptTerminalCleanup(terminalCleanupFailures, shutdownSessionSync);
+const terminalHumanAccountService = currentHumanAccountService();
+const terminalSessionSyncCoordinator = currentSessionSyncCoordinator();
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  () => terminalHumanAccountService?.closeAdmission(),
+);
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  () => cloudWorkspaceSummaries.closeAdmission(),
+);
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  async () => await shutdownSessionSync({ retainAuthorityFence: true }),
+);
 await attemptTerminalCleanup(
   terminalCleanupFailures,
   shutdownHRARunnerPairing,
@@ -6366,13 +6901,27 @@ await attemptTerminalCleanup(
   terminalCleanupFailures,
   stopHumanOrganizationProvisioning,
 );
-const terminalHumanAccountService = currentHumanAccountService();
 await attemptTerminalCleanup(
   terminalCleanupFailures,
   async () => {
     await terminalHumanAccountService?.cancelSignIn();
   },
 );
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  async () => await cloudWorkspaceSummaries.settled(),
+);
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  async () => await terminalHumanAccountService?.settled(),
+);
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  async () => await terminalSessionSyncCoordinator?.settled(),
+);
+if (sessionSyncCoordinator === terminalSessionSyncCoordinator) {
+  sessionSyncCoordinator = null;
+}
 humanAccountService = null;
 humanOrganizationOperations = null;
 cloudAttachmentAvailability = null;
@@ -6485,6 +7034,7 @@ if (terminalHarnessDatabaseClosePermitted) {
 }
 if (terminalDatabaseClosed) {
   database = null;
+  chatExecutionSettings = null;
   const terminalLifetimeLock = currentLifetimeLock();
   await attemptTerminalCleanup(
     terminalCleanupFailures,

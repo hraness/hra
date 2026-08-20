@@ -324,6 +324,7 @@ export interface CodexPersistentActorProviderOptions {
     | "resumeHarnessActorThread"
     | "readHarnessModelCatalog"
     | "startHarnessActorTurn"
+    | "settleHarnessActorTurnWorkspaceAdmission"
     | "readHarnessActorChatAttachment"
     | "readHarnessActorContinuationHistory"
     | "injectHarnessActorContinuationHistory"
@@ -762,6 +763,7 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
       scans[1],
       await this.#fence(request),
     );
+    this.#settleSessionTurnWorkspaceAdmission(request, outcome, scans);
     const proof = this.#turnProof(`turn-reconcile-${outcome.kind}`, request, scans,
       outcome.kind !== "pending");
     if (outcome.kind === "applied") {
@@ -1212,6 +1214,7 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
       scans[1],
       fence,
     );
+    this.#settleSessionTurnWorkspaceAdmission(request, outcome, scans);
     const proof = this.#turnProof(
       `continuation-turn-reconcile-${outcome.kind}`,
       request,
@@ -1899,6 +1902,34 @@ export class CodexPersistentActorProvider implements PersistentActorProviderPort
     return pinnedCodexTurnScansHaveExactEvidence(scans[0], scans[1])
       ? scans
       : null;
+  }
+
+  #settleSessionTurnWorkspaceAdmission(
+    request: PersistentActorTurnRequest,
+    outcome: ReturnType<typeof reconcilePinnedCodexTurnStart>,
+    scans: readonly [PinnedCodexTurnScan, PinnedCodexTurnScan],
+  ): void {
+    if (outcome.kind === "not_applied") {
+      this.#sessions.settleHarnessActorTurnWorkspaceAdmission({
+        accountProfileId: request.accountProfileId,
+        clientUserMessageId: request.clientUserMessageId,
+        disposition: "notApplied",
+        expectedGeneration: requestObservationGeneration(request),
+        providerThreadId: request.providerThreadId,
+      });
+      return;
+    }
+    if (outcome.kind !== "applied" || outcome.turnId === undefined) return;
+    const matched = scans[0].turns.find(({ turn }) => turn.id === outcome.turnId);
+    if (matched === undefined) return;
+    this.#sessions.settleHarnessActorTurnWorkspaceAdmission({
+      accountProfileId: request.accountProfileId,
+      clientUserMessageId: request.clientUserMessageId,
+      disposition: matched.turn.status === "inProgress" ? "active" : "terminal",
+      expectedGeneration: requestObservationGeneration(request),
+      providerThreadId: request.providerThreadId,
+      providerTurnId: outcome.turnId,
+    });
   }
 
   async #scanTurns(

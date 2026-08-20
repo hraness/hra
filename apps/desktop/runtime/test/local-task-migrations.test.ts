@@ -407,6 +407,26 @@ describe("local task SQLite migrations", () => {
             version: 57,
             name: "keyed-provider-thread-archive-containment-journal",
           },
+          {
+            version: 58,
+            name: "global-chat-execution-settings",
+          },
+          {
+            version: 59,
+            name: "scheduled-chat-cloud-authority",
+          },
+          {
+            version: 60,
+            name: "scheduled-chat-proven-quota-retry",
+          },
+          {
+            version: 61,
+            name: "session-sync-durable-human-origin",
+          },
+          {
+            version: 62,
+            name: "scheduled-chat-durable-off-intent",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -429,6 +449,7 @@ describe("local task SQLite migrations", () => {
         "chat_attachment_upload_chunks",
         "chat_attachment_vault_state",
         "chat_attachments",
+        "chat_execution_settings",
         "chat_message_ambiguous_resolutions",
         "chat_message_attachment_refs",
         "chat_message_ledger",
@@ -444,6 +465,11 @@ describe("local task SQLite migrations", () => {
         "chat_provider_thread_archive_intents",
         "chat_provider_thread_archive_targets_v57",
         "chat_reasoning_item_receipts",
+        "chat_scheduled_chat_desired_off",
+        "chat_scheduled_chat_generation_high_water",
+        "chat_scheduled_chat_mutations",
+        "chat_scheduled_chat_runs",
+        "chat_scheduled_chats",
         "chat_turn_receipts",
         "harness_actor_account_leases",
         "harness_longitudinal_routing_analyses",
@@ -945,6 +971,7 @@ describe("local task SQLite migrations", () => {
         "chat_attachment_upload_chunks",
         "chat_attachment_vault_state",
         "chat_attachments",
+        "chat_execution_settings",
         "chat_message_ambiguous_resolutions",
         "chat_message_attachment_refs",
         "chat_message_ledger",
@@ -960,6 +987,11 @@ describe("local task SQLite migrations", () => {
         "chat_provider_thread_archive_intents",
         "chat_provider_thread_archive_targets_v57",
         "chat_reasoning_item_receipts",
+        "chat_scheduled_chat_desired_off",
+        "chat_scheduled_chat_generation_high_water",
+        "chat_scheduled_chat_mutations",
+        "chat_scheduled_chat_runs",
+        "chat_scheduled_chats",
         "chat_turn_receipts",
       ]);
 

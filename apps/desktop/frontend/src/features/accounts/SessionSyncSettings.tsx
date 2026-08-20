@@ -32,6 +32,26 @@ type SessionSyncAction =
   | "reveal"
   | "saved";
 
+type ActiveSessionSyncStatus = Extract<
+  SessionSyncStatusProjection,
+  { readonly state: "active" }
+>;
+type ScheduledChatRecoveryProjection =
+  ActiveSessionSyncStatus["scheduledChatRecovery"];
+
+export interface ScheduledChatOrphanActionView {
+  readonly error: string | null;
+  readonly pending: boolean;
+}
+
+interface ScopedScheduledChatOrphanAction extends ScheduledChatOrphanActionView {
+  readonly attempt: number;
+  readonly expectedRevision: number;
+  readonly orphanId: string;
+  readonly scope: string;
+  readonly securityGeneration: number;
+}
+
 export interface RevealedRecoveryKit {
   readonly expiresAt: number;
   readonly revealId: string;
@@ -132,6 +152,85 @@ function unavailableMessage(
   }
 }
 
+export function scheduledChatOrphanClearCommand(
+  status: ActiveSessionSyncStatus,
+  orphanId: string,
+): RuntimeSessionSyncDomainCommand {
+  if (
+    status.scheduledChatRecovery === null
+    || !status.scheduledChatRecovery.orphans.some(
+      (orphan) => orphan.orphanId === orphanId,
+    )
+  ) {
+    throw new RangeError("The scheduled-chat recovery item is no longer current.");
+  }
+  return {
+    type: "sessionSync.scheduledChat.orphan.clear",
+    expectedRevision: status.revision,
+    orphanId,
+  };
+}
+
+function scheduledChatRecoveryError(message: string): string {
+  return message.replace(
+    /syncscheduleorphan_[a-f0-9]{32}/gu,
+    "this schedule",
+  );
+}
+
+export function ScheduledChatRecoverySettings({
+  actions,
+  isDisabled,
+  onRemove,
+  recovery,
+}: Readonly<{
+  actions: ReadonlyMap<string, ScheduledChatOrphanActionView>;
+  isDisabled: boolean;
+  onRemove: (orphanId: string) => void;
+  recovery: ScheduledChatRecoveryProjection;
+}>) {
+  if (recovery === null) return null;
+  const hasPendingAction = [...actions.values()].some((action) => action.pending);
+
+  return (
+    <div className="session-sync-pending">
+      <h3>Scheduled chat recovery</h3>
+      <ul aria-label="Cloud schedules requiring recovery">
+        {recovery.orphans.map((orphan, index) => {
+          const action = actions.get(orphan.orphanId) ?? null;
+          return (
+            <li key={orphan.orphanId}>
+              <div>
+                <strong>Unavailable scheduled chat</strong>
+                <span>
+                  This cloud schedule belongs to newer chat state that is unavailable on this
+                  Mac. Remove it before session sync can continue.
+                </span>
+                {action?.error === null || action?.error === undefined ? null : (
+                  <span className="session-sync-warning" role="alert">
+                    {action.error}
+                  </span>
+                )}
+              </div>
+              <Button
+                aria-label={`Remove unavailable cloud schedule ${index + 1}`}
+                isDisabled={isDisabled || (hasPendingAction && action?.pending !== true)}
+                isPending={action?.pending === true}
+                onPress={() => onRemove(orphan.orphanId)}
+                size="compact"
+                type="button"
+                variant="secondary"
+              >
+                {action?.pending === true ? "Removing…" : "Remove schedule"}
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell }) {
   const snapshot = useRuntimeShellSelector(
     shell,
@@ -147,7 +246,18 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
   const [pending, setPending] = useState<SessionSyncAction | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [scheduledChatOrphanActions, setScheduledChatOrphanActions] = useState<
+    readonly ScopedScheduledChatOrphanAction[]
+  >([]);
+  const scheduledChatOrphanActionsRef = useRef(scheduledChatOrphanActions);
+  const scheduledChatOrphanAttemptRef = useRef(0);
   const status = snapshot.status;
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const runtimeReadyRef = useRef(runtimeReady);
+  runtimeReadyRef.current = runtimeReady;
+  const pendingRef = useRef(pending);
+  pendingRef.current = pending;
   const securityScope = sessionSyncSecurityScope(status);
   const securityScopeRef = useRef(securityScope);
   const securityGenerationRef = useRef(0);
@@ -175,6 +285,45 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
     securityGenerationRef.current,
   );
   const revealedKit = scopedRecoverySecrets.revealedKit;
+
+  const publishScheduledChatOrphanActions = useCallback((
+    update: (
+      current: readonly ScopedScheduledChatOrphanAction[],
+    ) => readonly ScopedScheduledChatOrphanAction[],
+  ) => {
+    const current = scheduledChatOrphanActionsRef.current;
+    const next = update(current);
+    if (next === current) return;
+    scheduledChatOrphanActionsRef.current = next;
+    if (securityScopeRef.current !== "unmounted") {
+      setScheduledChatOrphanActions(next);
+    }
+  }, []);
+
+  scheduledChatOrphanActionsRef.current = scheduledChatOrphanActions;
+  const currentScheduledChatRecovery = status.state === "active"
+    ? status.scheduledChatRecovery
+    : null;
+  const currentScheduledChatOrphanIds = new Set(
+    currentScheduledChatRecovery?.orphans.map((orphan) => orphan.orphanId) ?? [],
+  );
+  const currentScheduledChatOrphanActions = new Map<string, ScheduledChatOrphanActionView>();
+  if (status.state === "active") {
+    for (const action of scheduledChatOrphanActions) {
+      if (
+        action.scope === securityScope
+        && action.securityGeneration === securityGenerationRef.current
+        && action.expectedRevision === status.revision
+        && currentScheduledChatOrphanIds.has(action.orphanId)
+      ) {
+        currentScheduledChatOrphanActions.set(action.orphanId, action);
+      }
+    }
+  }
+  const scheduledChatOrphanMutationPending = [
+    ...currentScheduledChatOrphanActions.values(),
+  ].some((action) => action.pending);
+  const mutationPending = pending !== null || scheduledChatOrphanMutationPending;
 
   const clearRecoverySecrets = useCallback(() => {
     const cleared = emptyRecoverySecrets(
@@ -205,6 +354,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
   useEffect(() => () => {
     securityScopeRef.current = "unmounted";
     securityGenerationRef.current += 1;
+    scheduledChatOrphanActionsRef.current = [];
     recoverySecretsRef.current = emptyRecoverySecrets(
       "unmounted",
       securityGenerationRef.current,
@@ -232,7 +382,15 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
     action: SessionSyncAction,
     command: RuntimeSessionSyncDomainCommand,
   ) => {
-    if (pending !== null) return null;
+    const projected = statusRef.current;
+    const scheduledChatMutationPendingNow = projected.state === "active"
+      && scheduledChatOrphanActionsRef.current.some(
+        (orphanAction) => orphanAction.pending
+          && orphanAction.scope === securityScopeRef.current
+          && orphanAction.securityGeneration === securityGenerationRef.current
+          && orphanAction.expectedRevision === projected.revision,
+      );
+    if (pendingRef.current !== null || scheduledChatMutationPendingNow) return null;
     if (!runtimeReady) {
       setError("The local runtime is not ready.");
       return null;
@@ -240,6 +398,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
     const commandScope = securityScopeRef.current;
     const commandGeneration = securityGenerationRef.current;
     if (action === "disable") clearRecoverySecrets();
+    pendingRef.current = action;
     setPending(action);
     setError(null);
     setNotice(null);
@@ -273,9 +432,93 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
       );
       return null;
     } finally {
+      pendingRef.current = null;
       setPending(null);
     }
-  }, [clearRecoverySecrets, pending, runtimeReady, shell]);
+  }, [
+    clearRecoverySecrets,
+    runtimeReady,
+    shell,
+  ]);
+
+  const clearOrphanedScheduledChat = useCallback(async (orphanId: string) => {
+    const currentStatus = statusRef.current;
+    const commandScope = securityScopeRef.current;
+    const commandGeneration = securityGenerationRef.current;
+    if (
+      currentStatus.state !== "active"
+      || commandScope === "unmounted"
+      || !runtimeReadyRef.current
+      || pendingRef.current !== null
+    ) return;
+
+    let command: RuntimeSessionSyncDomainCommand;
+    try {
+      command = scheduledChatOrphanClearCommand(currentStatus, orphanId);
+    } catch {
+      return;
+    }
+    const expectedRevision = currentStatus.revision;
+    const hasPendingAction = scheduledChatOrphanActionsRef.current.some(
+      (action) => action.pending
+        && action.scope === commandScope
+        && action.securityGeneration === commandGeneration
+        && action.expectedRevision === expectedRevision,
+    );
+    if (hasPendingAction) return;
+
+    const attempt = scheduledChatOrphanAttemptRef.current + 1;
+    scheduledChatOrphanAttemptRef.current = attempt;
+    const pendingAction: ScopedScheduledChatOrphanAction = {
+      attempt,
+      error: null,
+      expectedRevision,
+      orphanId,
+      pending: true,
+      scope: commandScope,
+      securityGeneration: commandGeneration,
+    };
+    publishScheduledChatOrphanActions((actions) => [
+      ...actions.filter((action) => action.orphanId !== orphanId),
+      pendingAction,
+    ]);
+
+    const actionIsCurrent = () => {
+      const projected = statusRef.current;
+      return securityScopeRef.current === commandScope
+        && securityGenerationRef.current === commandGeneration
+        && projected.state === "active"
+        && projected.revision === expectedRevision
+        && projected.scheduledChatRecovery?.orphans.some(
+          (orphan) => orphan.orphanId === orphanId,
+        ) === true;
+    };
+    const settle = (failure: string | null) => {
+      publishScheduledChatOrphanActions((actions) => {
+        const current = actions.find(
+          (action) => action.orphanId === orphanId && action.attempt === attempt,
+        );
+        if (current === undefined) return actions;
+        if (failure === null || !actionIsCurrent()) {
+          return actions.filter((action) => action !== current);
+        }
+        return actions.map((action) => action === current
+          ? { ...action, error: scheduledChatRecoveryError(failure), pending: false }
+          : action);
+      });
+    };
+
+    try {
+      const response = await shell.dispatch(command);
+      settle(response.ok ? null : response.error.message);
+    } catch (reason: unknown) {
+      settle(
+        reason instanceof Error
+          ? reason.message
+          : "The cloud schedule could not be removed.",
+      );
+    }
+  }, [publishScheduledChatOrphanActions, shell]);
 
   return (
     <section aria-labelledby="session-sync-title" className="settings-section session-sync-settings">
@@ -291,7 +534,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
           {status.retryable ? (
             <IconButton
               aria-label="Retry session sync"
-              isDisabled={!runtimeReady || pending !== null}
+              isDisabled={!runtimeReady || mutationPending}
               isPending={pending === "retry"}
               onPress={() => void run("retry", { type: "sessionSync.retry" })}
               size="compact"
@@ -318,7 +561,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
           <Button
             isDisabled={
               !runtimeReady
-              || pending !== null
+              || mutationPending
               || deviceName.trim().length === 0
             }
             onPress={() => void run("enable", {
@@ -350,7 +593,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             {status.retryable ? (
               <IconButton
                 aria-label="Retry device enrollment"
-                isDisabled={!runtimeReady || pending !== null}
+                isDisabled={!runtimeReady || mutationPending}
                 isPending={pending === "retry"}
                 onPress={() => void run("retry", { type: "sessionSync.retry" })}
                 size="compact"
@@ -363,7 +606,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             ) : null}
             <IconButton
               aria-label="Turn off session sync"
-              isDisabled={!runtimeReady || pending !== null}
+              isDisabled={!runtimeReady || mutationPending}
               isPending={pending === "disable"}
               onPress={() => void run("disable", {
                 type: "sessionSync.disable",
@@ -430,6 +673,13 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             </div>
           )}
 
+          <ScheduledChatRecoverySettings
+            actions={currentScheduledChatOrphanActions}
+            isDisabled={!runtimeReady || mutationPending}
+            onRemove={(orphanId) => void clearOrphanedScheduledChat(orphanId)}
+            recovery={status.scheduledChatRecovery}
+          />
+
           <div className="session-sync-recovery">
             <div>
               <h3>Recovery kit</h3>
@@ -440,7 +690,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             <div aria-label="Recovery kit actions" className="session-sync-actions" role="group">
               <IconButton
                 aria-label="Reveal recovery kit"
-                isDisabled={!runtimeReady || pending !== null}
+                isDisabled={!runtimeReady || mutationPending}
                 isPending={pending === "reveal"}
                 onPress={() => void run("reveal", {
                   type: "sessionSync.recovery.reveal",
@@ -464,7 +714,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
                 <pre aria-label="Recovery kit">{revealedKit.value}</pre>
                 <div className="session-sync-actions">
                   <Button
-                    isDisabled={!runtimeReady || pending !== null}
+                    isDisabled={!runtimeReady || mutationPending}
                     isPending={pending === "saved"}
                     onPress={() => void (async () => {
                       const result = await run("saved", {
@@ -511,7 +761,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             {status.retryable ? (
               <IconButton
                 aria-label="Retry session sync"
-                isDisabled={!runtimeReady || pending !== null}
+                isDisabled={!runtimeReady || mutationPending}
                 isPending={pending === "retry"}
                 onPress={() => void run("retry", { type: "sessionSync.retry" })}
                 size="compact"
@@ -524,7 +774,7 @@ export function SessionSyncSettings({ shell }: { readonly shell: RuntimeShell })
             ) : null}
             <IconButton
               aria-label="Turn off session sync"
-              isDisabled={!runtimeReady || pending !== null}
+              isDisabled={!runtimeReady || mutationPending}
               isPending={pending === "disable"}
               onPress={() => void run("disable", {
                 type: "sessionSync.disable",

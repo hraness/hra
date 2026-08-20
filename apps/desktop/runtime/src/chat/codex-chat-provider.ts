@@ -18,6 +18,7 @@ import { ChatProviderEffectError } from "./types";
 type ChatSessionRuntime = Pick<
   SessionService,
   | "injectChatHistory"
+  | "interpretChatSchedule"
   | "archiveChatThread"
   | "prepareChatThreadArchive"
   | "reconcileChatThreadArchive"
@@ -72,6 +73,22 @@ export class CodexChatProvider implements ChatProviderPort {
       });
     } catch (error: unknown) {
       throw providerFailure(error, false, "configuration");
+    }
+  }
+
+  async interpretSchedule(
+    request: Parameters<ChatProviderPort["interpretSchedule"]>[0],
+  ): ReturnType<ChatProviderPort["interpretSchedule"]> {
+    try {
+      return await this.#sessions.interpretChatSchedule({
+        accountProfileId: request.accountProfileId,
+        workspacePath: request.workingDirectory,
+        instruction: request.instruction,
+        timeZone: request.timeZone,
+        now: request.now,
+      });
+    } catch (error: unknown) {
+      throw preserveOrMap(error, true);
     }
   }
 

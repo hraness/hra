@@ -2,11 +2,16 @@ import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { AccountSummary } from "../../../../contracts/runtime";
+import type {
+  AccountSummary,
+  HumanAccountSnapshot,
+} from "../../../../contracts/runtime";
 import type { RuntimeShell } from "../../runtime";
 import {
   SubscriptionsSettings,
   accountStatus,
+  canClearHumanCredential,
+  canStartHumanSignIn,
   humanAccountDescription,
   humanAccountStatus,
 } from "./SubscriptionsSettings";
@@ -83,6 +88,40 @@ test("HRA Cloud explains unavailable and usable endpoint states", () => {
   expect(humanAccountDescription({ state: "signedOut", revision: 1 })).toContain(
     "Sign in to connect this Mac to HRA Cloud",
   );
+});
+
+test("a credential from another configured cloud has an exact clear path", async () => {
+  const foreignCredential = {
+    state: "error",
+    revision: 7,
+    code: "CONFIGURATION_UNAVAILABLE",
+    message: "HRA Cloud configuration is unavailable.",
+    retryable: false,
+    profile: {
+      user: {
+        id: "user_LOCAL",
+        email: "builder@example.test",
+        name: null,
+      },
+      organization: null,
+      workspace: null,
+    },
+  } as const satisfies HumanAccountSnapshot;
+  expect(canClearHumanCredential(foreignCredential)).toBeTrue();
+  expect(canStartHumanSignIn(foreignCredential)).toBeTrue();
+  expect(humanAccountDescription(foreignCredential)).toContain(
+    "Sign in to this build's configured cloud",
+  );
+  expect(canClearHumanCredential({
+    ...foreignCredential,
+    profile: null,
+  })).toBeFalse();
+  const source = await Bun.file(
+    new URL("./SubscriptionsSettings.tsx", import.meta.url),
+  ).text();
+  expect(source).toContain('aria-label={storedCredentialRecovery');
+  expect(source).toContain('"Remove stored HRA Cloud credential"');
+  expect(source).toContain('type: "human.signOut"');
 });
 
 test("failed account and transport recovery stay reachable through compact icon buttons", async () => {

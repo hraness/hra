@@ -14,6 +14,13 @@ function emptySnapshot(): RuntimeSnapshot {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
     sessionSync: {
       status: {

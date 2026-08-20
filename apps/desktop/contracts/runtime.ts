@@ -1,10 +1,14 @@
 import { z } from "@hra-internal/schema";
 import {
+  canonicalScheduledChatRRuleSchema,
+  MAX_SCHEDULED_CHAT_RRULE_UTF8_BYTES,
+  MAX_SCHEDULED_CHAT_TIME_ZONE_UTF8_BYTES,
   organizationIdSchema,
   organizationNameSchema,
   organizationRoleSchema,
   hraWorkspaceCapabilitiesSchema,
   portableInvalidationSchema,
+  parseCanonicalScheduledChatRRule,
   portableProjectionCursorSchema,
   revisionSchema as workspaceProjectionRevisionSchema,
   taskWorkspaceMutationIntentSchema,
@@ -24,6 +28,7 @@ import {
   runnerPresenceViewSchema,
   sessionPublicIdSchema as syncedSessionPublicIdSchema,
   sessionSyncEnrollmentRequestIdSchema,
+  scheduledChatTimeZoneSchema,
   syncEnrollmentPairingCodeSchema,
   syncDeviceIdSchema,
   type OperationReceipt,
@@ -40,6 +45,8 @@ export const runtimeSnapshotCommand = "hra.runtime.snapshot" as const;
 export const runtimeDispatchCommand = "hra.runtime.dispatch" as const;
 /** Pathless Native chooser request; private onboarding remains host-only. */
 export const runtimeProjectAddCommand = "hra.project.add" as const;
+/** Pathless Native chooser for the one folder shared by every local chat. */
+export const runtimeFolderAccessSelectCommand = "hra.folderAccess.select" as const;
 export const runtimeEventName = "hra:runtime-event" as const;
 /** Pathless Native-owned gateway lifecycle recovery command. */
 export const runtimeTransportRetryCommand = "hra.runtime.retryTransport" as const;
@@ -119,6 +126,9 @@ export const runtimeChatAttachmentInputByteLimit = 24 * 1024 * 1024;
 export const runtimeChatAttachmentChunkByteLimit = 512 * 1024;
 export const runtimeChatAttachmentPreviewByteLimit = 512 * 1024;
 export const runtimeChatMessageUtf8ByteLimit = runtimeChatTurnPromptUtf8ByteLimit;
+export const runtimeChatScheduleRruleUtf8ByteLimit = MAX_SCHEDULED_CHAT_RRULE_UTF8_BYTES;
+export const runtimeChatScheduleTimeZoneUtf8ByteLimit =
+  MAX_SCHEDULED_CHAT_TIME_ZONE_UTF8_BYTES;
 export const runtimeChatQueueUtf8ByteLimit = 512 * 1024;
 export const runtimeNativeBridgeRequestUtf8ByteLimit = 1024 * 1024;
 export const runtimeChatDeltaUtf8ByteLimit = 4 * 1024;
@@ -600,6 +610,23 @@ const chatPaneTitleSchema = z
 export const chatModelSchema = z.literal("gpt-5.6-sol");
 export const chatReasoningEffortSchema = z.enum(["ultra", "max"]);
 export const chatServiceTierSchema = z.enum(["standard", "fast"]);
+export const chatScheduleProjectionSchema = z
+  .object({
+    revision: revisionSchema,
+    rrule: canonicalScheduledChatRRuleSchema,
+    timeZone: scheduledChatTimeZoneSchema,
+    nextRunAt: chatIsoDateTimeSchema,
+  })
+  .strict()
+  .superRefine((schedule, context) => {
+    if (parseCanonicalScheduledChatRRule(schedule.rrule)?.timeZone !== schedule.timeZone) {
+      context.addIssue({
+        code: "custom",
+        message: "chat schedule RRULE and time zone must match",
+        path: ["timeZone"],
+      });
+    }
+  });
 export const chatRootTurnWorkClassSchema = z.enum([
   "boundedLeaf",
   "standard",
@@ -1409,6 +1436,7 @@ export const chatPaneProjectionSchema = z
     attention: chatAttentionSchema.nullable(),
     recoverablePrompt: z.boolean().default(false),
     canStartFreshContext: z.boolean().default(false),
+    schedule: chatScheduleProjectionSchema.nullable().default(null),
     messageQueue: chatMessageQueueProjectionSchema,
     attachments: chatAttachmentPaneProjectionSchema.default({
       drafts: [],
@@ -1423,6 +1451,13 @@ export const chatPaneProjectionSchema = z
         code: "custom",
         message: "chat panes require a workspace and harness observers cannot own one",
         path: ["workspace"],
+      });
+    }
+    if (pane.interactionMode !== "chat" && pane.schedule !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "only ordinary chat panes can own a schedule",
+        path: ["schedule"],
       });
     }
     if (
@@ -1577,6 +1612,7 @@ export const chatPaneStateProjectionSchema = z
     attention: chatAttentionSchema.nullable(),
     recoverablePrompt: z.boolean().default(false),
     canStartFreshContext: z.boolean().default(false),
+    schedule: chatScheduleProjectionSchema.nullable().default(null),
   })
   .strict()
   .superRefine((pane, context) => {
@@ -1585,6 +1621,13 @@ export const chatPaneStateProjectionSchema = z
         code: "custom",
         message: "chat panes require a workspace and harness observers cannot own one",
         path: ["workspace"],
+      });
+    }
+    if (pane.interactionMode !== "chat" && pane.schedule !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "only ordinary chat panes can own a schedule",
+        path: ["schedule"],
       });
     }
     if (
@@ -1688,6 +1731,10 @@ export const chatSnapshotSchema = z
 
 const sessionSyncRevisionSchema = z.number().int().nonnegative().safe();
 const sessionSyncTimestampSchema = z.number().int().nonnegative().safe();
+export const sessionSyncScheduledChatOrphanIdSchema = z.string()
+  .min(25)
+  .max(96)
+  .regex(/^syncscheduleorphan_[a-f0-9]{32}$/u);
 
 function isSafeSessionSyncDisplayText(value: string): boolean {
   for (const character of value) {
@@ -1790,6 +1837,12 @@ export const sessionSyncStatusProjectionSchema = z.discriminatedUnion(
         .max(runtimeSessionSyncDeviceHistoryLimit),
       pendingEnrollments: z.array(sessionSyncEnrollmentProjectionSchema)
         .max(runtimeSessionSyncPendingEnrollmentLimit),
+      scheduledChatRecovery: z.object({
+        state: z.literal("clearRequired"),
+        orphans: z.array(z.object({
+          orphanId: sessionSyncScheduledChatOrphanIdSchema,
+        }).strict()).min(1).max(runtimeChatPaneLimit),
+      }).strict().nullable(),
     }).strict().superRefine((status, context) => {
       const deviceIds = new Set<string>();
       let currentCount = 0;
@@ -1927,6 +1980,24 @@ export const sessionSyncSnapshotSchema = z.object({
   remoteSessions: [],
 });
 
+export const executionFolderAccessProjectionSchema = z.object({
+  revision: revisionSchema,
+  displayName: utf8StringSchema({ minBytes: 1, maxBytes: 160 }).refine(
+    isSafeSessionSyncDisplayText,
+    "execution folder display name contains a display control character",
+  ),
+  availability: z.enum(["ready", "missing"]),
+}).strict();
+
+export const executionProjectionSchema = z.object({
+  folderAccess: executionFolderAccessProjectionSchema,
+  approvalPolicy: z.literal("never"),
+  approvalsReviewer: z.literal("auto_review"),
+  sandbox: z.literal("danger-full-access"),
+  /** Required policy; usable capability is proven again for each provider thread. */
+  computerUse: z.literal("required"),
+}).strict();
+
 /**
  * This is the complete global renderer snapshot. Scoped task pages/details,
  * worktrees, usage, raw provider sessions/interactions, and diagnostics never
@@ -1943,6 +2014,7 @@ export const runtimeSnapshotSchema = z
       .array(retainedAccountLocalDataSchema)
       .max(runtimeRetainedAccountLocalDataLimit),
     humanAccount: humanAccountSnapshotSchema,
+    execution: executionProjectionSchema,
     chat: chatSnapshotSchema,
     sessionSync: sessionSyncSnapshotSchema,
     harness: harnessSnapshotSchema.nullable().default(null),
@@ -2453,6 +2525,29 @@ const runtimeChatPaneRenameCommandSchema = z
   })
   .strict();
 
+const runtimeChatPaneScheduleConfigureCommandSchema = z
+  .object({
+    type: z.literal("chat.pane.schedule.configure"),
+    paneId: chatPaneIdSchema,
+    expectedRevision: revisionSchema,
+    instruction: utf8StringSchema({
+      minBytes: 1,
+      maxBytes: runtimeChatMessageUtf8ByteLimit,
+    }).refine(
+      (value) => value.trim().length > 0,
+      "chat schedule instruction must contain non-whitespace text",
+    ),
+  })
+  .strict();
+
+const runtimeChatPaneScheduleRemoveCommandSchema = z
+  .object({
+    type: z.literal("chat.pane.schedule.remove"),
+    paneId: chatPaneIdSchema,
+    expectedRevision: revisionSchema,
+  })
+  .strict();
+
 const runtimeChatPaneWorkspaceRecoverCommandSchema = z
   .object({
     type: z.literal("chat.pane.workspace.recover"),
@@ -2744,6 +2839,8 @@ export const runtimeChatPaneResultSchema = z.object({
 const runtimeChatPaneReplayCommandTypeSchema = z.enum([
   "chat.pane.create",
   "chat.pane.rename",
+  "chat.pane.schedule.configure",
+  "chat.pane.schedule.remove",
   "chat.pane.workspace.recover",
   "chat.pane.repository.select",
   "chat.turn.stop",
@@ -2804,6 +2901,8 @@ const runtimeHarnessChildStopCommandSchema = z
 export const runtimeChatDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
+  runtimeChatPaneScheduleConfigureCommandSchema,
+  runtimeChatPaneScheduleRemoveCommandSchema,
   runtimeChatPaneWorkspaceRecoverCommandSchema,
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
@@ -2836,6 +2935,11 @@ export const runtimeSessionSyncDomainCommandSchema = z.discriminatedUnion(
       ...sessionSyncExpectedRevisionField,
     }).strict(),
     z.object({ type: z.literal("sessionSync.retry") }).strict(),
+    z.object({
+      type: z.literal("sessionSync.scheduledChat.orphan.clear"),
+      ...sessionSyncExpectedRevisionField,
+      orphanId: sessionSyncScheduledChatOrphanIdSchema,
+    }).strict(),
     z.object({
       type: z.literal("sessionSync.enrollment.approve"),
       ...sessionSyncExpectedRevisionField,
@@ -2879,6 +2983,8 @@ export const runtimeSessionSyncDomainCommandSchema = z.discriminatedUnion(
 export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
+  runtimeChatPaneScheduleConfigureCommandSchema,
+  runtimeChatPaneScheduleRemoveCommandSchema,
   runtimeChatPaneWorkspaceRecoverCommandSchema,
   runtimeChatPaneRepositorySelectCommandSchema,
   runtimeChatPaneRemoveCommandSchema,
@@ -3023,6 +3129,40 @@ export const runtimeDispatchTransportRequestSchema = z.union([
 export const runtimeProjectAddRequestSchema = z
   .object({ version: z.literal(runtimeProtocolVersion) })
   .strict();
+
+export const runtimeFolderAccessSelectRequestSchema = z
+  .object({ version: z.literal(runtimeProtocolVersion) })
+  .strict();
+
+const runtimeFolderAccessSelectErrorSchema = z.object({
+  code: z.enum([
+    "invalid_directory",
+    "invalid_request",
+    "persistence_failed",
+    "runtime_unavailable",
+  ]),
+  message: utf8StringSchema({ minBytes: 1, maxBytes: 240 }),
+}).strict();
+
+export const runtimeFolderAccessSelectResultSchema = z.discriminatedUnion(
+  "status",
+  [
+    z.object({
+      version: z.literal(runtimeProtocolVersion),
+      status: z.literal("cancelled"),
+    }).strict(),
+    z.object({
+      version: z.literal(runtimeProtocolVersion),
+      status: z.literal("selected"),
+      folderAccess: executionFolderAccessProjectionSchema,
+    }).strict(),
+    z.object({
+      version: z.literal(runtimeProtocolVersion),
+      status: z.literal("failed"),
+      error: runtimeFolderAccessSelectErrorSchema,
+    }).strict(),
+  ],
+);
 
 const runtimeProjectAddRepositorySchema = z
   .object({
@@ -3492,6 +3632,10 @@ export const runtimeDispatchTransportResponseSchema = z.union([
 export const runtimeDomainEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("runtime.changed"), runtime: runtimeStatusSchema }).strict(),
   z.object({ type: z.literal("runner.changed"), runner: runnerConnectionStatusSchema }).strict(),
+  z.object({
+    type: z.literal("execution.changed"),
+    execution: executionProjectionSchema,
+  }).strict(),
   z.object({ type: z.literal("account.upserted"), account: accountSummarySchema }).strict(),
   z.object({ type: z.literal("account.removed"), accountProfileId: accountProfileIdSchema }).strict(),
   z
@@ -3689,6 +3833,7 @@ export type ChatRootTurnRoutingProjection = z.infer<
 >;
 export type ChatPaneActivityKind = z.infer<typeof chatPaneActivityKindSchema>;
 export type ChatPaneActivity = z.infer<typeof chatPaneActivitySchema>;
+export type ChatScheduleProjection = z.infer<typeof chatScheduleProjectionSchema>;
 export type ChatPaneState = z.infer<typeof chatPaneStateSchema>;
 export type ChatPaneInteractionMode = z.infer<typeof chatPaneInteractionModeSchema>;
 export type ChatTurnStatus = z.infer<typeof chatTurnStatusSchema>;
@@ -3741,6 +3886,10 @@ export type RuntimeHumanOrganization = z.infer<
   typeof runtimeHumanOrganizationSchema
 >;
 export type RuntimeHumanWorkspace = z.infer<typeof workspaceViewSchema>;
+export type ExecutionFolderAccessProjection = z.infer<
+  typeof executionFolderAccessProjectionSchema
+>;
+export type ExecutionProjection = z.infer<typeof executionProjectionSchema>;
 export type RuntimeSnapshot = z.infer<typeof runtimeSnapshotSchema>;
 export type RuntimeSnapshotRequest = z.infer<typeof runtimeSnapshotRequestSchema>;
 export type RuntimeSnapshotResponse = z.infer<typeof runtimeSnapshotResponseSchema>;
@@ -3801,6 +3950,12 @@ export type RuntimeTaskMutationReconciliation = z.infer<
 >;
 export type RuntimeProjectAddRequest = z.infer<typeof runtimeProjectAddRequestSchema>;
 export type RuntimeProjectAddResult = z.infer<typeof runtimeProjectAddResultSchema>;
+export type RuntimeFolderAccessSelectRequest = z.infer<
+  typeof runtimeFolderAccessSelectRequestSchema
+>;
+export type RuntimeFolderAccessSelectResult = z.infer<
+  typeof runtimeFolderAccessSelectResultSchema
+>;
 export type RuntimeDispatchRequest = z.infer<typeof runtimeDispatchRequestSchema>;
 export type RuntimeTaskDispatchRequest = z.infer<typeof runtimeTaskDispatchRequestSchema>;
 export type RuntimeDispatchContinuationRequest = z.infer<
@@ -3888,6 +4043,18 @@ export function parseRuntimeDispatchTransportRequest(
 
 export function parseRuntimeProjectAddRequest(value: unknown): RuntimeProjectAddRequest {
   return runtimeProjectAddRequestSchema.parse(value);
+}
+
+export function parseRuntimeFolderAccessSelectRequest(
+  value: unknown,
+): RuntimeFolderAccessSelectRequest {
+  return runtimeFolderAccessSelectRequestSchema.parse(value);
+}
+
+export function parseRuntimeFolderAccessSelectResult(
+  value: unknown,
+): RuntimeFolderAccessSelectResult {
+  return runtimeFolderAccessSelectResultSchema.parse(value);
 }
 
 export function parseRuntimeProjectAddResult(value: unknown): RuntimeProjectAddResult {
@@ -3979,6 +4146,58 @@ export function parseRuntimeChatDispatchResponseForRequest(
         pane.title !== request.command.title
       ) {
         chatResponseMismatch("pane rename");
+      }
+      return response;
+    }
+    case "chat.pane.schedule.configure": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== request.command.expectedRevision + 1
+        ) {
+          chatResponseMismatch("schedule configuration replay");
+        }
+        return response;
+      }
+      if (response.result.type !== "chatPane") {
+        chatResponseMismatch("schedule configuration");
+      }
+      const { pane, appliedRevision } = response.result;
+      const expectedAppliedRevision = request.command.expectedRevision + 1;
+      if (
+        pane.id !== request.command.paneId ||
+        appliedRevision !== expectedAppliedRevision ||
+        pane.revision !== expectedAppliedRevision ||
+        pane.schedule === null ||
+        pane.interactionMode !== "chat"
+      ) {
+        chatResponseMismatch("schedule configuration");
+      }
+      return response;
+    }
+    case "chat.pane.schedule.remove": {
+      if (response.result.type === "chatPaneReplay") {
+        if (
+          response.result.paneId !== request.command.paneId ||
+          response.result.commandType !== request.command.type ||
+          response.result.appliedRevision !== request.command.expectedRevision + 1
+        ) {
+          chatResponseMismatch("schedule removal replay");
+        }
+        return response;
+      }
+      if (response.result.type !== "chatPane") chatResponseMismatch("schedule removal");
+      const { pane, appliedRevision } = response.result;
+      const expectedAppliedRevision = request.command.expectedRevision + 1;
+      if (
+        pane.id !== request.command.paneId ||
+        appliedRevision !== expectedAppliedRevision ||
+        pane.revision !== expectedAppliedRevision ||
+        pane.schedule !== null ||
+        pane.interactionMode !== "chat"
+      ) {
+        chatResponseMismatch("schedule removal");
       }
       return response;
     }

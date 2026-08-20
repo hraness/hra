@@ -52,6 +52,12 @@ import {
   type CodexStreamPosition,
 } from "./rpc-core";
 import { CodexJsonlWriter } from "./writer";
+import {
+  verifyComputerUseServerStatus,
+  withComputerUseDeveloperInstructions,
+  withComputerUseThreadConfig,
+  type ComputerUseProvisioning,
+} from "./computer-use-provisioning";
 
 const SHA_256_PATTERN = /^[a-f0-9]{64}$/u;
 const PROBE_PROTOCOL_TIMEOUT_MS = 30_000;
@@ -132,6 +138,10 @@ export interface PinnedCodexDynamicToolLifecycleProbeInput {
   readonly accountProfileId: AccountProfileId;
   readonly binarySha256: string;
   readonly codexVersion: typeof PINNED_CODEX_DYNAMIC_TOOL_VERSION;
+  readonly executionWorkspace?: Readonly<{
+    readonly revision: number;
+    readonly runtimeWorkspaceRoots: readonly [string];
+  }>;
   readonly paths: RuntimePaths;
   readonly processGeneration: number;
 }
@@ -163,6 +173,15 @@ export interface PinnedCodexDynamicToolCapabilityResolverOptions {
   readonly hashBinary?: PinnedCodexDynamicToolBinaryHasher;
   readonly now?: () => number;
   readonly readVersion?: PinnedCodexDynamicToolVersionReader;
+  /** Required by production so probe threads use the same global execution capability. */
+  readonly execution?: Readonly<{
+    readonly computerUse: ComputerUseProvisioning;
+    readonly acquireRuntimeWorkspaceAdmission: () => Promise<Readonly<{
+      readonly revision: number;
+      readonly runtimeWorkspaceRoots: readonly [string];
+      release(): void;
+    }>>;
+  }>;
 }
 
 interface CapabilitySlot {
@@ -181,14 +200,19 @@ export class PinnedCodexDynamicToolCapabilityResolver {
   readonly #now: () => number;
   readonly #probe: PinnedCodexDynamicToolLifecycleProbe;
   readonly #readVersion: PinnedCodexDynamicToolVersionReader;
+  readonly #execution: PinnedCodexDynamicToolCapabilityResolverOptions["execution"];
   readonly #slots = new Map<AccountProfileId, CapabilitySlot>();
 
   constructor(options: PinnedCodexDynamicToolCapabilityResolverOptions = {}) {
     this.#hashBinary = options.hashBinary ?? hashPinnedCodexBinary;
     this.#now = options.now ?? Date.now;
     this.#readVersion = options.readVersion ?? readPinnedCodexVersion;
+    this.#execution = options.execution;
     this.#probe = options.probe ?? new DirectPinnedCodexDynamicToolLifecycleProbe({
       now: this.#now,
+      ...(options.execution?.computerUse === undefined
+        ? {}
+        : { computerUse: options.execution.computerUse }),
     });
   }
 
@@ -226,16 +250,42 @@ export class PinnedCodexDynamicToolCapabilityResolver {
   async #resolveOnce(
     input: PinnedCodexDynamicToolCapabilityResolverInput,
   ): Promise<PinnedCodexDynamicToolProtocolCapability | null> {
+    let releaseWorkspaceAdmission: (() => void) | null = null;
     try {
       const startedAtMs = exactNow(this.#now);
       const beforeHash = parseSha256(await this.#hashBinary(input.paths.codexBinary));
       if (beforeHash === null) return null;
       const version = parsePinnedVersion(await this.#readVersion(input.paths));
       if (version === null) return null;
+      const executionWorkspace = this.#execution === undefined
+        ? undefined
+        : await this.#execution.acquireRuntimeWorkspaceAdmission();
+      if (executionWorkspace !== undefined) {
+        releaseWorkspaceAdmission = executionWorkspace.release;
+        if (
+          !Number.isSafeInteger(executionWorkspace.revision) ||
+          executionWorkspace.revision < 1 ||
+          executionWorkspace.runtimeWorkspaceRoots.length !== 1 ||
+          !isAbsolute(executionWorkspace.runtimeWorkspaceRoots[0])
+        ) {
+          return null;
+        }
+      }
+      const probeExecutionWorkspace = executionWorkspace === undefined
+        ? undefined
+        : Object.freeze({
+            revision: executionWorkspace.revision,
+            runtimeWorkspaceRoots: Object.freeze<readonly [string]>([
+              executionWorkspace.runtimeWorkspaceRoots[0],
+            ]),
+          });
       const receiptValue = await this.#probe.run(Object.freeze({
         accountProfileId: input.accountProfileId,
         binarySha256: beforeHash,
         codexVersion: version,
+        ...(probeExecutionWorkspace === undefined
+          ? {}
+          : { executionWorkspace: probeExecutionWorkspace }),
         paths: input.paths,
         processGeneration: input.generation,
       }));
@@ -310,6 +360,15 @@ export class PinnedCodexDynamicToolCapabilityResolver {
       }
     } catch {
       return null;
+    } finally {
+      if (releaseWorkspaceAdmission !== null) {
+        try {
+          releaseWorkspaceAdmission();
+        } catch {
+          // The capability decision is already fail closed; release must not
+          // turn cleanup into a second provider effect.
+        }
+      }
     }
   }
 }
@@ -374,6 +433,7 @@ class GenerationMemoryEvidenceCustody
 export interface DirectPinnedCodexDynamicToolLifecycleProbeOptions {
   readonly now?: () => number;
   readonly randomUuid?: () => string;
+  readonly computerUse?: ComputerUseProvisioning;
 }
 
 /**
@@ -385,10 +445,12 @@ export class DirectPinnedCodexDynamicToolLifecycleProbe
   implements PinnedCodexDynamicToolLifecycleProbe {
   readonly #now: () => number;
   readonly #randomUuid: () => string;
+  readonly #computerUse: ComputerUseProvisioning | undefined;
 
   constructor(options: DirectPinnedCodexDynamicToolLifecycleProbeOptions = {}) {
     this.#now = options.now ?? Date.now;
     this.#randomUuid = options.randomUuid ?? randomUUID;
+    this.#computerUse = options.computerUse;
   }
 
   async run(input: PinnedCodexDynamicToolLifecycleProbeInput): Promise<unknown> {
@@ -398,7 +460,11 @@ export class DirectPinnedCodexDynamicToolLifecycleProbe
     let threadId: string | null = null;
     let current: DirectProbeGeneration | null = null;
     try {
-      current = await DirectProbeGeneration.start(1, input.paths);
+      current = await DirectProbeGeneration.start(
+        1,
+        input.paths,
+        this.#directExecution(input),
+      );
       await current.requireSignedIn();
       threadId = await current.startThread(cwd);
 
@@ -431,7 +497,11 @@ export class DirectPinnedCodexDynamicToolLifecycleProbe
       await current.rejectDuplicateReplay(duplicate, cwd);
       await current.close();
 
-      current = await DirectProbeGeneration.start(2, input.paths);
+      current = await DirectProbeGeneration.start(
+        2,
+        input.paths,
+        this.#directExecution(input),
+      );
       await current.requireSignedIn();
       await current.resumeThread(threadId, cwd);
       const beforeRestart = await current.startCall(
@@ -442,7 +512,11 @@ export class DirectPinnedCodexDynamicToolLifecycleProbe
       const expiredGeneration = current;
       await expiredGeneration.close();
 
-      current = await DirectProbeGeneration.start(3, input.paths);
+      current = await DirectProbeGeneration.start(
+        3,
+        input.paths,
+        this.#directExecution(input),
+      );
       await current.requireSignedIn();
       const replayAfter = current.eventOrdinal;
       await current.resumeThread(threadId, cwd);
@@ -498,6 +572,27 @@ export class DirectPinnedCodexDynamicToolLifecycleProbe
   #uuid(): string {
     return z.string().uuid().parse(this.#randomUuid());
   }
+
+  #directExecution(
+    input: PinnedCodexDynamicToolLifecycleProbeInput,
+  ): DirectProbeExecution | undefined {
+    if (this.#computerUse === undefined) return undefined;
+    const workspace = input.executionWorkspace;
+    if (workspace === undefined) {
+      throw new Error("dynamic tool probe lacks a global workspace admission");
+    }
+    return Object.freeze({
+      computerUse: this.#computerUse,
+      executionSettingsRevision: workspace.revision,
+      runtimeWorkspaceRoots: workspace.runtimeWorkspaceRoots,
+    });
+  }
+}
+
+interface DirectProbeExecution {
+  readonly computerUse: ComputerUseProvisioning;
+  readonly executionSettingsRevision: number;
+  readonly runtimeWorkspaceRoots: readonly [string];
 }
 
 interface ProbeDynamicCall {
@@ -533,6 +628,7 @@ class DirectProbeGeneration {
   readonly #core: CodexRpcCore;
   readonly #events: ProbeEvent[] = [];
   readonly #ledger = new PinnedCodexDynamicToolLedger();
+  readonly #execution: DirectProbeExecution | undefined;
   readonly #threadPolicyReceipts = new Map<string, ProductionExecutionPolicyReceipt>();
   readonly #stderrTask: Promise<void>;
   readonly #stdoutTask: Promise<void>;
@@ -544,7 +640,12 @@ class DirectProbeGeneration {
   #nextOrdinal = 1;
   #permittedDuplicateProtocolFault = false;
 
-  private constructor(generation: number, paths: RuntimePaths) {
+  private constructor(
+    generation: number,
+    paths: RuntimePaths,
+    execution: DirectProbeExecution | undefined,
+  ) {
+    this.#execution = execution;
     this.#child = Bun.spawn([paths.codexBinary, "app-server", "--stdio"], {
       cwd: paths.codexHome,
       env: childEnvironment(paths),
@@ -668,8 +769,9 @@ class DirectProbeGeneration {
   static async start(
     generation: number,
     paths: RuntimePaths,
+    execution: DirectProbeExecution | undefined,
   ): Promise<DirectProbeGeneration> {
-    const instance = new DirectProbeGeneration(generation, paths);
+    const instance = new DirectProbeGeneration(generation, paths, execution);
     try {
       const initialized = await instance.#request("clientInitialize", {
         clientInfo: {
@@ -705,15 +807,26 @@ class DirectProbeGeneration {
 
   async startThread(cwd: string): Promise<string> {
     const proof = await this.#preflightProductionPolicy();
+    const roots = this.#runtimeWorkspaceRoots(cwd);
+    const baseDeveloperInstructions =
+      "This is an HRA protocol proof. For each user request, call " +
+      "oprte/rlm_run exactly once with the exact JSON arguments provided, " +
+      "wait for its result, and do not invoke any other tool.";
     const input = pinnedCodexCodecPairs.threadStart.input.parse({
       cwd,
+      runtimeWorkspaceRoots: roots,
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
-      developerInstructions:
-        "This is an HRA protocol proof. For each user request, call " +
-        "oprte/rlm_run exactly once with the exact JSON arguments provided, " +
-        "wait for its result, and do not invoke any other tool.",
+      config: this.#execution === undefined
+        ? undefined
+        : withComputerUseThreadConfig(this.#execution.computerUse, undefined),
+      developerInstructions: this.#execution === undefined
+        ? baseDeveloperInstructions
+        : withComputerUseDeveloperInstructions(
+          this.#execution.computerUse,
+          baseDeveloperInstructions,
+        ),
       ephemeral: false,
       historyMode: "paginated",
       threadSource: "appServer",
@@ -733,21 +846,39 @@ class DirectProbeGeneration {
       streamPosition: raw.streamPosition,
       request: input,
       response,
+      executionSettingsRevision:
+        this.#execution?.executionSettingsRevision ?? 0,
     });
+    await this.#verifyComputerUse(
+      response.thread.id,
+      raw.generation,
+      raw.streamPosition,
+    );
     this.#threadPolicyReceipts.set(response.thread.id, receipt);
     return response.thread.id;
   }
 
   async resumeThread(threadId: string, cwd: string): Promise<void> {
     const proof = await this.#preflightProductionPolicy();
+    const roots = this.#runtimeWorkspaceRoots(cwd);
+    const baseDeveloperInstructions =
+      "This is an HRA protocol proof. Call oprte/rlm_run exactly as requested.";
     const input = pinnedCodexCodecPairs.threadResume.input.parse({
       threadId,
       cwd,
+      runtimeWorkspaceRoots: roots,
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandbox: HRA_PRODUCTION_EXECUTION_POLICY.threadSandbox,
-      developerInstructions:
-        "This is an HRA protocol proof. Call oprte/rlm_run exactly as requested.",
+      config: this.#execution === undefined
+        ? undefined
+        : withComputerUseThreadConfig(this.#execution.computerUse, undefined),
+      developerInstructions: this.#execution === undefined
+        ? baseDeveloperInstructions
+        : withComputerUseDeveloperInstructions(
+          this.#execution.computerUse,
+          baseDeveloperInstructions,
+        ),
     });
     const positioned = await this.#requestWithResponsePosition("threadResume", input);
     const receipt = verifyProductionThreadAdmission({
@@ -756,7 +887,14 @@ class DirectProbeGeneration {
       streamPosition: positioned.streamPosition,
       request: input,
       response: positioned.output,
+      executionSettingsRevision:
+        this.#execution?.executionSettingsRevision ?? 0,
     });
+    await this.#verifyComputerUse(
+      positioned.output.thread.id,
+      positioned.generation,
+      positioned.streamPosition,
+    );
     this.#threadPolicyReceipts.set(positioned.output.thread.id, receipt);
   }
 
@@ -785,6 +923,9 @@ class DirectProbeGeneration {
           })} and wait for its result.`,
         text_elements: [],
       }],
+      runtimeWorkspaceRoots: this.#runtimeWorkspaceRoots(
+        threadReceipt.runtimeWorkspaceRoots[0] ?? "",
+      ),
       approvalPolicy: HRA_PRODUCTION_EXECUTION_POLICY.approvalPolicy,
       approvalsReviewer: HRA_PRODUCTION_EXECUTION_POLICY.approvalsReviewer,
       sandboxPolicy: HRA_PRODUCTION_EXECUTION_POLICY.turnSandboxPolicy,
@@ -796,6 +937,8 @@ class DirectProbeGeneration {
       generation: result.generation,
       streamPosition: result.streamPosition,
       request: input,
+      executionSettingsRevision:
+        this.#execution?.executionSettingsRevision ?? 0,
     });
     const event = await this.#waitFor(
       (candidate) =>
@@ -819,6 +962,42 @@ class DirectProbeGeneration {
       throw new Error("dynamic tool probe arguments lost exact identity");
     }
     return event.value;
+  }
+
+  #runtimeWorkspaceRoots(fallbackCwd: string): string[] {
+    return this.#execution === undefined
+      ? [fallbackCwd]
+      : [...this.#execution.runtimeWorkspaceRoots];
+  }
+
+  async #verifyComputerUse(
+    threadId: string,
+    generation: number,
+    admissionPosition: number,
+  ): Promise<void> {
+    if (this.#execution === undefined) return;
+    const positioned = await this.#requestWithResponsePosition(
+      "mcpServerStatusList",
+      {
+        cursor: null,
+        limit: 64,
+        detail: "toolsAndAuthOnly",
+        threadId,
+      },
+    );
+    if (
+      positioned.generation !== generation
+      || positioned.streamPosition <= admissionPosition
+    ) {
+      throw new Error("dynamic tool probe Computer Use admission fence changed");
+    }
+    verifyComputerUseServerStatus({
+      provisioning: this.#execution.computerUse,
+      generation,
+      threadId,
+      streamPosition: positioned.streamPosition,
+      output: positioned.output,
+    });
   }
 
   async completeCall(call: ProbeDynamicCall, success: boolean): Promise<void> {

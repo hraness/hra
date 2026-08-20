@@ -56,6 +56,7 @@ const activeStatus = sessionSyncStatusProjectionSchema.parse({
     },
   ],
   pendingEnrollments: [],
+  scheduledChatRecovery: null,
 });
 if (activeStatus.state !== "active") {
   throw new Error("The active session-sync fixture did not parse as active.");
@@ -70,6 +71,17 @@ function baseSnapshot() {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: {
+        revision: 1,
+        displayName: "Documents",
+        availability: "ready",
+      },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes: [] },
     harness: null,
   });

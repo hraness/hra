@@ -19,7 +19,9 @@ import {
   type PaneTitleMutationPort,
 } from "./ChatPane";
 import {
+  composerMode,
   composerEnterAction,
+  configurePaneScheduleCommand,
   createMessageId,
   createPaneCommand,
   createPaneId,
@@ -27,6 +29,8 @@ import {
   discardAmbiguousMessageCommand,
   editQueuedMessageCommand,
   enqueueMessageCommand,
+  executionEqual,
+  formatNextRunRelative,
   normalizePaneTitle,
   openHarnessChildCommand,
   paneAccessibleName,
@@ -41,12 +45,14 @@ import {
   paneTitleErrorId,
   reconcilePaneTitleCommit,
   recoverPaneWorkspaceCommand,
+  removePaneScheduleCommand,
   removeQueuedMessageCommand,
   reorderPanesCommand,
   resolveLocalPaneGridSlots,
   remoteSessionIdsEqual,
   remoteSessionRowEqual,
   selectAccountCreationAvailable,
+  selectExecution,
   selectHarness,
   selectPaneRepositoryCommand,
   selectPane,
@@ -116,6 +122,7 @@ function shellStateWithRemoteSessions(
             connection: "online" as const,
           }],
           pendingEnrollments: [],
+          scheduledChatRecovery: null,
         },
         localGridSlots: options.localGridSlots ?? [],
         remoteSessions,
@@ -145,6 +152,7 @@ function pane(overrides: Partial<ChatPaneProjection> = {}): ChatPaneProjection {
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,
@@ -1183,4 +1191,67 @@ test("prompt and scroll guards retain intentional whitespace and reader position
   expect(normalizePaneTitle("  Pane name  ")).toBe("Pane name");
   expect(isNearPaneBottom({ clientHeight: 300, scrollHeight: 1_000, scrollTop: 644 })).toBeTrue();
   expect(isNearPaneBottom({ clientHeight: 300, scrollHeight: 1_000, scrollTop: 500 })).toBeFalse();
+});
+
+test("scheduled composer mode follows durable state or an explicit local draft", () => {
+  const schedule = {
+    revision: 3,
+    rrule: "DTSTART;TZID=America/Puerto_Rico:20260820T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+    timeZone: "America/Puerto_Rico",
+    nextRunAt: "2026-08-20T13:00:00.000Z",
+  } as const;
+  expect(composerMode(null, false)).toBe("chat");
+  expect(composerMode(null, true)).toBe("schedule");
+  expect(composerMode(schedule, false)).toBe("schedule");
+  expect(composerMode(schedule, true)).toBe("schedule");
+});
+
+test("next-run labels are concise, deterministic, and never claim invalid time", () => {
+  const now = Date.parse("2026-08-19T12:00:00.000Z");
+  expect(formatNextRunRelative("invalid", now)).toBe("time unavailable");
+  expect(formatNextRunRelative("2026-08-19T11:59:59.000Z", now)).toBe("due now");
+  expect(formatNextRunRelative("2026-08-19T12:00:00.001Z", now)).toBe("in 1s");
+  expect(formatNextRunRelative("2026-08-19T12:01:00.001Z", now)).toBe("in 2m");
+  expect(formatNextRunRelative("2026-08-19T13:00:00.001Z", now)).toBe("in 2h");
+  expect(formatNextRunRelative("2026-08-20T12:00:00.001Z", now)).toBe("in 2d");
+});
+
+test("schedule commands carry one pane revision and never enter the message queue", () => {
+  expect(runtimeChatDomainCommandSchema.parse(configurePaneScheduleCommand({
+    paneId: "pane_example0001",
+    expectedRevision: 7,
+    instruction: "Every weekday at 9, summarize open pull requests",
+  }))).toEqual({
+    type: "chat.pane.schedule.configure",
+    paneId: "pane_example0001",
+    expectedRevision: 7,
+    instruction: "Every weekday at 9, summarize open pull requests",
+  });
+  expect(runtimeChatDomainCommandSchema.parse(removePaneScheduleCommand({
+    paneId: "pane_example0001",
+    expectedRevision: 8,
+  }))).toEqual({
+    type: "chat.pane.schedule.remove",
+    paneId: "pane_example0001",
+    expectedRevision: 8,
+  });
+});
+
+test("execution selection is pathless and compares the fixed policy projection", () => {
+  const unavailable = selectExecution({ state: "connecting" });
+  expect(unavailable).toEqual({
+    folderAccess: { revision: 1, displayName: "Documents", availability: "missing" },
+    approvalPolicy: "never",
+    approvalsReviewer: "auto_review",
+    sandbox: "danger-full-access",
+    computerUse: "required",
+  });
+  const snapshot = emptyRuntimeSnapshot();
+  const projected = snapshot.execution;
+  expect(selectExecution({ state: "ready", snapshot })).toBe(projected);
+  expect(executionEqual(projected, structuredClone(projected))).toBeTrue();
+  expect(executionEqual(projected, {
+    ...projected,
+    folderAccess: { ...projected.folderAccess, revision: projected.folderAccess.revision + 1 },
+  })).toBeFalse();
 });

@@ -63,6 +63,7 @@ function session(character: string) {
 }
 
 const humanAuthority = {
+  apiOrigin: "https://hra.example.com",
   userId: "user_original",
   organizationId: "organization_original",
 } as const;
@@ -394,6 +395,7 @@ describe("encrypted session-sync SQLite store", () => {
         head: fixture.head,
         wrappedRoot: fixture.wrappedRoot,
         humanAuthority: {
+          apiOrigin: humanAuthority.apiOrigin,
           userId: "user_attacker",
           organizationId: humanAuthority.organizationId,
         },
@@ -403,7 +405,8 @@ describe("encrypted session-sync SQLite store", () => {
 
       fixture.database.query(`
         UPDATE session_sync_vault_state
-        SET human_user_id = NULL, human_organization_id = NULL
+        SET human_user_id = NULL, human_organization_id = NULL,
+          human_api_origin = NULL
         WHERE singleton = 1
       `).run();
       expect(fixture.store.vault()?.humanAuthority).toBeNull();
@@ -588,6 +591,8 @@ describe("encrypted session-sync SQLite store", () => {
       const replay = restarted.attempt(sessionId);
       if (replay === null) throw new Error("missing persisted replay attempt");
       expect(replay.envelope).toEqual(envelope);
+      restarted.markHeadConflict(sessionId, 204);
+      expect(restarted.localHead(sessionId)?.syncState).toBe("conflict");
       expect(restarted.publicationWork(sessionId)).toEqual({
         kind: "replay",
         attempt: replay,

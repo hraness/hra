@@ -44,6 +44,7 @@ const threadAdmissionFixture = Object.freeze({
   approvalPolicy: "never",
   approvalsReviewer: "user",
   sandbox: Object.freeze({ type: "readOnly" as const, networkAccess: false }),
+  runtimeWorkspaceRoots: Object.freeze(["/tmp/oprte-dynamic"]),
 });
 const v1ActorProgramFixture: PinnedCodexJsonValue = {
   version: 2,
@@ -529,6 +530,39 @@ describe("pinned Codex dynamic tool admission", () => {
     });
     await start;
 
+    const interpreterStart = witnessed.request("scheduleInterpreterThreadStart", {
+      cwd: "/tmp/oprte-dynamic",
+      runtimeWorkspaceRoots: ["/tmp/oprte-dynamic"],
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "read-only",
+      ephemeral: true,
+      environments: [],
+      selectedCapabilityRoots: [],
+    });
+    await Bun.sleep(0);
+    const interpreterEnvelope = parseWrites(witnessedSink)[1];
+    expect(interpreterEnvelope).toMatchObject({
+      method: "thread/start",
+      params: {
+        cwd: "/tmp/oprte-dynamic",
+        dynamicTools: [],
+        environments: [],
+        selectedCapabilityRoots: [],
+      },
+    });
+    if (typeof interpreterEnvelope?.id !== "string") {
+      throw new Error("interpreter request id missing");
+    }
+    await witnessed.receiveValue(17, {
+      id: interpreterEnvelope.id,
+      result: {
+        ...threadAdmissionFixture,
+        approvalsReviewer: "auto_review",
+      },
+    });
+    await interpreterStart;
+
     const resume = witnessed.request("threadResume", {
       threadId: "thread-1",
       cwd: "/tmp/oprte-dynamic",
@@ -536,7 +570,7 @@ describe("pinned Codex dynamic tool admission", () => {
       sandbox: "read-only",
     });
     await Bun.sleep(0);
-    const resumeEnvelope = parseWrites(witnessedSink)[1];
+    const resumeEnvelope = parseWrites(witnessedSink)[2];
     expect(resumeEnvelope).toMatchObject({
       method: "thread/resume",
       params: { threadId: "thread-1", cwd: "/tmp/oprte-dynamic" },

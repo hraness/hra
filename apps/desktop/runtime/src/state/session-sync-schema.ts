@@ -666,3 +666,35 @@ export const SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL = `
     SELECT RAISE(ABORT, 'session sync human scope is incomplete');
   END;
 `;
+
+/**
+ * Bind the persisted human scope to the exact cloud backend that issued it.
+ * Pre-v61 rows remain NULL and are intentionally fail-closed; a later launch
+ * must never infer their authority from mutable build configuration.
+ */
+export const SESSION_SYNC_HUMAN_ORIGIN_SCHEMA_SQL = `
+  ALTER TABLE session_sync_vault_state
+    ADD COLUMN human_api_origin TEXT CHECK (
+      human_api_origin IS NULL OR (
+        length(human_api_origin) BETWEEN 1 AND 2048
+        AND instr(human_api_origin, char(0)) = 0
+      )
+    );
+
+  CREATE TRIGGER session_sync_vault_human_origin_insert_guard
+  BEFORE INSERT ON session_sync_vault_state
+  WHEN NEW.human_api_origin IS NOT NULL
+    AND (NEW.human_user_id IS NULL OR NEW.human_organization_id IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'session sync human origin has no bound scope');
+  END;
+
+  CREATE TRIGGER session_sync_vault_human_origin_update_guard
+  BEFORE UPDATE OF human_api_origin, human_user_id, human_organization_id
+    ON session_sync_vault_state
+  WHEN NEW.human_api_origin IS NOT NULL
+    AND (NEW.human_user_id IS NULL OR NEW.human_organization_id IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'session sync human origin has no bound scope');
+  END;
+`;

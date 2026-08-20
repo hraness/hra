@@ -47,11 +47,15 @@ import {
   compactComposerDelivery,
   paneIdentityStyle,
   QueuedMessageStack,
+  ScheduledChatStatus,
+  ScheduleModeToggle,
   TurnElapsed,
   type CompactChatPaneSurface,
 } from "./CompactChatSurface";
 import {
+  composerMode,
   composerEnterAction,
+  configurePaneScheduleCommand,
   createTitleDebouncer,
   createMessageId,
   discardAmbiguousMessageCommand,
@@ -70,6 +74,7 @@ import {
   paneTitleUtf16CodeUnitLimit,
   reconcilePaneTitleCommit,
   recoverPaneWorkspaceCommand,
+  removePaneScheduleCommand,
   removeQueuedMessageCommand,
   renamePaneCommand,
   resolvePaneRevisionConflict,
@@ -328,6 +333,13 @@ export function fencePendingPaneTitleInteraction(
 
 export function paneAcceptsUserInteraction(pane: ChatPaneProjection): boolean {
   return pane.interactionMode === "chat";
+}
+
+export function scheduleOffRequiresCommand(
+  schedule: ChatPaneProjection["schedule"],
+  configureSubmitted: boolean,
+): boolean {
+  return schedule !== null || configureSubmitted;
 }
 
 function usePaneAutoScroll(dependencyKey: string) {
@@ -705,21 +717,27 @@ export function ChatPaneView({
   );
   const workspaceStatus = paneWorkspaceStatus(pane);
   const [prompt, setPrompt] = useState("");
+  const [scheduleDraftMode, setScheduleDraftMode] = useState(false);
   const [pendingAction, setPendingAction] = useState<
-    "queue" | "remove" | "repository" | "send" | "stop" | "workspace" | null
+    "queue" | "remove" | "repository" | "schedule" | "send" | "stop" | "workspace" | null
   >(null);
   const [titlePending, setTitlePending] = useState(false);
   const [titleEditRequest, setTitleEditRequest] = useState(0);
   const titlePendingRef = useRef(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const scheduleConfigureSubmittedRef = useRef(false);
   const draftMessageIdRef = useRef(createMessageId());
   const frozenComposerRequestRef = useRef<FrozenComposerRequest | null>(null);
   const attachmentIdentityRef = useRef(
     surface?.attachments.map(({ id }) => id).join("\0") ?? "",
   );
   const active = paneIsActive(pane.state);
+  const promptMode = composerMode(pane.schedule, scheduleDraftMode);
+  const scheduling = promptMode === "schedule";
   const composerCanDraft = canMessage && (paneCanCompose(pane.state) || active);
-  const showComposerForm = canMessage || active;
+  // An active schedule must always retain its turn-off control, even when the
+  // managed workspace is unavailable and ordinary message admission is closed.
+  const showComposerForm = canMessage || active || pane.schedule !== null;
   const acceptsUserInteraction = paneAcceptsUserInteraction(pane);
   const paneHarness = pane.harness ?? null;
   const descendants = paneHarness?.descendants ?? null;
@@ -729,6 +747,7 @@ export function ChatPaneView({
     && paneCanCompose(pane.state)
     && pendingAction === null
     && !titlePending;
+  const scheduleCanDraft = configurable && canMessage;
   const titleEditable = runtimeReady
     && paneCanRename(pane.state)
     && pendingAction === null;
@@ -739,6 +758,10 @@ export function ChatPaneView({
     turn?.reasoningSummary.totalUtf8Bytes ?? 0,
     turn?.responseMarkdown.totalUtf8Bytes ?? 0,
   ].join(":");
+
+  useEffect(() => {
+    if (pane.schedule !== null) setScheduleDraftMode(false);
+  }, [pane.schedule]);
 
   useEffect(() => {
     const identity = surface?.attachments.map(({ id }) => id).join("\0") ?? "";
@@ -802,6 +825,41 @@ export function ChatPaneView({
   }, [configurable, pane.id, pane.revision, shell, workspaceStatus]);
 
   const send = useCallback(async (steerModifier = false) => {
+    if (scheduling) {
+      if (!scheduleCanDraft) return;
+      const validation = validatedPrompt(prompt);
+      if (!validation.ok) {
+        setLocalError(
+          validation.message === "Write a message first."
+            ? "Describe the schedule first."
+            : validation.message,
+        );
+        return;
+      }
+      const scheduleRevision = pane.schedule?.revision ?? null;
+      scheduleConfigureSubmittedRef.current = true;
+      setPendingAction("schedule");
+      setLocalError(null);
+      try {
+        await dispatchPaneMutationWithRetry(
+          shell,
+          pane.id,
+          pane.revision,
+          (expectedRevision) => configurePaneScheduleCommand({
+            paneId: pane.id,
+            expectedRevision,
+            instruction: validation.prompt,
+          }),
+          (currentPane) => (currentPane.schedule?.revision ?? null) === scheduleRevision,
+        );
+        setPrompt("");
+      } catch (reason: unknown) {
+        setLocalError(commandErrorMessage(reason));
+      } finally {
+        setPendingAction(null);
+      }
+      return;
+    }
     if (
       !runtimeReady
       || !canMessage
@@ -879,7 +937,46 @@ export function ChatPaneView({
     } finally {
       setPendingAction(null);
     }
-  }, [active, canMessage, pane.id, pane.messageQueue, pane.state, pendingAction, prompt, runtimeReady, shell, surface, titlePending, turn]);
+  }, [active, canMessage, pane.id, pane.messageQueue, pane.revision, pane.schedule, pane.state, pendingAction, prompt, runtimeReady, scheduleCanDraft, scheduling, shell, surface, titlePending, turn]);
+
+  const toggleScheduleMode = useCallback(async (selected: boolean) => {
+    if (!configurable) return;
+    setLocalError(null);
+    if (selected) {
+      setScheduleDraftMode(true);
+      return;
+    }
+    if (!scheduleOffRequiresCommand(
+      pane.schedule,
+      scheduleConfigureSubmittedRef.current,
+    )) {
+      setScheduleDraftMode(false);
+      return;
+    }
+    const scheduleRevision = pane.schedule?.revision ?? null;
+    setPendingAction("schedule");
+    try {
+      await dispatchPaneMutationWithRetry(
+        shell,
+        pane.id,
+        pane.revision,
+        (expectedRevision) => removePaneScheduleCommand({
+          paneId: pane.id,
+          expectedRevision,
+        }),
+        (currentPane) => currentPane.schedule !== null && (
+          scheduleRevision === null
+          || currentPane.schedule.revision >= scheduleRevision
+        ),
+      );
+      scheduleConfigureSubmittedRef.current = false;
+      setScheduleDraftMode(false);
+    } catch (reason: unknown) {
+      setLocalError(commandErrorMessage(reason));
+    } finally {
+      setPendingAction(null);
+    }
+  }, [configurable, pane.id, pane.revision, pane.schedule, shell]);
 
   const mutateQueue = useCallback(async (command: RuntimeChatMessageLedgerCommand) => {
     if (!runtimeReady || pendingAction !== null || titlePending) {
@@ -1053,6 +1150,7 @@ export function ChatPaneView({
       data-pane-id={pane.id}
       data-pane-harness={paneHarness === null ? undefined : "true"}
       data-pane-interaction-mode={pane.interactionMode}
+      data-pane-scheduled={pane.schedule === null ? undefined : "true"}
       data-pane-state={pane.state}
       onChangeCapture={fenceTitlePendingInteraction}
       onClickCapture={fenceTitlePendingInteraction}
@@ -1122,6 +1220,12 @@ export function ChatPaneView({
               </IconButton>
             ) : null}
             <span className="chat-pane__repository">{pane.repository.name}</span>
+            <ScheduledChatStatus
+              {...(surface?.nowUnixMilliseconds === undefined
+                ? {}
+                : { nowUnixMilliseconds: surface.nowUnixMilliseconds })}
+              schedule={pane.schedule}
+            />
           </div>
         </div>
         <div className="chat-pane__header-actions">
@@ -1235,13 +1339,20 @@ export function ChatPaneView({
           }}
         >
           <CompactComposerBar
-            attachments={surface?.attachments ?? []}
-            {...(surface?.onAttachFiles === undefined
+            attachments={scheduling ? [] : surface?.attachments ?? []}
+            {...(scheduling || surface?.onAttachFiles === undefined
               ? {}
               : { onAttachFiles: surface.onAttachFiles })}
-            {...(surface?.onRemoveAttachment === undefined
+            {...(scheduling || surface?.onRemoveAttachment === undefined
               ? {}
               : { onRemoveAttachment: surface.onRemoveAttachment })}
+            left={(
+              <ScheduleModeToggle
+                disabled={!configurable}
+                onChange={(selected) => void toggleScheduleMode(selected)}
+                selected={scheduling}
+              />
+            )}
             right={(
               <>
                 <TurnElapsed
@@ -1265,25 +1376,30 @@ export function ChatPaneView({
                   </IconButton>
                 ) : null}
                 <IconButton
-                  aria-label={pendingAction === "send"
-                    ? `${active ? "Queueing" : "Sending"} message for ${pane.title}`
-                    : `${active ? "Queue" : "Send"} message for ${pane.title}`}
+                  aria-label={scheduling
+                    ? pendingAction === "schedule"
+                      ? `Updating schedule for ${pane.title}`
+                      : `${pane.schedule === null ? "Schedule" : "Update schedule for"} ${pane.title}`
+                    : pendingAction === "send"
+                      ? `${active ? "Queueing" : "Sending"} message for ${pane.title}`
+                      : `${active ? "Queue" : "Send"} message for ${pane.title}`}
                   controlClassName="pane-send"
                   isDisabled={
                     !runtimeReady
-                    || !composerCanDraft
+                    || (scheduling ? !scheduleCanDraft : !composerCanDraft)
                     || pendingAction !== null
                     || titlePending
                     || (
                       prompt.trim().length === 0 &&
-                      (surface?.attachments.filter(({ status }) => status === "ready").length ?? 0) === 0
+                      (scheduling ||
+                        (surface?.attachments.filter(({ status }) => status === "ready").length ?? 0) === 0)
                     )
                   }
                   size="compact"
                   type="submit"
                   variant="quiet"
                 >
-                  <HRAIcon name="send" />
+                  <HRAIcon name={scheduling ? "clock" : "send"} />
                 </IconButton>
               </>
             )}
@@ -1291,9 +1407,12 @@ export function ChatPaneView({
             <TextAreaField
               className="pane-prompt-field"
               isDisabled={
-                !runtimeReady || !composerCanDraft || pendingAction !== null || titlePending
+                !runtimeReady
+                || (scheduling ? !scheduleCanDraft : !composerCanDraft)
+                || pendingAction !== null
+                || titlePending
               }
-              label={`Message ${pane.title}`}
+              label={scheduling ? `Schedule ${pane.title}` : `Message ${pane.title}`}
               onChange={(value) => {
                 if (value !== prompt) {
                   draftMessageIdRef.current = createMessageId();
@@ -1313,6 +1432,17 @@ export function ChatPaneView({
                 id: `prompt-${pane.id}`,
                 maxLength: runtimeChatMessageUtf8ByteLimit,
                 onKeyDown: (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                  if (scheduling) {
+                    const action = composerEnterAction({
+                      isComposing: event.nativeEvent.isComposing,
+                      key: event.key,
+                      shiftKey: event.shiftKey,
+                    });
+                    if (action !== "submit") return;
+                    event.preventDefault();
+                    void send(false);
+                    return;
+                  }
                   const action = composerSubmissionAction({
                     isComposing: event.nativeEvent.isComposing,
                     key: event.key,
@@ -1332,9 +1462,9 @@ export function ChatPaneView({
                   }
                   void send(steerModifier);
                 },
-                onPaste: (event) => {
-                  capturePastedImages(event, surface?.onAttachFiles);
-                },
+                onPaste: scheduling
+                  ? undefined
+                  : (event) => capturePastedImages(event, surface?.onAttachFiles),
                 rows: 2,
               }}
               value={prompt}

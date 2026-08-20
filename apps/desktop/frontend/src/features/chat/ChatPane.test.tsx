@@ -17,6 +17,7 @@ import {
   freezeComposerRequest,
   paneAcceptsUserInteraction,
   paneTitleKeyAction,
+  scheduleOffRequiresCommand,
   settleComposerRequest,
 } from "./ChatPane";
 
@@ -46,6 +47,7 @@ function pane(
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,
@@ -142,7 +144,9 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   const source = await Bun.file(new URL("./ChatPane.tsx", import.meta.url)).text();
   expect(source).toContain('pane.interactionMode !== "chat" ? null : <footer className="chat-pane__composer">');
   expect(source).toContain("{!showComposerForm ? null : <form");
-  expect(source).toContain('label={`Message $' + '{pane.title}`}');
+  expect(source).toContain(
+    'label={scheduling ? `Schedule $' + '{pane.title}` : `Message $' + '{pane.title}`}',
+  );
   expect(source).toContain('<MenuItem id="rename" textValue="Rename pane">');
   expect(source).not.toContain('label="Codex subscription"');
   expect(source).not.toContain('Automatic subscription');
@@ -154,6 +158,74 @@ test("ordinary chat panes preserve interaction chrome and fail closed before hyd
   expect(source).not.toContain("ModelRoutingToggle");
   expect(source).not.toContain("FastModeToggle");
   expect(source).toContain("recoverPaneWorkspaceCommand");
+});
+
+test("scheduled panes show one concise next-run status without RRULE details", () => {
+  const scheduled = pane("chat", {
+    schedule: {
+      revision: 1,
+      rrule: "DTSTART;TZID=America/Puerto_Rico:20260824T090000\nRRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO",
+      timeZone: "America/Puerto_Rico",
+      nextRunAt: "2026-08-24T13:00:00.000Z",
+    },
+  });
+  const html = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: scheduled,
+    shell: shellFor(scheduled),
+    surface: { attachments: [], nowUnixMilliseconds: Date.parse("2026-08-24T12:00:00.000Z") },
+  }));
+
+  expect(html).toContain('data-pane-scheduled="true"');
+  expect(html).toContain("Scheduled · in 1h");
+  expect(html).not.toContain("FREQ=WEEKLY");
+});
+
+test("scheduled panes retain the turn-off control when their workspace is unavailable", () => {
+  const scheduled = pane("chat", {
+    state: "attention",
+    attention: {
+      code: "runtime_unavailable",
+      message: "The isolated workspace needs recovery.",
+      retryable: true,
+    },
+    workspace: {
+      mode: "managedWorktree",
+      state: "recoveryRequired",
+      revision: 2,
+      recoveryKind: "unknown",
+    },
+    schedule: {
+      revision: 1,
+      rrule: "DTSTART;TZID=America/Puerto_Rico:20260824T090000\nRRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO",
+      timeZone: "America/Puerto_Rico",
+      nextRunAt: "2026-08-24T13:00:00.000Z",
+    },
+  });
+  const html = renderToStaticMarkup(createElement(ChatPaneView, {
+    gridPosition: 0,
+    pane: scheduled,
+    shell: shellFor(scheduled),
+  }));
+
+  expect(html).toContain('aria-label="Turn off scheduling"');
+  expect(html).toContain('aria-pressed="true"');
+  expect(html).toContain("<textarea");
+  expect(html).toContain("disabled");
+});
+
+test("schedule off dispatches after a submitted configure even before projection", () => {
+  const projectedSchedule = pane("chat", {
+    schedule: {
+      revision: 1,
+      rrule: "DTSTART;TZID=America/Puerto_Rico:20260824T090000\nRRULE:FREQ=DAILY;INTERVAL=1",
+      timeZone: "America/Puerto_Rico",
+      nextRunAt: "2026-08-24T13:00:00.000Z",
+    },
+  }).schedule;
+  expect(scheduleOffRequiresCommand(null, false)).toBeFalse();
+  expect(scheduleOffRequiresCommand(null, true)).toBeTrue();
+  expect(scheduleOffRequiresCommand(projectedSchedule, false)).toBeTrue();
 });
 
 test("fresh-context quarantine renders the explicit action and orphan quarantine stays blocked", () => {

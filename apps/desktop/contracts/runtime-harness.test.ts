@@ -60,6 +60,7 @@ function pane(
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness,
@@ -75,6 +76,13 @@ function snapshot(panes: readonly ChatPaneProjection[] = [pane()]) {
     accounts: [],
     retainedAccountLocalData: [],
     humanAccount: { state: "signedOut", revision: 0 },
+    execution: {
+      folderAccess: { revision: 1, displayName: "Documents", availability: "ready" },
+      approvalPolicy: "never",
+      approvalsReviewer: "auto_review",
+      sandbox: "danger-full-access",
+      computerUse: "required",
+    },
     chat: { revision: 1, panes },
     harness: {
       revision: 4,

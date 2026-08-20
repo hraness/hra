@@ -62,6 +62,7 @@ function createDatabase(): Database {
 }
 
 const originalScope: SessionSyncHumanScope = {
+  apiOrigin: "https://oprte.example.com",
   signedIn: true,
   credentialGeneration: 7,
   userId: "user_original",
@@ -71,6 +72,7 @@ const originalScope: SessionSyncHumanScope = {
 describe("session sync coordinator human-authority fence", () => {
   test("matches exact user and organization while allowing credential refresh", () => {
     const bound = {
+      apiOrigin: originalScope.apiOrigin,
       userId: originalScope.userId!,
       organizationId: originalScope.organizationId!,
     };
@@ -89,6 +91,7 @@ describe("session sync coordinator human-authority fence", () => {
     })).toBeFalse();
     expect(sessionSyncHumanAuthorityMatches(bound, {
       ...originalScope,
+      apiOrigin: null,
       signedIn: false,
       userId: null,
       organizationId: null,
@@ -173,6 +176,7 @@ describe("session sync coordinator human-authority fence", () => {
       head,
       wrappedRoot,
       humanAuthority: {
+        apiOrigin: originalScope.apiOrigin,
         userId: originalScope.userId!,
         organizationId: originalScope.organizationId!,
       },

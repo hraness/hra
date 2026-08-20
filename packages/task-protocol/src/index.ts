@@ -239,6 +239,7 @@ export * from "./session-sync-crypto";
 export * from "./session-sync-pairing";
 export * from "./session-sync-recovery";
 export * from "./session-sync-recovery-crypto";
+export * from "./session-sync-scheduled-chat";
 export * from "./session-sync-wire";
 export * from "./hra-human-wire";
 export * from "./model";

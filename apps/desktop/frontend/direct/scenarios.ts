@@ -118,6 +118,7 @@ function chatPane(
     attention: null,
     recoverablePrompt: false,
     canStartFreshContext: false,
+    schedule: null,
     messageQueue: { revision: 1, pauseReason: null, blockedMessage: null, messages: [] },
     attachments: { drafts: [], referenced: [] },
     harness: null,
@@ -158,6 +159,7 @@ const activeSessionSyncStatus = runtimeSnapshotSchema.parse({
       retryable: false,
       notice: null,
       recovery: "ready",
+      scheduledChatRecovery: null,
       devices: [{
         id: directCurrentSyncDeviceId,
         name: "Studio Mac",
@@ -940,6 +942,28 @@ const scenarioInputs = [
     runtime: logicalRuntime,
   },
   {
+    id: "chat-scheduled",
+    title: "Scheduled chat",
+    description: "A scheduled pane shows its concise next run while the real composer removes, recreates, and rejects an uninterpretable schedule without enqueueing a message.",
+    route: "/",
+    world: createHRADirectWorld({
+      gateway: {
+        snapshots: [snapshotWithChat([chatPane("pane_scheduled001", {
+          title: "Scheduled release audit",
+          schedule: {
+            revision: 1,
+            rrule: "DTSTART;TZID=America/Puerto_Rico:20260719T110000\nRRULE:FREQ=DAILY;INTERVAL=1",
+            timeZone: "America/Puerto_Rico",
+            nextRunAt: HRA_DIRECT_TIMESTAMP,
+          },
+        })])],
+        encoding: { kind: "chunked", chunkBytes: 257 },
+        events: [],
+      },
+    }),
+    runtime: logicalRuntime,
+  },
+  {
     id: "chat-completed",
     title: "Completed chat pane",
     description: "A settled pane renders the latest response plus completion-verified Markdown reasoning while unverified terminal reasoning stays hidden.",
@@ -1596,6 +1620,7 @@ type HRAScenarioId = (typeof scenarioInputs)[number]["id"];
 export const hraScenarioMetadata = {
   "chat-draft": { group: "Panes", viewport: "wide" },
   "chat-streaming": { group: "Panes", viewport: "wide" },
+  "chat-scheduled": { group: "Panes", viewport: "wide" },
   "chat-completed": { group: "Panes", viewport: "wide" },
   "chat-compact-malleable": { group: "Panes", viewport: "compact" },
   "chat-attention": { group: "Recovery", viewport: "wide" },
@@ -1652,6 +1677,7 @@ export const hraDirectDefinition = defineDirect({
   coverage: [
     { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, compact pane actions, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
     { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning and response Markdown through one safe renderer while provider tool activity remains intentionally absent from chat UI.", scenarios: ["chat-streaming"] },
+    { key: "chat.pane.schedule", mode: "mixed", claim: "A chat schedule is configured and removed through one explicit composer mode, never enters the message queue or attachment path, preserves the editable instruction on interpretation failure, and shows only a concise next-run label.", scenarios: ["chat-scheduled"] },
     { key: "chat.pane.latest-response", mode: "fixture", claim: "A settled pane renders the latest assistant Markdown response plus only completion-reconciled verified Markdown reasoning; raw or unverified terminal reasoning stays hidden and the composer re-enables.", scenarios: ["chat-completed"] },
     { key: "chat.pane.attention-recovery", mode: "fixture", claim: "The rendered quota, continuation, approval, runtime, and turn attention presentations remain concise, expose no HITL answer controls, and each permit a later message.", scenarios: ["chat-attention"] },
     { key: "chat.pane.create", mode: "mixed", claim: "The real New pane control opens the pathless native chooser only for the first pane, then reuses the visually last local repository through the typed pane-create command.", scenarios: ["chat-create-pane", "chat-create-pane-inherit"] },
@@ -1665,6 +1691,7 @@ export const hraDirectDefinition = defineDirect({
     { key: "chat.pane.elapsed", mode: "fixture", claim: "One logical HRA turn duration renders beside the submit and Stop controls outside every live region.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.pane.identity-status", mode: "fixture", claim: "The typed frontend palette port selects a golden-angle identity accent while text, glyphs, and semantic outlines retain status independently of hue; durable palette projection remains integration evidence.", scenarios: ["chat-compact-malleable"] },
     { key: "chat.subscription-gate", mode: "fixture", claim: "Without a signed-in Codex subscription, the canonical route is Settings and no panes destination or creation affordance is rendered.", scenarios: ["settings-no-subscriptions"] },
+    { key: "execution.shared-folder", mode: "mixed", claim: "One pathless header control selects the globally shared folder display name while fixed full-access, automatic review, and verified Computer Use policy remain runtime-owned.", scenarios: ["chat-scheduled"] },
     { key: "harness.ordinary-zero-chrome", mode: "fixture", claim: "An ordinary chat pane receives an explicit null harness projection and renders no recursive controls.", scenarios: ["chat-draft"] },
     { key: "harness.recursive-children", mode: "fixture", claim: "One bounded parent projection distinguishes persistent actor states in a pinned compact list without prompts, provider identities, filesystem paths, or per-child action chrome.", scenarios: ["harness-children-mixed", "chat-compact-malleable"] },
     { key: "harness.settings", mode: "fixture", claim: "Settings exposes only recursive sessions, bounded context quota, Off or Suggest refinement, and read-only proposal titles.", scenarios: ["harness-settings"] },

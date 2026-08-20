@@ -150,7 +150,7 @@ body,
   top: 0;
   display: grid;
   min-height: 2.35rem;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(8rem, 2fr) minmax(0, 1fr);
   align-items: center;
   gap: 1rem;
   padding:
@@ -171,8 +171,47 @@ body,
 
 .new-pane-button-shell,
 .hra-header__spacer {
-  grid-column: 2;
+  grid-column: 3;
   justify-self: end;
+}
+
+.hra-folder-access-shell {
+  min-width: 0;
+  max-width: min(24rem, 100%);
+  grid-column: 2;
+  justify-self: center;
+}
+
+.hra-folder-access {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  min-height: max(1.85rem, var(--interactive-min-height));
+  align-items: center;
+  gap: 0.28rem;
+  padding: 0.25rem 0.42rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--muted);
+  font: 0.62rem/1.2 var(--font-mono);
+}
+
+.hra-folder-access:not(:disabled):hover {
+  background: var(--surface-hover);
+  color: var(--foreground);
+}
+
+.hra-folder-access[data-availability="missing"] {
+  color: var(--danger);
+}
+
+.hra-folder-access__label {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .hra-nav a {
@@ -583,6 +622,22 @@ body,
   white-space: nowrap;
 }
 
+.pane-schedule-status {
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 0.16rem;
+  color: var(--faint);
+  font: 0.58rem/1.25 var(--font-mono);
+  white-space: nowrap;
+}
+
+.pane-schedule-status .hra-icon {
+  width: 0.72rem;
+  height: 0.72rem;
+}
+
 .chat-pane__header-actions {
   display: flex;
   flex: 0 0 auto;
@@ -820,6 +875,7 @@ body,
 .pane-stop,
 .pane-retry,
 .pane-attach,
+.pane-schedule-toggle,
 .pane-queue-action,
 .pane-attachment__remove {
   display: grid;
@@ -831,6 +887,11 @@ body,
   border-radius: 0.2rem;
   background: transparent;
   color: var(--muted);
+}
+
+.pane-schedule-toggle[aria-pressed="true"] {
+  background: var(--surface-hover);
+  color: var(--foreground);
 }
 
 .pane-send {
@@ -1511,7 +1572,7 @@ body,
 
 @media (max-width: 40rem) {
   .hra-header {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 0.45rem;
   }
 
@@ -1562,6 +1623,10 @@ body,
     gap: 0.15rem;
   }
 
+  .hra-folder-access__label {
+    max-width: 8.5rem;
+  }
+
   .pane-grid {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -1594,6 +1659,7 @@ body,
   .pane-stop,
   .pane-retry,
   .pane-attach,
+  .pane-schedule-toggle,
   .pane-queue-action,
   .pane-queue-discard,
   .pane-attachment__remove {
@@ -1632,6 +1698,10 @@ body,
     border: 1px solid ButtonText;
     background: ButtonFace;
     color: ButtonText;
+  }
+
+  .pane-schedule-toggle[aria-pressed="true"] {
+    border: 1px solid Highlight;
   }
 }
 

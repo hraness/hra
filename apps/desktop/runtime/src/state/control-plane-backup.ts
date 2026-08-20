@@ -63,6 +63,7 @@ import {
   operationReceiptKeyByteLength,
 } from "./operation-receipt-key";
 import {
+  assertPortableScheduledChatTransferReady,
   inspectPortableProviderContext,
   portableProviderContextProjectionAttestationSchema,
   projectPortableProviderContext,
@@ -655,6 +656,9 @@ export function createEncryptedControlPlaneBackup(
           "The serialized control-plane migration changed during backup",
         );
       }
+      assertControlPlanePortableScheduleTransferReady(
+        sourceSnapshotProof.database,
+      );
       attachmentPayload = captureAttachmentVaultPayload(
         sourceSnapshotProof.database,
         attachmentVaultRoot,
@@ -4512,6 +4516,7 @@ function inspectCoherentRestoreTarget(
     normalizeSerializedSnapshot(inspectionBytes);
     const snapshot = inspectSnapshot(inspectionBytes, releaseIdentity);
     try {
+      assertControlPlanePortableScheduleTransferReady(snapshot.database);
       const vault = attachmentVaultPresent
         ? inspectControlPlaneAttachmentVault(paths.attachmentVault)
         : null;
@@ -4537,6 +4542,17 @@ function inspectCoherentRestoreTarget(
     inspectionBytes?.fill(0);
     databaseBytes.fill(0);
     receiptKey.fill(0);
+  }
+}
+
+function assertControlPlanePortableScheduleTransferReady(
+  database: Database,
+): void {
+  try {
+    assertPortableScheduledChatTransferReady(database);
+  } catch (error: unknown) {
+    if (!(error instanceof PortableProviderContextProjectionError)) throw error;
+    throw new ControlPlaneBackupError("invalid_input", error.message);
   }
 }
 

@@ -19,6 +19,7 @@ import {
   type HumanAccountMetadata,
   type HumanAccountMetadataPort,
   type HumanAccountSnapshot,
+  type HumanCredentialClearAuthority,
 } from "../src/cloud";
 
 const LOCATOR = "0123456789ABCDEFGHJKMNPQRS";
@@ -190,6 +191,8 @@ describe("optional desktop WorkOS account service", () => {
     const finalRefresh = "final-refresh-token-that-must-stay-private";
     const emitted: HumanAccountSnapshot[] = [];
     const requests: Request[] = [];
+    let authenticationCommitCount = 0;
+    let authenticationAuthorityCount = 0;
     const metadata = new MemoryMetadata();
     const credentials = new HumanCredentialCustody({
       metadata,
@@ -208,6 +211,14 @@ describe("optional desktop WorkOS account service", () => {
       configuration: configuration(),
       metadata,
       credentials,
+      withAuthenticationCommit: async (_authentication, commit) => {
+        authenticationCommitCount += 1;
+        return await commit();
+      },
+      withAuthenticationAuthority: async (_authority, operation) => {
+        authenticationAuthorityCount += 1;
+        return await operation();
+      },
       emit: (snapshot) => emitted.push(snapshot),
       sleep: () => Promise.resolve(),
       fetch: (input, init) => {
@@ -362,6 +373,7 @@ describe("optional desktop WorkOS account service", () => {
       state: "signed_in",
       profile: { user: { email: "chef@example.com" } },
     });
+    expect(authenticationCommitCount).toBe(1);
     const signedInBeforeDuplicateStart = account.snapshot();
     expect(account.startSignIn()).toBe(signedInBeforeDuplicateStart);
     expect(await account.createOrganization({
@@ -375,6 +387,8 @@ describe("optional desktop WorkOS account service", () => {
       ok: true,
       data: { organization: { id: "org_oprte" } },
     });
+    expect(authenticationCommitCount).toBe(1);
+    expect(authenticationAuthorityCount).toBe(1);
     expect(await account.selectWorkspace("workspace_oprte")).toMatchObject({
       ok: true,
       data: { workspace: { id: "workspace_oprte" } },
@@ -397,6 +411,8 @@ describe("optional desktop WorkOS account service", () => {
       state: "signed_in",
       credentialGeneration: 3,
     });
+    expect(authenticationCommitCount).toBe(1);
+    expect(authenticationAuthorityCount).toBe(1);
     expect(metadata.account).toMatchObject({ credentialGeneration: 3 });
 
     const rendererSource = JSON.stringify(emitted);
@@ -475,6 +491,63 @@ describe("optional desktop WorkOS account service", () => {
     expect(await credentials.read()).toBeNull();
     expect(metadata.account?.profile ?? null).toBeNull();
     expect(polls).toBe(0);
+  });
+
+  test("closed admission joins a detached sign-in custody write before teardown", async () => {
+    const metadata = new MemoryMetadata();
+    const backing = memorySecrets();
+    let markWriteEntered = (): void => undefined;
+    const writeEntered = new Promise<void>((resolve) => {
+      markWriteEntered = resolve;
+    });
+    let releaseWrite = (): void => undefined;
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const gatedSecrets: SecretStore = {
+      get: async (input) => await backing.get(input),
+      set: async (input) => {
+        markWriteEntered();
+        await writeReleased;
+        await backing.set(input);
+      },
+      delete: async (input) => await backing.delete(input),
+    };
+    const credentials = new HumanCredentialCustody({
+      metadata,
+      secrets: gatedSecrets,
+      nextSlot: () => "quiescedsignin01",
+    });
+    const account = new HumanAccountService({
+      configuration: configuration(),
+      metadata,
+      credentials,
+      fetch: successfulDeviceFetch(),
+      sleep: () => Promise.resolve(),
+      now: () => 1_000,
+    });
+
+    expect(await account.initialize()).toMatchObject({ state: "signed_out" });
+    account.startSignIn();
+    await writeEntered;
+    account.closeAdmission();
+    const cancellation = account.cancelSignIn();
+    const settlement = account.settled();
+    expect(account.hasActiveOperation()).toBeTrue();
+    expect(await Promise.race([
+      settlement.then(() => "settled" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 5)),
+    ])).toBe("blocked");
+
+    releaseWrite();
+    await Promise.all([cancellation, settlement]);
+    expect(account.hasActiveOperation()).toBeFalse();
+    expect(await credentials.read()).toBeNull();
+    expect(backing.values.size).toBe(0);
+    expect(await account.signOut().then(
+      () => null,
+      (error: unknown) => error,
+    )).toBeInstanceOf(Error);
   });
 
   test("explicit sign-out abandons a crash before Keychain write and permits attachment again", async () => {
@@ -991,9 +1064,12 @@ describe("optional desktop WorkOS account service", () => {
         expect(metadata.quarantined).toHaveLength(0);
         access = "healthy";
         if (!repeated.ok) throw new Error("repeated reinspection was rejected");
+        // Authority inspection failed before sign-out could durably clear any
+        // credential. Recovery therefore restores the untouched principal;
+        // the user can issue a fresh, fully-authorized sign-out.
         expect(await account.retryCredentialRecovery(
           repeated.snapshot.revision,
-        )).toMatchObject({ ok: true, snapshot: { state: "signed_out" } });
+        )).toMatchObject({ ok: true, snapshot: { state: "signed_in" } });
       } else {
         expect(retried.snapshot).toMatchObject({ state: "recovery_required" });
         const recovered = await account.confirmLegacyCredentialReconnect(
@@ -1007,7 +1083,7 @@ describe("optional desktop WorkOS account service", () => {
           "legacy_identity_access_denied",
         ]);
       }
-      expect(deleteAttempts).toBe(mode === "transient" ? 2 : 1);
+      expect(deleteAttempts).toBe(mode === "transient" ? 0 : 1);
     }
   });
 
@@ -1206,5 +1282,389 @@ describe("optional desktop WorkOS account service", () => {
       credentialGeneration: 2,
     });
     expect(legacyDeleteAttempts).toBe(0);
+  });
+
+  test("legacy reconnect cannot project a retained credential that fails schedule authority", async () => {
+    const metadata = new MemoryMetadata();
+    const credentials = new HumanCredentialCustody({
+      metadata,
+      secrets: memorySecrets(),
+      nextSlot: () => "retained_foreign_identity",
+    });
+    await credentials.write(humanAuthenticationSchema.parse({
+      version: 1,
+      apiUrl: API_ORIGIN,
+      accessToken: "foreign-retained-access-token",
+      refreshToken: "foreign-retained-refresh-token",
+      user: {
+        id: "user_foreignretainedidentity",
+        email: "foreign@example.com",
+        name: "Foreign",
+      },
+    }));
+    Object.defineProperty(credentials, "inspectLegacyIdentityReconnect", {
+      configurable: true,
+      value: () => Promise.resolve({ state: "required" }),
+    });
+    Object.defineProperty(credentials, "quarantineLegacyIdentityPointers", {
+      configurable: true,
+      value: () => Promise.resolve(),
+    });
+    let authenticationCommits = 0;
+    const account = new HumanAccountService({
+      configuration: configuration(),
+      metadata,
+      credentials,
+      acceptAuthentication: () => {
+        throw new Error("scheduled-chat authority mismatch");
+      },
+      withAuthenticationCommit: async (_authentication, commit) => {
+        authenticationCommits += 1;
+        return await commit();
+      },
+    });
+    const recovery = await account.initialize();
+    expect(recovery).toMatchObject({ state: "recovery_required" });
+    const result = await account.confirmLegacyCredentialReconnect(
+      recovery.revision,
+    );
+    expect(result).toMatchObject({ ok: false, kind: "failed" });
+    expect(account.snapshot()).toBe(recovery);
+    expect(authenticationCommits).toBe(0);
+  });
+
+  for (const rejectedPending of [
+    "foreign_principal",
+    "foreign_origin",
+    "malformed_payload",
+  ] as const) {
+    test(`reconnect quarantines an exact ${rejectedPending} pending credential before restoring the committed authority`, async () => {
+      const metadata = new MemoryMetadata();
+      const secrets = memorySecrets();
+      const committedSlot = `committed_${rejectedPending}`;
+      const pendingSlot = `pending_${rejectedPending}`;
+      const committedAuthentication = humanAuthenticationSchema.parse({
+        version: 1,
+        apiUrl: API_ORIGIN,
+        accessToken: "committed-authority-access-token",
+        refreshToken: "committed-authority-refresh-token",
+        user: {
+          id: "user_committedscheduleauthority",
+          email: "committed@example.com",
+          name: "Committed",
+        },
+      });
+      const pendingValue = rejectedPending === "malformed_payload"
+        ? "not a human authentication payload"
+        : JSON.stringify(humanAuthenticationSchema.parse({
+          version: 1,
+          apiUrl: rejectedPending === "foreign_origin"
+            ? "https://other-hra.example.com"
+            : API_ORIGIN,
+          accessToken: "rejected-pending-access-token",
+          refreshToken: "rejected-pending-refresh-token",
+          user: {
+            id: rejectedPending === "foreign_principal"
+              ? "user_foreignpendingauthority"
+              : committedAuthentication.user.id,
+            email: rejectedPending === "foreign_principal"
+              ? "foreign@example.com"
+              : committedAuthentication.user.email,
+            name: rejectedPending === "foreign_principal"
+              ? "Foreign"
+              : committedAuthentication.user.name,
+          },
+        }));
+      metadata.journal = {
+        version: 1,
+        revision: 8,
+        latestGeneration: 1,
+        service: "kitchen.hraness.cloud-human.v1",
+        name: "primary",
+        committed: { generation: 0, slot: committedSlot },
+        pending: {
+          pointer: { generation: 1, slot: pendingSlot },
+          replacesGeneration: 0,
+        },
+      };
+      secrets.values.set(
+        `kitchen.hraness.cloud-human.v1:primary:slot:${committedSlot}`,
+        JSON.stringify({
+          version: 1,
+          generation: 0,
+          value: JSON.stringify(committedAuthentication),
+        }),
+      );
+      secrets.values.set(
+        `kitchen.hraness.cloud-human.v1:primary:slot:${pendingSlot}`,
+        JSON.stringify({ version: 1, generation: 1, value: pendingValue }),
+      );
+      const credentials = new HumanCredentialCustody({
+        metadata,
+        secrets,
+        nextSlot: () => "unused_reconnect_slot",
+      });
+      const account = new HumanAccountService({
+        configuration: configuration(),
+        metadata,
+        credentials,
+        acceptAuthentication: (authentication) => {
+          if (authentication.user.id !== committedAuthentication.user.id) {
+            throw new Error("scheduled-chat authority mismatch");
+          }
+        },
+        withAuthenticationCommit: async (_authentication, commit) =>
+          await commit(),
+      });
+
+      const recovery = await account.initialize();
+      expect(recovery).toMatchObject({ state: "recovery_required" });
+      expect(metadata.journal).toMatchObject({
+        revision: 8,
+        committed: { generation: 0, slot: committedSlot },
+        pending: { pointer: { generation: 1, slot: pendingSlot } },
+      });
+
+      const result = await account.confirmLegacyCredentialReconnect(
+        recovery.revision,
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        snapshot: {
+          state: "signed_in",
+          credentialGeneration: 0,
+          profile: { user: { id: committedAuthentication.user.id } },
+        },
+      });
+      expect(metadata.journal?.committed).toEqual({
+        generation: 0,
+        slot: committedSlot,
+      });
+      expect(metadata.journal?.pending).toBeUndefined();
+      expect(metadata.quarantined).toHaveLength(1);
+      expect(metadata.quarantined[0]).toMatchObject({
+        kind: "pending",
+        pointer: { generation: 1, slot: pendingSlot },
+        sourceRevision: 8,
+      });
+      expect(secrets.values.has(
+        `kitchen.hraness.cloud-human.v1:primary:slot:${pendingSlot}`,
+      )).toBeTrue();
+    });
+  }
+
+  test("recovery-required sign-out cannot delete a bound pending credential", async () => {
+    const metadata = new MemoryMetadata();
+    const secrets = memorySecrets();
+    const committedSlot = "committed_foreign_signout";
+    const pendingSlot = "pending_bound_signout";
+    const foreign = humanAuthenticationSchema.parse({
+      version: 1,
+      apiUrl: API_ORIGIN,
+      accessToken: "foreign-committed-access-token",
+      refreshToken: "foreign-committed-refresh-token",
+      user: {
+        id: "user_foreigncommittedsignout",
+        email: "foreign@example.com",
+        name: "Foreign",
+      },
+    });
+    const bound = humanAuthenticationSchema.parse({
+      version: 1,
+      apiUrl: API_ORIGIN,
+      accessToken: "bound-pending-access-token",
+      refreshToken: "bound-pending-refresh-token",
+      user: {
+        id: "user_boundscheduleauthority",
+        email: "bound@example.com",
+        name: "Bound",
+      },
+      workosOrganizationId: "org_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      organization: {
+        id: "organization_boundscheduleauthority",
+        name: "Bound organization",
+        role: "admin",
+        status: "active",
+        workosOrganizationId: "org_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      },
+    });
+    metadata.journal = {
+      version: 1,
+      revision: 12,
+      latestGeneration: 1,
+      service: "kitchen.hraness.cloud-human.v1",
+      name: "primary",
+      committed: { generation: 0, slot: committedSlot },
+      pending: {
+        pointer: { generation: 1, slot: pendingSlot },
+        replacesGeneration: 0,
+      },
+    };
+    secrets.values.set(
+      `kitchen.hraness.cloud-human.v1:primary:slot:${committedSlot}`,
+      JSON.stringify({
+        version: 1,
+        generation: 0,
+        value: JSON.stringify(foreign),
+      }),
+    );
+    secrets.values.set(
+      `kitchen.hraness.cloud-human.v1:primary:slot:${pendingSlot}`,
+      JSON.stringify({
+        version: 1,
+        generation: 1,
+        value: JSON.stringify(bound),
+      }),
+    );
+    const credentials = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: () => "unused_signout_slot",
+    });
+    const inspectedAuthorities: HumanCredentialClearAuthority[] = [];
+    const account = new HumanAccountService({
+      configuration: configuration(),
+      metadata,
+      credentials,
+      acceptAuthentication: () => {
+        throw new Error("scheduled-chat recovery authority is not settled");
+      },
+      withSignOutCommit: async (authority, commit) => {
+        inspectedAuthorities.push(authority);
+        if (authority.identities.some(({ userId }) =>
+          userId === bound.user.id
+        )) {
+          throw new Error("Turn off scheduled chats before clearing their cloud credential.");
+        }
+        return await commit();
+      },
+    });
+    expect(await account.initialize()).toMatchObject({
+      state: "recovery_required",
+    });
+    const journalBefore = structuredClone(metadata.journal);
+
+    expect(account.signOut()).rejects.toThrow("Turn off scheduled chats");
+    const inspectedAuthority = inspectedAuthorities[0];
+    if (inspectedAuthority === undefined) {
+      throw new Error("credential clear authority was not inspected");
+    }
+    expect(inspectedAuthority.sourceRevision).toBe(12);
+    expect(inspectedAuthority.hasUnrecognizedValue).toBeFalse();
+    expect(inspectedAuthority.identities.some((identity) =>
+      identity.apiUrl === foreign.apiUrl
+      && identity.userId === foreign.user.id
+    )).toBeTrue();
+    expect(inspectedAuthority.identities.some((identity) =>
+      identity.apiUrl === bound.apiUrl
+      && identity.userId === bound.user.id
+      && identity.organizationId === bound.organization?.id
+    )).toBeTrue();
+    expect(metadata.journal).toEqual(journalBefore);
+    expect(secrets.values.has(
+      `kitchen.hraness.cloud-human.v1:primary:slot:${pendingSlot}`,
+    )).toBeTrue();
+  });
+
+  test("a foreign-origin committed credential remains exactly clearable", async () => {
+    const metadata = new MemoryMetadata();
+    const secrets = memorySecrets();
+    const credentials = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: () => "foreign_origin_clear_slot",
+    });
+    const foreignOrigin = humanAuthenticationSchema.parse({
+      version: 1,
+      apiUrl: "https://foreign-hra.example.com",
+      accessToken: "foreign-origin-access-token",
+      refreshToken: "foreign-origin-refresh-token",
+      user: {
+        id: "user_sameidentitydifferentorigin",
+        email: "same@example.com",
+        name: "Same identity",
+      },
+    });
+    await credentials.write(foreignOrigin);
+    let clearAuthority: Parameters<
+      NonNullable<ConstructorParameters<typeof HumanAccountService>[0]["withSignOutCommit"]>
+    >[0] | null = null;
+    const account = new HumanAccountService({
+      configuration: configuration(),
+      metadata,
+      credentials,
+      withSignOutCommit: async (authority, commit) => {
+        clearAuthority = authority;
+        return await commit();
+      },
+    });
+
+    expect(await account.initialize()).toMatchObject({
+      state: "error",
+      error: { code: "CONFIGURATION_UNAVAILABLE", retryable: false },
+    });
+    expect(await account.signOut()).toMatchObject({ state: "signed_out" });
+    expect(clearAuthority).toMatchObject({
+      identities: [{
+        apiUrl: foreignOrigin.apiUrl,
+        userId: foreignOrigin.user.id,
+      }],
+      hasUnrecognizedValue: false,
+    });
+    expect(metadata.journal?.committed).toBeUndefined();
+  });
+
+  test("a configured-cloud sign-in replaces a foreign-origin credential with the same user identity", async () => {
+    const metadata = new MemoryMetadata();
+    const secrets = memorySecrets();
+    const slots = ["foreign_origin_existing_slot", "configured_origin_replacement_slot"];
+    const credentials = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: () => slots.shift() ?? "unused_replacement_slot",
+    });
+    const userId = "user_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    await credentials.write(humanAuthenticationSchema.parse({
+      version: 1,
+      apiUrl: "https://foreign-hra.example.com",
+      accessToken: "foreign-origin-access-token",
+      refreshToken: "foreign-origin-refresh-token",
+      user: {
+        id: userId,
+        email: "chef@example.com",
+        name: "Chef",
+      },
+    }));
+    const acceptedOrigins: string[] = [];
+    const account = new HumanAccountService({
+      configuration: configuration(),
+      metadata,
+      credentials,
+      fetch: successfulDeviceFetch(),
+      sleep: () => Promise.resolve(),
+      withAuthenticationCommit: async (authentication, commit) => {
+        expect(authentication.user.id).toBe(userId);
+        acceptedOrigins.push(authentication.apiUrl);
+        return await commit();
+      },
+    });
+
+    expect(await account.initialize()).toMatchObject({
+      state: "error",
+      error: { code: "CONFIGURATION_UNAVAILABLE", retryable: false },
+    });
+    expect(account.startSignIn()).toMatchObject({ state: "signing_in" });
+    expect(await account.signInCompletion()).toMatchObject({
+      state: "signed_in",
+      profile: { user: { id: userId } },
+    });
+    expect(acceptedOrigins).toEqual([API_ORIGIN]);
+    expect(await credentials.read()).toMatchObject({
+      generation: 1,
+      authentication: {
+        apiUrl: API_ORIGIN,
+        user: { id: userId },
+      },
+    });
   });
 });

@@ -16,6 +16,8 @@ import {
   type SecretCustodyReconnectInspection,
   type SecretCustodyReconnectRecovery,
   type SecretCustodyRecovery,
+  type SecretCustodyRecoveryCandidateInspection,
+  type SecretCustodyRecoveryToken,
   type SecretStore,
 } from "@hraness/hra-human-client";
 import { z } from "@hra-internal/schema";
@@ -84,6 +86,32 @@ export function createOpaqueHumanSecretSlot(): string {
   return `human_${randomBytes(24).toString("base64url")}`;
 }
 
+export type HumanCredentialRecoveryCandidateInspection =
+  | Exclude<SecretCustodyRecoveryCandidateInspection, { state: "valid" }>
+  | Readonly<{
+      state: "product_invalid";
+      role: "committed" | "pending";
+      sourceRevision: number;
+      token: SecretCustodyRecoveryToken;
+    }>
+  | Readonly<{
+      state: "valid";
+      role: "committed" | "pending";
+      sourceRevision: number;
+      snapshot: HumanAuthenticationSnapshot;
+      token: SecretCustodyRecoveryToken;
+    }>;
+
+export interface HumanCredentialClearAuthority {
+  readonly sourceRevision: number | null;
+  readonly identities: readonly Readonly<{
+    apiUrl: string;
+    userId: string;
+    organizationId?: string;
+  }>[];
+  readonly hasUnrecognizedValue: boolean;
+}
+
 export class HumanCredentialCustody implements HumanAuthenticationStore {
   readonly #custody: GenerationalSecretCustody;
 
@@ -100,13 +128,44 @@ export class HumanCredentialCustody implements HumanAuthenticationStore {
       metadata: options.metadata,
       secrets: options.secrets ?? bunHumanKeychain,
       nextSlot: options.nextSlot ?? createOpaqueHumanSecretSlot,
+      requireExplicitPendingRecovery: true,
     });
   }
 
   async recover(
-    options: { readonly abandonMissingPending: boolean },
+    options: {
+      readonly abandonMissingPending: boolean;
+      readonly candidate?: SecretCustodyRecoveryToken;
+      readonly deferDeletingCleanup?: boolean;
+    },
   ): Promise<SecretCustodyRecovery> {
     return await this.#custody.recover(options);
+  }
+
+  async inspectRecoveryAuthenticationCandidate(): Promise<
+    HumanCredentialRecoveryCandidateInspection
+  > {
+    const inspected = await this.#custody.inspectRecoveryCandidate();
+    if (inspected.state !== "valid") return inspected;
+    const authentication = parseHumanAuthentication(inspected.value);
+    if (authentication === null) {
+      return {
+        state: "product_invalid",
+        role: inspected.role,
+        sourceRevision: inspected.sourceRevision,
+        token: inspected.token,
+      };
+    }
+    return {
+      state: "valid",
+      role: inspected.role,
+      sourceRevision: inspected.sourceRevision,
+      token: inspected.token,
+      snapshot: humanAuthenticationSnapshotSchema.parse({
+        generation: inspected.pointer.generation,
+        authentication,
+      }),
+    };
   }
 
   async inspectLegacyIdentityReconnect(): Promise<SecretCustodyReconnectInspection> {
@@ -127,10 +186,14 @@ export class HumanCredentialCustody implements HumanAuthenticationStore {
       : { state: "not_required" };
   }
 
-  async quarantineLegacyIdentityPointers(): Promise<SecretCustodyReconnectRecovery> {
-    let recovered = await this.#custody.quarantineLegacyIdentityPointers();
+  async quarantineLegacyIdentityPointers(options: {
+    readonly candidate?: SecretCustodyRecoveryToken;
+  } = {}): Promise<SecretCustodyReconnectRecovery> {
+    let recovered = await this.#custody.quarantineLegacyIdentityPointers(
+      options,
+    );
     if (recovered.state === "not_required") {
-      recovered = await this.#custody.preservePointerAnomalies();
+      recovered = await this.#custody.preservePointerAnomalies(options);
     }
     if (recovered.state === "quarantined") return recovered;
     const committed = await this.#custody.inspectCommittedForRecovery();
@@ -146,7 +209,44 @@ export class HumanCredentialCustody implements HumanAuthenticationStore {
       committed.state === "missing"
         ? "missing_pointer_abandoned"
         : "invalid_pointer_preserved",
+      options,
     );
+  }
+
+  async preserveRejectedPendingCandidate(
+    token: SecretCustodyRecoveryToken,
+  ): Promise<SecretCustodyReconnectRecovery> {
+    return await this.#custody.preserveInspectedPendingForRecovery(token);
+  }
+
+  async inspectClearAuthority(): Promise<HumanCredentialClearAuthority> {
+    const inspected = await this.#custody.inspectLiveValues();
+    const identities: Array<{
+      apiUrl: string;
+      userId: string;
+      organizationId?: string;
+    }> = [];
+    let hasUnrecognizedValue = false;
+    for (const value of inspected.values) {
+      const authentication = value.state === "valid"
+        ? parseHumanAuthentication(value.value)
+        : null;
+      if (authentication === null) {
+        hasUnrecognizedValue = true;
+        continue;
+      }
+      const organizationId = authentication.organization?.id;
+      identities.push({
+        apiUrl: authentication.apiUrl,
+        userId: authentication.user.id,
+        ...(organizationId === undefined ? {} : { organizationId }),
+      });
+    }
+    return {
+      sourceRevision: inspected.sourceRevision,
+      identities,
+      hasUnrecognizedValue,
+    };
   }
 
   async read(): Promise<HumanAuthenticationSnapshot | null> {
@@ -201,6 +301,13 @@ export class HumanCredentialCustody implements HumanAuthenticationStore {
         ? {}
         : { onJournaled: input.onJournaled },
     );
+  }
+
+  /** User-authorized sign-out removes committed and interrupted pending state. */
+  async clearAllIfSourceRevision(
+    expectedSourceRevision: number | null,
+  ): Promise<boolean> {
+    return await this.#custody.clearIfSourceRevision(expectedSourceRevision);
   }
 }
 

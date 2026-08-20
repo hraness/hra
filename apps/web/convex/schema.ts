@@ -1609,6 +1609,111 @@ export default defineSchema({
     .index("by_origin_and_state", ["originDeviceId", "state", "sessionId"])
     .index("by_state_and_grant_expiry", ["state", "creationGrantExpiresAt"]),
 
+  syncScheduledChats: defineTable({
+    vaultId: v.id("syncVaults"),
+    sessionEntryId: v.id("syncSessionEntries"),
+    sessionId: v.string(),
+    originDeviceId: v.id("syncDevices"),
+    originDevicePublicId: v.string(),
+    state: v.union(v.literal("active"), v.literal("cleared")),
+    generation: v.string(),
+    rrule: v.string(),
+    timeZone: v.string(),
+    nextRunAt: v.optional(v.number()),
+    definitionFirstRunAt: v.number(),
+    occurrenceSequence: v.string(),
+    definitionCiphertextDigest: v.string(),
+    definitionCiphertextBytes: v.number(),
+    definitionEnvelopeJson: v.string(),
+    clearedBy: v.optional(v.union(
+      v.literal("user"),
+      v.literal("session_deleted"),
+      v.literal("schedule_exhausted"),
+      v.literal("authority_lost"),
+    )),
+    clearedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_session_entry", ["sessionEntryId"])
+    .index("by_origin_and_session", ["originDeviceId", "sessionId"])
+    .index("by_vault_and_session", ["vaultId", "sessionId"])
+    .index("by_origin_state_and_due", [
+      "originDeviceId",
+      "state",
+      "nextRunAt",
+      "sessionId",
+    ])
+    .index("by_vault_and_state", ["vaultId", "state", "sessionId"])
+    .index("by_state_and_due", ["state", "nextRunAt", "sessionId"]),
+
+  syncScheduledChatWakes: defineTable({
+    scheduleId: v.id("syncScheduledChats"),
+    vaultId: v.id("syncVaults"),
+    sessionEntryId: v.id("syncSessionEntries"),
+    originDeviceId: v.id("syncDevices"),
+    generation: v.string(),
+    occurrenceSequence: v.string(),
+    expectedRunAt: v.number(),
+    state: v.union(
+      v.literal("pending"),
+      v.literal("completed"),
+      v.literal("stale"),
+    ),
+    completedAt: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_schedule_generation_and_sequence", [
+      "scheduleId",
+      "generation",
+      "occurrenceSequence",
+    ])
+    .index("by_schedule_and_state", ["scheduleId", "state"])
+    .index("by_state_and_due", ["state", "expectedRunAt"]),
+
+  syncScheduledChatRuns: defineTable({
+    scheduleId: v.id("syncScheduledChats"),
+    vaultId: v.id("syncVaults"),
+    sessionEntryId: v.id("syncSessionEntries"),
+    sessionId: v.string(),
+    originDeviceId: v.id("syncDevices"),
+    runId: v.string(),
+    generation: v.string(),
+    occurrenceSequence: v.string(),
+    scheduledFor: v.number(),
+    definitionCiphertextDigest: v.string(),
+    definitionEnvelopeJson: v.string(),
+    state: v.union(
+      v.literal("pending"),
+      v.literal("acknowledged"),
+      v.literal("cancelled"),
+    ),
+    acknowledgedBootId: v.optional(v.string()),
+    acknowledgedBootGeneration: v.optional(v.string()),
+    acknowledgedHasNextRun: v.optional(v.boolean()),
+    acknowledgedNextRunAt: v.optional(v.number()),
+    acknowledgedAt: v.optional(v.number()),
+    cancelledAt: v.optional(v.number()),
+    purgeAfter: v.optional(v.number()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_public_id", ["runId"])
+    .index("by_schedule_generation_and_sequence", [
+      "scheduleId",
+      "generation",
+      "occurrenceSequence",
+    ])
+    .index("by_schedule_and_state", ["scheduleId", "state"])
+    .index("by_state_and_purge_after", ["state", "purgeAfter"])
+    .index("by_origin_state_and_due", [
+      "originDeviceId",
+      "state",
+      "scheduledFor",
+      "runId",
+    ]),
+
   syncSessionHeads: defineTable({
     vaultId: v.id("syncVaults"),
     sessionEntryId: v.id("syncSessionEntries"),

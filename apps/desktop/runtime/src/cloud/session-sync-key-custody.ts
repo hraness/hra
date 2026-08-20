@@ -1046,6 +1046,58 @@ export async function verifySessionSyncRootKeyChainToGenesis(input: {
   }
 }
 
+export async function deriveSessionSyncHistoricalRootKey(input: {
+  readonly expectedVault: SyncVaultCoordinate;
+  readonly currentMembershipEpoch: PositiveSyncUint64;
+  readonly currentRootKeyEpoch: PositiveSyncUint64;
+  readonly currentRootKeyCommitment: SyncSha256Digest;
+  readonly currentRootKeyLinkDigest: SyncSha256Digest | null;
+  readonly currentRootKey: Uint8Array;
+  readonly targetRootKeyEpoch: PositiveSyncUint64;
+  readonly pages: readonly SessionSyncRootKeyLinkPageExchange[];
+}): Promise<Uint8Array> {
+  const target = positiveSyncUint64Schema.parse(input.targetRootKeyEpoch);
+  if (BigInt(target) > BigInt(input.currentRootKeyEpoch)) {
+    throw new Error("Session sync historical root target is newer than the current root.");
+  }
+  await verifySessionSyncRootKeyChainToGenesis(input);
+  let childEpoch = positiveSyncUint64Schema.parse(input.currentRootKeyEpoch);
+  let childRoot = copyBytes(input.currentRootKey);
+  try {
+    if (childEpoch === target) return copyBytes(childRoot);
+    for (const exchange of input.pages) {
+      const links = z.array(wrappedSyncVaultRootKeyLinkSchema)
+        .max(MAX_SYNC_DIRECTORY_PAGE_SIZE)
+        .parse(exchange.response.links);
+      for (const link of links) {
+        if (
+          link.context.childRootKeyEpoch !== childEpoch
+          || link.linkDigest !== await digestSyncVaultRootKeyLink(link)
+          || await commitSyncVaultRootKey(childRoot)
+            !== link.context.childRootKeyCommitment
+        ) {
+          throw new Error("Session sync historical root link changed after verification.");
+        }
+        const parentRoot = await unwrapSyncParentVaultRootKey(
+          link,
+          link.context,
+          childRoot,
+        );
+        childRoot.fill(0);
+        childRoot = parentRoot;
+        childEpoch = link.context.parentRootKeyEpoch;
+        if (childEpoch === target) return copyBytes(childRoot);
+        if (BigInt(childEpoch) < BigInt(target)) {
+          throw new Error("Session sync historical root chain skipped the target epoch.");
+        }
+      }
+    }
+    throw new Error("Session sync historical root chain did not contain the target epoch.");
+  } finally {
+    childRoot.fill(0);
+  }
+}
+
 /**
  * Fixed, installation-scoped custody for session-sync private material. The
  * returned runtime private keys are always nonextractable. SQLite receives
@@ -1267,6 +1319,10 @@ export class SessionSyncKeyCustody {
     readonly expectedPublicKeys: SyncDevicePublicKeys;
     readonly expectedVaultRootKeyring: SessionSyncVaultRootKeyringMetadata;
     readonly next: VaultRootKeyringInput;
+    readonly authenticatedRootHistory?: Readonly<{
+      readonly head: SyncMembershipHead;
+      readonly pages: readonly SessionSyncRootKeyLinkPageExchange[];
+    }>;
   }): Promise<SessionSyncVaultPendingTransitionMetadata> {
     return await this.#serialized(async () => {
       const record = await this.#readRecord();
@@ -1307,11 +1363,17 @@ export class SessionSyncKeyCustody {
       const nextRootsByEpoch = new Map(
         next.rootKeys.map(({ keyEpoch, rootKey }) => [keyEpoch, rootKey]),
       );
-      if (record.activeVaultRootKeyring.rootKeys.some(({ keyEpoch, rootKey }) =>
-        nextRootsByEpoch.get(keyEpoch) !== rootKey
-      )) {
+      const discardedRoots = record.activeVaultRootKeyring.rootKeys.filter(
+        ({ keyEpoch }) => !nextRootsByEpoch.has(keyEpoch),
+      );
+      const conflictingRetainedRoot = record.activeVaultRootKeyring.rootKeys
+        .some(({ keyEpoch, rootKey }) => {
+          const retained = nextRootsByEpoch.get(keyEpoch);
+          return retained !== undefined && retained !== rootKey;
+        });
+      if (conflictingRetainedRoot) {
         throw new Error(
-          "Session sync vault root transition cannot discard authenticated root history.",
+          "Session sync vault root transition conflicts with authenticated root history.",
         );
       }
       const parentMembershipDigest = syncSha256DigestSchema.parse(
@@ -1322,6 +1384,42 @@ export class SessionSyncKeyCustody {
       );
       if (parentMembershipDigest === childMembershipDigest) {
         throw new TypeError("Session sync membership transition digest must advance.");
+      }
+      if (discardedRoots.length > 0) {
+        const evidence = input.authenticatedRootHistory;
+        if (evidence === undefined) {
+          throw new Error(
+            "Session sync vault root transition cannot discard history without authenticated compaction evidence.",
+          );
+        }
+        const head = syncMembershipHeadSchema.parse(evidence.head);
+        const statementDigest = await digestSyncMembershipStatement(
+          head.statement,
+        );
+        const nextCurrentRoot = next.rootKeys.find(
+          ({ keyEpoch }) => keyEpoch === next.currentRootKeyEpoch,
+        );
+        if (
+          nextCurrentRoot === undefined
+          || head.statementDigest !== statementDigest
+          || head.statementDigest !== childMembershipDigest
+          || !sameVault(vaultFromMembershipHead(head), next.vault)
+          || head.statement.membershipEpoch !== next.membershipEpoch
+          || head.statement.rootKeyEpoch !== next.currentRootKeyEpoch
+        ) {
+          throw new Error(
+            "Session sync vault root compaction evidence does not match the accepted next membership.",
+          );
+        }
+        await verifySessionSyncRootKeyChainToGenesis({
+          expectedVault: next.vault,
+          currentMembershipEpoch: head.statement.membershipEpoch,
+          currentRootKeyEpoch: head.statement.rootKeyEpoch,
+          currentRootKeyCommitment: head.statement.rootKeyCommitment,
+          currentRootKeyLinkDigest: head.statement.rootKeyLinkDigest,
+          currentRootKey: decodeBase64Url(nextCurrentRoot.rootKey),
+          pages: evidence.pages,
+        });
       }
       const requestDigest = digestSessionSyncJournalValue(input.request);
       if (requestDigest !== syncSha256DigestSchema.parse(input.requestDigest)) {

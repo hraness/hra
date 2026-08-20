@@ -41,6 +41,7 @@ import {
 } from "../src/state/session-sync-store";
 
 const humanScope: SessionSyncHumanScope = {
+  apiOrigin: "https://hra.example.com",
   signedIn: true,
   credentialGeneration: 7,
   userId: "user_capacity",
@@ -161,6 +162,7 @@ async function activeFixture() {
     head,
     wrappedRoot,
     humanAuthority: {
+      apiOrigin: humanScope.apiOrigin,
       userId: humanScope.userId!,
       organizationId: humanScope.organizationId!,
     },

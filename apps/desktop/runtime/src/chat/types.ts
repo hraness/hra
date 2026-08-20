@@ -437,6 +437,20 @@ export interface ChatProviderSteerRequest {
   readonly fence: ChatProviderSteerFence;
 }
 
+/** Gateway-private input for one non-persistent schedule interpretation. */
+export interface ChatProviderScheduleInterpretationRequest {
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly workingDirectory: string;
+  readonly instruction: string;
+  readonly timeZone: string;
+  readonly now: string;
+}
+
+export interface ChatProviderScheduleInterpretation {
+  readonly prompt: string;
+  readonly rrule: string;
+}
+
 export interface ChatProviderPort {
   /** Resolves the first HRA-ordered candidate from one exact provider catalog. */
   resolveConfiguration(
@@ -444,6 +458,9 @@ export interface ChatProviderPort {
     candidates: readonly ChatProviderConfiguration[],
     requiredInputClass: ChatRequiredInputClass,
   ): Promise<ChatProviderResolvedConfiguration>;
+  interpretSchedule(
+    request: ChatProviderScheduleInterpretationRequest,
+  ): Promise<ChatProviderScheduleInterpretation>;
   startThread(request: ChatProviderThreadRequest): Promise<Readonly<{
     threadId: string;
     restartThreadId: string;
@@ -490,6 +507,39 @@ export interface ChatProviderPort {
   }>>;
 }
 
+/**
+ * Cloud-backed scheduled-chat authority. Prompts remain encrypted outside the
+ * gateway; the port exposes only one interpreted definition at configuration
+ * time and one authenticated plaintext occurrence at execution time.
+ */
+export interface ChatScheduledChatPort {
+  isScheduled(paneId: ChatPaneId): boolean;
+  configure(input: Readonly<{
+    paneId: ChatPaneId;
+    expectedRevision: number;
+    prompt: string;
+    rrule: string;
+    timeZone: string;
+    now: number;
+  }>): Promise<void>;
+  remove(input: Readonly<{
+    paneId: ChatPaneId;
+    expectedRevision: number;
+    now: number;
+  }>): Promise<void>;
+}
+
+export interface ChatScheduledOccurrence {
+  readonly runId: string;
+  readonly paneId: ChatPaneId;
+  readonly sessionId: string;
+  readonly scheduleGeneration: string;
+  readonly occurrenceSequence: string;
+  readonly scheduledFor: number;
+  readonly definitionCiphertextDigest: string;
+  readonly prompt: string;
+}
+
 export type ChatProviderFailureCode =
   | "quota_reached"
   | "authentication"
@@ -528,6 +578,17 @@ export type ChatPaneCommand =
       readonly paneId: ChatPaneId;
       readonly expectedRevision: number;
       readonly title: string;
+    }>
+  | Readonly<{
+      readonly type: "chat.pane.schedule.configure";
+      readonly paneId: ChatPaneId;
+      readonly expectedRevision: number;
+      readonly instruction: string;
+    }>
+  | Readonly<{
+      readonly type: "chat.pane.schedule.remove";
+      readonly paneId: ChatPaneId;
+      readonly expectedRevision: number;
     }>
   | Readonly<{
       readonly type: "chat.pane.workspace.recover";

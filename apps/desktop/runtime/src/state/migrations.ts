@@ -15,7 +15,12 @@ import { CHAT_MESSAGE_IDEMPOTENCY_SCHEMA_V1_SQL } from
 import { PROVIDER_THREAD_ARCHIVE_JOURNAL_V57_SQL } from
   "./provider-thread-archive-journal-v57";
 import {
+  SCHEDULED_CHAT_DURABLE_OFF_INTENT_SCHEMA_SQL,
+  SCHEDULED_CHAT_LOCAL_SCHEMA_V1_SQL,
+} from "./scheduled-chat-store";
+import {
   SESSION_SYNC_HARDENING_SCHEMA_SQL,
+  SESSION_SYNC_HUMAN_ORIGIN_SCHEMA_SQL,
   SESSION_SYNC_HUMAN_SCOPE_SCHEMA_SQL,
   SESSION_SYNC_OPERATION_SCHEMA_SQL,
   SESSION_SYNC_SCHEMA_SQL,
@@ -3650,5 +3655,92 @@ export const migrations = [
     version: 57,
     name: "keyed-provider-thread-archive-containment-journal",
     sql: PROVIDER_THREAD_ARCHIVE_JOURNAL_V57_SQL,
+  },
+  {
+    version: 58,
+    name: "global-chat-execution-settings",
+    sql: `
+      CREATE TABLE chat_execution_settings (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        revision INTEGER NOT NULL CHECK (revision > 0),
+        folder_path TEXT NOT NULL CHECK (
+          length(folder_path) BETWEEN 1 AND 4096
+          AND instr(folder_path, char(0)) = 0
+        ),
+        updated_at INTEGER NOT NULL CHECK (updated_at >= 0)
+      ) STRICT;
+    `,
+  },
+  {
+    version: 59,
+    name: "scheduled-chat-cloud-authority",
+    sql: SCHEDULED_CHAT_LOCAL_SCHEMA_V1_SQL,
+  },
+  {
+    version: 60,
+    name: "scheduled-chat-proven-quota-retry",
+    sql: `
+      DROP TRIGGER chat_message_ledger_state_transition_guard;
+
+      CREATE TRIGGER chat_message_ledger_state_transition_guard
+      BEFORE UPDATE OF state ON chat_message_ledger
+      WHEN NOT (
+        (OLD.state = 'queued' AND NEW.state IN (
+          'start_claimed', 'steer_prepared', 'cancelled'
+        ))
+        OR (OLD.state = 'start_claimed' AND NEW.state IN (
+          'queued', 'start_effect_started', 'cancelled'
+        ))
+        OR (OLD.state = 'start_effect_started' AND NEW.state IN (
+          'start_acknowledged', 'ambiguous'
+        ))
+        OR (
+          OLD.state = 'start_effect_started' AND NEW.state = 'queued'
+          AND EXISTS (
+            SELECT 1 FROM harness_root_turn_routing_receipts AS route
+            WHERE route.pane_id = OLD.pane_id
+              AND route.chat_turn_id = OLD.claimed_turn_id
+              AND route.state = 'terminal'
+              AND route.operational_outcome = 'quotaRejected'
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM chat_scheduled_chat_runs AS run
+            JOIN chat_scheduled_chats AS schedule
+              ON schedule.pane_id = run.pane_id
+             AND schedule.session_id = run.session_id
+             AND schedule.generation = run.schedule_generation
+            WHERE run.pane_id = OLD.pane_id
+              AND run.message_id = OLD.message_id
+              AND run.cancelled_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM chat_scheduled_chat_mutations AS mutation
+                WHERE mutation.pane_id = OLD.pane_id
+              )
+          )
+        )
+        OR (OLD.state = 'start_acknowledged' AND NEW.state = 'completed')
+        OR (OLD.state = 'steer_prepared' AND NEW.state IN (
+          'queued', 'steer_effect_started', 'cancelled'
+        ))
+        OR (OLD.state = 'steer_effect_started' AND NEW.state IN (
+          'steer_acknowledged', 'ambiguous'
+        ))
+        OR (OLD.state = 'steer_acknowledged' AND NEW.state = 'completed')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid chat message ledger transition');
+      END;
+    `,
+  },
+  {
+    version: 61,
+    name: "session-sync-durable-human-origin",
+    sql: SESSION_SYNC_HUMAN_ORIGIN_SCHEMA_SQL,
+  },
+  {
+    version: 62,
+    name: "scheduled-chat-durable-off-intent",
+    sql: SCHEDULED_CHAT_DURABLE_OFF_INTENT_SCHEMA_SQL,
   },
 ] as const satisfies readonly Migration[];

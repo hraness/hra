@@ -36,6 +36,8 @@ test("the desktop product is a lean panes and settings shell", () => {
   expect(html).toContain('href="#settings"');
   expect(html).toContain("Settings");
   expect(html).toContain('aria-label="New pane"');
+  expect(html).toContain('aria-label="Shared folder access: Documents. Choose folder"');
+  expect(html).toContain("Shared folder · Documents");
   expect(html).toContain('class="hra-icon"');
   expect(html).not.toContain("new-pane-button__label");
   expect(html).toContain("Starting HRA");
@@ -167,6 +169,14 @@ test("the shell gates panes on signed-in subscriptions and reuses the last repos
   expect(app).not.toContain("reasoningEffort");
   expect(app).not.toContain("routingMode");
   expect(app).not.toContain("serviceTier");
+});
+
+test("the header owns one pathless shared-folder chooser", async () => {
+  const app = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
+  expect(app).toContain("shell.selectFolderAccess()");
+  expect(app).toContain("execution.folderAccess.displayName");
+  expect(app).toContain("Shared folder ·");
+  expect(app).not.toContain("execution.folderAccess.path");
 });
 
 test("a stale inherited repository falls back to project selection", () => {

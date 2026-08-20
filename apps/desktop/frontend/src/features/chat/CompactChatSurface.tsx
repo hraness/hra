@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 
-import { IconButton } from "../../ui";
+import { IconButton, ToggleButton } from "../../ui";
 
 import type {
   ChatBlockedMessageProjection,
@@ -20,10 +20,12 @@ import type {
   ChatMessageQueueProjection,
   ChatQueuedMessageProjection,
   ChatProviderSubagentsProjection,
+  ChatScheduleProjection,
   ChatTurnProjection,
   HarnessChildProjection,
 } from "../../../../contracts/runtime";
 import { HRAIcon } from "./Icon";
+import { formatNextRunRelative } from "./model";
 
 export const paneIdentityGoldenAngleDegrees = 137.507_764_050_037_85;
 export const paneIdentityInitialHueDegrees = 255;
@@ -222,6 +224,32 @@ export const TurnElapsed = memo(function TurnElapsed({
     >
       {formatted}
     </time>
+  );
+});
+
+export const ScheduledChatStatus = memo(function ScheduledChatStatus({
+  nowUnixMilliseconds,
+  schedule,
+}: Readonly<{
+  nowUnixMilliseconds?: number;
+  schedule: ChatScheduleProjection | null;
+}>) {
+  const coarseNow = useCoarseTurnNow(
+    schedule !== null && nowUnixMilliseconds === undefined,
+  );
+  if (schedule === null) return null;
+  const now = nowUnixMilliseconds ?? coarseNow;
+  const relative = formatNextRunRelative(schedule.nextRunAt, now);
+  return (
+    <span className="pane-schedule-status">
+      <HRAIcon name="clock" />
+      <time
+        aria-label={`Scheduled, next run ${relative}`}
+        dateTime={schedule.nextRunAt}
+      >
+        Scheduled · {relative}
+      </time>
+    </span>
   );
 });
 
@@ -770,15 +798,43 @@ export function CompactAttachmentButton({
   );
 }
 
+export function ScheduleModeToggle({
+  disabled,
+  onChange,
+  selected,
+}: Readonly<{
+  disabled: boolean;
+  onChange: (selected: boolean) => void;
+  selected: boolean;
+}>) {
+  const label = selected ? "Turn off scheduling" : "Schedule this chat";
+  return (
+    <ToggleButton
+      aria-label={label}
+      controlClassName="pane-schedule-toggle"
+      isDisabled={disabled}
+      isIconOnly
+      isSelected={selected}
+      onChange={onChange}
+      size="compact"
+      variant="quiet"
+    >
+      <HRAIcon name="clock" />
+    </ToggleButton>
+  );
+}
+
 export function CompactComposerBar({
   attachments,
   children,
+  left,
   onAttachFiles,
   onRemoveAttachment,
   right,
 }: Readonly<{
   attachments: readonly CompactAttachmentPreview[];
   children: ReactNode;
+  left?: ReactNode;
   onAttachFiles?: (files: readonly File[]) => void;
   onRemoveAttachment?: (attachmentId: ChatMessageAttachmentId) => void;
   right: ReactNode;
@@ -792,6 +848,7 @@ export function CompactComposerBar({
       {children}
       <div className="pane-composer-bar">
         <span className="pane-composer-bar__left">
+          {left}
           <CompactAttachmentButton
             {...(onAttachFiles === undefined ? {} : { onFiles: onAttachFiles })}
           />

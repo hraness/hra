@@ -2,6 +2,8 @@ import {
   acceptedSessionHeadSchema,
   assertObservationOnlySyncValue,
   canonicalSessionSyncJson,
+  clearOrphanedScheduledChatAsHumanRequestSchema,
+  readScheduledChatRecoveryInventoryAsHumanRequestSchema,
   decodeSyncUint64,
   digestSyncRecoveryVaultRootWrap,
   digestSyncVaultRootWrapManifest,
@@ -15,8 +17,10 @@ import {
   MAX_SYNC_RETAINED_CIPHERTEXT_BYTES,
   MAX_SYNC_RETAINED_EVENTS,
   MAX_SYNC_RETAINED_ROOT_KEY_EPOCHS,
+  nextScheduledChatOccurrence,
   retiredSessionIdFenceSchema,
   recoverSyncVaultRequestSchema,
+  sealedScheduledChatDefinitionSchema,
   sessionDirectoryChangePageSchema,
   sessionDirectorySnapshotPageSchema,
   sessionSyncTombstoneSchema,
@@ -30,6 +34,8 @@ import {
   wrappedSyncVaultRootKeyLinkSchema,
   wrappedSyncRecoveryVaultRootKeySchema,
   type SyncDeviceProof,
+  type ClearOrphanedScheduledChatAsHumanRequest,
+  type ReadScheduledChatRecoveryInventoryAsHumanRequest,
   type RecoverSyncVaultRequest,
 } from "@hraness/agent-tasks-protocol";
 import { makeFunctionReference } from "convex/server";
@@ -136,6 +142,20 @@ const MAX_ENROLLMENT_PROOF_NONCES_PER_DEVICE = 64;
 const MAX_ACTIVE_PROOF_NONCES_PER_DEVICE = 256;
 const SESSION_SYNC_RATE_LIMIT_WINDOW_MS = 60_000;
 const SESSION_SYNC_RATE_LIMIT_RETENTION_MS = 2 * SESSION_SYNC_RATE_LIMIT_WINDOW_MS;
+const SCHEDULED_CHAT_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+
+type ScheduledChatWakeArgs = Readonly<{
+  scheduleId: Id<"syncScheduledChats">;
+  wakeId: Id<"syncScheduledChatWakes">;
+  generation: string;
+  occurrenceSequence: string;
+  expectedRunAt: number;
+}>;
+const wakeScheduledChatReference = makeFunctionReference<
+  "mutation",
+  ScheduledChatWakeArgs,
+  Readonly<{ status: "applied" | "rescheduled" | "stale" }>
+>("sessionSyncScheduledChats:wakeScheduledChat");
 
 type SessionSyncRateClass =
   | "registration"
@@ -173,7 +193,9 @@ function rateClassForRequest(request: SessionSyncBackendRequest): SessionSyncRat
     case "root_key_link_page":
     case "list_enrollment_requests":
     case "snapshot_page":
-    case "change_page": return "read_poll";
+    case "change_page":
+    case "scheduled_chat_inventory":
+    case "scheduled_run_page": return "read_poll";
     case "admit_membership_proposal":
     case "update_membership":
     case "approve_enrollment": return "membership";
@@ -181,6 +203,10 @@ function rateClassForRequest(request: SessionSyncBackendRequest): SessionSyncRat
     case "acquire_writer":
     case "publish_session":
     case "delete_session":
+    case "put_scheduled_chat":
+    case "clear_scheduled_chat":
+    case "clear_orphaned_scheduled_chat":
+    case "ack_scheduled_run":
     case "begin_snapshot": return "ingest";
   }
 }
@@ -342,6 +368,8 @@ function proofMethod(request: SessionSyncBackendRequest): "GET" | "POST" {
     case "list_enrollment_requests":
     case "snapshot_page":
     case "change_page":
+    case "scheduled_chat_inventory":
+    case "scheduled_run_page":
       return "GET";
     case "admit_membership_proposal":
     case "update_membership":
@@ -352,6 +380,10 @@ function proofMethod(request: SessionSyncBackendRequest): "GET" | "POST" {
     case "acquire_writer":
     case "publish_session":
     case "delete_session":
+    case "put_scheduled_chat":
+    case "clear_scheduled_chat":
+    case "clear_orphaned_scheduled_chat":
+    case "ack_scheduled_run":
     case "begin_snapshot":
       return "POST";
   }
@@ -401,6 +433,48 @@ async function authorizeSyncContext(
   return { vault, device };
 }
 
+async function authorizeMembershipRecoveryReadContext(
+  ctx: ReadCtx,
+  proof: SyncDeviceProof,
+): Promise<AuthorizedSyncContext | BackendFailure> {
+  const human = await authorizeOrganizationHuman(ctx, {
+    requestId: proof.payload.nonce,
+  });
+  if (!human.ok) return failure("AUTHENTICATION_FAILED");
+  const vault = await ctx.db
+    .query("syncVaults")
+    .withIndex("by_vault_id", (query) =>
+      query.eq("vaultId", proof.payload.vaultId),
+    )
+    .unique();
+  if (
+    vault === null
+    || vault.status !== "active"
+    || vault.organizationId !== human.authorization.organization._id
+    || vault.ownerUserId !== human.authorization.user._id
+    || vault.tenantId !== proof.payload.tenantId
+    || vault.organizationCoordinate !== proof.payload.organizationId
+    || vault.ownerUserCoordinate !== proof.payload.ownerUserId
+    || vault.vaultGeneration !== proof.payload.vaultGeneration
+    || compareSyncUint64(proof.payload.membershipEpoch, vault.membershipEpoch) >= 0
+  ) return failure("STALE_MEMBERSHIP");
+  const device = await ctx.db
+    .query("syncDevices")
+    .withIndex("by_vault_and_device", (query) =>
+      query.eq("vaultId", vault._id).eq("deviceId", proof.payload.deviceId),
+    )
+    .unique();
+  if (
+    device === null
+    || device.status !== "active"
+    || device.organizationId !== vault.organizationId
+    || device.ownerUserId !== vault.ownerUserId
+    || device.membershipEpoch !== vault.membershipEpoch
+    || device.signingKeyId !== proof.signingKeyId
+  ) return failure("AUTHORIZATION_DENIED");
+  return { vault, device };
+}
+
 async function authorizeAndConsumeProof(
   ctx: MutationCtx,
   request: SessionSyncBackendRequest,
@@ -420,9 +494,30 @@ async function authorizeAndConsumeProof(
   if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt) || now < issuedAt || now > expiresAt) {
     return failure("PROOF_EXPIRED");
   }
-  const context = await authorizeSyncContext(ctx, proof);
+  let context = await authorizeSyncContext(ctx, proof);
+  if (
+    "ok" in context
+    && context.code === "STALE_MEMBERSHIP"
+    && (
+      request.operation === "read_membership"
+      || request.operation === "root_key_link_page"
+    )
+  ) {
+    context = await authorizeMembershipRecoveryReadContext(ctx, proof);
+  }
   if ("ok" in context) return context;
-  const nonceFailure = await consumeDeviceProofNonce(ctx, context, proof, now, "reject");
+  const nonceFailure = await consumeDeviceProofNonce(
+    ctx,
+    context,
+    proof,
+    now,
+    request.operation === "put_scheduled_chat"
+      || request.operation === "clear_scheduled_chat"
+      || request.operation === "clear_orphaned_scheduled_chat"
+      || request.operation === "ack_scheduled_run"
+      ? "allow"
+      : "reject",
+  );
   if (nonceFailure !== null) return nonceFailure;
   return context;
 }
@@ -506,7 +601,10 @@ async function consumeEnrollmentPossessionProof(
 }
 
 export const readProofContext = internalQuery({
-  args: { proofJson: v.string() },
+  args: {
+    proofJson: v.string(),
+    allowStaleMembershipRead: v.boolean(),
+  },
   returns: proofContextResultValidator,
   handler: async (ctx, args) => {
     let proof: SyncDeviceProof;
@@ -515,7 +613,14 @@ export const readProofContext = internalQuery({
     } catch {
       return { ok: false as const, code: "PROOF_INVALID" as const };
     }
-    const authorized = await authorizeSyncContext(ctx, proof);
+    let authorized = await authorizeSyncContext(ctx, proof);
+    if (
+      "ok" in authorized
+      && authorized.code === "STALE_MEMBERSHIP"
+      && args.allowStaleMembershipRead
+    ) {
+      authorized = await authorizeMembershipRecoveryReadContext(ctx, proof);
+    }
     if ("ok" in authorized) return authorized;
     const [head, activeDevices] = await Promise.all([
       ctx.db
@@ -1114,6 +1219,12 @@ export const recoverVaultTransition = internalMutation({
       }
     }
     await archiveCurrentKeyMaterial(ctx, currentKeyMaterial, now);
+    await clearScheduledChatsForAuthorityLoss(
+      ctx,
+      vault,
+      activeDevices,
+      now,
+    );
     const forcedOffline = await forceOfflineRevokedOrigins(ctx, vault, activeDevices, now);
     for (const device of activeDevices) {
       await ctx.db.patch(device._id, {
@@ -1643,9 +1754,9 @@ export const claimEnrollmentTransition = internalMutation({
   },
 });
 
-async function currentBoot(
+function currentBoot(
   context: AuthorizedSyncContext,
-): Promise<{ bootId: string; bootGeneration: string } | SessionSyncBackendResult> {
+): { bootId: string; bootGeneration: string } | SessionSyncBackendResult {
   if (context.device.bootId === undefined || context.device.bootGeneration === undefined) {
     return failure("STALE_BOOT");
   }
@@ -1966,7 +2077,7 @@ async function retainedRootEpochsForTransition(
   vault: Doc<"syncVaults">,
   nextRootKeyEpoch: string,
 ): Promise<string[] | null> {
-  const [heads, events] = await Promise.all([
+  const [heads, events, scheduledChats] = await Promise.all([
     ctx.db
       .query("syncSessionHeads")
       .withIndex("by_vault_and_session", (query) => query.eq("vaultId", vault._id))
@@ -1975,10 +2086,41 @@ async function retainedRootEpochsForTransition(
       .query("syncSessionEvents")
       .withIndex("by_vault_and_observed", (query) => query.eq("vaultId", vault._id))
       .collect(),
+    ctx.db
+      .query("syncScheduledChats")
+      .withIndex("by_vault_and_state", (query) =>
+        query.eq("vaultId", vault._id).eq("state", "active"),
+      )
+      .take(MAX_SYNC_DIRECTORY_SESSIONS + 1),
   ]);
+  if (scheduledChats.length > MAX_SYNC_DIRECTORY_SESSIONS) {
+    throw new Error("active scheduled chat key retention exceeds its directory bound");
+  }
   const epochs = new Set<string>([nextRootKeyEpoch]);
   for (const head of heads) epochs.add(head.keyEpoch);
   for (const event of events) epochs.add(event.keyEpoch);
+  for (const scheduledChat of scheduledChats) {
+    if (scheduledChat.vaultId !== vault._id) {
+      throw new Error("active scheduled chat key retention escaped its vault");
+    }
+    const definition = sealedScheduledChatDefinitionSchema.parse(
+      parseJson(scheduledChat.definitionEnvelopeJson),
+    );
+    if (
+      definition.header.tenantId !== vault.tenantId
+      || definition.header.organizationId !== vault.organizationCoordinate
+      || definition.header.ownerUserId !== vault.ownerUserCoordinate
+      || definition.header.vaultId !== vault.vaultId
+      || definition.header.vaultGeneration !== vault.vaultGeneration
+      || definition.header.sessionId !== scheduledChat.sessionId
+      || definition.header.originDeviceId !== scheduledChat.originDevicePublicId
+      || definition.header.generation !== scheduledChat.generation
+      || definition.ciphertextDigest !== scheduledChat.definitionCiphertextDigest
+    ) {
+      throw new Error("active scheduled chat key retention found incoherent authority");
+    }
+    epochs.add(definition.header.keyEpoch);
+  }
   if (epochs.size > MAX_SYNC_RETAINED_ROOT_KEY_EPOCHS) return null;
   return [...epochs].sort((left, right) => compareSyncUint64(left, right));
 }
@@ -2051,6 +2193,43 @@ async function forceOfflineRevokedOrigins(
     }
   }
   return { directoryVersion, activeStreamCount };
+}
+
+async function clearScheduledChatsForAuthorityLoss(
+  ctx: MutationCtx,
+  vault: Doc<"syncVaults">,
+  devices: readonly Doc<"syncDevices">[],
+  now: number,
+): Promise<void> {
+  let count = 0;
+  for (const device of devices) {
+    const schedules = await ctx.db
+      .query("syncScheduledChats")
+      .withIndex("by_origin_state_and_due", (query) =>
+        query.eq("originDeviceId", device._id).eq("state", "active"),
+      )
+      .take(MAX_SYNC_DIRECTORY_SESSIONS + 1);
+    if (schedules.length > MAX_SYNC_DIRECTORY_SESSIONS) {
+      throw new Error("scheduled chat authority-loss sweep exceeds its bound");
+    }
+    count += schedules.length;
+    if (count > MAX_SYNC_DIRECTORY_SESSIONS) {
+      throw new Error("vault scheduled chat authority-loss sweep exceeds its bound");
+    }
+    for (const schedule of schedules) {
+      if (schedule.vaultId !== vault._id) {
+        throw new Error("scheduled chat authority-loss sweep escaped its vault");
+      }
+      await cancelPendingScheduledChatWork(ctx, schedule, now);
+      await ctx.db.patch(schedule._id, {
+        state: "cleared",
+        nextRunAt: undefined,
+        clearedBy: "authority_lost",
+        clearedAt: now,
+        updatedAt: now,
+      });
+    }
+  }
 }
 
 async function updateMembership(
@@ -2144,6 +2323,17 @@ async function updateMembership(
   if (activeMembers.length > MAX_SYNC_DEVICES) return failure("DEVICE_LIMIT");
   const activeIds = new Set<string>(activeMembers.map((member) => member.deviceId));
   const newlyRevoked = currentActiveDevices.filter((device) => !activeIds.has(device.deviceId));
+  const revokedOriginSchedules = await Promise.all(newlyRevoked.map(
+    async (device) => await ctx.db
+      .query("syncScheduledChats")
+      .withIndex("by_origin_state_and_due", (query) =>
+        query.eq("originDeviceId", device._id).eq("state", "active"),
+      )
+      .first(),
+  ));
+  if (revokedOriginSchedules.some((schedule) => schedule !== null)) {
+    return failure("CONFLICT");
+  }
   const revokedCurrent = newlyRevoked.length > 0;
   if (statement.recoveryGeneration !== context.vault.recoveryGeneration) {
     return failure("CONFLICT");
@@ -2334,7 +2524,7 @@ async function updateMembership(
       .query("syncMembershipSigningIntents")
       .withIndex("by_proposal_and_signer", (query) =>
         query
-          .eq("proposalId", proposal!._id)
+          .eq("proposalId", proposal._id)
           .eq("signerDeviceId", context.device.deviceId),
       )
       .unique();
@@ -2822,7 +3012,7 @@ async function reserveSession(
   request: Extract<SessionSyncBackendRequest, { operation: "reserve_session" }>,
   now: number,
 ): Promise<SessionSyncBackendResult> {
-  const boot = await currentBoot(context);
+  const boot = currentBoot(context);
   if ("ok" in boot) return boot;
   const existing = await ctx.db
     .query("syncSessionEntries")
@@ -2916,7 +3106,7 @@ async function acquireWriter(
   request: Extract<SessionSyncBackendRequest, { operation: "acquire_writer" }>,
   now: number,
 ): Promise<SessionSyncBackendResult> {
-  const boot = await currentBoot(context);
+  const boot = currentBoot(context);
   if ("ok" in boot) return boot;
   if (request.bootId !== boot.bootId || request.bootGeneration !== boot.bootGeneration) {
     return failure("STALE_BOOT");
@@ -3129,7 +3319,7 @@ async function publishSession(
   request: Extract<SessionSyncBackendRequest, { operation: "publish_session" }>,
   now: number,
 ): Promise<SessionSyncBackendResult> {
-  const boot = await currentBoot(context);
+  const boot = currentBoot(context);
   if ("ok" in boot) return boot;
   const envelope = request.envelope;
   const entry = await ctx.db
@@ -3337,13 +3527,807 @@ async function publishSession(
   return success({ kind: "session_accepted", accepted, replay: false });
 }
 
+async function loadScheduledChat(
+  ctx: ReadCtx,
+  sessionEntryId: Id<"syncSessionEntries">,
+): Promise<Doc<"syncScheduledChats"> | null> {
+  return await ctx.db
+    .query("syncScheduledChats")
+    .withIndex("by_session_entry", (query) => query.eq("sessionEntryId", sessionEntryId))
+    .unique();
+}
+
+async function cancelPendingScheduledChatWork(
+  ctx: MutationCtx,
+  schedule: Doc<"syncScheduledChats">,
+  now: number,
+): Promise<void> {
+  const [wakes, runs] = await Promise.all([
+    ctx.db
+      .query("syncScheduledChatWakes")
+      .withIndex("by_schedule_and_state", (query) =>
+        query.eq("scheduleId", schedule._id).eq("state", "pending"),
+      )
+      .take(2),
+    ctx.db
+      .query("syncScheduledChatRuns")
+      .withIndex("by_schedule_and_state", (query) =>
+        query.eq("scheduleId", schedule._id).eq("state", "pending"),
+      )
+      .take(2),
+  ]);
+  if (wakes.length > 1 || runs.length > 1) {
+    throw new Error("scheduled chat has more than one outstanding occurrence");
+  }
+  for (const wake of wakes) {
+    await ctx.db.delete(wake._id);
+  }
+  for (const run of runs) {
+    await ctx.db.patch(run._id, {
+      state: "cancelled",
+      cancelledAt: now,
+      purgeAfter: now + SCHEDULED_CHAT_RUN_RETENTION_MS,
+      updatedAt: now,
+    });
+  }
+}
+
+async function createScheduledChatWake(
+  ctx: MutationCtx,
+  input: Readonly<{
+    scheduleId: Id<"syncScheduledChats">;
+    vaultId: Id<"syncVaults">;
+    sessionEntryId: Id<"syncSessionEntries">;
+    originDeviceId: Id<"syncDevices">;
+    generation: string;
+    occurrenceSequence: string;
+    expectedRunAt: number;
+    now: number;
+  }>,
+): Promise<void> {
+  const wakeId = await ctx.db.insert("syncScheduledChatWakes", {
+    scheduleId: input.scheduleId,
+    vaultId: input.vaultId,
+    sessionEntryId: input.sessionEntryId,
+    originDeviceId: input.originDeviceId,
+    generation: input.generation,
+    occurrenceSequence: input.occurrenceSequence,
+    expectedRunAt: input.expectedRunAt,
+    state: "pending",
+    createdAt: input.now,
+    updatedAt: input.now,
+  });
+  await ctx.scheduler.runAt(input.expectedRunAt, wakeScheduledChatReference, {
+    scheduleId: input.scheduleId,
+    wakeId,
+    generation: input.generation,
+    occurrenceSequence: input.occurrenceSequence,
+    expectedRunAt: input.expectedRunAt,
+  });
+}
+
+function scheduledChatHeaderMatchesAuthority(
+  context: AuthorizedSyncContext,
+  entry: Doc<"syncSessionEntries">,
+  boot: Readonly<{ bootId: string; bootGeneration: string }>,
+  header: ReturnType<typeof sealedScheduledChatDefinitionSchema.parse>["header"],
+): boolean {
+  return entry.state === "active"
+    && entry.vaultId === context.vault._id
+    && entry.originDeviceId === context.device._id
+    && entry.originDevicePublicId === context.device.deviceId
+    && header.tenantId === context.vault.tenantId
+    && header.organizationId === context.vault.organizationCoordinate
+    && header.ownerUserId === context.vault.ownerUserCoordinate
+    && header.vaultId === context.vault.vaultId
+    && header.vaultGeneration === context.vault.vaultGeneration
+    && header.membershipEpoch === context.vault.membershipEpoch
+    && header.originDeviceId === context.device.deviceId
+    && header.sessionId === entry.sessionId
+    && header.mirrorEpoch === entry.mirrorEpoch
+    && header.writerGeneration === entry.writerGeneration
+    && header.bootId === boot.bootId
+    && header.bootGeneration === boot.bootGeneration
+    && header.bootId === entry.writerBootId
+    && header.bootGeneration === entry.writerBootGeneration
+    && header.keyEpoch === context.vault.rootKeyEpoch;
+}
+
+async function putScheduledChat(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, { operation: "put_scheduled_chat" }>,
+  now: number,
+): Promise<SessionSyncBackendResult> {
+  const definition = request.definition;
+  const header = definition.header;
+  const entry = await ctx.db
+    .query("syncSessionEntries")
+    .withIndex("by_vault_and_session", (query) =>
+      query.eq("vaultId", context.vault._id).eq("sessionId", header.sessionId),
+    )
+    .unique();
+  if (
+    entry === null
+    || entry.originDeviceId !== context.device._id
+    || entry.state === "retired"
+    || entry.state === "tombstone"
+  ) return failure("NOT_FOUND");
+  const existing = await loadScheduledChat(ctx, entry._id);
+  const envelopeJson = canonicalSessionSyncJson(definition);
+  if (
+    existing !== null
+    && existing.state === "active"
+    && existing.generation === header.generation
+  ) {
+    if (
+      existing.vaultId !== context.vault._id
+      || existing.sessionId !== entry.sessionId
+      || existing.originDeviceId !== context.device._id
+      || existing.originDevicePublicId !== context.device.deviceId
+      || existing.rrule !== header.rrule
+      || existing.timeZone !== header.timeZone
+      || existing.definitionCiphertextDigest !== definition.ciphertextDigest
+      || existing.definitionCiphertextBytes !== definition.ciphertextBytes
+      || existing.definitionEnvelopeJson !== envelopeJson
+    ) return failure("CONFLICT");
+    return success({
+      kind: "scheduled_chat_put",
+      sessionId: entry.sessionId,
+      schedule: {
+        generation: existing.generation,
+        rrule: existing.rrule,
+        timeZone: existing.timeZone,
+        nextRunAt: existing.definitionFirstRunAt,
+      },
+      ciphertextDigest: existing.definitionCiphertextDigest,
+      replay: true,
+    });
+  }
+  if (existing !== null && existing.generation === header.generation) {
+    return failure("CONFLICT");
+  }
+  const boot = currentBoot(context);
+  if ("ok" in boot) return boot;
+  if (!scheduledChatHeaderMatchesAuthority(context, entry, boot, header)) {
+    return failure("STALE_WRITER");
+  }
+  if (
+    (existing === null
+      && (header.previousGeneration !== "0" || header.generation !== "1"))
+    || (existing !== null
+      && (header.previousGeneration !== existing.generation
+        || header.generation !== nextRequiredSyncUint64(existing.generation)))
+  ) return failure("CONFLICT");
+  const nextRunAt = nextScheduledChatOccurrence({
+    rrule: header.rrule,
+    timeZone: header.timeZone,
+    after: now,
+  });
+  if (nextRunAt === null) return failure("INVALID_REQUEST");
+  const occurrenceSequence = "1";
+  let scheduleId: Id<"syncScheduledChats">;
+  if (existing === null) {
+    scheduleId = await ctx.db.insert("syncScheduledChats", {
+      vaultId: context.vault._id,
+      sessionEntryId: entry._id,
+      sessionId: entry.sessionId,
+      originDeviceId: context.device._id,
+      originDevicePublicId: context.device.deviceId,
+      state: "active",
+      generation: header.generation,
+      rrule: header.rrule,
+      timeZone: header.timeZone,
+      nextRunAt,
+      definitionFirstRunAt: nextRunAt,
+      occurrenceSequence,
+      definitionCiphertextDigest: definition.ciphertextDigest,
+      definitionCiphertextBytes: definition.ciphertextBytes,
+      definitionEnvelopeJson: envelopeJson,
+      createdAt: now,
+      updatedAt: now,
+    });
+  } else {
+    await cancelPendingScheduledChatWork(ctx, existing, now);
+    scheduleId = existing._id;
+    await ctx.db.patch(existing._id, {
+      state: "active",
+      generation: header.generation,
+      rrule: header.rrule,
+      timeZone: header.timeZone,
+      nextRunAt,
+      definitionFirstRunAt: nextRunAt,
+      occurrenceSequence,
+      definitionCiphertextDigest: definition.ciphertextDigest,
+      definitionCiphertextBytes: definition.ciphertextBytes,
+      definitionEnvelopeJson: envelopeJson,
+      clearedBy: undefined,
+      clearedAt: undefined,
+      updatedAt: now,
+    });
+  }
+  await createScheduledChatWake(ctx, {
+    scheduleId,
+    vaultId: context.vault._id,
+    sessionEntryId: entry._id,
+    originDeviceId: context.device._id,
+    generation: header.generation,
+    occurrenceSequence,
+    expectedRunAt: nextRunAt,
+    now,
+  });
+  return success({
+    kind: "scheduled_chat_put",
+    sessionId: entry.sessionId,
+    schedule: {
+      generation: header.generation,
+      rrule: header.rrule,
+      timeZone: header.timeZone,
+      nextRunAt,
+    },
+    ciphertextDigest: definition.ciphertextDigest,
+    replay: false,
+  });
+}
+
+function clearRequestMatchesAuthority(
+  context: AuthorizedSyncContext,
+  entry: Doc<"syncSessionEntries">,
+  boot: Readonly<{ bootId: string; bootGeneration: string }>,
+  request: Extract<SessionSyncBackendRequest, { operation: "clear_scheduled_chat" }>,
+): boolean {
+  return entry.state === "active"
+    && entry.vaultId === context.vault._id
+    && entry.originDeviceId === context.device._id
+    && request.tenantId === context.vault.tenantId
+    && request.organizationId === context.vault.organizationCoordinate
+    && request.ownerUserId === context.vault.ownerUserCoordinate
+    && request.vaultId === context.vault.vaultId
+    && request.vaultGeneration === context.vault.vaultGeneration
+    && request.membershipEpoch === context.vault.membershipEpoch
+    && request.originDeviceId === context.device.deviceId
+    && request.sessionId === entry.sessionId
+    && request.mirrorEpoch === entry.mirrorEpoch
+    && request.writerGeneration === entry.writerGeneration
+    && request.bootId === boot.bootId
+    && request.bootGeneration === boot.bootGeneration
+    && request.bootId === entry.writerBootId
+    && request.bootGeneration === entry.writerBootGeneration
+    && request.keyEpoch === context.vault.rootKeyEpoch;
+}
+
+async function clearScheduledChat(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, { operation: "clear_scheduled_chat" }>,
+  now: number,
+): Promise<SessionSyncBackendResult> {
+  const entry = await ctx.db
+    .query("syncSessionEntries")
+    .withIndex("by_vault_and_session", (query) =>
+      query.eq("vaultId", context.vault._id).eq("sessionId", request.sessionId),
+    )
+    .unique();
+  if (entry === null || entry.originDeviceId !== context.device._id) return failure("NOT_FOUND");
+  const schedule = await loadScheduledChat(ctx, entry._id);
+  if (
+    schedule === null
+    || schedule.vaultId !== context.vault._id
+    || schedule.originDeviceId !== context.device._id
+  ) return failure("NOT_FOUND");
+  if (schedule.state === "cleared") {
+    if (
+      schedule.generation === request.expectedGeneration
+      && schedule.clearedBy === "user"
+    ) {
+      return success({
+        kind: "scheduled_chat_cleared",
+        sessionId: entry.sessionId,
+        generation: schedule.generation,
+        replay: true,
+      });
+    }
+    return failure("CONFLICT");
+  }
+  if (schedule.generation !== request.expectedGeneration) return failure("CONFLICT");
+  const boot = currentBoot(context);
+  if ("ok" in boot) return boot;
+  if (!clearRequestMatchesAuthority(context, entry, boot, request)) {
+    return failure("STALE_WRITER");
+  }
+  await cancelPendingScheduledChatWork(ctx, schedule, now);
+  await ctx.db.patch(schedule._id, {
+    state: "cleared",
+    nextRunAt: undefined,
+    clearedBy: "user",
+    clearedAt: now,
+    updatedAt: now,
+  });
+  return success({
+    kind: "scheduled_chat_cleared",
+    sessionId: entry.sessionId,
+    generation: schedule.generation,
+    replay: false,
+  });
+}
+
+async function clearOrphanedScheduledChat(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, {
+    operation: "clear_orphaned_scheduled_chat";
+  }>,
+  now: number,
+): Promise<SessionSyncBackendResult> {
+  if (request.originDeviceId !== context.device.deviceId) {
+    return failure("AUTHORIZATION_DENIED");
+  }
+  const schedule = await ctx.db
+    .query("syncScheduledChats")
+    .withIndex("by_origin_and_session", (query) =>
+      query.eq("originDeviceId", context.device._id).eq("sessionId", request.sessionId),
+    )
+    .unique();
+  if (
+    schedule === null
+    || schedule.vaultId !== context.vault._id
+    || schedule.originDeviceId !== context.device._id
+    || schedule.originDevicePublicId !== context.device.deviceId
+  ) return failure("NOT_FOUND");
+  if (
+    schedule.generation !== request.expectedGeneration
+    || schedule.definitionCiphertextDigest !== request.expectedCiphertextDigest
+  ) return failure("CONFLICT");
+  if (schedule.state === "cleared") {
+    return success({
+      kind: "scheduled_chat_cleared",
+      sessionId: schedule.sessionId,
+      generation: schedule.generation,
+      replay: true,
+    });
+  }
+  await cancelPendingScheduledChatWork(ctx, schedule, now);
+  await ctx.db.patch(schedule._id, {
+    state: "cleared",
+    nextRunAt: undefined,
+    clearedBy: "authority_lost",
+    clearedAt: now,
+    updatedAt: now,
+  });
+  return success({
+    kind: "scheduled_chat_cleared",
+    sessionId: schedule.sessionId,
+    generation: schedule.generation,
+    replay: false,
+  });
+}
+
+export const clearOrphanedScheduledChatAsHumanTransition = internalMutation({
+  args: { requestJson: v.string() },
+  returns: backendResultValidator,
+  handler: async (ctx, args) => {
+    let request: ClearOrphanedScheduledChatAsHumanRequest;
+    try {
+      request = clearOrphanedScheduledChatAsHumanRequestSchema.parse(
+        parseJson(args.requestJson),
+      );
+    } catch {
+      return failure("INVALID_REQUEST");
+    }
+    const human = await authorizeOrganizationHuman(ctx, {
+      requestId: `scheduled-chat-recovery:${request.sessionId}`,
+    });
+    if (!human.ok) return failure("AUTHENTICATION_FAILED");
+    const vault = await ctx.db
+      .query("syncVaults")
+      .withIndex("by_vault_id", (query) => query.eq("vaultId", request.vaultId))
+      .unique();
+    if (
+      vault === null
+      || vault.status !== "active"
+      || vault.vaultGeneration !== request.vaultGeneration
+      || vault.tenantId !== request.tenantId
+      || vault.organizationCoordinate !== request.organizationId
+      || vault.ownerUserCoordinate !== request.ownerUserId
+      || vault.organizationId !== human.authorization.organization._id
+      || vault.ownerUserId !== human.authorization.user._id
+    ) return failure("NOT_FOUND");
+    const origin = await ctx.db
+      .query("syncDevices")
+      .withIndex("by_vault_and_device", (query) =>
+        query.eq("vaultId", vault._id).eq("deviceId", request.originDeviceId),
+      )
+      .unique();
+    if (origin === null) return failure("NOT_FOUND");
+    const schedule = await ctx.db
+      .query("syncScheduledChats")
+      .withIndex("by_origin_and_session", (query) =>
+        query.eq("originDeviceId", origin._id).eq("sessionId", request.sessionId),
+      )
+      .unique();
+    if (
+      schedule === null
+      || schedule.vaultId !== vault._id
+      || schedule.originDeviceId !== origin._id
+      || schedule.originDevicePublicId !== request.originDeviceId
+    ) return failure("NOT_FOUND");
+    if (
+      schedule.generation !== request.expectedGeneration
+      || schedule.definitionCiphertextDigest !== request.expectedCiphertextDigest
+    ) return failure("CONFLICT");
+    if (schedule.state === "cleared") {
+      return success({
+        kind: "scheduled_chat_cleared",
+        sessionId: schedule.sessionId,
+        generation: schedule.generation,
+        replay: true,
+      });
+    }
+    const rateFailure = await consumeSessionSyncRateLimit(ctx, "registration", [
+      {
+        kind: "human",
+        key: `${human.authorization.user._id}\u0000${human.authorization.organization._id}`,
+      },
+      { kind: "vault", key: vault._id },
+    ], Date.now());
+    if (rateFailure !== null) return rateFailure;
+    const now = Date.now();
+    await cancelPendingScheduledChatWork(ctx, schedule, now);
+    await ctx.db.patch(schedule._id, {
+      state: "cleared",
+      nextRunAt: undefined,
+      clearedBy: "authority_lost",
+      clearedAt: now,
+      updatedAt: now,
+    });
+    return success({
+      kind: "scheduled_chat_cleared",
+      sessionId: schedule.sessionId,
+      generation: schedule.generation,
+      replay: false,
+    });
+  },
+});
+
+export const readScheduledChatRecoveryInventoryAsHumanTransition = internalMutation({
+  args: { requestJson: v.string() },
+  returns: backendResultValidator,
+  handler: async (ctx, args) => {
+    let request: ReadScheduledChatRecoveryInventoryAsHumanRequest;
+    try {
+      request = readScheduledChatRecoveryInventoryAsHumanRequestSchema.parse(
+        parseJson(args.requestJson),
+      );
+    } catch {
+      return failure("INVALID_REQUEST");
+    }
+    const human = await authorizeOrganizationHuman(ctx, {
+      requestId: `scheduled-chat-inventory:${request.vaultId}`,
+    });
+    if (!human.ok) return failure("AUTHENTICATION_FAILED");
+    const vault = await ctx.db
+      .query("syncVaults")
+      .withIndex("by_vault_id", (query) => query.eq("vaultId", request.vaultId))
+      .unique();
+    if (
+      vault === null
+      || vault.status !== "active"
+      || vault.vaultGeneration !== request.vaultGeneration
+      || vault.tenantId !== request.tenantId
+      || vault.organizationCoordinate !== request.organizationId
+      || vault.ownerUserCoordinate !== request.ownerUserId
+      || vault.organizationId !== human.authorization.organization._id
+      || vault.ownerUserId !== human.authorization.user._id
+    ) return failure("NOT_FOUND");
+    const originDevice = await ctx.db
+      .query("syncDevices")
+      .withIndex("by_vault_and_device", (query) =>
+        query.eq("vaultId", vault._id).eq("deviceId", request.originDeviceId)
+      )
+      .unique();
+    if (originDevice === null) return failure("NOT_FOUND");
+    const rateFailure = await consumeSessionSyncRateLimit(ctx, "registration", [
+      {
+        kind: "human",
+        key: `${human.authorization.user._id}\u0000${human.authorization.organization._id}`,
+      },
+      { kind: "vault", key: vault._id },
+    ], Date.now());
+    if (rateFailure !== null) return rateFailure;
+    const rows = await ctx.db
+      .query("syncScheduledChats")
+      .withIndex("by_origin_and_session", (query) => {
+        const scope = query.eq("originDeviceId", originDevice._id);
+        return request.afterSessionId === undefined
+          ? scope
+          : scope.gt("sessionId", request.afterSessionId);
+      })
+      .order("asc")
+      .take(request.pageSize + 1);
+    const selected = rows.slice(0, request.pageSize);
+    const schedules = selected.map((row) => {
+      if (
+        row.vaultId !== vault._id
+        || row.originDeviceId !== originDevice._id
+        || row.originDevicePublicId !== originDevice.deviceId
+      ) {
+        throw new Error("scheduled chat recovery inventory escaped its vault");
+      }
+      return {
+        state: row.state,
+        sessionId: row.sessionId,
+        originDeviceId: row.originDevicePublicId,
+        generation: row.generation,
+        ciphertextDigest: row.definitionCiphertextDigest,
+      };
+    });
+    const hasMore = rows.length > request.pageSize;
+    return success({
+      kind: "scheduled_chat_recovery_inventory",
+      vault: vaultCoordinates(vault),
+      originDeviceId: originDevice.deviceId,
+      schedules,
+      hasMore,
+      ...(hasMore ? { nextAfterSessionId: schedules.at(-1)?.sessionId } : {}),
+    });
+  },
+});
+
+async function scheduledChatInventory(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, {
+    operation: "scheduled_chat_inventory";
+  }>,
+): Promise<SessionSyncBackendResult> {
+  const rows = await ctx.db
+    .query("syncScheduledChats")
+    .withIndex("by_origin_and_session", (query) => {
+      const origin = query.eq("originDeviceId", context.device._id);
+      return request.afterSessionId === undefined
+        ? origin
+        : origin.gt("sessionId", request.afterSessionId);
+    })
+    .order("asc")
+    .take(request.pageSize + 1);
+  const selected = rows.slice(0, request.pageSize);
+  const schedules = selected.map((row) => {
+    if (
+      row.vaultId !== context.vault._id
+      || row.originDeviceId !== context.device._id
+      || row.originDevicePublicId !== context.device.deviceId
+    ) throw new Error("scheduled chat inventory escaped its origin authority");
+    if (row.state === "cleared") {
+      return {
+        state: "cleared" as const,
+        sessionId: row.sessionId,
+        originDeviceId: row.originDevicePublicId,
+        generation: row.generation,
+      };
+    }
+    if (row.nextRunAt === undefined) {
+      throw new Error("active scheduled chat inventory entry has no next run");
+    }
+    const definition = sealedScheduledChatDefinitionSchema.parse(
+      parseJson(row.definitionEnvelopeJson),
+    );
+    if (
+      definition.header.sessionId !== row.sessionId
+      || definition.header.originDeviceId !== row.originDevicePublicId
+      || definition.header.generation !== row.generation
+      || definition.ciphertextDigest !== row.definitionCiphertextDigest
+      || definition.ciphertextBytes !== row.definitionCiphertextBytes
+    ) throw new Error("scheduled chat inventory definition is incoherent");
+    return {
+      state: "active" as const,
+      sessionId: row.sessionId,
+      originDeviceId: row.originDevicePublicId,
+      generation: row.generation,
+      nextRunAt: row.nextRunAt,
+      definition,
+    };
+  });
+  const hasMore = rows.length > request.pageSize;
+  return success({
+    kind: "scheduled_chat_inventory",
+    schedules,
+    hasMore,
+    ...(hasMore
+      ? { nextAfterSessionId: schedules.at(-1)?.sessionId }
+      : {}),
+  });
+}
+
+async function scheduledRunPage(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, { operation: "scheduled_run_page" }>,
+): Promise<SessionSyncBackendResult> {
+  const boot = currentBoot(context);
+  if ("ok" in boot) return boot;
+  if (request.bootId !== boot.bootId || request.bootGeneration !== boot.bootGeneration) {
+    return failure("STALE_BOOT");
+  }
+  const rows = await ctx.db
+    .query("syncScheduledChatRuns")
+    .withIndex("by_origin_state_and_due", (query) =>
+      query.eq("originDeviceId", context.device._id).eq("state", "pending"),
+    )
+    .order("asc")
+    .take(request.pageSize + 1);
+  const selected = rows.slice(0, request.pageSize);
+  const runs = [];
+  for (const row of selected) {
+    const [schedule, entry] = await Promise.all([
+      ctx.db.get(row.scheduleId),
+      ctx.db.get(row.sessionEntryId),
+    ]);
+    if (
+      schedule === null
+      || entry === null
+      || schedule.state !== "active"
+      || entry.state !== "active"
+      || schedule.vaultId !== context.vault._id
+      || row.vaultId !== context.vault._id
+      || schedule.sessionEntryId !== entry._id
+      || schedule.originDeviceId !== context.device._id
+      || row.originDeviceId !== context.device._id
+      || schedule.generation !== row.generation
+      || schedule.definitionCiphertextDigest !== row.definitionCiphertextDigest
+      || schedule.definitionEnvelopeJson !== row.definitionEnvelopeJson
+    ) throw new Error("pending scheduled chat run is not currently authorized");
+    runs.push({
+      runId: row.runId,
+      sessionId: row.sessionId,
+      scheduleGeneration: row.generation,
+      occurrenceSequence: row.occurrenceSequence,
+      scheduledFor: row.scheduledFor,
+      definition: sealedScheduledChatDefinitionSchema.parse(
+        parseJson(row.definitionEnvelopeJson),
+      ),
+    });
+  }
+  return success({
+    kind: "scheduled_run_page",
+    runs,
+    hasMore: rows.length > request.pageSize,
+  });
+}
+
+async function acknowledgeScheduledRun(
+  ctx: MutationCtx,
+  context: AuthorizedSyncContext,
+  request: Extract<SessionSyncBackendRequest, { operation: "ack_scheduled_run" }>,
+  now: number,
+): Promise<SessionSyncBackendResult> {
+  const run = await ctx.db
+    .query("syncScheduledChatRuns")
+    .withIndex("by_public_id", (query) => query.eq("runId", request.runId))
+    .unique();
+  if (run === null || run.originDeviceId !== context.device._id) return failure("NOT_FOUND");
+  if (
+    run.sessionId !== request.sessionId
+    || run.generation !== request.scheduleGeneration
+    || run.occurrenceSequence !== request.occurrenceSequence
+    || run.scheduledFor !== request.scheduledFor
+  ) return failure("CONFLICT");
+  if (run.state === "acknowledged") {
+    if (
+      run.acknowledgedBootId !== request.bootId
+      || run.acknowledgedBootGeneration !== request.bootGeneration
+      || run.acknowledgedHasNextRun === undefined
+    ) return failure("CONFLICT");
+    return success({
+      kind: "scheduled_run_acknowledged",
+      runId: run.runId,
+      sessionId: run.sessionId,
+      generation: run.generation,
+      nextRunAt: run.acknowledgedHasNextRun
+        ? run.acknowledgedNextRunAt ?? null
+        : null,
+      replay: true,
+    });
+  }
+  if (run.state === "cancelled") return failure("CONFLICT");
+  const boot = currentBoot(context);
+  if ("ok" in boot) return boot;
+  if (request.bootId !== boot.bootId || request.bootGeneration !== boot.bootGeneration) {
+    return failure("STALE_BOOT");
+  }
+  const [schedule, entry] = await Promise.all([
+    ctx.db.get(run.scheduleId),
+    ctx.db.get(run.sessionEntryId),
+  ]);
+  if (
+    schedule === null
+    || entry === null
+    || schedule.state !== "active"
+    || entry.state !== "active"
+    || schedule.vaultId !== context.vault._id
+    || schedule.sessionEntryId !== entry._id
+    || schedule.originDeviceId !== context.device._id
+    || entry.originDeviceId !== context.device._id
+    || schedule.generation !== run.generation
+    || schedule.occurrenceSequence !== run.occurrenceSequence
+    || schedule.nextRunAt !== run.scheduledFor
+    || schedule.definitionCiphertextDigest !== run.definitionCiphertextDigest
+    || schedule.definitionEnvelopeJson !== run.definitionEnvelopeJson
+  ) return failure("CONFLICT");
+  const nextRunAt = nextScheduledChatOccurrence({
+    rrule: schedule.rrule,
+    timeZone: schedule.timeZone,
+    after: Math.max(now, run.scheduledFor),
+  });
+  const nextSequence = nextRequiredSyncUint64(run.occurrenceSequence);
+  await ctx.db.patch(run._id, {
+    state: "acknowledged",
+    acknowledgedBootId: request.bootId,
+    acknowledgedBootGeneration: request.bootGeneration,
+    acknowledgedHasNextRun: nextRunAt !== null,
+    acknowledgedNextRunAt: nextRunAt ?? undefined,
+    acknowledgedAt: now,
+    purgeAfter: now + SCHEDULED_CHAT_RUN_RETENTION_MS,
+    updatedAt: now,
+  });
+  if (nextRunAt === null) {
+    await ctx.db.patch(schedule._id, {
+      state: "cleared",
+      nextRunAt: undefined,
+      clearedBy: "schedule_exhausted",
+      clearedAt: now,
+      updatedAt: now,
+    });
+  } else {
+    await ctx.db.patch(schedule._id, {
+      occurrenceSequence: nextSequence,
+      nextRunAt,
+      updatedAt: now,
+    });
+    await createScheduledChatWake(ctx, {
+      scheduleId: schedule._id,
+      vaultId: schedule.vaultId,
+      sessionEntryId: schedule.sessionEntryId,
+      originDeviceId: schedule.originDeviceId,
+      generation: schedule.generation,
+      occurrenceSequence: nextSequence,
+      expectedRunAt: nextRunAt,
+      now,
+    });
+  }
+  return success({
+    kind: "scheduled_run_acknowledged",
+    runId: run.runId,
+    sessionId: run.sessionId,
+    generation: run.generation,
+    nextRunAt,
+    replay: false,
+  });
+}
+
+async function clearScheduledChatForSessionDeletion(
+  ctx: MutationCtx,
+  entry: Doc<"syncSessionEntries">,
+  now: number,
+): Promise<void> {
+  const schedule = await loadScheduledChat(ctx, entry._id);
+  if (schedule === null || schedule.state !== "active") return;
+  await cancelPendingScheduledChatWork(ctx, schedule, now);
+  await ctx.db.patch(schedule._id, {
+    state: "cleared",
+    nextRunAt: undefined,
+    clearedBy: "session_deleted",
+    clearedAt: now,
+    updatedAt: now,
+  });
+}
+
 async function deleteSession(
   ctx: MutationCtx,
   context: AuthorizedSyncContext,
   request: Extract<SessionSyncBackendRequest, { operation: "delete_session" }>,
   now: number,
 ): Promise<SessionSyncBackendResult> {
-  const boot = await currentBoot(context);
+  const boot = currentBoot(context);
   if ("ok" in boot) return boot;
   const entry = await ctx.db
     .query("syncSessionEntries")
@@ -3411,6 +4395,7 @@ async function deleteSession(
     serverObservedAt,
     purgeAfter,
   });
+  await clearScheduledChatForSessionDeletion(ctx, entry, now);
   const tombstoneId = await ctx.db.insert("syncSessionTombstones", {
     vaultId: context.vault._id,
     sessionEntryId: entry._id,
@@ -4140,6 +5125,26 @@ export const commitAuthenticatedRequest = internalMutation({
       case "acquire_writer": return await acquireWriter(ctx, context, request, now);
       case "publish_session": return await publishSession(ctx, context, request, now);
       case "delete_session": return await deleteSession(ctx, context, request, now);
+      case "put_scheduled_chat": return await putScheduledChat(ctx, context, request, now);
+      case "clear_scheduled_chat": return await clearScheduledChat(ctx, context, request, now);
+      case "clear_orphaned_scheduled_chat": return await clearOrphanedScheduledChat(
+        ctx,
+        context,
+        request,
+        now,
+      );
+      case "scheduled_chat_inventory": return await scheduledChatInventory(
+        ctx,
+        context,
+        request,
+      );
+      case "scheduled_run_page": return await scheduledRunPage(ctx, context, request);
+      case "ack_scheduled_run": return await acknowledgeScheduledRun(
+        ctx,
+        context,
+        request,
+        now,
+      );
       case "begin_snapshot": return await beginSnapshot(ctx, context, request, now);
       case "snapshot_page": return await snapshotPage(ctx, context, request, now);
       case "change_page": return await changePage(ctx, context, request);

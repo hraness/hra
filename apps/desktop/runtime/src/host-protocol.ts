@@ -27,6 +27,8 @@ import {
 
 export const hostProjectOnboardingCommand =
   "hra.runtime.onboardProject" as const;
+export const hostFolderAccessSelectCommand =
+  "hra.runtime.selectFolderAccess" as const;
 export const hostLocalDataRemovalRecoveryCommand =
   "hra.runtime.recoverLocalDataRemoval" as const;
 export const hostAccountProfileNativeResultCommand =
@@ -48,6 +50,7 @@ export const hostRequestSchema = z
       runtimeSnapshotCommand,
       runtimeDispatchCommand,
       hostProjectOnboardingCommand,
+      hostFolderAccessSelectCommand,
       hostLocalDataRemovalRecoveryCommand,
       hostAccountProfileNativeResultCommand,
       hostHarnessCustodyNativeResultCommand,
@@ -88,6 +91,11 @@ const hostProjectOnboardingPayloadSchema = z.object({
   workspaceName: taskDomain.workspaceNameSchema.optional(),
   provider: taskDomain.repositoryProviderSchema.optional(),
   publicUrl: taskDomain.absoluteHttpsUrlSchema.optional(),
+}).strict();
+
+const hostFolderAccessSelectPayloadSchema = z.object({
+  version: z.literal(runtimeProtocolVersion),
+  trustedDirectoryPath: z.string().min(1).max(4_096),
 }).strict();
 
 const hostLocalDataRemovalRecoveryPayloadSchema = z
@@ -167,6 +175,9 @@ export type HostRequest = z.infer<typeof hostRequestSchema>;
 export type HostProjectOnboardingPayload = z.infer<
   typeof hostProjectOnboardingPayloadSchema
 >;
+export type HostFolderAccessSelectPayload = z.infer<
+  typeof hostFolderAccessSelectPayloadSchema
+>;
 export type HostLocalDataRemovalNativeLaunch = z.infer<
   typeof hostLocalDataRemovalNativeLaunchSchema
 >;
@@ -223,6 +234,15 @@ export function parseHostProjectOnboardingPayload(
     throw new TypeError("Host request is not a project onboarding command");
   }
   return hostProjectOnboardingPayloadSchema.parse(request.payload);
+}
+
+export function parseHostFolderAccessSelectPayload(
+  request: HostRequest,
+): HostFolderAccessSelectPayload {
+  if (request.command !== hostFolderAccessSelectCommand) {
+    throw new TypeError("Host request is not a folder-access selection command");
+  }
+  return hostFolderAccessSelectPayloadSchema.parse(request.payload);
 }
 
 export function parseHostLocalDataRemovalRecoveryPayload(
