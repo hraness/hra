@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  cp,
   lstat,
   mkdtemp,
   open,
@@ -11,14 +12,26 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { loadBunNativeLicenseInventory } from "./bun-native-licenses";
 import {
+  type CodexNativeLicenseInventory,
   renderCodexNativeLicenseNotices,
   serializeCodexNativeLicenseInventory,
   verifyCodexNativeLicenseInventory,
   verifyCodexNativePayloadsAtPaths,
 } from "./codex-native-licenses";
+import {
+  codexSignatureNormalizationEntry,
+  codexSignatureNormalizationManifestEntries,
+  codexSignatureNormalizationPolicy,
+  parseCodexSignatureNormalizationEntitlements,
+  reconstructCodexSignatureSource,
+  verifyCodexSignatureNormalizationContent,
+  verifyCodexSignatureNormalizationPackaged,
+  verifyCodexSignatureNormalizationSource,
+} from "./codex-signature-normalization";
 import {
   correspondingSourceSpecs,
   verifyCorrespondingSourceArchive,
@@ -194,8 +207,18 @@ function number(value: unknown, label: string): number {
 
 async function codeSignature(path: string): Promise<Readonly<{
   cdHash: string;
+  flags: readonly string[];
+  hashChoices: readonly string[];
+  hashType: string | null;
   identifier: string;
+  infoPlistBound: boolean | null;
+  internalRequirementsCount: number | null;
+  pageSize: number | null;
+  runtimeVersion: string | null;
+  sealedResources: string | null;
+  signatureKind: string | null;
   teamIdentifier: string | null;
+  timestamp: string | null;
 }>> {
   const result = await run([
     "/usr/bin/codesign",
@@ -209,14 +232,47 @@ async function codeSignature(path: string): Promise<Readonly<{
   const cdHash = value(/^CDHash=([0-9a-fA-F]+)$/mu)?.toLowerCase() ?? null;
   const identifier = value(/^Identifier=(.+)$/mu);
   const rawTeam = value(/^TeamIdentifier=(.+)$/mu);
+  const rawFlags = value(/^CodeDirectory .* flags=0x[0-9a-fA-F]+\(([^)]*)\)/mu);
+  const rawHashChoices = value(/^Hash choices=(.+)$/mu);
+  const rawInfoPlist = value(/^Info\.plist=(.+)$/mu);
+  const rawRequirementsCount = value(/^Internal requirements count=([0-9]+) size=/mu);
+  const rawPageSize = value(/^Page size=([0-9]+)$/mu);
   if (cdHash === null || identifier === null) {
     throw new Error(`Missing code signature metadata: ${path}`);
   }
   return {
     cdHash,
+    flags: rawFlags === null || rawFlags.length === 0 ? [] : rawFlags.split(","),
+    hashChoices: rawHashChoices === null || rawHashChoices.length === 0
+      ? []
+      : rawHashChoices.split(","),
+    hashType: value(/^Hash type=([^ ]+) size=/mu),
     identifier,
+    infoPlistBound: rawInfoPlist === null ? null : rawInfoPlist !== "not bound",
+    internalRequirementsCount:
+      rawRequirementsCount === null ? null : Number(rawRequirementsCount),
+    pageSize: rawPageSize === null ? null : Number(rawPageSize),
+    runtimeVersion: value(/^Runtime Version=(.+)$/mu),
+    sealedResources: value(/^Sealed Resources=(.+)$/mu),
+    signatureKind: value(/^Signature=(.+)$/mu),
     teamIdentifier: rawTeam === "not set" ? null : rawTeam,
+    timestamp: value(/^Timestamp=(.+)$/mu),
   };
+}
+
+async function codeSignatureEntitlements(
+  path: string,
+): Promise<Readonly<Record<string, boolean>>> {
+  const result = await run([
+    "/usr/bin/codesign",
+    "--display",
+    "--entitlements",
+    ":-",
+    path,
+  ]);
+  return parseCodexSignatureNormalizationEntitlements(
+    `${result.stdout}\n${result.stderr}`,
+  );
 }
 
 async function verifyRuntimeManifest(
@@ -300,6 +356,8 @@ async function verifyRuntimeManifest(
       !== runtimeVersions.codex.dependencyLicenseInventorySha256
     || codex["dependencyLicenseNoticesSha256"]
       !== runtimeVersions.codex.dependencyLicenseNoticesSha256
+    || codex["sourceBinarySha256"]
+      !== codexSignatureNormalizationEntry("bin/codex").source.sha256
     || git["version"] !== runtimeVersions.git.version
     || git["assetSha256"] !== runtimeVersions.git.assetSha256
     || gitCredentialManager["version"] !== runtimeVersions.gitCredentialManager.version
@@ -336,6 +394,51 @@ async function verifyRuntimeManifest(
   if (imageNormalizer["cdHash"] !== imageNormalizerSignature.cdHash) {
     throw new Error("Image normalizer CodeDirectory hash differs from the manifest.");
   }
+  const expectedNormalized = codexSignatureNormalizationManifestEntries();
+  const normalized = runtime["normalizedSignatures"];
+  if (!isDeepStrictEqual(normalized, expectedNormalized)) {
+    throw new Error("Runtime manifest normalized Codex signatures differ from policy.");
+  }
+  const normalizedPaths = new Set<string>();
+  for (const entry of codexSignatureNormalizationPolicy.entries) {
+    const absolute = resolve(appPath, entry.appRelativePath);
+    const deltaPath = resolve(appPath, entry.sourceDelta.path);
+    if (!inside(appPath, absolute) || !inside(appPath, deltaPath)) {
+      throw new Error(`Normalized Codex evidence escaped the app: ${entry.payloadPath}`);
+    }
+    const [status, deltaStatus] = await Promise.all([
+      lstat(absolute),
+      lstat(deltaPath),
+    ]);
+    if (
+      !status.isFile()
+      || status.isSymbolicLink()
+      || status.nlink !== 1
+      || !deltaStatus.isFile()
+      || deltaStatus.isSymbolicLink()
+      || deltaStatus.nlink !== 1
+      || deltaStatus.size !== entry.sourceDelta.size
+      || await sha256File(deltaPath) !== entry.sourceDelta.sha256
+    ) {
+      throw new Error(`Normalized Codex evidence differs: ${entry.payloadPath}`);
+    }
+    verifyCodexSignatureNormalizationPackaged(entry, {
+      sha256: await sha256File(absolute),
+      signature: {
+        ...await codeSignature(absolute),
+        entitlements: await codeSignatureEntitlements(absolute),
+      },
+      size: status.size,
+    });
+    await run([
+      "/usr/bin/codesign",
+      "--verify",
+      "--strict",
+      "--verbose=6",
+      absolute,
+    ]);
+    normalizedPaths.add(entry.appRelativePath);
+  }
   const preserved = runtime["preservedSignatures"];
   if (!Array.isArray(preserved) || preserved.length === 0) {
     throw new Error("Runtime manifest has no preserved third-party signatures.");
@@ -346,6 +449,9 @@ async function verifyRuntimeManifest(
     const team = string(entry["teamIdentifier"], `preserved signature ${index} team`);
     if (!trustedThirdPartyTeams.has(team)) {
       throw new Error(`Untrusted preserved signature team: ${team}`);
+    }
+    if (normalizedPaths.has(path)) {
+      throw new Error(`Normalized signature cannot also be preserved: ${path}`);
     }
     const absolute = resolve(appPath, path);
     if (!inside(appPath, absolute)) {
@@ -368,6 +474,76 @@ async function verifyRuntimeManifest(
     throw new Error("Runtime tree hash differs from the manifest.");
   }
   return { commit, runtimeManifest: manifest, treeSha256 };
+}
+
+async function verifyReconstructedCodexSourcePayloads(
+  appPath: string,
+  inventory: CodexNativeLicenseInventory,
+  manifestPath: string,
+): Promise<void> {
+  const temporaryRoot = await realpath(
+    await mkdtemp(join(tmpdir(), "hra-codex-source-recovery-")),
+  );
+  const temporaryStatus = await lstat(temporaryRoot);
+  if (
+    !temporaryStatus.isDirectory()
+    || temporaryStatus.isSymbolicLink()
+    || temporaryStatus.uid !== process.getuid?.()
+    || (temporaryStatus.mode & 0o777) !== 0o700
+  ) {
+    await rm(temporaryRoot, { force: true, recursive: true });
+    throw new Error("Codex source recovery root is not an owner-private directory.");
+  }
+  const vendorRoot = join(temporaryRoot, "vendor");
+  try {
+    await cp(join(appPath, "Contents/Resources/runtime/codex"), vendorRoot, {
+      force: false,
+      recursive: true,
+      verbatimSymlinks: true,
+    });
+    for (const entry of codexSignatureNormalizationPolicy.entries) {
+      const packagedPath = resolve(appPath, entry.appRelativePath);
+      const deltaPath = resolve(appPath, entry.sourceDelta.path);
+      const reconstructedPath = join(vendorRoot, entry.payloadPath);
+      await rm(reconstructedPath, { force: true });
+      await reconstructCodexSignatureSource(
+        packagedPath,
+        deltaPath,
+        reconstructedPath,
+      );
+      await verifyCodexSignatureNormalizationContent(
+        reconstructedPath,
+        packagedPath,
+      );
+      const status = await lstat(reconstructedPath);
+      if (!status.isFile() || status.isSymbolicLink() || status.nlink !== 1) {
+        throw new Error(
+          `Reconstructed Codex source is not a regular single-link file: ${entry.payloadPath}`,
+        );
+      }
+      verifyCodexSignatureNormalizationSource(entry, {
+        sha256: await sha256File(reconstructedPath),
+        signature: await codeSignature(reconstructedPath),
+        size: status.size,
+      });
+      const sourceStrict = await run([
+        "/usr/bin/codesign",
+        "--verify",
+        "--strict",
+        "--verbose=6",
+        reconstructedPath,
+      ], { allowFailure: true });
+      process.stdout.write(
+        `Reconstructed Codex source signature ${entry.payloadPath}: strict ${sourceStrict.exitCode === 0 ? "accepted" : "rejected"}; source provenance remains exact.\n`,
+      );
+    }
+    await verifyCodexNativePayloadsAtPaths(inventory, {
+      manifestPath,
+      vendorRoot,
+    });
+  } finally {
+    await rm(temporaryRoot, { force: true, recursive: true });
+  }
 }
 
 export async function verifyMacOSApp(
@@ -480,10 +656,12 @@ export async function verifyMacOSApp(
   if (stagedCodexNotices !== renderCodexNativeLicenseNotices(stagedCodexInventory)) {
     throw new Error("Staged Codex native license notices differ from their inventory.");
   }
-  await verifyCodexNativePayloadsAtPaths(stagedCodexInventory, {
-    manifestPath: join(licenseRoot, "CODEX-platform-package.json"),
-    vendorRoot: join(runtimeRoot, "codex"),
-  });
+  const release = await verifyRuntimeManifest(canonical);
+  await verifyReconstructedCodexSourcePayloads(
+    canonical,
+    stagedCodexInventory,
+    join(licenseRoot, "CODEX-platform-package.json"),
+  );
   const [stagedRuntimeVersions, sourceRuntimeVersions] = await Promise.all([
     readFile(join(licenseRoot, "RUNTIME-VERSIONS.json"), "utf8"),
     readFile(join(import.meta.dir, "runtime-versions.json"), "utf8"),
@@ -492,7 +670,6 @@ export async function verifyMacOSApp(
     throw new Error("Staged runtime version pins differ from source.");
   }
 
-  const release = await verifyRuntimeManifest(canonical);
   const dataRemover = await codeSignature(join(runtimeRoot, "bin/oprte-data-remover"));
   if (dataRemover.identifier !== "oprte-data-remover") {
     throw new Error("Data remover code identifier differs.");

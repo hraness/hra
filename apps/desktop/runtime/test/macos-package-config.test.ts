@@ -110,6 +110,7 @@ describe("macOS ad-hoc package contract", () => {
     expect(requiredLicenseFileNames).toContain("BUN-DEPENDENCY-LICENSES.txt");
     expect(requiredLicenseFileNames).toContain("CODEX-NATIVE-LICENSES.json");
     expect(requiredLicenseFileNames).toContain("CODEX-NATIVE-LICENSES.txt");
+    expect(requiredLicenseFileNames).toContain("CODEX-SIGNATURE-NORMALIZATION.md");
     expect(requiredLicenseFileNames).toContain("GIT-COPYING.txt");
     expect(requiredLicenseFileNames).toContain("GIT-LFS-LICENSE.md");
     expect(requiredLicenseFileNames).toContain("GIT-CREDENTIAL-MANAGER-LICENSE.txt");
