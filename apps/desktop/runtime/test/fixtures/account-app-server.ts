@@ -263,26 +263,24 @@ async function handle(line: string): Promise<void> {
       if (prompt.includes("interaction")) {
         interactionTurns.add(turnKey(threadId, turnId));
         write({ id, result: { turn } });
-        setTimeout(() => {
-          write({
-            id: `chat-request-${String(nextTurn)}`,
-            method: "item/tool/requestUserInput",
-            params: {
-              threadId,
-              turnId,
-              itemId,
-              questions: [{
-                id: "fixture-choice",
-                header: "Choice",
-                question: "Choose one",
-                isOther: false,
-                isSecret: false,
-                options: [{ label: "One", description: "Continue" }],
-              }],
-              autoResolutionMs: 60_000,
-            },
-          });
-        }, 5);
+        write({
+          id: `chat-request-${String(nextTurn)}`,
+          method: "item/tool/requestUserInput",
+          params: {
+            threadId,
+            turnId,
+            itemId,
+            questions: [{
+              id: "fixture-choice",
+              header: "Choice",
+              question: "Choose one",
+              isOther: false,
+              isSecret: false,
+              options: [{ label: "One", description: "Continue" }],
+            }],
+            autoResolutionMs: 60_000,
+          },
+        });
         return;
       }
       const reasoning = "Thinking 🌿";

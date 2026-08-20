@@ -154,6 +154,15 @@ interface PaneEarlySessionEvents {
   unknownOverflow: boolean;
 }
 
+interface EarlyUnexpectedInteractionLatch {
+  readonly paneId: ChatPaneId;
+  readonly logicalTurnId: ChatTurnId;
+  readonly accountProfileId: ChatAccountProfileId;
+  readonly providerThreadId: string;
+  readonly providerTurnId: string;
+  conflicted: boolean;
+}
+
 interface TurnContainmentTarget {
   readonly paneId: ChatPaneId;
   readonly turnId: ChatTurnId;
@@ -375,6 +384,8 @@ export class ChatService {
     new Map<ChatPaneId, ExactProviderTerminalReceipt>();
   readonly #exactProviderTerminalWaiters = new Map<ChatPaneId, ExactProviderTerminalWaiter>();
   readonly #earlySessionEvents = new Map<ChatPaneId, PaneEarlySessionEvents>();
+  readonly #earlyUnexpectedInteractions =
+    new Map<ChatPaneId, EarlyUnexpectedInteractionLatch>();
   readonly #attachedHarnessProjectionFences = new Map<
     ChatPaneId,
     AttachedHarnessProjectionFence
@@ -944,6 +955,9 @@ export class ChatService {
    */
   closeAdmission(): void {
     this.#admissionClosed = true;
+    // An early interaction belongs to an already-admitted provider-start tail.
+    // Retain it so that tail can consume the exact rejection before settled()
+    // releases shutdown; the ordinary terminal/poison cleanup then removes it.
     this.#flushStreamPersistence();
     for (const retry of this.#attachedHarnessStartupRetries.values()) {
       if (retry.timer !== null) clearTimeout(retry.timer);
@@ -1088,9 +1102,23 @@ export class ChatService {
       pane === null ||
       !activePane(pane.projection) ||
       pane.projection.turn === null ||
-      pane.providerTurnId !== event.turnId ||
       this.#poisonedTurns.get(pane.projection.id) === pane.projection.turn.id
     ) return false;
+    if (pane.providerTurnId === null) {
+      if (
+        pane.projection.interactionMode !== "chat" ||
+        pane.binding?.accountProfileId !== event.accountProfileId ||
+        pane.binding.threadId !== event.threadId
+      ) return false;
+      if (
+        this.#pendingTurnStops.get(pane.projection.id)?.turnId === pane.projection.turn.id ||
+        this.#pendingTurnContainments.get(pane.projection.id)?.turnId ===
+          pane.projection.turn.id
+      ) return true;
+      this.#latchEarlyUnexpectedInteraction(pane, event);
+      return true;
+    }
+    if (pane.providerTurnId !== event.turnId) return false;
     // Reject HITL at the provider boundary immediately. Renderer projection is
     // deliberately not an admission dependency: a blocked delta must never
     // leave Codex waiting for an approval HRA cannot safely answer.
@@ -1723,12 +1751,12 @@ export class ChatService {
     await this.#publishMessageQueue(paneId, queue);
   }
 
-  async #acknowledgeStartMessageEffect(
+  #acknowledgeStartMessageEffect(
     paneId: ChatPaneId,
     turnId: ChatTurnId,
-  ): Promise<void> {
+  ): ChatMessageQueueProjection | null {
     const tracked = this.#activeStartMessageEffects.get(paneId);
-    if (tracked === undefined) return;
+    if (tracked === undefined) return null;
     if (tracked.turnId !== turnId || tracked.state !== "effectStarted") {
       throw new ChatPaneStoreError(
         "invalid_state",
@@ -1745,7 +1773,7 @@ export class ChatService {
     });
     tracked.revision += 1;
     tracked.state = "acknowledged";
-    await this.#publishMessageQueue(paneId, queue);
+    return queue;
   }
 
   async #publishAndDeliverPreparedSteer(
@@ -2518,12 +2546,60 @@ export class ChatService {
   }
 
   #discardEarlySessionEvents(paneId: ChatPaneId): PaneEarlySessionEvents | undefined {
+    this.#earlyUnexpectedInteractions.delete(paneId);
     const paneBuffer = this.#earlySessionEvents.get(paneId);
     if (paneBuffer === undefined) return undefined;
     this.#earlySessionEvents.delete(paneId);
     this.#earlySessionEventCount -= paneBuffer.eventCount;
     this.#earlySessionEventUtf8Bytes -= paneBuffer.totalBytes;
     return paneBuffer;
+  }
+
+  #latchEarlyUnexpectedInteraction(
+    pane: ChatPanePrivateRecord,
+    event: SessionInteractionRequest,
+  ): void {
+    const logicalTurnId = pane.projection.turn?.id;
+    if (logicalTurnId === undefined) return;
+    const existing = this.#earlyUnexpectedInteractions.get(pane.projection.id);
+    if (existing === undefined) {
+      this.#earlyUnexpectedInteractions.set(pane.projection.id, {
+        paneId: pane.projection.id,
+        logicalTurnId,
+        accountProfileId: event.accountProfileId,
+        providerThreadId: event.threadId,
+        providerTurnId: event.turnId,
+        conflicted: false,
+      });
+      return;
+    }
+    if (
+      existing.paneId !== pane.projection.id ||
+      existing.logicalTurnId !== logicalTurnId ||
+      existing.accountProfileId !== event.accountProfileId ||
+      existing.providerThreadId !== event.threadId ||
+      existing.providerTurnId !== event.turnId
+    ) existing.conflicted = true;
+  }
+
+  #claimEarlyUnexpectedInteraction(
+    paneId: ChatPaneId,
+    logicalTurnId: ChatTurnId,
+    binding: ChatThreadBinding,
+    providerTurnId: string,
+  ): "exact" | "conflicted" | null {
+    const latch = this.#earlyUnexpectedInteractions.get(paneId);
+    if (latch === undefined) return null;
+    this.#earlyUnexpectedInteractions.delete(paneId);
+    if (
+      latch.conflicted ||
+      latch.paneId !== paneId ||
+      latch.logicalTurnId !== logicalTurnId ||
+      latch.accountProfileId !== binding.accountProfileId ||
+      latch.providerThreadId !== binding.threadId ||
+      latch.providerTurnId !== providerTurnId
+    ) return "conflicted";
+    return "exact";
   }
 
   async #drainEarlySessionEvents(
@@ -2952,7 +3028,10 @@ export class ChatService {
     }, false);
   }
 
-  async #applyUnexpectedInteraction(event: ChatUnexpectedInteraction): Promise<void> {
+  async #applyUnexpectedInteraction(
+    event: ChatUnexpectedInteraction,
+    containment: "exact" | "account_generation" = "exact",
+  ): Promise<void> {
     const pane = this.#store.get(event.paneId);
     if (pane?.projection.turn?.id !== event.turnId || !activePane(pane.projection)) return;
     if (pane.projection.interactionMode === "harnessObserver") {
@@ -2962,7 +3041,10 @@ export class ChatService {
       // here would be an unjournaled second authority over the same turn.
       return;
     }
-    const target = containmentTarget(pane);
+    const exactTarget = containmentTarget(pane);
+    const target = containment === "exact"
+      ? exactTarget
+      : { ...exactTarget, providerTurnId: null };
     await this.#beginTurnContainment(target, !this.#admissionClosed, async () => {
       await this.#publishAttention(event.paneId, event.turnId, {
         code: "approval_required",
@@ -4337,9 +4419,25 @@ export class ChatService {
           acceptedStreamPosition: accepted.quotaProofCursor.streamPosition,
           now: this.#now(),
         });
-        await this.#acknowledgeStartMessageEffect(paneId, turnId);
+        const acknowledgedQueue = this.#acknowledgeStartMessageEffect(paneId, turnId);
         this.#rememberQuotaFloor(paneId, turnId, binding.accountProfileId, accepted.quotaProofCursor);
         const streaming = this.#store.markTurnAccepted(paneId, turnId, accepted.turnId, this.#now());
+        const earlyInteraction = this.#claimEarlyUnexpectedInteraction(
+          paneId,
+          turnId,
+          binding,
+          accepted.turnId,
+        );
+        if (earlyInteraction !== null) {
+          await this.#applyUnexpectedInteraction(
+            { paneId, turnId },
+            earlyInteraction === "exact" ? "exact" : "account_generation",
+          );
+          if (this.#turnStartupMustStop(paneId, turnId)) return;
+        }
+        if (acknowledgedQueue !== null) {
+          await this.#publishMessageQueue(paneId, acknowledgedQueue);
+        }
         await this.#projection.paneStateChanged(streaming);
         await this.#drainEarlySessionEvents(
           paneId,
