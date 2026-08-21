@@ -6,7 +6,7 @@ import {
   LinkButton,
   SearchField,
   SegmentedControl,
-  ThemeToggle,
+  ThemeMenuButton,
 } from "@hra-internal/design-kit/react";
 import {
   useLayoutEffect,
@@ -138,7 +138,6 @@ function Frame({
           </div>
           <div className="direct-probe"><ProbeStatus session={session} /></div>
           <div className="direct-actions">
-            <ThemeToggle labels={{ dark: "Dark", light: "Light", system: "System" }} />
             <SegmentedControl
               aria-label="Preview viewport"
               className="direct-viewport"
@@ -152,6 +151,7 @@ function Frame({
             />
             <LinkButton href={scenarioUrl(activation.scenario, true)} size="compact" target="_blank" variant="quiet">open frame</LinkButton>
             <Button onPress={() => globalThis.location?.reload()} size="compact" variant="quiet">reset</Button>
+            <ThemeMenuButton />
           </div>
         </header>
         <div className="direct-scroll">

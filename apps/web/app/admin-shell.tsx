@@ -24,7 +24,7 @@ import {
   SettingsCard,
   SkipLink,
   Spinner,
-  ThemeToggle,
+  ThemeMenuButton,
   TopBar,
 } from "@hra-internal/design-kit/react";
 import { useAuth } from "@workos-inc/authkit-nextjs/components";
@@ -55,6 +55,7 @@ import { listOrganizationOptions } from "./organization-actions";
 import type { OrganizationOptionsResult } from "./organization-options";
 import { Cancel01Icon } from "./hra-icon-data";
 import { HRA_BRAND_ICON_PATH } from "./site";
+import { StandaloneThemeHeader } from "./standalone-theme-header";
 import { SuiteAccountControl } from "./suite-account-control";
 import { ConvexTaskWorkspaceAdapter } from "./convex-task-workspace-adapter";
 
@@ -343,7 +344,7 @@ function ConfirmAction({
 function FullPageState({ children, eyebrow, title }: { children: ReactNode; eyebrow: string; title: string }) {
   return (
     <main className="state-page" id="main-content">
-      <ThemeToggle className="standalone-theme-toggle" />
+      <StandaloneThemeHeader />
       <SettingsCard className="state-card" title={title}>
         <PageIntro eyebrow={eyebrow} title="HRA" titleAs="h2" />
         {children}
@@ -1121,7 +1122,6 @@ function AuthorizedDashboard({
       footer={(
         <div className="hra-rail-footer">
           <HranessBrand />
-          <ThemeToggle />
           <LinkButton href="/download" size="compact" variant="quiet">
             macOS Preview
           </LinkButton>
@@ -1181,6 +1181,7 @@ function AuthorizedDashboard({
         rail={rail}
         topBar={(
           <TopBar
+            actions={<ThemeMenuButton />}
             className="topbar"
             leading={(
               <div className="topbar-route">

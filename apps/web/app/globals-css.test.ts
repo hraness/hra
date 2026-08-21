@@ -61,6 +61,14 @@ test("the public landing stays responsive, keyboard-visible, and token-driven", 
   expect(stylesheet).toMatch(/@media \(forced-colors:\s*active\)[\s\S]*?\.landing-button,[\s\S]*?border:\s*1px solid CanvasText;/u);
 });
 
+test("standalone appearance controls belong to a header instead of absolute or rail chrome", () => {
+  expect(firstRule(".state-page")).toContain("grid-template-rows: auto minmax(0, 1fr)");
+  expect(firstRule(".standalone-header.jungle-top-bar")).toContain("width: 100%");
+  expect(firstRule(".state-card")).toContain("place-self: center");
+  expect(stylesheet).not.toContain(".standalone-theme-toggle");
+  expect(stylesheet).not.toContain(".hra-rail-footer .jungle-theme-toggle");
+});
+
 test("landing accent text uses a semantic foreground with light and dark contrast", () => {
   const landingStyles = stylesheet.slice(stylesheet.indexOf(".landing-page"));
   expect(landingStyles).not.toContain("color: var(--accent);");

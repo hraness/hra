@@ -366,6 +366,7 @@ test("empty, loading, and alert surfaces use tonal contrast without decorative c
   const zov2 = await Bun.file(new URL("./zov2.css", import.meta.url)).text();
   const empty = declarations(ruleBody(zov2, ".jungle-empty-state"));
   const icon = declarations(ruleBody(zov2, ".jungle-empty-state__icon"));
+  const routeContent = declarations(ruleBody(zov2, ".jungle-route-state__content"));
   const loading = declarations(ruleBody(zov2, ".jungle-route-state__loading"));
   const alert = declarations(ruleBody(zov2, ".jungle-inline-alert"));
 
@@ -375,6 +376,7 @@ test("empty, loading, and alert surfaces use tonal contrast without decorative c
   expect(icon.get("border")).toBe("0");
   expect(icon.get("border-radius")).toBe("var(--radius-round)");
   expect(icon.get("background")).toBe("var(--surface-raised)");
+  expect(routeContent.get("grid-row")).toBe("2");
   expect(loading.get("border")).toBe("0");
   expect(loading.get("box-shadow")).toBe("none");
   expect(alert.get("border")).toBe("0");

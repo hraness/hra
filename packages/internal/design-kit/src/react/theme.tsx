@@ -206,14 +206,17 @@ export type ThemeToggleProps =
   & ThemeToggleControlProps
   & ThemeTogglePresentationProps;
 
-/** A hydration-stable, persisted Light/Dark/System appearance control. */
+/**
+ * A hydration-stable, persisted Light/Dark/System appearance control.
+ * Persistent product chrome defaults to the compact menu presentation.
+ */
 export function ThemeToggle({
   "aria-label": ariaLabel = "Appearance",
   className,
-  display = "icons",
+  display,
   labels,
   onChange,
-  presentation = "segmented",
+  presentation,
   size = "compact",
   value: controlledValue,
 }: ThemeToggleProps) {
@@ -222,7 +225,11 @@ export function ThemeToggle({
   const controlled = controlledValue !== undefined;
   const ready = controlled || hydrated;
   const value = controlledValue ?? (hydrated ? normalizeDesignTheme(theme) : defaultDesignTheme);
-  const items = display === "icons" ? themeToggleIconItems(labels) : themeToggleItems(labels);
+  const resolvedPresentation = presentation ?? (display === undefined ? "menu" : "segmented");
+  const resolvedDisplay = display ?? "icons";
+  const items = resolvedDisplay === "icons"
+    ? themeToggleIconItems(labels)
+    : themeToggleItems(labels);
   const changeTheme = (nextTheme: DesignTheme): void => {
     if (controlled) onChange?.(nextTheme);
     else setTheme(nextTheme);
@@ -232,16 +239,22 @@ export function ThemeToggle({
   return (
     <div
       aria-busy={!ready || undefined}
-      className={classNames("jungle-theme-toggle", className)}
-      data-display={presentation === "menu" ? "icons" : display}
-      data-presentation={presentation}
+      className={classNames(
+        "jungle-theme-toggle",
+        "hraness-design-theme-toggle",
+        className,
+      )}
+      data-display={resolvedPresentation === "menu" ? "icons" : resolvedDisplay}
+      data-hraness-appearance-menu={resolvedPresentation === "menu" ? "" : undefined}
+      data-presentation={resolvedPresentation}
       data-ready={ready ? "true" : "false"}
       data-theme-value={value}
     >
-      {presentation === "menu" ? (
+      {resolvedPresentation === "menu" ? (
         <MenuTrigger>
           <IconButton
             aria-label={`${ariaLabel}: ${currentLabel}`}
+            controlClassName="jungle-theme-toggle__trigger hraness-design-theme-toggle__trigger"
             isDisabled={!ready}
             size={size}
             tooltip={`${ariaLabel}: ${currentLabel}`}
@@ -250,21 +263,23 @@ export function ThemeToggle({
           </IconButton>
           <Menu
             aria-label={ariaLabel}
-            className="jungle-theme-toggle__menu"
+            className="jungle-theme-toggle__menu hraness-design-theme-toggle__menu"
             disallowEmptySelection
             onAction={(key) => {
               if (isDesignTheme(key)) changeTheme(key);
             }}
-            popoverClassName="jungle-theme-toggle__popover"
+            popoverClassName="jungle-theme-toggle__popover hraness-design-theme-toggle__popover"
             selectedKeys={[value]}
             selectionMode="single"
           >
             {designThemes.map((id) => (
               <MenuItem
+                className="jungle-theme-toggle__item hraness-design-theme-toggle__item"
                 data-theme-value={id}
                 id={id}
                 key={id}
                 leading={themeToggleIcon(id)}
+                textValue={themeToggleLabel(id, labels)}
               >
                 {themeToggleLabel(id, labels)}
               </MenuItem>
@@ -283,6 +298,16 @@ export function ThemeToggle({
       )}
     </div>
   );
+}
+
+export type ThemeMenuButtonProps = ThemeToggleBaseProps & ThemeToggleControlProps;
+
+/**
+ * The canonical persistent appearance selector. Render it as the final action
+ * in a product header so every surface exposes the same icon-menu pattern.
+ */
+export function ThemeMenuButton(props: ThemeMenuButtonProps) {
+  return <ThemeToggle {...props} presentation="menu" />;
 }
 
 export interface ThemeColorSyncProps {

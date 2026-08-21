@@ -81,6 +81,7 @@ body {
   display: flex;
   align-items: center;
   gap: 5px;
+  justify-content: flex-end;
 }
 .direct-actions .jungle-button__control,
 .direct-viewport .jungle-segmented-control__item {

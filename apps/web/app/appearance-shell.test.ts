@@ -46,7 +46,9 @@ describe("HRA shared appearance and shell contract", () => {
     expect(shell).toContain("new URLSearchParams({ surface, workspace: workspaceId })");
     expect(shell).toMatch(/return `\/app\?\$\{parameters\.toString\(\)\}`;/u);
     expect(shell).toContain("<HranessBrand />");
-    expect(shell).toContain("<ThemeToggle />");
+    expect(shell).toContain("actions={<ThemeMenuButton />}");
+    expect(shell.match(/<ThemeMenuButton\b/gu)).toHaveLength(1);
+    expect(shell).not.toMatch(/className="hra-rail-footer"[\s\S]{0,240}?ThemeMenuButton/u);
   });
 
   test("keeps the alert dismiss action named and discoverable", async () => {
@@ -84,8 +86,13 @@ describe("HRA shared appearance and shell contract", () => {
     expect(loading).not.toContain("PageIntro");
     expect(loading).not.toContain("Restoring the server-authorized organization");
     expect(notFound).toContain("<EmptyState");
+    for (const routeState of [error, loading, notFound]) {
+      expect(routeState).toContain("<StandaloneThemeHeader />");
+      expect(routeState).not.toContain("ThemeToggle");
+    }
     expect(globalError).toContain('import "./globals.css"');
     expect(globalError).toContain("GlobalErrorDocument");
+    expect(globalError).not.toContain("ThemeMenuButton");
   });
 
   test("consumes the shared foundation without fixed-dark color literals", async () => {

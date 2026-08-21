@@ -4,12 +4,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import { AnimatedRailStage, railStageMotion } from "./animated-rail-stage";
 import { useDesignPortalTheme } from "./design-theme-context";
+import { RouteErrorPage, RouteNotFoundPage } from "./route-state";
 import {
   defaultDesignTheme,
   DesignThemeProvider,
   normalizeDesignTheme,
   themeColorFor,
   themeToggleItems,
+  ThemeMenuButton,
   ThemeToggle,
 } from "./theme";
 
@@ -50,7 +52,7 @@ test("theme color resolution is dark only for a resolved dark appearance", () =>
   expect(themeColorFor(undefined, values)).toBe(values.light);
 });
 
-test("the provider and toggle server-render a system-first three-choice surface", () => {
+test("the provider and default toggle server-render the canonical system-first menu button", () => {
   const html = renderToStaticMarkup(
     <DesignThemeProvider>
       <ThemeToggle />
@@ -60,22 +62,24 @@ test("the provider and toggle server-render a system-first three-choice surface"
   expect(html).toContain("jungle-design-theme-v1");
   expect(html).toContain('data-ready="false"');
   expect(html).toContain('data-display="icons"');
+  expect(html).toContain('data-hraness-appearance-menu=""');
+  expect(html).toContain('data-presentation="menu"');
   expect(html).toContain('data-theme-value="system"');
-  expect(html).toContain('aria-label="Appearance"');
-  expect(html).toContain('aria-label="Light"');
-  expect(html).toContain('aria-label="Dark"');
-  expect(html).toContain('aria-label="System"');
-  expect(html).not.toContain(">Light<");
-  expect(html).not.toContain(">Dark<");
-  expect(html).not.toContain(">System<");
-  expect(html.match(/data-slot="appearance-icon"/gu)).toHaveLength(3);
-  expect(html).toContain('data-selected="true"');
+  expect(html).toContain('aria-label="Appearance: System"');
+  expect(html).toContain("hraness-design-theme-toggle__trigger");
+  expect(html.match(/data-slot="appearance-icon"/gu)).toHaveLength(1);
+  expect(html).not.toContain('input type="radio"');
   expect(html).toContain('disabled=""');
 });
 
 test("appearance labels remain available for explicit teaching surfaces", () => {
   const html = renderToStaticMarkup(
-    <ThemeToggle display="labels" onChange={() => undefined} value="light" />,
+    <ThemeToggle
+      display="labels"
+      onChange={() => undefined}
+      presentation="segmented"
+      value="light"
+    />,
   );
 
   expect(html).toContain('data-display="labels"');
@@ -84,12 +88,11 @@ test("appearance labels remain available for explicit teaching surfaces", () => 
   expect(html).toContain(">System<");
 });
 
-test("the menu presentation keeps persistent chrome to one named trigger", () => {
+test("the canonical menu button keeps persistent chrome to one named trigger", async () => {
   const html = renderToStaticMarkup(
-    <ThemeToggle
+    <ThemeMenuButton
       aria-label="Site appearance"
       onChange={() => undefined}
-      presentation="menu"
       value="system"
     />,
   );
@@ -101,18 +104,40 @@ test("the menu presentation keeps persistent chrome to one named trigger", () =>
   expect(html.match(/data-slot="appearance-icon"/gu)).toHaveLength(1);
   expect(html).not.toContain('input type="radio"');
   expect(html).not.toContain('class="jungle-segmented-control');
+
+  const source = await Bun.file(new URL("./theme.tsx", import.meta.url)).text();
+  expect(source).toContain("hraness-design-theme-toggle__item");
+  expect(source).toContain("textValue={themeToggleLabel(id, labels)}");
 });
 
 test("a controlled theme toggle is hydration-stable and immediately operable", () => {
   const html = renderToStaticMarkup(
-    <ThemeToggle onChange={() => undefined} value="system" />,
+    <ThemeMenuButton onChange={() => undefined} value="system" />,
   );
 
   expect(html).toContain('data-ready="true"');
   expect(html).toContain('data-theme-value="system"');
   expect(html).not.toContain('aria-busy="true"');
   expect(html).not.toContain('disabled=""');
-  expect(html).toMatch(/data-selected="true"[^>]*>[\s\S]*?value="system"/u);
+  expect(html).toContain('aria-label="Appearance: System"');
+});
+
+test("route states defer to the product header and keep any opt-in menu inside a header", () => {
+  const notFound = renderToStaticMarkup(<RouteNotFoundPage />);
+  const error = renderToStaticMarkup(
+    <RouteErrorPage
+      announce={false}
+      autoFocus={false}
+      error={new Error("Boom")}
+      reset={() => undefined}
+    />,
+  );
+  const optedIn = renderToStaticMarkup(<RouteNotFoundPage showThemeToggle />);
+
+  expect(notFound).not.toContain("hraness-design-theme-toggle");
+  expect(error).not.toContain("hraness-design-theme-toggle");
+  expect(optedIn).toContain('<header class="jungle-route-state__header">');
+  expect(optedIn).toContain('data-presentation="menu"');
 });
 
 test("a forced provider omits preference repair and system selection", () => {

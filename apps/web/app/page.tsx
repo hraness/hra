@@ -1,5 +1,5 @@
 import { HranessBrand } from "@hra-internal/brand-ui";
-import { ThemeToggle } from "@hra-internal/design-kit/react";
+import { ThemeMenuButton } from "@hra-internal/design-kit/react";
 import {
   createPublicSiteMetadata,
   serializeJsonLd,
@@ -148,9 +148,9 @@ export default function LandingPage() {
           <Link href="/alternatives">Compare</Link>
         </nav>
         <div className="landing-header-actions">
-          <ThemeToggle />
           <a className="landing-text-link" href="https://github.com/hraness/hra">GitHub</a>
           <Link className="landing-button landing-button--compact" href="/app">Open HRA</Link>
+          <ThemeMenuButton />
         </div>
       </header>
 

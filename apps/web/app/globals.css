@@ -114,13 +114,22 @@ code {
   position: relative;
   display: grid;
   min-height: 100vh;
-  place-items: center;
+  grid-template-rows: auto minmax(0, 1fr);
   padding: 2rem 1rem;
   background: var(--background);
 }
 
+.standalone-header.jungle-top-bar {
+  width: 100%;
+  min-height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
 .state-card {
   width: min(46rem, 100%);
+  place-self: center;
   padding: clamp(1.25rem, 4vw, 2.5rem);
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
@@ -466,12 +475,9 @@ code {
   text-transform: uppercase;
 }
 
-.standalone-theme-toggle {
-  position: absolute;
-  z-index: 2;
-  top: 1rem;
-  right: 1rem;
-  max-width: calc(100vw - 2rem);
+.design-page {
+  min-height: 100vh;
+  background: var(--background);
 }
 
 .configuration-list {
@@ -824,10 +830,6 @@ code {
 .hra-rail-footer .hraness-brand:hover,
 .hra-rail-footer .hraness-brand:focus-visible {
   color: var(--foreground);
-}
-
-.hra-rail-footer .jungle-theme-toggle {
-  justify-self: start;
 }
 
 .jungle-modal-overlay:has(.jungle-app-shell__drawer) {
@@ -1990,6 +1992,7 @@ code {
   border-bottom: 1px solid var(--line);
 }
 
+.alternatives-header-actions,
 .alternatives-header nav {
   display: flex;
   align-items: center;
@@ -2639,6 +2642,7 @@ code {
     padding-block: 1rem;
   }
 
+  .alternatives-header-actions,
   .alternatives-header nav {
     align-items: flex-end;
     flex-direction: column;
