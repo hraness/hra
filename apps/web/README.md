@@ -378,7 +378,7 @@ block WorkOS sign-in or any HRA task capability.
 
 HRA web has a credential-free Direct composition that renders the real task workspace through the same app-owned props and action port used by the live Convex adapter. It does not mount WorkOS, construct a Convex client, import generated APIs, or claim to simulate provider sessions and database transaction semantics.
 
-The workbench also mounts the shared appearance provider and starts in light mode, so its Light/Dark/System control exercises the same theme-relative task surface without importing any production identity or transport adapter.
+The workbench also mounts the shared System-first appearance provider with a concrete light pre-bootstrap fallback. Its final toolbar action is the same one-trigger Light/Dark/System menu used by production, so the deterministic surface exercises persisted preference, keyboard operation, and theme-relative task presentation without importing any production identity or transport adapter.
 
 Start the scenario workbench or run its bounded Chromium evidence pass from the repository root:
 

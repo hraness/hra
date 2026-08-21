@@ -1,4 +1,8 @@
-import { DesignSystemGallery } from "@hra-internal/design-kit/react";
+import {
+  DesignSystemGallery,
+  ThemeMenuButton,
+  TopBar,
+} from "@hra-internal/design-kit/react";
 import { NOINDEX_ROBOTS } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 
@@ -9,5 +13,13 @@ export const metadata: Metadata = {
 };
 
 export default function DesignPage() {
-  return <DesignSystemGallery />;
+  return (
+    <div className="design-page">
+      <TopBar
+        actions={<ThemeMenuButton />}
+        aria-label="Design system controls"
+      />
+      <DesignSystemGallery />
+    </div>
+  );
 }

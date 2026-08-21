@@ -4,13 +4,14 @@ import {
   Button,
   InlineAlert,
   PageIntro,
-  ThemeToggle,
 } from "@hra-internal/design-kit/react";
+
+import { StandaloneThemeHeader } from "./standalone-theme-header";
 
 export default function ErrorState({ reset }: Readonly<{ error: Error; reset: () => void }>) {
   return (
     <main className="state-page" id="main-content">
-      <ThemeToggle className="standalone-theme-toggle" />
+      <StandaloneThemeHeader />
       <section className="state-card" role="alert">
         <PageIntro
           description="Your session remains intact. Retry the current route without exposing provider details."

@@ -427,10 +427,24 @@ jelly-card.jungle-button:defined {
 .jungle-route-state {
   display: grid;
   min-height: min(46rem, 100dvh);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.jungle-route-state__header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.jungle-route-state__content {
+  display: grid;
+  grid-row: 2;
+  min-height: 0;
   place-items: center;
 }
 
-.jungle-route-state > .jungle-empty-state {
+.jungle-route-state__content > .jungle-empty-state {
   width: min(100%, 40rem);
 }
 

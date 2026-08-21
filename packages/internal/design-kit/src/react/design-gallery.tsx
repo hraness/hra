@@ -19,7 +19,6 @@ import {
   LinkButton as PublicLinkButton,
   QuietSiteFooter as PublicQuietSiteFooter,
   SearchField as PublicSearchField,
-  SegmentedControl as PublicSegmentedControl,
   SocialIcon as PublicSocialIcon,
   Tag as PublicTag,
   TextField as PublicTextField,
@@ -34,8 +33,7 @@ import {
   RefreshIcon,
   Search01Icon,
 } from "@hugeicons/core-free-icons";
-import { useTheme } from "next-themes";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { Accordion } from "./accordion";
 import { AnimatedRailStage } from "./animated-rail-stage";
@@ -55,7 +53,6 @@ import {
   SettingsCard,
 } from "./content-primitives";
 import { Avatar, DataTable, type DataTableColumn } from "./data-display";
-import { DesignPortalThemeProvider } from "./design-theme-context";
 import { Disclosure } from "./disclosure";
 import { EmojiIcon, type EmojiIconSource } from "./emoji-icon";
 import { Fader } from "./fader";
@@ -63,7 +60,6 @@ import { Progress, Skeleton, Spinner } from "./feedback";
 import { FileField } from "./file-field";
 import { Icon } from "./icon";
 import { InlineHelp } from "./inline-help";
-import { setJellyThemeMode } from "./jelly-runtime";
 import { IconLink, LinkButton, LinkCard } from "./link-button";
 import { ListBox, ListBoxItem, ListBoxSection } from "./list-box";
 import { DialogTrigger, Modal } from "./modal";
@@ -102,8 +98,6 @@ import { TextAreaField, TextField } from "./text-field";
 import {
   type ConcreteDesignTheme,
   type DesignTheme,
-  isDesignTheme,
-  ThemeToggle,
 } from "./theme";
 import { ToggleGroup } from "./toggle-group";
 import { Toolbar } from "./toolbar";
@@ -237,7 +231,6 @@ export const designGalleryVisualRecipeCoverage = [
   { fixture: "selection", recipe: "Tabs" },
   { fixture: "fields", recipe: "TextAreaField" },
   { fixture: "fields", recipe: "TextField" },
-  { fixture: "hero", recipe: "ThemeToggle" },
   { fixture: "content-data", recipe: "ThemedSurface" },
   { fixture: "actions", recipe: "ToggleButton" },
   { fixture: "selection", recipe: "ToggleGroup" },
@@ -260,7 +253,7 @@ export const designGalleryRecipeExclusions = [
   },
   {
     exportName: "DesignThemeProvider",
-    reason: "Application appearance provider has no visual output; ThemeToggle is the visible recipe.",
+    reason: "Application appearance provider has no visual output; the product header owns its selector.",
   },
   {
     exportName: "DesignKitRouterProvider",
@@ -277,6 +270,14 @@ export const designGalleryRecipeExclusions = [
   {
     exportName: "ThemeColorSync",
     reason: "Document metadata synchronizer has no visual output.",
+  },
+  {
+    exportName: "ThemeMenuButton",
+    reason: "Persistent appearance selection belongs to the host product header, outside nested gallery content.",
+  },
+  {
+    exportName: "ThemeToggle",
+    reason: "The compatibility control is represented by the host header's canonical ThemeMenuButton.",
   },
   {
     exportName: "GlobalErrorDocument",
@@ -313,12 +314,6 @@ const longFieldOptions = [
 const densityItems = [
   { id: "comfortable", label: "Comfortable" },
   { id: "compact", label: "Compact" },
-] as const;
-
-const publicAppearanceItems = [
-  { ariaLabel: "Light", id: "light", label: <PublicAppearanceIcon name="light" /> },
-  { ariaLabel: "Dark", id: "dark", label: <PublicAppearanceIcon name="dark" /> },
-  { ariaLabel: "System", id: "system", label: <PublicAppearanceIcon name="system" /> },
 ] as const;
 
 const viewItems = [
@@ -883,101 +878,16 @@ export function DesignSystemGallery({
   const [isPendingGeometry, setPendingGeometry] = useState(false);
   const [isPinned, setPinned] = useState(false);
   const [tab, setTab] = useState<GalleryTab>("preview");
-  const [theme, setGalleryTheme] = useState<GalleryTheme>("system");
   const [view, setView] = useState<View>("canvas");
-  const standaloneThemeSnapshot = useRef<Readonly<{
-    colorScheme: string;
-    jellyMode: string | null;
-    theme: string | null;
-  }> | null>(null);
-  const { forcedTheme, setTheme: setPersistedTheme, theme: persistedTheme } = useTheme();
   const Root = isNestedInMain ? "div" : "main";
 
-  const hasForcedThemeProvider = forcedTheme === "dark" || forcedTheme === "light";
-  const hasSelectableThemeProvider = !hasForcedThemeProvider && persistedTheme !== undefined;
-
-  useEffect(() => {
-    const providerTheme = hasForcedThemeProvider
-      ? forcedTheme
-      : hasSelectableThemeProvider && isDesignTheme(persistedTheme)
-        ? persistedTheme
-        : undefined;
-    if (providerTheme === undefined) return;
-    // A fixed-theme product provides the gallery's initial state, but it must
-    // not overwrite a later explicit gallery choice during hydration.
-    setGalleryTheme((currentTheme) => (
-      hasForcedThemeProvider && currentTheme !== "system"
-        ? currentTheme
-        : providerTheme
-    ));
-  }, [forcedTheme, hasForcedThemeProvider, hasSelectableThemeProvider, persistedTheme]);
-
-  useEffect(() => {
-    if (hasSelectableThemeProvider) return undefined;
-    const root = document.documentElement;
-    const previousColorScheme = root.style.colorScheme;
-    const previousTheme = root.getAttribute("data-theme");
-    const previousJellyMode = root.getAttribute("data-jelly-mode");
-    const snapshot = {
-      colorScheme: previousColorScheme,
-      jellyMode: previousJellyMode,
-      theme: previousTheme,
-    };
-    standaloneThemeSnapshot.current = snapshot;
-    return () => {
-      root.style.colorScheme = snapshot.colorScheme;
-      if (snapshot.theme === null) root.removeAttribute("data-theme");
-      else root.setAttribute("data-theme", snapshot.theme);
-      void setJellyThemeMode(
-        snapshot.jellyMode === "dark" || snapshot.jellyMode === "light"
-          ? snapshot.jellyMode
-          : "auto",
-      );
-      if (standaloneThemeSnapshot.current === snapshot) standaloneThemeSnapshot.current = null;
-    };
-  }, [hasSelectableThemeProvider]);
-
-  useEffect(() => {
-    if (hasSelectableThemeProvider) return undefined;
-    const root = document.documentElement;
-    const systemPreference = window.matchMedia("(prefers-color-scheme: dark)");
-    const applyTheme = () => {
-      const resolvedTheme = resolveGalleryTheme(theme, systemPreference.matches);
-      if (root.style.colorScheme !== resolvedTheme) root.style.colorScheme = resolvedTheme;
-      if (root.getAttribute("data-theme") !== resolvedTheme) {
-        root.setAttribute("data-theme", resolvedTheme);
-      }
-      if (root.getAttribute("data-jelly-mode") !== resolvedTheme) {
-        void setJellyThemeMode(resolvedTheme);
-      }
-    };
-    const rootThemeObserver = new MutationObserver(applyTheme);
-    rootThemeObserver.observe(root, {
-      attributeFilter: ["data-jelly-mode", "data-theme", "style"],
-      attributes: true,
-    });
-    applyTheme();
-    if (theme === "system") systemPreference.addEventListener("change", applyTheme);
-    return () => {
-      rootThemeObserver.disconnect();
-      if (theme === "system") systemPreference.removeEventListener("change", applyTheme);
-    };
-  }, [hasSelectableThemeProvider, theme]);
-
-  const changeGalleryTheme = (nextTheme: GalleryTheme) => {
-    setGalleryTheme(nextTheme);
-    if (hasSelectableThemeProvider) setPersistedTheme(nextTheme);
-  };
-
   return (
-    <DesignPortalThemeProvider theme={theme === "system" ? undefined : theme}>
-      <Root
-        className="design-gallery"
-        data-design-gallery-nested={isNestedInMain ? "true" : "false"}
-        data-theme={theme === "system" ? undefined : theme}
-        id="design-gallery-main"
-        tabIndex={-1}
-      >
+    <Root
+      className="design-gallery"
+      data-design-gallery-nested={isNestedInMain ? "true" : "false"}
+      id="design-gallery-main"
+      tabIndex={-1}
+    >
       <SkipLink href="#design-gallery-main">Skip to design specimens</SkipLink>
       <header
         className="design-gallery__hero"
@@ -999,12 +909,6 @@ export function DesignSystemGallery({
           : (
               <div className="design-gallery__hero-actions">
                 <Badge tone="success"><StatusDot tone="success" />Live specification</Badge>
-                <ThemeToggle
-                  aria-label="Gallery theme"
-                  onChange={changeGalleryTheme}
-                  size="compact"
-                  value={theme}
-                />
               </div>
             )}
       </header>
@@ -1271,13 +1175,6 @@ export function DesignSystemGallery({
                       <PublicAppearanceIcon name="dark" />
                       <PublicAppearanceIcon name="system" />
                     </div>
-                    <PublicSegmentedControl
-                      aria-label="Portable appearance"
-                      items={publicAppearanceItems}
-                      onChange={changeGalleryTheme}
-                      size="compact"
-                      value={theme}
-                    />
                   </PublicCardContent>
                   <PublicCardFooter>
                     <div className="design-gallery__control-wrap">
@@ -1659,21 +1556,6 @@ export function DesignSystemGallery({
                     size="compact"
                     value="compact"
                   />
-                </div>
-              </Specimen>
-              <Specimen title="Appearance in constrained chrome">
-                <div className="design-gallery__state-stack">
-                  <ThemeToggle
-                    aria-label="Compact appearance"
-                    onChange={changeGalleryTheme}
-                    presentation="menu"
-                    size="compact"
-                    value={theme}
-                  />
-                  <p className="design-gallery__hint">
-                    One trigger preserves all three choices when persistent chrome must reflow
-                    under enlarged text.
-                  </p>
                 </div>
               </Specimen>
               <Specimen title="Toggle group">
@@ -2059,7 +1941,6 @@ export function DesignSystemGallery({
           </GallerySection>
         </div>
       </div>
-      </Root>
-    </DesignPortalThemeProvider>
+    </Root>
   );
 }

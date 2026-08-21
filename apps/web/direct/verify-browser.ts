@@ -461,6 +461,12 @@ function scenarioUrl(baseUrl: string, id: string): string {
   return url.href;
 }
 
+function workbenchScenarioUrl(baseUrl: string, id: string): string {
+  const url = new URL("/", `${normalizeRootHttpOrigin(baseUrl)}/`);
+  url.searchParams.set("__direct_scenario", id);
+  return url.href;
+}
+
 function parseData<Value>(schema: z.ZodType<Value>, input: unknown, label: string): Value {
   const parsed = schema.safeParse(input);
   if (!parsed.success) throw new Error(`${label} is invalid: ${parsed.error.message}`);
@@ -572,6 +578,130 @@ async function verifyThemeColorResolution(
         );
       }
     }
+  } finally {
+    await browser.evaluate('localStorage.removeItem("jungle-design-theme-v1")');
+  }
+}
+
+async function verifyThemeMenuKeyboard(
+  browser: AgentBrowser,
+  baseUrl: string,
+): Promise<void> {
+  const url = workbenchScenarioUrl(baseUrl, "tasks-rich-review");
+
+  try {
+    await browser.run(["set", "media", "light"]);
+    await browser.run(["open", url]);
+    await browser.evaluate('localStorage.removeItem("jungle-design-theme-v1")');
+    await browser.run(["reload"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      `document.querySelector('.hraness-design-theme-toggle[data-ready="true"]') !== null`,
+    ]);
+
+    const structure = await browser.evaluate(`(() => {
+      const menus = [...document.querySelectorAll("[data-hraness-appearance-menu]")];
+      const root = menus[0];
+      const actions = document.querySelector(".direct-actions");
+      const triggers = document.querySelectorAll(".hraness-design-theme-toggle__trigger");
+      return {
+        finalAction: root instanceof HTMLElement && actions?.lastElementChild === root,
+        menuCount: menus.length,
+        ownerIsHeader: root?.closest(".direct-toolbar") instanceof HTMLElement,
+        triggerCount: triggers.length,
+      };
+    })()`);
+    if (
+      typeof structure !== "object"
+      || structure === null
+      || !("menuCount" in structure)
+      || structure.menuCount !== 1
+      || !("triggerCount" in structure)
+      || structure.triggerCount !== 1
+      || !("finalAction" in structure)
+      || structure.finalAction !== true
+      || !("ownerIsHeader" in structure)
+      || structure.ownerIsHeader !== true
+    ) {
+      throw new Error(`The Direct header does not own one final appearance menu: ${JSON.stringify(structure)}`);
+    }
+
+    await browser.run(["focus", ".hraness-design-theme-toggle__trigger"]);
+    await browser.run(["press", "Enter"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      `document.querySelector('[role="menu"][aria-label="Appearance"]') !== null`,
+    ]);
+    const choices = await browser.evaluate(`(() => (
+      [...document.querySelectorAll('[role="menu"][aria-label="Appearance"] [role="menuitemradio"]')]
+        .map((item) => ({
+          text: item.textContent?.trim() ?? "",
+          value: item.getAttribute("data-theme-value"),
+        }))
+    ))()`);
+    if (
+      JSON.stringify(choices) !== JSON.stringify([
+        { text: "Light", value: "light" },
+        { text: "Dark", value: "dark" },
+        { text: "System", value: "system" },
+      ])
+    ) {
+      throw new Error(`The appearance menu choices are not canonical: ${JSON.stringify(choices)}`);
+    }
+
+    await browser.run(["press", "Home"]);
+    await browser.run(["press", "ArrowDown"]);
+    await browser.run(["press", "Enter"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      `document.documentElement.getAttribute("data-theme") === "dark"
+        && localStorage.getItem("jungle-design-theme-v1") === "dark"
+        && document.querySelector('[role="menu"][aria-label="Appearance"]') === null`,
+    ]);
+    const selected = await browser.evaluate(`(() => {
+      const trigger = document.querySelector(".hraness-design-theme-toggle__trigger");
+      return {
+        focused: trigger instanceof HTMLElement && document.activeElement === trigger,
+        label: trigger?.getAttribute("aria-label"),
+        rootValue: trigger?.closest("[data-hraness-appearance-menu]")
+          ?.getAttribute("data-theme-value"),
+      };
+    })()`);
+    if (
+      typeof selected !== "object"
+      || selected === null
+      || !("focused" in selected)
+      || selected.focused !== true
+      || !("label" in selected)
+      || selected.label !== "Appearance: Dark"
+      || !("rootValue" in selected)
+      || selected.rootValue !== "dark"
+    ) {
+      throw new Error(`Keyboard selection did not restore the Dark trigger: ${JSON.stringify(selected)}`);
+    }
+
+    await browser.run(["press", "Enter"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      `document.querySelector('[role="menu"][aria-label="Appearance"]') !== null`,
+    ]);
+    await browser.run(["press", "s"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      'document.activeElement?.getAttribute("data-theme-value") === "system"',
+    ]);
+    await browser.run(["press", "Escape"]);
+    await browser.run([
+      "wait",
+      "--fn",
+      `document.querySelector('[role="menu"][aria-label="Appearance"]') === null
+        && document.activeElement === document.querySelector(".hraness-design-theme-toggle__trigger")`,
+    ]);
   } finally {
     await browser.evaluate('localStorage.removeItem("jungle-design-theme-v1")');
   }
@@ -988,6 +1118,8 @@ async function run(repositoryRoot: string, baseUrl: string): Promise<string> {
     }
     console.log("Verifying opposing system and saved theme-color preferences...");
     await verifyThemeColorResolution(browser, baseUrl);
+    console.log("Verifying the sole header appearance menu by keyboard...");
+    await verifyThemeMenuKeyboard(browser, baseUrl);
     const parsedCoverage = parseDefinitionCoverageSnapshot(
       bindDirectScenarioCatalog(sessionManifests),
       agentTasksDirectDefinition,

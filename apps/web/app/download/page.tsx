@@ -1,6 +1,6 @@
 import {
   LinkButton,
-  ThemeToggle,
+  ThemeMenuButton,
 } from "@hra-internal/design-kit/react";
 import { createPublicSiteMetadata } from "@hraness/web-discovery";
 import type { Metadata } from "next";
@@ -57,7 +57,7 @@ export default function DownloadPage() {
             <Link className="download-control-plane-link" href="/app">
               Open control plane
             </Link>
-            <ThemeToggle />
+            <ThemeMenuButton />
           </div>
         </header>
 

@@ -1,13 +1,14 @@
 import {
   Skeleton,
   Spinner,
-  ThemeToggle,
 } from "@hra-internal/design-kit/react";
+
+import { StandaloneThemeHeader } from "./standalone-theme-header";
 
 export default function Loading() {
   return (
     <main className="state-page" id="main-content">
-      <ThemeToggle className="standalone-theme-toggle" />
+      <StandaloneThemeHeader />
       <section className="state-card state-card--loading" role="status">
         <div className="state-loading-row">
           <Spinner label="Loading" />

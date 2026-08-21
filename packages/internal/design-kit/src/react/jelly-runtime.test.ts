@@ -31,12 +31,16 @@ test("theme changes use Jelly's public API and emit the canvas repaint event", a
   expect(vendor).toContain("setThemeMode");
 });
 
-test("the gallery applies and restores theme through the repainting adapter", async () => {
-  const gallery = await Bun.file(new URL("./design-gallery.tsx", import.meta.url)).text();
+test("the gallery defers Jelly appearance synchronization to its host provider", async () => {
+  const [gallery, theme] = await Promise.all([
+    Bun.file(new URL("./design-gallery.tsx", import.meta.url)).text(),
+    Bun.file(new URL("./theme.tsx", import.meta.url)).text(),
+  ]);
 
-  expect(gallery.match(/setJellyThemeMode\(/g)).toHaveLength(2);
-  expect(gallery).toContain('snapshot.jellyMode === "dark"');
-  expect(gallery).toContain(': "auto"');
+  expect(gallery).not.toContain("setJellyThemeMode(");
+  expect(gallery).not.toContain("useTheme()");
+  expect(theme).toContain("void setJellyThemeMode(resolvedTheme);");
+  expect(theme).toContain("<JellyThemeSync />");
 });
 
 test("a rejected Jelly runtime load can retry instead of poisoning the singleton", async () => {

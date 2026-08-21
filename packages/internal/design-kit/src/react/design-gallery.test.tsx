@@ -14,25 +14,21 @@ import {
   resolveGalleryTheme,
 } from "./design-gallery";
 
-test("standalone gallery System appearance resolves to the live OS theme", async () => {
+test("the gallery defers appearance selection to its host header", async () => {
   expect(resolveGalleryTheme("system", false)).toBe("light");
   expect(resolveGalleryTheme("system", true)).toBe("dark");
   expect(resolveGalleryTheme("light", true)).toBe("light");
   expect(resolveGalleryTheme("dark", false)).toBe("dark");
 
   const source = await Bun.file(new URL("./design-gallery.tsx", import.meta.url)).text();
-  expect(source).toContain('window.matchMedia("(prefers-color-scheme: dark)")');
-  expect(source).toContain('systemPreference.addEventListener("change", applyTheme)');
-  expect(source).toContain("root.setAttribute(\"data-theme\", resolvedTheme)");
-  expect(source).toContain("void setJellyThemeMode(resolvedTheme)");
-  expect(source).toContain("new MutationObserver(applyTheme)");
-  expect(source).toContain('attributeFilter: ["data-jelly-mode", "data-theme", "style"]');
-  expect(source).toContain("root.style.colorScheme = resolvedTheme");
-  expect(source).toContain("root.style.colorScheme = snapshot.colorScheme");
-  expect(source).toContain('hasForcedThemeProvider && currentTheme !== "system"');
+  expect(source).not.toContain("<ThemeToggle");
+  expect(source).not.toContain("<PublicSegmentedControl");
+  expect(source).not.toContain("setGalleryTheme");
 
   const html = renderToStaticMarkup(<DesignSystemGallery />);
   expect(html).toContain("Selectable browser surfaces start with System appearance");
+  expect(html).not.toContain("hraness-design-theme-toggle");
+  expect(html).not.toContain('aria-label="Portable appearance"');
 });
 
 test("gallery icon buttons own their tooltips without nested triggers", async () => {
@@ -51,6 +47,7 @@ test("the shared gallery exposes every specimen through stable in-page anchors",
   expect(html).toStartWith('<main class="design-gallery"');
   expect(html.match(/<main\b/gu)).toHaveLength(1);
   expect(html).toContain('data-design-gallery-nested="false"');
+  expect(html).not.toContain("hraness-design-theme-toggle");
   expect(html.match(/data-design-section="true"/g)).toHaveLength(designGallerySections.length);
   for (const section of designGallerySections) {
     expect(html).toContain(`id="${section.id}"`);

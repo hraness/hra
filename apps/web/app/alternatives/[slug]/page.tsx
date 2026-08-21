@@ -1,5 +1,5 @@
 import { HranessBrand } from "@hra-internal/brand-ui";
-import { ThemeToggle } from "@hra-internal/design-kit/react";
+import { ThemeMenuButton } from "@hra-internal/design-kit/react";
 import { createPublicSiteMetadata, serializeJsonLd } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 import Image from "next/image";
@@ -105,11 +105,13 @@ export default async function ComparisonPage({ params }: ComparisonPageProps) {
           </span>
           <strong>HRA</strong>
         </Link>
-        <nav aria-label="Comparison navigation">
-          <Link href="/alternatives">All comparisons</Link>
-          <Link href="/download">Download</Link>
-          <ThemeToggle />
-        </nav>
+        <div className="alternatives-header-actions">
+          <nav aria-label="Comparison navigation">
+            <Link href="/alternatives">All comparisons</Link>
+            <Link href="/download">Download</Link>
+          </nav>
+          <ThemeMenuButton />
+        </div>
       </header>
 
       <main className="alternatives-shell" id="main-content">

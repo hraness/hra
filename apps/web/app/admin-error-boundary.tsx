@@ -5,9 +5,10 @@ import {
   InlineAlert,
   PageIntro,
   SettingsCard,
-  ThemeToggle,
 } from "@hra-internal/design-kit/react";
 import { Component, type ErrorInfo, type ReactNode } from "react";
+
+import { StandaloneThemeHeader } from "./standalone-theme-header";
 
 type AdminErrorBoundaryProps = Readonly<{ children: ReactNode }>;
 type AdminErrorBoundaryState = Readonly<{ failed: boolean }>;
@@ -32,7 +33,7 @@ export class AdminErrorBoundary extends Component<
     if (!this.state.failed) return this.props.children;
     return (
       <main className="state-page" id="main-content">
-        <ThemeToggle className="standalone-theme-toggle" />
+        <StandaloneThemeHeader />
         <SettingsCard className="state-card" title="The live view could not be loaded.">
           <PageIntro eyebrow="Control plane unavailable" title="HRA" titleAs="h2" />
           <InlineAlert title="Subscription interrupted" tone="danger">

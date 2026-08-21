@@ -4,13 +4,13 @@ import {
   LinkButton,
   PageIntro,
   SettingsCard,
-  ThemeToggle,
 } from "@hra-internal/design-kit/react";
 import { createPrivateSiteMetadata } from "@hraness/web-discovery";
 import type { Metadata } from "next";
 
 import { AdminControlPlane } from "../admin-shell";
 import { hraSearchSite } from "../site";
+import { StandaloneThemeHeader } from "../standalone-theme-header";
 import {
   missingWorkOSEnvironment,
 } from "../workos-configuration";
@@ -30,7 +30,7 @@ function ConfigurationState({
 }) {
   return (
     <main className="state-page" id="main-content">
-      <ThemeToggle className="standalone-theme-toggle" />
+      <StandaloneThemeHeader />
       <SettingsCard
         className="state-card state-card--configuration"
         description={detail}

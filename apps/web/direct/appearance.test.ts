@@ -29,7 +29,12 @@ describe("Agent Tasks lab appearance", () => {
     expect(main.indexOf('import "@hraness/agent-tasks-ui/styles.css"')).toBeLessThan(
       main.indexOf('import "./workbench.css"'),
     );
-    expect(workbench).toContain("<ThemeToggle");
+    expect(workbench).toContain("<ThemeMenuButton />");
+    expect(workbench).not.toContain("<ThemeToggle");
+    expect(workbench.indexOf("<ThemeMenuButton />")).toBeGreaterThan(
+      workbench.indexOf(">reset</Button>"),
+    );
+    expect(verifier).toContain("verifyThemeMenuKeyboard");
     expect(stylesheet).not.toMatch(/#[0-9a-fA-F]{3,8}\b/u);
     expect(stylesheet).not.toMatch(/rgba?\(/u);
   });

@@ -1283,8 +1283,8 @@ test("live alerts use urgency-appropriate semantics and preserve explicit roles"
 
 test("route fallbacks share branded recovery and loading semantics", () => {
   const notFound = renderToStaticMarkup(<RouteNotFoundPage />);
-  const fixedNotFound = renderToStaticMarkup(
-    <RouteNotFoundPage showThemeToggle={false} />,
+  const selectableNotFound = renderToStaticMarkup(
+    <RouteNotFoundPage showThemeToggle />,
   );
   const error = renderToStaticMarkup(
     <RouteErrorPage error={new Error("fixture failure")} reset={() => undefined} />,
@@ -1334,10 +1334,9 @@ test("route fallbacks share branded recovery and loading semantics", () => {
   expect(notFound).toContain("Page not found");
   expect(notFound.match(/<h1(?:\s|>)/g)).toHaveLength(1);
   expect(notFound).toContain('href="/"');
-  expect(notFound).toContain("Light");
-  expect(notFound).toContain("Dark");
-  expect(notFound).toContain("System");
-  expect(fixedNotFound).not.toContain('aria-label="Appearance"');
+  expect(notFound).not.toContain("data-hraness-appearance-menu");
+  expect(selectableNotFound).toContain('<header class="jungle-route-state__header">');
+  expect(selectableNotFound).toContain('aria-label="Appearance: System"');
   expect(error).toContain("This view could not load");
   expect(error.match(/<h1(?:\s|>)/g)).toHaveLength(1);
   expect(error).toContain("Try again");
@@ -1356,13 +1355,13 @@ test("route fallbacks share branded recovery and loading semantics", () => {
   expect(globalError).toContain('data-theme="light"');
   expect(globalError).toContain('data-jungle-theme-guard=""');
   expect(globalError).toContain("jungle-design-theme-v1");
-  expect(globalError).not.toContain('aria-label="Appearance"');
+  expect(globalError).not.toContain("data-hraness-appearance-menu");
   expect(fixedGlobalError).toContain('data-theme="dark"');
   expect(fixedGlobalError).toContain('<body class="fixture-product-theme">');
   expect(fixedGlobalError).not.toContain('data-jungle-theme-guard=""');
   for (const shellFallback of [shellNotFound, shellError, shellLoading]) {
     expect(shellFallback).not.toContain("<main");
-    expect(shellFallback).not.toContain('aria-label="Appearance"');
+    expect(shellFallback).not.toContain("data-hraness-appearance-menu");
   }
 });
 
