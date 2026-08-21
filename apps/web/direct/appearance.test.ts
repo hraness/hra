@@ -6,16 +6,23 @@ async function source(name: string): Promise<string> {
 
 describe("Agent Tasks lab appearance", () => {
   test("uses the shared system-first runtime with a concrete light bootstrap fallback", async () => {
-    const [document, main, stylesheet, workbench] = await Promise.all([
+    const [document, main, stylesheet, verifier, workbench] = await Promise.all([
       source("./index.html"),
       source("./main.tsx"),
       source("./workbench.css"),
+      source("./verify-browser.ts"),
       source("./workbench.tsx"),
     ]);
 
     expect(document).toContain('data-theme="light"');
+    expect(document).toContain('<meta name="theme-color" content="#fbf6f2" media="(prefers-color-scheme: light)" />');
+    expect(document).toContain('<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />');
     expect(main).toContain("<DesignThemeProvider>");
     expect(main).toContain("<ThemeColorSync />");
+    expect(verifier).toContain('{ expectedColor: colors.light.background, os: "dark", preference: "light" }');
+    expect(verifier).toContain('{ expectedColor: colors.dark.background, os: "light", preference: "dark" }');
+    expect(verifier).toContain('media !== "not all"');
+    expect(verifier).toContain("evidence.matchingColors.length !== 1");
     expect(main.indexOf('import "../app/globals.css"')).toBeLessThan(
       main.indexOf('import "@hraness/agent-tasks-ui/styles.css"'),
     );

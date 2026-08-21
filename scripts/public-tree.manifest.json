@@ -2290,6 +2290,8 @@
     "packages/internal/design-kit/src/react/syntax-code.tsx",
     "packages/internal/design-kit/src/react/tabs.tsx",
     "packages/internal/design-kit/src/react/text-field.tsx",
+    "packages/internal/design-kit/src/react/theme-color-meta.test.ts",
+    "packages/internal/design-kit/src/react/theme-color-meta.ts",
     "packages/internal/design-kit/src/react/theme.tsx",
     "packages/internal/design-kit/src/react/toggle-group.tsx",
     "packages/internal/design-kit/src/react/toolbar.tsx",

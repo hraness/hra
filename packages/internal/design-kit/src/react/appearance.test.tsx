@@ -136,6 +136,16 @@ test("the provider owns the Jelly repaint bridge for runtime appearance changes"
   expect(source).toContain("<JellyThemeSync />");
 });
 
+test("theme-color takeover waits for concrete resolution and retains one registration", async () => {
+  const source = await Bun.file(new URL("./theme.tsx", import.meta.url)).text();
+
+  expect(source).toContain("const hasResolvedColor = resolvedColor !== undefined;");
+  expect(source).toContain("if (!hasResolvedColor || latestColor.current === undefined)");
+  expect(source).toContain("const current = acquireThemeColorMeta(");
+  expect(source).toContain("current.release();");
+  expect(source).toContain("registration.current?.update(resolvedColor)");
+});
+
 test("the provider repairs invalid persisted values before next-themes resolves first paint", () => {
   const html = renderToStaticMarkup(
     <DesignThemeProvider storageKey="appearance-test-key">
