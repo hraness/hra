@@ -11,6 +11,7 @@
 # Guidelines
 
 - Permit remote Convex mutation only from Vercel Production with the source-pinned deployment name and a matching production deploy key.
+- Keep routine Vercel deployment within the single `deployment:deploy` action by passing Convex's fixed `--push-all-modules` option. The default remote module-hash optimization requires `deployment:data:view`; do not broaden the deploy key for that optimization.
 - Keep Preview app-only and anonymous. Refuse every deployment credential, production origin claim, authentication secret, analytics ingestion token, and provider-write capability even when its value is empty. The reviewed public Convex URLs are its only production data-plane inputs.
 - Let Production omit analytics entirely, but refuse a configured PostHog value unless it is a complete checked public `phc_` token before the Next.js child starts.
 - Revalidate Production before its nested application build. Strip deploy keys and server-only secrets from the final Next child while retaining the exact checked public Convex and HRA site literals.
