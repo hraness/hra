@@ -25,6 +25,8 @@ describe("HRA proxy routing", () => {
       "/favicon.ico",
       "/icon",
       "/icon.png",
+      "/llms.txt",
+      "/llms.txt/",
       "/opengraph-image",
       "/robots.txt",
       "/sitemap.xml",

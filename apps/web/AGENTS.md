@@ -11,7 +11,7 @@
 - `next.config.ts` – standalone-workspace-aware Next.js configuration, HRA response policy, and source-bound Vercel delivery proof.
 - `vercel.json` – production provider entry point pinned to the checked Convex deployment.
 - `production-icon-boundary.ts` – fail-closed resolved-module and emitted-output checks for the HRA-local production icon adapter.
-- `proxy.ts` – exact public/static exclusions from configured WorkOS authentication.
+- `proxy.ts` – exact public/static exclusions from configured WorkOS authentication, plus public Markdown negotiation.
 - `.env.example` – separated public WorkOS/Convex/Accounts origins, Production-only public analytics token, server-only OIDC custody, and Convex-only key material.
 - `tsconfig.json` – strict Next.js and Convex TypeScript coverage.
 
@@ -25,7 +25,7 @@
 - Render a precise missing-configuration state when local Convex or WorkOS settings are absent.
 - Keep provider secrets in Convex environment variables. Browser-visible configuration contains only public URLs and client identifiers.
 - Parse all server, browser, and provider boundaries from `unknown`.
-- Use `@hraness/web-discovery` for product-neutral metadata, crawler, sitemap, JSON-LD, and social-image primitives. Keep HRA titles, routes, dates, and crawler decisions in this workspace.
+- Use `@hraness/web-discovery` for product-neutral metadata, crawler, sitemap, JSON-LD, and social-image primitives. Keep HRA titles, routes, dates, and crawler decisions in this workspace. Keep `/llms.txt`, Accept Markdown negotiation, and agent-recoverable 404s aligned with the existing public product, not a new API surface.
 - Parse public deployment configuration through `@hra-internal/convex` before constructing the official client.
 - Use the shared System-first appearance runtime and design roles from `@hra-internal/design-kit`. Every ordinary selectable HTML surface owns exactly one `ThemeMenuButton` as its final/rightmost header action; fixed-theme, embedded frame-only, global-error, and non-HTML surfaces remain control-free. HRA app styles may add only hosted-shell aliases while task presentation stays in the shared UI package.
 - Resolve shared icon entry points to the HRA-local SVG adapter for the Next.js graph, and reject Hugeicons module identifiers or emitted markers during every production build.
