@@ -83,6 +83,8 @@ describe("HRA public and control-plane route boundary", () => {
     ]);
     expect(proxy).toContain("resolvePublicDiscovery");
     expect(proxy).toContain("appendVaryAccept");
+    expect(proxy).toContain('from "./response-headers"');
+    expect(proxy).not.toContain("next.config");
     expect(proxy).toContain('"/llms.txt"');
     expect(llmsRoute).toContain("HRA_LLMS_TXT");
     expect(llmsRoute).toContain("MARKDOWN_CONTENT_TYPE");

@@ -12,7 +12,7 @@ import {
   resolvePublicDiscovery,
 } from "./app/public-markdown";
 import { isWorkOSEnvironmentConfigured } from "./app/workos-configuration";
-import { hraSecurityHeaders } from "./next.config";
+import { hraSecurityHeaders } from "./response-headers";
 
 const configuredProxy = authkitProxy();
 

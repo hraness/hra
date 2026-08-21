@@ -2059,6 +2059,7 @@
     "apps/web/package.json",
     "apps/web/production-icon-boundary.ts",
     "apps/web/proxy.ts",
+    "apps/web/response-headers.ts",
     "apps/web/scripts/AGENTS.md",
     "apps/web/scripts/create-convex-deploy-key.test.ts",
     "apps/web/scripts/create-convex-deploy-key.ts",

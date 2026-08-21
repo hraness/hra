@@ -9,6 +9,7 @@
 - `package.json` – web, Convex, validation, and test commands.
 - `convex.json` – Convex code-generation configuration.
 - `next.config.ts` – standalone-workspace-aware Next.js configuration, HRA response policy, and source-bound Vercel delivery proof.
+- `response-headers.ts` – edge-safe HRA security and private-cache header lists shared by `next.config.ts` and `proxy.ts`.
 - `vercel.json` – production provider entry point pinned to the checked Convex deployment.
 - `production-icon-boundary.ts` – fail-closed resolved-module and emitted-output checks for the HRA-local production icon adapter.
 - `proxy.ts` – exact public/static exclusions from configured WorkOS authentication, plus public Markdown negotiation.
