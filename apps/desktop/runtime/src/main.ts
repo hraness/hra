@@ -103,6 +103,7 @@ import {
   hostDevelopmentReloadDecision,
   parseRuntimeBridgeProfile,
 } from "./development-reload";
+import { isolateRawDevelopmentSecrets } from "./development-isolation";
 import { DispatchActivityAdapter } from "./dispatch/activity-adapter";
 import { DispatchAccountReservationArbiter } from "./dispatch/account-reservations";
 import { HRADispatchHttpClient } from "./dispatch/cloud-client";
@@ -116,7 +117,7 @@ import {
 import {
   createHumanAccountRuntime,
   parseHRACloudConfiguration,
-  WorkOsExternalUrlOpener,
+  DesktopPairingExternalUrlOpener,
   type CloudAttachmentAvailability,
   CloudInvalidationCoordinator,
   type CloudWorkspaceClient,
@@ -204,7 +205,8 @@ import { hraReleaseIdentity } from "../release-identity";
 import { SnapshotTransferStore } from "./snapshot-transfer";
 import {
   prepareApplicationSupportMigration,
-  type ApplicationSupportStartup,
+  prepareIsolatedDevelopmentApplicationSupport,
+  type ApplicationSupportStartupAuthority,
 } from "./state/application-support";
 import {
   ApplicationSupportWorktreeRepairError,
@@ -293,7 +295,10 @@ import {
   type ProjectOnboardingOutcome,
 } from "./workspaces/onboarding-service";
 import { WorkspaceBroker } from "./workspaces/workspace-broker";
-import { bunHumanKeychain } from "./cloud/keychain-custody";
+import {
+  bunHumanKeychain,
+  HumanCredentialCustody,
+} from "./cloud/keychain-custody";
 import {
   FileLocalDataRemovalReceiptStore,
   createLocalDataRemovalPlan,
@@ -498,8 +503,20 @@ let accountProfileFileSystem: NativeAccountProfileFileSystem | null = null;
 const nativeHarnessKeyCustody = new NativeHarnessKeyCustody({
   writeRequest: writeHost,
 });
+const rawDevelopmentSecrets = isolateRawDevelopmentSecrets(bunHumanKeychain);
+
+function rawDevelopmentIsolationEnabled(): boolean {
+  const profile = parseRuntimeBridgeProfile();
+  return profile !== "production" && profile !== "automation";
+}
+
 const localDataRemovalKeychain: AuthenticatedLocalDataRemovalSecretStore = {
   delete: async (input, authorization) => {
+    if (rawDevelopmentIsolationEnabled()) {
+      throw new Error(
+        "Production credential removal is disabled in raw development.",
+      );
+    }
     const isHarnessInstallKey = input.name === harnessInstallKeyDescriptor.name
       && (
         input.service === harnessInstallKeyDescriptor.service
@@ -617,12 +634,18 @@ function bundledGitRunner(paths: RuntimePaths): BundledGitRunner {
       process.env,
       "HRA_SOURCE_TEST_ALLOW_PATH_GIT",
     ) === "1";
+  const descriptorExecutorBinary = optionalRenamedEnvironmentValue(
+    process.env,
+    "HRA_GIT_EXECUTOR_PATH",
+  );
   return new BundledGitRunner(
     paths,
     process.env,
     sourceTestPathExecution
       ? { unsafeTestOnlyAllowPathExecution: true }
-      : {},
+      : descriptorExecutorBinary === undefined
+      ? {}
+      : { descriptorExecutorBinary },
   );
 }
 let activeControlPlanePath: string | null = null;
@@ -694,7 +717,6 @@ function rendererHumanOrganization(
     readonly name: string;
     readonly role: "owner" | "admin" | "member";
     readonly status: "provisioning" | "active" | "failed";
-    readonly workosOrganizationId?: string | undefined;
   },
 ): RuntimeHumanOrganization {
   return {
@@ -702,7 +724,6 @@ function rendererHumanOrganization(
     name: organization.name,
     role: organization.role,
     status: organization.status,
-    workosOrganizationId: organization.workosOrganizationId ?? null,
   };
 }
 
@@ -734,9 +755,7 @@ function rendererHumanProfile(
       email: profile.user.email,
       name: profile.user.name ?? null,
     },
-    organization: profile.organization === undefined
-      ? null
-      : rendererHumanOrganization(profile.organization),
+    organization: rendererHumanOrganization(profile.organization),
     workspace: profile.workspace === undefined
       ? null
       : rendererHumanWorkspace(profile.workspace),
@@ -785,7 +804,7 @@ function rendererHumanAccountSnapshot(
       return {
         state: "signingIn",
         revision: snapshot.revision,
-        userCode: snapshot.verification?.userCode ?? null,
+        comparisonCode: snapshot.verification?.comparisonCode ?? null,
         expiresAt: snapshot.verification?.expiresAt ?? null,
       };
     case "signed_in":
@@ -1166,7 +1185,9 @@ async function initializeDispatchRunner(
   publishWithDrainRetry({ type: "runner.changed", runner: { state: "connecting" } });
   try {
     const authorization = options.authorization ??
-      await recoverPairedDispatchAuthorization();
+      (rawDevelopmentIsolationEnabled()
+        ? null
+        : await recoverPairedDispatchAuthorization());
     if (authorization === null) {
       publishWithDrainRetry({ type: "runner.changed", runner: { state: "notPaired" } });
       return;
@@ -1975,31 +1996,46 @@ async function initializeGateway(): Promise<void> {
   let initializingChatService: ChatService | null = null;
   let initializingHarness: HarnessProductionCompositionV2 | null = null;
   let initializingHarnessBound = false;
-  let applicationSupport: ApplicationSupportStartup | null = null;
+  let applicationSupport: ApplicationSupportStartupAuthority | null = null;
   let assets: PortableRuntimeAssets | null = null;
   let worktreeRepairContext: WorktreeRepairContext | null = null;
   let worktreeRepairDatabase: Database | null = null;
   let worktreeRepairNeedsReverse = false;
   let preserveForwardOnlyCutover = false;
   try {
-    // Native v2 custody must resolve any fixed v1 migration before the Harness
-    // graph can initialize or generate a replacement installation master.
-    await nativeHarnessKeyCustody.ensureMigrated();
-    const initializingHarnessKeyCustody = new HarnessInstallKeyCustody({
-      secrets: nativeHarnessKeyCustody,
-    });
     const effectiveHome = userInfo().homedir;
+    const isolatedDevelopment = rawDevelopmentIsolationEnabled();
+    // Native v2 custody must resolve any fixed v1 migration before the Harness
+    // graph can initialize or generate a replacement installation master. Raw
+    // source development never calls the production custodian and instead
+    // uses the service-rewritten development Keychain namespace.
+    if (!isolatedDevelopment) {
+      await nativeHarnessKeyCustody.ensureMigrated();
+    }
+    const initializingHarnessKeyCustody = new HarnessInstallKeyCustody({
+      secrets: isolatedDevelopment
+        ? rawDevelopmentSecrets
+        : nativeHarnessKeyCustody,
+    });
     const computerUse = provisionOfficialComputerUse({
       homeDirectory: effectiveHome,
     });
-    const expectedDatabasePath = defaultControlPlanePath();
+    applicationSupport = isolatedDevelopment
+      ? prepareIsolatedDevelopmentApplicationSupport(effectiveHome)
+      : prepareApplicationSupportMigration({
+          environment: { HOME: effectiveHome },
+        });
+    // Prove/create the dedicated source-development root before any release
+    // preflight can resolve a database path beneath it. Production retains its
+    // existing migration ordering below.
+    if (isolatedDevelopment) applicationSupport.prepareTargetRoot();
+    const expectedDatabasePath = isolatedDevelopment
+      ? controlPlanePathFromApplicationSupportRoot(applicationSupport.root)
+      : defaultControlPlanePath();
     preflightControlPlaneRelease(
       expectedDatabasePath,
       hraReleaseIdentity,
     );
-    applicationSupport = prepareApplicationSupportMigration({
-      environment: { HOME: effectiveHome },
-    });
     const databasePath = controlPlanePathFromApplicationSupportRoot(applicationSupport.root);
     if (databasePath !== expectedDatabasePath) {
       throw new Error(
@@ -2007,7 +2043,7 @@ async function initializeGateway(): Promise<void> {
       );
     }
     preflightControlPlaneRelease(databasePath, hraReleaseIdentity);
-    applicationSupport.prepareTargetRoot();
+    if (!isolatedDevelopment) applicationSupport.prepareTargetRoot();
 
     const migratedFromRoot = applicationSupport.migratedFromRoot;
     if (
@@ -2102,7 +2138,9 @@ async function initializeGateway(): Promise<void> {
     const humanMetadata = new HumanAccountMetadataStore({ database });
     const initializingScheduledChatStore = new ScheduledChatStore(database);
     const syncStore = new SessionSyncStore(database);
-    const humanCloudConfiguration = parseHRACloudConfiguration(process.env);
+    const humanCloudConfiguration = parseHRACloudConfiguration(
+      isolatedDevelopment ? {} : process.env,
+    );
     const storedHumanAuthorityIsDurable = (): boolean => {
       const vault = syncStore.vault();
       return initializingScheduledChatStore.hasAuthorityBearingState()
@@ -2171,6 +2209,14 @@ async function initializeGateway(): Promise<void> {
     const humanRuntime = createHumanAccountRuntime({
       configuration: humanCloudConfiguration,
       metadata: humanMetadata,
+      ...(isolatedDevelopment
+        ? {
+            credentials: new HumanCredentialCustody({
+              metadata: humanMetadata,
+              secrets: rawDevelopmentSecrets,
+            }),
+          }
+        : {}),
       acceptAuthentication: (authentication) => {
         const organizationId = authentication.organization?.id;
         if (sessionSyncCoordinator !== null) {
@@ -2234,7 +2280,12 @@ async function initializeGateway(): Promise<void> {
         }
       },
       openBrowser: async (url) => {
-        await new WorkOsExternalUrlOpener().open(url);
+        if (humanCloudConfiguration.web.state !== "enabled") {
+          throw new Error("The HRA browser origin is unavailable.");
+        }
+        await new DesktopPairingExternalUrlOpener(
+          humanCloudConfiguration.web.value.origin,
+        ).open(url);
       },
     });
     cloudAttachmentAvailability = humanRuntime.availability;
@@ -2270,8 +2321,12 @@ async function initializeGateway(): Promise<void> {
           await service.resumeEligibleScheduledOccurrences();
         },
         journal: new SessionSyncOperationJournal(database),
-        keyCustody: new SessionSyncKeyCustody(),
-        recoveryCustody: new SessionSyncRecoveryKeyCustody(),
+        keyCustody: new SessionSyncKeyCustody(
+          isolatedDevelopment ? { secrets: rawDevelopmentSecrets } : {},
+        ),
+        recoveryCustody: new SessionSyncRecoveryKeyCustody(
+          isolatedDevelopment ? { secrets: rawDevelopmentSecrets } : {},
+        ),
         client: new SessionSyncBearerClient({
           session: humanRuntime.session,
           transport: new SessionSyncHttpTransport({
@@ -2587,9 +2642,12 @@ async function initializeGateway(): Promise<void> {
       process.env,
       "HRA_GATEWAY_PATH",
     );
-    const imageNormalizerBinary = gatewayBinary === undefined
+    const imageNormalizerBinary = optionalRenamedEnvironmentValue(
+      process.env,
+      "HRA_IMAGE_NORMALIZER_PATH",
+    ) ?? (gatewayBinary === undefined
       ? join(import.meta.dir, "../../zig-out/bin/hra-image-normalizer")
-      : join(dirname(gatewayBinary), "hra-image-normalizer");
+      : join(dirname(gatewayBinary), "hra-image-normalizer"));
     const initializingChatAttachmentVault = new SQLiteChatAttachmentVault({
       database,
       root: chatAttachmentVaultRoot(databasePath),

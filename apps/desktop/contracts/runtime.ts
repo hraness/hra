@@ -1,6 +1,7 @@
 import { z } from "@hra-internal/schema";
 import {
   canonicalScheduledChatRRuleSchema,
+  desktopPairingComparisonCodeSchema,
   MAX_SCHEDULED_CHAT_RRULE_UTF8_BYTES,
   MAX_SCHEDULED_CHAT_TIME_ZONE_UTF8_BYTES,
   organizationIdSchema,
@@ -23,8 +24,7 @@ import {
   workspacePublicIdSchema,
   workspaceSummarySchema,
   workspaceViewSchema,
-  workosOrganizationIdSchema,
-  workosUserIdSchema,
+  humanUserIdSchema,
   runnerPresenceViewSchema,
   sessionPublicIdSchema as syncedSessionPublicIdSchema,
   sessionSyncEnrollmentRequestIdSchema,
@@ -289,6 +289,13 @@ const accountLoginStateSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("failed"), message: z.string().min(1).max(240) }).strict(),
 ]);
 
+const accountWeeklyUsageSchema = z
+  .object({
+    remainingPercent: z.number().min(0).max(100),
+    resetsAt: z.string().datetime(),
+  })
+  .strict();
+
 const accountSummarySchema = z
   .object({
     id: accountProfileIdSchema,
@@ -297,7 +304,7 @@ const accountSummarySchema = z
     selected: z.boolean(),
     identityLabel: z.string().min(1).max(160).nullable(),
     planLabel: z.string().min(1).max(80).nullable(),
-    usageRemainingPercent: z.number().min(0).max(100).nullable().default(null),
+    weeklyUsage: accountWeeklyUsageSchema.nullable().default(null),
     authState: z.enum([
       "signedOut",
       "signingIn",
@@ -466,7 +473,7 @@ const humanAccountErrorCodeSchema = z.enum([
 
 const runtimeHumanUserSchema = z
   .object({
-    id: workosUserIdSchema,
+    id: humanUserIdSchema,
     email: z.string().email(),
     name: z.string().min(1).max(240).nullable(),
   })
@@ -478,21 +485,8 @@ const runtimeHumanOrganizationSchema = z
     name: organizationNameSchema,
     role: organizationRoleSchema,
     status: z.enum(["provisioning", "active", "failed"]),
-    workosOrganizationId: workosOrganizationIdSchema.nullable(),
   })
-  .strict()
-  .superRefine((organization, context) => {
-    if (
-      organization.status === "active" &&
-      organization.workosOrganizationId === null
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "active organization requires a WorkOS organization ID",
-        path: ["workosOrganizationId"],
-      });
-    }
-  });
+  .strict();
 
 const humanAccountProfileSchema = z
   .object({
@@ -546,7 +540,7 @@ export const humanAccountSnapshotSchema = z.discriminatedUnion("state", [
     .object({
       state: z.literal("signingIn"),
       revision: z.number().int().nonnegative().safe(),
-      userCode: z.string().min(1).max(128).nullable(),
+      comparisonCode: desktopPairingComparisonCodeSchema.nullable(),
       expiresAt: taskDomain.epochMsSchema.nullable(),
     })
     .strict(),

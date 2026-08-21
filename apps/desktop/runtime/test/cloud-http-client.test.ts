@@ -344,6 +344,7 @@ describe("strict OPRTE cloud HTTP transport", () => {
     const store: HumanAuthenticationStore = {
       read: () => Promise.resolve(null),
       compareAndSwap: () => Promise.resolve(null),
+      preserveForRecovery: () => Promise.resolve(false),
       clear: () => Promise.resolve(false),
     };
     const transport = new HRAHumanHttpTransport({
@@ -375,19 +376,26 @@ describe("strict OPRTE cloud HTTP transport", () => {
     const snapshot = humanAuthenticationSnapshotSchema.parse({
       generation: 4,
       authentication: {
-        version: 1,
+        version: 2,
         apiUrl: "https://hra.example.com",
         accessToken: TOKEN,
         refreshToken: "refresh-token-that-remains-inside-custody",
         user: {
-          id: "user_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
           email: "chef@example.com",
+        },
+        organization: {
+          id: "org_oprte",
+          name: "OPRTE",
+          role: "owner",
+          status: "active",
         },
       },
     });
     const store: HumanAuthenticationStore = {
       read: () => Promise.resolve(snapshot),
       compareAndSwap: () => Promise.resolve(null),
+      preserveForRecovery: () => Promise.resolve(false),
       clear: () => Promise.resolve(false),
     };
     const transport = new HRAHumanHttpTransport({

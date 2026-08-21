@@ -21,6 +21,7 @@ import {
   readinessRetryDelay,
   waitForDevReadiness,
 } from "../dev-supervisor";
+import { nativeSourceHelperEnvironment } from "../run-native";
 
 const sessionId = devSessionIdFromBytes(new Uint8Array(32).fill(0x2a));
 const otherSessionId = devSessionIdFromBytes(new Uint8Array(32).fill(0x2b));
@@ -243,6 +244,31 @@ describe("HRA development lifecycle", () => {
       NATIVE_SDK_MODE: "dev",
       HRA_DEV_SESSION_ID: sessionId,
     });
+  });
+
+  test("binds source launches to the freshly built native helpers", () => {
+    expect(nativeSourceHelperEnvironment("/private/tmp/hra/apps/desktop")).toEqual({
+      HRA_DATA_REMOVER_PATH:
+        "/private/tmp/hra/apps/desktop/zig-out/bin/oprte-data-remover",
+      HRA_GIT_EXECUTOR_PATH:
+        "/private/tmp/hra/apps/desktop/zig-out/bin/oprte-git-executor",
+      HRA_IMAGE_NORMALIZER_PATH:
+        "/private/tmp/hra/apps/desktop/zig-out/bin/hra-image-normalizer",
+    });
+  });
+
+  test("does not authorize the raw Debug host to launch the Keychain custodian", async () => {
+    const environment = nativeSourceHelperEnvironment(
+      "/private/tmp/hra/apps/desktop",
+    ) as Record<string, string>;
+    expect(environment.HRA_KEYCHAIN_CUSTODIAN_PATH).toBeUndefined();
+    const source = await Bun.file(new URL("../run-native.ts", import.meta.url)).text();
+    expect(source).toContain(
+      "Keychain-backed cloud features require the signed app and are disabled in raw Debug",
+    );
+    expect(source).toContain("delete environment.HRA_KEYCHAIN_CUSTODIAN_PATH");
+    expect(source).toContain("delete environment.OPRTE_KEYCHAIN_CUSTODIAN_PATH");
+    expect(source).toContain("delete environment.KITCHEN_KEYCHAIN_CUSTODIAN_PATH");
   });
 
   test("retires the completed build process group before the app can run long enough for PID reuse", async () => {

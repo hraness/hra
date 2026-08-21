@@ -1,5 +1,3 @@
-import type { OrganizationView } from "@hraness/agent-tasks-protocol";
-
 import {
   humanAuthenticationSnapshotSchema,
   refreshedHumanAuthentication,
@@ -22,13 +20,19 @@ export interface HumanAuthenticationStore {
     readonly expectedGeneration: number;
     readonly next: HumanAuthenticationSnapshot;
   }): Promise<HumanAuthenticationSnapshot | null>;
+  /**
+   * Remove one exact generation from live admission while preserving its
+   * secret-store bytes and durable recovery evidence.
+   */
+  preserveForRecovery(input: {
+    readonly expectedGeneration: number;
+  }): Promise<boolean>;
   clear(input: { readonly expectedGeneration: number }): Promise<boolean>;
 }
 
 export interface HumanRefreshDriver {
   refresh(input: {
     readonly refreshToken: string;
-    readonly workosOrganizationId?: string;
   }): Promise<
     | { readonly ok: true; readonly data: unknown }
     | {
@@ -68,6 +72,22 @@ export type HumanSessionResult<
   | {
       readonly ok: false;
       readonly kind: "session";
+      readonly error: HumanSessionFailure;
+    };
+
+export interface HumanSessionTransition {
+  execute<Value, Failure extends HumanOperationFailure>(
+    operation: (
+      accessToken: string,
+      authority: HumanAuthenticationSnapshot,
+    ) => Promise<HumanOperationResult<Value, Failure>>,
+  ): Promise<HumanSessionResult<Value, Failure>>;
+}
+
+export type HumanSessionTransitionResult<Value> =
+  | { readonly ok: true; readonly data: Value }
+  | {
+      readonly ok: false;
       readonly error: HumanSessionFailure;
     };
 
@@ -117,7 +137,8 @@ function samePrincipal(
   return (
     left.apiUrl === right.apiUrl &&
     left.user.id === right.user.id &&
-    left.workosOrganizationId === right.workosOrganizationId
+    left.organization.id === right.organization.id &&
+    left.workspace?.id === right.workspace?.id
   );
 }
 
@@ -133,6 +154,8 @@ export class HumanSessionCoordinator {
   }> | null = null;
   #activeOperations = 0;
   #admissionClosed = false;
+  #transitionInProgress = false;
+  readonly #operationSettleWaiters = new Set<() => void>();
   readonly #settleWaiters = new Set<() => void>();
 
   constructor(options: HumanSessionCoordinatorOptions) {
@@ -147,20 +170,53 @@ export class HumanSessionCoordinator {
     this.#admissionClosed = true;
   }
 
+  /**
+   * Reopen a recovery-contained coordinator only after its owner has committed
+   * a fresh credential. Active bearer work and refresh settlement make that
+   * transition unsafe, so the caller must wait and try again.
+   */
+  reopenAdmission(): boolean {
+    if (
+      this.#activeOperations !== 0 || this.#refreshInFlight !== null ||
+      this.#transitionInProgress
+    ) {
+      return false;
+    }
+    this.#admissionClosed = false;
+    return true;
+  }
+
   async settled(): Promise<void> {
-    while (this.#activeOperations > 0) {
+    while (this.#activeOperations > 0 || this.#transitionInProgress) {
       await new Promise<void>((resolve) => {
         this.#settleWaiters.add(resolve);
       });
     }
   }
 
-  #completeOperation(): void {
-    this.#activeOperations -= 1;
-    if (this.#activeOperations !== 0) return;
+  async #operationsSettled(): Promise<void> {
+    while (this.#activeOperations > 0) {
+      await new Promise<void>((resolve) => {
+        this.#operationSettleWaiters.add(resolve);
+      });
+    }
+  }
+
+  #notifySettlement(): void {
+    if (this.#activeOperations === 0) {
+      const operationWaiters = [...this.#operationSettleWaiters];
+      this.#operationSettleWaiters.clear();
+      for (const resolve of operationWaiters) resolve();
+    }
+    if (this.#activeOperations !== 0 || this.#transitionInProgress) return;
     const waiters = [...this.#settleWaiters];
     this.#settleWaiters.clear();
     for (const resolve of waiters) resolve();
+  }
+
+  #completeOperation(): void {
+    this.#activeOperations -= 1;
+    this.#notifySettlement();
   }
 
   async #readSnapshot(): Promise<HumanAuthenticationSnapshot | null> {
@@ -185,18 +241,66 @@ export class HumanSessionCoordinator {
   async #clearStale(
     snapshot: HumanAuthenticationSnapshot,
   ): Promise<void> {
+    let cleared = false;
     try {
-      await this.#store.clear({
+      cleared = await this.#store.clear({
         expectedGeneration: snapshot.generation,
       });
     } catch {
-      // A failed clear is deliberately not surfaced with custody details.
+      // Resolve whether the clear committed or lost to a newer writer below.
     }
+    if (cleared) return;
+
+    try {
+      const winner = await this.#readSnapshot();
+      if (
+        winner === null ||
+        winner.generation > snapshot.generation
+      ) {
+        return;
+      }
+    } catch {
+      // Admission closes below when the current generation cannot be proven.
+    }
+    // The server definitively rejected this generation. It can never remain
+    // eligible for another bearer operation when its exact clear is false or
+    // indeterminate.
+    this.#admissionClosed = true;
+  }
+
+  async #preserveStale(
+    snapshot: HumanAuthenticationSnapshot,
+  ): Promise<void> {
+    let preserved = false;
+    try {
+      preserved = await this.#store.preserveForRecovery({
+        expectedGeneration: snapshot.generation,
+      });
+    } catch {
+      // Resolve the live winner below. The preservation call may have lost its
+      // response after either committing or losing the exact-generation CAS.
+    }
+    if (preserved) {
+      this.#admissionClosed = true;
+      return;
+    }
+
+    try {
+      const winner = await this.#readSnapshot();
+      if (winner !== null && winner.generation > snapshot.generation) {
+        // A newer valid credential owns admission. It may represent an
+        // authorized organization/workspace selection and must not be killed
+        // by an older refresh whose outcome became indeterminate.
+        return;
+      }
+    } catch {
+      // Admission closes below when the current generation cannot be proven.
+    }
+    this.#admissionClosed = true;
   }
 
   async #performRefresh(
     stale: HumanAuthenticationSnapshot,
-    targetOrganization?: OrganizationView,
   ): Promise<InternalRefresh> {
     let current: HumanAuthenticationSnapshot | null;
     try {
@@ -219,36 +323,29 @@ export class HumanSessionCoordinator {
 
     let refreshed: Awaited<ReturnType<HumanRefreshDriver["refresh"]>>;
     try {
-      const workosOrganizationId =
-        targetOrganization?.workosOrganizationId ??
-        current.authentication.workosOrganizationId;
       refreshed = await this.#refresh.refresh({
         refreshToken: current.authentication.refreshToken,
-        ...(workosOrganizationId === undefined
-          ? {}
-          : { workosOrganizationId }),
       });
     } catch {
-      await this.#clearStale(current);
+      await this.#preserveStale(current);
       return sessionFailure("AUTH_REFRESH_INDETERMINATE");
     }
     if (!refreshed.ok) {
+      if (refreshed.outcome === "indeterminate") {
+        await this.#preserveStale(current);
+        return sessionFailure("AUTH_REFRESH_INDETERMINATE");
+      }
       await this.#clearStale(current);
-      return sessionFailure(
-        refreshed.outcome === "indeterminate"
-          ? "AUTH_REFRESH_INDETERMINATE"
-          : "AUTHENTICATION_FAILED",
-      );
+      return sessionFailure("AUTHENTICATION_FAILED");
     }
 
     const nextAuthentication = refreshedHumanAuthentication(
       current.authentication,
       refreshed.data,
-      targetOrganization,
     );
     if (!nextAuthentication.ok) {
-      await this.#clearStale(current);
-      return sessionFailure("AUTHENTICATION_FAILED");
+      await this.#preserveStale(current);
+      return sessionFailure("AUTH_REFRESH_INDETERMINATE");
     }
     const next = humanAuthenticationSnapshotSchema.parse({
       generation: current.generation + 1,
@@ -277,7 +374,7 @@ export class HumanSessionCoordinator {
       ) {
         return { ok: true, snapshot: winner };
       }
-      await this.#clearStale(current);
+      await this.#preserveStale(current);
       return sessionFailure("AUTH_REFRESH_INDETERMINATE");
     }
     if (replaced !== null) {
@@ -285,7 +382,8 @@ export class HumanSessionCoordinator {
         replaced.generation <= current.generation ||
         !samePrincipal(replaced.authentication, next.authentication)
       ) {
-        return sessionFailure("AUTHENTICATION_FAILED");
+        await this.#preserveStale(replaced);
+        return sessionFailure("AUTH_REFRESH_INDETERMINATE");
       }
       return { ok: true, snapshot: replaced };
     }
@@ -308,23 +406,21 @@ export class HumanSessionCoordinator {
 
   async #refreshOnce(
     stale: HumanAuthenticationSnapshot,
-    targetOrganization?: OrganizationView,
   ): Promise<InternalRefresh> {
     const key = JSON.stringify([
       stale.generation,
       stale.authentication.apiUrl,
       stale.authentication.user.id,
-      stale.authentication.workosOrganizationId ?? null,
-      targetOrganization?.id ?? null,
-      targetOrganization?.workosOrganizationId ?? null,
+      stale.authentication.organization.id,
+      stale.authentication.workspace?.id ?? null,
     ]);
     const existing = this.#refreshInFlight;
     if (existing !== null) {
       if (existing.key === key) return await existing.promise;
       await existing.promise;
-      return await this.#refreshOnce(stale, targetOrganization);
+      return await this.#refreshOnce(stale);
     }
-    const refresh = this.#performRefresh(stale, targetOrganization);
+    const refresh = this.#performRefresh(stale);
     this.#refreshInFlight = { key, promise: refresh };
     try {
       return await refresh;
@@ -343,15 +439,75 @@ export class HumanSessionCoordinator {
   async execute<Value, Failure extends HumanOperationFailure>(
     operation: (
       accessToken: string,
+      authority: HumanAuthenticationSnapshot,
     ) => Promise<HumanOperationResult<Value, Failure>>,
   ): Promise<HumanSessionResult<Value, Failure>> {
-    if (this.#admissionClosed) {
+    if (this.#admissionClosed || this.#transitionInProgress) {
       return {
         ok: false,
         kind: "session",
         error: sessionFailure("SERVICE_UNAVAILABLE").error,
       };
     }
+    return await this.#executeAdmitted(operation);
+  }
+
+  /**
+   * Pause ordinary bearer admission, drain work admitted before the pause, and
+   * keep that pause held while one credential-rotating transition performs its
+   * network attempt and durable local commit. Terminal or recovery admission
+   * closure during the transition is never undone when the lease releases.
+   */
+  async withExclusiveTransition<Value>(
+    transition: (
+      session: HumanSessionTransition,
+    ) => Promise<Value>,
+  ): Promise<HumanSessionTransitionResult<Value>> {
+    if (this.#admissionClosed || this.#transitionInProgress) {
+      return {
+        ok: false,
+        error: sessionFailure("SERVICE_UNAVAILABLE").error,
+      };
+    }
+    this.#transitionInProgress = true;
+    try {
+      await this.#operationsSettled();
+      if (this.#admissionClosed) {
+        return {
+          ok: false,
+          error: sessionFailure("SERVICE_UNAVAILABLE").error,
+        };
+      }
+      const session: HumanSessionTransition = {
+        execute: async <OperationValue, Failure extends HumanOperationFailure>(
+          operation: (
+            accessToken: string,
+            authority: HumanAuthenticationSnapshot,
+          ) => Promise<HumanOperationResult<OperationValue, Failure>>,
+        ): Promise<HumanSessionResult<OperationValue, Failure>> => {
+          if (this.#admissionClosed) {
+            return {
+              ok: false,
+              kind: "session",
+              error: sessionFailure("SERVICE_UNAVAILABLE").error,
+            };
+          }
+          return await this.#executeAdmitted(operation);
+        },
+      };
+      return { ok: true, data: await transition(session) };
+    } finally {
+      this.#transitionInProgress = false;
+      this.#notifySettlement();
+    }
+  }
+
+  async #executeAdmitted<Value, Failure extends HumanOperationFailure>(
+    operation: (
+      accessToken: string,
+      authority: HumanAuthenticationSnapshot,
+    ) => Promise<HumanOperationResult<Value, Failure>>,
+  ): Promise<HumanSessionResult<Value, Failure>> {
     this.#activeOperations += 1;
     try {
     let snapshot: HumanAuthenticationSnapshot | null;
@@ -373,7 +529,10 @@ export class HumanSessionCoordinator {
 
     let result: HumanOperationResult<Value, Failure>;
     try {
-      result = await operation(snapshot.authentication.accessToken);
+      result = await operation(
+        snapshot.authentication.accessToken,
+        snapshot,
+      );
     } catch {
       return {
         ok: false,
@@ -393,6 +552,7 @@ export class HumanSessionCoordinator {
     try {
       const replay = await operation(
         refreshed.snapshot.authentication.accessToken,
+        refreshed.snapshot,
       );
       if (replay.ok) return replay;
       if (!this.#isAuthenticationFailure(replay.error)) {

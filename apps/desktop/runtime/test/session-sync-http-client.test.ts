@@ -48,19 +48,26 @@ function session(): HumanSessionCoordinator {
   const snapshot = humanAuthenticationSnapshotSchema.parse({
     generation: 1,
     authentication: {
-      version: 1,
+      version: 2,
       apiUrl: "https://oprte.example.com",
       accessToken: "session-sync-access-token",
       refreshToken: "session-sync-refresh-token-in-keychain",
       user: {
-        id: "user_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         email: "chef@example.com",
+      },
+      organization: {
+        id: "org_oprte",
+        name: "OPRTE",
+        role: "owner",
+        status: "active",
       },
     },
   });
   const store: HumanAuthenticationStore = {
     read: () => Promise.resolve(snapshot),
     compareAndSwap: () => Promise.resolve(null),
+    preserveForRecovery: () => Promise.resolve(false),
     clear: () => Promise.resolve(false),
   };
   return new HumanSessionCoordinator({

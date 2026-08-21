@@ -438,6 +438,21 @@ describe("HarnessRendererSQLiteAdapterV2", () => {
 
   test("pages only sorted renderer-safe identities and reads actor evidence", () => {
     const value = fixture();
+    const archived = value.chats.create({
+      paneId: "pane_renderer_archived01",
+      repository: {
+        id: repositoryId,
+        name: "Renderer SQLite",
+        workingDirectory: "/tmp/renderer-sqlite",
+      },
+      accountProfileId: null,
+      now: new Date(later),
+    });
+    value.chats.remove(
+      archived.id,
+      archived.revision,
+      new Date("2030-01-01T00:00:02.000Z"),
+    );
     value.chats.create({
       paneId: "pane_renderer_child001",
       repository: {

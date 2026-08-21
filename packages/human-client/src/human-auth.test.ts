@@ -7,7 +7,24 @@ import {
   humanProfileSchema,
   profileFromHumanAuthentication,
   refreshedHumanAuthentication,
+  storedHumanAuthenticationDisposition,
 } from "./human-auth";
+
+const organization = {
+  id: "org_cloud",
+  name: "Cloud",
+  role: "owner",
+  status: "active",
+} as const;
+
+const workspace = {
+  id: "workspace_cloud",
+  organizationId: organization.id,
+  name: "Cloud",
+  slug: "cloud",
+  taskKeyPrefix: "CLD",
+  roles: ["planner" as const],
+};
 
 describe("human authentication contracts", () => {
   test("preserves the stable OPRTE human and runner Keychain storage IDs", () => {
@@ -24,7 +41,7 @@ describe("human authentication contracts", () => {
 
   test("projects only safe metadata outside custody", () => {
     const authentication = humanAuthenticationSchema.parse({
-      version: 1,
+      version: 2,
       apiUrl: "https://hra.example.com",
       accessToken: "access-token-that-is-long-enough",
       refreshToken: "refresh-token-that-is-long-enough",
@@ -32,6 +49,8 @@ describe("human authentication contracts", () => {
         id: "user_abc123",
         email: "human@example.com",
       },
+      organization,
+      workspace,
     });
 
     const profile = profileFromHumanAuthentication(
@@ -40,13 +59,15 @@ describe("human authentication contracts", () => {
     );
 
     expect(profile).toEqual({
-      version: 1,
+      version: 2,
       apiUrl: "https://hra.example.com",
       secretStore: "keychain",
       user: {
         id: "user_abc123",
         email: "human@example.com",
       },
+      organization,
+      workspace,
     });
     expect(JSON.stringify(profile)).not.toContain(authentication.accessToken);
     expect(JSON.stringify(profile)).not.toContain(authentication.refreshToken);
@@ -54,11 +75,13 @@ describe("human authentication contracts", () => {
 
   test("rejects a rotated token for another principal", () => {
     const current = humanAuthenticationSchema.parse({
-      version: 1,
+      version: 2,
       apiUrl: "https://hra.example.com",
       accessToken: "access-token-that-is-long-enough",
       refreshToken: "refresh-token-that-is-long-enough",
       user: { id: "user_abc123", email: "human@example.com" },
+      organization,
+      workspace,
     });
 
     expect(
@@ -66,24 +89,39 @@ describe("human authentication contracts", () => {
         accessToken: "rotated-access-token-that-is-long-enough",
         refreshToken: "rotated-refresh-token-that-is-long-enough",
         user: { id: "user_other", email: "other@example.com" },
+        organization,
+        workspace,
       }),
     ).toEqual({ ok: false, reason: "identity_mismatch" });
   });
 
   test("rejects inconsistent account selections in token-free profile metadata", () => {
     expect(humanProfileSchema.safeParse({
-      version: 1,
+      version: 2,
       apiUrl: "https://hra.example.com",
       secretStore: "keychain",
       user: { id: "user_abc123", email: "human@example.com" },
+      organization,
       workspace: {
         id: "workspace_cloud",
-        organizationId: "org_cloud",
+        organizationId: "org_other",
         name: "Cloud",
         slug: "cloud",
-        keyPrefix: "CLD",
-        role: "member",
+        taskKeyPrefix: "CLD",
+        roles: ["planner"],
       },
     }).success).toBeFalse();
+  });
+
+  test("classifies version-one custody as recovery-required without interpreting it", () => {
+    expect(storedHumanAuthenticationDisposition({
+      version: 1,
+      apiUrl: "https://hra.example.com",
+      accessToken: "legacy-access-material",
+      refreshToken: "legacy-refresh-material",
+      user: { id: "user_abc123" },
+      externalOrganizationId: "external-id",
+    })).toBe("legacy");
+    expect(storedHumanAuthenticationDisposition({ version: 3 })).toBe("invalid");
   });
 });

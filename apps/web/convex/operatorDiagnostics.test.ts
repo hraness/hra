@@ -30,15 +30,12 @@ function emptyInput(): MutableDiagnosticsInput {
     credentials: { rows: [], limit: 256, truncated: false },
     dueWakes: { rows: [], limit: 128, truncated: false },
     wakeSamples: [],
-    reconciliationStates: { rows: [], limit: 2, truncated: false },
-    quarantines: { rows: [], limit: 256, truncated: false },
-    provisioningOperations: { rows: [], limit: 256, truncated: false },
     workspaceUsage: { rows: [], limit: 256, truncated: false },
   };
 }
 
 describe("operator diagnostics", () => {
-  test("returns a stable zero snapshot with explicit missing reconciliation state", () => {
+  test("returns a stable zero snapshot", () => {
     const snapshot = buildOperatorDiagnostics(emptyInput());
 
     expect(snapshot.generatedAt).toBe(NOW);
@@ -48,10 +45,6 @@ describe("operator diagnostics", () => {
     expect(snapshot.rateLimits.requestsObserved).toBe(0);
     expect(snapshot.claims).toMatchObject({ overdue: 0, stuck: 0, oldestOverdueMs: null });
     expect(snapshot.review).toMatchObject({ pending: 0, aged: 0, oldestPendingAgeMs: null });
-    expect(snapshot.identity.reconciliation.map((row) => row.status)).toEqual([
-      "missing",
-      "missing",
-    ]);
     expect(snapshot.quotas.highestActiveTaskPercent).toBe(0);
   });
 
@@ -175,42 +168,6 @@ describe("operator diagnostics", () => {
       limit: 128,
       truncated: false,
     };
-    input.quarantines = {
-      rows: [
-        {
-          reason: "projection_collision",
-          occurrences: 2,
-          firstSeenAt: NOW - DAY,
-        },
-        {
-          reason: "invalid_provider_record",
-          occurrences: 1,
-          firstSeenAt: NOW - 2 * DAY,
-          resolvedAt: NOW - DAY,
-        },
-      ],
-      limit: 256,
-      truncated: false,
-    };
-    input.provisioningOperations = {
-      rows: [
-        {
-          status: "provider_organization_ready",
-          membershipProvisioningLeaseUntil: NOW,
-          membershipCreateDispatchedAt:
-            NOW - OPERATOR_DIAGNOSTIC_THRESHOLDS.provisioningStuckAfterMs,
-          createdAt: NOW - DAY,
-          updatedAt: NOW - OPERATOR_DIAGNOSTIC_THRESHOLDS.provisioningStuckAfterMs,
-        },
-        {
-          status: "failed",
-          createdAt: NOW - DAY,
-          updatedAt: NOW - DAY,
-        },
-      ],
-      limit: 256,
-      truncated: false,
-    };
     input.workspaceUsage = {
       rows: [
         {
@@ -254,81 +211,12 @@ describe("operator diagnostics", () => {
       activeUnused: 1,
     });
     expect(snapshot.wakes).toMatchObject({ overdue: 1, stuck: 1 });
-    expect(snapshot.identity).toMatchObject({
-      unresolvedQuarantines: 1,
-      repeatedUnresolvedQuarantines: 1,
-    });
-    expect(snapshot.provisioning).toMatchObject({
-      inFlight: 1,
-      stuck: 1,
-      expiredLeases: 1,
-      dispatchMarkedAndStuck: 1,
-      failed: 1,
-    });
     expect(snapshot.quotas).toMatchObject({
       workspacesAtOrAboveWarning: 1,
       workspacesAtOrAboveLimit: 1,
       highestActiveTaskPercent: 80,
       highestActiveAgentPercent: 100,
     });
-  });
-
-  test("classifies reconciliation running, stuck, failed, stale, and healthy", () => {
-    const input = emptyInput();
-    input.reconciliationStates = {
-      rows: [
-        {
-          key: "workos_memberships",
-          runId: "run_live",
-          leaseUntil: NOW + MINUTE,
-          lastCompletedAt: NOW - MINUTE,
-        },
-        {
-          key: "workos_organizations",
-          lastCompletedAt: NOW - MINUTE,
-        },
-      ],
-      limit: 2,
-      truncated: false,
-    };
-    expect(buildOperatorDiagnostics(input).identity.reconciliation.map((row) => row.status)).toEqual([
-      "running",
-      "healthy",
-    ]);
-
-    input.reconciliationStates = {
-      rows: [
-        {
-          key: "workos_memberships",
-          runId: "run_stuck",
-          leaseUntil: NOW,
-        },
-        {
-          key: "workos_organizations",
-          lastCompletedAt: NOW - MINUTE,
-          lastErrorAt: NOW,
-        },
-      ],
-      limit: 2,
-      truncated: false,
-    };
-    expect(buildOperatorDiagnostics(input).identity.reconciliation.map((row) => row.status)).toEqual([
-      "stuck",
-      "failed",
-    ]);
-
-    input.reconciliationStates = {
-      rows: [
-        {
-          key: "workos_memberships",
-          lastCompletedAt:
-            NOW - OPERATOR_DIAGNOSTIC_THRESHOLDS.reconciliationStaleAfterMs,
-        },
-      ],
-      limit: 2,
-      truncated: false,
-    };
-    expect(buildOperatorDiagnostics(input).identity.reconciliation[0]?.status).toBe("stale");
   });
 
   test("caps samples, reports truncation, and never forwards secret-bearing fields", () => {
@@ -349,23 +237,8 @@ describe("operator diagnostics", () => {
       verifierDigest: secret,
       responseJson: secret,
     };
-    const quarantine = {
-      reason: "provider_locator_mismatch" as const,
-      occurrences: 1,
-      firstSeenAt: NOW,
-      providerResourceId: secret,
-    };
-    const provisioning = {
-      status: "completed" as const,
-      createdAt: NOW,
-      updatedAt: NOW,
-      providerOrganizationId: secret,
-      requestDigest: secret,
-    };
     input.rateLimitBuckets = { rows: [subject], limit: 1, truncated: true };
     input.credentials = { rows: [credential], limit: 1, truncated: true };
-    input.quarantines = { rows: [quarantine], limit: 1, truncated: true };
-    input.provisioningOperations = { rows: [provisioning], limit: 1, truncated: true };
     input.claimSamples = Array.from(
       { length: OPERATOR_DIAGNOSTIC_LIMITS.samples + 4 },
       (_, index) => ({
@@ -389,8 +262,5 @@ describe("operator diagnostics", () => {
     expect(encoded).not.toContain('"locator":');
     expect(encoded).not.toContain('"internalDocumentId":');
     expect(encoded).not.toContain('"responseJson":');
-    expect(encoded).not.toContain('"providerResourceId":');
-    expect(encoded).not.toContain('"providerOrganizationId":');
-    expect(encoded).not.toContain('"requestDigest":');
   });
 });

@@ -60,7 +60,10 @@ const personal = {
     identityLabel: "builder@personal.example",
     selected: true,
   }),
-  usageRemainingPercent: 78,
+  weeklyUsage: {
+    remainingPercent: 78,
+    resetsAt: new Date(HRA_DIRECT_TIME + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+  },
 };
 const work = {
   ...signedInAccount({
@@ -69,7 +72,10 @@ const work = {
     identityLabel: "builder@work.example",
     selected: false,
   }),
-  usageRemainingPercent: 64,
+  weeklyUsage: {
+    remainingPercent: 64,
+    resetsAt: new Date(HRA_DIRECT_TIME + 5 * 24 * 60 * 60 * 1_000).toISOString(),
+  },
 };
 
 function snapshotWithAccounts(accounts: HRADirectWorld["gateway"]["snapshots"][number]["accounts"]) {

@@ -15,6 +15,11 @@ import {
   createOrganizationRequestSchema,
   createWorkspaceEnvelopeSchema,
   createWorkspaceRequestSchema,
+  desktopPairingIdSchema,
+  desktopPairingRedeemEnvelopeSchema,
+  desktopPairingRedeemRequestSchema,
+  desktopPairingStartEnvelopeSchema,
+  desktopPairingStartRequestSchema,
   disableAgentEnvelopeSchema,
   disableAgentRequestSchema,
   getAgentEnvelopeSchema,
@@ -31,6 +36,8 @@ import {
   listWorkspacesQuerySchema,
   refreshAuthEnvelopeSchema,
   refreshAuthRequestSchema,
+  selectHumanScopeEnvelopeSchema,
+  selectHumanScopeRequestSchema,
   revokeAgentCredentialEnvelopeSchema,
   revokeAgentCredentialRequestSchema,
 } from "./human";
@@ -109,6 +116,9 @@ export const taskctlHeaders = {
 } as const;
 
 export const agentRouteParamsSchema = z.object({ agentId: agentIdSchema }).strict();
+export const desktopPairingRouteParamsSchema = z
+  .object({ pairingId: desktopPairingIdSchema })
+  .strict();
 export const agentCredentialRouteParamsSchema = z
   .object({ agentId: agentIdSchema, credentialId: locatorSchema })
   .strict();
@@ -119,6 +129,11 @@ export const taskReferenceRouteParamsSchema = z
 
 function agentPath(agentId: string): string {
   return `/v1/agents/${encodeURIComponent(agentRouteParamsSchema.parse({ agentId }).agentId)}`;
+}
+
+function desktopPairingRedeemPath(pairingId: string): string {
+  const parsed = desktopPairingRouteParamsSchema.parse({ pairingId });
+  return `/v1/auth/desktop-pairings/${encodeURIComponent(parsed.pairingId)}/redeem`;
 }
 
 function agentEnrollmentPath(agentId: string): string {
@@ -154,6 +169,9 @@ function taskReferenceRemovePath(key: TaskKey, referenceId: string): string {
 
 export const taskctlApiRoutes = {
   refreshAuth: "/v1/auth/refresh",
+  selectHumanScope: "/v1/auth/selection",
+  desktopPairings: "/v1/auth/desktop-pairings",
+  desktopPairingRedeem: desktopPairingRedeemPath,
   organizations: "/v1/organizations",
   workspaces: "/v1/workspaces",
   agents: "/v1/agents",
@@ -198,6 +216,25 @@ export const taskctlApiRoutes = {
 } as const;
 
 export const taskctlApiOperations = {
+  startDesktopPairing: {
+    method: "POST",
+    path: taskctlApiRoutes.desktopPairings,
+    authorization: "none",
+    session: false,
+    idempotency: false,
+    requestSchema: desktopPairingStartRequestSchema,
+    responseSchema: desktopPairingStartEnvelopeSchema,
+  },
+  redeemDesktopPairing: {
+    method: "POST",
+    path: taskctlApiRoutes.desktopPairingRedeem,
+    pathParamsSchema: desktopPairingRouteParamsSchema,
+    authorization: "none",
+    session: false,
+    idempotency: false,
+    requestSchema: desktopPairingRedeemRequestSchema,
+    responseSchema: desktopPairingRedeemEnvelopeSchema,
+  },
   refreshAuth: {
     method: "POST",
     path: taskctlApiRoutes.refreshAuth,
@@ -206,6 +243,15 @@ export const taskctlApiOperations = {
     idempotency: false,
     requestSchema: refreshAuthRequestSchema,
     responseSchema: refreshAuthEnvelopeSchema,
+  },
+  selectHumanScope: {
+    method: "POST",
+    path: taskctlApiRoutes.selectHumanScope,
+    authorization: "human-account",
+    session: false,
+    idempotency: false,
+    requestSchema: selectHumanScopeRequestSchema,
+    responseSchema: selectHumanScopeEnvelopeSchema,
   },
   listOrganizations: {
     method: "GET",

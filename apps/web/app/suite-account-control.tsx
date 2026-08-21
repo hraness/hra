@@ -127,7 +127,7 @@ function planLabel(features: readonly SuiteFeature[]): string {
 
 function localStatus(local: LocalLink | undefined): string {
   if (local === undefined) return "Checking…";
-  if (local.kind === "signed_out") return "WorkOS session required";
+  if (local.kind === "signed_out") return "HRA session required";
   if (local.kind === "unlinked") return "Not linked";
   if (local.verification.kind === "unverified") return "Linked · not verified";
   if (local.verification.freshness === "stale") {
@@ -250,7 +250,7 @@ export function SuiteAccountControl() {
         <span>Hraness account</span>
         <strong>{localStatus(local)}</strong>
       </div>
-      <small>Plan status only. WorkOS continues to control HRA access.</small>
+      <small>Plan status only. HRA organization and workspace memberships control access.</small>
       {session.kind === "loading" || local === undefined ? (
         <span aria-live="polite" className="suite-account-control__state">
           Checking central session…

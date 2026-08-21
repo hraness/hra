@@ -27,7 +27,7 @@ import {
   ThemeToggle,
   TopBar,
 } from "@hra-internal/design-kit/react";
-import { useAuth } from "@workos-inc/authkit-nextjs/components";
+import { useAuthActions } from "@convex-dev/auth/react";
 import type { FunctionReturnType } from "convex/server";
 import { useConvexAuth, useMutation, useQuery } from "convex/react";
 import Image from "next/image";
@@ -51,7 +51,6 @@ import {
   withWorkspaceRole,
   workspaceRoleValues,
 } from "./admin-state";
-import { listOrganizationOptions } from "./organization-actions";
 import type { OrganizationOptionsResult } from "./organization-options";
 import { Cancel01Icon } from "./hra-icon-data";
 import { HRA_BRAND_ICON_PATH } from "./site";
@@ -356,7 +355,7 @@ function SignedOutState() {
   return (
     <FullPageState eyebrow="Human control plane" title="Supervision starts with a human session.">
       <p className="lede">
-        Sign in through WorkOS to select an organization, inspect persistent agents, and manage
+        Sign in to select an organization, inspect persistent agents, and manage
         their access.
       </p>
       <div className="button-row">
@@ -389,7 +388,7 @@ function OrganizationRequired({
   return (
     <FullPageState eyebrow="Organization required" title="Choose where you are working.">
       <p className="lede">
-        The WorkOS session is valid, but it is not scoped to an organization. Task data stays
+        Your session is valid, but it is not scoped to an organization. Task data stays
         hidden until the session is switched.
       </p>
       {options.kind === "loading" || options.kind === "idle" ? <LoadingState label="Loading active memberships…" /> : null}
@@ -1060,18 +1059,22 @@ function WorkspacePanel({
 }
 
 function AuthorizedDashboard({
-  activeWorkOSOrganizationId,
+  activeOrganizationId,
+  activeWorkspaceId,
   options,
   onRetryOrganizations,
   onSignOut,
   onSwitchOrganization,
+  onSwitchWorkspace,
   transport,
 }: {
-  activeWorkOSOrganizationId: string;
+  activeOrganizationId: string;
+  activeWorkspaceId?: string;
   options: OrganizationOptionsState;
   onRetryOrganizations: () => void;
   onSignOut: () => void;
   onSwitchOrganization: (organizationId: string, organizationName: string) => void;
+  onSwitchWorkspace: (workspaceId: string, workspaceName: string) => void;
   transport: "cloud" | "local";
 }) {
   const contextResult = useQuery(api.humanAdmin.currentContext, {});
@@ -1082,9 +1085,19 @@ function AuthorizedDashboard({
 
   const workspaces = workspacesResult?.ok ? workspacesResult.data.workspaces : [];
   const selectedWorkspaceId = refreshedSelection(
-    requestedWorkspaceId,
+    requestedWorkspaceId ?? activeWorkspaceId ?? null,
     workspaces.map((workspace: Workspace) => workspace.id),
   );
+  const selectedWorkspace = workspaces.find(
+    (workspace: Workspace) => workspace.id === selectedWorkspaceId,
+  );
+  const workspaceSelectionPending = selectedWorkspace !== undefined &&
+    selectedWorkspace.id !== activeWorkspaceId;
+
+  useEffect(() => {
+    if (!workspaceSelectionPending || selectedWorkspace === undefined) return;
+    onSwitchWorkspace(selectedWorkspace.id, selectedWorkspace.name);
+  }, [onSwitchWorkspace, selectedWorkspace, workspaceSelectionPending]);
 
   if (contextResult === undefined || workspacesResult === undefined) {
     return (
@@ -1110,9 +1123,6 @@ function AuthorizedDashboard({
 
   const context: ContextData = contextResult.data;
   const canManage = isOrganizationAdministrator(context.organization.role);
-  const selectedWorkspace = workspaces.find(
-    (workspace: Workspace) => workspace.id === selectedWorkspaceId,
-  );
   const navigationKey = `${selectedWorkspaceId ?? "empty"}:${surface}`;
   const rail = (
     <NavigationRail
@@ -1190,7 +1200,7 @@ function AuthorizedDashboard({
             )}
           >
             <OrganizationSwitcher
-              activeId={activeWorkOSOrganizationId}
+              activeId={activeOrganizationId}
               activeName={context.organization.name}
               onRetry={onRetryOrganizations}
               onSwitch={onSwitchOrganization}
@@ -1206,7 +1216,7 @@ function AuthorizedDashboard({
                 Your organization membership is active, but no workspace has been assigned. An owner or
                 administrator can add one with <code>taskctl workspace create</code> or grant you access.
               </EmptyState>
-            ) : selectedWorkspace === undefined ? (
+            ) : selectedWorkspace === undefined || workspaceSelectionPending ? (
               <LoadingState label="Selecting workspace…" />
             ) : (
               <WorkspacePanel
@@ -1225,45 +1235,30 @@ function AuthorizedDashboard({
 }
 
 export function AdminControlPlane({ transport }: { transport: "cloud" | "local" }) {
-  const { loading, organizationId, signOut, switchToOrganization, user } = useAuth();
   const convexAuth = useConvexAuth();
-  const [organizationReload, setOrganizationReload] = useState(0);
-  const [organizationLoad, setOrganizationLoad] = useState<null | Readonly<{
-    key: string;
-    result: OrganizationOptionsResult;
-  }>>(null);
-  const [transition, setTransition] = useState<null | Readonly<{ kind: "organization"; name: string }> | Readonly<{ kind: "sign-out" }>>(null);
+  const { signOut } = useAuthActions();
+  const scopes = useQuery(api.desktopPairing.accountScopes, {});
+  const selectSession = useMutation(api.desktopPairing.selectSession);
+  const [transition, setTransition] = useState<
+    | null
+    | Readonly<{ kind: "organization" | "workspace"; name: string }>
+    | Readonly<{ kind: "sign-out" }>
+  >(null);
   const [switchError, setSwitchError] = useState<string | null>(null);
-  const userId = user?.id;
-  const organizationLoadKey = userId === undefined ? null : `${userId}:${organizationReload}`;
   const organizationOptions = useMemo<OrganizationOptionsState>(
-    () =>
-      organizationLoadKey !== null && organizationLoad?.key === organizationLoadKey
-        ? organizationLoad.result
-        : { kind: "loading" },
-    [organizationLoad, organizationLoadKey],
+    () => scopes === undefined
+      ? { kind: "loading" }
+      : scopes === null
+        ? { kind: "signed-out" }
+        : {
+            kind: "ready",
+            organizations: scopes.organizations.map(({ id, name }) => ({ id, name })),
+          },
+    [scopes],
   );
-
-  useEffect(() => {
-    if (organizationLoadKey === null) return;
-    let active = true;
-    void (async () => {
-      let result: OrganizationOptionsResult;
-      try {
-        result = await listOrganizationOptions();
-      } catch {
-        result = { kind: "unavailable" };
-      }
-      if (active) setOrganizationLoad({ key: organizationLoadKey, result });
-    })();
-    return () => {
-      active = false;
-    };
-  }, [organizationLoadKey]);
-
-  const retryOrganizations = useCallback(() => {
-    setOrganizationReload((value) => value + 1);
-  }, []);
+  const organizationId = scopes?.selectedOrganizationId;
+  const workspaceId = scopes?.selectedWorkspaceId;
+  const retryOrganizations = useCallback(() => window.location.reload(), []);
 
   const switchOrganization = useCallback(async (targetId: string, targetName: string) => {
     if (organizationOptions.kind !== "ready") return;
@@ -1272,33 +1267,54 @@ export function AdminControlPlane({ transport }: { transport: "cloud" | "local" 
     setSwitchError(null);
     setTransition({ kind: "organization", name: targetName });
     try {
-      const result = await switchToOrganization(targetId, {
-        revalidationStrategy: "none",
-        returnTo: "/app",
-      });
-      if ("error" in result) throw new Error("organization switch rejected");
+      const result = await selectSession({ organizationId: targetId });
+      if (result === null) throw new Error("organization switch rejected");
       window.location.replace("/app");
     } catch {
       setTransition(null);
       setSwitchError("The organization could not be opened. Your previous tenant remains active.");
     }
-  }, [organizationOptions, switchToOrganization]);
+  }, [organizationOptions, selectSession]);
+
+  const switchWorkspace = useCallback(async (targetId: string, targetName: string) => {
+    if (organizationId === undefined) return;
+    setSwitchError(null);
+    setTransition({ kind: "workspace", name: targetName });
+    try {
+      const result = await selectSession({
+        organizationId,
+        workspaceId: targetId,
+      });
+      if (result?.workspace?.id !== targetId) throw new Error("workspace switch rejected");
+      const currentSurface: WorkspaceSurface =
+        new URL(window.location.href).searchParams.get("surface") === "access"
+          ? "access"
+          : "tasks";
+      window.location.replace(controlPlaneHref(targetId, currentSurface));
+    } catch {
+      setTransition(null);
+      setSwitchError("The workspace could not be opened. Your previous scope remains active.");
+      window.history.replaceState(null, "", "/app");
+    }
+  }, [organizationId, selectSession]);
 
   const beginSignOut = useCallback(() => {
     setTransition({ kind: "sign-out" });
-    void signOut({ returnTo: "/" });
+    void signOut().finally(() => window.location.replace("/"));
   }, [signOut]);
 
-  if (loading) {
+  if (convexAuth.isLoading || scopes === undefined) {
     return (
       <FullPageState eyebrow="Human authentication" title="Restoring your session…">
-        <LoadingState label="Checking the WorkOS session boundary…" />
+        <LoadingState label="Checking your HRA session…" />
       </FullPageState>
     );
   }
-  if (user === null) return <SignedOutState />;
+  if (!convexAuth.isAuthenticated || scopes === null) return <SignedOutState />;
   if (transition !== null) {
-    const title = transition.kind === "organization" ? `Opening ${transition.name}…` : "Signing out…";
+    const title = transition.kind === "sign-out"
+      ? "Signing out…"
+      : `Opening ${transition.name}…`;
     return (
       <FullPageState eyebrow="Tenant boundary" title={title}>
         <LoadingState label="The previous organization view is hidden while the session changes." />
@@ -1315,45 +1331,21 @@ export function AdminControlPlane({ transport }: { transport: "cloud" | "local" 
       />
     );
   }
-  if (convexAuth.isLoading) {
-    return (
-      <FullPageState eyebrow="Control-plane session" title="Authorizing live data…">
-        <LoadingState label="Exchanging a short-lived WorkOS access token…" />
-      </FullPageState>
-    );
-  }
-  if (!convexAuth.isAuthenticated) {
-    return (
-      <FullPageState eyebrow="Control-plane session" title="Live authorization failed.">
-        <p className="lede">The human session exists, but Convex could not authenticate it.</p>
-        <div className="button-row">
-          <Button
-            onPress={() => window.location.reload()}
-            variant="primary"
-          >
-            Retry session
-          </Button>
-          <Button onPress={beginSignOut} variant="quiet">
-            Sign out
-          </Button>
-        </div>
-      </FullPageState>
-    );
-  }
-
   return (
     <AdminErrorBoundary>
       <AuthorizedDashboard
-        activeWorkOSOrganizationId={organizationId}
+        activeOrganizationId={organizationId}
+        {...(workspaceId === undefined ? {} : { activeWorkspaceId: workspaceId })}
         onRetryOrganizations={retryOrganizations}
         onSignOut={beginSignOut}
         onSwitchOrganization={(id, name) => void switchOrganization(id, name)}
+        onSwitchWorkspace={(id, name) => void switchWorkspace(id, name)}
         options={organizationOptions}
         transport={transport}
       />
       {switchError === null ? null : (
         <div role="alert">
-          <InlineAlert className="global-notice" title="Organization unchanged" tone="danger">
+          <InlineAlert className="global-notice" title="Selection unchanged" tone="danger">
             <span>{switchError}</span>
             <IconButton
               aria-label="Dismiss"

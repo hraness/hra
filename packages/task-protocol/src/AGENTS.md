@@ -1,7 +1,7 @@
 # Contents
 
 - `index.ts` – the public protocol surface.
-- `model.ts` – cloud-only scopes, roles, credential/session settings, WorkOS and tenant locators, UUID/request-correlated cloud events, and exact task-domain model re-exports.
+- `model.ts` – cloud-only scopes, roles, credential/session settings, HRA-owned identity and tenant locators, UUID/request-correlated cloud events, and exact task-domain model re-exports.
 - `errors.ts` – typed API errors, exit classes, and error-envelope parsing.
 - `tokens.ts` – opaque token formatting, parsing, and redaction contracts.
 - `http.ts` – fixed HTTP headers and versioned API route builders.
@@ -9,7 +9,7 @@
 - `dispatch-identifiers.ts` – compatibility re-exports of task-domain runner, boot, claim, run, and event identifiers.
 - `interactions.ts` – bounded, claim-fenced, response-body-free human-interaction sync and view contracts.
 - `interaction-crypto.ts` – boot-scoped P-256/HKDF/AES-GCM response sealing, fixed padding, and authority-bound authenticated data.
-- `human.ts` – strict human-auth, organization, workspace, and agent-administration wire contracts.
+- `human.ts` – strict human-auth, browser desktop-pairing, organization, workspace, and agent-administration wire contracts.
 - `hra-human-wire.ts` – dedicated human-bearer HRA workspace reads, mutation intents, sealed HITL responses, invalidation polling, route builders, and route parsing.
 - `session-sync.ts`, `session-sync-wire.ts`, and `session-sync-pairing.ts` – strict encrypted summary, membership, device-presence, directory snapshot/change, pairing, quota, and authenticated relay contracts.
 - `session-sync-crypto.ts`, `session-sync-recovery.ts`, and `session-sync-recovery-crypto.ts` – non-extractable device custody, per-session AEAD, root wrapping/linking, one-use recovery authority, and retained-keyring validation.
@@ -25,6 +25,7 @@
 - Make invalid scope, state, actor, token, and error combinations unrepresentable with discriminated unions.
 - Keep token parsing total and redact full matches without preserving credential identifiers.
 - Keep human lifecycle views metadata-only: public locators and timestamps may cross the wire, but bearer verifiers and session authorization IDs may not.
+- Scope selection rotates and returns one complete human credential bound to the exact authorized user, organization, and optional workspace; never model selection as mutable bearer-session metadata.
 - Keep HITL response plaintext out of every cloud wire shape. Seal only to a non-extractable boot key, authenticate the full authority tuple and request digest, and reject any digest or context mismatch before opening.
 - Cloud-visible run display events may contain only bounded Codex reasoning-summary deltas, bounded assistant-message deltas, or content-free tool-activity state. Never add raw reasoning, commands, tool identity, arguments, output, provider IDs, or local paths to this boundary.
 - Convert every shrunk property failure into a named example regression.

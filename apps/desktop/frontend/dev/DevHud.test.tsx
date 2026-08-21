@@ -15,6 +15,18 @@ const baseStatus: DevStatusEnvelope = parseDevStatusEnvelope({
 });
 
 describe("development HUD language", () => {
+  test("mounts in the header action slot instead of covering centered chrome", async () => {
+    const [entry, styles, app] = await Promise.all([
+      Bun.file(new URL("./main.dev.tsx", import.meta.url)).text(),
+      Bun.file(new URL("./dev.css", import.meta.url)).text(),
+      Bun.file(new URL("../src/App.tsx", import.meta.url)).text(),
+    ]);
+    expect(entry).toContain("headerAccessory={<DevHud transport={transport} />}");
+    expect(app).toContain('<div className="hra-header__actions">');
+    expect(styles).toMatch(/\.hra-dev\s*\{[^}]*position:\s*relative;/su);
+    expect(styles).not.toMatch(/\.hra-dev\s*\{[^}]*position:\s*fixed;/su);
+  });
+
   test("explains the three reload lanes without backend details", () => {
     const current = devHudPresentation(
       { kind: "status", status: baseStatus },

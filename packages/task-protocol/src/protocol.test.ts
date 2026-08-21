@@ -13,6 +13,10 @@ import {
   createOpaqueId,
   createUuidV7,
   createTaskResponseSchema,
+  desktopPairingChallengeSchema,
+  desktopPairingRedeemResponseSchema,
+  desktopPairingStartResponseSchema,
+  desktopPairingVerifierSchema,
   DEFAULT_AGENT_CREDENTIAL_LIFETIME_MS,
   credentialTokenSchema,
   decodeBearerSecret,
@@ -44,6 +48,7 @@ import {
   taskctlApiRoutes,
   workspaceViewSchema,
   safeErrorMessage,
+  selectHumanScopeResponseSchema,
   uuidV7Timestamp,
   uuidV7Schema,
 } from "./index";
@@ -274,9 +279,25 @@ test("an in-progress task has exactly one claim representation", () => {
 });
 
 test("the route matrix freezes auth, session, and idempotency requirements", () => {
+  expect(taskctlApiOperations.startDesktopPairing).toMatchObject({
+    method: "POST",
+    authorization: "none",
+    idempotency: false,
+  });
+  expect(taskctlApiOperations.redeemDesktopPairing).toMatchObject({
+    method: "POST",
+    authorization: "none",
+    idempotency: false,
+  });
   expect(taskctlApiOperations.refreshAuth).toMatchObject({
     method: "POST",
     authorization: "human-refresh",
+    idempotency: false,
+  });
+  expect(taskctlApiOperations.selectHumanScope).toMatchObject({
+    method: "POST",
+    path: "/v1/auth/selection",
+    authorization: "human-account",
     idempotency: false,
   });
   expect(taskctlApiOperations.createOrganization).toMatchObject({
@@ -343,10 +364,8 @@ test("human views preserve tenant anchors and unique roles", () => {
     role: "owner",
     status: "active",
   } as const;
-  expect(organizationViewSchema.safeParse(organization).success).toBeFalse();
-  expect(
-    organizationViewSchema.safeParse({ ...organization, workosOrganizationId: "org_01LOCAL" }).success,
-  ).toBeTrue();
+  expect(organizationViewSchema.safeParse(organization).success).toBeTrue();
+  expect(organizationViewSchema.safeParse({ ...organization, providerId: "external" }).success).toBeFalse();
   const workspace = {
     id: "workspace-id",
     organizationId: "organization-id",
@@ -356,6 +375,66 @@ test("human views preserve tenant anchors and unique roles", () => {
   };
   expect(workspaceViewSchema.safeParse({ ...workspace, roles: ["planner", "planner"] }).success).toBeFalse();
   expect(workspaceViewSchema.safeParse({ ...workspace, roles: ["planner", "reviewer"] }).success).toBeTrue();
+});
+
+test("human scope selection rotates a complete credential for one exact tenant", () => {
+  const response = {
+    accessToken: "selected-access-token-that-is-long-enough",
+    refreshToken: "selected-refresh-token-that-is-long-enough",
+    user: { id: "user_stable", email: "human@example.com" },
+    organization: {
+      id: "organization-id",
+      name: "Example",
+      role: "owner",
+      status: "active",
+    },
+    workspace: {
+      id: "workspace-id",
+      organizationId: "organization-id",
+      slug: "core",
+      name: "Core",
+      taskKeyPrefix: "CORE",
+      roles: ["planner"],
+    },
+  } as const;
+  expect(selectHumanScopeResponseSchema.safeParse(response).success).toBeTrue();
+  expect(selectHumanScopeResponseSchema.safeParse({
+    organization: response.organization,
+    workspace: response.workspace,
+  }).success).toBeFalse();
+  expect(selectHumanScopeResponseSchema.safeParse({
+    ...response,
+    workspace: { ...response.workspace, organizationId: "another-organization" },
+  }).success).toBeFalse();
+});
+
+test("desktop pairing routes bind a public locator to a credential-free browser URL", () => {
+  const pairingId = "pair_00000000000000000000000000";
+  const verifier = createBearerSecret(bytes(32, 21));
+  const challenge = createBearerSecret(bytes(32, 99));
+  expect(desktopPairingVerifierSchema.parse(verifier)).toBe(verifier);
+  expect(desktopPairingChallengeSchema.parse(challenge)).toBe(challenge);
+  expect(taskctlApiRoutes.desktopPairingRedeem(pairingId)).toBe(
+    `/v1/auth/desktop-pairings/${pairingId}/redeem`,
+  );
+  expect(desktopPairingStartResponseSchema.safeParse({
+    pairingId,
+    verificationUri: `https://hra.sh/pair/desktop/${pairingId}`,
+    comparisonCode: "2345-6789",
+    expiresAt: 1_720_000_060_000,
+    pollIntervalMs: 2_000,
+  }).success).toBeTrue();
+  expect(desktopPairingStartResponseSchema.safeParse({
+    pairingId,
+    verificationUri: `https://hra.sh/pair/desktop/${pairingId}?verifier=${verifier}`,
+    comparisonCode: "2345-6789",
+    expiresAt: 1_720_000_060_000,
+    pollIntervalMs: 2_000,
+  }).success).toBeFalse();
+  expect(desktopPairingRedeemResponseSchema.safeParse({
+    status: "pending",
+    retryAfterMs: 2_000,
+  }).success).toBeTrue();
 });
 
 test("dynamic agent enrollment paths validate their route parameter", () => {

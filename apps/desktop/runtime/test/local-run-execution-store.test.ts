@@ -42,7 +42,7 @@ function executionAccount(): DispatchAccountSummary {
     selected: true,
     identityLabel: null,
     planLabel: null,
-    usageRemainingPercent: 100,
+    weeklyUsage: null,
     authState: "signedIn",
     login: { state: "idle" },
     usage: {

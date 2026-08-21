@@ -1,29 +1,24 @@
 import {
   HumanClientError,
-  loginWithWorkosDevice as loginWithPortableWorkosDevice,
-  type WorkosDeviceLoginOptions,
+  loginWithDesktopPairing as loginWithPortableDesktopPairing,
+  type DesktopPairingLoginOptions,
 } from "@hraness/hra-human-client";
 
 import { TaskctlConfigError } from "./config";
 
 export type {
-  DeviceVerification,
-  WorkosDeviceLoginOptions,
+  DesktopPairingLoginOptions,
+  DesktopPairingVerification,
 } from "@hraness/hra-human-client";
 
-export async function loginWithWorkosDevice(
-  options: WorkosDeviceLoginOptions,
-): ReturnType<typeof loginWithPortableWorkosDevice> {
+export async function loginWithDesktopPairing(
+  options: DesktopPairingLoginOptions,
+): ReturnType<typeof loginWithPortableDesktopPairing> {
   try {
-    return await loginWithPortableWorkosDevice(options);
+    return await loginWithPortableDesktopPairing(options);
   } catch (error) {
     if (error instanceof HumanClientError) {
-      throw new TaskctlConfigError(
-        error.code,
-        error.code === "VALIDATION_ERROR"
-          ? "TASKCTL_WORKOS_CLIENT_ID is invalid"
-          : error.message,
-      );
+      throw new TaskctlConfigError(error.code, error.message);
     }
     throw error;
   }

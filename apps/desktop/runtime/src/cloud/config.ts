@@ -1,15 +1,8 @@
 import { normalizeApiOrigin } from "@hraness/hra-human-client";
-import { z } from "@hra-internal/schema";
 import { renamedEnvironmentValue } from "../security/renamed-environment";
 
 export const HRA_CLOUD_API_URL_ENV = "HRA_CLOUD_API_URL";
-export const HRA_WORKOS_CLIENT_ID_ENV = "HRA_WORKOS_CLIENT_ID";
-
-const workosClientIdSchema = z
-  .string()
-  .min(1)
-  .max(512)
-  .refine((value) => !/\s/u.test(value), "WorkOS client ID cannot contain whitespace");
+export const HRA_CLOUD_WEB_URL_ENV = "HRA_CLOUD_WEB_URL";
 
 export type CloudConfigurationComponent<Value> =
   | { readonly state: "enabled"; readonly value: Value }
@@ -20,14 +13,14 @@ export type CloudConfigurationComponent<Value> =
 
 export interface HRACloudConfiguration {
   readonly api: CloudConfigurationComponent<Readonly<{ origin: string }>>;
-  readonly workos: CloudConfigurationComponent<Readonly<{ clientId: string }>>;
+  readonly web: CloudConfigurationComponent<Readonly<{ origin: string }>>;
 }
 
 export type CloudAttachmentAvailability =
   | {
       readonly state: "enabled";
       readonly apiOrigin: string;
-      readonly workosClientId: string;
+      readonly webOrigin: string;
     }
   | {
       readonly state: "disabled";
@@ -35,9 +28,9 @@ export type CloudAttachmentAvailability =
         | "api_missing"
         | "api_invalid"
         | "api_conflicting"
-        | "workos_missing"
-        | "workos_invalid"
-        | "workos_conflicting";
+        | "web_missing"
+        | "web_invalid"
+        | "web_conflicting";
     };
 
 type Environment = Readonly<Record<string, string | undefined>>;
@@ -75,28 +68,25 @@ function parseApi(
   };
 }
 
-function parseWorkos(
+function parseWeb(
   environment: Environment,
-): HRACloudConfiguration["workos"] {
-  const renamed = renamedEnvironmentValue(environment, HRA_WORKOS_CLIENT_ID_ENV);
+): HRACloudConfiguration["web"] {
+  const renamed = renamedEnvironmentValue(environment, HRA_CLOUD_WEB_URL_ENV);
   if (renamed.state === "conflicting") {
     return { state: "disabled", reason: "conflicting" };
   }
-  const values = configuredValues(environment, [
-    "TASKCTL_WORKOS_CLIENT_ID",
-    "WORKOS_CLIENT_ID",
-  ]);
+  const values: string[] = [];
   if (renamed.state === "value") values.push(renamed.value);
   if (values.length === 0) return { state: "disabled", reason: "missing" };
-  const parsed = values.map((value) => workosClientIdSchema.safeParse(value));
-  if (parsed.some((value) => !value.success)) {
+  const normalized = values.map(normalizeApiOrigin);
+  if (normalized.some((value) => value === null)) {
     return { state: "disabled", reason: "invalid" };
   }
-  const clientIds = new Set(parsed.map((value) => value.success ? value.data : ""));
-  if (clientIds.size !== 1) return { state: "disabled", reason: "conflicting" };
+  const origins = new Set(normalized as readonly string[]);
+  if (origins.size !== 1) return { state: "disabled", reason: "conflicting" };
   return {
     state: "enabled",
-    value: { clientId: [...clientIds][0] as string },
+    value: { origin: [...origins][0] as string },
   };
 }
 
@@ -109,7 +99,7 @@ export function parseHRACloudConfiguration(
 ): HRACloudConfiguration {
   return {
     api: parseApi(environment),
-    workos: parseWorkos(environment),
+    web: parseWeb(environment),
   };
 }
 
@@ -122,15 +112,15 @@ export function cloudAttachmentAvailability(
       reason: `api_${configuration.api.reason}`,
     };
   }
-  if (configuration.workos.state === "disabled") {
+  if (configuration.web.state === "disabled") {
     return {
       state: "disabled",
-      reason: `workos_${configuration.workos.reason}`,
+      reason: `web_${configuration.web.reason}`,
     };
   }
   return {
     state: "enabled",
     apiOrigin: configuration.api.value.origin,
-    workosClientId: configuration.workos.value.clientId,
+    webOrigin: configuration.web.value.origin,
   };
 }

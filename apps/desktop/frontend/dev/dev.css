@@ -1,11 +1,10 @@
 .hra-dev {
-  position: fixed;
+  position: relative;
   z-index: 40;
-  top: 0.68rem;
-  left: 50%;
+  min-width: 0;
+  flex: 0 0 auto;
   color: var(--foreground);
   font-size: 0.72rem;
-  transform: translateX(-50%);
 }
 
 .hra-dev__pill {
@@ -57,10 +56,9 @@
 .hra-dev__panel {
   position: absolute;
   top: calc(100% + 0.48rem);
-  left: 50%;
+  right: 0;
   width: min(21rem, calc(100vw - 1.5rem));
   padding: 0.9rem;
-  transform: translateX(-50%);
   border: 1px solid var(--line);
   border-radius: 0.72rem;
   background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
@@ -133,16 +131,8 @@
 }
 
 @media (max-width: 520px) {
-  .hra-dev {
-    right: 3.2rem;
-    left: auto;
-    transform: none;
-  }
-
-  .hra-dev__panel {
-    right: -2.45rem;
-    left: auto;
-    transform: none;
+  .hra-header__actions:has(.new-pane-button-shell) .hra-dev__panel {
+    right: calc(-1 * (max(1.85rem, var(--interactive-min-height)) + 0.35rem));
   }
 }
 

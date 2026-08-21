@@ -14,6 +14,7 @@ import {
   canStartHumanSignIn,
   humanAccountDescription,
   humanAccountStatus,
+  weeklyUsageStatus,
 } from "./SubscriptionsSettings";
 
 test("settings stays lean and limits account setup to the browser sign-in flow", async () => {
@@ -30,10 +31,10 @@ test("settings stays lean and limits account setup to the browser sign-in flow",
   expect(html).toContain("Add subscription");
   expect(html).not.toContain(">Add subscription<");
   expect(html).toContain("HRA Cloud");
-  expect(html).toContain("Sign in to HRA Cloud");
+  expect(html).toContain("Pair this Mac");
   expect(html).toContain("This build does not have an HRA Cloud endpoint configured.");
   expect(html).toMatch(
-    /<button(?=[^>]*aria-label="Sign in to HRA Cloud")(?=[^>]*disabled="")[^>]*>/u,
+    /<button(?=[^>]*aria-label="Pair this Mac with HRA Cloud")(?=[^>]*disabled="")[^>]*>/u,
   );
   expect(source).toContain("<Button");
   expect(html).not.toContain("Text size");
@@ -49,9 +50,12 @@ test("settings stays lean and limits account setup to the browser sign-in flow",
   expect(source).not.toContain('mode: "deviceCode"');
   expect(source).not.toContain("userCode");
   expect(source).not.toContain("<code>");
+  expect(source).toContain("Comparison code");
+  expect(source).toContain("Continue in browser");
+  expect(source).toContain("Pair this Mac");
 });
 
-test("signed-in subscription status joins email and numeric remaining usage", () => {
+test("signed-in subscription item shows weekly remaining usage and its reset time", async () => {
   const account = {
     id: "acct_example01",
     revision: 1,
@@ -59,19 +63,32 @@ test("signed-in subscription status joins email and numeric remaining usage", ()
     selected: true,
     identityLabel: "builder@example.test",
     planLabel: "Pro",
-    usageRemainingPercent: 42.6,
+    weeklyUsage: {
+      remainingPercent: 42.6,
+      resetsAt: "2026-08-21T20:00:00.000Z",
+    },
     authState: "signedIn",
     login: { state: "idle" },
     runtime: { state: "ready", generation: 1 },
   } satisfies AccountSummary;
 
-  expect(accountStatus(account)).toBe("builder@example.test · 43% remaining");
-  expect(accountStatus({ ...account, usageRemainingPercent: null })).toBe(
-    "builder@example.test",
+  const formatter = {
+    format: () => "Fri, Aug 21, 8:00 PM UTC",
+  } satisfies Pick<Intl.DateTimeFormat, "format">;
+  expect(accountStatus(account)).toBe("builder@example.test");
+  expect(weeklyUsageStatus(account.weeklyUsage, formatter)).toBe(
+    "43% weekly remaining · Resets Fri, Aug 21, 8:00 PM UTC",
   );
-  expect(accountStatus({ ...account, usageRemainingPercent: undefined })).toBe(
-    "builder@example.test",
-  );
+  expect(weeklyUsageStatus(null, formatter)).toBeNull();
+
+  const source = await Bun.file(new URL("./SubscriptionsSettings.tsx", import.meta.url)).text();
+  expect(source).toContain("weeklyUsageStatus(account.weeklyUsage)");
+  expect(source).not.toContain("windowDurationMins");
+  expect(source).not.toContain("codex_other");
+  expect(accountStatus({
+    authState: account.authState,
+    identityLabel: account.identityLabel,
+  })).toBe("builder@example.test");
 });
 
 test("HRA Cloud explains unavailable and usable endpoint states", () => {
@@ -99,7 +116,7 @@ test("a credential from another configured cloud has an exact clear path", async
     retryable: false,
     profile: {
       user: {
-        id: "user_LOCAL",
+        id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         email: "builder@example.test",
         name: null,
       },
@@ -156,7 +173,7 @@ test("credential recovery uses revision-scoped two-step consent and a non-destru
     revision: 5,
     profile: {
       user: {
-        id: "user_LOCAL",
+        id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         email: "builder@example.test",
         name: null,
       },

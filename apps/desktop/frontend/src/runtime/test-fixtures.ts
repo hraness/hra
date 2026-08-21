@@ -17,7 +17,7 @@ export function fixtureAccount(overrides: Partial<AccountSummary> = {}): Account
     selected: true,
     identityLabel: "builder@example.com",
     planLabel: "pro",
-    usageRemainingPercent: null,
+    weeklyUsage: null,
     authState: "signedIn",
     login: { state: "idle" },
     runtime: { state: "ready", generation: 1 },

@@ -169,9 +169,17 @@ body,
   justify-self: start;
 }
 
+.hra-header__actions {
+  display: flex;
+  min-width: 0;
+  grid-column: 3;
+  align-items: center;
+  gap: 0.35rem;
+  justify-self: end;
+}
+
 .new-pane-button-shell,
 .hra-header__spacer {
-  grid-column: 3;
   justify-self: end;
 }
 
@@ -1312,6 +1320,21 @@ body,
 
 .settings-inline-confirmation .subscription-actions {
   flex: 0 0 auto;
+}
+
+.settings-pairing-code {
+  display: inline-grid;
+  gap: 0.25rem;
+  margin-top: 0.75rem;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.settings-pairing-code strong {
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 1rem;
+  letter-spacing: 0.08em;
 }
 
 .subscription-list .settings-error {

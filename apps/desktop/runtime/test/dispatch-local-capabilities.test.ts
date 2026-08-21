@@ -22,9 +22,7 @@ function account(
     selected,
     identityLabel: null,
     planLabel: null,
-    usageRemainingPercent: usedPercents === null
-      ? null
-      : 100 - Math.max(...usedPercents),
+    weeklyUsage: null,
     authState: "signedIn",
     login: { state: "idle" },
     usage: usedPercents === null

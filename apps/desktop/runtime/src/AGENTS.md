@@ -3,6 +3,7 @@
 
 - `main.ts` – compiled private-stdio gateway entrypoint, account-service initialization, snapshots, dispatch, and lifecycle integration.
 - `package-smoke.ts` – isolated packaged-runtime identity probe used only by the bounded native release smoke.
+- `development-reload.ts` and `development-isolation.ts` – authenticated hot-reload admission plus raw-Debug Application Support and Keychain namespace isolation.
 - `host-protocol.ts` – narrow Native host request/response envelope parsing, renderer dispatch separation, and the private path-bearing project-onboarding capability.
 - `app-server-process.ts` – real child-process lifecycle wired through the generation-scoped pinned Codex protocol.
 - `codex/facts.ts`, `codex/fact-projector.ts`, and `codex/fact-router.ts` – the sole parsed-notification-to-owned-fact path and explicit account/session fan-out.
@@ -13,7 +14,7 @@
 - `chat/` – durable app-owned pane state, renderer-safe projection, per-pane command admission, model capability checks, and pre-turn account routing.
 - `attachments/` – private chunked upload vault, native image normalization, provider-delivery leases, verified previews, crash reconciliation, and privacy cleanup.
 - `dispatch/` – outbound cloud presence, claims, fences, capacity, worktree/Codex coordination, semantic outbox, and revocation.
-- `cloud/` – optional WorkOS human-account custody, strict HRA HTTP transport, local/cloud authority routing, invalidation polling, and sealed interaction replies.
+- `cloud/` – optional Convex human-account pairing and custody, strict HRA HTTP transport, local/cloud authority routing, invalidation polling, and sealed interaction replies.
 - `promotion/` – frozen local-to-cloud snapshots, receipt-backed transfer and recovery, activation, cleanup, and post-activation runner pairing.
 - `tasks/` – bounded boot-fenced local due-work scheduling and provider-neutral system-command admission.
 - `workspaces/` – trusted local project onboarding, canonical repository inspection, and app-owned managed-worktree provisioning through bundled Git.

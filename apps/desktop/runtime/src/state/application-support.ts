@@ -43,6 +43,8 @@ const historicalOprteDirectoryName = "Oprte";
 const historicalOperateDevelopmentDirectoryName = "OPeRaTE";
 const predecessorDirectoryName = "Kitchen";
 const legacyDevelopmentDirectoryName = "Hraness Kitchen Development";
+export const isolatedDevelopmentApplicationSupportDirectoryName =
+  "HRA Source Development";
 const predecessorPrimaryDirectoryName = "Hraness Kitchen";
 const migrationReceiptFileName = ".oprte-application-support-migration-v2.json";
 const migrationStageDirectoryName = ".oprte-application-support-migration-v2.stage";
@@ -212,7 +214,20 @@ export class ApplicationSupportMigrationError extends Error {
   }
 }
 
-export class ApplicationSupportStartup {
+export interface ApplicationSupportStartupAuthority {
+  readonly root: string;
+  readonly initialState: ApplicationSupportMigrationState["kind"];
+  readonly activated: boolean;
+  readonly migratedFromRoot: string | null;
+  hasControlPlaneDatabase(): boolean;
+  prepareTargetRoot(): void;
+  preserveForwardOnlyForRetry(): void;
+  activate(): void;
+  rollbackBeforeActivation(): boolean;
+}
+
+export class ApplicationSupportStartup
+  implements ApplicationSupportStartupAuthority {
   readonly root: string;
   readonly initialState: ApplicationSupportMigrationState["kind"];
   readonly #options: ApplicationSupportMigrationOptions;
@@ -393,6 +408,53 @@ export class ApplicationSupportStartup {
   }
 }
 
+class IsolatedDevelopmentApplicationSupportStartup
+  implements ApplicationSupportStartupAuthority {
+  readonly root: string;
+  readonly initialState: "neither" | "targetOnly";
+  #activated = false;
+
+  constructor(root: string) {
+    this.root = root;
+    this.initialState = readMetadata(root) === null ? "neither" : "targetOnly";
+  }
+
+  get activated(): boolean {
+    return this.#activated;
+  }
+
+  get migratedFromRoot(): null {
+    return null;
+  }
+
+  hasControlPlaneDatabase(): boolean {
+    return protectedFileMetadata(join(this.root, "control-plane.sqlite")) !== null;
+  }
+
+  prepareTargetRoot(): void {
+    ensureDirectDirectory(
+      this.root,
+      isolatedDevelopmentApplicationSupportDirectoryName,
+    );
+    validateOwnedTree(this.root);
+    verifyControlPlaneCutover(this.root, {});
+  }
+
+  preserveForwardOnlyForRetry(): void {
+    // This root never enters a forward-only production migration.
+  }
+
+  activate(): void {
+    assertOwnedDirectory(this.root, "development target");
+    validateOwnedTree(this.root);
+    this.#activated = true;
+  }
+
+  rollbackBeforeActivation(): boolean {
+    return false;
+  }
+}
+
 type RootState =
   | Readonly<{ kind: "missing" }>
   | Readonly<{ kind: "directory"; metadata: Stats }>
@@ -424,6 +486,32 @@ export function applicationSupportPaths(homeDirectory: string): ApplicationSuppo
 
 export function applicationSupportRoot(homeDirectory: string): string {
   return applicationSupportPaths(homeDirectory).target;
+}
+
+export function isolatedDevelopmentApplicationSupportRoot(
+  homeDirectory: string,
+): string {
+  if (!isAbsolute(homeDirectory) || homeDirectory === parse(homeDirectory).root) {
+    throw new Error("HOME must be an absolute user directory");
+  }
+  return join(
+    homeDirectory,
+    "Library",
+    "Application Support",
+    isolatedDevelopmentApplicationSupportDirectoryName,
+  );
+}
+
+/**
+ * Raw source development owns a fresh root that has no migration relationship
+ * with the signed product's OPRTE authority or any historical production root.
+ */
+export function prepareIsolatedDevelopmentApplicationSupport(
+  homeDirectory: string,
+): ApplicationSupportStartupAuthority {
+  const root = isolatedDevelopmentApplicationSupportRoot(homeDirectory);
+  ensureApplicationSupportParent(dirname(root));
+  return new IsolatedDevelopmentApplicationSupportStartup(root);
 }
 
 export function inspectApplicationSupportMigration(

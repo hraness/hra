@@ -64,19 +64,26 @@ function signedInStore(): HumanAuthenticationStore {
   const snapshot = humanAuthenticationSnapshotSchema.parse({
     generation: 1,
     authentication: {
-      version: 1,
+      version: 2,
       apiUrl: "https://oprte.example.com",
       accessToken: HUMAN_TOKEN,
       refreshToken: "human-refresh-token-that-remains-in-custody",
       user: {
-        id: "user_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         email: "chef@example.com",
+      },
+      organization: {
+        id: "org_oprte",
+        name: "OPRTE",
+        role: "owner",
+        status: "active",
       },
     },
   });
   return {
     read: () => Promise.resolve(snapshot),
     compareAndSwap: () => Promise.resolve(null),
+    preserveForRecovery: () => Promise.resolve(false),
     clear: () => Promise.resolve(false),
   };
 }

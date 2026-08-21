@@ -203,6 +203,7 @@ extern fn hra_macos_run_attested_account_profile_operation(
     deletion_nonce: ?[*]const u8,
     deletion_nonce_length: usize,
     expected_revision: u64,
+    source_development: bool,
     timeout_milliseconds: u32,
 ) bool;
 extern fn hra_macos_prepare_attested_account_profile_operations() void;
@@ -384,8 +385,10 @@ pub const PathOptions = struct {
     codex_bin: ?[]const u8 = null,
     git_root: ?[]const u8 = null,
     git_bin: ?[]const u8 = null,
+    git_executor_path: ?[]const u8 = null,
     data_remover_path: ?[]const u8 = null,
     keychain_custodian_path: ?[]const u8 = null,
+    image_normalizer_path: ?[]const u8 = null,
 };
 
 pub const RuntimePaths = struct {
@@ -394,8 +397,10 @@ pub const RuntimePaths = struct {
     codex_bin: []u8,
     git_root: []u8,
     git_bin: []u8,
+    git_executor_path: []u8,
     data_remover_path: []u8,
     keychain_custodian_path: []u8,
+    image_normalizer_path: []u8,
 
     pub fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
         allocator.free(self.runtime_root);
@@ -403,8 +408,10 @@ pub const RuntimePaths = struct {
         allocator.free(self.codex_bin);
         allocator.free(self.git_root);
         allocator.free(self.git_bin);
+        allocator.free(self.git_executor_path);
         allocator.free(self.data_remover_path);
         allocator.free(self.keychain_custodian_path);
+        allocator.free(self.image_normalizer_path);
         self.* = undefined;
     }
 };
@@ -477,6 +484,13 @@ fn resolveRuntimePathsForExecutable(
             "OPRTE_GIT_BIN",
             "KITCHEN_GIT_BIN",
         ),
+        .git_executor_path = options.git_executor_path orelse
+            try renamedEnvironmentValue(
+                parent,
+                "HRA_GIT_EXECUTOR_PATH",
+                "OPRTE_GIT_EXECUTOR_PATH",
+                "KITCHEN_GIT_EXECUTOR_PATH",
+            ),
         .data_remover_path = options.data_remover_path orelse
             try renamedEnvironmentValue(
                 parent,
@@ -490,6 +504,13 @@ fn resolveRuntimePathsForExecutable(
                 "HRA_KEYCHAIN_CUSTODIAN_PATH",
                 "OPRTE_KEYCHAIN_CUSTODIAN_PATH",
                 "KITCHEN_KEYCHAIN_CUSTODIAN_PATH",
+            ),
+        .image_normalizer_path = options.image_normalizer_path orelse
+            try renamedEnvironmentValue(
+                parent,
+                "HRA_IMAGE_NORMALIZER_PATH",
+                "OPRTE_IMAGE_NORMALIZER_PATH",
+                "KITCHEN_IMAGE_NORMALIZER_PATH",
             ),
     });
 }
@@ -525,8 +546,10 @@ const ToolOverrides = struct {
     codex_bin: ?[]const u8 = null,
     git_root: ?[]const u8 = null,
     git_bin: ?[]const u8 = null,
+    git_executor_path: ?[]const u8 = null,
     data_remover_path: ?[]const u8 = null,
     keychain_custodian_path: ?[]const u8 = null,
+    image_normalizer_path: ?[]const u8 = null,
 };
 
 fn runtimePathsFromRoot(
@@ -562,6 +585,15 @@ fn runtimePathsFromRoot(
         try joinAbsolute(allocator, &.{ paths.git_root, "bin", "git" });
     errdefer allocator.free(paths.git_bin);
 
+    paths.git_executor_path = if (overrides.git_executor_path) |path|
+        try normalizedAbsolute(allocator, path)
+    else
+        try joinAbsolute(
+            allocator,
+            &.{ paths.runtime_root, "bin", "oprte-git-executor" },
+        );
+    errdefer allocator.free(paths.git_executor_path);
+
     paths.data_remover_path = if (overrides.data_remover_path) |path|
         try normalizedAbsolute(allocator, path)
     else
@@ -587,6 +619,15 @@ fn runtimePathsFromRoot(
             },
         );
     errdefer allocator.free(paths.keychain_custodian_path);
+
+    paths.image_normalizer_path = if (overrides.image_normalizer_path) |path|
+        try normalizedAbsolute(allocator, path)
+    else
+        try joinAbsolute(
+            allocator,
+            &.{ paths.runtime_root, "bin", "hra-image-normalizer" },
+        );
+    errdefer allocator.free(paths.image_normalizer_path);
 
     return paths;
 }
@@ -625,22 +666,23 @@ const inherited_environment_keys = [_][]const u8{
     "TZ",
 };
 
-const development_cloud_environment_keys = [_][]const u8{
-    // Development and automation may select an exact local or hosted fixture.
+const automation_cloud_environment_keys = [_][]const u8{
+    // Automation may select an exact local or hosted fixture. Raw source
+    // development is intentionally cloud-detached so its ad-hoc executable
+    // identity can never reach production credential custody or journals.
     // Preserve compatibility names so the TypeScript boundary can reject
     // conflicts instead of Native silently choosing one.
     "HRA_CLOUD_API_URL",
     "OPRTE_CLOUD_API_URL",
     "TASKCTL_API_URL",
-    "HRA_WORKOS_CLIENT_ID",
-    "OPRTE_WORKOS_CLIENT_ID",
-    "TASKCTL_WORKOS_CLIENT_ID",
-    "WORKOS_CLIENT_ID",
+    "HRA_CLOUD_WEB_URL",
+    "OPRTE_CLOUD_WEB_URL",
+    "KITCHEN_CLOUD_WEB_URL",
 };
 
 pub const PublicCloudConfiguration = struct {
     api_origin: []const u8,
-    workos_client_id: []const u8,
+    web_origin: []const u8,
 };
 
 /// Constructs the sidecar's complete environment instead of cloning the app's
@@ -662,15 +704,16 @@ pub fn buildSanitizedEnvironment(
         if (parent.get(key)) |value| try environment.put(key, value);
     }
     switch (profile) {
-        .development, .automation => for (development_cloud_environment_keys) |key| {
+        .development => {},
+        .automation => for (automation_cloud_environment_keys) |key| {
             if (parent.get(key)) |value| try environment.put(key, value);
         },
         .production => if (production_cloud) |configuration| {
             // Release builds use checked public coordinates. An ambient shell
             // environment cannot redirect a packaged app to another relay or
-            // identity client.
+            // browser control plane.
             try environment.put("HRA_CLOUD_API_URL", configuration.api_origin);
-            try environment.put("HRA_WORKOS_CLIENT_ID", configuration.workos_client_id);
+            try environment.put("HRA_CLOUD_WEB_URL", configuration.web_origin);
         },
     }
 
@@ -684,9 +727,14 @@ pub fn buildSanitizedEnvironment(
     try environment.put("HRA_CODEX_BIN", paths.codex_bin);
     try environment.put("HRA_GIT_ROOT", paths.git_root);
     try environment.put("HRA_GIT_BIN", paths.git_bin);
+    try environment.put("HRA_GIT_EXECUTOR_PATH", paths.git_executor_path);
     try environment.put(
         "HRA_DATA_REMOVER_PATH",
         paths.data_remover_path,
+    );
+    try environment.put(
+        "HRA_IMAGE_NORMALIZER_PATH",
+        paths.image_normalizer_path,
     );
 
     const gateway_dir = std.fs.path.dirname(paths.gateway_path) orelse paths.runtime_root;
@@ -3081,6 +3129,10 @@ fn encodeProjectionOverflowEvent(allocator: std.mem.Allocator, sequence: u64) st
 pub const Options = struct {
     paths: PathOptions = .{},
     bridge_profile: BridgeProfile = .production,
+    /// Gateway storage/cloud classification. When omitted it follows the
+    /// renderer bridge profile; raw Debug hosts set it explicitly so bundled
+    /// UI launches remain cloud-detached without opening the Vite origin.
+    runtime_profile: ?BridgeProfile = null,
     production_cloud: ?PublicCloudConfiguration = null,
     shutdown_grace_ms: u16 = 500,
     directory_picker: ?DirectoryPicker = null,
@@ -3092,6 +3144,10 @@ pub const Options = struct {
     max_recovery_attempts: u8 = default_max_recovery_attempts,
     recovery_backoff_ms: u16 = default_recovery_backoff_ms,
 };
+
+fn resolvedRuntimeProfile(options: *const Options) BridgeProfile {
+    return options.runtime_profile orelse options.bridge_profile;
+}
 
 pub const HarnessCustodyHelperResult = union(enum) {
     envelope_read: HarnessCustodyValue,
@@ -3520,6 +3576,65 @@ fn productionAccountProfileOperation(
     deletion_nonce: ?[]const u8,
     expected_revision: u64,
 ) bool {
+    return runAttestedAccountProfileOperation(
+        false,
+        context,
+        helper_path,
+        action,
+        control_plane_path,
+        account_profile_id,
+        state_root_device,
+        state_root_inode,
+        control_plane_device,
+        control_plane_inode,
+        deletion_nonce,
+        expected_revision,
+    );
+}
+
+fn sourceDevelopmentAccountProfileOperation(
+    context: ?*anyopaque,
+    helper_path: []const u8,
+    action: []const u8,
+    control_plane_path: []const u8,
+    account_profile_id: []const u8,
+    state_root_device: []const u8,
+    state_root_inode: []const u8,
+    control_plane_device: []const u8,
+    control_plane_inode: []const u8,
+    deletion_nonce: ?[]const u8,
+    expected_revision: u64,
+) bool {
+    return runAttestedAccountProfileOperation(
+        true,
+        context,
+        helper_path,
+        action,
+        control_plane_path,
+        account_profile_id,
+        state_root_device,
+        state_root_inode,
+        control_plane_device,
+        control_plane_inode,
+        deletion_nonce,
+        expected_revision,
+    );
+}
+
+fn runAttestedAccountProfileOperation(
+    source_development: bool,
+    context: ?*anyopaque,
+    helper_path: []const u8,
+    action: []const u8,
+    control_plane_path: []const u8,
+    account_profile_id: []const u8,
+    state_root_device: []const u8,
+    state_root_inode: []const u8,
+    control_plane_device: []const u8,
+    control_plane_inode: []const u8,
+    deletion_nonce: ?[]const u8,
+    expected_revision: u64,
+) bool {
     _ = context;
     if (comptime !std.mem.eql(u8, build_options.platform, "macos")) {
         return false;
@@ -3546,6 +3661,7 @@ fn productionAccountProfileOperation(
         deletion_nonce_pointer,
         if (deletion_nonce) |nonce| nonce.len else 0,
         expected_revision,
+        source_development,
         if (std.mem.eql(u8, action, "ensure"))
             account_profile_ensure_helper_timeout_ms
         else
@@ -3565,6 +3681,16 @@ const production_account_profile_runner: AccountProfileOperationRunner = .{
     .run_fn = productionAccountProfileOperation,
     .cancel_fn = cancelProductionAccountProfileOperation,
 };
+
+const source_development_account_profile_runner: AccountProfileOperationRunner = .{
+    .context = null,
+    .run_fn = sourceDevelopmentAccountProfileOperation,
+    .cancel_fn = cancelProductionAccountProfileOperation,
+};
+
+pub fn isolatedDevelopmentAccountProfileRunner() AccountProfileOperationRunner {
+    return source_development_account_profile_runner;
+}
 
 fn harnessInstallEnvelopeSHA256(
     value: []const u8,
@@ -4056,6 +4182,39 @@ const production_harness_custody_runner: HarnessCustodyHelperRunner = .{
     .run_fn = productionHarnessCustodyOperation,
     .cancel_fn = cancelProductionHarnessCustodyOperation,
 };
+
+fn rejectIsolatedDevelopmentHarnessCustodyOperation(
+    context: ?*anyopaque,
+    helper_path: []const u8,
+    action: HarnessCustodyHelperAction,
+    value: ?[]const u8,
+    timeout_milliseconds: u32,
+    output: *HarnessCustodyHelperResult,
+) bool {
+    _ = context;
+    _ = helper_path;
+    _ = action;
+    _ = value;
+    _ = timeout_milliseconds;
+    _ = output;
+    return false;
+}
+
+fn ignoreIsolatedDevelopmentHarnessCustodyCancellation(
+    context: ?*anyopaque,
+) void {
+    _ = context;
+}
+
+const isolated_development_harness_custody_runner: HarnessCustodyHelperRunner = .{
+    .context = null,
+    .run_fn = rejectIsolatedDevelopmentHarnessCustodyOperation,
+    .cancel_fn = ignoreIsolatedDevelopmentHarnessCustodyCancellation,
+};
+
+pub fn isolatedDevelopmentHarnessCustodyRunner() HarnessCustodyHelperRunner {
+    return isolated_development_harness_custody_runner;
+}
 
 fn parseLegacyHarnessCustodyResponse(
     delete_action: bool,
@@ -5431,6 +5590,10 @@ pub const RuntimeHost = struct {
         };
     }
 
+    fn runtimeProfile(self: *const RuntimeHost) BridgeProfile {
+        return resolvedRuntimeProfile(&self.options);
+    }
+
     pub fn dispatcher(self: *RuntimeHost) native_sdk.bridge.Dispatcher {
         self.handlers[0] = .{
             .name = snapshot_command,
@@ -5555,7 +5718,7 @@ pub const RuntimeHost = struct {
             self.allocator,
             self.parent_environment,
             &paths,
-            self.options.bridge_profile,
+            self.runtimeProfile(),
             self.options.production_cloud,
         );
         defer environment.deinit();
@@ -5631,10 +5794,12 @@ pub const RuntimeHost = struct {
         self.reader_delivery_ready.store(false, .release);
         self.account_profile_finished.store(false, .release);
         self.harness_custody_finished.store(false, .release);
-        if (self.options.account_profile_runner == null) {
-            if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
-                hra_macos_prepare_attested_account_profile_operations();
-            }
+        if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
+            // Both product and isolated source-development account-profile
+            // helpers share this generation-scoped cancellation fence. The
+            // selected runner still pins which Application Support root the
+            // helper may open.
+            hra_macos_prepare_attested_account_profile_operations();
         }
         if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
             if (self.options.harness_custody_runner == null) {
@@ -10737,6 +10902,14 @@ test "packaged runtime paths ignore every executable and root override" {
     try parent.put("HRA_CODEX_BIN", "/tmp/untrusted/codex");
     try parent.put("HRA_GIT_ROOT", "/tmp/untrusted/git");
     try parent.put("HRA_GIT_BIN", "/tmp/untrusted/git/bin/git");
+    try parent.put(
+        "HRA_GIT_EXECUTOR_PATH",
+        "/tmp/untrusted/bin/oprte-git-executor",
+    );
+    try parent.put(
+        "HRA_IMAGE_NORMALIZER_PATH",
+        "/tmp/untrusted/bin/hra-image-normalizer",
+    );
 
     var paths = try resolveRuntimePathsForExecutable(std.testing.allocator, &parent, .{
         .runtime_root = "/tmp/explicit/runtime",
@@ -10744,6 +10917,8 @@ test "packaged runtime paths ignore every executable and root override" {
         .codex_bin = "/tmp/explicit/codex",
         .git_root = "/tmp/explicit/git",
         .git_bin = "/tmp/explicit/git/bin/git",
+        .git_executor_path = "/tmp/explicit/bin/oprte-git-executor",
+        .image_normalizer_path = "/tmp/explicit/bin/hra-image-normalizer",
     }, "/Applications/HRA.app/Contents/MacOS/hra");
     defer paths.deinit(std.testing.allocator);
 
@@ -10753,12 +10928,20 @@ test "packaged runtime paths ignore every executable and root override" {
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git", paths.git_root);
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git/bin/git", paths.git_bin);
     try std.testing.expectEqualStrings(
+        "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-git-executor",
+        paths.git_executor_path,
+    );
+    try std.testing.expectEqualStrings(
         "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-data-remover",
         paths.data_remover_path,
     );
     try std.testing.expectEqualStrings(
         testing_keychain_custodian_path,
         paths.keychain_custodian_path,
+    );
+    try std.testing.expectEqualStrings(
+        "/Applications/HRA.app/Contents/Resources/runtime/bin/hra-image-normalizer",
+        paths.image_normalizer_path,
     );
 }
 
@@ -10790,12 +10973,22 @@ test "development path overrides are explicit and independently preserved" {
     try parent.put("HRA_CODEX_BIN", "/opt/codex/codex");
     try parent.put("HRA_GIT_ROOT", "/opt/git-runtime");
     try parent.put("HRA_GIT_BIN", "/opt/git-runtime/libexec/git");
+    try parent.put(
+        "HRA_GIT_EXECUTOR_PATH",
+        "/opt/runtime/bin/oprte-git-executor",
+    );
+    try parent.put(
+        "HRA_IMAGE_NORMALIZER_PATH",
+        "/opt/runtime/bin/hra-image-normalizer",
+    );
 
     var paths = try resolveRuntimePathsForExecutable(std.testing.allocator, &parent, .{
         .gateway_path = "/tmp/explicit-runtime/bin/oprte-gateway",
         .codex_bin = "/tmp/explicit-codex/codex",
         .git_root = "/tmp/explicit-git",
         .git_bin = "/tmp/explicit-git/libexec/git",
+        .git_executor_path = "/tmp/explicit/bin/oprte-git-executor",
+        .image_normalizer_path = "/tmp/explicit/bin/hra-image-normalizer",
     }, "/tmp/hra-tests/zig-out/bin/hra-test");
     defer paths.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/tmp/explicit-runtime", paths.runtime_root);
@@ -10803,6 +10996,14 @@ test "development path overrides are explicit and independently preserved" {
     try std.testing.expectEqualStrings("/tmp/explicit-codex/codex", paths.codex_bin);
     try std.testing.expectEqualStrings("/tmp/explicit-git", paths.git_root);
     try std.testing.expectEqualStrings("/tmp/explicit-git/libexec/git", paths.git_bin);
+    try std.testing.expectEqualStrings(
+        "/tmp/explicit/bin/oprte-git-executor",
+        paths.git_executor_path,
+    );
+    try std.testing.expectEqualStrings(
+        "/tmp/explicit/bin/hra-image-normalizer",
+        paths.image_normalizer_path,
+    );
 }
 
 test "non-bundle execution requires an explicit development runtime" {
@@ -10867,7 +11068,7 @@ test "development path overrides treat empty renamed values as absent" {
     );
 }
 
-test "sidecar environment is allowlisted and pins runtime tools" {
+test "raw development sidecar is cloud detached while pinning runtime tools" {
     var parent: std.process.Environ.Map = .init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("HOME", "/Users/tester");
@@ -10876,10 +11077,8 @@ test "sidecar environment is allowlisted and pins runtime tools" {
     try parent.put("HRA_CLOUD_API_URL", "https://hra.example.com");
     try parent.put("OPRTE_CLOUD_API_URL", "https://hra.example.com");
     try parent.put("TASKCTL_API_URL", "https://compat.example.com");
-    try parent.put("HRA_WORKOS_CLIENT_ID", "client_public-current");
-    try parent.put("OPRTE_WORKOS_CLIENT_ID", "client_public-current");
-    try parent.put("TASKCTL_WORKOS_CLIENT_ID", "client_public-compat");
-    try parent.put("WORKOS_CLIENT_ID", "client_public-legacy");
+    try parent.put("HRA_CLOUD_WEB_URL", "https://app.hra.example.com");
+    try parent.put("OPRTE_CLOUD_WEB_URL", "https://app.hra.example.com");
     try parent.put("GITHUB_TOKEN", "must-not-leak");
     try parent.put("SSH_AUTH_SOCK", "/tmp/agent.sock");
     try parent.put("DYLD_INSERT_LIBRARIES", "/tmp/inject.dylib");
@@ -10901,20 +11100,63 @@ test "sidecar environment is allowlisted and pins runtime tools" {
     try std.testing.expect(environment.get("HOME") == null);
     try std.testing.expect(environment.get("CFFIXED_USER_HOME") == null);
     try std.testing.expectEqualStrings("en_US.UTF-8", environment.get("LANG").?);
-    try std.testing.expectEqualStrings("https://hra.example.com", environment.get("HRA_CLOUD_API_URL").?);
-    try std.testing.expectEqualStrings("https://hra.example.com", environment.get("OPRTE_CLOUD_API_URL").?);
-    try std.testing.expectEqualStrings("https://compat.example.com", environment.get("TASKCTL_API_URL").?);
-    try std.testing.expectEqualStrings("client_public-current", environment.get("OPRTE_WORKOS_CLIENT_ID").?);
-    try std.testing.expectEqualStrings("client_public-compat", environment.get("TASKCTL_WORKOS_CLIENT_ID").?);
-    try std.testing.expectEqualStrings("client_public-legacy", environment.get("WORKOS_CLIENT_ID").?);
+    try std.testing.expect(environment.get("HRA_CLOUD_API_URL") == null);
+    try std.testing.expect(environment.get("OPRTE_CLOUD_API_URL") == null);
+    try std.testing.expect(environment.get("TASKCTL_API_URL") == null);
+    try std.testing.expect(environment.get("HRA_CLOUD_WEB_URL") == null);
+    try std.testing.expect(environment.get("OPRTE_CLOUD_WEB_URL") == null);
     try std.testing.expectEqualStrings("/opt/hra/runtime/bin/oprte-gateway", environment.get("HRA_GATEWAY_PATH").?);
     try std.testing.expectEqualStrings("/opt/hra/runtime/codex/bin/codex", environment.get("HRA_CODEX_BIN").?);
+    try std.testing.expectEqualStrings(
+        "/opt/hra/runtime/bin/oprte-git-executor",
+        environment.get("HRA_GIT_EXECUTOR_PATH").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/opt/hra/runtime/bin/hra-image-normalizer",
+        environment.get("HRA_IMAGE_NORMALIZER_PATH").?,
+    );
     try std.testing.expect(environment.get("OPRTE_GATEWAY_PATH") == null);
     try std.testing.expect(environment.get("OPRTE_CODEX_BIN") == null);
     try std.testing.expect(environment.get("GITHUB_TOKEN") == null);
     try std.testing.expect(environment.get("SSH_AUTH_SOCK") == null);
     try std.testing.expect(environment.get("DYLD_INSERT_LIBRARIES") == null);
     try std.testing.expect(environment.get("NODE_OPTIONS") == null);
+}
+
+test "automation sidecar may receive explicit fixture cloud coordinates" {
+    var parent: std.process.Environ.Map = .init(std.testing.allocator);
+    defer parent.deinit();
+    try parent.put("HRA_CLOUD_API_URL", "http://127.0.0.1:4100");
+    try parent.put("TASKCTL_API_URL", "http://127.0.0.1:4200");
+    try parent.put("HRA_CLOUD_WEB_URL", "http://127.0.0.1:4300");
+    var paths = try resolveRuntimePathsForExecutable(
+        std.testing.allocator,
+        &parent,
+        .{ .runtime_root = "/opt/hra/runtime" },
+        "/tmp/hra-tests/zig-out/bin/hra-test",
+    );
+    defer paths.deinit(std.testing.allocator);
+    var environment = try buildSanitizedEnvironment(
+        std.testing.allocator,
+        &parent,
+        &paths,
+        .automation,
+        null,
+    );
+    defer environment.deinit();
+
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:4100",
+        environment.get("HRA_CLOUD_API_URL").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:4200",
+        environment.get("TASKCTL_API_URL").?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:4300",
+        environment.get("HRA_CLOUD_WEB_URL").?,
+    );
 }
 
 test "startup removal recovery environment is exact and Native controlled" {
@@ -10957,9 +11199,8 @@ test "production cloud coordinates are pinned and ambient overrides are ignored"
     try parent.put("HRA_CLOUD_API_URL", "https://canonical-attacker.example.com");
     try parent.put("OPRTE_CLOUD_API_URL", "https://legacy-attacker.example.com");
     try parent.put("TASKCTL_API_URL", "https://compat.example.com");
-    try parent.put("HRA_WORKOS_CLIENT_ID", "client_canonical_ambient");
-    try parent.put("OPRTE_WORKOS_CLIENT_ID", "client_legacy_ambient");
-    try parent.put("WORKOS_CLIENT_ID", "client_legacy");
+    try parent.put("HRA_CLOUD_WEB_URL", "https://web-attacker.example.com");
+    try parent.put("OPRTE_CLOUD_WEB_URL", "https://legacy-web-attacker.example.com");
     var paths = try resolveRuntimePathsForExecutable(
         std.testing.allocator,
         &parent,
@@ -10977,11 +11218,10 @@ test "production cloud coordinates are pinned and ambient overrides are ignored"
     );
     defer disabled.deinit();
     try std.testing.expect(disabled.get("HRA_CLOUD_API_URL") == null);
-    try std.testing.expect(disabled.get("HRA_WORKOS_CLIENT_ID") == null);
+    try std.testing.expect(disabled.get("HRA_CLOUD_WEB_URL") == null);
     try std.testing.expect(disabled.get("OPRTE_CLOUD_API_URL") == null);
-    try std.testing.expect(disabled.get("OPRTE_WORKOS_CLIENT_ID") == null);
+    try std.testing.expect(disabled.get("OPRTE_CLOUD_WEB_URL") == null);
     try std.testing.expect(disabled.get("TASKCTL_API_URL") == null);
-    try std.testing.expect(disabled.get("WORKOS_CLIENT_ID") == null);
 
     var enabled = try buildSanitizedEnvironment(
         std.testing.allocator,
@@ -10989,23 +11229,22 @@ test "production cloud coordinates are pinned and ambient overrides are ignored"
         &paths,
         .production,
         .{
-            .api_origin = "https://hra.sh",
-            .workos_client_id = "client_release",
+            .api_origin = "https://benevolent-akita-439.convex.site",
+            .web_origin = "https://hra.sh",
         },
     );
     defer enabled.deinit();
     try std.testing.expectEqualStrings(
-        "https://hra.sh",
+        "https://benevolent-akita-439.convex.site",
         enabled.get("HRA_CLOUD_API_URL").?,
     );
     try std.testing.expectEqualStrings(
-        "client_release",
-        enabled.get("HRA_WORKOS_CLIENT_ID").?,
+        "https://hra.sh",
+        enabled.get("HRA_CLOUD_WEB_URL").?,
     );
     try std.testing.expect(enabled.get("TASKCTL_API_URL") == null);
-    try std.testing.expect(enabled.get("WORKOS_CLIENT_ID") == null);
     try std.testing.expect(enabled.get("OPRTE_CLOUD_API_URL") == null);
-    try std.testing.expect(enabled.get("OPRTE_WORKOS_CLIENT_ID") == null);
+    try std.testing.expect(enabled.get("OPRTE_CLOUD_WEB_URL") == null);
 }
 
 test "gateway stderr is visible only in Debug hosts" {
@@ -11062,6 +11301,29 @@ test "bridge profiles isolate production development and automation origins" {
     try std.testing.expect(automation.allows(transport_health_command, "zero://inline"));
 }
 
+test "raw Debug gateway isolation does not widen bundled renderer authority" {
+    const raw_debug: Options = .{
+        .bridge_profile = .production,
+        .runtime_profile = .development,
+    };
+    try std.testing.expectEqual(
+        BridgeProfile.development,
+        resolvedRuntimeProfile(&raw_debug),
+    );
+    const renderer = bridgePolicy(raw_debug.bridge_profile);
+    try std.testing.expect(renderer.allows(dispatch_command, "zero://app"));
+    try std.testing.expect(!renderer.allows(
+        dispatch_command,
+        "http://127.0.0.1:5173",
+    ));
+
+    const inherited: Options = .{ .bridge_profile = .automation };
+    try std.testing.expectEqual(
+        BridgeProfile.automation,
+        resolvedRuntimeProfile(&inherited),
+    );
+}
+
 test "development reload is Debug and development profile only" {
     try std.testing.expect(developmentReloadAvailableForMode(
         .Debug,
@@ -11089,6 +11351,36 @@ test "development reload is Debug and development profile only" {
         builtin.mode == .Debug,
         developmentReloadAvailable(.development),
     );
+}
+
+test "raw development rejects every native Keychain custody operation" {
+    const runner = isolatedDevelopmentHarnessCustodyRunner();
+    for ([_]HarnessCustodyHelperAction{
+        .envelope_read,
+        .envelope_set_if_absent,
+        .envelope_delete,
+        .marker_read,
+        .marker_prepare,
+        .marker_commit,
+        .marker_delete,
+    }) |action| {
+        var output: HarnessCustodyHelperResult = .{
+            .envelope_delete = true,
+        };
+        try std.testing.expect(!runner.run_fn(
+            runner.context,
+            "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-keychain-custodian",
+            action,
+            if (action == .envelope_set_if_absent) "secret" else null,
+            1,
+            &output,
+        ));
+        try std.testing.expectEqual(
+            HarnessCustodyHelperResult{ .envelope_delete = true },
+            output,
+        );
+    }
+    runner.cancel_fn(runner.context);
 }
 
 test "development reload private decisions and public results are exact" {

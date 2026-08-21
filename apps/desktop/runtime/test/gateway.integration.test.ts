@@ -40,6 +40,7 @@ import {
   HRA_SESSION_SYNC_KEYCHAIN_SERVICE,
   HRA_SESSION_SYNC_RECOVERY_KEYCHAIN_NAME,
 } from "../src/cloud/session-sync-key-custody";
+import { runtimeBridgeProfileEnvironment } from "../src/development-reload";
 import {
   hostAccountProfileNativeResultCommand,
   hostHarnessCustodyNativeResultCommand,
@@ -125,6 +126,11 @@ function gatewayProcessEnvironment(
 ): Record<string, string | undefined> {
   return {
     ...environment,
+    // This suite exercises the packaged gateway contract directly, outside
+    // Native. Declare that authority instead of letting an absent Native
+    // profile fall into the fail-closed raw-development data boundary.
+    [runtimeBridgeProfileEnvironment]:
+      environment[runtimeBridgeProfileEnvironment] ?? "production",
     HRA_DATA_REMOVER_PATH:
       environment.HRA_DATA_REMOVER_PATH ?? "/usr/bin/false",
     HRA_GATEWAY_PATH:

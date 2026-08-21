@@ -1,6 +1,6 @@
 # Contents
 
-- `src/` – portable human authentication schemas, strict typed HTTP transport, WorkOS device flow, session refresh coordination, and secret-custody contracts.
+- `src/` – portable human authentication schemas, strict typed HTTP transport, browser desktop pairing, session refresh coordination, and secret-custody contracts.
 - `package.json` – the source-first `@hraness/hra-human-client` workspace and its focused verification commands.
 
 # Guidelines

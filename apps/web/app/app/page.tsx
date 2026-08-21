@@ -11,9 +11,6 @@ import type { Metadata } from "next";
 
 import { AdminControlPlane } from "../admin-shell";
 import { hraSearchSite } from "../site";
-import {
-  missingWorkOSEnvironment,
-} from "../workos-configuration";
 
 export const metadata = createPrivateSiteMetadata({
   ...hraSearchSite,
@@ -63,17 +60,7 @@ function ConfigurationState({
 }
 
 export default function ControlPlanePage() {
-  const missing = missingWorkOSEnvironment(process.env);
   const deployment = parseConvexDeployment(process.env.NEXT_PUBLIC_CONVEX_URL);
-
-  if (missing.length > 0) {
-    return (
-      <ConfigurationState
-        detail="Configure the local WorkOS session boundary before opening the human control plane."
-        missing={missing}
-      />
-    );
-  }
 
   if (deployment.kind === "missing") {
     return (

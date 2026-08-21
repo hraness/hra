@@ -37,7 +37,8 @@ test("the desktop product is a lean panes and settings shell", () => {
   expect(html).toContain("Settings");
   expect(html).toContain('aria-label="New pane"');
   expect(html).toContain('aria-label="Shared folder access: Documents. Choose folder"');
-  expect(html).toContain("Shared folder · Documents");
+  expect(html).toContain('class="hra-folder-access__label">Documents</span>');
+  expect(html).not.toContain("Shared folder ·");
   expect(html).toContain('class="hra-icon"');
   expect(html).not.toContain("new-pane-button__label");
   expect(html).toContain("Starting HRA");
@@ -175,7 +176,7 @@ test("the header owns one pathless shared-folder chooser", async () => {
   const app = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
   expect(app).toContain("shell.selectFolderAccess()");
   expect(app).toContain("execution.folderAccess.displayName");
-  expect(app).toContain("Shared folder ·");
+  expect(app).not.toContain("Shared folder ·");
   expect(app).not.toContain("execution.folderAccess.path");
 });
 

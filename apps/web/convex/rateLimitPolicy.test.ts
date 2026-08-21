@@ -1,10 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  humanRefreshTokenSchema,
-  taskctlApiOperations,
-} from "@hraness/agent-tasks-protocol";
-
-import { hmacSha256Utf8KeyBase64Url } from "./crypto";
+import { taskctlApiOperations } from "@hraness/agent-tasks-protocol";
 import {
   AUTHENTICATED_RATE_LIMIT_SHARDS,
   MAX_RATE_LIMIT_CLEANUP_ROWS,
@@ -127,7 +122,7 @@ describe("prerelease rate-limit policy", () => {
       authenticationFailureClass: "enrollment_auth_failure",
     });
     expect(apiOperationRateLimitClass.refreshAuth).toEqual({
-      kind: "opaque_pre_auth",
+      kind: "verified_refresh",
       routeClass: "refresh_auth",
     });
     expect(perShardRateLimit("human_poll", "user")).toBe(3);
@@ -349,58 +344,12 @@ describe("prerelease rate-limit policy", () => {
     ).toBe("invalid");
   });
 
-  test("bounds random refresh tokens and isolates valid token slots", async () => {
-    const workosKey = "sk_test_rate_limit_key";
-    const tokens = Array.from(
-      { length: 1_024 },
-      (_, index) => `workos-refresh-token-${index.toString().padStart(6, "0")}`,
-    );
-    expect(tokens.every((token) => humanRefreshTokenSchema.safeParse(token).success)).toBeTrue();
-    const slotPairs = await Promise.all(
-      tokens.map(async (refreshToken) => {
-        const digest = await hmacSha256Utf8KeyBase64Url(
-          workosKey,
-          `taskctl-refresh-rate-limit-v1:${refreshToken}`,
-        );
-        return [refreshToken, unauthenticatedSlotKey(digest)] as const;
-      }),
-    );
-    const slots = new Set(slotPairs.flatMap(([, slot]) => (slot === null ? [] : [slot])));
-    expect(slots.size).toBeLessThanOrEqual(UNAUTHENTICATED_RATE_LIMIT_SLOTS);
-    expect(
-      UNAUTHENTICATED_RATE_LIMIT_SLOTS *
-        rateLimitPolicies.refresh_auth.shardCount *
-        2,
-    ).toBe(2_048);
-    for (const [refreshToken, slot] of slotPairs) {
-      expect(slot).not.toContain(refreshToken);
-    }
-    const first = slotPairs[0]?.[1];
-    const isolated = slotPairs.find(([, slot]) => slot !== first)?.[1];
-    expect(first).toBeDefined();
-    expect(isolated).toBeDefined();
-    if (first === null || first === undefined || isolated === null || isolated === undefined) {
-      throw new Error("Refresh HMAC fixtures must occupy two slots.");
-    }
-    for (const [index, slot] of [first, isolated].entries()) {
-      expect(
-        planRateLimitConsumption({
-          routeClass: "refresh_auth",
-          subjects: [{ kind: "unauthenticated", key: slot }],
-          currentWindowBuckets: [],
-          requestId: requestId(index + 90),
-          now: 0,
-        }).kind,
-      ).toBe("allowed");
-    }
-  });
-
-  test("refresh slots enforce eight-per-minute target and reset by window", () => {
+  test("refresh sessions enforce eight-per-minute target and reset by window", () => {
     const store: RateLimitBucketSnapshot[] = [];
-    const subjects = [{ kind: "unauthenticated" as const, key: "slot_007" }];
+    const subjects = [{ kind: "credential" as const, key: "convex-session-id" }];
     const id = requestId(707);
-    const allowance = perShardRateLimit("refresh_auth", "unauthenticated");
-    expect(allowance).toBe(2);
+    const allowance = perShardRateLimit("refresh_auth", "credential");
+    expect(allowance).toBe(8);
     if (allowance === null) throw new Error("missing refresh allowance");
     for (let index = 0; index < allowance; index += 1) {
       expect(consume(store, "refresh_auth", subjects, id, 10_000).kind).toBe("allowed");
@@ -413,6 +362,13 @@ describe("prerelease rate-limit policy", () => {
     expect(consume(store, "refresh_auth", subjects, id, RATE_LIMIT_WINDOW_MS).kind).toBe(
       "allowed",
     );
+    expect(planRateLimitConsumption({
+      routeClass: "refresh_auth",
+      subjects: [{ kind: "unauthenticated", key: "slot_007" }],
+      currentWindowBuckets: [],
+      requestId: id,
+      now: 0,
+    }).kind).toBe("invalid");
   });
 
   test("selects cleanup rows deterministically and never exceeds the hard bound", () => {

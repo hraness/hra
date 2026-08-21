@@ -11,8 +11,8 @@ import {
   HumanAccountService,
   HumanCredentialCustody,
   HRA_CLOUD_API_URL_ENV,
+  HRA_CLOUD_WEB_URL_ENV,
   HRA_HUMAN_KEYCHAIN_NAME,
-  HRA_WORKOS_CLIENT_ID_ENV,
   cloudAttachmentAvailability,
   isLegacyKeychainIdentityAccessDenied,
   parseHRACloudConfiguration,
@@ -111,14 +111,20 @@ class MemoryHumanMetadata implements HumanAccountMetadataPort {
 
 function authentication(access: string, refresh: string) {
   return humanAuthenticationSchema.parse({
-    version: 1,
+    version: 2,
     apiUrl: "https://oprte.example.com",
     accessToken: access,
     refreshToken: refresh,
     user: {
-      id: "user_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
       email: "chef@example.com",
       name: "Chef",
+    },
+    organization: {
+      id: "org_oprte",
+      name: "OPRTE",
+      role: "owner",
+      status: "active",
     },
   });
 }
@@ -155,28 +161,33 @@ describe("desktop cloud configuration", () => {
   test("accepts HTTPS and exact loopback HTTP, and fails closed on conflicts", () => {
     expect(cloudAttachmentAvailability(parseHRACloudConfiguration({
       [HRA_CLOUD_API_URL_ENV]: "https://oprte.example.com",
-      [HRA_WORKOS_CLIENT_ID_ENV]: "client_public123",
+      [HRA_CLOUD_WEB_URL_ENV]: "https://app.oprte.example.com",
     }))).toEqual({
       state: "enabled",
       apiOrigin: "https://oprte.example.com",
-      workosClientId: "client_public123",
+      webOrigin: "https://app.oprte.example.com",
     });
 
     expect(cloudAttachmentAvailability(parseHRACloudConfiguration({
       [HRA_CLOUD_API_URL_ENV]: "http://127.0.0.1:3210",
-      [HRA_WORKOS_CLIENT_ID_ENV]: "client_public123",
+      [HRA_CLOUD_WEB_URL_ENV]: "http://127.0.0.1:5173",
     }))).toMatchObject({ state: "enabled" });
 
     expect(cloudAttachmentAvailability(parseHRACloudConfiguration({
       [HRA_CLOUD_API_URL_ENV]: "http://oprte.example.com",
-      [HRA_WORKOS_CLIENT_ID_ENV]: "client_public123",
+      [HRA_CLOUD_WEB_URL_ENV]: "https://app.oprte.example.com",
     }))).toEqual({ state: "disabled", reason: "api_invalid" });
 
     expect(cloudAttachmentAvailability(parseHRACloudConfiguration({
       [HRA_CLOUD_API_URL_ENV]: "https://one.example.com",
       TASKCTL_API_URL: "https://two.example.com",
-      [HRA_WORKOS_CLIENT_ID_ENV]: "client_public123",
+      [HRA_CLOUD_WEB_URL_ENV]: "https://app.oprte.example.com",
     }))).toEqual({ state: "disabled", reason: "api_conflicting" });
+
+    expect(cloudAttachmentAvailability(parseHRACloudConfiguration({
+      [HRA_CLOUD_API_URL_ENV]: "https://api.oprte.example.com",
+      [HRA_CLOUD_WEB_URL_ENV]: "http://app.oprte.example.com",
+    }))).toEqual({ state: "disabled", reason: "web_invalid" });
   });
 
   test("missing attachment configuration performs zero network operations", async () => {
@@ -305,6 +316,139 @@ describe("desktop generational Keychain custody", () => {
       .toBeFalse();
     expect((await custody.read())?.authentication.user.email)
       .toBe("chef@example.com");
+  });
+
+  test("preserves one exact authentication generation without deleting Keychain bytes", async () => {
+    const metadata = new MemoryHumanMetadata();
+    const secrets = memorySecrets();
+    const custody = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: () => "refreshcontainment01",
+    });
+    const written = await custody.write(authentication(
+      "indeterminate-refresh-access-token",
+      "indeterminate-refresh-token",
+    ));
+    const before = new Map(secrets.values);
+
+    expect(await custody.preserveForRecovery({
+      expectedGeneration: written.generation + 1,
+    })).toBeFalse();
+    expect(await custody.read()).toEqual(written);
+
+    expect(await custody.preserveForRecovery({
+      expectedGeneration: written.generation,
+    })).toBeTrue();
+    expect(await custody.read()).toBeNull();
+    expect(secrets.values).toEqual(before);
+    expect(metadata.quarantined).toMatchObject([{
+      kind: "committed",
+      pointer: { generation: written.generation },
+      reason: "invalid_pointer_preserved",
+    }]);
+
+    const restarted = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: () => "refreshcontainment02",
+    });
+    expect(await restarted.read()).toBeNull();
+    expect(secrets.values).toEqual(before);
+  });
+
+  test("stale scope containment leaves a newer same-user generation live", async () => {
+    const metadata = new MemoryHumanMetadata();
+    const secrets = memorySecrets();
+    const custody = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: slots("scope_old_generation", "scope_new_generation"),
+    });
+    const old = await custody.write(authentication(
+      "scope-old-access-token",
+      "scope-old-refresh-token",
+    ));
+    const authority = await custody.inspectScopeSelectionAuthority(old);
+    const next = {
+      generation: old.generation + 1,
+      authentication: authentication(
+        "scope-new-access-token",
+        "scope-new-refresh-token",
+      ),
+    };
+    expect(await custody.compareAndSwap({
+      expectedGeneration: old.generation,
+      next,
+    })).toEqual(next);
+
+    expect(await custody.preserveIndeterminateScopeSession({ authority }))
+      .toEqual({ state: "newer_winner", snapshot: next });
+    expect(await custody.read()).toEqual(next);
+    expect(metadata.quarantined).toHaveLength(0);
+    expect(secrets.values.size).toBe(1);
+  });
+
+  test("stale scope containment never projects a newer committed value beside pending custody", async () => {
+    const metadata = new MemoryHumanMetadata();
+    const backing = memorySecrets();
+    let rejectPendingWrite = false;
+    const secrets: SecretStore = {
+      get: async (input) => await backing.get(input),
+      set: async (input) => {
+        if (rejectPendingWrite) {
+          rejectPendingWrite = false;
+          throw new Error("injected pending write fault");
+        }
+        await backing.set(input);
+      },
+      delete: async (input) => await backing.delete(input),
+    };
+    const custody = new HumanCredentialCustody({
+      metadata,
+      secrets,
+      nextSlot: slots(
+        "scope_pending_old_01",
+        "scope_pending_new_02",
+        "scope_pending_gap_03",
+      ),
+    });
+    const old = await custody.write(authentication(
+      "scope-pending-old-access",
+      "scope-pending-old-refresh",
+    ));
+    const authority = await custody.inspectScopeSelectionAuthority(old);
+    const newer = {
+      generation: old.generation + 1,
+      authentication: authentication(
+        "scope-pending-new-access",
+        "scope-pending-new-refresh",
+      ),
+    };
+    expect(await custody.compareAndSwap({
+      expectedGeneration: old.generation,
+      next: newer,
+    })).toEqual(newer);
+    rejectPendingWrite = true;
+    expect(custody.compareAndSwap({
+      expectedGeneration: newer.generation,
+      next: {
+        generation: newer.generation + 1,
+        authentication: authentication(
+          "scope-pending-gap-access",
+          "scope-pending-gap-refresh",
+        ),
+      },
+    })).rejects.toMatchObject({ reason: "custody_unavailable" });
+
+    expect(custody.preserveIndeterminateScopeSession({ authority }))
+      .rejects.toMatchObject({ reason: "concurrent_update" });
+    expect(metadata.quarantined).toHaveLength(0);
+    expect(metadata.journal).toMatchObject({
+      committed: { generation: newer.generation },
+      pending: { pointer: { generation: newer.generation + 1 } },
+    });
+    expect(backing.values.size).toBe(1);
   });
 
   test("requires explicit proof before abandoning an indeterminate pre-Keychain crash", async () => {

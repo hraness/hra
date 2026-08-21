@@ -17,6 +17,9 @@ import {
   createAgentEnrollmentRequestSchema,
   createAgentRequestSchema,
   createOrganizationRequestSchema,
+  desktopPairingRouteParamsSchema,
+  desktopPairingStartRequestSchema,
+  desktopPairingRedeemRequestSchema,
   createTaskRequestSchema,
   createWorkspaceRepositoryRequestSchema,
   createWorkspaceRequestSchema,
@@ -67,6 +70,7 @@ import {
   runnerHeartbeatRequestSchema,
   sessionSyncHttpRoutes,
   sessionIdSchema,
+  selectHumanScopeRequestSchema,
   startSessionRequestSchema,
   submitTaskRequestSchema,
   syncRunInteractionsEnvelopeSchema,
@@ -86,23 +90,20 @@ import {
   type ErrorDetails,
   type RunInteractionRequest,
 } from "@hraness/agent-tasks-protocol";
-import type { OrganizationMembership } from "@workos-inc/node";
 import { httpRouter } from "convex/server";
 
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import { env, httpAction, type ActionCtx } from "./_generated/server";
 import {
   digestArrayBuffer,
   hmacSha256Base64Url,
-  hmacSha256Utf8KeyBase64Url,
   sha256Base64Url,
   verifyHmacSha256,
 } from "./crypto";
 import { parseBoundedJsonBody } from "./boundedJsonBody";
 import { randomRequestId } from "./domain";
-import { readHumanIdentity } from "./humanAuthorization";
-import { workOSWebhook } from "./identityWebhooks";
+import { auth } from "./auth";
 import {
   hraHumanHttp,
   hraPromotionHttp,
@@ -117,20 +118,9 @@ import {
   type AuthenticatedAgentOperation,
   type FailureRouteClass,
 } from "./rateLimitPolicy";
-import {
-  createWorkOSOwnerMembership,
-  createWorkOSOrganization,
-  findWorkOSOrganizationByExternalId,
-  isActiveWorkOSOwnerMembership,
-  isDefinitiveRefreshRejection,
-  listWorkOSMemberships,
-  pollWorkOSOwnerMembership,
-  refreshWorkOSAuthentication,
-  workOSMembershipLocatorMatches,
-  workOSOrganizationExternalIdMatches,
-} from "./workos";
 
 const http = httpRouter();
+auth.addHttpRoutes(http);
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
@@ -180,12 +170,6 @@ async function runIdempotentMutationWithRetry<Value>(
   return { kind: "exhausted" };
 }
 
-http.route({
-  method: "POST",
-  path: "/webhooks/workos",
-  handler: workOSWebhook,
-});
-
 type PepperFamily = "credential" | "enrollment";
 type ApiOperationName = keyof typeof apiOperationRateLimitClass;
 
@@ -223,6 +207,26 @@ function bearerValue(request: Request): string | null {
   const value = request.headers.get(taskctlHeaders.authorization);
   if (value === null || !value.startsWith("Bearer ") || value.slice(7).includes(" ")) return null;
   return value.slice(7);
+}
+
+function authRefreshTokenParts(token: string): {
+  refreshTokenId: Id<"authRefreshTokens">;
+  sessionId: Id<"authSessions">;
+} | null {
+  const parts = token.split("|");
+  if (
+    parts.length !== 2 || parts[0] === undefined || parts[1] === undefined ||
+    parts[0].length === 0 || parts[0].length > 512 ||
+    parts[1].length === 0 || parts[1].length > 512
+  ) return null;
+  return {
+    refreshTokenId: parts[0] as Id<"authRefreshTokens">,
+    sessionId: parts[1] as Id<"authSessions">,
+  };
+}
+
+function authSessionIdFromRefreshToken(token: string): Id<"authSessions"> | null {
+  return authRefreshTokenParts(token)?.sessionId ?? null;
 }
 
 function idempotencyKey(request: Request): string | null {
@@ -393,20 +397,19 @@ async function humanRateLimitResponse(
   return errorResponse("SERVICE_UNAVAILABLE", requestId);
 }
 
-async function refreshRateLimitResponse(
+async function opaquePairingRateLimitResponse(
   ctx: ActionCtx,
-  refreshToken: string,
+  opaqueCredential: string,
   requestId: string,
+  operation: "startDesktopPairing" | "redeemDesktopPairing",
 ): Promise<Response | null> {
-  const rule = apiOperationRateLimitClass.refreshAuth;
-  const workosApiKey = env.WORKOS_API_KEY;
-  if (rule.kind !== "opaque_pre_auth" || workosApiKey === undefined || workosApiKey.length === 0) {
+  const rule = apiOperationRateLimitClass[operation];
+  if (rule.kind !== "opaque_pre_auth") {
     return errorResponse("SERVICE_UNAVAILABLE", requestId);
   }
   try {
-    const opaqueDigest = await hmacSha256Utf8KeyBase64Url(
-      workosApiKey,
-      `taskctl-refresh-rate-limit-v1:${refreshToken}`,
+    const opaqueDigest = await sha256Base64Url(
+      `hra-opaque-auth-rate-limit-v1:${operation}:${opaqueCredential}`,
     );
     const slotKey = unauthenticatedSlotKey(opaqueDigest);
     if (slotKey === null) return errorResponse("SERVICE_UNAVAILABLE", requestId);
@@ -423,6 +426,76 @@ async function refreshRateLimitResponse(
   } catch {
     return errorResponse("SERVICE_UNAVAILABLE", requestId);
   }
+}
+
+async function desktopPairingRateLimitResponse(
+  ctx: ActionCtx,
+  operation: "startDesktopPairing" | "redeemDesktopPairing",
+  locator: string,
+  requestId: string,
+): Promise<Response | null> {
+  const global = await opaquePairingRateLimitResponse(
+    ctx,
+    "global-admission",
+    requestId,
+    operation,
+  );
+  if (global !== null) return global;
+  return await opaquePairingRateLimitResponse(ctx, locator, requestId, operation);
+}
+
+async function stableRefreshRateLimitResponse(
+  ctx: ActionCtx,
+  refreshToken: string,
+  requestId: string,
+): Promise<Response | null> {
+  const parts = authRefreshTokenParts(refreshToken);
+  let result;
+  try {
+    result = await ctx.runMutation(internal.rateLimits.consumeRefresh, {
+      refreshTokenId: parts?.refreshTokenId ?? "invalid",
+      sessionId: parts?.sessionId ?? "invalid",
+      requestId,
+    });
+  } catch {
+    return errorResponse("SERVICE_UNAVAILABLE", requestId);
+  }
+  if (result.kind === "allowed") return null;
+  if (result.kind === "limited") {
+    return errorResponse("RATE_LIMITED", requestId, { retryAfterMs: result.retryAfterMs });
+  }
+  return errorResponse("SERVICE_UNAVAILABLE", requestId);
+}
+
+function desktopPairingVerificationUri(pairingId: string): string | null {
+  const configured = env.NEXT_PUBLIC_SITE_URL;
+  if (configured === undefined) return null;
+  try {
+    const origin = new URL(configured);
+    const loopback = origin.hostname === "localhost" || origin.hostname === "127.0.0.1" ||
+      origin.hostname === "[::1]" || origin.hostname === "::1";
+    if (
+      (origin.protocol !== "https:" && !(origin.protocol === "http:" && loopback)) ||
+      origin.username !== "" || origin.password !== "" ||
+      origin.pathname !== "/" || origin.search !== "" || origin.hash !== ""
+    ) return null;
+    return new URL(`/pair/desktop/${pairingId}`, origin).toString();
+  } catch {
+    return null;
+  }
+}
+
+function desktopPairingIdFromRedeemPath(pathname: string): string | null {
+  const match = /^\/v1\/auth\/desktop-pairings\/([^/]+)\/redeem$/u.exec(pathname);
+  if (match?.[1] === undefined) return null;
+  let pairingId: string;
+  try {
+    pairingId = decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+  const parsed = desktopPairingRouteParamsSchema.safeParse({ pairingId });
+  return parsed.success ? parsed.data.pairingId : null;
 }
 
 async function authenticateEnrollment(ctx: ActionCtx, token: string) {
@@ -629,31 +702,132 @@ async function prepareEnrollmentToken(token: string): Promise<
   }
 }
 
-function membershipRoleSlugs(value: unknown): string[] {
-  if (typeof value !== "object" || value === null) return [];
-  const membership = value as Record<string, unknown>;
-  const fallback = membership["role"];
-  if (typeof fallback !== "object" || fallback === null) return [];
-  const fallbackSlug = (fallback as Record<string, unknown>)["slug"];
-  if (typeof fallbackSlug !== "string") return [];
-  const configured = membership["roles"];
-  if (configured !== undefined && configured !== null && !Array.isArray(configured)) return [];
-  const slugs: string[] = [];
-  for (const value of configured ?? []) {
-    if (typeof value !== "object" || value === null) return [];
-    const slug = (value as Record<string, unknown>)["slug"];
-    if (typeof slug !== "string") return [];
-    slugs.push(slug);
-  }
-  return [...new Set(slugs.length === 0 ? [fallbackSlug] : slugs)];
-}
+http.route({
+  method: "POST",
+  path: taskctlApiRoutes.desktopPairings,
+  handler: httpAction(async (ctx, request) => {
+    const requestId = randomRequestId();
+    try {
+      if (!hasJsonContentType(request)) return errorResponse("VALIDATION_ERROR", requestId);
+      const body = desktopPairingStartRequestSchema.safeParse(await parseJsonBody(request));
+      if (!body.success) return errorResponse("VALIDATION_ERROR", requestId);
+      const limited = await desktopPairingRateLimitResponse(
+        ctx,
+        "startDesktopPairing",
+        body.data.challenge,
+        requestId,
+      );
+      if (limited !== null) return limited;
+      const started = await ctx.runMutation(internal.desktopPairing.start, body.data);
+      const verificationUri = desktopPairingVerificationUri(started.pairingId);
+      if (verificationUri === null) return errorResponse("SERVICE_UNAVAILABLE", requestId);
+      return resultResponse(
+        {
+          ok: true as const,
+          data: { ...started, verificationUri },
+          requestId,
+        },
+        taskctlApiOperations.startDesktopPairing.responseSchema,
+      );
+    } catch {
+      return errorResponse("INTERNAL_ERROR", requestId);
+    }
+  }),
+});
+
+http.route({
+  method: "POST",
+  pathPrefix: "/v1/auth/desktop-pairings/",
+  handler: httpAction(async (ctx, request) => {
+    const requestId = randomRequestId();
+    try {
+      if (!hasJsonContentType(request)) return errorResponse("VALIDATION_ERROR", requestId);
+      const pairingId = desktopPairingIdFromRedeemPath(new URL(request.url).pathname);
+      if (pairingId === null) return errorResponse("NOT_FOUND", requestId);
+      const body = desktopPairingRedeemRequestSchema.safeParse(await parseJsonBody(request));
+      if (!body.success) return errorResponse("VALIDATION_ERROR", requestId);
+      const limited = await desktopPairingRateLimitResponse(
+        ctx,
+        "redeemDesktopPairing",
+        pairingId,
+        requestId,
+      );
+      if (limited !== null) return limited;
+      const pairing = await ctx.runQuery(internal.desktopPairing.status, { pairingId });
+      if (pairing === null || pairing.status === "expired") {
+        return resultResponse(
+          { ok: true as const, data: { status: "expired" as const }, requestId },
+          taskctlApiOperations.redeemDesktopPairing.responseSchema,
+        );
+      }
+      if (pairing.status === "pending") {
+        return resultResponse(
+          {
+            ok: true as const,
+            data: { status: "pending" as const, retryAfterMs: pairing.retryAfterMs },
+            requestId,
+          },
+          taskctlApiOperations.redeemDesktopPairing.responseSchema,
+        );
+      }
+      if (pairing.status === "denied" || pairing.status === "consumed") {
+        return resultResponse(
+          { ok: true as const, data: { status: pairing.status }, requestId },
+          taskctlApiOperations.redeemDesktopPairing.responseSchema,
+        );
+      }
+
+      const signedIn = await ctx.runAction(api.auth.signIn, {
+        provider: "desktop-pairing",
+        params: { pairingId, verifier: body.data.verifier },
+        calledBy: "hra-desktop-pairing",
+      });
+      if (signedIn.tokens === null || signedIn.tokens === undefined) {
+        const after = await ctx.runQuery(internal.desktopPairing.status, { pairingId });
+        const terminal = after?.status;
+        if (terminal === "consumed" || terminal === "denied" || terminal === "expired") {
+          return resultResponse(
+            { ok: true as const, data: { status: terminal }, requestId },
+            taskctlApiOperations.redeemDesktopPairing.responseSchema,
+          );
+        }
+        return errorResponse("AUTHENTICATION_FAILED", requestId);
+      }
+      const sessionId = authSessionIdFromRefreshToken(signedIn.tokens.refreshToken);
+      if (sessionId === null) return errorResponse("INTERNAL_ERROR", requestId);
+      const authentication = await ctx.runQuery(
+        internal.desktopPairing.authenticationForSession,
+        { sessionId },
+      );
+      if (authentication === null || authentication.workspace === undefined) {
+        return errorResponse("MEMBERSHIP_INACTIVE", requestId);
+      }
+      return resultResponse(
+        {
+          ok: true as const,
+          data: {
+            status: "approved" as const,
+            authentication: {
+              accessToken: signedIn.tokens.token,
+              refreshToken: signedIn.tokens.refreshToken,
+              ...authentication,
+            },
+          },
+          requestId,
+        },
+        taskctlApiOperations.redeemDesktopPairing.responseSchema,
+      );
+    } catch {
+      return errorResponse("INTERNAL_ERROR", requestId);
+    }
+  }),
+});
 
 http.route({
   method: "POST",
   path: taskctlApiRoutes.refreshAuth,
   handler: httpAction(async (ctx, request) => {
     const requestId = randomRequestId();
-    let providerDispatched = false;
     try {
       if (!hasJsonContentType(request)) return errorResponse("VALIDATION_ERROR", requestId);
       const refreshToken = bearerValue(request);
@@ -665,50 +839,39 @@ http.route({
       }
       const body = refreshAuthRequestSchema.safeParse(await parseJsonBody(request));
       if (!body.success) return errorResponse("VALIDATION_ERROR", requestId);
-      const limited = await refreshRateLimitResponse(ctx, refreshToken, requestId);
+      const limited = await stableRefreshRateLimitResponse(ctx, refreshToken, requestId);
       if (limited !== null) return limited;
-      let authentication;
+      let tokens;
       try {
-        providerDispatched = true;
-        authentication = await refreshWorkOSAuthentication({
+        const result = await ctx.runAction(api.auth.signIn, {
           refreshToken,
-          ...(body.data.workosOrganizationId === undefined
-            ? {}
-            : { organizationId: body.data.workosOrganizationId }),
+          calledBy: "hra-http-refresh",
         });
-      } catch (error) {
-        return errorResponse(
-          isDefinitiveRefreshRejection(error)
-            ? "AUTHENTICATION_FAILED"
-            : "AUTH_REFRESH_INDETERMINATE",
-          requestId,
-        );
-      }
-      if (authentication === null) return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      if (
-        body.data.workosOrganizationId !== undefined &&
-        authentication.organizationId !== body.data.workosOrganizationId
-      ) {
+        tokens = result.tokens;
+      } catch {
         return errorResponse("AUTH_REFRESH_INDETERMINATE", requestId);
       }
+      if (tokens === null || tokens === undefined) {
+        return errorResponse("AUTHENTICATION_FAILED", requestId);
+      }
+      const sessionId = authSessionIdFromRefreshToken(tokens.refreshToken);
+      if (sessionId === null) return errorResponse("AUTH_REFRESH_INDETERMINATE", requestId);
+      const authentication = await ctx.runQuery(
+        internal.desktopPairing.authenticationForSession,
+        { sessionId },
+      );
+      if (authentication === null) return errorResponse("MEMBERSHIP_INACTIVE", requestId);
       const data = {
-        accessToken: authentication.accessToken,
-        refreshToken: authentication.refreshToken,
-        user: {
-          id: authentication.user.id,
-          email: authentication.user.email,
-          ...(authentication.user.name === null ? {} : { name: authentication.user.name }),
-        },
-        ...(authentication.organizationId === undefined
-          ? {}
-          : { workosOrganizationId: authentication.organizationId }),
+        accessToken: tokens.token,
+        refreshToken: tokens.refreshToken,
+        ...authentication,
       };
       return resultResponse(
         { ok: true as const, data, requestId },
         taskctlApiOperations.refreshAuth.responseSchema,
       );
     } catch {
-      return errorResponse(providerDispatched ? "AUTH_REFRESH_INDETERMINATE" : "INTERNAL_ERROR", requestId);
+      return errorResponse("INTERNAL_ERROR", requestId);
     }
   }),
 });
@@ -723,30 +886,11 @@ http.route({
         Object.fromEntries(new URL(request.url).searchParams),
       );
       if (!query.success) return errorResponse("VALIDATION_ERROR", requestId);
-      const identified = await readHumanIdentity(ctx, requestId, false);
-      if (!identified.ok) {
-        return errorResponse(identified.error.code, identified.error.requestId, identified.error.details);
-      }
       const limited = await humanRateLimitResponse(ctx, "listOrganizations", requestId);
       if (limited !== null) return limited;
-      const observedAt = Date.now();
-      const page = await listWorkOSMemberships({
-        userId: identified.identity.subject,
+      const result = await ctx.runQuery(internal.humanTenancy.listOrganizationsOwned, {
         ...(query.data.cursor === undefined ? {} : { cursor: query.data.cursor }),
         limit: query.data.limit,
-      });
-      if (page === null) return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      const result = await ctx.runMutation(internal.humanTenancy.syncOrganizationPage, {
-        memberships: page.memberships.map((membership) => ({
-          membershipId: membership.id,
-          workosOrganizationId: membership.organizationId,
-          workosUserId: membership.userId,
-          organizationName: membership.organizationName,
-          roleSlugs: membershipRoleSlugs(membership),
-          providerUpdatedAt: Date.parse(membership.updatedAt),
-          observedAt,
-        })),
-        cursor: page.cursor,
         requestId,
       });
       return resultResponse(result, taskctlApiOperations.listOrganizations.responseSchema);
@@ -758,202 +902,79 @@ http.route({
 
 http.route({
   method: "POST",
+  path: taskctlApiRoutes.selectHumanScope,
+  handler: httpAction(async (ctx, request) => {
+    const requestId = randomRequestId();
+    try {
+      if (!hasJsonContentType(request)) return errorResponse("VALIDATION_ERROR", requestId);
+      const body = selectHumanScopeRequestSchema.safeParse(await parseJsonBody(request));
+      if (!body.success) return errorResponse("VALIDATION_ERROR", requestId);
+      const limited = await humanRateLimitResponse(ctx, "selectHumanScope", requestId);
+      if (limited !== null) return limited;
+      const prepared = await ctx.runMutation(api.desktopPairing.prepareScopeRotation, {
+        organizationId: body.data.organizationId,
+        ...(body.data.workspaceId === undefined ? {} : { workspaceId: body.data.workspaceId }),
+      });
+      if (prepared === null) return errorResponse("NOT_FOUND", requestId);
+      const signedIn = await ctx.runAction(api.auth.signIn, {
+        provider: "scope-selection",
+        params: { credential: prepared.credential },
+        calledBy: "hra-http-scope-selection",
+      });
+      if (signedIn.tokens === null || signedIn.tokens === undefined) {
+        return errorResponse("INTERNAL_ERROR", requestId);
+      }
+      const sessionId = authSessionIdFromRefreshToken(signedIn.tokens.refreshToken);
+      if (sessionId === null) return errorResponse("INTERNAL_ERROR", requestId);
+      const authentication = await ctx.runQuery(
+        internal.desktopPairing.authenticationForSession,
+        { sessionId },
+      );
+      if (authentication === null) return errorResponse("MEMBERSHIP_INACTIVE", requestId);
+      return resultResponse(
+        {
+          ok: true as const,
+          data: {
+            accessToken: signedIn.tokens.token,
+            refreshToken: signedIn.tokens.refreshToken,
+            ...authentication,
+          },
+          requestId,
+        },
+        taskctlApiOperations.selectHumanScope.responseSchema,
+      );
+    } catch {
+      return errorResponse("INTERNAL_ERROR", requestId);
+    }
+  }),
+});
+
+
+http.route({
+  method: "POST",
   path: taskctlApiRoutes.organizations,
   handler: httpAction(async (ctx, request) => {
     const requestId = randomRequestId();
-    let operationId: Id<"accountProvisioningOperations"> | undefined;
-    let membershipLeaseId: string | undefined;
-    let membershipCreateDispatched = false;
-    let releaseMembershipLease: (() => Promise<void>) | undefined;
     try {
       if (!hasJsonContentType(request)) return errorResponse("VALIDATION_ERROR", requestId);
       const key = idempotencyKey(request);
       if (key === null) return errorResponse("IDEMPOTENCY_REQUIRED", requestId);
       const body = createOrganizationRequestSchema.safeParse(await parseJsonBody(request));
       if (!body.success) return errorResponse("VALIDATION_ERROR", requestId);
-      const identified = await readHumanIdentity(ctx, requestId, false);
-      if (!identified.ok) {
-        return errorResponse(identified.error.code, identified.error.requestId, identified.error.details);
-      }
       const limited = await humanRateLimitResponse(ctx, "createOrganization", requestId);
       if (limited !== null) return limited;
       const requestDigest = await sha256Base64Url(
         JSON.stringify({ operation: "organizations.create", name: body.data.name }),
       );
-      const reservation = await ctx.runMutation(
-        internal.humanTenancy.reserveOrganizationProvisioning,
-        {
-          name: body.data.name,
-          idempotencyKey: key,
-          requestDigest,
-          requestId,
-        },
-      );
-      if (!reservation.ok) {
-        return errorResponse(
-          reservation.error.code,
-          reservation.error.requestId,
-          reservation.error.details,
-        );
-      }
-      if (reservation.data.kind === "replay") {
-        return resultResponse(
-          {
-            ok: true as const,
-            data: { organization: reservation.data.organization },
-            requestId: reservation.data.originalRequestId,
-          },
-          taskctlApiOperations.createOrganization.responseSchema,
-        );
-      }
-      operationId = reservation.data.operationId;
-      let organizationObservedAt = Date.now();
-      let organization = await findWorkOSOrganizationByExternalId(reservation.data.externalId);
-      if (organization === undefined) return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      if (organization === null) {
-        organizationObservedAt = Date.now();
-        organization = await createWorkOSOrganization({
-          name: reservation.data.name,
-          externalId: reservation.data.externalId,
-          idempotencyKey: key,
-        });
-      }
-      if (organization === null) return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      if (!workOSOrganizationExternalIdMatches(organization, reservation.data.externalId)) {
-        return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      }
-      const checkpoint = await ctx.runMutation(
-        internal.humanTenancy.checkpointOrganizationProvisioning,
-        {
-          operationId: reservation.data.operationId,
-          workosOrganizationId: organization.id,
-          organizationName: organization.name,
-          externalId: reservation.data.externalId,
-          providerUpdatedAt: Date.parse(organization.updatedAt),
-          observedAt: organizationObservedAt,
-          idempotencyKey: key,
-          requestDigest,
-          requestId,
-        },
-      );
-      if (!checkpoint.ok) {
-        return errorResponse(
-          checkpoint.error.code,
-          checkpoint.error.requestId,
-          checkpoint.error.details,
-        );
-      }
-      if (!checkpoint.data.projectionActive) {
-        return errorResponse("PROVISIONING_IN_PROGRESS", requestId, { retryAfterMs: 1_000 });
-      }
-      const lease = await ctx.runMutation(
-        internal.humanTenancy.acquireOwnerMembershipProvisioningLease,
-        {
-          operationId: reservation.data.operationId,
-          workosOrganizationId: organization.id,
-          idempotencyKey: key,
-          requestDigest,
-          requestId,
-        },
-      );
-      if (!lease.ok) {
-        return errorResponse(lease.error.code, lease.error.requestId, lease.error.details);
-      }
-      membershipLeaseId = lease.data.leaseId;
-      releaseMembershipLease = async () => {
-        if (operationId === undefined || membershipLeaseId === undefined) return;
-        const leaseId = membershipLeaseId;
-        membershipLeaseId = undefined;
-        await ctx.runMutation(internal.humanTenancy.releaseOwnerMembershipProvisioningLease, {
-          operationId,
-          leaseId,
-          requestId,
-        });
-      };
-      let membershipObservedAt = Date.now();
-      const polled = await pollWorkOSOwnerMembership({
-        userId: identified.identity.subject,
-        organizationId: organization.id,
+      const result = await ctx.runMutation(internal.humanTenancy.createOrganizationOwned, {
+        name: body.data.name,
+        idempotencyKey: key,
+        requestDigest,
+        requestId,
       });
-      if (polled === null) {
-        await releaseMembershipLease();
-        return errorResponse("SERVICE_UNAVAILABLE", requestId);
-      }
-      let membership: OrganizationMembership;
-      if (polled.kind === "active") {
-        membership = polled.membership;
-      } else if (polled.kind === "not_ready") {
-        await releaseMembershipLease();
-        return errorResponse("PROVISIONING_IN_PROGRESS", requestId, { retryAfterMs: 1_000 });
-      } else {
-        const dispatch = await ctx.runMutation(
-          internal.humanTenancy.markOwnerMembershipCreateDispatched,
-          {
-            operationId: reservation.data.operationId,
-            workosOrganizationId: organization.id,
-            leaseId: lease.data.leaseId,
-            idempotencyKey: key,
-            requestDigest,
-            requestId,
-          },
-        );
-        if (!dispatch.ok) {
-          await releaseMembershipLease();
-          return errorResponse(dispatch.error.code, dispatch.error.requestId, dispatch.error.details);
-        }
-        if (!dispatch.data.dispatch) {
-          await releaseMembershipLease();
-          return errorResponse("PROVISIONING_IN_PROGRESS", requestId, { retryAfterMs: 1_000 });
-        }
-        membershipCreateDispatched = true;
-        membershipObservedAt = Date.now();
-        const created = await createWorkOSOwnerMembership({
-          userId: identified.identity.subject,
-          organizationId: organization.id,
-        });
-        if (
-          created === null ||
-          !workOSMembershipLocatorMatches(created, {
-            userId: identified.identity.subject,
-            organizationId: organization.id,
-          }) ||
-          !isActiveWorkOSOwnerMembership(created)
-        ) {
-          await releaseMembershipLease();
-          return errorResponse("PROVISIONING_IN_PROGRESS", requestId, { retryAfterMs: 1_000 });
-        }
-        membership = created;
-      }
-      const result = await ctx.runMutation(
-        internal.humanTenancy.completeOrganizationProvisioning,
-        {
-          operationId: reservation.data.operationId,
-          workosOrganizationId: organization.id,
-          workosMembershipId: membership.id,
-          workosMembershipOrganizationId: membership.organizationId,
-          workosMembershipUserId: membership.userId,
-          roleSlugs: membershipRoleSlugs(membership),
-          providerUpdatedAt: Date.parse(membership.updatedAt),
-          observedAt: membershipObservedAt,
-          leaseId: lease.data.leaseId,
-          idempotencyKey: key,
-          requestDigest,
-          requestId,
-        },
-      );
-      if (!result.ok) await releaseMembershipLease();
       return resultResponse(result, taskctlApiOperations.createOrganization.responseSchema);
     } catch {
-      if (releaseMembershipLease !== undefined) {
-        try {
-          await releaseMembershipLease();
-        } catch {
-          // The durable lease expires; the dispatch marker still prevents a second POST.
-        }
-      }
-      return membershipCreateDispatched
-        ? errorResponse("PROVISIONING_IN_PROGRESS", requestId, { retryAfterMs: 1_000 })
-        : errorResponse("SERVICE_UNAVAILABLE", requestId);
+      return errorResponse("INTERNAL_ERROR", requestId);
     }
   }),
 });

@@ -53,7 +53,7 @@ async function storedAuthorizationIsActive(
     organization.status === "active" &&
     user.status === "active" &&
     organization.publicId === session.organizationPublicId &&
-    user.workosUserId === session.startedByWorkosUserId &&
+    user.publicId === session.startedByUserPublicId &&
     membership.organizationId === session.organizationId &&
     membership.userId === session.startedByUserId &&
     membership.status === "active" &&

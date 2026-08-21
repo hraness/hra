@@ -6,6 +6,7 @@ import {
   humanProfileSchema,
   profileFromHumanAuthentication,
   secretCustodyJournalSchema,
+  SecretCustodyError,
   SecretStoreAccessDeniedError,
   type HumanAuthentication,
   type HumanAuthenticationSnapshot,
@@ -37,9 +38,28 @@ export const humanAccountMetadataSchema = z
     revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     credentialGeneration: credentialGenerationSchema,
     profile: humanProfileSchema.nullable(),
+    credentialRecoveryPending: z.literal(true).optional(),
   })
   .strict();
 export type HumanAccountMetadata = z.infer<typeof humanAccountMetadataSchema>;
+
+export const legacyHumanAccountMetadataReferenceSchema = z
+  .object({
+    state: z.literal("legacy_profile"),
+    revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    credentialGeneration: credentialGenerationSchema,
+  })
+  .strict();
+export type LegacyHumanAccountMetadataReference = z.infer<
+  typeof legacyHumanAccountMetadataReferenceSchema
+>;
+
+export class LegacyHumanAccountMetadataError extends Error {
+  constructor() {
+    super("Legacy human account metadata requires explicit recovery.");
+    this.name = "LegacyHumanAccountMetadataError";
+  }
+}
 
 /**
  * SQLite owns the implementation. Both values are token-free and each CAS must
@@ -111,6 +131,20 @@ export interface HumanCredentialClearAuthority {
   }>[];
   readonly hasUnrecognizedValue: boolean;
 }
+
+export interface HumanScopeSelectionCustodyAuthority {
+  readonly sourceRevision: number;
+  readonly generation: number;
+  readonly apiUrl: string;
+  readonly userId: string;
+}
+
+export type HumanScopeSelectionContainment =
+  | SecretCustodyReconnectRecovery
+  | Readonly<{
+      state: "newer_winner";
+      snapshot: HumanAuthenticationSnapshot;
+    }>;
 
 export class HumanCredentialCustody implements HumanAuthenticationStore {
   readonly #custody: GenerationalSecretCustody;
@@ -217,6 +251,181 @@ export class HumanCredentialCustody implements HumanAuthenticationStore {
     token: SecretCustodyRecoveryToken,
   ): Promise<SecretCustodyReconnectRecovery> {
     return await this.#custody.preserveInspectedPendingForRecovery(token);
+  }
+
+  /**
+   * Retire an indeterminate rotated session from live custody without deleting
+   * any Keychain value. Every readable live value must still belong to the
+   * exact API/user authority that initiated the server-side rotation. A
+   * malformed committed value fails closed for explicit recovery; a malformed
+   * pending value is allowed only alongside that exact readable committed
+   * predecessor, which is the pre-Keychain failure shape of a local CAS.
+   */
+  async inspectScopeSelectionAuthority(
+    snapshot: HumanAuthenticationSnapshot,
+  ): Promise<HumanScopeSelectionCustodyAuthority> {
+    const inspected = await this.#custody.inspectLiveValues();
+    const committed = inspected.values.find(
+      (value) => value.role === "committed",
+    );
+    const authentication = committed?.state === "valid"
+      ? parseHumanAuthentication(committed.value)
+      : null;
+    if (
+      inspected.sourceRevision === null || committed === undefined ||
+      authentication === null ||
+      committed.pointer.generation !== snapshot.generation ||
+      JSON.stringify(authentication) !== JSON.stringify(snapshot.authentication)
+    ) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    return {
+      sourceRevision: inspected.sourceRevision,
+      generation: snapshot.generation,
+      apiUrl: snapshot.authentication.apiUrl,
+      userId: snapshot.authentication.user.id,
+    };
+  }
+
+  async preserveIndeterminateScopeSession(options: {
+    readonly authority: HumanScopeSelectionCustodyAuthority;
+    readonly candidate?: HumanAuthenticationSnapshot;
+  }): Promise<HumanScopeSelectionContainment> {
+    const inspected = await this.#custody.inspectLiveValues();
+    const committed = inspected.values.find(
+      (value) => value.role === "committed",
+    );
+    const committedAuthentication = committed?.state === "valid"
+      ? parseHumanAuthentication(committed.value)
+      : null;
+    if (
+      committed !== undefined &&
+      committed.pointer.generation > options.authority.generation
+    ) {
+      if (inspected.values.some((value) => value.role === "pending")) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      if (committedAuthentication === null) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      if (
+        committedAuthentication.apiUrl !== options.authority.apiUrl ||
+        committedAuthentication.user.id !== options.authority.userId
+      ) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      const snapshot = humanAuthenticationSnapshotSchema.parse({
+        generation: committed.pointer.generation,
+        authentication: committedAuthentication,
+      });
+      if (
+        options.candidate !== undefined &&
+        JSON.stringify(snapshot) === JSON.stringify(options.candidate)
+      ) {
+        return await this.#custody.preserveLiveValuesForRecovery(inspected);
+      }
+      return { state: "newer_winner", snapshot };
+    }
+
+    let candidateObserved = false;
+    for (const value of inspected.values) {
+      if (value.state !== "valid") {
+        if (
+          value.role === "committed" || options.candidate === undefined ||
+          value.pointer.generation !== options.candidate.generation
+        ) {
+          throw new SecretCustodyError("concurrent_update");
+        }
+        candidateObserved = true;
+        continue;
+      }
+      const authentication = parseHumanAuthentication(value.value);
+      if (
+        authentication === null ||
+        authentication.apiUrl !== options.authority.apiUrl ||
+        authentication.user.id !== options.authority.userId
+      ) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      if (
+        options.candidate !== undefined &&
+        value.pointer.generation === options.candidate.generation &&
+        JSON.stringify(authentication) ===
+          JSON.stringify(options.candidate.authentication)
+      ) {
+        candidateObserved = true;
+      }
+    }
+    const exactAuthorityRemains = committed !== undefined &&
+      committed.pointer.generation === options.authority.generation &&
+      committedAuthentication !== null &&
+      committedAuthentication.apiUrl === options.authority.apiUrl &&
+      committedAuthentication.user.id === options.authority.userId;
+    if (
+      !exactAuthorityRemains && !candidateObserved &&
+      inspected.values.length > 0
+    ) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    if (
+      inspected.sourceRevision !== options.authority.sourceRevision &&
+      !candidateObserved
+    ) {
+      throw new SecretCustodyError("concurrent_update");
+    }
+    return await this.#custody.preserveLiveValuesForRecovery(inspected);
+  }
+
+  /**
+   * Retire one exact committed authentication generation after a remote
+   * credential rotation or pairing commit becomes indeterminate. This is the
+   * HumanAuthenticationStore containment primitive: it preserves every live
+   * Keychain byte and atomically removes the inspected pointers from bearer
+   * admission only when the committed product payload still matches the
+   * caller's exact generation.
+   */
+  async preserveForRecovery(input: {
+    readonly expectedGeneration: number;
+  }): Promise<boolean> {
+    const inspected = await this.#custody.inspectLiveValues();
+    const committed = inspected.values.find(
+      (value) => value.role === "committed",
+    );
+    if (
+      committed === undefined ||
+      committed.pointer.generation !== input.expectedGeneration ||
+      committed.state !== "valid" ||
+      parseHumanAuthentication(committed.value) === null
+    ) {
+      return false;
+    }
+    const recovery = await this.#custody.preserveLiveValuesForRecovery(
+      inspected,
+    );
+    return recovery.state === "quarantined";
+  }
+
+  /**
+   * A durable pairing intent proves these pointers were created by the local
+   * pairing commit that must now be recovered explicitly. Preserve its exact
+   * inspected inventory without promoting a pending value or deleting bytes.
+   */
+  async preserveMarkedCredentialForRecovery(
+    expectedApiUrl?: string,
+  ): Promise<SecretCustodyReconnectRecovery> {
+    const inspected = await this.#custody.inspectLiveValues();
+    for (const value of inspected.values) {
+      if (value.state !== "valid") continue;
+      const authentication = parseHumanAuthentication(value.value);
+      if (
+        authentication === null ||
+        (expectedApiUrl !== undefined &&
+          authentication.apiUrl !== expectedApiUrl)
+      ) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+    }
+    return await this.#custody.preserveLiveValuesForRecovery(inspected);
   }
 
   async inspectClearAuthority(): Promise<HumanCredentialClearAuthority> {
@@ -336,6 +545,7 @@ function tokenFreeProfile(
 export async function reconcileHumanAccountMetadata(
   store: HumanAccountMetadataPort,
   snapshot: HumanAuthenticationSnapshot | null,
+  options: { readonly replaceLegacyProfile?: boolean } = {},
 ): Promise<HumanAccountMetadata> {
   const profile = snapshot === null
     ? null
@@ -345,22 +555,36 @@ export async function reconcileHumanAccountMetadata(
     const parsed = source === null
       ? null
       : humanAccountMetadataSchema.safeParse(source);
-    if (parsed !== null && !parsed.success) {
+    const legacy = source === null || parsed?.success
+      ? null
+      : legacyHumanAccountMetadataReferenceSchema.safeParse(source);
+    if (parsed !== null && !parsed.success && (legacy === null || !legacy.success)) {
       throw new Error("Human account metadata is invalid.");
     }
     const current = parsed?.data ?? null;
+    const legacyCurrent = legacy?.success === true ? legacy.data : null;
+    if (
+      legacyCurrent !== null &&
+      options.replaceLegacyProfile !== true
+    ) {
+      throw new LegacyHumanAccountMetadataError();
+    }
+    const currentRevision = current?.revision ?? legacyCurrent?.revision ?? null;
+    const currentCredentialGeneration = current?.credentialGeneration ??
+      legacyCurrent?.credentialGeneration;
     if (
       snapshot !== null &&
-      current !== null &&
-      current.credentialGeneration > snapshot.generation
+      currentCredentialGeneration !== undefined &&
+      currentCredentialGeneration > snapshot.generation
     ) {
       throw new Error("Human credential generation moved backwards.");
     }
     const credentialGeneration = snapshot?.generation ??
-      current?.credentialGeneration ??
+      currentCredentialGeneration ??
       0;
     if (
       current !== null &&
+      current.credentialRecoveryPending !== true &&
       current.credentialGeneration === credentialGeneration &&
       JSON.stringify(current.profile) === JSON.stringify(profile)
     ) {
@@ -368,9 +592,47 @@ export async function reconcileHumanAccountMetadata(
     }
     const next = humanAccountMetadataSchema.parse({
       version: 1,
-      revision: (current?.revision ?? -1) + 1,
+      revision: (currentRevision ?? -1) + 1,
       credentialGeneration,
       profile,
+    });
+    if (
+      await store.compareAndSwapAccountMetadata({
+        expectedRevision: currentRevision,
+        next,
+      })
+    ) {
+      return next;
+    }
+  }
+  throw new Error("Human account metadata changed concurrently.");
+}
+
+/**
+ * Record a token-free, restart-durable intent before a pairing write or after
+ * exact refresh containment cannot be proven. Normal metadata reconciliation
+ * clears the marker. If the process stops mid-recovery, startup requires an
+ * explicit quarantine decision instead of silently adopting the credential.
+ */
+export async function markHumanCredentialRecoveryPending(
+  store: HumanAccountMetadataPort,
+): Promise<HumanAccountMetadata> {
+  for (let attempt = 0; attempt < MAX_METADATA_CAS_ATTEMPTS; attempt += 1) {
+    const source = await store.readAccountMetadata();
+    const parsed = source === null
+      ? null
+      : humanAccountMetadataSchema.safeParse(source);
+    if (parsed !== null && !parsed.success) {
+      throw new LegacyHumanAccountMetadataError();
+    }
+    const current = parsed?.data ?? null;
+    if (current?.credentialRecoveryPending === true) return current;
+    const next = humanAccountMetadataSchema.parse({
+      version: 1,
+      revision: (current?.revision ?? -1) + 1,
+      credentialGeneration: current?.credentialGeneration ?? 0,
+      profile: current?.profile ?? null,
+      credentialRecoveryPending: true,
     });
     if (
       await store.compareAndSwapAccountMetadata({
@@ -382,6 +644,21 @@ export async function reconcileHumanAccountMetadata(
     }
   }
   throw new Error("Human account metadata changed concurrently.");
+}
+
+export async function isHumanCredentialRecoveryPending(
+  store: HumanAccountMetadataPort,
+): Promise<boolean> {
+  const source = await store.readAccountMetadata();
+  if (source === null) return false;
+  const parsed = humanAccountMetadataSchema.safeParse(source);
+  if (!parsed.success) {
+    if (legacyHumanAccountMetadataReferenceSchema.safeParse(source).success) {
+      return false;
+    }
+    throw new Error("Human account metadata is invalid.");
+  }
+  return parsed.data.credentialRecoveryPending === true;
 }
 
 export function parseSecretCustodyJournal(

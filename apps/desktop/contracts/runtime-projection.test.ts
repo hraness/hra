@@ -83,7 +83,10 @@ const account: AccountSummary = {
   selected: true,
   identityLabel: "builder@example.com",
   planLabel: "pro",
-  usageRemainingPercent: 73,
+  weeklyUsage: {
+    remainingPercent: 73,
+    resetsAt: "2026-08-24T12:00:00.000Z",
+  },
   authState: "signedIn",
   login: { state: "idle" },
   runtime: { state: "ready", generation: 1 },

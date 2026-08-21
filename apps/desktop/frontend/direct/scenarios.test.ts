@@ -202,14 +202,17 @@ describe("HRA Direct catalogs", () => {
     }
   });
 
-  test("projects bounded remaining capacity beside a distinct cloud sign-in state", () => {
+  test("projects weekly remaining capacity and reset beside a distinct cloud sign-in state", () => {
     const scenario = hraScenarioCatalog.resolve("settings-browser-login");
     if (!scenario.ok) throw new Error(scenario.error.message);
     const snapshot = scenario.value.world.gateway.snapshots[0];
 
     expect(snapshot?.accounts.find(({ label }) => label === "Work")).toMatchObject({
       identityLabel: "builder@work.example",
-      usageRemainingPercent: 64,
+      weeklyUsage: {
+        remainingPercent: 64,
+        resetsAt: "2026-07-24T15:00:00.000Z",
+      },
     });
     expect(snapshot?.humanAccount).toEqual({ state: "signedOut", revision: 0 });
     expect(hraCoverageCatalog.list().find(

@@ -1,6 +1,6 @@
 # Contents
 
-- `config.ts` – optional cloud API and WorkOS public-client environment parsing with fail-closed disabled states.
+- `config.ts` – optional cloud API and browser-origin environment parsing with fail-closed disabled states.
 - `keychain-custody.ts` – Bun Keychain adaptation, generation-preserving human credential custody, and token-free metadata ports.
 - `http-client.ts` – strict typed human-account and HRA workspace HTTP transports.
 - `human-account-service.ts` – optional device sign-in, safe renderer snapshots, organization/workspace selection, refresh, cancellation, and sign-out.
@@ -16,7 +16,7 @@
 
 # Guidelines
 
-- Never persist, log, throw, emit, or project access tokens, refresh tokens, device codes, authorization headers, plaintext interaction answers, or raw upstream bodies.
+- Never persist, log, throw, emit, or project access tokens, refresh tokens, pairing verifiers or challenges, authorization headers, plaintext interaction answers, or raw upstream bodies. Only the comparison code and expiry may cross the renderer boundary during pairing.
 - Keep optional cloud configuration fail-closed. Missing or invalid configuration performs no network access and must not affect account-free local workspaces.
 - Store human credentials only through the `kitchen.hraness.cloud-human.v1` Keychain service. SQLite implementations may persist only the exported custody journal and token-free account metadata.
 - Fence asynchronous sign-in, refresh, workspace selection, and invalidation work by credential and loop generation. A stale completion cannot update state or emit an invalidation.

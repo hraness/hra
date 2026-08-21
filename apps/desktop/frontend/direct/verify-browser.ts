@@ -268,13 +268,13 @@ const scenarios = [
     expectedBeforeAction: [
       "Scheduled release audit",
       "Scheduled · due now",
-      "Shared folder · Documents",
+      "Documents",
     ],
     expectedText: [
       "Scheduled release audit",
       "Scheduled · due now",
       "Direct could not interpret that schedule.",
-      "Shared folder · Documents",
+      "Documents",
     ],
     expectedVisibleControls: [
       "Shared folder access: Documents. Choose folder",

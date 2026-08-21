@@ -20,15 +20,16 @@ describe("HRA shared appearance and shell contract", () => {
   });
 
   test("keeps the public editorial routes outside hosted auth providers", async () => {
-    const providers = await source("./providers.tsx");
+    const [layout, providers, authenticated] = await Promise.all([
+      source("./layout.tsx"),
+      source("./providers.tsx"),
+      source("./authenticated-layout.tsx"),
+    ]);
 
-    expect(providers).toContain('pathname === "/"');
-    expect(providers).toContain('pathname === "/download"');
-    expect(providers).toContain('pathname === "/download/"');
-    expect(providers).toContain("isHraPublicComparisonPath(pathname)");
-    expect(providers).not.toContain('pathname.startsWith("/alternatives/")');
-    expect(providers).toContain("standalonePublicRoute || !authConfigured");
-    expect(providers).not.toContain('pathname.startsWith("/download")');
+    expect(layout).not.toContain("ConvexAuthNextjsServerProvider");
+    expect(providers).not.toContain("ConvexAuthNextjsProvider");
+    expect(authenticated).toContain("ConvexAuthNextjsServerProvider");
+    expect(authenticated).toContain("ConvexAuthBridge");
   });
 
   test("keeps rail and bars persistent while the query-addressed body animates", async () => {

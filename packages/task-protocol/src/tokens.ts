@@ -5,10 +5,10 @@ const BEARER_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const EMBEDDED_SECRET_TOKEN_PATTERN = /(?:agt|enr)_[0-9A-HJKMNP-TV-Z]{26}_[A-Za-z0-9_-]{43}/gu;
 const EMBEDDED_JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu;
 const SENSITIVE_JSON_FIELD_PATTERN =
-  /("(?:accessToken|refreshToken|access_token|refresh_token|deviceCode|device_code|authorization)"\s*:\s*)"(?:\\(?:["\\/bfnrt]|u[0-9a-f]{4})|[^"\\])*"/giu;
+  /("(?:accessToken|refreshToken|access_token|refresh_token|deviceCode|device_code|pairingVerifier|verifier|authorization)"\s*:\s*)"(?:\\(?:["\\/bfnrt]|u[0-9a-f]{4})|[^"\\])*"/giu;
 const AUTHORIZATION_HEADER_PATTERN = /(Authorization\s*:\s*(?:Bearer\s+)?)[^\s,;]+/giu;
 const SENSITIVE_FORM_FIELD_PATTERN =
-  /((?:access_token|refresh_token|device_code|deviceCode|refreshToken|accessToken)=)[^&\s]*/giu;
+  /((?:access_token|refresh_token|device_code|deviceCode|refreshToken|accessToken|pairingVerifier|verifier)=)[^&\s]*/giu;
 
 export const locatorSchema = z
   .string()

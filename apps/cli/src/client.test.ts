@@ -63,7 +63,20 @@ describe("TaskctlClient", () => {
             accessToken: "rotated-access-token-long-enough",
             refreshToken: "rotated-refresh-token-long-enough",
             user: { id: "user_abc123", email: "human@example.com" },
-            workosOrganizationId: "org_abc123",
+            organization: {
+              id: "organization-1",
+              name: "Example",
+              role: "owner",
+              status: "active",
+            },
+            workspace: {
+              id: "workspace-1",
+              organizationId: "organization-1",
+              slug: "core",
+              name: "Core",
+              taskKeyPrefix: "OPS",
+              roles: ["planner"],
+            },
           },
           requestId: REQUEST_ID,
         }),
@@ -73,10 +86,12 @@ describe("TaskctlClient", () => {
 
     const result = await client.refreshHumanAuthentication(
       "current-refresh-token-long-enough",
-      { workosOrganizationId: "org_abc123" },
     );
 
-    expect(result).toMatchObject({ ok: true, data: { workosOrganizationId: "org_abc123" } });
+    expect(result).toMatchObject({
+      ok: true,
+      data: { organization: { id: "organization-1" }, workspace: { id: "workspace-1" } },
+    });
     const captured = captures[0];
     if (captured === undefined) throw new Error("request was not captured");
     expect(captured.url.pathname).toBe("/v1/auth/refresh");
@@ -84,9 +99,7 @@ describe("TaskctlClient", () => {
     expect(headers.get("Authorization")).toBe("Bearer current-refresh-token-long-enough");
     expect(headers.get("Idempotency-Key")).toBeNull();
     expect(headers.get("X-Taskctl-Session")).toBeNull();
-    expect(JSON.parse(stringBody(captured.init?.body))).toEqual({
-      workosOrganizationId: "org_abc123",
-    });
+    expect(JSON.parse(stringBody(captured.init?.body))).toEqual({});
     expect(stringBody(captured.init?.body)).not.toContain("current-refresh-token-long-enough");
   });
 
@@ -110,7 +123,7 @@ describe("TaskctlClient", () => {
         ),
     });
 
-    const result = await client.refreshHumanAuthentication(refreshToken, {});
+    const result = await client.refreshHumanAuthentication(refreshToken);
 
     expect(result).toMatchObject({
       ok: false,

@@ -9,9 +9,6 @@ import {
   MIN_AGENT_CREDENTIAL_LIFETIME_MS,
   organizationNameSchema,
   revokeAgentCredentialResponseSchema,
-  workosMembershipIdSchema,
-  workosOrganizationIdSchema,
-  workosUserIdSchema,
   workspaceNameSchema,
   workspaceSlugSchema,
   taskKeyPrefixSchema,
@@ -40,22 +37,14 @@ import {
   authorizeOrganizationHuman,
   authorizeWorkspaceHuman,
   readHumanIdentity,
-  upsertHumanUser,
 } from "./humanAuthorization";
-import {
-  applyMembershipObservation,
-  applyOrganizationObservation,
-} from "./identityProjection";
 import {
   agentScopeValidator,
   domainErrorValidator,
   ENROLLMENT_LIFETIME_MS,
   MAX_COMMAND_RECEIPT_BYTES,
 } from "./model";
-import { WORKOS_OWNER_MEMBERSHIP_PROVIDER_POLICY } from "./workos";
 const IDEMPOTENCY_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
-const MEMBERSHIP_PROVISIONING_LEASE_MS =
-  WORKOS_OWNER_MEMBERSHIP_PROVIDER_POLICY.leaseDurationMs;
 const ALL_WORKSPACE_ROLES = ["planner", "reviewer", "viewer"] as const;
 const CREDENTIAL_SESSION_REVOCATION_BATCH = 64;
 
@@ -64,29 +53,12 @@ const organizationRoleValidator = v.union(
   v.literal("admin"),
   v.literal("member"),
 );
-const organizationViewValidator = v.union(
-  v.object({
-    id: v.string(),
-    workosOrganizationId: v.optional(v.string()),
-    name: v.string(),
-    role: organizationRoleValidator,
-    status: v.literal("provisioning"),
-  }),
-  v.object({
-    id: v.string(),
-    workosOrganizationId: v.string(),
-    name: v.string(),
-    role: organizationRoleValidator,
-    status: v.literal("active"),
-  }),
-  v.object({
-    id: v.string(),
-    workosOrganizationId: v.optional(v.string()),
-    name: v.string(),
-    role: organizationRoleValidator,
-    status: v.literal("failed"),
-  }),
-);
+const organizationViewValidator = v.object({
+  id: v.string(),
+  name: v.string(),
+  role: organizationRoleValidator,
+  status: v.literal("active"),
+});
 const workspaceRoleValidator = v.union(
   v.literal("planner"),
   v.literal("reviewer"),
@@ -312,50 +284,6 @@ export const setWorkspaceRolesResultValidator = v.union(
   }),
   v.object({ ok: v.literal(false), error: domainErrorValidator }),
 );
-const reservationResultValidator = v.union(
-  v.object({
-    ok: v.literal(true),
-    data: v.union(
-      v.object({
-        kind: v.literal("reserved"),
-        operationId: v.id("accountProvisioningOperations"),
-        externalId: v.string(),
-        name: v.string(),
-      }),
-      v.object({
-        kind: v.literal("replay"),
-        organization: organizationViewValidator,
-        originalRequestId: v.string(),
-      }),
-    ),
-    requestId: v.string(),
-  }),
-  v.object({ ok: v.literal(false), error: domainErrorValidator }),
-);
-const provisioningCheckpointResultValidator = v.union(
-  v.object({
-    ok: v.literal(true),
-    data: v.object({ workosOrganizationId: v.string(), projectionActive: v.boolean() }),
-    requestId: v.string(),
-  }),
-  v.object({ ok: v.literal(false), error: domainErrorValidator }),
-);
-const membershipLeaseResultValidator = v.union(
-  v.object({
-    ok: v.literal(true),
-    data: v.object({ leaseId: v.string(), workosOrganizationId: v.string() }),
-    requestId: v.string(),
-  }),
-  v.object({ ok: v.literal(false), error: domainErrorValidator }),
-);
-const membershipCreateDispatchResultValidator = v.union(
-  v.object({
-    ok: v.literal(true),
-    data: v.object({ dispatch: v.boolean() }),
-    requestId: v.string(),
-  }),
-  v.object({ ok: v.literal(false), error: domainErrorValidator }),
-);
 
 export interface HumanReceiptIdentity {
   readonly kind: "account" | "organization";
@@ -480,763 +408,6 @@ function parseWithSchema<Data>(schema: { safeParse(value: unknown): { success: b
     return parsed.success && parsed.data !== undefined ? parsed.data : null;
   };
 }
-
-export const syncOrganizationPage = internalMutation({
-  args: {
-    memberships: v.array(
-      v.object({
-        membershipId: v.string(),
-        workosOrganizationId: v.string(),
-        workosUserId: v.string(),
-        organizationName: v.string(),
-        roleSlugs: v.array(v.string()),
-        providerUpdatedAt: v.number(),
-        observedAt: v.number(),
-      }),
-    ),
-    cursor: v.union(v.string(), v.null()),
-    requestId: v.string(),
-  },
-  returns: listOrganizationsResultValidator,
-  handler: async (ctx, args) => {
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    const now = Date.now();
-    const normalizedMemberships: Array<{
-      item: (typeof args.memberships)[number];
-      organizationName: string;
-    }> = [];
-    for (const item of args.memberships) {
-      const parsedName = organizationNameSchema.safeParse(item.organizationName);
-      if (
-        !workosMembershipIdSchema.safeParse(item.membershipId).success ||
-        !workosOrganizationIdSchema.safeParse(item.workosOrganizationId).success ||
-        !workosUserIdSchema.safeParse(item.workosUserId).success ||
-        item.workosUserId !== identified.identity.subject ||
-        !parsedName.success ||
-        item.roleSlugs.length === 0 ||
-        !item.roleSlugs.every((role) => role.length > 0 && role.length <= 128) ||
-        !Number.isSafeInteger(item.providerUpdatedAt) ||
-        item.providerUpdatedAt < 0 ||
-        !Number.isSafeInteger(item.observedAt) ||
-        item.observedAt < 0
-      ) {
-        return domainFailure("SERVICE_UNAVAILABLE", args.requestId);
-      }
-      normalizedMemberships.push({ item, organizationName: parsedName.data });
-    }
-    // The complete provider page is validated before the first write so a
-    // foreign or malformed trailing record cannot commit a partial projection.
-    const user = await upsertHumanUser(ctx, identified.identity, now);
-    const organizations = [];
-    for (const { item, organizationName } of normalizedMemberships) {
-      await applyMembershipObservation(
-        ctx,
-        {
-          kind: "organization_membership",
-          workosMembershipId: item.membershipId,
-          workosOrganizationId: item.workosOrganizationId,
-          workosUserId: item.workosUserId,
-          organizationName,
-          status: "active",
-          roleSlugs: item.roleSlugs,
-          providerUpdatedAt: item.providerUpdatedAt,
-          observedAt: item.observedAt,
-        },
-        now,
-      );
-      const organization = await ctx.db
-        .query("organizations")
-        .withIndex("by_workos_organization_id", (query) =>
-          query.eq("workosOrganizationId", item.workosOrganizationId),
-        )
-        .unique();
-      if (organization === null) throw new Error("Organization synchronization failed.");
-      const membership = await ctx.db
-        .query("organizationMemberships")
-        .withIndex("by_workos_membership_id", (query) =>
-          query.eq("workosMembershipId", item.membershipId),
-        )
-        .unique();
-      if (
-        membership === null ||
-        membership.organizationId !== organization._id ||
-        membership.userId !== user._id ||
-        membership.status !== "active" ||
-        organization.status !== "active"
-      ) {
-        continue;
-      }
-      organizations.push({
-        id: organization.publicId,
-        workosOrganizationId: item.workosOrganizationId,
-        name: organization.name,
-        role: membership.role,
-        status: "active" as const,
-      });
-    }
-    return { ok: true as const, data: { organizations, cursor: args.cursor }, requestId: args.requestId };
-  },
-});
-
-export const reserveOrganizationProvisioning = internalMutation({
-  args: {
-    name: v.string(),
-    idempotencyKey: v.string(),
-    requestDigest: v.string(),
-    requestId: v.string(),
-  },
-  returns: reservationResultValidator,
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const metadata = assertRequestMetadata({ ...args, now });
-    if (!metadata.ok) return { ok: false as const, error: metadata.error };
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    const parsedName = organizationNameSchema.safeParse(args.name);
-    if (!parsedName.success) return domainFailure("VALIDATION_ERROR", args.requestId);
-    const user = await upsertHumanUser(ctx, identified.identity, now);
-    const identity = { kind: "account" as const, principalId: identified.identity.subject };
-    const receipt = await lookupHumanReceipt(ctx, {
-      identity,
-      operation: "organizations.create",
-      idempotencyKey: args.idempotencyKey,
-      requestDigest: args.requestDigest,
-      requestId: args.requestId,
-      parse: parseWithSchema(createOrganizationResponseSchema),
-    });
-    if (receipt.kind === "failure") return { ok: false as const, error: receipt.error };
-    if (receipt.kind === "replay") {
-      const replayedOrganization = receipt.data.organization;
-      const organization =
-        replayedOrganization.status === "active"
-          ? {
-              id: replayedOrganization.id,
-              workosOrganizationId: replayedOrganization.workosOrganizationId,
-              name: replayedOrganization.name,
-              role: replayedOrganization.role,
-              status: "active" as const,
-            }
-          : replayedOrganization.status === "provisioning"
-            ? {
-                id: replayedOrganization.id,
-                ...(replayedOrganization.workosOrganizationId === undefined
-                  ? {}
-                  : { workosOrganizationId: replayedOrganization.workosOrganizationId }),
-                name: replayedOrganization.name,
-                role: replayedOrganization.role,
-                status: "provisioning" as const,
-              }
-            : {
-                id: replayedOrganization.id,
-                ...(replayedOrganization.workosOrganizationId === undefined
-                  ? {}
-                  : { workosOrganizationId: replayedOrganization.workosOrganizationId }),
-                name: replayedOrganization.name,
-                role: replayedOrganization.role,
-                status: "failed" as const,
-              };
-      return {
-        ok: true as const,
-        data: {
-          kind: "replay" as const,
-          organization,
-          originalRequestId: receipt.requestId,
-        },
-        requestId: args.requestId,
-      };
-    }
-    const existing = await ctx.db
-      .query("accountProvisioningOperations")
-      .withIndex("by_principal_and_key", (query) =>
-        query.eq("principalId", identified.identity.subject).eq("idempotencyKey", args.idempotencyKey),
-      )
-      .unique();
-    if (existing !== null) {
-      const storedDigest =
-        typeof existing.requestDigest === "string"
-          ? existing.requestDigest
-          : encodeDigest(existing.requestDigest);
-      if (storedDigest !== args.requestDigest || existing.name !== parsedName.data) {
-        return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-      }
-      if (existing.status === "failed") return domainFailure("PROVISIONING_FAILED", args.requestId);
-      return {
-        ok: true as const,
-        data: {
-          kind: "reserved" as const,
-          operationId: existing._id,
-          externalId: existing.externalId,
-          name: existing.name,
-        },
-        requestId: args.requestId,
-      };
-    }
-    const requestDigest = digestArrayBuffer(args.requestDigest);
-    if (requestDigest === null) return domainFailure("VALIDATION_ERROR", args.requestId);
-    const publicId = randomHumanId("org");
-    const organizationId = await ctx.db.insert("organizations", {
-      publicId,
-      workosExternalId: `taskctl:${publicId}`,
-      name: parsedName.data,
-      status: "provisioning",
-      createdAt: now,
-      updatedAt: now,
-    });
-    const externalId = `taskctl:${publicId}`;
-    const operationId = await ctx.db.insert("accountProvisioningOperations", {
-      userId: user._id,
-      principalId: identified.identity.subject,
-      organizationId,
-      externalId,
-      name: parsedName.data,
-      idempotencyKey: args.idempotencyKey,
-      requestDigest,
-      requestId: args.requestId,
-      status: "reserved",
-      createdAt: now,
-      updatedAt: now,
-    });
-    return {
-      ok: true as const,
-      data: { kind: "reserved" as const, operationId, externalId, name: parsedName.data },
-      requestId: args.requestId,
-    };
-  },
-});
-
-export const checkpointOrganizationProvisioning = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    workosOrganizationId: v.string(),
-    organizationName: v.string(),
-    externalId: v.string(),
-    providerUpdatedAt: v.number(),
-    observedAt: v.number(),
-    idempotencyKey: v.string(),
-    requestDigest: v.string(),
-    requestId: v.string(),
-  },
-  returns: provisioningCheckpointResultValidator,
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const metadata = assertRequestMetadata({ ...args, now });
-    if (!metadata.ok) return { ok: false as const, error: metadata.error };
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    const parsedName = organizationNameSchema.safeParse(args.organizationName);
-    if (
-      !parsedName.success ||
-      !workosOrganizationIdSchema.safeParse(args.workosOrganizationId).success ||
-      !Number.isSafeInteger(args.providerUpdatedAt) ||
-      args.providerUpdatedAt < 0 ||
-      !Number.isSafeInteger(args.observedAt) ||
-      args.observedAt < 0
-    ) {
-      return domainFailure("SERVICE_UNAVAILABLE", args.requestId);
-    }
-    const operation = await ctx.db.get(args.operationId);
-    if (
-      operation === null ||
-      operation.principalId !== identified.identity.subject ||
-      operation.idempotencyKey !== args.idempotencyKey ||
-      operation.externalId !== args.externalId
-    ) {
-      return domainFailure("AUTHORIZATION_DENIED", args.requestId);
-    }
-    const storedDigest =
-      typeof operation.requestDigest === "string"
-        ? operation.requestDigest
-        : encodeDigest(operation.requestDigest);
-    if (storedDigest !== args.requestDigest) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    if (operation.status === "failed") {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-    if (
-      operation.workosOrganizationId !== undefined &&
-      operation.workosOrganizationId !== args.workosOrganizationId
-    ) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    const organization = await ctx.db.get(operation.organizationId);
-    if (organization === null || organization.workosExternalId !== operation.externalId) {
-      return domainFailure("INTERNAL_ERROR", args.requestId);
-    }
-    const conflicting = await ctx.db
-      .query("organizations")
-      .withIndex("by_workos_organization_id", (query) =>
-        query.eq("workosOrganizationId", args.workosOrganizationId),
-      )
-      .unique();
-    if (conflicting !== null && conflicting._id !== organization._id) {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-
-    // Provider identity binding is durable even when the lifecycle observation is stale.
-    // This lets membership webhooks correlate during the remainder of the saga.
-    if (organization.workosOrganizationId === undefined) {
-      await ctx.db.patch(organization._id, {
-        workosOrganizationId: args.workosOrganizationId,
-        updatedAt: now,
-      });
-    } else if (organization.workosOrganizationId !== args.workosOrganizationId) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    await applyOrganizationObservation(
-      ctx,
-      {
-        kind: "organization",
-        workosOrganizationId: args.workosOrganizationId,
-        externalId: args.externalId,
-        name: parsedName.data,
-        status: "active",
-        providerUpdatedAt: args.providerUpdatedAt,
-        observedAt: args.observedAt,
-      },
-      now,
-    );
-    if (operation.status !== "completed") {
-      await ctx.db.patch(operation._id, {
-        workosOrganizationId: args.workosOrganizationId,
-        ...(operation.status === "reserved" ? { status: "provider_organization_ready" as const } : {}),
-        updatedAt: now,
-      });
-    }
-    const projected = await ctx.db.get(organization._id);
-    if (projected === null) return domainFailure("INTERNAL_ERROR", args.requestId);
-    return {
-      ok: true as const,
-      data: {
-        workosOrganizationId: args.workosOrganizationId,
-        projectionActive: projected.status === "active",
-      },
-      requestId: args.requestId,
-    };
-  },
-});
-
-export const acquireOwnerMembershipProvisioningLease = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    workosOrganizationId: v.string(),
-    idempotencyKey: v.string(),
-    requestDigest: v.string(),
-    requestId: v.string(),
-  },
-  returns: membershipLeaseResultValidator,
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const metadata = assertRequestMetadata({ ...args, now });
-    if (!metadata.ok) return { ok: false as const, error: metadata.error };
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    const operation = await ctx.db.get(args.operationId);
-    if (
-      operation === null ||
-      operation.principalId !== identified.identity.subject ||
-      operation.idempotencyKey !== args.idempotencyKey
-    ) {
-      return domainFailure("AUTHORIZATION_DENIED", args.requestId);
-    }
-    const storedDigest =
-      typeof operation.requestDigest === "string"
-        ? operation.requestDigest
-        : encodeDigest(operation.requestDigest);
-    if (storedDigest !== args.requestDigest) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    if (operation.status === "failed") {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-    if (
-      operation.status === "completed" ||
-      operation.workosOrganizationId !== args.workosOrganizationId
-    ) {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    const organization = await ctx.db.get(operation.organizationId);
-    if (organization === null || organization.status !== "active") {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    if (
-      operation.membershipProvisioningLeaseUntil !== undefined &&
-      operation.membershipProvisioningLeaseUntil > now
-    ) {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, {
-        retryAfterMs: Math.max(1, operation.membershipProvisioningLeaseUntil - now),
-      });
-    }
-    const leaseId = `lease_${randomCrockford(26)}`;
-    await ctx.db.patch(operation._id, {
-      membershipProvisioningLeaseId: leaseId,
-      membershipProvisioningLeaseUntil: now + MEMBERSHIP_PROVISIONING_LEASE_MS,
-      updatedAt: now,
-    });
-    return {
-      ok: true as const,
-      data: { leaseId, workosOrganizationId: args.workosOrganizationId },
-      requestId: args.requestId,
-    };
-  },
-});
-
-export const markOwnerMembershipCreateDispatched = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    workosOrganizationId: v.string(),
-    leaseId: v.string(),
-    idempotencyKey: v.string(),
-    requestDigest: v.string(),
-    requestId: v.string(),
-  },
-  returns: membershipCreateDispatchResultValidator,
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const metadata = assertRequestMetadata({ ...args, now });
-    if (!metadata.ok) return { ok: false as const, error: metadata.error };
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    const operation = await ctx.db.get(args.operationId);
-    if (
-      operation === null ||
-      operation.principalId !== identified.identity.subject ||
-      operation.idempotencyKey !== args.idempotencyKey
-    ) {
-      return domainFailure("AUTHORIZATION_DENIED", args.requestId);
-    }
-    const storedDigest =
-      typeof operation.requestDigest === "string"
-        ? operation.requestDigest
-        : encodeDigest(operation.requestDigest);
-    if (storedDigest !== args.requestDigest) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    if (operation.status === "failed") {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-    if (
-      operation.status === "completed" ||
-      operation.workosOrganizationId !== args.workosOrganizationId ||
-      operation.membershipProvisioningLeaseId !== args.leaseId ||
-      operation.membershipProvisioningLeaseUntil === undefined ||
-      operation.membershipProvisioningLeaseUntil < now
-    ) {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    const organization = await ctx.db.get(operation.organizationId);
-    if (
-      organization === null ||
-      organization.status !== "active" ||
-      organization.workosOrganizationId !== args.workosOrganizationId
-    ) {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    if (operation.membershipCreateDispatchedAt !== undefined) {
-      return { ok: true as const, data: { dispatch: false }, requestId: args.requestId };
-    }
-    // This durable marker is committed before the non-idempotent provider POST.
-    // A crash before dispatch deliberately requires operator recovery; automatic
-    // retries remain poll-only so an indeterminate success can never be duplicated.
-    await ctx.db.patch(operation._id, {
-      membershipCreateDispatchedAt: now,
-      membershipCreateDispatchLeaseId: args.leaseId,
-      updatedAt: now,
-    });
-    return { ok: true as const, data: { dispatch: true }, requestId: args.requestId };
-  },
-});
-
-export const releaseOwnerMembershipProvisioningLease = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    leaseId: v.string(),
-    requestId: v.string(),
-  },
-  returns: v.object({ released: v.boolean() }),
-  handler: async (ctx, args) => {
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return { released: false };
-    const operation = await ctx.db.get(args.operationId);
-    if (
-      operation === null ||
-      operation.principalId !== identified.identity.subject ||
-      operation.membershipProvisioningLeaseId !== args.leaseId ||
-      operation.status === "completed" ||
-      operation.status === "failed"
-    ) {
-      return { released: false };
-    }
-    await ctx.db.patch(operation._id, {
-      membershipProvisioningLeaseId: undefined,
-      membershipProvisioningLeaseUntil: undefined,
-      updatedAt: Date.now(),
-    });
-    return { released: true };
-  },
-});
-
-export const completeOrganizationProvisioning = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    workosOrganizationId: v.string(),
-    workosMembershipId: v.string(),
-    workosMembershipOrganizationId: v.string(),
-    workosMembershipUserId: v.string(),
-    roleSlugs: v.array(v.string()),
-    providerUpdatedAt: v.number(),
-    observedAt: v.number(),
-    leaseId: v.string(),
-    idempotencyKey: v.string(),
-    requestDigest: v.string(),
-    requestId: v.string(),
-  },
-  returns: createOrganizationResultValidator,
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const metadata = assertRequestMetadata({ ...args, now });
-    if (!metadata.ok) return { ok: false as const, error: metadata.error };
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return identified;
-    if (
-      !workosOrganizationIdSchema.safeParse(args.workosOrganizationId).success ||
-      !workosMembershipIdSchema.safeParse(args.workosMembershipId).success ||
-      !workosOrganizationIdSchema.safeParse(args.workosMembershipOrganizationId).success ||
-      !workosUserIdSchema.safeParse(args.workosMembershipUserId).success ||
-      args.workosMembershipOrganizationId !== args.workosOrganizationId ||
-      args.workosMembershipUserId !== identified.identity.subject ||
-      args.roleSlugs.length === 0 ||
-      !args.roleSlugs.every((role) => role.length > 0 && role.length <= 128) ||
-      !Number.isSafeInteger(args.providerUpdatedAt) ||
-      args.providerUpdatedAt < 0 ||
-      !Number.isSafeInteger(args.observedAt) ||
-      args.observedAt < 0
-    ) {
-      return domainFailure("SERVICE_UNAVAILABLE", args.requestId);
-    }
-    const operation = await ctx.db.get(args.operationId);
-    if (
-      operation === null ||
-      operation.principalId !== identified.identity.subject ||
-      operation.idempotencyKey !== args.idempotencyKey
-    ) {
-      return domainFailure("AUTHORIZATION_DENIED", args.requestId);
-    }
-    const storedDigest =
-      typeof operation.requestDigest === "string"
-        ? operation.requestDigest
-        : encodeDigest(operation.requestDigest);
-    if (storedDigest !== args.requestDigest) return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    if (operation.status === "failed") return domainFailure("PROVISIONING_FAILED", args.requestId);
-    if (
-      operation.status === "completed" &&
-      (operation.workosOrganizationId !== args.workosOrganizationId ||
-        operation.workosMembershipId !== args.workosMembershipId)
-    ) {
-      return domainFailure("IDEMPOTENCY_CONFLICT", args.requestId);
-    }
-    const identity = { kind: "account" as const, principalId: identified.identity.subject };
-    const receipt = await lookupHumanReceipt(ctx, {
-      identity,
-      operation: "organizations.create",
-      idempotencyKey: args.idempotencyKey,
-      requestDigest: args.requestDigest,
-      requestId: args.requestId,
-      parse: parseWithSchema(createOrganizationResponseSchema),
-    });
-    if (receipt.kind === "failure") return { ok: false as const, error: receipt.error };
-    if (receipt.kind === "replay") {
-      const replayedOrganization = receipt.data.organization;
-      const organization =
-        replayedOrganization.status === "active"
-          ? {
-              id: replayedOrganization.id,
-              workosOrganizationId: replayedOrganization.workosOrganizationId,
-              name: replayedOrganization.name,
-              role: replayedOrganization.role,
-              status: "active" as const,
-            }
-          : replayedOrganization.status === "provisioning"
-            ? {
-                id: replayedOrganization.id,
-                ...(replayedOrganization.workosOrganizationId === undefined
-                  ? {}
-                  : { workosOrganizationId: replayedOrganization.workosOrganizationId }),
-                name: replayedOrganization.name,
-                role: replayedOrganization.role,
-                status: "provisioning" as const,
-              }
-            : {
-                id: replayedOrganization.id,
-                ...(replayedOrganization.workosOrganizationId === undefined
-                  ? {}
-                  : { workosOrganizationId: replayedOrganization.workosOrganizationId }),
-                name: replayedOrganization.name,
-                role: replayedOrganization.role,
-                status: "failed" as const,
-              };
-      return {
-        ok: true as const,
-        data: { organization },
-        requestId: receipt.requestId,
-      };
-    }
-    if (operation.status === "completed") {
-      return domainFailure("INTERNAL_ERROR", args.requestId);
-    }
-    if (
-      operation.membershipProvisioningLeaseId !== args.leaseId ||
-      operation.membershipProvisioningLeaseUntil === undefined ||
-      operation.membershipProvisioningLeaseUntil < now ||
-      operation.workosOrganizationId !== args.workosOrganizationId
-    ) {
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    const [organization, user] = await Promise.all([
-      ctx.db.get(operation.organizationId),
-      ctx.db.get(operation.userId),
-    ]);
-    if (
-      organization === null ||
-      organization.status !== "active" ||
-      organization.workosOrganizationId !== args.workosMembershipOrganizationId ||
-      user === null ||
-      user.workosUserId !== args.workosMembershipUserId
-    ) {
-      return domainFailure("INTERNAL_ERROR", args.requestId);
-    }
-    const conflicting = await ctx.db
-      .query("organizations")
-      .withIndex("by_workos_organization_id", (query) =>
-        query.eq("workosOrganizationId", args.workosOrganizationId),
-      )
-      .unique();
-    if (conflicting !== null && conflicting._id !== organization._id) {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-    const conflictingMembership = await ctx.db
-      .query("organizationMemberships")
-      .withIndex("by_workos_membership_id", (query) =>
-        query.eq("workosMembershipId", args.workosMembershipId),
-      )
-      .unique();
-    if (
-      conflictingMembership !== null &&
-      (conflictingMembership.organizationId !== organization._id ||
-        conflictingMembership.userId !== user._id)
-    ) {
-      return domainFailure("PROVISIONING_FAILED", args.requestId);
-    }
-    await applyMembershipObservation(
-      ctx,
-      {
-        kind: "organization_membership",
-        workosMembershipId: args.workosMembershipId,
-        workosOrganizationId: args.workosMembershipOrganizationId,
-        workosUserId: args.workosMembershipUserId,
-        organizationName: organization.name,
-        status: "active",
-        roleSlugs: args.roleSlugs,
-        providerUpdatedAt: args.providerUpdatedAt,
-        observedAt: args.observedAt,
-      },
-      now,
-    );
-    const [projectedOrganization, projectedMembership] = await Promise.all([
-      ctx.db.get(organization._id),
-      ctx.db
-        .query("organizationMemberships")
-        .withIndex("by_workos_membership_id", (query) =>
-          query.eq("workosMembershipId", args.workosMembershipId),
-        )
-        .unique(),
-    ]);
-    if (
-      projectedOrganization === null ||
-      projectedMembership === null ||
-      projectedMembership.organizationId !== organization._id ||
-      projectedMembership.userId !== user._id
-    ) {
-      return domainFailure("INTERNAL_ERROR", args.requestId);
-    }
-    if (
-      projectedOrganization.status !== "active" ||
-      projectedMembership.status !== "active" ||
-      projectedMembership.role !== "owner"
-    ) {
-      await ctx.db.patch(operation._id, {
-        workosMembershipId: args.workosMembershipId,
-        status: "provider_membership_ready",
-        membershipProvisioningLeaseId: undefined,
-        membershipProvisioningLeaseUntil: undefined,
-        updatedAt: now,
-      });
-      return domainFailure("PROVISIONING_IN_PROGRESS", args.requestId, { retryAfterMs: 1_000 });
-    }
-    await ctx.db.patch(operation._id, {
-      workosOrganizationId: args.workosOrganizationId,
-      workosMembershipId: args.workosMembershipId,
-      status: "completed",
-      membershipProvisioningLeaseId: undefined,
-      membershipProvisioningLeaseUntil: undefined,
-      updatedAt: now,
-    });
-    const data = {
-      organization: {
-        id: organization.publicId,
-        workosOrganizationId: args.workosOrganizationId,
-        name: projectedOrganization.name,
-        role: projectedMembership.role,
-        status: "active" as const,
-      },
-    };
-    await storeHumanReceipt(ctx, {
-      identity,
-      operation: "organizations.create",
-      idempotencyKey: args.idempotencyKey,
-      requestDigest: args.requestDigest,
-      requestId: args.requestId,
-      data,
-      now,
-    });
-    return { ok: true as const, data, requestId: args.requestId };
-  },
-});
-
-export const failOrganizationProvisioning = internalMutation({
-  args: {
-    operationId: v.id("accountProvisioningOperations"),
-    requestId: v.string(),
-  },
-  returns: v.object({ failed: v.boolean() }),
-  handler: async (ctx, args) => {
-    const identified = await readHumanIdentity(ctx, args.requestId, false);
-    if (!identified.ok) return { failed: false };
-    const operation = await ctx.db.get(args.operationId);
-    if (operation === null || operation.principalId !== identified.identity.subject) {
-      return { failed: false };
-    }
-    if (operation.status === "completed") return { failed: false };
-    if (operation.status === "failed") return { failed: true };
-    const organization = await ctx.db.get(operation.organizationId);
-    if (organization === null || organization.status !== "provisioning") {
-      return { failed: false };
-    }
-    const now = Date.now();
-    await ctx.db.patch(operation._id, {
-      status: "failed",
-      failureCode: "provider_rejected",
-      updatedAt: now,
-    });
-    await ctx.db.patch(organization._id, {
-      status: "failed",
-      failureCode: "provider_rejected",
-      updatedAt: now,
-    });
-    return { failed: true };
-  },
-});
 
 export const listWorkspaces = internalQuery({
   args: { cursor: v.optional(v.string()), limit: v.number(), requestId: v.string() },
@@ -2504,4 +1675,110 @@ export const setWorkspaceRoles = internalMutation({
   },
   returns: setWorkspaceRolesResultValidator,
   handler: setWorkspaceRolesForHuman,
+});
+
+/** Convex-owned organization list for an authenticated account. */
+export const listOrganizationsOwned = internalQuery({
+  args: { cursor: v.optional(v.string()), limit: v.number(), requestId: v.string() },
+  returns: listOrganizationsResultValidator,
+  handler: async (ctx, args) => {
+    if (
+      !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 100 ||
+      (args.cursor !== undefined && (args.cursor.length === 0 || args.cursor.length > 8_192))
+    ) return domainFailure("VALIDATION_ERROR", args.requestId);
+    const identified = await readHumanIdentity(ctx, args.requestId, false);
+    if (!identified.ok) return identified;
+    const page = await ctx.db
+      .query("organizationMemberships")
+      .withIndex("by_user_and_organization", (index) =>
+        index.eq("userId", identified.identity.userId))
+      .paginate({ cursor: args.cursor ?? null, numItems: args.limit });
+    const organizations = [];
+    for (const membership of page.page) {
+      if (membership.status !== "active") continue;
+      const organization = await ctx.db.get(membership.organizationId);
+      if (organization === null || organization.status !== "active") continue;
+      organizations.push({
+        id: organization.publicId,
+        name: organization.name,
+        role: membership.role,
+        status: "active" as const,
+      });
+    }
+    return {
+      ok: true as const,
+      data: { organizations, cursor: page.isDone ? null : page.continueCursor },
+      requestId: args.requestId,
+    };
+  },
+});
+
+/** Creates the organization and owner membership in one Convex transaction. */
+export const createOrganizationOwned = internalMutation({
+  args: {
+    name: v.string(),
+    idempotencyKey: v.string(),
+    requestDigest: v.string(),
+    requestId: v.string(),
+  },
+  returns: createOrganizationResultValidator,
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    const metadata = assertRequestMetadata({ ...args, now });
+    if (!metadata.ok) return { ok: false as const, error: metadata.error };
+    const identified = await readHumanIdentity(ctx, args.requestId, false);
+    if (!identified.ok) return identified;
+    const parsedName = organizationNameSchema.safeParse(args.name);
+    if (!parsedName.success) return domainFailure("VALIDATION_ERROR", args.requestId);
+    const user = await ctx.db.get(identified.identity.userId);
+    if (user === null || user.status !== "active") {
+      return domainFailure("AUTHENTICATION_FAILED", args.requestId);
+    }
+    const identity = { kind: "account" as const, principalId: user.publicId };
+    const receipt = await lookupHumanReceipt(ctx, {
+      identity,
+      operation: "organizations.create",
+      idempotencyKey: args.idempotencyKey,
+      requestDigest: args.requestDigest,
+      requestId: args.requestId,
+      parse: parseWithSchema(createOrganizationResponseSchema),
+    });
+    if (receipt.kind === "failure") return { ok: false as const, error: receipt.error };
+    if (receipt.kind === "replay") {
+      return { ok: true as const, data: receipt.data, requestId: receipt.requestId };
+    }
+    const organizationId = await ctx.db.insert("organizations", {
+      publicId: randomHumanId("org"),
+      name: parsedName.data,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    await ctx.db.insert("organizationMemberships", {
+      organizationId,
+      userId: user._id,
+      role: "owner",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    const data = {
+      organization: {
+        id: (await ctx.db.get(organizationId))!.publicId,
+        name: parsedName.data,
+        role: "owner" as const,
+        status: "active" as const,
+      },
+    };
+    await storeHumanReceipt(ctx, {
+      identity,
+      operation: "organizations.create",
+      idempotencyKey: args.idempotencyKey,
+      requestDigest: args.requestDigest,
+      requestId: args.requestId,
+      data,
+      now,
+    });
+    return { ok: true as const, data, requestId: args.requestId };
+  },
 });

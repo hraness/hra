@@ -144,7 +144,6 @@ describe("human organization provisioning journal", () => {
           name: "Studio",
           role: "owner",
           status: "active",
-          workosOrganizationId: "org_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         },
       }, 1_720_000_000_100);
       expect(store.started()).toEqual([]);

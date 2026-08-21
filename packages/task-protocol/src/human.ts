@@ -12,18 +12,17 @@ import {
   MAX_AGENT_CREDENTIAL_LIFETIME_MS,
   MIN_AGENT_CREDENTIAL_LIFETIME_MS,
   epochMsSchema,
+  humanUserIdSchema,
   organizationIdSchema,
   organizationNameSchema,
   organizationRoleSchema,
   taskKeyPrefixSchema,
-  workosOrganizationIdSchema,
-  workosUserIdSchema,
   workspaceIdSchema,
   workspaceNameSchema,
   workspaceRoleSchema,
   workspaceSlugSchema,
 } from "./model";
-import { enrollmentTokenSchema, locatorSchema } from "./tokens";
+import { bearerSecretSchema, enrollmentTokenSchema, locatorSchema } from "./tokens";
 
 const opaqueHumanTokenSchema = z
   .string()
@@ -35,59 +34,173 @@ export const humanAccessTokenSchema = opaqueHumanTokenSchema;
 export const humanRefreshTokenSchema = opaqueHumanTokenSchema.max(4_096);
 
 export const refreshAuthRequestSchema = z
-  .object({ workosOrganizationId: workosOrganizationIdSchema.optional() })
+  .object({})
   .strict();
 export type RefreshAuthRequest = z.infer<typeof refreshAuthRequestSchema>;
 
 export const humanUserViewSchema = z
   .object({
-    id: workosUserIdSchema,
+    id: humanUserIdSchema,
     email: z.string().email(),
     name: z.string().min(1).max(240).optional(),
   })
   .strict();
 
-export const refreshAuthResponseSchema = z
-  .object({
-    accessToken: humanAccessTokenSchema,
-    refreshToken: humanRefreshTokenSchema,
-    user: humanUserViewSchema,
-    workosOrganizationId: workosOrganizationIdSchema.optional(),
-  })
-  .strict();
-export type RefreshAuthResponse = z.infer<typeof refreshAuthResponseSchema>;
-export const refreshAuthEnvelopeSchema = successEnvelopeSchema(refreshAuthResponseSchema);
-
 const organizationViewBase = {
   id: organizationIdSchema,
   name: organizationNameSchema,
   role: organizationRoleSchema,
+  status: z.literal("active"),
 } as const;
 
-export const organizationViewSchema = z.discriminatedUnion("status", [
-  z
-    .object({
-      ...organizationViewBase,
-      status: z.literal("provisioning"),
-      workosOrganizationId: workosOrganizationIdSchema.optional(),
-    })
-    .strict(),
-  z
-    .object({
-      ...organizationViewBase,
-      status: z.literal("active"),
-      workosOrganizationId: workosOrganizationIdSchema,
-    })
-    .strict(),
-  z
-    .object({
-      ...organizationViewBase,
-      status: z.literal("failed"),
-      workosOrganizationId: workosOrganizationIdSchema.optional(),
-    })
-    .strict(),
-]);
+export const organizationViewSchema = z.object(organizationViewBase).strict();
 export type OrganizationView = z.infer<typeof organizationViewSchema>;
+
+export const workspaceViewSchema = z
+  .object({
+    id: workspaceIdSchema,
+    organizationId: organizationIdSchema,
+    slug: workspaceSlugSchema,
+    name: workspaceNameSchema,
+    taskKeyPrefix: taskKeyPrefixSchema,
+    roles: z
+      .array(workspaceRoleSchema)
+      .max(3)
+      .refine((roles) => new Set(roles).size === roles.length, "workspace roles must be unique"),
+  })
+  .strict();
+export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
+
+const humanAuthenticationResponseFields = {
+  accessToken: humanAccessTokenSchema,
+  refreshToken: humanRefreshTokenSchema,
+  user: humanUserViewSchema,
+  organization: organizationViewSchema,
+} as const;
+
+function requireWorkspaceOrganizationMatch(
+  value: Readonly<{ organization: OrganizationView; workspace?: WorkspaceView | undefined }>,
+  context: z.RefinementCtx,
+): void {
+  if (
+    value.workspace !== undefined &&
+    value.workspace.organizationId !== value.organization.id
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "workspace belongs to another organization",
+      path: ["workspace"],
+    });
+  }
+}
+
+export const refreshAuthResponseSchema = z.object({
+  ...humanAuthenticationResponseFields,
+  workspace: workspaceViewSchema.optional(),
+}).strict().superRefine(requireWorkspaceOrganizationMatch);
+export type RefreshAuthResponse = z.infer<typeof refreshAuthResponseSchema>;
+export const refreshAuthEnvelopeSchema = successEnvelopeSchema(refreshAuthResponseSchema);
+
+export const pairedHumanAuthenticationResponseSchema = z.object({
+  ...humanAuthenticationResponseFields,
+  workspace: workspaceViewSchema,
+}).strict().superRefine(requireWorkspaceOrganizationMatch);
+export type PairedHumanAuthenticationResponse = z.infer<
+  typeof pairedHumanAuthenticationResponseSchema
+>;
+
+export const selectHumanScopeRequestSchema = z.object({
+  organizationId: organizationIdSchema,
+  workspaceId: workspaceIdSchema.optional(),
+}).strict();
+export type SelectHumanScopeRequest = z.infer<typeof selectHumanScopeRequestSchema>;
+
+export const selectHumanScopeResponseSchema = z.object({
+  ...humanAuthenticationResponseFields,
+  workspace: workspaceViewSchema.optional(),
+}).strict().superRefine(requireWorkspaceOrganizationMatch);
+export type SelectHumanScopeResponse = z.infer<typeof selectHumanScopeResponseSchema>;
+export const selectHumanScopeEnvelopeSchema = successEnvelopeSchema(
+  selectHumanScopeResponseSchema,
+);
+
+export const desktopPairingIdSchema = z.string()
+  .regex(/^pair_[0-9A-HJKMNP-TV-Z]{26}$/u, "invalid desktop pairing ID");
+export type DesktopPairingId = z.infer<typeof desktopPairingIdSchema>;
+
+export const desktopPairingVerifierSchema = bearerSecretSchema;
+export const desktopPairingChallengeSchema = bearerSecretSchema;
+export const desktopPairingComparisonCodeSchema = z.string()
+  .regex(/^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/u, "invalid comparison code");
+
+export const desktopPairingStartRequestSchema = z.object({
+  challenge: desktopPairingChallengeSchema,
+}).strict();
+export type DesktopPairingStartRequest = z.infer<typeof desktopPairingStartRequestSchema>;
+
+function safeDesktopPairingVerificationUri(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" ||
+      url.hostname === "[::1]" || url.hostname === "::1";
+    return (
+      (url.protocol === "https:" || (url.protocol === "http:" && loopback)) &&
+      url.username.length === 0 &&
+      url.password.length === 0 &&
+      url.search.length === 0 &&
+      url.hash.length === 0 &&
+      /^\/pair\/desktop\/pair_[0-9A-HJKMNP-TV-Z]{26}$/u.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export const desktopPairingVerificationUriSchema = z.string()
+  .url()
+  .max(2_048)
+  .refine(safeDesktopPairingVerificationUri, "invalid desktop pairing verification URI");
+
+export const desktopPairingStartResponseSchema = z.object({
+  pairingId: desktopPairingIdSchema,
+  verificationUri: desktopPairingVerificationUriSchema,
+  comparisonCode: desktopPairingComparisonCodeSchema,
+  expiresAt: epochMsSchema,
+  pollIntervalMs: z.number().int().min(1_000).max(30_000),
+}).strict().superRefine((value, context) => {
+  if (new URL(value.verificationUri).pathname !== `/pair/desktop/${value.pairingId}`) {
+    context.addIssue({
+      code: "custom",
+      message: "verification URI does not match pairing ID",
+      path: ["verificationUri"],
+    });
+  }
+});
+export type DesktopPairingStartResponse = z.infer<typeof desktopPairingStartResponseSchema>;
+export const desktopPairingStartEnvelopeSchema = successEnvelopeSchema(
+  desktopPairingStartResponseSchema,
+);
+
+export const desktopPairingRedeemRequestSchema = z.object({
+  verifier: desktopPairingVerifierSchema,
+}).strict();
+export type DesktopPairingRedeemRequest = z.infer<typeof desktopPairingRedeemRequestSchema>;
+
+export const desktopPairingRedeemResponseSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("pending"), retryAfterMs: z.number().int().min(1_000).max(30_000) })
+    .strict(),
+  z.object({
+    status: z.literal("approved"),
+    authentication: pairedHumanAuthenticationResponseSchema,
+  }).strict(),
+  z.object({ status: z.literal("denied") }).strict(),
+  z.object({ status: z.literal("expired") }).strict(),
+  z.object({ status: z.literal("consumed") }).strict(),
+]);
+export type DesktopPairingRedeemResponse = z.infer<typeof desktopPairingRedeemResponseSchema>;
+export const desktopPairingRedeemEnvelopeSchema = successEnvelopeSchema(
+  desktopPairingRedeemResponseSchema,
+);
 
 const paginatedHumanListQuerySchema = z
   .object({
@@ -117,21 +230,6 @@ export type CreateOrganizationRequest = z.input<typeof createOrganizationRequest
 export const createOrganizationResponseSchema = z.object({ organization: organizationViewSchema }).strict();
 export type CreateOrganizationResponse = z.infer<typeof createOrganizationResponseSchema>;
 export const createOrganizationEnvelopeSchema = successEnvelopeSchema(createOrganizationResponseSchema);
-
-export const workspaceViewSchema = z
-  .object({
-    id: workspaceIdSchema,
-    organizationId: organizationIdSchema,
-    slug: workspaceSlugSchema,
-    name: workspaceNameSchema,
-    taskKeyPrefix: taskKeyPrefixSchema,
-    roles: z
-      .array(workspaceRoleSchema)
-      .max(3)
-      .refine((roles) => new Set(roles).size === roles.length, "workspace roles must be unique"),
-  })
-  .strict();
-export type WorkspaceView = z.infer<typeof workspaceViewSchema>;
 
 export const listWorkspacesResponseSchema = z
   .object({ workspaces: z.array(workspaceViewSchema).max(100), cursor: z.string().nullable() })
