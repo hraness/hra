@@ -41,6 +41,11 @@ import {
   hraOperationIdFromLegacyHostedMutationRecord,
   legacyHostedMutationOperationIdFields,
 } from "./hostedMutationPersistence";
+import {
+  attemptOperationForReceiptOperation,
+  receiptOperationsForAttempt,
+  type ReceiptOperation,
+} from "./hostedMutationReceiptPolicy";
 import { domainErrorValidator } from "./model";
 import { consumeAuthorizedHumanRateLimit } from "./rateLimits";
 
@@ -89,40 +94,6 @@ const targetTaskAttemptOperations = new Set<string>([
   "dispatch.retry",
   "dispatch.resolve_ambiguity",
 ]);
-
-const receiptOperationsByAttemptOperation = Object.freeze({
-  "task.create": ["tasks.create", "tasks.create_and_dispatch"],
-  "task.update": ["tasks.update"],
-  "task.cancel": ["tasks.cancel"],
-  "task.reopen": ["tasks.reopen"],
-  "task.assign": ["tasks.assign"],
-  "task.defer": ["tasks.defer"],
-  "task.parent_set": ["tasks.parent.set"],
-  "task.parent_clear": ["tasks.parent.clear"],
-  "task.label_add": ["tasks.labels.add"],
-  "task.label_remove": ["tasks.labels.remove"],
-  "task.comment_add": ["tasks.comments.add"],
-  "task.reference_add": ["tasks.references.add"],
-  "task.reference_remove": ["tasks.references.remove"],
-  "dependency.add": ["tasks.dependencies.add"],
-  "dependency.remove": ["tasks.dependencies.remove"],
-  "review.accept": ["tasks.accept"],
-  "review.reject": ["tasks.reject"],
-  "dispatch.stop": ["runs.stop"],
-  "dispatch.retry": ["runs.retry"],
-  "dispatch.resolve_ambiguity": ["runs.abandon_ambiguous"],
-  "interaction.respond": ["dispatch.interaction.respond"],
-} as const satisfies Readonly<
-  Record<
-    (typeof taskWorkspaceClientMutationIntentKindValues)[number],
-    readonly string[]
-  >
->);
-
-type ReceiptOperation =
-  (typeof receiptOperationsByAttemptOperation)[
-    keyof typeof receiptOperationsByAttemptOperation
-  ][number];
 
 const recoveryValidator = v.object({
   idempotencyKey: v.string(),
@@ -518,47 +489,13 @@ export async function resolveHostedMutationReceiptBinding(
   return binding;
 }
 
-function receiptOperationsForAttempt(operation: string): readonly string[] {
-  return validOperation(operation)
-    ? receiptOperationsByAttemptOperation[
-        operation as keyof typeof receiptOperationsByAttemptOperation
-      ]
-    : [];
-}
-
-type ReceiptAttemptOperation =
-  | Readonly<{ kind: "ambiguous" }>
-  | Readonly<{ kind: "none" }>
-  | Readonly<{ kind: "resolved"; operation: string }>;
-
-function attemptOperationForReceiptOperation(
-  receiptOperation: string,
-): ReceiptAttemptOperation {
-  let resolved: string | null = null;
-  for (
-    const [attemptOperation, receiptOperations] of
-      Object.entries(receiptOperationsByAttemptOperation)
-  ) {
-    if (!receiptOperations.some((operation) => operation === receiptOperation)) {
-      continue;
-    }
-    if (resolved !== null && resolved !== attemptOperation) {
-      return { kind: "ambiguous" };
-    }
-    resolved = attemptOperation;
-  }
-  return resolved === null
-    ? { kind: "none" }
-    : { kind: "resolved", operation: resolved };
-}
-
 function receiptMatchesAttempt(
   receipt: Doc<"humanCommandReceipts">,
   record: AttemptDoc,
   principal: Doc<"users">,
 ): boolean {
   return receipt.principalKind === "organization" &&
-    receipt.principalId === principal.workosUserId &&
+    receipt.principalId === principal.publicId &&
     receipt.organizationId === record.organizationId &&
     receipt.idempotencyKey === record.idempotencyKey &&
     receiptOperationsForAttempt(record.operation).includes(receipt.operation);
@@ -587,8 +524,8 @@ export async function legacyHostedMutationReceiptReference(
   }
   const principals = await ctx.db
     .query("users")
-    .withIndex("by_workos_user_id", (index) =>
-      index.eq("workosUserId", receipt.principalId))
+    .withIndex("by_public_id", (index) =>
+      index.eq("publicId", receipt.principalId))
     .take(2);
   if (principals.length !== 1) return "ambiguous";
   const principal = principals[0];
@@ -644,7 +581,7 @@ type AuthoritativeReceiptState =
   | Readonly<{ kind: "unlinked" }>
   | Readonly<{ kind: "corrupt" }>;
 
-async function authoritativeReceiptState(
+export async function authoritativeReceiptState(
   ctx: ReadCtx,
   record: AttemptDoc,
 ): Promise<AuthoritativeReceiptState> {
@@ -674,8 +611,7 @@ async function authoritativeReceiptState(
           receiptId: receipt._id,
         };
   }
-  const receiptPrincipalId = principal.workosUserId;
-  if (receiptPrincipalId === undefined) return { kind: "corrupt" };
+  const receiptPrincipalId = principal.publicId;
   for (const operation of receiptOperationsForAttempt(record.operation)) {
     const receipts = await ctx.db
       .query("humanCommandReceipts")

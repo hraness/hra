@@ -12,7 +12,7 @@ prompt, response, transcript, reasoning, tool data, account identity,
 provider identifier, or filesystem path. Remote summaries are view-only and a
 relay outage cannot block local desktop chat.
 
-The control plane uses the shared System-first design system. A first visit follows the operating-system appearance, while explicit Light, Dark, and System choices persist under the shared browser preference. The authenticated UI keeps its navigation rail and bars mounted while the selected workspace and `Tasks`/`Access` stage changes. Those selections are addressable with the `workspace` and `surface` query parameters; they do not change WorkOS organization authority or Convex task ownership. On compact viewports the same rail becomes a focus-trapped left drawer.
+The control plane uses the shared System-first design system. A first visit follows the operating-system appearance, while explicit Light, Dark, and System choices persist under the shared browser preference. The authenticated UI keeps its navigation rail and bars mounted while the selected workspace and `Tasks`/`Access` stage changes. The URL records those views, while the Convex Auth session records the exact selected organization and workspace used for authorization. On compact viewports the same rail becomes a focus-trapped left drawer.
 
 ## Local development
 
@@ -37,19 +37,13 @@ The four `HRA_HOSTED_MUTATION_FINGERPRINT_KEY_*` variables belong only in the Co
 
 Rotation is two-phase. Install a new current key and version while moving the former pair to `PREVIOUS`, then retain both until every open attempt bearing the previous version has settled. Only one previous version is accepted. Missing, malformed, duplicated, or half-configured key pairs fail closed. Removing the previous pair while one of its attempts remains open also makes new fingerprint resolution fail closed, preventing a replay under the new key.
 
-After the backend, WorkOS fixture, and web app are running, enroll the desktop with a dispatcher-scoped taskctl agent and map a returned `repo_...` identifier to a local repository as described in [`../desktop/README.md`](../desktop/README.md). The runner uses the same local HTTP origin during development. The web readiness strip remains offline or blocked until the gateway's first accepted heartbeat; this is expected and does not prevent read-only task supervision.
+After the Convex backend and web app are running, sign up with an email and password. New accounts atomically receive a personal organization, owner membership, and initial workspace. Then pair the desktop in its browser-opened `/pair/desktop/<pairingId>` page, compare the short code, and choose the exact organization and workspace. Enroll a dispatcher-scoped taskctl agent and map the returned `repo_...` identifier to a local repository as described in [`../desktop/README.md`](../desktop/README.md). The web readiness strip remains offline or blocked until the gateway's first accepted heartbeat; this is expected and does not prevent read-only task supervision.
 
-WorkOS is optional for the provider-neutral agent-domain tests. Human HTTP routes always require a signed WorkOS access token. Configure `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_COOKIE_PASSWORD`, and `NEXT_PUBLIC_WORKOS_REDIRECT_URI` in the Next.js environment, and configure the matching API key and client ID in the Convex deployment environment. Convex derives the two supported production issuers from that client ID: `https://api.workos.com/` and `https://api.workos.com/user_management/<client-id>`. An environment-provided issuer override is not accepted. AuthKit exposes `/auth/sign-in`, `/auth/sign-up`, and `/auth/callback`; the browser access token is forwarded to Convex through `ConvexProviderWithAuth` and is not persisted by the app.
+Human HTTP routes use normal Convex Auth access and refresh tokens. `POST /v1/auth/desktop-pairings` accepts a verifier challenge and returns only an opaque locator, credential-free same-origin browser URL, comparison code, expiry, and poll interval. Browser approval requires a current password session and selects an exact active organization/workspace membership. Redeem proves the native-held verifier once and returns the normal human authentication response; replay is consumed, expired requests fail closed, and the verifier never enters a URL or browser projection.
 
-The signed local acceptance harness may replace WorkOS with an exact-loopback server. Before pushing Convex functions, set `TASKCTL_LOCAL_FIXTURES_ENABLED=true`, `TASKCTL_LOCAL_FIXTURE_ISSUER`, and `TASKCTL_LOCAL_FIXTURE_JWKS_URL` in the deployment environment so `auth.config.ts` can register its RS256 provider. The issuer and JWKS URL must both be loopback URLs. Set `WORKOS_API_HOSTNAME=127.0.0.1`, `WORKOS_API_HTTPS=false`, and `WORKOS_API_PORT` to route the WorkOS SDK to the same fake server. This changes the provider endpoint only: `/v1/organizations`, `/v1/workspaces`, and `/v1/agents` still reject missing, unsigned, wrong-issuer, and incorrectly organization-bound JWTs.
+`POST /v1/auth/refresh` uses the Convex Auth refresh token and returns the stable HRA user plus the session's selected organization/workspace after a current membership recheck. `POST /v1/auth/selection` creates a new session with the requested current scope, invalidates the old session before returning, and returns the replacement access/refresh pair. A lost response therefore invalidates the locally held old authority instead of silently changing its tenant meaning.
 
-`POST /v1/auth/refresh` accepts the refresh token only in `Authorization: Bearer ...`, optionally selects a WorkOS organization from its JSON body, rotates the returned refresh token, and deliberately disables SDK retries so an ambiguous refresh cannot consume a token twice.
-
-Organization provisioning leases the owner-membership step and durably marks the one allowed membership create before sending its zero-retry WorkOS request. Once marked, every retry is poll-only, including after an indeterminate response or an eventually consistent empty list. This prevents duplicate memberships; the deliberate tradeoff is that a crash after the marker commits but before the request is sent requires operator recovery instead of an automatic second create.
-
-Configure `WORKOS_WEBHOOK_SECRET` in the Convex deployment and send WorkOS webhooks to `POST /webhooks/workos`. The route verifies the signature over the exact raw body before WorkOS parses JSON. It projects `organization.created`, `organization.updated`, `organization.deleted`, `organization_membership.created`, `organization_membership.updated`, and `organization_membership.deleted`; other valid signed events receive an idempotent ignored receipt. Receipts use the WorkOS event ID and remain for 30 days.
-
-Two leased, paginated Convex jobs run every 15 minutes. One rechecks projected membership IDs, including provider-side deletion; the other enumerates active, inactive, and pending provider memberships for every projected WorkOS organization so a missed create webhook is recoverable. Bounded runs schedule immediate cursor-based continuations instead of waiting for the next interval. Provider calls remain in actions, and projection writes remain in transactions.
+Existing pre-cutover HRA users must use a bounded operator-issued one-time migration claim. The server hashes the claim before it reaches the user transaction, binds it to one exact preserved HRA user, rejects email collisions and second password accounts, and consumes it atomically. See [`IDENTITY_CUTOVER.md`](IDENTITY_CUTOVER.md) for the mandatory staged schema and in-place identity migration. Production runtime paths never fall back to predecessor identifiers.
 
 The workspace serves the canonical `hra.sh` origin. Local `bun run build`
 compiles the application without provider mutation. Vercel uses the separate
@@ -66,7 +60,7 @@ Preview responses. Session sync remains fail-closed while
 `HRA_SESSION_SYNC_ENABLED` is absent or `false`; the unchanged
 `OPRTE_SESSION_SYNC_ENABLED` value remains a fallback, and conflicting names
 fail closed. Enable it only after the
-exact WorkOS application, Convex environment, desktop public coordinates, and
+exact Convex Auth environment, desktop public coordinates, and
 production HTTP route readbacks pass for the same source revision.
 
 ## Production provider cutover
@@ -139,8 +133,8 @@ Remove the local file only after Vercel scope and build readback succeed.
 
 Do not configure Convex-only custody in Vercel, even as an empty record. The
 Production wrapper refuses the receipt keyring, session flags, hosted-mutation
-keys, taskctl peppers or fixture settings, WorkOS webhook secret and owner
-role, and local WorkOS provider overrides. Configure those values only on the
+keys, taskctl peppers or fixture settings, identity-cutover gates, and
+authentication key material. Configure those values only on the
 exact Convex deployment.
 
 Leave `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST` unset while the release
@@ -155,7 +149,7 @@ before launching the final Next build.
 
 Transfer no custom-staging record. Preview refuses the deploy key, deployment
 token, Convex selector, canonical production site claim, Suite cookie or key
-selector, WorkOS credentials, and every other checked production capability,
+selector, authentication credentials, and every other checked production capability,
 including an empty provider record. Its two public Convex URLs grant no
 backend publication authority.
 
@@ -342,10 +336,10 @@ The shared deployment may retain
 `OPRTE_SESSION_SYNC_ENABLED` as compatibility inputs. HRA adopts the matching
 HRA names only when absent or byte-for-byte equal, so do not rotate or delete
 those values during this authority cutover. A production suite-link E2E also
-requires separately provisioned WorkOS provider authority. If it is absent,
-verify the parser, deployment readbacks, and unavailable response, and record
-the WorkOS-backed E2E as an external gate rather than creating credentials or
-claiming it passed.
+requires a live Convex Auth password account and current tenant membership. If
+that acceptance account is absent, verify the parser, deployment readbacks,
+and unavailable response, and record the authenticated E2E as an external gate
+rather than creating production credentials or claiming it passed.
 
 ## Public product pages
 
@@ -357,31 +351,31 @@ never holds signing credentials or release authority.
 `/alternatives` and its static child routes compare HRA with adjacent tools.
 Every positive competitor claim must cite a current first-party source, every
 page carries a review date, and “not documented” must never be presented as
-proof of absence. These routes remain public when WorkOS is configured; exact
+proof of absence. These routes remain public when Convex Auth is configured; exact
 near-miss and control-plane routes remain protected.
 
 ## Hraness suite account
 
-The authenticated rail includes an optional Hraness account status beside the human controls. This is additive subscription identity only. WorkOS remains authoritative for the human, organization, membership, and organization role; Convex remains authoritative for workspace roles and task state. A suite alias never identifies an agent, credential, session, desktop runner, or repository, and suite features do not gate an HRA capability.
+The authenticated rail includes an optional Hraness account status beside the human controls. This is additive subscription identity only. Convex Auth and the current Convex database membership remain authoritative for the human, organization, membership, and organization role; Convex also owns workspace roles and task state. A suite alias never identifies an agent, credential, session, desktop runner, or repository, and suite features do not gate an HRA capability.
 
 `/api/suite-auth/[...all]` is HRA's OAuth 2.1/OIDC relying-party route for the canonical `account.hraness.com` service. Access and refresh tokens remain encrypted in server-only `HttpOnly` cookies. The browser receives only the bounded suite session view and short-lived signed receipts; it does not persist provider tokens or send them to Convex.
 
-Linking requires both a live Hraness session and a currently authorized WorkOS human with an active projected organization membership. Convex mints a four-minute HMAC proof bound to that WorkOS subject, persists the challenge, verifies the returned link receipt, and atomically rejects both local-human-to-second-account and account-to-second-human conflicts. Entitlement receipts are verified with the same environment-scoped keyring before a monotonic revision/observation projection is stored. The public query labels that projection `fresh`, `stale`, or `unverified` and returns no receipt signature or secret.
+Linking requires both a live Hraness session and a currently authorized HRA human with an active organization membership. Convex mints a four-minute HMAC proof bound to that stable HRA user, persists the challenge, verifies the returned link receipt, and atomically rejects both local-human-to-second-account and account-to-second-human conflicts. Entitlement receipts are verified with the same environment-scoped keyring before a monotonic revision/observation projection is stored. The public query labels that projection `fresh`, `stale`, or `unverified` and returns no receipt signature or secret.
 
 Product-local identity linking fails closed until the HRA runtimes are configured:
 
 - The web host needs `NEXT_PUBLIC_SITE_URL=https://hra.sh`, a distinct `SUITE_OIDC_COOKIE_SECRET`, and `SUITE_IDENTITY_RECEIPT_KEY_VERSION`. Missing or mismatched values make the suite route return `503 SUITE_OIDC_UNAVAILABLE`.
 - Deploy exact Suite Accounts v0.3.0 overlap support before changing either receipt keyring. Generate a fresh independent secret as the canonical unpadded base64url encoding of at least 32 random bytes. The HRA Convex `SUITE_IDENTITY_LINK_KEYS` keyring contains only the `hra:production:v1` entry. Accounts appends that same HRA entry alongside its unrelated existing entry. Never copy the unrelated Accounts key into HRA. Both environments use `SUITE_IDENTITY_RECEIPT_KEY_VERSION=v1`.
 - This cutover admits exactly one HRA production/v1 key. Extra HRA versions, development entries, non-HRA entries, a selector other than `v1`, and malformed configuration make proof and receipt actions return `unavailable`. Rotate only through a later reviewed contract that restores bounded multi-key verification. No predecessor OPRTE/Kitchen receipt key is expected to exist, and the predecessor receipt authority being unavailable or invalid is not a rollout health gate.
-- The ordinary hosted WorkOS and HRA Convex configuration described above must also be live, because suite linking reuses the existing WorkOS human and active organization-membership authorization rather than creating another product principal.
+- The ordinary hosted Convex Auth configuration described above must also be live, because suite linking reuses the existing HRA human and current organization-membership authorization rather than creating another product principal.
 
-WorkOS-to-Hraness identity linking remains unavailable until the web session
+HRA-to-Hraness identity linking remains unavailable until the web session
 and HRA receipt keyring are configured. Missing suite configuration does not
-block WorkOS sign-in or any HRA task capability.
+block password sign-in or any HRA task capability.
 
 ## Deterministic browser lab
 
-HRA web has a credential-free Direct composition that renders the real task workspace through the same app-owned props and action port used by the live Convex adapter. It does not mount WorkOS, construct a Convex client, import generated APIs, or claim to simulate provider sessions and database transaction semantics.
+HRA web has a credential-free Direct composition that renders the real task workspace through the same app-owned props and action port used by the live Convex adapter. It does not mount Convex Auth, construct a Convex client, import generated APIs, or claim to simulate password sessions and database transaction semantics.
 
 The workbench also mounts the shared System-first appearance provider with a concrete light pre-bootstrap fallback. Its final toolbar action is the same one-trigger Light/Dark/System menu used by production, so the deterministic surface exercises persisted preference, keyboard operation, and theme-relative task presentation without importing any production identity or transport adapter.
 
@@ -396,4 +390,4 @@ From this directory, `bun run test:direct` checks the strict world parser, infer
 
 The browser verifier exercises representative read, mutation, failure, and retry paths at wide, stacked, and compact viewports. It waits for identical canonical probes, rejects console, page, request, pending-work, and script-drain failures, then writes ignored screenshots and an atomic manifest below `artifacts/direct/hra-web`.
 
-These scenarios are deterministic UI evidence. WorkOS authentication and organization switching, real Convex subscriptions and transactions, HTTP/CLI interoperability, and hosted deployment remain direct or mixed-evidence gates and are not relabeled as Direct coverage.
+These scenarios are deterministic UI evidence. Password authentication and tenant switching, real Convex subscriptions and transactions, HTTP/CLI interoperability, and hosted deployment remain direct or mixed-evidence gates and are not relabeled as Direct coverage.

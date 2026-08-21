@@ -211,6 +211,7 @@ export function assertConfigurationFileMetadata(
     | "session attempt"
     | "human profile"
     | "human secret"
+    | "human custody"
     | "enrollment output",
   metadata: ConfigurationFileMetadata,
   expectedUid: number | undefined,

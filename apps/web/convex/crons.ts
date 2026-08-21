@@ -60,16 +60,9 @@ crons.interval(
 );
 
 crons.interval(
-  "reconcile WorkOS memberships",
-  { minutes: 15 },
-  internal.identitySync.reconcileWorkOSMemberships,
-  {},
-);
-
-crons.interval(
-  "discover WorkOS memberships",
-  { minutes: 15 },
-  internal.identitySync.discoverWorkOSMemberships,
+  "retire expired desktop pairing requests",
+  { hours: 1 },
+  internal.desktopPairing.retireExpired,
   {},
 );
 

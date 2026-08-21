@@ -24,6 +24,10 @@ export const rateLimitRouteClasses = [
   "human_read",
   "human_mutation",
   "human_poll",
+  "desktop_pairing_start",
+  "desktop_pairing_redeem",
+  "password_sign_in",
+  "password_sign_up",
   "refresh_auth",
   "agent_auth_failure",
   "enrollment_auth_failure",
@@ -35,7 +39,12 @@ export type AuthenticatedAgentRouteClass = Extract<RateLimitRouteClass, `agent_$
   : never;
 export type HumanRouteClass = Extract<RateLimitRouteClass, `human_${string}`>;
 export type FailureRouteClass = Extract<RateLimitRouteClass, `${string}_auth_failure`>;
-export type RateLimitSubjectKind = "credential" | "workspace" | "user" | "unauthenticated";
+export type RateLimitSubjectKind =
+  | "credential"
+  | "workspace"
+  | "user"
+  | "unauthenticated"
+  | "global";
 
 export interface RateLimitPolicy {
   readonly windowMs: number;
@@ -92,10 +101,30 @@ export const rateLimitPolicies = {
     shardCount: AUTHENTICATED_RATE_LIMIT_SHARDS,
     limits: { user: 24, workspace: 64 },
   },
-  refresh_auth: {
+  desktop_pairing_start: {
     windowMs: RATE_LIMIT_WINDOW_MS,
     shardCount: UNAUTHENTICATED_RATE_LIMIT_SHARDS,
-    limits: { unauthenticated: 8 },
+    limits: { unauthenticated: 120 },
+  },
+  desktop_pairing_redeem: {
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    shardCount: UNAUTHENTICATED_RATE_LIMIT_SHARDS,
+    limits: { unauthenticated: 600 },
+  },
+  password_sign_in: {
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    shardCount: 1,
+    limits: { credential: 8, unauthenticated: 8, global: 60 },
+  },
+  password_sign_up: {
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    shardCount: 1,
+    limits: { unauthenticated: 4, global: 20 },
+  },
+  refresh_auth: {
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    shardCount: 1,
+    limits: { credential: 8, global: 120 },
   },
   agent_auth_failure: {
     windowMs: RATE_LIMIT_WINDOW_MS,
@@ -125,7 +154,16 @@ export type ApiRateLimitRule =
       readonly kind: "failure_only";
       readonly authenticationFailureClass: FailureRouteClass;
     }
-  | { readonly kind: "opaque_pre_auth"; readonly routeClass: "refresh_auth" };
+  | {
+      readonly kind: "opaque_pre_auth";
+      readonly routeClass:
+        | "desktop_pairing_start"
+        | "desktop_pairing_redeem";
+    }
+  | {
+      readonly kind: "verified_refresh";
+      readonly routeClass: "refresh_auth";
+    };
 
 const humanUser = (routeClass: HumanRouteClass): ApiRateLimitRule => ({
   kind: "consume",
@@ -154,7 +192,10 @@ const agent = (routeClass: AuthenticatedAgentRouteClass): AgentRateLimitRule => 
 
 /** Exhaustive even for operations implemented by dynamic path-prefix handlers. */
 export const apiOperationRateLimitClass = {
-  refreshAuth: { kind: "opaque_pre_auth", routeClass: "refresh_auth" },
+  startDesktopPairing: { kind: "opaque_pre_auth", routeClass: "desktop_pairing_start" },
+  redeemDesktopPairing: { kind: "opaque_pre_auth", routeClass: "desktop_pairing_redeem" },
+  refreshAuth: { kind: "verified_refresh", routeClass: "refresh_auth" },
+  selectHumanScope: humanUser("human_mutation"),
   listOrganizations: humanUser("human_read"),
   createOrganization: humanUser("human_mutation"),
   listWorkspaces: humanUser("human_read"),
@@ -284,7 +325,7 @@ export function isAgentReadOperation(
 
 export interface RateLimitSubject {
   readonly kind: RateLimitSubjectKind;
-  /** Server-derived Convex ID, or a fixed `slot_NNN` unauthenticated slot. */
+  /** Server-derived Convex ID, fixed global key, or `slot_NNN` unknown slot. */
   readonly key: string;
 }
 
@@ -396,10 +437,27 @@ function dimensionsAreValid(
   routeClass: RateLimitRouteClass,
   actualKinds: ReadonlySet<RateLimitSubjectKind>,
 ): boolean {
+  if (routeClass === "password_sign_in") {
+    return (
+      (actualKinds.size === 2 && actualKinds.has("global") &&
+        actualKinds.has("credential")) ||
+      (actualKinds.size === 2 && actualKinds.has("global") &&
+        actualKinds.has("unauthenticated"))
+    );
+  }
+  if (routeClass === "password_sign_up") {
+    return actualKinds.size === 2 && actualKinds.has("global") &&
+      actualKinds.has("unauthenticated");
+  }
+  if (routeClass === "refresh_auth") {
+    return actualKinds.size === 1 &&
+      (actualKinds.has("credential") || actualKinds.has("global"));
+  }
   if (
     routeClass === "agent_auth_failure" ||
     routeClass === "enrollment_auth_failure" ||
-    routeClass === "refresh_auth"
+    routeClass === "desktop_pairing_start" ||
+    routeClass === "desktop_pairing_redeem"
   ) {
     return actualKinds.size === 1 && actualKinds.has("unauthenticated");
   }

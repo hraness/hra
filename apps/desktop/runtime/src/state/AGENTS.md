@@ -2,7 +2,7 @@
 
 - `migrations.ts` – immutable, checksummed SQLite control-plane schema migrations, including account tombstones, local task authority, durable due work, frozen promotion state, and private bounded chat-pane state.
 - `control-plane-lock.ts` – no-follow, user-only, OS-released lifetime gate acquired after Application Support cutover and before the control-plane database opens.
-- `application-support.ts` – exclusive, receipt-backed migration from historical desktop state roots to HRA, including no-follow validation, WAL recovery, rollback, and downgrade guards.
+- `application-support.ts` – exclusive, receipt-backed migration from historical desktop state roots to HRA plus a separate no-migration raw-development root, including no-follow validation, WAL recovery, rollback, and downgrade guards.
 - `application-support-worktree-repair.ts` – journaled SQLite, recovery-manifest, external Git metadata, and moved-Codex-cwd repair after the Application Support root changes.
 - `database.ts` – private database path, permissions, connection, and migration lifecycle.
 - `release-compatibility.ts` – zero-mutation startup preflight plus explicit

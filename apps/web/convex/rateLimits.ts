@@ -14,6 +14,7 @@ import {
   MAX_RATE_LIMIT_CLEANUP_ROWS,
   apiOperationRateLimitClass,
   agentOperationAuthorizationPolicy,
+  isUnauthenticatedSlotKey,
   planRateLimitConsumption,
   rateLimitPolicies,
   rateLimitShard,
@@ -45,7 +46,10 @@ const humanRouteClassValidator = v.union(
   v.literal("human_poll"),
 );
 const opaqueRouteClassValidator = v.union(
-  v.literal("refresh_auth"),
+  v.literal("desktop_pairing_start"),
+  v.literal("desktop_pairing_redeem"),
+  v.literal("password_sign_in"),
+  v.literal("password_sign_up"),
   v.literal("agent_auth_failure"),
   v.literal("enrollment_auth_failure"),
 );
@@ -306,12 +310,107 @@ export const consumeOpaque = internalMutation({
     requestId: v.string(),
   },
   returns: consumeResultValidator,
-  handler: async (ctx, args) =>
-    await consume(ctx, {
+  handler: async (ctx, args) => await consumeOpaqueRateLimit(ctx, args),
+});
+
+export async function consumeOpaqueRateLimit(
+  ctx: MutationCtx,
+  args: {
+    readonly routeClass:
+      | "desktop_pairing_start"
+      | "desktop_pairing_redeem"
+      | "password_sign_in"
+      | "password_sign_up"
+      | "agent_auth_failure"
+      | "enrollment_auth_failure";
+    readonly slotKey: string;
+    readonly requestId: string;
+  },
+): Promise<RateLimitConsumeResult> {
+  return await consume(ctx, {
+    routeClass: args.routeClass,
+    subjects: [{ kind: "unauthenticated", key: args.slotKey }],
+    requestId: args.requestId,
+  });
+}
+
+/** Atomic password admission over exact known accounts or bounded unknown traffic. */
+export async function consumePasswordRateLimit(
+  ctx: MutationCtx,
+  args: {
+    readonly routeClass: "password_sign_in" | "password_sign_up";
+    readonly accountId?: Id<"authAccounts">;
+    readonly unknownSlotKey?: string;
+    readonly requestId: string;
+  },
+): Promise<RateLimitConsumeResult> {
+  if (args.accountId !== undefined) {
+    if (args.routeClass !== "password_sign_in" || args.unknownSlotKey !== undefined) {
+      return { kind: "unavailable" };
+    }
+    return await consume(ctx, {
       routeClass: args.routeClass,
-      subjects: [{ kind: "unauthenticated", key: args.slotKey }],
+      subjects: [
+        // Keep known-account credential stuffing in a separate aggregate
+        // budget from arbitrary unknown-email traffic. The exact credential
+        // dimension still prevents any one account from consuming the whole
+        // known-account allowance.
+        { kind: "global", key: "password_sign_in_known" },
+        { kind: "credential", key: args.accountId },
+      ],
       requestId: args.requestId,
-    }),
+    });
+  }
+  if (
+    args.unknownSlotKey === undefined ||
+    !isUnauthenticatedSlotKey(args.unknownSlotKey)
+  ) return { kind: "unavailable" };
+  return await consume(ctx, {
+    routeClass: args.routeClass,
+    subjects: [
+      { kind: "global", key: args.routeClass },
+      { kind: "unauthenticated", key: args.unknownSlotKey },
+    ],
+    requestId: args.requestId,
+  });
+}
+
+/**
+ * Binds valid refresh admission to the stable session behind the presented
+ * token. Invalid material shares one fixed bucket and can never choose a valid
+ * session's subject or reset admission by rotating a token locator.
+ */
+export const consumeRefresh = internalMutation({
+  args: {
+    refreshTokenId: v.string(),
+    sessionId: v.string(),
+    requestId: v.string(),
+  },
+  returns: consumeResultValidator,
+  handler: async (ctx, args) => {
+    const now = Date.now();
+    let refreshToken: Doc<"authRefreshTokens"> | null = null;
+    let session: Doc<"authSessions"> | null = null;
+    try {
+      refreshToken = await ctx.db.get(args.refreshTokenId as Id<"authRefreshTokens">);
+      session = await ctx.db.get(args.sessionId as Id<"authSessions">);
+    } catch {
+      // Malformed and foreign document IDs remain in fixed invalid admission.
+    }
+    const verifiedSessionId = refreshToken !== null && session !== null &&
+        refreshToken.sessionId === session._id &&
+        refreshToken.expirationTime > now && session.expirationTime > now
+      ? session._id
+      : null;
+    return await consume(ctx, {
+      routeClass: "refresh_auth",
+      subjects: verifiedSessionId !== null
+        ? [{ kind: "credential", key: verifiedSessionId }]
+        : [{ kind: "global", key: "refresh_auth_invalid" }],
+      requestId: args.requestId,
+      now,
+    });
+  },
 });
 
 export const sweepExpired = internalMutation({

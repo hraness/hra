@@ -52,7 +52,9 @@ describe("task UI package boundary", () => {
     for (const forbidden of [
       "next/",
       "convex/",
-      "@workos-inc/",
+      "@convex-dev/auth",
+      "@auth/",
+      "identity-provider",
       "Native",
       "SQLite",
       "node:fs",

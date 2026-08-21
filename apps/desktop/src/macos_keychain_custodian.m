@@ -33,6 +33,7 @@ static NSString *const HRALegacyGatewayCDHashHex =
     @"9f39a6414ae834959ec63b39237a0ee426fd978a";
 static NSString *const HRAKeychainCustodianIdentifier =
     @"oprte-keychain-custodian";
+static NSString *const HRAApplicationIdentifier = @"kitchen.hraness";
 static NSString *const HRALegacyGatewayIdentifier =
     @"kitchen.hraness.gateway";
 static NSString *const HRALegacyGatewayRequirement =
@@ -211,11 +212,13 @@ static bool HRAParentIdentityIsAuthorized(pid_t parentProcess) {
   NSArray<NSData *> *parentCertificates =
       HRACertificateChain(parentInformation);
   if (selfCertificates == nil || parentCertificates == nil) return false;
-  if (selfCertificates.count > 0) {
-    return [parentIdentifier isEqualToString:@"kitchen.hraness"] &&
-        [parentCertificates isEqualToArray:selfCertificates];
-  }
-  return false;
+  // The helper is a credential boundary. Ad-hoc identifiers are caller-chosen,
+  // so even an exact `hra` identifier cannot authenticate a raw Debug parent.
+  // Only the signed application with the helper's exact certificate chain may
+  // inherit Keychain custody.
+  return selfCertificates.count > 0 &&
+      [parentIdentifier isEqualToString:HRAApplicationIdentifier] &&
+      [parentCertificates isEqualToArray:selfCertificates];
 }
 
 static bool HRAAuthorizedParentRemainsLive(void) {

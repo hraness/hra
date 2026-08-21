@@ -38,7 +38,10 @@ const account = {
   selected: true,
   identityLabel: "builder@example.com",
   planLabel: "pro",
-  usageRemainingPercent: 73,
+  weeklyUsage: {
+    remainingPercent: 73,
+    resetsAt: "2026-08-24T12:00:00.000Z",
+  },
   authState: "signedIn",
   login: { state: "idle" },
   runtime: ready,
@@ -2144,7 +2147,7 @@ describe("renderer runtime contracts", () => {
       revision: 4,
       profile: {
         user: {
-          id: "user_LOCAL",
+          id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
           email: "builder@example.test",
           name: null,
         },
@@ -2153,7 +2156,6 @@ describe("renderer runtime contracts", () => {
           name: "Example",
           role: "owner",
           status: "active",
-          workosOrganizationId: "org_LOCAL",
         },
         workspace: null,
       },
@@ -2202,9 +2204,10 @@ describe("renderer runtime contracts", () => {
       {
         state: "signingIn",
         revision: 5,
-        userCode: "FERN-MOSS",
+        comparisonCode: "FERN-M0SS",
         expiresAt: 1_800_000_000_000,
-        verificationUri: "https://auth.example.test/device",
+        verificationUri:
+          "https://app.example.test/pair/desktop/pair_01ARZ3NDEKTSV4RRFFQ69G5FAV",
       },
     ]) {
       expect(() => parseRuntimeSnapshotResponse({

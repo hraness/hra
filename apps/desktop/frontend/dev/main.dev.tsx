@@ -26,8 +26,10 @@ const root = leaseDevelopmentRoot(lease, () => createRoot(rootElement));
 
 root.render(
   <StrictMode>
-    <App runtimeShellFactory={detectRuntimeShell} />
-    <DevHud transport={transport} />
+    <App
+      headerAccessory={<DevHud transport={transport} />}
+      runtimeShellFactory={detectRuntimeShell}
+    />
   </StrictMode>,
 );
 

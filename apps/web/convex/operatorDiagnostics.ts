@@ -38,8 +38,6 @@ export const OPERATOR_DIAGNOSTIC_THRESHOLDS = {
   reviewAgedAfterMs: 24 * 60 * 60 * 1_000,
   credentialRenewalWindowMs: 14 * 24 * 60 * 60 * 1_000,
   credentialUnusedAfterMs: 30 * 24 * 60 * 60 * 1_000,
-  reconciliationStaleAfterMs: 30 * 60 * 1_000,
-  provisioningStuckAfterMs: 15 * 60 * 1_000,
   quotaWarningPercent: 80,
 } as const;
 
@@ -113,35 +111,6 @@ export interface OperatorDiagnosticsInput {
     readonly generation: number;
     readonly expectedAvailableAt: number;
   }[];
-  readonly reconciliationStates: BoundedRows<{
-    readonly key: "workos_memberships" | "workos_organizations";
-    readonly runId?: string;
-    readonly leaseUntil?: number;
-    readonly lastStartedAt?: number;
-    readonly lastCompletedAt?: number;
-    readonly lastErrorAt?: number;
-  }>;
-  readonly quarantines: BoundedRows<{
-    readonly reason:
-      | "provider_locator_mismatch"
-      | "invalid_provider_record"
-      | "projection_collision";
-    readonly occurrences: number;
-    readonly firstSeenAt: number;
-    readonly resolvedAt?: number;
-  }>;
-  readonly provisioningOperations: BoundedRows<{
-    readonly status:
-      | "reserved"
-      | "provider_organization_ready"
-      | "provider_membership_ready"
-      | "completed"
-      | "failed";
-    readonly membershipProvisioningLeaseUntil?: number;
-    readonly membershipCreateDispatchedAt?: number;
-    readonly createdAt: number;
-    readonly updatedAt: number;
-  }>;
   readonly workspaceUsage: BoundedRows<{
     readonly workspacePublicId?: string;
     readonly activeTasks: number;
@@ -171,59 +140,6 @@ function percent(value: number, limit: number): number {
   return Math.round((value / limit) * 100);
 }
 
-function reconciliationState(
-  now: number,
-  key: "workos_memberships" | "workos_organizations",
-  row:
-    | {
-        readonly runId?: string;
-        readonly leaseUntil?: number;
-        readonly lastCompletedAt?: number;
-        readonly lastErrorAt?: number;
-      }
-    | undefined,
-) {
-  if (row === undefined) {
-    return {
-      key,
-      status: "missing" as const,
-      leaseOverdueMs: null,
-      lastCompletedAgeMs: null,
-      lastErrorAgeMs: null,
-    };
-  }
-  const lastCompletedAge =
-    row.lastCompletedAt === undefined ? null : ageMs(now, row.lastCompletedAt);
-  const lastErrorAge = row.lastErrorAt === undefined ? null : ageMs(now, row.lastErrorAt);
-  const leaseOverdue =
-    row.leaseUntil === undefined || row.leaseUntil > now ? null : ageMs(now, row.leaseUntil);
-  let status: "healthy" | "running" | "stuck" | "stale" | "failed";
-  if (row.runId !== undefined && row.leaseUntil !== undefined && row.leaseUntil > now) {
-    status = "running";
-  } else if (row.runId !== undefined || leaseOverdue !== null) {
-    status = "stuck";
-  } else if (
-    row.lastErrorAt !== undefined &&
-    (row.lastCompletedAt === undefined || row.lastErrorAt > row.lastCompletedAt)
-  ) {
-    status = "failed";
-  } else if (
-    lastCompletedAge === null ||
-    lastCompletedAge >= OPERATOR_DIAGNOSTIC_THRESHOLDS.reconciliationStaleAfterMs
-  ) {
-    status = "stale";
-  } else {
-    status = "healthy";
-  }
-  return {
-    key,
-    status,
-    leaseOverdueMs: leaseOverdue,
-    lastCompletedAgeMs: lastCompletedAge,
-    lastErrorAgeMs: lastErrorAge,
-  };
-}
-
 /**
  * Pure aggregation boundary. Inputs intentionally omit locators, subject keys,
  * digests, receipt bodies, provider IDs, and all bearer material.
@@ -251,6 +167,8 @@ export function buildOperatorDiagnostics(input: OperatorDiagnosticsInput) {
     };
   });
   const authRouteClasses = new Set<RateLimitRouteClass>([
+    "password_sign_in",
+    "password_sign_up",
     "refresh_auth",
     "agent_auth_failure",
     "enrollment_auth_failure",
@@ -341,22 +259,6 @@ export function buildOperatorDiagnostics(input: OperatorDiagnosticsInput) {
       generation: sample.generation,
       overdueMs: ageMs(input.now, sample.expectedAvailableAt),
     }));
-
-  const reconciliationByKey = new Map(
-    input.reconciliationStates.rows.map((row) => [row.key, row] as const),
-  );
-  const unresolvedQuarantines = input.quarantines.rows.filter(
-    (row) => row.resolvedAt === undefined,
-  );
-  const quarantineReasons = [
-    "provider_locator_mismatch",
-    "invalid_provider_record",
-    "projection_collision",
-  ] as const;
-
-  const inFlightProvisioning = input.provisioningOperations.rows.filter(
-    (row) => row.status !== "completed" && row.status !== "failed",
-  );
 
   const quotaRows = input.workspaceUsage.rows.map((row) => ({
     ...row,
@@ -506,51 +408,6 @@ export function buildOperatorDiagnostics(input: OperatorDiagnosticsInput) {
       samples: wakeSamples,
       coverage: coverage(input.dueWakes),
     },
-    identity: {
-      reconciliation: (["workos_memberships", "workos_organizations"] as const).map(
-        (key) => reconciliationState(input.now, key, reconciliationByKey.get(key)),
-      ),
-      reconciliationCoverage: coverage(input.reconciliationStates),
-      unresolvedQuarantines: unresolvedQuarantines.length,
-      repeatedUnresolvedQuarantines: unresolvedQuarantines.filter(
-        (row) => row.occurrences > 1,
-      ).length,
-      oldestUnresolvedQuarantineAgeMs: oldestAgeMs(
-        input.now,
-        unresolvedQuarantines.map((row) => row.firstSeenAt),
-      ),
-      quarantinesByReason: quarantineReasons.map((reason) => ({
-        reason,
-        unresolved: unresolvedQuarantines.filter((row) => row.reason === reason).length,
-      })),
-      quarantineCoverage: coverage(input.quarantines),
-    },
-    provisioning: {
-      inFlight: inFlightProvisioning.length,
-      stuck: inFlightProvisioning.filter(
-        (row) =>
-          ageMs(input.now, row.updatedAt) >=
-          OPERATOR_DIAGNOSTIC_THRESHOLDS.provisioningStuckAfterMs,
-      ).length,
-      expiredLeases: inFlightProvisioning.filter(
-        (row) =>
-          row.membershipProvisioningLeaseUntil !== undefined &&
-          row.membershipProvisioningLeaseUntil <= input.now,
-      ).length,
-      dispatchMarkedAndStuck: inFlightProvisioning.filter(
-        (row) =>
-          row.membershipCreateDispatchedAt !== undefined &&
-          ageMs(input.now, row.membershipCreateDispatchedAt) >=
-            OPERATOR_DIAGNOSTIC_THRESHOLDS.provisioningStuckAfterMs,
-      ).length,
-      failed: input.provisioningOperations.rows.filter((row) => row.status === "failed")
-        .length,
-      oldestInFlightAgeMs: oldestAgeMs(
-        input.now,
-        inFlightProvisioning.map((row) => row.createdAt),
-      ),
-      coverage: coverage(input.provisioningOperations),
-    },
     quotas: {
       limits: {
         activeTasks: WORKSPACE_ACTIVE_TASK_LIMIT,
@@ -602,6 +459,10 @@ const routeClassValidator = v.union(
   v.literal("human_mutation"),
   v.literal("human_poll"),
   v.literal("refresh_auth"),
+  v.literal("desktop_pairing_start"),
+  v.literal("desktop_pairing_redeem"),
+  v.literal("password_sign_in"),
+  v.literal("password_sign_up"),
   v.literal("agent_auth_failure"),
   v.literal("enrollment_auth_failure"),
 );
@@ -617,8 +478,6 @@ const diagnosticsValidator = v.object({
     reviewAgedAfterMs: v.number(),
     credentialRenewalWindowMs: v.number(),
     credentialUnusedAfterMs: v.number(),
-    reconciliationStaleAfterMs: v.number(),
-    provisioningStuckAfterMs: v.number(),
     quotaWarningPercent: v.number(),
   }),
   rateLimits: v.object({
@@ -727,48 +586,6 @@ const diagnosticsValidator = v.object({
     ),
     coverage: coverageValidator,
   }),
-  identity: v.object({
-    reconciliation: v.array(
-      v.object({
-        key: v.union(v.literal("workos_memberships"), v.literal("workos_organizations")),
-        status: v.union(
-          v.literal("missing"),
-          v.literal("healthy"),
-          v.literal("running"),
-          v.literal("stuck"),
-          v.literal("stale"),
-          v.literal("failed"),
-        ),
-        leaseOverdueMs: nullableNumberValidator,
-        lastCompletedAgeMs: nullableNumberValidator,
-        lastErrorAgeMs: nullableNumberValidator,
-      }),
-    ),
-    reconciliationCoverage: coverageValidator,
-    unresolvedQuarantines: v.number(),
-    repeatedUnresolvedQuarantines: v.number(),
-    oldestUnresolvedQuarantineAgeMs: nullableNumberValidator,
-    quarantinesByReason: v.array(
-      v.object({
-        reason: v.union(
-          v.literal("provider_locator_mismatch"),
-          v.literal("invalid_provider_record"),
-          v.literal("projection_collision"),
-        ),
-        unresolved: v.number(),
-      }),
-    ),
-    quarantineCoverage: coverageValidator,
-  }),
-  provisioning: v.object({
-    inFlight: v.number(),
-    stuck: v.number(),
-    expiredLeases: v.number(),
-    dispatchMarkedAndStuck: v.number(),
-    failed: v.number(),
-    oldestInFlightAgeMs: nullableNumberValidator,
-    coverage: coverageValidator,
-  }),
   quotas: v.object({
     limits: v.object({
       activeTasks: v.number(),
@@ -847,9 +664,6 @@ export const snapshot = internalQuery({
       repairDocs,
       credentialDocs,
       wakeDocs,
-      reconciliationDocs,
-      quarantineDocs,
-      provisioningDocs,
       usageDocs,
       workspaceDocs,
     ] = await Promise.all([
@@ -879,13 +693,6 @@ export const snapshot = internalQuery({
         )
         .order("asc")
         .take(indexedLimit + 1),
-      ctx.db.query("identityReconciliationState").take(3),
-      ctx.db
-        .query("identityReconciliationQuarantines")
-        .withIndex("by_last_seen")
-        .order("desc")
-        .take(scannedLimit + 1),
-      ctx.db.query("accountProvisioningOperations").order("desc").take(scannedLimit + 1),
       ctx.db.query("workspaceUsage").order("asc").take(scannedLimit + 1),
       ctx.db.query("workspaces").order("asc").take(workspaceLimit + 1),
     ]);
@@ -1079,44 +886,6 @@ export const snapshot = internalQuery({
         })),
       },
       wakeSamples,
-      reconciliationStates: {
-        ...bounded(reconciliationDocs, 2),
-        rows: bounded(reconciliationDocs, 2).rows.map((row) => ({
-          key: row.key,
-          ...(row.runId === undefined ? {} : { runId: row.runId }),
-          ...(row.leaseUntil === undefined ? {} : { leaseUntil: row.leaseUntil }),
-          ...(row.lastStartedAt === undefined
-            ? {}
-            : { lastStartedAt: row.lastStartedAt }),
-          ...(row.lastCompletedAt === undefined
-            ? {}
-            : { lastCompletedAt: row.lastCompletedAt }),
-          ...(row.lastErrorAt === undefined ? {} : { lastErrorAt: row.lastErrorAt }),
-        })),
-      },
-      quarantines: {
-        ...bounded(quarantineDocs, scannedLimit),
-        rows: bounded(quarantineDocs, scannedLimit).rows.map((row) => ({
-          reason: row.reason,
-          occurrences: row.occurrences,
-          firstSeenAt: row.firstSeenAt,
-          ...(row.resolvedAt === undefined ? {} : { resolvedAt: row.resolvedAt }),
-        })),
-      },
-      provisioningOperations: {
-        ...bounded(provisioningDocs, scannedLimit),
-        rows: bounded(provisioningDocs, scannedLimit).rows.map((row) => ({
-          status: row.status,
-          ...(row.membershipProvisioningLeaseUntil === undefined
-            ? {}
-            : { membershipProvisioningLeaseUntil: row.membershipProvisioningLeaseUntil }),
-          ...(row.membershipCreateDispatchedAt === undefined
-            ? {}
-            : { membershipCreateDispatchedAt: row.membershipCreateDispatchedAt }),
-          createdAt: row.createdAt,
-          updatedAt: row.updatedAt,
-        })),
-      },
       workspaceUsage: {
         rows: usage.rows.map((row) => {
           const workspacePublicId = quotaWorkspaceIds.get(row.workspaceId);

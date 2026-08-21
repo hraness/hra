@@ -24,6 +24,8 @@ import {
   type ListWorkspacesResponse,
   type OrganizationView,
   type RequestId,
+  type SelectHumanScopeRequest,
+  type SelectHumanScopeResponse,
   type TaskKey,
   type WorkspaceView,
 } from "@hraness/agent-tasks-protocol";
@@ -74,16 +76,17 @@ import {
 import {
   bunHumanSecretStore,
   clearHumanAuthentication,
+  compareAndSwapHumanAuthentication,
   humanAuthenticationSchema,
   humanProfileOutput,
   readEnrollmentFile,
   readHumanAuthentication,
-  readHumanProfile,
+  preserveHumanAuthenticationIfCredentialMatches,
   resolveHumanStoragePaths,
-  updateHumanAuthentication,
   writeHumanAuthentication,
   writeNewEnrollmentFile,
   type HumanAuthentication,
+  type HumanAuthenticationObservation,
   type HumanProfile,
   type HumanSecretStore,
   type HumanStoragePaths,
@@ -96,10 +99,10 @@ import {
   type CliIo,
 } from "./output";
 import {
-  loginWithWorkosDevice,
+  loginWithDesktopPairing,
   openVerificationUrl,
-  type DeviceVerification,
-} from "./workos-device";
+  type DesktopPairingVerification,
+} from "./desktop-pairing";
 
 export interface RunCliOptions {
   readonly environment?: TaskctlEnvironment;
@@ -1045,6 +1048,7 @@ interface PreparedHumanAuthentication {
   readonly client: TaskctlClient;
   readonly authentication: HumanAuthentication;
   readonly profile: HumanProfile;
+  readonly generation: number | null;
 }
 
 type HumanRefresh =
@@ -1059,6 +1063,7 @@ type HumanCall<Value> =
   | { readonly ok: false; readonly exitCode: number }
   | {
       readonly ok: true;
+      readonly prepared: PreparedHumanAuthentication;
       readonly result: ClientResult<Value>;
     };
 
@@ -1073,28 +1078,7 @@ async function prepareHumanAuthentication(
       "no human authentication is configured; run auth login",
     );
   }
-  const { authentication, profile } = stored;
-  if (requirement !== "account") {
-    const organization = authentication.organization;
-    if (organization === undefined || authentication.workosOrganizationId === undefined) {
-      throw new TaskctlConfigError(
-        "ORGANIZATION_REQUIRED",
-        "select an organization with organization use",
-      );
-    }
-    if (organization.status === "provisioning") {
-      throw new TaskctlConfigError(
-        "PROVISIONING_IN_PROGRESS",
-        "the selected organization is still provisioning",
-      );
-    }
-    if (organization.status === "failed") {
-      throw new TaskctlConfigError(
-        "PROVISIONING_FAILED",
-        "the selected organization could not be provisioned",
-      );
-    }
-  }
+  const { authentication, profile, generation } = stored;
   if (requirement === "workspace" && authentication.workspace === undefined) {
     throw new TaskctlConfigError(
       "VALIDATION_ERROR",
@@ -1104,6 +1088,7 @@ async function prepareHumanAuthentication(
   return {
     authentication,
     profile,
+    generation,
     client: new TaskctlClient({
       apiUrl: authentication.apiUrl,
       ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch }),
@@ -1111,28 +1096,95 @@ async function prepareHumanAuthentication(
   };
 }
 
-async function clearAfterRefreshFailure(runtime: Runtime): Promise<void> {
-  await clearHumanAuthentication(runtime.humanPaths, runtime.humanSecretStore);
+function exactHumanAuthentication(
+  left: HumanAuthentication,
+  right: HumanAuthentication,
+): boolean {
+  return JSON.stringify(humanAuthenticationSchema.parse(left)) ===
+    JSON.stringify(humanAuthenticationSchema.parse(right));
+}
+
+async function containHumanAuthentication(
+  runtime: Runtime,
+  prepared: PreparedHumanAuthentication,
+  candidates: readonly HumanAuthentication[],
+  failureMessage: string,
+): Promise<void> {
+  const successorGeneration = prepared.generation === null
+    ? 0
+    : prepared.generation < Number.MAX_SAFE_INTEGER
+      ? prepared.generation + 1
+      : null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      if (await preserveHumanAuthenticationIfCredentialMatches(
+        runtime.humanPaths,
+        {
+          expectedGeneration: prepared.generation,
+          candidates,
+        },
+        runtime.random,
+        runtime.humanSecretStore,
+      )) return;
+    } catch {
+      // Resolve an exact committed successor or a newer winner below.
+    }
+
+    let current: HumanAuthenticationObservation | null;
+    try {
+      current = await readHumanAuthentication(
+        runtime.humanPaths,
+        runtime.humanSecretStore,
+      );
+    } catch {
+      throw new TaskctlConfigError("INTERNAL_ERROR", failureMessage);
+    }
+    if (current === null) return;
+    const exactCandidate = candidates.some((candidate) =>
+      exactHumanAuthentication(current.authentication, candidate)
+    );
+    const containmentGeneration =
+      current.generation === prepared.generation ||
+      current.generation === successorGeneration;
+    if (containmentGeneration && exactCandidate) {
+      if (attempt === 0) continue;
+      throw new TaskctlConfigError("INTERNAL_ERROR", failureMessage);
+    }
+    const validNewerWinner = current.generation !== null &&
+      (prepared.generation === null ||
+        current.generation > prepared.generation);
+    if (validNewerWinner) return;
+    throw new TaskctlConfigError("INTERNAL_ERROR", failureMessage);
+  }
+}
+
+async function preserveAfterRefreshFailure(
+  runtime: Runtime,
+  prepared: PreparedHumanAuthentication,
+  candidates: readonly HumanAuthentication[],
+): Promise<void> {
+  await containHumanAuthentication(
+    runtime,
+    prepared,
+    candidates,
+    "could not contain rejected human authentication",
+  );
 }
 
 async function refreshHumanAuthentication(
   runtime: Runtime,
   prepared: PreparedHumanAuthentication,
   json: boolean,
-  targetOrganization?: OrganizationView,
 ): Promise<HumanRefresh> {
-  const workosOrganizationId =
-    targetOrganization?.workosOrganizationId ?? prepared.authentication.workosOrganizationId;
   const result = await prepared.client.refreshHumanAuthentication(
     prepared.authentication.refreshToken,
-    workosOrganizationId === undefined ? {} : { workosOrganizationId },
   );
   if (!result.ok) {
     if (
       result.error.code === "SERVICE_UNAVAILABLE" ||
       result.error.code === "AUTH_REFRESH_INDETERMINATE"
     ) {
-      await clearAfterRefreshFailure(runtime);
+      await preserveAfterRefreshFailure(runtime, prepared, [prepared.authentication]);
       return {
         ok: false,
         exitCode: writeFailure(
@@ -1140,7 +1192,7 @@ async function refreshHumanAuthentication(
           {
             code: "AUTH_REFRESH_INDETERMINATE",
             message:
-              "the refresh outcome is unknown; local human authentication was cleared, so run auth login",
+              "the refresh outcome is unknown; local human authentication was preserved for recovery, so run auth login",
             requestId: result.error.requestId ?? localRequestId(runtime),
             details: {},
           },
@@ -1149,7 +1201,7 @@ async function refreshHumanAuthentication(
       };
     }
     if (result.error.code === "AUTHENTICATION_FAILED") {
-      await clearAfterRefreshFailure(runtime);
+      await preserveAfterRefreshFailure(runtime, prepared, [prepared.authentication]);
     }
     return { ok: false, exitCode: clientFailure(runtime, result.error, json) };
   }
@@ -1157,10 +1209,9 @@ async function refreshHumanAuthentication(
   const refreshed = refreshedHumanAuthentication(
     prepared.authentication,
     result.data,
-    targetOrganization,
   );
   if (!refreshed.ok) {
-    await clearAfterRefreshFailure(runtime);
+    await preserveAfterRefreshFailure(runtime, prepared, [prepared.authentication]);
     return {
       ok: false,
       exitCode: writeFailure(
@@ -1177,19 +1228,62 @@ async function refreshHumanAuthentication(
   }
 
   const nextAuthentication = refreshed.authentication;
-  await updateHumanAuthentication(
-    runtime.humanPaths,
-    prepared.profile,
-    nextAuthentication,
-    runtime.random,
-    runtime.humanSecretStore,
-  );
+  let committed: HumanAuthenticationObservation | null;
+  try {
+    committed = await compareAndSwapHumanAuthentication(
+      runtime.humanPaths,
+      prepared,
+      nextAuthentication,
+      runtime.random,
+      runtime.humanSecretStore,
+    );
+  } catch {
+    await preserveAfterRefreshFailure(runtime, prepared, [
+      prepared.authentication,
+      nextAuthentication,
+    ]);
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTH_REFRESH_INDETERMINATE",
+          message:
+            "the refreshed credential could not be committed; local human authentication was preserved for recovery, so run auth login",
+          requestId: result.requestId,
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
+  if (committed === null) {
+    await preserveAfterRefreshFailure(runtime, prepared, [
+      prepared.authentication,
+      nextAuthentication,
+    ]);
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTH_REFRESH_INDETERMINATE",
+          message:
+            "human authentication changed during refresh; run auth login if the current session is unavailable",
+          requestId: result.requestId,
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
   return {
     ok: true,
     requestId: result.requestId,
     prepared: {
-      authentication: nextAuthentication,
-      profile: (await readHumanProfile(runtime.humanPaths)) ?? prepared.profile,
+      authentication: committed.authentication,
+      profile: committed.profile,
+      generation: committed.generation,
       client: prepared.client,
     },
   };
@@ -1208,8 +1302,162 @@ async function humanCall<Value>(
     if (!refreshed.ok) return refreshed;
     prepared = refreshed.prepared;
     result = await operation(prepared);
+    if (!result.ok && result.error.code === "AUTHENTICATION_FAILED") {
+      await preserveAfterRefreshFailure(runtime, prepared, [
+        prepared.authentication,
+      ]);
+    }
   }
-  return { ok: true, result };
+  return { ok: true, prepared, result };
+}
+
+type HumanScopeSelection =
+  | { readonly ok: false; readonly exitCode: number }
+  | {
+      readonly ok: true;
+      readonly data: SelectHumanScopeResponse;
+      readonly requestId: RequestId;
+    };
+
+async function quarantineHumanScopeSelection(
+  runtime: Runtime,
+  prepared: PreparedHumanAuthentication,
+  candidates: readonly HumanAuthentication[],
+): Promise<void> {
+  await containHumanAuthentication(
+    runtime,
+    prepared,
+    candidates,
+    "could not quarantine indeterminate human authentication",
+  );
+}
+
+async function commitHumanScopeSelection(
+  runtime: Runtime,
+  json: boolean,
+  request: SelectHumanScopeRequest,
+  call: HumanCall<SelectHumanScopeResponse>,
+): Promise<HumanScopeSelection> {
+  if (!call.ok) return call;
+  if (!call.result.ok) {
+    const indeterminate =
+      call.result.error.code === "SERVICE_UNAVAILABLE" ||
+      call.result.error.code === "AUTH_REFRESH_INDETERMINATE";
+    if (indeterminate || call.result.error.code === "AUTHENTICATION_FAILED") {
+      await quarantineHumanScopeSelection(
+        runtime,
+        call.prepared,
+        [call.prepared.authentication],
+      );
+    }
+    if (!indeterminate) {
+      return {
+        ok: false,
+        exitCode: clientFailure(runtime, call.result.error, json),
+      };
+    }
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTH_REFRESH_INDETERMINATE",
+          message:
+            "the scope selection outcome is unknown; local human authentication was preserved for recovery, so run auth login",
+          requestId: call.result.error.requestId ?? localRequestId(runtime),
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
+
+  const response = call.result.data;
+  const nextAuthentication = humanAuthenticationSchema.parse({
+    version: 2,
+    apiUrl: call.prepared.authentication.apiUrl,
+    accessToken: response.accessToken,
+    refreshToken: response.refreshToken,
+    user: response.user,
+    organization: response.organization,
+    ...(response.workspace === undefined ? {} : { workspace: response.workspace }),
+  });
+  const matchesRequest =
+    response.user.id === call.prepared.authentication.user.id &&
+    response.organization.id === request.organizationId &&
+    (request.workspaceId === undefined
+      ? response.workspace === undefined
+      : response.workspace?.id === request.workspaceId);
+  if (!matchesRequest) {
+    await quarantineHumanScopeSelection(runtime, call.prepared, [
+      call.prepared.authentication,
+      nextAuthentication,
+    ]);
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTHENTICATION_FAILED",
+          message: "the server returned another human scope selection; run auth login",
+          requestId: call.result.requestId,
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
+
+  let committed: HumanAuthenticationObservation | null;
+  try {
+    committed = await compareAndSwapHumanAuthentication(
+      runtime.humanPaths,
+      call.prepared,
+      nextAuthentication,
+      runtime.random,
+      runtime.humanSecretStore,
+    );
+  } catch {
+    await quarantineHumanScopeSelection(runtime, call.prepared, [
+      call.prepared.authentication,
+      nextAuthentication,
+    ]);
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTH_REFRESH_INDETERMINATE",
+          message:
+            "the selected credential could not be committed; local human authentication was preserved for recovery, so run auth login",
+          requestId: call.result.requestId,
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
+  if (committed === null) {
+    await quarantineHumanScopeSelection(runtime, call.prepared, [
+      call.prepared.authentication,
+      nextAuthentication,
+    ]);
+    return {
+      ok: false,
+      exitCode: writeFailure(
+        runtime.io,
+        {
+          code: "AUTH_REFRESH_INDETERMINATE",
+          message:
+            "human authentication changed during scope selection; run auth login if the current session is unavailable",
+          requestId: call.result.requestId,
+          details: {},
+        },
+        json,
+      ),
+    };
+  }
+  return { ok: true, data: response, requestId: call.result.requestId };
 }
 
 function outputHumanCall<Value>(
@@ -1227,25 +1475,24 @@ function outputHumanCall<Value>(
   return 0;
 }
 
-function writeDeviceVerification(
+function writePairingVerification(
   runtime: Runtime,
-  verification: DeviceVerification,
+  verification: DesktopPairingVerification,
   json: boolean,
 ): void {
   if (json) {
     runtime.io.stderr(
       `${JSON.stringify({
-        deviceAuthorization: {
-          userCode: verification.userCode,
+        desktopPairing: {
           verificationUri: verification.verificationUri,
-          expiresAt: verification.expiresAt,
+          comparisonCode: verification.comparisonCode,
         },
       })}\n`,
     );
     return;
   }
   runtime.io.stderr(
-    `Open ${verification.verificationUri} and enter code ${verification.userCode}.\n`,
+    `Open ${verification.verificationUri} and confirm code ${verification.comparisonCode}.\n`,
   );
 }
 
@@ -1253,33 +1500,33 @@ async function authLogin(
   runtime: Runtime,
   command: Extract<CliCommand, { kind: "auth_login" }>,
 ): Promise<number> {
-  const clientId =
-    runtime.environment["TASKCTL_WORKOS_CLIENT_ID"] ?? runtime.environment["WORKOS_CLIENT_ID"];
-  if (clientId === undefined) {
-    throw new TaskctlConfigError(
-      "VALIDATION_ERROR",
-      "TASKCTL_WORKOS_CLIENT_ID is required for human login",
-    );
-  }
   const agentProfile = await readProfile(runtime.paths);
   const apiUrl = resolveApiUrl(runtime.environment, agentProfile);
-  const authenticated = await loginWithWorkosDevice({
-    clientId,
-    fetch: runtime.fetch ?? globalThis.fetch,
+  const webUrl = runtime.environment["TASKCTL_WEB_URL"];
+  if (webUrl === undefined) {
+    throw new TaskctlConfigError(
+      "VALIDATION_ERROR",
+      "TASKCTL_WEB_URL is required to pin the browser pairing origin",
+    );
+  }
+  const authenticated = await loginWithDesktopPairing({
+    apiUrl,
+    expectedWebOrigin: webUrl,
+    ...(runtime.fetch === undefined ? {} : { fetch: runtime.fetch }),
     now: runtime.now,
     sleep: runtime.sleep,
-    onVerification: (verification) => writeDeviceVerification(runtime, verification, command.json),
+    randomBytes: runtime.random,
+    onVerification: (verification) => writePairingVerification(runtime, verification, command.json),
     ...(command.openBrowser ? { openBrowser: runtime.openBrowser } : {}),
   });
   const authentication = humanAuthenticationSchema.parse({
-    version: 1,
+    version: 2,
     apiUrl,
     accessToken: authenticated.accessToken,
     refreshToken: authenticated.refreshToken,
     user: authenticated.user,
-    ...(authenticated.workosOrganizationId === undefined
-      ? {}
-      : { workosOrganizationId: authenticated.workosOrganizationId }),
+    organization: authenticated.organization,
+    workspace: authenticated.workspace,
   });
   await writeHumanAuthentication(
     runtime.humanPaths,
@@ -1287,9 +1534,13 @@ async function authLogin(
     command.secretStore,
     runtime.random,
     runtime.humanSecretStore,
+    { replaceLegacy: true },
   );
-  const profile = await readHumanProfile(runtime.humanPaths);
-  writeData(runtime.io, humanProfileOutput(profile), command.json);
+  const stored = await readHumanAuthentication(
+    runtime.humanPaths,
+    runtime.humanSecretStore,
+  );
+  writeData(runtime.io, humanProfileOutput(stored?.profile ?? null), command.json);
   return 0;
 }
 
@@ -1475,32 +1726,26 @@ async function execute(runtime: Runtime, command: CliCommand): Promise<number> {
     case "organization_use": {
       const found = await findOrganization(runtime, command.organizationId, command.json);
       if (!found.ok) return found.exitCode;
-      if (found.organization.status === "provisioning" || found.organization.workosOrganizationId === undefined) {
-        throw new TaskctlConfigError(
-          "PROVISIONING_IN_PROGRESS",
-          "the organization is not ready to select",
-        );
-      }
-      if (found.organization.status === "failed") {
-        throw new TaskctlConfigError(
-          "PROVISIONING_FAILED",
-          "the organization could not be provisioned",
-        );
-      }
-      const prepared = await prepareHumanAuthentication(runtime, "account");
-      const refreshed = await refreshHumanAuthentication(
-        runtime,
-        prepared,
-        command.json,
-        found.organization,
+      const request = { organizationId: found.organization.id } as const;
+      const call = await humanCall(runtime, command.json, "account", async (prepared) =>
+        await prepared.client.selectHumanScope(
+          prepared.authentication.accessToken,
+          request,
+        ),
       );
-      if (!refreshed.ok) return refreshed.exitCode;
+      const selected = await commitHumanScopeSelection(
+        runtime,
+        command.json,
+        request,
+        call,
+      );
+      if (!selected.ok) return selected.exitCode;
       writeData(
         runtime.io,
         {
-          organization: found.organization,
+          organization: selected.data.organization,
           workspace: null,
-          requestId: refreshed.requestId,
+          requestId: selected.requestId,
         },
         command.json,
       );
@@ -1546,23 +1791,33 @@ async function execute(runtime: Runtime, command: CliCommand): Promise<number> {
       if (!found.ok) return found.exitCode;
       const prepared = await prepareHumanAuthentication(runtime, "organization");
       const organization = prepared.authentication.organization;
-      if (organization === undefined || found.workspace.organizationId !== organization.id) {
+      if (found.workspace.organizationId !== organization.id) {
         throw new TaskctlConfigError("NOT_FOUND", "the workspace was not found");
       }
-      const nextAuthentication = humanAuthenticationSchema.parse({
-        ...prepared.authentication,
-        workspace: found.workspace,
-      });
-      await updateHumanAuthentication(
-        runtime.humanPaths,
-        prepared.profile,
-        nextAuthentication,
-        runtime.random,
-        runtime.humanSecretStore,
+      const request = {
+        organizationId: organization.id,
+        workspaceId: found.workspace.id,
+      } as const;
+      const call = await humanCall(runtime, command.json, "organization", async (current) =>
+        await current.client.selectHumanScope(
+          current.authentication.accessToken,
+          request,
+        ),
       );
+      const selected = await commitHumanScopeSelection(
+        runtime,
+        command.json,
+        request,
+        call,
+      );
+      if (!selected.ok) return selected.exitCode;
       writeData(
         runtime.io,
-        { organization, workspace: found.workspace },
+        {
+          organization: selected.data.organization,
+          workspace: selected.data.workspace,
+          requestId: selected.requestId,
+        },
         command.json,
       );
       return 0;

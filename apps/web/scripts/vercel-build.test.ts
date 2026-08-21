@@ -4,6 +4,9 @@ import { readFileSync } from "node:fs";
 import {
   applicationBuildSecretEnvironmentVariables,
   convexOnlyEnvironmentVariables,
+  isLegacyIdentityProviderEnvironmentVariable,
+  legacyIdentityProviderEnvironmentPrefixes,
+  legacyIdentityProviderEnvironmentVariables,
   parseVercelPreviewSurfaceOrigin,
   planVercelAppBuild,
   planVercelConvexBuild,
@@ -12,6 +15,7 @@ import {
   releasePublicationCommitEnvironmentVariable,
   runVercelAppBuild,
   runVercelConvexBuild,
+  stripLegacyIdentityProviderEnvironment,
   type VercelConvexBuildLauncher,
 } from "./vercel-build";
 
@@ -190,6 +194,81 @@ describe("HRA Vercel Convex target plans", () => {
       kind: "refuse",
       reason: "production-deploy-key-outside-production",
     });
+  });
+
+  test("refuses every predecessor identity environment record in every build mode", () => {
+    for (const environment of [productionEnvironment, previewEnvironment, {}] as const) {
+      for (const variable of legacyIdentityProviderEnvironmentVariables) {
+        for (const value of ["", "configured"]) {
+          const configured = { ...environment, [variable]: value };
+          expect(planVercelConvexBuild(configured), `${variable}:convex`).toEqual({
+            kind: "refuse",
+            reason: "legacy-identity-provider-configuration",
+          });
+          expect(planVercelAppBuild(configured), `${variable}:app`).toEqual({
+            kind: "refuse",
+            reason: "legacy-identity-provider-configuration",
+          });
+        }
+      }
+    }
+  });
+
+  test("covers the reviewed baseline and rejects future provider aliases by prefix", () => {
+    expect(legacyIdentityProviderEnvironmentVariables).toEqual([
+      "FOREIGN_WORKOS_USER_ID",
+      "HRA_WORKOS_CLIENT_ID",
+      "NEXT_PUBLIC_WORKOS_REDIRECT_URI",
+      "OPRTE_WORKOS_CLIENT_ID",
+      "SECOND_WORKOS_USER_ID",
+      "TASKCTL_TEST_FAKE_WORKOS_ORIGIN",
+      "TASKCTL_TEST_WORKOS_USER_ID",
+      "TASKCTL_WORKOS_CLIENT_ID",
+      "WORKOS_API_HOSTNAME",
+      "WORKOS_API_HTTPS",
+      "WORKOS_API_KEY",
+      "WORKOS_API_ORIGIN",
+      "WORKOS_API_PORT",
+      "WORKOS_CLIENT_ID",
+      "WORKOS_COOKIE_PASSWORD",
+      "WORKOS_ORGANIZATION_ID",
+      "WORKOS_ORIGIN",
+      "WORKOS_OWNER_MEMBERSHIP_PROVIDER_POLICY",
+      "WORKOS_OWNER_ROLE_SLUG",
+      "WORKOS_REQUEST_TIMEOUT_MS",
+      "WORKOS_USER_ID",
+      "WORKOS_WEBHOOK_SECRET",
+    ]);
+    for (const prefix of legacyIdentityProviderEnvironmentPrefixes) {
+      const alias = `${prefix}UNREVIEWED_ALIAS`;
+      expect(isLegacyIdentityProviderEnvironmentVariable(alias), alias).toBeTrue();
+      expect(planVercelConvexBuild({ [alias]: "configured" }), alias).toEqual({
+        kind: "refuse",
+        reason: "legacy-identity-provider-configuration",
+      });
+    }
+  });
+
+  test("defensively strips every predecessor identity record from child environments", () => {
+    const configured = Object.fromEntries(
+      [
+        ...legacyIdentityProviderEnvironmentVariables,
+        ...legacyIdentityProviderEnvironmentPrefixes.map((prefix) =>
+          `${prefix}UNREVIEWED_ALIAS`
+        ),
+      ].map((name) => [name, "configured"]),
+    );
+    const stripped = stripLegacyIdentityProviderEnvironment({
+      ...configured,
+      KEEP_PUBLIC_VALUE: "kept",
+    });
+    expect(stripped.KEEP_PUBLIC_VALUE).toBe("kept");
+    for (const variable of legacyIdentityProviderEnvironmentVariables) {
+      expect(stripped[variable]).toBeUndefined();
+    }
+    for (const prefix of legacyIdentityProviderEnvironmentPrefixes) {
+      expect(stripped[`${prefix}UNREVIEWED_ALIAS`]).toBeUndefined();
+    }
   });
 });
 

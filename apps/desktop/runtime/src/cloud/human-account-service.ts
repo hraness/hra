@@ -5,9 +5,8 @@ import {
   humanAuthenticationSchema,
   humanAuthenticationSnapshotSchema,
   profileFromHumanAuthentication,
-  refreshedHumanAuthentication,
-  loginWithWorkosDevice,
-  type DeviceVerification,
+  loginWithDesktopPairing,
+  type DesktopPairingVerification,
   type FetchLike,
   type HumanAuthenticationSnapshot,
   type HumanAuthentication,
@@ -42,9 +41,13 @@ import {
 } from "./http-client";
 import {
   HumanCredentialCustody,
+  LegacyHumanAccountMetadataError,
+  isHumanCredentialRecoveryPending,
+  markHumanCredentialRecoveryPending,
   reconcileHumanAccountMetadata,
   type HumanCredentialClearAuthority,
   type HumanCredentialRecoveryCandidateInspection,
+  type HumanScopeSelectionCustodyAuthority,
   type HumanAccountMetadataPort,
 } from "./keychain-custody";
 
@@ -79,8 +82,8 @@ function sameHumanAuthenticationSnapshot(
       JSON.stringify(right.authentication);
 }
 
-export interface SafeDeviceVerification {
-  readonly userCode: string;
+export interface SafeDesktopPairingVerification {
+  readonly comparisonCode: string;
   readonly verificationUri: string;
   readonly expiresAt: number;
 }
@@ -116,7 +119,7 @@ export type HumanAccountSnapshot =
     })
   | (SnapshotBase & {
       readonly state: "signing_in";
-      readonly verification?: SafeDeviceVerification;
+      readonly verification?: SafeDesktopPairingVerification;
     })
   | (SnapshotBase & {
       readonly state: "signed_in";
@@ -321,6 +324,9 @@ class OriginBoundAuthenticationStore implements HumanAuthenticationStore {
   readonly #onChanged: (
     snapshot: HumanAuthenticationSnapshot | null,
   ) => Promise<void>;
+  readonly #onRecoveryRequired: (
+    containmentConfirmed: boolean,
+  ) => Promise<void>;
   readonly #origin: string;
 
   constructor(options: {
@@ -328,10 +334,14 @@ class OriginBoundAuthenticationStore implements HumanAuthenticationStore {
     readonly onChanged: (
       snapshot: HumanAuthenticationSnapshot | null,
     ) => Promise<void>;
+    readonly onRecoveryRequired: (
+      containmentConfirmed: boolean,
+    ) => Promise<void>;
     readonly origin: string;
   }) {
     this.#credentials = options.credentials;
     this.#onChanged = options.onChanged;
+    this.#onRecoveryRequired = options.onRecoveryRequired;
     this.#origin = options.origin;
   }
 
@@ -362,6 +372,36 @@ class OriginBoundAuthenticationStore implements HumanAuthenticationStore {
       ...input,
       onJournaled: async () => await this.#onChanged(null),
     });
+  }
+
+  async preserveForRecovery(input: {
+    readonly expectedGeneration: number;
+  }): Promise<boolean> {
+    let preserved: boolean;
+    try {
+      preserved = await this.#credentials.preserveForRecovery(input);
+    } catch (error: unknown) {
+      const winner = await this.#newerWinner(input.expectedGeneration);
+      if (winner) return false;
+      await this.#onRecoveryRequired(false);
+      throw error;
+    }
+    if (!preserved) {
+      if (await this.#newerWinner(input.expectedGeneration)) return false;
+      await this.#onRecoveryRequired(false);
+      return false;
+    }
+    await this.#onRecoveryRequired(true);
+    return true;
+  }
+
+  async #newerWinner(expectedGeneration: number): Promise<boolean> {
+    try {
+      const current = await this.#credentials.read();
+      return current !== null && current.generation > expectedGeneration;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -398,6 +438,7 @@ export class HumanAccountService {
   #admissionClosed = false;
   #credentialProjectionFence = 0;
   #recoveryGenerationFloor = -1;
+  #sessionAdmissionContained = false;
   #snapshot: HumanAccountSnapshot = { state: "initializing", revision: 0 };
 
   constructor(options: HumanAccountServiceOptions) {
@@ -427,6 +468,8 @@ export class HumanAccountService {
         origin: this.#availability.apiOrigin,
         onChanged: async (snapshot) =>
           await this.#sessionCredentialChanged(snapshot),
+        onRecoveryRequired: async (containmentConfirmed) =>
+          await this.#sessionCredentialRecoveryRequired(containmentConfirmed),
       });
       this.#session = new HumanSessionCoordinator({
         store,
@@ -506,6 +549,12 @@ export class HumanAccountService {
 
   async #reinspectCredentials(): Promise<HumanAccountSnapshot> {
     try {
+      if (await isHumanCredentialRecoveryPending(this.#metadata)) {
+        return this.#update({
+          state: "recovery_required",
+          reason: "credential_reconnect_required",
+        });
+      }
       const reconnect = await this.#credentials.inspectLegacyIdentityReconnect();
       if (reconnect.state === "required") {
         return this.#update({
@@ -562,6 +611,12 @@ export class HumanAccountService {
         );
       } catch (error: unknown) {
         if (error instanceof RejectedPendingCredentialError) {
+          return this.#update({
+            state: "recovery_required",
+            reason: "credential_reconnect_required",
+          });
+        }
+        if (error instanceof LegacyHumanAccountMetadataError) {
           return this.#update({
             state: "recovery_required",
             reason: "credential_reconnect_required",
@@ -685,7 +740,12 @@ export class HumanAccountService {
     this.#loginGeneration += 1;
     this.#loginAbort?.abort();
     await task.catch(() => undefined);
-    if (this.#snapshot.state === "signed_in") return this.#snapshot;
+    if (
+      this.#snapshot.state === "signed_in" ||
+      this.#snapshot.state === "recovery_required"
+    ) {
+      return this.#snapshot;
+    }
     return this.#update({ state: "signed_out" });
   }
 
@@ -745,6 +805,27 @@ export class HumanAccountService {
         };
       }
       try {
+        if (await isHumanCredentialRecoveryPending(this.#metadata)) {
+          await beforeQuarantine();
+          await this.#credentials.preserveMarkedCredentialForRecovery(
+            this.#availability.state === "enabled"
+              ? this.#availability.apiOrigin
+              : undefined,
+          );
+          await reconcileHumanAccountMetadata(this.#metadata, null);
+          return {
+            ok: true,
+            snapshot: this.#update({ state: "signed_out" }),
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          kind: "failed",
+          error: safeError("SERVICE_UNAVAILABLE"),
+        };
+      }
+      try {
         return await this.#withRecoveryCandidateAuthority(
           async (candidate) => {
             await beforeQuarantine();
@@ -758,7 +839,9 @@ export class HumanAccountService {
             await this.#credentials.quarantineLegacyIdentityPointers();
             const retained = await this.#credentials.read();
             if (retained === null) {
-              await reconcileHumanAccountMetadata(this.#metadata, null);
+              await reconcileHumanAccountMetadata(this.#metadata, null, {
+                replaceLegacyProfile: true,
+              });
               return {
                 ok: true as const,
                 snapshot: this.#update({ state: "signed_out" }),
@@ -771,7 +854,9 @@ export class HumanAccountService {
               throw new SecretCustodyError("concurrent_update");
             }
             const commit = async (): Promise<HumanCredentialReconnectResult> => {
-            await reconcileHumanAccountMetadata(this.#metadata, retained);
+            await reconcileHumanAccountMetadata(this.#metadata, retained, {
+              replaceLegacyProfile: true,
+            });
             return {
               ok: true as const,
               snapshot: this.#signedIn(retained),
@@ -795,7 +880,9 @@ export class HumanAccountService {
             await this.#credentials.quarantineLegacyIdentityPointers();
             const retained = await this.#credentials.read();
             if (retained === null) {
-              await reconcileHumanAccountMetadata(this.#metadata, null);
+              await reconcileHumanAccountMetadata(this.#metadata, null, {
+                replaceLegacyProfile: true,
+              });
               return {
                 ok: true,
                 snapshot: this.#update({ state: "signed_out" }),
@@ -804,7 +891,9 @@ export class HumanAccountService {
             return await this.#commitAcceptedAuthentication(
               retained.authentication,
               async () => {
-                await reconcileHumanAccountMetadata(this.#metadata, retained);
+                await reconcileHumanAccountMetadata(this.#metadata, retained, {
+                  replaceLegacyProfile: true,
+                });
                 return {
                   ok: true,
                   snapshot: this.#signedIn(retained),
@@ -866,20 +955,9 @@ export class HumanAccountService {
     if (!parsed.success) {
       return { ok: false, error: safeError("VALIDATION_ERROR") };
     }
-    return await this.#serialized(async () => {
-      const found = await this.#findOrganization(parsed.data);
-      if (!found.ok) return found;
-      if (found.data.status === "provisioning") {
-        return {
-          ok: false,
-          error: safeError("PROVISIONING_IN_PROGRESS"),
-        };
-      }
-      if (found.data.status === "failed") {
-        return { ok: false, error: safeError("PROVISIONING_FAILED") };
-      }
-      return await this.#bindOrganization(found.data);
-    });
+    const found = await this.#findOrganization(parsed.data);
+    if (!found.ok) return found;
+    return await this.#bindOrganization(found.data);
   }
 
   async listWorkspaces(
@@ -907,55 +985,9 @@ export class HumanAccountService {
     if (!parsed.success) {
       return { ok: false, error: safeError("VALIDATION_ERROR") };
     }
-    return await this.#serialized(async () => {
-      const found = await this.#findWorkspace(parsed.data);
-      if (!found.ok) return found;
-      let current: HumanAuthenticationSnapshot | null;
-      try {
-        current = await this.#credentials.read();
-      } catch {
-        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-      }
-      if (current === null || current.authentication.organization === undefined) {
-        return { ok: false, error: safeError("SIGNED_OUT") };
-      }
-      if (
-        found.data.organizationId !== current.authentication.organization.id
-      ) {
-        return { ok: false, error: safeError("NOT_FOUND") };
-      }
-      const nextAuthentication = humanAuthenticationSchema.safeParse({
-        ...current.authentication,
-        workspace: found.data,
-      });
-      if (!nextAuthentication.success) {
-        return { ok: false, error: safeError("VALIDATION_ERROR") };
-      }
-      const next = humanAuthenticationSnapshotSchema.parse({
-        generation: current.generation + 1,
-        authentication: nextAuthentication.data,
-      });
-      try {
-        const replaced = await this.#credentials.compareAndSwap({
-          expectedGeneration: current.generation,
-          next,
-        });
-        if (replaced === null) {
-          return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-        }
-        await reconcileHumanAccountMetadata(this.#metadata, replaced);
-        this.#signedIn(replaced);
-        return {
-          ok: true,
-          data: profileFromHumanAuthentication(
-            replaced.authentication,
-            "keychain",
-          ),
-        };
-      } catch {
-        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-      }
-    });
+    const found = await this.#findWorkspace(parsed.data);
+    if (!found.ok) return found;
+    return await this.#bindWorkspace(found.data);
   }
 
   async #performSignIn(
@@ -963,9 +995,11 @@ export class HumanAccountService {
     signal: AbortSignal,
   ): Promise<void> {
     if (this.#availability.state === "disabled") return;
+    let pairingCommitPending = false;
     try {
-      const authenticated = await loginWithWorkosDevice({
-        clientId: this.#availability.workosClientId,
+      const authenticated = await loginWithDesktopPairing({
+        apiUrl: this.#availability.apiOrigin,
+        expectedWebOrigin: this.#availability.webOrigin,
         fetch: abortableFetch(this.#fetch, signal),
         now: this.#now,
         sleep: abortableSleep(this.#sleep, signal),
@@ -978,29 +1012,33 @@ export class HumanAccountService {
       });
       if (signal.aborted || generation !== this.#loginGeneration) return;
       const authentication = humanAuthenticationSchema.parse({
-        version: 1,
+        version: 2,
         apiUrl: this.#availability.apiOrigin,
-        accessToken: authenticated.accessToken,
-        refreshToken: authenticated.refreshToken,
-        user: authenticated.user,
-        ...(authenticated.workosOrganizationId === undefined
-          ? {}
-          : {
-              workosOrganizationId: authenticated.workosOrganizationId,
-            }),
+        ...authenticated,
       });
       await this.#commitAcceptedAuthentication(authentication, async () => {
-        const snapshot = await this.#credentials.write(authentication);
+        if (signal.aborted || generation !== this.#loginGeneration) return;
+        await markHumanCredentialRecoveryPending(this.#metadata);
+        pairingCommitPending = true;
         if (signal.aborted || generation !== this.#loginGeneration) {
-          await this.#credentials
-            .clear({ expectedGeneration: snapshot.generation })
-            .catch(() => false);
+          pairingCommitPending = !(await this.#containCancelledPairing(null));
           return;
         }
+        const snapshot = await this.#credentials.write(authentication);
+        if (signal.aborted || generation !== this.#loginGeneration) {
+          pairingCommitPending = !(await this.#containCancelledPairing(snapshot));
+          return;
+        }
+        await this.#reopenContainedSessionForFreshPairing(snapshot);
         await reconcileHumanAccountMetadata(this.#metadata, snapshot);
+        pairingCommitPending = false;
         this.#signedIn(snapshot);
       });
     } catch (error) {
+      if (pairingCommitPending) {
+        this.#projectRecoveryRequired();
+        return;
+      }
       if (signal.aborted || generation !== this.#loginGeneration) return;
       const code = error instanceof HumanClientError &&
           error.code === "AUTHENTICATION_FAILED"
@@ -1031,16 +1069,71 @@ export class HumanAccountService {
     });
   }
 
+  async #containCancelledPairing(
+    snapshot: HumanAuthenticationSnapshot | null,
+  ): Promise<boolean> {
+    try {
+      if (
+        snapshot !== null &&
+        !(await this.#credentials.preserveForRecovery({
+          expectedGeneration: snapshot.generation,
+        }))
+      ) {
+        this.#projectRecoveryRequired();
+        return false;
+      }
+      await reconcileHumanAccountMetadata(this.#metadata, null);
+      return true;
+    } catch {
+      this.#projectRecoveryRequired();
+      return false;
+    }
+  }
+
+  async #reopenContainedSessionForFreshPairing(
+    snapshot: HumanAuthenticationSnapshot,
+  ): Promise<void> {
+    if (!this.#sessionAdmissionContained) return;
+    const session = this.#session;
+    if (session === null) {
+      throw new Error("Human session admission is unavailable.");
+    }
+    // Recovery can be projected from inside the old execute callback. Wait
+    // outside account mutation locks for that operation to unwind, then prove
+    // the fresh pairing is still the exact live credential before reopening.
+    await session.settled();
+    const current = await this.#credentials.read();
+    if (
+      this.#admissionClosed || current === null ||
+      !sameHumanAuthenticationSnapshot(current, snapshot) ||
+      !session.reopenAdmission()
+    ) {
+      throw new Error("Human session admission could not reopen safely.");
+    }
+    this.#sessionAdmissionContained = false;
+  }
+
+  #projectRecoveryRequired(): HumanAccountSnapshot {
+    this.#sessionAdmissionContained = true;
+    this.#session?.closeAdmission();
+    return this.#snapshot.state === "recovery_required"
+      ? this.#snapshot
+      : this.#update({
+          state: "recovery_required",
+          reason: "credential_reconnect_required",
+        });
+  }
+
   #verification(
     generation: number,
     signal: AbortSignal,
-    verification: DeviceVerification,
+    verification: DesktopPairingVerification,
   ): void {
     if (signal.aborted || generation !== this.#loginGeneration) return;
     this.#update({
       state: "signing_in",
       verification: {
-        userCode: verification.userCode,
+        comparisonCode: verification.comparisonCode,
         verificationUri: verification.verificationUri,
         expiresAt: verification.expiresAt,
       },
@@ -1106,117 +1199,307 @@ export class HumanAccountService {
   }
 
   async #bindOrganization(
-    organization: OrganizationView & {
-      readonly status: "active";
-      readonly workosOrganizationId: string;
-    },
+    organization: OrganizationView,
   ): Promise<HumanAccountResult<HumanProfile>> {
-    const transport = this.#transport;
-    if (transport === null) {
+    return await this.#selectScope(organization);
+  }
+
+  async #bindWorkspace(
+    workspace: WorkspaceView,
+  ): Promise<HumanAccountResult<HumanProfile>> {
+    let current: HumanAuthenticationSnapshot | null;
+    try {
+      current = await this.#credentials.read();
+    } catch {
+      return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+    }
+    if (current === null) {
+      return { ok: false, error: safeError("SIGNED_OUT") };
+    }
+    if (workspace.organizationId !== current.authentication.organization.id) {
+      return { ok: false, error: safeError("NOT_FOUND") };
+    }
+    return await this.#selectScope(current.authentication.organization, workspace);
+  }
+
+  async #selectScope(
+    organization: OrganizationView,
+    workspace?: WorkspaceView,
+  ): Promise<HumanAccountResult<HumanProfile>> {
+    if (this.#transport === null || this.#session === null) {
       return {
         ok: false,
         error: safeError("CONFIGURATION_UNAVAILABLE"),
       };
     }
-    let authority: HumanAuthenticationSnapshot | null;
     try {
-      authority = await this.#credentials.read();
+      return await this.#serialized(async () => {
+        let initialAuthority: HumanAuthenticationSnapshot | null;
+        try {
+          initialAuthority = await this.#credentials.read();
+        } catch {
+          return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+        }
+        if (initialAuthority === null) {
+          return { ok: false, error: safeError("SIGNED_OUT") };
+        }
+        let executionAuthority: HumanAuthenticationSnapshot | null = null;
+        let custodyAuthority: HumanScopeSelectionCustodyAuthority | null = null;
+        let serverMayHaveRotated = false;
+        let selectionCandidate: HumanAuthenticationSnapshot | undefined;
+        const containExactTransition = async (): Promise<void> => {
+          if (executionAuthority === null || custodyAuthority === null) {
+            this.#projectRecoveryRequired();
+            return;
+          }
+          await this.#containIndeterminateScopeSelection(
+            executionAuthority,
+            custodyAuthority,
+            selectionCandidate,
+          );
+        };
+        try {
+          return await this.#withAcceptedAuthenticationAuthority(
+            {
+              apiUrl: initialAuthority.authentication.apiUrl,
+              userId: initialAuthority.authentication.user.id,
+              organizationId: organization.id,
+            },
+            async () => {
+              const transition = await this.#session!
+                .withExclusiveTransition<HumanAccountResult<HumanProfile>>(
+                async (transitionSession) => {
+                  const selected = await transitionSession.execute(
+                    async (token, attemptAuthority) => {
+                      if (
+                        token !== attemptAuthority.authentication.accessToken
+                      ) {
+                        throw new Error("Selection bearer authority mismatch.");
+                      }
+                      const inspected = await this.#credentials
+                        .inspectScopeSelectionAuthority(attemptAuthority);
+                      await markHumanCredentialRecoveryPending(this.#metadata);
+                      // Refresh can replace A with B before a replay. Bind the
+                      // recovery evidence to the exact bearer snapshot used by
+                      // each POST, and only then allow the server to rotate it.
+                      executionAuthority = attemptAuthority;
+                      custodyAuthority = inspected;
+                      selectionCandidate = undefined;
+                      serverMayHaveRotated = true;
+                      return await this.#transport!.selectHumanScope(token, {
+                        organizationId: organization.id,
+                        ...(workspace === undefined
+                          ? {}
+                          : { workspaceId: workspace.id }),
+                      });
+                    },
+                  );
+                  if (!selected.ok) {
+                    if (!serverMayHaveRotated) return mapSessionResult(selected);
+                    if (
+                      selected.error.code === "SERVICE_UNAVAILABLE" ||
+                      selected.error.code === "AUTH_REFRESH_INDETERMINATE"
+                    ) {
+                      await containExactTransition();
+                    } else if (
+                      executionAuthority === null ||
+                      !(await this.#clearDefinitiveScopeSelectionIntent(
+                        executionAuthority,
+                        selected.kind === "session",
+                      ))
+                    ) {
+                      await containExactTransition();
+                    }
+                    return mapSessionResult(selected);
+                  }
+                  if (executionAuthority === null) {
+                    this.#projectRecoveryRequired();
+                    return {
+                      ok: false,
+                      error: safeError("SERVICE_UNAVAILABLE"),
+                    };
+                  }
+                  const nextAuthentication = humanAuthenticationSchema.safeParse({
+                    version: 2,
+                    apiUrl: executionAuthority.authentication.apiUrl,
+                    ...selected.data,
+                  });
+                  if (
+                    !nextAuthentication.success ||
+                    nextAuthentication.data.user.id !==
+                      executionAuthority.authentication.user.id ||
+                    nextAuthentication.data.organization.id !== organization.id ||
+                    (workspace === undefined
+                      ? nextAuthentication.data.workspace !== undefined
+                      : nextAuthentication.data.workspace?.id !== workspace.id ||
+                        nextAuthentication.data.workspace.organizationId !==
+                          organization.id)
+                  ) {
+                    await containExactTransition();
+                    return {
+                      ok: false,
+                      error: safeError("AUTHENTICATION_FAILED"),
+                    };
+                  }
+                  selectionCandidate = humanAuthenticationSnapshotSchema.parse({
+                    generation: executionAuthority.generation + 1,
+                    authentication: nextAuthentication.data,
+                  });
+                  let current: HumanAuthenticationSnapshot | null;
+                  try {
+                    current = await this.#credentials.read();
+                  } catch {
+                    await containExactTransition();
+                    return {
+                      ok: false,
+                      error: safeError("SERVICE_UNAVAILABLE"),
+                    };
+                  }
+                  if (
+                    current === null ||
+                    !sameHumanAuthenticationSnapshot(
+                      current,
+                      executionAuthority,
+                    )
+                  ) {
+                    await containExactTransition();
+                    return {
+                      ok: false,
+                      error: safeError("AUTHENTICATION_FAILED"),
+                    };
+                  }
+                  const next = selectionCandidate;
+                  try {
+                    return await this.#commitAcceptedAuthentication(
+                      next.authentication,
+                      async () => {
+                        const replaced = await this.#credentials.compareAndSwap({
+                          expectedGeneration: executionAuthority!.generation,
+                          next,
+                        });
+                        if (replaced === null) {
+                          await containExactTransition();
+                          return {
+                            ok: false,
+                            error: safeError("SERVICE_UNAVAILABLE"),
+                          };
+                        }
+                        try {
+                          await reconcileHumanAccountMetadata(
+                            this.#metadata,
+                            replaced,
+                          );
+                        } catch {
+                          selectionCandidate = replaced;
+                          await containExactTransition();
+                          return {
+                            ok: false,
+                            error: safeError("SERVICE_UNAVAILABLE"),
+                          };
+                        }
+                        this.#signedIn(replaced);
+                        return {
+                          ok: true,
+                          data: profileFromHumanAuthentication(
+                            replaced.authentication,
+                            "keychain",
+                          ),
+                        };
+                      },
+                      true,
+                    );
+                  } catch {
+                    await containExactTransition();
+                    return {
+                      ok: false,
+                      error: safeError("SERVICE_UNAVAILABLE"),
+                    };
+                  }
+                },
+              );
+              return transition.ok
+                ? transition.data
+                : { ok: false, error: safeError(transition.error.code) };
+            },
+          );
+        } catch {
+          if (serverMayHaveRotated) {
+            await containExactTransition();
+          }
+          return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+        }
+      });
     } catch {
       return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
     }
-    if (authority === null) {
-      return { ok: false, error: safeError("SIGNED_OUT") };
-    }
+  }
+
+  /**
+   * Scope selection rotates and revokes the exact server session used for the
+   * request. Preserve that transition's values as immutable evidence. A newer
+   * writer is left byte-for-byte live but never adopted, and bearer admission
+   * remains closed until explicit recovery establishes its authority.
+   */
+  async #containIndeterminateScopeSelection(
+    authority: HumanAuthenticationSnapshot,
+    custodyAuthority: HumanScopeSelectionCustodyAuthority,
+    candidate?: HumanAuthenticationSnapshot,
+  ): Promise<void> {
     try {
-      return await this.#withAcceptedAuthenticationAuthority(
-        {
-          apiUrl: authority.authentication.apiUrl,
-          userId: authority.authentication.user.id,
-          organizationId: organization.id,
-        },
-        async () => await this.#serializedRefresh(async () => {
-      let current: HumanAuthenticationSnapshot | null;
-      try {
-        current = await this.#credentials.read();
-      } catch {
-        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+      if (
+        custodyAuthority.generation !== authority.generation ||
+        custodyAuthority.apiUrl !== authority.authentication.apiUrl ||
+        custodyAuthority.userId !== authority.authentication.user.id
+      ) {
+        throw new SecretCustodyError("concurrent_update");
       }
-      if (current === null) {
-        return { ok: false, error: safeError("SIGNED_OUT") };
+      const contained = await this.#credentials.preserveIndeterminateScopeSession({
+        authority: custodyAuthority,
+        ...(candidate === undefined ? {} : { candidate }),
+      });
+      if (contained.state === "newer_winner") {
+        // Another writer owns a newer live generation, so this transition may
+        // neither quarantine it nor infer that it survived the server-side
+        // revocation. Keep its bytes/pointer intact but close bearer admission
+        // until explicit recovery can establish its authority.
+        await markHumanCredentialRecoveryPending(this.#metadata);
+        this.#projectRecoveryRequired();
+        return;
+      }
+      await reconcileHumanAccountMetadata(this.#metadata, null);
+      this.#update({ state: "signed_out" });
+      return;
+    } catch {
+      // If exact preservation cannot be proven, close bearer admission and
+      // require explicit recovery/restart. Never delete or reinterpret values.
+    }
+    await markHumanCredentialRecoveryPending(this.#metadata).catch(
+      () => undefined,
+    );
+    this.#projectRecoveryRequired();
+  }
+
+  async #clearDefinitiveScopeSelectionIntent(
+    authority: HumanAuthenticationSnapshot,
+    sessionEnded: boolean,
+  ): Promise<boolean> {
+    try {
+      const current = await this.#credentials.read();
+      if (sessionEnded) {
+        if (current !== null) return false;
+        await reconcileHumanAccountMetadata(this.#metadata, null);
+        return true;
       }
       if (
-        current.generation !== authority.generation
-        || current.authentication.user.id !== authority.authentication.user.id
+        current === null ||
+        !sameHumanAuthenticationSnapshot(current, authority)
       ) {
-        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+        return false;
       }
-      const refreshed = await transport.refresh(
-        current.authentication.refreshToken,
-        organization.workosOrganizationId,
-      );
-      if (!refreshed.ok) {
-        await this.#credentials
-          .clear({ expectedGeneration: current.generation })
-          .catch(() => false);
-        await reconcileHumanAccountMetadata(this.#metadata, null).catch(
-          () => undefined,
-        );
-        const code = refreshed.outcome === "authentication_failed"
-          ? "AUTHENTICATION_FAILED"
-          : "AUTH_REFRESH_INDETERMINATE";
-        this.#update({ state: "error", error: safeError(code) });
-        return { ok: false, error: safeError(code) };
-      }
-      const nextAuthentication = refreshedHumanAuthentication(
-        current.authentication,
-        refreshed.data,
-        organization,
-      );
-      if (!nextAuthentication.ok) {
-        await this.#credentials
-          .clear({ expectedGeneration: current.generation })
-          .catch(() => false);
-        await reconcileHumanAccountMetadata(this.#metadata, null).catch(
-          () => undefined,
-        );
-        const error = safeError("AUTHENTICATION_FAILED");
-        this.#update({ state: "error", error });
-        return { ok: false, error };
-      }
-      const next = humanAuthenticationSnapshotSchema.parse({
-        generation: current.generation + 1,
-        authentication: nextAuthentication.authentication,
-      });
-      try {
-        return await this.#commitAcceptedAuthentication(
-          next.authentication,
-          async () => {
-            const replaced = await this.#credentials.compareAndSwap({
-              expectedGeneration: current.generation,
-              next,
-            });
-            if (replaced === null) {
-              return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-            }
-            await reconcileHumanAccountMetadata(this.#metadata, replaced);
-            this.#signedIn(replaced);
-            return {
-              ok: true,
-              data: profileFromHumanAuthentication(
-                replaced.authentication,
-                "keychain",
-              ),
-            };
-          },
-          true,
-        );
-      } catch {
-        return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
-      }
-        }),
-      );
+      await reconcileHumanAccountMetadata(this.#metadata, current);
+      return true;
     } catch {
-      return { ok: false, error: safeError("SERVICE_UNAVAILABLE") };
+      return false;
     }
   }
 
@@ -1243,19 +1526,12 @@ export class HumanAccountService {
             accessToken: current.authentication.accessToken,
             refreshToken: current.authentication.refreshToken,
             user: current.authentication.user,
-            ...(current.authentication.workosOrganizationId === undefined
-              ? {}
-              : {
-                  workosOrganizationId:
-                    current.authentication.workosOrganizationId,
-                }),
+            organization: current.authentication.organization,
+            workspace: current.authentication.workspace,
           },
         };
       }
-      return await this.#transport.refresh(
-        input.refreshToken,
-        input.workosOrganizationId,
-      );
+      return await this.#transport.refresh(input.refreshToken);
     });
   }
 
@@ -1313,6 +1589,21 @@ export class HumanAccountService {
         return;
       }
     }
+  }
+
+  async #sessionCredentialRecoveryRequired(
+    containmentConfirmed: boolean,
+  ): Promise<void> {
+    if (containmentConfirmed) {
+      await reconcileHumanAccountMetadata(this.#metadata, null).catch(
+        () => undefined,
+      );
+    } else {
+      await markHumanCredentialRecoveryPending(this.#metadata).catch(
+        () => undefined,
+      );
+    }
+    this.#projectRecoveryRequired();
   }
 
   #signedIn(snapshot: HumanAuthenticationSnapshot): HumanAccountSnapshot {

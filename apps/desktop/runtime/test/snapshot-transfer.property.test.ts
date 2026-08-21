@@ -81,7 +81,7 @@ function snapshotResponse(text: string): RuntimeSnapshotResponse {
         selected: true,
         identityLabel: null,
         planLabel: null,
-        usageRemainingPercent: null,
+        weeklyUsage: null,
         authState: "signedOut",
         login: { state: "idle" },
         runtime: { state: "stopped", generation: 0 },

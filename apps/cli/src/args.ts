@@ -102,7 +102,7 @@ commands:
   workspace repo list [--cursor CURSOR] [--limit 1-100] [--json]
   workspace repo remove REPOSITORY_ID [--json] [--idempotency-key UUIDV7]
 
-Human login reads the public client ID from TASKCTL_WORKOS_CLIENT_ID and uses the OS keychain by default.
+Human login pairs once through the browser and uses the OS keychain by default.
 Agent enrollment uses the OS keychain by default; file storage is an explicit fallback.
 Enrollment tokens are accepted only through stdin or TASKCTL_ENROLLMENT_TOKEN.`;
 

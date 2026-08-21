@@ -28,21 +28,22 @@ import { SessionSyncSettings } from "./SessionSyncSettings";
 type AccountAction = "cancel" | "connect" | "create" | "logout" | "open" | "recover" | "reinspect" | "restart";
 
 type AccountStatusInput = Readonly<
-  Pick<AccountSummary, "authState" | "identityLabel"> & {
-    usageRemainingPercent?: number | null | undefined;
-  }
+  Pick<AccountSummary, "authState" | "identityLabel">
 >;
+
+const weeklyResetFormatter = new Intl.DateTimeFormat(undefined, {
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  month: "short",
+  timeZoneName: "short",
+  weekday: "short",
+});
 
 export function accountStatus(account: AccountStatusInput): string | null {
   switch (account.authState) {
     case "signedIn": {
-      const remaining = typeof account.usageRemainingPercent === "number"
-        ? `${String(Math.round(account.usageRemainingPercent))}% remaining`
-        : null;
-      if (account.identityLabel === null) return remaining;
-      return remaining === null
-        ? account.identityLabel
-        : `${account.identityLabel} · ${remaining}`;
+      return account.identityLabel;
     }
     case "signingIn":
       return "Signing in";
@@ -57,6 +58,14 @@ export function accountStatus(account: AccountStatusInput): string | null {
   }
 }
 
+export function weeklyUsageStatus(
+  usage: AccountSummary["weeklyUsage"],
+  formatter: Pick<Intl.DateTimeFormat, "format"> = weeklyResetFormatter,
+): string | null {
+  if (usage === null) return null;
+  return `${String(Math.round(usage.remainingPercent))}% weekly remaining · Resets ${formatter.format(new Date(usage.resetsAt))}`;
+}
+
 export function humanAccountStatus(account: HumanAccountSnapshot): string | null {
   switch (account.state) {
     case "unavailable":
@@ -66,7 +75,7 @@ export function humanAccountStatus(account: HumanAccountSnapshot): string | null
     case "signedOut":
       return "Not connected";
     case "signingIn":
-      return "Signing in";
+      return "Pairing this Mac";
     case "signedIn":
       return account.profile.user.email;
     case "recoveryRequired":
@@ -90,7 +99,7 @@ export function humanAccountDescription(account: HumanAccountSnapshot): string {
     case "signedIn":
       return "This Mac is connected to HRA Cloud. Session sync remains off until you enable it below.";
     case "signingIn":
-      return "Complete sign-in in your browser to connect this Mac to HRA Cloud.";
+      return "Continue in browser and confirm that its comparison code matches this Mac.";
     case "recoveryRequired":
       return "Reconnect the protected credential before signing in to HRA Cloud.";
     case "error":
@@ -288,11 +297,13 @@ export function SubscriptionsSettings({
               const restartable = account.runtime.state === "failed" &&
                 account.runtime.canRestart;
               const status = accountStatus(account);
+              const weeklyUsage = signedIn ? weeklyUsageStatus(account.weeklyUsage) : null;
               return (
                 <li key={account.id}>
                   <div className="subscription-identity">
                     <strong>{account.label}</strong>
                     {status === null ? null : <span>{status}</span>}
+                    {weeklyUsage === null ? null : <span>{weeklyUsage}</span>}
                   </div>
                   <div aria-label={`${account.label} actions`} className="subscription-actions" role="group">
                     {restartable ? (
@@ -416,12 +427,12 @@ export function SubscriptionsSettings({
               ) : null}
               {humanAccount.state === "signingIn" ? (
                 <IconButton
-                  aria-label="Cancel HRA Cloud sign-in"
+                  aria-label="Cancel HRA Cloud pairing"
                   isDisabled={!runtimeReady || pending.has("human")}
                   isPending={pending.get("human") === "cancel"}
                   onPress={() => void run("human", "cancel", { type: "human.signIn.cancel" })}
                   size="compact"
-                  tooltip="Cancel HRA Cloud sign-in"
+                  tooltip="Cancel pairing"
                   type="button"
                   variant="quiet"
                 >
@@ -463,7 +474,7 @@ export function SubscriptionsSettings({
                 </IconButton>
               ) : humanAccount.state === "unavailable" || canStartHumanSignIn(humanAccount) ? (
                 <Button
-                  aria-label="Sign in to HRA Cloud"
+                  aria-label="Pair this Mac with HRA Cloud"
                   isDisabled={
                     humanAccount.state === "unavailable" ||
                     !runtimeReady ||
@@ -480,13 +491,20 @@ export function SubscriptionsSettings({
                   variant="secondary"
                 >
                   {humanAccount.state !== "unavailable" && pending.get("human") === "connect"
-                    ? "Signing in…"
-                    : "Sign in to HRA Cloud"}
+                    ? "Opening browser…"
+                    : "Pair this Mac"}
                 </Button>
               ) : null}
             </div>
           </div>
           <p className="settings-empty">{humanAccountDescription(humanAccount)}</p>
+          {humanAccount.state === "signingIn" &&
+              humanAccount.comparisonCode !== null ? (
+            <div className="settings-pairing-code" role="status">
+              <span>Comparison code</span>
+              <strong>{humanAccount.comparisonCode}</strong>
+            </div>
+          ) : null}
           {errors.get("human") === undefined ? null : (
             <p className="settings-error" role="alert">{errors.get("human")}</p>
           )}
@@ -497,9 +515,9 @@ export function SubscriptionsSettings({
               role="group"
             >
               <p>
-                The previous credential stays protected in Keychain. Continue
-                to reconnect this installation. If this account was retired,
-                Connect will start a fresh browser sign-in.
+                The previous credential stays protected in Keychain but cannot
+                be reused by the new pairing flow. Continue to preserve its
+                recovery evidence, then pair this Mac in your browser.
               </p>
               <div className="subscription-actions">
                 <IconButton

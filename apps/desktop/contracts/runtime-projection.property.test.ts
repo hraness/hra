@@ -171,7 +171,7 @@ function eventsFor(actions: readonly boolean[]): RuntimeEvent[] {
             selected: index % 2 === 0,
             identityLabel: null,
             planLabel: null,
-            usageRemainingPercent: null,
+            weeklyUsage: null,
             authState: "signedOut" as const,
             login: { state: "idle" as const },
             runtime: { state: "stopped" as const, generation: 0 },

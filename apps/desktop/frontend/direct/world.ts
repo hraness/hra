@@ -477,7 +477,7 @@ export function fixtureAccount(overrides: AccountOverrides): AccountSummary {
     selected: overrides.selected ?? false,
     identityLabel: overrides.identityLabel ?? null,
     planLabel: overrides.planLabel ?? null,
-    usageRemainingPercent: overrides.usageRemainingPercent ?? null,
+    weeklyUsage: overrides.weeklyUsage ?? null,
     authState: overrides.authState ?? "signedOut",
     login: overrides.login ?? { state: "idle" },
     runtime: overrides.runtime ?? {

@@ -1,10 +1,10 @@
 # taskctl
 
-`taskctl` is the non-interactive HTTP client for human control-plane administration and agent task work. Human commands authenticate through WorkOS; agent commands use an enrolled agent credential and session.
+`taskctl` is the non-interactive HTTP client for human control-plane administration and agent task work. Human commands use HRA browser pairing; agent commands use an enrolled agent credential and session.
 
 ## Human administration
 
-Set `TASKCTL_API_URL` to the task service origin and `TASKCTL_WORKOS_CLIENT_ID` to the public WorkOS client ID, then authenticate and select the organization and workspace that subsequent commands must use:
+Set `TASKCTL_API_URL` to the task service origin and `TASKCTL_WEB_URL` to the separately hosted browser origin, then authenticate. The web origin is required and pinned before any pairing URL is displayed or opened. After browser approval, the selected organization and workspace are stored for subsequent commands:
 
 ```sh
 taskctl auth login
@@ -13,6 +13,12 @@ taskctl organization use ORGANIZATION_ID
 taskctl workspace list
 taskctl workspace use WORKSPACE_ID
 ```
+
+Use `taskctl auth login --no-browser` on a headless host. It prints only the browser URL and comparison code to stderr. The locally generated verifier and returned access and refresh tokens stay out of URLs, arguments, output, and profile metadata. Human credentials use immutable generational slots in the operating-system keychain by default; `--secret-store file` selects equivalent owner-only mode-`0600` slots. A token-free, append-only revision journal provides the cross-process compare-and-swap boundary. The profile file is only a display projection: every authorized operation derives its user, organization, and workspace from the winning credential generation.
+
+Version-one human custody is never reinterpreted. A new `taskctl auth login` first copies the exact legacy profile and secret bytes into immutable recovery custody, retires that pointer to durable quarantine without deleting the original Keychain or fallback-file value, and only then commits the new version-two credential.
+
+`organization use` and `workspace use` each rotate the complete access/refresh credential and commit its exact user, organization, and optional workspace as one local compare-and-swap. If the response is lost or local custody cannot commit it, `taskctl` atomically removes the exact involved committed and pending pointers from live admission, retains their Keychain or file bytes plus recovery evidence, and requires pairing again. A stale process cannot retire a newer generation.
 
 The selected workspace is authoritative. Agent administration commands do not accept a workspace override:
 
@@ -78,7 +84,7 @@ Every mutation accepts `--idempotency-key UUIDV7`; one is generated when omitted
 
 Before update, assignment, defer, label, dependency, parent, reference, release, and submit mutations, the CLI reads the authoritative task state. If the authenticated stable agent owns an `in_progress` task whose lease has five minutes or less remaining, it performs exactly one claim renewal with a separate idempotency key and forwards only the renewed revision, fence, generation, and deadline to the requested mutation. A failed or internally inconsistent renewal aborts the requested mutation; a claim held by another agent fails with `CLAIM_NOT_OWNED`. Successful JSON output includes `automaticClaimRenewal` when this preflight renewed the lease. Open tasks still use the explicit revision and optional fence supplied by the caller, while comments and reviewer operations never renew a worker claim.
 
-Task cancellation, reopening, and repository registration use the selected human workspace. The workspace selector comes only from local profile metadata and cannot be overridden on the command line. Agent task requests never send a tenant selector because the credential and session are already workspace-bound.
+Task cancellation, reopening, and repository registration use the selected human workspace. The workspace selector comes only from the authoritative human credential generation and cannot be overridden on the command line. Agent task requests never send a tenant selector because the credential and session are already workspace-bound.
 
 ## Standalone binaries
 

@@ -881,11 +881,11 @@ export const agentTasksDirectDefinition = defineDirect({
     { key: "runner.hitl.response", mode: "mixed", claim: "Pending human input is promoted above autonomous tasks and exact file-approval and user-input responses drive the real inline controls; production browser sealing, backend authority, and provider continuation remain direct evidence.", scenarios: ["runner-waiting-approval", "runner-waiting-question"] },
     { key: "runner.dispatch.readiness", mode: "mixed", claim: "A ready display can still converge to one durable queued task and run; production atomicity and runner selection remain direct evidence.", scenarios: ["tasks-readiness-race", "tasks-create-success"] },
     { key: "runner.recovery.commands", mode: "mixed", claim: "Exact Stop, Retry, and Resolve requests drive the real recovery controls while production idempotency, fences, and claim release remain direct evidence.", scenarios: ["runner-queued-cancel", "runner-failed-retry", "runner-cancelled-retry", "runner-ambiguous-resolve"] },
-    { key: "auth.workos-session", mode: "direct", claim: "WorkOS session establishment is excluded from credential-free fixture evidence.", scenarios: [] },
-    { key: "auth.organization-switch", mode: "direct", claim: "Organization selection and tenant membership require provider-backed integration evidence.", scenarios: [] },
+    { key: "auth.password-session", mode: "direct", claim: "Convex Auth password session establishment is excluded from credential-free fixture evidence.", scenarios: [] },
+    { key: "auth.organization-switch", mode: "direct", claim: "Organization and workspace selection plus current membership require authenticated integration evidence.", scenarios: [] },
     { key: "convex.realtime-subscriptions", mode: "direct", claim: "Convex subscription ordering and reconnect behavior require live deployment evidence.", scenarios: [] },
     { key: "convex.command-semantics", mode: "direct", claim: "Production transactions, tenant guards, fences, and idempotency remain proven by direct backend suites.", scenarios: [] },
-    { key: "configuration.next-runtime", mode: "direct", claim: "Next.js, WorkOS, and Convex runtime configuration is outside the isolated Vite graph.", scenarios: [] },
+    { key: "configuration.next-runtime", mode: "direct", claim: "Next.js and Convex Auth runtime configuration is outside the isolated Vite graph.", scenarios: [] },
   ],
 });
 

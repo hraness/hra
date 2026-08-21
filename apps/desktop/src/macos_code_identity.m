@@ -787,7 +787,8 @@ static bool HRAPrefixedLowercaseHexIsValid(
 
 static bool HRAControlPlanePathIsValid(
     const char *bytes,
-    size_t length) {
+    size_t length,
+    bool sourceDevelopment) {
   if (bytes == NULL || length == 0 || length > 4096 ||
       memchr(bytes, '\0', length) != NULL) {
     return false;
@@ -797,7 +798,8 @@ static bool HRAControlPlanePathIsValid(
   NSString *expected =
       [[[[home stringByAppendingPathComponent:@"Library"]
           stringByAppendingPathComponent:@"Application Support"]
-          stringByAppendingPathComponent:@"OPRTE"]
+          stringByAppendingPathComponent:
+              sourceDevelopment ? @"HRA Source Development" : @"OPRTE"]
           stringByAppendingPathComponent:@"control-plane.sqlite"]
           .stringByStandardizingPath;
   NSString *provided =
@@ -958,13 +960,16 @@ bool hra_macos_run_attested_account_profile_operation(
     const char *deletion_nonce,
     size_t deletion_nonce_length,
     uint64_t expected_revision,
+    bool source_development,
     uint32_t timeout_milliseconds) {
   @autoreleasepool {
     bool ensure = HRABytesEqual(action, action_length, "ensure");
     bool delete = HRABytesEqual(action, action_length, "delete");
     if ((!ensure && !delete) ||
         !HRAControlPlanePathIsValid(
-            control_plane_path, control_plane_path_length) ||
+            control_plane_path,
+            control_plane_path_length,
+            source_development) ||
         !HRAOpaqueIdentifierIsValid(
             account_profile_id, account_profile_id_length, "acct") ||
         !HRACanonicalPositiveDecimalIsValid(

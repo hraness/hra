@@ -43,7 +43,7 @@ function account(index: number, selected: boolean): AccountSummary {
     selected,
     identityLabel: null,
     planLabel: null,
-    usageRemainingPercent: null,
+    weeklyUsage: null,
     authState: "signedOut",
     login: { state: "idle" },
     runtime: { state: "stopped", generation: 0 },

@@ -41,13 +41,7 @@ async function currentHuman(ctx: ReadCtx): Promise<CurrentHuman | null> {
   });
   if (!authorized.ok) return null;
   const { subject, user } = authorized.authorization;
-  if (
-    user.status !== "active"
-    || (
-      user.workosUserId !== subject
-      && user.publicId !== subject
-    )
-  ) {
+  if (user.status !== "active" || user.publicId !== subject) {
     return null;
   }
   return { localSubject: subject, userId: user._id };

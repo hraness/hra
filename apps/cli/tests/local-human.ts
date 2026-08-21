@@ -16,8 +16,7 @@ import type { FetchLike } from "../src/client";
 import type { CliIo } from "../src/output";
 
 const SITE_ORIGIN_ENV = "TASKCTL_TEST_CONVEX_SITE_ORIGIN";
-const FAKE_WORKOS_ORIGIN_ENV = "TASKCTL_TEST_FAKE_WORKOS_ORIGIN";
-const CLIENT_ID_ENV = "TASKCTL_WORKOS_CLIENT_ID";
+const PAIRING_ORIGIN_ENV = "TASKCTL_TEST_PAIRING_ORIGIN";
 const REALTIME_PROOF_ROOT_ENV = "TASKCTL_TEST_REALTIME_PROOF_ROOT";
 const REALTIME_MARKER_FILE = "taskctl-ready.json";
 const REALTIME_SUBSCRIPTION_ACK_FILE = "subscription-ready";
@@ -156,21 +155,21 @@ async function removeRealtimeProofFiles(root: string): Promise<void> {
   );
 }
 
-function makeRoutedFetch(fakeWorkosOrigin: string): FetchLike {
+function makeRoutedFetch(siteOrigin: string, pairingOrigin: string): FetchLike {
   return async (input, init) => {
     const rawUrl = input instanceof Request ? input.url : String(input);
     const url = new URL(rawUrl);
     if (
-      url.origin === "https://api.workos.com" &&
-      (url.pathname === "/user_management/authorize/device" ||
-        url.pathname === "/user_management/authenticate")
+      url.origin === siteOrigin &&
+      (url.pathname === "/v1/auth/desktop-pairings" ||
+        /^\/v1\/auth\/desktop-pairings\/pair_[0-9A-HJKMNP-TV-Z]{26}\/redeem$/u.test(
+          url.pathname,
+        ))
     ) {
-      const target = new URL(`${url.pathname}${url.search}`, fakeWorkosOrigin);
+      const target = new URL(`${url.pathname}${url.search}`, pairingOrigin);
       const routed = await globalThis.fetch(target, init);
-      // The portable client correctly rejects a response whose visible origin
-      // differs from api.workos.com. This loopback-only fixture is an injected
-      // transport, not a redirect, so return a fresh response with no foreign
-      // URL metadata while preserving the exact status, headers, and stream.
+      // This loopback-only fixture is an injected transport, not a redirect.
+      // Preserve the production API origin visible to the strict client.
       return new Response(routed.body, {
         status: routed.status,
         statusText: routed.statusText,
@@ -184,12 +183,10 @@ function makeRoutedFetch(fakeWorkosOrigin: string): FetchLike {
 async function main(): Promise<void> {
   console.log("taskctl signed human + agent CLI acceptance");
   const siteOrigin = localOrigin(process.env[SITE_ORIGIN_ENV], "local Convex site origin");
-  const fakeWorkosOrigin = localOrigin(
-    process.env[FAKE_WORKOS_ORIGIN_ENV],
-    "fake WorkOS origin",
+  const pairingOrigin = localOrigin(
+    process.env[PAIRING_ORIGIN_ENV],
+    "desktop pairing fixture origin",
   );
-  const clientId = process.env[CLIENT_ID_ENV];
-  assert(clientId !== undefined && clientId.length > 0, "The WorkOS client ID is unavailable.");
 
   const temporaryRoot = await mkdtemp(join(tmpdir(), "taskctl-human-local-"));
   const humanProfileFile = join(temporaryRoot, "human-profile.json");
@@ -208,12 +205,12 @@ async function main(): Promise<void> {
   const environment = {
     ...process.env,
     TASKCTL_API_URL: siteOrigin,
+    TASKCTL_WEB_URL: pairingOrigin,
     TASKCTL_CONFIG_HOME: temporaryRoot,
     TASKCTL_HUMAN_PROFILE_FILE: humanProfileFile,
     TASKCTL_HUMAN_SECRET_FILE: humanSecretFile,
-    TASKCTL_WORKOS_CLIENT_ID: clientId,
   };
-  const routedFetch = makeRoutedFetch(fakeWorkosOrigin);
+  const routedFetch = makeRoutedFetch(siteOrigin, pairingOrigin);
   const commandResults: CommandResult[] = [];
   const processResults: CommandResult[] = [];
 
@@ -326,7 +323,7 @@ async function main(): Promise<void> {
     ]);
     const profileSource = await readFile(humanProfileFile, "utf8");
     assert(!profileSource.includes("accessToken") && !profileSource.includes("refreshToken"), "Human profile stored bearer material.");
-    console.log("  completed browser-confirmed device login with separated 0600 secret storage");
+    console.log("  completed browser-confirmed desktop pairing with separated 0600 secret storage");
 
     const initialOrganizations = asRecord(
       (await command(["organization", "list", "--limit", "100", "--json"])).data,
@@ -334,16 +331,17 @@ async function main(): Promise<void> {
     );
     assert(
       Array.isArray(initialOrganizations["organizations"]) &&
-        initialOrganizations["organizations"].length === 0,
-      "A new account unexpectedly had an organization.",
+        initialOrganizations["organizations"].length >= 1,
+      "Browser pairing did not return an authorized organization.",
     );
-    const organizationRequired = await command(["workspace", "list", "--json"], {
-      expectSuccess: false,
-    });
+    const initialWorkspaces = asRecord(
+      (await command(["workspace", "list", "--json"])).data,
+      "Initial workspace list",
+    );
     assert(
-      stringField(asRecord(organizationRequired.data, "Workspace failure")["error"], "code", "Workspace error") ===
-        "ORGANIZATION_REQUIRED",
-      "Org-less workspace access did not fail with ORGANIZATION_REQUIRED.",
+      Array.isArray(initialWorkspaces["workspaces"]) &&
+        initialWorkspaces["workspaces"].length >= 1,
+      "Browser pairing did not return an authorized workspace.",
     );
 
     const alphaOrganizationKey = nextIdempotencyKey();
@@ -361,11 +359,6 @@ async function main(): Promise<void> {
       "Alpha organization",
     );
     const alphaOrganizationId = stringField(alphaOrganization, "id", "Alpha organization");
-    const alphaWorkosOrganizationId = stringField(
-      alphaOrganization,
-      "workosOrganizationId",
-      "Alpha organization",
-    );
     const alphaReplay = await command([
       "organization",
       "create",
@@ -686,12 +679,7 @@ async function main(): Promise<void> {
       "Beta organization",
     );
     const betaOrganizationId = stringField(betaOrganization, "id", "Beta organization");
-    const betaWorkosOrganizationId = stringField(
-      betaOrganization,
-      "workosOrganizationId",
-      "Beta organization",
-    );
-    assert(betaWorkosOrganizationId !== alphaWorkosOrganizationId, "Two tenants shared one WorkOS organization.");
+    assert(betaOrganizationId !== alphaOrganizationId, "Two tenants shared one organization ID.");
 
     const alphaAuthentication = asRecord(
       JSON.parse(await readFile(humanSecretFile, "utf8")) as unknown,
@@ -848,7 +836,6 @@ async function main(): Promise<void> {
         },
       })}`,
     );
-    void alphaWorkosOrganizationId;
     console.log("✓ taskctl signed human + agent CLI acceptance passed");
   } finally {
     if (realtimeProofRoot !== undefined) {

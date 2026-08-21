@@ -221,6 +221,18 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(&frontend_build.step);
+    if (data_remover_install) |install| {
+        run.step.dependOn(&install.step);
+    }
+    if (keychain_custodian_install) |install| {
+        run.step.dependOn(&install.step);
+    }
+    if (git_executor_install) |install| {
+        run.step.dependOn(&install.step);
+    }
+    if (image_normalizer_install) |install| {
+        run.step.dependOn(&install.step);
+    }
     addCefRuntimeRunFiles(b, target, run, exe, web_engine, cef_dir);
     addWebView2RuntimeRunFiles(b, target, run, web_engine, web_layer, native_sdk_path);
     const run_step = b.step("run", "Run the app");
@@ -418,6 +430,25 @@ pub fn build(b: *std.Build) void {
         const run_parent_probe = b.addRunArtifact(parent_probe);
         run_parent_probe.addArtifactArg(helper);
         test_step.dependOn(&run_parent_probe.step);
+
+        const development_parent_probe = b.addExecutable(.{
+            // An ad-hoc binary can choose the direct Debug host identifier.
+            // Prove that identifier-only impersonation cannot cross the
+            // Keychain boundary. Keep the probe out of zig-out so it cannot
+            // become a launch artifact or a packaged executable.
+            .name = app_exe_name,
+            .root_module = localModule(
+                b,
+                target,
+                .Debug,
+                "src/keychain_custodian_development_parent_probe.zig",
+            ),
+        });
+        const run_development_parent_probe = b.addRunArtifact(
+            development_parent_probe,
+        );
+        run_development_parent_probe.addArtifactArg(helper);
+        test_step.dependOn(&run_development_parent_probe.step);
     }
     if (data_remover) |_| {
         const helper_tests = b.addTest(.{

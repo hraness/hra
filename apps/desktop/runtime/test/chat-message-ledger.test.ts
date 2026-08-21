@@ -992,6 +992,37 @@ test("restart returns prepared rows, fences effect-started rows, and pauses drai
   });
 });
 
+test("restart leaves pristine empty queues running and clears a stale restart pause", () => {
+  withStore((store, database) => {
+    createPane(store);
+
+    expect(store.reconcileMessageQueueAfterRestart(PANE, later(1))).toEqual({
+      revision: 1,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    });
+
+    database.query(`
+      UPDATE chat_panes SET
+        message_queue_pause_reason = 'runtime_restart',
+        message_queue_revision = message_queue_revision + 1,
+        updated_at = ?2
+      WHERE pane_id = ?1
+    `).run(PANE, later(2).toISOString());
+
+    const recovered = store.reconcileMessageQueueAfterRestart(PANE, later(3));
+    expect(recovered).toEqual({
+      revision: 3,
+      pauseReason: null,
+      blockedMessage: null,
+      messages: [],
+    });
+    expect(store.reconcileMessageQueueAfterRestart(PANE, later(4)))
+      .toEqual(recovered);
+  });
+});
+
 test("restart cancels atomic pre-effect steers and exact replay needs no live custody refs", () => {
   for (const attachment of ["none", "restorable", "expired"] as const) {
     withStore((store, database) => {
@@ -1030,7 +1061,7 @@ test("restart cancels atomic pre-effect steers and exact replay needs no live cu
         attachment === "expired" ? later(2) : later(1),
       );
       expect(recovered).toMatchObject({
-        pauseReason: "runtimeRestart",
+        pauseReason: null,
         blockedMessage: null,
         messages: [],
       });

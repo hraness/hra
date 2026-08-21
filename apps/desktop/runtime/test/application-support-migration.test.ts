@@ -24,7 +24,9 @@ import {
   applicationSupportPaths,
   inspectApplicationSupportMigration,
   inspectApplicationSupportReadiness,
+  isolatedDevelopmentApplicationSupportRoot,
   prepareApplicationSupportMigration,
+  prepareIsolatedDevelopmentApplicationSupport,
   type ApplicationSupportMigrationFaultPoint,
 } from "../src/state/application-support";
 
@@ -151,6 +153,39 @@ function faultAt(point: ApplicationSupportMigrationFaultPoint) {
 }
 
 describe("Application Support migration", () => {
+  test("raw development owns a distinct root and never consumes production or historical development state", async () => {
+    const { home, paths } = await fixture();
+    await mkdir(paths.target);
+    await writeFile(join(paths.target, "production-sentinel"), "production");
+    await mkdir(paths.developmentFallback);
+    await writeFile(
+      join(paths.developmentFallback, "historical-sentinel"),
+      "historical",
+    );
+
+    const startup = prepareIsolatedDevelopmentApplicationSupport(home);
+    expect(startup.root).toBe(isolatedDevelopmentApplicationSupportRoot(home));
+    expect(startup.root).not.toBe(paths.target);
+    expect(startup.root).not.toBe(paths.developmentFallback);
+    startup.prepareTargetRoot();
+    startup.activate();
+    const developmentDatabase = new Database(
+      join(startup.root, "control-plane.sqlite"),
+      { create: true },
+    );
+    developmentDatabase.exec("CREATE TABLE development_only(value TEXT)");
+    developmentDatabase.close();
+
+    expect(await readFile(join(paths.target, "production-sentinel"), "utf8"))
+      .toBe("production");
+    expect(await readFile(
+      join(paths.developmentFallback, "historical-sentinel"),
+      "utf8",
+    )).toBe("historical");
+    expect((await stat(join(startup.root, "control-plane.sqlite"))).isFile())
+      .toBeTrue();
+  });
+
   test("inspects fresh, ready, retry, and conflicting roots without mutation", async () => {
     {
       const { environment, paths } = await fixture();

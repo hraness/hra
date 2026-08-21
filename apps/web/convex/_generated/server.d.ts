@@ -22,9 +22,14 @@ import {
 import type { DataModel } from "./dataModel.js";
 
 /**
- * Typesafe environment variables declared in `convex.config.ts`.
+ * Typesafe environment variables.
+ *
+ * This includes platform-provided env vars and any variables declared in
+ * `convex.config.ts`.
  */
 type Env = {
+  readonly CONVEX_CLOUD_URL: string;
+  readonly CONVEX_SITE_URL: string;
   readonly HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT: string | undefined;
   readonly HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT_VERSION:
     string | undefined;
@@ -32,6 +37,9 @@ type Env = {
   readonly HRA_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS_VERSION:
     string | undefined;
   readonly HRA_SESSION_SYNC_ENABLED: string | undefined;
+  readonly JWKS: string;
+  readonly JWT_PRIVATE_KEY: string;
+  readonly NEXT_PUBLIC_SITE_URL: string;
   readonly OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT: string | undefined;
   readonly OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT_VERSION:
     string | undefined;
@@ -39,6 +47,7 @@ type Env = {
   readonly OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS_VERSION:
     string | undefined;
   readonly OPRTE_SESSION_SYNC_ENABLED: string | undefined;
+  readonly SITE_URL: string;
   readonly SUITE_IDENTITY_LINK_KEYS: string | undefined;
   readonly SUITE_IDENTITY_RECEIPT_KEY_VERSION: string | undefined;
   readonly TASKCTL_CREDENTIAL_PEPPER_CURRENT: string | undefined;
@@ -50,16 +59,7 @@ type Env = {
   readonly TASKCTL_ENROLLMENT_PEPPER_PREVIOUS: string | undefined;
   readonly TASKCTL_ENROLLMENT_PEPPER_PREVIOUS_VERSION: string | undefined;
   readonly TASKCTL_LOCAL_FIXTURES_ENABLED: string | undefined;
-  readonly TASKCTL_LOCAL_FIXTURE_ISSUER: string | undefined;
-  readonly TASKCTL_LOCAL_FIXTURE_JWKS_URL: string | undefined;
   readonly TASKCTL_LOCAL_FIXTURE_SUBJECT: string | undefined;
-  readonly WORKOS_API_HOSTNAME: string | undefined;
-  readonly WORKOS_API_HTTPS: string | undefined;
-  readonly WORKOS_API_KEY: string | undefined;
-  readonly WORKOS_API_PORT: string | undefined;
-  readonly WORKOS_CLIENT_ID: string | undefined;
-  readonly WORKOS_OWNER_ROLE_SLUG: string | undefined;
-  readonly WORKOS_WEBHOOK_SECRET: string | undefined;
 };
 
 /**
@@ -137,7 +137,10 @@ export declare const internalAction: ActionBuilder<DataModel, "internal">;
 export declare const httpAction: HttpActionBuilder;
 
 /**
- * Typesafe environment variables declared in `convex.config.ts`.
+ * Typesafe environment variables.
+ *
+ * This includes platform-provided env vars and any variables declared in
+ * `convex.config.ts`.
  */
 export declare const env: Env;
 

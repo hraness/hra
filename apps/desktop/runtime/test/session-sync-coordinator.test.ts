@@ -219,6 +219,7 @@ describe("session sync coordinator human-authority fence", () => {
       store: {
         read: () => Promise.resolve(null),
         compareAndSwap: () => Promise.resolve(null),
+        preserveForRecovery: () => Promise.resolve(false),
         clear: () => Promise.resolve(false),
       },
       refresh: {

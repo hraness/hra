@@ -196,7 +196,7 @@ async function activeStoredPromotionAuthorization(
     organization._id === session.organizationId &&
     organization.publicId === session.organizationPublicId &&
     user._id === session.startedByUserId &&
-    user.workosUserId === session.startedByWorkosUserId &&
+    user.publicId === session.startedByUserPublicId &&
     membership._id === session.authorizationMembershipId &&
     membership.organizationId === session.organizationId &&
     membership.userId === session.startedByUserId &&
@@ -397,9 +397,7 @@ export const start = internalMutation({
       organizationId: authorized.authorization.organization._id,
       organizationPublicId: authorized.authorization.organization.publicId,
       startedByUserId: authorized.authorization.user._id,
-      startedByWorkosUserId:
-        authorized.authorization.user.workosUserId ??
-        authorized.authorization.subject,
+      startedByUserPublicId: authorized.authorization.user.publicId,
       authorizationMembershipId: authorized.authorization.membership._id,
       sourceWorkspacePublicId: manifest.sourceWorkspaceId,
       stagingWorkspaceId,

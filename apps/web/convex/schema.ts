@@ -2,6 +2,7 @@ import {
   PREVIOUS_SUITE_CATALOG_REVISION,
   SUITE_CATALOG_REVISION,
 } from "../suite-account-contracts";
+import { authTables } from "@convex-dev/auth/server";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
@@ -39,41 +40,113 @@ import {
   wakeStateValidator,
 } from "./model";
 
+const { users: authUsers, ...authTablesWithoutUsers } = authTables;
+void authUsers;
+
 export default defineSchema({
+  ...authTablesWithoutUsers,
+
   organizations: defineTable({
     publicId: v.string(),
-    workosOrganizationId: v.optional(v.string()),
-    workosExternalId: v.optional(v.string()),
     name: v.string(),
-    status: v.union(
-      v.literal("provisioning"),
-      v.literal("active"),
-      v.literal("failed"),
-      v.literal("disabled"),
-    ),
-    failureCode: v.optional(v.string()),
-    workosUpdatedAt: v.optional(v.number()),
-    workosObservedAt: v.optional(v.number()),
-    workosHardDeletedAt: v.optional(v.number()),
-    workosQuarantinedAt: v.optional(v.number()),
-    createdAt: v.number(),
-    updatedAt: v.number(),
-  })
-    .index("by_public_id", ["publicId"])
-    .index("by_workos_organization_id", ["workosOrganizationId"])
-    .index("by_workos_external_id", ["workosExternalId"]),
-
-  users: defineTable({
-    publicId: v.string(),
-    workosUserId: v.optional(v.string()),
-    name: v.string(),
-    email: v.optional(v.string()),
     status: v.union(v.literal("active"), v.literal("disabled")),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
-    .index("by_public_id", ["publicId"])
-    .index("by_workos_user_id", ["workosUserId"]),
+    .index("by_public_id", ["publicId"]),
+
+  users: defineTable({
+    publicId: v.string(),
+    name: v.string(),
+    image: v.optional(v.string()),
+    email: v.optional(v.string()),
+    emailVerificationTime: v.optional(v.number()),
+    phone: v.optional(v.string()),
+    phoneVerificationTime: v.optional(v.number()),
+    isAnonymous: v.optional(v.boolean()),
+    status: v.union(v.literal("active"), v.literal("disabled")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("email", ["email"])
+    .index("phone", ["phone"])
+    .index("by_public_id", ["publicId"]),
+
+  authSessionSelections: defineTable({
+    sessionId: v.id("authSessions"),
+    userId: v.id("users"),
+    organizationId: v.id("organizations"),
+    workspaceId: v.optional(v.id("workspaces")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_session", ["sessionId"])
+    .index("by_user", ["userId"]),
+
+  passwordSessionProofs: defineTable({
+    sessionId: v.id("authSessions"),
+    userId: v.id("users"),
+    authenticatedAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_session", ["sessionId"])
+    .index("by_expiry", ["expiresAt"]),
+
+  authSessionRotationRequests: defineTable({
+    credentialDigest: v.string(),
+    userId: v.id("users"),
+    oldSessionId: v.id("authSessions"),
+    organizationId: v.id("organizations"),
+    workspaceId: v.optional(v.id("workspaces")),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_credential_digest", ["credentialDigest"])
+    .index("by_old_session", ["oldSessionId"])
+    .index("by_expiry", ["expiresAt"]),
+
+  passwordMigrationClaims: defineTable({
+    claimProofDigest: v.string(),
+    userId: v.id("users"),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    consumedAt: v.optional(v.number()),
+  })
+    .index("by_claim_proof_digest", ["claimProofDigest"])
+    .index("by_expiry", ["expiresAt"]),
+
+  passwordSignUpReservations: defineTable({
+    emailDigest: v.string(),
+    targetUserId: v.optional(v.id("users")),
+    migrationClaimId: v.optional(v.id("passwordMigrationClaims")),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+  })
+    .index("by_email_digest", ["emailDigest"])
+    .index("by_expiry", ["expiresAt"]),
+
+  desktopPairingRequests: defineTable({
+    pairingId: v.string(),
+    challenge: v.string(),
+    comparisonCode: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("approved"),
+      v.literal("consumed"),
+      v.literal("denied"),
+      v.literal("expired"),
+    ),
+    userId: v.optional(v.id("users")),
+    organizationId: v.optional(v.id("organizations")),
+    workspaceId: v.optional(v.id("workspaces")),
+    authSessionId: v.optional(v.id("authSessions")),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    approvedAt: v.optional(v.number()),
+    consumedAt: v.optional(v.number()),
+  })
+    .index("by_pairing_id", ["pairingId"])
+    .index("by_expiry", ["expiresAt"]),
 
   suiteEntitlementProjections: defineTable({
     catalogRevision: v.union(
@@ -94,6 +167,7 @@ export default defineSchema({
     updatedAt: v.number(),
     userId: v.id("users"),
   })
+    .index("by_local_subject", ["localSubject"])
     .index("by_suite_account", ["suiteAccountId"])
     .index("by_user", ["userId"]),
 
@@ -137,8 +211,6 @@ export default defineSchema({
   organizationMemberships: defineTable({
     organizationId: v.id("organizations"),
     userId: v.id("users"),
-    workosMembershipId: v.optional(v.string()),
-    workosRoleSlugs: v.optional(v.array(v.string())),
     role: v.union(v.literal("owner"), v.literal("admin"), v.literal("member")),
     status: v.union(
       v.literal("active"),
@@ -146,27 +218,12 @@ export default defineSchema({
       v.literal("pending"),
       v.literal("removed"),
     ),
-    workosUpdatedAt: v.optional(v.number()),
-    workosObservedAt: v.optional(v.number()),
-    workosHardDeletedAt: v.optional(v.number()),
-    workosHardDeletedMembershipId: v.optional(v.string()),
-    workosQuarantinedAt: v.optional(v.number()),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_organization_and_user", ["organizationId", "userId"])
     .index("by_organization_status_and_user", ["organizationId", "status", "userId"])
-    .index("by_user_and_organization", ["userId", "organizationId"])
-    .index("by_workos_membership_id", ["workosMembershipId"]),
-
-  workosMembershipRetirements: defineTable({
-    workosMembershipId: v.string(),
-    organizationId: v.id("organizations"),
-    userId: v.id("users"),
-    replacementWorkosMembershipId: v.string(),
-    hardDeletedAt: v.optional(v.number()),
-    retiredAt: v.number(),
-  }).index("by_workos_membership_id", ["workosMembershipId"]),
+    .index("by_user_and_organization", ["userId", "organizationId"]),
 
   workspaces: defineTable({
     organizationId: v.id("organizations"),
@@ -901,61 +958,13 @@ export default defineSchema({
     ])
     .index("by_receipt", ["receiptId"]),
 
-  identityWebhookReceipts: defineTable({
-    providerEventId: v.string(),
-    eventType: v.string(),
-    payloadDigest: v.bytes(),
-    eventCreatedAt: v.number(),
-    resourceKind: v.union(
-      v.literal("organization"),
-      v.literal("organization_membership"),
-      v.literal("ignored"),
-    ),
-    resourceId: v.string(),
-    result: v.union(v.literal("applied"), v.literal("stale"), v.literal("ignored")),
-    createdAt: v.number(),
-    expiresAt: v.number(),
-  })
-    .index("by_provider_event_id", ["providerEventId"])
-    .index("by_expiry", ["expiresAt"]),
-
-  identityReconciliationState: defineTable({
-    key: v.union(v.literal("workos_memberships"), v.literal("workos_organizations")),
-    version: v.optional(v.number()),
-    runId: v.optional(v.string()),
-    leaseUntil: v.optional(v.number()),
-    cursor: v.optional(v.string()),
-    providerOrganizationId: v.optional(v.string()),
-    providerCursor: v.optional(v.string()),
-    lastStartedAt: v.optional(v.number()),
-    lastCompletedAt: v.optional(v.number()),
-    lastErrorAt: v.optional(v.number()),
-    updatedAt: v.number(),
-  }).index("by_key", ["key"]),
-
-  identityReconciliationQuarantines: defineTable({
-    resourceKey: v.string(),
-    resourceKind: v.union(v.literal("organization"), v.literal("organization_membership")),
-    resourceId: v.string(),
-    reason: v.union(
-      v.literal("provider_locator_mismatch"),
-      v.literal("invalid_provider_record"),
-      v.literal("projection_collision"),
-    ),
-    occurrences: v.number(),
-    firstSeenAt: v.number(),
-    lastSeenAt: v.number(),
-    resolvedAt: v.optional(v.number()),
-  })
-    .index("by_resource_key", ["resourceKey"])
-    .index("by_last_seen", ["lastSeenAt"]),
-
   apiRateLimitBuckets: defineTable({
     subjectKind: v.union(
       v.literal("credential"),
       v.literal("workspace"),
       v.literal("user"),
       v.literal("unauthenticated"),
+      v.literal("global"),
     ),
     subjectKey: v.string(),
     routeClass: v.union(
@@ -967,6 +976,10 @@ export default defineSchema({
       v.literal("human_read"),
       v.literal("human_mutation"),
       v.literal("human_poll"),
+      v.literal("desktop_pairing_start"),
+      v.literal("desktop_pairing_redeem"),
+      v.literal("password_sign_in"),
+      v.literal("password_sign_up"),
       v.literal("refresh_auth"),
       v.literal("agent_auth_failure"),
       v.literal("enrollment_auth_failure"),
@@ -984,35 +997,6 @@ export default defineSchema({
       "shard",
     ])
     .index("by_expiry", ["expiresAt"]),
-
-  accountProvisioningOperations: defineTable({
-    userId: v.id("users"),
-    principalId: v.string(),
-    organizationId: v.id("organizations"),
-    externalId: v.string(),
-    name: v.string(),
-    idempotencyKey: v.string(),
-    requestDigest: v.union(v.bytes(), v.string()),
-    requestId: v.string(),
-    status: v.union(
-      v.literal("reserved"),
-      v.literal("provider_organization_ready"),
-      v.literal("provider_membership_ready"),
-      v.literal("completed"),
-      v.literal("failed"),
-    ),
-    workosOrganizationId: v.optional(v.string()),
-    workosMembershipId: v.optional(v.string()),
-    membershipProvisioningLeaseId: v.optional(v.string()),
-    membershipProvisioningLeaseUntil: v.optional(v.number()),
-    membershipCreateDispatchedAt: v.optional(v.number()),
-    membershipCreateDispatchLeaseId: v.optional(v.string()),
-    failureCode: v.optional(v.string()),
-    createdAt: v.number(),
-    updatedAt: v.number(),
-  })
-    .index("by_principal_and_key", ["principalId", "idempotencyKey"])
-    .index("by_external_id", ["externalId"]),
 
   workspaceProjectionHeads: defineTable({
     organizationId: v.id("organizations"),
@@ -1076,7 +1060,7 @@ export default defineSchema({
     organizationId: v.id("organizations"),
     organizationPublicId: v.string(),
     startedByUserId: v.id("users"),
-    startedByWorkosUserId: v.string(),
+    startedByUserPublicId: v.string(),
     authorizationMembershipId: v.id("organizationMemberships"),
     sourceWorkspacePublicId: v.string(),
     stagingWorkspaceId: v.id("workspaces"),

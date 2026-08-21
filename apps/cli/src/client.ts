@@ -62,6 +62,8 @@ import {
   renewClaimEnvelopeSchema,
   renewClaimRequestSchema,
   safeErrorMessage,
+  selectHumanScopeEnvelopeSchema,
+  selectHumanScopeRequestSchema,
   startSessionEnvelopeSchema,
   startSessionRequestSchema,
   setTaskParentRequestSchema,
@@ -126,6 +128,8 @@ import {
   type RequestId,
   type RefreshAuthRequest,
   type RefreshAuthResponse,
+  type SelectHumanScopeRequest,
+  type SelectHumanScopeResponse,
   type RevokeAgentCredentialRequest,
   type RevokeAgentCredentialResponse,
   type ReopenTaskRequest,
@@ -360,15 +364,28 @@ export class TaskctlClient {
 
   async refreshHumanAuthentication(
     refreshToken: string,
-    request: RefreshAuthRequest,
   ): Promise<ClientResult<RefreshAuthResponse>> {
-    const body = refreshAuthRequestSchema.parse(request);
+    const body: RefreshAuthRequest = refreshAuthRequestSchema.parse({});
     return await this.#request({
       method: taskctlApiOperations.refreshAuth.method,
       path: taskctlApiRoutes.refreshAuth,
       authorization: refreshToken,
       body,
       responseSchema: refreshAuthEnvelopeSchema,
+    });
+  }
+
+  async selectHumanScope(
+    accessToken: string,
+    request: SelectHumanScopeRequest,
+  ): Promise<ClientResult<SelectHumanScopeResponse>> {
+    const body = selectHumanScopeRequestSchema.parse(request);
+    return await this.#request({
+      method: taskctlApiOperations.selectHumanScope.method,
+      path: taskctlApiRoutes.selectHumanScope,
+      authorization: accessToken,
+      body,
+      responseSchema: selectHumanScopeEnvelopeSchema,
     });
   }
 

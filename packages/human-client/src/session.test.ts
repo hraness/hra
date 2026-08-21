@@ -20,7 +20,7 @@ function authentication(
   refreshToken = "refresh-token-that-is-long-enough",
 ): HumanAuthentication {
   return {
-    version: 1,
+    version: 2,
     apiUrl: "https://hra.example.com",
     accessToken,
     refreshToken,
@@ -29,6 +29,34 @@ function authentication(
       email: "human@example.com",
       name: "Human",
     },
+    organization: {
+      id: "org_cloud",
+      name: "Cloud",
+      role: "owner",
+      status: "active",
+    },
+    workspace: {
+      id: "workspace_cloud",
+      organizationId: "org_cloud",
+      slug: "cloud",
+      name: "Cloud",
+      taskKeyPrefix: "CLD",
+      roles: ["planner"],
+    },
+  };
+}
+
+function refreshData(
+  accessToken: string,
+  refreshToken: string,
+  base: HumanAuthentication = authentication(),
+): unknown {
+  return {
+    accessToken,
+    refreshToken,
+    user: base.user,
+    organization: base.organization,
+    workspace: base.workspace,
   };
 }
 
@@ -42,13 +70,15 @@ function snapshot(
 function memoryStore(
   initial: HumanAuthenticationSnapshot | null,
 ): HumanAuthenticationStore & {
-  current: HumanAuthenticationSnapshot | null;
-  compareCalls: number;
-  clearCalls: number;
+    current: HumanAuthenticationSnapshot | null;
+    compareCalls: number;
+    preserveCalls: number;
+    clearCalls: number;
 } {
   return {
     current: initial,
     compareCalls: 0,
+    preserveCalls: 0,
     clearCalls: 0,
     read() {
       return Promise.resolve(this.current);
@@ -60,6 +90,14 @@ function memoryStore(
       }
       this.current = input.next;
       return Promise.resolve(this.current);
+    },
+    preserveForRecovery(input) {
+      this.preserveCalls += 1;
+      if (this.current?.generation !== input.expectedGeneration) {
+        return Promise.resolve(false);
+      }
+      this.current = null;
+      return Promise.resolve(true);
     },
     clear(input) {
       this.clearCalls += 1;
@@ -73,6 +111,45 @@ function memoryStore(
 }
 
 describe("human session coordinator", () => {
+  test("reopens recovery admission only after active bearer work settles", async () => {
+    const store = memoryStore(snapshot(0));
+    let entered = (): void => undefined;
+    const operationEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release = (): void => undefined;
+    const operationReleased = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+    const active = coordinator.execute(async () => {
+      entered();
+      await operationReleased;
+      return { ok: true as const, data: "settled" };
+    });
+    await operationEntered;
+
+    coordinator.closeAdmission();
+    expect(coordinator.reopenAdmission()).toBe(false);
+    release();
+    expect(await active).toEqual({ ok: true, data: "settled" });
+    await coordinator.settled();
+    expect(coordinator.reopenAdmission()).toBe(true);
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "fresh" }))).toEqual({
+      ok: true,
+      data: "fresh",
+    });
+  });
+
   test("closed admission joins every bearer operation through credential settlement", async () => {
     const store = memoryStore(snapshot(0));
     let operationEntered = (): void => undefined;
@@ -214,15 +291,10 @@ describe("human session coordinator", () => {
     expect(refreshCalls).toBe(1);
     releaseRefresh?.({
       ok: true,
-      data: {
-        accessToken: "rotated-access-token-that-is-long-enough",
-        refreshToken: "rotated-refresh-token-that-is-long-enough",
-        user: {
-          id: "user_abc123",
-          email: "human@example.com",
-          name: "Human",
-        },
-      },
+      data: refreshData(
+        "rotated-access-token-that-is-long-enough",
+        "rotated-refresh-token-that-is-long-enough",
+      ),
     });
     const results = await Promise.all(executions);
 
@@ -237,6 +309,93 @@ describe("human session coordinator", () => {
     expect(store.compareCalls).toBe(1);
     expect(store.current?.generation).toBe(8);
     expect(JSON.stringify(results)).not.toContain("refresh-token");
+  });
+
+  test("supplies the exact credential snapshot used by each retried attempt", async () => {
+    const store = memoryStore(snapshot(3));
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: true,
+          data: refreshData(
+            "attempt-authority-b-access-token",
+            "attempt-authority-b-refresh-token",
+          ),
+        }),
+      },
+    });
+    const attempts: Array<Readonly<{ generation: number; token: string }>> = [];
+
+    expect(await coordinator.execute<string, OperationFailure>(
+      (accessToken, authority) => {
+        attempts.push({ generation: authority.generation, token: accessToken });
+        expect(authority.authentication.accessToken).toBe(accessToken);
+        return Promise.resolve(
+          authority.generation === 3
+            ? {
+                ok: false,
+                error: { code: "AUTHENTICATION_FAILED" },
+              }
+            : { ok: true, data: "selected" },
+        );
+      },
+    )).toEqual({ ok: true, data: "selected" });
+    expect(attempts).toEqual([
+      { generation: 3, token: "access-token-that-is-long-enough" },
+      { generation: 4, token: "attempt-authority-b-access-token" },
+    ]);
+  });
+
+  test("an exclusive transition drains ordinary work and never reopens terminal admission", async () => {
+    const store = memoryStore(snapshot(0));
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+    let releaseTransition = (): void => undefined;
+    const transitionReleased = new Promise<void>((resolve) => {
+      releaseTransition = resolve;
+    });
+    let transitionEntered = (): void => undefined;
+    const entered = new Promise<void>((resolve) => {
+      transitionEntered = resolve;
+    });
+    const transition = coordinator.withExclusiveTransition(async (session) => {
+      const result = await session.execute(() => {
+        transitionEntered();
+        return Promise.resolve({ ok: true, data: "rotated" });
+      });
+      await transitionReleased;
+      return result;
+    });
+    await entered;
+
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must be paused" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+    coordinator.closeAdmission();
+    expect(coordinator.reopenAdmission()).toBe(false);
+    releaseTransition();
+    expect(await transition).toEqual({
+      ok: true,
+      data: { ok: true, data: "rotated" },
+    });
+    await coordinator.settled();
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must stay closed" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
   });
 
   test("a stale refresh writer adopts a newer generation instead of overwriting it", async () => {
@@ -255,15 +414,10 @@ describe("human session coordinator", () => {
           store.current = winner;
           return Promise.resolve({
             ok: true,
-            data: {
-              accessToken: "loser-access-token-that-is-long-enough",
-              refreshToken: "loser-refresh-token-that-is-long-enough",
-              user: {
-                id: "user_abc123",
-                email: "human@example.com",
-                name: "Human",
-              },
-            },
+            data: refreshData(
+              "loser-access-token-that-is-long-enough",
+              "loser-refresh-token-that-is-long-enough",
+            ),
           });
         },
       },
@@ -294,7 +448,62 @@ describe("human session coordinator", () => {
     expect(JSON.stringify(result)).not.toContain("winner-refresh-token");
   });
 
-  test("an indeterminate rotation clears only the attempted generation", async () => {
+  test("a stale refresh writer never adopts a concurrent workspace selection", async () => {
+    const store = memoryStore(snapshot(3));
+    const selectedWorkspace = {
+      id: "workspace_selected",
+      organizationId: "org_cloud",
+      slug: "selected",
+      name: "Selected",
+      taskKeyPrefix: "SEL",
+      roles: ["planner" as const],
+    };
+    const winner = snapshot(4, {
+      ...authentication(
+        "selected-access-token-that-is-long-enough",
+        "selected-refresh-token-that-is-long-enough",
+      ),
+      workspace: selectedWorkspace,
+    });
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => {
+          store.current = winner;
+          return Promise.resolve({
+            ok: true,
+            data: refreshData(
+              "loser-access-token-that-is-long-enough",
+              "loser-refresh-token-that-is-long-enough",
+            ),
+          });
+        },
+      },
+    });
+    const seenTokens: string[] = [];
+
+    const result = await coordinator.execute<string, OperationFailure>(
+      (accessToken) => {
+        seenTokens.push(accessToken);
+        return Promise.resolve({
+          ok: false,
+          error: { code: "AUTHENTICATION_FAILED" },
+        });
+      },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTHENTICATION_FAILED" },
+    });
+    expect(seenTokens).toEqual(["access-token-that-is-long-enough"]);
+    expect(store.current).toEqual(winner);
+    expect(store.current?.authentication.workspace).toEqual(selectedWorkspace);
+    expect(store.clearCalls).toBe(0);
+  });
+
+  test("an indeterminate rotation preserves only the attempted generation for recovery", async () => {
     const store = memoryStore(snapshot(0));
     const coordinator = new HumanSessionCoordinator({
       store,
@@ -317,10 +526,97 @@ describe("human session coordinator", () => {
       error: { code: "AUTH_REFRESH_INDETERMINATE" },
     });
     expect(store.current).toBeNull();
-    expect(store.clearCalls).toBe(1);
+    expect(store.preserveCalls).toBe(1);
+    expect(store.clearCalls).toBe(0);
     expect(JSON.stringify(result)).not.toContain(
       "refresh-token-that-is-long-enough",
     );
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must stay closed" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+  });
+
+  test("a failed recovery preservation permanently closes bearer admission", async () => {
+    const store = memoryStore(snapshot(5));
+    store.preserveForRecovery = function () {
+      this.preserveCalls += 1;
+      return Promise.reject(new Error("durable quarantine unavailable"));
+    };
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.reject(new Error("lost refresh response")),
+      },
+    });
+
+    expect(await coordinator.execute<string, OperationFailure>(() =>
+      Promise.resolve({
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTH_REFRESH_INDETERMINATE" },
+    });
+    expect(store.current?.generation).toBe(5);
+    expect(store.preserveCalls).toBe(1);
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must stay closed" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+  });
+
+  test("an old indeterminate refresh does not close admission for a newer selected scope", async () => {
+    const stale = snapshot(5);
+    const selectedWorkspace = {
+      id: "workspace_selected",
+      organizationId: "org_cloud",
+      slug: "selected",
+      name: "Selected",
+      taskKeyPrefix: "SEL",
+      roles: ["planner" as const],
+    };
+    const winner = snapshot(6, {
+      ...authentication(
+        "selected-access-token-that-is-long-enough",
+        "selected-refresh-token-that-is-long-enough",
+      ),
+      workspace: selectedWorkspace,
+    });
+    const store = memoryStore(stale);
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => {
+          store.current = winner;
+          return Promise.reject(new Error("old refresh response was lost"));
+        },
+      },
+    });
+
+    expect(await coordinator.execute<string, OperationFailure>(() =>
+      Promise.resolve({
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTH_REFRESH_INDETERMINATE" },
+    });
+    expect(store.current).toEqual(winner);
+    expect(store.preserveCalls).toBe(1);
+
+    const seen: string[] = [];
+    expect(await coordinator.execute<string, OperationFailure>((accessToken) => {
+      seen.push(accessToken);
+      return Promise.resolve({ ok: true, data: "selected" });
+    })).toEqual({ ok: true, data: "selected" });
+    expect(seen).toEqual(["selected-access-token-that-is-long-enough"]);
   });
 
   test("never shares an in-flight refresh across a changed principal", async () => {
@@ -342,14 +638,14 @@ describe("human session coordinator", () => {
           if (refreshCalls === 1) return firstRefresh;
           return Promise.resolve({
             ok: true,
-            data: {
-              accessToken: "second-rotated-access-token",
-              refreshToken: "second-rotated-refresh-token",
-              user: {
-                id: "user_second",
-                email: "second@example.com",
+            data: refreshData(
+              "second-rotated-access-token",
+              "second-rotated-refresh-token",
+              {
+                ...authentication(),
+                user: { id: "user_second", email: "second@example.com" },
               },
-            },
+            ),
           });
         },
       },
@@ -388,14 +684,10 @@ describe("human session coordinator", () => {
     );
     releaseFirst?.({
       ok: true,
-      data: {
-        accessToken: "first-rotated-access-token",
-        refreshToken: "first-rotated-refresh-token",
-        user: {
-          id: "user_abc123",
-          email: "human@example.com",
-        },
-      },
+      data: refreshData(
+        "first-rotated-access-token",
+        "first-rotated-refresh-token",
+      ),
     });
 
     expect(await first).toMatchObject({
@@ -420,14 +712,7 @@ describe("human session coordinator", () => {
         refresh: () =>
           Promise.resolve({
             ok: true,
-            data: {
-              accessToken: "rotated-access-token",
-              refreshToken: "rotated-refresh-token",
-              user: {
-                id: "user_abc123",
-                email: "human@example.com",
-              },
-            },
+            data: refreshData("rotated-access-token", "rotated-refresh-token"),
           }),
       },
     });
@@ -445,6 +730,122 @@ describe("human session coordinator", () => {
     });
     expect(store.current).toBeNull();
     expect(store.clearCalls).toBe(1);
+  });
+
+  test("closes admission when a definitive authentication clear returns false", async () => {
+    const store = memoryStore(snapshot(4));
+    store.clear = function () {
+      this.clearCalls += 1;
+      return Promise.resolve(false);
+    };
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+
+    expect(await coordinator.execute<string, OperationFailure>(() =>
+      Promise.resolve({
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTHENTICATION_FAILED" },
+    });
+    expect(store.current?.generation).toBe(4);
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must stay closed" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+  });
+
+  test("closes admission when a definitive authentication clear throws", async () => {
+    const store = memoryStore(snapshot(4));
+    store.clear = function () {
+      this.clearCalls += 1;
+      return Promise.reject(new Error("clear response was lost"));
+    };
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+
+    expect(await coordinator.execute<string, OperationFailure>(() =>
+      Promise.resolve({
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTHENTICATION_FAILED" },
+    });
+    expect(store.current?.generation).toBe(4);
+    expect(await coordinator.execute(() =>
+      Promise.resolve({ ok: true, data: "must stay closed" }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+  });
+
+  test("a failed definitive clear leaves a newer selected generation admissible", async () => {
+    const store = memoryStore(snapshot(4));
+    const winner = snapshot(5, {
+      ...authentication(
+        "newer-selection-access-token-that-is-long-enough",
+        "newer-selection-refresh-token-that-is-long-enough",
+      ),
+      workspace: {
+        id: "workspace_newer_selection",
+        organizationId: "org_cloud",
+        slug: "newer-selection",
+        name: "Newer selection",
+        taskKeyPrefix: "NEW",
+        roles: ["planner"],
+      },
+    });
+    store.clear = function () {
+      this.clearCalls += 1;
+      this.current = winner;
+      return Promise.resolve(false);
+    };
+    const coordinator = new HumanSessionCoordinator({
+      store,
+      refresh: {
+        refresh: () => Promise.resolve({
+          ok: false,
+          outcome: "authentication_failed",
+        }),
+      },
+    });
+
+    expect(await coordinator.execute<string, OperationFailure>(() =>
+      Promise.resolve({
+        ok: false,
+        error: { code: "AUTHENTICATION_FAILED" },
+      }))).toMatchObject({
+      ok: false,
+      kind: "session",
+      error: { code: "AUTHENTICATION_FAILED" },
+    });
+    const seen: string[] = [];
+    expect(await coordinator.execute<string, OperationFailure>((accessToken) => {
+      seen.push(accessToken);
+      return Promise.resolve({ ok: true, data: "newer" });
+    })).toEqual({ ok: true, data: "newer" });
+    expect(seen).toEqual(["newer-selection-access-token-that-is-long-enough"]);
   });
 
   test("uses the actual replacement generation returned across a custody gap", async () => {
@@ -466,14 +867,7 @@ describe("human session coordinator", () => {
         refresh: () =>
           Promise.resolve({
             ok: true,
-            data: {
-              accessToken: "gap-rotated-access-token",
-              refreshToken: "gap-rotated-refresh-token",
-              user: {
-                id: "user_abc123",
-                email: "human@example.com",
-              },
-            },
+            data: refreshData("gap-rotated-access-token", "gap-rotated-refresh-token"),
           }),
       },
     });

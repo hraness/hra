@@ -673,6 +673,85 @@ export class GenerationalSecretCustody {
     });
   }
 
+  /**
+   * Retire the exact live-value inventory after the owning product determines
+   * that its credential rotation may have committed remotely. The committed
+   * and pending pointers move atomically to durable quarantine, their Keychain
+   * bytes remain untouched, and a valid pending value is never promoted.
+   *
+   * `invalid_pointer_preserved` also covers a structurally valid generic
+   * envelope whose product-owned credential is no longer safe to execute.
+   */
+  async preserveLiveValuesForRecovery(
+    inspected: SecretCustodyLiveInspection,
+  ): Promise<SecretCustodyReconnectRecovery> {
+    return await this.#exclusive(async () => {
+      const journal = await this.#readJournal();
+      if ((journal?.revision ?? null) !== inspected.sourceRevision) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      const candidates = journal === null
+        ? []
+        : [
+            ...(journal.committed === undefined
+              ? []
+              : [{ role: "committed" as const, pointer: journal.committed }]),
+            ...(journal.pending === undefined
+              ? []
+              : [{ role: "pending" as const, pointer: journal.pending.pointer }]),
+          ];
+      if (candidates.length !== inspected.values.length) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+
+      const quarantined: SecretCustodyQuarantinePointer[] = [];
+      for (const [index, candidate] of candidates.entries()) {
+        const observation = inspected.values[index];
+        if (
+          observation === undefined ||
+          observation.role !== candidate.role ||
+          observation.pointer.generation !== candidate.pointer.generation ||
+          observation.pointer.slot !== candidate.pointer.slot
+        ) {
+          throw new SecretCustodyError("concurrent_update");
+        }
+        const current = await this.#inspectCommitted(candidate.pointer);
+        if (
+          current.state !== observation.state ||
+          (current.state === "valid" &&
+            (observation.state !== "valid" || current.value !== observation.value))
+        ) {
+          throw new SecretCustodyError("concurrent_update");
+        }
+        quarantined.push(secretCustodyQuarantinePointerSchema.parse({
+          kind: candidate.role,
+          pointer: candidate.pointer,
+          sourceRevision: journal?.revision,
+          reason: "invalid_pointer_preserved",
+        }));
+      }
+
+      if (journal === null || quarantined.length === 0) {
+        return { state: "not_required" };
+      }
+      const next = parseOwnedJournal({
+        version: 1,
+        revision: nextRevision(journal),
+        latestGeneration: journal.latestGeneration,
+        service: journal.service,
+        name: journal.name,
+        ...deletingJournalField(deletingPointers(journal)),
+      });
+      if (!(await this.#swapWithQuarantine(journal, next, quarantined))) {
+        throw new SecretCustodyError("concurrent_update");
+      }
+      return {
+        state: "quarantined",
+        quarantinedPointerCount: quarantined.length,
+      };
+    });
+  }
+
   async #inspectPointers(
     journal: SecretCustodyJournal,
   ): Promise<readonly SecretPointerInspection[]> {
@@ -1407,6 +1486,15 @@ export class GenerationalSecretCustody {
           expectedSourceRevision !== undefined
           && (current?.revision ?? null) !== expectedSourceRevision
         ) return false;
+        if (
+          expectedGeneration !== undefined &&
+          current?.pending !== undefined
+        ) {
+          // A pending pointer owns the successor rotation. An exact-generation
+          // clear may retire only its committed observation; it must never
+          // absorb a queued G+1 write whose settlement or response faulted.
+          return false;
+        }
         const journal = current?.pending === undefined
           ? (await this.#settle(false)).journal
           : current;

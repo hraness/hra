@@ -247,7 +247,23 @@ function signalExitCode(signal: ShutdownSignal): number {
   }
 }
 
+export function nativeSourceHelperEnvironment(
+  desktopRoot: string,
+): Readonly<{
+  HRA_DATA_REMOVER_PATH: string;
+  HRA_GIT_EXECUTOR_PATH: string;
+  HRA_IMAGE_NORMALIZER_PATH: string;
+}> {
+  const nativeBinRoot = resolve(desktopRoot, "zig-out", "bin");
+  return {
+    HRA_DATA_REMOVER_PATH: resolve(nativeBinRoot, "oprte-data-remover"),
+    HRA_GIT_EXECUTOR_PATH: resolve(nativeBinRoot, "oprte-git-executor"),
+    HRA_IMAGE_NORMALIZER_PATH: resolve(nativeBinRoot, "hra-image-normalizer"),
+  };
+}
+
 function runtimeEnvironment(
+  desktopRoot: string,
   gatewayPath: string,
   runtimePaths: ReturnType<typeof resolvePortableRuntimeAssets>,
 ): Record<string, string | undefined> {
@@ -257,13 +273,19 @@ function runtimeEnvironment(
     HRA_GATEWAY_PATH: gatewayPath,
     HRA_GIT_BIN: runtimePaths.gitBinary,
     HRA_GIT_ROOT: runtimePaths.gitRoot,
+    ...nativeSourceHelperEnvironment(desktopRoot),
   };
   // The bundled run path must not inherit a stale dev envelope. Development
-  // adds all four exact values together only after this sanitization.
+  // adds the source-safe helper paths together only after this sanitization.
+  // The Keychain custodian is intentionally absent: an ad-hoc Debug parent
+  // cannot establish executable identity for credential custody.
   delete environment.NATIVE_SDK_FRONTEND_URL;
   delete environment.NATIVE_SDK_HMR;
   delete environment.NATIVE_SDK_MODE;
   delete environment[HRA_DEV_SESSION_ENV];
+  delete environment.HRA_KEYCHAIN_CUSTODIAN_PATH;
+  delete environment.OPRTE_KEYCHAIN_CUSTODIAN_PATH;
+  delete environment.KITCHEN_KEYCHAIN_CUSTODIAN_PATH;
   return environment;
 }
 
@@ -420,10 +442,11 @@ async function runDevelopment(
       () => {
         console.log("[hra dev] launching HRA; frontend edits now hot reload");
         console.log("[hra dev] use the DEV control for runtime apply and restart guidance");
+        console.log("[hra dev] Keychain-backed cloud features require the signed app and are disabled in raw Debug");
         return spawnOwnedProcess("app", [appPath], {
           cwd: desktopRoot,
           env: {
-            ...runtimeEnvironment(stableGatewayPath, runtimePaths),
+            ...runtimeEnvironment(desktopRoot, stableGatewayPath, runtimePaths),
             ...nativeDevFrontendEnvironment(sessionId),
           },
         });
@@ -469,6 +492,9 @@ async function runBundled(
   runtimePaths: ReturnType<typeof resolvePortableRuntimeAssets>,
   zigExecutable: string,
 ): Promise<number> {
+  console.log(
+    "[hra run] Keychain-backed cloud features require the signed app and are disabled in raw Debug",
+  );
   const child = Bun.spawn(
     [
       zigExecutable,
@@ -479,7 +505,7 @@ async function runBundled(
     ],
     {
       cwd: desktopRoot,
-      env: runtimeEnvironment(gatewayPath, runtimePaths),
+      env: runtimeEnvironment(desktopRoot, gatewayPath, runtimePaths),
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",

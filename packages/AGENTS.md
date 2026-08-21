@@ -12,7 +12,7 @@
 - Keep `@hra-internal/codex-app-sdk` provider-neutral and source-first. Preserve its root, React, and testing subpaths, and retain its MIT license and snapshot provenance.
 - Keep generated Convex types, database implementation, desktop runtime code, and CLI storage out of product-private packages.
 - Keep `@hraness/hra-human-client` portable across the CLI and compiled desktop gateway; provider tokens remain behind its custody ports and never enter renderer, SQLite metadata, or diagnostics.
-- Reusable React UI is allowed only in a provider-free package consumed by at least two product apps; keep Next.js, Convex, WorkOS, Native, SQLite, filesystem, generated APIs, and authority adapters outside its production graph.
+- Reusable React UI is allowed only in a provider-free package consumed by at least two product apps; keep Next.js, Convex, identity-provider SDKs, Native, SQLite, filesystem, generated APIs, and authority adapters outside its production graph.
 - Retain `@hraness/agent-tasks-protocol` as the package name during the family migration; rename it only through an explicit versioned contract migration.
 - Keep `@hraness/agent-tasks-domain` dependent only on `@hra-internal/schema`; protocol re-exports its portable contracts for compatibility while transport, cloud tenancy, and provider adapters stay outside the leaf.
 - Keep fixtures behind explicit non-root subpath exports so production imports cannot reach deterministic examples accidentally.

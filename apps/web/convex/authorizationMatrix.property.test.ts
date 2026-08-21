@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   agentScopeValues,
   type AgentScope,
@@ -14,17 +14,12 @@ import { authorizeWorkspaceHuman } from "./humanAuthorization";
 
 const now = 1_000_000;
 const requestId = "req_00000000000000000000000000";
-const workosClientId = "client_authorization_matrix";
-const workosUserId = "user_authorizationmatrix";
-const workosOrganizationId = "org_authorizationmatrix";
-const foreignWorkosOrganizationId = "org_foreignauthorizationmatrix";
-const originalWorkOSClientId = process.env.WORKOS_CLIENT_ID;
-
 const currentOrganizationId = "organization_current" as Id<"organizations">;
 const foreignOrganizationId = "organization_foreign" as Id<"organizations">;
 const currentWorkspaceId = "workspace_current" as Id<"workspaces">;
 const foreignWorkspaceId = "workspace_foreign" as Id<"workspaces">;
 const currentUserId = "user_current" as Id<"users">;
+const currentHumanSessionId = "human_session_current" as Id<"authSessions">;
 const currentMembershipId = "membership_current" as Id<"organizationMemberships">;
 const currentWorkspaceMembershipId =
   "workspace_membership_current" as Id<"workspaceMemberships">;
@@ -35,7 +30,7 @@ const currentCredentialId = "credential_current" as Id<"agentCredentials">;
 const foreignCredentialId = "credential_foreign" as Id<"agentCredentials">;
 const currentSessionId = "session_current" as Id<"agentSessions">;
 
-type OrganizationStatus = "provisioning" | "active" | "failed" | "disabled";
+type OrganizationStatus = "active" | "disabled";
 type WorkspaceStatus = "active" | "disabled";
 type MembershipStatus = "active" | "inactive" | "pending" | "removed";
 type WorkspaceMembershipStatus = "active" | "removed";
@@ -113,9 +108,8 @@ type HumanAuthorizationExpectation =
   | {
       readonly ok: false;
       readonly code:
-        | "ORGANIZATION_MISMATCH"
-        | "PROVISIONING_IN_PROGRESS"
-        | "PROVISIONING_FAILED"
+        | "AUTHENTICATION_FAILED"
+        | "ORGANIZATION_REQUIRED"
         | "MEMBERSHIP_INACTIVE"
         | "WORKSPACE_ROLE_REQUIRED"
         | "NOT_FOUND";
@@ -130,6 +124,7 @@ interface InstrumentedContext {
 interface GetFixture {
   readonly id: string;
   readonly result: unknown;
+  readonly times?: number;
 }
 
 interface IndexClause {
@@ -157,15 +152,20 @@ function queryFixtureKey(fixture: Omit<UniqueQueryFixture, "result">): string {
   ]);
 }
 
-function fixtureMap<Fixture extends { readonly result: unknown }>(
+interface FixtureState {
+  readonly result: unknown;
+  remaining: number;
+}
+
+function fixtureMap<Fixture extends { readonly result: unknown; readonly times?: number }>(
   fixtures: readonly Fixture[],
   keyOf: (fixture: Fixture) => string,
-): Map<string, unknown> {
-  const entries = new Map<string, unknown>();
+): Map<string, FixtureState> {
+  const entries = new Map<string, FixtureState>();
   for (const fixture of fixtures) {
     const key = keyOf(fixture);
     if (entries.has(key)) throw new Error(`Duplicate authorization fixture: ${key}`);
-    entries.set(key, fixture.result);
+    entries.set(key, { result: fixture.result, remaining: fixture.times ?? 1 });
   }
   return entries;
 }
@@ -185,11 +185,12 @@ function instrumentedContext(args: {
   const gets = fixtureMap(args.getFixtures ?? [], ({ id }) => getFixtureKey(id));
   const queries = fixtureMap(args.queryFixtures ?? [], queryFixtureKey);
 
-  const consume = (fixtures: Map<string, unknown>, key: string): unknown => {
-    if (!fixtures.has(key)) throw new Error(`Unexpected authorization read: ${key}`);
-    const result = fixtures.get(key);
-    fixtures.delete(key);
-    return result;
+  const consume = (fixtures: Map<string, FixtureState>, key: string): unknown => {
+    const state = fixtures.get(key);
+    if (state === undefined) throw new Error(`Unexpected authorization read: ${key}`);
+    state.remaining -= 1;
+    if (state.remaining === 0) fixtures.delete(key);
+    return state.result;
   };
   const write = async (operation: string): Promise<string> => {
     writes.push(operation);
@@ -363,19 +364,15 @@ function expectedAgentAuthorization(matrix: AgentMatrix): AuthorizationExpectati
 }
 
 function expectedHumanAuthorization(matrix: HumanMatrix): HumanAuthorizationExpectation {
-  if (matrix.organizationSelector !== "matching") {
-    return { ok: false, code: "ORGANIZATION_MISMATCH" };
+  if (!matrix.userPresent || !matrix.userActive) {
+    return { ok: false, code: "AUTHENTICATION_FAILED" };
   }
-  if (matrix.organizationStatus === "provisioning") {
-    return { ok: false, code: "PROVISIONING_IN_PROGRESS" };
-  }
-  if (matrix.organizationStatus === "failed") {
-    return { ok: false, code: "PROVISIONING_FAILED" };
+  if (matrix.organizationSelector === "missing") {
+    return { ok: false, code: "ORGANIZATION_REQUIRED" };
   }
   if (
+    matrix.organizationSelector !== "matching" ||
     matrix.organizationStatus !== "active" ||
-    !matrix.userPresent ||
-    !matrix.userActive ||
     !matrix.membershipPresent ||
     matrix.membershipStatus !== "active"
   ) {
@@ -518,13 +515,12 @@ function agentContext(
   });
 }
 
-function humanIdentity(organizationId: string) {
+function humanIdentity() {
   return {
-    issuer: "https://api.workos.com/",
-    org_id: organizationId,
-    sid: "session_authorization_matrix",
-    subject: workosUserId,
-    tokenIdentifier: `${workosClientId}|${workosUserId}`,
+    issuer: "https://convex.test",
+    subject: `${currentUserId}|${currentHumanSessionId}`,
+    tokenIdentifier:
+      `https://convex.test|${currentUserId}|${currentHumanSessionId}`,
   };
 }
 
@@ -532,23 +528,41 @@ function humanContext(
   matrix: HumanMatrix,
   workspacePublicId = "wsp_selected",
 ): InstrumentedContext {
-  const selectedWorkosOrganizationId =
-    matrix.organizationSelector === "foreign"
-      ? foreignWorkosOrganizationId
-      : workosOrganizationId;
+  const selectedOrganizationId = matrix.organizationSelector === "foreign"
+    ? foreignOrganizationId
+    : currentOrganizationId;
+  const selectedWorkspaceId = matrix.workspaceSelector === "foreign"
+    ? foreignWorkspaceId
+    : currentWorkspaceId;
   const organization = {
     _id: currentOrganizationId,
     name: "Current organization",
     publicId: "org_current",
     status: matrix.organizationStatus,
-    workosOrganizationId,
+    createdAt: 1,
+    updatedAt: 1,
   };
   const user = {
     _id: currentUserId,
     name: "Current human",
-    publicId: workosUserId,
+    publicId: "usr_authorizationmatrix",
     status: matrix.userActive ? "active" : "disabled",
-    workosUserId,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const session = {
+    _id: currentHumanSessionId,
+    userId: currentUserId,
+    expirationTime: Date.now() + 60_000,
+  };
+  const selection = {
+    _id: "selection_current",
+    sessionId: currentHumanSessionId,
+    userId: currentUserId,
+    organizationId: selectedOrganizationId,
+    workspaceId: selectedWorkspaceId,
+    createdAt: 1,
+    updatedAt: 1,
   };
   const membership = {
     _id: currentMembershipId,
@@ -558,8 +572,7 @@ function humanContext(
     userId: currentUserId,
   };
   const workspace = {
-    _id:
-      matrix.workspaceSelector === "foreign" ? foreignWorkspaceId : currentWorkspaceId,
+    _id: selectedWorkspaceId,
     name: "Selected workspace",
     organizationId:
       matrix.workspaceSelector === "foreign"
@@ -593,33 +606,29 @@ function humanContext(
     roleGatePasses &&
     matrix.workspaceSelector === "matching" &&
     matrix.workspaceStatus === "active";
+  const identityGatePasses = matrix.userPresent && matrix.userActive;
+  const selectionPresent = matrix.organizationSelector !== "missing";
+  const organizationReadRuns = identityGatePasses && selectionPresent;
+  const getFixtures: GetFixture[] = [
+    {
+      id: currentUserId,
+      result: matrix.userPresent ? user : null,
+      times: organizationReadRuns ? 2 : 1,
+    },
+    { id: currentHumanSessionId, result: session },
+    ...(organizationReadRuns
+      ? [{
+          id: selectedOrganizationId,
+          result: matrix.organizationSelector === "matching" ? organization : null,
+        }]
+      : []),
+  ];
   const queryFixtures: UniqueQueryFixture[] = [
     {
-      clauses: [{ field: "workosUserId", value: workosUserId }],
-      index: "by_workos_user_id",
-      result: matrix.userPresent ? user : null,
-      table: "users",
-    },
-    ...(!matrix.userPresent
-      ? [
-          {
-            clauses: [{ field: "publicId", value: workosUserId }],
-            index: "by_public_id",
-            result: null,
-            table: "users",
-          },
-        ]
-      : []),
-    {
-      clauses: [
-        {
-          field: "workosOrganizationId",
-          value: selectedWorkosOrganizationId,
-        },
-      ],
-      index: "by_workos_organization_id",
-      result: matrix.organizationSelector === "matching" ? organization : null,
-      table: "organizations",
+      clauses: [{ field: "sessionId", value: currentHumanSessionId }],
+      index: "by_session",
+      result: selectionPresent ? selection : null,
+      table: "authSessionSelections",
     },
     ...(organizationGatePasses
       ? [
@@ -659,7 +668,8 @@ function humanContext(
       : []),
   ];
   return instrumentedContext({
-    identity: humanIdentity(selectedWorkosOrganizationId),
+    getFixtures,
+    identity: humanIdentity(),
     queryFixtures,
   });
 }
@@ -782,16 +792,6 @@ const agentTupleFaultCases = [
     apply: (matrix) => ({ ...matrix, workspaceStatus: "disabled" }),
   },
   {
-    name: "a provisioning organization",
-    expectedCode: "AUTHORIZATION_DENIED",
-    apply: (matrix) => ({ ...matrix, organizationStatus: "provisioning" }),
-  },
-  {
-    name: "a failed organization",
-    expectedCode: "AUTHORIZATION_DENIED",
-    apply: (matrix) => ({ ...matrix, organizationStatus: "failed" }),
-  },
-  {
     name: "a disabled organization",
     expectedCode: "AUTHORIZATION_DENIED",
     apply: (matrix) => ({ ...matrix, organizationStatus: "disabled" }),
@@ -847,23 +847,13 @@ const agentScopeFaultCases = [
 const humanFaultCases = [
   {
     name: "a missing organization",
-    expectedCode: "ORGANIZATION_MISMATCH",
+    expectedCode: "ORGANIZATION_REQUIRED",
     apply: (matrix) => ({ ...matrix, organizationSelector: "missing" }),
   },
   {
     name: "a foreign organization",
-    expectedCode: "ORGANIZATION_MISMATCH",
+    expectedCode: "MEMBERSHIP_INACTIVE",
     apply: (matrix) => ({ ...matrix, organizationSelector: "foreign" }),
-  },
-  {
-    name: "a provisioning organization",
-    expectedCode: "PROVISIONING_IN_PROGRESS",
-    apply: (matrix) => ({ ...matrix, organizationStatus: "provisioning" }),
-  },
-  {
-    name: "a failed organization",
-    expectedCode: "PROVISIONING_FAILED",
-    apply: (matrix) => ({ ...matrix, organizationStatus: "failed" }),
   },
   {
     name: "a disabled organization",
@@ -872,12 +862,12 @@ const humanFaultCases = [
   },
   {
     name: "a missing user",
-    expectedCode: "MEMBERSHIP_INACTIVE",
+    expectedCode: "AUTHENTICATION_FAILED",
     apply: (matrix) => ({ ...matrix, userPresent: false }),
   },
   {
     name: "a disabled user",
-    expectedCode: "MEMBERSHIP_INACTIVE",
+    expectedCode: "AUTHENTICATION_FAILED",
     apply: (matrix) => ({ ...matrix, userActive: false }),
   },
   {
@@ -1009,15 +999,6 @@ async function assertHumanCase(
   assertNoDeniedWrites(result, harness.writes);
   return { harness, result };
 }
-
-beforeEach(() => {
-  process.env.WORKOS_CLIENT_ID = workosClientId;
-});
-
-afterEach(() => {
-  if (originalWorkOSClientId === undefined) delete process.env.WORKOS_CLIENT_ID;
-  else process.env.WORKOS_CLIENT_ID = originalWorkOSClientId;
-});
 
 describe("agent authorization matrix properties", () => {
   test("authorizes every generated live tuple with the required scope", async () => {

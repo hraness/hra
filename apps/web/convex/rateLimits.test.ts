@@ -10,7 +10,7 @@ import { RATE_LIMIT_SELECTED_SHARD_INDEX_FIELDS } from "./rateLimitPolicy";
 
 interface StoredBucket {
   readonly _id: Id<"apiRateLimitBuckets">;
-  readonly subjectKind: "credential" | "workspace" | "user" | "unauthenticated";
+  readonly subjectKind: "credential" | "workspace" | "user" | "unauthenticated" | "global";
   readonly subjectKey: string;
   readonly routeClass:
     | "agent_read"

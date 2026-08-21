@@ -308,7 +308,8 @@ export class HarnessRendererSQLiteAdapterV2 implements
     const input = paneListSchema.parse(inputValue);
     const rows: unknown[] = this.#database.query(`
       SELECT pane_id FROM chat_panes
-      WHERE pane_id > COALESCE(?1, '')
+      WHERE archived_at IS NULL
+        AND pane_id > COALESCE(?1, '')
       ORDER BY pane_id
       LIMIT ?2
     `).all(input.afterPaneId, input.limit);

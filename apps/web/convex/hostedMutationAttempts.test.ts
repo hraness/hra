@@ -18,10 +18,9 @@ import {
 } from "./hostedMutationPersistence";
 import schema from "./schema";
 
-const WORKOS_CLIENT_ID = "client_hosted_mutation_attempts";
-const WORKOS_ORGANIZATION_ID = "org_hostedmutationattempts";
-const WORKOS_USER_ID = "user_hostedmutationattempts";
-const SECOND_WORKOS_USER_ID = "user_hostedmutationattemptssecond";
+const ORGANIZATION_PUBLIC_ID = "org_00000000000000000000000001";
+const USER_PUBLIC_ID = "usr_00000000000000000000000001";
+const SECOND_USER_PUBLIC_ID = "usr_00000000000000000000000002";
 const WORKSPACE_PUBLIC_ID = "wsp_00000000000000000000000001";
 const FOREIGN_WORKSPACE_PUBLIC_ID = "wsp_00000000000000000000000002";
 const SOURCE_ID = "oprte.web.task-workspace.v1";
@@ -32,7 +31,6 @@ const FINGERPRINT_KEY =
 const SECOND_FINGERPRINT_KEY =
   "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"; // gitleaks:allow - deterministic test vector
 const FINGERPRINT_KEY_VERSION = "test-v1";
-const originalWorkosClientId = process.env.WORKOS_CLIENT_ID;
 const originalFingerprintKey =
   process.env.HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT;
 const originalFingerprintKeyVersion =
@@ -82,13 +80,11 @@ function opaqueFingerprint(index: number): string {
   return `hmac_sha256_${String(index).padStart(43, "0")}`;
 }
 
-function identity(subject = WORKOS_USER_ID) {
+function identity(userId: string, sessionId: string) {
   return {
-    issuer: `https://api.workos.com/user_management/${WORKOS_CLIENT_ID}`,
-    org_id: WORKOS_ORGANIZATION_ID,
-    sid: `session_${subject}`,
-    subject,
-    tokenIdentifier: `${WORKOS_CLIENT_ID}|${subject}`,
+    issuer: "https://convex.test",
+    subject: `${userId}|${sessionId}`,
+    tokenIdentifier: `https://convex.test|${userId}|${sessionId}`,
   };
 }
 
@@ -152,27 +148,24 @@ async function resolvedPrepareArgs(
   };
 }
 
-async function seedTenancy(t: HostedMutationTest): Promise<void> {
-  await t.run(async (ctx) => {
+async function seedTenancy(t: HostedMutationTest) {
+  return await t.run(async (ctx) => {
     const organizationId = await ctx.db.insert("organizations", {
-      publicId: "org_00000000000000000000000001",
-      workosOrganizationId: WORKOS_ORGANIZATION_ID,
+      publicId: ORGANIZATION_PUBLIC_ID,
       name: "HRA",
       status: "active",
       createdAt: NOW,
       updatedAt: NOW,
     });
     const userId = await ctx.db.insert("users", {
-      publicId: WORKOS_USER_ID,
-      workosUserId: WORKOS_USER_ID,
+      publicId: USER_PUBLIC_ID,
       name: "Ada",
       status: "active",
       createdAt: NOW,
       updatedAt: NOW,
     });
     const secondUserId = await ctx.db.insert("users", {
-      publicId: SECOND_WORKOS_USER_ID,
-      workosUserId: SECOND_WORKOS_USER_ID,
+      publicId: SECOND_USER_PUBLIC_ID,
       name: "Grace",
       status: "active",
       createdAt: NOW,
@@ -194,7 +187,7 @@ async function seedTenancy(t: HostedMutationTest): Promise<void> {
       createdAt: NOW,
       updatedAt: NOW,
     });
-    await ctx.db.insert("workspaces", {
+    const workspaceId = await ctx.db.insert("workspaces", {
       organizationId,
       publicId: WORKSPACE_PUBLIC_ID,
       slug: "hra",
@@ -207,7 +200,6 @@ async function seedTenancy(t: HostedMutationTest): Promise<void> {
 
     const foreignOrganizationId = await ctx.db.insert("organizations", {
       publicId: "org_00000000000000000000000002",
-      workosOrganizationId: "org_hostedmutationattemptsforeign",
       name: "Foreign",
       status: "active",
       createdAt: NOW,
@@ -223,21 +215,43 @@ async function seedTenancy(t: HostedMutationTest): Promise<void> {
       createdAt: NOW,
       updatedAt: NOW,
     });
+    const sessionExpiration = Date.now() + 60_000;
+    const firstSessionId = await ctx.db.insert("authSessions", {
+      userId,
+      expirationTime: sessionExpiration,
+    });
+    const secondSessionId = await ctx.db.insert("authSessions", {
+      userId: secondUserId,
+      expirationTime: sessionExpiration,
+    });
+    for (const [sessionId, selectedUserId] of [
+      [firstSessionId, userId],
+      [secondSessionId, secondUserId],
+    ] as const) {
+      await ctx.db.insert("authSessionSelections", {
+        sessionId,
+        userId: selectedUserId,
+        organizationId,
+        workspaceId,
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+    }
+    return { firstSessionId, secondSessionId, userId, secondUserId };
   });
 }
 
 async function fixture() {
   const t = convexTest(schema, modules);
-  await seedTenancy(t);
+  const seeded = await seedTenancy(t);
   return {
     anonymous: t,
-    first: t.withIdentity(identity()),
-    second: t.withIdentity(identity(SECOND_WORKOS_USER_ID)),
+    first: t.withIdentity(identity(seeded.userId, seeded.firstSessionId)),
+    second: t.withIdentity(identity(seeded.secondUserId, seeded.secondSessionId)),
   };
 }
 
 beforeEach(() => {
-  process.env.WORKOS_CLIENT_ID = WORKOS_CLIENT_ID;
   process.env.HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT =
     FINGERPRINT_KEY;
   process.env.HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT_VERSION =
@@ -251,11 +265,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (originalWorkosClientId === undefined) {
-    delete process.env.WORKOS_CLIENT_ID;
-  } else {
-    process.env.WORKOS_CLIENT_ID = originalWorkosClientId;
-  }
   if (originalFingerprintKey === undefined) {
     delete process.env.HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT;
   } else {
@@ -805,8 +814,8 @@ describe("hosted Convex mutation attempt journal", () => {
     await anonymous.run(async (ctx) => {
       const organization = await ctx.db
         .query("organizations")
-        .withIndex("by_workos_organization_id", (index) =>
-          index.eq("workosOrganizationId", WORKOS_ORGANIZATION_ID)
+        .withIndex("by_public_id", (index) =>
+          index.eq("publicId", ORGANIZATION_PUBLIC_ID)
         )
         .unique();
       const linkedAttempt = (await ctx.db
@@ -821,7 +830,7 @@ describe("hosted Convex mutation attempt journal", () => {
       }
       const receiptId = await ctx.db.insert("humanCommandReceipts", {
         principalKind: "organization",
-        principalId: WORKOS_USER_ID,
+        principalId: USER_PUBLIC_ID,
         organizationId: organization._id,
         operation: "tasks.comments.add",
         idempotencyKey: linked.idempotencyKey,
@@ -904,8 +913,8 @@ describe("hosted Convex mutation attempt journal", () => {
     const linkedReceiptId = await anonymous.run(async (ctx) => {
       const organization = await ctx.db
         .query("organizations")
-        .withIndex("by_workos_organization_id", (index) =>
-          index.eq("workosOrganizationId", WORKOS_ORGANIZATION_ID)
+        .withIndex("by_public_id", (index) =>
+          index.eq("publicId", ORGANIZATION_PUBLIC_ID)
         )
         .unique();
       const attempt = (await ctx.db
@@ -920,7 +929,7 @@ describe("hosted Convex mutation attempt journal", () => {
       }
       const receiptId = await ctx.db.insert("humanCommandReceipts", {
         principalKind: "organization",
-        principalId: WORKOS_USER_ID,
+        principalId: USER_PUBLIC_ID,
         organizationId: organization._id,
         operation: "tasks.comments.add",
         idempotencyKey: original.idempotencyKey,
@@ -1016,14 +1025,14 @@ describe("hosted Convex mutation attempt journal", () => {
     const scope = await anonymous.run(async (ctx) => {
       const organization = await ctx.db
         .query("organizations")
-        .withIndex("by_workos_organization_id", (index) =>
-          index.eq("workosOrganizationId", WORKOS_ORGANIZATION_ID)
+        .withIndex("by_public_id", (index) =>
+          index.eq("publicId", ORGANIZATION_PUBLIC_ID)
         )
         .unique();
       const user = await ctx.db
         .query("users")
-        .withIndex("by_workos_user_id", (index) =>
-          index.eq("workosUserId", WORKOS_USER_ID)
+        .withIndex("by_public_id", (index) =>
+          index.eq("publicId", USER_PUBLIC_ID)
         )
         .unique();
       const workspace = await ctx.db

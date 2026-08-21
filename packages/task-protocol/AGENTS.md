@@ -11,6 +11,6 @@
 - Keep scope strings, error codes, task states, actor kinds, and envelope versions closed and exhaustively handled.
 - Do not export Convex document IDs as trusted values or import generated Convex server types.
 - Depend on `@hraness/agent-tasks-domain` for portable task models, public identifiers, run events, and laws. Re-export the exact domain schema objects so existing protocol consumers remain source-compatible.
-- Keep HTTP routes and envelopes, credential/token contracts, WorkOS identity, runner election and leases, and interaction cryptography in protocol or provider adapters rather than the leaf domain.
+- Keep HTTP routes and envelopes, credential/token contracts, HRA identity, runner election and leases, and interaction cryptography in protocol or provider adapters rather than the leaf domain.
 - Keep session sync content-blind: the relay may receive strict encrypted summary envelopes, authenticated schedule metadata, and an opaque end-to-end-encrypted scheduled definition. It must never receive a plaintext prompt, response, reasoning, tool detail, transcript, provider datum, command, or local path; only an authenticated HRA device may decrypt a scheduled definition and enqueue its prompt.
 - Bind membership, recovery, root-wrap, boot, writer, nonce, snapshot, reset, and retirement transitions to their complete tenant/vault/device/session coordinates. Keep all quotas and lifetime limits explicit in the shared protocol.
