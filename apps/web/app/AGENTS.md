@@ -1,7 +1,7 @@
 # Contents
 
 - `design/` – the shared static browser-component gallery mounted at `/design`.
-- `layout.tsx` – inheritable site-wide document defaults and the deterministic light-first document boundary.
+- `layout.tsx` – inheritable site-wide document defaults and the concrete light SSR fallback used until the System-first appearance bootstrap resolves.
 - `providers.tsx` – shared appearance/router composition around the optional WorkOS and Convex providers.
 - `analytics.ts` and `analytics-provider.tsx` – strict canonical-public-route classification and anonymous, cookieless PostHog pageview delivery.
 - `workos-configuration.ts` – one whitespace-safe WorkOS configuration predicate shared by proxy, auth routes, layout providers, and the `/app` configuration state.
@@ -36,7 +36,7 @@
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.
 - Resolve the transient semantic digest to a server-keyed, tenant/principal/source-bound HMAC before entering the generic mutation journal. Preserve that opaque fingerprint exactly across prepare, reads, and transitions. Prepare before effect, mark immediately before the command, and settle only a definitive authority result. Retain ambiguous attempts with their exact idempotency key, HRA operation ID, and supplied task ID. Never persist the browser digest, raw intent, answers, transcript, or provider data.
 - Starting, remounting, and projection retry never execute a pending mutation. A terminal journal row is a durable tombstone and is absent from open recovery; only a later explicit UI dispatch may create fresh controls for the same semantic action.
-- Server-render `data-theme="light"`, suppress only the expected theme attribute hydration difference, and provide a visible shared Light/Dark/System control on standalone and authenticated surfaces.
+- Default selectable appearance to System while server-rendering `data-theme="light"` as the concrete pre-bootstrap fallback. Suppress only the expected theme attribute hydration difference, preserve explicit persisted Light/Dark/System choices, and provide a visible shared control on standalone and authenticated surfaces.
 - Keep `AppShell`, `NavigationRail`, top bars, and rail controls mounted while query-addressed workspace/surface content changes; animate only the main stage and close the accessible mobile drawer on its navigation key.
 - Keep the canonical Hraness lockup in the shared rail footer so desktop and mobile-drawer shells expose the same identity.
 - Consume shared foundation colors, type, spacing, controls, route states, and overlays directly. Reserve product chroma for explicit human/agent identity, runner state, task status, recovery, and review evidence.

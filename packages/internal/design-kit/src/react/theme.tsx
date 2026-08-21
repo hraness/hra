@@ -19,6 +19,7 @@ import { SegmentedControl, type SegmentedItem } from "./segmented-control";
 export const designThemes = ["light", "dark", "system"] as const;
 export type DesignTheme = (typeof designThemes)[number];
 export type ConcreteDesignTheme = Exclude<DesignTheme, "system">;
+export const defaultDesignTheme = "system" as const satisfies DesignTheme;
 
 const concreteThemes = ["light", "dark"] as const;
 const emptySubscribe = (): (() => void) => () => undefined;
@@ -29,7 +30,7 @@ export function isDesignTheme(value: unknown): value is DesignTheme {
 
 /** Invalid or unavailable persisted values resolve to the deterministic first-visit theme. */
 export function normalizeDesignTheme(value: unknown): DesignTheme {
-  return isDesignTheme(value) ? value : "light";
+  return isDesignTheme(value) ? value : defaultDesignTheme;
 }
 
 function useHydrated(): boolean {
@@ -41,14 +42,14 @@ function themeStorageGuardScript(storageKey: string): string {
     .replaceAll("<", "\\u003c")
     .replaceAll("\u2028", "\\u2028")
     .replaceAll("\u2029", "\\u2029");
-  return `(()=>{try{const key=${serializedKey};const value=localStorage.getItem(key);if(value!==null&&value!=="light"&&value!=="dark"&&value!=="system")localStorage.setItem(key,"light")}catch{}})();`;
+  return `(()=>{try{const key=${serializedKey};const value=localStorage.getItem(key);if(value!==null&&value!=="light"&&value!=="dark"&&value!=="system")localStorage.setItem(key,"${defaultDesignTheme}")}catch{}})();`;
 }
 
 function PersistedThemeNormalizer() {
   const { setTheme, theme } = useTheme();
 
   useEffect(() => {
-    if (theme !== undefined && !isDesignTheme(theme)) setTheme("light");
+    if (theme !== undefined && !isDesignTheme(theme)) setTheme(defaultDesignTheme);
   }, [setTheme, theme]);
 
   return null;
@@ -96,8 +97,9 @@ export interface DesignThemeProviderProps {
 }
 
 /**
- * Shared appearance boundary for browser products. Light is the deterministic
- * first visit; system appearance remains an explicit user choice.
+ * Shared appearance boundary for browser products. System is the first-visit
+ * preference; the server may retain a concrete light fallback until the
+ * blocking bootstrap resolves the live operating-system appearance.
  */
 export function DesignThemeProvider({
   children,
@@ -118,7 +120,7 @@ export function DesignThemeProvider({
       <NextThemeProvider
         {...(nonce === undefined ? {} : { nonce })}
         attribute="data-theme"
-        defaultTheme={forcedTheme ?? "light"}
+        defaultTheme={forcedTheme ?? defaultDesignTheme}
         disableTransitionOnChange
         enableSystem={forcedTheme === undefined}
         forcedTheme={forcedTheme}
@@ -214,7 +216,7 @@ export function ThemeToggle({
   const { setTheme, theme } = useTheme();
   const controlled = controlledValue !== undefined;
   const ready = controlled || hydrated;
-  const value = controlledValue ?? (hydrated ? normalizeDesignTheme(theme) : "light");
+  const value = controlledValue ?? (hydrated ? normalizeDesignTheme(theme) : defaultDesignTheme);
   const items = display === "icons" ? themeToggleIconItems(labels) : themeToggleItems(labels);
   const changeTheme = (nextTheme: DesignTheme): void => {
     if (controlled) onChange?.(nextTheme);

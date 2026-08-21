@@ -7,7 +7,13 @@ import { EmptyState, type ContentHeadingLevel } from "./content-primitives";
 import { LinkButton } from "./link-button";
 import { Skeleton, Spinner } from "./feedback";
 import { PageCanvas } from "./surfaces";
-import { ThemeToggle } from "./theme";
+import {
+  defaultDesignTheme,
+  DesignThemeProvider,
+  type DesignTheme,
+  ThemeColorSync,
+  ThemeToggle,
+} from "./theme";
 
 export interface RouteErrorPageProps {
   /** Set false only for an already-visible, inert demonstration of this state. */
@@ -36,7 +42,7 @@ export interface RouteLoadingPageProps {
 export interface GlobalErrorDocumentProps extends RouteErrorPageProps {
   readonly bodyClassName?: string;
   readonly diagnostics?: ReactNode;
-  readonly theme?: "dark" | "light";
+  readonly theme?: DesignTheme;
 }
 
 function RouteActions({ children }: Readonly<{ children: ReactNode }>) {
@@ -141,14 +147,25 @@ export function RouteLoadingPage({
 export function GlobalErrorDocument({
   bodyClassName,
   diagnostics,
-  theme = "light",
+  theme = defaultDesignTheme,
   ...props
 }: GlobalErrorDocumentProps) {
+  const content = (
+    <>
+      {diagnostics}
+      <RouteErrorPage {...props} showThemeToggle={false} />
+    </>
+  );
+
   return (
-    <html data-theme={theme} lang="en" suppressHydrationWarning>
+    <html data-theme={theme === "system" ? "light" : theme} lang="en" suppressHydrationWarning>
       <body className={bodyClassName}>
-        {diagnostics}
-        <RouteErrorPage {...props} showThemeToggle={false} />
+        {theme === "system" ? (
+          <DesignThemeProvider>
+            <ThemeColorSync />
+            {content}
+          </DesignThemeProvider>
+        ) : content}
       </body>
     </html>
   );

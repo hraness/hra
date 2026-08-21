@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { AnimatedRailStage, railStageMotion } from "./animated-rail-stage";
 import { useDesignPortalTheme } from "./design-theme-context";
 import {
+  defaultDesignTheme,
   DesignThemeProvider,
   normalizeDesignTheme,
   themeColorFor,
@@ -30,11 +31,13 @@ test("appearance choices are complete, ordered, and labelable", () => {
   ]);
 });
 
-test("missing and invalid persisted appearance values fall back to light", () => {
-  expect(normalizeDesignTheme(undefined)).toBe("light");
-  expect(normalizeDesignTheme(null)).toBe("light");
-  expect(normalizeDesignTheme("sepia")).toBe("light");
-  expect(normalizeDesignTheme({ theme: "dark" })).toBe("light");
+test("missing and invalid persisted appearance values fall back to system", () => {
+  expect(defaultDesignTheme).toBe("system");
+  expect(normalizeDesignTheme(undefined)).toBe("system");
+  expect(normalizeDesignTheme(null)).toBe("system");
+  expect(normalizeDesignTheme("sepia")).toBe("system");
+  expect(normalizeDesignTheme({ theme: "dark" })).toBe("system");
+  expect(normalizeDesignTheme("light")).toBe("light");
   expect(normalizeDesignTheme("dark")).toBe("dark");
   expect(normalizeDesignTheme("system")).toBe("system");
 });
@@ -47,7 +50,7 @@ test("theme color resolution is dark only for a resolved dark appearance", () =>
   expect(themeColorFor(undefined, values)).toBe(values.light);
 });
 
-test("the provider and toggle server-render a light-first three-choice surface", () => {
+test("the provider and toggle server-render a system-first three-choice surface", () => {
   const html = renderToStaticMarkup(
     <DesignThemeProvider>
       <ThemeToggle />
@@ -57,7 +60,7 @@ test("the provider and toggle server-render a light-first three-choice surface",
   expect(html).toContain("jungle-design-theme-v1");
   expect(html).toContain('data-ready="false"');
   expect(html).toContain('data-display="icons"');
-  expect(html).toContain('data-theme-value="light"');
+  expect(html).toContain('data-theme-value="system"');
   expect(html).toContain('aria-label="Appearance"');
   expect(html).toContain('aria-label="Light"');
   expect(html).toContain('aria-label="Dark"');
@@ -150,11 +153,13 @@ test("the provider repairs invalid persisted values before next-themes resolves 
     },
   };
   runInNewContext(guard ?? "", { localStorage });
-  expect(value).toBe("light");
+  expect(value).toBe("system");
 
-  value = "dark";
-  runInNewContext(guard ?? "", { localStorage });
-  expect(value).toBe("dark");
+  for (const persistedTheme of ["light", "dark", "system"] as const) {
+    value = persistedTheme;
+    runInNewContext(guard ?? "", { localStorage });
+    expect(value).toBe(persistedTheme);
+  }
 });
 
 test("rail stages enter and exit in opposite directions at the shared duration", () => {

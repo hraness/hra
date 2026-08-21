@@ -12,7 +12,7 @@ prompt, response, transcript, reasoning, tool data, account identity,
 provider identifier, or filesystem path. Remote summaries are view-only and a
 relay outage cannot block local desktop chat.
 
-The control plane uses the shared default-light design system. Light, Dark, and System appearance choices persist under the shared browser preference, and the authenticated UI keeps its navigation rail and bars mounted while the selected workspace and `Tasks`/`Access` stage changes. Those selections are addressable with the `workspace` and `surface` query parameters; they do not change WorkOS organization authority or Convex task ownership. On compact viewports the same rail becomes a focus-trapped left drawer.
+The control plane uses the shared System-first design system. A first visit follows the operating-system appearance, while explicit Light, Dark, and System choices persist under the shared browser preference. The authenticated UI keeps its navigation rail and bars mounted while the selected workspace and `Tasks`/`Access` stage changes. Those selections are addressable with the `workspace` and `surface` query parameters; they do not change WorkOS organization authority or Convex task ownership. On compact viewports the same rail becomes a focus-trapped left drawer.
 
 ## Local development
 

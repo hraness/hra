@@ -27,7 +27,7 @@
 - Parse all server, browser, and provider boundaries from `unknown`.
 - Use `@hraness/web-discovery` for product-neutral metadata, crawler, sitemap, JSON-LD, and social-image primitives. Keep HRA titles, routes, dates, and crawler decisions in this workspace.
 - Parse public deployment configuration through `@hra-internal/convex` before constructing the official client.
-- Use the shared default-light appearance runtime and design roles from `@hra-internal/design-kit`; HRA app styles may add only hosted-shell aliases while task presentation stays in the shared UI package.
+- Use the shared System-first appearance runtime and design roles from `@hra-internal/design-kit`; HRA app styles may add only hosted-shell aliases while task presentation stays in the shared UI package.
 - Resolve shared icon entry points to the HRA-local SVG adapter for the Next.js graph, and reject Hugeicons module identifiers or emitted markers during every production build.
 - Keep the authenticated control plane inside the persistent shared app shell. Workspace and Tasks/Access route state belongs in the query-addressed rail, and only the changing main stage animates.
 - Keep `/` public and indexable without WorkOS or Convex client providers. Keep `/app` authenticated when WorkOS is configured, and send sign-in, sign-up, callback, organization-switch, and internal control-plane navigation back to that route.

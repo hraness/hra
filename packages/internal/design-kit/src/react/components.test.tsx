@@ -1353,10 +1353,13 @@ test("route fallbacks share branded recovery and loading semantics", () => {
   expect(silentLoading).not.toContain('role="status"');
   expect(nestedNotFound).toContain("<h4");
   expect(globalError.match(/<h1(?:\s|>)/g)).toHaveLength(1);
-  expect(globalError).not.toContain("<script");
+  expect(globalError).toContain('data-theme="light"');
+  expect(globalError).toContain('data-jungle-theme-guard=""');
+  expect(globalError).toContain("jungle-design-theme-v1");
   expect(globalError).not.toContain('aria-label="Appearance"');
   expect(fixedGlobalError).toContain('data-theme="dark"');
   expect(fixedGlobalError).toContain('<body class="fixture-product-theme">');
+  expect(fixedGlobalError).not.toContain('data-jungle-theme-guard=""');
   for (const shellFallback of [shellNotFound, shellError, shellLoading]) {
     expect(shellFallback).not.toContain("<main");
     expect(shellFallback).not.toContain('aria-label="Appearance"');

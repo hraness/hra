@@ -7,7 +7,7 @@ async function source(name: string): Promise<string> {
 }
 
 describe("HRA shared appearance and shell contract", () => {
-  test("starts light and installs the persisted shared appearance runtime", async () => {
+  test("keeps a light SSR fallback while the shared runtime starts with System", async () => {
     const [layout, providers] = await Promise.all([
       source("./layout.tsx"),
       source("./providers.tsx"),

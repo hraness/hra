@@ -30,6 +30,9 @@ test("standalone gallery System appearance resolves to the live OS theme", async
   expect(source).toContain("root.style.colorScheme = resolvedTheme");
   expect(source).toContain("root.style.colorScheme = snapshot.colorScheme");
   expect(source).toContain('hasForcedThemeProvider && currentTheme !== "system"');
+
+  const html = renderToStaticMarkup(<DesignSystemGallery />);
+  expect(html).toContain("Selectable browser surfaces start with System appearance");
 });
 
 test("gallery icon buttons own their tooltips without nested triggers", async () => {
