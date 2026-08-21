@@ -990,7 +990,8 @@ export function DesignSystemGallery({
           <p className="design-gallery__lede">
             Inspect edge-aligned architecture, bounded Jelly objects, shared spacing, compact
             information patterns, and the interaction states required for touch, pointer, and
-            keyboard input.
+            keyboard input. Selectable browser surfaces start with System appearance; explicit
+            Light, Dark, and System choices persist.
           </p>
         </div>
         {isNestedInMain

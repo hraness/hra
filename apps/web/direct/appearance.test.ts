@@ -5,7 +5,7 @@ async function source(name: string): Promise<string> {
 }
 
 describe("Agent Tasks lab appearance", () => {
-  test("uses the shared light-first appearance runtime without fixed-dark literals", async () => {
+  test("uses the shared system-first runtime with a concrete light bootstrap fallback", async () => {
     const [document, main, stylesheet, workbench] = await Promise.all([
       source("./index.html"),
       source("./main.tsx"),
