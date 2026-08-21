@@ -14,7 +14,7 @@
 
 - Keep this directory development-only. Production Next.js entries, Convex functions, and provider adapters must never import it.
 - Import `TaskWorkspace`, `TaskWorkspaceProps`, and `TaskWorkspaceActions` from `@hraness/agent-tasks-ui`, and deterministic examples only from its `/fixtures` subpath; do not fork task presentation or controls.
-- Keep the lab on the same shared System-first Light/Dark/System appearance runtime as production while retaining its visibly labeled evidence workbench and concrete light pre-bootstrap fallback.
+- Keep the lab on the same shared System-first Light/Dark/System appearance runtime and adaptive first-paint browser chrome as production while retaining its visibly labeled evidence workbench and concrete light pre-bootstrap fallback.
 - Never mount WorkOS, `ConvexProvider`, `ConvexTaskWorkspaceAdapter`, or contact a deployment. This lab replaces the backend-neutral workspace port, not provider protocols.
 - Keep worlds strict, bounded, versioned, JSON-safe, cloned, and deterministic. Reject unknown keys, prototype-pollution keys, duplicate identities, inconsistent selections, and mismatched scripts.
 - Use exact ordered scripts for commands whose request, conflict, and state transition are part of the claim. Unexpected or exhausted requests must remain verifier-visible violations.

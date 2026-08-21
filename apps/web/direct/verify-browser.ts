@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { colors } from "@hra-internal/design-kit";
 import { z } from "@hra-internal/schema";
 import {
   classifyCoverageEvidence,
@@ -137,6 +138,16 @@ interface ScenarioEvidence {
   readonly probe: ProbeSnapshot;
   readonly screenshot: string;
   readonly url: string;
+}
+
+interface ThemeColorEvidence {
+  readonly activeContent: string;
+  readonly activeHasMedia: boolean;
+  readonly adaptiveMedia: readonly string[];
+  readonly backgroundColor: string;
+  readonly matchingColors: readonly string[];
+  readonly metaCount: number;
+  readonly unqualifiedCount: number;
 }
 
 interface ScenarioVerification {
@@ -469,6 +480,115 @@ async function readProbe(browser: AgentBrowser): Promise<ProbeSnapshot> {
       "Agent Tasks remaining work",
     ),
   });
+}
+
+async function verifyThemeColorResolution(
+  browser: AgentBrowser,
+  baseUrl: string,
+): Promise<void> {
+  const url = scenarioUrl(baseUrl, "tasks-rich-review");
+  const scenarios = [
+    { expectedColor: colors.light.background, os: "dark", preference: "light" },
+    { expectedColor: colors.dark.background, os: "light", preference: "dark" },
+  ] as const;
+
+  try {
+    for (const scenario of scenarios) {
+      await browser.run(["set", "media", scenario.os]);
+      await browser.run(["open", url]);
+      await browser.evaluate(
+        `localStorage.setItem("jungle-design-theme-v1", ${JSON.stringify(scenario.preference)})`,
+      );
+      await browser.run(["reload"]);
+      await browser.run([
+        "wait",
+        "--fn",
+        `document.documentElement.getAttribute("data-theme") === ${JSON.stringify(scenario.preference)}`,
+      ]);
+      await browser.run([
+        "wait",
+        "--fn",
+        `(() => {
+          const metas = [...document.head.querySelectorAll('meta[name="theme-color"]')];
+          return metas.length === 3
+            && metas.filter((meta) => !meta.hasAttribute("media")).length === 1;
+        })()`,
+      ]);
+
+      const evidence = await browser.evaluate(`(() => {
+        const metas = [...document.head.querySelectorAll('meta[name="theme-color"]')];
+        const active = metas.find((meta) => !meta.hasAttribute("media"));
+        if (!(active instanceof HTMLMetaElement)) {
+          throw new Error("The synchronized theme-color meta is missing.");
+        }
+        const normalizeColor = (value) => {
+          const probe = document.createElement("span");
+          probe.style.color = value;
+          document.body.append(probe);
+          const normalized = getComputedStyle(probe).color;
+          probe.remove();
+          return normalized;
+        };
+        return {
+          activeContent: active.content,
+          activeHasMedia: active.hasAttribute("media"),
+          adaptiveMedia: metas
+            .filter((meta) => meta !== active)
+            .map((meta) => meta.getAttribute("media") ?? ""),
+          backgroundColor: getComputedStyle(document.body).backgroundColor,
+          matchingColors: metas
+            .filter((meta) => !meta.hasAttribute("media") || matchMedia(meta.media).matches)
+            .map((meta) => normalizeColor(meta.content)),
+          metaCount: metas.length,
+          unqualifiedCount: metas.filter((meta) => !meta.hasAttribute("media")).length,
+        };
+      })()`);
+      if (!isThemeColorEvidence(evidence)) {
+        throw new Error(
+          `${scenario.os}/${scenario.preference}: theme-color evidence is malformed: ${JSON.stringify(evidence)}`,
+        );
+      }
+      const expectedBackground = await browser.evaluate(`(() => {
+        const probe = document.createElement("span");
+        probe.style.color = ${JSON.stringify(scenario.expectedColor)};
+        document.body.append(probe);
+        const normalized = getComputedStyle(probe).color;
+        probe.remove();
+        return normalized;
+      })()`);
+      if (
+        evidence.activeContent !== scenario.expectedColor
+        || evidence.activeHasMedia
+        || evidence.adaptiveMedia.length !== 2
+        || evidence.adaptiveMedia.some((media) => media !== "not all")
+        || evidence.backgroundColor !== expectedBackground
+        || evidence.matchingColors.length !== 1
+        || evidence.matchingColors[0] !== expectedBackground
+        || evidence.metaCount !== 3
+        || evidence.unqualifiedCount !== 1
+      ) {
+        throw new Error(
+          `${scenario.os}/${scenario.preference}: resolved theme-color did not match the painted background: ${JSON.stringify(evidence)}`,
+        );
+      }
+    }
+  } finally {
+    await browser.evaluate('localStorage.removeItem("jungle-design-theme-v1")');
+  }
+}
+
+function isThemeColorEvidence(value: unknown): value is ThemeColorEvidence {
+  if (typeof value !== "object" || value === null) return false;
+  const evidence = value as Partial<ThemeColorEvidence>;
+  return typeof evidence.activeContent === "string"
+    && typeof evidence.activeHasMedia === "boolean"
+    && Array.isArray(evidence.adaptiveMedia)
+    && evidence.adaptiveMedia.every((media) => typeof media === "string")
+    && typeof evidence.backgroundColor === "string"
+    && Array.isArray(evidence.matchingColors)
+    && evidence.matchingColors.every((color) => typeof color === "string")
+    && typeof evidence.metaCount === "number"
+    && typeof evidence.unqualifiedCount === "number";
 }
 
 async function clickButton(browser: AgentBrowser, label: string): Promise<void> {
@@ -866,6 +986,8 @@ async function run(repositoryRoot: string, baseUrl: string): Promise<string> {
       evidence.push(verified.evidence);
       sessionManifests.push(verified.manifest);
     }
+    console.log("Verifying opposing system and saved theme-color preferences...");
+    await verifyThemeColorResolution(browser, baseUrl);
     const parsedCoverage = parseDefinitionCoverageSnapshot(
       bindDirectScenarioCatalog(sessionManifests),
       agentTasksDirectDefinition,

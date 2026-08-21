@@ -14,6 +14,9 @@ describe("HRA shared appearance and shell contract", () => {
     ]);
 
     expect(layout).toContain('<html data-theme="light" lang="en" suppressHydrationWarning>');
+    expect(layout).toContain("export const viewport = {");
+    expect(layout).toContain('{ color: colors.light.background, media: "(prefers-color-scheme: light)" }');
+    expect(layout).toContain('{ color: colors.dark.background, media: "(prefers-color-scheme: dark)" }');
     expect(providers).toContain("<DesignThemeProvider>");
     expect(providers).toContain("<ThemeColorSync />");
     expect(providers).toContain("<DesignKitRouterProvider");

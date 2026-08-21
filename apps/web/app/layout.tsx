@@ -1,5 +1,6 @@
+import { colors } from "@hra-internal/design-kit";
 import { parseConvexDeployment } from "@hra-internal/convex";
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 
 import "./globals.css";
@@ -9,6 +10,12 @@ import { hraRootMetadata } from "./site";
 import { isWorkOSEnvironmentConfigured } from "./workos-configuration";
 
 export const metadata = hraRootMetadata satisfies Metadata;
+export const viewport = {
+  themeColor: [
+    { color: colors.light.background, media: "(prefers-color-scheme: light)" },
+    { color: colors.dark.background, media: "(prefers-color-scheme: dark)" },
+  ],
+} satisfies Viewport;
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   const authConfigured = isWorkOSEnvironmentConfigured(process.env);
