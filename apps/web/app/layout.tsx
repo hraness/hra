@@ -11,6 +11,7 @@ import { isWorkOSEnvironmentConfigured } from "./workos-configuration";
 
 export const metadata = hraRootMetadata satisfies Metadata;
 export const viewport = {
+  colorScheme: "light dark",
   themeColor: [
     { color: colors.light.background, media: "(prefers-color-scheme: light)" },
     { color: colors.dark.background, media: "(prefers-color-scheme: dark)" },

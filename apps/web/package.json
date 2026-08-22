@@ -23,7 +23,7 @@
     "convex:dev:once": "CONVEX_AGENT_MODE=anonymous convex dev --once --tail-logs disable",
     "build": "bun run scripts/vercel-build.ts --run-app-build --production-deployment benevolent-akita-439",
     "build:app": "next build --webpack && bun run check:production-icons && bun run check:direct-boundary",
-    "build:direct": "vite build --config direct/vite.config.ts",
+    "build:direct": "bun run direct/build.ts",
     "check:direct-boundary": "bun run direct/check-production-boundary.ts",
     "check:production-icons": "bun run production-icon-boundary.ts",
     "start": "next start",

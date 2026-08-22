@@ -15,6 +15,10 @@ describe("HRA shared appearance and shell contract", () => {
 
     expect(layout).toContain('<html data-theme="light" lang="en" suppressHydrationWarning>');
     expect(layout).toContain("export const viewport = {");
+    expect(layout.match(/colorScheme: "light dark"/gu)).toHaveLength(1);
+    expect(layout.indexOf('colorScheme: "light dark"')).toBeLessThan(
+      layout.indexOf("themeColor: ["),
+    );
     expect(layout).toContain('{ color: colors.light.background, media: "(prefers-color-scheme: light)" }');
     expect(layout).toContain('{ color: colors.dark.background, media: "(prefers-color-scheme: dark)" }');
     expect(providers).toContain("<DesignThemeProvider>");
@@ -92,6 +96,7 @@ describe("HRA shared appearance and shell contract", () => {
     }
     expect(globalError).toContain('import "./globals.css"');
     expect(globalError).toContain("GlobalErrorDocument");
+    expect(globalError).toContain("export default GlobalErrorDocument");
     expect(globalError).not.toContain("ThemeMenuButton");
   });
 

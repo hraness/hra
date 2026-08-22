@@ -31,10 +31,12 @@ import {
   type DirectBrowserContract,
 } from "@hraness/direct/tooling/browser-verification";
 
+import { directAppearanceStorageKey } from "./appearance-bootstrap";
 import { agentTasksDirectDefinition } from "./scenarios";
 const DEFAULT_BASE_URL = "http://127.0.0.1:5176";
 const SERVER_START_TIMEOUT_MS = 30_000;
 const DIRECT_ROOT_ASSET_PATHS = new Set([
+  "/appearance-bootstrap.ts",
   "/main.tsx",
   "/mount.ts",
   "/runtime.tsx",
@@ -88,6 +90,34 @@ const networkSchema = z.object({
     url: z.string(),
   })),
 });
+const appearanceBootstrapEvidenceSchema = z.object({
+  activeThemeColor: z.string(),
+  appStartTheme: z.enum(["dark", "light"]),
+  bodyBackground: z.string(),
+  bootstrapBackgroundColor: z.string(),
+  bootstrapBackgroundStyleRemoved: z.boolean(),
+  bootstrapPreference: z.enum(["dark", "light", "system"]),
+  bootstrapReceiptConfigurable: z.boolean(),
+  bootstrapReceiptFrozen: z.boolean(),
+  bootstrapReceiptWritable: z.boolean(),
+  bootstrapResolvedTheme: z.enum(["dark", "light"]),
+  bootstrapStoredValue: z.string().nullable(),
+  bootstrapThemeColor: z.string(),
+  bootstrapThemeColorMetaRemoved: z.boolean(),
+  classicHeadScript: z.boolean(),
+  initialBackground: z.string(),
+  initialRootBackground: z.string(),
+  initialThemeColor: z.string(),
+  jellyMode: z.enum(["dark", "light"]),
+  optionValue: z.enum(["dark", "light", "system"]),
+  rootTheme: z.enum(["dark", "light"]),
+  scriptBeforeAppModule: z.boolean(),
+  storageRepaired: z.boolean(),
+  storedValue: z.string().nullable(),
+  systemPrefersDark: z.boolean(),
+  themeColorMetaCount: z.number().int().nonnegative(),
+  unqualifiedThemeColorCount: z.number().int().nonnegative(),
+});
 type ProbeSnapshot = Readonly<
   Omit<DirectProbeSnapshot, "remainingWork">
   & { readonly remainingWork: z.infer<typeof remainingWorkSchema> }
@@ -99,6 +129,7 @@ interface CoveragePolicyEntry {
   readonly scenarios: readonly string[];
 }
 type NetworkRequest = z.infer<typeof networkSchema>["requests"][number];
+export type AppearanceBootstrapEvidence = z.infer<typeof appearanceBootstrapEvidenceSchema>;
 type ScenarioAction =
   | "accept-conflict"
   | "answer-question"
@@ -486,6 +517,227 @@ async function readProbe(browser: AgentBrowser): Promise<ProbeSnapshot> {
       "Agent Tasks remaining work",
     ),
   });
+}
+
+function browserColor(hex: string): string {
+  const channels = /^#(?<red>[\da-f]{2})(?<green>[\da-f]{2})(?<blue>[\da-f]{2})$/iu.exec(hex)?.groups;
+  if (channels === undefined) {
+    throw new TypeError(`Expected a six-digit browser color; received ${hex}.`);
+  }
+  return `rgb(${Number.parseInt(channels.red ?? "", 16)}, ${Number.parseInt(channels.green ?? "", 16)}, ${Number.parseInt(channels.blue ?? "", 16)})`;
+}
+
+export async function verifyAppearanceBootstrap(
+  browser: AgentBrowser,
+  baseUrl: string,
+): Promise<readonly AppearanceBootstrapEvidence[]> {
+  const url = workbenchScenarioUrl(baseUrl, "tasks-rich-review");
+  await browser.run(["set", "media", "light"]);
+  await browser.run(["open", url]);
+  await browser.run(["errors", "--clear"]);
+  await browser.run(["console", "--clear"]);
+
+  const cases = [
+    {
+      label: "missing preference on dark OS",
+      preference: "system",
+      resolvedTheme: "dark",
+      storageRepaired: false,
+      storedValue: null,
+      systemTheme: "dark",
+    },
+    {
+      label: "invalid preference on light OS",
+      preference: "system",
+      resolvedTheme: "light",
+      storageRepaired: true,
+      storedValue: "sepia",
+      systemTheme: "light",
+    },
+    {
+      label: "saved System on dark OS",
+      preference: "system",
+      resolvedTheme: "dark",
+      storageRepaired: false,
+      storedValue: "system",
+      systemTheme: "dark",
+    },
+    {
+      label: "saved Light on dark OS",
+      preference: "light",
+      resolvedTheme: "light",
+      storageRepaired: false,
+      storedValue: "light",
+      systemTheme: "dark",
+    },
+    {
+      label: "saved Dark on light OS",
+      preference: "dark",
+      resolvedTheme: "dark",
+      storageRepaired: false,
+      storedValue: "dark",
+      systemTheme: "light",
+    },
+  ] as const;
+  const evidence: AppearanceBootstrapEvidence[] = [];
+
+  for (const fixture of cases) {
+    await browser.run(["set", "media", fixture.systemTheme]);
+    await browser.evaluate(`(() => {
+      const value = ${JSON.stringify(fixture.storedValue)};
+      if (value === null) localStorage.removeItem(${JSON.stringify(directAppearanceStorageKey)});
+      else localStorage.setItem(${JSON.stringify(directAppearanceStorageKey)}, value);
+    })()`);
+    await browser.run(["open", url]);
+
+    const expectedThemeColor = colors[fixture.resolvedTheme].background;
+    const expectedBackground = browserColor(expectedThemeColor);
+    const expectedStoredValue = fixture.storageRepaired ? "system" : fixture.storedValue;
+    await browser.run([
+      "wait",
+      "--fn",
+      `(() => {
+        const receipt = window.__hraAppearanceBootstrap;
+        const receiptDescriptor = Object.getOwnPropertyDescriptor(
+          window,
+          '__hraAppearanceBootstrap',
+        );
+        const menu = document.querySelector('.hraness-design-theme-toggle');
+        const metas = [...document.head.querySelectorAll('meta[name="theme-color"]')];
+        const active = metas.find((meta) => !meta.hasAttribute('media'));
+        return receipt?.schema === 'hra.appearance-bootstrap/v1'
+          && receipt.preference === ${JSON.stringify(fixture.preference)}
+          && receipt.resolvedTheme === ${JSON.stringify(fixture.resolvedTheme)}
+          && receipt.backgroundColor === ${JSON.stringify(expectedBackground)}
+          && receipt.themeColor === ${JSON.stringify(expectedThemeColor)}
+          && Object.isFrozen(receipt)
+          && receiptDescriptor?.configurable === false
+          && receiptDescriptor?.writable === false
+          && document.documentElement.dataset.hraAppearanceBeforeApp === ${JSON.stringify(fixture.resolvedTheme)}
+          && document.documentElement.dataset.hraBackgroundBeforeApp === ${JSON.stringify(expectedBackground)}
+          && document.documentElement.dataset.hraRootBackgroundBeforeApp === ${JSON.stringify(expectedBackground)}
+          && document.documentElement.dataset.hraThemeColorBeforeApp === ${JSON.stringify(expectedThemeColor)}
+          && document.querySelector('style[data-hra-appearance-bootstrap-background]') === null
+          && document.querySelector('meta[data-hra-appearance-bootstrap-theme-color]') === null
+          && active?.content === ${JSON.stringify(expectedThemeColor)}
+          && metas.length === 3
+          && menu?.getAttribute('data-ready') === 'true'
+          && menu?.getAttribute('data-theme-value') === ${JSON.stringify(fixture.preference)};
+      })()`,
+      "--timeout",
+      "30000",
+    ]);
+
+    const captured = parseData(
+      appearanceBootstrapEvidenceSchema,
+      await browser.evaluate(`(() => {
+        const receipt = window.__hraAppearanceBootstrap;
+        const receiptDescriptor = Object.getOwnPropertyDescriptor(
+          window,
+          '__hraAppearanceBootstrap',
+        );
+        const script = document.querySelector('script[data-hra-appearance-bootstrap-script]');
+        const appModule = [...document.querySelectorAll('script[type="module"]')]
+          .find((candidate) => (candidate.getAttribute('src') || '').includes('/main.tsx'));
+        const menu = document.querySelector('.hraness-design-theme-toggle');
+        const metas = [...document.head.querySelectorAll('meta[name="theme-color"]')];
+        const active = metas.find((meta) => !meta.hasAttribute('media'));
+        return {
+          activeThemeColor: active?.content || '',
+          appStartTheme: document.documentElement.dataset.hraAppearanceBeforeApp || '',
+          bodyBackground: getComputedStyle(document.body).backgroundColor,
+          bootstrapBackgroundColor: receipt?.backgroundColor || '',
+          bootstrapBackgroundStyleRemoved:
+            document.querySelector('style[data-hra-appearance-bootstrap-background]') === null,
+          bootstrapPreference: receipt?.preference || '',
+          bootstrapReceiptConfigurable: receiptDescriptor?.configurable === true,
+          bootstrapReceiptFrozen: Object.isFrozen(receipt),
+          bootstrapReceiptWritable: receiptDescriptor?.writable === true,
+          bootstrapResolvedTheme: receipt?.resolvedTheme || '',
+          bootstrapStoredValue: receipt?.storedValue ?? null,
+          bootstrapThemeColor: receipt?.themeColor || '',
+          bootstrapThemeColorMetaRemoved:
+            document.querySelector('meta[data-hra-appearance-bootstrap-theme-color]') === null,
+          classicHeadScript: script instanceof HTMLScriptElement
+            && script.parentElement === document.head
+            && !script.hasAttribute('src')
+            && !script.hasAttribute('type'),
+          initialBackground: document.documentElement.dataset.hraBackgroundBeforeApp || '',
+          initialRootBackground:
+            document.documentElement.dataset.hraRootBackgroundBeforeApp || '',
+          initialThemeColor: document.documentElement.dataset.hraThemeColorBeforeApp || '',
+          jellyMode: document.documentElement.dataset.jellyMode || '',
+          optionValue: menu?.getAttribute('data-theme-value') || '',
+          rootTheme: document.documentElement.dataset.theme || '',
+          scriptBeforeAppModule: script instanceof HTMLScriptElement
+            && appModule instanceof HTMLScriptElement
+            && (script.compareDocumentPosition(appModule) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+          storageRepaired: receipt?.storageRepaired === true,
+          storedValue: localStorage.getItem(${JSON.stringify(directAppearanceStorageKey)}),
+          systemPrefersDark: matchMedia('(prefers-color-scheme: dark)').matches,
+          themeColorMetaCount: metas.length,
+          unqualifiedThemeColorCount: metas.filter((meta) => !meta.hasAttribute('media')).length,
+        };
+      })()`),
+      fixture.label,
+    );
+    if (
+      captured.activeThemeColor !== expectedThemeColor
+      || captured.appStartTheme !== fixture.resolvedTheme
+      || captured.bodyBackground !== expectedBackground
+      || captured.bootstrapBackgroundColor !== expectedBackground
+      || !captured.bootstrapBackgroundStyleRemoved
+      || captured.bootstrapPreference !== fixture.preference
+      || captured.bootstrapReceiptConfigurable
+      || !captured.bootstrapReceiptFrozen
+      || captured.bootstrapReceiptWritable
+      || captured.bootstrapResolvedTheme !== fixture.resolvedTheme
+      || captured.bootstrapStoredValue !== expectedStoredValue
+      || captured.bootstrapThemeColor !== expectedThemeColor
+      || !captured.bootstrapThemeColorMetaRemoved
+      || !captured.classicHeadScript
+      || captured.initialBackground !== expectedBackground
+      || captured.initialRootBackground !== expectedBackground
+      || captured.initialThemeColor !== expectedThemeColor
+      || captured.jellyMode !== fixture.resolvedTheme
+      || captured.optionValue !== fixture.preference
+      || captured.rootTheme !== fixture.resolvedTheme
+      || !captured.scriptBeforeAppModule
+      || captured.storageRepaired !== fixture.storageRepaired
+      || captured.storedValue !== expectedStoredValue
+      || captured.systemPrefersDark !== (fixture.systemTheme === "dark")
+      || captured.themeColorMetaCount !== 3
+      || captured.unqualifiedThemeColorCount !== 1
+    ) {
+      throw new Error(
+        `${fixture.label} did not resolve background, data-theme, and theme-color before app evaluation: ${JSON.stringify(captured)}`,
+      );
+    }
+    evidence.push(captured);
+  }
+
+  const pageErrors = parseData(
+    browserErrorsSchema,
+    await browser.run(["errors"]),
+    "appearance browser errors",
+  ).errors;
+  const consoleFailures = parseData(
+    consoleSchema,
+    await browser.run(["console"]),
+    "appearance browser console",
+  ).messages.filter(({ type }) => type === "assert" || type === "error");
+  if (pageErrors.length > 0 || consoleFailures.length > 0) {
+    throw new Error(`appearance bootstrap reported browser failures: ${JSON.stringify({
+      consoleFailures,
+      pageErrors,
+    })}`);
+  }
+
+  await browser.run(["set", "media", "light"]);
+  await browser.evaluate(
+    `localStorage.setItem(${JSON.stringify(directAppearanceStorageKey)}, "system")`,
+  );
+  return evidence;
 }
 
 async function verifyThemeColorResolution(
@@ -1099,11 +1351,14 @@ async function run(repositoryRoot: string, baseUrl: string): Promise<string> {
     startServer: () => startServer(repositoryRoot, baseUrl),
   });
   const browser = createAgentBrowser({ repositoryRoot, sessionPrefix: "atc" });
+  let appearanceBootstrap: readonly AppearanceBootstrapEvidence[] = [];
   const evidence: ScenarioEvidence[] = [];
   const sessionManifests: DirectBrowserContract["manifest"][] = [];
   let failure: unknown = null;
   let coverage: readonly CoverageEntry[] = [];
   try {
+    console.log("Verifying first-paint appearance across opposing operating-system preferences...");
+    appearanceBootstrap = await verifyAppearanceBootstrap(browser, baseUrl);
     for (const definition of scenarios) {
       console.log(`Verifying ${definition.id}...`);
       const verified = await verifyScenario({
@@ -1160,6 +1415,7 @@ async function run(repositoryRoot: string, baseUrl: string): Promise<string> {
 
   await writeJsonAtomically(artifactRun.manifestPath, {
     $schema: "hra.direct.web-verification/v1",
+    appearanceBootstrap,
     baseUrl,
     coverage,
     coverageResults: coverage.map((entry) => ({

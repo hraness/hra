@@ -5,8 +5,9 @@
 - `runtime.tsx` – the session-owned stateful deterministic adapter implementing the real `TaskWorkspace` props and actions port.
 - `mount.ts` – failure-atomic session and browser ownership that remains safe under React effect replay.
 - `workbench.tsx` and `workbench.css` – isolated framing around the real task surface after containment is active.
-- `main.tsx`, `index.html`, and `vite.config.ts` – the development-only React/Vite entry and separate `dist-direct` graph.
-- `verify-browser.ts` – bounded browser evidence for representative commands, recovery, pagination, responsive layout, quiescence, and network containment.
+- `appearance-bootstrap.ts`, `index.html`, and `main.tsx` – the development-only classic pre-module appearance bootstrap, frozen receipt, and React handoff.
+- `vite.config.ts`, `build.ts`, and `verify-built-appearance.ts` – the separate `dist-direct` graph, generated-bootstrap build, and built-HTML asset and ordering proof.
+- `verify-browser.ts` – bounded browser evidence for first paint, representative commands, recovery, pagination, responsive layout, quiescence, and network containment.
 - `check-production-boundary.ts` – product-owned source and emitted-asset marker policy.
 - `*.test.ts` and `*.property.test.ts` – deterministic world, catalog, adapter, verifier-policy, and boundary evidence.
 
@@ -14,7 +15,7 @@
 
 - Keep this directory development-only. Production Next.js entries, Convex functions, and provider adapters must never import it.
 - Import `TaskWorkspace`, `TaskWorkspaceProps`, and `TaskWorkspaceActions` from `@hraness/agent-tasks-ui`, and deterministic examples only from its `/fixtures` subpath; do not fork task presentation or controls.
-- Keep the lab on the same shared System-first Light/Dark/System appearance runtime and adaptive first-paint browser chrome as production while retaining its visibly labeled evidence workbench and concrete light pre-bootstrap fallback. The full workbench owns one `ThemeMenuButton` as the final toolbar action; embedded frame-only and diagnostic states stay control-free.
+- Keep the lab on the same shared System-first Light/Dark/System appearance runtime and adaptive first-paint browser chrome as production while retaining its visibly labeled evidence workbench and concrete light SSR fallback. Preserve the generated classic head bootstrap, its frozen pre-module receipt, the built-HTML verifier, and opposing-OS browser evidence for initial background, `data-theme`, and `theme-color`. The full workbench owns one `ThemeMenuButton` as the final toolbar action; embedded frame-only and diagnostic states stay control-free.
 - Never mount WorkOS, `ConvexProvider`, `ConvexTaskWorkspaceAdapter`, or contact a deployment. This lab replaces the backend-neutral workspace port, not provider protocols.
 - Keep worlds strict, bounded, versioned, JSON-safe, cloned, and deterministic. Reject unknown keys, prototype-pollution keys, duplicate identities, inconsistent selections, and mismatched scripts.
 - Use exact ordered scripts for commands whose request, conflict, and state transition are part of the claim. Unexpected or exhausted requests must remain verifier-visible violations.
