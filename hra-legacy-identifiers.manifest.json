@@ -2042,6 +2042,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "d0a500b1c4ff0c643e1bdf2d64157390b29ef6d01774a95ba6be829c7d4ad691",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/web/app/public-markdown.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "f1a9328d3bb1ba0e23b29226225f8b995f382e39fc46c966476f67c8db11f87d",
       "occurrences": {
         "kitchen": 3,

@@ -13,6 +13,7 @@ describe("HRA public and control-plane route boundary", () => {
       "/alternatives",
       "/alternatives/codex-app",
       "/download",
+      "/llms.txt",
       "/opengraph-image",
       "/robots.txt",
       "/sitemap.xml",
@@ -75,6 +76,21 @@ describe("HRA public and control-plane route boundary", () => {
     expect(form).not.toContain("migrationClaim: rawMigrationClaim");
     expect(form).toContain("The email or password was not accepted.");
     expect(pairing).toContain("desktopPairingIdSchema.safeParse(pairingId)");
+  });
+
+  test("negotiates markdown for public pages without inventing an API surface", async () => {
+    const [proxy, proxyPolicy, llmsRoute] = await Promise.all([
+      source("../proxy.ts"),
+      source("../proxy-policy.ts"),
+      source("./llms.txt/route.ts"),
+    ]);
+    expect(proxy).toContain("resolvePublicDiscovery");
+    expect(proxy).toContain("appendVaryAccept");
+    expect(proxy).toContain('from "./response-headers"');
+    expect(proxy).not.toContain("next.config");
+    expect(proxyPolicy).toContain('"/llms.txt"');
+    expect(llmsRoute).toContain("HRA_LLMS_TXT");
+    expect(llmsRoute).toContain("MARKDOWN_CONTENT_TYPE");
   });
 
   test("returns internal control-plane links to app and guards its complete route tree", async () => {

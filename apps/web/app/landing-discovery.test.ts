@@ -13,6 +13,7 @@ import { metadata as downloadMetadata } from "./download/page";
 import { metadata as notFoundMetadata } from "./not-found";
 import OpenGraphImage from "./opengraph-image";
 import { metadata as homepageMetadata } from "./page";
+import { HRA_LLMS_TXT } from "./public-markdown";
 import robots from "./robots";
 import {
   hraRootMetadata,
@@ -125,6 +126,13 @@ describe("HRA public discovery contract", () => {
     });
     expect(notFoundMetadata).not.toHaveProperty("alternates");
     expect(notFoundMetadata).not.toHaveProperty("openGraph");
+  });
+
+  test("keeps crawler files on the existing public product surface", () => {
+    expect(HRA_LLMS_TXT).toContain("When to use this:");
+    expect(HRA_LLMS_TXT).toContain("https://hra.sh/sitemap.xml");
+    expect(robots().sitemap).toBe("https://hra.sh/sitemap.xml");
+    expect(sitemap().some((entry) => entry.url === "https://hra.sh/llms.txt")).toBeFalse();
   });
 
   test("indexes the public product, download, and sourced comparison surfaces", () => {

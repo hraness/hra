@@ -10,6 +10,10 @@ import { readFileSync } from "node:fs";
 
 await mock.module("server-only", () => ({}));
 
+async function source(name: string): Promise<string> {
+  return Bun.file(new URL(name, import.meta.url)).text();
+}
+
 describe("HRA proxy routing", () => {
   test("runs on every route", () => {
     expect(AUTH_PROXY_MATCHER).toEqual(["/:path*"]);
@@ -66,6 +70,13 @@ describe("HRA proxy routing", () => {
     }
   });
 
+  test("does not import next.config into the edge proxy bundle", async () => {
+    const proxy = await source("../proxy.ts");
+    expect(proxy).toContain('from "./response-headers"');
+    expect(proxy).not.toContain("next.config");
+    expect(proxy).not.toContain("hra-icon-runtime");
+  });
+
   test("keeps exact public assets and pages outside configured auth", () => {
     for (const path of [
       "/",
@@ -81,6 +92,8 @@ describe("HRA proxy routing", () => {
       "/favicon.ico",
       "/icon",
       "/icon.png",
+      "/llms.txt",
+      "/llms.txt/",
       "/opengraph-image",
       "/robots.txt",
       "/sitemap.xml",

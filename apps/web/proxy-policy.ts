@@ -13,6 +13,8 @@ const AUTH_PROXY_EXCLUDED_EXACT_PATHS: ReadonlySet<string> = new Set([
   "/favicon.ico",
   "/icon",
   "/icon.png",
+  "/llms.txt",
+  "/llms.txt/",
   "/opengraph-image",
   "/robots.txt",
   "/sitemap.xml",
