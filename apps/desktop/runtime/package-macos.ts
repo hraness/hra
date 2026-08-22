@@ -88,6 +88,7 @@ const contentsRoot = join(appRoot, "Contents");
 const resourcesRoot = join(contentsRoot, "Resources");
 const runtimeRoot = join(resourcesRoot, "runtime");
 const binRoot = join(runtimeRoot, "bin");
+const cliRoot = join(resourcesRoot, "cli");
 const licensesRoot = join(runtimeRoot, "licenses");
 const infoPlist = join(contentsRoot, "Info.plist");
 const gatewayEntitlements = join(
@@ -99,6 +100,10 @@ const ownedCode = Object.freeze([
   {
     identifier: imageNormalizerPackageContract.identifier,
     path: join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
+  },
+  {
+    identifier: "hra-local-observation-cli",
+    path: join(cliRoot, "hra"),
   },
   {
     identifier: "oprte-data-remover",
@@ -606,8 +611,12 @@ async function main(): Promise<void> {
   });
 
   const pins = await verifyRuntimePins();
-  await rm(runtimeRoot, { force: true, recursive: true });
+  await Promise.all([
+    rm(runtimeRoot, { force: true, recursive: true }),
+    rm(cliRoot, { force: true, recursive: true }),
+  ]);
   await mkdir(binRoot, { recursive: true, mode: 0o755 });
+  await mkdir(cliRoot, { recursive: true, mode: 0o755 });
   await mkdir(licensesRoot, { recursive: true, mode: 0o755 });
   await Promise.all([
     copyExclusive(
@@ -615,6 +624,8 @@ async function main(): Promise<void> {
       join(runtimeRoot, imageNormalizerPackageContract.runtimeRelativePath),
     ),
     copyExclusive(join(macosPackage.desktopRoot, "runtime/dist/oprte-gateway"), join(binRoot, "oprte-gateway")),
+    copyExclusive(pins.bunCompiler.executable, join(binRoot, "bun")),
+    copyExclusive(join(macosPackage.desktopRoot, "../local-cli/dist/hra"), join(cliRoot, "hra")),
     copyExclusive(join(macosPackage.desktopRoot, "zig-out/bin/oprte-data-remover"), join(binRoot, "oprte-data-remover")),
     copyExclusive(join(macosPackage.desktopRoot, "zig-out/bin/oprte-git-executor"), join(binRoot, "oprte-git-executor")),
     copyExclusive(join(macosPackage.desktopRoot, "zig-out/bin/oprte-keychain-custodian"), join(binRoot, "oprte-keychain-custodian")),
@@ -629,9 +640,13 @@ async function main(): Promise<void> {
       verbatimSymlinks: true,
     }),
   ]);
-  await Promise.all(ownedCode
-    .filter((entry) => dirname(entry.path) === binRoot)
-    .map((entry) => chmod(entry.path, 0o755)));
+  await Promise.all([
+    chmod(join(binRoot, "bun"), 0o755),
+    chmod(join(cliRoot, "hra"), 0o755),
+    ...ownedCode
+      .filter((entry) => dirname(entry.path) === binRoot)
+      .map((entry) => chmod(entry.path, 0o755)),
+  ]);
   const codexNativeInventory = await stageLicenseFiles({
     codexPackageRoot: pins.codexPackageRoot,
     codexPlatformPackageJson: pins.codexPlatformPackageJson,
@@ -726,6 +741,14 @@ async function main(): Promise<void> {
         dependencyLicenseNoticesSha256:
           runtimeVersions.bun.dependencyLicenseNoticesSha256,
         sha256: await sha256(join(binRoot, "oprte-gateway")),
+      },
+      bun: {
+        binarySha256: await sha256(join(binRoot, "bun")),
+        sourceBinarySha256: pins.bunCompiler.binarySha256,
+        version: pins.bunCompiler.version,
+      },
+      localCli: {
+        sha256: await sha256(join(cliRoot, "hra")),
       },
       git: {
         assetSha256: runtimeVersions.git.assetSha256,

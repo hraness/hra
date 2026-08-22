@@ -154,6 +154,7 @@ const custodyQuarantineRowSchema = z
 export interface FixedLocalDataRemovalPaths {
   readonly applicationSupportParent: string;
   readonly applicationSupportRoot: string;
+  readonly workspaceSetupRoot: string;
   readonly fixedCodexProfileRoots:
     readonly [string, string, string, string, string];
   readonly controlPlanePath: string;
@@ -200,6 +201,7 @@ export function fixedLocalDataRemovalPaths(
   return {
     applicationSupportParent,
     applicationSupportRoot,
+    workspaceSetupRoot: join(applicationSupportRoot, "workspace-setup"),
     fixedCodexProfileRoots: [
       join(applicationSupportRoot, "profiles", "default", "codex-home"),
       join(applicationSupportRoot, "dispatch", "codex-home"),
@@ -247,6 +249,42 @@ export function fixedLocalDataRemovalPaths(
       join(chatWorktrees, ".kitchen-manifests"),
     ],
   };
+}
+
+export function gatewayAdditionalApplicationStateArtifacts(
+  fixed: FixedLocalDataRemovalPaths,
+): readonly LocalDataRemovalArtifactCandidate[] {
+  return [
+    {
+      path: fixed.workspaceSetupRoot,
+      kind: "directory",
+    },
+    // Harness worktrees are inventoried separately as managed worktrees so
+    // a dirty checkout can never hide inside an opaque application-state
+    // target. These four sibling roots contain the remaining v1 harness
+    // state, including encrypted heap bytes whose installation key is an
+    // independently inventoried Keychain target.
+    ...fixed.harnessApplicationStateRoots.map((path) => ({
+      path,
+      kind: "directory" as const,
+    })),
+    {
+      path: fixed.nativeInstanceLockPath,
+      kind: "file",
+    },
+    {
+      path: fixed.updateHazardPath,
+      kind: "file",
+    },
+    {
+      path: fixed.updateHazardTemporaryPath,
+      kind: "file",
+    },
+    ...fixed.manifestRoots.map((path) => ({
+      path,
+      kind: "directory" as const,
+    })),
+  ];
 }
 
 export interface LocalDataRemovalDatabaseInventory {
@@ -416,34 +454,8 @@ export async function discoverGatewayLocalDataRemovalInventory(
       roots: fixed.managedWorktreeRoots,
       git,
     });
-  const additionalApplicationStateArtifacts:
-    LocalDataRemovalArtifactCandidate[] = [
-      // Harness worktrees are inventoried separately as managed worktrees so
-      // a dirty checkout can never hide inside an opaque application-state
-      // target. These four sibling roots contain the remaining v1 harness
-      // state, including encrypted heap bytes whose installation key is an
-      // independently inventoried Keychain target.
-      ...fixed.harnessApplicationStateRoots.map((path) => ({
-        path,
-        kind: "directory" as const,
-      })),
-      {
-        path: fixed.nativeInstanceLockPath,
-        kind: "file",
-      },
-      {
-        path: fixed.updateHazardPath,
-        kind: "file",
-      },
-      {
-        path: fixed.updateHazardTemporaryPath,
-        kind: "file",
-      },
-      ...fixed.manifestRoots.map((path) => ({
-        path,
-        kind: "directory" as const,
-      })),
-    ];
+  const additionalApplicationStateArtifacts =
+    gatewayAdditionalApplicationStateArtifacts(fixed);
   return await discoverLocalDataRemovalInventory({
     homeDirectory: options.effectiveHome,
     applicationSupportRoot: fixed.applicationSupportRoot,

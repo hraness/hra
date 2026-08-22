@@ -660,6 +660,34 @@ export class ChatService {
     return this.#store.list().map((pane) => this.#projectPane(pane));
   }
 
+  /**
+   * Trusted workspace-setup callback. Approval itself is committed by the
+   * setup coordinator; this method only wakes the existing pane-scoped
+   * provision path so it can re-read that durable authority before readiness.
+   */
+  resumeWorkspaceSetup(paneIdValue: ChatPaneId): void {
+    if (this.#admissionClosed) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "Chat admission is closed.",
+      );
+    }
+    const paneId = chatPaneIdSchema.parse(paneIdValue);
+    const pane = this.#store.require(paneId).projection;
+    if (
+      pane.interactionMode !== "chat" ||
+      pane.workspace?.mode !== "managedWorktree" ||
+      pane.workspace.state === "ready" ||
+      pane.workspace.state === "preserved"
+    ) {
+      throw new ChatPaneStoreError(
+        "invalid_state",
+        "The pane has no pending managed-workspace setup.",
+      );
+    }
+    this.#scheduleWorkspaceProvision(paneId);
+  }
+
   async handleAccountUnavailable(
     accountProfileId: ChatAccountProfileId,
     options: Readonly<{

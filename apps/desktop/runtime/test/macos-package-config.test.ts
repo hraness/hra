@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -15,6 +16,7 @@ import {
   hranessUiStylesheetInput,
   imageNormalizerPackageContract,
   macosPackage,
+  requiredCliFileNames,
   requiredLicenseFileNames,
   requiredRuntimeBinFileNames,
   trustedThirdPartyTeams,
@@ -126,6 +128,8 @@ describe("macOS ad-hoc package contract", () => {
     expect(names).toEqual([...new Set(names)].sort());
     expect(names).toContain("hra-image-normalizer");
     expect(names).toContain("oprte-gateway");
+    expect(names).not.toContain("hra");
+    expect(requiredCliFileNames).toEqual(["hra"]);
     expect(imageNormalizerPackageContract).toEqual({
       canonicalFileName: "canonical.png",
       identifier: "hra-image-normalizer",
@@ -141,6 +145,21 @@ describe("macOS ad-hoc package contract", () => {
     expect(imageNormalizerPackageContract.temporaryDirectoryPattern.test(
       ".hra-image-normalizer-0123456789ABCDEF0123456789ABCDEF.tmp",
     )).toBe(false);
+  });
+
+  test("verifies the packaged local CLI identity, architecture, entitlements, and execution", () => {
+    const verifier = readFileSync(
+      join(import.meta.dir, "../verify-macos-package.ts"),
+      "utf8",
+    );
+    expect(verifier).toContain('localCli.identifier !== "hra-local-observation-cli"');
+    expect(verifier).toContain("Local observation CLI architecture differs");
+    expect(verifier).toContain("Local observation CLI must not carry entitlements");
+    expect(verifier).toContain("Local observation CLI execution smoke failed");
+    expect(verifier).toContain('join(cliRoot, "hra")');
+    expect(verifier).toContain("Advertised CLI set differs");
+    expect(verifier).toContain("Advertised CLI root must be a real directory");
+    expect(verifier).toContain("Advertised local CLI must be one regular file");
   });
 
   test("carries the image normalizer through build, manifest, and mounted strict verification", async () => {

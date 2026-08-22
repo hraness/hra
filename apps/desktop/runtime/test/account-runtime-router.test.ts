@@ -57,6 +57,7 @@ function launchOptions(
 
 function paths(account: string): RuntimePaths {
   return {
+    bunBinary: process.execPath,
     codexBinary: "/runtime/codex",
     codexHome: `/profiles/${account}/codex-home`,
     gitBinary: "/runtime/git",

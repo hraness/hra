@@ -5,6 +5,7 @@
 - `package-smoke.ts` – isolated packaged-runtime identity probe used only by the bounded native release smoke.
 - `development-reload.ts` and `development-isolation.ts` – authenticated hot-reload admission plus raw-Debug Application Support and Keychain namespace isolation.
 - `host-protocol.ts` – narrow Native host request/response envelope parsing, renderer dispatch separation, and the private path-bearing project-onboarding capability.
+- `host-request-lanes.ts` – product-wide mutation serialization with explicit independent read and per-pane chat lanes.
 - `app-server-process.ts` – real child-process lifecycle wired through the generation-scoped pinned Codex protocol.
 - `codex/facts.ts`, `codex/fact-projector.ts`, and `codex/fact-router.ts` – the sole parsed-notification-to-owned-fact path and explicit account/session fan-out.
 - `internal-contracts.ts` – gateway-only account-budget, model, project, worktree, session, turn, item, and interaction types that cannot cross the renderer parser.

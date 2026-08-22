@@ -45,6 +45,7 @@
         "@hra-internal/schema": "workspace:*",
         "@hraness/agent-tasks-protocol": "workspace:*",
         "@hraness/hra-human-client": "workspace:*",
+        "@hraness/hra-local-observation-protocol": "workspace:*",
         "@openai/codex": "catalog:",
         "dugite": "catalog:",
         "react": "catalog:",
@@ -68,6 +69,24 @@
         "playwright-core": "catalog:",
         "typescript": "catalog:",
         "vite": "catalog:",
+      },
+    },
+    "apps/local-cli": {
+      "name": "@hraness/hra-local-cli",
+      "version": "0.1.0",
+      "bin": {
+        "hra": "./src/index.ts",
+      },
+      "dependencies": {
+        "@hraness/hra-local-observation-protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@hra-internal/eslint-config": "workspace:*",
+        "@hra-internal/typescript-config": "workspace:*",
+        "@types/bun": "catalog:",
+        "@types/node": "catalog:",
+        "eslint": "catalog:",
+        "typescript": "catalog:",
       },
     },
     "apps/web": {
@@ -271,6 +290,23 @@
     "packages/internal/typescript-config": {
       "name": "@hra-internal/typescript-config",
       "version": "0.1.0",
+    },
+    "packages/local-observation-protocol": {
+      "name": "@hraness/hra-local-observation-protocol",
+      "version": "0.1.0",
+      "dependencies": {
+        "@hra-internal/schema": "workspace:*",
+        "@hraness/agent-tasks-domain": "workspace:*",
+      },
+      "devDependencies": {
+        "@hra-internal/eslint-config": "workspace:*",
+        "@hra-internal/test": "workspace:*",
+        "@hra-internal/typescript-config": "workspace:*",
+        "@types/bun": "catalog:",
+        "eslint": "catalog:",
+        "fast-check": "catalog:",
+        "typescript": "catalog:",
+      },
     },
     "packages/task-domain": {
       "name": "@hraness/agent-tasks-domain",
@@ -539,6 +575,10 @@
     "@hraness/hra-cli": ["@hraness/hra-cli@workspace:apps/cli"],
 
     "@hraness/hra-human-client": ["@hraness/hra-human-client@workspace:packages/human-client"],
+
+    "@hraness/hra-local-cli": ["@hraness/hra-local-cli@workspace:apps/local-cli"],
+
+    "@hraness/hra-local-observation-protocol": ["@hraness/hra-local-observation-protocol@workspace:packages/local-observation-protocol"],
 
     "@hraness/hra-web": ["@hraness/hra-web@workspace:apps/web"],
 
@@ -1995,6 +2035,8 @@
     "@eslint-community/eslint-utils/eslint-visitor-keys": ["eslint-visitor-keys@3.4.3", "", {}, "sha512-wpc+LXeiyiisxPlEkUzU6svyS1frIO3Mgxj1fdy7Pm8Ygzguax2N3Fa/D/ag1WqbOprdI+uY6wMUl8/a2G+iag=="],
 
     "@eslint/eslintrc/globals": ["globals@14.0.0", "", {}, "sha512-oahGvuMGQlPw/ivIYBjVSrWAfWLBeku5tpPE2fOPLi+WHffIWbuh2tCjhyQhTBPMf5E9jDEH4FOmTYgYwbKwtQ=="],
+
+    "@hra-internal/schema/@hraness/result": ["@hraness/result@github:hraness/result#17b311c", {}, "hraness-result-17b311c", "sha512-OzIzJ598pWxKqpuYO+Omki/LYlhZ+bg04u7N0DuhW9FoAruP3ocRs4eyCyWxEEa4gtpEG9AEaTlheYnDlXh2mQ=="],
 
     "@reduxjs/toolkit/immer": ["immer@11.1.16", "", {}, "sha512-Xs7H9rBc+kti1J6RueUvbEBkmOz7jqj11XYgf+YMXAYzu8EeE7hwZ9poLXdVfVnGmJu7QAf41T7H2KuF6QoK6Q=="],
 

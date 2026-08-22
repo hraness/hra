@@ -106,6 +106,15 @@ const portableScheduleAuthorityPresenceSchema = z.object({
   desired_off_present: z.union([z.literal(0), z.literal(1)]),
   pending_mutation_present: z.union([z.literal(0), z.literal(1)]),
 }).strict();
+const portableWorkspaceSetupTableRowSchema = z.object({
+  name: z.enum([
+    "workspace_setup_lane_heads",
+    "workspace_setup_requests",
+  ]),
+}).strict();
+const portableWorkspaceSetupPresenceSchema = z.object({
+  unsettled_setup_present: z.union([z.literal(0), z.literal(1)]),
+}).strict();
 
 type BindingRow = z.infer<typeof bindingRowSchema>;
 type PaneEvidenceRow = z.infer<typeof paneEvidenceRowSchema>;
@@ -119,6 +128,11 @@ interface ProviderThreadArchiveAuthorityRowsV57 {
   readonly attempts: readonly CompleteAuthorityRow[];
   readonly cuts: readonly CompleteAuthorityRow[];
   readonly cutMembers: readonly CompleteAuthorityRow[];
+}
+
+interface WorkspaceSetupAuthorityRowsV63 {
+  readonly heads: readonly CompleteAuthorityRow[];
+  readonly requests: readonly CompleteAuthorityRow[];
 }
 
 export const portableProviderContextProjectionAttestationSchema = z.object({
@@ -164,6 +178,84 @@ export class PortableProviderContextProjectionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PortableProviderContextProjectionError";
+  }
+}
+
+/**
+ * A portable source must have no active setup authority. Terminal and
+ * preserved rows are allowed only as projection input: the portable copy
+ * removes every setup row, including local-only child transcripts.
+ */
+export function assertPortableWorkspaceSetupTransferReady(
+  database: Database,
+  knownMigrationVersion?: number,
+): void {
+  let migrationVersion: number;
+  let tableRows: readonly unknown[];
+  try {
+    migrationVersion = knownMigrationVersion ??
+      validateSupportedMigrationPrefix(database);
+    tableRows = database.query(`
+      SELECT name
+      FROM sqlite_schema
+      WHERE type = 'table'
+        AND name IN ('workspace_setup_lane_heads', 'workspace_setup_requests')
+      ORDER BY name COLLATE BINARY
+    `).all();
+  } catch (error: unknown) {
+    throw new PortableProviderContextProjectionError(
+      `Workspace-setup portability state could not be inspected: ${errorMessage(error)}`,
+    );
+  }
+  const tables = tableRows.map((row) =>
+    portableWorkspaceSetupTableRowSchema.parse(row).name
+  );
+  const expectedTables = migrationVersion < 63
+    ? []
+    : ["workspace_setup_lane_heads", "workspace_setup_requests"];
+  if (
+    tables.length !== expectedTables.length ||
+    tables.some((table, index) => table !== expectedTables[index])
+  ) {
+    throw new PortableProviderContextProjectionError(
+      "Workspace-setup portability state is incomplete.",
+    );
+  }
+  if (migrationVersion < 63) return;
+  let presence: z.infer<typeof portableWorkspaceSetupPresenceSchema>;
+  try {
+    presence = portableWorkspaceSetupPresenceSchema.parse(database.query(`
+      SELECT EXISTS(
+        SELECT 1
+        FROM workspace_setup_requests AS request
+        JOIN workspace_setup_lane_heads AS head
+          ON head.request_id = request.request_id
+         AND head.lane_id = request.lane_id
+        WHERE request.state != 'succeeded'
+          AND (
+            EXISTS (
+              SELECT 1 FROM chat_pane_workspace_bindings AS binding
+              WHERE binding.expected_lane_id = request.lane_id
+                AND binding.workspace_lease_id = request.lane_id
+                AND binding.state != 'preserved'
+            )
+            OR NOT EXISTS (
+              SELECT 1 FROM chat_pane_workspace_bindings AS binding
+              WHERE binding.expected_lane_id = request.lane_id
+                AND binding.workspace_lease_id = request.lane_id
+            )
+          )
+      ) AS unsettled_setup_present
+    `).get());
+  } catch (error: unknown) {
+    throw new PortableProviderContextProjectionError(
+      `Workspace-setup portability state could not be inspected: ${errorMessage(error)}`,
+    );
+  }
+  if (presence.unsettled_setup_present === 1) {
+    throw new PortableProviderContextProjectionError(
+      "Finish or resolve workspace setup before creating or restoring a portable backup.",
+    );
   }
 }
 
@@ -216,6 +308,7 @@ export function assertPortableScheduledChatTransferReady(
       "Scheduled-chat portability state is incomplete.",
     );
   }
+  assertPortableWorkspaceSetupTransferReady(database, migrationVersion);
   if (migrationVersion < 59) return;
   let presence: z.infer<typeof portableScheduleAuthorityPresenceSchema>;
   try {
@@ -278,6 +371,9 @@ export function projectPortableProviderContext(
       const providerThreadArchiveAuthorityV57 = readProviderThreadArchiveAuthorityV57(
         projectionDatabase,
       );
+      const workspaceSetupAuthorityV63 = readWorkspaceSetupAuthorityV63(
+        projectionDatabase,
+      );
       verifyProviderThreadArchiveAuthorityV57(
         projectionDatabase,
         receiptKey,
@@ -302,8 +398,17 @@ export function projectPortableProviderContext(
           leases,
           providerThreadArchiveIntents,
           providerThreadArchiveAuthorityV57,
+          ...(workspaceSetupAuthorityV63.heads.length === 0 &&
+              workspaceSetupAuthorityV63.requests.length === 0
+            ? {}
+            : { workspaceSetupAuthorityV63 }),
         }), "utf8")
         .digest("hex");
+
+      deleteWorkspaceSetupAuthorityV63(
+        projectionDatabase,
+        workspaceSetupAuthorityV63,
+      );
 
       deleteProviderThreadArchiveAuthorityV57(
         projectionDatabase,
@@ -508,6 +613,7 @@ export function inspectPortableProviderContext(
     const providerThreadArchiveAuthorityV57 = readProviderThreadArchiveAuthorityV57(
       database,
     );
+    const workspaceSetupAuthorityV63 = readWorkspaceSetupAuthorityV63(database);
     verifyProviderThreadArchiveAuthorityV57(
       database,
       receiptKey,
@@ -521,9 +627,11 @@ export function inspectPortableProviderContext(
       || providerThreadArchiveAuthorityV57.attempts.length !== 0
       || providerThreadArchiveAuthorityV57.cuts.length !== 0
       || providerThreadArchiveAuthorityV57.cutMembers.length !== 0
+      || workspaceSetupAuthorityV63.heads.length !== 0
+      || workspaceSetupAuthorityV63.requests.length !== 0
     ) {
       throw new PortableProviderContextProjectionError(
-        "The portable copy still contains resumable provider metadata.",
+        "The portable copy still contains resumable provider metadata or local-only setup authority.",
       );
     }
     const affectedPaneIds = readResetRequiredPaneIds(database);
@@ -648,6 +756,76 @@ function readProviderThreadArchiveAuthorityV57(
       completeAuthorityRowSchema.parse(row)
     )),
   });
+}
+
+function readWorkspaceSetupAuthorityV63(
+  database: Database,
+): WorkspaceSetupAuthorityRowsV63 {
+  const migrationVersion = validateSupportedMigrationPrefix(database);
+  if (migrationVersion < 63) {
+    return Object.freeze({ heads: Object.freeze([]), requests: Object.freeze([]) });
+  }
+  const headRows: unknown[] = database.query(`
+    SELECT * FROM workspace_setup_lane_heads
+    ORDER BY lane_id COLLATE BINARY, request_id COLLATE BINARY
+  `).all();
+  const requestRows: unknown[] = database.query(`
+    SELECT * FROM workspace_setup_requests
+    ORDER BY lane_id COLLATE BINARY, request_id COLLATE BINARY
+  `).all();
+  return Object.freeze({
+    heads: Object.freeze(headRows.map((row) =>
+      completeAuthorityRowSchema.parse(row)
+    )),
+    requests: Object.freeze(requestRows.map((row) =>
+      completeAuthorityRowSchema.parse(row)
+    )),
+  });
+}
+
+function deleteWorkspaceSetupAuthorityV63(
+  database: Database,
+  expected: WorkspaceSetupAuthorityRowsV63,
+): void {
+  const tableCount = z.object({ count: z.number().int().nonnegative() }).strict()
+    .parse(database.query(`
+      SELECT COUNT(*) AS count FROM sqlite_schema
+      WHERE type = 'table'
+        AND name IN ('workspace_setup_lane_heads', 'workspace_setup_requests')
+    `).get()).count;
+  if (tableCount === 0) {
+    if (expected.heads.length !== 0 || expected.requests.length !== 0) {
+      throw new PortableProviderContextProjectionError(
+        "Portable workspace-setup authority tables disappeared.",
+      );
+    }
+    return;
+  }
+  if (tableCount !== 2) {
+    throw new PortableProviderContextProjectionError(
+      "Portable workspace-setup authority tables are incomplete.",
+    );
+  }
+  const removedHeads = database.query(
+    "DELETE FROM workspace_setup_lane_heads",
+  ).run();
+  const removedRequests = database.query(
+    "DELETE FROM workspace_setup_requests",
+  ).run();
+  if (
+    Number(removedHeads.changes) !== expected.heads.length ||
+    Number(removedRequests.changes) !== expected.requests.length
+  ) {
+    throw new PortableProviderContextProjectionError(
+      "Portable workspace-setup authority deletion did not settle exactly once.",
+    );
+  }
+  const remaining = readWorkspaceSetupAuthorityV63(database);
+  if (remaining.heads.length !== 0 || remaining.requests.length !== 0) {
+    throw new PortableProviderContextProjectionError(
+      "Portable workspace-setup authority survived projection.",
+    );
+  }
 }
 
 function verifyProviderThreadArchiveAuthorityV57(

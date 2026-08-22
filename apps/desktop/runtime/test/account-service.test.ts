@@ -702,6 +702,7 @@ async function fixture(
     const created = new AccountService({
       archiveAdmissionGate,
       assets: {
+        bunBinary: process.execPath,
         codexBinary: "/fixture/codex",
         gitBinary: "/fixture/git/bin/git",
         gitRoot: "/fixture/git",
@@ -802,6 +803,7 @@ async function generationRecoveryFixture(options: Readonly<{
   service = new AccountService({
     archiveAdmissionGate,
     assets: {
+      bunBinary: process.execPath,
       codexBinary: "/fixture/codex",
       gitBinary: "/fixture/git/bin/git",
       gitRoot: "/fixture/git",

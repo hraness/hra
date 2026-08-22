@@ -100,9 +100,13 @@ export const requiredLicenseFileNames = Object.freeze([
 ] as const);
 
 export const requiredRuntimeBinFileNames = Object.freeze([
+  "bun",
   imageNormalizerPackageContract.identifier,
   "oprte-data-remover",
   "oprte-gateway",
   "oprte-git-executor",
   "oprte-keychain-custodian",
 ] as const);
+
+/** Exact inventory of the only directory users are instructed to add to PATH. */
+export const requiredCliFileNames = Object.freeze(["hra"] as const);

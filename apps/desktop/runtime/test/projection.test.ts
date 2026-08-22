@@ -138,6 +138,21 @@ function chatPane(responseMarkdown = "Ready"): ChatPaneProjection {
 }
 
 describe("renderer-safe gateway projection", () => {
+  test("observes a detached snapshot without compacting renderer delivery", () => {
+    const projection = new RuntimeProjection(emptySnapshot());
+    projection.publish({ type: "account.upserted", account: account() });
+    const queuedCount = projection.queuedEventCount;
+    const queuedBytes = projection.queuedByteCount;
+
+    const observed = projection.observeSnapshot();
+    observed.accounts.length = 0;
+
+    expect(queuedCount).toBe(1);
+    expect(projection.queuedEventCount).toBe(queuedCount);
+    expect(projection.queuedByteCount).toBe(queuedBytes);
+    expect(projection.observeSnapshot().accounts).toHaveLength(1);
+  });
+
   test("maintains exact queue bytes across publish and partial drain", () => {
     const projection = new RuntimeProjection(emptySnapshot());
     const accountEvent = { type: "account.upserted", account: account() } as const;

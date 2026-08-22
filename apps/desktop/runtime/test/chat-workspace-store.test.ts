@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { applyMigrations } from "../src/state/database";
 import { ChatPaneStore } from "../src/state/chat-pane-store";
+import { WorkspaceSetupStore } from "../src/state/workspace-setup-store";
 import { ProviderThreadArchiveJournalV57 } from
   "../src/state/provider-thread-archive-journal-v57";
 import {
@@ -384,6 +385,50 @@ describe.skipIf(gitBinary === null)("ordinary chat managed workspaces", () => {
       `).get();
       expect(preserved?.state).toBe("preserved");
       expect((await stat(preserved!.canonical_checkout_path)).isDirectory()).toBeTrue();
+    } finally {
+      value.database.close();
+    }
+  }, 30_000);
+
+  test("never retries a v62-ready recipe lane after clean replacement is required", async () => {
+    const value = await fixture();
+    try {
+      createPane(value, PANE_ONE);
+      const service = workspaceService(value);
+      const ready = await service.provision(PANE_ONE, value.repository);
+      expect(ready.workspace?.state).toBe("ready");
+      const binding = value.workspaceStore.activeBinding(PANE_ONE);
+      if (binding === null) throw new Error("Expected ready workspace binding");
+      const setup = new WorkspaceSetupStore(value.database, { now: () => NOW });
+      const fenced = setup.requireCleanReplacementForLegacyReadyLane({
+        identity: {
+          runId: binding.expected_lane_id,
+          laneId: binding.expected_lane_id,
+          baseSha: binding.base_sha,
+          branchName: binding.branch_name,
+          canonicalRepositoryPath: binding.canonical_repository_path,
+          canonicalGitCommonDir: binding.canonical_git_common_dir,
+          canonicalCheckoutPath: binding.canonical_checkout_path,
+          recoveryManifestPath: binding.recovery_manifest_path,
+        },
+        recipeDigest: "a".repeat(64),
+        executorDigest: "b".repeat(64),
+      });
+      expect(fenced).toMatchObject({
+        state: "rejected",
+        failureCode: "clean_replacement_required",
+      });
+
+      const stillBlocked = await service.provision(PANE_ONE, value.repository);
+      expect(stillBlocked.workspace).toMatchObject({
+        state: "recoveryRequired",
+        recoveryKind: "provisionInterrupted",
+      });
+      expect(value.workspaceStore.activeBinding(PANE_ONE)).toMatchObject({
+        state: "quarantined",
+        recovery_reason: "provision_interrupted",
+      });
+      expect(setup.headForLane(binding.expected_lane_id)).toEqual(fenced);
     } finally {
       value.database.close();
     }

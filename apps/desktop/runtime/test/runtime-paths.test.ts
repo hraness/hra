@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,6 +49,7 @@ test("shares portable runtime assets while isolating every account Codex home", 
   const second = accountPaths(assets, join(root, "second", "codex-home"));
 
   expect(first.codexBinary).toBe(second.codexBinary);
+  expect(first.bunBinary).toBe(second.bunBinary);
   expect(first.gitBinary).toBe(second.gitBinary);
   expect(first.codexHome).not.toBe(second.codexHome);
   expect((await stat(first.codexHome)).mode & 0o777).toBe(0o700);
@@ -64,6 +66,22 @@ test("rejects a relative account credential home", () => {
   expect(() => accountPaths(assets, "profiles/account/codex-home")).toThrow(
     "Codex home must be an absolute path",
   );
+});
+
+test("accepts only an absolute executable Bun runtime", () => {
+  expect(() => resolvePortableRuntimeAssets({
+    HRA_BUN_BIN: "relative/bun",
+    HRA_CODEX_BIN: "/usr/bin/true",
+    HRA_GIT_BIN: "/usr/bin/true",
+    HRA_GIT_ROOT: "/usr",
+  })).toThrow("Bun binary must be an absolute path");
+
+  expect(resolvePortableRuntimeAssets({
+    HRA_BUN_BIN: process.execPath,
+    HRA_CODEX_BIN: "/usr/bin/true",
+    HRA_GIT_BIN: "/usr/bin/true",
+    HRA_GIT_ROOT: "/usr",
+  }).bunBinary).toBe(realpathSync(process.execPath));
 });
 
 test("uses the OPRTE root for the development credential fallback", async () => {

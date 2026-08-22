@@ -39,6 +39,12 @@ import {
   type TaskListPage,
   type WorkspaceSummary,
 } from "@hraness/agent-tasks-protocol";
+import {
+  attentionProjectionSchema,
+  workspaceRecipeDigestSchema,
+  workspaceSetupRequestIdSchema,
+  type AttentionProjection,
+} from "@hraness/hra-local-observation-protocol/attention";
 
 export const runtimeProtocolVersion = 3 as const;
 export const runtimeSnapshotCommand = "hra.runtime.snapshot" as const;
@@ -2482,6 +2488,17 @@ const runtimeTaskPromotionRecoveryCommandSchema = z.object({
   promotionId: taskDomain.promotionIdSchema,
 }).strict();
 
+const runtimeAttentionListCommandSchema = z.object({
+  type: z.literal("observation.attention.list"),
+}).strict();
+
+const runtimeWorkspaceSetupApproveCommandSchema = z.object({
+  type: z.literal("workspace.setup.approve"),
+  setupRequestId: workspaceSetupRequestIdSchema,
+  recipeDigest: workspaceRecipeDigestSchema,
+  expectedSetupRevision: revisionSchema,
+}).strict();
+
 export const runtimeTaskDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeTaskWorkspaceListCommandSchema,
   runtimeTaskRepositoryListCommandSchema,
@@ -2975,6 +2992,8 @@ export const runtimeSessionSyncDomainCommandSchema = z.discriminatedUnion(
 );
 
 export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
+  runtimeAttentionListCommandSchema,
+  runtimeWorkspaceSetupApproveCommandSchema,
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
   runtimeChatPaneScheduleConfigureCommandSchema,
@@ -3247,6 +3266,17 @@ export const runtimeErrorSchema = z
 
 const runtimeCommandResultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted") }).strict(),
+  z.object({
+    type: z.literal("attentionProjection"),
+    projection: attentionProjectionSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("workspaceSetupApproval"),
+    setupRequestId: workspaceSetupRequestIdSchema,
+    recipeDigest: workspaceRecipeDigestSchema,
+    revision: revisionSchema,
+    changed: z.boolean(),
+  }).strict(),
   runtimeChatPaneResultSchema,
   runtimeChatPaneReplayResultSchema,
   runtimeChatMessageQueueResultSchema,
@@ -3978,6 +4008,7 @@ export type WorkspaceDatabaseSequence = Extract<
   { outcome: "committed" }
 >["eventSequence"];
 export type RuntimeTaskWorkspaceSummaries = readonly WorkspaceSummary[];
+export type RuntimeAttentionProjection = AttentionProjection;
 export type RuntimeTaskRepositorySummary = z.infer<
   typeof runtimeTaskRepositorySummarySchema
 >;

@@ -22,6 +22,7 @@ import {
 } from "../src/cloud/session-sync-key-custody";
 import {
   fixedLocalDataRemovalPaths,
+  gatewayAdditionalApplicationStateArtifacts,
   isLocalDataRemovalBundledGitPathContained,
   readLocalDataRemovalDatabaseInventory,
   reconcileGatewayManagedWorktreeInventory,
@@ -169,6 +170,8 @@ describe("gateway local-data removal inventory", () => {
         "/Users/example/Library/Application Support",
       applicationSupportRoot:
         "/Users/example/Library/Application Support/OPRTE",
+      workspaceSetupRoot:
+        "/Users/example/Library/Application Support/OPRTE/workspace-setup",
       fixedCodexProfileRoots: [
         "/Users/example/Library/Application Support/OPRTE/profiles/default/codex-home",
         "/Users/example/Library/Application Support/OPRTE/dispatch/codex-home",
@@ -208,6 +211,15 @@ describe("gateway local-data removal inventory", () => {
         "/Users/example/Library/Application Support/OPRTE/chat-worktrees/.oprte-manifests",
         "/Users/example/Library/Application Support/OPRTE/chat-worktrees/.kitchen-manifests",
       ],
+    });
+  });
+
+  test("inventories the exact workspace-setup private root as application state", () => {
+    const fixed = fixedLocalDataRemovalPaths("/Users/example");
+    expect(gatewayAdditionalApplicationStateArtifacts(fixed)).toContainEqual({
+      path:
+        "/Users/example/Library/Application Support/OPRTE/workspace-setup",
+      kind: "directory",
     });
   });
 

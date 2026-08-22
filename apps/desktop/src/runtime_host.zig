@@ -382,6 +382,7 @@ pub const PathOptions = struct {
     /// a `.app/Contents/MacOS` directory.
     gateway_path: ?[]const u8 = null,
     runtime_root: ?[]const u8 = null,
+    bun_bin: ?[]const u8 = null,
     codex_bin: ?[]const u8 = null,
     git_root: ?[]const u8 = null,
     git_bin: ?[]const u8 = null,
@@ -394,6 +395,7 @@ pub const PathOptions = struct {
 pub const RuntimePaths = struct {
     runtime_root: []u8,
     gateway_path: []u8,
+    bun_bin: []u8,
     codex_bin: []u8,
     git_root: []u8,
     git_bin: []u8,
@@ -405,6 +407,7 @@ pub const RuntimePaths = struct {
     pub fn deinit(self: *RuntimePaths, allocator: std.mem.Allocator) void {
         allocator.free(self.runtime_root);
         allocator.free(self.gateway_path);
+        allocator.free(self.bun_bin);
         allocator.free(self.codex_bin);
         allocator.free(self.git_root);
         allocator.free(self.git_bin);
@@ -466,6 +469,12 @@ fn resolveRuntimePathsForExecutable(
     };
     return runtimePathsFromRoot(allocator, raw_runtime_root, .{
         .gateway_path = gateway_override,
+        .bun_bin = options.bun_bin orelse try renamedEnvironmentValue(
+            parent,
+            "HRA_BUN_BIN",
+            "OPRTE_BUN_BIN",
+            "KITCHEN_BUN_BIN",
+        ),
         .codex_bin = options.codex_bin orelse try renamedEnvironmentValue(
             parent,
             "HRA_CODEX_BIN",
@@ -543,6 +552,7 @@ fn renamedEnvironmentValue(
 
 const ToolOverrides = struct {
     gateway_path: ?[]const u8 = null,
+    bun_bin: ?[]const u8 = null,
     codex_bin: ?[]const u8 = null,
     git_root: ?[]const u8 = null,
     git_bin: ?[]const u8 = null,
@@ -566,6 +576,12 @@ fn runtimePathsFromRoot(
     else
         try joinAbsolute(allocator, &.{ paths.runtime_root, "bin", "oprte-gateway" });
     errdefer allocator.free(paths.gateway_path);
+
+    paths.bun_bin = if (overrides.bun_bin) |path|
+        try normalizedAbsolute(allocator, path)
+    else
+        try joinAbsolute(allocator, &.{ paths.runtime_root, "bin", "bun" });
+    errdefer allocator.free(paths.bun_bin);
 
     paths.codex_bin = if (overrides.codex_bin) |path|
         try normalizedAbsolute(allocator, path)
@@ -724,6 +740,7 @@ pub fn buildSanitizedEnvironment(
     });
 
     try environment.put("HRA_GATEWAY_PATH", paths.gateway_path);
+    try environment.put("HRA_BUN_BIN", paths.bun_bin);
     try environment.put("HRA_CODEX_BIN", paths.codex_bin);
     try environment.put("HRA_GIT_ROOT", paths.git_root);
     try environment.put("HRA_GIT_BIN", paths.git_bin);
@@ -10899,6 +10916,7 @@ test "packaged runtime paths ignore every executable and root override" {
     var parent: std.process.Environ.Map = .init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("HRA_GATEWAY_PATH", "/tmp/untrusted/bin/oprte-gateway");
+    try parent.put("HRA_BUN_BIN", "/tmp/untrusted/bun");
     try parent.put("HRA_CODEX_BIN", "/tmp/untrusted/codex");
     try parent.put("HRA_GIT_ROOT", "/tmp/untrusted/git");
     try parent.put("HRA_GIT_BIN", "/tmp/untrusted/git/bin/git");
@@ -10914,6 +10932,7 @@ test "packaged runtime paths ignore every executable and root override" {
     var paths = try resolveRuntimePathsForExecutable(std.testing.allocator, &parent, .{
         .runtime_root = "/tmp/explicit/runtime",
         .gateway_path = "/tmp/explicit/runtime/bin/oprte-gateway",
+        .bun_bin = "/tmp/explicit/runtime/bin/bun",
         .codex_bin = "/tmp/explicit/codex",
         .git_root = "/tmp/explicit/git",
         .git_bin = "/tmp/explicit/git/bin/git",
@@ -10924,6 +10943,7 @@ test "packaged runtime paths ignore every executable and root override" {
 
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime", paths.runtime_root);
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-gateway", paths.gateway_path);
+    try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/bin/bun", paths.bun_bin);
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/codex/bin/codex", paths.codex_bin);
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git", paths.git_root);
     try std.testing.expectEqualStrings("/Applications/HRA.app/Contents/Resources/runtime/git/bin/git", paths.git_bin);
@@ -10970,6 +10990,7 @@ test "development path overrides are explicit and independently preserved" {
     var parent: std.process.Environ.Map = .init(std.testing.allocator);
     defer parent.deinit();
     try parent.put("HRA_GATEWAY_PATH", "/tmp/hra-runtime/bin/oprte-gateway");
+    try parent.put("HRA_BUN_BIN", "/opt/runtime/bin/bun");
     try parent.put("HRA_CODEX_BIN", "/opt/codex/codex");
     try parent.put("HRA_GIT_ROOT", "/opt/git-runtime");
     try parent.put("HRA_GIT_BIN", "/opt/git-runtime/libexec/git");
@@ -10984,6 +11005,7 @@ test "development path overrides are explicit and independently preserved" {
 
     var paths = try resolveRuntimePathsForExecutable(std.testing.allocator, &parent, .{
         .gateway_path = "/tmp/explicit-runtime/bin/oprte-gateway",
+        .bun_bin = "/tmp/explicit-runtime/bin/bun",
         .codex_bin = "/tmp/explicit-codex/codex",
         .git_root = "/tmp/explicit-git",
         .git_bin = "/tmp/explicit-git/libexec/git",
@@ -10993,6 +11015,7 @@ test "development path overrides are explicit and independently preserved" {
     defer paths.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/tmp/explicit-runtime", paths.runtime_root);
     try std.testing.expectEqualStrings("/tmp/explicit-runtime/bin/oprte-gateway", paths.gateway_path);
+    try std.testing.expectEqualStrings("/tmp/explicit-runtime/bin/bun", paths.bun_bin);
     try std.testing.expectEqualStrings("/tmp/explicit-codex/codex", paths.codex_bin);
     try std.testing.expectEqualStrings("/tmp/explicit-git", paths.git_root);
     try std.testing.expectEqualStrings("/tmp/explicit-git/libexec/git", paths.git_bin);
@@ -11106,6 +11129,7 @@ test "raw development sidecar is cloud detached while pinning runtime tools" {
     try std.testing.expect(environment.get("HRA_CLOUD_WEB_URL") == null);
     try std.testing.expect(environment.get("OPRTE_CLOUD_WEB_URL") == null);
     try std.testing.expectEqualStrings("/opt/hra/runtime/bin/oprte-gateway", environment.get("HRA_GATEWAY_PATH").?);
+    try std.testing.expectEqualStrings("/opt/hra/runtime/bin/bun", environment.get("HRA_BUN_BIN").?);
     try std.testing.expectEqualStrings("/opt/hra/runtime/codex/bin/codex", environment.get("HRA_CODEX_BIN").?);
     try std.testing.expectEqualStrings(
         "/opt/hra/runtime/bin/oprte-git-executor",

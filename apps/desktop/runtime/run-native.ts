@@ -269,6 +269,7 @@ function runtimeEnvironment(
 ): Record<string, string | undefined> {
   const environment: Record<string, string | undefined> = {
     ...scrubRetiredSelfEditEnvironment(process.env),
+    HRA_BUN_BIN: runtimePaths.bunBinary,
     HRA_CODEX_BIN: runtimePaths.codexBinary,
     HRA_GATEWAY_PATH: gatewayPath,
     HRA_GIT_BIN: runtimePaths.gitBinary,

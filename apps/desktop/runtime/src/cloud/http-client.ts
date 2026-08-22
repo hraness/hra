@@ -486,6 +486,7 @@ export class HRAHumanHttpTransport {
     input: {
       readonly cursor?: HRAProjectionCursor;
       readonly limit?: number;
+      readonly signal?: AbortSignal;
     } = {},
   ): Promise<HRACloudOperation<HRAWorkspaceList>> {
     const cursor = cursorFor(input.cursor, { scope: "workspaces" });
@@ -494,6 +495,7 @@ export class HRAHumanHttpTransport {
       method: "GET",
       path: hraHumanApiRoutes.workspaces,
       responseSchema: listHRAWorkspacesEnvelopeSchema,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
       query: validatedQuery(listHRAWorkspacesQuerySchema, {
         cursor: cursor?.token,
         limit: String(boundedPageLimit(input.limit)),

@@ -130,6 +130,8 @@ const maximumArgumentCount = 256;
 const maximumArgumentBytes = 64 * 1_024;
 const allowedGitCommands = new Set([
   "branch",
+  "cat-file",
+  "ls-tree",
   "rev-parse",
   "show-ref",
   "status",
@@ -1020,6 +1022,23 @@ function assertArguments(args: readonly string[]): void {
   }
   if (command === undefined || !allowedGitCommands.has(command)) {
     throw new GitExecutionError("invalid_arguments");
+  }
+  const commandIndex = args.indexOf(command);
+  if (command === "cat-file") {
+    if (
+      commandIndex < 0 || args.length - commandIndex !== 3 ||
+      args[commandIndex + 1] !== "blob" ||
+      !/^[a-f0-9]{40,64}$/u.test(args[commandIndex + 2] ?? "")
+    ) throw new GitExecutionError("invalid_arguments");
+  }
+  if (command === "ls-tree") {
+    if (
+      commandIndex < 0 || args.length - commandIndex !== 5 ||
+      args[commandIndex + 1] !== "-z" ||
+      !/^[a-f0-9]{40,64}$/u.test(args[commandIndex + 2] ?? "") ||
+      args[commandIndex + 3] !== "--" ||
+      args[commandIndex + 4] !== ".hra/workspace.json"
+    ) throw new GitExecutionError("invalid_arguments");
   }
 }
 

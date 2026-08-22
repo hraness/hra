@@ -13,6 +13,7 @@ import type {
   RuntimeDispatchResponse,
 } from "../../contracts/runtime";
 import { SubscriptionsSettings } from "./features/accounts/SubscriptionsSettings";
+import { AttentionDrawer } from "./features/attention/AttentionDrawer";
 import { HRAIcon } from "./features/chat/Icon";
 import { PaneGrid } from "./features/chat/PaneGrid";
 import {
@@ -33,6 +34,7 @@ import {
 } from "./features/chat/model";
 import {
   type RuntimeShell,
+  type RuntimeShellState,
   useRuntimeShellSelector,
 } from "./runtime";
 import { useUiScale } from "./ui-scale";
@@ -76,6 +78,50 @@ export function inheritedRepositoryIsUnavailable(
     && response.error.message === "This repository is unavailable.";
 }
 
+export function selectAttentionRefreshKey(state: RuntimeShellState): string {
+  const snapshot = state.state === "ready" || state.state === "reconnecting" ||
+      state.state === "failed"
+    ? state.snapshot
+    : undefined;
+  if (snapshot == null) return state.state;
+  const syncStatus = snapshot.sessionSync.status;
+  return JSON.stringify({
+    shell: state.state,
+    runtime: snapshot.runtime,
+    runner: snapshot.runner,
+    accounts: snapshot.accounts.map(({ id, revision }) => [id, revision]),
+    folderAccessRevision: snapshot.execution.folderAccess.revision,
+    humanAccountRevision: snapshot.humanAccount.revision,
+    paneAttention: snapshot.chat.panes.map((pane) => ({
+      id: pane.id,
+      title: pane.title,
+      repositoryName: pane.repository.name,
+      workspaceRevision: pane.workspace?.revision ?? null,
+      workspaceRecoveryKind: pane.workspace?.recoveryKind ?? null,
+      attentionCode: pane.attention?.code ?? null,
+      queuePauseReason: pane.messageQueue.pauseReason,
+      blockedMessage: pane.messageQueue.blockedMessage !== null,
+    })),
+    sessionSync: syncStatus.state === "active"
+      ? {
+          state: syncStatus.state,
+          revision: syncStatus.revision,
+          health: syncStatus.health,
+          recovery: syncStatus.recovery,
+          pendingEnrollmentCount: syncStatus.pendingEnrollments.length,
+          scheduledChatRecovery: syncStatus.scheduledChatRecovery?.state ?? null,
+          remoteSessions: snapshot.sessionSync.remoteSessions.map(
+            ({ sessionId, sourceRevision, state: remoteState }) => [
+              sessionId,
+              sourceRevision,
+              remoteState,
+            ],
+          ),
+        }
+      : syncStatus,
+  });
+}
+
 export default function App({ headerAccessory, runtimeShellFactory }: AppProps) {
   const shellRef = useRef<RuntimeShell | null>(null);
   const [runtimeShell, setRuntimeShell] = useState<RuntimeShell | null>(null);
@@ -102,6 +148,10 @@ export default function App({ headerAccessory, runtimeShellFactory }: AppProps) 
     runtimeShell,
     selectExecution,
     executionEqual,
+  );
+  const attentionRefreshKey = useRuntimeShellSelector(
+    runtimeShell,
+    selectAttentionRefreshKey,
   );
 
   useEffect(() => {
@@ -288,6 +338,11 @@ export default function App({ headerAccessory, runtimeShellFactory }: AppProps) 
         </Button>
         <div className="hra-header__actions">
           {headerAccessory}
+          <AttentionDrawer
+            isAvailable={availability.kind === "ready"}
+            refreshKey={attentionRefreshKey}
+            shell={runtimeShell}
+          />
           {effectiveRoute === "panes" ? (
             <IconButton
               aria-label={creatingPane ? "Choosing a project" : "New pane"}

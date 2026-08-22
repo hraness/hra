@@ -2,7 +2,7 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1198c5072fdde8d94fd6587c876f2f389dacec5528fa88c23a46d9598583e738",
+      "matchingLinesSha256": "c8666f8e00af8eb866683eae0f2e775b0ea82707f085dbcafdf88cfdf82b3b20",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -62,7 +62,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c94589943b1002434fb8d0805717c19cf05a0d23b98c5c3ca1962d2ab58c3cef",
+      "matchingLinesSha256": "dc8131c40793c4ad5c91f9b41c406d27ae1a9c2d31fc94f30241ecb521024bfa",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -152,7 +152,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6e9254f9daf76aca9f9c6174f7827e4e160f8cfabff7ce5d10e0c5716651a880",
+      "matchingLinesSha256": "7beb2ecf18f41962de6d776749a08278db7c2f0aaad81004a06e7e9994c0e3d2",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -162,7 +162,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9a96d5c718ca96009d517504a8c79e47895a97f8dc28f022df5522f968f5a278",
+      "matchingLinesSha256": "1eb04cafbbcfa66174ddbd2f2c55a7c5a942aa0c6475208b9b28524efd7a0b61",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -172,7 +172,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1915a4fadd1b2142932412f439a07dcaeae62cfcd7ac425ded5b37b565bbdf0e",
+      "matchingLinesSha256": "4533ce720a8c7b9539e8933db355c065ba6f741c9487f1a76c389a88ba968f9c",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -232,7 +232,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "87a60c9a1750adb3a12fd0ed54f82c0327674f89b8eff439aaf80be987314182",
+      "matchingLinesSha256": "2007627584e228c4a9ab153ab5fa16367456ac10904cb5100fd68e45f686f392",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -572,7 +572,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "90d4602e18dd58d3e00b31bc904a2d7fe498087ef7feeac4c6546a202b43daef",
+      "matchingLinesSha256": "dbe5e8098ff00ff56c6772e578dc5e0523b2020e4887c6edfd882230d55db25c",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
@@ -672,7 +672,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "e1caa4f874bae52f4a4fc0bae7f79eac2761a24c4e88d858ea2a0e8c6dba7457",
+      "matchingLinesSha256": "272b17e5fffc60dbecb6699da36aecfa441e1c351b501579b2f1b5d2a265b329",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -752,6 +752,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "98d96d9990a353a8a4497dc1a4858a37affa3bbaeb97c8cf49caa4c3b5dfad9a",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/state/workspace-setup-store.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "2604bba7f254abb9386c79ff35607e8343e95c38d0ecd303a3a52c0a78c114ba",
       "occurrences": {
         "kitchen": 0,
@@ -762,7 +772,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "63235abb0706a13684d9879aa92d73a6141a1f51c1fba251e3f88af71bd40ccd",
+      "matchingLinesSha256": "08a2518959e0f1215f0957f038b7e498e983d25add5e394c04fc60cac7578489",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -792,7 +802,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "185cd0fd13b0d1e128c2f79df309d15049b3ee7d793aebabaf4eaff014d6d9c3",
+      "matchingLinesSha256": "bac4d2cdaab1c797c05d74b3ddfaa14b6d1dac2d1066e3ab3adfba9749e09809",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -802,7 +812,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "ea48ad4b4777b360cceacc344c622152b25ae084de729ed3faaed6a7421cca29",
+      "matchingLinesSha256": "7a6cfae369e3468e923973db1ddc5a6d23e1b3d0e1ad6b999175cacba7b6bd8b",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -812,7 +822,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "38497553dda5912c335c57c79a4725dbd81393408f710d7c8a0db35f6bfb3e7b",
+      "matchingLinesSha256": "a98f03d940da57bd4a01afe632823dbed6c75004572f3626946607c8c26abd40",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -839,6 +849,16 @@
         "oprte": 8
       },
       "path": "apps/desktop/runtime/test/application-support-worktree-repair.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cd1a3c8e398fd9d2a095e9f2441c6aeef24fdd5e96027e622b9eec8bb3959fb8",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/bundled-bun-workspace-setup.test.ts"
     },
     {
       "category": "compatibility",
@@ -872,7 +892,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "967a093185e4acb8a4bd3c78599c71fb2ad4263eb9d7c600509b0b3f1e3a32ff",
+      "matchingLinesSha256": "5300636f46d21c6c12dd74b1dc3c471b9d52bf5baf9c645ae9934cac00ee4e0c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -882,7 +902,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d6a47afa5d1da0a2877c4179326364c9fdf32160750980ec966a98917364ff34",
+      "matchingLinesSha256": "4a2752af582cb6bdad67d36bf3271c0d8df8673cd967e20ba239d6949f83556c",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
@@ -922,7 +942,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "137ea2f231378facbda686aafce18f704953d21199b6d78465d0d03331528163",
+      "matchingLinesSha256": "007e7c1864a8f964ea79034c933e7b5f4e458aa8d560545bbfc9d9fa7f7e6bb4",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1002,11 +1022,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6cbecaee394dd0a2942f80985b34459b1d0952a53aefa4f823bee275e27f2458",
+      "matchingLinesSha256": "8be7e65132a147e8c5b01771ebd5e761a1bcc929e4a615d9c09901e07a3c362d",
       "occurrences": {
         "kitchen": 5,
         "operateStylized": 0,
-        "oprte": 57
+        "oprte": 58
       },
       "path": "apps/desktop/runtime/test/control-plane-backup.test.ts"
     },
@@ -1029,6 +1049,16 @@
         "oprte": 10
       },
       "path": "apps/desktop/runtime/test/control-plane-maintenance.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cd589bffb0dab3d1d0164f4b298aaba4b30c30ee80be7dc3e15f4f6ddd521bb8",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/control-plane-portable-projection.test.ts"
     },
     {
       "category": "compatibility",
@@ -1312,7 +1342,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c72db276b867f15d114f3d7381632f92c849f937e4a998426ea8a4e6a153bdf5",
+      "matchingLinesSha256": "490acbd28a785b51b51375a883085ad95f139f48f0327c3a824fa5239d30708c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1502,11 +1532,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "f8cee97eef6af9fd726e94d04d3ec228e853022cca8e46d1916c77775b97c143",
+      "matchingLinesSha256": "3930295c2127812a7135c01194b11163dad8921cb568ecde565d351e2aeb6f36",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
-        "oprte": 44
+        "oprte": 46
       },
       "path": "apps/desktop/runtime/test/local-data-removal-inventory.test.ts"
     },
@@ -1532,7 +1562,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c696ed27df6ed56f3c90a56181f1ab87844308136a21705201fadcf5c371ffcc",
+      "matchingLinesSha256": "507784e185d7417dab00bb504f23e7f63f5d795bb5d746559ebe30c9a276d0bd",
       "occurrences": {
         "kitchen": 5,
         "operateStylized": 0,
@@ -1592,7 +1622,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "14f98d8f3df9aabc2c0f603b48545f21d447ed3d2960dbf25ad2094463155a4f",
+      "matchingLinesSha256": "0d00fb4544083f831973db9b54e769f626f9fdd392ec8c470c1bd5b6e2ac59c8",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1612,7 +1642,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "160d6226a851d16b24195f4a75babeadf4d2a412e2765a1b24b60b0f43ce2158",
+      "matchingLinesSha256": "1c3e31d73e294d58ce040491960cd4efd0f11134821b3a766d64f6665be9b7cc",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -1712,7 +1742,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "0f94774a25eaa0ac1d77a5ce75fac8678910bdc1e9730e8bc43b5183fa5d002b",
+      "matchingLinesSha256": "bcf93e5d4bebfbd16ce2baf32cc92ee728adf0bfb25ce9086d6cbc2b417292a0",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1772,7 +1802,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "dcdcd418dfcb71fcd46af5d5c0aacdeea66ed60f6e60b713ed998f72d83a27cf",
+      "matchingLinesSha256": "ceba54b2c9fc999c7c86d092def6b27c992f01b1bbd90eaf50b23ef04e37a2a9",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1782,7 +1812,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "463cc64762c73e25c1ccbc36cf8680ff9509701bdeeb9fc5605ecbdb10aa5357",
+      "matchingLinesSha256": "11a574e087194e470acf9372b524554074efb2472913d3951c6cfc4880c87f5c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1792,7 +1822,17 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "2284296e2a788b581938be2c73bf83113aacdc37ce50b7c8a6af81a863718a22",
+      "matchingLinesSha256": "7cd542b4255fd5b263fab32e02f595b41ed435874835a1079f268fdd22dbcda1",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/workspace-setup-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "ec7abbd464d5fc89cfa88d3ef29479a439dbed7a10f7aad70c879b0af0b7a0c3",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -1912,13 +1952,33 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "12ee16eecc00b30d2c4a8faf551452d706a31f7c49d4a8016da6a5212281c2d1",
+      "matchingLinesSha256": "ea1eb5b39312cd89e77511c21105c8d8858d86e1f54c78bb627b914b10dc275f",
       "occurrences": {
-        "kitchen": 11,
+        "kitchen": 12,
         "operateStylized": 0,
-        "oprte": 74
+        "oprte": 75
       },
       "path": "apps/desktop/src/runtime_host.zig"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9f1c0418fc60ab628565722d297907640d6dd03c52d7d6ccaf72036da3a010da",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/local-cli/src/discovery.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "851afff7f26f5ccede46bcfd98ca24933e1b9bacbdb91c9f77dee253fc58b8fe",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/local-cli/src/discovery.ts"
     },
     {
       "category": "compatibility",

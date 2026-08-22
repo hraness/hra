@@ -1,6 +1,6 @@
 # Contents
 
-- `migrations.ts` – immutable, checksummed SQLite control-plane schema migrations, including account tombstones, local task authority, durable due work, frozen promotion state, and private bounded chat-pane state.
+- `migrations.ts` – immutable, checksummed SQLite control-plane schema migrations, including account tombstones, local task authority, durable due work, frozen promotion state, private bounded chat-pane state, and workspace-setup authority.
 - `control-plane-lock.ts` – no-follow, user-only, OS-released lifetime gate acquired after Application Support cutover and before the control-plane database opens.
 - `application-support.ts` – exclusive, receipt-backed migration from historical desktop state roots to HRA plus a separate no-migration raw-development root, including no-follow validation, WAL recovery, rollback, and downgrade guards.
 - `application-support-worktree-repair.ts` – journaled SQLite, recovery-manifest, external Git metadata, and moved-Codex-cwd repair after the Application Support root changes.
@@ -16,6 +16,7 @@
 - `dispatch-runner-installation.ts` – stable installation identity, boot generation, accepted heartbeat sequence, and exact secret-free pending heartbeat replay.
 - `local-task-store.ts` – account-free workspace onboarding, atomic portable task commands, keyed receipts, metadata-only renderer effect recovery and legacy quarantine, typed event sequences, and fixed-query atomic renderer-safe workspace projections with immutable list continuations.
 - `chat-pane-store.ts` – private bounded chat panes, exact pane and turn revision clocks, provider-thread bindings, bounded local conversation history, idempotent turn receipts, and restart recovery.
+- `workspace-setup-store.ts` – content-free immutable-base recipe approval, exact effect claims, terminal diagnostics, executor-generation recovery, and pane attention coordinates.
 - `chat-message-ledger-schema-v1.ts` and `chat-message-ledger.ts` – the additive app-owned FIFO message ledger, independent queue and row CAS clocks, bounded complete text, opaque ready-only attachment authority, lifecycle cuts, pause reasons, and restart reconciliation primitives.
 - `chat-pane-palette-schema-v1.ts` – deterministic existing-pane backfill plus transactional, monotonic, immutable decorative palette identity.
 - `chat-message-ambiguous-resolution-schema-v1.ts` – append-only user discard receipts for terminally contained ambiguous message effects.
@@ -55,6 +56,7 @@
 - Complete Application Support cutover, integrity checks, and path repair before accounts, Codex, or cloud dispatch can start. Never merge roots or follow a link or special file during migration.
 - Keep database and parent-directory permissions user-only. The authoritative connection must prove foreign keys, WAL, FULL synchronization, and `trusted_schema=OFF` before migrations or state access.
 - Bind operation receipts with the separate per-install HMAC key; never retain commands or unkeyed command digests. Persist chat successes as bounded content-free receipts. A replay returns a sparse operation proof rather than a current pane or queue snapshot masquerading as historical state.
+- Bind workspace setup to the exact lane, project, immutable base SHA, recipe digest, and executor digest. Persist approval before the fixed setup effect, mark effect start before spawning, and convert every prior-executor effect to ambiguity at startup without replay. Keep child output bounded and local-only; projections receive only opaque request identity, digest, revision, and closed outcome.
 - Acquire and retain the control-plane lifetime lock before opening SQLite; process metadata is diagnostic only and must never override the OS-released lock.
 - Hold that same OS lifetime lock across every production backup restore,
   interrupted-restore recovery, and journal-authorized namespace cleanup. Tests

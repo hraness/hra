@@ -31,6 +31,7 @@ import {
   type WorkspaceLaneIdentity,
   type WorkspaceLaneIdentityStore,
 } from "../src/workspaces/workspace-broker";
+import type { WorkspaceSetupGate } from "../src/workspaces/workspace-setup";
 
 const temporaryRoots: string[] = [];
 const gitBinary = Bun.which("git");
@@ -79,6 +80,8 @@ class ObservedGitRunner implements GitRunner {
 class MemoryWorkspaceIdentityStore implements WorkspaceLaneIdentityStore {
   identity: WorkspaceLaneIdentity | null = null;
   recoveryOverride: WorkspaceLaneIdentity | null | undefined;
+  readonly events: string[] = [];
+  readyCalls = 0;
 
   bindWorkspaceLane(input: WorkspaceLaneIdentity): WorkspaceLaneIdentity {
     if (this.identity === null) this.identity = input;
@@ -91,7 +94,10 @@ class MemoryWorkspaceIdentityStore implements WorkspaceLaneIdentityStore {
       : this.recoveryOverride;
   }
 
-  markWorkspaceLaneReady(): void {}
+  markWorkspaceLaneReady(): void {
+    this.events.push("ready");
+    this.readyCalls += 1;
+  }
 }
 
 async function repositoryFixture(prefix: string): Promise<{
@@ -269,6 +275,132 @@ describe.skipIf(gitBinary === null)("managed workspace broker", () => {
       });
 
       expect(replay).toEqual({ ...first, recovered: true });
+    },
+    20_000,
+  );
+
+  test(
+    "gates created and recovered lanes before the durable ready edge",
+    async () => {
+      const { baseSha, git, lanesRoot, repository } = await repositoryFixture(
+        "hra-workspace-setup-gate-",
+      );
+      const identityStore = new MemoryWorkspaceIdentityStore();
+      let blocked = true;
+      let calls = 0;
+      const setupGate: WorkspaceSetupGate = {
+        async beforeWorkspaceReady(input) {
+          calls += 1;
+          identityStore.events.push("setup");
+          expect(await lstat(input.canonicalCheckoutPath)).toMatchObject({});
+          if (blocked) throw new Error("approval required");
+        },
+      };
+      const broker = new WorkspaceBroker({
+        git,
+        identityStore,
+        lanesRoot,
+        setupGate,
+      });
+
+      expect(await rejectionMessage(broker.provision({
+        runId: "run_setupgate001",
+        repositoryPath: repository,
+        baseSha,
+      }))).toBe("approval required");
+      expect(identityStore.identity).not.toBeNull();
+      expect(identityStore.readyCalls).toBe(0);
+      expect(await lstat(join(lanesRoot, "run_setupgate001"))).toMatchObject({});
+
+      blocked = false;
+      const recovered = await broker.provision({
+        runId: "run_setupgate001",
+        repositoryPath: repository,
+        baseSha,
+      });
+      expect(recovered.recovered).toBeTrue();
+      expect(calls).toBe(2);
+      expect(identityStore.events).toEqual(["setup", "setup", "ready"]);
+      expect(identityStore.readyCalls).toBe(1);
+    },
+    20_000,
+  );
+
+  test(
+    "does not retain the repository provisioning lock while setup waits",
+    async () => {
+      const { baseSha, git, lanesRoot, repository } = await repositoryFixture(
+        "hra-workspace-setup-unlocked-",
+      );
+      let releaseFirst!: () => void;
+      const firstMayFinish = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let firstEntered!: () => void;
+      const firstSetupEntered = new Promise<void>((resolve) => {
+        firstEntered = resolve;
+      });
+      let secondEntered!: () => void;
+      const secondSetupEntered = new Promise<void>((resolve) => {
+        secondEntered = resolve;
+      });
+      const setupGate: WorkspaceSetupGate = {
+        async beforeWorkspaceReady(input) {
+          if (input.laneId === "run_setupslow001") {
+            firstEntered();
+            await firstMayFinish;
+          } else {
+            secondEntered();
+          }
+        },
+      };
+      const broker = new WorkspaceBroker({ git, lanesRoot, setupGate });
+      const first = broker.provision({
+        runId: "run_setupslow001",
+        repositoryPath: repository,
+        baseSha,
+      });
+      await firstSetupEntered;
+      const second = broker.provision({
+        runId: "run_setupslow002",
+        repositoryPath: repository,
+        baseSha,
+      });
+      await Promise.race([
+        secondSetupEntered,
+        Bun.sleep(2_000).then(() => {
+          throw new Error("second lane remained behind the setup gate lock");
+        }),
+      ]);
+      releaseFirst();
+      await Promise.all([first, second]);
+    },
+    20_000,
+  );
+
+  test(
+    "never applies the managed setup gate to read-only snapshots",
+    async () => {
+      const { baseSha, git, lanesRoot, repository } = await repositoryFixture(
+        "hra-workspace-setup-read-only-",
+      );
+      let calls = 0;
+      const broker = new WorkspaceBroker({
+        git,
+        lanesRoot,
+        setupGate: {
+          beforeWorkspaceReady() {
+            calls += 1;
+            return Promise.resolve();
+          },
+        },
+      });
+      await broker.provisionReadOnlySnapshot({
+        snapshotId: "snapshot_setupreadonly01",
+        repositoryPath: repository,
+        sourceSha: baseSha,
+      });
+      expect(calls).toBe(0);
     },
     20_000,
   );

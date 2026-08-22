@@ -67,6 +67,7 @@ import {
   type RuntimeTransportLifecycle,
 } from "../../contracts/runtime";
 import { runtimeChatPaneStateChangedEvent } from "../../contracts/runtime-delivery";
+import { projectAttention } from "../../runtime/src/observation";
 import type { RuntimeTransport } from "../src/runtime-bridge";
 import type { HRADirectRoute } from "./scenarios";
 import {
@@ -799,6 +800,25 @@ class DeterministicRuntimeTransport {
     const request = parseRuntimeDispatchRequest(payload);
     const command = request.command;
     switch (command.type) {
+      case "observation.attention.list":
+        return this.#success(request, {
+          type: "attentionProjection",
+          projection: projectAttention({
+            snapshot: this.#snapshot,
+            tasks: {
+              completeness: "complete",
+              workspaces: this.#taskState.workspaces,
+            },
+          }),
+        });
+      case "workspace.setup.approve":
+        return this.#success(request, {
+          type: "workspaceSetupApproval",
+          setupRequestId: command.setupRequestId,
+          recipeDigest: command.recipeDigest,
+          revision: command.expectedSetupRevision + 1,
+          changed: true,
+        });
       case "chat.pane.create": {
         if (this.#snapshot.chat.panes.length >= 64) {
           return this.#chatFailure(

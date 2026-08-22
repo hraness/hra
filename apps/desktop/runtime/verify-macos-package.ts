@@ -40,6 +40,7 @@ import {
   hranessUiStylesheetInput,
   imageNormalizerPackageContract,
   macosPackage,
+  requiredCliFileNames,
   requiredLicenseFileNames,
   requiredRuntimeBinFileNames,
   trustedThirdPartyTeams,
@@ -304,6 +305,8 @@ async function verifyRuntimeManifest(
   }
 
   const gateway = record(runtime["gateway"], "runtime gateway");
+  const bun = record(runtime["bun"], "runtime Bun");
+  const localCli = record(runtime["localCli"], "runtime local CLI");
   const dataRemover = record(runtime["dataRemover"], "runtime data remover");
   const gitExecutor = record(runtime["gitExecutor"], "runtime Git executor");
   const imageNormalizer = record(runtime["imageNormalizer"], "runtime image normalizer");
@@ -322,6 +325,7 @@ async function verifyRuntimeManifest(
       string(imageNormalizer["sha256"], "image normalizer SHA-256"),
     ],
     ["bin/oprte-gateway", string(gateway["sha256"], "gateway SHA-256")],
+    ["bin/bun", string(bun["binarySha256"], "Bun SHA-256")],
     ["bin/oprte-data-remover", string(dataRemover["sha256"], "data remover SHA-256")],
     ["bin/oprte-git-executor", string(gitExecutor["sha256"], "Git executor SHA-256")],
     ["bin/oprte-keychain-custodian", string(keychainCustodian["sha256"], "Keychain custodian SHA-256")],
@@ -339,8 +343,17 @@ async function verifyRuntimeManifest(
       throw new Error(`Runtime hash differs: ${path}`);
     }
   }
+  const localCliSha256 = string(localCli["sha256"], "local CLI SHA-256");
   if (
-    gateway["bunVersion"] !== runtimeVersions.bun.version
+    !/^[0-9a-f]{64}$/u.test(localCliSha256) ||
+    await sha256File(join(appPath, "Contents/Resources/cli/hra")) !== localCliSha256
+  ) {
+    throw new Error("Local observation CLI hash differs.");
+  }
+  if (
+    bun["version"] !== runtimeVersions.bun.version
+    || bun["sourceBinarySha256"] !== runtimeVersions.bun.binarySha256
+    || gateway["bunVersion"] !== runtimeVersions.bun.version
     || gateway["compilerBinarySha256"] !== runtimeVersions.bun.binarySha256
     || gateway["compilerReleaseAssetSha256"] !== runtimeVersions.bun.releaseAssetSha256
     || gateway["compilerSourceCommit"] !== runtimeVersions.bun.sourceCommit
@@ -559,6 +572,7 @@ export async function verifyMacOSApp(
   }
   const contentsRoot = join(canonical, "Contents");
   const runtimeRoot = join(contentsRoot, "Resources/runtime");
+  const cliRoot = join(contentsRoot, "Resources/cli");
   const plist = join(contentsRoot, "Info.plist");
   const expectedPlist = new Map([
     ["CFBundleDisplayName", macosPackage.displayName],
@@ -591,6 +605,24 @@ export async function verifyMacOSApp(
   const bins = (await readdir(join(runtimeRoot, "bin"))).sort();
   if (JSON.stringify(bins) !== JSON.stringify([...requiredRuntimeBinFileNames])) {
     throw new Error(`Runtime bin set differs: ${bins.join(", ")}`);
+  }
+  const [cliRootStatus, localCliStatus] = await Promise.all([
+    lstat(cliRoot),
+    lstat(join(cliRoot, "hra")),
+  ]);
+  if (!cliRootStatus.isDirectory() || cliRootStatus.isSymbolicLink()) {
+    throw new Error("Advertised CLI root must be a real directory.");
+  }
+  if (
+    !localCliStatus.isFile() ||
+    localCliStatus.isSymbolicLink() ||
+    localCliStatus.nlink !== 1
+  ) {
+    throw new Error("Advertised local CLI must be one regular file.");
+  }
+  const cliFiles = (await readdir(cliRoot)).sort();
+  if (JSON.stringify(cliFiles) !== JSON.stringify([...requiredCliFileNames])) {
+    throw new Error(`Advertised CLI set differs: ${cliFiles.join(", ")}`);
   }
   const licenses = (await readdir(join(runtimeRoot, "licenses"))).sort();
   if (JSON.stringify(licenses) !== JSON.stringify([...requiredLicenseFileNames])) {
@@ -732,6 +764,37 @@ export async function verifyMacOSApp(
   ) {
     throw new Error("Gateway JIT entitlement is missing.");
   }
+  const localCliPath = join(cliRoot, "hra");
+  const localCli = await codeSignature(localCliPath);
+  if (
+    localCli.identifier !== "hra-local-observation-cli" ||
+    localCli.teamIdentifier !== null
+  ) {
+    throw new Error("Local observation CLI code identity differs.");
+  }
+  await run(["/usr/bin/codesign", "--verify", "--strict", localCliPath]);
+  if (!isDeepStrictEqual(await codeSignatureEntitlements(localCliPath), {})) {
+    throw new Error("Local observation CLI must not carry entitlements.");
+  }
+  const localCliArchs = (await run([
+    "/usr/bin/lipo",
+    "-archs",
+    localCliPath,
+  ])).stdout.trim();
+  if (localCliArchs !== macosPackage.architecture) {
+    throw new Error(`Local observation CLI architecture differs: ${localCliArchs}`);
+  }
+  const localCliSmoke = await run([localCliPath, "package-smoke"], {
+    allowFailure: true,
+  });
+  if (
+    localCliSmoke.exitCode !== 2 ||
+    localCliSmoke.stdout !== "" ||
+    localCliSmoke.stderr !==
+      "usage:\n  hra attention list --json\n  hra pane list --json\n"
+  ) {
+    throw new Error("Local observation CLI execution smoke failed.");
+  }
   const host = await codeSignature(join(contentsRoot, `MacOS/${macosPackage.executableName}`));
   if (host.identifier !== macosPackage.bundleIdentifier || host.teamIdentifier !== null) {
     throw new Error("Ad-hoc host code identity differs.");
@@ -751,6 +814,10 @@ export async function verifyMacOSApp(
   ])).stdout.trim();
   if (archs !== macosPackage.architecture) {
     throw new Error(`Host architecture differs: ${archs}`);
+  }
+  const bunVersion = (await run([join(runtimeRoot, "bin/bun"), "--version"])).stdout.trim();
+  if (bunVersion !== runtimeVersions.bun.version) {
+    throw new Error(`Bundled Bun version differs: ${bunVersion}`);
   }
   const codexVersion = (await run([join(runtimeRoot, "codex/bin/codex"), "--version"])).stdout.trim();
   if (codexVersion !== `codex-cli ${runtimeVersions.codex.version}`) {
@@ -912,6 +979,7 @@ export async function launchSmokeMacOSApp(
       || markerStatus.mode & 0o077
       || marker["schemaVersion"] !== 1
       || marker["bunVersion"] !== "1.3.14"
+      || marker["setupBunVersion"] !== runtimeVersions.bun.version
       || marker["codexVersion"] !== `codex-cli ${runtimeVersions.codex.version}`
       || marker["gitVersion"] !== `git version ${runtimeVersions.git.version}`
     ) {

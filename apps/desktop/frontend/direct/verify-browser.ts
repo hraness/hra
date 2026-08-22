@@ -184,6 +184,7 @@ interface CoveragePolicyEntry {
 type ScenarioAction =
   | "prepare-draft"
   | "create-pane"
+  | "open-attention"
   | "exercise-malleable-chat"
   | "exercise-scheduled-chat"
   | "exercise-compact-controls"
@@ -354,6 +355,28 @@ const scenarios = [
     ],
     forbiddenText: ["Allow once", "Approve", "Queue", "Steer", "Submit answer"],
     viewport: { width: 1_760, height: 900 },
+  },
+  {
+    id: "attention-mission-control",
+    action: "open-attention",
+    expectedBeforeAction: ["Release delivery"],
+    expectedText: [
+      "Attention",
+      "Local recovery, decisions, and reviews",
+      "Recovery",
+      "Message delivery is uncertain",
+      "Needs you",
+      "2 tasks need attention",
+      "Review",
+      "1 task is ready for review",
+    ],
+    expectedVisibleControls: [
+      "Attention, 3 items",
+      "Refresh attention",
+      "Close attention",
+    ],
+    forbiddenText: ["providerSession", "/Users/"],
+    viewport: { width: 1_120, height: 780 },
   },
   {
     id: "chat-compact-320",
@@ -1220,6 +1243,17 @@ async function runAction(
   switch (action) {
     case "none":
       return;
+    case "open-attention": {
+      await clickButton(browser, "Attention, 3 items");
+      await waitForVisibleText(browser, "Local recovery, decisions, and reviews");
+      const drawerText = await browser.evaluate(
+        "document.querySelector('.attention-drawer')?.textContent ?? ''",
+      );
+      if (typeof drawerText !== "string" || drawerText.includes("Private queued text")) {
+        throw new Error("The attention drawer exposed private queue content.");
+      }
+      return;
+    }
     case "prepare-draft": {
       await clickButton(browser, "Choose project for HRA");
       await browser.run(["wait", "--fn", "document.querySelector('.chat-pane__repository')?.textContent?.trim() === 'hra'"]);
@@ -2172,6 +2206,11 @@ async function verifyScenarioSemantics(
     failures.push("a send button is not contained by its composer surface");
   }
   switch (scenarioId) {
+    case "attention-mission-control":
+      if (state.paneCount !== 1 || state.paneStates[0] !== "ready") {
+        failures.push("mission control did not retain its one local ready pane");
+      }
+      break;
     case "chat-draft":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("configured draft is not one ready pane");
       if (state.titleInputCount !== 0) failures.push("title editor did not close after explicit commit");

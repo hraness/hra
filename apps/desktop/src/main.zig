@@ -195,10 +195,10 @@ const App = struct {
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
-        if (comptime std.mem.eql(u8, build_options.platform, "macos") and
-            self.product_native_authority)
-        {
-            hra_macos_updater_stop();
+        if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
+            if (self.product_native_authority) {
+                hra_macos_updater_stop();
+            }
         }
         self.runtime_host.stop(runtime);
         self.releaseMacOSInstanceGuard();

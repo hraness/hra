@@ -28,6 +28,7 @@ const {
 const expectedScenarios = [
   "account-maximum-label",
   "account-signed-out",
+  "attention-mission-control",
   "chat-attention",
   "chat-compact-320",
   "chat-compact-415",
@@ -69,6 +70,7 @@ const expectedScenarios = [
 ] as const;
 
 const expectedCoverage = [
+  "attention.mission-control",
   "chat.pane.attachment-preview",
   "chat.pane.attention-recovery",
   "chat.pane.compact-responsive",

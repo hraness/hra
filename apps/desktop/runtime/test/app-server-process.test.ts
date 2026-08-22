@@ -35,7 +35,13 @@ async function fixturePaths(codexHomeName = "codex-home"): Promise<RuntimePaths>
     build.exited,
   ]);
   if (exitCode !== 0) throw new Error(`fixture compile failed: ${stdout}${stderr}`);
-  return { codexBinary, codexHome, gitBinary: "/usr/bin/git", gitRoot: "/usr" };
+  return {
+    bunBinary: process.execPath,
+    codexBinary,
+    codexHome,
+    gitBinary: "/usr/bin/git",
+    gitRoot: "/usr",
+  };
 }
 
 describe("Codex app-server process integration", () => {

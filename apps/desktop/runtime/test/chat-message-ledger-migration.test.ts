@@ -38,7 +38,7 @@ test("message-ledger migrations backfill a pane and reopen with exact queue cloc
   expect(archiveIntentMigration.name).toBe(
     "durable-provider-thread-archive-intent",
   );
-  expect(migrations.at(-1)?.version).toBe(62);
+  expect(migrations.at(-1)?.version).toBe(63);
 
   const legacy = new Database(":memory:", { strict: true });
   legacy.exec("PRAGMA foreign_keys = ON");

@@ -6,6 +6,7 @@ import { z } from "@hra-internal/schema";
 
 import type { GitRunner, GitRunOptions } from "./git-runner";
 import { GitCommandError, requireGit } from "./git-runner";
+import type { WorkspaceSetupGate } from "./workspace-setup";
 
 const runIdPattern = /^[a-z0-9][a-z0-9_-]{7,127}$/u;
 const commitPattern = /^[a-f0-9]{40,64}$/u;
@@ -203,6 +204,7 @@ export class WorkspaceBroker {
   readonly #identityStore: WorkspaceLaneIdentityStore | null;
   readonly #lanesRootGuard: WorkspaceLanesRootGuard | null;
   readonly #readOnlyIdentityStore: ReadOnlySnapshotIdentityStore | null;
+  readonly #setupGate: WorkspaceSetupGate | null;
   readonly #lanesRoot: string;
 
   constructor(options: {
@@ -211,6 +213,7 @@ export class WorkspaceBroker {
     readonly identityStore?: WorkspaceLaneIdentityStore;
     readonly lanesRootGuard?: WorkspaceLanesRootGuard;
     readonly readOnlyIdentityStore?: ReadOnlySnapshotIdentityStore;
+    readonly setupGate?: WorkspaceSetupGate;
     readonly lanesRoot: string;
   }) {
     if (!isAbsolute(options.lanesRoot)) throw new Error("Managed-worktree root must be absolute");
@@ -219,6 +222,7 @@ export class WorkspaceBroker {
     this.#identityStore = options.identityStore ?? null;
     this.#lanesRootGuard = options.lanesRootGuard ?? null;
     this.#readOnlyIdentityStore = options.readOnlyIdentityStore ?? null;
+    this.#setupGate = options.setupGate ?? null;
     this.#lanesRoot = options.lanesRoot;
   }
 
@@ -314,7 +318,7 @@ export class WorkspaceBroker {
       })
     );
     if (existing !== null) {
-      return await withRecoveryInspectionSlot(() =>
+      const recovered = await withRecoveryInspectionSlot(() =>
         this.#recoverManagedWorkspace({
           existing,
           expectedIdentity,
@@ -322,6 +326,10 @@ export class WorkspaceBroker {
           lanesRoot,
           manifestPath,
         })
+      );
+      return await this.#completeManagedWorkspace(
+        recovered,
+        expectedIdentity,
       );
     }
 
@@ -397,8 +405,6 @@ export class WorkspaceBroker {
         })
       );
       this.#bindIdentity(expectedIdentity);
-      this.#identityStore?.markWorkspaceLaneReady(expectedIdentity);
-      await this.#assertLanesRoot();
       return { kind: "created" as const, workspace: recovered };
     }
     if (branchProbe.exitCode !== 1) {
@@ -443,13 +449,11 @@ export class WorkspaceBroker {
       ),
       recovered: false,
     };
-    this.#identityStore?.markWorkspaceLaneReady(expectedIdentity);
-    await this.#assertLanesRoot();
     return { kind: "created" as const, workspace };
       },
     );
     if (outcome.kind === "recover") {
-      return await withRecoveryInspectionSlot(() =>
+      const recovered = await withRecoveryInspectionSlot(() =>
         this.#recoverManagedWorkspace({
           existing: outcome.existing,
           expectedIdentity,
@@ -458,8 +462,15 @@ export class WorkspaceBroker {
           manifestPath,
         })
       );
+      return await this.#completeManagedWorkspace(
+        recovered,
+        expectedIdentity,
+      );
     }
-    return outcome.workspace;
+    return await this.#completeManagedWorkspace(
+      outcome.workspace,
+      expectedIdentity,
+    );
   }
 
   async #recoverManagedWorkspace(input: Readonly<{
@@ -489,7 +500,15 @@ export class WorkspaceBroker {
       })
     );
     this.#bindIdentity(input.expectedIdentity);
-    this.#identityStore?.markWorkspaceLaneReady(input.expectedIdentity);
+    return workspace;
+  }
+
+  async #completeManagedWorkspace(
+    workspace: ManagedWorkspace,
+    identity: WorkspaceLaneIdentity,
+  ): Promise<ManagedWorkspace> {
+    await this.#setupGate?.beforeWorkspaceReady(identity);
+    this.#identityStore?.markWorkspaceLaneReady(identity);
     await this.#assertLanesRoot();
     return workspace;
   }

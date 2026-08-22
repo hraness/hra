@@ -697,6 +697,65 @@ describe("encrypted control-plane backup and restore", () => {
     source.database.close();
   }, 60_000);
 
+  test("refuses to publish while workspace setup awaits or follows an effect", () => {
+    for (const state of [
+      "approval_required",
+      "rejected",
+      "prepared",
+      "effect_started",
+      "failed",
+      "ambiguous",
+    ] as const) {
+      const root = privateTemporaryDirectory(`hra-backup-workspace-setup-${state}-`);
+      const source = createControlPlane(root, "source", release100, sourceInstallation);
+      seedWorkspaceSetupState(source.database, state);
+      const archivePath = join(root, "control-plane.hkb");
+
+      const failure = captureControlPlaneBackupError(() => {
+        createBackup(source, archivePath, release100);
+      });
+      expect(failure.code).toBe("invalid_input");
+      expect(failure.message).toContain("Finish or resolve workspace setup");
+      expect(existsSync(archivePath)).toBe(false);
+      expect(existsSync(backupCandidatePath(archivePath))).toBe(false);
+      expect(source.database.query(`
+        SELECT state FROM workspace_setup_requests
+      `).get()).toEqual({ state });
+      source.database.close();
+    }
+  });
+
+  test("refuses restore before mutating a destination with unsettled workspace setup", () => {
+    const root = privateTemporaryDirectory("hra-restore-workspace-setup-");
+    const source = createControlPlane(root, "source", release100, sourceInstallation);
+    const archivePath = join(root, "older-control-plane.hkb");
+    const backup = createBackup(source, archivePath, release100);
+    source.database.close();
+
+    const target = createControlPlane(root, "target", release100, oldInstallation);
+    seedWorkspaceSetupState(target.database, "prepared");
+    checkpointAndClose(target.database);
+    const before = snapshotControlPlanePair(target.databasePath);
+    const vaultBefore = inspectControlPlaneAttachmentVault(
+      target.attachmentVaultRoot,
+    );
+
+    const failure = captureControlPlaneBackupError(() => {
+      restoreEncryptedControlPlaneBackup({
+        archivePath,
+        databasePath: target.databasePath,
+        passphrase,
+        releaseIdentity: release100,
+        confirmedArchiveSha256: backup.archiveSha256,
+      });
+    });
+    expect(failure.code).toBe("invalid_input");
+    expect(failure.message).toContain("Finish or resolve workspace setup");
+    expect(snapshotControlPlanePair(target.databasePath)).toEqual(before);
+    expect(inspectControlPlaneAttachmentVault(target.attachmentVaultRoot))
+      .toEqual(vaultBefore);
+  }, 60_000);
+
   test("verifies and restores a valid v61 portable schedule snapshot", () => {
     const root = privateTemporaryDirectory("hra-backup-v61-schedule-");
     const source = createControlPlane(root, "source", release100, sourceInstallation);
@@ -3556,11 +3615,150 @@ function seedPortableScheduledChatState(
   );
 }
 
+function seedWorkspaceSetupState(
+  database: Database,
+  state:
+    | "approval_required"
+    | "rejected"
+    | "prepared"
+    | "effect_started"
+    | "failed"
+    | "ambiguous",
+): void {
+  const at = "2026-08-19T12:00:00.000Z";
+  const requestId = `wssetup_${"f".repeat(32)}`;
+  const laneId = "lane_backup_setup0001";
+  const repositoryId = "repo_backup_setup0001";
+  const projectId = "project_backup_setup0001";
+  const paneId = "pane_backup_setup0001";
+  const repositoryPath = "/backup/setup";
+  const gitCommonDir = "/backup/setup/.git";
+  const checkoutPath = "/backup/setup-lane";
+  const manifestPath = "/backup/setup-manifest.json";
+  const branchName = "codex/oprte-lane_backup_setup0001";
+  const baseSha = "1".repeat(40);
+  database.query(`
+    INSERT INTO local_repositories(
+      repository_id, name, canonical_repository_path,
+      canonical_git_common_dir, created_at, updated_at
+    ) VALUES (?1, 'Backup setup', ?2, ?3, 1, 1)
+  `).run(repositoryId, repositoryPath, gitCommonDir);
+  database.query(`
+    INSERT INTO projects(
+      project_id, canonical_repository_path, canonical_git_common_dir,
+      display_name, created_at, updated_at
+    ) VALUES (?1, ?2, ?3, 'Backup setup', ?4, ?4)
+  `).run(projectId, repositoryPath, gitCommonDir, at);
+  database.query(`
+    INSERT INTO workspace_leases(
+      lane_id, project_id, canonical_checkout_path, mode, status, base_sha,
+      branch_name, retention, recovery_manifest_path, created_at, updated_at
+    ) VALUES (?1, ?2, ?3, 'chat_managed_worktree', 'provisioning', ?4,
+      ?5, 'preserve', ?6, ?7, ?7)
+  `).run(
+    laneId,
+    projectId,
+    checkoutPath,
+    baseSha,
+    branchName,
+    manifestPath,
+    at,
+  );
+  database.query(`
+    INSERT INTO chat_panes(
+      pane_id, palette_index, repository_id, repository_name, revision, title,
+      reasoning_effort, state, display_order, workspace_mode,
+      workspace_state, workspace_revision, workspace_recovery_reason,
+      created_at, updated_at
+    ) VALUES (
+      ?1,
+      (SELECT next_palette_index FROM chat_pane_palette_sequence WHERE singleton = 1),
+      ?2, 'Backup setup', 1, 'Backup setup', 'ultra', 'ready', 0,
+      'managed_worktree', 'preparing', 1, NULL, ?3, ?3
+    )
+  `).run(paneId, repositoryId, at);
+  database.query(`
+    INSERT INTO chat_pane_workspace_bindings(
+      binding_id, pane_id, repository_id, project_id, expected_lane_id,
+      workspace_lease_id, base_sha, branch_name,
+      canonical_repository_path, canonical_git_common_dir,
+      canonical_checkout_path, recovery_manifest_path, state, revision,
+      recovery_reason, created_at, updated_at
+    ) VALUES (
+      'chatws_backup_setup0001', ?1, ?2, ?3, ?4,
+      ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'provisioning', 1,
+      NULL, ?11, ?11
+    )
+  `).run(
+    paneId,
+    repositoryId,
+    projectId,
+    laneId,
+    baseSha,
+    branchName,
+    repositoryPath,
+    gitCommonDir,
+    checkoutPath,
+    manifestPath,
+    at,
+  );
+  const approved = !["approval_required", "rejected"].includes(state);
+  const effectStarted = !["approval_required", "rejected", "prepared"].includes(
+    state,
+  );
+  const terminal = ["rejected", "failed", "ambiguous"].includes(state);
+  const transcript = state === "failed" ? "install failed" : null;
+  database.query(`
+    INSERT INTO workspace_setup_requests(
+      request_id, lane_id, project_id, base_sha, recipe_digest,
+      executor_digest, state, setup_revision, approval_binding_digest,
+      executor_instance_id, failure_code, transcript, transcript_bytes,
+      created_at, updated_at, approved_at, effect_started_at, completed_at
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5,
+      ?6, ?7, ?8, ?9,
+      ?10, ?11, ?12, ?13,
+      ?14, ?14, ?15, ?16, ?17
+    )
+  `).run(
+    requestId,
+    laneId,
+    projectId,
+    baseSha,
+    "2".repeat(64),
+    "3".repeat(64),
+    state,
+    state === "approval_required" || state === "rejected" ? 1 :
+      state === "prepared" ? 2 :
+      state === "effect_started" ? 3 : 4,
+    approved ? "4".repeat(64) : null,
+    effectStarted ? "executor_backup_setup_0001" : null,
+    state === "rejected"
+      ? "invalid_recipe"
+      : state === "failed"
+      ? "exit_nonzero"
+      : null,
+    transcript,
+    transcript === null ? null : Buffer.byteLength(transcript, "utf8"),
+    at,
+    approved ? at : null,
+    effectStarted ? at : null,
+    terminal ? at : null,
+  );
+  database.query(`
+    INSERT INTO workspace_setup_lane_heads(lane_id, request_id, updated_at)
+    VALUES (?1, ?2, ?3)
+  `).run(laneId, requestId, at);
+}
+
 function downgradeScheduledChatSchemaToV61(database: Database): void {
   database.exec(`
+    DROP TABLE workspace_setup_lane_heads;
+    DROP TABLE workspace_setup_requests;
     DROP TRIGGER chat_scheduled_chat_desired_off_pane_update_quarantine;
     DROP TRIGGER chat_scheduled_chat_desired_off_pane_delete_quarantine;
     DROP TABLE chat_scheduled_chat_desired_off;
+    DELETE FROM schema_migrations WHERE version = 63;
     DELETE FROM schema_migrations WHERE version = 62;
     UPDATE app_release_state SET migration_version = 61;
   `);

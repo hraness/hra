@@ -3743,4 +3743,372 @@ export const migrations = [
     name: "scheduled-chat-durable-off-intent",
     sql: SCHEDULED_CHAT_DURABLE_OFF_INTENT_SCHEMA_SQL,
   },
+  {
+    version: 63,
+    name: "durable-workspace-setup-authority",
+    sql: `
+      CREATE TABLE workspace_setup_requests (
+        request_id TEXT PRIMARY KEY CHECK (
+          length(request_id) = 40
+          AND request_id GLOB 'wssetup_[a-f0-9]*'
+          AND substr(request_id, 9) NOT GLOB '*[^a-f0-9]*'
+        ),
+        lane_id TEXT NOT NULL
+          REFERENCES workspace_leases(lane_id) ON DELETE RESTRICT,
+        project_id TEXT NOT NULL
+          REFERENCES projects(project_id) ON DELETE RESTRICT,
+        base_sha TEXT NOT NULL CHECK (
+          length(base_sha) BETWEEN 40 AND 64
+          AND base_sha NOT GLOB '*[^a-f0-9]*'
+        ),
+        recipe_digest TEXT NOT NULL CHECK (
+          length(recipe_digest) = 64
+          AND recipe_digest NOT GLOB '*[^a-f0-9]*'
+        ),
+        executor_digest TEXT NOT NULL CHECK (
+          length(executor_digest) = 64
+          AND executor_digest NOT GLOB '*[^a-f0-9]*'
+        ),
+        pane_workspace_revision_origin INTEGER NOT NULL DEFAULT 1 CHECK (
+          pane_workspace_revision_origin > 0
+        ),
+        state TEXT NOT NULL CHECK (state IN (
+          'approval_required', 'rejected', 'prepared', 'effect_started',
+          'succeeded', 'failed', 'ambiguous'
+        )),
+        setup_revision INTEGER NOT NULL CHECK (
+          (state IN ('approval_required', 'rejected') AND setup_revision = 1)
+          OR (state = 'prepared' AND setup_revision = 2)
+          OR (state = 'effect_started' AND setup_revision = 3)
+          OR (state IN ('succeeded', 'failed', 'ambiguous')
+            AND setup_revision = 4)
+        ),
+        approval_binding_digest TEXT CHECK (
+          approval_binding_digest IS NULL OR (
+            length(approval_binding_digest) = 64
+            AND approval_binding_digest NOT GLOB '*[^a-f0-9]*'
+          )
+        ),
+        executor_instance_id TEXT CHECK (
+          executor_instance_id IS NULL OR (
+            length(executor_instance_id) BETWEEN 16 AND 128
+            AND instr(executor_instance_id, char(0)) = 0
+          )
+        ),
+        failure_code TEXT CHECK (
+          failure_code IS NULL OR failure_code IN (
+            'clean_replacement_required', 'invalid_recipe',
+            'runtime_unavailable', 'exit_nonzero',
+            'timeout', 'output_limit', 'containment_failed',
+            'transcript_unavailable'
+          )
+        ),
+        transcript TEXT CHECK (
+          transcript IS NULL OR instr(transcript, char(0)) = 0
+        ),
+        transcript_bytes INTEGER CHECK (
+          transcript_bytes IS NULL OR
+          (transcript_bytes >= 0 AND transcript_bytes <= 262144)
+        ),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        approved_at TEXT,
+        effect_started_at TEXT,
+        completed_at TEXT,
+        UNIQUE (lane_id, base_sha, recipe_digest, executor_digest),
+        CHECK ((transcript IS NULL) = (transcript_bytes IS NULL)),
+        CHECK (
+          transcript IS NULL OR
+          transcript_bytes = length(CAST(transcript AS BLOB))
+        ),
+        CHECK (
+          state != 'approval_required' OR (
+            approval_binding_digest IS NULL
+            AND executor_instance_id IS NULL
+            AND failure_code IS NULL
+            AND transcript IS NULL
+            AND transcript_bytes IS NULL
+            AND approved_at IS NULL
+            AND effect_started_at IS NULL
+            AND completed_at IS NULL
+          )
+        ),
+        CHECK (
+          state != 'rejected' OR (
+            approval_binding_digest IS NULL
+            AND executor_instance_id IS NULL
+            AND failure_code IN (
+              'clean_replacement_required', 'invalid_recipe',
+              'runtime_unavailable'
+            )
+            AND transcript IS NULL
+            AND transcript_bytes IS NULL
+            AND approved_at IS NULL
+            AND effect_started_at IS NULL
+            AND completed_at IS NOT NULL
+          )
+        ),
+        CHECK (
+          state != 'prepared' OR (
+            approval_binding_digest IS NOT NULL
+            AND executor_instance_id IS NULL
+            AND failure_code IS NULL
+            AND transcript IS NULL
+            AND transcript_bytes IS NULL
+            AND approved_at IS NOT NULL
+            AND effect_started_at IS NULL
+            AND completed_at IS NULL
+          )
+        ),
+        CHECK (
+          state != 'effect_started' OR (
+            approval_binding_digest IS NOT NULL
+            AND executor_instance_id IS NOT NULL
+            AND failure_code IS NULL
+            AND transcript IS NULL
+            AND transcript_bytes IS NULL
+            AND approved_at IS NOT NULL
+            AND effect_started_at IS NOT NULL
+            AND completed_at IS NULL
+          )
+        ),
+        CHECK (
+          state != 'succeeded' OR (
+            approval_binding_digest IS NOT NULL
+            AND executor_instance_id IS NOT NULL
+            AND failure_code IS NULL
+            AND approved_at IS NOT NULL
+            AND effect_started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+            AND transcript IS NOT NULL
+          )
+        ),
+        CHECK (
+          state != 'failed' OR (
+            approval_binding_digest IS NOT NULL
+            AND executor_instance_id IS NOT NULL
+            AND failure_code IS NOT NULL
+            AND approved_at IS NOT NULL
+            AND effect_started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+            AND transcript IS NOT NULL
+          )
+        ),
+        CHECK (
+          state != 'ambiguous' OR (
+            approval_binding_digest IS NOT NULL
+            AND executor_instance_id IS NOT NULL
+            AND failure_code IS NULL
+            AND transcript IS NULL
+            AND transcript_bytes IS NULL
+            AND approved_at IS NOT NULL
+            AND effect_started_at IS NOT NULL
+            AND completed_at IS NOT NULL
+          )
+        )
+      ) STRICT;
+
+      CREATE TABLE workspace_setup_lane_heads (
+        lane_id TEXT PRIMARY KEY
+          REFERENCES workspace_leases(lane_id) ON DELETE RESTRICT,
+        request_id TEXT NOT NULL UNIQUE
+          REFERENCES workspace_setup_requests(request_id) ON DELETE RESTRICT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX workspace_setup_state_idx
+        ON workspace_setup_requests(state, updated_at, request_id);
+
+      CREATE TRIGGER workspace_setup_request_project_guard
+      BEFORE INSERT ON workspace_setup_requests
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM workspace_leases AS lease
+        JOIN chat_pane_workspace_bindings AS binding
+          ON binding.expected_lane_id = lease.lane_id
+         AND binding.workspace_lease_id = lease.lane_id
+         AND binding.project_id = lease.project_id
+         AND binding.state != 'preserved'
+        WHERE lease.lane_id = NEW.lane_id
+          AND lease.project_id = NEW.project_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace setup request project mismatch');
+      END;
+
+      CREATE TRIGGER workspace_setup_head_insert_guard
+      BEFORE INSERT ON workspace_setup_lane_heads
+      WHEN NOT EXISTS (
+        SELECT 1 FROM workspace_setup_requests AS request
+        JOIN workspace_leases AS lease
+          ON lease.lane_id = request.lane_id
+         AND lease.project_id = request.project_id
+        JOIN chat_pane_workspace_bindings AS binding
+          ON binding.expected_lane_id = request.lane_id
+         AND binding.workspace_lease_id = request.lane_id
+         AND binding.project_id = request.project_id
+         AND binding.state != 'preserved'
+        WHERE request.request_id = NEW.request_id
+          AND request.lane_id = NEW.lane_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace setup head identity mismatch');
+      END;
+
+      CREATE TRIGGER workspace_setup_head_update_guard
+      BEFORE UPDATE OF lane_id, request_id ON workspace_setup_lane_heads
+      WHEN NEW.lane_id IS NOT OLD.lane_id
+        OR NEW.request_id IS OLD.request_id
+        OR NOT EXISTS (
+          SELECT 1 FROM workspace_setup_requests AS request
+          JOIN workspace_leases AS lease
+            ON lease.lane_id = request.lane_id
+           AND lease.project_id = request.project_id
+          JOIN chat_pane_workspace_bindings AS binding
+            ON binding.expected_lane_id = request.lane_id
+           AND binding.workspace_lease_id = request.lane_id
+           AND binding.project_id = request.project_id
+           AND binding.state != 'preserved'
+          WHERE request.request_id = NEW.request_id
+            AND request.lane_id = NEW.lane_id
+        )
+        OR EXISTS (
+          SELECT 1 FROM workspace_setup_requests AS request
+          WHERE request.request_id = OLD.request_id
+            AND request.state NOT IN (
+              'rejected', 'succeeded', 'failed', 'ambiguous'
+            )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid workspace setup head replacement');
+      END;
+
+      CREATE TRIGGER workspace_setup_identity_immutable
+      BEFORE UPDATE OF request_id, lane_id, project_id, base_sha,
+        recipe_digest, executor_digest, pane_workspace_revision_origin,
+        created_at
+      ON workspace_setup_requests
+      WHEN NEW.request_id IS NOT OLD.request_id
+        OR NEW.lane_id IS NOT OLD.lane_id
+        OR NEW.project_id IS NOT OLD.project_id
+        OR NEW.base_sha IS NOT OLD.base_sha
+        OR NEW.recipe_digest IS NOT OLD.recipe_digest
+        OR NEW.executor_digest IS NOT OLD.executor_digest
+        OR NEW.pane_workspace_revision_origin IS NOT
+          OLD.pane_workspace_revision_origin
+        OR NEW.created_at IS NOT OLD.created_at
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace setup identity is immutable');
+      END;
+
+      CREATE TRIGGER workspace_setup_transition_guard
+      BEFORE UPDATE OF state ON workspace_setup_requests
+      WHEN NOT (
+        (OLD.state = 'approval_required' AND OLD.setup_revision = 1
+          AND NEW.state = 'prepared' AND NEW.setup_revision = 2)
+        OR (OLD.state = 'prepared' AND OLD.setup_revision = 2
+          AND NEW.state = 'effect_started' AND NEW.setup_revision = 3)
+        OR (OLD.state = 'effect_started'
+          AND OLD.setup_revision = 3
+          AND NEW.state IN ('succeeded', 'failed', 'ambiguous')
+          AND NEW.setup_revision = 4)
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid workspace setup transition');
+      END;
+
+      CREATE TRIGGER workspace_setup_revision_guard
+      BEFORE UPDATE OF setup_revision ON workspace_setup_requests
+      WHEN NEW.state IS OLD.state
+        OR NEW.setup_revision != OLD.setup_revision + 1
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid workspace setup revision');
+      END;
+
+      DROP TRIGGER IF EXISTS workspace_setup_pane_preservation_guard;
+      CREATE TRIGGER workspace_setup_pane_preservation_guard
+      BEFORE UPDATE OF state ON chat_pane_workspace_bindings
+      WHEN OLD.state != 'preserved' AND NEW.state = 'preserved'
+        AND EXISTS (
+          SELECT 1
+          FROM workspace_setup_lane_heads AS head
+          JOIN workspace_setup_requests AS request
+            ON request.request_id = head.request_id
+           AND request.lane_id = head.lane_id
+          JOIN workspace_leases AS lease
+            ON lease.lane_id = request.lane_id
+           AND lease.project_id = request.project_id
+          WHERE head.lane_id = OLD.expected_lane_id
+            AND request.project_id = OLD.project_id
+            AND request.state = 'effect_started'
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'workspace setup effect must settle before pane preservation');
+      END;
+
+      DROP TRIGGER chat_pane_workspace_projection_update_guard;
+      CREATE TRIGGER chat_pane_workspace_projection_update_guard
+      BEFORE UPDATE OF workspace_mode, workspace_state, workspace_revision,
+        workspace_recovery_reason ON chat_panes
+      WHEN (
+        (
+          NEW.workspace_mode IS NOT OLD.workspace_mode
+          OR NEW.workspace_state IS NOT OLD.workspace_state
+          OR NEW.workspace_recovery_reason IS NOT OLD.workspace_recovery_reason
+        )
+        AND NEW.workspace_revision != OLD.workspace_revision + 1
+      ) OR (
+        NOT (
+          NEW.workspace_mode IS NOT OLD.workspace_mode
+          OR NEW.workspace_state IS NOT OLD.workspace_state
+          OR NEW.workspace_recovery_reason IS NOT OLD.workspace_recovery_reason
+        )
+        AND NOT (
+          NEW.workspace_revision = OLD.workspace_revision
+          OR (
+            NEW.workspace_revision = OLD.workspace_revision + 1
+            AND NEW.revision = OLD.revision + 1
+            AND EXISTS (
+              SELECT 1
+              FROM workspace_setup_lane_heads AS head
+              JOIN workspace_setup_requests AS request
+                ON request.request_id = head.request_id
+               AND request.lane_id = head.lane_id
+              JOIN workspace_leases AS lease
+                ON lease.lane_id = request.lane_id
+               AND lease.project_id = request.project_id
+              JOIN chat_pane_workspace_bindings AS binding
+                ON binding.expected_lane_id = request.lane_id
+               AND binding.workspace_lease_id = request.lane_id
+               AND binding.project_id = request.project_id
+               AND binding.state != 'preserved'
+              WHERE binding.pane_id = NEW.pane_id
+                AND request.pane_workspace_revision_origin
+                  + request.setup_revision = NEW.workspace_revision
+            )
+          )
+        )
+      ) OR (
+        NEW.workspace_state IN ('waiting_capacity', 'recovery_required')
+      ) != (NEW.workspace_recovery_reason IS NOT NULL)
+        OR (
+          NEW.workspace_state IN ('preparing', 'ready', 'preserved')
+          AND NEW.workspace_recovery_reason IS NOT NULL
+        )
+        OR (
+          OLD.workspace_mode = 'managed_worktree'
+          AND NEW.workspace_mode != 'managed_worktree'
+        )
+        OR (
+          NEW.workspace_mode = 'legacy_unbound'
+          AND NOT (
+            NEW.workspace_state = 'recovery_required'
+            AND NEW.workspace_recovery_reason = 'legacy_unbound'
+          )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'invalid chat workspace projection transition');
+      END;
+    `,
+  },
 ] as const satisfies readonly Migration[];
