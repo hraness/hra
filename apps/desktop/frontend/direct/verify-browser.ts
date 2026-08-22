@@ -537,7 +537,8 @@ const scenarios = [
       "Personal",
       "Signing in",
       "Work",
-      "builder@work.example · 64% remaining",
+      "builder@work.example",
+      "64% weekly remaining",
       "Codex 3",
       "HRA Cloud",
       "Sign in to connect this Mac to HRA Cloud",
@@ -549,7 +550,7 @@ const scenarios = [
       "Log out Work",
       "Open sign-in for Codex 3",
       "Cancel sign-in for Codex 3",
-      "Sign in to HRA Cloud",
+      "Pair this Mac with HRA Cloud",
     ],
     forbiddenText: ["Use device code", "Workspace", "Task", "Text size", "Token usage"],
     viewport: { width: 860, height: 780 },
@@ -560,11 +561,11 @@ const scenarios = [
     expectedText: [
       "Codex subscriptions",
       "HRA Cloud",
-      "Signing in",
+      "Pairing this Mac",
     ],
     expectedVisibleControls: [
       "Add subscription",
-      "Cancel HRA Cloud sign-in",
+      "Cancel HRA Cloud pairing",
     ],
     forbiddenText: [
       "Keychain slot",
@@ -1470,7 +1471,7 @@ async function runAction(
       await clickButton(browser, "Review HRA Cloud reconnect");
       await waitForVisibleText(
         browser,
-        "The previous credential stays protected in Keychain.",
+        "The previous credential stays protected in Keychain but cannot be reused by the new pairing flow.",
       );
       const consentFocused = await browser.evaluate(`(() => {
         const confirmation = document.querySelector(
@@ -1499,8 +1500,8 @@ async function runAction(
         "document.querySelector('[role=group][aria-label=\"Confirm HRA Cloud reconnect\"]') === null",
       ]);
       await waitForStableProbe(browser);
-      await clickButton(browser, "Sign in to HRA Cloud");
-      await waitForVisibleText(browser, "Signing in");
+      await clickButton(browser, "Pair this Mac with HRA Cloud");
+      await waitForVisibleText(browser, "Pairing this Mac");
       await waitForStableProbe(browser);
       return;
     }

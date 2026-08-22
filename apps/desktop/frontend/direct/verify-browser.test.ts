@@ -219,7 +219,7 @@ describe("HRA browser verifier policy", () => {
         "Log out Work",
         "Open sign-in for Codex 3",
         "Cancel sign-in for Codex 3",
-        "Sign in to HRA Cloud",
+        "Pair this Mac with HRA Cloud",
       ],
       id: "settings-browser-login",
       viewport: { width: 860, height: 780 },
@@ -235,7 +235,7 @@ describe("HRA browser verifier policy", () => {
       expectedUiScale: "1",
       expectedVisibleControls: [
         "Add subscription",
-        "Cancel HRA Cloud sign-in",
+        "Cancel HRA Cloud pairing",
       ],
       id: "settings-human-credential-recovery",
       viewport: { width: 860, height: 780 },
