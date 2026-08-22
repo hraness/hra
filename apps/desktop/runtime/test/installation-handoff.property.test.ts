@@ -2,9 +2,13 @@ import { expect, test } from "bun:test";
 import { fc } from "@hra-internal/test";
 
 import { parseInstallationHandoffJournal } from "../installation-handoff";
+import {
+  expectedHistoricalOprtePreviewSignature,
+  expectedHistoricalOprtePreviewTree,
+} from "../historical-oprte-preview";
 
 const validReceipt = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   createdAt: 1,
   operationId: `handoff_${"a".repeat(24)}`,
   phase: "created",
@@ -39,14 +43,8 @@ const validReceipt = {
       executable: "oprte",
       version: "0.1.4",
     },
-    tree: {
-      bytes: 0,
-      directories: 0,
-      digest: "e".repeat(64),
-      entries: 0,
-      files: 0,
-      symlinks: 0,
-    },
+    signature: expectedHistoricalOprtePreviewSignature,
+    tree: expectedHistoricalOprtePreviewTree,
   },
   candidate: {
     identity: {
@@ -55,6 +53,7 @@ const validReceipt = {
       executable: "hra",
       version: "0.1.12",
     },
+    signature: { policy: "strict" },
     tree: {
       bytes: 0,
       directories: 0,

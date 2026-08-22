@@ -2,11 +2,11 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1198c5072fdde8d94fd6587c876f2f389dacec5528fa88c23a46d9598583e738",
+      "matchingLinesSha256": "9ce9c30bb342664dddc43933aed0d6b52614742c472775ec10ed16d1b926408c",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
-        "oprte": 8
+        "oprte": 10
       },
       "path": "apps/desktop/README.md"
     },
@@ -142,11 +142,21 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "b85afbeb2a7492e4771ac266a1b601157490075e71b99e8752e5c9abcb72be2d",
+      "matchingLinesSha256": "047353f86b5d11b78e95a5a1ea35d01f18548be92e002c46c9df72e9e7c06f42",
       "occurrences": {
-        "kitchen": 12,
+        "kitchen": 3,
         "operateStylized": 0,
-        "oprte": 15
+        "oprte": 172
+      },
+      "path": "apps/desktop/runtime/historical-oprte-preview.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9ccf1c24132aab2ee7927a41b524a8f64506612a4470a36b3af758c909eff5ea",
+      "occurrences": {
+        "kitchen": 11,
+        "operateStylized": 0,
+        "oprte": 61
       },
       "path": "apps/desktop/runtime/installation-handoff.ts"
     },
@@ -1422,6 +1432,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "a4c4539f90330ccb052ca173eedea4c05c3791618b3b9345d0da88da47e0eba5",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 104
+      },
+      "path": "apps/desktop/runtime/test/historical-oprte-preview.test.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "fbbeb36cde88762618e01ef9ff26d6e7d33a3e8079708f014465db3c33b8ba0f",
       "occurrences": {
         "kitchen": 0,
@@ -1442,31 +1462,31 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "b09032964f13c3c98eeb239e4e0103a042aeaabbff557f6093e26fa2887fcd62",
+      "matchingLinesSha256": "5ae7764871d825e8f6c5da5120374b000b42486f560f73fa9829769fc8b67ce6",
       "occurrences": {
         "kitchen": 6,
         "operateStylized": 0,
-        "oprte": 1
+        "oprte": 20
       },
       "path": "apps/desktop/runtime/test/installation-handoff-schema.test.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "380082cd4794ad78a732fef645250fd34a7df0457c35384f75781cc67caecfe3",
+      "matchingLinesSha256": "e4e26fa1b54e3fb00e119e1de8bcae61de9893bc14508eeab312ca5bf87e9743",
       "occurrences": {
         "kitchen": 2,
         "operateStylized": 0,
-        "oprte": 1
+        "oprte": 6
       },
       "path": "apps/desktop/runtime/test/installation-handoff.property.test.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "8d4149bba76cd3fe1537b29246c1007cb0b86dbb65a518b73c8327a4be629152",
+      "matchingLinesSha256": "044886c32b3ec52a67d3308cfb6ddc67f664230851603cec5ad7664659322ccf",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
-        "oprte": 23
+        "oprte": 43
       },
       "path": "apps/desktop/runtime/test/installation-handoff.test.ts"
     },

@@ -44,6 +44,17 @@ import {
 } from "@hraness/hra-human-client";
 
 import {
+  expectedHistoricalOprtePreviewIdentity,
+  expectedHistoricalOprtePreviewSignature,
+  expectedHistoricalOprtePreviewTree,
+  historicalOprtePreviewSignaturePolicy,
+  inspectHistoricalOprtePreview,
+  strictBundleSignaturePolicy,
+  withHistoricalOprteBoundaryProof,
+  type BundleSignatureEvidence,
+  type BundleSignaturePolicy,
+} from "./historical-oprte-preview";
+import {
   authoritiesOverlap,
   inspectProspectivePathAuthority,
   renameWithPathAuthority,
@@ -64,12 +75,7 @@ import { launchSmokeMacOSApp } from "./verify-macos-package";
 const handoffConfirmation = "RETIRE-OPRTE-IN-FAVOR-OF-HRA";
 const committedCleanupConfirmation = "CLEAN-COMMITTED-HRA-HANDOFF-STAGING";
 const rollbackConfirmation = "ROLL-BACK-HRA-TO-OPRTE";
-const expectedPredecessor = Object.freeze({
-  build: "5",
-  bundleIdentifier: "kitchen.hraness",
-  executable: "oprte",
-  version: "0.1.4",
-});
+const expectedPredecessor = expectedHistoricalOprtePreviewIdentity;
 const expectedCandidate = Object.freeze({
   build: "13",
   bundleIdentifier: "kitchen.hraness",
@@ -157,8 +163,9 @@ export interface BundleIdentity {
   readonly version: string;
 }
 
-interface BundleContinuityEvidence {
+export interface BundleContinuityEvidence {
   readonly identity: BundleIdentity;
+  readonly signature: BundleSignatureEvidence;
   readonly tree: TreeEvidence;
 }
 
@@ -204,7 +211,7 @@ export interface InstallationHandoffCleanupInput {
 }
 
 interface HandoffJournal {
-  readonly schemaVersion: 1;
+  readonly schemaVersion: 2;
   readonly createdAt: number;
   readonly operationId: string;
   readonly phase:
@@ -240,6 +247,10 @@ export interface InstallationHandoffDependencies {
   readonly keychainRead: (
     descriptor: Readonly<{ service: string; name: string }>,
   ) => Promise<string | null>;
+  readonly inspectBundle: (
+    path: string,
+    signaturePolicy: BundleSignaturePolicy,
+  ) => Promise<BundleContinuityEvidence>;
   readonly now: () => number;
   readonly openFilesAreQuiescent: (
     paths: InstallationHandoffPaths,
@@ -262,6 +273,7 @@ const defaultDependencies: InstallationHandoffDependencies = {
   acquireControlPlaneLock: acquireControlPlaneLifetimeLock,
   acquireNativeLock: acquireNativeInstallationLock,
   copyTree: copyTreeWithDitto,
+  inspectBundle: inspectInstallationBundle,
   keychainRead: async ({ service, name }) => await Bun.secrets.get({ service, name }),
   now: Date.now,
   openFilesAreQuiescent: inspectOpenFileQuiescence,
@@ -368,17 +380,26 @@ export async function performInstallationHandoff(
     controlPlaneLock = dependencies.acquireControlPlaneLock(paths.controlPlanePath);
     controlPlaneLock.bindControlPlane();
     await requireQuiescent(paths, dependencies);
-    const predecessor = await inspectBundle(paths.predecessorApp);
+    const predecessor = await dependencies.inspectBundle(
+      paths.predecessorApp,
+      historicalOprtePreviewSignaturePolicy,
+    );
     assertBundleIdentity(predecessor.identity, expectedPredecessor, "predecessor");
     const hadPriorHra = await exists(paths.canonicalApp);
     const priorHra = hadPriorHra
-      ? await inspectBundle(paths.canonicalApp)
+      ? await dependencies.inspectBundle(
+          paths.canonicalApp,
+          strictBundleSignaturePolicy,
+        )
       : undefined;
     if (priorHra !== undefined) {
       assertSupportedPriorHraIdentity(priorHra.identity);
     }
 
-    const candidate = await inspectBundle(paths.candidateApp);
+    const candidate = await dependencies.inspectBundle(
+      paths.candidateApp,
+      strictBundleSignaturePolicy,
+    );
     assertBundleIdentity(candidate.identity, expectedCandidate, "candidate");
     const candidateVerification = await dependencies.verifyCandidate(paths.candidateApp);
     const candidateCommit = requireCommit(candidateVerification.commit);
@@ -399,7 +420,7 @@ export async function performInstallationHandoff(
       throw new InstallationHandoffError("invalid_arguments", "Handoff time is invalid.");
     }
     journal = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       createdAt,
       operationId,
       phase: "created",
@@ -430,17 +451,23 @@ export async function performInstallationHandoff(
 
     const predecessorArchive = join(backupDirectory, "predecessor.bundle");
     await dependencies.copyTree(paths.predecessorApp, predecessorArchive);
-    assertTreeEvidence(
-      predecessor.tree,
-      await inspectTree(predecessorArchive),
+    assertBundleEvidence(
+      predecessor,
+      await dependencies.inspectBundle(
+        predecessorArchive,
+        predecessor.signature.policy,
+      ),
       "predecessor archive",
     );
     if (priorHra !== undefined) {
       const priorHraArchive = join(backupDirectory, "prior-hra.bundle");
       await dependencies.copyTree(paths.canonicalApp, priorHraArchive);
-      assertTreeEvidence(
-        priorHra.tree,
-        await inspectTree(priorHraArchive),
+      assertBundleEvidence(
+        priorHra,
+        await dependencies.inspectBundle(
+          priorHraArchive,
+          priorHra.signature.policy,
+        ),
         "prior HRA archive",
       );
     }
@@ -460,7 +487,14 @@ export async function performInstallationHandoff(
         "Staged candidate provenance differs from the verified source candidate.",
       );
     }
-    assertTreeEvidence(candidate.tree, await inspectTree(candidateStage), "staged candidate");
+    assertBundleEvidence(
+      candidate,
+      await dependencies.inspectBundle(
+        candidateStage,
+        candidate.signature.policy,
+      ),
+      "staged candidate",
+    );
     journal = await advance(backupDirectory, journal, "candidate_staged");
     input.onCheckpoint?.("after_candidate_staged");
 
@@ -470,19 +504,27 @@ export async function performInstallationHandoff(
       priorHra !== undefined,
     );
     await syncDirectory(paths.applicationsDirectory);
+    if (priorHra !== undefined) {
+      assertBundleEvidence(
+        priorHra,
+        await dependencies.inspectBundle(
+          candidateStage,
+          priorHra.signature.policy,
+        ),
+        "retired prior HRA",
+      );
+    }
     journal = await advance(backupDirectory, journal, "candidate_installed");
     input.onCheckpoint?.("after_candidate_installed");
 
     await requireQuiescent(paths, dependencies);
-    const installedBeforeRetirement = await inspectBundle(paths.canonicalApp);
-    assertBundleIdentity(
-      installedBeforeRetirement.identity,
-      expectedCandidate,
-      "installed HRA before predecessor retirement",
+    const installedBeforeRetirement = await dependencies.inspectBundle(
+      paths.canonicalApp,
+      candidate.signature.policy,
     );
-    assertTreeEvidence(
-      candidate.tree,
-      installedBeforeRetirement.tree,
+    assertBundleEvidence(
+      candidate,
+      installedBeforeRetirement,
       "installed HRA before predecessor retirement",
     );
     const predecessorRetirementStage = join(
@@ -492,7 +534,7 @@ export async function performInstallationHandoff(
     await stageExactBundle(
       paths.predecessorApp,
       predecessorRetirementStage,
-      predecessor.tree,
+      predecessor,
       dependencies,
     );
     journal = await advance(backupDirectory, journal, "predecessor_retired");
@@ -504,9 +546,11 @@ export async function performInstallationHandoff(
         "The predecessor app remains present after retirement.",
       );
     }
-    const installed = await inspectBundle(paths.canonicalApp);
-    assertBundleIdentity(installed.identity, expectedCandidate, "installed HRA");
-    assertTreeEvidence(candidate.tree, installed.tree, "installed HRA");
+    const installed = await dependencies.inspectBundle(
+      paths.canonicalApp,
+      candidate.signature.policy,
+    );
+    assertBundleEvidence(candidate, installed, "installed HRA");
     const stateAfter = await inspectStateContinuity(paths.stateRoot, paths.controlPlanePath);
     assertStateContinuity(state, stateAfter, "post-install state");
     await assertKeychainContinuity(keychainBefore, dependencies);
@@ -518,6 +562,7 @@ export async function performInstallationHandoff(
     await cleanupCommittedInstallationStages(
       paths,
       journal,
+      dependencies,
       input.onCheckpoint,
     );
 
@@ -595,12 +640,15 @@ export async function resumeCommittedInstallationHandoffCleanup(
         "Committed cleanup refuses while the predecessor path exists.",
       );
     }
-    const installed = await inspectBundle(paths.canonicalApp);
-    assertBundleIdentity(installed.identity, journal.candidate.identity, "committed HRA");
-    assertTreeEvidence(journal.candidate.tree, installed.tree, "committed HRA");
+    const installed = await dependencies.inspectBundle(
+      paths.canonicalApp,
+      journal.candidate.signature.policy,
+    );
+    assertBundleEvidence(journal.candidate, installed, "committed HRA");
     await cleanupCommittedInstallationStages(
       paths,
       journal,
+      dependencies,
       input.onCheckpoint,
     );
     return { operationId: journal.operationId, status: "clean" };
@@ -612,12 +660,14 @@ export async function resumeCommittedInstallationHandoffCleanup(
 async function cleanupCommittedInstallationStages(
   paths: InstallationHandoffPaths,
   journal: HandoffJournal,
+  dependencies: InstallationHandoffDependencies,
   onCheckpoint?: (point: InstallationHandoffFaultPoint) => void,
 ): Promise<void> {
   await removeVerifiedStage(
     join(paths.applicationsDirectory, `.${journal.operationId}.predecessor.bundle`),
-    journal.predecessor.tree,
+    journal.predecessor,
     "committed predecessor retirement",
+    dependencies,
   );
   onCheckpoint?.("after_committed_predecessor_cleanup");
 
@@ -628,8 +678,9 @@ async function cleanupCommittedInstallationStages(
   if (journal.priorHra !== undefined) {
     await removeVerifiedStage(
       candidateStage,
-      journal.priorHra.tree,
+      journal.priorHra,
       "committed prior HRA retirement",
+      dependencies,
     );
   } else if (await exists(candidateStage)) {
     throw new InstallationHandoffError(
@@ -747,12 +798,15 @@ async function rollbackFromJournal(
 
   let canonicalDisposition: "candidate" | "prior" | "missing" = "missing";
   if (await exists(paths.canonicalApp)) {
-    const current = await inspectBundle(paths.canonicalApp);
+    const current = await dependencies.inspectBundle(
+      paths.canonicalApp,
+      strictBundleSignaturePolicy,
+    );
     if (journal.priorHra?.tree.digest === current.tree.digest) {
-      assertBundleIdentity(current.identity, journal.priorHra.identity, "rollback prior HRA");
+      assertBundleEvidence(journal.priorHra, current, "rollback prior HRA");
       canonicalDisposition = "prior";
     } else if (journal.candidate?.tree.digest === current.tree.digest) {
-      assertBundleIdentity(current.identity, journal.candidate.identity, "rollback candidate");
+      assertBundleEvidence(journal.candidate, current, "rollback candidate");
       canonicalDisposition = "candidate";
     } else {
       throw new InstallationHandoffError(
@@ -764,13 +818,11 @@ async function rollbackFromJournal(
 
   let predecessorAlreadyRestored = false;
   if (await exists(paths.predecessorApp)) {
-    const predecessor = await inspectBundle(paths.predecessorApp);
-    assertBundleIdentity(
-      predecessor.identity,
-      journal.predecessor.identity,
-      "restored predecessor",
+    const predecessor = await dependencies.inspectBundle(
+      paths.predecessorApp,
+      journal.predecessor.signature.policy,
     );
-    assertTreeEvidence(journal.predecessor.tree, predecessor.tree, "restored predecessor");
+    assertBundleEvidence(journal.predecessor, predecessor, "restored predecessor");
     predecessorAlreadyRestored = true;
   }
 
@@ -784,6 +836,7 @@ async function rollbackFromJournal(
           ],
           journal.predecessor,
           "predecessor",
+          dependencies,
         ),
         paths.predecessorApp,
         journal.predecessor,
@@ -803,6 +856,7 @@ async function rollbackFromJournal(
           ],
           journal.priorHra,
           "prior HRA",
+          dependencies,
         ),
         paths.canonicalApp,
         journal.priorHra,
@@ -820,17 +874,11 @@ async function rollbackFromJournal(
       false,
     );
     await syncDirectory(paths.applicationsDirectory);
-    const installed = await inspectBundle(paths.predecessorApp);
-    assertBundleIdentity(
-      installed.identity,
-      journal.predecessor.identity,
-      "rollback predecessor",
+    const installed = await dependencies.inspectBundle(
+      paths.predecessorApp,
+      journal.predecessor.signature.policy,
     );
-    assertTreeEvidence(
-      journal.predecessor.tree,
-      installed.tree,
-      "rollback predecessor",
-    );
+    assertBundleEvidence(journal.predecessor, installed, "rollback predecessor");
   }
   onCheckpoint?.("after_rollback_predecessor_published");
 
@@ -841,17 +889,11 @@ async function rollbackFromJournal(
       canonicalDisposition === "candidate",
     );
     await syncDirectory(paths.applicationsDirectory);
-    const installed = await inspectBundle(paths.canonicalApp);
-    assertBundleIdentity(
-      installed.identity,
-      priorRestore.expected.identity,
-      "rollback prior HRA",
+    const installed = await dependencies.inspectBundle(
+      paths.canonicalApp,
+      priorRestore.expected.signature.policy,
     );
-    assertTreeEvidence(
-      priorRestore.expected.tree,
-      installed.tree,
-      "rollback prior HRA",
-    );
+    assertBundleEvidence(priorRestore.expected, installed, "rollback prior HRA");
   } else if (!journal.hadPriorHra && canonicalDisposition === "candidate") {
     await requireMissing(
       retainedCandidateStage,
@@ -863,9 +905,12 @@ async function rollbackFromJournal(
       false,
     );
     await syncDirectory(paths.applicationsDirectory);
-    assertTreeEvidence(
-      journal.candidate.tree,
-      await inspectTree(retainedCandidateStage),
+    assertBundleEvidence(
+      journal.candidate,
+      await dependencies.inspectBundle(
+        retainedCandidateStage,
+        journal.candidate.signature.policy,
+      ),
       "retained rollback candidate",
     );
   }
@@ -882,7 +927,7 @@ async function rollbackFromJournal(
     retainedCandidateStage,
     ...(priorRestore === null ? [] : [priorRestore.stage]),
   ])) {
-    await removeKnownRollbackStage(stage, journal);
+    await removeKnownRollbackStage(stage, journal, dependencies);
   }
   await syncDirectory(paths.applicationsDirectory);
 }
@@ -891,13 +936,16 @@ async function selectRestoreSource(
   candidates: readonly string[],
   expected: BundleContinuityEvidence,
   label: string,
+  dependencies: InstallationHandoffDependencies,
 ): Promise<string> {
   for (const candidate of candidates) {
     if (!await exists(candidate)) continue;
     try {
-      const inspected = await inspectBundle(candidate);
-      assertBundleIdentity(inspected.identity, expected.identity, label);
-      assertTreeEvidence(expected.tree, inspected.tree, label);
+      const inspected = await dependencies.inspectBundle(
+        candidate,
+        expected.signature.policy,
+      );
+      assertBundleEvidence(expected, inspected, label);
       return candidate;
     } catch {
       continue;
@@ -912,21 +960,34 @@ async function selectRestoreSource(
 async function removeKnownRollbackStage(
   stage: string,
   journal: HandoffJournal,
+  dependencies: InstallationHandoffDependencies,
 ): Promise<void> {
   if (!await exists(stage)) return;
-  const tree = await inspectTree(stage);
-  const expected = [
-    journal.candidate.tree,
-    journal.predecessor.tree,
-    ...(journal.priorHra === undefined ? [] : [journal.priorHra.tree]),
-  ].find(candidate => candidate.digest === tree.digest);
-  if (expected === undefined) {
+  const candidates = [
+    journal.candidate,
+    ...(journal.priorHra === undefined ? [] : [journal.priorHra]),
+    journal.predecessor,
+  ];
+  let verified = false;
+  for (const expected of candidates) {
+    try {
+      assertBundleEvidence(
+        expected,
+        await dependencies.inspectBundle(stage, expected.signature.policy),
+        "rollback staging bundle",
+      );
+      verified = true;
+      break;
+    } catch {
+      continue;
+    }
+  }
+  if (!verified) {
     throw new InstallationHandoffError(
       "rollback_unsafe",
       "Rollback found an unknown installation staging bundle.",
     );
   }
-  assertTreeEvidence(expected, tree, "rollback staging bundle");
   await rm(stage, { recursive: true, force: false });
 }
 
@@ -943,16 +1004,20 @@ async function stageBundleRestore(
 }>> {
   const stage = join(dirname(target), `.${operationId}.${basename(target)}.restore.bundle`);
   if (await exists(stage)) {
-    const restored = await inspectBundle(stage);
-    assertBundleIdentity(restored.identity, expected.identity, "rollback bundle");
-    assertTreeEvidence(expected.tree, restored.tree, "rollback bundle");
+    const restored = await dependencies.inspectBundle(
+      stage,
+      expected.signature.policy,
+    );
+    assertBundleEvidence(expected, restored, "rollback bundle");
     return { stage, target, expected };
   }
   try {
     await dependencies.copyTree(archive, stage);
-    const restored = await inspectBundle(stage);
-    assertBundleIdentity(restored.identity, expected.identity, "rollback bundle");
-    assertTreeEvidence(expected.tree, restored.tree, "rollback bundle");
+    const restored = await dependencies.inspectBundle(
+      stage,
+      expected.signature.policy,
+    );
+    assertBundleEvidence(expected, restored, "rollback bundle");
     return { stage, target, expected };
   } catch (error: unknown) {
     if (await exists(stage)) await rm(stage, { recursive: true, force: false });
@@ -1415,7 +1480,10 @@ function eraseKeychainEvidence(evidence: KeychainEvidence | null): void {
   for (const digest of evidence.fingerprints.values()) digest?.fill(0);
 }
 
-async function inspectBundle(path: string): Promise<BundleContinuityEvidence> {
+export async function inspectInstallationBundle(
+  path: string,
+  signaturePolicy: BundleSignaturePolicy,
+): Promise<BundleContinuityEvidence> {
   const status = await lstat(path);
   if (!status.isDirectory() || status.isSymbolicLink()) {
     throw new InstallationHandoffError(
@@ -1430,20 +1498,53 @@ async function inspectBundle(path: string): Promise<BundleContinuityEvidence> {
     executable: await plistValue(plist, "CFBundleExecutable"),
     version: await plistValue(plist, "CFBundleShortVersionString"),
   };
-  const signature = await runCommand([
-    "/usr/bin/codesign",
-    "--verify",
-    "--deep",
-    "--strict",
-    path,
-  ], true);
-  if (signature.exitCode !== 0) {
+  if (signaturePolicy === strictBundleSignaturePolicy) {
+    const verification = await runCommand([
+      "/usr/bin/codesign",
+      "--verify",
+      "--deep",
+      "--strict",
+      path,
+    ], true);
+    if (verification.exitCode !== 0) {
+      throw new InstallationHandoffError(
+        "candidate_invalid",
+        `Application code signature is invalid: ${verification.stderr.trim()}`,
+      );
+    }
+    return {
+      identity,
+      signature: { policy: strictBundleSignaturePolicy },
+      tree: await inspectTree(path),
+    };
+  }
+  if (signaturePolicy !== historicalOprtePreviewSignaturePolicy) {
     throw new InstallationHandoffError(
-      "candidate_invalid",
-      `Application code signature is invalid: ${signature.stderr.trim()}`,
+      "invalid_arguments",
+      "Application signature policy is invalid.",
     );
   }
-  return { identity, tree: await inspectTree(path) };
+
+  assertBundleIdentity(identity, expectedPredecessor, "predecessor");
+  try {
+    return await withHistoricalOprteBoundaryProof(path, async () => {
+      const treeBefore = await inspectTree(path);
+      const signature: BundleSignatureEvidence =
+        await inspectHistoricalOprtePreview(path, identity, treeBefore);
+      const treeAfter = await inspectTree(path);
+      assertTreeEvidence(
+        treeBefore,
+        treeAfter,
+        "historical predecessor reinspection",
+      );
+      return { identity, signature, tree: treeAfter };
+    });
+  } catch (error: unknown) {
+    throw new InstallationHandoffError(
+      "predecessor_invalid",
+      `Historical OPRTE Preview evidence is invalid: ${message(error)}`,
+    );
+  }
 }
 
 function assertBundleIdentity(
@@ -1457,6 +1558,21 @@ function assertBundleIdentity(
       `${label} application identity differs from the checked handoff contract.`,
     );
   }
+}
+
+function assertBundleEvidence(
+  expected: BundleContinuityEvidence,
+  actual: BundleContinuityEvidence,
+  label: string,
+): void {
+  assertBundleIdentity(actual.identity, expected.identity, label);
+  if (JSON.stringify(actual.signature) !== JSON.stringify(expected.signature)) {
+    throw new InstallationHandoffError(
+      "continuity_failed",
+      `${label} signature authority differs from its source bundle.`,
+    );
+  }
+  assertTreeEvidence(expected.tree, actual.tree, label);
 }
 
 function assertSupportedPriorHraIdentity(actual: BundleIdentity): void {
@@ -1565,23 +1681,36 @@ function assertTreeEvidence(expected: TreeEvidence, actual: TreeEvidence, label:
 async function stageExactBundle(
   source: string,
   staging: string,
-  expected: TreeEvidence,
+  expected: BundleContinuityEvidence,
   dependencies: InstallationHandoffDependencies,
 ): Promise<void> {
-  assertTreeEvidence(expected, await inspectTree(source), "bundle retirement source");
+  assertBundleEvidence(
+    expected,
+    await dependencies.inspectBundle(source, expected.signature.policy),
+    "bundle retirement source",
+  );
   await requireMissing(staging, "Bundle retirement staging path already exists.");
   await dependencies.publishBundle(source, staging, false);
   await syncDirectory(dirname(source));
-  assertTreeEvidence(expected, await inspectTree(staging), "retired bundle staging");
+  assertBundleEvidence(
+    expected,
+    await dependencies.inspectBundle(staging, expected.signature.policy),
+    "retired bundle staging",
+  );
 }
 
 async function removeVerifiedStage(
   staging: string,
-  expected: TreeEvidence,
+  expected: BundleContinuityEvidence,
   label: string,
+  dependencies: InstallationHandoffDependencies,
 ): Promise<void> {
   if (!await exists(staging)) return;
-  assertTreeEvidence(expected, await inspectTree(staging), label);
+  assertBundleEvidence(
+    expected,
+    await dependencies.inspectBundle(staging, expected.signature.policy),
+    label,
+  );
   await rm(staging, { recursive: true, force: false });
   await syncDirectory(dirname(staging));
 }
@@ -1864,16 +1993,99 @@ const identitySchema = (identity: BundleIdentity) => z.object({
   executable: z.literal(identity.executable),
   version: z.literal(identity.version),
 }).strict();
-const bundleEvidenceSchema = (identity: BundleIdentity) => z.object({
+const strictSignatureEvidenceSchema = z.object({
+  policy: z.literal(strictBundleSignaturePolicy),
+}).strict();
+const historicalOprteSignatureEvidenceSchema = z.object({
+  policy: z.literal(historicalOprtePreviewSignaturePolicy),
+  cmsByteLength: z.literal(expectedHistoricalOprtePreviewSignature.cmsByteLength),
+  cmsSigningTimeMs: z.literal(
+    expectedHistoricalOprtePreviewSignature.cmsSigningTimeMs,
+  ),
+  codeDirectoryByteLength: z.literal(
+    expectedHistoricalOprtePreviewSignature.codeDirectoryByteLength,
+  ),
+  codeDirectoryCdHash: z.literal(
+    expectedHistoricalOprtePreviewSignature.codeDirectoryCdHash,
+  ),
+  codeDirectorySha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.codeDirectorySha256,
+  ),
+  codeResourcesSha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.codeResourcesSha256,
+  ),
+  designatedRequirement: z.literal(
+    expectedHistoricalOprtePreviewSignature.designatedRequirement,
+  ),
+  executableSha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.executableSha256,
+  ),
+  infoPlistSha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.infoPlistSha256,
+  ),
+  leafCertificateSha1: z.literal(
+    expectedHistoricalOprtePreviewSignature.leafCertificateSha1,
+  ),
+  leafCertificateSha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.leafCertificateSha256,
+  ),
+  leafNotAfterMs: z.literal(
+    expectedHistoricalOprtePreviewSignature.leafNotAfterMs,
+  ),
+  leafNotBeforeMs: z.literal(
+    expectedHistoricalOprtePreviewSignature.leafNotBeforeMs,
+  ),
+  rootCertificateSha1: z.literal(
+    expectedHistoricalOprtePreviewSignature.rootCertificateSha1,
+  ),
+  rootCertificateSha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.rootCertificateSha256,
+  ),
+  rootGroup: z.literal(expectedHistoricalOprtePreviewSignature.rootGroup),
+  rootMode: z.literal(expectedHistoricalOprtePreviewSignature.rootMode),
+  rootNotAfterMs: z.literal(
+    expectedHistoricalOprtePreviewSignature.rootNotAfterMs,
+  ),
+  rootNotBeforeMs: z.literal(
+    expectedHistoricalOprtePreviewSignature.rootNotBeforeMs,
+  ),
+  rootOwner: z.literal(expectedHistoricalOprtePreviewSignature.rootOwner),
+  xattrCount: z.literal(expectedHistoricalOprtePreviewSignature.xattrCount),
+  xattrInventorySha256: z.literal(
+    expectedHistoricalOprtePreviewSignature.xattrInventorySha256,
+  ),
+  xattrName: z.literal(expectedHistoricalOprtePreviewSignature.xattrName),
+  xattrValueHex: z.literal(
+    expectedHistoricalOprtePreviewSignature.xattrValueHex,
+  ),
+}).strict();
+const bundleEvidenceSchema = (
+  identity: BundleIdentity,
+  signature: typeof strictSignatureEvidenceSchema
+    | typeof historicalOprteSignatureEvidenceSchema,
+) => z.object({
   identity: identitySchema(identity),
+  signature,
   tree: treeEvidenceSchema,
 }).strict();
 const priorHraEvidenceSchema = z.union([
-  bundleEvidenceSchema(expectedPriorHraV017),
-  bundleEvidenceSchema(expectedPriorHraV018),
-  bundleEvidenceSchema(expectedPriorHraV019),
-  bundleEvidenceSchema(expectedPriorHraV0110),
+  bundleEvidenceSchema(expectedPriorHraV017, strictSignatureEvidenceSchema),
+  bundleEvidenceSchema(expectedPriorHraV018, strictSignatureEvidenceSchema),
+  bundleEvidenceSchema(expectedPriorHraV019, strictSignatureEvidenceSchema),
+  bundleEvidenceSchema(expectedPriorHraV0110, strictSignatureEvidenceSchema),
 ]);
+const historicalPredecessorEvidenceSchema = z.object({
+  identity: identitySchema(expectedPredecessor),
+  signature: historicalOprteSignatureEvidenceSchema,
+  tree: z.object({
+    bytes: z.literal(expectedHistoricalOprtePreviewTree.bytes),
+    directories: z.literal(expectedHistoricalOprtePreviewTree.directories),
+    digest: z.literal(expectedHistoricalOprtePreviewTree.digest),
+    entries: z.literal(expectedHistoricalOprtePreviewTree.entries),
+    files: z.literal(expectedHistoricalOprtePreviewTree.files),
+    symlinks: z.literal(expectedHistoricalOprtePreviewTree.symlinks),
+  }).strict(),
+}).strict();
 const keychainDescriptorSchema = z.string().max(2048).refine(value => {
   const separator = value.indexOf("\u0000");
   return separator > 0
@@ -1891,7 +2103,7 @@ const keychainDescriptorsSchema = z.array(keychainDescriptorSchema).max(4096)
     }
   });
 const handoffJournalSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   createdAt: nonNegativeSafeIntegerSchema,
   operationId: z.string().regex(operationIdPattern),
   phase: z.enum([
@@ -1909,8 +2121,8 @@ const handoffJournalSchema = z.object({
   candidateCommit: z.string().regex(commitPattern),
   hadPriorHra: z.boolean(),
   state: stateEvidenceSchema,
-  predecessor: bundleEvidenceSchema(expectedPredecessor),
-  candidate: bundleEvidenceSchema(expectedCandidate),
+  predecessor: historicalPredecessorEvidenceSchema,
+  candidate: bundleEvidenceSchema(expectedCandidate, strictSignatureEvidenceSchema),
   priorHra: priorHraEvidenceSchema.optional(),
   keychainDescriptors: keychainDescriptorsSchema,
 }).strict().superRefine((value, context) => {

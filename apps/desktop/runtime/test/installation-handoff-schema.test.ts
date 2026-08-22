@@ -9,6 +9,10 @@ import {
   parseInstallationHandoffJournal,
   readKeychainTargets,
 } from "../installation-handoff";
+import {
+  expectedHistoricalOprtePreviewSignature,
+  expectedHistoricalOprtePreviewTree,
+} from "../historical-oprte-preview";
 
 const tree = {
   bytes: 1,
@@ -26,7 +30,7 @@ function receipt(
   }>,
 ): Record<string, unknown> {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     createdAt: 1,
     operationId: `handoff_${"a".repeat(24)}`,
     phase: "committed",
@@ -54,7 +58,8 @@ function receipt(
         executable: "oprte",
         version: "0.1.4",
       },
-      tree,
+      signature: expectedHistoricalOprtePreviewSignature,
+      tree: expectedHistoricalOprtePreviewTree,
     },
     candidate: {
       identity: {
@@ -63,6 +68,7 @@ function receipt(
         executable: "hra",
         version: "0.1.12",
       },
+      signature: { policy: "strict" },
       tree,
     },
     ...(priorHraIdentity === undefined ? {} : {
@@ -73,6 +79,7 @@ function receipt(
           executable: "hra",
           version: priorHraIdentity.version,
         },
+        signature: { policy: "strict" },
         tree,
       },
     }),
@@ -86,6 +93,84 @@ describe("installation handoff receipt schema", () => {
       phase: "committed",
       candidateCommit: "b".repeat(40),
     });
+  });
+
+  test("rejects v1 receipts and any bundle-policy or historical-pin drift", () => {
+    const v1 = receipt();
+    v1["schemaVersion"] = 1;
+
+    const predecessorStrict = receipt();
+    (predecessorStrict["predecessor"] as Record<string, unknown>)["signature"] = {
+      policy: "strict",
+    };
+
+    const candidateHistorical = receipt();
+    (candidateHistorical["candidate"] as Record<string, unknown>)["signature"] =
+      expectedHistoricalOprtePreviewSignature;
+
+    const pinDrifts = [
+      {
+        cmsSigningTimeMs:
+          expectedHistoricalOprtePreviewSignature.cmsSigningTimeMs + 1,
+      },
+      { leafCertificateSha256: "0".repeat(64) },
+      {
+        leafNotBeforeMs:
+          expectedHistoricalOprtePreviewSignature.leafNotBeforeMs - 1,
+      },
+      {
+        leafNotAfterMs:
+          expectedHistoricalOprtePreviewSignature.leafNotAfterMs + 1,
+      },
+      {
+        rootNotBeforeMs:
+          expectedHistoricalOprtePreviewSignature.rootNotBeforeMs - 1,
+      },
+      {
+        rootNotAfterMs:
+          expectedHistoricalOprtePreviewSignature.rootNotAfterMs + 1,
+      },
+    ].map(signatureMutation => {
+      const mutation = receipt();
+      const predecessor = mutation["predecessor"] as Record<string, unknown>;
+      predecessor["signature"] = {
+        ...expectedHistoricalOprtePreviewSignature,
+        ...signatureMutation,
+      };
+      return mutation;
+    });
+
+    for (const mutation of [
+      v1,
+      predecessorStrict,
+      candidateHistorical,
+      ...pinDrifts,
+    ]) {
+      expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
+        "Handoff receipt is invalid",
+      );
+    }
+  });
+
+  test("literal-binds every historical predecessor tree field", () => {
+    for (const [field, value] of [
+      ["bytes", expectedHistoricalOprtePreviewTree.bytes + 1],
+      ["directories", expectedHistoricalOprtePreviewTree.directories + 1],
+      ["digest", `0${expectedHistoricalOprtePreviewTree.digest.slice(1)}`],
+      ["entries", expectedHistoricalOprtePreviewTree.entries + 1],
+      ["files", expectedHistoricalOprtePreviewTree.files + 1],
+      ["symlinks", expectedHistoricalOprtePreviewTree.symlinks + 1],
+    ] as const) {
+      const mutation = receipt();
+      const predecessor = mutation["predecessor"] as Record<string, unknown>;
+      predecessor["tree"] = {
+        ...expectedHistoricalOprtePreviewTree,
+        [field]: value,
+      };
+      expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
+        "Handoff receipt is invalid",
+      );
+    }
   });
 
   test("retains exact v0.1.7 through v0.1.10 prior-HRA rollback evidence", () => {
@@ -116,6 +201,7 @@ describe("installation handoff receipt schema", () => {
           bundleIdentifier: "kitchen.hraness",
           executable: "hra",
         },
+        signature: { policy: "strict" },
         tree,
       };
       expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
