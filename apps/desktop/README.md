@@ -158,6 +158,8 @@ bun run installation:handoff \
 
 An existing `/Applications/HRA.app` is accepted only when it is the exact v0.1.7 build 8, immutable v0.1.8 build 9, immutable v0.1.9 build 10, or immutable v0.1.10 build 11 release. The handoff archives that prior app and can restore it through the bounded rollback path.
 
+The exact OPRTE v0.1.4 build 5 predecessor uses the historical self-managed OPRTE Preview certificate chain, which current macOS can report as untrusted even when its signature bytes are unchanged. The handoff accepts that trust result only for the frozen predecessor tree, designated requirement, CodeDirectory, detached CMS signature, certificate fingerprints and chain, signed CMS time within the exact encoded leaf-certificate validity interval, root metadata, and extended-attribute inventory. Preview signing requested no secure timestamp. The pinned executable hash freezes the exact CMS bytes, and the verifier pins the signed time instead of making receipt-bound rollback depend on the current wall clock. The v0.1.12 candidate, every supported prior HRA, and every other bundle remain subject to strict system code-signature verification. The receipt preserves the selected policy so archive, restart, rollback, and staging deletion checks cannot infer the exception from a bundle name or error message.
+
 The retired annotated `v0.1.11` tag object `e4c171e33e414d74a36791fc8577cbfbcef8e52e` points directly to candidate commit `5a2a9842cacc75fee42ab8e23ca8c215a643e21e`. GitHub has no release or assets for that tag. HRA v0.1.11 build 12 is tagged-only historical evidence, never installed-app or rollback authority, and the tag must not be moved or reused.
 
 The backup directory must not exist. The operation creates it with user-only permissions and writes durable phase receipts. It rejects symbolic-link, case, Unicode-normalization, inode, process-birth, AppKit launch-identity, open-file, updater, receipt, custody, bundle, and Git-provenance ambiguity. A pre-commit interruption restores both original applications. An interruption after the committed receipt preserves HRA authority. Resume only its bounded, idempotent staging cleanup with the committed receipt:
@@ -170,7 +172,7 @@ bun run installation:cleanup \
 
 Cleanup revalidates the committed candidate, requires the predecessor path to remain absent, and deletes only the exact receipt-bound predecessor and prior-HRA staging bundles. It can be rerun after any cleanup interruption.
 
-Ordinary rollback is available only while the complete state tree still matches the pre-cutover receipt. HRA's first normal launch advances the SQLite schema, so any launch or other state change makes this command refuse without touching either application:
+Ordinary rollback is available only while the complete state tree still matches the pre-cutover receipt. HRA v0.1.11 and v0.1.12 both use SQLite migration 62, but HRA's first normal launch writes the v0.1.12 build 13 release state and generation fence. That launch or any other state change makes this command refuse without touching either application:
 
 ```sh
 bun run installation:rollback \

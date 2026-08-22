@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  inspectInstallationBundle,
   inspectTree,
   performInstallationHandoff,
   resumeCommittedInstallationHandoffCleanup,
@@ -25,6 +26,12 @@ import {
   type InstallationHandoffPaths,
   type StateContinuityEvidence,
 } from "../installation-handoff";
+import {
+  expectedHistoricalOprtePreviewSignature,
+  expectedHistoricalOprtePreviewTree,
+  historicalOprtePreviewSignaturePolicy,
+  strictBundleSignaturePolicy,
+} from "../historical-oprte-preview";
 import {
   inspectProspectivePathAuthority,
   renameWithPathAuthority,
@@ -168,6 +175,122 @@ describe("OPRTE to HRA installation handoff", () => {
       }, fixture.dependencies);
       expect(await inspectTree(fixture.paths.canonicalApp)).toEqual(priorHraBefore);
     }
+  }, 60_000);
+
+  test("routes every predecessor archive, stage, restore, and deletion through the historical policy", async () => {
+    const fixture = await createFixture();
+    const inspections: Array<Readonly<{
+      executable: string;
+      path: string;
+      policy: string;
+    }>> = [];
+    const dependencies: InstallationHandoffDependencies = {
+      ...fixture.dependencies,
+      async inspectBundle(path, policy) {
+        const inspected = await fixture.dependencies.inspectBundle(path, policy);
+        inspections.push({
+          executable: inspected.identity.executable,
+          path,
+          policy,
+        });
+        return inspected;
+      },
+    };
+    const result = await performInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      candidateApp: fixture.paths.candidateApp,
+      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+      paths: fixture.paths,
+    }, dependencies);
+    await rollbackInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      confirmation: "ROLL-BACK-HRA-TO-OPRTE",
+      paths: fixture.paths,
+    }, dependencies);
+
+    const faultFixture = await createFixture();
+    const faultInspections: typeof inspections = [];
+    const faultDependencies: InstallationHandoffDependencies = {
+      ...faultFixture.dependencies,
+      async inspectBundle(path, policy) {
+        const inspected = await faultFixture.dependencies.inspectBundle(path, policy);
+        faultInspections.push({
+          executable: inspected.identity.executable,
+          path,
+          policy,
+        });
+        return inspected;
+      },
+    };
+    expect(performInstallationHandoff({
+      backupDirectory: faultFixture.backupDirectory,
+      candidateApp: faultFixture.paths.candidateApp,
+      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+      paths: faultFixture.paths,
+      onCheckpoint(point) {
+        if (point === "after_predecessor_retired") {
+          throw new Error("exercise rollback-stage deletion");
+        }
+      },
+    }, faultDependencies)).rejects.toThrow("exercise rollback-stage deletion");
+    const faultReceipt = JSON.parse(
+      await readFile(
+        join(faultFixture.backupDirectory, "handoff-receipt.json"),
+        "utf8",
+      ),
+    ) as { operationId: string };
+
+    const allInspections = [...inspections, ...faultInspections];
+    expect(allInspections.some(value => value.executable === "oprte")).toBeTrue();
+    expect(allInspections.some(value => value.executable === "hra")).toBeTrue();
+    for (const inspection of allInspections) {
+      expect(inspection.policy).toBe(
+        inspection.executable === "oprte"
+          ? historicalOprtePreviewSignaturePolicy
+          : strictBundleSignaturePolicy,
+      );
+    }
+
+    const historicalCount = (
+      ledger: typeof inspections,
+      expectedPath: string,
+    ): number => ledger.filter(inspection =>
+      inspection.path === expectedPath
+      && inspection.policy === historicalOprtePreviewSignaturePolicy
+    ).length;
+    const predecessorArchive = join(
+      fixture.backupDirectory,
+      "predecessor.bundle",
+    );
+    const predecessorRetirementStage = join(
+      fixture.paths.applicationsDirectory,
+      `.${result.operationId}.predecessor.bundle`,
+    );
+    const predecessorRestoreStage = join(
+      fixture.paths.applicationsDirectory,
+      `.${result.operationId}.OPRTE.app.restore.bundle`,
+    );
+    expect(historicalCount(inspections, fixture.paths.predecessorApp)).toBeGreaterThanOrEqual(3);
+    expect(historicalCount(inspections, predecessorArchive)).toBeGreaterThanOrEqual(2);
+    expect(historicalCount(inspections, predecessorRetirementStage)).toBeGreaterThanOrEqual(2);
+    expect(historicalCount(inspections, predecessorRestoreStage)).toBeGreaterThanOrEqual(1);
+
+    const faultRetirementStage = join(
+      faultFixture.paths.applicationsDirectory,
+      `.${faultReceipt.operationId}.predecessor.bundle`,
+    );
+    const faultRestoreStage = join(
+      faultFixture.paths.applicationsDirectory,
+      `.${faultReceipt.operationId}.OPRTE.app.restore.bundle`,
+    );
+    expect(historicalCount(
+      faultInspections,
+      faultRetirementStage,
+    )).toBeGreaterThanOrEqual(3);
+    expect(historicalCount(
+      faultInspections,
+      faultRestoreStage,
+    )).toBeGreaterThanOrEqual(1);
   }, 60_000);
 
   test("rejects tagged-only v0.1.11 and current v0.1.12 as unreceipted prior HRA authority", async () => {
@@ -386,7 +509,66 @@ describe("OPRTE to HRA installation handoff", () => {
     expect(lstat(fixture.paths.canonicalApp)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  test("the frozen tree proof detects resource, executable, nested-code, symlink, and mode tampering", async () => {
+    const mutations = [
+      ["resource", async (root: string) => {
+        await writeFile(join(root, "Contents", "Resources", "resource.txt"), "changed\n");
+      }],
+      ["executable", async (root: string) => {
+        await writeFile(join(root, "Contents", "MacOS", "oprte"), "changed\n", {
+          mode: 0o755,
+        });
+      }],
+      ["nested helper", async (root: string) => {
+        await writeFile(
+          join(root, "Contents", "Resources", "runtime", "helper"),
+          "changed\n",
+          { mode: 0o755 },
+        );
+      }],
+      ["symlink", async (root: string) => {
+        const path = join(root, "Contents", "Frameworks", "Current");
+        await rm(path);
+        await symlink("Versions/C", path);
+      }],
+      ["mode", async (root: string) => {
+        await chmod(join(root, "Contents", "Resources", "runtime", "helper"), 0o700);
+      }],
+    ] as const;
+
+    for (const [label, mutate] of mutations) {
+      const root = await createTreeTamperFixture();
+      const before = await inspectTree(root);
+      await mutate(root);
+      expect((await inspectTree(root)).digest, label).not.toBe(before.digest);
+    }
+  });
+
 });
+
+async function createTreeTamperFixture(): Promise<string> {
+  const parent = await realpath(
+    await mkdtemp(join(tmpdir(), "hra-installation-tree-tamper-test-")),
+  );
+  roots.push(parent);
+  const root = join(parent, "OPRTE.app");
+  await mkdir(join(root, "Contents", "MacOS"), { recursive: true });
+  await mkdir(join(root, "Contents", "Resources", "runtime"), { recursive: true });
+  await mkdir(join(root, "Contents", "Frameworks", "Versions", "B"), {
+    recursive: true,
+  });
+  await writeFile(join(root, "Contents", "MacOS", "oprte"), "executable\n", {
+    mode: 0o755,
+  });
+  await writeFile(join(root, "Contents", "Resources", "resource.txt"), "resource\n");
+  await writeFile(
+    join(root, "Contents", "Resources", "runtime", "helper"),
+    "helper\n",
+    { mode: 0o755 },
+  );
+  await symlink("Versions/B", join(root, "Contents", "Frameworks", "Current"));
+  return root;
+}
 
 async function createFixture(
   options: Readonly<{
@@ -486,6 +668,26 @@ async function createFixture(
         preserveTimestamps: true,
         verbatimSymlinks: true,
       });
+    },
+    async inspectBundle(path, signaturePolicy) {
+      const inspected = await inspectInstallationBundle(
+        path,
+        strictBundleSignaturePolicy,
+      );
+      if (inspected.identity.executable === "oprte") {
+        if (signaturePolicy !== historicalOprtePreviewSignaturePolicy) {
+          throw new Error("Fixture predecessor requires historical policy.");
+        }
+        return {
+          ...inspected,
+          signature: expectedHistoricalOprtePreviewSignature,
+          tree: expectedHistoricalOprtePreviewTree,
+        };
+      }
+      if (signaturePolicy !== strictBundleSignaturePolicy) {
+        throw new Error("Fixture HRA requires strict policy.");
+      }
+      return inspected;
     },
     keychainRead: () => Promise.resolve(null),
     now: () => 1_786_934_400_000,
