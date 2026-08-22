@@ -196,7 +196,7 @@ Use this order for the shared backend:
    predecessor OPRTE/Kitchen receipt is expected and is not a health gate.
 7. From the same candidate commit C recorded in step 3, complete its full
    package, then follow the desktop release runbook to create and push the
-   direct annotated `v0.1.12` tag and
+   direct annotated `v0.1.13` tag and
    publish the exact seven-asset immutable GitHub prerelease. Fill the
    working-tree publication contract from C's emitted evidence and require
    `bun run verify:remote-release` to read back exact remote names, byte counts,
@@ -211,6 +211,12 @@ Use this order for the shared backend:
    `5a2a9842cacc75fee42ab8e23ca8c215a643e21e`, but has no GitHub release or
    assets. Treat it as retired tag-only evidence, never as publication or
    installation authority.
+   The immutable v0.1.12 build 13 prerelease remains the current published
+   predecessor and valid prior installed-app authority while v0.1.13 is a
+   candidate. Its direct annotated tag object
+   `626be494d24733d12e53d09932cb5cc6218bc2fe` points to
+   `9ab991d08d1507fd73c9e7ef5fb4a37baee9c014`; do not retire, replace, or
+   relabel that release.
 8. Retain the predecessor deploy key only for the bounded rollback window.
    Revoke it after HRA authority and rollback disposition are complete.
 

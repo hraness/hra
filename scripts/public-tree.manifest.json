@@ -1718,6 +1718,7 @@
     "apps/desktop/runtime/test/human-organization-operation-store.test.ts",
     "apps/desktop/runtime/test/image-normalizer.macos.test.ts",
     "apps/desktop/runtime/test/installation-handoff-schema.test.ts",
+    "apps/desktop/runtime/test/installation-handoff.macos.test.ts",
     "apps/desktop/runtime/test/installation-handoff.property.test.ts",
     "apps/desktop/runtime/test/installation-handoff.test.ts",
     "apps/desktop/runtime/test/installation-path-authority.test.ts",
