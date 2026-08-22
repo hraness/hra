@@ -9,6 +9,11 @@ const convexDeployArguments = [
   "x",
   "convex",
   "deploy",
+  // Convex 1.44 otherwise reads remote module hashes through
+  // /api/get_config_hashes before the push. That optional optimization needs
+  // deployment:data:view, while pushing every module stays within the checked
+  // deployment:deploy key boundary.
+  "--push-all-modules",
   "--cmd-url-env-var-name",
   "NEXT_PUBLIC_CONVEX_URL",
   "--cmd",

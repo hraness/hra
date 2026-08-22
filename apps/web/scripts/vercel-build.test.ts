@@ -308,12 +308,14 @@ describe("provider process boundary", () => {
       "x",
       "convex",
       "deploy",
+      "--push-all-modules",
       "--cmd-url-env-var-name",
       "NEXT_PUBLIC_CONVEX_URL",
       "--cmd",
       "bun run build",
     ]);
     expect(observed.calls[0]?.command.join(" ")).not.toContain("secret");
+    expect(observed.calls[0]?.command).toContain("--push-all-modules");
     expect(observed.calls[0]?.environment.CONVEX_PROVIDER_AUTHORITY)
       .toContain("|secret");
     expect(

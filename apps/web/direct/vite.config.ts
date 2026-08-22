@@ -1,15 +1,27 @@
 import react from "@vitejs/plugin-react";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
+
+import { injectDirectAppearanceBootstrap } from "./appearance-bootstrap";
 
 const directRoot = fileURLToPath(new URL(".", import.meta.url));
 const productRoot = resolve(directRoot, "..");
 
+export function directAppearanceBootstrapPlugin(): Plugin {
+  return {
+    name: "hra-direct-appearance-bootstrap",
+    transformIndexHtml: {
+      order: "pre",
+      handler: injectDirectAppearanceBootstrap,
+    },
+  };
+}
+
 export default defineConfig({
   root: directRoot,
   base: "./",
-  plugins: [react()],
+  plugins: [directAppearanceBootstrapPlugin(), react()],
   resolve: {
     alias: [{ find: /^@\/(.*)$/u, replacement: `${productRoot}/$1` }],
   },
