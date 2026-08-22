@@ -196,7 +196,7 @@ Use this order for the shared backend:
    predecessor OPRTE/Kitchen receipt is expected and is not a health gate.
 7. From the same candidate commit C recorded in step 3, complete its full
    package, then follow the desktop release runbook to create and push the
-   direct annotated `v0.1.11` tag and
+   direct annotated `v0.1.12` tag and
    publish the exact seven-asset immutable GitHub prerelease. Fill the
    working-tree publication contract from C's emitted evidence and require
    `bun run verify:remote-release` to read back exact remote names, byte counts,
@@ -206,6 +206,11 @@ Use this order for the shared backend:
    that exact P. Only then set
    `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST=P` in Production and Preview, and
    redeploy exact P before enabling or exercising the installation handoff.
+   The existing annotated `v0.1.11` tag object
+   `e4c171e33e414d74a36791fc8577cbfbcef8e52e` points directly to
+   `5a2a9842cacc75fee42ab8e23ca8c215a643e21e`, but has no GitHub release or
+   assets. Treat it as retired tag-only evidence, never as publication or
+   installation authority.
 8. Retain the predecessor deploy key only for the bounded rollback window.
    Revoke it after HRA authority and rollback disposition are complete.
 
