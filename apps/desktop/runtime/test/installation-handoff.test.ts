@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  candidateStagePath,
   inspectInstallationBundle,
   inspectTree,
   lsofResultIsQuiescent,
@@ -47,6 +48,7 @@ const supportedPriorHraIdentities = [
   { build: "10", version: "0.1.9" },
   { build: "11", version: "0.1.10" },
   { build: "13", version: "0.1.12" },
+  { build: "14", version: "0.1.13" },
 ] as const;
 const faultPoints: readonly InstallationHandoffFaultPoint[] = [
   "after_full_backup",
@@ -71,6 +73,34 @@ afterAll(async () => {
 });
 
 describe("OPRTE to HRA installation handoff", () => {
+  test("derives candidate staging only from a normalized non-root directory and exact operation ID", () => {
+    const operationId = `handoff_${"a".repeat(24)}`;
+    expect(candidateStagePath("/Applications", operationId)).toBe(
+      `/Applications/.${operationId}.candidate.app`,
+    );
+    for (const invalidOperationId of [
+      `../${operationId}`,
+      `${operationId}/../escape`,
+      `${operationId}\\escape`,
+      `handoff_${"a".repeat(23)}`,
+    ]) {
+      expect(() => candidateStagePath("/Applications", invalidOperationId))
+        .toThrow("Candidate stage operation ID is invalid.");
+    }
+    for (const invalidApplicationsDirectory of [
+      "/",
+      "Applications",
+      "/Applications/",
+      "/Applications/../Applications",
+      "/Applications\u0000/escape",
+    ]) {
+      expect(() => candidateStagePath(invalidApplicationsDirectory, operationId))
+        .toThrow(
+          "Applications directory must be an absolute normalized non-root path.",
+        );
+    }
+  });
+
   test("binds its control-plane descriptor before fail-closed lsof checks in handoff and rollback", async () => {
     const handoffOrder = [
       "quit",
@@ -136,6 +166,50 @@ describe("OPRTE to HRA installation handoff", () => {
       expect(lsofResultIsQuiescent(result(malformedStatus))).toBeFalse();
     }
   });
+
+  test("keeps the staged candidate under an app path and rolls a verifier failure back", async () => {
+    const fixture = await createFixture();
+    const stateBefore = await inspectTree(fixture.paths.stateRoot, stateTreeOptions);
+    const predecessorBefore = await inspectTree(fixture.paths.predecessorApp);
+    const hraBefore = await inspectTree(fixture.paths.canonicalApp);
+    const verificationPaths: string[] = [];
+    const dependencies: InstallationHandoffDependencies = {
+      ...fixture.dependencies,
+      verifyCandidate(path) {
+        verificationPaths.push(path);
+        if (!path.endsWith(".app")) {
+          return Promise.reject(new Error("Packaged app path must end in .app."));
+        }
+        return verificationPaths.length === 1
+          ? Promise.resolve({ commit: expectedCommit })
+          : Promise.reject(new Error("injected staged candidate verifier failure"));
+      },
+    };
+
+    expect(performInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      candidateApp: fixture.paths.candidateApp,
+      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+      paths: fixture.paths,
+    }, dependencies)).rejects.toThrow("injected staged candidate verifier failure");
+
+    const receipt = JSON.parse(
+      await readFile(join(fixture.backupDirectory, "handoff-receipt.json"), "utf8"),
+    ) as Record<string, unknown>;
+    const stagedCandidate = join(
+      fixture.paths.applicationsDirectory,
+      `.${String(receipt["operationId"])}.candidate.app`,
+    );
+    expect(verificationPaths).toEqual([
+      fixture.paths.candidateApp,
+      stagedCandidate,
+    ]);
+    expect(receipt["phase"]).toBe("rolled_back");
+    expect(await inspectTree(fixture.paths.stateRoot, stateTreeOptions)).toEqual(stateBefore);
+    expect(await inspectTree(fixture.paths.predecessorApp)).toEqual(predecessorBefore);
+    expect(await inspectTree(fixture.paths.canonicalApp)).toEqual(hraBefore);
+    expect(lstat(stagedCandidate)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 60_000);
 
   test("rolls every deterministic fault checkpoint back to both original apps and exact state", async () => {
     for (const faultPoint of faultPoints) {
@@ -361,10 +435,10 @@ describe("OPRTE to HRA installation handoff", () => {
     )).toBeGreaterThanOrEqual(1);
   }, 60_000);
 
-  test("rejects tagged-only v0.1.11 and current v0.1.13 as unreceipted prior HRA authority", async () => {
+  test("rejects tagged-only v0.1.11 and current v0.1.14 as unreceipted prior HRA authority", async () => {
     for (const identity of [
       { build: "12", version: "0.1.11" },
-      { build: "14", version: "0.1.13" },
+      { build: "15", version: "0.1.14" },
     ] as const) {
       const fixture = await createFixture({ priorHra: false });
       await createBundle(fixture.paths.canonicalApp, {
@@ -459,7 +533,7 @@ describe("OPRTE to HRA installation handoff", () => {
     );
     const priorHraStage = join(
       fixture.paths.applicationsDirectory,
-      `.${operationId}.candidate.bundle`,
+      `.${operationId}.candidate.app`,
     );
     await lstat(predecessorStage);
     await lstat(priorHraStage);
@@ -710,7 +784,7 @@ async function createFixture(
     version: "0.1.4",
   });
   const priorHra = options.priorHra === undefined
-    ? supportedPriorHraIdentities[4]
+    ? supportedPriorHraIdentities[5]
     : options.priorHra;
   if (priorHra !== false) {
     await createBundle(join(applicationsDirectory, "HRA.app"), {
@@ -721,10 +795,10 @@ async function createFixture(
     });
   }
   await createBundle(candidateApp, {
-    build: "14",
+    build: "15",
     executable: "hra",
     marker: "candidate",
-    version: "0.1.13",
+    version: "0.1.14",
   });
   const controlPlanePath = join(stateRoot, "control-plane.sqlite");
   const database = openControlPlane(controlPlanePath, {
