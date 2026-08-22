@@ -23,8 +23,8 @@ import {
   type SessionSyncHumanScope,
 } from "../src/cloud/session-sync-coordinator";
 import {
-  SessionSyncKeyCustody,
   SessionSyncRecoveryKeyCustody,
+  type SessionSyncKeyCustody,
 } from "../src/cloud/session-sync-key-custody";
 import {
   SessionSyncBearerClient,
@@ -193,6 +193,10 @@ describe("session sync coordinator human-authority fence", () => {
       rootKey.slice(),
     );
     class TestRecoveryCustody extends SessionSyncRecoveryKeyCustody {
+      override pendingTransitionMetadata() {
+        return Promise.resolve(null);
+      }
+
       override metadata() {
         return Promise.resolve({
           authority: generatedRecovery.authority,
@@ -208,6 +212,9 @@ describe("session sync coordinator human-authority fence", () => {
       }
     }
     const recoveryCustody = new TestRecoveryCustody();
+    const keyCustody = {
+      pendingVaultRootTransitionMetadata: () => Promise.resolve(null),
+    } as unknown as SessionSyncKeyCustody;
     const humanSession = new HumanSessionCoordinator({
       store: {
         read: () => Promise.resolve(null),
@@ -224,7 +231,7 @@ describe("session sync coordinator human-authority fence", () => {
     const coordinator = new SessionSyncCoordinator({
       store,
       journal: new SessionSyncOperationJournal(database),
-      keyCustody: new SessionSyncKeyCustody(),
+      keyCustody,
       recoveryCustody,
       client: new SessionSyncBearerClient({
         session: humanSession,
