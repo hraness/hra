@@ -18,6 +18,7 @@ The desktop build pins the Codex and Git versions it was tested against. Apple S
 flowchart LR
     UI["React panes and Settings"] --> Host["Native SDK Zig host"]
     Host -->|"bounded JSONL"| Gateway["compiled Bun gateway"]
+    CLI["local hra CLI"] -->|"owner-private read channel"| Gateway
     Gateway --> DB["SQLite control plane"]
     Gateway --> A["Account A app-server<br/>isolated CODEX_HOME"]
     Gateway --> B["Account B app-server<br/>isolated CODEX_HOME"]
@@ -29,6 +30,7 @@ flowchart LR
 - The Zig host owns application lifecycle, the system WKWebView, trusted directory selection, and the bounded Native bridge.
 - The compiled Bun gateway owns SQLite, Codex and Git processes, account routing, local execution, recovery, and destructive-data authority.
 - The renderer receives pathless projections and app-owned commands. It never receives provider thread IDs, raw protocol messages, local paths, credentials, commands, or tool output.
+- The packaged `hra` CLI reaches the gateway through a separate owner-private local read channel. It receives the same minimized attention projection or a bounded pane summary and has no mutation authority.
 - Each account gets a separate `CODEX_HOME` and durable process generation. A generation advances before replacement, so stale responses cannot reach a newer process.
 - The renderer hydrates one atomic snapshot and applies ordered events. A sequence gap or `snapshot.invalidated` event triggers a fresh snapshot.
 
@@ -45,6 +47,52 @@ The pane header shows the next run as a concise relative time. HRA owns scheduli
 The header contains one shared-folder control for every chat. It defaults to the user’s Documents directory. The selected folder is admitted as an additional runtime workspace root for every Codex turn, while each pane’s managed Git worktree remains its working directory and repository identity. The renderer receives only the folder’s display name, never its full path.
 
 HRA applies one immutable execution policy: `danger-full-access`, approval policy `never`, and automatic approval review. Computer use is required and verified for each provider thread. It depends on the official signed Computer Use helper installed with the supported OpenAI application and the required macOS permissions. HRA does not copy or redistribute that helper, and it refuses the provider thread when the capability cannot be proven.
+
+## Attention and local observation
+
+The header Attention drawer is a fresh gateway-owned projection. It emits at most one reason for each pane, prioritizing ambiguous delivery, workspace setup ambiguity or approval, setup failure, managed-workspace recovery, chat attention, and a paused queue. Account and system recovery can appear beside those pane items. Hosted task data is limited to aggregate attention and review counts by workspace. Paths, queue contents, prompts, responses, task details, provider identifiers, commands, output, and setup transcripts never enter the projection.
+
+Local pane and recovery items remain available when hosted task refresh fails. The drawer marks that result as partial instead of hiding local work. Ordinary schedules stay quiet, and an optional HRA Cloud account that is signed out or not configured does not create attention by itself.
+
+The desktop package includes a separate read-only `hra` executable. HRA does
+not silently edit shell profiles or install a privileged link. After placing
+`HRA.app` in `/Applications`, opt in to the packaged command for the current
+shell with:
+
+```sh
+export PATH="/Applications/HRA.app/Contents/Resources/cli:$PATH"
+```
+
+Persist that exact line in your shell profile if you want `hra` available in
+new terminals. Then run:
+
+```sh
+hra attention list --json
+hra pane list --json
+```
+
+This local `hra` command is distinct from `taskctl`. `taskctl` is the HTTP client for hosted task operations; `hra` observes only the running desktop gateway. It discovers fixed production or source-development endpoints, authenticates with a fresh owner-private generation capability, and accepts no endpoint, token, profile, provider, path, or mutation override. Successful output is one validated JSON value. Diagnostics remain pathless and never print the capability.
+
+## Declarative managed-workspace setup
+
+A repository may opt into one closed setup recipe at `.hra/workspace.json`. HRA reads the file from the pane's immutable base commit, not from mutable checkout bytes. Version 1 accepts only this shape:
+
+```json
+{
+  "version": 1,
+  "setup": {
+    "kind": "bunInstall",
+    "frozenLockfile": true,
+    "lifecycleScripts": "disabled",
+    "timeoutSeconds": 300,
+    "outputLimitBytes": 262144
+  }
+}
+```
+
+The schema has no shell command, argument, environment, hook, or copy field. HRA invokes the bundled Bun runtime directly with a frozen lockfile and disabled lifecycle scripts, bounded by the declared timeout and output ceiling. A recipe requires explicit approval bound to the exact setup request, recipe digest, and setup revision before its first effect.
+
+Setup completion is durable and fail-closed. If HRA restarts after an effect began but before it can prove the outcome, the request becomes ambiguous. HRA does not retry that effect or reuse the uncertain workspace; replace it with a clean managed workspace. A repository without the recipe follows normal managed-worktree provisioning.
 
 ## Local state and account isolation
 

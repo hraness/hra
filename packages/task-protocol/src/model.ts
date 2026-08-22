@@ -113,12 +113,11 @@ export const phaseOneSecurityEventByTransition = {
   startSession: "agent.session_started",
 } as const satisfies Record<string, SecurityEventType>;
 
-export const workosUserIdSchema = z.string()
-  .regex(/^user_[A-Za-z0-9]+$/u, "invalid WorkOS user ID");
-export const workosOrganizationIdSchema = z.string()
-  .regex(/^org_[A-Za-z0-9]+$/u, "invalid WorkOS organization ID");
-export const workosMembershipIdSchema = z.string()
-  .regex(/^om_[A-Za-z0-9]+$/u, "invalid WorkOS organization membership ID");
+export const humanUserIdSchema = z.string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u, "invalid human user ID");
+export type HumanUserId = z.infer<typeof humanUserIdSchema>;
 
 function hasOnlyAllowedOwnedTextControls(value: string): boolean {
   for (const character of value) {

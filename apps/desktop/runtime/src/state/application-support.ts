@@ -24,6 +24,10 @@ import {
 import { basename, dirname, isAbsolute, join, parse, relative, sep } from "node:path";
 import { z } from "@hra-internal/schema";
 import {
+  localObservationDirectoryName,
+  localObservationSocketFileName,
+} from "@hraness/hra-local-observation-protocol/wire";
+import {
   assertBoundedControlPlaneIntegrity,
   ControlPlaneIntegrityError,
 } from "./control-plane-integrity";
@@ -43,6 +47,8 @@ const historicalOprteDirectoryName = "Oprte";
 const historicalOperateDevelopmentDirectoryName = "OPeRaTE";
 const predecessorDirectoryName = "Kitchen";
 const legacyDevelopmentDirectoryName = "Hraness Kitchen Development";
+export const isolatedDevelopmentApplicationSupportDirectoryName =
+  "HRA Source Development";
 const predecessorPrimaryDirectoryName = "Hraness Kitchen";
 const migrationReceiptFileName = ".oprte-application-support-migration-v2.json";
 const migrationStageDirectoryName = ".oprte-application-support-migration-v2.stage";
@@ -212,7 +218,20 @@ export class ApplicationSupportMigrationError extends Error {
   }
 }
 
-export class ApplicationSupportStartup {
+export interface ApplicationSupportStartupAuthority {
+  readonly root: string;
+  readonly initialState: ApplicationSupportMigrationState["kind"];
+  readonly activated: boolean;
+  readonly migratedFromRoot: string | null;
+  hasControlPlaneDatabase(): boolean;
+  prepareTargetRoot(): void;
+  preserveForwardOnlyForRetry(): void;
+  activate(): void;
+  rollbackBeforeActivation(): boolean;
+}
+
+export class ApplicationSupportStartup
+  implements ApplicationSupportStartupAuthority {
   readonly root: string;
   readonly initialState: ApplicationSupportMigrationState["kind"];
   readonly #options: ApplicationSupportMigrationOptions;
@@ -252,7 +271,9 @@ export class ApplicationSupportStartup {
 
   prepareTargetRoot(): void {
     ensureDirectDirectory(this.#paths.target, legacyOprteApplicationSupportDirectoryName);
-    validateOwnedTree(this.#paths.target);
+    validateOwnedTree(this.#paths.target, {
+      allowCurrentLocalObservationSocket: true,
+    });
     verifyControlPlaneCutover(this.#paths.target, this.#options);
   }
 
@@ -279,7 +300,9 @@ export class ApplicationSupportStartup {
 
   activate(): void {
     assertOwnedDirectory(this.#paths.target, "target");
-    validateOwnedTree(this.#paths.target);
+    validateOwnedTree(this.#paths.target, {
+      allowCurrentLocalObservationSocket: true,
+    });
     const existingReceipt = readMigrationReceipt(this.#paths.receipt);
     if (existingReceipt?.phase === "activated") {
       this.#activated = true;
@@ -393,6 +416,57 @@ export class ApplicationSupportStartup {
   }
 }
 
+class IsolatedDevelopmentApplicationSupportStartup
+  implements ApplicationSupportStartupAuthority {
+  readonly root: string;
+  readonly initialState: "neither" | "targetOnly";
+  #activated = false;
+
+  constructor(root: string) {
+    this.root = root;
+    this.initialState = readMetadata(root) === null ? "neither" : "targetOnly";
+  }
+
+  get activated(): boolean {
+    return this.#activated;
+  }
+
+  get migratedFromRoot(): null {
+    return null;
+  }
+
+  hasControlPlaneDatabase(): boolean {
+    return protectedFileMetadata(join(this.root, "control-plane.sqlite")) !== null;
+  }
+
+  prepareTargetRoot(): void {
+    ensureDirectDirectory(
+      this.root,
+      isolatedDevelopmentApplicationSupportDirectoryName,
+    );
+    validateOwnedTree(this.root, {
+      allowCurrentLocalObservationSocket: true,
+    });
+    verifyControlPlaneCutover(this.root, {});
+  }
+
+  preserveForwardOnlyForRetry(): void {
+    // This root never enters a forward-only production migration.
+  }
+
+  activate(): void {
+    assertOwnedDirectory(this.root, "development target");
+    validateOwnedTree(this.root, {
+      allowCurrentLocalObservationSocket: true,
+    });
+    this.#activated = true;
+  }
+
+  rollbackBeforeActivation(): boolean {
+    return false;
+  }
+}
+
 type RootState =
   | Readonly<{ kind: "missing" }>
   | Readonly<{ kind: "directory"; metadata: Stats }>
@@ -424,6 +498,32 @@ export function applicationSupportPaths(homeDirectory: string): ApplicationSuppo
 
 export function applicationSupportRoot(homeDirectory: string): string {
   return applicationSupportPaths(homeDirectory).target;
+}
+
+export function isolatedDevelopmentApplicationSupportRoot(
+  homeDirectory: string,
+): string {
+  if (!isAbsolute(homeDirectory) || homeDirectory === parse(homeDirectory).root) {
+    throw new Error("HOME must be an absolute user directory");
+  }
+  return join(
+    homeDirectory,
+    "Library",
+    "Application Support",
+    isolatedDevelopmentApplicationSupportDirectoryName,
+  );
+}
+
+/**
+ * Raw source development owns a fresh root that has no migration relationship
+ * with the signed product's OPRTE authority or any historical production root.
+ */
+export function prepareIsolatedDevelopmentApplicationSupport(
+  homeDirectory: string,
+): ApplicationSupportStartupAuthority {
+  const root = isolatedDevelopmentApplicationSupportRoot(homeDirectory);
+  ensureApplicationSupportParent(dirname(root));
+  return new IsolatedDevelopmentApplicationSupportStartup(root);
 }
 
 export function inspectApplicationSupportMigration(
@@ -1151,6 +1251,7 @@ function assertSameVolume(parent: string, source: string): void {
 
 function validateStateTree(paths: ApplicationSupportPaths): boolean {
   let interruptedRestore = false;
+  const targetMetadata = readMetadata(paths.target);
   for (const path of [
     paths.target,
     paths.stage,
@@ -1158,13 +1259,24 @@ function validateStateTree(paths: ApplicationSupportPaths): boolean {
   ]) {
     const metadata = readMetadata(path);
     if (metadata?.isDirectory()) {
-      interruptedRestore = validateOwnedTree(path) || interruptedRestore;
+      interruptedRestore = validateOwnedTree(path, {
+        allowCurrentLocalObservationSocket:
+          targetMetadata?.isDirectory() === true
+          && sameFileIdentity(metadata, targetMetadata),
+      }) || interruptedRestore;
     }
   }
   return interruptedRestore;
 }
 
-function validateOwnedTree(root: string): boolean {
+interface OwnedTreeValidationOptions {
+  readonly allowCurrentLocalObservationSocket?: boolean;
+}
+
+function validateOwnedTree(
+  root: string,
+  options: OwnedTreeValidationOptions = {},
+): boolean {
   const rootMetadata = lstatSync(root);
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
     throw unsafeRoot(root, "state-tree root is not a directory");
@@ -1194,10 +1306,38 @@ function validateOwnedTree(root: string): boolean {
           );
         }
         if (metadata.isDirectory()) {
+          if (
+            options.allowCurrentLocalObservationSocket === true
+            && path === join(root, localObservationDirectoryName)
+            && (
+              metadata.uid !== process.geteuid?.()
+              || (metadata.mode & 0o777) !== 0o700
+            )
+          ) {
+            throw unsafeRoot(
+              path,
+              "local-observation directory ownership or mode is unsafe",
+            );
+          }
           if (!isOpaqueStateDirectory(root, path)) pending.push(path);
           continue;
         }
         if (!metadata.isFile()) {
+          if (
+            options.allowCurrentLocalObservationSocket === true
+            && path === join(
+              root,
+              localObservationDirectoryName,
+              localObservationSocketFileName,
+            )
+            && metadata.isSocket()
+            && metadata.dev === rootMetadata.dev
+            && metadata.uid === process.geteuid?.()
+            && metadata.nlink === 1
+            && (metadata.mode & 0o777) === 0o600
+          ) {
+            continue;
+          }
           throw unsafeRoot(path, "nested FIFO, socket, or device");
         }
       }

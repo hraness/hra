@@ -6,7 +6,7 @@
 - `protocol.ts` – bounded provider-neutral projection of already parsed account, login, rate-limit, and token-usage values.
 - `dispatch-budget.ts` – conservative freshness and remaining-capacity classification for local-only account routing.
 - `runtime-router.ts` – one lazy, durable-generation-scoped supervised app-server process per account profile.
-- `account-service.ts` – serialized domain-command orchestration, generation-bound login authority, reconciliation, dispatch-budget refresh, removal, retained-local-data deletion, and projection updates.
+- `account-service.ts` – serialized domain-command orchestration, generation-bound login authority, reconciliation, dispatch-budget refresh, semantic weekly-usage projection, removal, retained-local-data deletion, and projection updates.
 
 # Guidelines
 
@@ -20,5 +20,5 @@
 - Delegate full `CODEX_HOME` deletion to the Native-resolved helper. Keep its process environment closed, its deadline and output bounded, its errors pathless, and advance the durable deletion tombstone only after exit zero.
 - Preserve a snapshot-projected retained-local-data tombstone until full local data is actually deleted so renderer and app restarts cannot hide recoverable state.
 - Consume only pinned-protocol owned values. Let the pinned boundary brand approved provider authorization URLs, keep product projection here, and revalidate external-open sinks as defense in depth without reparsing raw app-server payloads.
-- Rank task and interactive-pane accounts from fresh local rate-limit projections only. Honor a healthy pane preference and proactively choose another eligible account before a new provider effect begins. A definitive provider usage-limit rejection stops that logical turn and cannot authorize post-rejection routing, continuation, or replay. Never expose budgets or provider identity to the renderer or cloud.
+- Rank task and interactive-pane accounts from fresh local rate-limit projections only. Honor a healthy pane preference and proactively choose another eligible account before a new provider effect begins. A definitive provider usage-limit rejection stops that logical turn and cannot authorize post-rejection routing, continuation, or replay. Project only the exact seven-day remaining percentage and future reset time to Settings; never expose routing budgets, bucket identities, other windows, or provider identity to the renderer or cloud.
 - Treat a strictly classified invalidated authentication response as durable session expiry, clear private budget state, and publish only the owned re-login status.

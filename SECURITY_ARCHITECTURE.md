@@ -25,9 +25,12 @@ HRA is designed to:
 
 The web application owns organizations, workspaces, tasks, dependencies,
 claims, submissions, reviews, bounded display events, and human decisions.
-WorkOS authenticates humans and organization membership. Convex stores the
-authorized task graph and applies tenant and role checks at each external
-boundary.
+Convex Auth authenticates humans with password-first accounts. Convex owns the
+user, organization, and workspace membership records alongside the authorized
+task graph, and reloads tenant and role authority at each external boundary.
+Desktop and CLI clients receive an ordinary Convex Auth session only after a
+short-lived, verifier-bound browser pairing is approved by the signed-in human;
+the resulting rotating credentials remain in the existing Keychain custody.
 
 The browser is a supervision client. It cannot hold Codex credentials, select
 canonical local paths, start an arbitrary provider operation, or become the

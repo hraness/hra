@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from "react";
 
 import { Button, IconButton, IconLink } from "./ui";
@@ -12,6 +13,7 @@ import type {
   RuntimeDispatchResponse,
 } from "../../contracts/runtime";
 import { SubscriptionsSettings } from "./features/accounts/SubscriptionsSettings";
+import { AttentionDrawer } from "./features/attention/AttentionDrawer";
 import { HRAIcon } from "./features/chat/Icon";
 import { PaneGrid } from "./features/chat/PaneGrid";
 import {
@@ -32,6 +34,7 @@ import {
 } from "./features/chat/model";
 import {
   type RuntimeShell,
+  type RuntimeShellState,
   useRuntimeShellSelector,
 } from "./runtime";
 import { useUiScale } from "./ui-scale";
@@ -39,6 +42,8 @@ import { useUiScale } from "./ui-scale";
 export interface AppProps {
   /** StrictMode mounts must each own a fresh transport and shell lifecycle. */
   readonly runtimeShellFactory: () => RuntimeShell | null;
+  /** Optional serve-only chrome supplied by the development composition. */
+  readonly headerAccessory?: ReactNode;
 }
 
 function initialRoute(): ChatRoute {
@@ -73,7 +78,51 @@ export function inheritedRepositoryIsUnavailable(
     && response.error.message === "This repository is unavailable.";
 }
 
-export default function App({ runtimeShellFactory }: AppProps) {
+export function selectAttentionRefreshKey(state: RuntimeShellState): string {
+  const snapshot = state.state === "ready" || state.state === "reconnecting" ||
+      state.state === "failed"
+    ? state.snapshot
+    : undefined;
+  if (snapshot == null) return state.state;
+  const syncStatus = snapshot.sessionSync.status;
+  return JSON.stringify({
+    shell: state.state,
+    runtime: snapshot.runtime,
+    runner: snapshot.runner,
+    accounts: snapshot.accounts.map(({ id, revision }) => [id, revision]),
+    folderAccessRevision: snapshot.execution.folderAccess.revision,
+    humanAccountRevision: snapshot.humanAccount.revision,
+    paneAttention: snapshot.chat.panes.map((pane) => ({
+      id: pane.id,
+      title: pane.title,
+      repositoryName: pane.repository.name,
+      workspaceRevision: pane.workspace?.revision ?? null,
+      workspaceRecoveryKind: pane.workspace?.recoveryKind ?? null,
+      attentionCode: pane.attention?.code ?? null,
+      queuePauseReason: pane.messageQueue.pauseReason,
+      blockedMessage: pane.messageQueue.blockedMessage !== null,
+    })),
+    sessionSync: syncStatus.state === "active"
+      ? {
+          state: syncStatus.state,
+          revision: syncStatus.revision,
+          health: syncStatus.health,
+          recovery: syncStatus.recovery,
+          pendingEnrollmentCount: syncStatus.pendingEnrollments.length,
+          scheduledChatRecovery: syncStatus.scheduledChatRecovery?.state ?? null,
+          remoteSessions: snapshot.sessionSync.remoteSessions.map(
+            ({ sessionId, sourceRevision, state: remoteState }) => [
+              sessionId,
+              sourceRevision,
+              remoteState,
+            ],
+          ),
+        }
+      : syncStatus,
+  });
+}
+
+export default function App({ headerAccessory, runtimeShellFactory }: AppProps) {
   const shellRef = useRef<RuntimeShell | null>(null);
   const [runtimeShell, setRuntimeShell] = useState<RuntimeShell | null>(null);
   const [nativeUnavailable, setNativeUnavailable] = useState(false);
@@ -99,6 +148,10 @@ export default function App({ runtimeShellFactory }: AppProps) {
     runtimeShell,
     selectExecution,
     executionEqual,
+  );
+  const attentionRefreshKey = useRuntimeShellSelector(
+    runtimeShell,
+    selectAttentionRefreshKey,
   );
 
   useEffect(() => {
@@ -281,31 +334,37 @@ export default function App({ runtimeShellFactory }: AppProps) {
           type="button"
           variant="quiet"
         >
-          <span className="hra-folder-access__label">
-            Shared folder · {execution.folderAccess.displayName}
-          </span>
+          <span className="hra-folder-access__label">{execution.folderAccess.displayName}</span>
         </Button>
-        {effectiveRoute === "panes" ? (
-          <IconButton
-            aria-label={creatingPane ? "Choosing a project" : "New pane"}
-            className="new-pane-button-shell"
-            controlClassName="new-pane-button"
-            isDisabled={
-              runtimeShell === null ||
-              availability.kind !== "ready" ||
-              subscriptionGate !== "available" ||
-              creatingPane ||
-              paneIds.length >= 64
-            }
-            onPress={() => void createPane()}
-            isPending={creatingPane}
-            size="compact"
-            type="button"
-            variant="quiet"
-          >
-            <HRAIcon name="plus" />
-          </IconButton>
-        ) : <span className="hra-header__spacer" />}
+        <div className="hra-header__actions">
+          {headerAccessory}
+          <AttentionDrawer
+            isAvailable={availability.kind === "ready"}
+            refreshKey={attentionRefreshKey}
+            shell={runtimeShell}
+          />
+          {effectiveRoute === "panes" ? (
+            <IconButton
+              aria-label={creatingPane ? "Choosing a project" : "New pane"}
+              className="new-pane-button-shell"
+              controlClassName="new-pane-button"
+              isDisabled={
+                runtimeShell === null ||
+                availability.kind !== "ready" ||
+                subscriptionGate !== "available" ||
+                creatingPane ||
+                paneIds.length >= 64
+              }
+              onPress={() => void createPane()}
+              isPending={creatingPane}
+              size="compact"
+              type="button"
+              variant="quiet"
+            >
+              <HRAIcon name="plus" />
+            </IconButton>
+          ) : <span className="hra-header__spacer" />}
+        </div>
       </header>
       <main id="main-content" tabIndex={-1}>
         {folderAccessError === null ? null : (

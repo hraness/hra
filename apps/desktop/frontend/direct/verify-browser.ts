@@ -184,6 +184,7 @@ interface CoveragePolicyEntry {
 type ScenarioAction =
   | "prepare-draft"
   | "create-pane"
+  | "open-attention"
   | "exercise-malleable-chat"
   | "exercise-scheduled-chat"
   | "exercise-compact-controls"
@@ -268,13 +269,13 @@ const scenarios = [
     expectedBeforeAction: [
       "Scheduled release audit",
       "Scheduled · due now",
-      "Shared folder · Documents",
+      "Documents",
     ],
     expectedText: [
       "Scheduled release audit",
       "Scheduled · due now",
       "Direct could not interpret that schedule.",
-      "Shared folder · Documents",
+      "Documents",
     ],
     expectedVisibleControls: [
       "Shared folder access: Documents. Choose folder",
@@ -354,6 +355,28 @@ const scenarios = [
     ],
     forbiddenText: ["Allow once", "Approve", "Queue", "Steer", "Submit answer"],
     viewport: { width: 1_760, height: 900 },
+  },
+  {
+    id: "attention-mission-control",
+    action: "open-attention",
+    expectedBeforeAction: ["Release delivery"],
+    expectedText: [
+      "Attention",
+      "Local recovery, decisions, and reviews",
+      "Recovery",
+      "Message delivery is uncertain",
+      "Needs you",
+      "2 tasks need attention",
+      "Review",
+      "1 task is ready for review",
+    ],
+    expectedVisibleControls: [
+      "Attention, 3 items",
+      "Refresh attention",
+      "Close attention",
+    ],
+    forbiddenText: ["providerSession", "/Users/"],
+    viewport: { width: 1_120, height: 780 },
   },
   {
     id: "chat-compact-320",
@@ -514,7 +537,8 @@ const scenarios = [
       "Personal",
       "Signing in",
       "Work",
-      "builder@work.example · 64% remaining",
+      "builder@work.example",
+      "64% weekly remaining",
       "Codex 3",
       "HRA Cloud",
       "Sign in to connect this Mac to HRA Cloud",
@@ -526,7 +550,7 @@ const scenarios = [
       "Log out Work",
       "Open sign-in for Codex 3",
       "Cancel sign-in for Codex 3",
-      "Sign in to HRA Cloud",
+      "Pair this Mac with HRA Cloud",
     ],
     forbiddenText: ["Use device code", "Workspace", "Task", "Text size", "Token usage"],
     viewport: { width: 860, height: 780 },
@@ -537,11 +561,11 @@ const scenarios = [
     expectedText: [
       "Codex subscriptions",
       "HRA Cloud",
-      "Signing in",
+      "Pairing this Mac",
     ],
     expectedVisibleControls: [
       "Add subscription",
-      "Cancel HRA Cloud sign-in",
+      "Cancel HRA Cloud pairing",
     ],
     forbiddenText: [
       "Keychain slot",
@@ -1220,6 +1244,17 @@ async function runAction(
   switch (action) {
     case "none":
       return;
+    case "open-attention": {
+      await clickButton(browser, "Attention, 3 items");
+      await waitForVisibleText(browser, "Local recovery, decisions, and reviews");
+      const drawerText = await browser.evaluate(
+        "document.querySelector('.attention-drawer')?.textContent ?? ''",
+      );
+      if (typeof drawerText !== "string" || drawerText.includes("Private queued text")) {
+        throw new Error("The attention drawer exposed private queue content.");
+      }
+      return;
+    }
     case "prepare-draft": {
       await clickButton(browser, "Choose project for HRA");
       await browser.run(["wait", "--fn", "document.querySelector('.chat-pane__repository')?.textContent?.trim() === 'hra'"]);
@@ -1436,7 +1471,7 @@ async function runAction(
       await clickButton(browser, "Review HRA Cloud reconnect");
       await waitForVisibleText(
         browser,
-        "The previous credential stays protected in Keychain.",
+        "The previous credential stays protected in Keychain but cannot be reused by the new pairing flow.",
       );
       const consentFocused = await browser.evaluate(`(() => {
         const confirmation = document.querySelector(
@@ -1465,8 +1500,8 @@ async function runAction(
         "document.querySelector('[role=group][aria-label=\"Confirm HRA Cloud reconnect\"]') === null",
       ]);
       await waitForStableProbe(browser);
-      await clickButton(browser, "Sign in to HRA Cloud");
-      await waitForVisibleText(browser, "Signing in");
+      await clickButton(browser, "Pair this Mac with HRA Cloud");
+      await waitForVisibleText(browser, "Pairing this Mac");
       await waitForStableProbe(browser);
       return;
     }
@@ -2172,6 +2207,11 @@ async function verifyScenarioSemantics(
     failures.push("a send button is not contained by its composer surface");
   }
   switch (scenarioId) {
+    case "attention-mission-control":
+      if (state.paneCount !== 1 || state.paneStates[0] !== "ready") {
+        failures.push("mission control did not retain its one local ready pane");
+      }
+      break;
     case "chat-draft":
       if (state.paneCount !== 1 || state.paneStates[0] !== "ready") failures.push("configured draft is not one ready pane");
       if (state.titleInputCount !== 0) failures.push("title editor did not close after explicit commit");

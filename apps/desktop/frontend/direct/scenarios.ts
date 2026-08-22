@@ -60,7 +60,10 @@ const personal = {
     identityLabel: "builder@personal.example",
     selected: true,
   }),
-  usageRemainingPercent: 78,
+  weeklyUsage: {
+    remainingPercent: 78,
+    resetsAt: new Date(HRA_DIRECT_TIME + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+  },
 };
 const work = {
   ...signedInAccount({
@@ -69,7 +72,10 @@ const work = {
     identityLabel: "builder@work.example",
     selected: false,
   }),
-  usageRemainingPercent: 64,
+  weeklyUsage: {
+    remainingPercent: 64,
+    resetsAt: new Date(HRA_DIRECT_TIME + 5 * 24 * 60 * 60 * 1_000).toISOString(),
+  },
 };
 
 function snapshotWithAccounts(accounts: HRADirectWorld["gateway"]["snapshots"][number]["accounts"]) {
@@ -447,6 +453,36 @@ const attentionChatPanes = attentionPresentations.map((presentation, index) => c
     recoverablePrompt: presentation.recoverablePrompt,
   },
 ));
+
+const missionControlWorkspace = {
+  ...fixtureLocalWorkspace(1),
+  counts: {
+    all: { capped: false, value: 3 },
+    ready: { capped: false, value: 0 },
+    blocked: { capped: false, value: 0 },
+    deferred: { capped: false, value: 0 },
+    attention: { capped: false, value: 2 },
+    assigned: { capped: false, value: 0 },
+    review: { capped: false, value: 1 },
+  },
+};
+
+const missionControlPane = chatPane("pane_missioncontrol", {
+  title: "Release delivery",
+  messageQueue: {
+    revision: 2,
+    pauseReason: "ambiguousEffect",
+    blockedMessage: {
+      id: "chatmsg_missioncontrol",
+      ordinal: 1,
+      revision: 1,
+      text: "Private queued text must never appear in the attention drawer.",
+      attachmentRefs: [],
+      deliveryOutcome: "deliveryOutcomeUnknown",
+    },
+    messages: [],
+  },
+});
 
 const streamingInitialPane = chatPane("pane_streaming001", {
   activity: { ordinal: 1, kind: "messageSent" },
@@ -1012,6 +1048,35 @@ const scenarioInputs = [
         snapshots: [snapshotWithChat(attentionChatPanes)],
         encoding: { kind: "chunked", chunkBytes: 257 },
         events: [],
+      },
+    }),
+    runtime: logicalRuntime,
+  },
+  {
+    id: "attention-mission-control",
+    title: "Attention mission control",
+    description: "The real header drawer joins pathless local recovery with aggregate task attention and review counts.",
+    route: "/",
+    world: createHRADirectWorld({
+      gateway: {
+        snapshots: [snapshotWithChat([missionControlPane])],
+        encoding: { kind: "chunked", chunkBytes: 257 },
+        events: [],
+      },
+      task: {
+        initialStateId: "mission-control",
+        mutationTransitions: [],
+        projectAdd: { version: runtimeProtocolVersion, status: "cancelled" },
+        states: [{
+          id: "mission-control",
+          projectionJson: JSON.stringify({
+            workspaces: [missionControlWorkspace],
+            contexts: [],
+            repositories: [],
+            pages: [],
+            details: [],
+          }),
+        }],
       },
     }),
     runtime: logicalRuntime,
@@ -1618,6 +1683,7 @@ const scenarioInputs = [
 type HRAScenarioId = (typeof scenarioInputs)[number]["id"];
 
 export const hraScenarioMetadata = {
+  "attention-mission-control": { group: "Recovery", viewport: "wide" },
   "chat-draft": { group: "Panes", viewport: "wide" },
   "chat-streaming": { group: "Panes", viewport: "wide" },
   "chat-scheduled": { group: "Panes", viewport: "wide" },
@@ -1675,6 +1741,7 @@ export const hraDirectDefinition = defineDirect({
   defaultScenario: "chat-draft",
   scenarios: scenarioInputs,
   coverage: [
+    { key: "attention.mission-control", mode: "mixed", claim: "One accessible header drawer uses the real bridge and shell to join pathless local recovery with aggregate-only task attention and review counts while optional signed-out cloud stays quiet.", scenarios: ["attention-mission-control"] },
     { key: "chat.pane.draft", mode: "fixture", claim: "A new pane exposes one minimal composer, compact pane actions, automatic account routing, and no user-facing model or speed configuration.", scenarios: ["chat-draft"] },
     { key: "chat.pane.streaming", mode: "fixture", claim: "Ordered shell events render bounded reasoning and response Markdown through one safe renderer while provider tool activity remains intentionally absent from chat UI.", scenarios: ["chat-streaming"] },
     { key: "chat.pane.schedule", mode: "mixed", claim: "A chat schedule is configured and removed through one explicit composer mode, never enters the message queue or attachment path, preserves the editable instruction on interpretation failure, and shows only a concise next-run label.", scenarios: ["chat-scheduled"] },

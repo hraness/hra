@@ -78,16 +78,19 @@ export async function runPackageSmoke(root: string): Promise<void> {
   }
   const runtimeRoot = dirname(dirname(gateway));
   if (
-    !inside(runtimeRoot, assets.codexBinary)
+    !inside(runtimeRoot, assets.bunBinary)
+    || !inside(runtimeRoot, assets.codexBinary)
     || !inside(runtimeRoot, assets.gitBinary)
     || !inside(runtimeRoot, assets.gitRoot)
   ) {
     throw new Error("Package smoke toolchain escaped the bundled runtime.");
   }
   const codexVersion = commandVersion([assets.codexBinary, "--version"]);
+  const bunVersion = commandVersion([assets.bunBinary, "--version"]);
   const gitVersion = commandVersion([assets.gitBinary, "--version"]);
   if (
     Bun.version !== "1.3.14"
+    || bunVersion !== runtimeVersions.bun.version
     || codexVersion !== `codex-cli ${runtimeVersions.codex.version}`
     || gitVersion !== `git version ${runtimeVersions.git.version}`
   ) {
@@ -109,6 +112,7 @@ export async function runPackageSmoke(root: string): Promise<void> {
   try {
     writeFileSync(descriptor, `${JSON.stringify({
       bunVersion: Bun.version,
+      setupBunVersion: bunVersion,
       codexVersion,
       gitVersion,
       schemaVersion: 1,

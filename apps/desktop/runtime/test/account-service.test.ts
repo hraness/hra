@@ -18,10 +18,15 @@ import type {
 } from "../../contracts/runtime";
 import {
   AccountService,
+  accountWeeklyUsage,
   type AccountRuntimeRouterPort,
   type AccountUsageProjectionScheduler,
   type ExternalUrlOpener,
 } from "../src/accounts/account-service";
+import type {
+  AccountUsageState,
+  RateLimitSummary,
+} from "../src/internal-contracts";
 import { dispatchBudgetFreshnessMs } from "../src/accounts/dispatch-budget";
 import { rankChatAccountCandidates } from "../src/chat/chat-service";
 import type { AccountProfileFileSystem } from "../src/accounts/local-data-remover";
@@ -92,6 +97,91 @@ async function withinDeadline<T>(operation: Promise<T>, timeoutMs = 1_000): Prom
     if (timer !== null) clearTimeout(timer);
   }
 }
+
+function readyUsage(limits: readonly RateLimitSummary[]): AccountUsageState {
+  return {
+    state: "ready",
+    limits,
+    tokens: { state: "unavailable" },
+    updatedAt: "2026-08-20T12:00:00.000Z",
+  };
+}
+
+function usageLimit(
+  id: string,
+  primary: RateLimitSummary["primary"],
+  secondary: RateLimitSummary["secondary"] = null,
+): RateLimitSummary {
+  return {
+    id,
+    name: id,
+    primary,
+    secondary,
+    individual: null,
+    unlimited: false,
+    reached: false,
+  };
+}
+
+describe("weekly account usage projection", () => {
+  const nowMs = Date.parse("2026-08-20T12:00:00.000Z");
+  const resetsAt = "2026-08-21T20:00:00.000Z";
+
+  test("selects the exact seven-day Codex window regardless of slot", () => {
+    const weekly = {
+      usedPercent: 42.4,
+      windowDurationMinutes: 10_080,
+      resetsAt,
+    };
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("codex", {
+        usedPercent: 9,
+        windowDurationMinutes: 300,
+        resetsAt,
+      }, weekly),
+    ]), nowMs)).toEqual({ remainingPercent: 57.6, resetsAt });
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("codex", weekly, {
+        usedPercent: 9,
+        windowDurationMinutes: 300,
+        resetsAt,
+      }),
+    ]), nowMs)).toEqual({ remainingPercent: 57.6, resetsAt });
+  });
+
+  test("uses a single weekly window when an older server omits the Codex bucket id", () => {
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("legacy", null, {
+        usedPercent: 25,
+        windowDurationMinutes: 10_080,
+        resetsAt,
+      }),
+      usageLimit("other", {
+        usedPercent: 5,
+        windowDurationMinutes: 300,
+        resetsAt,
+      }),
+    ]), nowMs)).toEqual({ remainingPercent: 75, resetsAt });
+  });
+
+  test("fails closed for ambiguous, expired, or reset-less weekly windows", () => {
+    const weekly = {
+      usedPercent: 25,
+      windowDurationMinutes: 10_080,
+      resetsAt,
+    };
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("first", weekly),
+      usageLimit("second", weekly),
+    ]), nowMs)).toBeNull();
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("codex", { ...weekly, resetsAt: "2026-08-20T12:00:00.000Z" }),
+    ]), nowMs)).toBeNull();
+    expect(accountWeeklyUsage(readyUsage([
+      usageLimit("codex", { ...weekly, resetsAt: null }),
+    ]), nowMs)).toBeNull();
+  });
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -567,7 +657,7 @@ function rateLimit(id: string, usedPercent: number) {
     limitId: id,
     limitName: id,
     primary: { usedPercent, windowDurationMins: 300, resetsAt: 1_800_000_000 },
-    secondary: null,
+    secondary: { usedPercent, windowDurationMins: 10_080, resetsAt: 1_800_000_000 },
     credits: null,
     individualLimit: null,
     planType: "pro",
@@ -612,6 +702,7 @@ async function fixture(
     const created = new AccountService({
       archiveAdmissionGate,
       assets: {
+        bunBinary: process.execPath,
         codexBinary: "/fixture/codex",
         gitBinary: "/fixture/git/bin/git",
         gitRoot: "/fixture/git",
@@ -712,6 +803,7 @@ async function generationRecoveryFixture(options: Readonly<{
   service = new AccountService({
     archiveAdmissionGate,
     assets: {
+      bunBinary: process.execPath,
       codexBinary: "/fixture/codex",
       gitBinary: "/fixture/git/bin/git",
       gitRoot: "/fixture/git",
@@ -3111,7 +3203,7 @@ describe("AccountService", () => {
     }
   });
 
-  test("projects only the bounded remaining capacity while retaining routing detail", async () => {
+  test("projects semantic weekly usage while retaining private routing detail", async () => {
     const { database, router, service, store } = await fixture();
     try {
       const created = accountResult(await service.execute({ type: "account.create", label: "Work" }));
@@ -3123,7 +3215,10 @@ describe("AccountService", () => {
       expect(accounts[0]).toMatchObject({
         id: created.id,
         authState: "signedIn",
-        usageRemainingPercent: 90,
+        weeklyUsage: {
+          remainingPercent: 90,
+          resetsAt: "2027-01-15T08:00:00.000Z",
+        },
         usage: {
           state: "ready",
           limits: [{ id: "limit-0001", primary: { usedPercent: 10 } }],
@@ -4343,7 +4438,7 @@ describe("AccountService", () => {
     }
   });
 
-  test("refreshes a persisted signed-in account's bounded remaining capacity after startup", async () => {
+  test("refreshes a persisted signed-in account's weekly usage after startup", async () => {
     const { database, events, service, store } = await fixture();
     try {
       const created = store.create("Connected", new Date("2026-07-19T11:00:00.000Z"));
@@ -4352,14 +4447,14 @@ describe("AccountService", () => {
       expect((await service.initialize())[0]).toMatchObject({
         id: created.id,
         authState: "signedIn",
-        usageRemainingPercent: null,
+        weeklyUsage: null,
       });
       for (let attempts = 0; attempts < 200; attempts += 1) {
         const latest = events.findLast(
           (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
             event.type === "account.upserted" && event.account.id === created.id,
         );
-        if (latest?.account.usageRemainingPercent === 90) break;
+        if (latest?.account.weeklyUsage?.remainingPercent === 90) break;
         await Bun.sleep(1);
       }
       expect(events.findLast(
@@ -4367,7 +4462,10 @@ describe("AccountService", () => {
           event.type === "account.upserted" && event.account.id === created.id,
       )?.account).toMatchObject({
         authState: "signedIn",
-        usageRemainingPercent: 90,
+        weeklyUsage: {
+          remainingPercent: 90,
+          resetsAt: "2027-01-15T08:00:00.000Z",
+        },
       });
     } finally {
       await service.shutdown();
@@ -4375,7 +4473,7 @@ describe("AccountService", () => {
     }
   });
 
-  test("never projects stale remaining capacity after a provider sign-out", async () => {
+  test("never projects stale weekly usage after a provider sign-out", async () => {
     const { database, events, router, service, store } = await fixture();
     try {
       const created = accountResult(
@@ -4398,7 +4496,7 @@ describe("AccountService", () => {
           event.type === "account.upserted" && event.account.id === created.id,
       )?.account).toMatchObject({
         authState: "signedOut",
-        usageRemainingPercent: null,
+        weeklyUsage: null,
       });
       expect(service.dispatchAccounts()).toEqual([]);
     } finally {
@@ -4407,7 +4505,7 @@ describe("AccountService", () => {
     }
   });
 
-  test("expires the renderer usage percentage without waiting for another provider fact", async () => {
+  test("keeps weekly usage beyond routing freshness and refreshes it at reset", async () => {
     let nowMs = Date.UTC(2026, 6, 19, 12, 0, 0);
     const scheduler = new FakeUsageProjectionScheduler();
     const { database, events, service, store } = await fixture({
@@ -4423,22 +4521,36 @@ describe("AccountService", () => {
       expect(events.findLast(
         (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
           event.type === "account.upserted" && event.account.id === created.id,
-      )?.account.usageRemainingPercent).toBe(90);
+      )?.account.weeklyUsage).toEqual({
+        remainingPercent: 90,
+        resetsAt: "2027-01-15T08:00:00.000Z",
+      });
 
       nowMs += dispatchBudgetFreshnessMs;
       expect(scheduler.runNext()).toBe(dispatchBudgetFreshnessMs);
       for (let attempts = 0; attempts < 100; attempts += 1) {
-        const remaining = events.findLast(
-          (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
-            event.type === "account.upserted" && event.account.id === created.id,
-        )?.account.usageRemainingPercent;
-        if (remaining === null) break;
+        if (scheduler.tasks.some(({ active }) => active)) break;
         await Bun.sleep(1);
       }
       expect(events.findLast(
         (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
           event.type === "account.upserted" && event.account.id === created.id,
-      )?.account.usageRemainingPercent).toBeNull();
+      )?.account.weeklyUsage?.remainingPercent).toBe(90);
+
+      nowMs = 1_800_000_000 * 1_000;
+      expect(scheduler.runNext()).toBe(nowMs - Date.UTC(2026, 6, 19, 12, 2, 0));
+      for (let attempts = 0; attempts < 100; attempts += 1) {
+        const weeklyUsage = events.findLast(
+          (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
+            event.type === "account.upserted" && event.account.id === created.id,
+        )?.account.weeklyUsage;
+        if (weeklyUsage === null) break;
+        await Bun.sleep(1);
+      }
+      expect(events.findLast(
+        (event): event is Extract<AccountEvent, { type: "account.upserted" }> =>
+          event.type === "account.upserted" && event.account.id === created.id,
+      )?.account.weeklyUsage).toBeNull();
     } finally {
       await service.shutdown();
       database.close();

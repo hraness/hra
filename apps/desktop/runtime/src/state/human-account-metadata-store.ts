@@ -4,6 +4,7 @@ import {
   secretCustodyJournalSchema,
   secretCustodyQuarantinePointerSchema,
   secretSlotSchema,
+  storedHumanProfileDisposition,
   type SecretCustodyDescriptor,
   type SecretCustodyJournal,
   type SecretCustodyQuarantinePointer,
@@ -12,8 +13,10 @@ import { z } from "@hra-internal/schema";
 
 import {
   humanAccountMetadataSchema,
+  legacyHumanAccountMetadataReferenceSchema,
   type HumanAccountMetadata,
   type HumanAccountMetadataPort,
+  type LegacyHumanAccountMetadataReference,
 } from "../cloud/keychain-custody";
 
 const custodyRowSchema = z
@@ -44,6 +47,33 @@ function parseJson(value: string, label: string): unknown {
   } catch {
     throw new Error(`${label} is not valid JSON.`);
   }
+}
+
+function legacyAccountMetadataReference(
+  value: unknown,
+): LegacyHumanAccountMetadataReference | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+  const keys = Object.keys(record).sort();
+  if (
+    keys.length !== 4 ||
+    keys[0] !== "credentialGeneration" ||
+    keys[1] !== "profile" ||
+    keys[2] !== "revision" ||
+    keys[3] !== "version" ||
+    record.version !== 1 ||
+    storedHumanProfileDisposition(record.profile) !== "legacy"
+  ) {
+    return null;
+  }
+  const reference = legacyHumanAccountMetadataReferenceSchema.safeParse({
+    state: "legacy_profile",
+    revision: record.revision,
+    credentialGeneration: record.credentialGeneration,
+  });
+  return reference.success ? reference.data : null;
 }
 
 /**
@@ -308,9 +338,14 @@ export class HumanAccountMetadataStore implements HumanAccountMetadataPort {
     `).get();
     const row = accountRowSchema.nullable().parse(value);
     if (row === null) return Promise.resolve(null);
-    const metadata = humanAccountMetadataSchema.parse(
-      parseJson(row.metadata_json, "Human account metadata"),
-    );
+    const source = parseJson(row.metadata_json, "Human account metadata");
+    const current = humanAccountMetadataSchema.safeParse(source);
+    const metadata = current.success
+      ? current.data
+      : legacyAccountMetadataReference(source);
+    if (metadata === null) {
+      throw new Error("Human account metadata is invalid.");
+    }
     if (metadata.revision !== row.revision) {
       throw new Error("Human account metadata revision does not match SQLite.");
     }

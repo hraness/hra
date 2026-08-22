@@ -71,10 +71,8 @@ import {
   type SessionSyncBackendRequest,
 } from "./sessionSyncSchemas";
 
-const WORKOS_CLIENT_ID = "client_session_sync";
-const WORKOS_ORGANIZATION_ID = "org_sessionsync";
-const WORKOS_USER_ID = "user_sessionsync";
-const FOREIGN_WORKOS_USER_ID = "user_sessionsyncforeign";
+const USER_PUBLIC_ID = "usr_sessionsync";
+const FOREIGN_USER_PUBLIC_ID = "usr_sessionsyncforeign";
 const NOW = Date.now();
 
 const modules = {
@@ -156,7 +154,6 @@ const wakeScheduledChatRef = makeFunctionReference<
   { status: "applied" | "rescheduled" | "stale" }
 >("sessionSyncScheduledChats:wakeScheduledChat");
 
-const originalClientId = process.env.WORKOS_CLIENT_ID;
 const originalSyncEnabled = process.env.HRA_SESSION_SYNC_ENABLED;
 const originalLegacySyncEnabled = process.env.OPRTE_SESSION_SYNC_ENABLED;
 
@@ -164,30 +161,30 @@ function opaque(prefix: string, character: string): string {
   return `${prefix}_${character.repeat(32)}`;
 }
 
-function identity(subject = WORKOS_USER_ID) {
+function identity(userId = "missing_user", sessionId = "missing_session") {
   return {
-    issuer: `https://api.workos.com/user_management/${WORKOS_CLIENT_ID}`,
-    org_id: WORKOS_ORGANIZATION_ID,
-    sid: `session_${subject}`,
-    subject,
-    tokenIdentifier: `${WORKOS_CLIENT_ID}|${subject}`,
+    issuer: "https://convex.test",
+    subject: `${userId}|${sessionId}`,
+    tokenIdentifier: `https://convex.test|${userId}|${sessionId}`,
   };
 }
 
-async function seedHumanScope(t: SyncTest): Promise<void> {
-  await t.run(async (ctx) => {
+async function seedHumanScope(t: SyncTest): Promise<{
+  actor: SyncActor;
+  foreign: SyncActor;
+}> {
+  const seeded = await t.run(async (ctx) => {
     const organizationId = await ctx.db.insert("organizations", {
       publicId: "org_00000000000000000000007001",
-      workosOrganizationId: WORKOS_ORGANIZATION_ID,
       name: "Session sync",
       status: "active",
       createdAt: NOW,
       updatedAt: NOW,
     });
-    for (const [index, subject] of [WORKOS_USER_ID, FOREIGN_WORKOS_USER_ID].entries()) {
+    const identities: Array<{ userId: Id<"users">; sessionId: Id<"authSessions"> }> = [];
+    for (const [index, publicId] of [USER_PUBLIC_ID, FOREIGN_USER_PUBLIC_ID].entries()) {
       const userId = await ctx.db.insert("users", {
-        publicId: subject,
-        workosUserId: subject,
+        publicId,
         name: `Session sync ${index}`,
         status: "active",
         createdAt: NOW,
@@ -201,8 +198,27 @@ async function seedHumanScope(t: SyncTest): Promise<void> {
         createdAt: NOW,
         updatedAt: NOW,
       });
+      const sessionId = await ctx.db.insert("authSessions", {
+        userId,
+        expirationTime: Date.now() + 60_000,
+      });
+      await ctx.db.insert("authSessionSelections", {
+        sessionId,
+        userId,
+        organizationId,
+        createdAt: NOW,
+        updatedAt: NOW,
+      });
+      identities.push({ userId, sessionId });
     }
+    return identities;
   });
+  const [first, second] = seeded;
+  if (first === undefined || second === undefined) throw new Error("Missing sync identity fixture.");
+  return {
+    actor: t.withIdentity(identity(first.userId, first.sessionId)),
+    foreign: t.withIdentity(identity(second.userId, second.sessionId)),
+  };
 }
 
 const vault = syncVaultCoordinateSchema.parse({
@@ -388,14 +404,11 @@ async function bootstrap(
 }
 
 beforeEach(() => {
-  process.env.WORKOS_CLIENT_ID = WORKOS_CLIENT_ID;
   process.env.HRA_SESSION_SYNC_ENABLED = "true";
   delete process.env.OPRTE_SESSION_SYNC_ENABLED;
 });
 
 afterEach(() => {
-  if (originalClientId === undefined) delete process.env.WORKOS_CLIENT_ID;
-  else process.env.WORKOS_CLIENT_ID = originalClientId;
   if (originalSyncEnabled === undefined) delete process.env.HRA_SESSION_SYNC_ENABLED;
   else process.env.HRA_SESSION_SYNC_ENABLED = originalSyncEnabled;
   if (originalLegacySyncEnabled === undefined) {
@@ -421,8 +434,7 @@ describe("session sync Convex boundary", () => {
 
   test("publishes, replays a lost acknowledgement, pages a pinned directory, and absorbs deletion", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     const rootKey = createSyncVaultRootKey();
     expect(data(await bootstrap(actor, keys, rootKey))).toMatchObject({ kind: "vault_created" });
@@ -979,9 +991,7 @@ describe("session sync Convex boundary", () => {
 
   test("durably delivers one encrypted scheduled occurrence and exactly replays schedule writes", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
-    const foreign = t.withIdentity(identity(FOREIGN_WORKOS_USER_ID));
+    const { actor, foreign } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     const rootKey = createSyncVaultRootKey();
     expect(data(await bootstrap(actor, keys, rootKey))).toMatchObject({ kind: "vault_created" });
@@ -1434,8 +1444,7 @@ describe("session sync Convex boundary", () => {
 
   test("makes bounded ciphertext pruning retryable and never commits a later rejected plan", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     const rootKey = createSyncVaultRootKey();
     expect((await bootstrap(actor, keys, rootKey)).ok).toBeTrue();
@@ -1748,8 +1757,7 @@ describe("session sync Convex boundary", () => {
 
   test("materializes and pages the full 512-entry encrypted directory in exact order", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     const rootKey = createSyncVaultRootKey();
     expect((await bootstrap(actor, keys, rootKey)).ok).toBeTrue();
@@ -1882,9 +1890,7 @@ describe("session sync Convex boundary", () => {
 
   test("requires possession beyond a stolen device selector and keeps tenants opaque", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
-    const foreign = t.withIdentity(identity(FOREIGN_WORKOS_USER_ID));
+    const { actor, foreign } = await seedHumanScope(t);
     const ownerKeys = await createSyncDeviceKeyPairs();
     expect((await bootstrap(actor, ownerKeys, createSyncVaultRootKey())).ok).toBeTrue();
 
@@ -1908,9 +1914,7 @@ describe("session sync Convex boundary", () => {
 
   test("recovers quorum loss with a one-use authority, preserves the retained keyring, and fences lost origins", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
-    const foreign = t.withIdentity(identity(FOREIGN_WORKOS_USER_ID));
+    const { actor, foreign } = await seedHumanScope(t);
     const ownerKeys = await createSyncDeviceKeyPairs();
     const replacementKeys = await createSyncDeviceKeyPairs();
     const rootKey1 = createSyncVaultRootKey();
@@ -2245,9 +2249,7 @@ describe("session sync Convex boundary", () => {
 
   test("admits a quorum-approved device then makes revocation and root rotation immediate", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
-    const foreign = t.withIdentity(identity(FOREIGN_WORKOS_USER_ID));
+    const { actor, foreign } = await seedHumanScope(t);
     const ownerKeys = await createSyncDeviceKeyPairs();
     const joiningCustody = await generateSyncDeviceKeyCustody();
     const joiningKeys = await importSyncDeviceKeyPairs(
@@ -2989,8 +2991,7 @@ describe("session sync Convex boundary", () => {
 
   test("consumes each signed proof once", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     expect((await bootstrap(actor, keys, createSyncVaultRootKey())).ok).toBeTrue();
     const request = {
@@ -3011,8 +3012,7 @@ describe("session sync Convex boundary", () => {
 
   test("authenticates, kill-switches, and rate-bounds negotiation before capability disclosure", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const request = (authorization: string) => ({
       method: "POST",
       headers: {
@@ -3084,8 +3084,7 @@ describe("session sync Convex boundary", () => {
 
   test("server-assigns a fenced boot generation after local database loss and replays only the exact establishment", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     expect((await bootstrap(actor, keys, createSyncVaultRootKey())).ok).toBeTrue();
     const firstBoot = {
@@ -3131,8 +3130,7 @@ describe("session sync Convex boundary", () => {
 
   test("admits one winner at the exact directory quota under concurrent reservations", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     expect((await bootstrap(actor, keys, createSyncVaultRootKey())).ok).toBeTrue();
     expect((await execute(actor, {
@@ -3179,8 +3177,7 @@ describe("session sync Convex boundary", () => {
 
   test("drains enrollment expiry and purge indexes beyond one bounded sweep page", async () => {
     const t = convexTest(schema, modules);
-    await seedHumanScope(t);
-    const actor = t.withIdentity(identity());
+    const { actor } = await seedHumanScope(t);
     const keys = await createSyncDeviceKeyPairs();
     expect((await bootstrap(actor, keys, createSyncVaultRootKey())).ok).toBeTrue();
     await t.run(async (ctx) => {

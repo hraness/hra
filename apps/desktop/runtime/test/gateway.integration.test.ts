@@ -40,6 +40,7 @@ import {
   HRA_SESSION_SYNC_KEYCHAIN_SERVICE,
   HRA_SESSION_SYNC_RECOVERY_KEYCHAIN_NAME,
 } from "../src/cloud/session-sync-key-custody";
+import { runtimeBridgeProfileEnvironment } from "../src/development-reload";
 import {
   hostAccountProfileNativeResultCommand,
   hostHarnessCustodyNativeResultCommand,
@@ -125,6 +126,11 @@ function gatewayProcessEnvironment(
 ): Record<string, string | undefined> {
   return {
     ...environment,
+    // This suite exercises the packaged gateway contract directly, outside
+    // Native. Declare that authority instead of letting an absent Native
+    // profile fall into the fail-closed raw-development data boundary.
+    [runtimeBridgeProfileEnvironment]:
+      environment[runtimeBridgeProfileEnvironment] ?? "production",
     HRA_DATA_REMOVER_PATH:
       environment.HRA_DATA_REMOVER_PATH ?? "/usr/bin/false",
     HRA_GATEWAY_PATH:
@@ -1242,6 +1248,12 @@ async function installFakeGit(root: string): Promise<Readonly<{
     "  branch:--show-current) cat .fixture-branch ;;",
     "  status:--porcelain=v1)",
     "    [ ! -f .fixture-dirty ] || printf ' M .fixture-dirty\\n'",
+    "    ;;",
+    "  ls-tree:-z)",
+    `    [ "$3" = "${fixtureCommit}" ] &&`,
+    `      [ "$4" = "--" ] &&`,
+    `      [ "$5" = ".hra/workspace.json" ] || exit 1`,
+    "    exit 0",
     "    ;;",
     "  *) printf 'unsupported fixture git command\\n' >&2; exit 1 ;;",
     "esac",
@@ -3827,6 +3839,11 @@ describe("compiled gateway boundary", () => {
         second.exited,
       ]);
       expect(secondError.length).toBeGreaterThan(0);
+      expect([
+        'code: "legacy_state_in_use"',
+        'code: "already_running"',
+      ].some((code) => secondError.includes(code))).toBeTrue();
+      expect(secondError).not.toContain("Unsafe Application Support root");
       expect(secondExitCode).not.toBe(0);
       expect(hasRuntimeState(secondLines, "ready")).toBeFalse();
       expect(hasRuntimeState(secondLines, "failed")).toBeFalse();

@@ -11,6 +11,18 @@ test("the serve-only plugin swaps exactly one renderer entry", () => {
   expect(rewriteHraDevelopmentEntry(source)).toContain(
     `src="${HRA_DEVELOPMENT_ENTRY_PATH}"`,
   );
+  expect(rewriteHraDevelopmentEntry(
+    '<script type="module" src="./src/main.tsx?t=123"></script>',
+  )).toContain(`src="${HRA_DEVELOPMENT_ENTRY_PATH}?t=123"`);
+  const transformed = rewriteHraDevelopmentEntry(source);
+  expect(rewriteHraDevelopmentEntry(transformed)).toBe(transformed);
+  for (const servedEntry of [
+    '<script type="module" src="./dev/main.dev.tsx"></script>',
+    '<script type="module" src="./dev/main.dev.tsx?t=123"></script>',
+    '<script type="module" src="/dev/main.dev.tsx?t=123"></script>',
+  ]) {
+    expect(rewriteHraDevelopmentEntry(servedEntry)).toBe(servedEntry);
+  }
   expect(() => rewriteHraDevelopmentEntry("<main></main>")).toThrow(
     "exactly one production renderer entry",
   );

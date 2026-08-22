@@ -6,8 +6,14 @@ import {
   runtimeProtocolVersion,
   type RuntimeDispatchResponse,
 } from "../../contracts/runtime";
-import App, { focusMainContent, inheritedRepositoryIsUnavailable } from "./App";
+import { advanceRuntimeProjection } from "../../contracts/runtime-projection";
+import App, {
+  focusMainContent,
+  inheritedRepositoryIsUnavailable,
+  selectAttentionRefreshKey,
+} from "./App";
 import { chatRouteFromHash, chatRouteHash } from "./features/chat/model";
+import { emptyRuntimeSnapshot } from "./runtime/test-fixtures";
 
 function relativeLuminance(hex: string): number {
   const [red = 0, green = 0, blue = 0] = hex.match(/[0-9a-f]{2}/giu)
@@ -36,8 +42,11 @@ test("the desktop product is a lean panes and settings shell", () => {
   expect(html).toContain('href="#settings"');
   expect(html).toContain("Settings");
   expect(html).toContain('aria-label="New pane"');
+  expect(html).toContain('aria-label="Attention"');
+  expect(html).toContain('aria-expanded="false"');
   expect(html).toContain('aria-label="Shared folder access: Documents. Choose folder"');
-  expect(html).toContain("Shared folder · Documents");
+  expect(html).toContain('class="hra-folder-access__label">Documents</span>');
+  expect(html).not.toContain("Shared folder ·");
   expect(html).toContain('class="hra-icon"');
   expect(html).not.toContain("new-pane-button__label");
   expect(html).toContain("Starting HRA");
@@ -175,8 +184,71 @@ test("the header owns one pathless shared-folder chooser", async () => {
   const app = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
   expect(app).toContain("shell.selectFolderAccess()");
   expect(app).toContain("execution.folderAccess.displayName");
-  expect(app).toContain("Shared folder ·");
+  expect(app).not.toContain("Shared folder ·");
   expect(app).not.toContain("execution.folderAccess.path");
+});
+
+test("the header owns the real minimized attention drawer", async () => {
+  const app = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
+  const css = await Bun.file(new URL("./index.css", import.meta.url)).text();
+  expect(app).toContain("<AttentionDrawer");
+  expect(app).toContain('availability.kind === "ready"');
+  expect(css).toMatch(/\.attention-drawer\s*\{[^}]*position:\s*fixed;[^}]*max-height:/su);
+  expect(css).toMatch(/\.attention-drawer__group li\s*\{[^}]*grid-template-columns:/su);
+  expect(css).toContain("width: min(23rem, calc(100vw - 0.8rem))");
+});
+
+test("attention refresh ignores read completions and follows semantic changes", () => {
+  const initial = emptyRuntimeSnapshot();
+  const readCompleted = advanceRuntimeProjection(initial, {
+    version: runtimeProtocolVersion,
+    sequence: 1,
+    event: {
+      type: "operation.completed",
+      operationId: "op_attentionread01",
+      outcome: { ok: true },
+    },
+  });
+  const folderMissing = advanceRuntimeProjection(initial, {
+    version: runtimeProtocolVersion,
+    sequence: 1,
+    event: {
+      type: "execution.changed",
+      execution: {
+        ...initial.execution,
+        folderAccess: {
+          revision: 2,
+          displayName: "Documents",
+          availability: "missing",
+        },
+      },
+    },
+  });
+
+  const initialKey = selectAttentionRefreshKey({
+    state: "ready",
+    snapshot: initial,
+  });
+  const streamOnlyRevision = {
+    ...initial,
+    revision: initial.revision + 1,
+    chat: {
+      ...initial.chat,
+      revision: initial.chat.revision + 1,
+    },
+  };
+  expect(selectAttentionRefreshKey({
+    state: "ready",
+    snapshot: readCompleted,
+  })).toBe(initialKey);
+  expect(selectAttentionRefreshKey({
+    state: "ready",
+    snapshot: streamOnlyRevision,
+  })).toBe(initialKey);
+  expect(selectAttentionRefreshKey({
+    state: "ready",
+    snapshot: folderMissing,
+  })).not.toBe(initialKey);
 });
 
 test("a stale inherited repository falls back to project selection", () => {

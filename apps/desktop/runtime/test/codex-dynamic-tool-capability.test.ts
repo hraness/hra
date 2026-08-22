@@ -43,6 +43,7 @@ const computerUseProvisioning: ComputerUseProvisioning = Object.freeze({
 
 function paths(account: "a" | "b" = "a"): RuntimePaths {
   return {
+    bunBinary: process.execPath,
     codexBinary: "/runtime/codex",
     codexHome: `/profiles/${account}/codex-home`,
     gitBinary: "/runtime/git/bin/git",

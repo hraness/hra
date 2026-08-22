@@ -55,7 +55,7 @@ const expectedCoverageKeys = [
   "runner.hitl.response",
   "runner.dispatch.readiness",
   "runner.recovery.commands",
-  "auth.workos-session",
+  "auth.password-session",
   "auth.organization-switch",
   "convex.realtime-subscriptions",
   "convex.command-semantics",

@@ -4704,6 +4704,41 @@ export class ChatPaneStore {
           mutated = true;
         }
       }
+      const queuedValue: unknown = this.#database.query(`
+        SELECT COUNT(*) AS count FROM chat_message_ledger
+        WHERE pane_id = ?1 AND state = 'queued'
+      `).get(paneId);
+      const hasQueuedMessages = countRowSchema.parse(queuedValue).count > 0;
+      if (
+        !ambiguous &&
+        !hasQueuedMessages &&
+        metadata.message_queue_pause_reason !== "ambiguous_effect"
+      ) {
+        const nextReason = metadata.message_queue_pause_reason === "runtime_restart"
+          ? null
+          : metadata.message_queue_pause_reason;
+        if (
+          !mutated &&
+          metadata.message_queue_pause_reason === nextReason
+        ) {
+          return this.#messageQueueProjection(metadata);
+        }
+        const advanced = this.#database.query(`
+          UPDATE chat_panes SET
+            message_queue_pause_reason = ?3,
+            message_queue_revision = message_queue_revision + 1,
+            updated_at = ?4
+          WHERE pane_id = ?1 AND message_queue_revision = ?2
+            AND archived_at IS NULL
+        `).run(
+          paneId,
+          metadata.message_queue_revision,
+          nextReason,
+          now,
+        );
+        if (advanced.changes !== 1) throw staleQueueRevision();
+        return this.messageQueue(paneId);
+      }
       const nextReason = ambiguous ? "ambiguous_effect" : "runtime_restart";
       if (
         !mutated &&

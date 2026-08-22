@@ -5,8 +5,6 @@ import {
   organizationViewSchema,
   refreshAuthResponseSchema,
   workspaceViewSchema,
-  workosOrganizationIdSchema,
-  type OrganizationView,
 } from "@hraness/agent-tasks-protocol";
 import { z } from "@hra-internal/schema";
 
@@ -23,21 +21,13 @@ export const humanApiOriginSchema = z
 
 function humanSelectionIssues(
   value: Readonly<{
-    organization?: OrganizationView | undefined;
+    organization: z.infer<typeof organizationViewSchema>;
     workspace?: z.infer<typeof workspaceViewSchema> | undefined;
-    workosOrganizationId?: string | undefined;
   }>,
   context: z.RefinementCtx,
 ): void {
-  if (value.workspace !== undefined && value.organization === undefined) {
-    context.addIssue({
-      code: "custom",
-      message: "workspace selection requires an organization",
-    });
-  }
   if (
     value.workspace !== undefined &&
-    value.organization !== undefined &&
     value.workspace.organizationId !== value.organization.id
   ) {
     context.addIssue({
@@ -45,26 +35,16 @@ function humanSelectionIssues(
       message: "workspace belongs to another organization",
     });
   }
-  if (
-    value.organization?.workosOrganizationId !== undefined &&
-    value.workosOrganizationId !== value.organization.workosOrganizationId
-  ) {
-    context.addIssue({
-      code: "custom",
-      message: "token belongs to another organization",
-    });
-  }
 }
 
 export const humanAuthenticationSchema = z
   .object({
-    version: z.literal(1),
+    version: z.literal(2),
     apiUrl: humanApiOriginSchema,
     accessToken: humanAccessTokenSchema,
     refreshToken: humanRefreshTokenSchema,
     user: humanUserViewSchema,
-    workosOrganizationId: workosOrganizationIdSchema.optional(),
-    organization: organizationViewSchema.optional(),
+    organization: organizationViewSchema,
     workspace: workspaceViewSchema.optional(),
   })
   .strict()
@@ -77,12 +57,11 @@ export type HumanSecretStoreKind = z.infer<typeof humanSecretStoreKindSchema>;
 
 export const humanProfileSchema = z
   .object({
-    version: z.literal(1),
+    version: z.literal(2),
     apiUrl: humanApiOriginSchema,
     secretStore: humanSecretStoreKindSchema,
     user: humanUserViewSchema,
-    workosOrganizationId: workosOrganizationIdSchema.optional(),
-    organization: organizationViewSchema.optional(),
+    organization: organizationViewSchema,
     workspace: workspaceViewSchema.optional(),
   })
   .strict()
@@ -104,20 +83,46 @@ export function profileFromHumanAuthentication(
   secretStore: HumanSecretStoreKind,
 ): HumanProfile {
   return humanProfileSchema.parse({
-    version: 1,
+    version: 2,
     apiUrl: authentication.apiUrl,
     secretStore,
     user: authentication.user,
-    ...(authentication.workosOrganizationId === undefined
-      ? {}
-      : { workosOrganizationId: authentication.workosOrganizationId }),
-    ...(authentication.organization === undefined
-      ? {}
-      : { organization: authentication.organization }),
+    organization: authentication.organization,
     ...(authentication.workspace === undefined
       ? {}
       : { workspace: authentication.workspace }),
   });
+}
+
+export type StoredHumanAuthenticationDisposition = "current" | "legacy" | "invalid";
+
+function isLegacyVersionOne(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "version" in value &&
+    value.version === 1
+  );
+}
+
+/**
+ * Classify custody without reading any version-1 identity fields. Legacy
+ * credentials require an explicit new pairing and are never reinterpreted.
+ */
+export function storedHumanAuthenticationDisposition(
+  value: unknown,
+): StoredHumanAuthenticationDisposition {
+  if (humanAuthenticationSchema.safeParse(value).success) return "current";
+  if (isLegacyVersionOne(value)) return "legacy";
+  return "invalid";
+}
+
+export function storedHumanProfileDisposition(
+  value: unknown,
+): StoredHumanAuthenticationDisposition {
+  if (humanProfileSchema.safeParse(value).success) return "current";
+  if (isLegacyVersionOne(value)) return "legacy";
+  return "invalid";
 }
 
 export type RefreshedHumanAuthentication =
@@ -128,45 +133,36 @@ export type RefreshedHumanAuthentication =
     };
 
 /**
- * Validate rotated credentials while preserving only selections that remain
- * bound to the same user and WorkOS organization.
+ * Validate rotated credentials while preserving only the exact stable user,
+ * organization, and workspace selection.
  */
 export function refreshedHumanAuthentication(
   current: HumanAuthentication,
   response: unknown,
-  targetOrganization?: OrganizationView,
 ): RefreshedHumanAuthentication {
   const parsedResponse = refreshAuthResponseSchema.safeParse(response);
   if (!parsedResponse.success) return { ok: false, reason: "invalid_response" };
 
-  const expectedOrganizationId =
-    targetOrganization?.workosOrganizationId ?? current.workosOrganizationId;
   if (
     parsedResponse.data.user.id !== current.user.id ||
-    (expectedOrganizationId !== undefined &&
-      parsedResponse.data.workosOrganizationId !== expectedOrganizationId)
+    parsedResponse.data.organization.id !== current.organization.id ||
+    parsedResponse.data.workspace?.id !== current.workspace?.id ||
+    (parsedResponse.data.workspace !== undefined &&
+      parsedResponse.data.workspace.organizationId !== parsedResponse.data.organization.id)
   ) {
     return { ok: false, reason: "identity_mismatch" };
   }
 
-  const preserveWorkspace = targetOrganization === undefined;
   const next = humanAuthenticationSchema.safeParse({
-    version: 1,
+    version: 2,
     apiUrl: current.apiUrl,
     accessToken: parsedResponse.data.accessToken,
     refreshToken: parsedResponse.data.refreshToken,
     user: parsedResponse.data.user,
-    ...(parsedResponse.data.workosOrganizationId === undefined
+    organization: parsedResponse.data.organization,
+    ...(parsedResponse.data.workspace === undefined
       ? {}
-      : { workosOrganizationId: parsedResponse.data.workosOrganizationId }),
-    ...(targetOrganization === undefined
-      ? current.organization === undefined
-        ? {}
-        : { organization: current.organization }
-      : { organization: targetOrganization }),
-    ...(preserveWorkspace && current.workspace !== undefined
-      ? { workspace: current.workspace }
-      : {}),
+      : { workspace: parsedResponse.data.workspace }),
   });
   return next.success
     ? { ok: true, authentication: next.data }

@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import type { RandomSource, StoragePaths } from "./config";
 import {
+  compareAndSwapHumanAuthentication,
   readHumanAuthentication,
   resolveHumanStoragePaths,
   writeHumanAuthentication,
@@ -50,6 +51,25 @@ function memoryKeychain(): HumanSecretStore & { readonly values: Map<string, str
   };
 }
 
+function lostCleanupKeychain(): HumanSecretStore & {
+  readonly values: Map<string, string>;
+} {
+  const base = memoryKeychain();
+  let cleanupFailures = 1;
+  return {
+    values: base.values,
+    get: async (input) => await base.get(input),
+    set: async (input) => await base.set(input),
+    delete: async (input) => {
+      if (cleanupFailures > 0) {
+        cleanupFailures -= 1;
+        throw new Error("retired Keychain cleanup response was lost");
+      }
+      return await base.delete(input);
+    },
+  };
+}
+
 async function temporaryStorage(): Promise<{
   readonly directory: string;
   readonly paths: StoragePaths;
@@ -71,7 +91,6 @@ function inputUrl(input: string | URL | Request): URL {
 
 const organization = {
   id: "organization-1",
-  workosOrganizationId: "org_abc123",
   name: "Hraness",
   role: "owner",
   status: "active",
@@ -88,22 +107,23 @@ const workspace = {
 
 function accountAuthentication(): HumanAuthentication {
   return {
-    version: 1,
+    version: 2,
     apiUrl: "http://127.0.0.1:3211",
     accessToken: "account-access-token-long-enough",
     refreshToken: "account-refresh-token-long-enough",
     user: { id: "user_abc123", email: "human@example.com" },
+    organization,
   };
 }
 
 describe("human CLI", () => {
-  test("logs in through the direct device flow without exposing device or bearer secrets", async () => {
+  test("logs in through browser pairing without exposing verifier or bearer secrets", async () => {
     const { directory, paths } = await temporaryStorage();
     const keychain = memoryKeychain();
     const captured = captureIo();
-    const deviceCode = "device-code-that-must-stay-secret";
     const accessToken = "human-access-token-that-must-stay-secret";
     const refreshToken = "human-refresh-token-that-must-stay-secret";
+    let verifier = "";
     let now = 1_000;
     let requestCount = 0;
     try {
@@ -112,7 +132,7 @@ describe("human CLI", () => {
         {
           environment: {
             TASKCTL_API_URL: "http://127.0.0.1:3211",
-            TASKCTL_WORKOS_CLIENT_ID: "client_public123",
+            TASKCTL_WEB_URL: "https://hra.sh",
           },
           storagePaths: paths,
           humanSecretStore: keychain,
@@ -123,25 +143,44 @@ describe("human CLI", () => {
             now += milliseconds;
             return Promise.resolve();
           },
-          fetch: (input) => {
+          fetch: (input, init) => {
             requestCount += 1;
             const url = inputUrl(input);
-            if (url.pathname.endsWith("/authorize/device")) {
+            if (url.pathname === "/v1/auth/desktop-pairings") {
               return Promise.resolve(
                 Response.json({
-                  device_code: deviceCode,
-                  user_code: "ABCD-EFGH",
-                  verification_uri: "https://auth.example.com/device",
-                  expires_in: 300,
-                  interval: 1,
+                  ok: true,
+                  data: {
+                    pairingId: "pair_00000000000000000000000000",
+                    verificationUri:
+                      "https://hra.sh/pair/desktop/pair_00000000000000000000000000",
+                    comparisonCode: "2345-6789",
+                    expiresAt: 301_000,
+                    pollIntervalMs: 1_000,
+                  },
+                  requestId: REQUEST_ID,
                 }),
               );
             }
+            const body: unknown = JSON.parse(typeof init?.body === "string" ? init.body : "null");
+            if (typeof body !== "object" || body === null || !("verifier" in body)) {
+              throw new Error("missing pairing verifier");
+            }
+            verifier = String(body.verifier);
             return Promise.resolve(
               Response.json({
-                access_token: accessToken,
-                refresh_token: refreshToken,
-                user: { id: "user_abc123", email: "human@example.com" },
+                ok: true,
+                data: {
+                  status: "approved",
+                  authentication: {
+                    accessToken,
+                    refreshToken,
+                    user: { id: "user_abc123", email: "human@example.com" },
+                    organization,
+                    workspace: { ...workspace, roles: [...workspace.roles] },
+                  },
+                },
+                requestId: REQUEST_ID,
               }),
             );
           },
@@ -151,8 +190,8 @@ describe("human CLI", () => {
       expect(exitCode).toBe(0);
       expect(requestCount).toBe(2);
       const allOutput = `${captured.stdout.join("")}\n${captured.stderr.join("")}`;
-      expect(allOutput).toContain("ABCD-EFGH");
-      expect(allOutput).not.toContain(deviceCode);
+      expect(allOutput).toContain("2345-6789");
+      expect(allOutput).not.toContain(verifier);
       expect(allOutput).not.toContain(accessToken);
       expect(allOutput).not.toContain(refreshToken);
       expect(JSON.parse(captured.stdout.join(""))).toMatchObject({
@@ -196,14 +235,47 @@ describe("human CLI", () => {
     }
   });
 
-  test("clears rotated human state after one indeterminate organization switch", async () => {
+  test("requires a pinned browser origin before pairing is displayed or opened", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const captured = captureIo();
+    let requests = 0;
+    let opens = 0;
+    try {
+      expect(
+        await runCli(["auth", "login", "--json"], {
+          environment: { TASKCTL_API_URL: "http://127.0.0.1:3211" },
+          storagePaths: paths,
+          io: captured.io,
+          random,
+          fetch: () => {
+            requests += 1;
+            return Promise.reject(new Error("must not fetch"));
+          },
+          openBrowser: () => {
+            opens += 1;
+            return Promise.resolve();
+          },
+        }),
+      ).toBe(2);
+      expect(requests).toBe(0);
+      expect(opens).toBe(0);
+      expect(JSON.parse(captured.stderr.join(""))).toMatchObject({
+        error: { code: "VALIDATION_ERROR" },
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("quarantines local authority when organization selection loses its response", async () => {
     const { directory, paths } = await temporaryStorage();
     const keychain = memoryKeychain();
     const humanPaths = resolveHumanStoragePaths({}, paths);
     const captured = captureIo();
-    let refreshRequests = 0;
+    let selectionRequests = 0;
     try {
       await writeHumanAuthentication(humanPaths, accountAuthentication(), "keychain", random, keychain);
+      const evidenceBefore = [...keychain.values.entries()];
       const exitCode = await runCli(["organization", "use", organization.id, "--json"], {
         environment: { TASKCTL_API_URL: "http://127.0.0.1:3211" },
         storagePaths: paths,
@@ -222,18 +294,390 @@ describe("human CLI", () => {
               }),
             );
           }
-          refreshRequests += 1;
+          selectionRequests += 1;
           return Promise.reject(new Error("lost after dispatch"));
         },
       });
 
       expect(exitCode).toBe(6);
-      expect(refreshRequests).toBe(1);
+      expect(selectionRequests).toBe(1);
       expect(JSON.parse(captured.stderr.join(""))).toMatchObject({
         error: { code: "AUTH_REFRESH_INDETERMINATE" },
       });
       expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
-      expect(keychain.values.size).toBe(0);
+      expect([...keychain.values.entries()]).toEqual(evidenceBefore);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("quarantines both possible credentials when selected custody cannot commit", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const baseKeychain = memoryKeychain();
+    let sets = 0;
+    const keychain: HumanSecretStore & { readonly values: Map<string, string> } = {
+      values: baseKeychain.values,
+      get: async (input) => await baseKeychain.get(input),
+      set: async (input) => {
+        sets += 1;
+        await baseKeychain.set(input);
+        if (sets === 2) throw new Error("injected lost Keychain write response");
+      },
+      delete: async (input) => await baseKeychain.delete(input),
+    };
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    const selectedAccess = "selected-access-token-that-must-stay-secret";
+    const selectedRefresh = "selected-refresh-token-that-must-stay-secret";
+    try {
+      await writeHumanAuthentication(humanPaths, accountAuthentication(), "keychain", random, keychain);
+      const exitCode = await runCli(["organization", "use", organization.id, "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/organizations") {
+            return Promise.resolve(Response.json({
+              ok: true,
+              data: { organizations: [organization], cursor: null },
+              requestId: REQUEST_ID,
+            }));
+          }
+          return Promise.resolve(Response.json({
+            ok: true,
+            data: {
+              accessToken: selectedAccess,
+              refreshToken: selectedRefresh,
+              user: accountAuthentication().user,
+              organization,
+            },
+            requestId: REQUEST_ID,
+          }));
+        },
+      });
+
+      expect(exitCode).toBe(6);
+      expect(JSON.parse(captured.stderr.join(""))).toMatchObject({
+        error: { code: "AUTH_REFRESH_INDETERMINATE" },
+      });
+      expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
+      expect(keychain.values.size).toBe(2);
+      expect([...keychain.values.values()].some((value) =>
+        value.includes(selectedAccess) && value.includes(selectedRefresh)
+      )).toBeTrue();
+      expect(`${captured.stdout.join("")}\n${captured.stderr.join("")}`)
+        .not.toContain(selectedAccess);
+      expect(`${captured.stdout.join("")}\n${captured.stderr.join("")}`)
+        .not.toContain(selectedRefresh);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("contains the committed selection when retired-slot cleanup throws", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const keychain = lostCleanupKeychain();
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    const selectedAccess = "cleanup-selected-access-token-that-must-stay-secret";
+    const selectedRefresh = "cleanup-selected-refresh-token-that-must-stay-secret";
+    try {
+      await writeHumanAuthentication(
+        humanPaths,
+        accountAuthentication(),
+        "keychain",
+        random,
+        keychain,
+      );
+      const exitCode = await runCli(["organization", "use", organization.id, "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/organizations") {
+            return Promise.resolve(Response.json({
+              ok: true,
+              data: { organizations: [organization], cursor: null },
+              requestId: REQUEST_ID,
+            }));
+          }
+          return Promise.resolve(Response.json({
+            ok: true,
+            data: {
+              accessToken: selectedAccess,
+              refreshToken: selectedRefresh,
+              user: accountAuthentication().user,
+              organization,
+            },
+            requestId: REQUEST_ID,
+          }));
+        },
+      });
+
+      expect(exitCode).toBe(6);
+      expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
+      expect([...keychain.values.values()].some((source) =>
+        source.includes(selectedAccess) && source.includes(selectedRefresh)
+      )).toBeTrue();
+      const rendered = `${captured.stdout.join("")}\n${captured.stderr.join("")}`;
+      expect(rendered).not.toContain(selectedAccess);
+      expect(rendered).not.toContain(selectedRefresh);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves exact Keychain bytes when refresh dispatch has an indeterminate outcome", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const keychain = memoryKeychain();
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    try {
+      await writeHumanAuthentication(
+        humanPaths,
+        accountAuthentication(),
+        "keychain",
+        random,
+        keychain,
+      );
+      const evidenceBefore = [...keychain.values.entries()];
+      const exitCode = await runCli(["workspace", "list", "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/auth/refresh") {
+            return Promise.reject(new Error("refresh response lost after dispatch"));
+          }
+          return Promise.resolve(Response.json({
+            error: {
+              code: "AUTHENTICATION_FAILED",
+              message: "Authentication failed.",
+              requestId: REQUEST_ID,
+              details: {},
+            },
+          }, { status: 401 }));
+        },
+      });
+
+      expect(exitCode).toBe(6);
+      expect(JSON.parse(captured.stderr.join(""))).toMatchObject({
+        error: {
+          code: "AUTH_REFRESH_INDETERMINATE",
+        },
+      });
+      expect(captured.stderr.join("")).toContain("preserved for recovery");
+      expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
+      expect([...keychain.values.entries()]).toEqual(evidenceBefore);
+      const rendered = `${captured.stdout.join("")}\n${captured.stderr.join("")}`;
+      expect(rendered).not.toContain(accountAuthentication().accessToken);
+      expect(rendered).not.toContain(accountAuthentication().refreshToken);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("contains the committed successor when refresh cleanup loses its response", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const keychain = lostCleanupKeychain();
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    const rotatedAccess = "cleanup-rotated-access-token-long-enough";
+    const rotatedRefresh = "cleanup-rotated-refresh-token-long-enough";
+    try {
+      await writeHumanAuthentication(
+        humanPaths,
+        accountAuthentication(),
+        "keychain",
+        random,
+        keychain,
+      );
+      const exitCode = await runCli(["workspace", "list", "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/auth/refresh") {
+            return Promise.resolve(Response.json({
+              ok: true,
+              data: {
+                accessToken: rotatedAccess,
+                refreshToken: rotatedRefresh,
+                user: accountAuthentication().user,
+                organization,
+              },
+              requestId: REQUEST_ID,
+            }));
+          }
+          return Promise.resolve(Response.json({
+            error: {
+              code: "AUTHENTICATION_FAILED",
+              message: "Authentication failed.",
+              requestId: REQUEST_ID,
+              details: {},
+            },
+          }, { status: 401 }));
+        },
+      });
+
+      expect(exitCode).toBe(6);
+      expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
+      expect([...keychain.values.values()].some((source) =>
+        source.includes(rotatedAccess) && source.includes(rotatedRefresh)
+      )).toBeTrue();
+      expect(`${captured.stdout.join("")}\n${captured.stderr.join("")}`)
+        .not.toContain(rotatedRefresh);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("contains a successfully refreshed credential rejected by the replay", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const keychain = memoryKeychain();
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    const rotatedAccess = "replay-rejected-access-token-long-enough";
+    const rotatedRefresh = "replay-rejected-refresh-token-long-enough";
+    try {
+      await writeHumanAuthentication(
+        humanPaths,
+        accountAuthentication(),
+        "keychain",
+        random,
+        keychain,
+      );
+      const exitCode = await runCli(["workspace", "list", "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/auth/refresh") {
+            return Promise.resolve(Response.json({
+              ok: true,
+              data: {
+                accessToken: rotatedAccess,
+                refreshToken: rotatedRefresh,
+                user: accountAuthentication().user,
+                organization,
+              },
+              requestId: REQUEST_ID,
+            }));
+          }
+          return Promise.resolve(Response.json({
+            error: {
+              code: "AUTHENTICATION_FAILED",
+              message: "Authentication failed.",
+              requestId: REQUEST_ID,
+              details: {},
+            },
+          }, { status: 401 }));
+        },
+      });
+
+      expect(exitCode).not.toBe(0);
+      expect(JSON.parse(captured.stderr.join(""))).toMatchObject({
+        error: { code: "AUTHENTICATION_FAILED" },
+      });
+      expect(await readHumanAuthentication(humanPaths, keychain)).toBeNull();
+      expect([...keychain.values.values()].some((source) =>
+        source.includes(rotatedAccess) && source.includes(rotatedRefresh)
+      )).toBeTrue();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("replay rejection never contains a concurrently selected newer winner", async () => {
+    const { directory, paths } = await temporaryStorage();
+    const keychain = memoryKeychain();
+    const humanPaths = resolveHumanStoragePaths({}, paths);
+    const captured = captureIo();
+    const rotatedAccess = "concurrent-refresh-access-token-long-enough";
+    const rotatedRefresh = "concurrent-refresh-token-long-enough";
+    let workspaceRequests = 0;
+    let selectedWinner: HumanAuthentication | null = null;
+    try {
+      await writeHumanAuthentication(
+        humanPaths,
+        accountAuthentication(),
+        "keychain",
+        random,
+        keychain,
+      );
+      const exitCode = await runCli(["workspace", "list", "--json"], {
+        environment: {},
+        storagePaths: paths,
+        humanSecretStore: keychain,
+        io: captured.io,
+        random,
+        fetch: async (input) => {
+          const url = inputUrl(input);
+          if (url.pathname === "/v1/auth/refresh") {
+            return Response.json({
+              ok: true,
+              data: {
+                accessToken: rotatedAccess,
+                refreshToken: rotatedRefresh,
+                user: accountAuthentication().user,
+                organization,
+              },
+              requestId: REQUEST_ID,
+            });
+          }
+          workspaceRequests += 1;
+          if (workspaceRequests === 2) {
+            const refreshed = await readHumanAuthentication(humanPaths, keychain);
+            if (refreshed === null) throw new Error("refreshed credential disappeared");
+            const nextWinner: HumanAuthentication = {
+              ...refreshed.authentication,
+              accessToken: "concurrent-selection-access-token-long-enough",
+              refreshToken: "concurrent-selection-refresh-token-long-enough",
+              workspace: {
+                ...workspace,
+                roles: [...workspace.roles],
+              },
+            };
+            const replaced = await compareAndSwapHumanAuthentication(
+              humanPaths,
+              refreshed,
+              nextWinner,
+              random,
+              keychain,
+            );
+            if (replaced === null) throw new Error("concurrent selection lost unexpectedly");
+            selectedWinner = nextWinner;
+          }
+          return Response.json({
+            error: {
+              code: "AUTHENTICATION_FAILED",
+              message: "Authentication failed.",
+              requestId: REQUEST_ID,
+              details: {},
+            },
+          }, { status: 401 });
+        },
+      });
+
+      expect(exitCode).not.toBe(0);
+      if (selectedWinner === null) throw new Error("selected winner was not committed");
+      expect((await readHumanAuthentication(humanPaths, keychain))?.authentication)
+        .toEqual(selectedWinner);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -254,8 +698,6 @@ describe("human CLI", () => {
         humanPaths,
         {
           ...accountAuthentication(),
-          workosOrganizationId: organization.workosOrganizationId,
-          organization,
         },
         "keychain",
         random,
@@ -280,7 +722,7 @@ describe("human CLI", () => {
                   accessToken: rotatedAccess,
                   refreshToken: rotatedRefresh,
                   user: { id: "user_abc123", email: "human@example.com" },
-                  workosOrganizationId: organization.workosOrganizationId,
+                  organization,
                 },
                 requestId: REQUEST_ID,
               }),
@@ -345,8 +787,6 @@ describe("human CLI", () => {
         humanPaths,
         {
           ...accountAuthentication(),
-          workosOrganizationId: organization.workosOrganizationId,
-          organization,
         },
         "keychain",
         random,
@@ -359,6 +799,21 @@ describe("human CLI", () => {
             Response.json({
               ok: true,
               data: { workspaces: [workspace], cursor: null },
+              requestId: REQUEST_ID,
+            }),
+          );
+        }
+        if (url.pathname === "/v1/auth/selection") {
+          return Promise.resolve(
+            Response.json({
+              ok: true,
+              data: {
+                accessToken: "workspace-access-token-long-enough",
+                refreshToken: "workspace-refresh-token-long-enough",
+                user: accountAuthentication().user,
+                organization,
+                workspace: { ...workspace, roles: [...workspace.roles] },
+              },
               requestId: REQUEST_ID,
             }),
           );
@@ -497,8 +952,6 @@ describe("human CLI", () => {
         humanPaths,
         {
           ...accountAuthentication(),
-          workosOrganizationId: organization.workosOrganizationId,
-          organization,
           workspace: { ...workspace, roles: [...workspace.roles] },
         },
         "keychain",

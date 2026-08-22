@@ -1,20 +1,21 @@
 # Contents
 
 - `design/` – the shared static browser-component gallery mounted at `/design`.
-- `layout.tsx` – inheritable site-wide document defaults and the concrete light SSR fallback used until the System-first appearance bootstrap resolves.
-- `providers.tsx` – shared appearance/router composition around the optional WorkOS and Convex providers.
+- `layout.tsx` – inheritable site-wide document defaults, adaptive first-paint browser chrome, and the deterministic light-first document boundary used until the System-first appearance bootstrap resolves.
+- `providers.tsx` – public-safe shared appearance, analytics, and router composition with no Convex provider.
+- `authenticated-layout.tsx` and `authenticated-providers.tsx` – configuration-gated Convex Auth composition mounted only below `/app`, `/auth`, and `/pair`.
 - `analytics.ts` and `analytics-provider.tsx` – strict canonical-public-route classification and anonymous, cookieless PostHog pageview delivery.
-- `workos-configuration.ts` – one whitespace-safe WorkOS configuration predicate shared by proxy, auth routes, layout providers, and the `/app` configuration state.
+- `auth-configuration-state.tsx` – one configuration predicate and fail-closed state shared by password and pairing routes.
 - `global-error.tsx`, `error.tsx`, `loading.tsx`, and `not-found.tsx` – shared, themed route-state boundaries, including the root-layout replacement. `loading.tsx` stays heading-free so streamed public HTML cannot grow a second H1. `not-found.tsx` owns a distinct noindex title and must not inherit the homepage canonical.
 - `standalone-theme-header.tsx` – the single final header appearance action shared by configuration, loading, missing-route, signed-out, and recoverable standalone states.
 - `page.tsx` – canonical public landing page. It owns the homepage title, description, canonical `/`, indexable robots, matching social titles, product capabilities, boundaries, public-source entry points, and an honest analytics disclosure.
 - `accept-negotiation.ts` and `public-markdown.ts` – acceptmarkdown.com HTML/Markdown ranking, `llms.txt` body, and public-page Markdown representations used by the proxy.
 - `llms.txt/route.ts` – the root agent-instruction file with when-to-use guidance and links to the existing public pages.
 - `alternatives/` – public, dated, first-party-sourced comparisons that explain HRA's fit without inventing competitor limitations.
-- `app/page.tsx` – authenticated WorkOS/Convex control-plane entry and exact local missing-configuration states.
+- `app/page.tsx` – authenticated Convex control-plane entry and exact local missing-configuration states.
 - `download/` – public macOS prerelease status and source-build guidance.
 - `admin-shell.tsx` – authenticated human identity and agent lifecycle supervision inside the persistent rail, shared Hraness footer identity, suite-account status, final top-bar appearance action, and query-addressed Tasks/Access stages.
-- `suite-account-control.tsx` and `suite-account-protocol.ts` – same-origin central OIDC session control, strict receipt parsing, explicit WorkOS-human linking, and verified plan status.
+- `suite-account-control.tsx` and `suite-account-protocol.ts` – same-origin central OIDC session control, strict receipt parsing, explicit HRA-human linking, and verified plan status.
 - `api/suite-auth/` – exact shared OIDC relying-party catch-all with encrypted server-only token custody and fail-closed configuration.
 - `convex-task-workspace-adapter.tsx` – authenticated Convex subscriptions and human commands mapped into the shared task-workspace port.
 - `hosted-task-workspace-source.ts` – strict atomic roots, immutable continuations, scoped change-feed replay, and fenced human mutations behind the provider-free task client.
@@ -29,13 +30,13 @@
 # Guidelines
 
 - Keep route components focused on human supervision: work readiness, task state, agent identity, leases, and review.
-- Keep `/` public and indexable without mounting WorkOS or Convex. Keep `/app` behind the configured WorkOS proxy and preserve its server-rendered configuration failures before the authenticated control plane mounts.
+- Keep `/` public and indexable without mounting Convex Auth or Convex. Keep the complete `/app` tree behind the configured Convex Auth proxy and preserve server-rendered configuration failures before authenticated surfaces mount.
 - Keep `/download` honest about prerelease status. Link only to the exact public GitHub release contract in `site.ts`, disclose ad-hoc signing and missing notarization before the action, and never embed signing credentials or publication authority in the web app.
 - Keep `/alternatives` and its exact static child routes public. Date each review, cite current first-party sources, distinguish “not documented” from “absent,” and write product-specific analysis rather than name-swapped SEO pages.
 - Limit analytics to one personless, cookieless `$pageview` on `/`, `/download`, `/alternatives`, and the exact comparison routes accepted by `isHraPublicComparisonPath`. Require exact Production `https://hra.sh`, use only the slim no-external SDK entry, redact query, fragment, referrer, identity, account, task, command, and provider context, and keep every other event and route inert.
 - Build public and private discovery output with `@hraness/web-discovery`, while keeping HRA-owned origins, titles, descriptions, routes, dates, JSON-LD facts, and crawler choices in `site.ts` and the route that presents them. Keep homepage identity off the root layout. Keep HTML titles aligned with Open Graph titles.
 - Serve `Accept: text/markdown` on the existing public HTML documents from the proxy, with `Content-Type: text/markdown; charset=utf-8` and `Vary: Accept`. Return `406` only when a public document rejects every produced type. Keep `/llms.txt` as a dedicated Markdown file. Unknown public paths that prefer Markdown receive a real `404` whose body points at `/`, `/download`, `/alternatives`, `/llms.txt`, and `/sitemap.xml`. Do not invent API, OAuth, GraphQL, MCP, or commerce surfaces to satisfy agent scoring.
-- Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex, WorkOS, and generated-API import in hosted adapters.
+- Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex Auth, Convex, and generated-API import in hosted adapters.
 - Use `@hra-internal/codex-app-sdk` for provider-neutral client and mutation-journal contracts. Keep Convex authority, tenant scoping, HMAC derivation, and browser lifecycle composition in this app.
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.
 - Resolve the transient semantic digest to a server-keyed, tenant/principal/source-bound HMAC before entering the generic mutation journal. Preserve that opaque fingerprint exactly across prepare, reads, and transitions. Prepare before effect, mark immediately before the command, and settle only a definitive authority result. Retain ambiguous attempts with their exact idempotency key, HRA operation ID, and supplied task ID. Never persist the browser digest, raw intent, answers, transcript, or provider data.
@@ -48,5 +49,5 @@
 - Never visually conflate a human actor, persistent agent identity, credential, or process session.
 - Preserve keyboard operation, semantic headings, visible focus, and text alternatives while adding interactions.
 - Keep secrets and raw bearer material out of React props, browser storage, rendered errors, and URLs.
-- Treat suite identity as plan-status metadata for the authenticated WorkOS human. Require the Convex HMAC proof/receipt boundary for linking, and never use a central session or feature array to grant an organization, membership, role, workspace, agent, or runner capability.
+- Treat suite identity as plan-status metadata for the authenticated HRA human. Require the Convex HMAC proof/receipt boundary for linking, and never use a central session or feature array to grant an organization, membership, role, workspace, agent, or runner capability.
 - Enable task dispatch only from server-derived, non-expired runner readiness for the selected repository. Render only protocol-bounded reasoning summaries, assistant messages, anonymous tool activity, semantic run phases, and stop authority; never invent or infer raw reasoning or tool detail.

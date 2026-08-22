@@ -20,7 +20,7 @@ function account(index: number, usedPercent: number): DispatchAccountSummary {
     selected: false,
     identityLabel: null,
     planLabel: null,
-    usageRemainingPercent: 100 - usedPercent,
+    weeklyUsage: null,
     authState: "signedIn",
     login: { state: "idle" },
     usage: {

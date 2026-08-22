@@ -14,7 +14,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { runtimeLocalDataRemovalConfirmation } from "../../contracts/runtime";
 import {
@@ -27,6 +27,8 @@ import {
   HRA_HARNESS_LEGACY_KEYCHAIN_SERVICE,
   HRA_HARNESS_KEYCHAIN_SERVICE,
 } from "../src/harness/key-custody";
+import { fixedLocalDataRemovalPaths } from
+  "../src/maintenance/local-data-removal-inventory";
 import {
   createLocalDataRemovalPlan,
   controlPlaneSqliteRemovalArtifacts,
@@ -378,6 +380,85 @@ describe("whole-app local-data removal", () => {
       path: join(home, "Library", "Logs", "OPRTE"),
       kind: "directory",
     });
+  });
+
+  test("removes nested workspace-setup private bytes from the exact application-state target", async () => {
+    const base = await removalFixture();
+    const setupRoot = fixedLocalDataRemovalPaths(base.root).workspaceSetupRoot;
+    const nestedSetupBytes = join(
+      setupRoot,
+      "executor-generation",
+      "home",
+      ".bun",
+      "install",
+      "cache",
+      "setup-package.bin",
+    );
+    await mkdir(dirname(nestedSetupBytes), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(nestedSetupBytes, "setup-private-bytes");
+    const fixture: RemovalFixture = {
+      ...base,
+      roots: {
+        ...base.roots,
+        applicationState: [
+          ...base.roots.applicationState,
+          setupRoot,
+        ],
+      },
+      inventory: {
+        ...base.inventory,
+        filesystemTargets: [
+          ...base.inventory.filesystemTargets,
+          {
+            category: "application_state",
+            path: setupRoot,
+            kind: "directory",
+          },
+        ],
+      },
+      targets: [...base.targets, setupRoot],
+    };
+    const plan = await createLocalDataRemovalPlan({
+      inventory: fixture.inventory,
+      ownedRoots: fixture.roots,
+      signingKey: SIGNING_KEY,
+      previewId: "removal_setup01",
+      now: NOW,
+    });
+    expect(plan.privatePlan.filesystemTargets.some((target) =>
+      target.category === "application_state" &&
+      target.path === setupRoot &&
+      target.kind === "directory"
+    )).toBeTrue();
+    const launch = await prepareLocalDataRemovalHelperLaunch({
+      plan,
+      command: confirmation(plan, true),
+      operationId: "op_setup_removal01",
+      parentProcessId: 41_001,
+      ...revalidation(fixture),
+      signingKey: SIGNING_KEY,
+      signingKeyPath: fixture.signingKeyPath,
+      secrets: secretStore([]),
+      receipts: new FileLocalDataRemovalReceiptStore(
+        fixture.roots.helperStateRoot,
+      ),
+      now: NOW,
+    });
+
+    expect(await readFile(nestedSetupBytes, "utf8")).toBe(
+      "setup-private-bytes",
+    );
+    expect(await executeLocalDataRemovalFilesystemRequest({
+      request: launch.signedRequest,
+      signingKey: SIGNING_KEY,
+      ownedRoots: fixture.roots,
+      now: NOW,
+    })).toEqual({ state: "completed", alreadyCompleted: false });
+    expect(await lstat(setupRoot).catch(() => null)).toBeNull();
+    expect(await lstat(nestedSetupBytes).catch(() => null)).toBeNull();
   });
 
   test("rejects a forged inherited home before deriving any destructive target", async () => {

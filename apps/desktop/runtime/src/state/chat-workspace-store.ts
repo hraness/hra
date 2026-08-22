@@ -19,6 +19,8 @@ import {
   type WorkspaceLaneIdentityStore,
 } from "../workspaces/workspace-broker";
 import { GitExecutionError } from "../workspaces/git-runner";
+import { WorkspaceSetupDeferredError } from
+  "../workspaces/workspace-setup";
 import {
   ChatPaneStoreError,
   type ChatPaneStore,
@@ -368,6 +370,9 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
         pane.archived_at !== null || pane.interaction_mode !== "chat" ||
         pane.workspace_mode !== "managed_worktree"
       ) return this.#panes.require(paneId).projection;
+      if (this.#requiresCleanWorkspaceReplacement(paneId)) {
+        return this.#panes.require(paneId).projection;
+      }
       if (pane.workspace_state === "ready" || pane.workspace_state === "preparing") {
         return this.#panes.require(paneId).projection;
       }
@@ -592,6 +597,28 @@ export class ChatWorkspaceStore implements WorkspaceLaneIdentityStore {
       (lease.status !== "provisioning" && lease.status !== "ready")
     ) conflict("The managed chat workspace lease identity drifted.");
   }
+
+  #requiresCleanWorkspaceReplacement(paneId: ChatPaneId): boolean {
+    const value: unknown = this.#database.query(`
+      SELECT EXISTS(
+        SELECT 1
+        FROM chat_pane_workspace_bindings AS binding
+        JOIN workspace_setup_lane_heads AS head
+          ON head.lane_id = binding.expected_lane_id
+        JOIN workspace_setup_requests AS request
+          ON request.request_id = head.request_id
+         AND request.lane_id = head.lane_id
+         AND request.project_id = binding.project_id
+        WHERE binding.pane_id = ?1
+          AND binding.workspace_lease_id = binding.expected_lane_id
+          AND binding.state != 'preserved'
+          AND request.state = 'rejected'
+          AND request.failure_code = 'clean_replacement_required'
+      ) AS required
+    `).get(paneId);
+    return z.object({ required: z.union([z.literal(0), z.literal(1)]) })
+      .strict().parse(value).required === 1;
+  }
 }
 
 /** Coordinates exact broker recovery without ever returning the source checkout. */
@@ -620,7 +647,8 @@ export class ManagedChatWorkspaceService implements ChatWorkspacePort {
     if (current.workspace.mode === "legacyUnbound" || current.workspace.state === "preserved") {
       return current;
     }
-    this.#store.beginProvisioning(paneId);
+    const admission = this.#store.beginProvisioning(paneId);
+    if (admission.workspace?.state === "recoveryRequired") return admission;
     try {
       const binding = this.#store.activeBinding(paneId);
       const laneId = this.#store.expectedLaneId(paneId);
@@ -645,6 +673,9 @@ export class ManagedChatWorkspaceService implements ChatWorkspacePort {
       }
       return this.#panes.require(paneId).projection;
     } catch (error: unknown) {
+      if (error instanceof WorkspaceSetupDeferredError) {
+        return this.#panes.require(paneId).projection;
+      }
       if (error instanceof WorkspaceCapacityError) {
         return this.#store.markWaiting(paneId, error.code);
       }

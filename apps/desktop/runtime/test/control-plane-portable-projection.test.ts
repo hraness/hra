@@ -195,6 +195,145 @@ describe("portable provider-context projection", () => {
     }
   });
 
+  test.each([
+    "approval_required",
+    "rejected",
+    "prepared",
+    "effect_started",
+    "failed",
+    "ambiguous",
+  ] as const)("rejects %s workspace setup authority without mutating source", (state) => {
+    const database = fixtureDatabase();
+    try {
+      insertWorkspaceSetupRequest(database, state);
+      const sourceSnapshot = Buffer.from(database.serialize());
+
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "1".repeat(64),
+        attachmentVaultGenerationSha256: "2".repeat(64),
+      })).toThrow("Finish or resolve workspace setup");
+      expect(Buffer.from(database.serialize())).toEqual(sourceSnapshot);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("removes succeeded setup proof and local transcript from the portable copy", () => {
+    const database = fixtureDatabase();
+    let projected: Database | null = null;
+    try {
+      const privateTranscript = "/Users/example/private-checkout installed";
+      const requestId = insertWorkspaceSetupRequest(
+        database,
+        "succeeded",
+        privateTranscript,
+      );
+      expect(Buffer.from(database.serialize()).includes(privateTranscript)).toBe(true);
+      const result = projectFixture(database, {
+        sourceDatabaseSha256: "3".repeat(64),
+        attachmentVaultGenerationSha256: "4".repeat(64),
+      });
+      projected = result.database;
+      expect(projected.query(`
+        SELECT request_id, state FROM workspace_setup_requests
+        WHERE request_id = ?1
+      `).get(requestId)).toBeNull();
+      expect(projected.query(`
+        SELECT request_id FROM workspace_setup_lane_heads
+      `).get()).toBeNull();
+      expect(Buffer.from(projected.serialize()).includes(privateTranscript)).toBe(false);
+    } finally {
+      projected?.close();
+      database.close();
+    }
+  });
+
+  test("removes preserved unstarted setup authority from the portable copy", () => {
+    const database = fixtureDatabase();
+    let projected: Database | null = null;
+    try {
+      const requestId = insertWorkspaceSetupRequest(database, "prepared");
+      database.query(`
+        UPDATE chat_pane_workspace_bindings
+        SET state = 'preserved', revision = revision + 1, updated_at = ?1
+        WHERE expected_lane_id = 'lane_portable_setup0001'
+      `).run(now.toISOString());
+      const sourceSnapshot = Buffer.from(database.serialize());
+
+      const result = projectFixture(database, {
+        sourceDatabaseSha256: "b".repeat(64),
+        attachmentVaultGenerationSha256: "c".repeat(64),
+      });
+      projected = result.database;
+      expect(projected.query(`
+        SELECT request_id FROM workspace_setup_requests WHERE request_id = ?1
+      `).get(requestId)).toBeNull();
+      expect(projected.query(`
+        SELECT request_id FROM workspace_setup_lane_heads
+      `).get()).toBeNull();
+      expect(Buffer.from(database.serialize())).toEqual(sourceSnapshot);
+      expect(database.query(`
+        SELECT state, setup_revision FROM workspace_setup_requests
+        WHERE request_id = ?1
+      `).get(requestId)).toEqual({ state: "prepared", setup_revision: 2 });
+    } finally {
+      projected?.close();
+      database.close();
+    }
+  });
+
+  test("accepts a clean v62 snapshot with neither workspace setup table", () => {
+    const database = fixtureDatabase();
+    let projected: Database | null = null;
+    try {
+      downgradeWorkspaceSetupSchemaToV62(database);
+      const result = projectFixture(database, {
+        sourceDatabaseSha256: "5".repeat(64),
+        attachmentVaultGenerationSha256: "6".repeat(64),
+      });
+      projected = result.database;
+      expect(projected.query(`
+        SELECT MAX(version) AS version FROM schema_migrations
+      `).get()).toEqual({ version: 62 });
+      expect(projected.query(`
+        SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND name LIKE 'workspace_setup_%'
+      `).all()).toEqual([]);
+    } finally {
+      projected?.close();
+      database.close();
+    }
+  });
+
+  test("rejects a claimed v63 snapshot missing one setup table", () => {
+    const database = fixtureDatabase();
+    try {
+      database.exec("DROP TABLE workspace_setup_lane_heads");
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "7".repeat(64),
+        attachmentVaultGenerationSha256: "8".repeat(64),
+      })).toThrow("Workspace-setup portability state is incomplete");
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rejects workspace setup tables claimed by a v62 snapshot", () => {
+    const database = fixtureDatabase();
+    try {
+      database.exec(`
+        DELETE FROM schema_migrations WHERE version = 63;
+        UPDATE app_release_state SET migration_version = 62;
+      `);
+      expect(() => projectFixture(database, {
+        sourceDatabaseSha256: "9".repeat(64),
+        attachmentVaultGenerationSha256: "a".repeat(64),
+      })).toThrow("Workspace-setup portability state is incomplete");
+    } finally {
+      database.close();
+    }
+  });
+
   test("removes provider binding metadata while retaining display history and bytes authority", () => {
     const database = fixtureDatabase();
     let projected: Database | null = null;
@@ -1342,11 +1481,177 @@ function fixtureDatabase(): Database {
   return database;
 }
 
+type WorkspaceSetupFixtureState =
+  | "approval_required"
+  | "rejected"
+  | "prepared"
+  | "effect_started"
+  | "succeeded"
+  | "failed"
+  | "ambiguous";
+
+function insertWorkspaceSetupRequest(
+  database: Database,
+  state: WorkspaceSetupFixtureState,
+  succeededTranscript = "installed",
+): string {
+  const requestId = `wssetup_${"a".repeat(32)}`;
+  const laneId = "lane_portable_setup0001";
+  const repositoryId = "repo_portable_setup0001";
+  const projectId = "project_portable_setup0001";
+  const paneId = "pane_portable_setup0001";
+  const repositoryPath = "/portable/setup";
+  const gitCommonDir = "/portable/setup/.git";
+  const checkoutPath = "/portable/setup-lane";
+  const manifestPath = "/portable/setup-manifest.json";
+  const branchName = "codex/oprte-lane_portable_setup0001";
+  const baseSha = "b".repeat(40);
+  const at = now.toISOString();
+  database.query(`
+    INSERT INTO local_repositories(
+      repository_id, name, canonical_repository_path,
+      canonical_git_common_dir, created_at, updated_at
+    ) VALUES (?1, 'Portable setup', ?2, ?3, 1, 1)
+  `).run(repositoryId, repositoryPath, gitCommonDir);
+  database.query(`
+    INSERT INTO projects(
+      project_id, canonical_repository_path, canonical_git_common_dir,
+      display_name, created_at, updated_at
+    ) VALUES (?1, ?2, ?3, 'Portable setup', ?4, ?4)
+  `).run(projectId, repositoryPath, gitCommonDir, at);
+  database.query(`
+    INSERT INTO workspace_leases(
+      lane_id, project_id, canonical_checkout_path, mode, status, base_sha,
+      branch_name, retention, recovery_manifest_path, created_at, updated_at
+    ) VALUES (?1, ?2, ?3, 'chat_managed_worktree', 'provisioning', ?4,
+      ?5, 'preserve', ?6, ?7, ?7)
+  `).run(
+    laneId,
+    projectId,
+    checkoutPath,
+    baseSha,
+    branchName,
+    manifestPath,
+    at,
+  );
+  database.query(`
+    INSERT INTO chat_panes(
+      pane_id, palette_index, repository_id, repository_name, revision, title,
+      reasoning_effort, state, display_order, workspace_mode,
+      workspace_state, workspace_revision, workspace_recovery_reason,
+      created_at, updated_at
+    ) VALUES (
+      ?1,
+      (SELECT next_palette_index FROM chat_pane_palette_sequence WHERE singleton = 1),
+      ?2, 'Portable setup', 1, 'Portable setup', 'ultra', 'ready', 0,
+      'managed_worktree', 'preparing', 1, NULL, ?3, ?3
+    )
+  `).run(paneId, repositoryId, at);
+  database.query(`
+    INSERT INTO chat_pane_workspace_bindings(
+      binding_id, pane_id, repository_id, project_id, expected_lane_id,
+      workspace_lease_id, base_sha, branch_name,
+      canonical_repository_path, canonical_git_common_dir,
+      canonical_checkout_path, recovery_manifest_path, state, revision,
+      recovery_reason, created_at, updated_at
+    ) VALUES (
+      'chatws_portable_setup0001', ?1, ?2, ?3, ?4,
+      ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'provisioning', 1,
+      NULL, ?11, ?11
+    )
+  `).run(
+    paneId,
+    repositoryId,
+    projectId,
+    laneId,
+    baseSha,
+    branchName,
+    repositoryPath,
+    gitCommonDir,
+    checkoutPath,
+    manifestPath,
+    at,
+  );
+  const approved = !["approval_required", "rejected"].includes(state);
+  const effectStarted = !["approval_required", "rejected", "prepared"].includes(
+    state,
+  );
+  const terminal = ["rejected", "succeeded", "failed", "ambiguous"].includes(
+    state,
+  );
+  const transcript = state === "succeeded"
+    ? succeededTranscript
+    : state === "failed"
+    ? "install failed"
+    : null;
+  const setupRevision = state === "approval_required"
+    ? 1
+    : state === "rejected"
+    ? 1
+    : state === "prepared"
+    ? 2
+    : state === "effect_started"
+    ? 3
+    : 4;
+  database.query(`
+    INSERT INTO workspace_setup_requests(
+      request_id, lane_id, project_id, base_sha, recipe_digest,
+      executor_digest, state, setup_revision, approval_binding_digest,
+      executor_instance_id, failure_code, transcript, transcript_bytes,
+      created_at, updated_at, approved_at, effect_started_at, completed_at
+    ) VALUES (
+      ?1, ?2, ?3, ?4, ?5,
+      ?6, ?7, ?8, ?9,
+      ?10, ?11, ?12, ?13,
+      ?14, ?14, ?15, ?16, ?17
+    )
+  `).run(
+    requestId,
+    laneId,
+    projectId,
+    baseSha,
+    "c".repeat(64),
+    "d".repeat(64),
+    state,
+    setupRevision,
+    approved ? "e".repeat(64) : null,
+    effectStarted ? "executor_portable_setup_0001" : null,
+    state === "rejected"
+      ? "invalid_recipe"
+      : state === "failed"
+      ? "exit_nonzero"
+      : null,
+    transcript,
+    transcript === null ? null : Buffer.byteLength(transcript, "utf8"),
+    at,
+    approved ? at : null,
+    effectStarted ? at : null,
+    terminal ? at : null,
+  );
+  database.query(`
+    INSERT INTO workspace_setup_lane_heads(lane_id, request_id, updated_at)
+    VALUES (?1, ?2, ?3)
+  `).run(laneId, requestId, at);
+  return requestId;
+}
+
+function downgradeWorkspaceSetupSchemaToV62(database: Database): void {
+  database.exec(`
+    DROP TABLE workspace_setup_lane_heads;
+    DROP TABLE workspace_setup_requests;
+    DELETE FROM schema_migrations WHERE version = 63;
+    UPDATE app_release_state SET migration_version = 62;
+  `);
+}
+
 function downgradeScheduledChatSchemaToV61(database: Database): void {
   database.exec(`
+    DROP TABLE workspace_setup_lane_heads;
+    DROP TABLE workspace_setup_requests;
     DROP TRIGGER chat_scheduled_chat_desired_off_pane_update_quarantine;
     DROP TRIGGER chat_scheduled_chat_desired_off_pane_delete_quarantine;
     DROP TABLE chat_scheduled_chat_desired_off;
+    DELETE FROM schema_migrations WHERE version = 63;
     DELETE FROM schema_migrations WHERE version = 62;
     UPDATE app_release_state SET migration_version = 61;
   `);

@@ -866,6 +866,7 @@ function runtimePaths(
   gitRoot: string,
 ): RuntimePaths {
   return {
+    bunBinary: process.execPath,
     codexBinary: "/usr/bin/true",
     codexHome,
     gitBinary,

@@ -122,6 +122,34 @@ describe("strict OPRTE cloud HTTP transport", () => {
     expect(await requests[0]?.text()).toBe("");
   });
 
+  test("threads caller cancellation into a workspace-list request", async () => {
+    const observedSignal: { current: AbortSignal | null } = { current: null };
+    const transport = new HRAHumanHttpTransport({
+      apiUrl: "https://hra.example.com",
+      fetch: (_input, init) => {
+        observedSignal.current = init?.signal ?? null;
+        return new Promise<Response>((_resolve, reject) => {
+          observedSignal.current?.addEventListener("abort", () => {
+            reject(new Error("workspace list aborted"));
+          }, { once: true });
+        });
+      },
+    });
+    const controller = new AbortController();
+    const pending = transport.listWorkspaces(TOKEN, {
+      limit: 25,
+      signal: controller.signal,
+    });
+    await Promise.resolve();
+    controller.abort(new Error("attention budget exhausted"));
+
+    expect(await pending).toMatchObject({
+      ok: false,
+      error: { code: "SERVICE_UNAVAILABLE" },
+    });
+    expect(observedSignal.current?.aborted).toBe(true);
+  });
+
   test("rejects redirect, oversized, malformed, and route-mismatched responses without echoing secrets", async () => {
     const secret = "refresh-token-that-must-never-be-diagnostic-output";
     const responses = [
@@ -344,6 +372,7 @@ describe("strict OPRTE cloud HTTP transport", () => {
     const store: HumanAuthenticationStore = {
       read: () => Promise.resolve(null),
       compareAndSwap: () => Promise.resolve(null),
+      preserveForRecovery: () => Promise.resolve(false),
       clear: () => Promise.resolve(false),
     };
     const transport = new HRAHumanHttpTransport({
@@ -375,19 +404,26 @@ describe("strict OPRTE cloud HTTP transport", () => {
     const snapshot = humanAuthenticationSnapshotSchema.parse({
       generation: 4,
       authentication: {
-        version: 1,
+        version: 2,
         apiUrl: "https://hra.example.com",
         accessToken: TOKEN,
         refreshToken: "refresh-token-that-remains-inside-custody",
         user: {
-          id: "user_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
           email: "chef@example.com",
+        },
+        organization: {
+          id: "org_oprte",
+          name: "OPRTE",
+          role: "owner",
+          status: "active",
         },
       },
     });
     const store: HumanAuthenticationStore = {
       read: () => Promise.resolve(snapshot),
       compareAndSwap: () => Promise.resolve(null),
+      preserveForRecovery: () => Promise.resolve(false),
       clear: () => Promise.resolve(false),
     };
     const transport = new HRAHumanHttpTransport({

@@ -158,6 +158,15 @@ export class RuntimeProjection {
   }
 
   /**
+   * Returns a detached read model without compacting, resequencing, or
+   * draining renderer delivery. Local observation consumers must never gain
+   * snapshot-transfer authority merely to inspect current semantic state.
+   */
+  observeSnapshot(): RuntimeSnapshot {
+    return structuredClone(this.#snapshot);
+  }
+
+  /**
    * Wait for a drain or snapshot compaction to free queue capacity. The
    * projection owns no pending event data and all observers of one generation
    * share a single bounded promise.

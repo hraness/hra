@@ -96,6 +96,7 @@ type AccountEvent = Extract<
 >;
 
 const DEFAULT_ROUTING_REFRESH_TIMEOUT_MILLISECONDS = 5_000;
+const WEEKLY_USAGE_WINDOW_DURATION_MINUTES = 7 * 24 * 60;
 
 export function accountUsageProjectionDeadline(
   usage: AccountUsageState,
@@ -132,6 +133,30 @@ export function accountUsageRemainingPercent(
     : budget.kind === "exhausted"
       ? 0
       : null;
+}
+
+export function accountWeeklyUsage(
+  usage: AccountUsageState,
+  nowMs: number,
+): AccountSummary["weeklyUsage"] {
+  if (!Number.isFinite(nowMs) || usage.state !== "ready") return null;
+  const codexLimit = usage.limits.find(({ id }) => id === "codex");
+  const candidateLimits = codexLimit === undefined ? usage.limits : [codexLimit];
+  const weeklyWindows = candidateLimits.flatMap(({ primary, secondary }) =>
+    [primary, secondary].filter((window): window is NonNullable<typeof window> =>
+      window !== null &&
+      window.windowDurationMinutes === WEEKLY_USAGE_WINDOW_DURATION_MINUTES
+    )
+  );
+  if (weeklyWindows.length !== 1) return null;
+  const [weekly] = weeklyWindows;
+  if (weekly === undefined || weekly.resetsAt === null) return null;
+  const resetsAtMs = Date.parse(weekly.resetsAt);
+  if (!Number.isFinite(resetsAtMs) || resetsAtMs <= nowMs) return null;
+  return {
+    remainingPercent: 100 - weekly.usedPercent,
+    resetsAt: weekly.resetsAt,
+  };
 }
 
 export interface AccountRuntimeRouterPort {
@@ -3653,8 +3678,8 @@ export class AccountService {
       selected: profile.selected,
       identityLabel: profile.identityLabel,
       planLabel: profile.planLabel,
-      usageRemainingPercent: profile.authState === "signedIn"
-        ? accountUsageRemainingPercent(ephemeral.usage, nowMs)
+      weeklyUsage: profile.authState === "signedIn"
+        ? accountWeeklyUsage(ephemeral.usage, nowMs)
         : null,
       authState: profile.authState,
       login: ephemeral.login,
@@ -3686,19 +3711,26 @@ export class AccountService {
     this.#usageExpiryTimers.get(profile.id)?.cancel();
     this.#usageExpiryTimers.delete(profile.id);
     const usage = this.#ephemeralFor(profile).usage;
-    if (
-      profile.authState !== "signedIn" ||
-      account.usageRemainingPercent === null ||
-      usage.state !== "ready"
-    ) return;
-    const deadline = accountUsageProjectionDeadline(usage);
-    if (deadline === null || deadline <= nowMs) return;
+    if (profile.authState !== "signedIn" || usage.state !== "ready") return;
+    const routingProjectionDeadline = accountUsageRemainingPercent(usage, nowMs) === null
+      ? null
+      : accountUsageProjectionDeadline(usage);
+    const weeklyResetDeadline = account.weeklyUsage === null
+      ? null
+      : Date.parse(account.weeklyUsage.resetsAt);
+    const deadlines = [routingProjectionDeadline, weeklyResetDeadline].filter(
+      (deadline): deadline is number =>
+        deadline !== null && Number.isFinite(deadline) && deadline > nowMs,
+    );
+    if (deadlines.length === 0) return;
+    const deadline = Math.min(...deadlines);
+    const refreshAfterWeeklyReset = weeklyResetDeadline === deadline;
     const usageUpdatedAt = usage.updatedAt;
     const cancel = this.#usageProjectionScheduler.schedule(() => {
       const timer = this.#usageExpiryTimers.get(profile.id);
       if (timer?.usageUpdatedAt !== usageUpdatedAt) return;
       this.#usageExpiryTimers.delete(profile.id);
-      void this.#serialize(profile.id, () => {
+      void this.#serialize(profile.id, async () => {
         if (this.#archiveAdmissionGate.isHeld(profile.id)) return Promise.resolve();
         const current = this.#store.find(profile.id);
         const currentUsage = current === null ? null : this.#ephemeralFor(current).usage;
@@ -3708,8 +3740,11 @@ export class AccountService {
           currentUsage?.state !== "ready" ||
           currentUsage.updatedAt !== usageUpdatedAt
         ) return Promise.resolve();
+        if (refreshAfterWeeklyReset) {
+          await this.#refreshDispatchAccount(current);
+          return;
+        }
         this.#publish(current);
-        return Promise.resolve();
       }).catch(() => undefined);
     }, Math.max(1, deadline - nowMs));
     this.#usageExpiryTimers.set(profile.id, { cancel, usageUpdatedAt });

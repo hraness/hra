@@ -34,12 +34,13 @@
     "build:direct": "vite build --config frontend/direct/vite.config.ts",
     "build:runtime:dev": "bun build --compile --sourcemap=inline runtime/src/main.ts --outfile runtime/dist/oprte-gateway-dev",
     "build:runtime": "bun run runtime/build-release-gateway.ts && bun run check:direct-boundary",
+    "build:local-cli": "bun run --cwd ../local-cli build",
     "build:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-build -- bun run build:macos:uncoordinated",
     "build:macos:uncoordinated": "bun run check:generated:macos && bun run build:frontend && bun run build:runtime && bun run runtime/run-zig.ts build -Dplatform=macos -Doptimize=ReleaseFast && bun run check:direct-boundary",
     "package:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-package -- bun run package:macos:uncoordinated",
-    "package:macos:uncoordinated": "bun run check:generated:macos && bun run build:runtime && bun run runtime/run-zig.ts build package -Dplatform=macos -Doptimize=ReleaseFast && bun run runtime/package-macos.ts && bun run runtime/verify-macos-package.ts && bun run runtime/verify-codex-signature-tamper.ts && bun run runtime/create-dmg.ts",
+    "package:macos:uncoordinated": "bun run check:generated:macos && bun run build:runtime && bun run build:local-cli && bun run runtime/run-zig.ts build package -Dplatform=macos -Doptimize=ReleaseFast && bun run runtime/package-macos.ts && bun run runtime/verify-macos-package.ts && bun run runtime/verify-codex-signature-tamper.ts && bun run runtime/create-dmg.ts",
     "package:macos:adhoc": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-ad-hoc-package -- bun run package:macos:adhoc:uncoordinated",
-    "package:macos:adhoc:uncoordinated": "bun run check:generated:macos && bun run build:runtime && bun run runtime/run-zig.ts build package -Dplatform=macos -Doptimize=ReleaseFast && bun run runtime/package-macos.ts && bun run runtime/verify-macos-package.ts && bun run runtime/verify-codex-signature-tamper.ts && bun run runtime/create-dmg.ts --core-only",
+    "package:macos:adhoc:uncoordinated": "bun run check:generated:macos && bun run build:runtime && bun run build:local-cli && bun run runtime/run-zig.ts build package -Dplatform=macos -Doptimize=ReleaseFast && bun run runtime/package-macos.ts && bun run runtime/verify-macos-package.ts && bun run runtime/verify-codex-signature-tamper.ts && bun run runtime/create-dmg.ts --core-only",
     "verify:package:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-package-verification -- bun run verify:package:macos:uncoordinated",
     "verify:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --release-directory zig-out/release/macos/arm64",
     "verify:package:macos:adhoc": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-ad-hoc-package-verification -- bun run runtime/verify-macos-package.ts --core-release-directory zig-out/release/macos/arm64",
@@ -82,10 +83,11 @@
     "baseline:reactive": "bun run runtime/reactive-baseline.ts",
     "test:property": "bun test ./frontend/src/features/chat/model.property.test.ts ./frontend/src/runtime/*.property.test.ts ./frontend/direct/*.property.test.ts ./contracts/*.property.test.ts ./runtime/test/*.property.test.ts",
     "test:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-tests -- bun run test:macos:uncoordinated",
-    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts"
+    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts ./runtime/test/bun-preserved-signature.macos.test.ts"
   },
   "dependencies": {
     "@hraness/agent-tasks-protocol": "workspace:*",
+    "@hraness/hra-local-observation-protocol": "workspace:*",
     "@hra-internal/browser-storage": "workspace:*",
     "@hra-internal/codex-app-sdk": "workspace:*",
     "@hraness/hra-human-client": "workspace:*",

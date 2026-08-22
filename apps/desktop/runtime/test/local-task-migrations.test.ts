@@ -427,6 +427,10 @@ describe("local task SQLite migrations", () => {
             version: 62,
             name: "scheduled-chat-durable-off-intent",
           },
+          {
+            version: 63,
+            name: "durable-workspace-setup-authority",
+          },
         ]);
       const names = new Set(
         database.query<{ name: string }, []>(`
@@ -500,6 +504,8 @@ describe("local task SQLite migrations", () => {
         "human_organization_operations",
         "human_organization_operation_aliases",
         "local_workspaces",
+        "workspace_setup_lane_heads",
+        "workspace_setup_requests",
         "local_tasks",
         "local_task_dependencies",
         "local_workspace_events",

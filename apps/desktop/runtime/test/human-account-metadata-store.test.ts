@@ -10,7 +10,9 @@ import {
 
 import {
   HRA_HUMAN_KEYCHAIN_NAME,
+  LegacyHumanAccountMetadataError,
   humanAccountMetadataSchema,
+  reconcileHumanAccountMetadata,
 } from "../src/cloud";
 import { applyMigrations } from "../src/state/database";
 import { HumanAccountMetadataStore } from "../src/state/human-account-metadata-store";
@@ -43,13 +45,19 @@ describe("SQLite human account metadata", () => {
         revision: 0,
         credentialGeneration: 3,
         profile: {
-          version: 1,
+          version: 2,
           apiUrl: "https://oprte.example.test",
           secretStore: "keychain",
           user: {
-            id: "user_LOCAL",
+            id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
             email: "builder@example.test",
             name: "Builder",
+          },
+          organization: {
+            id: "org_local",
+            name: "Local",
+            role: "owner",
+            status: "active",
           },
         },
       });
@@ -88,6 +96,60 @@ describe("SQLite human account metadata", () => {
         .get()?.metadata_json ?? "";
       expect(serialized).not.toContain("accessToken");
       expect(serialized).not.toContain("refreshToken");
+    } finally {
+      database.close();
+    }
+  });
+
+  test("projects legacy token-free metadata only as an explicit-recovery reference", async () => {
+    const { database, store } = fixture();
+    try {
+      const legacy = {
+        version: 1,
+        revision: 0,
+        credentialGeneration: 4,
+        profile: {
+          version: 1,
+          apiUrl: "https://oprte.example.test",
+          secretStore: "keychain",
+          user: {
+            id: "legacy_user",
+            email: "legacy@example.test",
+            name: "Legacy user",
+          },
+          organization: {
+            id: "legacy_org",
+            name: "Legacy organization",
+            role: "owner",
+            status: "active",
+          },
+        },
+      };
+      database.query(`
+        INSERT INTO human_account_metadata(
+          singleton, revision, credential_generation, metadata_json, updated_at
+        ) VALUES (1, ?1, ?2, ?3, ?4)
+      `).run(0, 4, JSON.stringify(legacy), 1_700_000_000_000);
+
+      expect(await store.readAccountMetadata()).toEqual({
+        state: "legacy_profile",
+        revision: 0,
+        credentialGeneration: 4,
+      });
+      expect(reconcileHumanAccountMetadata(store, null)).rejects
+        .toBeInstanceOf(LegacyHumanAccountMetadataError);
+      expect(await reconcileHumanAccountMetadata(store, null, {
+        replaceLegacyProfile: true,
+      })).toEqual({
+        version: 1,
+        revision: 1,
+        credentialGeneration: 4,
+        profile: null,
+      });
+      expect(await store.readAccountMetadata()).toMatchObject({
+        revision: 1,
+        profile: null,
+      });
     } finally {
       database.close();
     }

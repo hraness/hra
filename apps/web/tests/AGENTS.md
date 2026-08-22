@@ -2,8 +2,8 @@
 
 - `local-convex.ts` – serial black-box acceptance against the anonymous local Convex HTTP boundary and real scheduler, including tenant-isolated task CRUD, graph laws, projection repair, idempotency, submissions/review, a 100-attempt claim race, exact 500-dependent propagation, pagination, claims, and events; an opt-in path measures 10,000 ready tasks.
 - `run-local-convex.ts` – fail-closed local Convex supervisor that requires the child black-box gate's exact success marker.
-- `fake-workos.ts` – loopback-only signed WorkOS, JWKS, membership, refresh, and webhook fixture without an authentication bypass.
-- `human-local-runner.ts` – keeps Convex and the fake provider alive while running signed CLI auth, provisioning, two-session promotion manifest convergence, fixed-slot refresh limiting, webhook, reconciliation, authorization, repository, direct human-review limiting, human cancel/reopen, and in-review cancellation acceptance.
+- `fake-desktop-pairing.ts` – loopback-only one-time pairing fixture for CLI protocol acceptance without an authentication bypass.
+- `human-local-runner.ts` – keeps Convex alive while proving password sign-up/sign-in, browser-approved desktop pairing, refresh rotation, scope rotation, revocation, and authenticated human task authority.
 - `realtime-cli-proof.ts` – two-phase, signed-human Convex subscription proof that brackets a real `taskctl` claim subprocess and verifies its durable claim tuple and persisted agent event actor without a manual refresh.
 - `realtime-cli-proof.test.ts` – deterministic marker and authoritative detail-observation regressions for the live subscription proof.
 
@@ -17,8 +17,8 @@
 - Run serially and use bounded eventual assertions for real scheduler timing.
 - Keep the 10,000-ready-task measurement opt-in; the default gate must still exercise the exact 500-dependent write boundary and 100 concurrent claim attempts.
 - Keep the concurrent create batch as an optimistic-concurrency regression while running the agent and signed-human suites themselves serially.
-- Make human-auth fixtures issue real RS256 JWTs through a JWKS endpoint and exercise the production-shaped provider adapter; never mint an identity inside a versioned API route.
-- Sign fake webhook bodies with the WorkOS HMAC format and cover duplicate, delayed-read, provisioning-window, downgrade, removal, discovery, and restoration behavior through final HTTP authorization.
-- Inspect persistence across provider removal/restoration and prove Convex-owned planner/viewer workspace assignments remain unchanged while live authorization is denied.
+- Exercise real Convex Auth password sessions through public auth routes; never mint a human identity inside a versioned API route.
+- Keep the pairing verifier on the native side, compare the browser code, approve an exact organization/workspace, and prove one-time redeem plus consumed replay.
+- Recheck current Convex-owned membership on refresh and every protected request, and prove removal immediately denies authority without erasing workspace assignments.
 - Prove authenticated limit subjects are live Convex IDs, opaque pre-authentication subjects are fixed slot keys, independent refresh credentials can occupy independent slots, and refresh persistence stays within the fixed two-window row ceiling.
-- Make membership-create ambiguity commit provider state before failing, hide that state from a later read, and assert recovery remains poll-only with exactly one provider POST.
+- Make lost pairing and scope-rotation responses fail closed, and prove retries never revive the invalidated prior credential.

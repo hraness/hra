@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { accessSync, chmodSync, constants, mkdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { codexChildEnvironment } from "./security/environment";
 import { optionalRenamedEnvironmentValue } from "./security/renamed-environment";
 import { applicationSupportRoot } from "./state/application-support";
@@ -9,6 +9,7 @@ import { applicationSupportRoot } from "./state/application-support";
 const require = createRequire(import.meta.url);
 
 export interface RuntimePaths {
+  readonly bunBinary: string;
   readonly codexBinary: string;
   readonly codexHome: string;
   readonly gitBinary: string;
@@ -43,6 +44,16 @@ function developmentGitRoot(): string {
   return join(dirname(require.resolve("dugite/package.json")), "git");
 }
 
+function developmentBunBinary(): string {
+  const candidate = realpathSync(process.execPath);
+  if (!basename(candidate).startsWith("bun")) {
+    throw new Error(
+      "A compiled gateway requires the exact packaged HRA_BUN_BIN runtime.",
+    );
+  }
+  return candidate;
+}
+
 export function resolveRuntimePaths(environment: NodeJS.ProcessEnv = process.env): RuntimePaths {
   const assets = resolvePortableRuntimeAssets(environment);
   const homeDirectory = environment.HOME ?? homedir();
@@ -72,6 +83,11 @@ export function resolvePortableRuntimeAssets(
   );
 
   return {
+    bunBinary: executable(
+      optionalRenamedEnvironmentValue(environment, "HRA_BUN_BIN")
+        ?? developmentBunBinary(),
+      "Bun binary",
+    ),
     codexBinary: executable(
       optionalRenamedEnvironmentValue(environment, "HRA_CODEX_BIN")
         ?? developmentCodexBinary(),

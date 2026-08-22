@@ -68,6 +68,7 @@ const apiRateLimitSubjectKindValidator = v.union(
   v.literal("workspace"),
   v.literal("user"),
   v.literal("unauthenticated"),
+  v.literal("global"),
 );
 const apiRateLimitRouteClassValidator = v.union(
   v.literal("refresh_auth"),
@@ -79,6 +80,10 @@ const apiRateLimitRouteClassValidator = v.union(
   v.literal("human_read"),
   v.literal("human_mutation"),
   v.literal("human_poll"),
+  v.literal("desktop_pairing_start"),
+  v.literal("desktop_pairing_redeem"),
+  v.literal("password_sign_in"),
+  v.literal("password_sign_up"),
   v.literal("agent_auth_failure"),
   v.literal("enrollment_auth_failure"),
 );
@@ -86,19 +91,52 @@ const apiRateLimitRouteClassValidator = v.union(
 async function requireLocalFixtureIdentity(ctx: FixtureCtx) {
   const configured =
     env.TASKCTL_LOCAL_FIXTURES_ENABLED === "true" &&
-    env.TASKCTL_LOCAL_FIXTURE_ISSUER !== undefined &&
     env.TASKCTL_LOCAL_FIXTURE_SUBJECT !== undefined;
   if (!configured) throw new Error("Local fixtures are disabled.");
   const identity = await ctx.auth.getUserIdentity();
   if (
     identity === null ||
-    identity.issuer !== env.TASKCTL_LOCAL_FIXTURE_ISSUER ||
     identity.subject !== env.TASKCTL_LOCAL_FIXTURE_SUBJECT
   ) {
     throw new Error("Local fixture identity denied.");
   }
   return identity;
 }
+
+export const setHumanMembershipStatus = mutation({
+  args: {
+    userPublicId: v.string(),
+    organizationPublicId: v.string(),
+    status: v.union(v.literal("active"), v.literal("removed")),
+  },
+  returns: v.object({ applied: v.boolean() }),
+  handler: async (ctx, args) => {
+    await requireLocalFixtureIdentity(ctx);
+    const [user, organization] = await Promise.all([
+      ctx.db
+        .query("users")
+        .withIndex("by_public_id", (index) => index.eq("publicId", args.userPublicId))
+        .unique(),
+      ctx.db
+        .query("organizations")
+        .withIndex("by_public_id", (index) =>
+          index.eq("publicId", args.organizationPublicId))
+        .unique(),
+    ]);
+    if (user === null || organization === null) return { applied: false };
+    const membership = await ctx.db
+      .query("organizationMemberships")
+      .withIndex("by_organization_and_user", (index) =>
+        index.eq("organizationId", organization._id).eq("userId", user._id))
+      .unique();
+    if (membership === null) return { applied: false };
+    await ctx.db.patch(membership._id, {
+      status: args.status,
+      updatedAt: Date.now(),
+    });
+    return { applied: true };
+  },
+});
 
 export const resetApiRateLimits = mutation({
   args: {
@@ -219,7 +257,7 @@ export const validateApiRateLimitSubjects = query({
 export const primeHumanMutationRateLimit = mutation({
   args: {
     workspaceId: v.string(),
-    workosUserId: v.string(),
+    userId: v.string(),
     mode: v.union(v.literal("saturated"), v.literal("invalid")),
   },
   returns: v.object({ seeded: v.number() }),
@@ -232,7 +270,7 @@ export const primeHumanMutationRateLimit = mutation({
         .unique(),
       ctx.db
         .query("users")
-        .withIndex("by_workos_user_id", (query) => query.eq("workosUserId", args.workosUserId))
+        .withIndex("by_public_id", (query) => query.eq("publicId", args.userId))
         .unique(),
     ]);
     if (workspace === null || user === null) {
@@ -282,18 +320,6 @@ export const primeHumanMutationRateLimit = mutation({
   },
 });
 
-const reconciliationStatusValidator = v.union(
-  v.literal("completed"),
-  v.literal("partial"),
-  v.literal("busy"),
-  v.literal("unavailable"),
-  v.literal("failed"),
-);
-
-type FixtureReconciliationResult = {
-  readonly status: "completed" | "partial" | "busy" | "unavailable" | "failed";
-  readonly processed: number;
-};
 
 export const seedOpenTask = mutation({
   args: { workspaceId: v.string(), title: v.string() },
@@ -516,128 +542,6 @@ export const seedInReviewTask = mutation({
       now,
     });
     return { key, submissionId: submissionPublicId, revision: 2 };
-  },
-});
-
-export const reconcileWorkOSMembershipsNow = action({
-  args: {},
-  returns: v.object({
-    existing: v.object({ status: reconciliationStatusValidator, processed: v.number() }),
-    discovery: v.object({ status: reconciliationStatusValidator, processed: v.number() }),
-  }),
-  handler: async (ctx): Promise<{
-    existing: FixtureReconciliationResult;
-    discovery: FixtureReconciliationResult;
-  }> => {
-    await requireLocalFixtureIdentity(ctx);
-    const existing: FixtureReconciliationResult = await ctx.runAction(
-      internal.identitySync.reconcileWorkOSMemberships,
-      {},
-    );
-    const discovery: FixtureReconciliationResult = await ctx.runAction(
-      internal.identitySync.discoverWorkOSMemberships,
-      {},
-    );
-    return { existing, discovery };
-  },
-});
-
-export const inspectIdentitySync = query({
-  args: {},
-  returns: v.object({
-    organizations: v.array(
-      v.object({
-        publicId: v.string(),
-        workosOrganizationId: v.optional(v.string()),
-        status: v.string(),
-        hardDeleted: v.boolean(),
-        quarantined: v.boolean(),
-      }),
-    ),
-    memberships: v.array(
-      v.object({
-        workosMembershipId: v.optional(v.string()),
-        workosOrganizationId: v.optional(v.string()),
-        workosUserId: v.optional(v.string()),
-        role: v.string(),
-        status: v.string(),
-        hardDeleted: v.boolean(),
-        quarantined: v.boolean(),
-      }),
-    ),
-    webhookReceipts: v.array(
-      v.object({ providerEventId: v.string(), eventType: v.string(), result: v.string() }),
-    ),
-    quarantines: v.array(
-      v.object({
-        resourceKind: v.string(),
-        resourceId: v.string(),
-        reason: v.string(),
-        resolved: v.boolean(),
-      }),
-    ),
-    membershipRetirements: v.array(
-      v.object({ workosMembershipId: v.string(), replacementWorkosMembershipId: v.string() }),
-    ),
-  }),
-  handler: async (ctx) => {
-    await requireLocalFixtureIdentity(ctx);
-    const [organizations, memberships, receipts, quarantines, membershipRetirements] = await Promise.all([
-      ctx.db.query("organizations").collect(),
-      ctx.db.query("organizationMemberships").collect(),
-      ctx.db.query("identityWebhookReceipts").collect(),
-      ctx.db.query("identityReconciliationQuarantines").collect(),
-      ctx.db.query("workosMembershipRetirements").collect(),
-    ]);
-    return {
-      organizations: organizations.map((organization) => ({
-        publicId: organization.publicId,
-        ...(organization.workosOrganizationId === undefined
-          ? {}
-          : { workosOrganizationId: organization.workosOrganizationId }),
-        status: organization.status,
-        hardDeleted: organization.workosHardDeletedAt !== undefined,
-        quarantined: organization.workosQuarantinedAt !== undefined,
-      })),
-      memberships: await Promise.all(
-        memberships.map(async (membership) => {
-          const [organization, user] = await Promise.all([
-            ctx.db.get(membership.organizationId),
-            ctx.db.get(membership.userId),
-          ]);
-          return {
-            ...(membership.workosMembershipId === undefined
-              ? {}
-              : { workosMembershipId: membership.workosMembershipId }),
-            ...(organization?.workosOrganizationId === undefined
-              ? {}
-              : { workosOrganizationId: organization.workosOrganizationId }),
-            ...(user?.workosUserId === undefined
-              ? {}
-              : { workosUserId: user.workosUserId }),
-            role: membership.role,
-            status: membership.status,
-            hardDeleted: membership.workosHardDeletedAt !== undefined,
-            quarantined: membership.workosQuarantinedAt !== undefined,
-          };
-        }),
-      ),
-      webhookReceipts: receipts.map((receipt) => ({
-        providerEventId: receipt.providerEventId,
-        eventType: receipt.eventType,
-        result: receipt.result,
-      })),
-      quarantines: quarantines.map((quarantine) => ({
-        resourceKind: quarantine.resourceKind,
-        resourceId: quarantine.resourceId,
-        reason: quarantine.reason,
-        resolved: quarantine.resolvedAt !== undefined,
-      })),
-      membershipRetirements: membershipRetirements.map((retirement) => ({
-        workosMembershipId: retirement.workosMembershipId,
-        replacementWorkosMembershipId: retirement.replacementWorkosMembershipId,
-      })),
-    };
   },
 });
 

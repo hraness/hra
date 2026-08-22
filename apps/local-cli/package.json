@@ -1,0 +1,38 @@
+{
+  "name": "@hraness/hra-local-cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The read-only local observation CLI for the HRA desktop.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "apps/local-cli"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "bin": {
+    "hra": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "build": "bun build --compile --minify --sourcemap=none src/index.ts --outfile dist/hra",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src"
+  },
+  "dependencies": {
+    "@hraness/hra-local-observation-protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "@types/node": "catalog:",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  }
+}

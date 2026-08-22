@@ -1,4 +1,7 @@
-import { authkitProxy } from "@workos-inc/authkit-nextjs";
+import {
+  convexAuthNextjsMiddleware,
+  nextjsMiddlewareRedirect,
+} from "@convex-dev/auth/nextjs/server";
 import type { NextFetchEvent, NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
@@ -6,47 +9,18 @@ import {
   appendVaryAccept,
   NOT_ACCEPTABLE_BODY,
 } from "./app/accept-negotiation";
-import { isHraPublicComparisonPath } from "./app/alternatives/slugs";
 import {
   isNextInternalNavigation,
   resolvePublicDiscovery,
 } from "./app/public-markdown";
-import { isWorkOSEnvironmentConfigured } from "./app/workos-configuration";
+import {
+  isPathAtOrBelow,
+  PASSWORD_ONLY_AUTH_SHOULD_HANDLE_CODE,
+  shouldApplyConfiguredAuthProxy,
+} from "./proxy-policy";
 import { hraSecurityHeaders } from "./response-headers";
 
-const configuredProxy = authkitProxy();
-
-const AUTH_PROXY_EXCLUDED_EXACT_PATHS: ReadonlySet<string> = new Set([
-  "/",
-  "/_next/image",
-  "/apple-icon",
-  "/apple-icon.png",
-  "/download",
-  "/download/",
-  "/favicon.ico",
-  "/icon",
-  "/icon.png",
-  "/llms.txt",
-  "/llms.txt/",
-  "/opengraph-image",
-  "/robots.txt",
-  "/sitemap.xml",
-]);
-
-const AUTH_PROXY_EXCLUDED_PATH_TREES = [
-  "/_next/static",
-] as const;
-
-function isPathAtOrBelow(pathname: string, root: string): boolean {
-  return pathname === root || pathname.startsWith(`${root}/`);
-}
-
-export function shouldApplyConfiguredAuthProxy(pathname: string): boolean {
-  return !AUTH_PROXY_EXCLUDED_EXACT_PATHS.has(pathname)
-    && !isHraPublicComparisonPath(pathname)
-    && !AUTH_PROXY_EXCLUDED_PATH_TREES.some((root) =>
-      isPathAtOrBelow(pathname, root));
-}
+export { shouldApplyConfiguredAuthProxy } from "./proxy-policy";
 
 function withHraSecurityHeaders(headers: Headers): Headers {
   for (const header of hraSecurityHeaders) {
@@ -90,16 +64,36 @@ function publicDiscoveryResponse(
   });
 }
 
-export default function proxy(request: NextRequest, event: NextFetchEvent) {
-  const negotiated = publicDiscoveryResponse(request);
-  if (negotiated !== null) return negotiated;
-  if (!shouldApplyConfiguredAuthProxy(request.nextUrl.pathname)) {
+const configuredProxy = convexAuthNextjsMiddleware(
+  async (request, { convexAuth }) => {
+    if (isPathAtOrBelow(request.nextUrl.pathname, "/app") &&
+      !(await convexAuth.isAuthenticated())) {
+      return nextjsMiddlewareRedirect(request, "/auth/sign-in?next=/app");
+    }
     return NextResponse.next();
-  }
-  const configured = isWorkOSEnvironmentConfigured(process.env);
-  return configured ? configuredProxy(request, event) : NextResponse.next();
+  },
+  { shouldHandleCode: PASSWORD_ONLY_AUTH_SHOULD_HANDLE_CODE },
+);
+
+type AuthProxy = (request: NextRequest, event: NextFetchEvent) => ReturnType<typeof configuredProxy>;
+
+export function createHraProxy(authProxy: AuthProxy = configuredProxy) {
+  return function hraProxy(request: NextRequest, event: NextFetchEvent) {
+    const negotiated = publicDiscoveryResponse(request);
+    if (negotiated !== null) return negotiated;
+    if (!shouldApplyConfiguredAuthProxy(request.nextUrl.pathname)) {
+      return NextResponse.next();
+    }
+    const configured = process.env.NEXT_PUBLIC_CONVEX_URL?.trim() !== "" &&
+      process.env.NEXT_PUBLIC_CONVEX_URL !== undefined;
+    return configured ? authProxy(request, event) : NextResponse.next();
+  };
 }
 
+export default createHraProxy();
+
 export const config = {
+  // Next.js statically evaluates this export and does not resolve imported
+  // constants here. Keep the literal aligned with AUTH_PROXY_MATCHER.
   matcher: ["/:path*"],
 };

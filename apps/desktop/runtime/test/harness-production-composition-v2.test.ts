@@ -53,6 +53,7 @@ const expiredFault = Object.freeze({
   reason: "generation_ended" as const,
 });
 const capabilityPaths: RuntimePaths = Object.freeze({
+  bunBinary: process.execPath,
   codexBinary: "/runtime/codex",
   codexHome: "/profiles/composition/codex-home",
   gitBinary: "/runtime/git/bin/git",

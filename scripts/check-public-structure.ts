@@ -9,6 +9,7 @@ const publicBugsUrl = "https://github.com/hraness/hra/issues";
 const expectedNamedWorkspaces: ReadonlyMap<string, string> = new Map([
   ["apps/cli", "@hraness/hra-cli"],
   ["apps/desktop", "@hraness/hra"],
+  ["apps/local-cli", "@hraness/hra-local-cli"],
   ["apps/web", "@hraness/hra-web"],
   ["packages/human-client", "@hraness/hra-human-client"],
   ["packages/internal/brand-ui", "@hra-internal/brand-ui"],
@@ -20,6 +21,7 @@ const expectedNamedWorkspaces: ReadonlyMap<string, string> = new Map([
   ["packages/internal/schema", "@hra-internal/schema"],
   ["packages/internal/test", "@hra-internal/test"],
   ["packages/internal/typescript-config", "@hra-internal/typescript-config"],
+  ["packages/local-observation-protocol", "@hraness/hra-local-observation-protocol"],
   ["packages/task-domain", "@hraness/agent-tasks-domain"],
   ["packages/task-protocol", "@hraness/agent-tasks-protocol"],
   ["packages/task-ui", "@hraness/agent-tasks-ui"],

@@ -51,6 +51,8 @@ const legacy_oprte_storage_app_name = "OPRTE";
 const bundle_id = "kitchen.hraness";
 const legacy_bundle_ids = &.{ "com.jungle.oprte", "com.jungle.kitchen" };
 const legacy_application_support_directory_name = "Hraness Kitchen";
+const source_development_app_name = "HRA Source Development";
+const source_development_bundle_id = "kitchen.hraness.source-development";
 const update_check_command = "hra.update.check";
 const instance_guard_unavailable: c_int = -1;
 const instance_guard_busy: c_int = 0;
@@ -95,16 +97,8 @@ comptime {
         )) {
             @compileError("HRA production cloud API origin must match its checked Convex HTTP deployment");
         }
-        if (cloud_config.workos_client_id.len == 0 or
-            cloud_config.workos_client_id.len > 512 or
-            !std.mem.startsWith(u8, cloud_config.workos_client_id, "client_"))
-        {
-            @compileError("HRA production WorkOS client ID is invalid");
-        }
-        for (cloud_config.workos_client_id) |byte| {
-            if (std.ascii.isWhitespace(byte) or byte == 0) {
-                @compileError("HRA production WorkOS client ID is invalid");
-            }
+        if (!std.mem.eql(u8, cloud_config.web_origin, "https://hra.sh")) {
+            @compileError("HRA production browser origin must match its checked web deployment");
         }
     }
 }
@@ -112,6 +106,7 @@ comptime {
 const App = struct {
     env_map: *std.process.Environ.Map,
     runtime_host: runtime_host.RuntimeHost,
+    product_native_authority: bool,
     instance_guard_acquired: bool = false,
     removal_recovery_required: bool = false,
 
@@ -134,6 +129,7 @@ const App = struct {
 
     fn ensureMacOSInstanceGuard(self: *@This(), io: std.Io) !void {
         if (comptime !std.mem.eql(u8, build_options.platform, "macos")) return;
+        if (!self.product_native_authority) return;
         if (self.instance_guard_acquired) return;
 
         // Sparkle may create the replacement process while the exact
@@ -169,7 +165,9 @@ const App = struct {
             return err;
         };
         if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
-            if (!self.removal_recovery_required) {
+            if (self.product_native_authority and
+                !self.removal_recovery_required)
+            {
                 _ = hra_macos_updater_start();
             }
         }
@@ -181,9 +179,11 @@ const App = struct {
             switch (value) {
                 .command => |command| {
                     if (std.mem.eql(u8, command.name, update_check_command)) {
-                        _ = hra_macos_updater_check_for_updates(
-                            !self.removal_recovery_required,
-                        );
+                        if (self.product_native_authority) {
+                            _ = hra_macos_updater_check_for_updates(
+                                !self.removal_recovery_required,
+                            );
+                        }
                         return;
                     }
                 },
@@ -196,7 +196,9 @@ const App = struct {
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context));
         if (comptime std.mem.eql(u8, build_options.platform, "macos")) {
-            hra_macos_updater_stop();
+            if (self.product_native_authority) {
+                hra_macos_updater_stop();
+            }
         }
         self.runtime_host.stop(runtime);
         self.releaseMacOSInstanceGuard();
@@ -213,17 +215,28 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map,
     );
     const bridge_profile = bridgeProfileForLaunch(
+        builtin.mode,
         development_frontend_enabled,
         build_options.automation,
     );
+    const runtime_profile = runtimeProfileForLaunch(
+        builtin.mode,
+        build_options.automation,
+    );
+    const launch_policy = nativeLaunchPolicy(runtime_profile);
     var app = App{
         .env_map = init.environ_map,
+        .product_native_authority = launch_policy.product_native_authority,
         .runtime_host = runtime_host.RuntimeHost.init(init, .{
             .bridge_profile = bridge_profile,
+            .runtime_profile = runtime_profile,
+            .removal_lifecycle = launch_policy.removal_lifecycle,
+            .account_profile_runner = launch_policy.account_profile_runner,
+            .harness_custody_runner = launch_policy.harness_custody_runner,
             .production_cloud = if (cloud_config.enabled)
                 .{
                     .api_origin = cloud_config.api_origin,
-                    .workos_client_id = cloud_config.workos_client_id,
+                    .web_origin = cloud_config.web_origin,
                 }
             else
                 null,
@@ -235,11 +248,11 @@ pub fn main(init: std.process.Init) !void {
     try app.ensureMacOSInstanceGuard(init.io);
     defer app.releaseMacOSInstanceGuard();
     try runner.runWithOptions(app.app(), .{
-        .app_name = legacy_oprte_storage_app_name,
+        .app_name = launch_policy.app_name,
         .window_title = display_name,
-        .bundle_id = bundle_id,
-        .legacy_window_state_bundle_ids = legacy_bundle_ids,
-        .legacy_application_support_directory_name = legacy_application_support_directory_name,
+        .bundle_id = launch_policy.bundle_id,
+        .legacy_window_state_bundle_ids = launch_policy.legacy_window_state_bundle_ids,
+        .legacy_application_support_directory_name = launch_policy.legacy_application_support_directory_name,
         .icon_path = "assets/icon.png",
         .bridge = app.runtime_host.dispatcher(),
         .web_inspector_enabled = webInspectorEnabledForMode(builtin.mode),
@@ -299,12 +312,133 @@ fn frontendSourceForMode(
 }
 
 fn bridgeProfileForLaunch(
+    mode: std.builtin.OptimizeMode,
     development_frontend_enabled: bool,
     automation_enabled: bool,
 ) runtime_host.BridgeProfile {
     if (automation_enabled) return .automation;
-    if (development_frontend_enabled) return .development;
+    if (mode == .Debug and development_frontend_enabled) return .development;
     return .production;
+}
+
+/// Runtime storage and native capability isolation is broader than remote-UI
+/// authority: every ad-hoc Debug host is source development, but only the
+/// nonce-authenticated HMR envelope may open the Vite bridge origin.
+fn runtimeProfileForLaunch(
+    mode: std.builtin.OptimizeMode,
+    automation_enabled: bool,
+) runtime_host.BridgeProfile {
+    if (automation_enabled) return .automation;
+    if (mode == .Debug) return .development;
+    return .production;
+}
+
+const NativeLaunchPolicy = struct {
+    app_name: []const u8,
+    bundle_id: []const u8,
+    legacy_window_state_bundle_ids: []const []const u8,
+    legacy_application_support_directory_name: ?[]const u8,
+    removal_lifecycle: ?runtime_host.RemovalLifecycle,
+    account_profile_runner: ?runtime_host.AccountProfileOperationRunner,
+    harness_custody_runner: ?runtime_host.HarnessCustodyHelperRunner,
+    product_native_authority: bool,
+};
+
+const isolated_development_removal_lifecycle: runtime_host.RemovalLifecycle = .{
+    .context = null,
+    .prepare_fn = rejectIsolatedDevelopmentRemoval,
+    .rollback_fn = ignoreIsolatedDevelopmentRemoval,
+    .spawn_fn = rejectIsolatedDevelopmentRemovalSpawn,
+    .recover_staged_fn = rejectIsolatedDevelopmentRemovalRecovery,
+    .arm_termination_watchdog_fn = rejectIsolatedDevelopmentRemovalTermination,
+    .terminate_fn = ignoreIsolatedDevelopmentRemoval,
+};
+
+fn rejectIsolatedDevelopmentRemoval(
+    context: ?*anyopaque,
+    helper_path: []const u8,
+    mode: runtime_host.RemovalPreparation,
+) bool {
+    _ = context;
+    _ = helper_path;
+    _ = mode;
+    return false;
+}
+
+fn ignoreIsolatedDevelopmentRemoval(context: ?*anyopaque) void {
+    _ = context;
+}
+
+fn rejectIsolatedDevelopmentRemovalSpawn(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    helper_path: []const u8,
+    request_path: []const u8,
+    signing_key_path: []const u8,
+    parent_process_id: u32,
+) !void {
+    _ = context;
+    _ = allocator;
+    _ = io;
+    _ = helper_path;
+    _ = request_path;
+    _ = signing_key_path;
+    _ = parent_process_id;
+    return error.ProductNativeAuthorityUnavailable;
+}
+
+fn rejectIsolatedDevelopmentRemovalRecovery(
+    context: ?*anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    helper_path: []const u8,
+    helper_state_root: []const u8,
+) !void {
+    _ = context;
+    _ = allocator;
+    _ = io;
+    _ = helper_path;
+    _ = helper_state_root;
+    return error.ProductNativeAuthorityUnavailable;
+}
+
+fn rejectIsolatedDevelopmentRemovalTermination(
+    context: ?*anyopaque,
+) bool {
+    _ = context;
+    return false;
+}
+
+/// Raw Debug runs are not signed product launches. Give them a disjoint Native
+/// state/log identity and keep them out of every production migration, process
+/// guard, removal-recovery, and updater authority. Automation intentionally
+/// retains the product-shaped identity so its existing fixtures stay exact.
+fn nativeLaunchPolicy(profile: runtime_host.BridgeProfile) NativeLaunchPolicy {
+    return switch (profile) {
+        .development => .{
+            .app_name = source_development_app_name,
+            .bundle_id = source_development_bundle_id,
+            .legacy_window_state_bundle_ids = &.{},
+            .legacy_application_support_directory_name = null,
+            .removal_lifecycle = isolated_development_removal_lifecycle,
+            .account_profile_runner =
+                runtime_host.isolatedDevelopmentAccountProfileRunner(),
+            .harness_custody_runner =
+                runtime_host.isolatedDevelopmentHarnessCustodyRunner(),
+            .product_native_authority = false,
+        },
+        .production, .automation => .{
+            .app_name = legacy_oprte_storage_app_name,
+            .bundle_id = bundle_id,
+            .legacy_window_state_bundle_ids = legacy_bundle_ids,
+            .legacy_application_support_directory_name = legacy_application_support_directory_name,
+            .removal_lifecycle = null,
+            .account_profile_runner = null,
+            .harness_custody_runner = null,
+            .product_native_authority = true,
+        },
+    };
 }
 
 test "application identity is stable" {
@@ -449,23 +583,102 @@ test "invalid or release launch markers always select bundled assets" {
     );
 }
 
-test "bridge navigation opens the Vite origin only for an authenticated dev launch" {
+test "remote bridge authority still requires the complete Debug envelope" {
     try std.testing.expectEqual(
         runtime_host.BridgeProfile.production,
-        bridgeProfileForLaunch(false, false),
+        bridgeProfileForLaunch(.Debug, false, false),
     );
     try std.testing.expectEqual(
         runtime_host.BridgeProfile.development,
-        bridgeProfileForLaunch(true, false),
+        bridgeProfileForLaunch(.Debug, true, false),
+    );
+    try std.testing.expectEqual(
+        runtime_host.BridgeProfile.production,
+        bridgeProfileForLaunch(.ReleaseSafe, false, false),
     );
     try std.testing.expectEqual(
         runtime_host.BridgeProfile.automation,
-        bridgeProfileForLaunch(false, true),
+        bridgeProfileForLaunch(.Debug, false, true),
     );
     try std.testing.expectEqual(
         runtime_host.BridgeProfile.automation,
-        bridgeProfileForLaunch(true, true),
+        bridgeProfileForLaunch(.ReleaseSafe, true, true),
     );
+}
+
+test "every raw Debug runtime uses isolated development authority" {
+    try std.testing.expectEqual(
+        runtime_host.BridgeProfile.development,
+        runtimeProfileForLaunch(.Debug, false),
+    );
+    try std.testing.expectEqual(
+        runtime_host.BridgeProfile.production,
+        runtimeProfileForLaunch(.ReleaseSafe, false),
+    );
+    try std.testing.expectEqual(
+        runtime_host.BridgeProfile.automation,
+        runtimeProfileForLaunch(.Debug, true),
+    );
+    try std.testing.expectEqual(
+        runtime_host.BridgeProfile.automation,
+        runtimeProfileForLaunch(.ReleaseSafe, true),
+    );
+}
+
+test "raw development has disjoint Native state and no product lifecycle authority" {
+    const development = nativeLaunchPolicy(.development);
+    try std.testing.expectEqualStrings(
+        "HRA Source Development",
+        development.app_name,
+    );
+    try std.testing.expectEqualStrings(
+        "kitchen.hraness.source-development",
+        development.bundle_id,
+    );
+    try std.testing.expectEqual(@as(usize, 0), development.legacy_window_state_bundle_ids.len);
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        development.legacy_application_support_directory_name,
+    );
+    try std.testing.expect(!development.product_native_authority);
+    try std.testing.expect(development.removal_lifecycle != null);
+    try std.testing.expect(development.account_profile_runner != null);
+    try std.testing.expect(development.harness_custody_runner != null);
+
+    const expected_account_runner =
+        runtime_host.isolatedDevelopmentAccountProfileRunner();
+    try std.testing.expect(
+        development.account_profile_runner.?.run_fn ==
+            expected_account_runner.run_fn,
+    );
+    const expected_harness_runner =
+        runtime_host.isolatedDevelopmentHarnessCustodyRunner();
+    try std.testing.expect(
+        development.harness_custody_runner.?.run_fn ==
+            expected_harness_runner.run_fn,
+    );
+
+    const removal = development.removal_lifecycle.?;
+    try std.testing.expect(!removal.prepare_fn(
+        removal.context,
+        "/Applications/HRA.app/Contents/Resources/runtime/bin/oprte-data-remover",
+        .requested,
+    ));
+
+    for ([_]runtime_host.BridgeProfile{ .production, .automation }) |profile| {
+        const product = nativeLaunchPolicy(profile);
+        try std.testing.expectEqualStrings("OPRTE", product.app_name);
+        try std.testing.expectEqualStrings("kitchen.hraness", product.bundle_id);
+        try std.testing.expectEqual(@as(usize, 2), product.legacy_window_state_bundle_ids.len);
+        try std.testing.expectEqualStrings(
+            "Hraness Kitchen",
+            product.legacy_application_support_directory_name.?,
+        );
+        try std.testing.expect(product.product_native_authority);
+        try std.testing.expect(product.removal_lifecycle == null);
+        try std.testing.expect(product.account_profile_runner == null);
+        try std.testing.expect(product.harness_custody_runner == null);
+    }
 }
 
 test "overlapping removal leases keep the updater gate closed until final release" {

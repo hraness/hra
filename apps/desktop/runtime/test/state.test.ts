@@ -223,6 +223,8 @@ describe("control-plane database", () => {
         "session_sync_vault_state",
         "thread_bindings",
         "workspace_leases",
+        "workspace_setup_lane_heads",
+        "workspace_setup_requests",
       ]);
     } finally {
       database.close();

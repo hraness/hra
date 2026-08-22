@@ -108,6 +108,7 @@ function replayHarness(
   const service = new AccountService({
     archiveAdmissionGate,
     assets: {
+      bunBinary: process.execPath,
       codexBinary: "/fixture/codex",
       gitBinary: "/fixture/git/bin/git",
       gitRoot: "/fixture/git",

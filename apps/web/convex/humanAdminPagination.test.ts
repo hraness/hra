@@ -1,14 +1,12 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 import type { QueryCtx } from "./_generated/server";
 import { listWorkspacesForHuman } from "./humanAdmin";
 
 type OrganizationRole = "owner" | "admin" | "member";
 
-const originalWorkOSClientId = process.env.WORKOS_CLIENT_ID;
-const workosClientId = "client_human_admin_pagination";
-const userId = "user_humanadminpagination";
-const workosOrganizationId = "org_humanadminpagination";
+const userPublicId = "usr_humanadminpagination";
+const sessionId = "auth_session_human_admin_pagination";
 
 function indexBuilder() {
   const builder = {
@@ -27,17 +25,30 @@ function createContext(role: OrganizationRole) {
     publicId: "org_public_current",
     status: "active",
     updatedAt: 1,
-    workosOrganizationId,
   };
   const user = {
     _creationTime: 1,
     _id: "user_document",
     createdAt: 1,
     name: "Current human",
-    publicId: userId,
+    publicId: userPublicId,
     status: "active",
     updatedAt: 1,
-    workosUserId: userId,
+  };
+  const authSession = {
+    _creationTime: 1,
+    _id: sessionId,
+    expirationTime: Date.now() + 60_000,
+    userId: user._id,
+  };
+  const authSessionSelection = {
+    _creationTime: 1,
+    _id: "auth_session_selection_document",
+    createdAt: 1,
+    organizationId: organization._id,
+    sessionId,
+    updatedAt: 1,
+    userId: user._id,
   };
   const organizationMembership = {
     _creationTime: 1,
@@ -74,7 +85,13 @@ function createContext(role: OrganizationRole) {
   };
 
   const db = {
-    get: async (id: string) => (id === visibleWorkspace._id ? visibleWorkspace : null),
+    get: async (id: string) => {
+      if (id === visibleWorkspace._id) return visibleWorkspace;
+      if (id === user._id) return user;
+      if (id === organization._id) return organization;
+      if (id === sessionId) return authSession;
+      return null;
+    },
     query: (table: string) => {
       let selectedIndex = "";
       const chain = {
@@ -89,8 +106,7 @@ function createContext(role: OrganizationRole) {
                 : [],
         }),
         unique: async () => {
-          if (table === "users") return user;
-          if (table === "organizations") return organization;
+          if (table === "authSessionSelections") return authSessionSelection;
           if (table === "organizationMemberships") return organizationMembership;
           return null;
         },
@@ -111,12 +127,10 @@ function createContext(role: OrganizationRole) {
   const ctx = {
     auth: {
       getUserIdentity: async () => ({
-        issuer: `https://api.workos.com/user_management/${workosClientId}`,
+        issuer: "https://convex.test",
         name: user.name,
-        org_id: workosOrganizationId,
-        sid: "session_human_admin_pagination",
-        subject: userId,
-        tokenIdentifier: `${workosClientId}|${userId}`,
+        subject: `${user._id}|${sessionId}`,
+        tokenIdentifier: `https://convex.test|${user._id}|${sessionId}`,
       }),
     },
     db,
@@ -124,15 +138,6 @@ function createContext(role: OrganizationRole) {
 
   return { ctx, sources };
 }
-
-beforeEach(() => {
-  process.env.WORKOS_CLIENT_ID = workosClientId;
-});
-
-afterEach(() => {
-  if (originalWorkOSClientId === undefined) delete process.env.WORKOS_CLIENT_ID;
-  else process.env.WORKOS_CLIENT_ID = originalWorkOSClientId;
-});
 
 describe("human admin workspace pagination", () => {
   test("paginates a member's active assignments inside the current organization", async () => {

@@ -293,4 +293,40 @@ describe("cloud workspace summary cache", () => {
     expect(reloads).toBe(1);
     expect(requests).toBe(1);
   });
+
+  test("an authoritative first page removes omitted cached workspaces", () => {
+    const cache = new CloudWorkspaceSummaryCache({
+      onInvalidated: () => undefined,
+    });
+    cache.replaceScope(SCOPE_A);
+    const retained = workspace("retained", "Retained", 1);
+    const revoked = workspace("revoked", "Revoked", 1);
+    expect(cache.remember(SCOPE_A, retained)).toBeTrue();
+    expect(cache.remember(SCOPE_A, revoked)).toBeTrue();
+    const replacement = cache.beginFirstPageReplacement(SCOPE_A);
+    expect(replacement).not.toBeNull();
+
+    expect(cache.replaceFirstPage(replacement!, [{ ...retained, revision: 2 }]))
+      .toBeTrue();
+    expect(cache.summaries(SCOPE_A).map(({ name }) => name)).toEqual(["Retained"]);
+  });
+
+  test("an older overlapping completion cannot regress a newer first page", () => {
+    const cache = new CloudWorkspaceSummaryCache({
+      onInvalidated: () => undefined,
+    });
+    cache.replaceScope(SCOPE_A);
+    const older = cache.beginFirstPageReplacement(SCOPE_A);
+    const newer = cache.beginFirstPageReplacement(SCOPE_A);
+    expect(older).not.toBeNull();
+    expect(newer).not.toBeNull();
+    const revisionTwo = workspace("overlap", "Current", 2);
+    const revisionOne = workspace("overlap", "Stale", 1);
+
+    expect(cache.replaceFirstPage(newer!, [revisionTwo])).toBeTrue();
+    expect(cache.replaceFirstPage(older!, [revisionOne])).toBeFalse();
+    expect(cache.summaries(SCOPE_A)).toEqual([revisionTwo]);
+    expect(cache.remember(SCOPE_A, revisionOne)).toBeFalse();
+    expect(cache.summaries(SCOPE_A)).toEqual([revisionTwo]);
+  });
 });

@@ -61,6 +61,7 @@ bool hra_macos_run_attested_account_profile_operation(
     const char *deletion_nonce,
     size_t deletion_nonce_length,
     uint64_t expected_revision,
+    bool source_development,
     uint32_t timeout_milliseconds);
 
 void hra_macos_prepare_attested_account_profile_operations(void);

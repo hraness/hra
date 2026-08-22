@@ -116,6 +116,7 @@ const resolverInputSchema = z.object({
   accountProfileId: accountProfileIdSchema,
   generation: positiveSafeIntegerSchema,
   paths: z.object({
+    bunBinary: absolutePathSchema,
     codexBinary: absolutePathSchema,
     codexHome: absolutePathSchema,
     gitBinary: absolutePathSchema,

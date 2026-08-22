@@ -12,6 +12,7 @@ const repository = required("HRA_TEST_REPOSITORY");
 const checkout = required("HRA_TEST_CHECKOUT");
 const runner = new BundledGitRunner(
   {
+    bunBinary: process.execPath,
     codexBinary: "/usr/bin/true",
     codexHome: required("HRA_TEST_CODEX_HOME"),
     gitBinary: required("HRA_TEST_GIT_BINARY"),

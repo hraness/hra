@@ -1,6 +1,7 @@
 import { z } from "@hra-internal/schema";
 import {
   canonicalScheduledChatRRuleSchema,
+  desktopPairingComparisonCodeSchema,
   MAX_SCHEDULED_CHAT_RRULE_UTF8_BYTES,
   MAX_SCHEDULED_CHAT_TIME_ZONE_UTF8_BYTES,
   organizationIdSchema,
@@ -23,8 +24,7 @@ import {
   workspacePublicIdSchema,
   workspaceSummarySchema,
   workspaceViewSchema,
-  workosOrganizationIdSchema,
-  workosUserIdSchema,
+  humanUserIdSchema,
   runnerPresenceViewSchema,
   sessionPublicIdSchema as syncedSessionPublicIdSchema,
   sessionSyncEnrollmentRequestIdSchema,
@@ -39,6 +39,12 @@ import {
   type TaskListPage,
   type WorkspaceSummary,
 } from "@hraness/agent-tasks-protocol";
+import {
+  attentionProjectionSchema,
+  workspaceRecipeDigestSchema,
+  workspaceSetupRequestIdSchema,
+  type AttentionProjection,
+} from "@hraness/hra-local-observation-protocol/attention";
 
 export const runtimeProtocolVersion = 3 as const;
 export const runtimeSnapshotCommand = "hra.runtime.snapshot" as const;
@@ -289,6 +295,13 @@ const accountLoginStateSchema = z.discriminatedUnion("state", [
   z.object({ state: z.literal("failed"), message: z.string().min(1).max(240) }).strict(),
 ]);
 
+const accountWeeklyUsageSchema = z
+  .object({
+    remainingPercent: z.number().min(0).max(100),
+    resetsAt: z.string().datetime(),
+  })
+  .strict();
+
 const accountSummarySchema = z
   .object({
     id: accountProfileIdSchema,
@@ -297,7 +310,7 @@ const accountSummarySchema = z
     selected: z.boolean(),
     identityLabel: z.string().min(1).max(160).nullable(),
     planLabel: z.string().min(1).max(80).nullable(),
-    usageRemainingPercent: z.number().min(0).max(100).nullable().default(null),
+    weeklyUsage: accountWeeklyUsageSchema.nullable().default(null),
     authState: z.enum([
       "signedOut",
       "signingIn",
@@ -466,7 +479,7 @@ const humanAccountErrorCodeSchema = z.enum([
 
 const runtimeHumanUserSchema = z
   .object({
-    id: workosUserIdSchema,
+    id: humanUserIdSchema,
     email: z.string().email(),
     name: z.string().min(1).max(240).nullable(),
   })
@@ -478,21 +491,8 @@ const runtimeHumanOrganizationSchema = z
     name: organizationNameSchema,
     role: organizationRoleSchema,
     status: z.enum(["provisioning", "active", "failed"]),
-    workosOrganizationId: workosOrganizationIdSchema.nullable(),
   })
-  .strict()
-  .superRefine((organization, context) => {
-    if (
-      organization.status === "active" &&
-      organization.workosOrganizationId === null
-    ) {
-      context.addIssue({
-        code: "custom",
-        message: "active organization requires a WorkOS organization ID",
-        path: ["workosOrganizationId"],
-      });
-    }
-  });
+  .strict();
 
 const humanAccountProfileSchema = z
   .object({
@@ -546,7 +546,7 @@ export const humanAccountSnapshotSchema = z.discriminatedUnion("state", [
     .object({
       state: z.literal("signingIn"),
       revision: z.number().int().nonnegative().safe(),
-      userCode: z.string().min(1).max(128).nullable(),
+      comparisonCode: desktopPairingComparisonCodeSchema.nullable(),
       expiresAt: taskDomain.epochMsSchema.nullable(),
     })
     .strict(),
@@ -2488,6 +2488,17 @@ const runtimeTaskPromotionRecoveryCommandSchema = z.object({
   promotionId: taskDomain.promotionIdSchema,
 }).strict();
 
+const runtimeAttentionListCommandSchema = z.object({
+  type: z.literal("observation.attention.list"),
+}).strict();
+
+const runtimeWorkspaceSetupApproveCommandSchema = z.object({
+  type: z.literal("workspace.setup.approve"),
+  setupRequestId: workspaceSetupRequestIdSchema,
+  recipeDigest: workspaceRecipeDigestSchema,
+  expectedSetupRevision: revisionSchema,
+}).strict();
+
 export const runtimeTaskDomainCommandSchema = z.discriminatedUnion("type", [
   runtimeTaskWorkspaceListCommandSchema,
   runtimeTaskRepositoryListCommandSchema,
@@ -2981,6 +2992,8 @@ export const runtimeSessionSyncDomainCommandSchema = z.discriminatedUnion(
 );
 
 export const runtimeDomainCommandSchema = z.discriminatedUnion("type", [
+  runtimeAttentionListCommandSchema,
+  runtimeWorkspaceSetupApproveCommandSchema,
   runtimeChatPaneCreateCommandSchema,
   runtimeChatPaneRenameCommandSchema,
   runtimeChatPaneScheduleConfigureCommandSchema,
@@ -3253,6 +3266,17 @@ export const runtimeErrorSchema = z
 
 const runtimeCommandResultSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("accepted") }).strict(),
+  z.object({
+    type: z.literal("attentionProjection"),
+    projection: attentionProjectionSchema,
+  }).strict(),
+  z.object({
+    type: z.literal("workspaceSetupApproval"),
+    setupRequestId: workspaceSetupRequestIdSchema,
+    recipeDigest: workspaceRecipeDigestSchema,
+    revision: revisionSchema,
+    changed: z.boolean(),
+  }).strict(),
   runtimeChatPaneResultSchema,
   runtimeChatPaneReplayResultSchema,
   runtimeChatMessageQueueResultSchema,
@@ -3984,6 +4008,7 @@ export type WorkspaceDatabaseSequence = Extract<
   { outcome: "committed" }
 >["eventSequence"];
 export type RuntimeTaskWorkspaceSummaries = readonly WorkspaceSummary[];
+export type RuntimeAttentionProjection = AttentionProjection;
 export type RuntimeTaskRepositorySummary = z.infer<
   typeof runtimeTaskRepositorySummarySchema
 >;

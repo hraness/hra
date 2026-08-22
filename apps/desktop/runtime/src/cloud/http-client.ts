@@ -41,6 +41,8 @@ import {
   respondHRARunInteractionEnvelopeSchema,
   respondHRARunInteractionRequestSchema,
   safeErrorMessage,
+  selectHumanScopeEnvelopeSchema,
+  selectHumanScopeRequestSchema,
   startSessionEnvelopeSchema,
   startSessionRequestSchema,
   taskctlApiRoutes,
@@ -57,6 +59,7 @@ import {
   type HRAProjectionCursor,
   type OrganizationView,
   type RequestId,
+  type SelectHumanScopeRequest,
   type RedeemEnrollmentResponse,
   type RespondHRARunInteractionRequest,
   type StartSessionResponse,
@@ -307,11 +310,8 @@ export class HRAHumanHttpTransport {
 
   async refresh(
     refreshToken: string,
-    workosOrganizationId?: string,
   ): Promise<ReturnType<HumanRefreshDriver["refresh"]> extends Promise<infer Value> ? Value : never> {
-    const body = workosOrganizationId === undefined
-      ? {}
-      : { workosOrganizationId };
+    const body = {};
     const result = await this.#client(undefined, false).request({
       method: "POST",
       path: taskctlApiRoutes.refreshAuth,
@@ -332,6 +332,23 @@ export class HRAHumanHttpTransport {
         ? "authentication_failed"
         : "indeterminate",
     };
+  }
+
+  async selectHumanScope(
+    accessToken: string,
+    inputValue: SelectHumanScopeRequest,
+  ): Promise<HRACloudOperation<EnvelopeData<typeof selectHumanScopeEnvelopeSchema>>> {
+    const input = selectHumanScopeRequestSchema.parse(inputValue);
+    return await this.#request({
+      accessToken,
+      method: "POST",
+      path: taskctlApiRoutes.selectHumanScope,
+      responseSchema: selectHumanScopeEnvelopeSchema,
+      body: {
+        value: input,
+        schema: selectHumanScopeRequestSchema,
+      },
+    });
   }
 
   async listOrganizations(
@@ -469,6 +486,7 @@ export class HRAHumanHttpTransport {
     input: {
       readonly cursor?: HRAProjectionCursor;
       readonly limit?: number;
+      readonly signal?: AbortSignal;
     } = {},
   ): Promise<HRACloudOperation<HRAWorkspaceList>> {
     const cursor = cursorFor(input.cursor, { scope: "workspaces" });
@@ -477,6 +495,7 @@ export class HRAHumanHttpTransport {
       method: "GET",
       path: hraHumanApiRoutes.workspaces,
       responseSchema: listHRAWorkspacesEnvelopeSchema,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
       query: validatedQuery(listHRAWorkspacesQuerySchema, {
         cursor: cursor?.token,
         limit: String(boundedPageLimit(input.limit)),
@@ -842,10 +861,7 @@ export const hraHumanRefreshDriver = (
   transport: HRAHumanHttpTransport,
 ): HumanRefreshDriver => ({
   refresh: async (input) =>
-    await transport.refresh(
-      input.refreshToken,
-      input.workosOrganizationId,
-    ),
+    await transport.refresh(input.refreshToken),
 });
 
 /**

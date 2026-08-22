@@ -43,7 +43,8 @@ describe("task-domain package boundary", () => {
       [...text.matchAll(sourceImport)].map((match) => match[1] ?? ""));
     for (const forbidden of [
       "convex",
-      "workos",
+      "@auth/",
+      "identity-provider",
       "next",
       "sqlite",
       "node:fs",
@@ -77,7 +78,7 @@ describe("task-domain package boundary", () => {
       "./model": "./src/model.ts",
     });
     for (const [subpath, target] of Object.entries(manifest.exports)) {
-      expect(`${subpath}:${target}`).not.toMatch(/(?:test|fixture|convex|workos|provider)/iu);
+      expect(`${subpath}:${target}`).not.toMatch(/(?:test|fixture|convex|provider)/iu);
     }
   });
 });

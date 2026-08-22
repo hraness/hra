@@ -1,0 +1,41 @@
+{
+  "name": "@hraness/hra-local-observation-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hraness/hra.git",
+    "directory": "packages/local-observation-protocol"
+  },
+  "homepage": "https://hra.sh",
+  "bugs": {
+    "url": "https://github.com/hraness/hra/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./attention": "./src/attention.ts",
+    "./panes": "./src/panes.ts",
+    "./wire": "./src/wire.ts"
+  },
+  "scripts": {
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test ./src",
+    "test:property": "bun test ./src/*.property.test.ts"
+  },
+  "dependencies": {
+    "@hraness/agent-tasks-domain": "workspace:*",
+    "@hra-internal/schema": "workspace:*"
+  },
+  "devDependencies": {
+    "@hra-internal/eslint-config": "workspace:*",
+    "@hra-internal/test": "workspace:*",
+    "@hra-internal/typescript-config": "workspace:*",
+    "@types/bun": "catalog:",
+    "eslint": "catalog:",
+    "fast-check": "catalog:",
+    "typescript": "catalog:"
+  }
+}

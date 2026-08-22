@@ -8,9 +8,7 @@ import {
 } from "./hostedMutationPersistence";
 import schema from "./schema";
 
-const WORKOS_CLIENT_ID = "client_receiptmaintenance";
-const WORKOS_ORGANIZATION_ID = "org_receiptmaintenance";
-const WORKOS_USER_ID = "user_receiptmaintenance";
+const USER_PUBLIC_ID = "usr_00000000000000000000000901";
 const WORKSPACE_PUBLIC_ID = "wsp_00000000000000000000000901";
 
 const modules = {
@@ -26,15 +24,13 @@ async function receiptScope(t: TestConvex<typeof schema>) {
     const now = Date.now();
     const organizationId = await ctx.db.insert("organizations", {
       publicId: "org_00000000000000000000000901",
-      workosOrganizationId: WORKOS_ORGANIZATION_ID,
       name: "Receipt maintenance",
       status: "active",
       createdAt: now,
       updatedAt: now,
     });
     const principalId = await ctx.db.insert("users", {
-      publicId: WORKOS_USER_ID,
-      workosUserId: WORKOS_USER_ID,
+      publicId: USER_PUBLIC_ID,
       name: "Receipt owner",
       status: "active",
       createdAt: now,
@@ -58,7 +54,19 @@ async function receiptScope(t: TestConvex<typeof schema>) {
       createdAt: now,
       updatedAt: now,
     });
-    return { organizationId, principalId, workspaceId };
+    const sessionId = await ctx.db.insert("authSessions", {
+      userId: principalId,
+      expirationTime: Date.now() + 60_000,
+    });
+    await ctx.db.insert("authSessionSelections", {
+      sessionId,
+      userId: principalId,
+      organizationId,
+      workspaceId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    return { organizationId, principalId, sessionId, workspaceId };
   });
 }
 
@@ -69,7 +77,7 @@ describe("receipt maintenance", () => {
     const receipts = await t.run(async (ctx) => {
       const common = {
         principalKind: "organization" as const,
-        principalId: WORKOS_USER_ID,
+        principalId: USER_PUBLIC_ID,
         organizationId: scope.organizationId,
         operation: "tasks.comments.add",
         requestDigest: "sha256_receipt_maintenance",
@@ -173,35 +181,23 @@ describe("receipt maintenance", () => {
       unreferenced: null,
     });
 
-    const previousClientId = process.env.WORKOS_CLIENT_ID;
-    process.env.WORKOS_CLIENT_ID = WORKOS_CLIENT_ID;
-    try {
-      const actor = t.withIdentity({
-        issuer:
-          `https://api.workos.com/user_management/${WORKOS_CLIENT_ID}`,
-        org_id: WORKOS_ORGANIZATION_ID,
-        sid: "session_receiptmaintenance",
-        subject: WORKOS_USER_ID,
-        tokenIdentifier: `${WORKOS_CLIENT_ID}|${WORKOS_USER_ID}`,
-      });
-      expect(await actor.mutation(api.hostedMutationAttempts.settle, {
-        workspaceId: WORKSPACE_PUBLIC_ID,
-        sourceId: "oprte.web.task-workspace.v1",
-        attemptId: "op_00000000000000000000000904",
-        expectedRevision: 2,
-        operation: "task.comment_add",
-        settlement: { kind: "cancelled", reason: "superseded" },
-      })).toMatchObject({
-        ok: false,
-        error: { code: "INTERNAL_ERROR" },
-      });
-    } finally {
-      if (previousClientId === undefined) {
-        delete process.env.WORKOS_CLIENT_ID;
-      } else {
-        process.env.WORKOS_CLIENT_ID = previousClientId;
-      }
-    }
+    const actor = t.withIdentity({
+      issuer: "https://convex.test",
+      subject: `${scope.principalId}|${scope.sessionId}`,
+      tokenIdentifier:
+        `https://convex.test|${scope.principalId}|${scope.sessionId}`,
+    });
+    expect(await actor.mutation(api.hostedMutationAttempts.settle, {
+      workspaceId: WORKSPACE_PUBLIC_ID,
+      sourceId: "oprte.web.task-workspace.v1",
+      attemptId: "op_00000000000000000000000904",
+      expectedRevision: 2,
+      operation: "task.comment_add",
+      settlement: { kind: "cancelled", reason: "superseded" },
+    })).toMatchObject({
+      ok: false,
+      error: { code: "INTERNAL_ERROR" },
+    });
     const retainedAttempt = await t.run(async (ctx) =>
       (await ctx.db.query("hostedMutationAttempts").collect())
         .find((record) =>
@@ -223,7 +219,7 @@ describe("receipt maintenance", () => {
       for (let index = 0; index < 65; index += 1) {
         await ctx.db.insert("humanCommandReceipts", {
           principalKind: "organization",
-          principalId: WORKOS_USER_ID,
+          principalId: USER_PUBLIC_ID,
           organizationId: scope.organizationId,
           operation: "tasks.comments.add",
           idempotencyKey:

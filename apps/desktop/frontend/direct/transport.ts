@@ -67,6 +67,7 @@ import {
   type RuntimeTransportLifecycle,
 } from "../../contracts/runtime";
 import { runtimeChatPaneStateChangedEvent } from "../../contracts/runtime-delivery";
+import { projectAttention } from "../../runtime/src/observation";
 import type { RuntimeTransport } from "../src/runtime-bridge";
 import type { HRADirectRoute } from "./scenarios";
 import {
@@ -363,7 +364,6 @@ class DeterministicRuntimeTransport {
     name: "Direct HRA",
     role: "owner",
     status: "active",
-    workosOrganizationId: "org_DIRECT",
   }];
   #humanWorkspaces: RuntimeHumanWorkspace[] = [{
     id: "workspace-direct",
@@ -800,6 +800,25 @@ class DeterministicRuntimeTransport {
     const request = parseRuntimeDispatchRequest(payload);
     const command = request.command;
     switch (command.type) {
+      case "observation.attention.list":
+        return this.#success(request, {
+          type: "attentionProjection",
+          projection: projectAttention({
+            snapshot: this.#snapshot,
+            tasks: {
+              completeness: "complete",
+              workspaces: this.#taskState.workspaces,
+            },
+          }),
+        });
+      case "workspace.setup.approve":
+        return this.#success(request, {
+          type: "workspaceSetupApproval",
+          setupRequestId: command.setupRequestId,
+          recipeDigest: command.recipeDigest,
+          revision: command.expectedSetupRevision + 1,
+          changed: true,
+        });
       case "chat.pane.create": {
         if (this.#snapshot.chat.panes.length >= 64) {
           return this.#chatFailure(
@@ -1741,7 +1760,7 @@ class DeterministicRuntimeTransport {
         this.#setHumanAccount({
           state: "signingIn",
           revision: this.#snapshot.humanAccount.revision + 1,
-          userCode: "FERN-MOSS",
+          comparisonCode: "FERN-M0SS",
           expiresAt: Date.parse(HRA_DIRECT_TIMESTAMP) + 15 * 60_000,
         });
         return this.#accepted(request);
@@ -1807,7 +1826,6 @@ class DeterministicRuntimeTransport {
           name: command.name,
           role: "owner",
           status: "active",
-          workosOrganizationId: `org_DIRECT${this.#nextOrganization}`,
         };
         this.#nextOrganization += 1;
         this.#humanOrganizations.push(organization);
@@ -1828,7 +1846,7 @@ class DeterministicRuntimeTransport {
           revision: this.#snapshot.humanAccount.revision + 1,
           profile: {
             user: {
-              id: "user_DIRECT",
+              id: "usr_01ARZ3NDEKTSV4RRFFQ69G5FAV",
               email: "hra@example.test",
               name: "HRA Tester",
             },

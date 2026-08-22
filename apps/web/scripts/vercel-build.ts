@@ -34,19 +34,88 @@ export const productionDeploymentNameEnvironmentVariable =
 export const previewSurfaceOriginEnvironmentVariable =
   "NEXT_PUBLIC_VERCEL_SURFACE_ORIGIN" as const;
 
+/** Predecessor identity-provider records forbidden after the atomic cutover. */
+export const legacyIdentityProviderEnvironmentVariables = [
+  "FOREIGN_WORKOS_USER_ID",
+  "HRA_WORKOS_CLIENT_ID",
+  "NEXT_PUBLIC_WORKOS_REDIRECT_URI",
+  "OPRTE_WORKOS_CLIENT_ID",
+  "SECOND_WORKOS_USER_ID",
+  "TASKCTL_TEST_FAKE_WORKOS_ORIGIN",
+  "TASKCTL_TEST_WORKOS_USER_ID",
+  "TASKCTL_WORKOS_CLIENT_ID",
+  "WORKOS_API_HOSTNAME",
+  "WORKOS_API_HTTPS",
+  "WORKOS_API_KEY",
+  "WORKOS_API_ORIGIN",
+  "WORKOS_API_PORT",
+  "WORKOS_CLIENT_ID",
+  "WORKOS_COOKIE_PASSWORD",
+  "WORKOS_ORGANIZATION_ID",
+  "WORKOS_ORIGIN",
+  "WORKOS_OWNER_MEMBERSHIP_PROVIDER_POLICY",
+  "WORKOS_OWNER_ROLE_SLUG",
+  "WORKOS_REQUEST_TIMEOUT_MS",
+  "WORKOS_USER_ID",
+  "WORKOS_WEBHOOK_SECRET",
+] as const;
+
+/** Prefixes close renamed/previously unseen provider aliases as well as the reviewed baseline names. */
+export const legacyIdentityProviderEnvironmentPrefixes = [
+  "AUTHKIT_",
+  "FOREIGN_WORKOS_",
+  "HRA_WORKOS_",
+  "NEXT_PUBLIC_AUTHKIT_",
+  "NEXT_PUBLIC_WORKOS_",
+  "OPRTE_WORKOS_",
+  "SECOND_WORKOS_",
+  "TASKCTL_TEST_FAKE_WORKOS_",
+  "TASKCTL_TEST_WORKOS_",
+  "TASKCTL_WORKOS_",
+  "WORKOS_",
+] as const;
+
+const legacyIdentityProviderEnvironmentVariableSet = new Set<string>(
+  legacyIdentityProviderEnvironmentVariables,
+);
+
+export function isLegacyIdentityProviderEnvironmentVariable(
+  name: string,
+): boolean {
+  return legacyIdentityProviderEnvironmentVariableSet.has(name) ||
+    legacyIdentityProviderEnvironmentPrefixes.some((prefix) =>
+      name.startsWith(prefix)
+    );
+}
+
+function configuredLegacyIdentityProviderEnvironmentVariables(
+  environment: VercelConvexBuildEnvironment,
+): string[] {
+  return Object.keys(environment)
+    .filter((name) =>
+      environment[name] !== undefined &&
+      isLegacyIdentityProviderEnvironmentVariable(name)
+    )
+    .sort();
+}
+
 /** Convex runtime custody that must never exist in the Vercel project. */
 export const convexOnlyEnvironmentVariables = [
   "HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT",
   "HRA_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT_VERSION",
   "HRA_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS",
   "HRA_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS_VERSION",
+  "HRA_IDENTITY_CUTOVER_ENABLED",
   "HRA_SESSION_SYNC_ENABLED",
+  "JWKS",
+  "JWT_PRIVATE_KEY",
   "OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT",
   "OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_CURRENT_VERSION",
   "OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS",
   "OPRTE_HOSTED_MUTATION_FINGERPRINT_KEY_PREVIOUS_VERSION",
   "OPRTE_SESSION_SYNC_ENABLED",
   "SUITE_IDENTITY_LINK_KEYS",
+  "SITE_URL",
   "TASKCTL_CREDENTIAL_PEPPER_CURRENT",
   "TASKCTL_CREDENTIAL_PEPPER_CURRENT_VERSION",
   "TASKCTL_CREDENTIAL_PEPPER_PREVIOUS",
@@ -56,14 +125,7 @@ export const convexOnlyEnvironmentVariables = [
   "TASKCTL_ENROLLMENT_PEPPER_PREVIOUS",
   "TASKCTL_ENROLLMENT_PEPPER_PREVIOUS_VERSION",
   "TASKCTL_LOCAL_FIXTURES_ENABLED",
-  "TASKCTL_LOCAL_FIXTURE_ISSUER",
-  "TASKCTL_LOCAL_FIXTURE_JWKS_URL",
   "TASKCTL_LOCAL_FIXTURE_SUBJECT",
-  "WORKOS_API_HOSTNAME",
-  "WORKOS_API_HTTPS",
-  "WORKOS_API_PORT",
-  "WORKOS_OWNER_ROLE_SLUG",
-  "WORKOS_WEBHOOK_SECRET",
 ] as const;
 export const releasePublicationCommitEnvironmentVariable =
   releasePublicationCommitAllowlistEnvironmentVariable;
@@ -77,19 +139,13 @@ export const previewForbiddenEnvironmentVariables = [
   ...convexOnlyEnvironmentVariables,
   "NEXT_PUBLIC_POSTHOG_KEY",
   "NEXT_PUBLIC_SITE_URL",
-  "NEXT_PUBLIC_WORKOS_REDIRECT_URI",
   "SUITE_IDENTITY_RECEIPT_KEY_VERSION",
   "SUITE_OIDC_COOKIE_SECRET",
-  "WORKOS_API_KEY",
-  "WORKOS_CLIENT_ID",
-  "WORKOS_COOKIE_PASSWORD",
 ] as const;
 
 export const applicationBuildSecretEnvironmentVariables = [
   ...convexOnlyEnvironmentVariables,
   "SUITE_OIDC_COOKIE_SECRET",
-  "WORKOS_API_KEY",
-  "WORKOS_COOKIE_PASSWORD",
 ] as const;
 
 export type VercelConvexBuildRefusal =
@@ -103,6 +159,7 @@ export type VercelConvexBuildRefusal =
   | "invalid-production-posthog-key"
   | "invalid-production-receipt-key-version"
   | "invalid-production-site-url"
+  | "legacy-identity-provider-configuration"
   | "malformed-production-deploy-key"
   | "missing-preview-convex-site-url"
   | "missing-preview-convex-url"
@@ -327,6 +384,9 @@ function declaredProductionDeployment(
 export function planVercelConvexBuild(
   environment: VercelConvexBuildEnvironment,
 ): VercelConvexBuildPlan {
+  if (configuredLegacyIdentityProviderEnvironmentVariables(environment).length > 0) {
+    return { kind: "refuse", reason: "legacy-identity-provider-configuration" };
+  }
   const target = environment.VERCEL_TARGET_ENV;
   const deploymentMarker =
     environment[productionDeploymentNameEnvironmentVariable];
@@ -443,6 +503,9 @@ function applicationEnvironment(
   surfaceOrigin?: string,
 ): Record<string, string | undefined> {
   const child: Record<string, string | undefined> = { ...environment };
+  for (const variable of configuredLegacyIdentityProviderEnvironmentVariables(child)) {
+    delete child[variable];
+  }
   for (const variable of Object.keys(child)) {
     if (variable.startsWith("CONVEX_")) delete child[variable];
   }
@@ -457,6 +520,16 @@ function applicationEnvironment(
       delete child[variable];
     }
     child[previewSurfaceOriginEnvironmentVariable] = surfaceOrigin;
+  }
+  return child;
+}
+
+export function stripLegacyIdentityProviderEnvironment(
+  environment: VercelConvexBuildEnvironment,
+): Record<string, string | undefined> {
+  const child = { ...environment };
+  for (const variable of configuredLegacyIdentityProviderEnvironmentVariables(child)) {
+    delete child[variable];
   }
   return child;
 }
@@ -495,7 +568,7 @@ export async function runVercelConvexBuild(
   return plan.environmentMode === "preview-app-only"
     ? await launchApplicationBuild(declared, launch, plan.surfaceOrigin)
     : await launch([process.execPath, ...convexDeployArguments], {
-        env: { ...declared },
+        env: stripLegacyIdentityProviderEnvironment(declared),
         stderr: "inherit",
         stdin: "inherit",
         stdout: "inherit",

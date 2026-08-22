@@ -322,6 +322,109 @@ describe("generational secret custody", () => {
     expect(metadata.quarantined).toEqual([]);
   });
 
+  test("atomically preserves the exact live scope-selection inventory without deleting Keychain bytes", async () => {
+    const committed = { generation: 1, slot: "scopecommitted01" };
+    const pending = { generation: 2, slot: "scopepending00001" };
+    const metadata = memoryMetadata({
+      version: 1,
+      revision: 5,
+      latestGeneration: 2,
+      service: descriptor.service,
+      name: descriptor.name,
+      committed,
+      pending: { pointer: pending, replacesGeneration: committed.generation },
+    });
+    const secrets = memorySecrets();
+    for (const [pointer, value] of [
+      [committed, "committed credential"],
+      [pending, "pending credential"],
+    ] as const) {
+      secrets.values.set(
+        `${descriptor.service}:${descriptor.name}:slot:${pointer.slot}`,
+        JSON.stringify({ version: 1, generation: pointer.generation, value }),
+      );
+    }
+    const originalKeychain = new Map(secrets.values);
+    const custody = new GenerationalSecretCustody({
+      descriptor,
+      metadata,
+      secrets,
+      nextSlot: slots("unusedscopevalue1"),
+    });
+
+    const inspected = await custody.inspectLiveValues();
+    expect(await custody.preserveLiveValuesForRecovery(inspected)).toEqual({
+      state: "quarantined",
+      quarantinedPointerCount: 2,
+    });
+    expect(metadata.current).toEqual({
+      version: 1,
+      revision: 6,
+      latestGeneration: 2,
+      service: descriptor.service,
+      name: descriptor.name,
+    });
+    expect(metadata.quarantined).toEqual([
+      {
+        kind: "committed",
+        pointer: committed,
+        sourceRevision: 5,
+        reason: "invalid_pointer_preserved",
+      },
+      {
+        kind: "pending",
+        pointer: pending,
+        sourceRevision: 5,
+        reason: "invalid_pointer_preserved",
+      },
+    ]);
+    expect(secrets.values).toEqual(originalKeychain);
+    expect(await custody.read()).toBeNull();
+  });
+
+  test("refuses to preserve a live inventory whose journal or Keychain value changed", async () => {
+    for (const changed of ["journal", "keychain"] as const) {
+      const pointer = { generation: 3, slot: `stalelive${changed.padEnd(8, "0")}` };
+      const metadata = memoryMetadata({
+        version: 1,
+        revision: 7,
+        latestGeneration: pointer.generation,
+        service: descriptor.service,
+        name: descriptor.name,
+        committed: pointer,
+      });
+      const secrets = memorySecrets();
+      const key = `${descriptor.service}:${descriptor.name}:slot:${pointer.slot}`;
+      secrets.values.set(key, JSON.stringify({
+        version: 1,
+        generation: pointer.generation,
+        value: "inspected credential",
+      }));
+      const custody = new GenerationalSecretCustody({
+        descriptor,
+        metadata,
+        secrets,
+        nextSlot: slots("unusedstalevalue"),
+      });
+      const inspected = await custody.inspectLiveValues();
+      if (changed === "journal" && metadata.current !== null) {
+        metadata.current = { ...metadata.current, revision: 8 };
+      } else {
+        secrets.values.set(key, JSON.stringify({
+          version: 1,
+          generation: pointer.generation,
+          value: "changed credential",
+        }));
+      }
+
+      expect(custody.preserveLiveValuesForRecovery(inspected)).rejects.toMatchObject({
+        reason: "concurrent_update",
+      });
+      expect(metadata.current?.committed).toEqual(pointer);
+      expect(metadata.quarantined).toEqual([]);
+    }
+  });
+
   for (const pendingCase of ["missing", "invalid", "valid"] as const) {
     test(`repairs a denied predecessor with a ${pendingCase} dependent pending slot`, async () => {
       const committedSlot = "legacycommitted01";
@@ -707,6 +810,103 @@ describe("generational secret custody", () => {
       value: "second-account-refresh-token",
     });
     expect(await firstWriter.clearIfGeneration(first.generation)).toBeFalse();
+  });
+
+  test("exact-generation clear leaves a committed value and pending successor byte-identical", async () => {
+    const committed = { generation: 7, slot: "clear_committed_07" };
+    const pending = { generation: 8, slot: "clear_pending_08__" };
+    const initial: SecretCustodyJournal = {
+      version: 1,
+      revision: 19,
+      latestGeneration: pending.generation,
+      service: descriptor.service,
+      name: descriptor.name,
+      committed,
+      pending: {
+        pointer: pending,
+        replacesGeneration: committed.generation,
+      },
+    };
+    const committedEnvelope = JSON.stringify({
+      version: 1,
+      generation: committed.generation,
+      value: "committed-authentication-byte-evidence",
+    });
+    const pendingEnvelope = JSON.stringify({
+      version: 1,
+      generation: pending.generation,
+      value: "pending-authentication-byte-evidence",
+    });
+    const metadata = memoryMetadata(initial);
+    const secrets = memorySecrets();
+    secrets.values.set(
+      `${descriptor.service}:${descriptor.name}:slot:${committed.slot}`,
+      committedEnvelope,
+    );
+    secrets.values.set(
+      `${descriptor.service}:${descriptor.name}:slot:${pending.slot}`,
+      pendingEnvelope,
+    );
+    const journalBefore = JSON.stringify(metadata.current);
+    const secretsBefore = [...secrets.values.entries()];
+    let journaled = false;
+    const custody = new GenerationalSecretCustody({
+      descriptor,
+      metadata,
+      secrets,
+      nextSlot: slots("unused_clear_slot"),
+      requireExplicitPendingRecovery: true,
+    });
+
+    expect(await custody.clearIfGeneration(committed.generation, {
+      onJournaled: () => {
+        journaled = true;
+        return Promise.resolve();
+      },
+    })).toBeFalse();
+    expect(journaled).toBeFalse();
+    expect(JSON.stringify(metadata.current)).toBe(journalBefore);
+    expect([...secrets.values.entries()]).toEqual(secretsBefore);
+  });
+
+  test("all-value source-revision clear still retires committed and pending values", async () => {
+    const committed = { generation: 3, slot: "source_committed3" };
+    const pending = { generation: 4, slot: "source_pending_04" };
+    const metadata = memoryMetadata({
+      version: 1,
+      revision: 8,
+      latestGeneration: pending.generation,
+      service: descriptor.service,
+      name: descriptor.name,
+      committed,
+      pending: {
+        pointer: pending,
+        replacesGeneration: committed.generation,
+      },
+    });
+    const secrets = memorySecrets();
+    for (const pointer of [committed, pending]) {
+      secrets.values.set(
+        `${descriptor.service}:${descriptor.name}:slot:${pointer.slot}`,
+        JSON.stringify({
+          version: 1,
+          generation: pointer.generation,
+          value: `source-clear-${pointer.generation}`,
+        }),
+      );
+    }
+    const custody = new GenerationalSecretCustody({
+      descriptor,
+      metadata,
+      secrets,
+      nextSlot: slots("unused_source_slot"),
+      requireExplicitPendingRecovery: true,
+    });
+
+    expect(await custody.clearIfSourceRevision(8)).toBeTrue();
+    expect(metadata.current?.committed).toBeUndefined();
+    expect(metadata.current?.pending).toBeUndefined();
+    expect(secrets.values.size).toBe(0);
   });
 
   const rotationCrashCases: readonly (

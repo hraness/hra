@@ -97,12 +97,17 @@ import {
   type HostProjectOnboardingPayload,
 } from "./host-protocol";
 import {
+  HostRequestLaneScheduler,
+  runtimeDispatchHostRequestLane,
+} from "./host-request-lanes";
+import {
   DevelopmentReloadAdmission,
   hasAuthoritativeDevelopmentReloadWork,
   hostDevelopmentReloadCommand,
   hostDevelopmentReloadDecision,
   parseRuntimeBridgeProfile,
 } from "./development-reload";
+import { isolateRawDevelopmentSecrets } from "./development-isolation";
 import { DispatchActivityAdapter } from "./dispatch/activity-adapter";
 import { DispatchAccountReservationArbiter } from "./dispatch/account-reservations";
 import { HRADispatchHttpClient } from "./dispatch/cloud-client";
@@ -116,7 +121,7 @@ import {
 import {
   createHumanAccountRuntime,
   parseHRACloudConfiguration,
-  WorkOsExternalUrlOpener,
+  DesktopPairingExternalUrlOpener,
   type CloudAttachmentAvailability,
   CloudInvalidationCoordinator,
   type CloudWorkspaceClient,
@@ -182,6 +187,18 @@ import {
   RuntimeProjection,
   unsupportedServerRequestError,
 } from "./projection";
+import { startLocalObservationServer, type LocalObservationServer } from
+  "./local-observation";
+import { AttentionObservationService } from
+  "./observation/attention-service";
+import {
+  readScopedTaskAttention,
+  readScopedTaskAttentionFallback,
+} from "./observation/task-attention";
+import type {
+  TaskAttentionObservation,
+  WorkspaceSetupAttentionObservation,
+} from "./observation/attention-projector";
 import {
   HRAPromotionHttpTransport,
   HRARunnerPairingCoordinator,
@@ -204,7 +221,8 @@ import { hraReleaseIdentity } from "../release-identity";
 import { SnapshotTransferStore } from "./snapshot-transfer";
 import {
   prepareApplicationSupportMigration,
-  type ApplicationSupportStartup,
+  prepareIsolatedDevelopmentApplicationSupport,
+  type ApplicationSupportStartupAuthority,
 } from "./state/application-support";
 import {
   ApplicationSupportWorktreeRepairError,
@@ -261,6 +279,10 @@ import {
   ChatWorkspaceStore,
   ManagedChatWorkspaceService,
 } from "./state/chat-workspace-store";
+import {
+  WorkspaceSetupStore,
+  WorkspaceSetupStoreError,
+} from "./state/workspace-setup-store";
 import { DispatchInteractionStore } from "./state/dispatch-interaction-store";
 import {
   DispatchRunnerInstallationStore,
@@ -293,7 +315,14 @@ import {
   type ProjectOnboardingOutcome,
 } from "./workspaces/onboarding-service";
 import { WorkspaceBroker } from "./workspaces/workspace-broker";
-import { bunHumanKeychain } from "./cloud/keychain-custody";
+import {
+  BundledBunWorkspaceSetupCoordinator,
+  BundledBunWorkspaceSetupCoordinatorClosedError,
+} from "./workspaces/bundled-bun-workspace-setup";
+import {
+  bunHumanKeychain,
+  HumanCredentialCustody,
+} from "./cloud/keychain-custody";
 import {
   FileLocalDataRemovalReceiptStore,
   createLocalDataRemovalPlan,
@@ -428,6 +457,8 @@ function notifyOrdinaryHostRequestDrain(): void {
 function developmentReloadHasInMemoryWork(): boolean {
   const human = humanAccountService;
   return projectionDrain !== null ||
+    localObservationShutdownTask !== null ||
+    attentionObservationService?.hasUnsettledWork() === true ||
     projection.queuedEventCount > 0 ||
     projectionCommits.pendingCommitCount > 0 ||
     human?.hasActiveOperation() === true ||
@@ -444,6 +475,7 @@ function developmentReloadHasInMemoryWork(): boolean {
     localRunCompletionAdapter?.hasUnsettledWork() === true ||
     dispatchActivityAdapter?.hasUnsettledWork() === true ||
     dispatchCompletionAdapter?.hasUnsettledWork() === true ||
+    workspaceSetupCoordinator?.hasUnsettledWork() === true ||
     chatService?.hasUnsettledWork() === true ||
     harnessProductionComposition?.hasUnsettledWork() === true ||
     localDataRemovalMaintenanceState !== "open";
@@ -451,11 +483,13 @@ function developmentReloadHasInMemoryWork(): boolean {
 
 function sealInternalDevelopmentReloadAdmissions(): void {
   developmentReloadInternalAdmissionsClosed = true;
+  beginLocalObservationShutdown();
   humanAccountService?.closeAdmission();
   cloudWorkspaceSummaries.closeAdmission();
   for (const { coordinator } of cloudInvalidationCoordinators.values()) {
     coordinator.closeAdmission();
   }
+  workspaceSetupCoordinator?.closeAdmission();
   chatService?.closeAdmission();
   harnessProductionComposition?.closeAdmissions();
   localTaskReconciler?.closeAdmission();
@@ -498,8 +532,20 @@ let accountProfileFileSystem: NativeAccountProfileFileSystem | null = null;
 const nativeHarnessKeyCustody = new NativeHarnessKeyCustody({
   writeRequest: writeHost,
 });
+const rawDevelopmentSecrets = isolateRawDevelopmentSecrets(bunHumanKeychain);
+
+function rawDevelopmentIsolationEnabled(): boolean {
+  const profile = parseRuntimeBridgeProfile();
+  return profile !== "production" && profile !== "automation";
+}
+
 const localDataRemovalKeychain: AuthenticatedLocalDataRemovalSecretStore = {
   delete: async (input, authorization) => {
+    if (rawDevelopmentIsolationEnabled()) {
+      throw new Error(
+        "Production credential removal is disabled in raw development.",
+      );
+    }
     const isHarnessInstallKey = input.name === harnessInstallKeyDescriptor.name
       && (
         input.service === harnessInstallKeyDescriptor.service
@@ -571,6 +617,83 @@ let localCompletionRetryTimer: ReturnType<typeof setInterval> | null = null;
 let localClaimRenewalTimer: ReturnType<typeof setInterval> | null = null;
 let operationReceipts: OperationReceiptStore | null = null;
 let portableRuntimeAssets: PortableRuntimeAssets | null = null;
+let attentionObservationService: AttentionObservationService | null = null;
+let localObservationServer: LocalObservationServer | null = null;
+let localObservationShutdownTask: Promise<void> | null = null;
+let workspaceSetupCoordinator:
+  BundledBunWorkspaceSetupCoordinator | null = null;
+let readWorkspaceSetupAttention:
+  () => readonly WorkspaceSetupAttentionObservation[] = () => [];
+
+async function shutdownWorkspaceSetup(): Promise<void> {
+  const coordinator = workspaceSetupCoordinator;
+  if (coordinator === null) return;
+  coordinator.closeAdmission();
+  await coordinator.settled();
+  if (workspaceSetupCoordinator === coordinator) {
+    workspaceSetupCoordinator = null;
+    readWorkspaceSetupAttention = () => [];
+  }
+}
+
+function beginLocalObservationShutdown(): void {
+  if (localObservationShutdownTask !== null) return;
+  const server = localObservationServer;
+  const service = attentionObservationService;
+  service?.closeAdmission();
+  if (localObservationServer === server) localObservationServer = null;
+  if (attentionObservationService === service) attentionObservationService = null;
+  if (server === null && service === null) return;
+  const task = (async () => {
+    const outcomes = await Promise.allSettled([
+      server?.close() ?? Promise.resolve(),
+      service?.settled() ?? Promise.resolve(),
+    ]);
+    const failure = outcomes.find(
+      (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+    );
+    if (failure !== undefined) throw failure.reason;
+  })();
+  localObservationShutdownTask = task;
+  void task.finally(() => {
+    if (localObservationShutdownTask === task) {
+      localObservationShutdownTask = null;
+    }
+  }).catch(() => undefined);
+}
+
+async function shutdownLocalObservation(): Promise<void> {
+  beginLocalObservationShutdown();
+  const task = localObservationShutdownTask;
+  if (task !== null) await task;
+}
+
+async function readTaskAttention(signal: AbortSignal): Promise<TaskAttentionObservation> {
+  const store = localTaskStore;
+  return await readScopedTaskAttention({
+    signal,
+    readLocal: store === null ? null : () => store.listWorkspaceSummaries(),
+    client: cloudWorkspaceClient,
+    scope: currentCloudWorkspaceScope(),
+    isScopeCurrent: (scope) => cloudWorkspaceSummaries.isCurrent(scope),
+    readCached: (scope) => cloudWorkspaceSummaries.summaries(scope),
+    beginFirstPageReplacement: (scope) =>
+      cloudWorkspaceSummaries.beginFirstPageReplacement(scope),
+    replaceFirstPage: (replacement, workspaces) =>
+      cloudWorkspaceSummaries.replaceFirstPage(replacement, workspaces),
+  });
+}
+
+function readTaskAttentionFallback(): TaskAttentionObservation {
+  const store = localTaskStore;
+  return readScopedTaskAttentionFallback({
+    readLocal: store === null ? null : () => store.listWorkspaceSummaries(),
+    cloudConfigured: cloudWorkspaceClient !== null,
+    scope: currentCloudWorkspaceScope(),
+    isScopeCurrent: (scope) => cloudWorkspaceSummaries.isCurrent(scope),
+    readCached: (scope) => cloudWorkspaceSummaries.summaries(scope),
+  });
+}
 
 function attachmentReferenceIds(
   queue: ChatPaneProjection["messageQueue"],
@@ -617,12 +740,18 @@ function bundledGitRunner(paths: RuntimePaths): BundledGitRunner {
       process.env,
       "HRA_SOURCE_TEST_ALLOW_PATH_GIT",
     ) === "1";
+  const descriptorExecutorBinary = optionalRenamedEnvironmentValue(
+    process.env,
+    "HRA_GIT_EXECUTOR_PATH",
+  );
   return new BundledGitRunner(
     paths,
     process.env,
     sourceTestPathExecution
       ? { unsafeTestOnlyAllowPathExecution: true }
-      : {},
+      : descriptorExecutorBinary === undefined
+      ? {}
+      : { descriptorExecutorBinary },
   );
 }
 let activeControlPlanePath: string | null = null;
@@ -694,7 +823,6 @@ function rendererHumanOrganization(
     readonly name: string;
     readonly role: "owner" | "admin" | "member";
     readonly status: "provisioning" | "active" | "failed";
-    readonly workosOrganizationId?: string | undefined;
   },
 ): RuntimeHumanOrganization {
   return {
@@ -702,7 +830,6 @@ function rendererHumanOrganization(
     name: organization.name,
     role: organization.role,
     status: organization.status,
-    workosOrganizationId: organization.workosOrganizationId ?? null,
   };
 }
 
@@ -734,9 +861,7 @@ function rendererHumanProfile(
       email: profile.user.email,
       name: profile.user.name ?? null,
     },
-    organization: profile.organization === undefined
-      ? null
-      : rendererHumanOrganization(profile.organization),
+    organization: rendererHumanOrganization(profile.organization),
     workspace: profile.workspace === undefined
       ? null
       : rendererHumanWorkspace(profile.workspace),
@@ -785,7 +910,7 @@ function rendererHumanAccountSnapshot(
       return {
         state: "signingIn",
         revision: snapshot.revision,
-        userCode: snapshot.verification?.userCode ?? null,
+        comparisonCode: snapshot.verification?.comparisonCode ?? null,
         expiresAt: snapshot.verification?.expiresAt ?? null,
       };
     case "signed_in":
@@ -1166,7 +1291,9 @@ async function initializeDispatchRunner(
   publishWithDrainRetry({ type: "runner.changed", runner: { state: "connecting" } });
   try {
     const authorization = options.authorization ??
-      await recoverPairedDispatchAuthorization();
+      (rawDevelopmentIsolationEnabled()
+        ? null
+        : await recoverPairedDispatchAuthorization());
     if (authorization === null) {
       publishWithDrainRetry({ type: "runner.changed", runner: { state: "notPaired" } });
       return;
@@ -1975,31 +2102,46 @@ async function initializeGateway(): Promise<void> {
   let initializingChatService: ChatService | null = null;
   let initializingHarness: HarnessProductionCompositionV2 | null = null;
   let initializingHarnessBound = false;
-  let applicationSupport: ApplicationSupportStartup | null = null;
+  let applicationSupport: ApplicationSupportStartupAuthority | null = null;
   let assets: PortableRuntimeAssets | null = null;
   let worktreeRepairContext: WorktreeRepairContext | null = null;
   let worktreeRepairDatabase: Database | null = null;
   let worktreeRepairNeedsReverse = false;
   let preserveForwardOnlyCutover = false;
   try {
-    // Native v2 custody must resolve any fixed v1 migration before the Harness
-    // graph can initialize or generate a replacement installation master.
-    await nativeHarnessKeyCustody.ensureMigrated();
-    const initializingHarnessKeyCustody = new HarnessInstallKeyCustody({
-      secrets: nativeHarnessKeyCustody,
-    });
     const effectiveHome = userInfo().homedir;
+    const isolatedDevelopment = rawDevelopmentIsolationEnabled();
+    // Native v2 custody must resolve any fixed v1 migration before the Harness
+    // graph can initialize or generate a replacement installation master. Raw
+    // source development never calls the production custodian and instead
+    // uses the service-rewritten development Keychain namespace.
+    if (!isolatedDevelopment) {
+      await nativeHarnessKeyCustody.ensureMigrated();
+    }
+    const initializingHarnessKeyCustody = new HarnessInstallKeyCustody({
+      secrets: isolatedDevelopment
+        ? rawDevelopmentSecrets
+        : nativeHarnessKeyCustody,
+    });
     const computerUse = provisionOfficialComputerUse({
       homeDirectory: effectiveHome,
     });
-    const expectedDatabasePath = defaultControlPlanePath();
+    applicationSupport = isolatedDevelopment
+      ? prepareIsolatedDevelopmentApplicationSupport(effectiveHome)
+      : prepareApplicationSupportMigration({
+          environment: { HOME: effectiveHome },
+        });
+    // Prove/create the dedicated source-development root before any release
+    // preflight can resolve a database path beneath it. Production retains its
+    // existing migration ordering below.
+    if (isolatedDevelopment) applicationSupport.prepareTargetRoot();
+    const expectedDatabasePath = isolatedDevelopment
+      ? controlPlanePathFromApplicationSupportRoot(applicationSupport.root)
+      : defaultControlPlanePath();
     preflightControlPlaneRelease(
       expectedDatabasePath,
       hraReleaseIdentity,
     );
-    applicationSupport = prepareApplicationSupportMigration({
-      environment: { HOME: effectiveHome },
-    });
     const databasePath = controlPlanePathFromApplicationSupportRoot(applicationSupport.root);
     if (databasePath !== expectedDatabasePath) {
       throw new Error(
@@ -2007,7 +2149,7 @@ async function initializeGateway(): Promise<void> {
       );
     }
     preflightControlPlaneRelease(databasePath, hraReleaseIdentity);
-    applicationSupport.prepareTargetRoot();
+    if (!isolatedDevelopment) applicationSupport.prepareTargetRoot();
 
     const migratedFromRoot = applicationSupport.migratedFromRoot;
     if (
@@ -2102,7 +2244,9 @@ async function initializeGateway(): Promise<void> {
     const humanMetadata = new HumanAccountMetadataStore({ database });
     const initializingScheduledChatStore = new ScheduledChatStore(database);
     const syncStore = new SessionSyncStore(database);
-    const humanCloudConfiguration = parseHRACloudConfiguration(process.env);
+    const humanCloudConfiguration = parseHRACloudConfiguration(
+      isolatedDevelopment ? {} : process.env,
+    );
     const storedHumanAuthorityIsDurable = (): boolean => {
       const vault = syncStore.vault();
       return initializingScheduledChatStore.hasAuthorityBearingState()
@@ -2171,6 +2315,14 @@ async function initializeGateway(): Promise<void> {
     const humanRuntime = createHumanAccountRuntime({
       configuration: humanCloudConfiguration,
       metadata: humanMetadata,
+      ...(isolatedDevelopment
+        ? {
+            credentials: new HumanCredentialCustody({
+              metadata: humanMetadata,
+              secrets: rawDevelopmentSecrets,
+            }),
+          }
+        : {}),
       acceptAuthentication: (authentication) => {
         const organizationId = authentication.organization?.id;
         if (sessionSyncCoordinator !== null) {
@@ -2234,7 +2386,12 @@ async function initializeGateway(): Promise<void> {
         }
       },
       openBrowser: async (url) => {
-        await new WorkOsExternalUrlOpener().open(url);
+        if (humanCloudConfiguration.web.state !== "enabled") {
+          throw new Error("The HRA browser origin is unavailable.");
+        }
+        await new DesktopPairingExternalUrlOpener(
+          humanCloudConfiguration.web.value.origin,
+        ).open(url);
       },
     });
     cloudAttachmentAvailability = humanRuntime.availability;
@@ -2270,8 +2427,12 @@ async function initializeGateway(): Promise<void> {
           await service.resumeEligibleScheduledOccurrences();
         },
         journal: new SessionSyncOperationJournal(database),
-        keyCustody: new SessionSyncKeyCustody(),
-        recoveryCustody: new SessionSyncRecoveryKeyCustody(),
+        keyCustody: new SessionSyncKeyCustody(
+          isolatedDevelopment ? { secrets: rawDevelopmentSecrets } : {},
+        ),
+        recoveryCustody: new SessionSyncRecoveryKeyCustody(
+          isolatedDevelopment ? { secrets: rawDevelopmentSecrets } : {},
+        ),
         client: new SessionSyncBearerClient({
           session: humanRuntime.session,
           transport: new SessionSyncHttpTransport({
@@ -2587,9 +2748,12 @@ async function initializeGateway(): Promise<void> {
       process.env,
       "HRA_GATEWAY_PATH",
     );
-    const imageNormalizerBinary = gatewayBinary === undefined
+    const imageNormalizerBinary = optionalRenamedEnvironmentValue(
+      process.env,
+      "HRA_IMAGE_NORMALIZER_PATH",
+    ) ?? (gatewayBinary === undefined
       ? join(import.meta.dir, "../../zig-out/bin/hra-image-normalizer")
-      : join(dirname(gatewayBinary), "hra-image-normalizer");
+      : join(dirname(gatewayBinary), "hra-image-normalizer"));
     const initializingChatAttachmentVault = new SQLiteChatAttachmentVault({
       database,
       root: chatAttachmentVaultRoot(databasePath),
@@ -2631,17 +2795,35 @@ async function initializeGateway(): Promise<void> {
     const initializingChatWorkspaceStore = new ChatWorkspaceStore(database, {
       panes: initializingChatPaneStore,
     });
+    const chatWorkspaceGit = bundledGitRunner({
+      ...assets,
+      codexHome: join(
+        dirname(databasePath),
+        "chat",
+        "git-codex-home",
+      ),
+    });
+    const workspaceSetupProfile = parseRuntimeBridgeProfile();
+    const initializingWorkspaceSetup =
+      await BundledBunWorkspaceSetupCoordinator.create({
+        bunBinary: assets.bunBinary,
+        git: chatWorkspaceGit,
+        processContainment:
+          workspaceSetupProfile === "production" ||
+            workspaceSetupProfile === "development"
+            ? "gateway_generation"
+            : "command_process_group",
+        setupRoot: join(dirname(databasePath), "workspace-setup"),
+        store: new WorkspaceSetupStore(database),
+      });
+    workspaceSetupCoordinator = initializingWorkspaceSetup;
+    readWorkspaceSetupAttention = () =>
+      initializingWorkspaceSetup.attentionObservations();
     const initializingChatWorkspaceBroker = new WorkspaceBroker({
-      git: bundledGitRunner({
-        ...assets,
-        codexHome: join(
-          dirname(databasePath),
-          "chat",
-          "git-codex-home",
-        ),
-      }),
+      git: chatWorkspaceGit,
       identityStore: initializingChatWorkspaceStore,
       lanesRoot: join(dirname(databasePath), "chat-worktrees"),
+      setupGate: initializingWorkspaceSetup,
     });
     const initializingChatWorkspaces = new ManagedChatWorkspaceService({
       broker: initializingChatWorkspaceBroker,
@@ -2975,6 +3157,30 @@ async function initializeGateway(): Promise<void> {
       sessions: localSessions,
     };
     const pairingCoordinator = hraRunnerPairingCoordinator;
+    const initializingAttention = new AttentionObservationService({
+      readSnapshot: () => projection.observeSnapshot(),
+      readSetup: () => readWorkspaceSetupAttention(),
+      readTasks: readTaskAttention,
+      readTaskFallback: readTaskAttentionFallback,
+    });
+    if (applicationSupport === null) {
+      throw new Error("Application Support authority is unavailable.");
+    }
+    const bridgeProfile = parseRuntimeBridgeProfile();
+    const initializingLocalObservation = await startLocalObservationServer({
+      endpointRoot: applicationSupport.root,
+      profile: bridgeProfile === "automation"
+        ? "automation"
+        : isolatedDevelopment
+        ? "development"
+        : "production",
+      captures: {
+        attention: (signal) => initializingAttention.list(signal),
+        panes: () => chatService?.list() ?? [],
+      },
+    });
+    attentionObservationService = initializingAttention;
+    localObservationServer = initializingLocalObservation;
     await projectionCommits.publish({
       type: "runtime.changed",
       runtime: {
@@ -3027,6 +3233,13 @@ async function initializeGateway(): Promise<void> {
       });
     });
   } catch (initializationError: unknown) {
+    try {
+      await shutdownLocalObservation();
+    } catch {
+      // The endpoint closes client sockets before its asynchronous server join.
+      // Continue joining product effect sources even if final path cleanup fails.
+    }
+    await shutdownWorkspaceSetup();
     if (
       worktreeRepairContext !== null
       && applicationSupport?.activated === true
@@ -3187,19 +3400,27 @@ async function quiesceGatewayForLocalDataRemoval(): Promise<void> {
     throw new Error("HRA removal maintenance is already starting.");
   }
   localDataRemovalMaintenanceState = "quiescing";
+  await shutdownLocalObservation();
   const quiescingChatService = chatService;
+  const quiescingWorkspaceSetup = workspaceSetupCoordinator;
   const quiescingSessionSync = sessionSyncCoordinator;
   const quiescingHumanAccount = humanAccountService;
+  quiescingWorkspaceSetup?.closeAdmission();
   quiescingChatService?.closeAdmission();
   quiescingSessionSync?.closeAdmission();
   quiescingHumanAccount?.closeAdmission();
   cloudWorkspaceSummaries.closeAdmission();
   const cancellingHumanSignIn = quiescingHumanAccount?.cancelSignIn();
   await Promise.all([
+    quiescingWorkspaceSetup?.settled(),
     quiescingChatService?.settled(),
     quiescingSessionSync?.stop(),
     quiescingSessionSync?.settled(),
   ]);
+  if (workspaceSetupCoordinator === quiescingWorkspaceSetup) {
+    workspaceSetupCoordinator = null;
+    readWorkspaceSetupAttention = () => [];
+  }
   await shutdownHRARunnerPairing();
   await shutdownDispatchRunner();
   await shutdownLocalPromotions();
@@ -5503,6 +5724,144 @@ async function executeDomainCommand(
       "none",
     );
   }
+  if (request.command.type === "observation.attention.list") {
+    const service = attentionObservationService;
+    if (service === null) {
+      return operationFailure(
+        request.operationId,
+        "runtime_unavailable",
+        "The local attention projection is unavailable.",
+        true,
+        "retry",
+      );
+    }
+    try {
+      return {
+        version: runtimeProtocolVersion,
+        operationId: request.operationId,
+        ok: true,
+        result: {
+          type: "attentionProjection",
+          projection: await service.list(),
+        },
+      };
+    } catch {
+      return operationFailure(
+        request.operationId,
+        "operation_failed",
+        "The local attention projection could not be read.",
+        true,
+        "retry",
+      );
+    }
+  }
+  if (request.command.type === "workspace.setup.approve") {
+    const coordinator = workspaceSetupCoordinator;
+    const service = chatService;
+    if (coordinator === null || service === null) {
+      return operationFailure(
+        request.operationId,
+        "runtime_unavailable",
+        "Workspace setup is unavailable.",
+        true,
+        "restartRuntime",
+      );
+    }
+    try {
+      const approval = coordinator.approve({
+        requestId: request.command.setupRequestId,
+        recipeDigest: request.command.recipeDigest,
+        expectedSetupRevision: request.command.expectedSetupRevision,
+      });
+      service.resumeWorkspaceSetup(approval.paneId);
+      return {
+        version: runtimeProtocolVersion,
+        operationId: request.operationId,
+        ok: true,
+        result: {
+          type: "workspaceSetupApproval",
+          setupRequestId: approval.requestId,
+          recipeDigest: approval.recipeDigest,
+          revision: approval.setupRevision,
+          changed: approval.changed,
+        },
+      };
+    } catch (error: unknown) {
+      if (error instanceof WorkspaceSetupStoreError) {
+        switch (error.code) {
+          case "not_found":
+            return operationFailure(
+              request.operationId,
+              "not_found",
+              error.message,
+              false,
+              "resolveAttention",
+            );
+          case "stale_revision":
+            return operationFailure(
+              request.operationId,
+              "revision_conflict",
+              error.message,
+              true,
+              "retry",
+            );
+          case "conflict":
+            return operationFailure(
+              request.operationId,
+              "conflict",
+              error.message,
+              false,
+              "resolveAttention",
+            );
+          case "invalid_state":
+            return operationFailure(
+              request.operationId,
+              "invalid_state",
+              error.message,
+              false,
+              "resolveAttention",
+            );
+          case "corrupt_state":
+            return operationFailure(
+              request.operationId,
+              "runtime_unavailable",
+              "Stored workspace setup authority is invalid.",
+              false,
+              "restartRuntime",
+            );
+        }
+      }
+      if (error instanceof BundledBunWorkspaceSetupCoordinatorClosedError) {
+        return operationFailure(
+          request.operationId,
+          "runtime_unavailable",
+          error.message,
+          true,
+          "restartRuntime",
+        );
+      }
+      if (error instanceof ChatPaneStoreError) {
+        return operationFailure(
+          request.operationId,
+          error.code === "revision_conflict"
+            ? "revision_conflict"
+            : error.code === "not_found"
+            ? "not_found"
+            : "invalid_state",
+          error.message,
+          error.code === "revision_conflict",
+          error.code === "revision_conflict" ? "retry" : "resolveAttention",
+        );
+      }
+      return operationFailure(
+        request.operationId,
+        "operation_failed",
+        "Workspace setup approval could not be applied.",
+        false,
+        "resolveAttention",
+      );
+    }
+  }
   const sessionSyncCommand = runtimeSessionSyncDomainCommandSchema.safeParse(
     request.command,
   );
@@ -6320,6 +6679,11 @@ async function dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatc
       "none",
     );
   }
+  // Attention is a fresh, content-minimized observation. Keeping it out of the
+  // durable mutation receipt table avoids turning a read into retained state.
+  if (request.command.type === "observation.attention.list") {
+    return await executeDomainCommand(request);
+  }
   // Recovery material is an intentionally transient, non-idempotent reveal.
   // It must never enter the generic durable operation-receipt table.
   if (request.command.type === "sessionSync.recovery.reveal") {
@@ -6410,7 +6774,7 @@ async function dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatc
 }
 
 let snapshotRequestTail: Promise<void> = Promise.resolve();
-let mutationRequestTail: Promise<void> = Promise.resolve();
+const hostRequestLanes = new HostRequestLaneScheduler();
 let releaseGatewayInitialization!: () => void;
 const gatewayInitialization = new Promise<void>((resolve) => {
   releaseGatewayInitialization = resolve;
@@ -6446,13 +6810,7 @@ function queueSnapshotRequest(
   return response;
 }
 
-function queueMutationRequest(task: () => Promise<void>): Promise<void> {
-  const response = mutationRequestTail.then(task);
-  mutationRequestTail = response.catch(() => undefined);
-  return response;
-}
-
-function isIndependentChatMutationRequest(
+function isIndependentRuntimeDispatchRequest(
   request: ReturnType<typeof parseHostRequest>,
 ): boolean {
   if (request.command !== runtimeDispatchCommand) return false;
@@ -6460,7 +6818,7 @@ function isIndependentChatMutationRequest(
     const payload = parseHostDispatchPayload(request);
     if ("transferId" in payload) return false;
     const parsed = parseRuntimeDispatchRequest(payload);
-    return runtimeChatDomainCommandSchema.safeParse(parsed.command).success;
+    return runtimeDispatchHostRequestLane(parsed) === "independent";
   } catch {
     return false;
   }
@@ -6749,10 +7107,12 @@ async function respondToHost(line: string): Promise<void> {
       await queueSnapshotRequest(request);
       return;
     }
-    if (isIndependentChatMutationRequest(request)) {
-      await respondToMutationRequest(request);
+    if (isIndependentRuntimeDispatchRequest(request)) {
+      await hostRequestLanes.run("independent", async () => {
+        await respondToMutationRequest(request);
+      });
     } else {
-      await queueMutationRequest(async () => {
+      await hostRequestLanes.run("serialized", async () => {
         await respondToMutationRequest(request);
       });
     }
@@ -6868,6 +7228,14 @@ async function attemptTerminalCleanup(
 }
 
 const terminalCleanupFailures: unknown[] = [];
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  shutdownLocalObservation,
+);
+await attemptTerminalCleanup(
+  terminalCleanupFailures,
+  shutdownWorkspaceSetup,
+);
 const terminalHumanAccountService = currentHumanAccountService();
 const terminalSessionSyncCoordinator = currentSessionSyncCoordinator();
 await attemptTerminalCleanup(

@@ -20,11 +20,17 @@ import { join } from "node:path";
 import { createServer } from "node:net";
 import { once } from "node:events";
 import {
+  localObservationDirectoryName,
+  localObservationSocketFileName,
+} from "@hraness/hra-local-observation-protocol/wire";
+import {
   ApplicationSupportMigrationError,
   applicationSupportPaths,
   inspectApplicationSupportMigration,
   inspectApplicationSupportReadiness,
+  isolatedDevelopmentApplicationSupportRoot,
   prepareApplicationSupportMigration,
+  prepareIsolatedDevelopmentApplicationSupport,
   type ApplicationSupportMigrationFaultPoint,
 } from "../src/state/application-support";
 
@@ -67,6 +73,34 @@ async function lstatIfPresent(filePath: string) {
       return null;
     }
     throw error;
+  }
+}
+
+async function withListeningSocketAt(
+  socketPath: string,
+  action: () => void | Promise<void>,
+): Promise<void> {
+  const socketStagingParent = process.platform === "darwin"
+    ? "/private/tmp"
+    : tmpdir();
+  const socketStagingRoot = await realpath(
+    await mkdtemp(join(socketStagingParent, "hra-migration-socket-")),
+  );
+  temporaryDirectories.push(socketStagingRoot);
+  const listeningSocket = join(socketStagingRoot, "s");
+  const server = createServer();
+  try {
+    server.listen(listeningSocket);
+    await once(server, "listening");
+    await chmod(listeningSocket, 0o600);
+    await rename(listeningSocket, socketPath);
+    await action();
+  } finally {
+    if (server.listening) {
+      const closed = once(server, "close");
+      server.close();
+      await closed;
+    }
   }
 }
 
@@ -151,6 +185,39 @@ function faultAt(point: ApplicationSupportMigrationFaultPoint) {
 }
 
 describe("Application Support migration", () => {
+  test("raw development owns a distinct root and never consumes production or historical development state", async () => {
+    const { home, paths } = await fixture();
+    await mkdir(paths.target);
+    await writeFile(join(paths.target, "production-sentinel"), "production");
+    await mkdir(paths.developmentFallback);
+    await writeFile(
+      join(paths.developmentFallback, "historical-sentinel"),
+      "historical",
+    );
+
+    const startup = prepareIsolatedDevelopmentApplicationSupport(home);
+    expect(startup.root).toBe(isolatedDevelopmentApplicationSupportRoot(home));
+    expect(startup.root).not.toBe(paths.target);
+    expect(startup.root).not.toBe(paths.developmentFallback);
+    startup.prepareTargetRoot();
+    startup.activate();
+    const developmentDatabase = new Database(
+      join(startup.root, "control-plane.sqlite"),
+      { create: true },
+    );
+    developmentDatabase.exec("CREATE TABLE development_only(value TEXT)");
+    developmentDatabase.close();
+
+    expect(await readFile(join(paths.target, "production-sentinel"), "utf8"))
+      .toBe("production");
+    expect(await readFile(
+      join(paths.developmentFallback, "historical-sentinel"),
+      "utf8",
+    )).toBe("historical");
+    expect((await stat(join(startup.root, "control-plane.sqlite"))).isFile())
+      .toBeTrue();
+  });
+
   test("inspects fresh, ready, retry, and conflicting roots without mutation", async () => {
     {
       const { environment, paths } = await fixture();
@@ -705,6 +772,154 @@ describe("Application Support migration", () => {
           await closed;
         }
       }
+    }
+  });
+
+  test("allows only the exact owned local-observation socket in the current target", async () => {
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+
+      await withListeningSocketAt(socket, () => {
+        expect(inspectApplicationSupportReadiness({ environment })).toEqual({
+          kind: "ready",
+        });
+        const startup = prepareApplicationSupportMigration({ environment });
+        expect(startup.initialState).toBe("targetOnly");
+        startup.prepareTargetRoot();
+        startup.activate();
+      });
+    }
+
+    {
+      const { home } = await fixture();
+      const startup = prepareIsolatedDevelopmentApplicationSupport(home);
+      startup.prepareTargetRoot();
+      const endpointDirectory = join(
+        startup.root,
+        localObservationDirectoryName,
+      );
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { mode: 0o700 });
+
+      await withListeningSocketAt(socket, () => {
+        startup.prepareTargetRoot();
+        startup.activate();
+      });
+    }
+  });
+
+  test("keeps the local-observation socket allowance out of legacy, stage, and other target entries", async () => {
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.legacy, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      await withListeningSocketAt(socket, () => {
+        expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+          expect.objectContaining({ code: "unsafe_root" }),
+        );
+      });
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      await writeLegacyTree(paths.legacy);
+      expect(() =>
+        prepareApplicationSupportMigration({
+          environment,
+          isFileOpenByAnotherProcess: () => false,
+          onCheckpoint: faultAt("afterSourceStaged"),
+        })
+      ).toThrow("fault:afterSourceStaged");
+      const endpointDirectory = join(paths.stage, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { mode: 0o700 });
+      await withListeningSocketAt(socket, () => {
+        expect(() =>
+          prepareApplicationSupportMigration({
+            environment,
+            isFileOpenByAnotherProcess: () => false,
+          })
+        ).toThrow(expect.objectContaining({ code: "unsafe_root" }));
+      });
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, "unexpected.sock");
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      await withListeningSocketAt(socket, () => {
+        expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+          expect.objectContaining({ code: "unsafe_root" }),
+        );
+      });
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      const outside = join(paths.parent, "linked-local-observation-socket");
+      await writeFile(outside, "not a socket");
+      await symlink(outside, socket);
+      expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+        expect.objectContaining({ code: "unsafe_root" }),
+      );
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      expect(Bun.spawnSync(["mkfifo", socket]).exitCode).toBe(0);
+      expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+        expect.objectContaining({ code: "unsafe_root" }),
+      );
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      await withListeningSocketAt(socket, async () => {
+        await link(socket, join(endpointDirectory, "socket-alias"));
+        expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+          expect.objectContaining({ code: "unsafe_root" }),
+        );
+      });
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      await withListeningSocketAt(socket, async () => {
+        await chmod(socket, 0o640);
+        expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+          expect.objectContaining({ code: "unsafe_root" }),
+        );
+      });
+    }
+
+    {
+      const { environment, paths } = await fixture();
+      const endpointDirectory = join(paths.target, localObservationDirectoryName);
+      const socket = join(endpointDirectory, localObservationSocketFileName);
+      await mkdir(endpointDirectory, { recursive: true, mode: 0o700 });
+      await withListeningSocketAt(socket, async () => {
+        await chmod(endpointDirectory, 0o755);
+        expect(() => prepareApplicationSupportMigration({ environment })).toThrow(
+          expect.objectContaining({ code: "unsafe_root" }),
+        );
+      });
     }
   });
 

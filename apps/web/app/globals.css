@@ -24,6 +24,39 @@
   color: var(--text);
 }
 
+.auth-form,
+.pairing-selection {
+  display: grid;
+  gap: 1rem;
+}
+
+.auth-form label,
+.pairing-selection label {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.auth-form input,
+.pairing-selection select {
+  min-height: 2.75rem;
+  border: 1px solid var(--border-subtle, currentColor);
+  border-radius: 0.5rem;
+  background: var(--surface-raised, transparent);
+  color: inherit;
+  padding: 0.65rem 0.75rem;
+  font: inherit;
+}
+
+.pairing-code {
+  display: block;
+  margin-block: 1rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: clamp(1.75rem, 8vw, 3rem);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-align: center;
+}
+
 * {
   box-sizing: border-box;
 }

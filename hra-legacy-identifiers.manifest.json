@@ -2,7 +2,7 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1198c5072fdde8d94fd6587c876f2f389dacec5528fa88c23a46d9598583e738",
+      "matchingLinesSha256": "c8666f8e00af8eb866683eae0f2e775b0ea82707f085dbcafdf88cfdf82b3b20",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -22,7 +22,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1bd4d0e42dfd911432debec5ff96e7b4b6a0a74c6a21d0fd3cc577fefea8c111",
+      "matchingLinesSha256": "47bcba6720cf5b1d06c8585c345fee419c0817a007381e9cb2517aba1672e497",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -32,7 +32,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "920d8edbd091f61310dd8436c7bbf12ca92d7730637b18b143fe75a2cc97f849",
+      "matchingLinesSha256": "87df36e89619b275db52801d18fbbf8138b68bf4b55ca97dd1bce06e956871e8",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -62,7 +62,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c94589943b1002434fb8d0805717c19cf05a0d23b98c5c3ca1962d2ab58c3cef",
+      "matchingLinesSha256": "9c21f7a9036d40ae4c3688a3d65f38660810d2de558a830cd50cef6e11057fcc",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -152,7 +152,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6e9254f9daf76aca9f9c6174f7827e4e160f8cfabff7ce5d10e0c5716651a880",
+      "matchingLinesSha256": "036c4422b0705de6ce820e5008b25577691b444b1e3114af1ce442adafb109e5",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -162,13 +162,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9a96d5c718ca96009d517504a8c79e47895a97f8dc28f022df5522f968f5a278",
+      "matchingLinesSha256": "e95db05112b8b30158c723af32614505000071fd4d61eb43e9fddeb4c2b00e34",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
         "oprte": 21
       },
       "path": "apps/desktop/runtime/package-macos.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "4533ce720a8c7b9539e8933db355c065ba6f741c9487f1a76c389a88ba968f9c",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 3
+      },
+      "path": "apps/desktop/runtime/run-native.ts"
     },
     {
       "category": "compatibility",
@@ -222,7 +232,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "87a60c9a1750adb3a12fd0ed54f82c0327674f89b8eff439aaf80be987314182",
+      "matchingLinesSha256": "2007627584e228c4a9ab153ab5fa16367456ac10904cb5100fd68e45f686f392",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -259,6 +269,16 @@
         "oprte": 1
       },
       "path": "apps/desktop/runtime/src/codex/pinned-codecs.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "20176cc10c29879501b5f1c3a7efa2395b002812b395b0ef07d9524fb722524e",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 0
+      },
+      "path": "apps/desktop/runtime/src/development-isolation.ts"
     },
     {
       "category": "compatibility",
@@ -552,7 +572,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "90d4602e18dd58d3e00b31bc904a2d7fe498087ef7feeac4c6546a202b43daef",
+      "matchingLinesSha256": "dbe5e8098ff00ff56c6772e578dc5e0523b2020e4887c6edfd882230d55db25c",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
@@ -632,17 +652,17 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "adc0b3aa9d57d4e4dbefd9f3252ef877f124c8f0ef9b0b0f9c3f5578e2f917ec",
+      "matchingLinesSha256": "697135319a0fe6678fe8b3714de3dc20c49e4a23e90b244b5a57fe1000b269a0",
       "occurrences": {
         "kitchen": 20,
         "operateStylized": 1,
-        "oprte": 35
+        "oprte": 36
       },
       "path": "apps/desktop/runtime/src/state/application-support.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "0f181a53c00c4fac2ec291732cfbeefc4095fbc87034ffe182910e4f41ee40b6",
+      "matchingLinesSha256": "7a400125b921db13c2cba46b26ae5decd74cd269a23cfafcb774e38c158dec7d",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -652,7 +672,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "e1caa4f874bae52f4a4fc0bae7f79eac2761a24c4e88d858ea2a0e8c6dba7457",
+      "matchingLinesSha256": "272b17e5fffc60dbecb6699da36aecfa441e1c351b501579b2f1b5d2a265b329",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -732,6 +752,16 @@
     },
     {
       "category": "compatibility",
+      "matchingLinesSha256": "98d96d9990a353a8a4497dc1a4858a37affa3bbaeb97c8cf49caa4c3b5dfad9a",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/src/state/workspace-setup-store.ts"
+    },
+    {
+      "category": "compatibility",
       "matchingLinesSha256": "2604bba7f254abb9386c79ff35607e8343e95c38d0ecd303a3a52c0a78c114ba",
       "occurrences": {
         "kitchen": 0,
@@ -742,7 +772,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "63235abb0706a13684d9879aa92d73a6141a1f51c1fba251e3f88af71bd40ccd",
+      "matchingLinesSha256": "08a2518959e0f1215f0957f038b7e498e983d25add5e394c04fc60cac7578489",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -772,7 +802,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "185cd0fd13b0d1e128c2f79df309d15049b3ee7d793aebabaf4eaff014d6d9c3",
+      "matchingLinesSha256": "bac4d2cdaab1c797c05d74b3ddfaa14b6d1dac2d1066e3ab3adfba9749e09809",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -782,7 +812,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "ed4f20485b5da4a3294e46e11896f019f8edb5eb8fbaafa06075c45a7003c6fe",
+      "matchingLinesSha256": "7a6cfae369e3468e923973db1ddc5a6d23e1b3d0e1ad6b999175cacba7b6bd8b",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -792,7 +822,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "38497553dda5912c335c57c79a4725dbd81393408f710d7c8a0db35f6bfb3e7b",
+      "matchingLinesSha256": "a98f03d940da57bd4a01afe632823dbed6c75004572f3626946607c8c26abd40",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -802,7 +832,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "4b3a152e7e99825d932df360e5dc0fc8a2299b8d0198eee2844ec53d6f5b62ae",
+      "matchingLinesSha256": "4f59aeff13aefc5d99bd7426350cba5d26475dbd20d2dde1a534307652245349",
       "occurrences": {
         "kitchen": 16,
         "operateStylized": 0,
@@ -819,6 +849,16 @@
         "oprte": 8
       },
       "path": "apps/desktop/runtime/test/application-support-worktree-repair.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "cd1a3c8e398fd9d2a095e9f2441c6aeef24fdd5e96027e622b9eec8bb3959fb8",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/bundled-bun-workspace-setup.test.ts"
     },
     {
       "category": "compatibility",
@@ -852,7 +892,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "967a093185e4acb8a4bd3c78599c71fb2ad4263eb9d7c600509b0b3f1e3a32ff",
+      "matchingLinesSha256": "5300636f46d21c6c12dd74b1dc3c471b9d52bf5baf9c645ae9934cac00ee4e0c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -862,21 +902,21 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "636721940f4f84afdf0d30c1a9342f3a62fcff578d8b5a72e537194d8f4e8ecd",
+      "matchingLinesSha256": "4a2752af582cb6bdad67d36bf3271c0d8df8673cd967e20ba239d6949f83556c",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
-        "oprte": 4
+        "oprte": 6
       },
       "path": "apps/desktop/runtime/test/cloud-http-client.test.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9fe3921555e575e30a5d514e383f0400163afa361603b3288e21d398e531e85a",
+      "matchingLinesSha256": "5082dbd6cba8e793251fce1685036e01b0e690b0339def345ec9beddf38f2d6a",
       "occurrences": {
-        "kitchen": 12,
+        "kitchen": 14,
         "operateStylized": 0,
-        "oprte": 20
+        "oprte": 17
       },
       "path": "apps/desktop/runtime/test/cloud-human-account-service.test.ts"
     },
@@ -892,17 +932,17 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "b58ec5b46ac6507adf3b0dc6e8744a015132a0a2bc73ee60df66ee4c760390b7",
+      "matchingLinesSha256": "f38fc73347898d4461b04b2277e646c22ce0265ea0e3755bb3aff3d4f4b3a9e6",
       "occurrences": {
         "kitchen": 3,
         "operateStylized": 0,
-        "oprte": 5
+        "oprte": 13
       },
       "path": "apps/desktop/runtime/test/cloud-keychain-custody.test.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "137ea2f231378facbda686aafce18f704953d21199b6d78465d0d03331528163",
+      "matchingLinesSha256": "007e7c1864a8f964ea79034c933e7b5f4e458aa8d560545bbfc9d9fa7f7e6bb4",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -982,11 +1022,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6cbecaee394dd0a2942f80985b34459b1d0952a53aefa4f823bee275e27f2458",
+      "matchingLinesSha256": "8be7e65132a147e8c5b01771ebd5e761a1bcc929e4a615d9c09901e07a3c362d",
       "occurrences": {
         "kitchen": 5,
         "operateStylized": 0,
-        "oprte": 57
+        "oprte": 58
       },
       "path": "apps/desktop/runtime/test/control-plane-backup.test.ts"
     },
@@ -1012,11 +1052,21 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "77aab981a9601fdee91d095c247d48464d2a242fd38091e2c94722fb519a48ec",
+      "matchingLinesSha256": "cd589bffb0dab3d1d0164f4b298aaba4b30c30ee80be7dc3e15f4f6ddd521bb8",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 2
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/control-plane-portable-projection.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "be6e555e680dea9023f74376b6a731f09e4b320388ae7f6b07d0f4e29fbfd48a",
+      "occurrences": {
+        "kitchen": 1,
+        "operateStylized": 0,
+        "oprte": 5
       },
       "path": "apps/desktop/runtime/test/dev-supervisor.test.ts"
     },
@@ -1122,7 +1172,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "3dc4d6f0acbb789d516b259f61567fe63d2e1e203a935fa74e4dd1162f50a383",
+      "matchingLinesSha256": "0ef117876268045424a56c76f0a032e0f248596b44df7616f04605c89645a36a",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1292,7 +1342,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c72db276b867f15d114f3d7381632f92c849f937e4a998426ea8a4e6a153bdf5",
+      "matchingLinesSha256": "490acbd28a785b51b51375a883085ad95f139f48f0327c3a824fa5239d30708c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1432,11 +1482,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1c50200dfc79dd119dd115c2f8bf25b0b4410cfd7ef79ea3535e050dd5af63af",
+      "matchingLinesSha256": "238f0569c2fe6895ab06e1c51230d244cd8312a5c16ab1548db6e07e0df69664",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 1
+        "oprte": 2
       },
       "path": "apps/desktop/runtime/test/human-account-metadata-store.test.ts"
     },
@@ -1482,11 +1532,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "f8cee97eef6af9fd726e94d04d3ec228e853022cca8e46d1916c77775b97c143",
+      "matchingLinesSha256": "3930295c2127812a7135c01194b11163dad8921cb568ecde565d351e2aeb6f36",
       "occurrences": {
         "kitchen": 8,
         "operateStylized": 0,
-        "oprte": 44
+        "oprte": 46
       },
       "path": "apps/desktop/runtime/test/local-data-removal-inventory.test.ts"
     },
@@ -1512,7 +1562,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "c696ed27df6ed56f3c90a56181f1ab87844308136a21705201fadcf5c371ffcc",
+      "matchingLinesSha256": "507784e185d7417dab00bb504f23e7f63f5d795bb5d746559ebe30c9a276d0bd",
       "occurrences": {
         "kitchen": 5,
         "operateStylized": 0,
@@ -1522,7 +1572,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6cfd5e8f5d75c3e341a4a089fd11f1fbaa367615b084cdd88e5d175aaebd47eb",
+      "matchingLinesSha256": "9bbd21b9726ef4743ec70cefaad14d2a46d5c7a48a02165deb62d819547f18b9",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1572,7 +1622,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "14f98d8f3df9aabc2c0f603b48545f21d447ed3d2960dbf25ad2094463155a4f",
+      "matchingLinesSha256": "0d00fb4544083f831973db9b54e769f626f9fdd392ec8c470c1bd5b6e2ac59c8",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1592,7 +1642,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "160d6226a851d16b24195f4a75babeadf4d2a412e2765a1b24b60b0f43ce2158",
+      "matchingLinesSha256": "fdbb50354298adda4249c6776620ff3ac6c8754232237356e8d0ab28ed17793c",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -1672,11 +1722,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "1e7c2638fa9456d8fda22512bd016bf4a18deae2b14cf2689a38fd8d03689faa",
+      "matchingLinesSha256": "f24b31145b0f6bad5a1deba23ba757faeb023c9da7ce67304270e59f7422838f",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 6
+        "oprte": 8
       },
       "path": "apps/desktop/runtime/test/runner-pairing-http-client.test.ts"
     },
@@ -1692,7 +1742,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "0f94774a25eaa0ac1d77a5ce75fac8678910bdc1e9730e8bc43b5183fa5d002b",
+      "matchingLinesSha256": "bcf93e5d4bebfbd16ce2baf32cc92ee728adf0bfb25ce9086d6cbc2b417292a0",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1722,7 +1772,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "4aa2c6b1b1dd8a32ac4f7df9e254226d98d76bfd2c76641b6f33efe6079791f8",
+      "matchingLinesSha256": "e00761c2b371c6264c780a3ffe906bf36fc2d9230fcb6d1d281611b80011e6b4",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1732,11 +1782,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "ccb8675b2b2e7b6ebfd07b31f37515dff4a727272eb9ec9f146cced53f7182d6",
+      "matchingLinesSha256": "3f88a15c1e293190b15565d55ffc9139e40e17ebe8425c17801af43dca9a0b38",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 3
+        "oprte": 5
       },
       "path": "apps/desktop/runtime/test/session-sync-http-client.test.ts"
     },
@@ -1752,7 +1802,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "dcdcd418dfcb71fcd46af5d5c0aacdeea66ed60f6e60b713ed998f72d83a27cf",
+      "matchingLinesSha256": "ceba54b2c9fc999c7c86d092def6b27c992f01b1bbd90eaf50b23ef04e37a2a9",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1762,7 +1812,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "463cc64762c73e25c1ccbc36cf8680ff9509701bdeeb9fc5605ecbdb10aa5357",
+      "matchingLinesSha256": "11a574e087194e470acf9372b524554074efb2472913d3951c6cfc4880c87f5c",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1772,13 +1822,33 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "2284296e2a788b581938be2c73bf83113aacdc37ce50b7c8a6af81a863718a22",
+      "matchingLinesSha256": "7cd542b4255fd5b263fab32e02f595b41ed435874835a1079f268fdd22dbcda1",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 2
+      },
+      "path": "apps/desktop/runtime/test/workspace-setup-store.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "e46b753a5219a29d94cc65e61618827b3b5e1735b186fdb3929434f9d978fde6",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
         "oprte": 13
       },
       "path": "apps/desktop/runtime/verify-macos-package.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "7cbe03f9e87161c6f2e65ade80f5f59c6d70f885deb9f97a5630c7bb21c7a30a",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/src/AGENTS.md"
     },
     {
       "category": "compatibility",
@@ -1802,7 +1872,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "a5ceab7e37d3be2ebcde676c66079181942d360e240166e573e86f1b08bf4a10",
+      "matchingLinesSha256": "5f887e68650d38ee2166f80479810eac6c6bc533288b800666ff64d1a949c085",
       "occurrences": {
         "kitchen": 2,
         "operateStylized": 0,
@@ -1832,7 +1902,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "19227aaa054f6560cb2fbc7d6cdc2ef390317d9b20353bc9deec27fe7868a26a",
+      "matchingLinesSha256": "4678a463fb974d1e79fc4c7e66a4bfc8e76537b6ce33cc9c9637bf1b316d8914",
       "occurrences": {
         "kitchen": 3,
         "operateStylized": 0,
@@ -1862,11 +1932,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "79f50dc90e6efda78b6895ecdf17e3aac422879c79281843ccdf87b72b43222b",
+      "matchingLinesSha256": "5617b892a4db4efd0a26383047a085830a6c70bc2524cd58df407aea726825b9",
       "occurrences": {
-        "kitchen": 93,
+        "kitchen": 97,
         "operateStylized": 0,
-        "oprte": 36
+        "oprte": 38
       },
       "path": "apps/desktop/src/main.zig"
     },
@@ -1882,17 +1952,37 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "3e450ce05dc1620d936861132844958386949dc17b40d324d5c30c65143a65ca",
+      "matchingLinesSha256": "ea1eb5b39312cd89e77511c21105c8d8858d86e1f54c78bb627b914b10dc275f",
       "occurrences": {
-        "kitchen": 8,
+        "kitchen": 12,
         "operateStylized": 0,
-        "oprte": 63
+        "oprte": 75
       },
       "path": "apps/desktop/src/runtime_host.zig"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "688790d11f6afd076cbbf9f6d11f499f1a02e23052ae42e3c668c268460a2894",
+      "matchingLinesSha256": "9f1c0418fc60ab628565722d297907640d6dd03c52d7d6ccaf72036da3a010da",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/local-cli/src/discovery.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "851afff7f26f5ccede46bcfd98ca24933e1b9bacbdb91c9f77dee253fc58b8fe",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/local-cli/src/discovery.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "769ac810e081f60bd367162206a48dd5d0f5a5117a9e5f6355cbcf716fd623eb",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1902,7 +1992,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "4f654b254d35aa9e1043cade5e7ab9a42e36c60d8ba73ea40f177bb0bf1493ce",
+      "matchingLinesSha256": "3c5b9030e1f4a5e0bcb68621df53250f9e46a37949812702e0a72504de280863",
       "occurrences": {
         "kitchen": 3,
         "operateStylized": 0,
@@ -1982,7 +2072,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "870019bc7f785ca6ab41d2654f34152ec3376211887c35dabb729b9475838ec6",
+      "matchingLinesSha256": "5c20d9553275d9eed569fbe1603e7f77cc8eaa6ab14824af30fcdbb9660bd294",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1992,7 +2082,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "90be797b330a16dc3299d585756a0ab5c483a7532398987adb82406f1fe8e7e0",
+      "matchingLinesSha256": "777e8aeeb4d9bcf0aaa742132dcfb33b4cdfe97925ca03223aab53b1e15b8d8b",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2002,7 +2092,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "6585c392d4f950f52d43e32b36e23df619c1c3b78c64c086a41a83d48041efe7",
+      "matchingLinesSha256": "901aaa0547d9cb498f0c3a84e7bc7c3d8fce5f14b7e04234b32b5111913cf410",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2012,7 +2102,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "954ae271357b5abe824b00344a5e35ed5814d8f1502daf32b916180bbdfbb866",
+      "matchingLinesSha256": "62b9138833f433ab8949b154d953be6bb198bdaf28dfc9a5c23b9b081c3f843d",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2102,7 +2192,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "d559283beb3b44c20929ed451f909fa9e6a02bcf58206739d4fe80720d09653b",
+      "matchingLinesSha256": "b1187718c27019ff09de240b002613eda358c3a2f37d78140b62b2fa8926c60e",
       "occurrences": {
         "kitchen": 5,
         "operateStylized": 0,
@@ -2122,7 +2212,17 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "a57b535ae637f69a90f240378f54e685ee0ea578c0c1403f41f2944658a4a911",
+      "matchingLinesSha256": "de452ece4c3d0b7b49b6e94f965267df8b1634d50870eee7aa5c592725513456",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 5
+      },
+      "path": "apps/web/convex/identityCutover.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "a82f0f9d7ccf2fc729a5307572a7be25fcc85e7da47b694408a22b1fac1ac9a1",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2132,7 +2232,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "8c319766744abbce67edfdb59a0e5d57f158e2fcac601f9ff14006137234a7ae",
+      "matchingLinesSha256": "a2a00740d3f2c66ad4a040377e55b92162f675fbae7a4525a057111b139012c7",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -2232,21 +2332,21 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "7015f2a93be67fcb1a49bdb14f80599645259a4f6a637210c6128f843d0fafd0",
+      "matchingLinesSha256": "96f092990afc578c2a674779cffa085db6ce0977820131f65e124d39d178fc66",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 1
+        "oprte": 2
       },
       "path": "apps/web/scripts/vercel-build.test.ts"
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "75bdff64058b8ce1ca5d348142c9e34a455d8bad89c08934bcb7bfba93dfc25f",
+      "matchingLinesSha256": "d661ef09a55ad00f590fb90df1f0f2d201d105fbbb5080f2aa6ded234f620fa0",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
-        "oprte": 5
+        "oprte": 7
       },
       "path": "apps/web/scripts/vercel-build.ts"
     },
@@ -2312,7 +2412,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "48dc5cea8d2d96e1e0000cefa3024cade60494300c2a56db6812b0a7c6fd6aec",
+      "matchingLinesSha256": "2b1e0a42f9582e766021766e93f6284374c2121bacf0f295dc8f153fe911e931",
       "occurrences": {
         "kitchen": 2,
         "operateStylized": 0,
@@ -2322,7 +2422,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "568e1c1fbb60add32e210a520ca7b60994f0f24cd0d3bf11843e339a0b24e1c3",
+      "matchingLinesSha256": "d633397cfecab038ac63393432f61e27ed895e1f9bd24f0510c8a92a8c0b1288",
       "occurrences": {
         "kitchen": 2,
         "operateStylized": 0,

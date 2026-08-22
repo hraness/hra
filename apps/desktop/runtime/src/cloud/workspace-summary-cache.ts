@@ -11,6 +11,11 @@ export interface CloudWorkspaceSummaryScope {
   readonly userId: string;
 }
 
+export interface CloudWorkspaceSummaryReplacement {
+  readonly scopeEpoch: number;
+  readonly ordinal: number;
+}
+
 type CloudWorkspaceListClient = Pick<CloudWorkspaceClient, "listWorkspaces">;
 
 function scopeKey(scope: CloudWorkspaceSummaryScope): string {
@@ -75,6 +80,9 @@ export class CloudWorkspaceSummaryCache {
   #admissionClosed = false;
   #scope: CloudWorkspaceSummaryScope | null = null;
   #summaries = new Map<string, WorkspaceSummary>();
+  #scopeEpoch = 0;
+  #nextReplacementOrdinal = 0;
+  #committedReplacementOrdinal = 0;
 
   constructor(options: {
     readonly onInvalidated: (invalidation: PortableInvalidation) => void;
@@ -106,6 +114,8 @@ export class CloudWorkspaceSummaryCache {
     const removed = this.#summaries.values().next().value;
     this.#scope = scope === null ? null : { ...scope };
     this.#summaries.clear();
+    this.#scopeEpoch += 1;
+    this.#committedReplacementOrdinal = ++this.#nextReplacementOrdinal;
     if (
       removed !== undefined &&
       options.invalidatePrevious !== false
@@ -138,7 +148,48 @@ export class CloudWorkspaceSummaryCache {
     workspace: WorkspaceSummary,
   ): boolean {
     if (!this.isCurrent(scope)) return false;
+    const current = this.#summaries.get(workspace.id);
+    if (current !== undefined && current.revision > workspace.revision) {
+      return false;
+    }
     this.#summaries.set(workspace.id, workspace);
+    // Fence any first-page read that began before this more targeted update.
+    this.#committedReplacementOrdinal = ++this.#nextReplacementOrdinal;
+    return true;
+  }
+
+  beginFirstPageReplacement(
+    scope: CloudWorkspaceSummaryScope,
+  ): CloudWorkspaceSummaryReplacement | null {
+    if (this.#admissionClosed || !this.isCurrent(scope)) return null;
+    return Object.freeze({
+      scopeEpoch: this.#scopeEpoch,
+      ordinal: ++this.#nextReplacementOrdinal,
+    });
+  }
+
+  replaceFirstPage(
+    replacement: CloudWorkspaceSummaryReplacement,
+    workspaces: readonly WorkspaceSummary[],
+  ): boolean {
+    if (
+      this.#scope === null ||
+      replacement.scopeEpoch !== this.#scopeEpoch ||
+      replacement.ordinal <= this.#committedReplacementOrdinal
+    ) return false;
+    const next = new Map<string, WorkspaceSummary>();
+    for (const workspace of workspaces) {
+      if (next.has(workspace.id)) return false;
+      const current = this.#summaries.get(workspace.id);
+      if (current !== undefined && current.revision > workspace.revision) {
+        return false;
+      }
+      next.set(workspace.id, workspace);
+    }
+    const invalidation = replacementInvalidation(this.#summaries, next);
+    this.#summaries = next;
+    this.#committedReplacementOrdinal = replacement.ordinal;
+    if (invalidation !== null) this.#onInvalidated(invalidation);
     return true;
   }
 
@@ -194,6 +245,8 @@ export class CloudWorkspaceSummaryCache {
     scope: CloudWorkspaceSummaryScope,
     client: CloudWorkspaceListClient,
   ): Promise<void> {
+    const replacement = this.beginFirstPageReplacement(scope);
+    if (replacement === null) return;
     let result: Awaited<ReturnType<CloudWorkspaceListClient["listWorkspaces"]>>;
     try {
       result = await client.listWorkspaces({ limit: 64 });
@@ -201,13 +254,6 @@ export class CloudWorkspaceSummaryCache {
       return;
     }
     if (!result.ok || !this.isCurrent(scope)) return;
-    const next = new Map<string, WorkspaceSummary>();
-    for (const workspace of result.data.workspaces) {
-      if (next.has(workspace.id)) return;
-      next.set(workspace.id, workspace);
-    }
-    const invalidation = replacementInvalidation(this.#summaries, next);
-    this.#summaries = next;
-    if (invalidation !== null) this.#onInvalidated(invalidation);
+    this.replaceFirstPage(replacement, result.data.workspaces);
   }
 }
