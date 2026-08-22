@@ -13,8 +13,10 @@ import { join } from "node:path";
 
 import { consumeUtf8Lines, correspondingSourceSpecs } from "../corresponding-sources";
 import {
+  exactPreservedThirdPartySignatures,
   hranessUiStylesheetInput,
   imageNormalizerPackageContract,
+  isExactPreservedThirdPartySignature,
   macosPackage,
   requiredCliFileNames,
   requiredLicenseFileNames,
@@ -381,6 +383,47 @@ describe("macOS ad-hoc package contract", () => {
       ["VEKTX9H2N7", "GitHub"],
       ["UBF8T346G9", "Microsoft"],
     ]);
+  });
+
+  test("preserves Bun only at its exact pinned path and identity", () => {
+    const expected = {
+      cdHash: "e954e4093beecf241f32b9ce07b270a39d3297d4",
+      entitlements: {
+        "com.apple.security.cs.allow-dyld-environment-variables": true,
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true,
+        "com.apple.security.cs.disable-executable-page-protection": true,
+        "com.apple.security.cs.disable-library-validation": true,
+      },
+      identifier: "bun",
+      sha256: "e0c90ec15d33363e6b70713d56bc3b2c7585c17f40a0fe0f8fd9305901d4e233",
+      size: 63_096_576,
+      teamIdentifier: "7FRXF46ZSN",
+    } as const;
+    expect([...exactPreservedThirdPartySignatures]).toEqual([[
+      "Contents/Resources/runtime/bin/bun",
+      expected,
+    ]]);
+    const actual = {
+      ...expected,
+      path: "Contents/Resources/runtime/bin/bun",
+    };
+    expect(isExactPreservedThirdPartySignature(actual)).toBeTrue();
+    for (const changed of [
+      { ...actual, cdHash: "0".repeat(40) },
+      { ...actual, identifier: "not-bun" },
+      { ...actual, path: "Contents/Resources/runtime/bin/not-bun" },
+      { ...actual, sha256: "0".repeat(64) },
+      { ...actual, size: actual.size + 1 },
+      { ...actual, teamIdentifier: "VEKTX9H2N7" },
+      { ...actual, entitlements: {} },
+      {
+        ...actual,
+        entitlements: { ...actual.entitlements, "unreviewed.entitlement": true },
+      },
+    ]) {
+      expect(isExactPreservedThirdPartySignature(changed)).toBeFalse();
+    }
   });
 
   test("grants the compiled gateway only its Bun JIT entitlement", async () => {

@@ -38,8 +38,10 @@ import {
 import { verifyPackagedFrontend } from "./frontend-package-integrity";
 import { loadGcmDependencyLicenseInventory } from "./gcm-dependency-licenses";
 import {
+  exactPreservedThirdPartySignatures,
   hranessUiStylesheetInput,
   imageNormalizerPackageContract,
+  isExactPreservedThirdPartySignature,
   macosPackage,
   requiredLicenseFileNames,
   trustedThirdPartyTeams,
@@ -540,6 +542,7 @@ async function signRuntimeTree(
   teamIdentifier: string;
 }>>> {
   const preserved: Array<Readonly<{ path: string; teamIdentifier: string }>> = [];
+  const observedExactPreservedPaths = new Set<string>();
   const ownedPaths = new Set(ownedCode.map((entry) => entry.path));
   const files = (await walkTree(runtimeRoot))
     .filter((entry) => entry.type === "file" && entry.path !== "manifest.json")
@@ -552,6 +555,7 @@ async function signRuntimeTree(
   for (const path of machOFiles) {
     if (ownedPaths.has(path)) continue;
     const signature = await codeSignature(path);
+    const appRelativePath = relative(appRoot, path).split(sep).join("/");
     if (preserveExactSignedPaths.has(path)) {
       if (
         signature.identifier === null
@@ -567,10 +571,37 @@ async function signRuntimeTree(
           );
         }
         preserved.push({
-          path: relative(appRoot, path).split(sep).join("/"),
+          path: appRelativePath,
           teamIdentifier: signature.teamIdentifier,
         });
       }
+      continue;
+    }
+    const exactPreserved = exactPreservedThirdPartySignatures.get(appRelativePath);
+    if (exactPreserved !== undefined) {
+      const status = await lstat(path);
+      if (
+        !status.isFile()
+        || status.isSymbolicLink()
+        || status.nlink !== 1
+        || !isExactPreservedThirdPartySignature({
+          cdHash: signature.cdHash,
+          entitlements: await codeSignatureEntitlements(path),
+          identifier: signature.identifier,
+          path: appRelativePath,
+          sha256: await sha256(path),
+          size: status.size,
+          teamIdentifier: signature.teamIdentifier,
+        })
+      ) {
+        throw new Error(`Exact preserved signature identity differs: ${appRelativePath}`);
+      }
+      await run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=6", path]);
+      observedExactPreservedPaths.add(appRelativePath);
+      preserved.push({
+        path: appRelativePath,
+        teamIdentifier: exactPreserved.teamIdentifier,
+      });
       continue;
     }
     if (signature.teamIdentifier !== null) {
@@ -581,12 +612,20 @@ async function signRuntimeTree(
       }
       await run(["/usr/bin/codesign", "--verify", "--strict", path]);
       preserved.push({
-        path: relative(appRoot, path).split(sep).join("/"),
+        path: appRelativePath,
         teamIdentifier: signature.teamIdentifier,
       });
       continue;
     }
     await signAdHoc(path);
+  }
+  if (
+    observedExactPreservedPaths.size !== exactPreservedThirdPartySignatures.size
+    || [...exactPreservedThirdPartySignatures.keys()].some(
+      (path) => !observedExactPreservedPaths.has(path),
+    )
+  ) {
+    throw new Error("Exact preserved signature inventory is incomplete.");
   }
   for (const entry of ownedCode) {
     await signAdHoc(entry.path, entry);

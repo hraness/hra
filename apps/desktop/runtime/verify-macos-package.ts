@@ -37,8 +37,10 @@ import {
   verifyCorrespondingSourceArchive,
 } from "./corresponding-sources";
 import {
+  exactPreservedThirdPartySignatures,
   hranessUiStylesheetInput,
   imageNormalizerPackageContract,
+  isExactPreservedThirdPartySignature,
   macosPackage,
   requiredCliFileNames,
   requiredLicenseFileNames,
@@ -319,13 +321,14 @@ async function verifyRuntimeManifest(
   );
   const gitLfs = record(runtime["gitLfs"], "runtime Git LFS");
   const ripgrep = record(runtime["ripgrep"], "runtime ripgrep");
+  const bunBinarySha256 = string(bun["binarySha256"], "Bun SHA-256");
   const expectedHashes = new Map([
     [
       imageNormalizerPackageContract.runtimeRelativePath,
       string(imageNormalizer["sha256"], "image normalizer SHA-256"),
     ],
     ["bin/oprte-gateway", string(gateway["sha256"], "gateway SHA-256")],
-    ["bin/bun", string(bun["binarySha256"], "Bun SHA-256")],
+    ["bin/bun", bunBinarySha256],
     ["bin/oprte-data-remover", string(dataRemover["sha256"], "data remover SHA-256")],
     ["bin/oprte-git-executor", string(gitExecutor["sha256"], "Git executor SHA-256")],
     ["bin/oprte-keychain-custodian", string(keychainCustodian["sha256"], "Keychain custodian SHA-256")],
@@ -352,6 +355,7 @@ async function verifyRuntimeManifest(
   }
   if (
     bun["version"] !== runtimeVersions.bun.version
+    || bunBinarySha256 !== runtimeVersions.bun.binarySha256
     || bun["sourceBinarySha256"] !== runtimeVersions.bun.binarySha256
     || gateway["bunVersion"] !== runtimeVersions.bun.version
     || gateway["compilerBinarySha256"] !== runtimeVersions.bun.binarySha256
@@ -456,13 +460,21 @@ async function verifyRuntimeManifest(
   if (!Array.isArray(preserved) || preserved.length === 0) {
     throw new Error("Runtime manifest has no preserved third-party signatures.");
   }
+  const observedExactPreservedPaths = new Set<string>();
+  let priorPreservedPath: string | null = null;
   for (const [index, rawEntry] of preserved.entries()) {
     const entry = record(rawEntry, `preserved signature ${index}`);
+    if (
+      !isDeepStrictEqual(Object.keys(entry).sort(), ["path", "teamIdentifier"])
+    ) {
+      throw new Error(`Preserved signature ${index} has unexpected fields.`);
+    }
     const path = string(entry["path"], `preserved signature ${index} path`);
     const team = string(entry["teamIdentifier"], `preserved signature ${index} team`);
-    if (!trustedThirdPartyTeams.has(team)) {
-      throw new Error(`Untrusted preserved signature team: ${team}`);
+    if (priorPreservedPath !== null && path.localeCompare(priorPreservedPath) <= 0) {
+      throw new Error("Preserved signature paths are not uniquely sorted.");
     }
+    priorPreservedPath = path;
     if (normalizedPaths.has(path)) {
       throw new Error(`Normalized signature cannot also be preserved: ${path}`);
     }
@@ -471,10 +483,45 @@ async function verifyRuntimeManifest(
       throw new Error(`Preserved signature escaped the app: ${path}`);
     }
     const signature = await codeSignature(absolute);
+    const exact = exactPreservedThirdPartySignatures.get(path);
+    if (exact !== undefined) {
+      const status = await lstat(absolute);
+      if (
+        team !== exact.teamIdentifier
+        || !status.isFile()
+        || status.isSymbolicLink()
+        || status.nlink !== 1
+        || !isExactPreservedThirdPartySignature({
+          cdHash: signature.cdHash,
+          entitlements: await codeSignatureEntitlements(absolute),
+          identifier: signature.identifier,
+          path,
+          sha256: await sha256File(absolute),
+          size: status.size,
+          teamIdentifier: signature.teamIdentifier,
+        })
+      ) {
+        throw new Error(`Exact preserved signature changed: ${path}`);
+      }
+      await run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=6", absolute]);
+      observedExactPreservedPaths.add(path);
+      continue;
+    }
+    if (!trustedThirdPartyTeams.has(team)) {
+      throw new Error(`Untrusted preserved signature team: ${team}`);
+    }
     if (signature.teamIdentifier !== team) {
       throw new Error(`Preserved signature changed: ${path}`);
     }
     await run(["/usr/bin/codesign", "--verify", "--strict", absolute]);
+  }
+  if (
+    observedExactPreservedPaths.size !== exactPreservedThirdPartySignatures.size
+    || [...exactPreservedThirdPartySignatures.keys()].some(
+      (path) => !observedExactPreservedPaths.has(path),
+    )
+  ) {
+    throw new Error("Exact preserved signature inventory is incomplete.");
   }
 
   const tree = (await walkTree(runtimeRoot))
@@ -773,7 +820,16 @@ export async function verifyMacOSApp(
     throw new Error("Local observation CLI code identity differs.");
   }
   await run(["/usr/bin/codesign", "--verify", "--strict", localCliPath]);
-  if (!isDeepStrictEqual(await codeSignatureEntitlements(localCliPath), {})) {
+  const localCliEntitlements = await run([
+    "/usr/bin/codesign",
+    "--display",
+    "--entitlements",
+    ":-",
+    localCliPath,
+  ], { allowFailure: true });
+  if (/<key>/u.test(
+    `${localCliEntitlements.stdout}\n${localCliEntitlements.stderr}`,
+  )) {
     throw new Error("Local observation CLI must not carry entitlements.");
   }
   const localCliArchs = (await run([
@@ -815,9 +871,22 @@ export async function verifyMacOSApp(
   if (archs !== macosPackage.architecture) {
     throw new Error(`Host architecture differs: ${archs}`);
   }
-  const bunVersion = (await run([join(runtimeRoot, "bin/bun"), "--version"])).stdout.trim();
+  const bunPath = join(runtimeRoot, "bin/bun");
+  const bunArchs = (await run(["/usr/bin/lipo", "-archs", bunPath])).stdout.trim();
+  if (bunArchs !== macosPackage.architecture) {
+    throw new Error(`Bundled Bun architecture differs: ${bunArchs}`);
+  }
+  const bunVersion = (await run([bunPath, "--version"])).stdout.trim();
   if (bunVersion !== runtimeVersions.bun.version) {
     throw new Error(`Bundled Bun version differs: ${bunVersion}`);
+  }
+  const bunJitSmoke = await run([
+    bunPath,
+    "-e",
+    "function sum(){let value=0;for(let index=0;index<10000;index+=1)value+=index;return value;}for(let iteration=0;iteration<1000;iteration+=1)if(sum()!==49995000)process.exit(1);process.stdout.write('hra-bun-jit-ok\\n');",
+  ]);
+  if (bunJitSmoke.stdout !== "hra-bun-jit-ok\n" || bunJitSmoke.stderr !== "") {
+    throw new Error("Bundled Bun JavaScript/JIT smoke failed.");
   }
   const codexVersion = (await run([join(runtimeRoot, "codex/bin/codex"), "--version"])).stdout.trim();
   if (codexVersion !== `codex-cli ${runtimeVersions.codex.version}`) {

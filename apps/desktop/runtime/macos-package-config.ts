@@ -29,6 +29,67 @@ export const trustedThirdPartyTeams: ReadonlyMap<string, string> = Object.freeze
   ["UBF8T346G9", "Microsoft"],
 ] as const));
 
+export type ExactPreservedThirdPartySignature = Readonly<{
+  cdHash: string;
+  entitlements: Readonly<Record<string, true>>;
+  identifier: string;
+  sha256: string;
+  size: number;
+  teamIdentifier: string;
+}>;
+
+export const exactPreservedThirdPartySignatures: ReadonlyMap<
+  string,
+  ExactPreservedThirdPartySignature
+> = Object.freeze(new Map([
+  [
+    "Contents/Resources/runtime/bin/bun",
+    Object.freeze({
+      cdHash: "e954e4093beecf241f32b9ce07b270a39d3297d4",
+      entitlements: Object.freeze({
+        "com.apple.security.cs.allow-dyld-environment-variables": true,
+        "com.apple.security.cs.allow-jit": true,
+        "com.apple.security.cs.allow-unsigned-executable-memory": true,
+        "com.apple.security.cs.disable-executable-page-protection": true,
+        "com.apple.security.cs.disable-library-validation": true,
+      }),
+      identifier: "bun",
+      sha256: "e0c90ec15d33363e6b70713d56bc3b2c7585c17f40a0fe0f8fd9305901d4e233",
+      size: 63_096_576,
+      teamIdentifier: "7FRXF46ZSN",
+    }),
+  ],
+] as const));
+
+export function isExactPreservedThirdPartySignature(input: Readonly<{
+  cdHash: string | null;
+  entitlements: Readonly<Record<string, unknown>>;
+  identifier: string | null;
+  path: string;
+  sha256: string;
+  size: number;
+  teamIdentifier: string | null;
+}>): boolean {
+  const expected = exactPreservedThirdPartySignatures.get(input.path);
+  if (
+    expected === undefined
+    || input.cdHash !== expected.cdHash
+    || input.identifier !== expected.identifier
+    || input.sha256 !== expected.sha256
+    || input.size !== expected.size
+    || input.teamIdentifier !== expected.teamIdentifier
+  ) {
+    return false;
+  }
+  const actualEntitlements = Object.keys(input.entitlements).sort();
+  const expectedEntitlements = Object.keys(expected.entitlements).sort();
+  return actualEntitlements.length === expectedEntitlements.length
+    && actualEntitlements.every(
+      (key, index) =>
+        key === expectedEntitlements[index] && input.entitlements[key] === true,
+    );
+}
+
 export const hranessUiStylesheetInput = Object.freeze({
   licenseSha256: "799b4743aab185faac6fd07349d8ab19f9c9714b47e261996ff0971dda3d4309",
   packageJsonSha256: "f5f5131405ee72b68b341485d6561f107ec14a3c34d82d902fff9e38c764b810",

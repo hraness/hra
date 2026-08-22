@@ -159,6 +159,33 @@ async function main(): Promise<void> {
       );
     }
 
+    const bunPath = join(appPath, "Contents/Resources/runtime/bin/bun");
+    await withRestoredFile(temporaryRoot, bunPath, "bun-bytes", async () => {
+      await mutateLastByte(bunPath);
+      await expectAppRejection(
+        appPath,
+        "preserved Bun bytes",
+        "Runtime hash differs: bin/bun",
+      );
+    });
+
+    await withRestoredFile(temporaryRoot, bunPath, "bun-signature", async () => {
+      await runCodesign([
+        "/usr/bin/codesign",
+        "--force",
+        "--sign",
+        "-",
+        "--identifier",
+        "bun",
+        bunPath,
+      ]);
+      await expectAppRejection(
+        appPath,
+        "Bun signature replaced with ad-hoc identity",
+        "Runtime hash differs: bin/bun",
+      );
+    });
+
     const manifestPath = join(appPath, "Contents/Resources/runtime/manifest.json");
     await withRestoredFile(temporaryRoot, manifestPath, "manifest", async () => {
       const manifest = runtimeManifest(JSON.parse(await readFile(manifestPath, "utf8")));
@@ -174,6 +201,74 @@ async function main(): Promise<void> {
         appPath,
         "normalized manifest path",
         "normalized Codex signatures differ from policy",
+      );
+    });
+
+    await withRestoredFile(temporaryRoot, manifestPath, "manifest-bun-source", async () => {
+      const manifest = runtimeManifest(JSON.parse(await readFile(manifestPath, "utf8")));
+      const runtime = runtimeManifest(manifest["runtime"]);
+      const bun = runtimeManifest(runtime["bun"]);
+      bun["sourceBinarySha256"] = "0".repeat(64);
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await expectAppRejection(
+        appPath,
+        "Bun source hash manifest drift",
+        "Runtime version pins differ from the manifest",
+      );
+    });
+
+    await withRestoredFile(temporaryRoot, manifestPath, "manifest-bun-path", async () => {
+      const manifest = runtimeManifest(JSON.parse(await readFile(manifestPath, "utf8")));
+      const runtime = runtimeManifest(manifest["runtime"]);
+      const preserved = runtime["preservedSignatures"];
+      if (!Array.isArray(preserved)) {
+        throw new Error("Runtime manifest has no preserved signature tamper target.");
+      }
+      const bun = preserved
+        .map((value: unknown) => runtimeManifest(value))
+        .find((value) => value["path"] === "Contents/Resources/runtime/bin/bun");
+      if (bun === undefined) {
+        throw new Error("Runtime manifest has no preserved Bun tamper target.");
+      }
+      runtimeManifest(bun)["path"] =
+        "Contents/Resources/runtime/bin/hra-image-normalizer";
+      preserved.sort((left, right) =>
+        String(runtimeManifest(left)["path"]).localeCompare(
+          String(runtimeManifest(right)["path"]),
+        )
+      );
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await expectAppRejection(
+        appPath,
+        "Bun team moved to another path",
+        "Untrusted preserved signature team: 7FRXF46ZSN",
+      );
+    });
+
+    await withRestoredFile(temporaryRoot, manifestPath, "manifest-bun-duplicate", async () => {
+      const manifest = runtimeManifest(JSON.parse(await readFile(manifestPath, "utf8")));
+      const runtime = runtimeManifest(manifest["runtime"]);
+      const preserved = runtime["preservedSignatures"];
+      if (!Array.isArray(preserved)) {
+        throw new Error("Runtime manifest has no preserved signature tamper target.");
+      }
+      const bun = preserved
+        .map((value: unknown) => runtimeManifest(value))
+        .find((value) => value["path"] === "Contents/Resources/runtime/bin/bun");
+      if (bun === undefined) {
+        throw new Error("Runtime manifest has no preserved Bun tamper target.");
+      }
+      preserved.push({ ...runtimeManifest(bun) });
+      preserved.sort((left, right) =>
+        String(runtimeManifest(left)["path"]).localeCompare(
+          String(runtimeManifest(right)["path"]),
+        )
+      );
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      await expectAppRejection(
+        appPath,
+        "duplicate preserved Bun path",
+        "Preserved signature paths are not uniquely sorted",
       );
     });
 

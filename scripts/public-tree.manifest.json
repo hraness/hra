@@ -1571,6 +1571,7 @@
     "apps/desktop/runtime/test/application-support-worktree-repair.test.ts",
     "apps/desktop/runtime/test/archive-admission-gate.test.ts",
     "apps/desktop/runtime/test/bun-native-licenses.test.ts",
+    "apps/desktop/runtime/test/bun-preserved-signature.macos.test.ts",
     "apps/desktop/runtime/test/bundled-bun-workspace-setup.test.ts",
     "apps/desktop/runtime/test/chat-attachment-vault-migration.test.ts",
     "apps/desktop/runtime/test/chat-attachment-vault.property.test.ts",

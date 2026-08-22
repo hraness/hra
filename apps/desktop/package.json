@@ -83,7 +83,7 @@
     "baseline:reactive": "bun run runtime/reactive-baseline.ts",
     "test:property": "bun test ./frontend/src/features/chat/model.property.test.ts ./frontend/src/runtime/*.property.test.ts ./frontend/direct/*.property.test.ts ./contracts/*.property.test.ts ./runtime/test/*.property.test.ts",
     "test:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-tests -- bun run test:macos:uncoordinated",
-    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts"
+    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts ./runtime/test/bun-preserved-signature.macos.test.ts"
   },
   "dependencies": {
     "@hraness/agent-tasks-protocol": "workspace:*",
