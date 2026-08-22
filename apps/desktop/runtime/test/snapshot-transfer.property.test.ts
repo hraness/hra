@@ -20,41 +20,51 @@ test("paged snapshots round-trip arbitrary multibyte content within every host e
         maxLength: 16,
       }),
       (pieces) => {
-        const response = snapshotResponse(pieces.join(""));
-        const store = new SnapshotTransferStore({
-          chunkByteLimit: 7,
-          createTransferId: () => "snapshot_12345678",
-          directByteCeiling: 64,
-        });
-        const first = store.start(response);
-        if (!("base64" in first)) throw new Error("property did not produce a paged snapshot");
-
-        const chunks: RuntimeSnapshotChunkResponse[] = [first];
-        for (let index = 1; index < first.count; index += 1) {
-          chunks.push(store.continue({
-            version: runtimeProtocolVersion,
-            transferId: first.transferId,
-            index,
-          }));
-        }
-
-        expect(chunks.map(({ index }) => index)).toEqual(
-          Array.from({ length: first.count }, (_, index) => index),
-        );
-        for (const chunk of chunks) {
-          const hostLine = JSON.stringify({ id: "x".repeat(64), ok: true, result: chunk });
-          expect(Buffer.byteLength(hostLine)).toBeLessThan(nativeBridgeResponseByteLimit);
-        }
-
-        const bytes = Buffer.concat(chunks.map(({ base64 }) => Buffer.from(base64, "base64")));
-        expect(parseRuntimeSnapshotResponse(JSON.parse(bytes.toString("utf8")) as unknown)).toEqual(
-          response,
-        );
+        expectPagedSnapshotRoundTrip(pieces.join(""));
       },
     ),
     { numRuns: 30 },
   );
 });
+
+test("escaped control content stays within the bounded page count", () => {
+  for (const text of [
+    "\u0000\u0000\u0000\u0000\u0000a\u0000\u0000\"",
+    "\u0000".repeat(16),
+  ]) {
+    expectPagedSnapshotRoundTrip(text);
+  }
+});
+
+function expectPagedSnapshotRoundTrip(text: string): void {
+  const response = snapshotResponse(text);
+  const store = new SnapshotTransferStore({
+    chunkByteLimit: 8,
+    createTransferId: () => "snapshot_12345678",
+    directByteCeiling: 64,
+  });
+  const first = store.start(response);
+  if (!("base64" in first)) throw new Error("test did not produce a paged snapshot");
+  const chunks: RuntimeSnapshotChunkResponse[] = [first];
+  for (let index = 1; index < first.count; index += 1) {
+    chunks.push(store.continue({
+      version: runtimeProtocolVersion,
+      transferId: first.transferId,
+      index,
+    }));
+  }
+  expect(chunks.map(({ index }) => index)).toEqual(
+    Array.from({ length: first.count }, (_, index) => index),
+  );
+  for (const chunk of chunks) {
+    const hostLine = JSON.stringify({ id: "x".repeat(64), ok: true, result: chunk });
+    expect(Buffer.byteLength(hostLine)).toBeLessThan(nativeBridgeResponseByteLimit);
+  }
+  const bytes = Buffer.concat(chunks.map(({ base64 }) => Buffer.from(base64, "base64")));
+  expect(parseRuntimeSnapshotResponse(JSON.parse(bytes.toString("utf8")) as unknown)).toEqual(
+    response,
+  );
+}
 
 function snapshotResponse(text: string): RuntimeSnapshotResponse {
   return {

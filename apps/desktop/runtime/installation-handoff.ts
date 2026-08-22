@@ -71,10 +71,10 @@ const expectedPredecessor = Object.freeze({
   version: "0.1.4",
 });
 const expectedCandidate = Object.freeze({
-  build: "12",
+  build: "13",
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
-  version: "0.1.11",
+  version: "0.1.12",
 });
 const expectedPriorHraV017 = Object.freeze({
   build: "8",
