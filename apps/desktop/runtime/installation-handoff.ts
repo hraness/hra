@@ -77,10 +77,10 @@ const committedCleanupConfirmation = "CLEAN-COMMITTED-HRA-HANDOFF-STAGING";
 const rollbackConfirmation = "ROLL-BACK-HRA-TO-OPRTE";
 const expectedPredecessor = expectedHistoricalOprtePreviewIdentity;
 const expectedCandidate = Object.freeze({
-  build: "14",
+  build: "15",
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
-  version: "0.1.13",
+  version: "0.1.14",
 });
 const expectedPriorHraV017 = Object.freeze({
   build: "8",
@@ -111,6 +111,12 @@ const expectedPriorHraV0112 = Object.freeze({
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
   version: "0.1.12",
+});
+const expectedPriorHraV0113 = Object.freeze({
+  build: "14",
+  bundleIdentifier: "kitchen.hraness",
+  executable: "hra",
+  version: "0.1.13",
 });
 const maximumTreeEntries = 2_000_000;
 const maximumTreeBytes = 128 * 1024 * 1024 * 1024;
@@ -480,9 +486,9 @@ export async function performInstallationHandoff(
     journal = await advance(backupDirectory, journal, "bundles_archived");
     input.onCheckpoint?.("after_bundle_archives");
 
-    const candidateStage = join(
+    const candidateStage = candidateStagePath(
       paths.applicationsDirectory,
-      `.${operationId}.candidate.bundle`,
+      operationId,
     );
     await requireMissing(candidateStage, "Candidate staging path already exists.");
     await dependencies.copyTree(paths.candidateApp, candidateStage);
@@ -677,9 +683,9 @@ async function cleanupCommittedInstallationStages(
   );
   onCheckpoint?.("after_committed_predecessor_cleanup");
 
-  const candidateStage = join(
+  const candidateStage = candidateStagePath(
     paths.applicationsDirectory,
-    `.${journal.operationId}.candidate.bundle`,
+    journal.operationId,
   );
   if (journal.priorHra !== undefined) {
     await removeVerifiedStage(
@@ -793,9 +799,9 @@ async function rollbackFromJournal(
     paths.applicationsDirectory,
     `.${journal.operationId}.predecessor.bundle`,
   );
-  const candidateStage = join(
+  const candidateStage = candidateStagePath(
     paths.applicationsDirectory,
-    `.${journal.operationId}.candidate.bundle`,
+    journal.operationId,
   );
   const retainedCandidateStage = join(
     paths.applicationsDirectory,
@@ -1588,6 +1594,7 @@ function assertSupportedPriorHraIdentity(actual: BundleIdentity): void {
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV019)
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV0110)
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV0112)
+    && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV0113)
   ) {
     throw new InstallationHandoffError(
       "candidate_invalid",
@@ -2098,6 +2105,7 @@ const priorHraEvidenceSchema = z.union([
   bundleEvidenceSchema(expectedPriorHraV019, strictSignatureEvidenceSchema),
   bundleEvidenceSchema(expectedPriorHraV0110, strictSignatureEvidenceSchema),
   bundleEvidenceSchema(expectedPriorHraV0112, strictSignatureEvidenceSchema),
+  bundleEvidenceSchema(expectedPriorHraV0113, strictSignatureEvidenceSchema),
 ]);
 const historicalPredecessorEvidenceSchema = z.object({
   identity: identitySchema(expectedPredecessor),
@@ -2334,6 +2342,20 @@ function createOperationId(bytes: Uint8Array): string {
     throw new InstallationHandoffError("invalid_arguments", "Operation entropy is invalid.");
   }
   return `handoff_${Buffer.from(bytes).toString("hex")}`;
+}
+
+export function candidateStagePath(
+  applicationsDirectory: string,
+  operationId: string,
+): string {
+  const directory = requireAbsoluteNormalized(
+    applicationsDirectory,
+    "Applications directory",
+  );
+  if (!operationIdPattern.test(operationId)) {
+    throw new Error("Candidate stage operation ID is invalid.");
+  }
+  return join(directory, `.${operationId}.candidate.app`);
 }
 
 function countMatching(values: readonly string[], pattern: RegExp): number {

@@ -143,15 +143,19 @@ keys, taskctl peppers or fixture settings, WorkOS webhook secret and owner
 role, and local WorkOS provider overrides. Configure those values only on the
 exact Convex deployment.
 
-Leave `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST` unset while the release
-contract is `candidate`. After the Required CI job succeeds on the exact
-publication commit P, set this non-secret trusted manual allowlist to P for
-Vercel Production and Preview, then redeploy that exact P. The provider wrapper
-proves only that Vercel's canonical `hraness/hra` Git SHA equals the allowlist;
-the operator's Required-CI readback is what authorizes setting it. A mismatch,
-missing value, non-Git build, wrong repository, or Production branch other
-than `main` makes a published build refuse. The wrapper removes the allowlist
-before launching the final Next build.
+For the one-time initial cutover, leave
+`HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST` unset while the release contract is
+`candidate`. For a subsequent release, preserve the exact currently published
+commit in that record while the new candidate is built. A candidate provider
+build may proceed with that unchanged record, and the wrapper removes it before
+launching the final Next build. When the contract changes to `published`, an
+automatic build for the new publication commit refuses on the old allowlist.
+After the Required CI job succeeds on exact P, replace this non-secret trusted
+manual allowlist with P for Vercel Production and Preview, then redeploy exact
+P. The provider wrapper proves only that Vercel's canonical `hraness/hra` Git
+SHA equals the allowlist; the operator's Required-CI readback is what authorizes
+changing it. A mismatch, missing value, non-Git build, wrong repository, or
+Production branch other than `main` makes a published build refuse.
 
 Transfer no custom-staging record. Preview refuses the deploy key, deployment
 token, Convex selector, canonical production site claim, Suite cookie or key
@@ -159,66 +163,64 @@ selector, WorkOS credentials, and every other checked production capability,
 including an empty provider record. Its two public Convex URLs grant no
 backend publication authority.
 
-Use this order for the shared backend:
+The create-only deploy-key and shared-authority procedures above are initialization
+and recovery guidance. They are not v0.1.14 publication steps while the verified
+v0.1.13 authorities remain live. Do not create or rotate the HRA deploy key,
+cookie or identity-link secret, Accounts entry, HRA keyring, or receipt-key
+selector for this recovery release.
 
-1. Freeze the exact predecessor OPRTE Vercel project before retaining its
-   deploy key for rollback. Disconnect its Git integration and disable every
-   automatic deployment or retry path without deleting its last READY
-   Production deployment. Read back and record that the project has no Git
-   connection, no queued or running deployment, and one unchanged READY
-   Production rollback anchor. A retained key without this publication freeze
-   is not a safe rollback boundary because old source could republish to the
-   shared Convex deployment.
-2. Generate the fresh HRA deploy key with the checked helper above, generate
-   the independent cookie secret, then install the scoped HRA Vercel values.
-   Leave Preview without every production-only record and transfer zero
-   predecessor secret values.
-3. After Required CI succeeds, run a Vercel Production deployment from the
-   exact reviewed candidate commit C on canonical `hraness/hra` `main`, and
-   read back that Vercel's system commit SHA is C. Convex 1.44 runs the checked
-   nested Next artifact build first, then pushes the HRA parser and functions
-   to `benevolent-akita-439`. Vercel promotes the new app only after that
-   complete build command succeeds, so the parser lands before the app becomes
-   production-visible. Do not change source between this deployment and C's
-   package and tag gates.
-4. Generate one fresh independent secret in a mode-0600 file as canonical
-   unpadded base64url for at least 32 random bytes. Derive the HRA keyring from
-   that file only. Do not use the unrelated key already held by Accounts.
-5. Append the candidate HRA entry to Accounts without deleting or copying its
-   unrelated entry, then prove the Accounts readback against the candidate.
-   Next set HRA Convex `SUITE_IDENTITY_LINK_KEYS` to an HRA-only keyring
-   containing `hra:production:v1` and prove its readback. Set HRA Convex
-   `SUITE_IDENTITY_RECEIPT_KEY_VERSION=v1` last, then rerun the exact HRA audit.
-   This verifier-first order avoids a window where HRA can mint a proof that
-   Accounts cannot verify. Remove the candidate file only after both
-   candidate-match gates pass inside the same bounded custody window.
-6. Redeploy and read back the HRA production routes. A missing or invalid
-   predecessor OPRTE/Kitchen receipt is expected and is not a health gate.
-7. From the same candidate commit C recorded in step 3, complete its full
-   package, then follow the desktop release runbook to create and push the
-   direct annotated `v0.1.13` tag and
+Use this order for the v0.1.14 recovery publication:
+
+1. Read back that the predecessor Vercel project remains publication-frozen,
+   has no deployment in flight, and retains its unchanged READY rollback
+   anchor. Preserve its bounded rollback key without rotating or recreating it.
+2. Read back the existing HRA Vercel project and Git link, exact build commands,
+   environment-name inventory, and environment scoping. Preserve every existing
+   deploy, cookie, Suite identity, WorkOS, and Convex selector authority without
+   exposing or rewriting its value. Preview must remain free of production-only
+   authority.
+3. Read back the existing Accounts HRA entry, HRA-only identity-link keyring,
+   and receipt-key selector with the checked audits. Treat any drift as a stop;
+   do not repair it by generating or appending a replacement during release.
+4. From the exact candidate commit C, complete the full package, then follow
+   the desktop release runbook to create and push the
+   direct annotated `v0.1.14` tag and
    publish the exact seven-asset immutable GitHub prerelease. Fill the
    working-tree publication contract from C's emitted evidence and require
    `bun run verify:remote-release` to read back exact remote names, byte counts,
    SHA-256 digests, checksum, manifest, DMG binding, and corresponding-source
    binding before committing P. Create P as the exact contract-only child,
    push it, and require the green Required CI source-and-remote readback for
-   that exact P. Only then set
-   `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST=P` in Production and Preview, and
-   redeploy exact P before enabling or exercising the installation handoff.
-   The existing annotated `v0.1.11` tag object
-   `e4c171e33e414d74a36791fc8577cbfbcef8e52e` points directly to
-   `5a2a9842cacc75fee42ab8e23ca8c215a643e21e`, but has no GitHub release or
-   assets. Treat it as retired tag-only evidence, never as publication or
-   installation authority.
-   The immutable v0.1.12 build 13 prerelease remains the current published
-   predecessor and valid prior installed-app authority while v0.1.13 is a
-   candidate. Its direct annotated tag object
-   `626be494d24733d12e53d09932cb5cc6218bc2fe` points to
-   `9ab991d08d1507fd73c9e7ef5fb4a37baee9c014`; do not retire, replace, or
-   relabel that release.
-8. Retain the predecessor deploy key only for the bounded rollback window.
-   Revoke it after HRA authority and rollback disposition are complete.
+   that exact P. Preserve the v0.1.13 publication allowlist throughout C. A Git
+   build of candidate C may proceed against the unchanged backend authority;
+   it must not create or rotate provider authority. The automatic build of
+   published P must then refuse against the retained v0.1.13 allowlist.
+5. Only after Required succeeds for exact P, replace
+   `HRA_RELEASE_PUBLICATION_COMMIT_ALLOWLIST` with P in Production and Preview.
+   This allowlist update is the only environment write for v0.1.14. Redeploy
+   exact P, then read back its canonical Git SHA, complete build commands,
+   unchanged environment inventory and scoping, READY state, production routes,
+   release delivery, discovery, and OIDC endpoints before enabling or exercising
+   the installation handoff.
+6. Preserve all predecessor and HRA backend authorities through installed-app
+   acceptance and the bounded rollback window. Their later disposition is a
+   separate handoff decision, not part of v0.1.14 publication.
+
+The existing annotated `v0.1.11` tag object
+`e4c171e33e414d74a36791fc8577cbfbcef8e52e` points directly to
+`5a2a9842cacc75fee42ab8e23ca8c215a643e21e`, but has no GitHub release or
+assets. Treat it as retired tag-only evidence, never as publication or
+installation authority.
+
+The immutable v0.1.13 build 14 prerelease remains the current published
+predecessor and valid prior installed-app authority while v0.1.14 is a
+candidate. Its direct annotated tag object
+`44f00fd5c5e00bc8dcded0c9b176a8e37ada90f3` points to
+`9ba06a441c9b12b448cfe34784432592dbeccb19`, and publication commit
+`7825cb231890aa971f965412c31dfa2cb7796561` records the release evidence. Its
+source handoff operator fails before installation because its hidden candidate
+stage does not retain the required `.app` suffix. Do not retire, replace,
+relabel, or use that source operator for cutover.
 
 ### Convex project identity retirement
 

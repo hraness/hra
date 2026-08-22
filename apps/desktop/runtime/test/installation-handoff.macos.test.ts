@@ -13,10 +13,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import {
+  candidateStagePath,
   inspectOpenFileQuiescence,
   type InstallationHandoffPaths,
 } from "../installation-handoff";
+import { macosPackage } from "../macos-package-config";
 import { acquireControlPlaneLifetimeLock } from "../src/state/control-plane-lock";
+import { verifyMacOSApp } from "../verify-macos-package";
 
 type ExternalHolder = Bun.Subprocess<"ignore", "pipe", "pipe">;
 
@@ -65,6 +68,33 @@ afterAll(async () => {
 });
 
 describe("installation handoff macOS open-file authority", () => {
+  test("keeps the real package verifier strict while admitting the hidden app staging path", async () => {
+    const operationId = `handoff_${"a".repeat(24)}`;
+    const stagedApp = candidateStagePath(paths.applicationsDirectory, operationId);
+    const invalidStage = stagedApp.replace(/\.app$/u, ".bundle");
+    await mkdir(invalidStage, { mode: 0o700 });
+    expect(verifyMacOSApp(invalidStage)).rejects.toThrow(
+      "Packaged app path must end in .app.",
+    );
+
+    const contents = join(stagedApp, "Contents");
+    await mkdir(contents, { mode: 0o700, recursive: true });
+    await writeFile(join(contents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleDisplayName</key><string>${macosPackage.displayName}</string>
+<key>CFBundleExecutable</key><string>${macosPackage.executableName}</string>
+<key>CFBundleIdentifier</key><string>${macosPackage.bundleIdentifier}</string>
+<key>CFBundleName</key><string>${macosPackage.productName}</string>
+<key>CFBundleShortVersionString</key><string>${macosPackage.version}</string>
+<key>CFBundleVersion</key><string>${String(macosPackage.build)}</string>
+<key>LSMinimumSystemVersion</key><string>${macosPackage.minimumMacOS}</string>
+</dict></plist>
+`, { mode: 0o600 });
+
+    expect(verifyMacOSApp(stagedApp)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   test("exempts only its bound main database descriptor", async () => {
     const lock = acquireControlPlaneLifetimeLock(paths.controlPlanePath);
     try {

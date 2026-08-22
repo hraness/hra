@@ -88,15 +88,15 @@ describe("macOS ad-hoc package contract", () => {
     expect(macosPackage).toMatchObject({
       appBundleName: "HRA",
       architecture: "arm64",
-      artifactBaseName: "HRA-0.1.13-14-macos-arm64",
-      build: 14,
+      artifactBaseName: "HRA-0.1.14-15-macos-arm64",
+      build: 15,
       bundleIdentifier: "kitchen.hraness",
       executableName: "hra",
       minimumMacOS: "13.0",
-      version: "0.1.13",
+      version: "0.1.14",
     });
     expect(macosPackage.appBundlePath).toEndWith(
-      "/zig-out/package/HRA-0.1.13-14-macos-arm64.app",
+      "/zig-out/package/HRA-0.1.14-15-macos-arm64.app",
     );
   });
 

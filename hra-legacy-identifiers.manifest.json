@@ -2,11 +2,11 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "0bc6a45696063958690d23eec6ffefcacb6a3960eca7027c3a0403c3c6810b2f",
+      "matchingLinesSha256": "dbb6ca57d23291846906756f03ae499bc9c7d0a1a739d88d026624b71838801c",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
-        "oprte": 10
+        "oprte": 12
       },
       "path": "apps/desktop/README.md"
     },
@@ -152,9 +152,9 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "2026faf7a83a22b28ace608b0a04b3e0a92e2ac9c115b673a9358da0c35a128e",
+      "matchingLinesSha256": "77b46a10ae167296381d6d8b5449827a5f57efc2de6e7030fb39af6b8cf494db",
       "occurrences": {
-        "kitchen": 12,
+        "kitchen": 13,
         "operateStylized": 0,
         "oprte": 61
       },
@@ -1462,7 +1462,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "84845871e4ecf2361bfe09d9ae28a94028548f7cf8b706b815a57bfca3982d83",
+      "matchingLinesSha256": "0571fbea23b32c46dff47f59ae014d1ae37ef4a2ced5f541dfef0a828e3e43dd",
       "occurrences": {
         "kitchen": 6,
         "operateStylized": 0,
@@ -1472,7 +1472,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9222121a861c0c6ed859856856d8e6df87f56342b278201a10c8ce3d906be350",
+      "matchingLinesSha256": "1d1e801c5a225f8f9806f9b6f5f937d26d88e0a69874c95f9004e81597c88fa8",
       "occurrences": {
         "kitchen": 0,
         "operateStylized": 0,
@@ -1492,11 +1492,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "516f9f62797fc4370c1800b59fca854d307ff1e1916ec42dec6b1bbfa47bfad7",
+      "matchingLinesSha256": "dc3ac70c91e1211c306d64a6e397d6d4a8c6c7429562d3cc3b9ca801da8637b1",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
-        "oprte": 45
+        "oprte": 46
       },
       "path": "apps/desktop/runtime/test/installation-handoff.test.ts"
     },
@@ -1932,11 +1932,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "e6157d64088147b53e4c2258c20c11f0faa74e4a11eed6f28fbd0348a45e5df3",
+      "matchingLinesSha256": "df639c666e11f0546c5581d47d804fa5eaecc1b9afd15c65f10512acb0aeeb40",
       "occurrences": {
-        "kitchen": 3,
+        "kitchen": 2,
         "operateStylized": 0,
-        "oprte": 18
+        "oprte": 16
       },
       "path": "apps/web/README.md"
     },

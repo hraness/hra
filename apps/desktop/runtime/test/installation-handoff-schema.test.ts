@@ -25,8 +25,8 @@ const tree = {
 
 function receipt(
   priorHraIdentity?: Readonly<{
-    build: "8" | "9" | "10" | "11" | "13";
-    version: "0.1.7" | "0.1.8" | "0.1.9" | "0.1.10" | "0.1.12";
+    build: "8" | "9" | "10" | "11" | "13" | "14";
+    version: "0.1.7" | "0.1.8" | "0.1.9" | "0.1.10" | "0.1.12" | "0.1.13";
   }>,
 ): Record<string, unknown> {
   return {
@@ -63,10 +63,10 @@ function receipt(
     },
     candidate: {
       identity: {
-        build: "14",
+        build: "15",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.13",
+        version: "0.1.14",
       },
       signature: { policy: "strict" },
       tree,
@@ -88,7 +88,7 @@ function receipt(
 }
 
 describe("installation handoff receipt schema", () => {
-  test("accepts only the exact v0.1.13 build-14 evidence shape", () => {
+  test("accepts only the exact v0.1.14 build-15 evidence shape", () => {
     expect(parseInstallationHandoffJournal(receipt())).toMatchObject({
       phase: "committed",
       candidateCommit: "b".repeat(40),
@@ -173,13 +173,14 @@ describe("installation handoff receipt schema", () => {
     }
   });
 
-  test("retains exact published prior-HRA rollback evidence through v0.1.12", () => {
+  test("retains exact published prior-HRA rollback evidence through v0.1.13", () => {
     for (const priorHraIdentity of [
       { build: "8", version: "0.1.7" },
       { build: "9", version: "0.1.8" },
       { build: "10", version: "0.1.9" },
       { build: "11", version: "0.1.10" },
       { build: "13", version: "0.1.12" },
+      { build: "14", version: "0.1.13" },
     ] as const) {
       expect(parseInstallationHandoffJournal(receipt(priorHraIdentity)))
         .toMatchObject({
@@ -189,10 +190,10 @@ describe("installation handoff receipt schema", () => {
     }
   });
 
-  test("rejects tagged-only v0.1.11 and current v0.1.13 as prior-HRA rollback evidence", () => {
+  test("rejects tagged-only v0.1.11 and current v0.1.14 as prior-HRA rollback evidence", () => {
     for (const identity of [
       { build: "12", version: "0.1.11" },
-      { build: "14", version: "0.1.13" },
+      { build: "15", version: "0.1.14" },
     ] as const) {
       const mutation = receipt();
       mutation["hadPriorHra"] = true;
