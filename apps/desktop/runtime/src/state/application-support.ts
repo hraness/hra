@@ -24,6 +24,10 @@ import {
 import { basename, dirname, isAbsolute, join, parse, relative, sep } from "node:path";
 import { z } from "@hra-internal/schema";
 import {
+  localObservationDirectoryName,
+  localObservationSocketFileName,
+} from "@hraness/hra-local-observation-protocol/wire";
+import {
   assertBoundedControlPlaneIntegrity,
   ControlPlaneIntegrityError,
 } from "./control-plane-integrity";
@@ -267,7 +271,9 @@ export class ApplicationSupportStartup
 
   prepareTargetRoot(): void {
     ensureDirectDirectory(this.#paths.target, legacyOprteApplicationSupportDirectoryName);
-    validateOwnedTree(this.#paths.target);
+    validateOwnedTree(this.#paths.target, {
+      allowCurrentLocalObservationSocket: true,
+    });
     verifyControlPlaneCutover(this.#paths.target, this.#options);
   }
 
@@ -294,7 +300,9 @@ export class ApplicationSupportStartup
 
   activate(): void {
     assertOwnedDirectory(this.#paths.target, "target");
-    validateOwnedTree(this.#paths.target);
+    validateOwnedTree(this.#paths.target, {
+      allowCurrentLocalObservationSocket: true,
+    });
     const existingReceipt = readMigrationReceipt(this.#paths.receipt);
     if (existingReceipt?.phase === "activated") {
       this.#activated = true;
@@ -436,7 +444,9 @@ class IsolatedDevelopmentApplicationSupportStartup
       this.root,
       isolatedDevelopmentApplicationSupportDirectoryName,
     );
-    validateOwnedTree(this.root);
+    validateOwnedTree(this.root, {
+      allowCurrentLocalObservationSocket: true,
+    });
     verifyControlPlaneCutover(this.root, {});
   }
 
@@ -446,7 +456,9 @@ class IsolatedDevelopmentApplicationSupportStartup
 
   activate(): void {
     assertOwnedDirectory(this.root, "development target");
-    validateOwnedTree(this.root);
+    validateOwnedTree(this.root, {
+      allowCurrentLocalObservationSocket: true,
+    });
     this.#activated = true;
   }
 
@@ -1239,6 +1251,7 @@ function assertSameVolume(parent: string, source: string): void {
 
 function validateStateTree(paths: ApplicationSupportPaths): boolean {
   let interruptedRestore = false;
+  const targetMetadata = readMetadata(paths.target);
   for (const path of [
     paths.target,
     paths.stage,
@@ -1246,13 +1259,24 @@ function validateStateTree(paths: ApplicationSupportPaths): boolean {
   ]) {
     const metadata = readMetadata(path);
     if (metadata?.isDirectory()) {
-      interruptedRestore = validateOwnedTree(path) || interruptedRestore;
+      interruptedRestore = validateOwnedTree(path, {
+        allowCurrentLocalObservationSocket:
+          targetMetadata?.isDirectory() === true
+          && sameFileIdentity(metadata, targetMetadata),
+      }) || interruptedRestore;
     }
   }
   return interruptedRestore;
 }
 
-function validateOwnedTree(root: string): boolean {
+interface OwnedTreeValidationOptions {
+  readonly allowCurrentLocalObservationSocket?: boolean;
+}
+
+function validateOwnedTree(
+  root: string,
+  options: OwnedTreeValidationOptions = {},
+): boolean {
   const rootMetadata = lstatSync(root);
   if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
     throw unsafeRoot(root, "state-tree root is not a directory");
@@ -1282,10 +1306,38 @@ function validateOwnedTree(root: string): boolean {
           );
         }
         if (metadata.isDirectory()) {
+          if (
+            options.allowCurrentLocalObservationSocket === true
+            && path === join(root, localObservationDirectoryName)
+            && (
+              metadata.uid !== process.geteuid?.()
+              || (metadata.mode & 0o777) !== 0o700
+            )
+          ) {
+            throw unsafeRoot(
+              path,
+              "local-observation directory ownership or mode is unsafe",
+            );
+          }
           if (!isOpaqueStateDirectory(root, path)) pending.push(path);
           continue;
         }
         if (!metadata.isFile()) {
+          if (
+            options.allowCurrentLocalObservationSocket === true
+            && path === join(
+              root,
+              localObservationDirectoryName,
+              localObservationSocketFileName,
+            )
+            && metadata.isSocket()
+            && metadata.dev === rootMetadata.dev
+            && metadata.uid === process.geteuid?.()
+            && metadata.nlink === 1
+            && (metadata.mode & 0o777) === 0o600
+          ) {
+            continue;
+          }
           throw unsafeRoot(path, "nested FIFO, socket, or device");
         }
       }

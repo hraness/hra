@@ -1249,6 +1249,12 @@ async function installFakeGit(root: string): Promise<Readonly<{
     "  status:--porcelain=v1)",
     "    [ ! -f .fixture-dirty ] || printf ' M .fixture-dirty\\n'",
     "    ;;",
+    "  ls-tree:-z)",
+    `    [ "$3" = "${fixtureCommit}" ] &&`,
+    `      [ "$4" = "--" ] &&`,
+    `      [ "$5" = ".hra/workspace.json" ] || exit 1`,
+    "    exit 0",
+    "    ;;",
     "  *) printf 'unsupported fixture git command\\n' >&2; exit 1 ;;",
     "esac",
     "",
@@ -3833,6 +3839,11 @@ describe("compiled gateway boundary", () => {
         second.exited,
       ]);
       expect(secondError.length).toBeGreaterThan(0);
+      expect([
+        'code: "legacy_state_in_use"',
+        'code: "already_running"',
+      ].some((code) => secondError.includes(code))).toBeTrue();
+      expect(secondError).not.toContain("Unsafe Application Support root");
       expect(secondExitCode).not.toBe(0);
       expect(hasRuntimeState(secondLines, "ready")).toBeFalse();
       expect(hasRuntimeState(secondLines, "failed")).toBeFalse();
