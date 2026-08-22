@@ -8,6 +8,8 @@
 - `global-error.tsx`, `error.tsx`, `loading.tsx`, and `not-found.tsx` – shared, themed route-state boundaries, including the root-layout replacement. `loading.tsx` stays heading-free so streamed public HTML cannot grow a second H1. `not-found.tsx` owns a distinct noindex title and must not inherit the homepage canonical.
 - `standalone-theme-header.tsx` – the single final header appearance action shared by configuration, loading, missing-route, signed-out, and recoverable standalone states.
 - `page.tsx` – canonical public landing page. It owns the homepage title, description, canonical `/`, indexable robots, matching social titles, product capabilities, boundaries, public-source entry points, and an honest analytics disclosure.
+- `accept-negotiation.ts` and `public-markdown.ts` – acceptmarkdown.com HTML/Markdown ranking, `llms.txt` body, and public-page Markdown representations used by the proxy.
+- `llms.txt/route.ts` – the root agent-instruction file with when-to-use guidance and links to the existing public pages.
 - `alternatives/` – public, dated, first-party-sourced comparisons that explain HRA's fit without inventing competitor limitations.
 - `app/page.tsx` – authenticated WorkOS/Convex control-plane entry and exact local missing-configuration states.
 - `download/` – public macOS prerelease status and source-build guidance.
@@ -32,6 +34,7 @@
 - Keep `/alternatives` and its exact static child routes public. Date each review, cite current first-party sources, distinguish “not documented” from “absent,” and write product-specific analysis rather than name-swapped SEO pages.
 - Limit analytics to one personless, cookieless `$pageview` on `/`, `/download`, `/alternatives`, and the exact comparison routes accepted by `isHraPublicComparisonPath`. Require exact Production `https://hra.sh`, use only the slim no-external SDK entry, redact query, fragment, referrer, identity, account, task, command, and provider context, and keep every other event and route inert.
 - Build public and private discovery output with `@hraness/web-discovery`, while keeping HRA-owned origins, titles, descriptions, routes, dates, JSON-LD facts, and crawler choices in `site.ts` and the route that presents them. Keep homepage identity off the root layout. Keep HTML titles aligned with Open Graph titles.
+- Serve `Accept: text/markdown` on the existing public HTML documents from the proxy, with `Content-Type: text/markdown; charset=utf-8` and `Vary: Accept`. Return `406` only when a public document rejects every produced type. Keep `/llms.txt` as a dedicated Markdown file. Unknown public paths that prefer Markdown receive a real `404` whose body points at `/`, `/download`, `/alternatives`, `/llms.txt`, and `/sitemap.xml`. Do not invent API, OAuth, GraphQL, MCP, or commerce surfaces to satisfy agent scoring.
 - Consume task presentation and state from `@hraness/agent-tasks-ui`; keep every Convex, WorkOS, and generated-API import in hosted adapters.
 - Use `@hra-internal/codex-app-sdk` for provider-neutral client and mutation-journal contracts. Keep Convex authority, tenant scoping, HMAC derivation, and browser lifecycle composition in this app.
 - Keep React on one immutable task-client snapshot. Effect setup owns fresh hosted sources and clients; scoped feed patches preserve continuations only after an exact-head proof.
