@@ -170,20 +170,24 @@ describe("OPRTE to HRA installation handoff", () => {
     }
   }, 60_000);
 
-  test("rejects the v0.1.11 candidate as an unreceipted prior HRA authority", async () => {
-    const fixture = await createFixture({ priorHra: false });
-    await createBundle(fixture.paths.canonicalApp, {
-      build: "12",
-      executable: "hra",
-      marker: "unreceipted-candidate",
-      version: "0.1.11",
-    });
-    expect(performInstallationHandoff({
-      backupDirectory: fixture.backupDirectory,
-      candidateApp: fixture.paths.candidateApp,
-      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
-      paths: fixture.paths,
-    }, fixture.dependencies)).rejects.toMatchObject({ code: "candidate_invalid" });
+  test("rejects tagged-only v0.1.11 and current v0.1.12 as unreceipted prior HRA authority", async () => {
+    for (const identity of [
+      { build: "12", version: "0.1.11" },
+      { build: "13", version: "0.1.12" },
+    ] as const) {
+      const fixture = await createFixture({ priorHra: false });
+      await createBundle(fixture.paths.canonicalApp, {
+        ...identity,
+        executable: "hra",
+        marker: "unreceipted-candidate",
+      });
+      expect(performInstallationHandoff({
+        backupDirectory: fixture.backupDirectory,
+        candidateApp: fixture.paths.candidateApp,
+        confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+        paths: fixture.paths,
+      }, fixture.dependencies)).rejects.toMatchObject({ code: "candidate_invalid" });
+    }
   });
 
   test("fails closed when a Keychain item changes during the cutover", async () => {
@@ -421,10 +425,10 @@ async function createFixture(
     });
   }
   await createBundle(candidateApp, {
-    build: "12",
+    build: "13",
     executable: "hra",
     marker: "candidate",
-    version: "0.1.11",
+    version: "0.1.12",
   });
   const controlPlanePath = join(stateRoot, "control-plane.sqlite");
   const database = openControlPlane(controlPlanePath, {

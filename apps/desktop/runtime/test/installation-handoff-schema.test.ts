@@ -58,10 +58,10 @@ function receipt(
     },
     candidate: {
       identity: {
-        build: "12",
+        build: "13",
         bundleIdentifier: "kitchen.hraness",
         executable: "hra",
-        version: "0.1.11",
+        version: "0.1.12",
       },
       tree,
     },
@@ -81,7 +81,7 @@ function receipt(
 }
 
 describe("installation handoff receipt schema", () => {
-  test("accepts only the exact v0.1.11 build-12 evidence shape", () => {
+  test("accepts only the exact v0.1.12 build-13 evidence shape", () => {
     expect(parseInstallationHandoffJournal(receipt())).toMatchObject({
       phase: "committed",
       candidateCommit: "b".repeat(40),
@@ -103,21 +103,25 @@ describe("installation handoff receipt schema", () => {
     }
   });
 
-  test("rejects the v0.1.11 candidate as prior-HRA rollback evidence", () => {
-    const mutation = receipt();
-    mutation["hadPriorHra"] = true;
-    mutation["priorHra"] = {
-      identity: {
-        build: "12",
-        bundleIdentifier: "kitchen.hraness",
-        executable: "hra",
-        version: "0.1.11",
-      },
-      tree,
-    };
-    expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
-      "Handoff receipt is invalid",
-    );
+  test("rejects tagged-only v0.1.11 and current v0.1.12 as prior-HRA rollback evidence", () => {
+    for (const identity of [
+      { build: "12", version: "0.1.11" },
+      { build: "13", version: "0.1.12" },
+    ] as const) {
+      const mutation = receipt();
+      mutation["hadPriorHra"] = true;
+      mutation["priorHra"] = {
+        identity: {
+          ...identity,
+          bundleIdentifier: "kitchen.hraness",
+          executable: "hra",
+        },
+        tree,
+      };
+      expect(() => parseInstallationHandoffJournal(mutation)).toThrow(
+        "Handoff receipt is invalid",
+      );
+    }
   });
 
   test("rejects unknown, stale, and inconsistent nested evidence", () => {
