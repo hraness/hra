@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import {
   inspectInstallationBundle,
   inspectTree,
+  lsofResultIsQuiescent,
   performInstallationHandoff,
   resumeCommittedInstallationHandoffCleanup,
   rollbackInstallationHandoff,
@@ -45,6 +46,7 @@ const supportedPriorHraIdentities = [
   { build: "9", version: "0.1.8" },
   { build: "10", version: "0.1.9" },
   { build: "11", version: "0.1.10" },
+  { build: "13", version: "0.1.12" },
 ] as const;
 const faultPoints: readonly InstallationHandoffFaultPoint[] = [
   "after_full_backup",
@@ -69,6 +71,72 @@ afterAll(async () => {
 });
 
 describe("OPRTE to HRA installation handoff", () => {
+  test("binds its control-plane descriptor before fail-closed lsof checks in handoff and rollback", async () => {
+    const handoffOrder = [
+      "quit",
+      "native:acquire",
+      "quit",
+      "control-plane:acquire",
+      "control-plane:bind",
+      "updater:inspect",
+      "open-files:inspect",
+      "updater:inspect",
+      "open-files:inspect",
+      "control-plane:release",
+      "native:release",
+    ];
+    const rollbackOrder = [
+      "quit",
+      "native:acquire",
+      "quit",
+      "control-plane:acquire",
+      "control-plane:bind",
+      "updater:inspect",
+      "open-files:inspect",
+      "control-plane:release",
+      "native:release",
+    ];
+
+    const fixture = await createFixture();
+    const actualHandoffOrder: string[] = [];
+    await performInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      candidateApp: fixture.paths.candidateApp,
+      confirmation: "RETIRE-OPRTE-IN-FAVOR-OF-HRA",
+      paths: fixture.paths,
+    }, recordingQuiescenceDependencies(
+      fixture.dependencies,
+      actualHandoffOrder,
+    ));
+    expect(actualHandoffOrder).toEqual(handoffOrder);
+
+    const actualRollbackOrder: string[] = [];
+    await rollbackInstallationHandoff({
+      backupDirectory: fixture.backupDirectory,
+      confirmation: "ROLL-BACK-HRA-TO-OPRTE",
+      paths: fixture.paths,
+    }, recordingQuiescenceDependencies(
+      fixture.dependencies,
+      actualRollbackOrder,
+    ));
+    expect(actualRollbackOrder).toEqual(rollbackOrder);
+  }, 60_000);
+
+  test("treats only lsof's exact empty no-match result as quiescent", () => {
+    const result = (exitCode: number, stdout = "", stderr = "") => ({
+      exitCode,
+      stderr,
+      stdout,
+    });
+    expect(lsofResultIsQuiescent(result(0))).toBeFalse();
+    expect(lsofResultIsQuiescent(result(1))).toBeTrue();
+    expect(lsofResultIsQuiescent(result(1, "p123\nf4\n/path\n"))).toBeFalse();
+    expect(lsofResultIsQuiescent(result(1, "", "lsof warning\n"))).toBeFalse();
+    for (const malformedStatus of [-1, 2, 64, 255]) {
+      expect(lsofResultIsQuiescent(result(malformedStatus))).toBeFalse();
+    }
+  });
+
   test("rolls every deterministic fault checkpoint back to both original apps and exact state", async () => {
     for (const faultPoint of faultPoints) {
       const fixture = await createFixture();
@@ -293,10 +361,10 @@ describe("OPRTE to HRA installation handoff", () => {
     )).toBeGreaterThanOrEqual(1);
   }, 60_000);
 
-  test("rejects tagged-only v0.1.11 and current v0.1.12 as unreceipted prior HRA authority", async () => {
+  test("rejects tagged-only v0.1.11 and current v0.1.13 as unreceipted prior HRA authority", async () => {
     for (const identity of [
       { build: "12", version: "0.1.11" },
-      { build: "13", version: "0.1.12" },
+      { build: "14", version: "0.1.13" },
     ] as const) {
       const fixture = await createFixture({ priorHra: false });
       await createBundle(fixture.paths.canonicalApp, {
@@ -570,6 +638,52 @@ async function createTreeTamperFixture(): Promise<string> {
   return root;
 }
 
+function recordingQuiescenceDependencies(
+  dependencies: InstallationHandoffDependencies,
+  order: string[],
+): InstallationHandoffDependencies {
+  return {
+    ...dependencies,
+    acquireControlPlaneLock(path) {
+      order.push("control-plane:acquire");
+      const lock = dependencies.acquireControlPlaneLock(path);
+      return {
+        path: lock.path,
+        bindControlPlane() {
+          order.push("control-plane:bind");
+          return lock.bindControlPlane();
+        },
+        release() {
+          order.push("control-plane:release");
+          lock.release();
+        },
+      };
+    },
+    acquireNativeLock(path) {
+      order.push("native:acquire");
+      const lock = dependencies.acquireNativeLock(path);
+      return {
+        release() {
+          order.push("native:release");
+          lock.release();
+        },
+      };
+    },
+    openFilesAreQuiescent() {
+      order.push("open-files:inspect");
+      return Promise.resolve(true);
+    },
+    async quitApplications(bundleRoots) {
+      order.push("quit");
+      await dependencies.quitApplications(bundleRoots);
+    },
+    async updaterIsQuiescent(paths) {
+      order.push("updater:inspect");
+      return await dependencies.updaterIsQuiescent(paths);
+    },
+  };
+}
+
 async function createFixture(
   options: Readonly<{
     priorHra?: false | (typeof supportedPriorHraIdentities)[number];
@@ -596,7 +710,7 @@ async function createFixture(
     version: "0.1.4",
   });
   const priorHra = options.priorHra === undefined
-    ? supportedPriorHraIdentities[3]
+    ? supportedPriorHraIdentities[4]
     : options.priorHra;
   if (priorHra !== false) {
     await createBundle(join(applicationsDirectory, "HRA.app"), {
@@ -607,10 +721,10 @@ async function createFixture(
     });
   }
   await createBundle(candidateApp, {
-    build: "13",
+    build: "14",
     executable: "hra",
     marker: "candidate",
-    version: "0.1.12",
+    version: "0.1.13",
   });
   const controlPlanePath = join(stateRoot, "control-plane.sqlite");
   const database = openControlPlane(controlPlanePath, {

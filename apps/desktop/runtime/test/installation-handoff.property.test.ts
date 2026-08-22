@@ -48,10 +48,10 @@ const validReceipt = {
   },
   candidate: {
     identity: {
-      build: "13",
+      build: "14",
       bundleIdentifier: "kitchen.hraness",
       executable: "hra",
-      version: "0.1.12",
+      version: "0.1.13",
     },
     signature: { policy: "strict" },
     tree: {

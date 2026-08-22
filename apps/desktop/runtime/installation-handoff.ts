@@ -77,10 +77,10 @@ const committedCleanupConfirmation = "CLEAN-COMMITTED-HRA-HANDOFF-STAGING";
 const rollbackConfirmation = "ROLL-BACK-HRA-TO-OPRTE";
 const expectedPredecessor = expectedHistoricalOprtePreviewIdentity;
 const expectedCandidate = Object.freeze({
-  build: "13",
+  build: "14",
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
-  version: "0.1.12",
+  version: "0.1.13",
 });
 const expectedPriorHraV017 = Object.freeze({
   build: "8",
@@ -105,6 +105,12 @@ const expectedPriorHraV0110 = Object.freeze({
   bundleIdentifier: "kitchen.hraness",
   executable: "hra",
   version: "0.1.10",
+});
+const expectedPriorHraV0112 = Object.freeze({
+  build: "13",
+  bundleIdentifier: "kitchen.hraness",
+  executable: "hra",
+  version: "0.1.12",
 });
 const maximumTreeEntries = 2_000_000;
 const maximumTreeBytes = 128 * 1024 * 1024 * 1024;
@@ -1581,6 +1587,7 @@ function assertSupportedPriorHraIdentity(actual: BundleIdentity): void {
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV018)
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV019)
     && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV0110)
+    && JSON.stringify(actual) !== JSON.stringify(expectedPriorHraV0112)
   ) {
     throw new InstallationHandoffError(
       "candidate_invalid",
@@ -1796,28 +1803,45 @@ async function quitExactApplicationProcesses(bundleRoots: readonly string[]): Pr
   }
 }
 
-async function inspectOpenFileQuiescence(
+export async function inspectOpenFileQuiescence(
   paths: InstallationHandoffPaths,
 ): Promise<boolean> {
-  const databasePaths = [
-    paths.controlPlanePath,
+  if (await exists(paths.controlPlanePath)) {
+    const result = await runCommand([
+      "/usr/sbin/lsof",
+      "-Fn",
+      "-a",
+      "-p",
+      `^${String(process.pid)}`,
+      "--",
+      paths.controlPlanePath,
+    ], true);
+    if (!lsofResultIsQuiescent(result)) return false;
+  }
+  const sidecarPaths = [
     `${paths.controlPlanePath}-wal`,
     `${paths.controlPlanePath}-shm`,
     `${paths.controlPlanePath}-journal`,
   ];
-  for (const path of databasePaths) {
+  for (const path of sidecarPaths) {
     if (!await exists(path)) continue;
     const result = await runCommand(["/usr/sbin/lsof", "-Fn", "--", path], true);
-    if (result.exitCode === 0) return false;
-    if (result.exitCode !== 1) return false;
+    if (!lsofResultIsQuiescent(result)) return false;
   }
   for (const root of [paths.predecessorApp, paths.canonicalApp]) {
     if (!await exists(root)) continue;
-    const result = await runCommand(["/usr/sbin/lsof", "+D", root], true);
-    if (result.exitCode === 0) return false;
-    if (result.exitCode !== 1) return false;
+    const result = await runCommand(["/usr/sbin/lsof", "-Fn", "+D", root], true);
+    if (!lsofResultIsQuiescent(result)) return false;
   }
   return true;
+}
+
+export function lsofResultIsQuiescent(
+  result: Readonly<{ exitCode: number; stderr: string; stdout: string }>,
+): boolean {
+  return result.exitCode === 1
+    && result.stdout.length === 0
+    && result.stderr.length === 0;
 }
 
 async function inspectUpdaterQuiescence(paths: InstallationHandoffPaths): Promise<boolean> {
@@ -2073,6 +2097,7 @@ const priorHraEvidenceSchema = z.union([
   bundleEvidenceSchema(expectedPriorHraV018, strictSignatureEvidenceSchema),
   bundleEvidenceSchema(expectedPriorHraV019, strictSignatureEvidenceSchema),
   bundleEvidenceSchema(expectedPriorHraV0110, strictSignatureEvidenceSchema),
+  bundleEvidenceSchema(expectedPriorHraV0112, strictSignatureEvidenceSchema),
 ]);
 const historicalPredecessorEvidenceSchema = z.object({
   identity: identitySchema(expectedPredecessor),

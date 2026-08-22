@@ -2,7 +2,7 @@
   "entries": [
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9ce9c30bb342664dddc43933aed0d6b52614742c472775ec10ed16d1b926408c",
+      "matchingLinesSha256": "0bc6a45696063958690d23eec6ffefcacb6a3960eca7027c3a0403c3c6810b2f",
       "occurrences": {
         "kitchen": 1,
         "operateStylized": 0,
@@ -152,9 +152,9 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "9ccf1c24132aab2ee7927a41b524a8f64506612a4470a36b3af758c909eff5ea",
+      "matchingLinesSha256": "2026faf7a83a22b28ace608b0a04b3e0a92e2ac9c115b673a9358da0c35a128e",
       "occurrences": {
-        "kitchen": 11,
+        "kitchen": 12,
         "operateStylized": 0,
         "oprte": 61
       },
@@ -1462,13 +1462,23 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "5ae7764871d825e8f6c5da5120374b000b42486f560f73fa9829769fc8b67ce6",
+      "matchingLinesSha256": "84845871e4ecf2361bfe09d9ae28a94028548f7cf8b706b815a57bfca3982d83",
       "occurrences": {
         "kitchen": 6,
         "operateStylized": 0,
         "oprte": 20
       },
       "path": "apps/desktop/runtime/test/installation-handoff-schema.test.ts"
+    },
+    {
+      "category": "compatibility",
+      "matchingLinesSha256": "9222121a861c0c6ed859856856d8e6df87f56342b278201a10c8ce3d906be350",
+      "occurrences": {
+        "kitchen": 0,
+        "operateStylized": 0,
+        "oprte": 1
+      },
+      "path": "apps/desktop/runtime/test/installation-handoff.macos.test.ts"
     },
     {
       "category": "compatibility",
@@ -1482,11 +1492,11 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "044886c32b3ec52a67d3308cfb6ddc67f664230851603cec5ad7664659322ccf",
+      "matchingLinesSha256": "516f9f62797fc4370c1800b59fca854d307ff1e1916ec42dec6b1bbfa47bfad7",
       "occurrences": {
         "kitchen": 4,
         "operateStylized": 0,
-        "oprte": 43
+        "oprte": 45
       },
       "path": "apps/desktop/runtime/test/installation-handoff.test.ts"
     },
@@ -1922,7 +1932,7 @@
     },
     {
       "category": "compatibility",
-      "matchingLinesSha256": "4f654b254d35aa9e1043cade5e7ab9a42e36c60d8ba73ea40f177bb0bf1493ce",
+      "matchingLinesSha256": "e6157d64088147b53e4c2258c20c11f0faa74e4a11eed6f28fbd0348a45e5df3",
       "occurrences": {
         "kitchen": 3,
         "operateStylized": 0,

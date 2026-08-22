@@ -9,7 +9,7 @@ and bringing it back for review.
 [Download for macOS](https://hra.sh/download) · [Website](https://hra.sh) ·
 [Compare HRA](https://hra.sh/alternatives) · [Open HRA](https://hra.sh/app)
 
-> HRA 0.1.12 build 13 is a source release candidate for Apple Silicon Macs.
+> HRA 0.1.13 build 14 is a source release candidate for Apple Silicon Macs.
 > Direct downloads remain disabled until its exact source commit, annotated
 > tag, runtime tree, manifest, checksum, and artifact hashes are published. The
 > candidate uses an ad-hoc code seal; it is not Developer ID signed or notarized.

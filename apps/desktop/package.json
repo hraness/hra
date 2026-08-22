@@ -1,6 +1,6 @@
 {
   "name": "@hraness/hra",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "type": "module",
   "description": "A local-first metaharness for durable Codex orchestration.",
@@ -44,7 +44,7 @@
     "verify:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --release-directory zig-out/release/macos/arm64",
     "verify:package:macos:adhoc": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-ad-hoc-package-verification -- bun run runtime/verify-macos-package.ts --core-release-directory zig-out/release/macos/arm64",
     "smoke:package:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-package-smoke -- bun run smoke:package:macos:uncoordinated",
-    "smoke:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --dmg zig-out/release/macos/arm64/HRA-0.1.12-13-macos-arm64.dmg --launch-smoke",
+    "smoke:package:macos:uncoordinated": "bun run runtime/verify-macos-package.ts --dmg zig-out/release/macos/arm64/HRA-0.1.13-14-macos-arm64.dmg --launch-smoke",
     "doctor:macos": "native doctor --manifest app.zon --strict",
     "state:doctor": "bun run runtime/control-plane-maintenance.ts doctor",
     "state:backup": "bun run runtime/control-plane-maintenance.ts backup",
@@ -82,7 +82,7 @@
     "baseline:reactive": "bun run runtime/reactive-baseline.ts",
     "test:property": "bun test ./frontend/src/features/chat/model.property.test.ts ./frontend/src/runtime/*.property.test.ts ./frontend/direct/*.property.test.ts ./contracts/*.property.test.ts ./runtime/test/*.property.test.ts",
     "test:macos": "bun run ../../scripts/check-resource-scheduler.ts --mode=exclusive --label=HRA-desktop-macOS-tests -- bun run test:macos:uncoordinated",
-    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts"
+    "test:macos:uncoordinated": "bun run runtime/run-zig.ts build test -Dplatform=macos && bun test ./runtime/test/image-normalizer.macos.test.ts ./runtime/test/codex-signature-normalization.macos.test.ts ./runtime/test/installation-handoff.macos.test.ts"
   },
   "dependencies": {
     "@hraness/agent-tasks-protocol": "workspace:*",
