@@ -3,6 +3,7 @@ import { Search01Icon } from "@hugeicons/core-free-icons";
 import { Menu as AriaMenu } from "react-aria-components";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { colors } from "../index";
 import {
   Accordion,
   AppShell,
@@ -1322,12 +1323,31 @@ test("route fallbacks share branded recovery and loading semantics", () => {
   const globalError = renderToStaticMarkup(
     <GlobalErrorDocument error={new Error("global fixture failure")} reset={() => undefined} />,
   );
+  const customGlobalError = renderToStaticMarkup(
+    <GlobalErrorDocument
+      darkColor="#101214"
+      error={new Error("custom global fixture failure")}
+      lightColor="#f4f5f6"
+      reset={() => undefined}
+    />,
+  );
   const fixedGlobalError = renderToStaticMarkup(
     <GlobalErrorDocument
       bodyClassName="fixture-product-theme"
+      darkColor="#201b19"
       error={new Error("fixed global fixture failure")}
+      lightColor="#f5eee8"
       reset={() => undefined}
       theme="dark"
+    />,
+  );
+  const fixedLightGlobalError = renderToStaticMarkup(
+    <GlobalErrorDocument
+      darkColor="#17191b"
+      error={new Error("fixed light global fixture failure")}
+      lightColor="#fafafa"
+      reset={() => undefined}
+      theme="light"
     />,
   );
 
@@ -1356,9 +1376,34 @@ test("route fallbacks share branded recovery and loading semantics", () => {
   expect(globalError).toContain('data-jungle-theme-guard=""');
   expect(globalError).toContain("jungle-design-theme-v1");
   expect(globalError).not.toContain("data-hraness-appearance-menu");
+  expect(globalError).toContain('<meta content="light dark" name="color-scheme"/>');
+  expect(globalError).toContain(
+    `<meta content="${colors.light.background}" media="(prefers-color-scheme: light)" name="theme-color"/>`,
+  );
+  expect(globalError).toContain(
+    `<meta content="${colors.dark.background}" media="(prefers-color-scheme: dark)" name="theme-color"/>`,
+  );
+  expect(globalError.match(/name="theme-color"/g)).toHaveLength(2);
+  expect(customGlobalError).toContain(
+    '<meta content="#f4f5f6" media="(prefers-color-scheme: light)" name="theme-color"/>',
+  );
+  expect(customGlobalError).toContain(
+    '<meta content="#101214" media="(prefers-color-scheme: dark)" name="theme-color"/>',
+  );
+  expect(customGlobalError.match(/name="theme-color"/g)).toHaveLength(2);
   expect(fixedGlobalError).toContain('data-theme="dark"');
   expect(fixedGlobalError).toContain('<body class="fixture-product-theme">');
+  expect(fixedGlobalError).toContain('<meta content="dark" name="color-scheme"/>');
+  expect(fixedGlobalError).toContain('<meta content="#201b19" name="theme-color"/>');
+  expect(fixedGlobalError.match(/name="theme-color"/g)).toHaveLength(1);
+  expect(fixedGlobalError).not.toContain("prefers-color-scheme");
   expect(fixedGlobalError).not.toContain('data-jungle-theme-guard=""');
+  expect(fixedLightGlobalError).toContain('data-theme="light"');
+  expect(fixedLightGlobalError).toContain('<meta content="light" name="color-scheme"/>');
+  expect(fixedLightGlobalError).toContain('<meta content="#fafafa" name="theme-color"/>');
+  expect(fixedLightGlobalError.match(/name="theme-color"/g)).toHaveLength(1);
+  expect(fixedLightGlobalError).not.toContain("prefers-color-scheme");
+  expect(fixedLightGlobalError).not.toContain('data-jungle-theme-guard=""');
   for (const shellFallback of [shellNotFound, shellError, shellLoading]) {
     expect(shellFallback).not.toContain("<main");
     expect(shellFallback).not.toContain("data-hraness-appearance-menu");

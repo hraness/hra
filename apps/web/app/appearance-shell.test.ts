@@ -92,6 +92,7 @@ describe("HRA shared appearance and shell contract", () => {
     }
     expect(globalError).toContain('import "./globals.css"');
     expect(globalError).toContain("GlobalErrorDocument");
+    expect(globalError).toContain("export default GlobalErrorDocument");
     expect(globalError).not.toContain("ThemeMenuButton");
   });
 

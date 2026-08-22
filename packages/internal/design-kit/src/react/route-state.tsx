@@ -2,6 +2,7 @@
 
 import { useEffect, useId, type ReactNode } from "react";
 
+import { colors } from "../index";
 import { Button } from "./button";
 import { EmptyState, type ContentHeadingLevel } from "./content-primitives";
 import { LinkButton } from "./link-button";
@@ -43,7 +44,9 @@ export interface RouteLoadingPageProps {
 
 export interface GlobalErrorDocumentProps extends RouteErrorPageProps {
   readonly bodyClassName?: string;
+  readonly darkColor?: string;
   readonly diagnostics?: ReactNode;
+  readonly lightColor?: string;
   readonly theme?: DesignTheme;
 }
 
@@ -158,7 +161,9 @@ export function RouteLoadingPage({
  */
 export function GlobalErrorDocument({
   bodyClassName,
+  darkColor = colors.dark.background,
   diagnostics,
+  lightColor = colors.light.background,
   theme = defaultDesignTheme,
   ...props
 }: GlobalErrorDocumentProps) {
@@ -171,10 +176,32 @@ export function GlobalErrorDocument({
 
   return (
     <html data-theme={theme === "system" ? "light" : theme} lang="en" suppressHydrationWarning>
+      <head>
+        <meta content={theme === "system" ? "light dark" : theme} name="color-scheme" />
+        {theme === "system" ? (
+          <>
+            <meta
+              content={lightColor}
+              media="(prefers-color-scheme: light)"
+              name="theme-color"
+            />
+            <meta
+              content={darkColor}
+              media="(prefers-color-scheme: dark)"
+              name="theme-color"
+            />
+          </>
+        ) : (
+          <meta
+            content={theme === "dark" ? darkColor : lightColor}
+            name="theme-color"
+          />
+        )}
+      </head>
       <body className={bodyClassName}>
         {theme === "system" ? (
           <DesignThemeProvider>
-            <ThemeColorSync />
+            <ThemeColorSync darkColor={darkColor} lightColor={lightColor} />
             {content}
           </DesignThemeProvider>
         ) : content}
