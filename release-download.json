@@ -5,28 +5,28 @@
     "architecture": "Apple Silicon",
     "artifacts": {
       "checksum": {
-        "bytes": null,
+        "bytes": 96,
         "name": "HRA-0.1.12-13-macos-arm64.dmg.sha256",
-        "sha256": null
+        "sha256": "1a7f4d353e8eaf7e2537b15828dc0b803528cd60ed396275e368b3610deae042"
       },
       "dmg": {
-        "bytes": null,
+        "bytes": 213069200,
         "name": "HRA-0.1.12-13-macos-arm64.dmg",
-        "sha256": null
+        "sha256": "246edd7ce995f7e5318aded0d35064041c0a062a98d4cd781ce746133f877dd4"
       },
       "manifest": {
-        "bytes": null,
+        "bytes": 31307,
         "name": "HRA-0.1.12-13-release-manifest.json",
-        "sha256": null
+        "sha256": "908f43a41ae2ff3def55518a9d06a35c57c6d14beb358502d3d41a8baabcdf1b"
       }
     },
-    "availability": "candidate",
+    "availability": "published",
     "build": 13,
     "minimumMacOS": "13",
     "source": {
-      "commit": null,
-      "runtimeTreeSha256": null,
-      "tagObject": null
+      "commit": "9ab991d08d1507fd73c9e7ef5fb4a37baee9c014",
+      "runtimeTreeSha256": "05fa784e75c4b243153de095c5130935e820ffc07af57efa34ecab9d303afece",
+      "tagObject": "626be494d24733d12e53d09932cb5cc6218bc2fe"
     },
     "tag": "v0.1.12",
     "version": "0.1.12"
