@@ -7,6 +7,7 @@ import {
   executeHostedSetup,
   generateHostedSecrets,
   HOSTED_ENVIRONMENT_NAMES,
+  HRA_SITE_URL,
   parseHostedArguments,
   parseHostedInput,
   readProtectedInput,
@@ -54,7 +55,7 @@ const pemMarker = (verb: "BEGIN" | "END"): string =>
 const validInput = {
   authEmailFrom: "HRA Auth <auth@hra.sh>",
   resendApiKey: ["re", "hostile", "resend", "sentinel", "7d48f4"].join("_"),
-  siteUrl: "https://hra.sh",
+  siteUrl: HRA_SITE_URL,
 } as const;
 
 const generatedSentinels: GeneratedHostedSecrets = {
@@ -279,6 +280,12 @@ describe("fresh hosted configuration", () => {
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, unexpected: true })))
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "http://hra.sh" })))
+      .toThrow("input_invalid");
+    expect(() => parseHostedInput(JSON.stringify({
+      ...validInput,
+      siteUrl: "https://try-hra.vercel.app",
+    }))).toThrow("input_invalid");
+    expect(() => parseHostedInput(JSON.stringify({ ...validInput, siteUrl: "https://hra.sh/" })))
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, resendApiKey: "not-a-key" })))
       .toThrow("input_invalid");

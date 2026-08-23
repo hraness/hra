@@ -33,10 +33,10 @@ The provider identity guard pins the intended Convex team to numeric ID `513923`
 `bun run hosted:configure` accepts one strict JSON object with exactly these fields:
 
 ```json
-{"authEmailFrom":"HRA Auth <auth@example.com>","resendApiKey":"<secret>","siteUrl":"https://example.com"}
+{"authEmailFrom":"HRA Auth <auth@example.com>","resendApiKey":"<secret>","siteUrl":"https://hra.sh"}
 ```
 
-`siteUrl` must be one HTTPS origin. `resendApiKey` must be a Resend key. `authEmailFrom` must be the verified sender accepted by Resend. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
+`siteUrl` must be one HTTPS origin. For the HRA `v0.1.0` authority it is exactly `https://hra.sh`, the final canonical origin. Do not substitute `https://try-hra.vercel.app` or an automatic deployment hostname: configuration is one-shot, while staging aliases move and rehearsal may replace candidate deployments. `resendApiKey` must be a Resend key. `authEmailFrom` must be the verified sender accepted by Resend. The helper generates a fresh 2048-bit RS256 private key, its matching public JWKS, and a 256-bit HMAC secret locally with WebCrypto.
 
 Pass the JSON from a protected secret source through standard input:
 

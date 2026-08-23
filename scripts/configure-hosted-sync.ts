@@ -24,6 +24,8 @@ export const HOSTED_ENVIRONMENT_NAMES = [
   "HRA_AUTH_EMAIL_FROM",
 ] as const;
 
+export const HRA_SITE_URL = "https://hra.sh" as const;
+
 const protectedInputMaximumBytes = 8 * 1024;
 const convexOutputMaximumBytes = 64 * 1024;
 const convexTimeoutMs = 60_000;
@@ -47,20 +49,7 @@ const hostedInputSchema = z.object({
     .min(8)
     .max(512)
     .regex(/^re_[A-Za-z0-9_-]+$/u),
-  siteUrl: z.string()
-    .min(8)
-    .max(2_048)
-    .refine((value) => {
-      try {
-        const parsed = new URL(value);
-        return parsed.protocol === "https:"
-          && parsed.username === ""
-          && parsed.password === ""
-          && parsed.origin === value;
-      } catch {
-        return false;
-      }
-    }),
+  siteUrl: z.literal(HRA_SITE_URL),
 }).strict();
 
 export type HostedInput = z.infer<typeof hostedInputSchema>;
