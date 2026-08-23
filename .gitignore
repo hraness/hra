@@ -9,3 +9,4 @@ coverage/
 .convex/
 .vercel/
 tmp/
+.env.local

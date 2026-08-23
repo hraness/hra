@@ -10,7 +10,10 @@ const newProjectId = "prj_8ciIt9t9foE3utG45frRN7cxckjS";
 const oldRepositoryId = 1_334_876_494;
 const newRepositoryId = 1_343_008_607;
 const team = "hraness";
-const alias = "hra.sh";
+const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
+const canonicalAlias = "hra.sh";
+const fallbackAlias = "hra-weld.vercel.app";
+const newStagingAlias = "try-hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
 const commandTimeoutMs = 30_000;
 const convergenceTimeoutMs = 60_000;
@@ -76,8 +79,10 @@ const cutoverPlanSchema = z.object({
 export type CutoverEndpoint = z.infer<typeof endpointSchema>;
 export type CutoverPlan = z.infer<typeof cutoverPlanSchema>;
 
+const managedAliasSchema = z.enum([canonicalAlias, fallbackAlias, newStagingAlias]);
+
 const aliasReadbackSchema = z.object({
-  alias: z.literal(alias),
+  alias: managedAliasSchema,
   deployment: z.object({
     id: deploymentIdSchema,
     url: deploymentUrlSchema,
@@ -99,6 +104,12 @@ const deploymentReadbackSchema = z.object({
   url: deploymentUrlSchema,
 });
 
+const projectReadbackSchema = z.object({
+  accountId: z.literal(teamId),
+  autoAssignCustomDomains: z.boolean(),
+  id: projectIdSchema,
+});
+
 const domainsReadbackSchema = z.object({
   domains: z.array(z.object({ name: z.string().min(1).max(253) })).max(1_024),
 });
@@ -116,20 +127,24 @@ const markerSchema = z.object({
 
 export type AliasReadback = z.infer<typeof aliasReadbackSchema>;
 export type DeploymentReadback = z.infer<typeof deploymentReadbackSchema>;
+export type ManagedAlias = z.infer<typeof managedAliasSchema>;
+export type ProjectReadback = z.infer<typeof projectReadbackSchema>;
 
 type DomainOwner = "ambiguous" | "source" | "target";
 
 export interface CutoverProvider {
   moveDomain(sourceProjectId: string, targetProjectId: string): Promise<void>;
-  readAlias(): Promise<AliasReadback>;
+  readAlias(aliasName: ManagedAlias): Promise<AliasReadback>;
   readDeployment(deploymentId: string): Promise<DeploymentReadback>;
   readDomainNames(projectId: string): Promise<readonly string[]>;
-  readMarker(): Promise<unknown>;
-  setAlias(deploymentUrl: string): Promise<void>;
+  readMarker(aliasName: ManagedAlias): Promise<unknown>;
+  readProject(projectId: string): Promise<ProjectReadback>;
+  setAlias(deploymentUrl: string, aliasName: ManagedAlias): Promise<void>;
 }
 
 type CutoverFailureCode =
   | "alias_readback_invalid"
+  | "automatic_domain_assignment_unsafe"
   | "command_failed"
   | "command_output_invalid"
   | "compensation_failed"
@@ -166,8 +181,12 @@ const defaultClock: CutoverClock = {
   },
 };
 
-const aliasMatches = (value: AliasReadback, endpoint: CutoverEndpoint): boolean =>
-  value.projectId === endpoint.projectId
+const aliasMatches = (
+  value: AliasReadback,
+  endpoint: CutoverEndpoint,
+  aliasName: ManagedAlias,
+): boolean => value.alias === aliasName
+  && value.projectId === endpoint.projectId
   && value.deploymentId === endpoint.deploymentId
   && value.deployment.id === endpoint.deploymentId
   && value.deployment.url === endpoint.deploymentUrl;
@@ -202,8 +221,8 @@ const readOwner = async (
     provider.readDomainNames(sourceProjectId),
     provider.readDomainNames(targetProjectId),
   ]);
-  const sourceCount = sourceNames.filter((name) => name === alias).length;
-  const targetCount = targetNames.filter((name) => name === alias).length;
+  const sourceCount = sourceNames.filter((name) => name === canonicalAlias).length;
+  const targetCount = targetNames.filter((name) => name === canonicalAlias).length;
   if (sourceCount === 1 && targetCount === 0) return "source";
   if (sourceCount === 0 && targetCount === 1) return "target";
   return "ambiguous";
@@ -212,6 +231,7 @@ const readOwner = async (
 const probeEndpoint = async (
   provider: CutoverProvider,
   endpoint: CutoverEndpoint,
+  aliasName: ManagedAlias,
   clock: CutoverClock,
   timeoutMs: number,
 ): Promise<boolean> => {
@@ -219,10 +239,13 @@ const probeEndpoint = async (
   do {
     try {
       const [aliasValue, markerValue] = await Promise.all([
-        provider.readAlias(),
-        endpoint.generation === null ? Promise.resolve(null) : provider.readMarker(),
+        provider.readAlias(aliasName),
+        endpoint.generation === null ? Promise.resolve(null) : provider.readMarker(aliasName),
       ]);
-      if (aliasMatches(aliasValue, endpoint) && markerMatches(markerValue, endpoint)) {
+      if (
+        aliasMatches(aliasValue, endpoint, aliasName)
+        && markerMatches(markerValue, endpoint)
+      ) {
         return true;
       }
     } catch {
@@ -237,17 +260,34 @@ const probeEndpoint = async (
 const restoreTraffic = async (
   provider: CutoverProvider,
   source: CutoverEndpoint,
+  aliasName: ManagedAlias,
   clock: CutoverClock,
   timeoutMs: number,
 ): Promise<void> => {
   try {
-    await provider.setAlias(source.deploymentUrl);
+    await provider.setAlias(source.deploymentUrl, aliasName);
   } catch {
     // Alias mutation failures are ambiguous, so the exact readback still decides.
   }
-  if (!await probeEndpoint(provider, source, clock, timeoutMs)) {
+  if (!await probeEndpoint(provider, source, aliasName, clock, timeoutMs)) {
     throw new DomainCutoverError("compensation_failed");
   }
+};
+
+const restoreArchiveTraffic = async (
+  provider: CutoverProvider,
+  source: CutoverEndpoint,
+  clock: CutoverClock,
+  timeoutMs: number,
+): Promise<never> => {
+  const results = await Promise.allSettled([
+    restoreTraffic(provider, source, canonicalAlias, clock, timeoutMs),
+    restoreTraffic(provider, source, fallbackAlias, clock, timeoutMs),
+  ]);
+  if (results.some((result) => result.status === "rejected")) {
+    throw new DomainCutoverError("compensation_failed");
+  }
+  throw new DomainCutoverError("cutover_reverted");
 };
 
 const reverseMetadataIfExact = async (
@@ -273,7 +313,7 @@ const compensateDomainMove = async (
   clock: CutoverClock,
   timeoutMs: number,
 ): Promise<never> => {
-  await restoreTraffic(provider, plan.source, clock, timeoutMs);
+  await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
   const metadata = await reverseMetadataIfExact(provider, plan);
   if (metadata !== "restored") throw new DomainCutoverError("cutover_ambiguous");
   throw new DomainCutoverError("cutover_reverted");
@@ -294,6 +334,20 @@ export async function executeCutoverPlan(
     throw new DomainCutoverError("usage_invalid");
   }
 
+  const projects = await Promise.all([
+    provider.readProject(oldProjectId),
+    provider.readProject(newProjectId),
+  ]).catch(() => {
+    throw new DomainCutoverError("automatic_domain_assignment_unsafe");
+  });
+  const expectedProjects = [oldProjectId, newProjectId] as const;
+  if (projects.some((project, index) => {
+    const parsed = projectReadbackSchema.safeParse(project);
+    return !parsed.success
+      || parsed.data.id !== expectedProjects[index]
+      || parsed.data.autoAssignCustomDomains;
+  })) throw new DomainCutoverError("automatic_domain_assignment_unsafe");
+
   const [sourceDeployment, targetDeployment] = await Promise.all([
     provider.readDeployment(plan.source.deploymentId),
     provider.readDeployment(plan.target.deploymentId),
@@ -305,25 +359,58 @@ export async function executeCutoverPlan(
     || !deploymentMatches(targetDeployment, plan.target)
   ) throw new DomainCutoverError("deployment_readback_invalid");
 
-  if (!await probeEndpoint(provider, plan.source, clock, timeoutMs)) {
+  if (!await probeEndpoint(provider, plan.source, canonicalAlias, clock, timeoutMs)) {
     throw new DomainCutoverError("source_not_authoritative");
+  }
+  const acceptedArchive = plan.direction === "forward" ? plan.source : plan.target;
+  const fallbackSource = plan.direction === "archive" ? plan.source : acceptedArchive;
+  if (!await probeEndpoint(provider, fallbackSource, fallbackAlias, clock, timeoutMs)) {
+    throw new DomainCutoverError("source_not_authoritative");
+  }
+  const acceptedNew = plan.direction === "forward" ? plan.target : plan.source;
+  if (plan.mode === "domain") {
+    if (!await probeEndpoint(provider, acceptedNew, newStagingAlias, clock, timeoutMs)) {
+      throw new DomainCutoverError("source_not_authoritative");
+    }
   }
   if (
     plan.mode === "domain"
     && await readOwner(provider, plan.source.projectId, plan.target.projectId) !== "source"
   ) throw new DomainCutoverError("source_not_authoritative");
 
+  if (plan.direction === "archive") {
+    try {
+      await provider.setAlias(plan.target.deploymentUrl, fallbackAlias);
+    } catch {
+      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    }
+    if (!await probeEndpoint(provider, plan.target, fallbackAlias, clock, timeoutMs)) {
+      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    }
+  }
+
   try {
-    await provider.setAlias(plan.target.deploymentUrl);
+    await provider.setAlias(plan.target.deploymentUrl, canonicalAlias);
   } catch {
-    await restoreTraffic(provider, plan.source, clock, timeoutMs);
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    }
+    await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
     throw new DomainCutoverError("cutover_reverted");
   }
-  if (!await probeEndpoint(provider, plan.target, clock, timeoutMs)) {
-    await restoreTraffic(provider, plan.source, clock, timeoutMs);
+  if (!await probeEndpoint(provider, plan.target, canonicalAlias, clock, timeoutMs)) {
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    }
+    await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
     throw new DomainCutoverError("cutover_reverted");
   }
-  if (plan.mode === "traffic-only") return;
+  if (plan.mode === "traffic-only") {
+    if (!await probeEndpoint(provider, plan.target, fallbackAlias, clock, timeoutMs)) {
+      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    }
+    return;
+  }
 
   try {
     await provider.moveDomain(plan.source.projectId, plan.target.projectId);
@@ -335,16 +422,20 @@ export async function executeCutoverPlan(
   do {
     try {
       const [aliasValue, owner] = await Promise.all([
-        provider.readAlias(),
+        provider.readAlias(canonicalAlias),
         readOwner(provider, plan.source.projectId, plan.target.projectId),
       ]);
-      if (aliasMatches(aliasValue, plan.target) && owner === "target") {
-        if (!await probeEndpoint(provider, plan.target, clock, timeoutMs)) {
+      if (aliasMatches(aliasValue, plan.target, canonicalAlias) && owner === "target") {
+        if (
+          !await probeEndpoint(provider, plan.target, canonicalAlias, clock, timeoutMs)
+          || !await probeEndpoint(provider, acceptedArchive, fallbackAlias, clock, timeoutMs)
+          || !await probeEndpoint(provider, acceptedNew, newStagingAlias, clock, timeoutMs)
+        ) {
           return await compensateDomainMove(provider, plan, clock, timeoutMs);
         }
         return;
       }
-      if (aliasMatches(aliasValue, plan.source) && owner === "target") {
+      if (aliasMatches(aliasValue, plan.source, canonicalAlias) && owner === "target") {
         return await compensateDomainMove(provider, plan, clock, timeoutMs);
       }
     } catch {
@@ -506,15 +597,20 @@ export class VercelCutoverProvider implements CutoverProvider {
     }
   }
 
-  async readAlias(): Promise<AliasReadback> {
+  async readAlias(aliasName: ManagedAlias): Promise<AliasReadback> {
+    if (!managedAliasSchema.safeParse(aliasName).success) {
+      throw new DomainCutoverError("alias_readback_invalid");
+    }
     try {
-      return aliasReadbackSchema.parse(parseProviderJson(await this.#invoke([
+      const parsed = aliasReadbackSchema.parse(parseProviderJson(await this.#invoke([
         "api",
-        `/v4/aliases/${alias}`,
+        `/v4/aliases/${aliasName}`,
         "--scope",
         team,
         "--raw",
       ])));
+      if (parsed.alias !== aliasName) throw new DomainCutoverError("alias_readback_invalid");
+      return parsed;
     } catch (error: unknown) {
       if (error instanceof DomainCutoverError && error.code === "command_failed") throw error;
       throw new DomainCutoverError("alias_readback_invalid");
@@ -554,12 +650,15 @@ export class VercelCutoverProvider implements CutoverProvider {
     return parsed.data.domains.map((domain) => domain.name);
   }
 
-  async readMarker(): Promise<unknown> {
+  async readMarker(aliasName: ManagedAlias): Promise<unknown> {
+    if (!managedAliasSchema.safeParse(aliasName).success) {
+      throw new DomainCutoverError("command_output_invalid");
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
     try {
       const response = await this.#fetcher(
-        `https://${alias}/.well-known/hra.json?cutover=${crypto.randomUUID()}`,
+        `https://${aliasName}/.well-known/hra.json?cutover=${crypto.randomUUID()}`,
         {
           cache: "no-store",
           headers: { "cache-control": "no-cache" },
@@ -600,11 +699,35 @@ export class VercelCutoverProvider implements CutoverProvider {
     }
   }
 
-  async setAlias(deploymentUrl: string): Promise<void> {
-    if (!deploymentUrlSchema.safeParse(deploymentUrl).success) {
+  async readProject(projectId: string): Promise<ProjectReadback> {
+    if (!projectIdSchema.safeParse(projectId).success) {
+      throw new DomainCutoverError("automatic_domain_assignment_unsafe");
+    }
+    try {
+      const parsed = projectReadbackSchema.parse(parseProviderJson(await this.#invoke([
+        "api",
+        `/v9/projects/${projectId}`,
+        "--scope",
+        team,
+        "--raw",
+      ])));
+      if (parsed.id !== projectId) {
+        throw new DomainCutoverError("automatic_domain_assignment_unsafe");
+      }
+      return parsed;
+    } catch {
+      throw new DomainCutoverError("automatic_domain_assignment_unsafe");
+    }
+  }
+
+  async setAlias(deploymentUrl: string, aliasName: ManagedAlias): Promise<void> {
+    if (
+      !deploymentUrlSchema.safeParse(deploymentUrl).success
+      || !managedAliasSchema.safeParse(aliasName).success
+    ) {
       throw new DomainCutoverError("usage_invalid");
     }
-    await this.#invoke(["alias", "set", deploymentUrl, alias, "--scope", team]);
+    await this.#invoke(["alias", "set", deploymentUrl, aliasName, "--scope", team]);
   }
 
   async moveDomain(sourceProjectId: string, targetProjectId: string): Promise<void> {
@@ -615,7 +738,7 @@ export class VercelCutoverProvider implements CutoverProvider {
     ) throw new DomainCutoverError("usage_invalid");
     await this.#invoke([
       "api",
-      `/v1/projects/${sourceProjectId}/domains/${alias}/move`,
+      `/v1/projects/${sourceProjectId}/domains/${canonicalAlias}/move`,
       "--scope",
       team,
       "-X",

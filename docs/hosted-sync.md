@@ -4,11 +4,11 @@ Use this sequence only for a new HRA Convex project and production deployment. T
 
 Never copy HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the new project. Keep the old project and deployment unchanged for rollback.
 
-The provider identity guard is numeric. HRA v0 owns Convex project ID `2680173` and production deployment ID `4677913`; neither may be renamed into or selected by this runbook. The new source repository has GitHub repository ID `1343008607`, and the new web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Names may change during cutover. These IDs do not.
+The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. HRA v0 owns Convex project ID `2680173` and production deployment ID `4677913`; neither may be renamed into or selected by this runbook. The new source repository has GitHub repository ID `1343008607`, and the new web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Project and deployment names may change during cutover. The team identity and numeric resource IDs do not.
 
 ## Create fresh state
 
-1. Create a new Convex project and production deployment in the HRA team.
+1. Create a new Convex project and production deployment in Convex team `cclrte` with numeric team ID `513923`.
 2. Record the new Convex project ID, production deployment ID, deployment name, deployment URL, and site URL in the private release record.
 3. Read those values back from Convex. Attach the readback to the release record and prove that both new numeric IDs and the deployment URL differ from HRA v0 project ID `2680173`, deployment ID `4677913`, and its deployment URL. Stop on a missing, reused, or name-only identity.
 4. Log in with the Convex CLI. Its global `config.json` must be a regular, single-link, mode-`0600` file. Do not supply a deploy key or deployment selector through an environment variable, `.env`, or `.env.local`.
@@ -17,14 +17,14 @@ The provider identity guard is numeric. HRA v0 owns Convex project ID `2680173` 
    ```sh
    bun run hosted:deploy -- \
      --deployment steady-otter-321 \
-     --team-id 765432 \
+     --team-id 513923 \
      --project-id 1234567 \
      --deployment-id 7654321 \
      --deployment-url https://steady-otter-321.convex.cloud \
      --source-commit 0123456789abcdef0123456789abcdef01234567
    ```
 
-   The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It reads the authenticated Convex management API before and after the mutation and requires the exact team, project, deployment, production type, generated deployment name, and URL. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the HRA v0 numeric IDs.
+   The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, and the exact project, deployment, production type, generated deployment name, and URL. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the HRA v0 numeric IDs.
 
    The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. It invokes `convex deploy --env-file` with that exact file, confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. This explicit binding takes precedence over hostile stale checkout files. Provider output is suppressed. A failure or a dirty postflight leaves the deployment quarantined for inspection; do not retry it.
 
@@ -43,7 +43,7 @@ Pass the JSON from a protected secret source through standard input:
 ```sh
 protected-json-source | bun run hosted:configure -- \
   --deployment steady-otter-321 \
-  --team-id 765432 \
+  --team-id 513923 \
   --project-id 1234567 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud
@@ -54,7 +54,7 @@ An agent can use a private nonterminal descriptor:
 ```sh
 bun run hosted:configure -- \
   --deployment steady-otter-321 \
-  --team-id 765432 \
+  --team-id 513923 \
   --project-id 1234567 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud \
@@ -81,7 +81,7 @@ No authentication, OTP, invitation, device, or application write may happen befo
 ```sh
 bun run hosted:bootstrap -- \
   --deployment steady-otter-321 \
-  --team-id 765432 \
+  --team-id 513923 \
   --project-id 1234567 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud \

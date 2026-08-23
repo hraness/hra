@@ -11,14 +11,18 @@ import {
   type CapabilitySink,
 } from "./bootstrap-hosted-sync";
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
-import type { ConvexTarget, ConvexTargetVerifier } from "./convex-target";
+import {
+  HRA_CONVEX_TEAM_ID,
+  type ConvexTarget,
+  type ConvexTargetVerifier,
+} from "./convex-target";
 
 const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
   projectId: 1_234_567,
-  teamId: 765_432,
+  teamId: HRA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -323,6 +327,13 @@ describe("fresh hosted bootstrap", () => {
       ...targetArguments,
       "--invite-output",
       "relative-invite",
+    ])).toThrow("usage_invalid");
+    expect(() => parseBootstrapArguments([
+      ...targetArguments.slice(0, 3),
+      String(HRA_CONVEX_TEAM_ID + 1),
+      ...targetArguments.slice(4),
+      "--invite-output",
+      "/protected/new-invite",
     ])).toThrow("usage_invalid");
     expect(() => parseBootstrapArguments([
       ...targetArguments,
