@@ -1085,11 +1085,28 @@ describe("state-backed cloud daemon adapter", () => {
       process.exit(0);
     `, cachePath]);
     const futurePaths = [cachePath, `${cachePath}-wal`, `${cachePath}-shm`];
-    for (const path of futurePaths) await chmod(path, 0o600);
-    const before = await Promise.all(futurePaths.map(async (path) => ({
-      bytes: await readFile(path),
-      mode: (await lstat(path)).mode,
-    })));
+    for (const path of futurePaths) {
+      try {
+        await chmod(path, 0o600);
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || path === cachePath) throw error;
+      }
+    }
+    const snapshotFutureFiles = async () => Promise.all(futurePaths.map(async (path) => {
+      try {
+        return {
+          path,
+          present: true as const,
+          bytes: await readFile(path),
+          mode: (await lstat(path)).mode,
+        };
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return { path, present: false as const };
+      }
+    }));
+    const before = await snapshotFutureFiles();
+    expect(before[0]).toMatchObject({ path: cachePath, present: true });
 
     const adapter = new StateBackedCloudDaemonAdapter({
       codex: value.codex,
@@ -1102,10 +1119,7 @@ describe("state-backed cloud daemon adapter", () => {
         code: "CACHE_NEWER_VERSION",
         state: "unavailable",
       });
-      const after = await Promise.all(futurePaths.map(async (path) => ({
-        bytes: await readFile(path),
-        mode: (await lstat(path)).mode,
-      })));
+      const after = await snapshotFutureFiles();
       expect(after).toEqual(before);
     } finally {
       adapter.close();

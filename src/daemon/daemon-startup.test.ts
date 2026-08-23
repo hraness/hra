@@ -78,13 +78,15 @@ describe("daemon startup receipts", () => {
 
   test("does not mistake a stale failed receipt for the newly spawned boot", async () => {
     const paths = await pathsFixture();
-    const stale = await DaemonLock.acquire(paths, { pid: 47, now: 0 });
-    await stale.release({ state: "failed", failure: "old failure", now: 1 });
-    let now = 1;
+    const staleReceiptAt = 1;
+    const beyondRecentFailureWindow = staleReceiptAt + 30_001;
+    const stale = await DaemonLock.acquire(paths, { pid: 2_147_483_647, now: 0 });
+    await stale.release({ state: "failed", failure: "old failure", now: staleReceiptAt });
+    let now = beyondRecentFailureWindow;
     let current: DaemonLock | undefined;
     const expected: DaemonIdentity = {
       protocol: DAEMON_PROTOCOL,
-      pid: 48,
+      pid: process.pid,
       nonce: "00000000-0000-4000-8000-000000000048",
       generation: 12,
       bootId: "boot_55555555555555555555555555555555",
