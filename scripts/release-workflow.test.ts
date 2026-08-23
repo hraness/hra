@@ -2,6 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+const reviewedActions = {
+  checkout: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+  downloadArtifact: "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+  sbom: "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
+  setupBun: "oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6",
+  uploadArtifact: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+} as const;
+
 function asRecord(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${label} must be an object`);
@@ -84,6 +92,17 @@ describe("release workflow", () => {
       throw new TypeError("verify job steps must be an array");
     }
     const verifySteps = verify.steps.map((step, index) => asRecord(step, `verify step ${index}`));
+    const actionUses = [...verifySteps, ...stageSteps]
+      .map((step) => step.uses)
+      .filter((value): value is string => typeof value === "string");
+    expect(actionUses).toEqual([
+      reviewedActions.checkout,
+      reviewedActions.setupBun,
+      reviewedActions.sbom,
+      reviewedActions.sbom,
+      reviewedActions.uploadArtifact,
+      reviewedActions.downloadArtifact,
+    ]);
     const checkout = verifySteps.find((step) => step.name === "Check out the tagged source");
     const exactHead = verifySteps.find((step) => step.name === "Verify exact release head and ordering");
     const generated = verifySteps.find((step) => step.name === "Verify generated public documents");
@@ -158,6 +177,10 @@ describe("release workflow", () => {
     }
 
     const parsedSteps = steps.map((step, index) => asRecord(step, `CI step ${index}`));
+    expect(parsedSteps
+      .map((step) => step.uses)
+      .filter((value): value is string => typeof value === "string"))
+      .toEqual([reviewedActions.checkout, reviewedActions.setupBun]);
     const checkout = parsedSteps.find((step) => step.name === "Check out source");
     const install = parsedSteps.find((step) => step.name === "Install dependencies");
     const generated = parsedSteps.find((step) => step.name === "Verify generated public documents");
