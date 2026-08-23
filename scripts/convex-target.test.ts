@@ -11,6 +11,7 @@ import {
   parseConvexTarget,
   parseConvexTargetArguments,
   readConvexAccessToken,
+  verifyConvexDefaultTarget,
   verifyConvexTarget,
   type ConvexManagementFetch,
   type ConvexTarget,
@@ -76,6 +77,7 @@ describe("numeric Convex target guard", () => {
         deploymentType: "prod",
         deploymentUrl: target.deploymentUrl,
         id: target.deploymentId,
+        isDefault: false,
         name: target.deploymentName,
         projectId: target.projectId,
       }), { status: 200 });
@@ -133,6 +135,7 @@ describe("numeric Convex target guard", () => {
           deploymentType: "prod",
           deploymentUrl: target.deploymentUrl,
           id: target.deploymentId,
+          isDefault: false,
           name: target.deploymentName,
           projectId: target.projectId,
         }), { status: 200 });
@@ -151,6 +154,7 @@ describe("numeric Convex target guard", () => {
           deploymentType: "prod",
           deploymentUrl: target.deploymentUrl,
           id: target.deploymentId + 1,
+          isDefault: false,
           name: target.deploymentName,
           projectId: target.projectId,
         },
@@ -161,6 +165,7 @@ describe("numeric Convex target guard", () => {
           deploymentType: "dev",
           deploymentUrl: target.deploymentUrl,
           id: target.deploymentId,
+          isDefault: false,
           name: target.deploymentName,
           projectId: target.projectId,
         },
@@ -186,6 +191,64 @@ describe("numeric Convex target guard", () => {
       };
       await expect(verifyConvexTarget(target, { configPath, fetch: fetcher }))
         .rejects.toThrow(scenario.expected);
+    }
+  });
+
+  test("requires both deployment and project default authority for a production push", async () => {
+    const { configPath } = await makeConfig();
+    const requests: string[] = [];
+    const makeFetcher = (
+      isDefault: boolean,
+      prodDeploymentName: string | null,
+      projectTeamId: number = target.teamId,
+    ): ConvexManagementFetch => async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.includes("/team_and_project")) {
+        return new Response(JSON.stringify({
+          project: "hra",
+          projectId: target.projectId,
+          team: HRA_CONVEX_TEAM_SLUG,
+          teamId: target.teamId,
+        }), { status: 200 });
+      }
+      if (url.includes(`/v1/projects/${target.projectId}`)) {
+        return new Response(JSON.stringify({
+          id: target.projectId,
+          prodDeploymentName,
+          teamId: projectTeamId,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        deploymentType: "prod",
+        deploymentUrl: target.deploymentUrl,
+        id: target.deploymentId,
+        isDefault,
+        name: target.deploymentName,
+        projectId: target.projectId,
+      }), { status: 200 });
+    };
+
+    await verifyConvexDefaultTarget(target, {
+      configPath,
+      fetch: makeFetcher(true, target.deploymentName),
+    });
+    expect(requests.sort()).toEqual([
+      `https://api.convex.dev/api/deployment/${target.deploymentName}/team_and_project`,
+      `https://api.convex.dev/v1/deployments/${target.deploymentName}`,
+      `https://api.convex.dev/v1/projects/${target.projectId}`,
+    ].sort());
+
+    for (const [isDefault, prodDeploymentName, projectTeamId] of [
+      [false, target.deploymentName, target.teamId],
+      [true, null, target.teamId],
+      [true, "other-otter-999", target.teamId],
+      [true, target.deploymentName, target.teamId + 1],
+    ] as const) {
+      await expect(verifyConvexDefaultTarget(target, {
+        configPath,
+        fetch: makeFetcher(isDefault, prodDeploymentName, projectTeamId),
+      })).rejects.toThrow("target_mismatch");
     }
   });
 

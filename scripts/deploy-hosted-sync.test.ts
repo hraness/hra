@@ -14,7 +14,13 @@ import {
   deployHostedSync,
   executeHostedDeploy,
   parseDeployArguments,
+  resolvedTargetAssertionCommand,
 } from "./deploy-hosted-sync";
+import {
+  HRA_EXPECTED_CONVEX_DEPLOY_URL,
+  HRA_RESOLVED_CONVEX_DEPLOY_URL,
+  resolvedConvexDeployTargetMatches,
+} from "./assert-convex-deploy-target";
 import {
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
@@ -164,11 +170,17 @@ describe("verified hosted deployment", () => {
       "enable",
       "--codegen",
       "disable",
+      "--cmd",
+      resolvedTargetAssertionCommand,
+      "--cmd-url-env-var-name",
+      HRA_RESOLVED_CONVEX_DEPLOY_URL,
+      "--skip-workos-check",
       "--message",
       `HRA source ${sourceCommit}`,
     ]);
     expect(deployRequest.environment).toEqual({
       HOME: "/operator-home",
+      [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
       NO_COLOR: "1",
       PATH: "/safe/bin",
       TERM: "dumb",
@@ -181,6 +193,15 @@ describe("verified hosted deployment", () => {
     expect(stderr).toEqual([]);
     expect(JSON.stringify({ stderr, stdout })).not.toContain("provider-stdout-sentinel");
     expect(JSON.stringify({ stderr, stdout })).not.toContain("provider-stderr-sentinel");
+  });
+
+  test("the mandatory pre-push command refuses a deployment resolved after a default switch", () => {
+    const environment = {
+      [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+      [HRA_RESOLVED_CONVEX_DEPLOY_URL]: "https://other-otter-999.convex.cloud",
+    };
+    expect(resolvedConvexDeployTargetMatches(environment)).toBeFalse();
+    expect(resolvedTargetAssertionCommand).toContain("assert-convex-deploy-target.ts");
   });
 
   test("refuses a dirty or wrong source before target verification or provider mutation", async () => {
