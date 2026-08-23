@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { readSync } from "node:fs";
+import { Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { Writable as WritableStream } from "node:stream";
 import { createInterface } from "node:readline/promises";
@@ -1671,7 +1672,8 @@ class JsonlFrameReader {
 
   constructor(fd: number) {
     if (isatty(fd)) throw new ScenarioFailure("operator_descriptor_invalid");
-    this.#stream = createReadStream("/dev/null", { autoClose: true, fd });
+    // IPC ownership makes a pending pipe read cancellable on Linux; fs.ReadStream does not.
+    this.#stream = new Socket({ fd, readable: true, writable: false });
     this.#iterator = this.#stream[Symbol.asyncIterator]();
   }
 

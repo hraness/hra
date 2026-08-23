@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
+import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
@@ -729,30 +731,80 @@ describe("live acceptance release scenario", () => {
         `import { JsonlLiveAcceptanceOperator } from ${JSON.stringify(moduleUrl)};`,
         "const operator = new JsonlLiveAcceptanceOperator();",
         "const controller = new AbortController();",
-        "setTimeout(() => controller.abort(), 100);",
+        "let subscriptions = 0;",
+        "const signal = {",
+        "  get aborted() { return controller.signal.aborted; },",
+        "  get reason() { return controller.signal.reason; },",
+        "  addEventListener(type, listener, options) {",
+        "    controller.signal.addEventListener(type, listener, options);",
+        "    subscriptions += 1;",
+        "    // The second subscription is installed immediately before the pending input read.",
+        "    if (subscriptions === 2) setImmediate(() => controller.abort());",
+        "  },",
+        "  removeEventListener(type, listener, options) {",
+        "    controller.signal.removeEventListener(type, listener, options);",
+        "  },",
+        "};",
         "try {",
-        "  await operator.protectedDocument({ kind: 'device_a_auth_invite', prompt: 'probe' }, controller.signal);",
+        "  await operator.protectedDocument({ kind: 'device_a_auth_invite', prompt: 'probe' }, signal);",
         "  process.exitCode = 2;",
-        "} catch {}",
+        "} catch {",
+        "  if (!controller.signal.aborted) process.exitCode = 3;",
+        "}",
       ].join("\n"),
     ], {
       cwd: join(import.meta.dir, ".."),
       stdio: ["ignore", "ignore", "ignore", "ignore", "pipe", "pipe"],
     });
-    const result = await new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }> | null>(
-      (resolvePromise) => {
-        const timeout = setTimeout(() => resolvePromise(null), 3_000);
-        child.once("exit", (code, signal) => {
-          clearTimeout(timeout);
-          resolvePromise({ code, signal });
-        });
-      },
-    );
-    if (result === null) {
-      child.kill("SIGKILL");
-      await new Promise<void>((resolvePromise) => child.once("exit", () => resolvePromise()));
+    const operatorOutput = (child.stdio as Array<Readable | Writable | null>)[5] as
+      | Readable
+      | null
+      | undefined;
+    if (operatorOutput === undefined || operatorOutput === null) {
+      throw new Error("Missing JSONL operator output pipe.");
     }
-    expect(result).toEqual({ code: 0, signal: null });
+    const outputLines = createInterface({ input: operatorOutput });
+    const outputIterator = outputLines[Symbol.asyncIterator]();
+    const exitPromise = new Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>>((resolvePromise) => {
+      child.once("exit", (code, signal) => {
+        resolvePromise({ code, signal });
+      });
+    });
+    const bounded = async <T>(promise: Promise<T>): Promise<T | null> => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<null>((resolvePromise) => {
+            timeout = setTimeout(() => resolvePromise(null), 3_000);
+          }),
+        ]);
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+    };
+    try {
+      const frame = await bounded(outputIterator.next());
+      if (frame === null || frame.done) throw new Error("Missing JSONL operator request.");
+      expect(JSON.parse(frame.value) as unknown).toMatchObject({
+        kind: "device_a_auth_invite",
+        prompt: "probe",
+        requestId: expect.any(String),
+        type: "protected_input_required",
+        version: 1,
+      });
+      expect(await bounded(exitPromise)).toEqual({ code: 0, signal: null });
+    } finally {
+      outputLines.close();
+      operatorOutput.resume();
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGKILL");
+        await exitPromise;
+      }
+    }
   }, 10_000);
 
   test("rejects terminal-unsafe provider login handoff before rendering it", async () => {

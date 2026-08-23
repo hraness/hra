@@ -50,7 +50,7 @@ Terminal mode hides every invite, OTP, auth document, interaction answer, and pe
 
 The gate also requires a clean Git worktree and resolves the exact `HEAD` commit before starting workers. Passing evidence binds the SHA-256 digest of the configured cloud origin, the package version, and the 40-character source revision. This makes a result from a local fake, a different deployment, a dirty checkout, or a different source revision distinguishable from the intended release candidate.
 
-Agent runners can select `{"operator":{"kind":"jsonl"}}`. In that mode fixed nonterminal descriptor 5 emits bounded requests and fixed nonterminal descriptor 4 accepts one matching response at a time. Requests carry a UUID and one of `protected_input_required`, `device_login_required`, or `progress`. Responses must echo the UUID and be exactly one of:
+Agent runners can select `{"operator":{"kind":"jsonl"}}`. In that mode fixed inherited streaming IPC descriptor 5 emits bounded requests and fixed inherited streaming IPC descriptor 4 accepts one matching response at a time. Requests carry a UUID and one of `protected_input_required`, `device_login_required`, or `progress`. Responses must echo the UUID and be exactly one of:
 
 ```json
 {"document":{"email":"person@example.com"},"requestId":"00000000-0000-4000-8000-000000000000","type":"protected_input","version":1}
