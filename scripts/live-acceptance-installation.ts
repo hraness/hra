@@ -1,5 +1,13 @@
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  openSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 import { z } from "zod";
@@ -70,15 +78,15 @@ async function acceptanceCodexEnvironment(
   return environment;
 }
 
-async function assertAcceptanceCodexConfig(configPath: string): Promise<void> {
+function assertAcceptanceCodexConfig(configPath: string): void {
   const currentUid = process.getuid?.();
   if (currentUid === undefined) {
     throw new Error("Live acceptance requires an operating system user ID.");
   }
 
-  const handle = await open(configPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const descriptor = openSync(configPath, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const before = await handle.stat();
+    const before = fstatSync(descriptor);
     if (
       !before.isFile()
       || before.nlink !== 1
@@ -92,12 +100,18 @@ async function assertAcceptanceCodexConfig(configPath: string): Promise<void> {
     const contents = Buffer.alloc(maximumAcceptanceCodexConfigBytes + 1);
     let length = 0;
     while (length < contents.length) {
-      const read = await handle.read(contents, length, contents.length - length, length);
-      if (read.bytesRead === 0) break;
-      length += read.bytesRead;
+      const bytesRead = readSync(
+        descriptor,
+        contents,
+        length,
+        contents.length - length,
+        length,
+      );
+      if (bytesRead === 0) break;
+      length += bytesRead;
     }
 
-    const after = await handle.stat();
+    const after = fstatSync(descriptor);
     if (
       !after.isFile()
       || after.nlink !== 1
@@ -113,7 +127,7 @@ async function assertAcceptanceCodexConfig(configPath: string): Promise<void> {
       throw new Error("Acceptance CODEX_HOME has an unexpected credential-store configuration.");
     }
   } finally {
-    await handle.close();
+    closeSync(descriptor);
   }
 }
 
@@ -124,28 +138,31 @@ async function prepareAcceptanceCodexHome(codexHome: string): Promise<void> {
   }
   const configPath = join(canonicalHome, "config.toml");
   try {
-    const handle = await open(
+    const descriptor = openSync(
       configPath,
       constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
       0o600,
     );
     try {
-      await handle.writeFile(acceptanceCodexConfig, "utf8");
-      await handle.chmod(0o600);
-      await handle.sync();
+      writeFileSync(descriptor, acceptanceCodexConfig, "utf8");
+      fchmodSync(descriptor, 0o600);
+      fsyncSync(descriptor);
     } finally {
-      await handle.close();
+      closeSync(descriptor);
     }
-    const directory = await open(canonicalHome, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const directoryDescriptor = openSync(
+      canonicalHome,
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
     try {
-      await directory.sync();
+      fsyncSync(directoryDescriptor);
     } finally {
-      await directory.close();
+      closeSync(directoryDescriptor);
     }
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
-  await assertAcceptanceCodexConfig(configPath);
+  assertAcceptanceCodexConfig(configPath);
   await ensurePrivateDirectory(join(canonicalHome, "tmp"));
 }
 

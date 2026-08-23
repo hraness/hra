@@ -326,6 +326,45 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("prepares many private credential homes concurrently", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const installation = createAcceptanceInstallation(layout.descriptors.a);
+      const codexHomes = Array.from({ length: 64 }, (_, index) => join(
+        layout.descriptors.a.rootDirectory,
+        "profiles",
+        `concurrent-${index}`,
+        "codex-home",
+      ));
+
+      await Promise.all(codexHomes.map(async (codexHome) => {
+        await installation.prepareCodexHome(codexHome);
+      }));
+
+      await Promise.all(codexHomes.map(async (codexHome) => {
+        const configPath = join(codexHome, "config.toml");
+        const [metadata, contents] = await Promise.all([
+          lstat(configPath),
+          readFile(configPath, "utf8"),
+        ]);
+        expect(metadata.isFile()).toBe(true);
+        expect(metadata.isSymbolicLink()).toBe(false);
+        expect(metadata.mode & 0o777).toBe(0o600);
+        expect(contents).toBe([
+          'cli_auth_credentials_store = "file"',
+          'mcp_oauth_credentials_store = "file"',
+          "",
+        ].join("\n"));
+      }));
+    } finally {
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  });
+
   test("keeps state, sockets, and capabilities out of worker argv and environment", async () => {
     const base = await privateTestBase();
     let runRoot: string | undefined;
