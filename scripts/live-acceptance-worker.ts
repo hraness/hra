@@ -1,9 +1,6 @@
 #!/usr/bin/env bun
 
-import { createReadStream } from "node:fs";
-import { readSync } from "node:fs";
 import type { Readable, Writable } from "node:stream";
-import { createWriteStream } from "node:fs";
 import { isatty } from "node:tty";
 
 import { callLocalDaemon } from "../src/daemon/local-transport";
@@ -19,7 +16,6 @@ import {
   assertAcceptanceDescriptorLayout,
   LIVE_ACCEPTANCE_CONTROL_FD,
   LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES,
-  LIVE_ACCEPTANCE_DESCRIPTOR_FD,
   LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES,
   LIVE_ACCEPTANCE_STATUS_FD,
   LIVE_ACCEPTANCE_STATUS_MAXIMUM_BYTES,
@@ -35,46 +31,91 @@ class WorkerFailure extends Error {
   }
 }
 
-function readDescriptor(): unknown {
-  if (isatty(LIVE_ACCEPTANCE_DESCRIPTOR_FD)) {
-    throw new WorkerFailure("descriptor_invalid");
+type InputFailureCode = "control_invalid" | "descriptor_invalid";
+
+class WorkerInput {
+  readonly #stream: Readable;
+  readonly #iterator: AsyncIterator<unknown>;
+  #buffer = Buffer.alloc(0);
+  #ended = false;
+
+  constructor() {
+    if (isatty(LIVE_ACCEPTANCE_CONTROL_FD)) {
+      throw new WorkerFailure("descriptor_invalid");
+    }
+    this.#stream = process.stdin;
+    this.#iterator = this.#stream[Symbol.asyncIterator]();
   }
-  const chunks: Buffer[] = [];
-  let total = 0;
-  try {
+
+  async readFrame(
+    maximumBytes: number,
+    failureCode: InputFailureCode,
+  ): Promise<Buffer | null> {
     for (;;) {
-      const remaining = LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES + 1 - total;
-      if (remaining <= 0) throw new WorkerFailure("descriptor_invalid");
-      const chunk = Buffer.allocUnsafe(Math.min(4 * 1024, remaining));
-      const count = readSync(
-        LIVE_ACCEPTANCE_DESCRIPTOR_FD,
-        chunk,
-        0,
-        chunk.byteLength,
-        null,
-      );
-      if (count === 0) {
+      const newline = this.#buffer.indexOf(0x0a);
+      if (newline >= 0) {
+        if (newline === 0 || newline + 1 > maximumBytes) {
+          throw new WorkerFailure(failureCode);
+        }
+        const line = Buffer.from(this.#buffer.subarray(0, newline));
+        const remainder = Buffer.from(this.#buffer.subarray(newline + 1));
+        this.#buffer.fill(0);
+        this.#buffer = remainder;
+        return line;
+      }
+      if (this.#buffer.byteLength >= maximumBytes) {
+        throw new WorkerFailure(failureCode);
+      }
+      if (this.#ended) {
+        if (this.#buffer.byteLength !== 0) throw new WorkerFailure(failureCode);
+        return null;
+      }
+      let next: IteratorResult<unknown>;
+      try {
+        next = await this.#iterator.next();
+      } catch {
+        throw new WorkerFailure(failureCode);
+      }
+      if (next.done) {
+        this.#ended = true;
+        continue;
+      }
+      const chunk = Buffer.isBuffer(next.value)
+        ? next.value
+        : Buffer.from(next.value as Uint8Array);
+      if (chunk.byteLength === 0) continue;
+      const prior = this.#buffer;
+      if (chunk.byteLength > LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES - prior.byteLength) {
+        prior.fill(0);
         chunk.fill(0);
-        break;
+        this.#buffer = Buffer.alloc(0);
+        throw new WorkerFailure(failureCode);
       }
-      chunks.push(chunk.subarray(0, count));
-      total += count;
-      if (total > LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES) {
-        throw new WorkerFailure("descriptor_invalid");
-      }
+      this.#buffer = Buffer.concat([prior, chunk]);
+      prior.fill(0);
+      chunk.fill(0);
     }
-    if (total === 0) throw new WorkerFailure("descriptor_invalid");
-    const bytes = Buffer.concat(chunks, total);
-    try {
-      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } finally {
-      bytes.fill(0);
-    }
-  } catch (error: unknown) {
-    if (error instanceof WorkerFailure) throw error;
+  }
+
+  destroy(): void {
+    this.#buffer.fill(0);
+    this.#buffer = Buffer.alloc(0);
+    this.#stream.destroy();
+  }
+}
+
+async function readDescriptor(input: WorkerInput): Promise<unknown> {
+  const frame = await input.readFrame(
+    LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES,
+    "descriptor_invalid",
+  );
+  if (frame === null) throw new WorkerFailure("descriptor_invalid");
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(frame)) as unknown;
+  } catch {
     throw new WorkerFailure("descriptor_invalid");
   } finally {
-    for (const chunk of chunks) chunk.fill(0);
+    frame.fill(0);
   }
 }
 
@@ -86,10 +127,7 @@ class StatusWriter {
     if (isatty(LIVE_ACCEPTANCE_STATUS_FD)) {
       throw new WorkerFailure("status_unavailable");
     }
-    this.#stream = createWriteStream("/dev/null", {
-      autoClose: false,
-      fd: LIVE_ACCEPTANCE_STATUS_FD,
-    });
+    this.#stream = process.stdout;
   }
 
   write(statusInput: LiveAcceptanceWorkerStatus): Promise<void> {
@@ -464,69 +502,54 @@ async function handleControl(
 }
 
 async function consumeControl(
+  input: WorkerInput,
   descriptor: AcceptanceInstallationDescriptor,
   status: StatusWriter,
   supervisor: DaemonSupervisor,
 ): Promise<ControlOutcome> {
-  if (isatty(LIVE_ACCEPTANCE_CONTROL_FD)) throw new WorkerFailure("control_invalid");
-  const stream: Readable = createReadStream("/dev/null", {
-    autoClose: false,
-    fd: LIVE_ACCEPTANCE_CONTROL_FD,
-  });
   const parentLifetime = new AbortController();
   const completed = deferred<ControlOutcome>();
-  let buffered = Buffer.alloc(0);
   let pendingFrames = 0;
   let tail = Promise.resolve<ControlOutcome | null>(null);
   try {
     const readLoop = (async () => {
       try {
-        for await (const unknownChunk of stream) {
-          const chunk = Buffer.isBuffer(unknownChunk)
-            ? unknownChunk
-            : Buffer.from(unknownChunk as Uint8Array);
-          buffered = Buffer.concat([buffered, chunk]);
-          if (buffered.byteLength > LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES) {
+        for (;;) {
+          const line = await input.readFrame(
+            LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES,
+            "control_invalid",
+          );
+          if (line === null) break;
+          let control: ReturnType<typeof liveAcceptanceWorkerControlSchema.parse>;
+          try {
+            control = liveAcceptanceWorkerControlSchema.parse(
+              JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as unknown,
+            );
+          } catch {
             throw new WorkerFailure("control_invalid");
+          } finally {
+            line.fill(0);
           }
-          for (;;) {
-            const newline = buffered.indexOf(0x0a);
-            if (newline < 0) break;
-            const line = buffered.subarray(0, newline);
-            buffered = buffered.subarray(newline + 1);
-            if (line.byteLength === 0) throw new WorkerFailure("control_invalid");
-            let control: ReturnType<typeof liveAcceptanceWorkerControlSchema.parse>;
+          pendingFrames += 1;
+          if (pendingFrames > 128) throw new WorkerFailure("control_invalid");
+          tail = tail.then(async (prior) => {
+            if (prior !== null) return prior;
             try {
-              control = liveAcceptanceWorkerControlSchema.parse(
-                JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as unknown,
+              const outcome = await handleControl(
+                control,
+                descriptor,
+                status,
+                supervisor,
+                parentLifetime.signal,
               );
-            } catch {
-              throw new WorkerFailure("control_invalid");
+              if (outcome !== null) completed.resolve(outcome);
+              return outcome;
             } finally {
-              line.fill(0);
+              pendingFrames -= 1;
             }
-            pendingFrames += 1;
-            if (pendingFrames > 128) throw new WorkerFailure("control_invalid");
-            tail = tail.then(async (prior) => {
-              if (prior !== null) return prior;
-              try {
-                const outcome = await handleControl(
-                  control,
-                  descriptor,
-                  status,
-                  supervisor,
-                  parentLifetime.signal,
-                );
-                if (outcome !== null) completed.resolve(outcome);
-                return outcome;
-              } finally {
-                pendingFrames -= 1;
-              }
-            });
-            void tail.catch((error: unknown) => completed.reject(error));
-          }
+          });
+          void tail.catch((error: unknown) => completed.reject(error));
         }
-        if (buffered.byteLength !== 0) throw new WorkerFailure("control_invalid");
         parentLifetime.abort(new Error("The acceptance parent control pipe closed."));
         supervisor.beginParentShutdown();
         completed.resolve("parent_closed");
@@ -539,7 +562,7 @@ async function consumeControl(
       parentLifetime.abort(new Error("The acceptance parent control pipe closed."));
       supervisor.beginParentShutdown();
     }
-    stream.destroy();
+    input.destroy();
     await readLoop.catch(() => undefined);
     await beforeDeadline(tail, 5_000).catch((error: unknown) => {
       if (outcome !== "parent_closed") throw error;
@@ -547,8 +570,7 @@ async function consumeControl(
     return outcome;
   } finally {
     parentLifetime.abort(new Error("The acceptance control lifetime ended."));
-    buffered.fill(0);
-    stream.destroy();
+    input.destroy();
   }
 }
 
@@ -562,10 +584,12 @@ const signalDaemon = (): void => {
 
 async function workerMain(): Promise<number> {
   let status: StatusWriter | undefined;
+  let input: WorkerInput | undefined;
   let descriptor: AcceptanceInstallationDescriptor | undefined;
   try {
     status = new StatusWriter();
-    descriptor = await assertAcceptanceDescriptorLayout(readDescriptor());
+    input = new WorkerInput();
+    descriptor = await assertAcceptanceDescriptorLayout(await readDescriptor(input));
     if (process.env.HOME !== descriptor.expectedHomeDirectory) {
       throw new WorkerFailure("home_changed");
     }
@@ -588,7 +612,7 @@ async function workerMain(): Promise<number> {
       type: "ready",
       version: 1,
     });
-    const outcome = await consumeControl(descriptor, status, supervisor);
+    const outcome = await consumeControl(input, descriptor, status, supervisor);
     if (outcome === "parent_closed") {
       const shutdown = new AbortController();
       await supervisor.stop("parent_closed", shutdown.signal);
@@ -618,6 +642,8 @@ async function workerMain(): Promise<number> {
     }).catch(() => undefined);
     await status?.close().catch(() => undefined);
     return 1;
+  } finally {
+    input?.destroy();
   }
 }
 

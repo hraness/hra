@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmod,
@@ -14,6 +15,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
 
 import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
 import { readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
@@ -26,7 +28,10 @@ import {
 import {
   assertAcceptanceDescriptorLayout,
   createLiveAcceptanceLayout,
+  LIVE_ACCEPTANCE_CONTROL_FD,
+  LIVE_ACCEPTANCE_WORKER_STDIO,
   liveAcceptanceRecoveryReceiptSchema,
+  liveAcceptanceWorkerStatusSchema,
   liveAcceptanceWorkerLaunch,
   LiveAcceptanceStartError,
   resumeLiveAcceptanceCleanup,
@@ -326,6 +331,45 @@ describe("source-only live acceptance isolation", () => {
     }
   });
 
+  test("prepares many private credential homes concurrently", async () => {
+    const base = await privateTestBase();
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const installation = createAcceptanceInstallation(layout.descriptors.a);
+      const codexHomes = Array.from({ length: 64 }, (_, index) => join(
+        layout.descriptors.a.rootDirectory,
+        "profiles",
+        `concurrent-${index}`,
+        "codex-home",
+      ));
+
+      await Promise.all(codexHomes.map(async (codexHome) => {
+        await installation.prepareCodexHome(codexHome);
+      }));
+
+      await Promise.all(codexHomes.map(async (codexHome) => {
+        const configPath = join(codexHome, "config.toml");
+        const [metadata, contents] = await Promise.all([
+          lstat(configPath),
+          readFile(configPath, "utf8"),
+        ]);
+        expect(metadata.isFile()).toBe(true);
+        expect(metadata.isSymbolicLink()).toBe(false);
+        expect(metadata.mode & 0o777).toBe(0o600);
+        expect(contents).toBe([
+          'cli_auth_credentials_store = "file"',
+          'mcp_oauth_credentials_store = "file"',
+          "",
+        ].join("\n"));
+      }));
+    } finally {
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  });
+
   test("keeps state, sockets, and capabilities out of worker argv and environment", async () => {
     const base = await privateTestBase();
     let runRoot: string | undefined;
@@ -335,6 +379,7 @@ describe("source-only live acceptance isolation", () => {
       const launch = liveAcceptanceWorkerLaunch(layout.descriptors.a);
       expect(launch.arguments).toHaveLength(1);
       expect(launch.arguments[0].endsWith("/scripts/live-acceptance-worker.ts")).toBe(true);
+      expect(LIVE_ACCEPTANCE_WORKER_STDIO).toEqual(["pipe", "pipe", "ignore"]);
       const serializedLaunch = JSON.stringify({
         arguments: launch.arguments,
         environment: launch.environment,
@@ -351,6 +396,74 @@ describe("source-only live acceptance isolation", () => {
       await removeOwnedTestBase(base);
     }
   });
+
+  test("carries descriptor and fatal controls on stdin with status only on stdout", async () => {
+    const base = await privateTestBase();
+    let child: ReturnType<typeof spawn> | undefined;
+    let childClosed: Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>> | undefined;
+    let runRoot: string | undefined;
+    try {
+      const layout = await createLiveAcceptanceLayout({ temporaryBaseDirectory: base });
+      runRoot = layout.runRoot.path;
+      const descriptor = layout.descriptors.a;
+      const launch = liveAcceptanceWorkerLaunch(descriptor);
+      child = spawn(launch.executable, [...launch.arguments], {
+        cwd: launch.cwd,
+        env: launch.environment,
+        stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
+      });
+      childClosed = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+        (resolvePromise) => child!.once("close", (code, signal) => {
+          resolvePromise({ code, signal });
+        }),
+      );
+      expect(child.stdio).toHaveLength(3);
+      expect(child.stdin).not.toBeNull();
+      expect(child.stdout).not.toBeNull();
+      expect(child.stderr).toBeNull();
+      const lines = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+
+      child.stdin!.write(`${JSON.stringify(descriptor)}\n`);
+      const readyLine = await lines.next();
+      expect(readyLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(readyLine.value!) as unknown,
+      )).toMatchObject({
+        device: descriptor.device,
+        runId: descriptor.runId,
+        type: "ready",
+      });
+
+      child.stdin!.write("{}\n");
+      const failedLine = await lines.next();
+      expect(failedLine.done).toBe(false);
+      expect(liveAcceptanceWorkerStatusSchema.parse(
+        JSON.parse(failedLine.value!) as unknown,
+      )).toEqual({
+        code: "control_invalid",
+        device: descriptor.device,
+        runId: descriptor.runId,
+        type: "failed",
+        version: 1,
+      });
+      expect(await lines.next()).toMatchObject({ done: true });
+      expect(await childClosed).toEqual({ code: 1, signal: null });
+      child = undefined;
+      childClosed = undefined;
+    } finally {
+      if (child !== undefined) {
+        child.stdin?.destroy();
+        child.stdout?.destroy();
+        child.kill("SIGTERM");
+        await childClosed?.catch(() => undefined);
+      }
+      if (runRoot !== undefined) await rm(runRoot, { force: false, recursive: true }).catch(() => undefined);
+      await removeOwnedTestBase(base);
+    }
+  }, 60_000);
 
   test("starts and cleanly joins two full daemon subprocesses with HOME unchanged", async () => {
     const base = await privateTestBase();
@@ -403,7 +516,7 @@ describe("source-only live acceptance isolation", () => {
         "auth",
         "login",
         "--input-fd",
-        "4",
+        String(LIVE_ACCEPTANCE_CONTROL_FD),
         "--json",
       ], { protectedDocument: { email: "not-an-email" } });
       expect(protectedRefusal).toMatchObject({ exitCode: 2, stderr: "" });

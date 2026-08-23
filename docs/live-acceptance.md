@@ -15,9 +15,9 @@ This harness is repository-only. It lives under `scripts/`, is excluded from the
 
 Every child is a canonical mode-`0700` directory owned by the invoking user. The harness records the device and inode of each directory before it starts either worker. It refuses any run directory that overlaps the production HRA state root or the invoking home in either direction.
 
-Each worker receives one strict descriptor through inherited nonterminal file descriptor 3. The descriptor is bounded to 8 KiB and contains the run ID, device name, state root, project directory, exact expected `HOME`, and optional cloud deployment URL. These values never appear in worker arguments or environment variables. The worker arguments contain only the fixed source-worker path.
+Each worker receives one strict installation document as the first bounded JSONL frame on standard input. The document is limited to 8 KiB and contains the run ID, device name, state root, project directory, exact expected `HOME`, and optional cloud deployment URL. These values never appear in worker arguments or environment variables. The worker arguments contain only the fixed source-worker path.
 
-File descriptor 4 carries bounded CLI invocations, protected input documents, and internal cleanup commands. It also owns the worker lifetime. Every scenario operation enters the exported HRA `main()` function, passes through the production parser and renderer, and reaches the daemon through the ordinary local transport. A protected command must select `--input-fd 4`; the worker proves that descriptor is nonterminal, consumes exactly one paired document, and rejects stdin, another descriptor, an unused document, `--follow`, and daemon lifecycle commands. Parent death aborts an in-flight local request immediately, closes the queue, and requests bounded daemon shutdown. File descriptor 5 carries bounded typed CLI results and lifecycle acknowledgements. Worker stdout and stderr are closed, so provider output, credentials, paths, and diagnostics cannot escape through process output.
+The same standard-input stream then carries bounded CLI invocations, paired protected input documents, and internal cleanup commands. Closing it owns the worker lifetime. Every scenario operation enters the exported HRA `main()` function, passes through the production parser and renderer, and reaches the daemon through the ordinary local transport. A protected command must select `--input-fd 0`; the worker proves that standard input is nonterminal, consumes exactly one paired document from the control frame, and rejects `--input-stdin`, another descriptor, an unused document, `--follow`, and daemon lifecycle commands. Parent death aborts an in-flight local request immediately, closes the queue, and requests bounded daemon shutdown. Standard output carries only bounded typed results and lifecycle acknowledgements. Worker stderr is discarded, so provider output, credentials, paths, and diagnostics cannot escape through process output.
 
 Each worker supervises sequential full daemon generations. A successful auth completion or account-deletion response that declares `daemonRestartRequired` is delivered first, then the worker waits for complete authority release and starts a new generation before accepting another operation. An unexpected daemon completion after readiness is terminal. Device suspend and resume stop and start a full generation while preserving the worker control process, which allows the scenario to cross the hosted presence boundary without a second state authority.
 
@@ -50,14 +50,28 @@ Terminal mode hides every invite, OTP, auth document, interaction answer, and pe
 
 The gate also requires a clean Git worktree and resolves the exact `HEAD` commit before starting workers. Passing evidence binds the SHA-256 digest of the configured cloud origin, the package version, and the 40-character source revision. This makes a result from a local fake, a different deployment, a dirty checkout, or a different source revision distinguishable from the intended release candidate.
 
-Agent runners can select `{"operator":{"kind":"jsonl"}}`. In that mode fixed inherited streaming IPC descriptor 5 emits bounded requests and fixed inherited streaming IPC descriptor 4 accepts one matching response at a time. Requests carry a UUID and one of `protected_input_required`, `device_login_required`, or `progress`. Responses must echo the UUID and be exactly one of:
+Agent runners start the gate with standard-stream mode:
+
+```sh
+bun run acceptance:live --scenario-stdin
+```
+
+The first standard-input line must be this bounded candidate configuration:
+
+```json
+{"cloudDeploymentUrl":"https://qualified-hummingbird-537.convex.cloud","operator":{"kind":"jsonl"},"version":1}
+```
+
+Later lines supply one matching response at a time. Standard output emits bounded JSONL requests, progress, and the final result. Response-bearing requests carry a UUID and have type `protected_input_required` or `device_login_required`; progress frames have type `progress` and no UUID. Responses must echo the request UUID and be exactly one of:
 
 ```json
 {"document":{"email":"person@example.com"},"requestId":"00000000-0000-4000-8000-000000000000","type":"protected_input","version":1}
 {"acknowledged":true,"requestId":"00000000-0000-4000-8000-000000000000","type":"device_login","version":1}
 ```
 
-The candidate configuration descriptor cannot reuse descriptor 4 or 5. A closed operator input, an unexpected response type or UUID, a terminal descriptor, an oversized frame, or extra fields fails closed and retains recovery state. `SIGINT` and `SIGTERM` abort protected reads, device calls, polls, presence sleeps, and cleanup waits. Preservation joins any in-flight cleanup before it writes a recovery state, so cleanup and interruption cannot race receipt deletion or overwrite each other's checkpoint.
+An agent distinguishes the terminal frame by its `ok` field; request and progress frames use `type`. Terminal status is `passed`, `startup_failed`, `recovery_required`, or `evidence_unavailable_after_cleanup`. Exit `0` reports passing evidence. Exit `1` reports a startup or run failure, and the terminal status says whether recovery state remains. Exit `75` reports interruption; the terminal frame still says whether recovery state remains. Exit `2` is an argument-usage error and emits no stdout frame. Agents must retain and surface `recoveryReceiptPath` whenever `recoveryReceiptRetained` is true.
+
+`--scenario-fd` accepts only terminal mode, and `--scenario-stdin` accepts only JSONL mode. A closed operator input, an unexpected response type or UUID, a terminal standard stream, an oversized frame, or extra fields fails closed and retains recovery state. `SIGINT` and `SIGTERM` abort protected reads, device calls, polls, presence sleeps, and cleanup waits. Preservation joins any in-flight cleanup before it writes a recovery state, so cleanup and interruption cannot race receipt deletion or overwrite each other's checkpoint.
 
 The source API remains available for deterministic tests and recovery tooling. `run.device("a")` exposes only the verified project directory, bounded CLI `execute()`, and daemon-generation `suspend()` and `resume()`. It does not expose arbitrary state paths, sockets, capabilities, cloud controls, or a public `LocalCommand` transport.
 
@@ -110,7 +124,7 @@ If cleanup stopped before daemon shutdown, recovery starts two new attached work
 
 ## Deterministic evidence
 
-The suite proves strict descriptor parsing, exact candidate selection, canonical private roots, unchanged `HOME`, distinct state and temporary paths, file-only HRA and Codex custody, disabled desktop switching, absence of state authority in worker argv and environment, real CLI and protected-input routing, full-generation suspend/resume, symlink refusal, lost-pair derivation, exact-peer revocation, ambiguous-logout reconciliation, gated quarantine deletion, authoritative on-disk recovery, checkpoint resumption, serialized cleanup interruption, and a real two-subprocess smoke in which both full daemons become ready and stop with released authority and absent socket and capability endpoints. The scenario test drives every release step through a deterministic two-device world, rejects prompt-only result markers, empty usage, local event gaps, wrong remote projection authority, incomplete remote turns, mismatched interaction receipts, mismatched B identity, and terminal-unsafe login handoffs. A real subprocess regression keeps the JSONL input descriptor open, aborts the read, and proves the child exits. Final evidence omits provider identity values, provider-derived hashes, and device-code values.
+The suite proves strict framing and descriptor parsing, exact candidate selection, canonical private roots, unchanged `HOME`, distinct state and temporary paths, file-only HRA and Codex custody, disabled desktop switching, absence of state authority in worker argv and environment, real CLI and protected-input routing, full-generation suspend/resume, symlink refusal, lost-pair derivation, exact-peer revocation, ambiguous-logout reconciliation, gated quarantine deletion, authoritative on-disk recovery, checkpoint resumption, serialized cleanup interruption, and a real two-subprocess smoke in which both full daemons become ready and stop with released authority and absent socket and capability endpoints. The scenario test drives every release step through a deterministic two-device world, rejects prompt-only result markers, empty usage, local event gaps, wrong remote projection authority, incomplete remote turns, mismatched interaction receipts, mismatched B identity, and terminal-unsafe login handoffs. A real subprocess regression keeps standard input open, aborts a pending JSONL read, and proves the child exits without inherited extra pipes. Final evidence omits provider identity values, provider-derived hashes, and device-code values.
 
 ```sh
 bun test scripts/live-acceptance.test.ts scripts/live-acceptance-scenario.test.ts
