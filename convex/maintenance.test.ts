@@ -44,6 +44,14 @@ const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, un
 );
 
 describe("bounded cloud retention", () => {
+  test("does not create maintenance state before hard genesis", async () => {
+    const runtime = convexTest(schema, modules);
+    await expect(runtime.mutation(cleanupExpired, { limit: 200 }))
+      .rejects.toThrow("QUOTA_AUTHORITY_CORRUPT");
+    expect(await runtime.run(async (ctx) =>
+      (await ctx.db.query("maintenanceState").collect()).length)).toBe(0);
+  });
+
   test("materializes a legacy usage cursor before deleting its final source row", async () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesisQuota, {});

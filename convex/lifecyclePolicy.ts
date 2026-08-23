@@ -41,6 +41,7 @@ export const HOSTED_TABLE_LIFECYCLE = {
   deviceRevocationJobs: { owner: "user", quota: "job", retention: "job_until_complete", deletionOrder: 80, disposition: "erase" },
   storageUsageByUser: { owner: "user", quota: null, retention: "active", deletionOrder: 150, disposition: "erase" },
   storageUsageService: { owner: "service", quota: null, retention: "service_permanent", deletionOrder: null, disposition: "service_reset" },
+  serviceControl: { owner: "service", quota: null, retention: "service_permanent", deletionOrder: null, disposition: "service_reset" },
   storageResourceUsageByUser: { owner: "user", quota: null, retention: "active", deletionOrder: 150, disposition: "erase" },
   storageResourceUsageByAccount: { owner: "user", quota: null, retention: "active", deletionOrder: 150, disposition: "erase" },
   maintenanceState: { owner: "service", quota: null, retention: "service_permanent", deletionOrder: null, disposition: "service_reset" },

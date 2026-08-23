@@ -12,6 +12,7 @@ import {
 import {
   digestInviteCapability,
   generateInviteAuthority,
+  invitePublicIdFromCapabilityDigest,
   minimumInviteLifetimeMs,
 } from "./authInvites";
 import { adjustParentAttributedQuotaForPatch } from "./quota";
@@ -37,6 +38,11 @@ const storeChallenge = makeFunctionReference<"mutation", Args, Id<"authOtpChalle
   "authDelivery:storeOtpChallenge",
 );
 const authStore = makeFunctionReference<"mutation", Args, unknown>("auth:store");
+const transitionAdmission = makeFunctionReference<
+  "mutation",
+  { expectedGeneration: number; mutationId: string; state: "frozen" | "open" },
+  unknown
+>("admissionControl:transition");
 
 async function hardRuntime() {
   const runtime = convexTest(schema, authModules);
@@ -100,9 +106,24 @@ describe("Convex Auth hard quota boundary", () => {
     });
   });
 
+  test("blocks refresh-session storage before its handler while admission is frozen", async () => {
+    const runtime = await hardRuntime();
+    await runtime.mutation(transitionAdmission, {
+      expectedGeneration: 0,
+      mutationId: "018bcfe5-6800-7000-8000-000000000903",
+      state: "frozen",
+    });
+    let reachedHandler = false;
+    await expect(runtime.run(async (ctx) =>
+      await runQuotaAwareAuthStoreForTest(ctx, "refreshSession", async () => {
+        reachedHandler = true;
+      }))).rejects.toThrow("AUTH_ADMISSION_FROZEN");
+    expect(reachedHandler).toBe(false);
+  });
+
   test("charges first invite admission and makes exact account replays quota-neutral", async () => {
     const runtime = await hardRuntime();
-    const invite = generateInviteAuthority("identity");
+    const invite = await generateInviteAuthority("identity");
     const capabilityDigest = await digestInviteCapability(invite.capability, "identity");
     await runtime.mutation(recordIssue, {
       capabilityDigest,
@@ -296,7 +317,7 @@ describe("Convex Auth hard quota boundary", () => {
     await expect(corrupt.mutation(recordIssue, {
       capabilityDigest: "d".repeat(64),
       lifetimeMs: minimumInviteLifetimeMs,
-      publicId: `invite_${"a".repeat(32)}`,
+      publicId: invitePublicIdFromCapabilityDigest("d".repeat(64)),
       purpose: "identity",
     })).rejects.toThrow("QUOTA_AUTHORITY_CORRUPT");
     expect(await corrupt.run(async (ctx) =>

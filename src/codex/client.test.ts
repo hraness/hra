@@ -147,6 +147,114 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("CodexAppServerClient", () => {
+  test("preflights both effective credential stores before becoming available", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configReads = 0;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        expect(message.params).toEqual({
+          cwd: configReads === 0
+            ? "/private/tmp/hra-acceptance/project-a"
+            : "/private/tmp/hra-acceptance/project-b",
+          includeLayers: false,
+        });
+        configReads += 1;
+        runtime.respond({
+          id: message.id,
+          result: {
+            config: {
+              cli_auth_credentials_store: "file",
+              mcp_oauth_credentials_store: "file",
+            },
+            origins: {},
+          },
+        });
+      }
+    });
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    await expect(client.initialize()).resolves.toMatchObject({
+      authority: { profileId: "profile-a", processGeneration: 7 },
+    });
+    await expect(client.assertCredentialStores(
+      "/private/tmp/hra-acceptance/project-b",
+    )).resolves.toBeUndefined();
+    expect(process.writes).toContainEqual({
+      id: 2,
+      method: "config/read",
+      params: {
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        includeLayers: false,
+      },
+    });
+    expect(configReads).toBe(2);
+    await client.close();
+  });
+
+  test("fails closed when an effective credential store is not file-backed", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            config: {
+              cli_auth_credentials_store: "file",
+              mcp_oauth_credentials_store: "keyring",
+            },
+            origins: {},
+          },
+        });
+      }
+    });
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    const error = await client.initialize().catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "RUNTIME_MISMATCH" });
+    expect(client.state).toBe("failed");
+    expect(process.signals).toEqual(["SIGTERM"]);
+  });
+
   test("sends the exact pinned login cancellation authority", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, runtime) => {

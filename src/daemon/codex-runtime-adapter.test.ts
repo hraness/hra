@@ -57,6 +57,60 @@ const makeThread = (turns: readonly CodexTurn[]): CodexThread => ({
 });
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("prepares each isolated Codex home and threads its bounded launch policy", async () => {
+    const steps: string[] = [];
+    let launched: LaunchPinnedCodexOptions | undefined;
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = new PinnedCodexRuntimeManager({
+      codexEnvironment: async (codexHome) => {
+        steps.push(`environment:${codexHome}`);
+        return { HOME: "/Users/person", TMPDIR: `${codexHome}/tmp` };
+      },
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      isCurrent: () => true,
+      launchClient: async (options) => {
+        steps.push("launch");
+        launched = options;
+        return fake;
+      },
+      observer: { account: () => undefined, fact: () => undefined },
+      prepareCodexHome: async (codexHome) => {
+        steps.push(`prepare:${codexHome}`);
+      },
+    });
+
+    await manager.readAccount({ authority, signal: new AbortController().signal });
+    expect(steps).toEqual([
+      `prepare:${authority.codexHome}`,
+      `environment:${authority.codexHome}`,
+      "launch",
+    ]);
+    expect(launched).toMatchObject({
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      environment: {
+        HOME: "/Users/person",
+        TMPDIR: `${authority.codexHome}/tmp`,
+      },
+      expectedCodexHome: authority.codexHome,
+    });
+    await manager.close();
+  });
+
   test("preserves the provider login ID and cancels only that exact current-generation login", async () => {
     const canceled: string[] = [];
     const fake = {

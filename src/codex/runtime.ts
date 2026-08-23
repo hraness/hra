@@ -123,6 +123,9 @@ export async function launchPinnedCodexAppServer(
     authority: options.authority,
     expectedCodexHome: options.expectedCodexHome,
     isAuthorityCurrent: options.isAuthorityCurrent,
+    ...(options.credentialStorePreflight === undefined
+      ? {}
+      : { credentialStorePreflight: options.credentialStorePreflight }),
     ...(options.experimentalApi === undefined
       ? {}
       : { experimentalApi: options.experimentalApi }),

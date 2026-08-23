@@ -238,6 +238,7 @@ export type CodexMethod =
   | "account/rateLimits/read"
   | "account/usage/read"
   | "app/list"
+  | "config/read"
   | "experimentalFeature/list"
   | "initialize"
   | "model/list"
@@ -256,6 +257,7 @@ export type CodexMethod =
 
 export const OPERATIONS: Readonly<Record<CodexMethod, CodexOperationDescriptor>> = {
   initialize: operation("initialize", "read", 10_000, "retry-read"),
+  "config/read": operation("config/read", "read", 10_000, "retry-read"),
   "account/read": operation("account/read", "read", 10_000, "retry-read"),
   "account/login/cancel": operation("account/login/cancel", "auth", 10_000, "retry-read"),
   "account/login/start": operation("account/login/start", "auth", 20_000, "reconcile"),
@@ -310,6 +312,11 @@ export interface InitializeResult {
   readonly codexHome: string;
   readonly platformFamily: string;
   readonly platformOs: string;
+}
+
+export interface CodexCredentialStores {
+  readonly cliAuth: "file" | "keyring" | "auto" | "ephemeral";
+  readonly mcpOauth: "file" | "keyring" | "auto";
 }
 
 export type CodexAccount =
@@ -769,6 +776,23 @@ export function parseInitialize(value: unknown): InitializeResult {
       max: 128,
     }),
     platformOs: string(root.platformOs, "initialize.platformOs", { min: 1, max: 128 }),
+  };
+}
+
+/** Closed projection of the two credential-store settings used by acceptance. */
+export function parseCredentialStores(value: unknown): CodexCredentialStores {
+  const config = record(record(value, "config/read result").config, "config/read config");
+  return {
+    cliAuth: oneOf(
+      config.cli_auth_credentials_store,
+      "config/read cli_auth_credentials_store",
+      ["file", "keyring", "auto", "ephemeral"] as const,
+    ),
+    mcpOauth: oneOf(
+      config.mcp_oauth_credentials_store,
+      "config/read mcp_oauth_credentials_store",
+      ["file", "keyring", "auto"] as const,
+    ),
   };
 }
 

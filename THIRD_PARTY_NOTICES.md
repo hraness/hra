@@ -2,4 +2,4 @@
 
 HRA depends on the official OpenAI Codex package, which is licensed under Apache License 2.0. HRA does not copy or redistribute Codex credentials.
 
-Exact dependency versions are recorded in `bun.lock` and `package.json`. Each release also includes a generated SPDX dependency inventory. Dependency packages retain their own license texts and source metadata.
+The immutable release source tag records the verified build graph in `bun.lock`, while the install tarball declares its direct runtime dependency versions in `package.json`. Each release includes an artifact-identity SPDX record whose SHA-256 digest binds that exact tarball. It also includes a separately named Ubuntu 24.04 x64 runtime SPDX inventory captured from the isolated installation accepted before publication. That inventory records the dependencies resolved for the acceptance runner; it does not claim to describe every consumer platform or later package-manager resolution. The tarball does not vendor transitive dependencies. Dependency packages retain their own license texts and source metadata.

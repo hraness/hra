@@ -25,6 +25,7 @@ import {
 import type { CloudSecretCustodyPort } from "./cloud/local-control";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
 import { DAEMON_PROTOCOL, DaemonLock } from "./daemon/daemon-lock";
+import { createAcceptanceInstallation } from "../scripts/live-acceptance-installation";
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
 import { FileSecretBackend, GenerationalSecretCustody } from "./storage/secret-custody";
 
@@ -110,6 +111,46 @@ describe("CLI entry point", () => {
       expect(captured.read().stderr).toBe("");
     } finally {
       await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("threads a source-only installation through initialization without changing HOME", async () => {
+    const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    const runRoot = await realpath(
+      await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)),
+    );
+    const documentsDirectory = join(runRoot, "project-a-fixture");
+    await mkdir(documentsDirectory, { mode: 0o700 });
+    try {
+      const expectedHomeDirectory = process.env.HOME;
+      if (expectedHomeDirectory === undefined) throw new Error("Test requires HOME.");
+      const installation = createAcceptanceInstallation({
+        device: "a",
+        documentsDirectory,
+        expectedHomeDirectory,
+        rootDirectory: join(runRoot, "device-a-fixture"),
+        runId,
+        type: "hra-live-acceptance-device",
+        version: 1,
+      });
+      const captured = capture();
+
+      expect(await main(["init", "--yes", "--json"], captured.output, {
+        installation,
+      })).toBe(0);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        data: {
+          defaultProjectCreated: true,
+          initialized: true,
+          stateRoot: installation.paths.root,
+        },
+        ok: true,
+        version: 1,
+      });
+      expect(process.env.HOME).toBe(expectedHomeDirectory);
+      expect((await lstat(installation.paths.database)).isFile()).toBe(true);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
     }
   });
 

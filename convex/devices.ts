@@ -21,6 +21,7 @@ import {
   requireAuthAuthority,
   requireDeviceAuthority,
 } from "./authority";
+import { requireAuthAdmissionsOpen } from "./admissionControl";
 import {
   loadIdempotencyReceipt,
   storeIdempotencyReceipt,
@@ -203,6 +204,7 @@ export const register = mutation({
       await bindRegistrationToAuthSession(ctx, auth, device);
       return summarizeDevice(device);
     }
+    await requireAuthAdmissionsOpen(ctx);
     const existingBindings = await ctx.db
       .query("deviceSessions")
       .withIndex("by_auth_session", (builder) =>

@@ -4,6 +4,7 @@ export const modules = {
   "./account.ts": async () => await import("./account"),
   "./authDelivery.ts": async () => await import("./authDelivery"),
   "./authInvites.ts": async () => await import("./authInvites"),
+  "./admissionControl.ts": async () => await import("./admissionControl"),
   "./commands.ts": async () => await import("./commands"),
   "./devices.ts": async () => await import("./devices"),
   "./deviceRevocation.ts": async () => await import("./deviceRevocation"),

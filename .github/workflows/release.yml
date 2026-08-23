@@ -41,10 +41,13 @@ jobs:
           if (process.env.GITHUB_REF_NAME !== expected)
           throw new Error(`tag ${process.env.GITHUB_REF_NAME ?? "<missing>"} does not match ${expected}`);'
 
+      - name: Bind release metadata
+        run: printf 'HRA_RELEASE_VERSION=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Verify exact release head and ordering
         run: |
           git fetch --force origin main --tags
-          tagged_commit="$(git rev-parse "$GITHUB_REF_NAME^{commit}")"
+          tagged_commit="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
           checked_out_commit="$(git rev-parse 'HEAD^{commit}')"
           main_commit="$(git rev-parse 'origin/main^{commit}')"
           test "$tagged_commit" = "$checked_out_commit"
@@ -55,6 +58,16 @@ jobs:
       - name: Verify generated public documents
         run: bun run build:site -- --check
 
+      - name: Verify public release availability
+        run: >-
+          bun -e 'const content = await import("./site/content.ts");
+          const template = await import("./site/template.ts");
+          const surfaces = [content.renderReadmeMarkdown(), content.renderPrivacyMarkdown(), template.renderSiteHtml()];
+          const forbidden = ["beta-not-yet-live", "hosted sync service is not live", "website is not live"];
+          const endpoints = content.publicContent.endpoints;
+          if (content.publicReleaseState !== "release-ready" || endpoints.betaTag !== "release-ready" || endpoints.githubRepository !== "live" || endpoints.hostedSync !== "live" || endpoints.website !== "live" || surfaces.some((surface) => forbidden.some((marker) => surface.toLowerCase().includes(marker))))
+          throw new Error("public release availability is not ready");'
+
       - name: Run the repository gate
         run: bun run check
 
@@ -64,31 +77,93 @@ jobs:
           bun pm pack --destination release
           mv "release/hra-${GITHUB_REF_NAME#v}.tgz" "release/hra-${GITHUB_REF_NAME}.tgz"
 
-      - name: Generate the SPDX SBOM
+      - name: Accept the exact packed installation
+        env:
+          BUN_INSTALL: ${{ runner.temp }}/hra-global
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          bun add --global --ignore-scripts "./release/hra-${GITHUB_REF_NAME}.tgz"
+          bun ./scripts/check-installed-package.ts "$BUN_INSTALL/install/global/node_modules/hra"
+          test "$("$BUN_INSTALL/bin/hra" --version)" = "hra ${GITHUB_REF_NAME#v}"
+          "$BUN_INSTALL/bin/hra" doctor --offline --json | bun -e 'const value = JSON.parse(await Bun.stdin.text()); if (value?.ok !== true || value?.data?.offline !== true) throw new Error("offline doctor failed");'
+
+      - name: Generate the artifact identity SPDX SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        env:
+          SYFT_SOURCE_NAME: hra
+          SYFT_SOURCE_VERSION: ${{ env.HRA_RELEASE_VERSION }}
         with:
-          artifact-name: hra-${{ github.ref_name }}.spdx.json
+          artifact-name: hra-${{ github.ref_name }}.artifact.spdx.json
+          file: release/hra-${{ github.ref_name }}.tgz
           format: spdx-json
-          output-file: release/hra-${{ github.ref_name }}.spdx.json
-          path: .
+          output-file: release/hra-${{ github.ref_name }}.artifact.spdx.json
           syft-version: v1.51.0
           upload-artifact: false
           upload-release-assets: false
 
+      - name: Verify the artifact identity SPDX SBOM
+        run: >-
+          bun -e 'const archive = Bun.file(`release/hra-${process.env.GITHUB_REF_NAME}.tgz`);
+          const value = await Bun.file(`release/hra-${process.env.GITHUB_REF_NAME}.artifact.spdx.json`).json();
+          if (typeof value !== "object" || value === null || !Array.isArray(value.packages)) throw new Error("SPDX packages are missing");
+          const exact = value.packages.find((entry) => entry && typeof entry === "object" && entry.name === "hra" && entry.versionInfo === process.env.HRA_RELEASE_VERSION);
+          if (!exact || !Array.isArray(exact.checksums)) throw new Error("exact HRA artifact identity is missing from SPDX");
+          const expected = new Bun.CryptoHasher("sha256").update(await archive.arrayBuffer()).digest("hex");
+          if (!exact.checksums.some((entry) => entry && typeof entry === "object" && entry.algorithm === "SHA256" && entry.checksumValue === expected)) throw new Error("artifact SPDX checksum does not bind the tarball");'
+
+      - name: Generate the Ubuntu 24.04 x64 runtime SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        env:
+          SYFT_SOURCE_NAME: hra-ubuntu-24.04-x64-runtime
+          SYFT_SOURCE_VERSION: ${{ env.HRA_RELEASE_VERSION }}
+        with:
+          artifact-name: hra-${{ github.ref_name }}.ubuntu-24.04-x64.runtime.spdx.json
+          config: .github/syft-runtime.yaml
+          format: spdx-json
+          output-file: release/hra-${{ github.ref_name }}.ubuntu-24.04-x64.runtime.spdx.json
+          path: ${{ runner.temp }}/hra-global/install/global/node_modules
+          syft-version: v1.51.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Verify the Ubuntu 24.04 x64 runtime SPDX SBOM
+        run: >-
+          bun -e 'const value = await Bun.file(`release/hra-${process.env.GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json`).json();
+          if (typeof value !== "object" || value === null || !Array.isArray(value.packages)) throw new Error("runtime SPDX packages are missing");
+          const required = [["hra", process.env.HRA_RELEASE_VERSION], ["@openai/codex", "0.149.0"], ["convex", "1.45.0"], ["zod", "4.4.3"]];
+          for (const [name, version] of required) if (!value.packages.some((entry) => entry && typeof entry === "object" && entry.name === name && entry.versionInfo === version)) throw new Error(`runtime SPDX is missing ${name}@${version}`);'
+
       - name: Write checksums
         working-directory: release
-        run: shasum -a 256 hra-*.tgz hra-*.spdx.json > SHA256SUMS
+        run: >-
+          shasum -a 256
+          "hra-${GITHUB_REF_NAME}.tgz"
+          "hra-${GITHUB_REF_NAME}.artifact.spdx.json"
+          "hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json"
+          > SHA256SUMS
+
+      - name: Preserve the reviewed release metadata
+        run: |
+          bun -e 'const notes = await Bun.file("docs/beta-release-notes.md").text(); if (notes.trim().length === 0) throw new Error("release notes are empty"); await Bun.write("release/RELEASE_NOTES.md", notes.trimEnd());'
+          git rev-parse 'HEAD^{commit}' > release/RELEASE_COMMIT
 
       - name: Preserve verified release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hra-release-${{ github.ref_name }}
-          path: release/
+          path: |
+            release/hra-${{ github.ref_name }}.tgz
+            release/hra-${{ github.ref_name }}.artifact.spdx.json
+            release/hra-${{ github.ref_name }}.ubuntu-24.04-x64.runtime.spdx.json
+            release/SHA256SUMS
+            release/RELEASE_NOTES.md
+            release/RELEASE_COMMIT
           if-no-files-found: error
           retention-days: 1
 
-  publish:
-    name: Publish immutable release
+  stage:
+    name: Stage verified release draft
     needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -101,12 +176,98 @@ jobs:
           name: hra-release-${{ github.ref_name }}
           path: release
 
-      - name: Create the GitHub release
+      - name: Create or resume the accepted release draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME" release/*
-          --verify-tag
-          --generate-notes
-          --title "HRA $GITHUB_REF_NAME"
+        run: |
+          test "$(wc -l < release/RELEASE_COMMIT | tr -d ' ')" = 1
+          grep -Eq '^[0-9a-f]{40}$' release/RELEASE_COMMIT
+          accepted_commit="$(tr -d '\n' < release/RELEASE_COMMIT)"
+          tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
+          main_commit="$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')"
+          test "$accepted_commit" = "$GITHUB_SHA"
+          test "$tag_commit" = "$accepted_commit"
+          test "$main_commit" = "$accepted_commit"
+          marker_status="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 30 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 60 \
+            --header 'Cache-Control: no-cache, no-store, max-age=0' --header 'Pragma: no-cache' \
+            --output canonical-marker-draft.json \
+            --write-out '%{http_code}' \
+            "https://hra.sh/.well-known/hra.json?release-check=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-draft")"
+          test "$marker_status" = 200
+          jq -e --arg commit "$accepted_commit" \
+            'type == "object" and .schemaVersion == 2 and .generation == 1 and .product == "HRA" and .repository.id == 1343008607 and .repository.path == "hraness/hra" and .version == "0.1.0" and .source.commit == $commit' \
+            canonical-marker-draft.json > /dev/null
+          release_ids="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")"
+          release_count="$(printf '%s\n' "$release_ids" | sed '/^$/d' | wc -l | tr -d ' ')"
+          test "$release_count" = 0 -o "$release_count" = 1
+          if test "$release_count" = 0; then
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --notes-file release/RELEASE_NOTES.md \
+              --title "HRA $GITHUB_REF_NAME"
+          fi
+          release_id="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")"
+          test "$(printf '%s\n' "$release_id" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.draft')" = true
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.immutable')" = false
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.prerelease')" = true
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.name')" = "HRA $GITHUB_REF_NAME"
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.body')" = "$(cat release/RELEASE_NOTES.md)"
+          gh release upload "$GITHUB_REF_NAME" \
+            "release/hra-${GITHUB_REF_NAME}.tgz" \
+            "release/hra-${GITHUB_REF_NAME}.artifact.spdx.json" \
+            "release/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json" \
+            release/SHA256SUMS \
+            --clobber
+
+      - name: Read back the staged draft assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          release_ids="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\" and .draft == true) | .id")"
+          test "$(printf '%s\n' "$release_ids" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          release_id="$release_ids"
+          mkdir published-draft
+          assets="$(gh api --paginate "repos/$GH_REPO/releases/$release_id/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          test "$(printf '%s\n' "$assets" | sed '/^$/d' | wc -l | tr -d ' ')" = 4
+          while IFS=$'\t' read -r asset_id asset_name; do
+            case "$asset_name" in
+              "hra-${GITHUB_REF_NAME}.tgz"|"hra-${GITHUB_REF_NAME}.artifact.spdx.json"|"hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json"|SHA256SUMS) ;;
+              *) exit 1 ;;
+            esac
+            gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$asset_id" > "published-draft/$asset_name"
+          done <<< "$assets"
+          cmp release/hra-${GITHUB_REF_NAME}.tgz published-draft/hra-${GITHUB_REF_NAME}.tgz
+          cmp release/hra-${GITHUB_REF_NAME}.artifact.spdx.json published-draft/hra-${GITHUB_REF_NAME}.artifact.spdx.json
+          cmp release/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json published-draft/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json
+          cmp release/SHA256SUMS published-draft/SHA256SUMS
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.tag_name')" = "$GITHUB_REF_NAME"
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.name')" = "HRA $GITHUB_REF_NAME"
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.draft')" = true
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.immutable')" = false
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.prerelease')" = true
+          test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.body')" = "$(cat release/RELEASE_NOTES.md)"
+          cd published-draft
+          shasum -a 256 -c SHA256SUMS
+          cd ..
+          accepted_commit="$(tr -d '\n' < release/RELEASE_COMMIT)"
+          tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
+          main_commit="$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')"
+          test "$accepted_commit" = "$GITHUB_SHA"
+          test "$tag_commit" = "$accepted_commit"
+          test "$main_commit" = "$accepted_commit"
+          marker_status="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 30 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 60 \
+            --header 'Cache-Control: no-cache, no-store, max-age=0' --header 'Pragma: no-cache' \
+            --output canonical-marker-publish.json \
+            --write-out '%{http_code}' \
+            "https://hra.sh/.well-known/hra.json?release-check=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-staged")"
+          test "$marker_status" = 200
+          jq -e --arg commit "$accepted_commit" \
+            'type == "object" and .schemaVersion == 2 and .generation == 1 and .product == "HRA" and .repository.id == 1343008607 and .repository.path == "hraness/hra" and .version == "0.1.0" and .source.commit == $commit' \
+            canonical-marker-publish.json > /dev/null

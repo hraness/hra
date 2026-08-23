@@ -118,8 +118,8 @@ ${renderHead(content, {
   <header class="hero">
     <h1>${escapeHtml(content.productName)}</h1>
     <pre class="install-command" tabindex="0"><code>${escapeHtml(content.installCommand)}</code></pre>
-    <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
     <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
+    <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
   </header>
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>

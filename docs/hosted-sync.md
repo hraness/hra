@@ -18,7 +18,7 @@ The provider identity guard pins the intended Convex team to numeric ID `513923`
    bun run hosted:deploy -- \
      --deployment steady-otter-321 \
      --team-id 513923 \
-     --project-id 1234567 \
+     --project-id 2854545 \
      --deployment-id 7654321 \
      --deployment-url https://steady-otter-321.convex.cloud \
      --source-commit 0123456789abcdef0123456789abcdef01234567
@@ -44,7 +44,7 @@ Pass the JSON from a protected secret source through standard input:
 protected-json-source | bun run hosted:configure -- \
   --deployment steady-otter-321 \
   --team-id 513923 \
-  --project-id 1234567 \
+  --project-id 2854545 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud
 ```
@@ -55,7 +55,7 @@ An agent can use a private nonterminal descriptor:
 bun run hosted:configure -- \
   --deployment steady-otter-321 \
   --team-id 513923 \
-  --project-id 1234567 \
+  --project-id 2854545 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud \
   --input-fd 3 3< <(protected-json-source)
@@ -74,36 +74,109 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
 
-## Establish hard quota authority and issue the first invite
+## Establish hosted authority and issue the first invite
 
-No authentication, OTP, invitation, device, or application write may happen before quota genesis. Choose a new absolute output path in a private operator directory. The path must not exist. Run the one-shot bootstrap on the exact new production deployment:
+No authentication, OTP, invitation, device, or application write may happen before bootstrap. One request-bound mutation atomically establishes hard quota authority, open generation-zero authentication-admission authority, a durable binding to the first invitation digest, and the charged first invitation. Choose a new absolute output path in a private operator directory. The path must not exist. Run the one-shot bootstrap on the exact new production deployment:
 
 ```sh
 bun run hosted:bootstrap -- \
   --deployment steady-otter-321 \
   --team-id 513923 \
-  --project-id 1234567 \
+  --project-id 2854545 \
   --deployment-id 7654321 \
   --deployment-url https://steady-otter-321.convex.cloud \
   --invite-output /absolute/private/path/identity-invite
 ```
 
-The helper uses the authenticated CLI state, strips inherited Convex deploy credentials, and performs numeric target preflight and postflight. It performs this closed sequence:
+The helper uses authenticated CLI state, strips inherited Convex deploy credentials and any inherited value containing an invitation capability, bounds every provider call, and performs numeric target preflight and postflight. It performs this closed sequence:
 
-- Read at most two `storageUsageService` rows through a bounded inline query and require an exact empty array.
-- Resolve and open the output's existing parent as a no-follow directory, hold and repeatedly verify its device and inode, then reserve the requested output with no-follow, exclusive creation and mode `0600`. Existing files and final-component symlinks are refused before mutation. The new directory entry is synced before genesis, so an issued capability can never depend on an output reservation that existed only in memory.
-- Run `quota:genesisHardAuthority` and require exactly `{"enforcement":"hard"}`. The mutation atomically refuses every pre-genesis authentication, invitation, device, application, or quota row covered by hard authority.
-- Read the authority again and require exactly one strict `global` row in `hard` mode, with all identity, record, logical-byte, service, and user counters at zero.
-- Run `authInvites:issue` once for a 24-hour identity invite and parse one strict result.
-- Read the exact numeric provider identity again after invite issuance and before disclosing the capability locally.
-- Sync only the bare bearer capability plus a newline to the already reserved file. Verify that the same inode remains a regular, single-link, mode-`0600` file, sync the parent directory again, and close both held handles. Abort removes only the inode this process reserved and syncs that removal.
+- Read at most two `storageUsageService`, `serviceControl`, `maintenanceState`, and `authInvites` rows through one bounded inline query and require all four exact empty arrays. Scheduled maintenance is hard-gated on quota authority and may not create its cursor first.
+- Resolve and open the output's existing parent as a no-follow directory, require that it is owned by the invoking user with exact mode `0700`, hold and repeatedly verify its owner, mode, device, and inode, then reserve the requested output with no-follow, exclusive creation and mode `0600`. Existing files, shared parent directories, and final-component symlinks are refused before mutation.
+- Generate the 256-bit bearer capability locally. Derive its remote public ID from its purpose-separated SHA-256 digest, sync only the capability plus a newline to the reserved file, and verify the same single-link mode-`0600` inode. This protected local custody is durable before the first provider mutation. The capability never enters provider arguments, environment, stdout, or stderr.
+- Run `quota:genesisHostedAuthority` with only the digest, derived public ID, and exact 24-hour lifetime. The mutation requires every covered authentication, invitation, device, application, quota, maintenance, and service-control table to be pristine. In one Convex transaction it creates the hard quota singleton, the open service-control singleton with the complete bootstrap binding, the first identity invitation, and its exact service quota charge. A concurrent request with a different full capability digest is refused. Replaying the exact request is neutral.
+- Read all three rows again. Require exactly one strict `global` hard quota row charged for exactly one service-owned invitation and zero user data, one strict open generation-zero service-control row bound to this full digest, public ID, and lifetime, and one strict issued invitation with the same binding. Recompute the stored invitation's Convex logical size locally and require both aggregate and service byte counters to equal it.
+- Read the exact numeric provider identity again after the mutation. A pre-custody failure removes only the inode this process reserved. Once custody is durable, every failure preserves the capability file for deterministic recovery.
 
-Provider stdout, provider stderr, and the capability are never forwarded. The safe success line attests that hard zero authority was read back before the first invitation write and that the capability reached the protected file.
+Provider stdout, provider stderr, and the capability are never forwarded. Success returns one bounded JSON object with the safe public invite ID and non-secret invitation state. It attests that the request-bound hosted authority and exact quota charge were read back and that the capability reached the protected file. Record the public ID so the first invitation can be inspected or revoked without reading its capability.
 
-A refusal means the deployment was dirty, genesis already existed, provider output was ambiguous, the exact zero singleton was not proven, invite issuance failed, or the output could not be protected. Do not retry or overwrite after any genesis attempt. Replace the still-unlaunched deployment and repeat the full fresh-state sequence.
+A refusal means the deployment was dirty, another request won bootstrap, provider output was ambiguous, exact authority or quota readback failed, or the output could not be protected. Do not overwrite or discard a populated capability file. Reconcile the exact default deployment first, then recover only through the bootstrap operator with that same file:
+
+```sh
+bun run hosted:bootstrap -- recover \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --invite-file /absolute/private/path/identity-invite
+```
+
+Recovery accepts only an invoking-user-owned, single-link, mode-`0600` regular file inside the same owned mode-`0700` directory. It rederives the full request binding, invokes only `quota:genesisHostedAuthority`, and requires the same exact three-row readback. It can finish a crash that happened after local custody but before the mutation, and it can reconcile a lost mutation response through exact durable state. It never calls ordinary `authInvites:recordIssue`. A different winner returns `bootstrap_authority_conflict`; the losing file remains intact and must never be passed to `hosted:invites recover`.
+
+If no populated capability file exists and every pre-bootstrap authority remains empty, replace the still-unlaunched deployment and repeat the full fresh-state sequence. Any other state is an incident and must remain quarantined for inspection.
 
 ## Accept the first invite
 
-Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow, confirm the identity and first device are active, then consume and remove the one-time capability file.
+Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
 Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled and do not move `hra.sh` until every live acceptance and rollback gate in the release plan passes.
+
+## Operate friend-beta invitations
+
+Run the friend-beta operator only after the one-shot bootstrap and first-invite acceptance are complete. The server refuses new friend invitations until the durable bootstrap-accepted fact exists. This operator never creates or retries hosted authority. Do not run fresh `hosted:bootstrap` on an initialized deployment; use its dedicated `recover` command only for the original protected bootstrap file.
+
+Issue one 24-hour identity invite into a new absolute path whose parent is an existing invoking-user-owned mode-`0700` operator directory:
+
+```sh
+bun run hosted:invites -- issue \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --invite-output /absolute/private/path/friend-name.invite
+```
+
+The output path must not exist. The operator reserves it with no-follow exclusive creation, fixes and verifies mode `0600`, generates the capability locally, and durably commits it before provider access. Convex receives only the capability digest and deterministic public ID through an idempotent mutation. It never receives or returns the bearer capability. The operator never puts the capability in argv, an environment variable, terminal output, provider output, or a temporary file. Success prints one bounded JSON object containing the safe public invite ID and non-secret state. Record that public ID in the private release record, then deliver the capability file through the same protected authentication-input flow used for the first invite.
+
+If issuance returns an indeterminate refusal after the capability file was committed, restore exact default-target certainty and recover from the same file:
+
+```sh
+bun run hosted:invites -- recover \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --invite-file /absolute/private/path/friend-name.invite
+```
+
+Recovery accepts only an owned, single-link, mode-`0600` regular file inside an owned mode-`0700` parent, holds and revalidates both inodes, reads the file without following links, and rederives the digest and public ID. It first reads status by that public ID. Existing issued, bound, consumed, or revoked state is returned without replay. If no row exists, it invokes the same idempotent record mutation and then requires a second status readback. A malformed or lost mutation response is therefore reconciled from durable remote state. Failure preserves the file and prints no capability.
+
+Read status with the public ID:
+
+```sh
+bun run hosted:invites -- status \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --public-id invite_PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
+```
+
+Revoke the same invite when delivery is abandoned or access should end:
+
+```sh
+bun run hosted:invites -- revoke \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --public-id invite_PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP
+```
+
+Status and revoke accept only the public ID, never the bearer capability. Revoke reads and validates identity-invite status before mutation. Every operation performs authenticated numeric target readback before and after its bounded Convex call, requires the exact HRA team, project, production deployment, generated name, and URL, and refuses HRA v0 project ID `2680173` and deployment ID `4677913`. Provider stdout and stderr are suppressed; failures return only a static refusal code.
+
+If issuance is refused after protected custody commits, do not repeat `issue` with a new path. Reconcile the exact default deployment, then use `recover` with the preserved file. Keep the file until a strict result returns its deterministic public ID or the deployment is formally quarantined.

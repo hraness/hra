@@ -13,6 +13,7 @@ import {
   releaseQuotaForDelete,
   releaseQuotaForStoredIdentity,
   releaseServiceQuotaForDelete,
+  requireHardQuotaAuthority,
 } from "./quota";
 import { internalMutation, type MutationCtx } from "./server";
 
@@ -417,6 +418,7 @@ const emptyCounts = (): CleanupCounts => ({
 export const cleanupExpired = internalMutation({
   args: { limit: v.number() },
   handler: async (ctx, args) => {
+    await requireHardQuotaAuthority(ctx);
     let remaining = requireCleanupLimit(args.limit);
     const now = Date.now();
     const counts = emptyCounts();

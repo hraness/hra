@@ -2,6 +2,7 @@ import { v } from "convex/values";
 
 export const authAttemptKind = v.union(v.literal("send"), v.literal("verify"));
 export const authSubjectStatus = v.union(v.literal("active"), v.literal("disabled"));
+export const authAdmissionState = v.union(v.literal("open"), v.literal("frozen"));
 export const challengeDeliveryState = v.union(
   v.literal("reserved"),
   v.literal("accepted"),

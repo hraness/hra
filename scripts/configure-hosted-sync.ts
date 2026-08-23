@@ -10,7 +10,7 @@ import {
   ConvexTargetError,
   parseConvexTarget,
   parseConvexTargetArguments,
-  verifyConvexTarget,
+  verifyConvexDefaultTarget,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -321,7 +321,7 @@ type ConfigureOptions = Readonly<{
 
 export async function configureHostedSync(options: ConfigureOptions): Promise<void> {
   const target = parseConvexTarget(options.target);
-  const verifyTarget = options.verifyTarget ?? verifyConvexTarget;
+  const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
   await verifyTarget(target);
   const generated = await (options.generate ?? generateHostedSecrets)();
   const forbidden = secretValues(options.input, generated);
@@ -339,6 +339,16 @@ export async function configureHostedSync(options: ConfigureOptions): Promise<vo
       executable,
       stdin,
     });
+  const invokeMutation = async (
+    arguments_: readonly string[],
+    stdin: string,
+  ): Promise<CommandResult> => {
+    try {
+      return await invoke(arguments_, stdin);
+    } finally {
+      await verifyTarget(target);
+    }
+  };
 
   const before = await invoke(listArguments(target.deploymentName), "");
   if (before.exitCode !== 0) {
@@ -349,7 +359,7 @@ export async function configureHostedSync(options: ConfigureOptions): Promise<vo
     throw new HostedSetupError("target_already_configured");
   }
 
-  const configured = await invoke(
+  const configured = await invokeMutation(
     setArguments(target.deploymentName),
     serializeHostedEnvironment(options.input, generated),
   );

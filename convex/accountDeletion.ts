@@ -119,6 +119,7 @@ export const ACCOUNT_DELETION_TABLE_STRATEGY = {
   storageResourceUsageByUser: "user_index",
   storageResourceUsageByAccount: "user_index",
   storageUsageService: "service_retained",
+  serviceControl: "service_retained",
   maintenanceState: "service_retained",
 } as const satisfies Readonly<Record<
   keyof typeof HOSTED_TABLE_LIFECYCLE,

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   HRA_CONVEX_TEAM_SLUG,
   HRA_V0_CONVEX_DEPLOYMENT_ID,
@@ -21,7 +22,7 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: 1_234_567,
+  projectId: HRA_CONVEX_PROJECT_ID,
   teamId: HRA_CONVEX_TEAM_ID,
 };
 
@@ -279,6 +280,10 @@ describe("numeric Convex target guard", () => {
     expect(() => parseConvexTarget({
       ...target,
       teamId: HRA_CONVEX_TEAM_ID + 1,
+    })).toThrow("target_invalid");
+    expect(() => parseConvexTarget({
+      ...target,
+      projectId: HRA_CONVEX_PROJECT_ID + 1,
     })).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments([
       ...targetArguments.slice(0, 3),

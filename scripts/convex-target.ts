@@ -21,6 +21,7 @@ export const HRA_V0_CONVEX_PROJECT_ID = 2_680_173;
 export const HRA_V0_CONVEX_DEPLOYMENT_ID = 4_677_913;
 export const HRA_CONVEX_TEAM_ID = 513_923;
 export const HRA_CONVEX_TEAM_SLUG = "cclrte";
+export const HRA_CONVEX_PROJECT_ID = 2_854_545;
 
 const generatedDeploymentNameSchema = z.string()
   .min(5)
@@ -49,12 +50,9 @@ const expectedTargetSchema = z.object({
   deploymentId: numericIdentifierSchema,
   deploymentName: generatedDeploymentNameSchema,
   deploymentUrl: deploymentUrlSchema,
-  projectId: numericIdentifierSchema,
+  projectId: z.literal(HRA_CONVEX_PROJECT_ID),
   teamId: z.literal(HRA_CONVEX_TEAM_ID),
 }).strict().superRefine((target, context) => {
-  if (target.projectId === HRA_V0_CONVEX_PROJECT_ID) {
-    context.addIssue({ code: "custom", message: "HRA v0 project is forbidden." });
-  }
   if (target.deploymentId === HRA_V0_CONVEX_DEPLOYMENT_ID) {
     context.addIssue({ code: "custom", message: "HRA v0 deployment is forbidden." });
   }
