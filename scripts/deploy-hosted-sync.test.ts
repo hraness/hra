@@ -64,6 +64,39 @@ const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
 });
 
 describe("verified hosted deployment", () => {
+  test("ships the Convex typecheck project required by the deploy gate", async () => {
+    const configuration = JSON.parse(await readFile(
+      join(import.meta.dir, "..", "convex", "tsconfig.json"),
+      "utf8",
+    )) as unknown;
+
+    expect(configuration).toEqual({
+      compilerOptions: {
+        allowJs: true,
+        allowImportingTsExtensions: true,
+        allowSyntheticDefaultImports: true,
+        exactOptionalPropertyTypes: true,
+        forceConsistentCasingInFileNames: true,
+        isolatedModules: true,
+        jsx: "react-jsx",
+        lib: ["ES2024", "DOM", "DOM.Iterable"],
+        module: "ESNext",
+        moduleDetection: "force",
+        moduleResolution: "Bundler",
+        noEmit: true,
+        noFallthroughCasesInSwitch: true,
+        noImplicitOverride: true,
+        noUncheckedIndexedAccess: true,
+        resolveJsonModule: true,
+        skipLibCheck: true,
+        strict: true,
+        target: "ES2024",
+      },
+      exclude: ["./_generated", "./**/*.test.ts", "./test.setup.ts"],
+      include: ["./**/*.ts"],
+    });
+  });
+
   test("binds deploy to one exact generated target and clean source without inheriting stale selectors", async () => {
     const repositoryRoot = await makeTemporaryDirectory("hra-hosted-source-");
     const temporaryRoot = await makeTemporaryDirectory("hra-hosted-binding-");
