@@ -1,7 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createWriteStream } from "node:fs";
 import { readSync } from "node:fs";
-import { Socket } from "node:net";
 import type { Readable, Writable } from "node:stream";
 import { Writable as WritableStream } from "node:stream";
 import { createInterface } from "node:readline/promises";
@@ -15,15 +13,16 @@ import {
 } from "../src/cloud/identity-custody";
 import { publicInteractionSchema, type PublicInteraction } from "../src/domain/interactions";
 import { sessionEventPageSchema, type SessionEvent } from "../src/domain/session-events";
-import type {
-  LiveAcceptanceCliResult,
-  LiveAcceptanceDevice,
-  LiveAcceptanceDeviceName,
-  LiveAcceptanceRun,
+import {
+  LIVE_ACCEPTANCE_CONTROL_FD,
+  type LiveAcceptanceCliResult,
+  type LiveAcceptanceDevice,
+  type LiveAcceptanceDeviceName,
+  type LiveAcceptanceRun,
 } from "./live-acceptance";
 
-const protectedOperatorInputFd = 4;
-const operatorOutputFd = 5;
+const operatorInputFd = 0;
+const operatorOutputFd = 1;
 const scenarioConfigurationMaximumBytes = 8 * 1024;
 const operatorFrameMaximumBytes = 64 * 1024;
 const accountLoginDeadlineMs = 10 * 60 * 1_000;
@@ -72,11 +71,13 @@ export interface LiveAcceptanceScenarioOperator {
     userCode: string;
     verificationUrl: string;
   }>, signal: AbortSignal): Promise<void>;
-  progress(step: string): void;
+  progress(step: string): Promise<void>;
   protectedDocument(
     request: LiveAcceptanceOperatorRequest,
     signal: AbortSignal,
   ): Promise<unknown>;
+  close?(): void;
+  flush?(): Promise<void>;
 }
 
 type ScenarioRun = Pick<
@@ -374,7 +375,7 @@ const protectedAuth = async (
   }
   const data = await executeJson(
     device,
-    ["auth", "login", "--input-fd", String(protectedOperatorInputFd), "--json"],
+    ["auth", "login", "--input-fd", String(LIVE_ACCEPTANCE_CONTROL_FD), "--json"],
     { protectedDocument: document },
   );
   return { data, emailDigest };
@@ -790,7 +791,7 @@ const resolveUserInput = async (
     "--revision",
     String(interaction.revision),
     "--input-fd",
-    String(protectedOperatorInputFd),
+    String(LIVE_ACCEPTANCE_CONTROL_FD),
     "--json",
   ], {
     protectedDocument: await operator.protectedDocument({
@@ -822,7 +823,7 @@ const resolvePermission = async (
     "--scope",
     "turn",
     "--input-fd",
-    String(protectedOperatorInputFd),
+    String(LIVE_ACCEPTANCE_CONTROL_FD),
     "--json",
   ], {
     protectedDocument: await operator.protectedDocument({
@@ -1092,10 +1093,10 @@ export async function runLiveAcceptanceScenario(
   const deviceA = cancellableDevice(run.device("a"), signal);
   const deviceB = cancellableDevice(run.device("b"), signal);
 
-  operator.progress("projects");
+  await operator.progress("projects");
   const [projectA] = await Promise.all([addProject(deviceA), addProject(deviceB)]);
 
-  operator.progress("device_a_auth");
+  await operator.progress("device_a_auth");
   const identityA = await protectedAuth(
     deviceA,
     operator,
@@ -1116,7 +1117,7 @@ export async function runLiveAcceptanceScenario(
     throw new ScenarioFailure("device_a_pairing_failed");
   }
 
-  operator.progress("codex_accounts");
+  await operator.progress("codex_accounts");
   const accountA = await addAccount(deviceA, "Acceptance Primary");
   const signedInA = await loginAccount({
     accountId: accountA,
@@ -1153,7 +1154,7 @@ export async function runLiveAcceptanceScenario(
   assertObservedUsage(usageA, accountA);
   assertObservedUsage(usageB, accountB);
 
-  operator.progress("device_b_pending");
+  await operator.progress("device_b_pending");
   await protectedAuth(
     deviceB,
     operator,
@@ -1202,7 +1203,7 @@ export async function runLiveAcceptanceScenario(
     "--json",
   ], { code: "UNAVAILABLE" });
 
-  operator.progress("device_b_approval");
+  await operator.progress("device_b_approval");
   const approved = record(await executeJson(
     deviceA,
     ["device", "approve", deviceBPublicId, "--json"],
@@ -1216,7 +1217,7 @@ export async function runLiveAcceptanceScenario(
     throw new ScenarioFailure("device_b_pairing_failed");
   }
 
-  operator.progress("sessions_and_interactions");
+  await operator.progress("sessions_and_interactions");
   const sessionA = await startSession(deviceA, accountA, projectA);
   const sessionB = await startSession(deviceA, accountB, projectA);
   const markerA = `hra-live-user-input-${randomUUID()}`;
@@ -1323,7 +1324,7 @@ export async function runLiveAcceptanceScenario(
     );
   }
 
-  operator.progress("sync_and_remote");
+  await operator.progress("sync_and_remote");
   await executeJson(deviceA, ["sync", "now", "--json"]);
   await executeJson(deviceB, ["sync", "now", "--json"]);
   const remoteHeads = record(await executeJson(
@@ -1413,7 +1414,7 @@ export async function runLiveAcceptanceScenario(
     sleep,
   });
 
-  operator.progress("presence_and_revocation");
+  await operator.progress("presence_and_revocation");
   const onlineBefore = deviceListScenarioSchema.parse(await executeJson(
     deviceA,
     ["device", "list", "--json"],
@@ -1519,7 +1520,7 @@ export async function runLiveAcceptanceScenario(
     status: "passed",
     version: 1,
   });
-  operator.progress("cleanup");
+  await operator.progress("cleanup");
   await run.cleanup({ signal });
   return evidence;
 }
@@ -1634,7 +1635,7 @@ export class TerminalLiveAcceptanceOperator implements LiveAcceptanceScenarioOpe
     }
   }
 
-  progress(step: string): void {
+  async progress(step: string): Promise<void> {
     process.stderr.write(`hra live acceptance: ${step}\n`);
   }
 
@@ -1670,10 +1671,9 @@ class JsonlFrameReader {
   #closed = false;
   #iterator: AsyncIterator<unknown>;
 
-  constructor(fd: number) {
-    if (isatty(fd)) throw new ScenarioFailure("operator_descriptor_invalid");
-    // IPC ownership makes a pending pipe read cancellable on Linux; fs.ReadStream does not.
-    this.#stream = new Socket({ fd, readable: true, writable: false });
+  constructor() {
+    if (isatty(operatorInputFd)) throw new ScenarioFailure("operator_descriptor_invalid");
+    this.#stream = process.stdin;
     this.#iterator = this.#stream[Symbol.asyncIterator]();
   }
 
@@ -1687,15 +1687,20 @@ class JsonlFrameReader {
     if (returned !== undefined) void returned.catch(() => undefined);
   }
 
-  async read(signal: AbortSignal): Promise<unknown> {
+  async read(
+    signal: AbortSignal,
+    maximumBytes: number = operatorFrameMaximumBytes,
+  ): Promise<unknown> {
     try {
       for (;;) {
         if (this.#closed) throw new ScenarioFailure("operator_closed");
         const newline = this.#buffer.indexOf(0x0a);
         if (newline >= 0) {
+          if (newline === 0 || newline + 1 > maximumBytes) {
+            throw new ScenarioFailure("operator_response_invalid");
+          }
           const line = this.#buffer.subarray(0, newline);
           this.#buffer = this.#buffer.subarray(newline + 1);
-          if (line.byteLength === 0) throw new ScenarioFailure("operator_response_invalid");
           try {
             return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(line)) as unknown;
           } catch {
@@ -1704,15 +1709,24 @@ class JsonlFrameReader {
             line.fill(0);
           }
         }
+        if (this.#buffer.byteLength >= maximumBytes) {
+          throw new ScenarioFailure("operator_response_invalid");
+        }
         const next = await abortable(async () => await this.#iterator.next(), signal);
         if (next.done) throw new ScenarioFailure("operator_closed");
         const chunk = Buffer.isBuffer(next.value)
           ? next.value
           : Buffer.from(next.value as Uint8Array);
-        this.#buffer = Buffer.concat([this.#buffer, chunk]);
-        if (this.#buffer.byteLength > operatorFrameMaximumBytes) {
+        const prior = this.#buffer;
+        if (chunk.byteLength > operatorFrameMaximumBytes - prior.byteLength) {
+          prior.fill(0);
+          chunk.fill(0);
+          this.#buffer = Buffer.alloc(0);
           throw new ScenarioFailure("operator_response_invalid");
         }
+        this.#buffer = Buffer.concat([prior, chunk]);
+        prior.fill(0);
+        chunk.fill(0);
       }
     } catch (error: unknown) {
       if (signal.aborted) this.close();
@@ -1745,22 +1759,50 @@ const writeFrame = async (
 export class JsonlLiveAcceptanceOperator implements LiveAcceptanceScenarioOperator {
   readonly #input: JsonlFrameReader;
   readonly #output: Writable;
+  #outputTail = Promise.resolve();
 
   constructor() {
-    if (isatty(protectedOperatorInputFd) || isatty(operatorOutputFd)) {
+    if (isatty(operatorInputFd) || isatty(operatorOutputFd)) {
       throw new ScenarioFailure("operator_descriptor_invalid");
     }
-    this.#input = new JsonlFrameReader(protectedOperatorInputFd);
-    this.#output = createWriteStream("/dev/null", {
-      autoClose: true,
-      fd: operatorOutputFd,
-    });
+    this.#input = new JsonlFrameReader();
+    this.#output = process.stdout;
   }
 
-  #closeAfterAbort(signal: AbortSignal): void {
-    if (!signal.aborted) return;
+  close(): void {
     this.#input.close();
-    this.#output.destroy();
+  }
+
+  async flush(): Promise<void> {
+    await this.#outputTail;
+  }
+
+  #write(value: unknown, signal?: AbortSignal): Promise<void> {
+    const operation = this.#outputTail.then(
+      async () => await writeFrame(this.#output, value, signal),
+    );
+    const guarded = operation.catch((error: unknown) => {
+      this.close();
+      throw error;
+    });
+    this.#outputTail = guarded;
+    void guarded.catch(() => undefined);
+    return guarded;
+  }
+
+  async readConfiguration(signal: AbortSignal): Promise<LiveAcceptanceScenarioConfiguration> {
+    try {
+      const configuration = liveAcceptanceScenarioConfigurationSchema.parse(
+        await this.#input.read(signal, scenarioConfigurationMaximumBytes),
+      );
+      if (configuration.operator.kind !== "jsonl") {
+        throw new ScenarioFailure("operator_descriptor_invalid");
+      }
+      return configuration;
+    } catch (error: unknown) {
+      this.close();
+      throw error;
+    }
   }
 
   async acknowledgeDeviceLogin(input: Readonly<{
@@ -1770,7 +1812,7 @@ export class JsonlLiveAcceptanceOperator implements LiveAcceptanceScenarioOperat
   }>, signal: AbortSignal): Promise<void> {
     const requestId = randomUUID();
     try {
-      await writeFrame(this.#output, {
+      await this.#write({
         ...input,
         requestId,
         type: "device_login_required",
@@ -1782,17 +1824,17 @@ export class JsonlLiveAcceptanceOperator implements LiveAcceptanceScenarioOperat
         || response.requestId !== requestId
       ) throw new ScenarioFailure("operator_response_invalid");
     } catch (error: unknown) {
-      this.#closeAfterAbort(signal);
+      this.close();
       throw error;
     }
   }
 
-  progress(step: string): void {
-    void writeFrame(this.#output, {
+  async progress(step: string): Promise<void> {
+    await this.#write({
       step,
       type: "progress",
       version: 1,
-    }).catch(() => undefined);
+    });
   }
 
   async protectedDocument(
@@ -1801,7 +1843,7 @@ export class JsonlLiveAcceptanceOperator implements LiveAcceptanceScenarioOperat
   ): Promise<unknown> {
     const requestId = randomUUID();
     try {
-      await writeFrame(this.#output, {
+      await this.#write({
         ...(request.context === undefined ? {} : { context: request.context }),
         kind: request.kind,
         prompt: request.prompt,
@@ -1815,7 +1857,7 @@ export class JsonlLiveAcceptanceOperator implements LiveAcceptanceScenarioOperat
       }
       return response.document;
     } catch (error: unknown) {
-      this.#closeAfterAbort(signal);
+      this.close();
       throw error;
     }
   }
@@ -1829,10 +1871,16 @@ export function createLiveAcceptanceScenarioOperator(
     : new JsonlLiveAcceptanceOperator();
 }
 
-export const liveAcceptanceScenarioFixedOperatorFds = {
-  input: protectedOperatorInputFd,
-  output: operatorOutputFd,
-} as const;
+export async function createStandardJsonlLiveAcceptanceScenario(
+  signal: AbortSignal,
+): Promise<Readonly<{
+  configuration: LiveAcceptanceScenarioConfiguration;
+  operator: JsonlLiveAcceptanceOperator;
+}>> {
+  const operator = new JsonlLiveAcceptanceOperator();
+  const configuration = await operator.readConfiguration(signal);
+  return { configuration, operator };
+}
 
 export const liveAcceptanceScenarioPresenceOfflineBoundaryMs = presenceOfflineBoundaryMs;
 

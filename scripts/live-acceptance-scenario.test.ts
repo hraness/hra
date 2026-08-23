@@ -1,18 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
-import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
 import type { SessionEvent } from "../src/domain/session-events";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
-import type {
-  LiveAcceptanceCliResult,
-  LiveAcceptanceDevice,
-  LiveAcceptanceDeviceName,
+import {
+  LIVE_ACCEPTANCE_CONTROL_FD,
+  type LiveAcceptanceCliResult,
+  type LiveAcceptanceDevice,
+  type LiveAcceptanceDeviceName,
 } from "./live-acceptance";
 import {
   liveAcceptanceScenarioConfigurationSchema,
@@ -537,7 +539,7 @@ class FakeOperator implements LiveAcceptanceScenarioOperator {
     this.deviceLogins += 1;
   }
 
-  progress(): void {}
+  async progress(): Promise<void> {}
 
   async protectedDocument(
     request: LiveAcceptanceOperatorRequest,
@@ -667,7 +669,8 @@ describe("live acceptance release scenario", () => {
     expect(Object.hasOwn(evidence, "providerIdentityDigests")).toBe(false);
     expect(serialized).not.toContain("ABCD-EFGH");
     expect(devices.a.calls.some((argv) =>
-      argv.includes("--input-fd") && argv.includes("4"))).toBe(true);
+      argv.includes("--input-fd") && argv.includes(String(LIVE_ACCEPTANCE_CONTROL_FD))))
+      .toBe(true);
     for (const action of ["auth", "disable", "enable", "install"]) {
       expect(devices.a.calls.some((argv) => argv[0] === "plugin" && argv[1] === action))
         .toBe(true);
@@ -723,7 +726,7 @@ describe("live acceptance release scenario", () => {
     await expect(startFakeScenario(noOpResolution, new FakeOperator()).promise).rejects.toThrow();
   });
 
-  test("JSONL operator abort closes the inherited input read and lets the process exit", async () => {
+  test("JSONL operator abort closes the standard-input read and lets the process exit", async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
     const child = spawn(process.execPath, [
       "-e",
@@ -751,25 +754,19 @@ describe("live acceptance release scenario", () => {
         "} catch {",
         "  if (!controller.signal.aborted) process.exitCode = 3;",
         "}",
+        "process.stdout.write(JSON.stringify({ status: 'after_abort', version: 1 }) + '\\n');",
       ].join("\n"),
     ], {
       cwd: join(import.meta.dir, ".."),
-      stdio: ["ignore", "ignore", "ignore", "ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "ignore"],
     });
-    const operatorOutput = (child.stdio as Array<Readable | Writable | null>)[5] as
-      | Readable
-      | null
-      | undefined;
-    if (operatorOutput === undefined || operatorOutput === null) {
-      throw new Error("Missing JSONL operator output pipe.");
-    }
-    const outputLines = createInterface({ input: operatorOutput });
-    const outputIterator = outputLines[Symbol.asyncIterator]();
-    const exitPromise = new Promise<Readonly<{
+    const operatorInput = child.stdin;
+    const operatorOutput = child.stdout;
+    const closePromise = new Promise<Readonly<{
       code: number | null;
       signal: NodeJS.Signals | null;
     }>>((resolvePromise) => {
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         resolvePromise({ code, signal });
       });
     });
@@ -786,7 +783,10 @@ describe("live acceptance release scenario", () => {
         if (timeout !== undefined) clearTimeout(timeout);
       }
     };
+    let outputLines: ReturnType<typeof createInterface> | undefined;
     try {
+      outputLines = createInterface({ input: operatorOutput });
+      const outputIterator = outputLines[Symbol.asyncIterator]();
       const frame = await bounded(outputIterator.next());
       if (frame === null || frame.done) throw new Error("Missing JSONL operator request.");
       expect(JSON.parse(frame.value) as unknown).toMatchObject({
@@ -796,14 +796,164 @@ describe("live acceptance release scenario", () => {
         type: "protected_input_required",
         version: 1,
       });
-      expect(await bounded(exitPromise)).toEqual({ code: 0, signal: null });
+      const finalFrame = await bounded(outputIterator.next());
+      if (finalFrame === null || finalFrame.done) throw new Error("Missing post-abort JSONL output.");
+      expect(JSON.parse(finalFrame.value) as unknown).toEqual({
+        status: "after_abort",
+        version: 1,
+      });
+      expect(await bounded(closePromise)).toEqual({ code: 0, signal: null });
     } finally {
-      outputLines.close();
-      operatorOutput.resume();
+      const inputClosed = operatorInput.closed
+        ? Promise.resolve()
+        : new Promise<void>((resolvePromise) => operatorInput.once("close", resolvePromise));
+      const outputClosed = operatorOutput.closed
+        ? Promise.resolve()
+        : new Promise<void>((resolvePromise) => operatorOutput.once("close", resolvePromise));
+      outputLines?.close();
+      operatorInput.destroy();
+      operatorOutput.destroy();
       if (child.exitCode === null && child.signalCode === null) {
         child.kill("SIGKILL");
-        await exitPromise;
       }
+      await Promise.all([closePromise, inputClosed, outputClosed]);
+    }
+  }, 10_000);
+
+  test("JSONL operator reads configuration and matching responses from one stdin stream", async () => {
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const child = spawn(process.execPath, [
+      "-e",
+      [
+        `import { createStandardJsonlLiveAcceptanceScenario } from ${JSON.stringify(moduleUrl)};`,
+        "const controller = new AbortController();",
+        "const { configuration, operator } = await createStandardJsonlLiveAcceptanceScenario(controller.signal);",
+        `if (configuration.cloudDeploymentUrl !== ${JSON.stringify(DEFAULT_CLOUD_DEPLOYMENT_URL)}) throw new Error('wrong_config');`,
+        "const document = await operator.protectedDocument({ kind: 'device_a_auth_invite', prompt: 'probe' }, controller.signal);",
+        "if (document?.answer !== 42) throw new Error('wrong_response');",
+        "await operator.progress('complete');",
+        "await operator.flush();",
+        "operator.close();",
+      ].join("\n"),
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let childStderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      childStderr += chunk;
+    });
+    const outputLines = createInterface({ input: child.stdout });
+    const outputIterator = outputLines[Symbol.asyncIterator]();
+    const closePromise = new Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>>((resolvePromise) => {
+      child.once("close", (code, signal) => resolvePromise({ code, signal }));
+    });
+    const writeLine = async (line: string): Promise<void> => {
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        child.stdin.write(`${line}\n`, (error) => {
+          if (error === undefined || error === null) resolvePromise();
+          else rejectPromise(error);
+        });
+      });
+    };
+    const write = async (value: unknown): Promise<void> => {
+      await writeLine(JSON.stringify(value));
+    };
+    try {
+      await writeLine(`  ${JSON.stringify({
+        cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+        operator: { kind: "jsonl" },
+        version: 1,
+      })}  `);
+      const requestLine = await outputIterator.next();
+      if (requestLine.done) throw new Error("Missing JSONL operator request.");
+      const request = JSON.parse(requestLine.value) as { requestId?: unknown };
+      const requestId = request.requestId;
+      expect(typeof requestId).toBe("string");
+      expect(request).toMatchObject({
+        kind: "device_a_auth_invite",
+        prompt: "probe",
+        requestId,
+        type: "protected_input_required",
+        version: 1,
+      });
+      await write({
+        document: { answer: 42 },
+        requestId,
+        type: "protected_input",
+        version: 1,
+      });
+      const progressLine = await outputIterator.next();
+      if (progressLine.done) throw new Error(`Missing JSONL progress frame. ${childStderr}`);
+      expect(JSON.parse(progressLine.value) as unknown).toEqual({
+        step: "complete",
+        type: "progress",
+        version: 1,
+      });
+      expect(await closePromise).toEqual({ code: 0, signal: null });
+      expect(await outputIterator.next()).toMatchObject({ done: true });
+      expect(childStderr).toBe("");
+    } finally {
+      outputLines.close();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closePromise;
+    }
+  }, 10_000);
+
+  test("JSONL operator rejects an otherwise-valid first frame above 8 KiB", async () => {
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const child = spawn(process.execPath, [
+      "-e",
+      [
+        `import { createStandardJsonlLiveAcceptanceScenario } from ${JSON.stringify(moduleUrl)};`,
+        "const controller = new AbortController();",
+        "try {",
+        "  await createStandardJsonlLiveAcceptanceScenario(controller.signal);",
+        "  process.stdout.write('accepted\\n');",
+        "  process.exitCode = 2;",
+        "} catch {",
+        "  process.stdout.write('rejected\\n');",
+        "}",
+      ].join("\n"),
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    const closePromise = new Promise<Readonly<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>>((resolvePromise) => {
+      child.once("close", (code, signal) => resolvePromise({ code, signal }));
+    });
+    try {
+      const validConfiguration = JSON.stringify({
+        cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+        operator: { kind: "jsonl" },
+        version: 1,
+      });
+      child.stdin.end(`${" ".repeat(8 * 1024)}${validConfiguration}\n`);
+      expect(await closePromise).toEqual({ code: 0, signal: null });
+      expect(stdout).toBe("rejected\n");
+      expect(stderr).toBe("");
+    } finally {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closePromise;
     }
   }, 10_000);
 
@@ -911,7 +1061,7 @@ describe("live acceptance release scenario", () => {
     });
   });
 
-  test("the executable refuses to start workers without an explicit scenario descriptor", async () => {
+  test("the executable requires one explicit terminal or agent scenario mode", async () => {
     const child = Bun.spawn([
       process.execPath,
       join(import.meta.dir, "live-acceptance.ts"),
@@ -927,6 +1077,78 @@ describe("live acceptance release scenario", () => {
     ]);
     expect(exitCode).toBe(2);
     expect(stdout).toBe("");
-    expect(stderr).toContain("explicit candidate configuration");
+    expect(stderr).toContain("--scenario-fd");
+    expect(stderr).toContain("--scenario-stdin");
+  });
+
+  test("the executable rejects terminal configuration on agent stdin with a final frame", async () => {
+    const child = Bun.spawn([
+      process.execPath,
+      join(import.meta.dir, "live-acceptance.ts"),
+      "--scenario-stdin",
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      stdin: "pipe",
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    await child.stdin.write(`${JSON.stringify({
+      cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+      operator: { kind: "terminal" },
+      version: 1,
+    })}\n`);
+    await child.stdin.end();
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stdout).toBe(`${JSON.stringify({
+      ok: false,
+      status: "startup_failed",
+      version: 1,
+    })}\n`);
+    expect(stderr).toContain("startup failed safely");
+  });
+
+  test("the executable rejects JSONL configuration from terminal descriptor mode", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "hra-scenario-mode-"));
+    try {
+      const configurationPath = join(directory, "configuration.json");
+      await writeFile(configurationPath, JSON.stringify({
+        cloudDeploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+        operator: { kind: "jsonl" },
+        version: 1,
+      }), { mode: 0o600 });
+      const child = Bun.spawn([
+        "/bin/sh",
+        "-c",
+        'exec 3< "$1"; exec "$2" "$3" --scenario-fd 3',
+        "hra-live-acceptance",
+        configurationPath,
+        process.execPath,
+        join(import.meta.dir, "live-acceptance.ts"),
+      ], {
+        cwd: join(import.meta.dir, ".."),
+        stdin: "ignore",
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stdout).toBe(`${JSON.stringify({
+        ok: false,
+        status: "startup_failed",
+        version: 1,
+      })}\n`);
+      expect(stderr).toContain("startup failed safely");
+    } finally {
+      await rm(directory, { force: false, recursive: true });
+    }
   });
 });

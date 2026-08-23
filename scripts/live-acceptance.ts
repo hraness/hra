@@ -38,12 +38,12 @@ import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
 import { HRA_VERSION } from "../src/version";
 
-export const LIVE_ACCEPTANCE_DESCRIPTOR_FD = 3;
-export const LIVE_ACCEPTANCE_CONTROL_FD = 4;
-export const LIVE_ACCEPTANCE_STATUS_FD = 5;
+export const LIVE_ACCEPTANCE_CONTROL_FD = 0;
+export const LIVE_ACCEPTANCE_STATUS_FD = 1;
 export const LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES = 8 * 1024;
 export const LIVE_ACCEPTANCE_CONTROL_MAXIMUM_BYTES = 256 * 1024;
 export const LIVE_ACCEPTANCE_STATUS_MAXIMUM_BYTES = 2 * 1024 * 1024;
+export const LIVE_ACCEPTANCE_WORKER_STDIO = ["pipe", "pipe", "ignore"] as const;
 
 const workerStartupDeadlineMs = 30_000;
 const workerCommandDeadlineMs = 90_000;
@@ -108,7 +108,7 @@ export const liveAcceptanceWorkerControlSchema = z.discriminatedUnion("type", [
     context.addIssue({ code: "custom", message: "Unbounded CLI following is unavailable." });
   }
   if (value.argv.includes("--input-stdin")) {
-    context.addIssue({ code: "custom", message: "Protected input must use inherited descriptor 4." });
+    context.addIssue({ code: "custom", message: "Protected input must use worker standard input descriptor 0." });
   }
   const inputFd = value.argv.indexOf("--input-fd");
   const requestsProtectedInput = inputFd >= 0
@@ -117,7 +117,7 @@ export const liveAcceptanceWorkerControlSchema = z.discriminatedUnion("type", [
     context.addIssue({ code: "custom", message: "Protected input and descriptor selection must agree." });
   }
   if (inputFd >= 0 && !requestsProtectedInput) {
-    context.addIssue({ code: "custom", message: "Only inherited descriptor 4 carries protected input." });
+    context.addIssue({ code: "custom", message: "Only worker standard input carries protected input." });
   }
 });
 
@@ -906,14 +906,13 @@ const asReadable = (value: unknown): Readable => {
   return value as Readable;
 };
 
-const writeStreamDocument = async (stream: Writable, document: string, close: boolean): Promise<void> => {
+const writeStreamDocument = async (stream: Writable, document: string): Promise<void> => {
   await new Promise<void>((resolvePromise, rejectPromise) => {
     const settle = (error?: Error | null): void => {
       if (error === undefined || error === null) resolvePromise();
       else rejectPromise(error);
     };
-    if (close) stream.end(document, settle);
-    else stream.write(document, settle);
+    stream.write(document, settle);
   });
 };
 
@@ -938,6 +937,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
   readonly projectDirectory: string;
   readonly #child: ChildProcess;
   readonly #control: Writable;
+  readonly #closed = deferredSignal();
   readonly #descriptor: AcceptanceInstallationDescriptor;
   readonly #lifetime = deferredSignal();
   readonly #ready = deferredSignal();
@@ -963,6 +963,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
     this.#descriptor = descriptor;
     this.#child = child;
     this.#control = control;
+    void this.#closed.promise.catch(() => undefined);
     void this.#lifetime.promise.catch(() => undefined);
     void this.#ready.promise.catch(() => undefined);
     void this.#stopped.promise.catch(() => undefined);
@@ -985,6 +986,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
       if (code !== 0 || signal !== null) this.#fail(new LiveAcceptanceError("worker_failed"));
     });
     child.once("close", (code, signal) => {
+      this.#closed.resolve();
       if (code !== 0 || signal !== null || !this.#receivedStopped || !this.#statusEnded) {
         this.#fail(new LiveAcceptanceError("worker_failed"));
         return;
@@ -999,25 +1001,38 @@ class ProcessWorker implements LiveAcceptanceWorker {
     const child = spawn(launch.executable, [...launch.arguments], {
       cwd: launch.cwd,
       env: launch.environment,
-      stdio: ["ignore", "ignore", "ignore", "pipe", "pipe", "pipe"],
+      stdio: [...LIVE_ACCEPTANCE_WORKER_STDIO],
+    });
+    const childClosed = new Promise<void>((resolvePromise) => {
+      child.once("close", () => resolvePromise());
     });
     try {
-      const extendedStdio = child.stdio as Array<null | Readable | Writable>;
-      const descriptorPipe = asWritable(extendedStdio[LIVE_ACCEPTANCE_DESCRIPTOR_FD]);
-      const control = asWritable(extendedStdio[LIVE_ACCEPTANCE_CONTROL_FD]);
-      const status = asReadable(extendedStdio[LIVE_ACCEPTANCE_STATUS_FD]);
+      const control = asWritable(child.stdin);
+      const status = asReadable(child.stdout);
       const worker = new ProcessWorker(descriptor, child, control, status);
       const serialized = `${JSON.stringify(descriptor)}\n`;
       if (Buffer.byteLength(serialized, "utf8") > LIVE_ACCEPTANCE_DESCRIPTOR_MAXIMUM_BYTES) {
         throw new LiveAcceptanceError("input_invalid");
       }
-      await writeStreamDocument(descriptorPipe, serialized, true);
+      await writeStreamDocument(control, serialized);
       return worker;
     } catch (error: unknown) {
-      for (const pipe of (child.stdio as Array<null | Readable | Writable>).slice(3)) {
-        pipe?.destroy();
-      }
+      child.stdin.destroy();
+      child.stdout.destroy();
       child.kill("SIGTERM");
+      const closedAfterTermination = await boundedDeadline(
+        childClosed,
+        workerShutdownDeadlineMs,
+        "worker_failed",
+      ).then(() => true, () => false);
+      if (!closedAfterTermination) {
+        child.kill("SIGKILL");
+        await boundedDeadline(
+          childClosed,
+          workerShutdownDeadlineMs,
+          "worker_failed",
+        );
+      }
       throw error;
     }
   }
@@ -1116,10 +1131,11 @@ class ProcessWorker implements LiveAcceptanceWorker {
   }
 
   async preserve(): Promise<void> {
-    if (this.#child.exitCode !== null || this.#child.signalCode !== null) return;
-    this.#control.end();
+    if (this.#child.exitCode === null && this.#child.signalCode === null) {
+      this.#control.end();
+    }
     await boundedDeadline(
-      this.#lifetime.promise.catch(() => undefined),
+      this.#closed.promise,
       workerShutdownDeadlineMs,
       "daemon_shutdown_unproven",
     ).catch(() => undefined);
@@ -1147,7 +1163,7 @@ class ProcessWorker implements LiveAcceptanceWorker {
       throw new LiveAcceptanceError("input_invalid");
     }
     try {
-      await writeStreamDocument(this.#control, frame, false);
+      await writeStreamDocument(this.#control, frame);
     } catch {
       const error = new LiveAcceptanceError("worker_failed");
       this.#fail(error);
@@ -2331,6 +2347,16 @@ export const liveAcceptanceSourceAttestation = async (
   };
 };
 
+const writeStandardOutputFrame = async (value: unknown): Promise<void> => {
+  const frame = `${JSON.stringify(value)}\n`;
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    process.stdout.write(frame, (error) => {
+      if (error === undefined || error === null) resolvePromise();
+      else rejectPromise(error);
+    });
+  });
+};
+
 export const liveAcceptanceMain = async (
   arguments_: readonly string[] = Bun.argv.slice(2),
 ): Promise<number> => {
@@ -2349,7 +2375,7 @@ export const liveAcceptanceMain = async (
         readLiveAcceptanceRecoveryReceiptFromFd(Number(rawFd)),
         { signal: resumeAbort.signal },
       );
-      process.stdout.write(`${JSON.stringify({ ok: true, status: "cleanup_complete", version: 1 })}\n`);
+      await writeStandardOutputFrame({ ok: true, status: "cleanup_complete", version: 1 });
       return 0;
     } catch {
       process.stderr.write("hra live acceptance: cleanup remains recovery-required\n");
@@ -2359,19 +2385,24 @@ export const liveAcceptanceMain = async (
       process.off("SIGTERM", stopResume);
     }
   }
-  if (
-    arguments_.length !== 2
-    || arguments_[0] !== "--scenario-fd"
-    || arguments_[1] === undefined
-    || !/^[0-9]+$/u.test(arguments_[1])
-  ) {
+  const standardStreamScenario = arguments_.length === 1
+    && arguments_[0] === "--scenario-stdin";
+  const descriptorScenario = arguments_.length === 2
+    && arguments_[0] === "--scenario-fd"
+    && arguments_[1] !== undefined
+    && /^[0-9]+$/u.test(arguments_[1]);
+  if (!standardStreamScenario && !descriptorScenario) {
     process.stderr.write(
-      "hra live acceptance: pass one explicit candidate configuration through --scenario-fd <nonterminal-fd>\n",
+      "hra live acceptance: use --scenario-fd <nonterminal-fd> for a terminal run or --scenario-stdin for a JSONL agent run\n",
     );
     return 2;
   }
-  const scenarioFd = Number(arguments_[1]);
+  const scenarioFd = descriptorScenario ? Number(arguments_[1]) : undefined;
   let run: LiveAcceptanceRun | undefined;
+  let scenarioOperator: Readonly<{
+    close?: () => void;
+    flush?: () => Promise<void>;
+  }> | undefined;
   const interruption = deferredSignal();
   const scenarioAbort = new AbortController();
   const stop = () => {
@@ -2385,19 +2416,26 @@ export const liveAcceptanceMain = async (
   process.once("SIGTERM", stop);
   try {
     const scenarioModule = await import("./live-acceptance-scenario");
-    const configuration = scenarioModule.readLiveAcceptanceScenarioConfigurationFromFd(
-      scenarioFd,
-    );
-    if (
-      configuration.operator.kind === "jsonl"
-      && (scenarioFd === scenarioModule.liveAcceptanceScenarioFixedOperatorFds.input
-        || scenarioFd === scenarioModule.liveAcceptanceScenarioFixedOperatorFds.output)
-    ) throw new LiveAcceptanceError("input_invalid");
+    const standardScenario = standardStreamScenario
+      ? await scenarioModule.createStandardJsonlLiveAcceptanceScenario(scenarioAbort.signal)
+      : undefined;
+    let configuration;
+    if (standardScenario !== undefined) {
+      configuration = standardScenario.configuration;
+    } else {
+      if (scenarioFd === undefined) throw new LiveAcceptanceError("input_invalid");
+      configuration = scenarioModule.readLiveAcceptanceScenarioConfigurationFromFd(scenarioFd);
+    }
+    if (!standardStreamScenario && configuration.operator.kind !== "terminal") {
+      throw new LiveAcceptanceError("input_invalid");
+    }
     if (
       configuration.operator.kind === "terminal"
       && (!process.stdin.isTTY || !process.stderr.isTTY)
     ) throw new LiveAcceptanceError("input_invalid");
-    const operator = scenarioModule.createLiveAcceptanceScenarioOperator(configuration);
+    const operator = standardScenario?.operator
+      ?? scenarioModule.createLiveAcceptanceScenarioOperator(configuration);
+    scenarioOperator = operator;
     const attestation = await liveAcceptanceSourceAttestation(configuration.cloudDeploymentUrl);
     if (scenarioAbort.signal.aborted) throw new LiveAcceptanceError("operator_interrupted");
     run = await startLiveAcceptanceRun({
@@ -2429,40 +2467,44 @@ export const liveAcceptanceMain = async (
         "worker_failed",
       ).catch(() => ({ type: "failed" as const }));
       if (preservation === "cleanup_complete" && settlement.type === "complete") {
-        process.stdout.write(`${JSON.stringify({
+        await scenarioOperator.flush?.();
+        await writeStandardOutputFrame({
           evidence: settlement.evidence,
           ok: true,
           status: "passed",
           version: 1,
-        })}\n`);
+        });
         return 0;
       }
       if (preservation === "cleanup_complete") {
-        process.stdout.write(`${JSON.stringify({
+        await scenarioOperator.flush?.();
+        await writeStandardOutputFrame({
           ok: false,
           recoveryReceiptRetained: false,
           runId: activeRun.runId,
           status: "evidence_unavailable_after_cleanup",
           version: 1,
-        })}\n`);
+        });
         return 1;
       }
-      process.stdout.write(`${JSON.stringify({
+      await scenarioOperator.flush?.();
+      await writeStandardOutputFrame({
         ok: false,
         recoveryReceiptPath: activeRun.recoveryReceiptPath,
         recoveryReceiptRetained: true,
         runId: activeRun.runId,
         status: "recovery_required",
         version: 1,
-      })}\n`);
+      });
       return 75;
     }
-    process.stdout.write(`${JSON.stringify({
+    await scenarioOperator.flush?.();
+    await writeStandardOutputFrame({
       evidence: outcome.evidence,
       ok: true,
       status: "passed",
       version: 1,
-    })}\n`);
+    });
     return 0;
   } catch (error: unknown) {
     const failedRun = run;
@@ -2479,31 +2521,39 @@ export const liveAcceptanceMain = async (
         operatorInterrupted ? "operator_interrupted" : "worker_failed",
       ).catch(() => undefined);
     if (failedRun !== undefined && preservation === "cleanup_complete") {
-      process.stdout.write(`${JSON.stringify({
+      await scenarioOperator?.flush?.().catch(() => undefined);
+      await writeStandardOutputFrame({
         ok: false,
         recoveryReceiptRetained: false,
         runId: failedRun.runId,
         status: "evidence_unavailable_after_cleanup",
         version: 1,
-      })}\n`);
+      }).catch(() => undefined);
       return 1;
     }
     const recovery = failedRun
       ?? (error instanceof LiveAcceptanceStartError ? error : undefined);
+    await scenarioOperator?.flush?.().catch(() => undefined);
     if (recovery !== undefined) {
-      process.stdout.write(`${JSON.stringify({
+      await writeStandardOutputFrame({
         ok: false,
         recoveryReceiptPath: recovery.recoveryReceiptPath,
         recoveryReceiptRetained: true,
         runId: recovery.runId,
         status: "recovery_required",
         version: 1,
-      })}\n`);
+      }).catch(() => undefined);
     } else {
+      await writeStandardOutputFrame({
+        ok: false,
+        status: "startup_failed",
+        version: 1,
+      }).catch(() => undefined);
       process.stderr.write("hra live acceptance: startup failed safely\n");
     }
     return operatorInterrupted ? 75 : 1;
   } finally {
+    scenarioOperator?.close?.();
     process.off("SIGINT", stop);
     process.off("SIGTERM", stop);
   }
