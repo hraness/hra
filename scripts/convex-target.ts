@@ -71,8 +71,15 @@ const deploymentReadbackSchema = z.object({
   deploymentType: z.literal("prod"),
   deploymentUrl: deploymentUrlSchema,
   id: numericIdentifierSchema,
+  isDefault: z.boolean(),
   name: generatedDeploymentNameSchema,
   projectId: numericIdentifierSchema,
+}).passthrough();
+
+const projectReadbackSchema = z.object({
+  id: numericIdentifierSchema,
+  prodDeploymentName: generatedDeploymentNameSchema.nullable(),
+  teamId: z.literal(HRA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const configSchema = z.object({
@@ -279,10 +286,11 @@ export type ConvexTargetVerificationOptions = Readonly<{
 
 export type ConvexTargetVerifier = (target: ConvexTarget) => Promise<void>;
 
-export async function verifyConvexTarget(
+const verifyConvexTargetWithRequirement = async (
   targetValue: ConvexTarget,
-  options: ConvexTargetVerificationOptions = {},
-): Promise<void> {
+  options: ConvexTargetVerificationOptions,
+  requireDefault: boolean,
+): Promise<void> => {
   const target = parseConvexTarget(targetValue);
   const accessToken = await readConvexAccessToken(options.configPath);
   const fetcher = options.fetch ?? fetch;
@@ -305,13 +313,20 @@ export async function verifyConvexTarget(
     return await readBoundedJson(response);
   };
 
-  const [teamAndProjectValue, deploymentValue] = await Promise.all([
+  const requests = [
     request(new URL(
       `/api/deployment/${encodedName}/team_and_project`,
       "https://api.convex.dev",
     )),
     request(new URL(`/v1/deployments/${encodedName}`, "https://api.convex.dev")),
-  ]);
+  ];
+  if (requireDefault) {
+    requests.push(request(new URL(
+      `/v1/projects/${target.projectId}`,
+      "https://api.convex.dev",
+    )));
+  }
+  const [teamAndProjectValue, deploymentValue, projectValue] = await Promise.all(requests);
   const teamAndProject = teamAndProjectSchema.safeParse(teamAndProjectValue);
   const deployment = deploymentReadbackSchema.safeParse(deploymentValue);
   if (
@@ -323,4 +338,27 @@ export async function verifyConvexTarget(
     || deployment.data.projectId !== target.projectId
     || deployment.data.deploymentUrl !== target.deploymentUrl
   ) throw new ConvexTargetError("target_mismatch");
+  if (requireDefault) {
+    const project = projectReadbackSchema.safeParse(projectValue);
+    if (
+      !project.success
+      || !deployment.data.isDefault
+      || project.data.id !== target.projectId
+      || project.data.prodDeploymentName !== target.deploymentName
+    ) throw new ConvexTargetError("target_mismatch");
+  }
+};
+
+export async function verifyConvexTarget(
+  targetValue: ConvexTarget,
+  options: ConvexTargetVerificationOptions = {},
+): Promise<void> {
+  await verifyConvexTargetWithRequirement(targetValue, options, false);
+}
+
+export async function verifyConvexDefaultTarget(
+  targetValue: ConvexTarget,
+  options: ConvexTargetVerificationOptions = {},
+): Promise<void> {
+  await verifyConvexTargetWithRequirement(targetValue, options, true);
 }

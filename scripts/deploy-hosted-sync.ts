@@ -17,10 +17,14 @@ import {
   type CommandRunner,
 } from "./configure-hosted-sync";
 import {
+  HRA_EXPECTED_CONVEX_DEPLOY_URL,
+  HRA_RESOLVED_CONVEX_DEPLOY_URL,
+} from "./assert-convex-deploy-target";
+import {
   ConvexTargetError,
   parseConvexTarget,
   parseConvexTargetArguments,
-  verifyConvexTarget,
+  verifyConvexDefaultTarget,
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
@@ -78,7 +82,19 @@ export function parseDeployArguments(arguments_: readonly string[]): DeployArgum
 }
 
 const convexCli = resolve(import.meta.dir, "..", "node_modules", "convex", "bin", "main.js");
+const resolvedTargetAssertion = resolve(
+  import.meta.dir,
+  "assert-convex-deploy-target.ts",
+);
 const defaultRepositoryRoot = resolve(import.meta.dir, "..");
+
+const shellQuote = (value: string): string =>
+  `'${value.replaceAll("'", `'"'"'`)}'`;
+
+export const resolvedTargetAssertionCommand = [
+  shellQuote(process.execPath),
+  shellQuote(resolvedTargetAssertion),
+].join(" ");
 
 const invokeGit = async (
   runner: CommandRunner,
@@ -209,8 +225,11 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
   const target = parseConvexTarget(options.target);
   const runner = options.runner ?? runCommand;
   const repositoryRoot = options.repositoryRoot ?? defaultRepositoryRoot;
-  const environment = buildConvexChildEnvironment(options.environment ?? process.env, []);
-  const verifyTarget = options.verifyTarget ?? verifyConvexTarget;
+  const environment = {
+    ...buildConvexChildEnvironment(options.environment ?? process.env, []),
+    [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+  };
+  const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
 
   await requireExactSource(
     runner,
@@ -238,6 +257,11 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
           "enable",
           "--codegen",
           "disable",
+          "--cmd",
+          resolvedTargetAssertionCommand,
+          "--cmd-url-env-var-name",
+          HRA_RESOLVED_CONVEX_DEPLOY_URL,
+          "--skip-workos-check",
           "--message",
           `HRA source ${options.sourceCommit}`,
         ],
