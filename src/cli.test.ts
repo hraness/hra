@@ -3,12 +3,26 @@ import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { initialize, main, renderRemoteSuccess, resolveSessionEventCursorCodec, selectDaemonCloudControl } from "./cli";
+import {
+  initialize,
+  main,
+  renderRemoteSuccess,
+  resolveDaemonCloudStartup,
+  resolveSessionEventCursorCodec,
+  selectDaemonCloudControl,
+} from "./cli";
 import {
   CloudDaemonJournalRecoveryBlocker,
+  CustodyCloudDaemonJournal,
   MemoryCloudDaemonJournal,
   type CloudProjectionRecoveryJournalEntry,
 } from "./cloud/daemon-journal";
+import {
+  cloudDeploymentAuthorityFromEnvironment,
+  DeploymentScopedCloudSecretCustody,
+  IdentityScopedCloudSecretCustody,
+} from "./cloud/identity-custody";
+import type { CloudSecretCustodyPort } from "./cloud/local-control";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
 import { DAEMON_PROTOCOL, DaemonLock } from "./daemon/daemon-lock";
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
@@ -22,6 +36,31 @@ const capture = () => {
     read: () => ({ stdout, stderr }),
   };
 };
+
+class MemoryCloudCustody implements CloudSecretCustodyPort {
+  readonly values = new Map<string, Readonly<{ generation: number; value: string }>>();
+
+  read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null> {
+    return Promise.resolve(this.values.get(slot) ?? null);
+  }
+
+  compareAndSwap(
+    slot: string,
+    expectedGeneration: number | null,
+    value: string,
+  ): Promise<Readonly<{ generation: number; value: string }> | null> {
+    const current = this.values.get(slot) ?? null;
+    if ((current?.generation ?? null) !== expectedGeneration) return Promise.resolve(null);
+    const committed = { generation: (current?.generation ?? -1) + 1, value };
+    this.values.set(slot, committed);
+    return Promise.resolve(committed);
+  }
+
+  clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean> {
+    if (this.values.get(slot)?.generation !== expectedGeneration) return Promise.resolve(false);
+    return Promise.resolve(this.values.delete(slot));
+  }
+}
 
 const runningDaemonResponse = () => ({
   ok: true as const,
@@ -640,15 +679,35 @@ describe("CLI entry point", () => {
     }
   });
 
-  test("remote commands remain explicit and offline when no cloud URL is configured", async () => {
+  test("remote commands remain explicit and offline when cloud is explicitly disabled", async () => {
     const previous = process.env.HRA_CONVEX_URL;
-    delete process.env.HRA_CONVEX_URL;
+    process.env.HRA_CONVEX_URL = "";
     try {
       const captured = capture();
       expect(await main(["remote", "list", "--json"], captured.output)).toBe(5);
       expect(JSON.parse(captured.read().stdout)).toMatchObject({
         ok: false,
-        error: { code: "UNAVAILABLE", message: expect.stringContaining("not configured") },
+        error: { code: "UNAVAILABLE", message: expect.stringContaining("disabled") },
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      if (previous === undefined) delete process.env.HRA_CONVEX_URL;
+      else process.env.HRA_CONVEX_URL = previous;
+    }
+  });
+
+  test("remote deployment configuration failures stay static and actionable", async () => {
+    const previous = process.env.HRA_CONVEX_URL;
+    process.env.HRA_CONVEX_URL = "not a deployment URL";
+    try {
+      const captured = capture();
+      expect(await main(["remote", "list", "--json"], captured.output)).toBe(5);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: false,
+        error: {
+          code: "UNAVAILABLE",
+          message: "Cloud sync is unavailable because HRA_CONVEX_URL is invalid.",
+        },
       });
       expect(captured.read().stderr).toBe("");
     } finally {
@@ -708,6 +767,112 @@ describe("CLI entry point", () => {
       signal: new AbortController().signal,
     })).toThrow("not configured");
     expect(await control.isCompactProjectionRecoveryUnsettled(affectedSession)).toBe(true);
+  });
+
+  test("daemon startup reads a mismatched target's scoped journal without enabling transport", async () => {
+    const raw = new MemoryCloudCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(raw, {
+      HRA_CONVEX_URL: "https://bound.convex.cloud",
+    });
+    if (authority === null) throw new Error("fixture authority is disabled");
+    expect(authority.custodyMode).toBe("scoped");
+    const deploymentCustody = new DeploymentScopedCloudSecretCustody(raw, authority);
+    const unselected = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    await unselected.activateIdentity("user_cli_recovery_12345678");
+    const identityCustody = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    const journal = new CustodyCloudDaemonJournal(identityCustody);
+    const affectedSession = `sess_${"4".repeat(32)}`;
+    expect(await journal.compareAndSwap(null, {
+      commands: [],
+      pendingUsageAccount: null,
+      projectionRecoveries: [{
+        authority: { bootGeneration: 1, bootId: "boot_cli_scoped_12345678", fence: 1 },
+        baselineCompletedTurns: [],
+        epochPublicId: "018bcfe5-6800-7000-8000-000000000893",
+        expectedCompactStreamEpoch: 0,
+        expectedHeadSequence: 400,
+        expectedTailDigest: "d".repeat(64),
+        idempotencyKey: "018bcfe5-6800-7000-8000-000000000894",
+        lineageCommitment: "e".repeat(64),
+        localAuthority: {
+          profileGeneration: 1,
+          profileId: "profile_cli_scoped_12345678",
+          providerUpdatedAt: 10,
+          providerThreadId: "thread_cli_scoped_12345678",
+          sessionRevision: 1,
+        },
+        phase: "prepared",
+        replacementCacheId: "cache_cli_scoped_replacement_12345678",
+        requestDigest: "f".repeat(64),
+        requestedAt: 1_700_000_000_000,
+        sessionPublicId: affectedSession,
+        sourceDevicePublicId: "device_cli_scoped_12345678",
+        sourceCacheId: "cache_cli_scoped_source_12345678",
+        userPublicId: "user_cli_recovery_12345678",
+      }],
+      projectionRecoveryReceipts: [],
+      usageAccounts: [],
+      version: 3,
+    })).not.toBeNull();
+    expect(await raw.read("cloud-daemon-journal")).toBeNull();
+
+    const startup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "https://requested.convex.cloud" },
+      secretCustody: raw,
+    });
+    expect(startup.deploymentAuthority).toBeNull();
+    expect(startup.diagnostic)
+      .toBe("Cloud sync is unavailable because this state root is bound to another deployment.");
+    expect(startup.journal).not.toBeNull();
+    expect(startup.identityNamespace).toBe(identityCustody.cacheNamespace);
+    expect(await startup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettled(affectedSession)).toBe(true);
+    expect(await startup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettled(`sess_${"5".repeat(32)}`)).toBe(false);
+  });
+
+  test("daemon startup fails projection recovery admission closed for corrupt authority", async () => {
+    const raw = new MemoryCloudCustody();
+    expect(await raw.compareAndSwap("cloud-deployment-authority", null, "corrupt"))
+      .not.toBeNull();
+    const startup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "https://requested.convex.cloud" },
+      secretCustody: raw,
+    });
+    expect(startup.deploymentAuthority).toBeNull();
+    expect(startup.journal).toBeNull();
+    expect(await startup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettled(`sess_${"6".repeat(32)}`)).toBe(true);
+    expect(await startup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettledForProfile("profile_cli_corrupt_12345678"))
+      .toBe(true);
+    expect(await startup.projectionRecoveryBlocker.supersedeTerminalCompactProjectionRecoveries())
+      .toEqual({ superseded: 0 });
+    await expect(startup.projectionRecoveryBlocker
+      .supersedeCompactProjectionRecoveryForProviderDeletion(`sess_${"6".repeat(32)}`))
+      .rejects.toThrow("Cloud projection recovery custody requires recovery.");
+  });
+
+  test("daemon cloud degradation preserves recovery reads and one bounded binding diagnostic", async () => {
+    const blocker = {
+      isCompactProjectionRecoveryUnsettled: async () => true,
+      isCompactProjectionRecoveryUnsettledForProfile: async () => false,
+      supersedeCompactProjectionRecoveryForProviderDeletion: async () => ({ superseded: false }),
+      supersedeTerminalCompactProjectionRecoveries: async () => ({ superseded: 0 }),
+    };
+    const diagnostic = "Cloud sync is unavailable until HRA_CONVEX_URL explicitly selects the legacy deployment.";
+    const control = selectDaemonCloudControl(null, blocker, diagnostic);
+    expect(await control.status(new AbortController().signal)).toEqual({
+      configured: false,
+      diagnostic,
+      signedIn: false,
+    });
+    expect(await control.isCompactProjectionRecoveryUnsettled("sess_33333333"))
+      .toBe(true);
+    expect(() => control.auth({ email: "reader@example.com", signal: new AbortController().signal }))
+      .toThrow(diagnostic);
+    expect(() => control.sync(new AbortController().signal)).toThrow(diagnostic);
+    expect(() => control.listDevices(new AbortController().signal)).toThrow(diagnostic);
   });
 
   test("remote sessions render stable human and JSON output", () => {

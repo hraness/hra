@@ -8,6 +8,15 @@ import {
   type CloudTransport,
 } from "./client";
 import {
+  acquireCloudDeploymentAuthority,
+  canonicalCloudDeploymentUrl,
+  cloudDeploymentSelectionFromEnvironment,
+  CloudDeploymentAuthorityError,
+  DeploymentScopedCloudSecretCustody,
+  IdentityScopedCloudSecretCustody,
+  type CloudDeploymentAuthority,
+} from "./identity-custody";
+import {
   cloudLimits,
   containsAbsolutePath,
   hasExactKeys,
@@ -111,7 +120,69 @@ function canSelectCloudIdentity(
     && typeof custody.activateIdentity === "function";
 }
 
+export function deploymentFencedSecretCustody(
+  custody: CloudSecretCustodyPort,
+  authority: CloudDeploymentAuthority,
+): CloudSecretCustodyPort {
+  const fenced: CloudSecretCustodyPort = {
+    clearIfGeneration: async (slot, expectedGeneration) => {
+      await authority.assertCurrent();
+      const cleared = await custody.clearIfGeneration(slot, expectedGeneration);
+      await authority.assertCurrent();
+      return cleared;
+    },
+    compareAndSwap: async (slot, expectedGeneration, value) => {
+      await authority.assertCurrent();
+      const committed = await custody.compareAndSwap(slot, expectedGeneration, value);
+      await authority.assertCurrent();
+      return committed;
+    },
+    read: async (slot) => {
+      await authority.assertCurrent();
+      const observed = await custody.read(slot);
+      await authority.assertCurrent();
+      return observed;
+    },
+  };
+  if (!canSelectCloudIdentity(custody)) return fenced;
+  return Object.assign(fenced, {
+    activateIdentity: async (userPublicId: string) => {
+      await authority.assertCurrent();
+      const selected = await custody.activateIdentity(userPublicId);
+      await authority.assertCurrent();
+      return selected;
+    },
+  });
+}
+
+export function deploymentFencedCloudTransport(
+  transport: CloudTransport,
+  authority: CloudDeploymentAuthority,
+): CloudTransport {
+  return {
+    action: async (name, args) => {
+      await authority.assertCurrent();
+      const result = await transport.action(name, args);
+      await authority.assertCurrent();
+      return result;
+    },
+    mutation: async (name, args) => {
+      await authority.assertCurrent();
+      const result = await transport.mutation(name, args);
+      await authority.assertCurrent();
+      return result;
+    },
+    query: async (name, args) => {
+      await authority.assertCurrent();
+      const result = await transport.query(name, args);
+      await authority.assertCurrent();
+      return result;
+    },
+  };
+}
+
 export type LocalCloudControlOptions = Readonly<{
+  deploymentAuthority: CloudDeploymentAuthority;
   deploymentUrl: string;
   deviceLabel?: string;
   lifetimeSignal?: AbortSignal;
@@ -121,6 +192,7 @@ export type LocalCloudControlOptions = Readonly<{
 }>;
 
 export type LocalCloudControlEnvironmentOptions = Readonly<{
+  deploymentAuthority?: CloudDeploymentAuthority;
   deviceLabel?: string;
   environment?: Readonly<Record<string, string | undefined>>;
   lifetimeSignal?: AbortSignal;
@@ -1561,25 +1633,6 @@ function serializeSecret(
   return JSON.stringify(value);
 }
 
-function validateDeploymentUrl(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("HRA_CONVEX_URL is invalid.");
-  }
-  const localHttp = url.protocol === "http:"
-    && (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]");
-  if (
-    (url.protocol !== "https:" && !localHttp)
-    || url.username !== ""
-    || url.password !== ""
-    || url.search !== ""
-    || url.hash !== ""
-  ) throw new Error("HRA_CONVEX_URL is invalid.");
-  return url.toString().replace(/\/$/u, "");
-}
-
 function validateDeviceLabel(value: string): string {
   const label = value.trim();
   if (label.length < 1 || label.length > 160 || containsAbsolutePath(label)) {
@@ -1643,11 +1696,12 @@ function abortBeforeEffect(signal: AbortSignal): void {
 export function deploymentUrlFromEnvironment(
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): string | null {
-  const value = environment.HRA_CONVEX_URL;
-  return value === undefined || value.trim() === "" ? null : validateDeploymentUrl(value);
+  const selection = cloudDeploymentSelectionFromEnvironment(environment);
+  return selection.kind === "disabled" ? null : selection.deploymentUrl;
 }
 
 export class LocalCloudControl implements CloudControlPort {
+  readonly #deploymentAuthority: CloudDeploymentAuthority;
   readonly #deviceLabel: string;
   readonly #now: () => number;
   readonly #secrets: CloudSecretCustodyPort;
@@ -1655,17 +1709,33 @@ export class LocalCloudControl implements CloudControlPort {
   #tail: Promise<unknown> = Promise.resolve();
 
   constructor(options: LocalCloudControlOptions) {
-    const deploymentUrl = validateDeploymentUrl(options.deploymentUrl);
+    const deploymentUrl = canonicalCloudDeploymentUrl(options.deploymentUrl);
+    if (deploymentUrl !== options.deploymentAuthority.deploymentUrl) {
+      throw new CloudDeploymentAuthorityError(
+        "target_mismatch",
+        "Cloud deployment authority does not match the requested deployment.",
+      );
+    }
+    this.#deploymentAuthority = options.deploymentAuthority;
     this.#deviceLabel = validateDeviceLabel(options.deviceLabel ?? "This device");
     this.#now = options.now ?? Date.now;
-    this.#secrets = options.secretCustody;
-    this.#transport = options.transport ?? createConvexCloudTransport({
-      accessToken: async () => (await this.#readTransportAuth())?.token ?? null,
+    this.#secrets = deploymentFencedSecretCustody(
+      options.secretCustody,
+      this.#deploymentAuthority,
+    );
+    const transport = options.transport ?? createConvexCloudTransport({
+      accessToken: async () => {
+        await this.#deploymentAuthority.assertCurrent();
+        const token = (await this.#readTransportAuth())?.token ?? null;
+        await this.#deploymentAuthority.assertCurrent();
+        return token;
+      },
       deploymentUrl,
       ...(options.lifetimeSignal === undefined
         ? {}
         : { lifetimeSignal: options.lifetimeSignal }),
     });
+    this.#transport = deploymentFencedCloudTransport(transport, this.#deploymentAuthority);
   }
 
   async auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown> {
@@ -3984,6 +4054,7 @@ export class LocalCloudControl implements CloudControlPort {
     allowDuringAccountDeletion = false,
   ): Promise<T> {
     const guarded = async (): Promise<T> => {
+      await this.#deploymentAuthority.assertCurrent();
       if (!allowDuringAccountDeletion && await this.#readPendingAccountDeletion() !== null) {
         throw new Error("Cloud effects are unavailable while hosted account erasure is in progress.");
       }
@@ -4003,19 +4074,34 @@ export function createLocalCloudControl(options: LocalCloudControlOptions): Clou
   return new LocalCloudControl(options);
 }
 
-export function createLocalCloudControlFromEnvironment(
+export async function createLocalCloudControlFromEnvironment(
   options: LocalCloudControlEnvironmentOptions,
-): LocalCloudControl | null {
-  const deploymentUrl = deploymentUrlFromEnvironment(options.environment);
-  if (deploymentUrl === null) return null;
+): Promise<LocalCloudControl | null> {
+  const selection = cloudDeploymentSelectionFromEnvironment(options.environment);
+  if (selection.kind === "disabled") return null;
+  const deploymentAuthority = options.deploymentAuthority
+    ?? await acquireCloudDeploymentAuthority(options.secretCustody, selection);
+  if (deploymentAuthority.deploymentUrl !== selection.deploymentUrl) {
+    throw new CloudDeploymentAuthorityError(
+      "target_mismatch",
+      "Cloud deployment authority does not match the requested deployment.",
+    );
+  }
+  await deploymentAuthority.assertCurrent();
+  const deploymentCustody = new DeploymentScopedCloudSecretCustody(
+    options.secretCustody,
+    deploymentAuthority,
+  );
+  const identityCustody = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
   return new LocalCloudControl({
-    deploymentUrl,
+    deploymentAuthority,
+    deploymentUrl: selection.deploymentUrl,
     ...(options.deviceLabel === undefined ? {} : { deviceLabel: options.deviceLabel }),
     ...(options.lifetimeSignal === undefined
       ? {}
       : { lifetimeSignal: options.lifetimeSignal }),
     ...(options.now === undefined ? {} : { now: options.now }),
-    secretCustody: options.secretCustody,
+    secretCustody: identityCustody,
     ...(options.transport === undefined ? {} : { transport: options.transport }),
   });
 }

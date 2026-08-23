@@ -112,23 +112,40 @@ const projectFor = (
   id: projectId,
 });
 
-const markerFor = (endpoint: CutoverEndpoint): unknown => ({
-  generation: endpoint.generation,
-  product: "HRA",
-  repository: {
-    id: endpoint.repositoryId,
-    path: endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra",
-  },
-  schemaVersion: 2,
-  source: { commit: endpoint.sourceCommit },
-  version: endpoint.version,
-});
+const markerFor = (endpoint: CutoverEndpoint): unknown => {
+  const shared = {
+    generation: endpoint.generation,
+    product: "HRA",
+    repository: {
+      id: endpoint.repositoryId,
+      path: endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra",
+    },
+    schemaVersion: 2,
+    source: { commit: endpoint.sourceCommit },
+  };
+  return endpoint.generation === 0
+    ? {
+        ...shared,
+        publication: {
+          build: 15,
+          dmgSha256: "7ff49500de3d1fc768c17454ef7642c51f6662dfa5bf0e2ba183a85bb67fcd03",
+          publicationCommit: "6221f79b745f154882080936b961ff431569f33e",
+          releaseId: 374_980_441,
+          sourceCommit: "7b39c459827b2acf45aa2d911c94fdb5d4f37860",
+          tag: "v0.1.14",
+          tagObject: "37ed37afb39cacfd6a51044cf7f3c1b873571aa3",
+          version: endpoint.version,
+        },
+      }
+    : { ...shared, version: endpoint.version };
+};
 
 type MoveBehavior = "ambiguous" | "commit" | "move-and-source-alias" | "noop";
 
 class FakeCutoverProvider implements CutoverProvider {
   readonly aliasEndpoints: Record<ManagedAlias, CutoverEndpoint>;
   markerBrokenForTargetAlias: ManagedAlias | undefined;
+  markerOverrideForTargetAlias: Readonly<{ alias: ManagedAlias; value: unknown }> | undefined;
   moveBehavior: MoveBehavior = "commit";
   owner: "ambiguous" | "source" | "target" = "source";
   sourceAliasSetFailure: ManagedAlias | undefined;
@@ -185,6 +202,10 @@ class FakeCutoverProvider implements CutoverProvider {
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
     const endpoint = this.aliasEndpoints[aliasName];
     this.operations.push(`read-marker:${aliasName}:${endpoint.deploymentId}`);
+    if (
+      this.markerOverrideForTargetAlias?.alias === aliasName
+      && endpoint === this.plan.target
+    ) return this.markerOverrideForTargetAlias.value;
     if (this.markerBrokenForTargetAlias === aliasName && endpoint === this.plan.target) {
       return { ...markerFor(endpoint) as object, source: { commit: "0".repeat(40) } };
     }
@@ -272,6 +293,9 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("{id,accountId,autoAssignCustomDomains}");
     expect(runbook).toContain("--prod --skip-domain");
     expect(runbook).toContain("vercel curl / --deployment <deployment-id>");
+    expect(runbook).toContain("publication.version");
+    expect(runbook).toContain("top-level `version`");
+    expect(runbook).not.toContain("vercel curl / --deployment <deployment-id> --scope");
     expect(runbook).toContain("/v4/aliases/hra-weld.vercel.app");
     expect(runbook).toContain("/v4/aliases/try-hra.vercel.app");
     expect(runbook).toContain("https://try-hra.vercel.app");
@@ -538,6 +562,50 @@ describe("domain cutover operator", () => {
     expect(provider.operations).not.toContain(
       `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
     );
+  });
+
+  test("refuses generation-zero markers with a wrong schema or top-level-only version", async () => {
+    for (const value of [
+      { ...markerFor(oldEndpoint) as object, schemaVersion: 1 },
+      {
+        generation: 0,
+        product: "HRA",
+        repository: {
+          id: oldEndpoint.repositoryId,
+          path: "hraness/hra-v0",
+        },
+        schemaVersion: 2,
+        source: { commit: oldEndpoint.sourceCommit },
+        version: oldEndpoint.version,
+      },
+    ]) {
+      const provider = new FakeCutoverProvider(archivePlan);
+      provider.markerOverrideForTargetAlias = { alias: fallbackAlias, value };
+
+      await expect(executeCutoverPlan(archivePlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_reverted" });
+      expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+    }
+  });
+
+  test("refuses a generation-one marker whose version exists only under publication", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    const marker = markerFor(newEndpoint) as Record<string, unknown>;
+    const { version, ...withoutVersion } = marker;
+    provider.markerOverrideForTargetAlias = {
+      alias: canonicalAlias,
+      value: { ...withoutVersion, publication: { version } },
+    };
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner).toBe("source");
   });
 
   test("restores both aliases to P if hra.sh fails after fallback Q is proven", async () => {

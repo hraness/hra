@@ -8,9 +8,13 @@ import {
   type WrappedKeyEnvelope,
 } from "./contracts";
 import { decodeBase64Url } from "./crypto";
-import { IdentityScopedCloudSecretCustody } from "./identity-custody";
+import {
+  cloudDeploymentAuthorityFromEnvironment,
+  IdentityScopedCloudSecretCustody,
+} from "./identity-custody";
 import {
   createLocalCloudControlFromEnvironment,
+  deploymentFencedCloudTransport,
   LocalCloudControl,
   type CloudSecretCustodyPort,
 } from "./local-control";
@@ -25,11 +29,22 @@ import { encryptCompactEvents } from "./projection";
 const fixedNow = 1_700_000_000_000;
 const signal = new AbortController().signal;
 const userPublicId = "user_12345678";
+const testDeploymentUrl = "https://example.convex.cloud";
+const testDeploymentAuthority = {
+  assertCurrent: () => Promise.resolve(),
+  cacheNamespace: null,
+  custodyMode: "legacy" as const,
+  deploymentUrl: testDeploymentUrl,
+  generation: 0,
+  scopeCustodySlot: (slot: string) => slot,
+};
 
 class MemoryCustody implements CloudSecretCustodyPort {
+  readonly reads: string[] = [];
   readonly values = new Map<string, Readonly<{ generation: number; value: string }>>();
 
   async read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null> {
+    this.reads.push(slot);
     return this.values.get(slot) ?? null;
   }
 
@@ -537,7 +552,8 @@ function control(
   now: () => number = () => fixedNow,
 ): LocalCloudControl {
   return new LocalCloudControl({
-    deploymentUrl: "https://example.convex.cloud",
+    deploymentAuthority: testDeploymentAuthority,
+    deploymentUrl: testDeploymentUrl,
     now,
     secretCustody: custody,
     transport: cloud.connect(),
@@ -698,7 +714,8 @@ describe("local cloud control", () => {
     const unbound = await IdentityScopedCloudSecretCustody.open(raw);
     const cloudA = new FakeCloud("user_identity_a");
     const authenticatingA = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => fixedNow,
       secretCustody: unbound,
       transport: cloudA.connect(),
@@ -707,7 +724,8 @@ describe("local cloud control", () => {
     await authenticatingA.auth({ code: "12345678", email: "reader@example.com", signal });
     const identityA = await IdentityScopedCloudSecretCustody.open(raw);
     const controlA = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => fixedNow,
       secretCustody: identityA,
       transport: cloudA.connect(),
@@ -718,7 +736,8 @@ describe("local cloud control", () => {
     const identityB = await IdentityScopedCloudSecretCustody.open(raw);
     const cloudB = new FakeCloud("user_identity_b");
     const controlB = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => fixedNow,
       secretCustody: identityB,
       transport: cloudB.connect(),
@@ -729,7 +748,8 @@ describe("local cloud control", () => {
     await identityB.activateIdentity("user_identity_a");
     const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
     const reopenedA = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => fixedNow,
       secretCustody: returnedA,
       transport: cloudA.connect(),
@@ -745,7 +765,8 @@ describe("local cloud control", () => {
     const raw = new MemoryCustody();
     const scoped = await IdentityScopedCloudSecretCustody.open(raw);
     const adapter = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => fixedNow,
       secretCustody: scoped,
       transport: cloud.connect(),
@@ -780,17 +801,79 @@ describe("local cloud control", () => {
     expect(JSON.stringify(cloud.authAttempts)).not.toContain(["hra", "otp"].join("-"));
   });
 
-  test("is absent until the explicit Convex URL is configured", () => {
+  test("uses the release deployment by default and honors an explicit empty disable", async () => {
     const custody = new MemoryCustody();
-    expect(createLocalCloudControlFromEnvironment({
+    expect(await createLocalCloudControlFromEnvironment({
       environment: {},
+      transport: new FakeCloud().connect(),
+      secretCustody: custody,
+    })).toBeInstanceOf(LocalCloudControl);
+    expect(await createLocalCloudControlFromEnvironment({
+      environment: { HRA_CONVEX_URL: "" },
       secretCustody: custody,
     })).toBeNull();
-    expect(createLocalCloudControlFromEnvironment({
-      environment: { HRA_CONVEX_URL: "https://example.convex.cloud" },
+  });
+
+  test("refuses implicit migration of legacy auth custody before transport", async () => {
+    const custody = new MemoryCustody();
+    custody.values.set("cloud-auth", { generation: 0, value: "legacy-auth" });
+    let transportCalls = 0;
+    const transport: CloudTransport = {
+      action: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      mutation: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      query: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+    };
+    await expect(createLocalCloudControlFromEnvironment({
+      environment: {},
       secretCustody: custody,
-      transport: new FakeCloud().connect(),
-    })).toBeInstanceOf(LocalCloudControl);
+      transport,
+    })).rejects.toThrow("requires an explicit HRA_CONVEX_URL");
+    expect(transportCalls).toBe(0);
+    expect(custody.values.has("cloud-deployment-authority")).toBe(false);
+  });
+
+  test("refuses stale deployment authority before reading auth custody or invoking transport", async () => {
+    const custody = new MemoryCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(custody, {
+      HRA_CONVEX_URL: testDeploymentUrl,
+    });
+    if (authority === null) throw new Error("fixture authority is disabled");
+    const cloud = new FakeCloud();
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: authority,
+      deploymentUrl: testDeploymentUrl,
+      secretCustody: custody,
+      transport: cloud.connect(),
+    });
+    custody.values.delete("cloud-deployment-authority");
+    custody.reads.length = 0;
+
+    await expect(adapter.auth({ email: "reader@example.com", signal }))
+      .rejects.toThrow("Cloud deployment authority is not current.");
+    expect(custody.reads).toEqual(["cloud-deployment-authority"]);
+    expect(cloud.authAttempts).toEqual([]);
+  });
+
+  test("rejects a transport response when deployment authority changes in flight", async () => {
+    const custody = new MemoryCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(custody, {
+      HRA_CONVEX_URL: testDeploymentUrl,
+    });
+    if (authority === null) throw new Error("fixture authority is disabled");
+    let transportCalls = 0;
+    const transport = deploymentFencedCloudTransport({
+      action: async () => { throw new Error("unexpected action"); },
+      mutation: async () => { throw new Error("unexpected mutation"); },
+      query: async () => {
+        transportCalls += 1;
+        custody.values.delete("cloud-deployment-authority");
+        return { unsafe: "stale response" };
+      },
+    }, authority);
+
+    await expect(transport.query("account:current", {}))
+      .rejects.toThrow("Cloud deployment authority is not current.");
+    expect(transportCalls).toBe(1);
   });
 
   test("keeps OTP tokens in injected custody and preserves device keys on logout", async () => {
@@ -849,7 +932,8 @@ describe("local cloud control", () => {
     let localNow = fixedNow;
     const transport = cloud.connect();
     const adapter = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => localNow,
       secretCustody: custody,
       transport,
@@ -893,13 +977,15 @@ describe("local cloud control", () => {
     let localNow = fixedNow;
     const transport = cloud.connect();
     const refreshingControl = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => localNow,
       secretCustody: custody,
       transport,
     });
     const logoutControl = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => localNow,
       secretCustody: custody,
       transport,
@@ -931,12 +1017,14 @@ describe("local cloud control", () => {
     const custody = new MemoryCustody();
     const transport = cloud.connect();
     const authenticatingControl = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       secretCustody: custody,
       transport,
     });
     const logoutControl = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       secretCustody: custody,
       transport,
     });
@@ -975,7 +1063,8 @@ describe("local cloud control", () => {
     let localNow = fixedNow;
     const transport = cloud.connect();
     const adapter = new LocalCloudControl({
-      deploymentUrl: "https://example.convex.cloud",
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
       now: () => localNow,
       secretCustody: custody,
       transport,

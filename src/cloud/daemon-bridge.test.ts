@@ -14,6 +14,7 @@ import {
   type CloudDaemonLocalSourcePort,
   type CloudLocalSessionHead,
   type CloudLocalUsageSnapshot,
+  createLocalCloudDaemonBridgeFromEnvironment,
   CustodyCloudDaemonIdentity,
   LocalCloudDaemonBridge,
   type RegisteredCloudIdentity,
@@ -29,7 +30,14 @@ import {
   type CloudDaemonJournalPort,
   type CloudProjectionRecoveryBaselineInteraction,
 } from "./daemon-journal";
-import type { CloudSecretCustodyPort } from "./local-control";
+import {
+  cloudDeploymentAuthorityFromEnvironment,
+  type CloudDeploymentAuthority,
+} from "./identity-custody";
+import {
+  createLocalCloudControlFromEnvironment,
+  type CloudSecretCustodyPort,
+} from "./local-control";
 import { PollingCloudDaemonLifecycle } from "./daemon-lifecycle";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
 import { encryptRemoteCommand, type RemoteCommandPayload } from "./payloads";
@@ -1180,6 +1188,31 @@ class IdentityCustody implements CloudSecretCustodyPort {
   }
 }
 
+class DeploymentCustody implements CloudSecretCustodyPort {
+  readonly values = new Map<string, Readonly<{ generation: number; value: string }>>();
+
+  async read(slot: string): Promise<Readonly<{ generation: number; value: string }> | null> {
+    return this.values.get(slot) ?? null;
+  }
+
+  async compareAndSwap(
+    slot: string,
+    expectedGeneration: number | null,
+    value: string,
+  ): Promise<Readonly<{ generation: number; value: string }> | null> {
+    const current = this.values.get(slot) ?? null;
+    if ((current?.generation ?? null) !== expectedGeneration) return null;
+    const next = { generation: expectedGeneration === null ? 0 : expectedGeneration + 1, value };
+    this.values.set(slot, next);
+    return next;
+  }
+
+  async clearIfGeneration(slot: string, expectedGeneration: number): Promise<boolean> {
+    if (this.values.get(slot)?.generation !== expectedGeneration) return false;
+    return this.values.delete(slot);
+  }
+}
+
 function pendingIdentity(input: Readonly<{
   authEpoch?: number;
   credentialGeneration?: number;
@@ -1234,6 +1267,7 @@ class RecordingExecutor implements CloudCommandExecutorPort {
 function bridge(input: {
   cloud: FakeCloud;
   daemonAuthorityFence?: Readonly<{ assertCurrent(): Promise<void> }>;
+  deploymentAuthority?: CloudDeploymentAuthority;
   device: string;
   executor?: RecordingExecutor;
   identity?: CloudDaemonIdentityPort;
@@ -1249,6 +1283,14 @@ function bridge(input: {
     daemonAuthority: { bootGeneration: 1, bootId: "boot_12345678" },
     daemonAuthorityFence: input.daemonAuthorityFence
       ?? { assertCurrent: () => Promise.resolve() },
+    deploymentAuthority: input.deploymentAuthority ?? {
+      assertCurrent: () => Promise.resolve(),
+      cacheNamespace: null,
+      custodyMode: "legacy",
+      deploymentUrl: "https://example.convex.cloud",
+      generation: 0,
+      scopeCustodySlot: (slot) => slot,
+    },
     executor: input.executor ?? new RecordingExecutor(),
     identity: input.identity ?? identity(input.device),
     journal: input.journal ?? new MemoryCloudDaemonJournal(),
@@ -1411,6 +1453,82 @@ function saturatedCommandJournal(
 }
 
 describe("cloud daemon bridge", () => {
+  test("control and daemon factories converge on one bound deployment before transport", async () => {
+    const custody = new DeploymentCustody();
+    const environment = { HRA_CONVEX_URL: "https://shared.convex.cloud/" };
+    let transportCalls = 0;
+    const transport: CloudTransport = {
+      action: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      mutation: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      query: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+    };
+    const control = await createLocalCloudControlFromEnvironment({
+      environment,
+      secretCustody: custody,
+      transport,
+    });
+    if (control === null) throw new Error("fixture control is disabled");
+    const daemon = await createLocalCloudDaemonBridgeFromEnvironment({
+      daemonAuthority: { bootGeneration: 1, bootId: "boot_shared_target_12345678" },
+      daemonAuthorityFence: { assertCurrent: () => Promise.resolve() },
+      environment,
+      executor: new RecordingExecutor(),
+      local: new EmptyLocal(),
+      registration: control,
+      secretCustody: custody,
+      transport,
+    });
+    expect(daemon).toBeInstanceOf(LocalCloudDaemonBridge);
+    expect(transportCalls).toBe(0);
+    const binding = custody.values.get("cloud-deployment-authority");
+    expect(binding?.generation).toBe(0);
+    expect(JSON.parse(binding?.value ?? "null")).toMatchObject({
+      deploymentUrl: "https://shared.convex.cloud",
+      version: 1,
+    });
+  });
+
+  test("refuses stale deployment authority before identity credentials or transport", async () => {
+    const custody = new DeploymentCustody();
+    const deploymentAuthority = await cloudDeploymentAuthorityFromEnvironment(custody, {
+      HRA_CONVEX_URL: "https://example.convex.cloud",
+    });
+    if (deploymentAuthority === null) throw new Error("fixture authority is disabled");
+    const cloud = new FakeCloud();
+    let identityCalls = 0;
+    let transportCalls = 0;
+    const guardedIdentity: CloudDaemonIdentityPort = {
+      async requireActive() {
+        identityCalls += 1;
+        throw new Error("unexpected identity credential read");
+      },
+      async requireRegistered() {
+        identityCalls += 1;
+        throw new Error("unexpected identity credential read");
+      },
+    };
+    const guardedTransport: CloudTransport = {
+      action: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      mutation: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+      query: async () => { transportCalls += 1; throw new Error("unexpected transport"); },
+    };
+    const daemon = bridge({
+      cloud,
+      deploymentAuthority,
+      device: "device_11111111",
+      identity: guardedIdentity,
+      local: new EmptyLocal(),
+      transport: guardedTransport,
+    });
+    custody.values.delete("cloud-deployment-authority");
+
+    const result = await daemon.cycle(new AbortController().signal);
+    expect(result.online).toBe(false);
+    expect(result.errors).toEqual(["Cloud deployment authority is not current."]);
+    expect(identityCalls).toBe(0);
+    expect(transportCalls).toBe(0);
+  });
+
   test("reads current credential generation for registered pending devices and migrates legacy absence to one", async () => {
     const custody = new IdentityCustody();
     const publicKey = JSON.stringify({

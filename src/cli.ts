@@ -34,19 +34,25 @@ import {
   containsAbsolutePath,
   createCloudDaemonLifecycle,
   createCloudUuidV7,
+  cloudDeploymentAuthorityFromEnvironment,
+  CloudDeploymentAuthorityError,
   createLocalCloudControlFromEnvironment,
   createLocalCloudDaemonBridgeFromEnvironment,
+  DeploymentScopedCloudSecretCustody,
   IdentityScopedCloudSecretCustody,
   isRecord,
   isSafeNonNegativeInteger,
   isSafePositiveInteger,
   isUuidV7,
   hasExactKeys,
+  readCloudDeploymentAuthority,
   redactAbsolutePaths,
   type CloudRemoteControlPort,
   type CloudRemoteSessionHead,
   type RemoteCommandPayload,
   type CloudDaemonLifecycle,
+  type CloudDeploymentAuthority,
+  type CloudSecretCustodyPort,
 } from "./cloud/index";
 import { resolvePinnedCodexRuntime } from "./codex/index";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
@@ -279,8 +285,214 @@ type CliMainInput = Readonly<{
 export function selectDaemonCloudControl(
   configured: CloudControlPort | null,
   projectionRecoveryBlocker: CompactProjectionRecoveryBlocker,
+  diagnostic?: string,
 ): CloudControlPort {
-  return configured ?? new UnavailableCloudControl(projectionRecoveryBlocker);
+  if (configured !== null) return configured;
+  if (diagnostic === undefined) return new UnavailableCloudControl(projectionRecoveryBlocker);
+  return new DiagnosedUnavailableCloudControl(projectionRecoveryBlocker, diagnostic);
+}
+
+class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
+  readonly #diagnostic: string;
+
+  constructor(projectionRecoveryBlocker: CompactProjectionRecoveryBlocker, diagnostic: string) {
+    super(projectionRecoveryBlocker);
+    this.#diagnostic = diagnostic;
+  }
+
+  #unavailable(): never {
+    throw new Error(this.#diagnostic);
+  }
+
+  override status(): Promise<unknown> {
+    return Promise.resolve({ configured: false, diagnostic: this.#diagnostic, signedIn: false });
+  }
+
+  override sync(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override recoverCompactProjection(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override auth(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override approveDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override revokeDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+}
+
+function cloudBindingDiagnostic(error: unknown): string {
+  if (!(error instanceof CloudDeploymentAuthorityError)) {
+    return "Cloud sync is unavailable because local cloud custody requires recovery.";
+  }
+  switch (error.code) {
+    case "invalid_configuration":
+      return "Cloud sync is unavailable because HRA_CONVEX_URL is invalid.";
+    case "legacy_binding_required":
+      return "Cloud sync is unavailable until HRA_CONVEX_URL explicitly selects the legacy deployment.";
+    case "target_mismatch":
+      return "Cloud sync is unavailable because this state root is bound to another deployment.";
+    case "concurrent_change":
+    case "corrupt_custody":
+    case "stale_authority":
+      return "Cloud sync is unavailable because deployment custody requires recovery.";
+  }
+}
+
+type DaemonCloudStartup = Readonly<{
+  deploymentAuthority: CloudDeploymentAuthority | null;
+  identityNamespace: string | null;
+  journal: CustodyCloudDaemonJournal | null;
+  projectionRecoveryBlocker: CompactProjectionRecoveryBlocker;
+  diagnostic?: string;
+}>;
+
+class FailClosedProjectionRecoveryBlocker implements CompactProjectionRecoveryBlocker {
+  readonly #delegate: CompactProjectionRecoveryBlocker | null;
+
+  constructor(delegate: CompactProjectionRecoveryBlocker | null) {
+    this.#delegate = delegate;
+  }
+
+  async isCompactProjectionRecoveryUnsettled(
+    sessionPublicId: Parameters<CompactProjectionRecoveryBlocker[
+      "isCompactProjectionRecoveryUnsettled"
+    ]>[0],
+  ): Promise<boolean> {
+    if (this.#delegate === null) return true;
+    try {
+      return await this.#delegate.isCompactProjectionRecoveryUnsettled(sessionPublicId);
+    } catch {
+      return true;
+    }
+  }
+
+  async isCompactProjectionRecoveryUnsettledForProfile(
+    profileId: Parameters<CompactProjectionRecoveryBlocker[
+      "isCompactProjectionRecoveryUnsettledForProfile"
+    ]>[0],
+  ): Promise<boolean> {
+    if (this.#delegate === null) return true;
+    try {
+      return await this.#delegate.isCompactProjectionRecoveryUnsettledForProfile(profileId);
+    } catch {
+      return true;
+    }
+  }
+
+  async supersedeCompactProjectionRecoveryForProviderDeletion(
+    sessionPublicId: Parameters<CompactProjectionRecoveryBlocker[
+      "supersedeCompactProjectionRecoveryForProviderDeletion"
+    ]>[0],
+  ): Promise<{ superseded: boolean }> {
+    if (this.#delegate !== null) {
+      try {
+        return await this.#delegate
+          .supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId);
+      } catch {
+        // Fall through to the static fail-closed diagnostic.
+      }
+    }
+    throw new Error("Cloud projection recovery custody requires recovery.");
+  }
+
+  async supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    if (this.#delegate === null) return { superseded: 0 };
+    try {
+      return await this.#delegate.supersedeTerminalCompactProjectionRecoveries();
+    } catch {
+      return { superseded: 0 };
+    }
+  }
+}
+
+function daemonCloudStartupResult(input: Readonly<{
+  deploymentAuthority: CloudDeploymentAuthority | null;
+  diagnostic?: string;
+  identityNamespace: string | null;
+  isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
+  journal: CustodyCloudDaemonJournal | null;
+}>): DaemonCloudStartup {
+  const delegate = input.journal === null
+    ? null
+    : new CloudDaemonJournalRecoveryBlocker(
+        input.journal,
+        input.isSessionTerminal === undefined
+          ? {}
+          : { isSessionTerminal: input.isSessionTerminal },
+      );
+  const result = {
+    deploymentAuthority: input.deploymentAuthority,
+    identityNamespace: input.identityNamespace,
+    journal: input.journal,
+    projectionRecoveryBlocker: new FailClosedProjectionRecoveryBlocker(delegate),
+  };
+  return input.diagnostic === undefined
+    ? result
+    : { ...result, diagnostic: input.diagnostic };
+}
+
+export async function resolveDaemonCloudStartup(input: Readonly<{
+  environment: Readonly<Record<string, string | undefined>>;
+  isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
+  secretCustody: CloudSecretCustodyPort;
+}>): Promise<DaemonCloudStartup> {
+  let deploymentAuthority: CloudDeploymentAuthority | null = null;
+  let diagnostic: string | undefined;
+  try {
+    deploymentAuthority = await cloudDeploymentAuthorityFromEnvironment(
+      input.secretCustody,
+      input.environment,
+    );
+    if (deploymentAuthority === null) {
+      diagnostic = "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL to use hosted sync.";
+    }
+  } catch (error: unknown) {
+    diagnostic = cloudBindingDiagnostic(error);
+  }
+
+  let recoveryAuthority = deploymentAuthority;
+  if (recoveryAuthority === null) {
+    try {
+      recoveryAuthority = await readCloudDeploymentAuthority(input.secretCustody);
+    } catch (error: unknown) {
+      return daemonCloudStartupResult({
+        deploymentAuthority: null,
+        diagnostic: diagnostic ?? cloudBindingDiagnostic(error),
+        identityNamespace: null,
+        ...(input.isSessionTerminal === undefined
+          ? {}
+          : { isSessionTerminal: input.isSessionTerminal }),
+        journal: null,
+      });
+    }
+  }
+
+  try {
+    const deploymentCustody = recoveryAuthority === null
+      ? input.secretCustody
+      : new DeploymentScopedCloudSecretCustody(input.secretCustody, recoveryAuthority);
+    const identityCustody = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    const journal = new CustodyCloudDaemonJournal(identityCustody);
+    await journal.read();
+    return daemonCloudStartupResult({
+      deploymentAuthority,
+      ...(diagnostic === undefined ? {} : { diagnostic }),
+      identityNamespace: identityCustody.cacheNamespace,
+      ...(input.isSessionTerminal === undefined
+        ? {}
+        : { isSessionTerminal: input.isSessionTerminal }),
+      journal,
+    });
+  } catch (error: unknown) {
+    return daemonCloudStartupResult({
+      deploymentAuthority: null,
+      diagnostic: diagnostic ?? cloudBindingDiagnostic(error),
+      identityNamespace: null,
+      ...(input.isSessionTerminal === undefined
+        ? {}
+        : { isSessionTerminal: input.isSessionTerminal }),
+      journal: null,
+    });
+  }
 }
 
 function boundedUtf8Text(value: string, maximumBytes: number): string {
@@ -907,24 +1119,22 @@ async function executeRemoteInvocation(
   const injectedStatus = invocation.command.kind === "remote.command"
     ? input.getRemoteCommandStatus
     : undefined;
-  const control = injectedStatus === undefined
-    ? createLocalCloudControlFromEnvironment({
-        lifetimeSignal: controller.signal,
-        secretCustody: await IdentityScopedCloudSecretCustody.open(
-          new GenerationalSecretCustody(paths),
-        ),
-      })
-    : null;
-  if (control === null && injectedStatus === undefined) {
-    return renderFailure({
-      code: "UNAVAILABLE",
-      message: "Cloud sync is not configured. Set HRA_CONVEX_URL and run `hra auth login`.",
-    }, invocation.json, output);
-  }
   const abort = () => controller.abort(new Error("Cloud remote operation was interrupted."));
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
   try {
+    const control = injectedStatus === undefined
+      ? await createLocalCloudControlFromEnvironment({
+          lifetimeSignal: controller.signal,
+          secretCustody: new GenerationalSecretCustody(paths),
+        })
+      : null;
+    if (control === null && injectedStatus === undefined) {
+      return renderFailure({
+        code: "UNAVAILABLE",
+        message: "Cloud sync is disabled. Unset HRA_CONVEX_URL for hosted sync, or set a deployment URL, then run `hra auth login`.",
+      }, invocation.json, output);
+    }
     if (invocation.command.kind === "remote.list") {
       if (control === null) throw new Error("Cloud sync is not configured.");
       const data = await control.listRemoteSessionHeads({
@@ -973,6 +1183,12 @@ async function executeRemoteInvocation(
     renderRemoteSuccess(invocation.command, data, invocation.json, output);
     return 0;
   } catch (error: unknown) {
+    if (error instanceof CloudDeploymentAuthorityError) {
+      return renderFailure({
+        code: "UNAVAILABLE",
+        message: cloudBindingDiagnostic(error),
+      }, invocation.json, output);
+    }
     const diagnostic = invocation.command.kind === "remote.command" && error instanceof Error
       ? new Error(sanitizeSyncDiagnostic(error.message))
       : error;
@@ -1087,10 +1303,9 @@ async function runDaemon(): Promise<number> {
       },
     });
     const secretCustody = new GenerationalSecretCustody(paths);
-    const cloudSecretCustody = await IdentityScopedCloudSecretCustody.open(secretCustody);
-    const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
-    const cloudJournal = new CustodyCloudDaemonJournal(cloudSecretCustody);
-    const projectionRecoveryBlocker = new CloudDaemonJournalRecoveryBlocker(cloudJournal, {
+    const cloudEnvironment = { HRA_CONVEX_URL: process.env.HRA_CONVEX_URL };
+    const cloudStartup = await resolveDaemonCloudStartup({
+      environment: cloudEnvironment,
       isSessionTerminal: (sessionPublicId) => {
         try {
           return activeStore.requireSession(sessionPublicId).state === "terminal";
@@ -1098,53 +1313,113 @@ async function runDaemon(): Promise<number> {
           return false;
         }
       },
+      secretCustody,
     });
+    const cloudDeploymentAuthority = cloudStartup.deploymentAuthority;
+    const cloudIdentityNamespace = cloudStartup.identityNamespace;
+    let cloudStartupDiagnostic = cloudStartup.diagnostic;
+    const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
+    const cloudJournal = cloudStartup.journal;
+    const projectionRecoveryBlocker = cloudStartup.projectionRecoveryBlocker;
     cloudRequestController = new AbortController();
-    const localCloudControl = createLocalCloudControlFromEnvironment({
-      lifetimeSignal: cloudRequestController.signal,
-      secretCustody: cloudSecretCustody,
-    });
-    let cloud = selectDaemonCloudControl(localCloudControl, projectionRecoveryBlocker);
-    if (localCloudControl !== null) {
-      const cloudCodex = new Proxy(codex, {
-        get(target, property) {
-          const value = Reflect.get(target, property, target) as unknown;
-          if (typeof value !== "function") return value;
-          if (property === "close") {
-            return (...args: unknown[]): unknown => Reflect.apply(value, target, args) as unknown;
+    let cloud = selectDaemonCloudControl(
+      null,
+      projectionRecoveryBlocker,
+      cloudStartupDiagnostic,
+    );
+    if (cloudDeploymentAuthority !== null && cloudJournal !== null) {
+      let candidateAdapter: StateBackedCloudDaemonAdapter | undefined;
+      let candidateBridge: Awaited<ReturnType<
+        typeof createLocalCloudDaemonBridgeFromEnvironment
+      >> | undefined;
+      try {
+        const localCloudControl = await createLocalCloudControlFromEnvironment({
+          deploymentAuthority: cloudDeploymentAuthority,
+          environment: cloudEnvironment,
+          lifetimeSignal: cloudRequestController.signal,
+          secretCustody,
+        });
+        if (localCloudControl === null) {
+          throw new CloudDeploymentAuthorityError(
+            "stale_authority",
+            "Cloud deployment authority changed during daemon startup.",
+          );
+        }
+        const cloudCodex = new Proxy(codex, {
+          get(target, property) {
+            const value = Reflect.get(target, property, target) as unknown;
+            if (typeof value !== "function") return value;
+            if (property === "close") {
+              return (...args: unknown[]): unknown => Reflect.apply(value, target, args) as unknown;
+            }
+            return async (...args: unknown[]) => {
+              await activeDaemonAuthority.assertCurrent();
+              const result = await Reflect.apply(value, target, args) as unknown;
+              await activeDaemonAuthority.assertCurrent();
+              return result;
+            };
+          },
+        }) as CodexRuntimePort;
+        candidateAdapter = new StateBackedCloudDaemonAdapter({
+          codex: cloudCodex,
+          executeRemote: async (command, expected, options) => {
+            const current = serviceReference.current;
+            if (current === undefined) throw new Error("The local command service is not ready.");
+            return await current.executeRemote(command, expected, { signal: options.signal });
+          },
+          paths,
+          store: activeStore,
+          cloudIdentityNamespace,
+        });
+        candidateBridge = await createLocalCloudDaemonBridgeFromEnvironment({
+          daemonAuthority: { bootGeneration: generation, bootId },
+          daemonAuthorityFence: activeDaemonAuthority,
+          deploymentAuthority: cloudDeploymentAuthority,
+          environment: cloudEnvironment,
+          executor: candidateAdapter,
+          lifetimeSignal: cloudRequestController.signal,
+          local: candidateAdapter,
+          journal: cloudJournal,
+          registration: localCloudControl,
+          secretCustody,
+        });
+        if (candidateBridge === null) {
+          throw new CloudDeploymentAuthorityError(
+            "stale_authority",
+            "Cloud deployment authority changed during daemon startup.",
+          );
+        }
+        const cloudBridge = candidateBridge;
+        const candidateCloud = new BridgedCloudControl(
+          localCloudControl,
+          cloudBridge,
+          candidateAdapter,
+        );
+        const candidateLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
+        cloudAdapter = candidateAdapter;
+        cloud = candidateCloud;
+        cloudLifecycle = candidateLifecycle;
+        candidateAdapter = undefined;
+        candidateBridge = undefined;
+      } catch (error: unknown) {
+        cloudRequestController.abort(new Error("Cloud initialization was fenced."));
+        if (candidateBridge !== undefined && candidateBridge !== null) {
+          try { await candidateBridge.close(); } catch (cleanupError: unknown) {
+            cleanupErrors.push(cleanupError);
           }
-          return async (...args: unknown[]) => {
-            await activeDaemonAuthority.assertCurrent();
-            const result = await Reflect.apply(value, target, args) as unknown;
-            await activeDaemonAuthority.assertCurrent();
-            return result;
-          };
-        },
-      }) as CodexRuntimePort;
-      cloudAdapter = new StateBackedCloudDaemonAdapter({
-        codex: cloudCodex,
-        executeRemote: async (command, expected, options) => {
-          const current = serviceReference.current;
-          if (current === undefined) throw new Error("The local command service is not ready.");
-          return await current.executeRemote(command, expected, { signal: options.signal });
-        },
-        paths,
-        store: activeStore,
-        cloudIdentityNamespace: cloudSecretCustody.cacheNamespace,
-      });
-      const cloudBridge = createLocalCloudDaemonBridgeFromEnvironment({
-        daemonAuthority: { bootGeneration: generation, bootId },
-        daemonAuthorityFence: activeDaemonAuthority,
-        executor: cloudAdapter,
-        lifetimeSignal: cloudRequestController.signal,
-        local: cloudAdapter,
-        journal: cloudJournal,
-        registration: localCloudControl,
-        secretCustody: cloudSecretCustody,
-      });
-      if (cloudBridge === null) throw new Error("The cloud deployment changed during daemon startup.");
-      cloud = new BridgedCloudControl(localCloudControl, cloudBridge, cloudAdapter);
-      cloudLifecycle = createCloudDaemonLifecycle({ bridge: cloudBridge });
+        }
+        if (candidateAdapter !== undefined) {
+          try { candidateAdapter.close(); } catch (cleanupError: unknown) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+        cloudStartupDiagnostic = cloudBindingDiagnostic(error);
+        cloud = selectDaemonCloudControl(
+          null,
+          projectionRecoveryBlocker,
+          cloudStartupDiagnostic,
+        );
+      }
     }
     checkpointBoot();
     const desktop = process.platform === "darwin"
