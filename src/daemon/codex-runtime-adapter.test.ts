@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import fc from "fast-check";
 
 import { IndeterminateCodexEffectError } from "../codex/index";
@@ -20,7 +22,12 @@ import {
 } from "./codex-runtime-adapter";
 import type { CodexAccountProjection } from "./ports";
 
-const authority = { id: "acct_00000000000000000000000000000000", generation: 1, codexHome: "/private/tmp/hra-fake", desktopUserData: "/private/tmp/hra-fake-desktop" } as const;
+const authority = {
+  id: "acct_00000000000000000000000000000000",
+  generation: 1,
+  codexHome: join(tmpdir(), "hra-fake"),
+  desktopUserData: join(tmpdir(), "hra-fake-desktop"),
+} as const;
 
 const makeTurn = (
   id: string,

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import type { ChatGptBundleCapability } from "./bundle.ts";
 import { deriveDesktopProfilePaths } from "./profile.ts";
@@ -8,7 +10,7 @@ import {
   type DesktopRecoveryStorePort,
 } from "./recovery.ts";
 
-const stateRoot = "/private/tmp/hra-recovery-test";
+const stateRoot = join(tmpdir(), "hra-recovery-test");
 const targetProfileId = "acct_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const idempotencyKey = "11111111-1111-4111-8111-111111111111";
 const executablePath = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";

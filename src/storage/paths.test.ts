@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "./paths";
@@ -7,7 +8,7 @@ import { HRA_KEYCHAIN_SERVICE } from "./secret-custody";
 
 describe("HRA v1 local namespace", () => {
   test("initializes beside HRA v0 custody without reading or changing it", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-namespace-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-namespace-")));
     const applicationSupport = join(home, "Library", "Application Support");
     const legacyState = join(applicationSupport, "OPRTE");
     const legacyWindowState = join(applicationSupport, "kitchen.hraness");

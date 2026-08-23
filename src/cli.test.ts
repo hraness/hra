@@ -501,7 +501,7 @@ describe("CLI entry point", () => {
   });
 
   test("init never opens or migrates the state database outside exclusive authority", async () => {
-    const temporary = await mkdtemp(join("/private/tmp", "hra-init-lock-"));
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-lock-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
     await initializeStatePaths(paths);
     const documents = join(temporary, "Documents");

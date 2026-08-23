@@ -4,7 +4,12 @@ import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { assertPublicText, assertPublicTree, PublicTextPolicyError } from "./public-text-policy";
+import {
+  assertPublicSensitiveText,
+  assertPublicText,
+  assertPublicTree,
+  PublicTextPolicyError,
+} from "./public-text-policy";
 
 describe("public text policy", () => {
   test("rejects credential sentinels, private scopes, and machine user paths without echoing them", () => {
@@ -43,6 +48,16 @@ describe("public text policy", () => {
         expect(error).toBeInstanceOf(PublicTextPolicyError);
       }
     }));
+  });
+
+  test("checks generated dependency text for secrets and paths without treating package scopes as prose", () => {
+    expect(() => assertPublicSensitiveText(
+      `@${["third", "party"].join("-")}/package`,
+      "generated dependency text",
+    )).not.toThrow();
+    const secret = ["github", "pat"].join("_") + "_" + "abcdefghijklmnopqrstuvwxyz123456";
+    expect(() => assertPublicSensitiveText(secret, "generated dependency text"))
+      .toThrow(PublicTextPolicyError);
   });
 
   test("scans SVG text and rejects unreviewed file types", async () => {

@@ -40,7 +40,7 @@ export class PublicTextPolicyError extends Error {
 }
 
 export function assertPublicText(value: string, label: string): void {
-  assertPublicSecretsAndPaths(value, label);
+  assertPublicSensitiveText(value, label);
 
   for (const match of value.matchAll(scopedPackage)) {
     const scope = match[1];
@@ -50,7 +50,7 @@ export function assertPublicText(value: string, label: string): void {
   }
 }
 
-function assertPublicSecretsAndPaths(value: string, label: string): void {
+export function assertPublicSensitiveText(value: string, label: string): void {
   for (const pattern of absoluteUserPaths) {
     if (pattern.test(value)) {
       throw new PublicTextPolicyError("ABSOLUTE_USER_PATH", label);
@@ -76,7 +76,7 @@ export async function assertPublicTree(root: string): Promise<void> {
         if (!excludedDirectories.has(entry.name)) await visit(child);
       } else if (entry.isFile() && textFile.test(child)) {
         const value = await readFile(child, "utf8");
-        if (entry.name === "bun.lock") assertPublicSecretsAndPaths(value, label);
+        if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);
         else assertPublicText(value, label);
       } else {
         throw new PublicTextPolicyError("UNREVIEWED_FILE_TYPE", label);

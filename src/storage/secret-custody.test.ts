@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "./paths";
@@ -15,7 +16,7 @@ class MemoryBackend implements SecretBackend {
 
 describe("GenerationalSecretCustody", () => {
   test("publishes immutable generations with exact CAS", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-secrets-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-secrets-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const backend = new MemoryBackend();
@@ -28,7 +29,7 @@ describe("GenerationalSecretCustody", () => {
   });
 
   test("two concurrent compare-and-swap attempts produce one winner", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-secrets-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-secrets-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const custody = new GenerationalSecretCustody(paths, new MemoryBackend());
@@ -43,7 +44,7 @@ describe("GenerationalSecretCustody", () => {
   });
 
   test("generation-checked clear cannot retire a newer winner", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-secrets-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-secrets-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const custody = new GenerationalSecretCustody(paths, new MemoryBackend());
@@ -54,7 +55,7 @@ describe("GenerationalSecretCustody", () => {
   });
 
   test("a concurrent clear cannot delete a value underneath an admitted read", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-secrets-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-secrets-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const backend = new MemoryBackend();

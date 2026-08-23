@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -336,7 +337,7 @@ async function fixture(
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; paths: ReturnType<typeof resolveStatePaths> }> {
-  const home = await mkdtemp(join("/private/tmp", "hra-service-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   const documents = join(home, "Documents");

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { CommandResponse } from "../domain/contracts";
@@ -14,7 +15,7 @@ import {
 } from "./daemon-startup";
 
 async function pathsFixture() {
-  const home = await mkdtemp(join("/private/tmp", "hra-startup-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-startup-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   return paths;

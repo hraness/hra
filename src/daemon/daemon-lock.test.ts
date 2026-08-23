@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rename, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
@@ -12,7 +13,7 @@ import {
 } from "./daemon-lock";
 
 async function pathsFixture() {
-  const home = await mkdtemp(join("/private/tmp", "hra-lock-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-lock-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   return paths;

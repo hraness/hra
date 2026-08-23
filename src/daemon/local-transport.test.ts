@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
-import { chmod, mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
@@ -21,7 +22,7 @@ afterEach(async () => {
 });
 
 async function fixture(deadlineMs = 200): Promise<{ paths: ReturnType<typeof resolveStatePaths>; server: LocalDaemonServer }> {
-  const home = await mkdtemp(join("/private/tmp", "hra-daemon-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const server = await LocalDaemonServer.start({
@@ -60,7 +61,7 @@ describe("local daemon transport", () => {
   });
 
   test("runs shutdown callbacks only after the response flushes", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-daemon-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let acknowledged = false;
@@ -75,14 +76,14 @@ describe("local daemon transport", () => {
   });
 
   test("classifies an absent endpoint as unavailable before dispatch", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-daemon-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     await expect(callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 20 })).rejects.toBeInstanceOf(LocalDaemonUnavailableError);
   });
 
   test("classifies reset after connect as indeterminate and never autostarts", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-daemon-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     await writeFile(paths.capability, `${randomBytes(32).toString("base64url")}\n`, { mode: 0o600 });
@@ -113,7 +114,7 @@ describe("local daemon transport", () => {
   });
 
   test("staged shutdown aborts admission and returns at an absolute join deadline", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-daemon-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let resolveEntered!: () => void;

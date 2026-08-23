@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Database } from "bun:sqlite";
@@ -17,7 +18,7 @@ afterEach(() => {
 });
 
 async function fixture(): Promise<{ store: StateStore; home: string }> {
-  const home = await mkdtemp(join("/private/tmp", "hra-store-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   const store = new StateStore(paths, { now: (() => { let value = 1_000; return () => value++; })() });
@@ -511,7 +512,7 @@ describe("StateStore", () => {
   });
 
   test("preserves enqueue FIFO when queue timestamps are identical", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-store-fifo-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-fifo-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const store = new StateStore(paths, { now: () => 1_000 });
@@ -878,7 +879,7 @@ describe("StateStore", () => {
   });
 
   test("enforces the original deadline before resolving a switch as not applied", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-desktop-deadline-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-desktop-deadline-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let now = 10_000;
@@ -1135,7 +1136,7 @@ describe("StateStore", () => {
   });
 
   test("evicts a deterministic contiguous event prefix by age and reports the exact floor gap", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-store-event-retention-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     let currentTime = 1_000;
@@ -1513,7 +1514,7 @@ describe("StateStore", () => {
   });
 
   test("opens and transactionally migrates a real v1 database without losing sessions", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-store-v1-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-v1-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const legacy = new Database(paths.database, { create: true, strict: true });
@@ -1645,7 +1646,7 @@ describe("StateStore", () => {
   });
 
   test("rejects databases written by a newer schema version", async () => {
-    const home = await mkdtemp(join("/private/tmp", "hra-store-newer-"));
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-newer-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });

@@ -5,7 +5,11 @@ import { basename, join, resolve } from "node:path";
 
 import { z } from "zod";
 
-import { assertPublicText, assertPublicTree } from "./public-text-policy";
+import {
+  assertPublicSensitiveText,
+  assertPublicText,
+  assertPublicTree,
+} from "./public-text-policy";
 
 const packageSchema = z.object({
   bin: z.object({ hra: z.literal("./src/cli.ts") }).strict(),
@@ -93,11 +97,30 @@ const packageJson = packageSchema.parse(
 if (!packageJson.files.includes("src")) throw new Error("The package must include src.");
 
 await assertPublicTree(repositoryRoot);
-const history = requireSuccess(
-  "Git history public-text check",
+const completeHistory = requireSuccess(
+  "Git history sensitive-text check",
   await run("git", ["log", "--all", "--format=", "--patch", "--no-ext-diff", "--no-textconv"], { cwd: repositoryRoot }),
 );
-assertPublicText(history.stdout, "Git history");
+assertPublicSensitiveText(completeHistory.stdout, "Git history");
+const authoredHistory = requireSuccess(
+  "Git history public-text check",
+  await run(
+    "git",
+    [
+      "log",
+      "--all",
+      "--format=",
+      "--patch",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--",
+      ".",
+      ":(exclude)bun.lock",
+    ],
+    { cwd: repositoryRoot },
+  ),
+);
+assertPublicText(authoredHistory.stdout, "Git history");
 
 const generated = requireSuccess(
   "generated public tree check",

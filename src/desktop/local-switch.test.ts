@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { CodexAccountProjection, ProfileAuthority } from "../daemon/ports.ts";
@@ -48,7 +49,7 @@ const capability: ChatGptBundleCapability = {
 };
 
 async function fixture() {
-  const home = await mkdtemp(join("/private/tmp", "hra-local-switch-"));
+  const home = await realpath(await mkdtemp(join(tmpdir(), "hra-local-switch-")));
   const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
   await initializeStatePaths(paths);
   await initializeProfilePaths(paths, sourceId);
