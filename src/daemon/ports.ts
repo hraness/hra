@@ -1,0 +1,181 @@
+import type { Preset } from "../domain/presets";
+import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import type { CodexTurnStatus } from "../codex/protocol";
+import type { CodexPluginCatalog } from "../codex/protocol";
+import type {
+  InteractionKind,
+  InteractionResolution,
+  ProviderInteractionAuthority,
+} from "../domain/interactions";
+import type { ProfileId, ProjectId, SessionId } from "../domain/values";
+
+export type ProfileAuthority = {
+  id: ProfileId;
+  generation: number;
+  codexHome: string;
+  desktopUserData: string;
+};
+
+export type RuntimeStartReview = {
+  readonly reviewId: string;
+  readonly kind: "session_start" | "turn_start";
+  readonly effectiveRuntimeProfile: EffectiveRuntimeProfile;
+};
+
+export type CodexAccountProjection = {
+  signedIn: boolean;
+  email?: string;
+  plan?: string;
+};
+
+export type ProjectionTextOmission = {
+  originalUtf8Bytes: number;
+  returnedUtf8Bytes: number;
+  omittedUtf8Bytes: number;
+};
+
+export type CodexProjectedMessage = {
+  role: "user" | "assistant";
+  text: string;
+  turnId?: string;
+  clientId?: string;
+  omission?: ProjectionTextOmission;
+};
+
+export type CodexTurnSummary = {
+  id: string;
+  status: "completed" | "interrupted" | "failed" | "inProgress";
+  startedAt?: number;
+  completedAt?: number;
+  runtimeMs?: number;
+  files: readonly string[];
+  actions: readonly string[];
+  omittedFiles: number;
+  omittedActions: number;
+};
+
+export type CodexProjectionOmission = {
+  hasMoreOlderTurns: boolean;
+  returnedTurns: number;
+  turnLimit: number;
+  omittedMessages: number;
+  truncatedMessages: number;
+  /** Sorted unique recent-turn ids with unread provider items after bounded hydration. */
+  unreadItemTurnIds: readonly string[];
+  /** Sorted unique completed-turn ids missing exact first-user or final-assistant proof. */
+  incompleteTurnIds: readonly string[];
+};
+
+export type CodexSessionProjection = {
+  providerThreadId: string;
+  title: string;
+  status: "active" | "idle" | "terminal";
+  projectRoot?: string;
+  providerUpdatedAt?: number;
+  activeTurnId?: string;
+  messages?: readonly CodexProjectedMessage[];
+  turnSummaries?: readonly CodexTurnSummary[];
+  omission?: CodexProjectionOmission;
+  turns?: readonly unknown[];
+};
+
+export interface CodexRuntimePort {
+  login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<{ status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection }>;
+  logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void>;
+  readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
+  readUsage(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<{ revision: number; observedAt: number; payload: unknown }>;
+  listPlugins(input: { authority: ProfileAuthority; projectRoot?: string; forceRefetch: boolean; signal: AbortSignal }): Promise<CodexPluginCatalog>;
+  listSessions(input: { authority: ProfileAuthority; limit: number; signal: AbortSignal }): Promise<readonly CodexSessionProjection[]>;
+  reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
+  startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
+  readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
+  reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
+  startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReview; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
+  steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void>;
+  interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
+  rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
+  inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
+  resolveInteraction?(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    resolution: InteractionResolution;
+    signal: AbortSignal;
+  }): Promise<{ responseWritten: true }>;
+  close(): Promise<void>;
+}
+
+export interface DesktopSwitchPort {
+  switchAccount(input: { source?: ProfileAuthority; target: ProfileAuthority; idempotencyKey: string; signal: AbortSignal }): Promise<{ status: "applied" | "recovery_required"; activeAccount?: CodexAccountProjection; diagnostic?: string; idempotencyKey: string }>;
+  recoverSwitch(input: { signal: AbortSignal }): Promise<unknown>;
+  currentRecovery(): unknown;
+}
+
+export interface CloudControlPort {
+  status(signal: AbortSignal): Promise<unknown>;
+  sync(signal: AbortSignal): Promise<unknown>;
+  isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean>;
+  isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean>;
+  recoverCompactProjection(input: { sessionPublicId: SessionId; idempotencyKey: string; acknowledgeGap: true; signal: AbortSignal }): Promise<unknown>;
+  auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown>;
+  logout(signal: AbortSignal): Promise<void>;
+  deleteAccount(input: { acknowledgeErasure: boolean; signal: AbortSignal }): Promise<unknown>;
+  listDevices(signal: AbortSignal): Promise<unknown>;
+  pairDevice(signal: AbortSignal): Promise<unknown>;
+  approveDevice(device: string, signal: AbortSignal): Promise<unknown>;
+  revokeDevice(device: string, signal: AbortSignal): Promise<unknown>;
+}
+
+export type CompactProjectionRecoveryBlocker = Pick<
+  CloudControlPort,
+  "isCompactProjectionRecoveryUnsettled" | "isCompactProjectionRecoveryUnsettledForProfile"
+>;
+
+export class UnavailableCodexRuntime implements CodexRuntimePort {
+  #unavailable(): never { throw new Error("The Codex runtime is unavailable on this machine."); }
+  login(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readUsage(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  listPlugins(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  steer(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  rename(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  inspectTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  async close(): Promise<void> {}
+}
+
+export class UnavailableCloudControl implements CloudControlPort {
+  readonly #projectionRecoveryBlocker: CompactProjectionRecoveryBlocker;
+
+  constructor(projectionRecoveryBlocker: CompactProjectionRecoveryBlocker) {
+    this.#projectionRecoveryBlocker = projectionRecoveryBlocker;
+  }
+
+  #unavailable(): never { throw new Error("Cloud sync is not configured. Run `hra auth login` first."); }
+  status(): Promise<unknown> { return Promise.resolve({ configured: false, signedIn: false }); }
+  sync(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean> {
+    return this.#projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettledForProfile(profileId);
+  }
+  isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean> {
+    return this.#projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettled(sessionPublicId);
+  }
+  recoverCompactProjection(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  auth(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  approveDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  revokeDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+}
+
+export type SessionProjectUpdate = { sessionId: SessionId; projectId: ProjectId | null };

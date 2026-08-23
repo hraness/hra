@@ -1,0 +1,670 @@
+import { describe, expect, test } from "bun:test";
+
+import fc from "fast-check";
+
+import {
+  CliUsageError,
+  completeProtectedAuthLogin,
+  completeProtectedInteraction,
+  parseCli,
+} from "./parser";
+
+describe("CLI parser", () => {
+  test("maps the recommended session controls", () => {
+    expect(parseCli(["session", "start", "work", "--preset", "ultra", "--fast"])).toMatchObject({ kind: "command", command: { kind: "session.start", account: "work", preset: "ultra", fast: true } });
+    expect(() => parseCli(["session", "start", "work", "--message", "ship it"])).toThrow("Unexpected argument");
+    expect(parseCli(["session", "fast", "session", "off", "--json"])).toEqual({ kind: "command", command: { kind: "session.fast", session: "session", enabled: false }, json: true });
+    expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
+  });
+
+  test("maps cloud session reads and the closed remote command set", () => {
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000001";
+    expect(parseCli(["remote", "list", "--limit", "25", "--json"])).toEqual({
+      kind: "remote",
+      command: { kind: "remote.list", limit: 25 },
+      json: true,
+    });
+    expect(parseCli([
+      "remote",
+      "send",
+      "session_12345678",
+      "--idempotency-key",
+      idempotencyKey,
+      "--",
+      "continue",
+      "--carefully",
+    ])).toEqual({
+      kind: "remote",
+      command: {
+        kind: "remote.send",
+        message: "continue --carefully",
+        session: "session_12345678",
+      },
+      idempotencyKey,
+      json: false,
+    });
+    expect(parseCli(["remote", "preset", "session_12345678", "low"]))
+      .toEqual({
+        kind: "remote",
+        command: { kind: "remote.preset", preset: "low", session: "session_12345678" },
+        json: false,
+      });
+    expect(parseCli(["remote", "fast", "session_12345678", "on"]))
+      .toMatchObject({ command: { enabled: true, kind: "remote.fast" } });
+    expect(parseCli(["remote", "command", idempotencyKey, "--json"])).toEqual({
+      command: { commandPublicId: idempotencyKey, kind: "remote.command" },
+      json: true,
+      kind: "remote",
+    });
+    expect(() => parseCli(["remote", "command", "not-a-command"])).toThrow(CliUsageError);
+    expect(() => parseCli(["remote", "list", "--idempotency-key", idempotencyKey]))
+      .toThrow(CliUsageError);
+  });
+
+  test("binds a relative project directory to the invoking CLI cwd", () => {
+    expect(parseCli(["project", "add", ".", "--name", "Workspace"], "/caller/workspace")).toEqual({
+      kind: "command",
+      command: { kind: "project.add", label: "Workspace", path: "/caller/workspace" },
+      json: false,
+    });
+  });
+
+  test("rejects unknown flags instead of ignoring them", () => {
+    expect(() => parseCli(["account", "list", "--surprise"])).toThrow(CliUsageError);
+  });
+
+  test("keeps destructive local profile and project deletion out of the beta surface", () => {
+    expect(() => parseCli(["account", "remove", "work"])).toThrow(CliUsageError);
+    expect(() => parseCli(["project", "remove", "workspace"])).toThrow(CliUsageError);
+  });
+
+  test("keeps cloud identity credentials off argv and accepts only exact protected documents", () => {
+    const stdin = parseCli(["auth", "login", "--input-stdin", "--json"]);
+    expect(stdin).toEqual({ input: { kind: "stdin" }, json: true, kind: "auth.login-protected" });
+    const descriptor = parseCli(["auth", "login", "--input-fd", "7"]);
+    expect(descriptor).toEqual({ input: { fd: 7, kind: "fd" }, json: false, kind: "auth.login-protected" });
+    if (stdin.kind !== "auth.login-protected") throw new Error("Expected protected auth input.");
+
+    expect(completeProtectedAuthLogin(stdin, { email: "person@example.com" })).toEqual({
+      email: "person@example.com",
+      kind: "auth.login",
+    });
+    expect(completeProtectedAuthLogin(stdin, {
+      email: "person@example.com",
+      invite: `hra_invite_identity_v1_${"a".repeat(43)}`,
+    })).toEqual({
+      email: "person@example.com",
+      invite: `hra_invite_identity_v1_${"a".repeat(43)}`,
+      kind: "auth.login",
+    });
+    expect(completeProtectedAuthLogin(stdin, {
+      code: "01234567",
+      email: "person@example.com",
+    })).toEqual({ code: "01234567", email: "person@example.com", kind: "auth.login" });
+
+    for (const argv of [
+      ["auth", "login"],
+      ["auth", "login", "person@example.com", "--input-stdin"],
+      ["auth", "login", "--email", "person@example.com", "--input-stdin"],
+      ["auth", "login", "--code", "01234567", "--input-stdin"],
+      ["auth", "login", "--invite", "secret", "--input-stdin"],
+      ["auth", "login", "--input-stdin", "--input-fd", "7"],
+      ["auth", "login", "--input-fd", "1"],
+      ["auth", "login", "--input-fd", "2"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+
+    for (const document of [
+      { code: "0123456", email: "person@example.com" },
+      { code: "01234567", email: "person@example.com", invite: `hra_invite_identity_v1_${"a".repeat(43)}` },
+      { email: "Person@example.com" },
+      { email: "person@example.com", unexpected: true },
+    ]) expect(() => completeProtectedAuthLogin(stdin, document)).toThrow(CliUsageError);
+  });
+
+  test("requires the literal account-erasure acknowledgement before creating a command", () => {
+    expect(parseCli(["auth", "delete", "--acknowledge-erasure", "--json"]))
+      .toEqual({
+        command: { acknowledgeErasure: true, kind: "auth.delete" },
+        json: true,
+        kind: "command",
+      });
+    for (const argv of [
+      ["auth", "delete"],
+      ["auth", "delete", "--acknowledge-erasure=false"],
+      ["auth", "delete", "--acknowledge-erasure", "extra"],
+      [
+        "auth",
+        "delete",
+        "--acknowledge-erasure",
+        "--idempotency-key",
+        "018bcfe5-6800-7000-8000-000000000001",
+      ],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("parses read-only plugin discovery and explicitly rejects every lifecycle effect", () => {
+    expect(parseCli([
+      "plugin",
+      "list",
+      "work",
+      "--project",
+      "release",
+      "--refresh",
+      "--json",
+    ])).toEqual({
+      command: {
+        account: "work",
+        kind: "plugin.list",
+        project: "release",
+        refresh: true,
+      },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli(["plugin", "show", "work", "Files", "--refresh"]))
+      .toEqual({
+        command: {
+          account: "work",
+          kind: "plugin.show",
+          plugin: "Files",
+          refresh: true,
+        },
+        json: false,
+        kind: "command",
+      });
+
+    for (const action of ["install", "enable", "disable"]) {
+      expect(() => parseCli(["plugin", action, "work", "files@official"]))
+        .toThrow("no safe separated plugin lifecycle effect");
+    }
+  });
+
+  test("preserves option-like message text after the conventional delimiter", () => {
+    expect(parseCli(["session", "send", "session", "--", "please", "run", "--help", "with", "--json"])).toMatchObject({
+      kind: "command",
+      json: false,
+      command: { kind: "session.send", message: "please run --help with --json" },
+    });
+  });
+
+  test("binds an explicit idempotency key to a mutation while preserving literal payload flags", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000104";
+    expect(parseCli(["session", "send", "session", "--idempotency-key", idempotencyKey, "--", "use", "--help"])).toMatchObject({
+      command: { kind: "session.send", idempotencyKey, message: "use --help" },
+    });
+    expect(parseCli(["account", "switch", "personal", "--idempotency-key", idempotencyKey])).toMatchObject({
+      command: { kind: "account.switch", account: "personal", idempotencyKey },
+    });
+    expect(() => parseCli(["account", "list", "--idempotency-key", idempotencyKey])).toThrow(CliUsageError);
+  });
+
+  test("generates a discoverable desktop-switch key before transport and parses recovery", () => {
+    const invocation = parseCli(["account", "switch", "personal"]);
+    expect(invocation).toMatchObject({
+      kind: "command",
+      command: { kind: "account.switch", account: "personal" },
+      json: false,
+    });
+    if (invocation.kind !== "command" || invocation.command.kind !== "account.switch") {
+      throw new Error("Expected an account switch command.");
+    }
+    expect(invocation.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(parseCli(["account", "switch-recover", "--json"])).toEqual({
+      kind: "command",
+      command: { kind: "account.switch-recover" },
+      json: true,
+    });
+  });
+
+  test("generates discoverable keys at the CLI boundary for every provider-effect command", () => {
+    const commands = [
+      ["account", "login", "work"],
+      ["account", "logout", "work"],
+      ["session", "start", "work"],
+      ["session", "send", "session", "hello"],
+      ["session", "queue", "session", "hello"],
+      ["session", "steer", "session", "hello"],
+      ["session", "stop", "session"],
+      ["session", "rename", "session", "New name"],
+    ] as const;
+    for (const argv of commands) {
+      const invocation = parseCli(argv);
+      if (invocation.kind !== "command" || !("idempotencyKey" in invocation.command)) {
+        throw new Error(`Expected ${argv.join(" ")} to carry a key.`);
+      }
+      expect(invocation.command.idempotencyKey).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+      );
+    }
+  });
+
+  test("admits append-only projection recovery only with an explicit gap acknowledgement", () => {
+    const warning = parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "My session",
+      "--json",
+    ]);
+    expect(warning).toMatchObject({
+      error: {
+        code: "INTERACTION_REQUIRED",
+        details: {
+          acknowledgementRequired: "--acknowledge-gap",
+        },
+      },
+      json: true,
+      kind: "interaction-required",
+    });
+    if (warning.kind !== "interaction-required") {
+      throw new Error("Expected projection recovery acknowledgement admission.");
+    }
+    const { idempotencyKey, nextCommand } = warning.error.details;
+    expect(idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(nextCommand).toBe(
+      `hra sync projection recover 'My session' --acknowledge-gap --idempotency-key ${idempotencyKey} --json`,
+    );
+
+    expect(parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "My session",
+      "--acknowledge-gap",
+      "--idempotency-key",
+      idempotencyKey,
+      "--json",
+    ])).toEqual({
+      command: {
+        acknowledgeGap: true,
+        idempotencyKey,
+        kind: "sync.projection-recover",
+        session: "My session",
+      },
+      json: true,
+      kind: "sync.projection-recover",
+      replayCommand: nextCommand,
+    });
+  });
+
+  test("generates a UUIDv7 before projection-recovery transport and preserves exact selectors", () => {
+    const invocation = parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "sess_12345678",
+      "--acknowledge-gap",
+    ]);
+    expect(invocation).toMatchObject({
+      command: {
+        acknowledgeGap: true,
+        kind: "sync.projection-recover",
+        session: "sess_12345678",
+      },
+      json: false,
+      kind: "sync.projection-recover",
+    });
+    if (invocation.kind !== "sync.projection-recover") {
+      throw new Error("Expected an admitted projection recovery.");
+    }
+    expect(invocation.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(invocation.replayCommand).toContain(invocation.command.idempotencyKey);
+    expect(invocation.replayCommand).toContain("sess_12345678");
+    expect(() => parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "sess_12345678",
+      "--acknowledge-gap",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000001",
+    ])).toThrow("current UUIDv7");
+    expect(() => parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "sess_12345678",
+      "--acknowledge-gap",
+      "--idempotency-key",
+      "00000000-0000-7000-8000-000000000001",
+    ])).toThrow("current UUIDv7");
+  });
+
+  test("shell-quotes the acknowledgement command without admitting unknown recovery options", () => {
+    const invocation = parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "team's $(unsafe) session",
+    ]);
+    if (invocation.kind !== "interaction-required") {
+      throw new Error("Expected an acknowledgement warning.");
+    }
+    expect(invocation.error.details.nextCommand).toContain(
+      `'team'\\''s $(unsafe) session'`,
+    );
+    expect(() => parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "sess_12345678",
+      "--acknowledge-gap",
+      "--force",
+    ])).toThrow(CliUsageError);
+    expect(() => parseCli(["sync", "projection", "reset", "sess_12345678"]))
+      .toThrow(CliUsageError);
+  });
+
+  test("parses bounded session status, event pages, follow mode, and interactions", () => {
+    expect(parseCli(["session", "status", "release"])).toEqual({
+      command: { kind: "session.status", session: "release" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli([
+      "session",
+      "events",
+      "release",
+      "--cursor",
+      "cursor-v1",
+      "--limit",
+      "80",
+      "--wait-ms",
+      "2500",
+      "--json",
+    ])).toEqual({
+      command: {
+        cursor: "cursor-v1",
+        kind: "session.events",
+        limit: 80,
+        session: "release",
+        waitMs: 2_500,
+      },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli(["session", "events", "release", "--follow"])).toEqual({
+      command: {
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 30_000,
+      },
+      jsonl: true,
+      kind: "session.events.follow",
+    });
+    expect(parseCli(["session", "events", "release", "--follow", "--json"])).toMatchObject({
+      jsonl: true,
+      kind: "session.events.follow",
+    });
+    expect(parseCli(["session", "interactions", "release", "--pending", "--limit", "12"]))
+      .toEqual({
+        command: {
+          kind: "session.interactions",
+          limit: 12,
+          pending: true,
+          session: "release",
+        },
+        json: false,
+        kind: "command",
+      });
+    for (const argv of [
+      ["session", "events", "release", "--limit", "0"],
+      ["session", "events", "release", "--limit", "201"],
+      ["session", "events", "release", "--wait-ms", "30001"],
+      ["session", "events", "release", "--wait-ms", "1.5"],
+      ["session", "events", "release", "--follow", "--wait-ms", "0"],
+      ["session", "interactions", "release", "--limit", "101"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+    expect(() => parseCli(["session", "events", "release", "--cursor", "x".repeat(2_049)]))
+      .toThrow(CliUsageError);
+  });
+
+  test("parses safe interaction decisions and keeps protected values out of argv", () => {
+    const interaction = "50000000-0000-4000-8000-000000000001";
+    expect(parseCli(["interaction", "list", "release", "--pending", "--limit", "20", "--json"]))
+      .toEqual({
+        command: { kind: "interaction.list", limit: 20, pending: true, session: "release" },
+        json: true,
+        kind: "command",
+      });
+    expect(parseCli(["interaction", "show", interaction])).toEqual({
+      command: { interaction, kind: "interaction.show" },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli([
+      "interaction",
+      "decide",
+      interaction,
+      "--revision",
+      "3",
+      "--decision",
+      "session",
+    ])).toEqual({
+      command: {
+        expectedRevision: 3,
+        interaction,
+        kind: "interaction.resolve",
+        resolution: { decision: "session", kind: "approval_decision" },
+      },
+      json: false,
+      kind: "command",
+    });
+    expect(parseCli([
+      "interaction",
+      "submit",
+      interaction,
+      "--revision",
+      "4",
+      "--action",
+      "cancel",
+    ])).toMatchObject({
+      command: {
+        expectedRevision: 4,
+        interaction,
+        resolution: { action: "cancel", kind: "mcp_submission" },
+      },
+      kind: "command",
+    });
+    expect(() => parseCli([
+      "interaction",
+      "decide",
+      interaction,
+      "--revision",
+      "0",
+      "--decision",
+      "once",
+    ])).toThrow(CliUsageError);
+    expect(() => parseCli(["interaction", "show", "not-an-id"])).toThrow(CliUsageError);
+  });
+
+  test("returns only protected-input metadata for secret-bearing interaction resolutions", () => {
+    const interaction = "60000000-0000-4000-8000-000000000001";
+    expect(parseCli([
+      "interaction",
+      "grant",
+      interaction,
+      "--revision",
+      "7",
+      "--scope",
+      "turn",
+      "--input-fd",
+      "3",
+      "--json",
+    ])).toEqual({
+      expectedRevision: 7,
+      input: { fd: 3, kind: "fd" },
+      interaction,
+      json: true,
+      kind: "interaction.resolve-protected",
+      resolution: { kind: "permission_grant", scope: "turn" },
+    });
+    expect(parseCli([
+      "interaction",
+      "answer",
+      interaction,
+      "--revision",
+      "8",
+      "--input-stdin",
+    ])).toEqual({
+      expectedRevision: 8,
+      input: { kind: "stdin" },
+      interaction,
+      json: false,
+      kind: "interaction.resolve-protected",
+      resolution: { kind: "user_answers" },
+    });
+    expect(parseCli([
+      "interaction",
+      "submit",
+      interaction,
+      "--revision",
+      "9",
+      "--action",
+      "accept",
+      "--input-fd",
+      "0",
+    ])).toMatchObject({
+      input: { fd: 0, kind: "fd" },
+      resolution: { action: "accept", kind: "mcp_submission" },
+    });
+    for (const argv of [
+      ["interaction", "grant", interaction, "--revision", "7"],
+      ["interaction", "answer", interaction, "--revision", "8", "secret-answer"],
+      ["interaction", "answer", interaction, "--revision", "8", "--input-fd", "1"],
+      ["interaction", "answer", interaction, "--revision", "8", "--input-stdin", "--input-fd", "3"],
+      ["interaction", "grant", interaction, "--revision", "8", "--permissions-json", "{\"secret\":true}"],
+      ["interaction", "submit", interaction, "--revision", "9", "--action", "decline", "--input-fd", "3"],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
+  test("completes protected resolutions only from exact injected JSON envelopes", () => {
+    const interaction = "60000000-0000-4000-8000-000000000001";
+    const grant = parseCli([
+      "interaction",
+      "grant",
+      interaction,
+      "--revision",
+      "7",
+      "--scope",
+      "session",
+      "--input-fd",
+      "3",
+    ]);
+    if (grant.kind !== "interaction.resolve-protected") {
+      throw new Error("Expected protected permission resolution.");
+    }
+    expect(completeProtectedInteraction(grant, {
+      permissions: { filesystem: { write: true } },
+    })).toEqual({
+      expectedRevision: 7,
+      interaction,
+      kind: "interaction.resolve",
+      resolution: {
+        kind: "permission_grant",
+        permissions: { filesystem: { write: true } },
+        scope: "session",
+      },
+    });
+
+    const answer = parseCli([
+      "interaction",
+      "answer",
+      interaction,
+      "--revision",
+      "8",
+      "--input-stdin",
+    ]);
+    if (answer.kind !== "interaction.resolve-protected") {
+      throw new Error("Expected protected answer resolution.");
+    }
+    expect(completeProtectedInteraction(answer, {
+      answers: { question_1: { answers: ["protected response"] } },
+    })).toMatchObject({
+      resolution: {
+        answers: { question_1: { answers: ["protected response"] } },
+        kind: "user_answers",
+      },
+    });
+
+    const submission = parseCli([
+      "interaction",
+      "submit",
+      interaction,
+      "--revision",
+      "9",
+      "--action",
+      "accept",
+      "--input-fd",
+      "0",
+    ]);
+    if (submission.kind !== "interaction.resolve-protected") {
+      throw new Error("Expected protected MCP submission.");
+    }
+    expect(completeProtectedInteraction(submission, {
+      content: { selected: ["resource-1"] },
+    })).toMatchObject({
+      resolution: {
+        action: "accept",
+        content: { selected: ["resource-1"] },
+        kind: "mcp_submission",
+      },
+    });
+
+    for (const document of [
+      null,
+      {},
+      { answers: {}, extra: true },
+      { permissions: {} },
+      { answers: { question_1: { answers: [1] } } },
+    ]) {
+      expect(() => completeProtectedInteraction(answer, document)).toThrow(CliUsageError);
+    }
+  });
+
+  test("preserves every valid bounded recovery selector through the acknowledged parser path", () => {
+    fc.assert(
+      fc.property(
+        fc.string({ minLength: 1, maxLength: 200 })
+          .filter((selector) => selector.trim().length > 0),
+        (selector) => {
+          const invocation = parseCli([
+            "sync",
+            "projection",
+            "recover",
+            "--acknowledge-gap",
+            "--",
+            selector,
+          ]);
+          expect(invocation.kind).toBe("sync.projection-recover");
+          if (invocation.kind !== "sync.projection-recover") return;
+          expect(invocation.command).toMatchObject({
+            acknowledgeGap: true,
+            kind: "sync.projection-recover",
+            session: selector.trim(),
+          });
+          expect(invocation.command.idempotencyKey).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+          );
+        },
+      ),
+      { numRuns: 500 },
+    );
+  });
+
+  test("is total for arbitrary argv", () => {
+    fc.assert(
+      fc.property(fc.array(fc.string(), { maxLength: 20 }), (argv) => {
+        try { parseCli(argv); } catch (error: unknown) { expect(error).toBeInstanceOf(Error); }
+      }),
+      { numRuns: 1_000 },
+    );
+  });
+});

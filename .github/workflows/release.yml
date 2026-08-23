@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Match the tag to package.json
+        run: >-
+          bun -e 'const packageJson: unknown = await Bun.file("package.json").json();
+          if (typeof packageJson !== "object" || packageJson === null || !("version" in packageJson) || typeof packageJson.version !== "string")
+          throw new Error("package.json has no string version");
+          const expected = `v${packageJson.version}`;
+          if (process.env.GITHUB_REF_NAME !== expected)
+          throw new Error(`tag ${process.env.GITHUB_REF_NAME ?? "<missing>"} does not match ${expected}`);'
+
+      - name: Verify release ancestry and ordering
+        run: |
+          git fetch --force origin main --tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          newest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
+          test "$newest" = "$GITHUB_REF_NAME"
+
+      - name: Verify generated public documents
+        run: bun run build:site -- --check
+
+      - name: Run the repository gate
+        run: bun run check
+
+      - name: Pack the source artifact
+        run: |
+          mkdir release
+          bun pm pack --destination release
+          mv "release/hra-${GITHUB_REF_NAME#v}.tgz" "release/hra-${GITHUB_REF_NAME}.tgz"
+
+      - name: Generate the SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          artifact-name: hra-${{ github.ref_name }}.spdx.json
+          format: spdx-json
+          output-file: release/hra-${{ github.ref_name }}.spdx.json
+          path: .
+          syft-version: v1.51.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Write checksums
+        working-directory: release
+        run: shasum -a 256 hra-*.tgz hra-*.spdx.json > SHA256SUMS
+
+      - name: Preserve verified release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hra-release-${{ github.ref_name }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish immutable release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hra-release-${{ github.ref_name }}
+          path: release
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" release/*
+          --verify-tag
+          --generate-notes
+          --title "HRA $GITHUB_REF_NAME"

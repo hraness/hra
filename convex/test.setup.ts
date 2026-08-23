@@ -1,0 +1,16 @@
+export const modules = {
+  "./_generated/server.ts": async () => await import("./server"),
+  "./accountDeletion.ts": async () => await import("./accountDeletion"),
+  "./account.ts": async () => await import("./account"),
+  "./authDelivery.ts": async () => await import("./authDelivery"),
+  "./authInvites.ts": async () => await import("./authInvites"),
+  "./commands.ts": async () => await import("./commands"),
+  "./devices.ts": async () => await import("./devices"),
+  "./deviceRevocation.ts": async () => await import("./deviceRevocation"),
+  "./leases.ts": async () => await import("./leases"),
+  "./maintenance.ts": async () => await import("./maintenance"),
+  "./presence.ts": async () => await import("./presence"),
+  "./quota.ts": async () => await import("./quota"),
+  "./sessions.ts": async () => await import("./sessions"),
+  "./usage.ts": async () => await import("./usage"),
+};

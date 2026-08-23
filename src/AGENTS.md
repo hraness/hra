@@ -1,0 +1,20 @@
+# Contents
+
+- `cli/` parses commands and renders stable human or JSON output.
+- `daemon/` owns the local socket, lifecycle, command dispatch, and joins.
+- `codex/` owns the pinned app-server process and protocol adapter.
+- `domain/` owns identifiers, presets, projections, state transitions, encryption envelopes, and command outcomes.
+- `storage/` owns SQLite migrations, repositories, secret custody, and state paths.
+- `cloud/` owns the optional Convex client, sync projections, device enrollment, execution leases, and remote commands.
+- `desktop/` owns the explicit macOS ChatGPT account-switch state machine.
+
+# Guidelines
+
+- Keep `cli.ts` a thin composition entry point. Put behavior in owned modules with injected ports.
+- Use closed command and result unions. Do not pass argv strings or provider method names into domain code.
+- Parse all filesystem, database, socket, provider, cloud, and JSON values from `unknown`.
+- Store a prepared receipt before every mutation. Bind it to the exact authority generation and reconcile indeterminate outcomes without replay.
+- Use absolute, canonical, no-follow paths for durable state and profile roots. Require user-only permissions.
+- Keep secrets in `Bun.secrets` when available. The file fallback is mode 0600, generation-bound, and never silently overwrites or deletes recovery evidence.
+- Preserve stdout for requested data. Send diagnostics to stderr. Never print secrets, provider payloads, environment values, or raw local paths in cloud-facing output.
+- Bound lines, frames, pages, bytes, timers, retries, queues, and retained records.
