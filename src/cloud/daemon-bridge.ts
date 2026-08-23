@@ -78,11 +78,22 @@ import {
 } from "./projection";
 import { parseUsageProjection, type UsageProjection } from "./usage";
 import {
-  deploymentUrlFromEnvironment,
+  deploymentFencedCloudTransport,
+  deploymentFencedSecretCustody,
   LocalCloudControl,
   type CloudDeviceRegistrationPort,
   type CloudSecretCustodyPort,
 } from "./local-control";
+import {
+  acquireCloudDeploymentAuthority,
+  canonicalCloudDeploymentUrl,
+  cloudDeploymentSelectionFromEnvironment,
+  CloudDeploymentAuthorityError,
+  DeploymentScopedCloudSecretCustody,
+  IdentityScopedCloudSecretCustody,
+  type CloudDeploymentAuthority,
+  type CloudDeploymentSelection,
+} from "./identity-custody";
 
 const maximumLocalSessions = 25;
 const maximumRemoteSessions = 25;
@@ -408,6 +419,7 @@ export interface CloudDaemonBridge {
 export type LocalCloudDaemonBridgeOptions = Readonly<{
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
+  deploymentAuthority: CloudDeploymentAuthority;
   executor: CloudCommandExecutorPort;
   identity: CloudDaemonIdentityPort;
   journal: CloudDaemonJournalPort;
@@ -424,6 +436,7 @@ export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
   daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
   deploymentUrl?: string;
+  deploymentAuthority?: CloudDeploymentAuthority;
   environment?: Readonly<Record<string, string | undefined>>;
   executor: CloudCommandExecutorPort;
   journal?: CloudDaemonJournalPort;
@@ -1532,6 +1545,7 @@ async function decryptPrivateLocalReference(
 export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #daemonAuthority: Readonly<{ bootGeneration: number; bootId: string }>;
   readonly #daemonAuthorityFence: Readonly<{ assertCurrent(): Promise<void> }>;
+  readonly #deploymentAuthority: CloudDeploymentAuthority;
   readonly #executor: CloudCommandExecutorPort;
   readonly #identity: CloudDaemonIdentityPort;
   readonly #journal: CloudDaemonJournalPort;
@@ -1567,6 +1581,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     ) throw new Error("Cloud daemon authority is invalid.");
     this.#daemonAuthority = options.daemonAuthority;
     this.#daemonAuthorityFence = options.daemonAuthorityFence;
+    this.#deploymentAuthority = options.deploymentAuthority;
     this.#executor = options.executor;
     this.#identity = options.identity;
     this.#journal = options.journal;
@@ -1576,7 +1591,10 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     this.#optionalSyncBudgetMs = optionalSyncBudgetMs;
     this.#randomConnectionUuid = options.randomConnectionUuid ?? (() => crypto.randomUUID());
     this.#randomUuid = options.randomUuid ?? (() => uuidV7(this.#now()));
-    this.#transport = options.transport;
+    this.#transport = deploymentFencedCloudTransport(
+      options.transport,
+      this.#deploymentAuthority,
+    );
   }
 
   async close(): Promise<void> {
@@ -3848,6 +3866,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
 
   async #assertDaemonCurrent(signal?: AbortSignal): Promise<void> {
     if (signal !== undefined) abortBeforeEffect(signal);
+    await this.#deploymentAuthority.assertCurrent();
     await this.#daemonAuthorityFence.assertCurrent();
     if (signal !== undefined) abortBeforeEffect(signal);
   }
@@ -3868,35 +3887,66 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   }
 }
 
-export function createLocalCloudDaemonBridgeFromEnvironment(
+export async function createLocalCloudDaemonBridgeFromEnvironment(
   options: LocalCloudDaemonBridgeEnvironmentOptions,
-): LocalCloudDaemonBridge | null {
-  const deploymentUrl = options.deploymentUrl
-    ?? deploymentUrlFromEnvironment(options.environment);
-  if (deploymentUrl === null) return null;
+): Promise<LocalCloudDaemonBridge | null> {
+  const selection: CloudDeploymentSelection = options.deploymentUrl === undefined
+    ? cloudDeploymentSelectionFromEnvironment(options.environment)
+    : {
+        deploymentUrl: canonicalCloudDeploymentUrl(options.deploymentUrl),
+        explicit: true,
+        kind: "enabled",
+      };
+  if (selection.kind === "disabled") return null;
+  const deploymentAuthority = options.deploymentAuthority
+    ?? await acquireCloudDeploymentAuthority(options.secretCustody, selection);
+  if (deploymentAuthority.deploymentUrl !== selection.deploymentUrl) {
+    throw new CloudDeploymentAuthorityError(
+      "target_mismatch",
+      "Cloud deployment authority does not match the requested deployment.",
+    );
+  }
+  await deploymentAuthority.assertCurrent();
+  const deploymentUrl = selection.deploymentUrl;
+  const deploymentCustody = new DeploymentScopedCloudSecretCustody(
+    options.secretCustody,
+    deploymentAuthority,
+  );
+  const identityCustody = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+  const fencedCustody = deploymentFencedSecretCustody(
+    identityCustody,
+    deploymentAuthority,
+  );
   let transport: CloudTransport;
   if (options.transport !== undefined) {
-    transport = options.transport;
+    transport = deploymentFencedCloudTransport(options.transport, deploymentAuthority);
   } else {
-    transport = createConvexCloudTransport({
-      accessToken: async () => (await readCustodyAuth(options.secretCustody))?.token ?? null,
+    const rawTransport = createConvexCloudTransport({
+      accessToken: async () => {
+        await deploymentAuthority.assertCurrent();
+        const token = (await readCustodyAuth(fencedCustody))?.token ?? null;
+        await deploymentAuthority.assertCurrent();
+        return token;
+      },
       deploymentUrl,
       ...(options.lifetimeSignal === undefined
         ? {}
         : { lifetimeSignal: options.lifetimeSignal }),
     });
+    transport = deploymentFencedCloudTransport(rawTransport, deploymentAuthority);
   }
   const registration = options.registration ?? new LocalCloudControl({
+    deploymentAuthority,
     deploymentUrl,
     ...(options.lifetimeSignal === undefined
       ? {}
       : { lifetimeSignal: options.lifetimeSignal }),
     ...(options.now === undefined ? {} : { now: options.now }),
-    secretCustody: options.secretCustody,
+    secretCustody: identityCustody,
     transport,
   });
   const identity = new CustodyCloudDaemonIdentity({
-    custody: options.secretCustody,
+    custody: fencedCustody,
     ...(options.now === undefined ? {} : { now: options.now }),
     registration,
     transport,
@@ -3904,9 +3954,10 @@ export function createLocalCloudDaemonBridgeFromEnvironment(
   return new LocalCloudDaemonBridge({
     daemonAuthority: options.daemonAuthority,
     daemonAuthorityFence: options.daemonAuthorityFence,
+    deploymentAuthority,
     executor: options.executor,
     identity,
-    journal: options.journal ?? new CustodyCloudDaemonJournal(options.secretCustody),
+    journal: options.journal ?? new CustodyCloudDaemonJournal(fencedCustody),
     ...(options.leaseDurationMs === undefined
       ? {}
       : { leaseDurationMs: options.leaseDurationMs }),

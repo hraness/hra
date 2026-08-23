@@ -114,16 +114,29 @@ const domainsReadbackSchema = z.object({
   domains: z.array(z.object({ name: z.string().min(1).max(253) })).max(1_024),
 });
 
-const markerSchema = z.object({
-  generation: z.union([z.literal(0), z.literal(1)]),
-  product: z.literal("HRA"),
-  repository: z.object({
-    id: z.number().int().positive(),
-    path: z.string().min(1).max(200),
-  }),
-  source: z.object({ commit: commitSchema }),
-  version: versionSchema,
-});
+const markerRepositorySchema = z.object({
+  id: z.number().int().positive(),
+  path: z.string().min(1).max(200),
+}).strict();
+const markerSourceSchema = z.object({ commit: commitSchema }).strict();
+const markerSchema = z.discriminatedUnion("generation", [
+  z.object({
+    generation: z.literal(0),
+    product: z.literal("HRA"),
+    publication: z.object({ version: versionSchema }).passthrough(),
+    repository: markerRepositorySchema,
+    schemaVersion: z.literal(2),
+    source: markerSourceSchema,
+  }).strict(),
+  z.object({
+    generation: z.literal(1),
+    product: z.literal("HRA"),
+    repository: markerRepositorySchema,
+    schemaVersion: z.literal(2),
+    source: markerSourceSchema,
+    version: versionSchema,
+  }).strict(),
+]);
 
 export type AliasReadback = z.infer<typeof aliasReadbackSchema>;
 export type DeploymentReadback = z.infer<typeof deploymentReadbackSchema>;
@@ -204,12 +217,17 @@ const markerMatches = (value: unknown, endpoint: CutoverEndpoint): boolean => {
   if (endpoint.generation === null) return true;
   const parsed = markerSchema.safeParse(value);
   const expectedPath = endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra";
+  const markerVersion = parsed.success
+    ? parsed.data.generation === 0
+      ? parsed.data.publication.version
+      : parsed.data.version
+    : null;
   return parsed.success
     && parsed.data.generation === endpoint.generation
     && parsed.data.repository.id === endpoint.repositoryId
     && parsed.data.repository.path === expectedPath
     && parsed.data.source.commit === endpoint.sourceCommit
-    && parsed.data.version === endpoint.version;
+    && markerVersion === endpoint.version;
 };
 
 const readOwner = async (

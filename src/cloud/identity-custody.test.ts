@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
 import type { CloudSecretCustodyPort } from "./local-control";
-import { IdentityScopedCloudSecretCustody } from "./identity-custody";
+import {
+  acquireCloudDeploymentAuthority,
+  cloudDeploymentAuthorityFromEnvironment,
+  cloudDeploymentSelectionFromEnvironment,
+  DEFAULT_CLOUD_DEPLOYMENT_URL,
+  DeploymentScopedCloudSecretCustody,
+  IdentityScopedCloudSecretCustody,
+  readCloudDeploymentAuthority,
+} from "./identity-custody";
 
 class MemoryCustody implements CloudSecretCustodyPort {
   readonly values = new Map<string, Readonly<{ generation: number; value: string }>>();
@@ -27,6 +35,23 @@ class MemoryCustody implements CloudSecretCustodyPort {
     if (current?.generation !== expectedGeneration) return Promise.resolve(false);
     this.values.delete(slot);
     return Promise.resolve(true);
+  }
+}
+
+class LegacyWriteDuringAuthorityCasCustody extends MemoryCustody {
+  #injected = false;
+
+  override async compareAndSwap(
+    slot: string,
+    expectedGeneration: number | null,
+    value: string,
+  ): Promise<Readonly<{ generation: number; value: string }> | null> {
+    const committed = await super.compareAndSwap(slot, expectedGeneration, value);
+    if (slot === "cloud-deployment-authority" && committed !== null && !this.#injected) {
+      this.#injected = true;
+      this.values.set("cloud-auth", { generation: 0, value: "late-legacy-auth" });
+    }
+    return committed;
   }
 }
 
@@ -102,5 +127,187 @@ describe("cloud identity-scoped custody", () => {
       version: 1,
     }));
     await expect(IdentityScopedCloudSecretCustody.open(raw)).rejects.toThrow("corrupt");
+  });
+
+  test("selects the release deployment by default, validates overrides, and treats only explicit empty as disabled", () => {
+    expect(cloudDeploymentSelectionFromEnvironment({})).toEqual({
+      deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+      explicit: false,
+      kind: "enabled",
+    });
+    expect(cloudDeploymentSelectionFromEnvironment({ HRA_CONVEX_URL: "  " }))
+      .toEqual({ kind: "disabled" });
+    expect(cloudDeploymentSelectionFromEnvironment({
+      HRA_CONVEX_URL: "https://EXAMPLE.convex.cloud/",
+    })).toEqual({
+      deploymentUrl: "https://example.convex.cloud",
+      explicit: true,
+      kind: "enabled",
+    });
+    for (const value of [
+      "not a URL",
+      "http://example.convex.cloud",
+      "https://user@example.convex.cloud",
+      "https://example.convex.cloud/path",
+      "https://example.convex.cloud?target=other",
+    ]) {
+      expect(() => cloudDeploymentSelectionFromEnvironment({ HRA_CONVEX_URL: value }))
+        .toThrow("HRA_CONVEX_URL is invalid.");
+    }
+  });
+
+  test("atomically acquires one exact deployment generation under concurrent opens", async () => {
+    const custody = new MemoryCustody();
+    const selection = cloudDeploymentSelectionFromEnvironment({});
+    if (selection.kind !== "enabled") throw new Error("fixture selection is disabled");
+    const [first, second] = await Promise.all([
+      acquireCloudDeploymentAuthority(custody, selection),
+      acquireCloudDeploymentAuthority(custody, selection),
+    ]);
+    expect(first.deploymentUrl).toBe(DEFAULT_CLOUD_DEPLOYMENT_URL);
+    expect(second.deploymentUrl).toBe(DEFAULT_CLOUD_DEPLOYMENT_URL);
+    expect(first.generation).toBe(0);
+    expect(second.generation).toBe(0);
+    expect(custody.values.get("cloud-deployment-authority")?.generation).toBe(0);
+    await Promise.all([first.assertCurrent(), second.assertCurrent()]);
+  });
+
+  test("allows only one deployment to win a competing first acquisition", async () => {
+    const custody = new MemoryCustody();
+    const firstSelection = cloudDeploymentSelectionFromEnvironment({
+      HRA_CONVEX_URL: "https://first.convex.cloud",
+    });
+    const secondSelection = cloudDeploymentSelectionFromEnvironment({
+      HRA_CONVEX_URL: "https://second.convex.cloud",
+    });
+    if (firstSelection.kind !== "enabled" || secondSelection.kind !== "enabled") {
+      throw new Error("fixture selection is disabled");
+    }
+    const results = await Promise.allSettled([
+      acquireCloudDeploymentAuthority(custody, firstSelection),
+      acquireCloudDeploymentAuthority(custody, secondSelection),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({
+      reason: { message: "Cloud deployment authority is bound to another deployment." },
+    });
+    if (fulfilled[0]?.status !== "fulfilled") throw new Error("fixture has no winner");
+    await fulfilled[0].value.assertCurrent();
+    expect(fulfilled[0].value.generation).toBe(0);
+  });
+
+  test("ignores a prior-version credential written concurrently after an implicit clean scan", async () => {
+    const custody = new LegacyWriteDuringAuthorityCasCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(custody, {});
+    if (authority === null) throw new Error("fixture authority is disabled");
+    expect(authority.custodyMode).toBe("scoped");
+    expect((await custody.read("cloud-auth"))?.value).toBe("late-legacy-auth");
+    const deploymentCustody = new DeploymentScopedCloudSecretCustody(custody, authority);
+    expect(await deploymentCustody.read("cloud-auth")).toBeNull();
+    expect(await deploymentCustody.compareAndSwap("cloud-auth", null, "bound-auth"))
+      .toMatchObject({ generation: 0, value: "bound-auth" });
+    expect((await custody.read("cloud-auth"))?.value).toBe("late-legacy-auth");
+    expect((await deploymentCustody.read("cloud-auth"))?.value).toBe("bound-auth");
+  });
+
+  test("requires an explicit one-time binding for legacy cloud custody", async () => {
+    for (const slot of ["cloud-auth", "cloud-auth-logout", "cloud-active-identity"]) {
+      const custody = new MemoryCustody();
+      await write(custody, slot, "legacy");
+      await expect(cloudDeploymentAuthorityFromEnvironment(custody, {}))
+        .rejects.toThrow("requires an explicit HRA_CONVEX_URL");
+      const bound = await cloudDeploymentAuthorityFromEnvironment(custody, {
+        HRA_CONVEX_URL: "https://legacy-target.convex.cloud",
+      });
+      expect(bound?.deploymentUrl).toBe("https://legacy-target.convex.cloud");
+      expect(bound?.custodyMode).toBe("legacy");
+      if (bound === null) throw new Error("fixture authority is disabled");
+      expect((await new DeploymentScopedCloudSecretCustody(custody, bound).read(slot))?.value)
+        .toBe("legacy");
+      await bound.assertCurrent();
+    }
+  });
+
+  test("preserves legacy cache custody while new bindings isolate the same cloud identity", async () => {
+    const activeIdentity = JSON.stringify({ userPublicId: "user_cache_12345678", version: 1 });
+    const legacyRaw = new MemoryCustody();
+    await write(legacyRaw, "cloud-active-identity", activeIdentity);
+    const unboundLegacy = await IdentityScopedCloudSecretCustody.open(legacyRaw);
+    const legacyAuthority = await cloudDeploymentAuthorityFromEnvironment(legacyRaw, {
+      HRA_CONVEX_URL: "https://legacy-cache.convex.cloud",
+    });
+    if (legacyAuthority === null) throw new Error("fixture authority is disabled");
+    const reboundLegacy = await IdentityScopedCloudSecretCustody.open(
+      new DeploymentScopedCloudSecretCustody(legacyRaw, legacyAuthority),
+    );
+    expect(legacyAuthority.custodyMode).toBe("legacy");
+    expect(reboundLegacy.cacheNamespace).toBe(unboundLegacy.cacheNamespace);
+
+    const scopedRaw = new MemoryCustody();
+    const scopedAuthority = await cloudDeploymentAuthorityFromEnvironment(scopedRaw, {});
+    if (scopedAuthority === null) throw new Error("fixture authority is disabled");
+    const deploymentCustody = new DeploymentScopedCloudSecretCustody(
+      scopedRaw,
+      scopedAuthority,
+    );
+    await write(deploymentCustody, "cloud-active-identity", activeIdentity);
+    const scopedIdentity = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    expect(scopedAuthority.custodyMode).toBe("scoped");
+    expect(scopedIdentity.cacheNamespace).not.toBe(unboundLegacy.cacheNamespace);
+    expect((await scopedRaw.read("cloud-active-identity"))).toBeNull();
+  });
+
+  test("refuses another deployment and makes absent configuration mean the exact default", async () => {
+    const customRaw = new MemoryCustody();
+    const custom = await cloudDeploymentAuthorityFromEnvironment(customRaw, {
+      HRA_CONVEX_URL: "https://custom.convex.cloud",
+    });
+    expect(custom?.deploymentUrl).toBe("https://custom.convex.cloud");
+    expect(custom?.custodyMode).toBe("scoped");
+    if (custom === null) throw new Error("fixture authority is disabled");
+    const customCustody = new DeploymentScopedCloudSecretCustody(customRaw, custom);
+    await write(customCustody, "cloud-state", "recoverable-state");
+    await expect(cloudDeploymentAuthorityFromEnvironment(customRaw, {}))
+      .rejects.toThrow("bound to another deployment");
+    await expect(cloudDeploymentAuthorityFromEnvironment(customRaw, {
+      HRA_CONVEX_URL: "https://other.convex.cloud",
+    })).rejects.toThrow("bound to another deployment");
+    const observedCustom = await readCloudDeploymentAuthority(customRaw);
+    if (observedCustom === null) throw new Error("fixture authority is absent");
+    expect((await new DeploymentScopedCloudSecretCustody(
+      customRaw,
+      observedCustom,
+    ).read("cloud-state"))?.value).toBe("recoverable-state");
+
+    const releaseCustody = new MemoryCustody();
+    const explicit = await cloudDeploymentAuthorityFromEnvironment(releaseCustody, {
+      HRA_CONVEX_URL: DEFAULT_CLOUD_DEPLOYMENT_URL,
+    });
+    const implicit = await cloudDeploymentAuthorityFromEnvironment(releaseCustody, {});
+    expect(implicit?.generation).toBe(explicit?.generation);
+    expect(implicit?.deploymentUrl).toBe(DEFAULT_CLOUD_DEPLOYMENT_URL);
+  });
+
+  test("fences changed, deleted, and delete-then-rebound authority observations", async () => {
+    const custody = new MemoryCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(custody, {});
+    if (authority === null) throw new Error("fixture authority is disabled");
+    const committed = custody.values.get("cloud-deployment-authority");
+    if (committed === undefined) throw new Error("fixture authority is absent");
+    custody.values.set("cloud-deployment-authority", {
+      generation: committed.generation + 1,
+      value: committed.value,
+    });
+    await expect(authority.assertCurrent()).rejects.toThrow("not current");
+
+    custody.values.delete("cloud-deployment-authority");
+    await expect(authority.assertCurrent()).rejects.toThrow("not current");
+    const rebound = await cloudDeploymentAuthorityFromEnvironment(custody, {});
+    expect(rebound?.generation).toBe(0);
+    await expect(authority.assertCurrent()).rejects.toThrow("not current");
+    await rebound?.assertCurrent();
   });
 });

@@ -21,7 +21,7 @@ The authenticated Vercel alias readback is the traffic authority. Its exact `(pr
 vercel api /v4/aliases/hra.sh --scope hraness --raw | jq -c '{alias,projectId,deploymentId,deployment:{id:.deployment.id,url:.deployment.url}}'
 ```
 
-`https://hra.sh/.well-known/hra.json` is independent product evidence. Generation 0 must identify repository ID `1334876494`, path `hraness/hra-v0`, and the exact accepted archive source commit. Generation 1 must identify repository ID `1343008607`, path `hraness/hra`, and the exact accepted new-HRA source commit. Both markers carry `source.commit` and version. A marker does not replace the deployment-ID readback because two deployments can share source and version.
+`https://hra.sh/.well-known/hra.json` is independent product evidence. Generation 0 must identify repository ID `1334876494`, path `hraness/hra-v0`, the exact accepted archive source commit, and the archive version at `publication.version`. Generation 1 must identify repository ID `1343008607`, path `hraness/hra`, the exact accepted new-HRA source commit, and its top-level `version`. Both schema-version-2 markers carry `source.commit`; their generation-discriminated version locations are intentional. A marker does not replace the deployment-ID readback because two deployments can share source and version.
 
 Record only filtered provider fields. Full deployment and alias responses can contain operator identity data. Do not use `--debug`, `--verbose`, `--token`, `--force`, remove-then-add, or a token-bearing shell variable.
 
@@ -53,20 +53,24 @@ vercel api /v13/deployments/<deployment-id> --scope hraness --raw | jq -c '{id,u
 
 Require `readyState` to be `READY`, `gitSource.type` to be `github`, `gitSource.ref` to be `main`, and the project ID, repository ID, source commit, deployment ID, and bare automatic hostname to match the accepted release. A bare automatic hostname already ends in `.vercel.app`; never append that suffix again. The deployment URL is an exact provider identity and alias destination, not proof that an unauthenticated browser can reach it. Deployment protection can cover automatic deployment URLs.
 
-Stage every production deployment without automatic alias promotion, even after disabling the project setting:
+Stage a source upload without automatic alias promotion, even after disabling the project setting:
 
 ```sh
 vercel deploy <project-path> --prod --skip-domain --project <fixed-project-id> --scope hraness
 ```
 
-Do not accept a Q or N deployment created by a command that omitted `--skip-domain`. Git-created deployments remain safe only while the exact numeric-project readbacks above stay `false`.
+Do not accept a source-uploaded Q or N deployment created by a command that omitted `--skip-domain`. A deployment created from Vercel's immutable Git source may instead be rebuilt with `vercel redeploy <exact-git-deployment-id> --target production` when the original build failed before release, but only after independently proving its exact `gitSource` tuple and reading `autoAssignCustomDomains === false` immediately before and after the rebuild. `vercel redeploy` has no `--skip-domain` option. The resulting deployment remains acceptable only when it preserves the exact GitHub repository ID, `main` ref, source commit, project ID, and disabled custom-domain setting. A CLI source upload whose deployment record has `gitSource: null` is not a Q or N candidate even when its Git metadata strings look correct.
 
 Inspect Q and N before exposing them through a public custom alias with the authenticated local Vercel session:
 
+From the fixed, mode-`0700` linked operator directory whose `.vercel/project.json` names the exact numeric project, run:
+
 ```sh
-vercel curl / --deployment <deployment-id> --scope hraness
-vercel curl /.well-known/hra.json --deployment <deployment-id> --scope hraness
+vercel curl / --deployment <deployment-id>
+vercel curl /.well-known/hra.json --deployment <deployment-id>
 ```
+
+Vercel CLI `54.18.0` forwards `--scope` to its nested curl process even when written as a global option, so do not add it to `vercel curl`. The protected fixed link supplies project and team identity; the separate deployment and project API readbacks remain authoritative.
 
 Use `vercel curl --deployment` for every release-specific path needed by acceptance. Do not pass, print, save, or script a protection-bypass secret. These authenticated checks do not replace the later public custom-alias probes.
 
