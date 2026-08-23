@@ -10,7 +10,7 @@ const legacyCloudSlots = [
   "cloud-auth",
   "cloud-auth-logout",
 ] as const;
-export const DEFAULT_CLOUD_DEPLOYMENT_URL = "https://quiet-bison-462.convex.cloud";
+export const DEFAULT_CLOUD_DEPLOYMENT_URL = "https://qualified-hummingbird-537.convex.cloud";
 const scopedSlots = new Set([
   "cloud-account-key",
   "cloud-account-deletion",

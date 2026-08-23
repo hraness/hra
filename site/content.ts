@@ -1,4 +1,4 @@
-export type EndpointAvailability = "beta-not-yet-live" | "live";
+export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
 
 export interface PublicEndpoints {
   readonly betaTag: EndpointAvailability;
@@ -92,13 +92,22 @@ const privacyBlocks: readonly ContentBlock[] = [
     text("The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key."),
   ),
   paragraph(
+    text("HRA uses Convex to authenticate the HRA identity and store server-visible metadata plus encrypted projections. Convex receives the verified email address and the service metadata described above, but not the keys required to decrypt session content."),
+  ),
+  paragraph(
+    text("HRA uses Resend to deliver verification email. Resend receives the recipient email address, sender identity, one-time verification code and message content, and ordinary delivery metadata. It receives no Codex credentials or encrypted session projection."),
+  ),
+  paragraph(
+    text("Vercel serves hra.sh. GitHub hosts the source repository, releases, and release downloads. When you visit or download from either service, that provider receives ordinary web request metadata such as the requested URL, IP address, user agent, and time. HRA does not add analytics, cookies, remote fonts, or executable JavaScript to the site."),
+  ),
+  paragraph(
     text("Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked."),
   ),
   paragraph(
     text("Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion."),
   ),
   paragraph(
-    text("The website uses no analytics, cookies, remote fonts, or executable JavaScript. Codex activity remains subject to OpenAI's own service and privacy terms."),
+    text("Codex activity remains subject to OpenAI's own service and privacy terms."),
   ),
   {
     kind: "notice",
@@ -109,11 +118,13 @@ const privacyBlocks: readonly ContentBlock[] = [
   },
 ];
 
+export const publicReleaseState: "release-ready" | "staged" = "staged";
+
 export const publicContent: PublicContent = {
   productName: "HRA",
   description: "A persistent Bun CLI for isolated Codex accounts, live sessions, safe macOS account switching, and optional encrypted sync.",
   siteUrl: "https://hra.sh",
-  installCommand: "bun add --global github:hraness/hra#v0.1.0",
+  installCommand: "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
   initCommand: "hra init",
   doctorCommand: "hra doctor --offline",
   endpoints: {
@@ -147,6 +158,49 @@ export const publicContent: PublicContent = {
     ),
   ],
   sections: [
+    {
+      id: "install-update-and-remove",
+      heading: "Install, update, and remove",
+      blocks: [
+        paragraph(
+          text("HRA requires Bun 1.3.14. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Install one reviewed immutable tag, then verify the binary before initialization:"),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "bun --version",
+            "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+            "hra --version",
+            "hra doctor --offline",
+          ],
+        },
+        paragraph(
+          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace both v0.1.0 occurrences in the URL with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra daemon stop",
+            "hra daemon status --json",
+            "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+            "hra --version",
+            "hra doctor --offline",
+            "hra daemon start",
+          ],
+        },
+        paragraph(
+          text("Removing the package does not remove HRA's local profiles, session history, recovery evidence, or cloud account. Log out each Codex profile and complete any intended cloud-account deletion before uninstalling. Then stop the daemon, confirm that it is stopped, and remove the installed command:"),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra daemon stop",
+            "hra daemon status --json",
+            "bun remove --global hra",
+          ],
+        },
+      ],
+    },
     {
       id: "first-account",
       heading: "First account",
@@ -185,9 +239,9 @@ export const publicContent: PublicContent = {
       heading: "Cloud sign-in and device pairing",
       blocks: [
         paragraph(
-          text("The hosted endpoint is beta-not-yet-live. Until it is published, these commands require an explicit deployment URL in "),
+          text("The hosted endpoint is beta-not-yet-live. An unset "),
           code("HRA_CONVEX_URL"),
-          text(" before the daemon starts. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:"),
+          text(" selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:"),
         ),
         {
           kind: "commands",
@@ -605,8 +659,8 @@ export const renderReadmeMarkdown = (content: PublicContent = publicContent): st
   return [
     `# ${content.productName}`,
     `\`\`\`sh\n${content.installCommand}\n\`\`\``,
-    `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     `\`\`\`sh\n${content.doctorCommand}\n\`\`\``,
+    `\`\`\`sh\n${content.initCommand}\n\`\`\``,
     renderMarkdownBlocks(content.introduction, 3),
     sections,
   ].join("\n\n") + "\n";

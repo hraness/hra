@@ -13,6 +13,7 @@ import {
   consumeBoundIdentityInvite,
   requireBoundIdentityInvite,
 } from "./authInvites";
+import { requireAuthAdmissionsOpen } from "./admissionControl";
 import {
   adjustParentAttributedQuotaForPatch,
   adjustQuotaForPatch,
@@ -119,6 +120,7 @@ export const reserveEmailAttempt = internalMutation({
     if (args.inviteCapabilityDigest !== undefined) {
       requireDigest(args.inviteCapabilityDigest);
     }
+    await requireAuthAdmissionsOpen(ctx);
     const now = Date.now();
     let subject = await subjectByEmail(ctx, args.emailDigest);
     let inviteBinding: "bound" | "not_required" | "replay" = "not_required";

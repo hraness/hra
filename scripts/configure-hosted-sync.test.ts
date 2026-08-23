@@ -17,6 +17,7 @@ import {
   type GeneratedHostedSecrets,
 } from "./configure-hosted-sync";
 import {
+  HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
@@ -26,7 +27,7 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: 1_234_567,
+  projectId: HRA_CONVEX_PROJECT_ID,
   teamId: HRA_CONVEX_TEAM_ID,
 };
 
@@ -239,14 +240,19 @@ describe("fresh hosted configuration", () => {
     ];
     for (const scenario of cases) {
       let index = 0;
+      let verifications = 0;
       const runner: CommandRunner = async () => scenario.results[index++]!;
       await expect(configureHostedSync({
         generate: async () => generatedSentinels,
         input: validInput,
         runner,
         target,
-        verifyTarget: exactTargetVerifier,
+        verifyTarget: async (value) => {
+          await exactTargetVerifier(value);
+          verifications += 1;
+        },
       })).rejects.toThrow(scenario.expected);
+      expect(verifications).toBe(scenario.results.length === 1 ? 1 : 2);
     }
   });
 

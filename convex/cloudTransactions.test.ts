@@ -56,6 +56,9 @@ const recoverEffectStarted = makeFunctionReference<"mutation", Args, unknown>(
 const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, unknown>(
   "quota:genesisHardAuthority",
 );
+const transitionAuthAdmission = makeFunctionReference<"mutation", Args, unknown>(
+  "admissionControl:transition",
+);
 
 const encryptedEnvelope = {
   algorithm: "A256GCM" as const,
@@ -120,6 +123,42 @@ async function authenticatedWorld() {
 }
 
 describe("cloud transactions", () => {
+  test("auth freeze blocks new device credentials but preserves exact registration replay", async () => {
+    const world = await authenticatedWorld();
+    const now = Date.now();
+    const registration = {
+      bootstrapKeyEnvelope: wrappedKeyEnvelope,
+      encryptedLabel: encryptedEnvelope,
+      idempotencyKey: uuidV7(now, "ad01"),
+      keyVersion: 1,
+      publicId: "device_admission1",
+      requestDigest: "e".repeat(64),
+      signingPublicKey: publicKey,
+      wrappingPublicKey: publicKey,
+    } as const;
+    await world.testRuntime.mutation(transitionAuthAdmission, {
+      expectedGeneration: 0,
+      mutationId: uuidV7(now, "ad02"),
+      state: "frozen",
+    });
+    await expectPromiseToReject(
+      world.runtime.mutation(register, registration),
+      "AUTH_ADMISSION_FROZEN",
+    );
+    await world.testRuntime.mutation(transitionAuthAdmission, {
+      expectedGeneration: 1,
+      mutationId: uuidV7(now, "ad03"),
+      state: "open",
+    });
+    const registered = await world.runtime.mutation(register, registration);
+    await world.testRuntime.mutation(transitionAuthAdmission, {
+      expectedGeneration: 2,
+      mutationId: uuidV7(now, "ad04"),
+      state: "frozen",
+    });
+    expect(await world.runtime.mutation(register, registration)).toEqual(registered);
+  });
+
   test("fences one encrypted command effect under an exact device and lease", async () => {
     const world = await authenticatedWorld();
     const now = Date.now();

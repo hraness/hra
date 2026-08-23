@@ -1,6 +1,12 @@
 import { paginationOptsValidator } from "convex/server";
 import { getDocumentSize, v, type GenericId as Id, type Value } from "convex/values";
 
+import {
+  identityInviteLifetimeMs,
+  invitePublicIdFromCapabilityDigest,
+  isInvitePublicId,
+} from "../src/cloud/inviteAuthority";
+import { isAuthDigest } from "./authPolicy";
 import { internalMutation, internalQuery, type MutationCtx } from "./server";
 import {
   quotaAccountResource,
@@ -138,6 +144,14 @@ function requireHardServiceAuthority<T extends HardServiceAuthority>(
     || authority.identities > authority.userRecords
   ) corrupt();
   return authority;
+}
+
+export async function requireHardQuotaAuthority(ctx: MutationCtx): Promise<void> {
+  const rows = await ctx.db.query("storageUsageService")
+    .withIndex("by_key", (builder) => builder.eq("key", "global"))
+    .take(2);
+  if (rows.length !== 1) corrupt();
+  requireHardServiceAuthority(rows[0]);
 }
 
 export function nextResourceRecords(
@@ -819,60 +833,217 @@ export const QUOTA_GENESIS_CHARGED_TABLES = [
 const hasAny = async <T>(promise: Promise<readonly T[]>): Promise<boolean> =>
   (await promise).length !== 0;
 
+async function requireGenesisEmpty(ctx: MutationCtx): Promise<void> {
+  const [serviceExists, controlExists] = await Promise.all([
+    hasAny(ctx.db.query("storageUsageService").take(1)),
+    hasAny(ctx.db.query("serviceControl").take(1)),
+  ]);
+  if (serviceExists || controlExists) {
+    throw new Error("QUOTA_HARD_GENESIS_ALREADY_EXISTS");
+  }
+  const occupied = await Promise.all([
+    hasAny(ctx.db.query("users").take(1)),
+    hasAny(ctx.db.query("authSessions").take(1)),
+    hasAny(ctx.db.query("authAccounts").take(1)),
+    hasAny(ctx.db.query("authRefreshTokens").take(1)),
+    hasAny(ctx.db.query("authVerificationCodes").take(1)),
+    hasAny(ctx.db.query("authVerifiers").take(1)),
+    hasAny(ctx.db.query("authRateLimits").take(1)),
+    hasAny(ctx.db.query("authSubjects").take(1)),
+    hasAny(ctx.db.query("authEmailAttemptEvents").take(1)),
+    hasAny(ctx.db.query("authOtpChallenges").take(1)),
+    hasAny(ctx.db.query("authInvites").take(1)),
+    hasAny(ctx.db.query("devices").take(1)),
+    hasAny(ctx.db.query("deviceSessions").take(1)),
+    hasAny(ctx.db.query("deviceBindChallenges").take(1)),
+    hasAny(ctx.db.query("deviceKeyEnvelopes").take(1)),
+    hasAny(ctx.db.query("recoveryEnvelopes").take(1)),
+    hasAny(ctx.db.query("devicePresence").take(1)),
+    hasAny(ctx.db.query("sessionHeads").take(1)),
+    hasAny(ctx.db.query("sessionChunks").take(1)),
+    hasAny(ctx.db.query("sessionStreamEpochs").take(1)),
+    hasAny(ctx.db.query("executionLeases").take(1)),
+    hasAny(ctx.db.query("sessionCommands").take(1)),
+    hasAny(ctx.db.query("codexAccounts").take(1)),
+    hasAny(ctx.db.query("deviceAccountBindings").take(1)),
+    hasAny(ctx.db.query("accountUsageSnapshots").take(1)),
+    hasAny(ctx.db.query("idempotencyReceipts").take(1)),
+    hasAny(ctx.db.query("securityEvents").take(1)),
+    hasAny(ctx.db.query("accountDeletionJobs").take(1)),
+    hasAny(ctx.db.query("accountDeletionReceipts").take(1)),
+    hasAny(ctx.db.query("deviceRevocationJobs").take(1)),
+    hasAny(ctx.db.query("storageUsageByUser").take(1)),
+    hasAny(ctx.db.query("storageResourceUsageByUser").take(1)),
+    hasAny(ctx.db.query("storageResourceUsageByAccount").take(1)),
+    hasAny(ctx.db.query("maintenanceState").take(1)),
+  ]);
+  if (occupied.some(Boolean)) throw new Error("QUOTA_HARD_GENESIS_NOT_EMPTY");
+}
+
+async function insertHardAuthority(
+  ctx: MutationCtx,
+  now: number,
+  bootstrap?: Readonly<{
+    capabilityDigest: string;
+    lifetimeMs: number;
+    publicId: string;
+  }>,
+): Promise<void> {
+  await ctx.db.insert("storageUsageService", {
+    enforcement: "hard",
+    identities: 0,
+    key: "global",
+    logicalBytes: 0,
+    records: 0,
+    serviceLogicalBytes: 0,
+    serviceRecords: 0,
+    updatedAt: now,
+    userLogicalBytes: 0,
+    userRecords: 0,
+  });
+  await ctx.db.insert("serviceControl", {
+    authAdmissionGeneration: 0,
+    authAdmissions: "open",
+    ...(bootstrap === undefined
+      ? {}
+      : {
+          bootstrapCompletedAt: now,
+          bootstrapInviteCapabilityDigest: bootstrap.capabilityDigest,
+          bootstrapInviteLifetimeMs: bootstrap.lifetimeMs,
+          bootstrapInvitePublicId: bootstrap.publicId,
+        }),
+    key: "global",
+    updatedAt: now,
+  });
+}
+
 export const genesisHardAuthority = internalMutation({
   args: {},
   handler: async (ctx) => {
-    const serviceExists = await hasAny(ctx.db.query("storageUsageService").take(1));
-    if (serviceExists) throw new Error("QUOTA_HARD_GENESIS_ALREADY_EXISTS");
-    const occupied = await Promise.all([
-      hasAny(ctx.db.query("users").take(1)),
-      hasAny(ctx.db.query("authSessions").take(1)),
-      hasAny(ctx.db.query("authAccounts").take(1)),
-      hasAny(ctx.db.query("authRefreshTokens").take(1)),
-      hasAny(ctx.db.query("authVerificationCodes").take(1)),
-      hasAny(ctx.db.query("authVerifiers").take(1)),
-      hasAny(ctx.db.query("authRateLimits").take(1)),
-      hasAny(ctx.db.query("authSubjects").take(1)),
-      hasAny(ctx.db.query("authEmailAttemptEvents").take(1)),
-      hasAny(ctx.db.query("authOtpChallenges").take(1)),
-      hasAny(ctx.db.query("authInvites").take(1)),
-      hasAny(ctx.db.query("devices").take(1)),
-      hasAny(ctx.db.query("deviceSessions").take(1)),
-      hasAny(ctx.db.query("deviceBindChallenges").take(1)),
-      hasAny(ctx.db.query("deviceKeyEnvelopes").take(1)),
-      hasAny(ctx.db.query("recoveryEnvelopes").take(1)),
-      hasAny(ctx.db.query("devicePresence").take(1)),
-      hasAny(ctx.db.query("sessionHeads").take(1)),
-      hasAny(ctx.db.query("sessionChunks").take(1)),
-      hasAny(ctx.db.query("sessionStreamEpochs").take(1)),
-      hasAny(ctx.db.query("executionLeases").take(1)),
-      hasAny(ctx.db.query("sessionCommands").take(1)),
-      hasAny(ctx.db.query("codexAccounts").take(1)),
-      hasAny(ctx.db.query("deviceAccountBindings").take(1)),
-      hasAny(ctx.db.query("accountUsageSnapshots").take(1)),
-      hasAny(ctx.db.query("idempotencyReceipts").take(1)),
-      hasAny(ctx.db.query("securityEvents").take(1)),
-      hasAny(ctx.db.query("accountDeletionJobs").take(1)),
-      hasAny(ctx.db.query("accountDeletionReceipts").take(1)),
-      hasAny(ctx.db.query("deviceRevocationJobs").take(1)),
-      hasAny(ctx.db.query("storageUsageByUser").take(1)),
-      hasAny(ctx.db.query("storageResourceUsageByUser").take(1)),
-      hasAny(ctx.db.query("storageResourceUsageByAccount").take(1)),
-    ]);
-    if (occupied.some(Boolean)) throw new Error("QUOTA_HARD_GENESIS_NOT_EMPTY");
-    await ctx.db.insert("storageUsageService", {
-      enforcement: "hard",
-      identities: 0,
-      key: "global",
-      logicalBytes: 0,
-      records: 0,
-      serviceLogicalBytes: 0,
-      serviceRecords: 0,
-      updatedAt: Date.now(),
-      userLogicalBytes: 0,
-      userRecords: 0,
-    });
+    await requireGenesisEmpty(ctx);
+    await insertHardAuthority(ctx, Date.now());
     return { enforcement: "hard" as const };
+  },
+});
+
+const refuseHostedBootstrap = (): never => {
+  throw new Error("HOSTED_BOOTSTRAP_AUTHORITY_REFUSED");
+};
+
+export const genesisHostedAuthority = internalMutation({
+  args: {
+    capabilityDigest: v.string(),
+    lifetimeMs: v.number(),
+    publicId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    if (
+      !isAuthDigest(args.capabilityDigest)
+      || args.lifetimeMs !== identityInviteLifetimeMs
+      || !isInvitePublicId(args.publicId)
+      || invitePublicIdFromCapabilityDigest(args.capabilityDigest) !== args.publicId
+    ) return refuseHostedBootstrap();
+
+    const [serviceRows, controlRows, publicInvites, digestInvites] = await Promise.all([
+      ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .take(2),
+      ctx.db.query("serviceControl")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .take(2),
+      ctx.db.query("authInvites")
+        .withIndex("by_public_id", (builder) => builder.eq("publicId", args.publicId))
+        .take(2),
+      ctx.db.query("authInvites")
+        .withIndex("by_capability_digest", (builder) =>
+          builder.eq("capabilityDigest", args.capabilityDigest))
+        .take(2),
+    ]);
+    if (serviceRows.length !== 0 || controlRows.length !== 0) {
+      const service = serviceRows[0];
+      const control = controlRows[0];
+      const invite = publicInvites[0];
+      if (
+        serviceRows.length !== 1
+        || controlRows.length !== 1
+        || publicInvites.length !== 1
+        || digestInvites.length !== 1
+        || service === undefined
+        || control === undefined
+        || invite === undefined
+        || digestInvites[0]?._id !== invite._id
+        || control.authAdmissionGeneration !== 0
+        || control.authAdmissions !== "open"
+        || control.bootstrapAcceptedAt !== undefined
+        || control.lastMutationId !== undefined
+        || control.bootstrapInviteCapabilityDigest !== args.capabilityDigest
+        || control.bootstrapInviteLifetimeMs !== args.lifetimeMs
+        || control.bootstrapInvitePublicId !== args.publicId
+        || control.bootstrapCompletedAt !== control.updatedAt
+        || invite.capabilityDigest !== args.capabilityDigest
+        || invite.publicId !== args.publicId
+        || invite.purpose !== "identity"
+        || invite.state !== "issued"
+        || invite.issuedByUserId !== undefined
+        || invite.requestedLifetimeMs !== args.lifetimeMs
+        || invite.admissionExpiresAt !== invite.expiresAt
+        || invite.expiresAt - invite.createdAt !== args.lifetimeMs
+        || invite.updatedAt !== invite.createdAt
+      ) return refuseHostedBootstrap();
+      requireHardServiceAuthority(service);
+      const inviteBytes = logicalDocumentBytes(invite);
+      if (
+        service.identities !== 0
+        || service.records !== 1
+        || service.logicalBytes !== inviteBytes
+        || service.serviceRecords !== 1
+        || service.serviceLogicalBytes !== inviteBytes
+        || service.userRecords !== 0
+        || service.userLogicalBytes !== 0
+      ) return refuseHostedBootstrap();
+      return {
+        enforcement: "hard" as const,
+        invite: {
+          expiresAt: invite.expiresAt,
+          publicId: invite.publicId,
+          purpose: invite.purpose,
+          state: invite.state,
+        },
+        replay: true,
+      };
+    }
+    if (publicInvites.length !== 0 || digestInvites.length !== 0) {
+      return refuseHostedBootstrap();
+    }
+
+    await requireGenesisEmpty(ctx);
+    const now = Date.now();
+    await insertHardAuthority(ctx, now, args);
+    const expiresAt = now + args.lifetimeMs;
+    const inviteId = await ctx.db.insert("authInvites", {
+      admissionExpiresAt: expiresAt,
+      capabilityDigest: args.capabilityDigest,
+      createdAt: now,
+      expiresAt,
+      publicId: args.publicId,
+      purpose: "identity",
+      requestedLifetimeMs: args.lifetimeMs,
+      state: "issued",
+      updatedAt: now,
+    });
+    const invite = await ctx.db.get(inviteId);
+    if (invite === null) return refuseHostedBootstrap();
+    await reserveServiceQuotaForInsert(ctx, invite);
+    return {
+      enforcement: "hard" as const,
+      invite: {
+        expiresAt,
+        publicId: args.publicId,
+        purpose: "identity" as const,
+        state: "issued" as const,
+      },
+      replay: false,
+    };
   },
 });
 

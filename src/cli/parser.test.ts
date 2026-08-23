@@ -81,6 +81,14 @@ describe("CLI parser", () => {
 
   test("rejects unknown flags instead of ignoring them", () => {
     expect(() => parseCli(["account", "list", "--surprise"])).toThrow(CliUsageError);
+    for (const argv of [
+      ["daemon", "run", "--state-root", "/tmp/other"],
+      ["daemon", "run", "--socket", "/tmp/other.sock"],
+      ["daemon", "run", "--capability", "/tmp/other.capability"],
+      ["daemon", "run", "--live-acceptance-fd", "3"],
+    ]) {
+      expect(() => parseCli(argv)).toThrow(CliUsageError);
+    }
   });
 
   test("never repeats unknown argv values in usage errors", () => {

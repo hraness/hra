@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
@@ -10,6 +10,7 @@ import {
   assertPublicText,
   assertPublicTree,
 } from "./public-text-policy";
+import { assertProductionPackageOnly } from "./package-policy";
 
 const packageSchema = z.object({
   bin: z.object({ hra: z.literal("./src/cli.ts") }).strict(),
@@ -74,27 +75,14 @@ const assertExactlyOneJsonValue = (value: string): unknown => {
   }
 };
 
-const assertProductionPackageOnly = async (root: string): Promise<void> => {
-  const visit = async (path: string): Promise<void> => {
-    for (const entry of await readdir(path, { withFileTypes: true })) {
-      const child = join(path, entry.name);
-      if (entry.isDirectory()) await visit(child);
-      else if (
-        entry.isFile()
-        && (entry.name === "AGENTS.md" || entry.name.endsWith(".test.ts") || entry.name === "testAssertions.ts")
-      ) {
-        throw new Error("The install artifact contains development-only source.");
-      }
-    }
-  };
-  await visit(root);
-};
-
 const repositoryRoot = resolve(import.meta.dir, "..");
 const packageJson = packageSchema.parse(
   JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as unknown,
 );
 if (!packageJson.files.includes("src")) throw new Error("The package must include src.");
+if (!packageJson.files.includes("!src/cloud/inviteAuthority.ts")) {
+  throw new Error("The package must exclude operator-only invite authority.");
+}
 
 await assertPublicTree(repositoryRoot);
 const completeHistory = requireSuccess(

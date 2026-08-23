@@ -1,38 +1,40 @@
-import { makeFunctionReference } from "convex/server";
 import { v, type GenericId as Id } from "convex/values";
 
 import {
-  identityInviteCapabilityPrefix,
-  identityInviteSecretLength,
-  isIdentityInviteCapability,
-} from "../src/cloud/authCredentials";
+  invitePublicIdFromCapabilityDigest,
+  isInvitePublicId,
+  type InvitePurpose,
+} from "../src/cloud/inviteAuthority";
 import { authOtpLifetimeMs, isAuthDigest } from "./authPolicy";
+import {
+  recordBootstrapInviteAccepted,
+  requireAuthAdmissionsOpen,
+} from "./admissionControl";
 import {
   adjustServiceQuotaForPatch,
   reserveServiceQuotaForInsert,
 } from "./quota";
 import {
-  internalAction,
   internalMutation,
   internalQuery,
   type MutationCtx,
 } from "./server";
 import { invitePurpose } from "./validators";
 
-export type InvitePurpose = "device" | "identity";
+export {
+  digestInviteCapability,
+  generateInviteAuthority,
+  invitePublicIdFromCapabilityDigest,
+  invitePublicIdPrefix,
+  isInviteCapability,
+  isInvitePublicId,
+} from "../src/cloud/inviteAuthority";
+export type { InvitePurpose } from "../src/cloud/inviteAuthority";
 
 export const minimumInviteLifetimeMs = authOtpLifetimeMs + 60_000;
 export const maximumInviteLifetimeMs = 30 * 24 * 60 * 60 * 1_000;
 export const terminalInviteReceiptLifetimeMs = 24 * 60 * 60 * 1_000;
-export const invitePublicIdPrefix = "invite_";
-
-const deviceInviteCapabilityPrefix = "hra_invite_device_v1_";
-const invitePublicIdPattern = /^invite_[A-Za-z0-9_-]{32}$/u;
-const deviceInviteCapabilityPattern =
-  /^hra_invite_device_v1_[A-Za-z0-9_-]{43}$/u;
 const authenticationRejectedMessage = "Authentication could not be completed.";
-const base64UrlAlphabet =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function rejectAuthentication(): never {
   throw new Error(authenticationRejectedMessage);
@@ -48,89 +50,12 @@ function isSafeLifetime(value: number): boolean {
     && value <= maximumInviteLifetimeMs;
 }
 
-export function isInvitePublicId(value: unknown): value is string {
-  return typeof value === "string" && invitePublicIdPattern.test(value);
-}
-
-export function isInviteCapability(
-  value: unknown,
-  purpose: InvitePurpose,
-): value is string {
-  return purpose === "identity"
-    ? isIdentityInviteCapability(value)
-    : typeof value === "string" && deviceInviteCapabilityPattern.test(value);
-}
-
-function encodeBase64Url(bytes: Uint8Array): string {
-  let encoded = "";
-  let buffer = 0;
-  let bits = 0;
-  for (const byte of bytes) {
-    buffer = (buffer << 8) | byte;
-    bits += 8;
-    while (bits >= 6) {
-      bits -= 6;
-      encoded += base64UrlAlphabet.charAt((buffer >>> bits) & 63);
-      buffer &= (1 << bits) - 1;
-    }
-  }
-  if (bits > 0) encoded += base64UrlAlphabet.charAt((buffer << (6 - bits)) & 63);
-  return encoded;
-}
-
-export function generateInviteAuthority(purpose: InvitePurpose): Readonly<{
-  capability: string;
-  publicId: string;
-}> {
-  const capabilitySecret = encodeBase64Url(
-    crypto.getRandomValues(new Uint8Array(32)),
-  );
-  const publicIdSecret = encodeBase64Url(
-    crypto.getRandomValues(new Uint8Array(24)),
-  );
-  if (
-    capabilitySecret.length !== identityInviteSecretLength
-    || publicIdSecret.length !== 32
-  ) rejectInviteTool();
-  return {
-    capability: `${purpose === "identity"
-      ? identityInviteCapabilityPrefix
-      : deviceInviteCapabilityPrefix}${capabilitySecret}`,
-    publicId: `${invitePublicIdPrefix}${publicIdSecret}`,
-  };
-}
-
-function toHex(bytes: ArrayBuffer): string {
-  return [...new Uint8Array(bytes)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-export async function digestInviteCapability(
-  capability: string,
-  purpose: InvitePurpose,
-): Promise<string> {
-  if (!isInviteCapability(capability, purpose)) rejectAuthentication();
-  const bytes = new TextEncoder().encode(
-    `hra-control-plane-invite-capability:v1:${purpose}:${capability}`,
-  );
-  return toHex(await crypto.subtle.digest("SHA-256", bytes));
-}
-
 function admissionExpiry(invite: Readonly<{
   admissionExpiresAt?: number;
   expiresAt: number;
 }>): number {
   return invite.admissionExpiresAt ?? invite.expiresAt;
 }
-
-type RecordIssueArgs = Readonly<{
-  capabilityDigest: string;
-  issuedByUserId?: Id<"users">;
-  lifetimeMs: number;
-  publicId: string;
-  purpose: InvitePurpose;
-}>;
 
 type IssueRecord = Readonly<{
   expiresAt: number;
@@ -139,12 +64,6 @@ type IssueRecord = Readonly<{
   replay: boolean;
   state: "issued";
 }>;
-
-const recordIssueReference = makeFunctionReference<
-  "mutation",
-  RecordIssueArgs,
-  IssueRecord
->("authInvites:recordIssue");
 
 export const recordIssue = internalMutation({
   args: {
@@ -158,8 +77,10 @@ export const recordIssue = internalMutation({
     if (
       !isAuthDigest(args.capabilityDigest)
       || !isInvitePublicId(args.publicId)
+      || invitePublicIdFromCapabilityDigest(args.capabilityDigest) !== args.publicId
       || !isSafeLifetime(args.lifetimeMs)
     ) rejectInviteTool();
+    const control = await requireAuthAdmissionsOpen(ctx);
     if (
       args.issuedByUserId !== undefined
       && await ctx.db.get(args.issuedByUserId) === null
@@ -200,6 +121,13 @@ export const recordIssue = internalMutation({
       };
     }
 
+    if (
+      control.bootstrapInvitePublicId !== undefined
+      && control.bootstrapAcceptedAt === undefined
+    ) {
+      rejectInviteTool();
+    }
+
     const now = Date.now();
     const expiresAt = now + args.lifetimeMs;
     const inviteId = await ctx.db.insert("authInvites", {
@@ -226,31 +154,6 @@ export const recordIssue = internalMutation({
       replay: false,
       state: "issued",
     };
-  },
-});
-
-export const issue = internalAction({
-  args: {
-    issuedByUserId: v.optional(v.id("users")),
-    lifetimeMs: v.number(),
-    purpose: invitePurpose,
-  },
-  handler: async (ctx, args) => {
-    if (!isSafeLifetime(args.lifetimeMs)) rejectInviteTool();
-    const authority = generateInviteAuthority(args.purpose);
-    const recorded = await ctx.runMutation(recordIssueReference, {
-      capabilityDigest: await digestInviteCapability(
-        authority.capability,
-        args.purpose,
-      ),
-      lifetimeMs: args.lifetimeMs,
-      publicId: authority.publicId,
-      purpose: args.purpose,
-      ...(args.issuedByUserId === undefined
-        ? {}
-        : { issuedByUserId: args.issuedByUserId }),
-    });
-    return { ...recorded, capability: authority.capability };
   },
 });
 
@@ -406,5 +309,6 @@ export async function consumeBoundIdentityInvite(
     updatedAt: now,
   } as const;
   await adjustServiceQuotaForPatch(ctx, invite, patch);
+  await recordBootstrapInviteAccepted(ctx, invite, now);
   await ctx.db.patch(invite._id, patch);
 }

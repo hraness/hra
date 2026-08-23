@@ -85,7 +85,7 @@ Q must pass authenticated root, privacy, `robots.txt`, `sitemap.xml`, `llms.txt`
 Assign N to the fixed new-HRA staging alias only after its authenticated checks pass:
 
 ```sh
-vercel alias set <N-bare-automatic-hostname>.vercel.app try-hra.vercel.app --scope hraness
+vercel alias set <N-bare-automatic-hostname> try-hra.vercel.app --scope hraness
 vercel api /v4/aliases/try-hra.vercel.app --scope hraness --raw | jq -c '{alias,projectId,deploymentId,deployment:{id:.deployment.id,url:.deployment.url}}'
 ```
 
@@ -189,8 +189,21 @@ This decision table is symmetric, so it applies to forward and reverse movement.
 
 Repository names and immutable tags do not roll back. Traffic can return to HRA v0 with the checked `reverse` plan:
 
-1. Prove Q and `https://hra-weld.vercel.app` healthy, then read P separately by ID.
-2. Run N → Q and require a `committed` JSON result.
-3. Independently verify exact Q alias, marker, and domain ownership.
-4. Disable new hosted invitations and credentials without changing HRA v0 data or provider state.
-5. Keep `hraness/hra` and every published tag intact. Repair forward on a new protected current-head commit, deploy it, rehearse both directions, and cut over again.
+1. Freeze new hosted authentication admission on the exact new-HRA Convex deployment before moving public traffic. Read the current generation, choose one UUIDv7, and preserve that safe replay tuple in the private incident record:
+
+   ```sh
+   bun run hosted:admission -- status <exact numeric target arguments>
+   bun run hosted:admission -- freeze --expected-generation <generation> --mutation-id <uuidv7> <exact numeric target arguments>
+   ```
+
+   The checked operator verifies the numeric team, project, deployment, production type, generated name, URL, and default-production binding before and after the mutation. Freeze blocks new identity invites, OTP requests and verification, auth session creation or refresh, and new device credentials. Existing reads, account deletion, device revocation, maintenance, and an exact replay of a registration already committed before the freeze remain available. A lost response is recovered only by repeating the same generation and UUIDv7. Do not rotate JWT, HMAC, email, or device keys as an incident shortcut.
+2. Prove Q and `https://hra-weld.vercel.app` healthy, then read P separately by ID. A failed Q proof leaves new-HRA admission frozen and public traffic unchanged.
+3. Run N → Q and require a `committed` JSON result. If reversal fails, keep admission frozen while the checked operator restores or proves the last safe traffic state.
+4. Independently verify exact Q alias, marker, and domain ownership.
+5. Revoke every still-live invitation by its recorded public ID with the checked invitation operator. Revoke a suspect device from another active device or begin authenticated account deletion for a compromised identity.
+6. Resume admission only after a fixed forward release passes the full live gate. Read the frozen generation, choose a new UUIDv7, and require the explicit resume acknowledgement:
+
+   ```sh
+   bun run hosted:admission -- resume --expected-generation <generation> --mutation-id <uuidv7> --acknowledge-resume <exact numeric target arguments>
+   ```
+7. Keep `hraness/hra` and every published tag intact. Repair forward on a new protected current-head commit, deploy it, rehearse both directions, and cut over again.

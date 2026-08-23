@@ -78,8 +78,13 @@ import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
 import { ExactChatGptBundlePort, LocalDesktopSwitchPort, PidBoundDesktopAccountRuntime } from "./desktop/index";
+import {
+  assertInstallationHome,
+  createProductionInstallation,
+  type HraInstallation,
+} from "./installation";
 import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./storage/paths";
-import { GenerationalSecretCustody } from "./storage/secret-custody";
+import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { HRA_VERSION } from "./version";
 
@@ -272,7 +277,9 @@ type ProjectionRecoverySummary =
       session: string;
     }>;
 
-type CliMainInput = Readonly<{
+export type CliMainInput = Readonly<{
+  installation?: HraInstallation;
+  startDaemon?: (installation: HraInstallation) => Promise<void>;
   statePaths?: StatePaths;
   callDaemon?: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>;
   getRemoteCommandStatus?: CloudRemoteControlPort["getRemoteCommandStatus"];
@@ -737,9 +744,13 @@ function renderProjectionRecoveryFailure(
   }, invocation.json, output);
 }
 
-async function startDaemonProcess(): Promise<void> {
+async function startDaemonProcess(installation: HraInstallation): Promise<void> {
+  assertInstallationHome(installation);
+  if (installation.kind !== "production") {
+    throw new Error("A live-acceptance daemon must be started by its source-only worker.");
+  }
   const cliPath = process.argv[1] ?? import.meta.path;
-  const paths = resolveStatePaths();
+  const paths = installation.paths;
   await initializeStatePaths(paths);
   const child = Bun.spawn([process.execPath, cliPath, "daemon", "run"], {
     detached: true,
@@ -767,13 +778,16 @@ async function startDaemonProcess(): Promise<void> {
 }
 
 async function callWithAutostart(
+  installation: HraInstallation,
   command: LocalCommand,
   signal?: AbortSignal,
+  injectedStart?: (installation: HraInstallation) => Promise<void>,
 ): Promise<Awaited<ReturnType<typeof callLocalDaemon>>> {
-  const paths = resolveStatePaths();
+  assertInstallationHome(installation);
+  const paths = installation.paths;
   return await callWithSafeAutostart(
     async () => await callLocalDaemon({ paths, command, ...(signal === undefined ? {} : { signal }) }),
-    startDaemonProcess,
+    async () => await (injectedStart ?? startDaemonProcess)(installation),
   );
 }
 
@@ -864,11 +878,16 @@ async function offlineDoctor(json: boolean, output: Output, paths: StatePaths): 
   return data.healthy ? 0 : 1;
 }
 
-async function editSessionNote(session: string, json: boolean, output: Output): Promise<number> {
+async function editSessionNote(
+  session: string,
+  json: boolean,
+  output: Output,
+  callDaemon: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>,
+): Promise<number> {
   if (json || !process.stdin.isTTY || !process.stdout.isTTY) {
     return renderFailure({ code: "INTERACTION_REQUIRED", message: "Note editing requires an interactive terminal. Use `session note set` for scripts." }, json, output);
   }
-  const current = await callWithAutostart({ kind: "session.note.get", session });
+  const current = await callDaemon({ kind: "session.note.get", session });
   if (!current.ok) return renderFailure(current.error, false, output);
   const note = typeof current.data === "object" && current.data !== null && "note" in current.data && typeof current.data.note === "string" ? current.data.note : "";
   const directory = await mkdtemp(join(tmpdir(), "hra-note-"));
@@ -882,7 +901,7 @@ async function editSessionNote(session: string, json: boolean, output: Output): 
     const exitCode = await child.exited;
     if (exitCode !== 0) throw new Error(`Editor exited with status ${exitCode}.`);
     const edited = await readFile(file, "utf8");
-    const response = await callWithAutostart({ kind: "session.note.set", session, note: edited });
+    const response = await callDaemon({ kind: "session.note.set", session, note: edited });
     if (!response.ok) return renderFailure(response.error, false, output);
     renderSuccess({ kind: "session.note.set", session, note: edited }, response.data, false, output);
     return 0;
@@ -1112,9 +1131,10 @@ export function renderRemoteSuccess(
 async function executeRemoteInvocation(
   invocation: Extract<CliInvocation, { kind: "remote" }>,
   output: Output,
-  input: Pick<CliMainInput, "getRemoteCommandStatus"> = {},
+  input: Pick<CliMainInput, "getRemoteCommandStatus" | "installation"> = {},
 ): Promise<number> {
-  const paths = resolveStatePaths();
+  const installation = input.installation ?? createProductionInstallation();
+  assertInstallationHome(installation);
   const controller = new AbortController();
   const injectedStatus = invocation.command.kind === "remote.command"
     ? input.getRemoteCommandStatus
@@ -1125,8 +1145,9 @@ async function executeRemoteInvocation(
   try {
     const control = injectedStatus === undefined
       ? await createLocalCloudControlFromEnvironment({
+          environment: installation.cloudEnvironment,
           lifetimeSignal: controller.signal,
-          secretCustody: new GenerationalSecretCustody(paths),
+          secretCustody: installation.createSecretCustody(),
         })
       : null;
     if (control === null && injectedStatus === undefined) {
@@ -1237,8 +1258,11 @@ async function joinBeforeDeadline<T>(operation: string, promise: Promise<T>, dea
   }
 }
 
-async function runDaemon(): Promise<number> {
-  const paths = resolveStatePaths();
+export async function runDaemon(
+  installation: HraInstallation = createProductionInstallation(),
+): Promise<number> {
+  assertInstallationHome(installation);
+  const paths = installation.paths;
   await initializeStatePaths(paths);
   await mkdir(paths.runtime, { recursive: true, mode: 0o700 });
   const daemonLock = await DaemonLock.acquire(paths);
@@ -1287,6 +1311,15 @@ async function runDaemon(): Promise<number> {
     checkpointBoot();
     const serviceReference: { current?: HraService } = {};
     codex = new PinnedCodexRuntimeManager({
+      ...(installation.kind === "live_acceptance"
+        ? {
+            codexEnvironment: installation.codexEnvironment,
+            prepareCodexHome: installation.prepareCodexHome,
+          }
+        : {}),
+      ...(installation.credentialStorePreflight === null
+        ? {}
+        : { credentialStorePreflight: installation.credentialStorePreflight }),
       isCurrent: (authority) => {
         try {
           const profile = activeStore.requireProfile(authority.id);
@@ -1302,8 +1335,8 @@ async function runDaemon(): Promise<number> {
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
       },
     });
-    const secretCustody = new GenerationalSecretCustody(paths);
-    const cloudEnvironment = { HRA_CONVEX_URL: process.env.HRA_CONVEX_URL };
+    const secretCustody = installation.createSecretCustody();
+    const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
       isSessionTerminal: (sessionPublicId) => {
@@ -1422,7 +1455,7 @@ async function runDaemon(): Promise<number> {
       }
     }
     checkpointBoot();
-    const desktop = process.platform === "darwin"
+    const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
           const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
           return new LocalDesktopSwitchPort({
@@ -1565,8 +1598,16 @@ async function runDaemon(): Promise<number> {
 
 const commandCaller = (
   input: CliMainInput,
-): ((command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>) =>
-  input.callDaemon ?? callWithAutostart;
+): ((command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>) => {
+  if (input.callDaemon !== undefined) return input.callDaemon;
+  const installation = input.installation ?? createProductionInstallation();
+  return async (command, signal) => await callWithAutostart(
+    installation,
+    command,
+    signal,
+    input.startDaemon,
+  );
+};
 
 const protectedInputDescriptor = (source: ProtectedInputSource): number =>
   source.kind === "stdin" ? 0 : source.fd;
@@ -2037,11 +2078,21 @@ async function executeInvocation(
   output: Output,
   input: CliMainInput = {},
 ): Promise<number> {
+  const installation = input.installation ?? createProductionInstallation();
+  assertInstallationHome(installation);
+  const callDaemon = commandCaller({ ...input, installation });
   if (invocation.kind === "help") { output.writeStdout(`${usageForGroup(invocation.group)}\n`); return 0; }
   if (invocation.kind === "version") { output.writeStdout(`hra ${HRA_VERSION}\n`); return 0; }
-  if (invocation.kind === "init") return await initialize(invocation.yes, invocation.json, output);
-  if (invocation.kind === "daemon.run") return await runDaemon();
-  if (invocation.kind === "remote") return await executeRemoteInvocation(invocation, output, input);
+  if (invocation.kind === "init") {
+    return await initialize(invocation.yes, invocation.json, output, {
+      documentsDirectory: installation.documentsDirectory,
+      paths: installation.paths,
+    });
+  }
+  if (invocation.kind === "daemon.run") return await runDaemon(installation);
+  if (invocation.kind === "remote") {
+    return await executeRemoteInvocation(invocation, output, { ...input, installation });
+  }
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);
   }
@@ -2055,7 +2106,7 @@ async function executeInvocation(
     return renderFailure(invocation.error, invocation.json, output);
   }
   if (invocation.kind === "sync.projection-recover") {
-    const response = await (input.callDaemon ?? callWithAutostart)(invocation.command);
+    const response = await callDaemon(invocation.command);
     if (!response.ok) {
       return renderProjectionRecoveryFailure(response.error, invocation, output);
     }
@@ -2063,7 +2114,7 @@ async function executeInvocation(
   }
   if (invocation.kind === "daemon.start") {
     try {
-      const existing = await callLocalDaemon({ paths: resolveStatePaths(), command: { kind: "daemon.status" }, deadlineMs: 500 });
+      const existing = await callLocalDaemon({ paths: installation.paths, command: { kind: "daemon.status" }, deadlineMs: 500 });
       if (existing.ok) {
         daemonStatusIdentity(existing);
         renderSuccess({ kind: "daemon.status" }, existing.data, invocation.json, output);
@@ -2072,15 +2123,15 @@ async function executeInvocation(
     } catch (error: unknown) {
       if (!isLocalDaemonUnavailable(error)) throw error;
     }
-    await startDaemonProcess();
-    const response = await callLocalDaemon({ paths: resolveStatePaths(), command: { kind: "daemon.status" } });
+    await (input.startDaemon ?? startDaemonProcess)(installation);
+    const response = await callLocalDaemon({ paths: installation.paths, command: { kind: "daemon.status" } });
     if (!response.ok) return renderFailure(response.error, invocation.json, output);
     daemonStatusIdentity(response);
     renderSuccess({ kind: "daemon.status" }, response.data, invocation.json, output);
     return 0;
   }
   if (invocation.command.kind === "doctor" && invocation.command.offline) {
-    return await offlineDoctor(invocation.json, output, input.statePaths ?? resolveStatePaths());
+    return await offlineDoctor(invocation.json, output, input.statePaths ?? installation.paths);
   }
   if (
     invocation.command.kind === "account.usage"
@@ -2089,10 +2140,12 @@ async function executeInvocation(
   ) {
     return await executeUsageRefreshAll(invocation.command, invocation.json, output, input);
   }
-  if (invocation.command.kind === "session.note.edit") return await editSessionNote(invocation.command.session, invocation.json, output);
+  if (invocation.command.kind === "session.note.edit") {
+    return await editSessionNote(invocation.command.session, invocation.json, output, callDaemon);
+  }
   if (invocation.command.kind === "daemon.status" || invocation.command.kind === "daemon.stop") {
     try {
-      const paths = resolveStatePaths();
+      const paths = installation.paths;
       const response = await callLocalDaemon({ paths, command: invocation.command, deadlineMs: 500 });
       if (!response.ok) return renderFailure(response.error, invocation.json, output);
       const identity = daemonStatusIdentity(response);
@@ -2128,7 +2181,7 @@ async function executeInvocation(
   const command = invocation.command.kind === "project.add"
     ? { ...invocation.command, path: await realpath(invocation.command.path) }
     : invocation.command;
-  const response = await (input.callDaemon ?? callWithAutostart)(command);
+  const response = await callDaemon(command);
   if (!response.ok) {
     return command.kind === "sync.now"
       ? renderSyncNowFailure(response.error, invocation.json, output)
@@ -2146,14 +2199,17 @@ export async function main(
   output: Output = processOutput,
   input: CliMainInput = {},
 ): Promise<number> {
-  const interactive = input.interactive
+  const installation = input.installation ?? createProductionInstallation();
+  assertInstallationHome(installation);
+  const resolvedInput = { ...input, installation };
+  const interactive = resolvedInput.interactive
     ?? (process.stdin.isTTY && process.stderr.isTTY);
-  if (argv.length === 0 && interactive) return await runPersistentShell(output, input);
+  if (argv.length === 0 && interactive) return await runPersistentShell(output, resolvedInput);
   const json = requestsJsonOutput(argv);
   let invocation: CliInvocation | undefined;
   try {
     invocation = parseCli(argv);
-    return await executeInvocation(invocation, output, input);
+    return await executeInvocation(invocation, output, resolvedInput);
   } catch (error: unknown) {
     const syncNow = invocation?.kind === "command" && invocation.command.kind === "sync.now";
     const projectionRecovery = invocation?.kind === "sync.projection-recover"

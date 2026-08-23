@@ -27,6 +27,7 @@ import {
 } from "./quota";
 import { internalMutation, type DataModel, type MutationCtx } from "./server";
 import { requireActiveAuthSubject } from "./authDelivery";
+import { requireAuthAdmissionsOpen } from "./admissionControl";
 
 export const hraOtpProviderId = "hra-control-plane-otp-v1";
 
@@ -392,6 +393,9 @@ export async function runQuotaAwareAuthStoreForTest<T>(
   handler: (ctx: MutationCtx) => Promise<T>,
 ): Promise<T> {
   requireAuthStoreOperation(operation);
+  if (operation === "refreshSession") {
+    await requireAuthAdmissionsOpen(ctx);
+  }
   await adjustServiceQuotaForPatch(
     ctx,
     { kind: "convex_auth_store_authority_probe", version: 1 },
@@ -461,6 +465,7 @@ const hraOtp = ConvexCredentials<DataModel>({
 const configuredAuth = convexAuth({
   callbacks: {
     async beforeSessionCreation(ctx, { userId }) {
+      await requireAuthAdmissionsOpen(ctx as unknown as MutationCtx);
       await requireActiveAuthSubject(
         ctx as unknown as MutationCtx,
         userId,

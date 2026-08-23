@@ -22,6 +22,7 @@ import {
   resolvedConvexDeployTargetMatches,
 } from "./assert-convex-deploy-target";
 import {
+  HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
@@ -32,7 +33,7 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: 1_234_567,
+  projectId: HRA_CONVEX_PROJECT_ID,
   teamId: HRA_CONVEX_TEAM_ID,
 };
 const targetArguments = [

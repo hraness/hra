@@ -309,6 +309,15 @@ describe("hosted quota authority", () => {
     await expect(attempted.mutation(genesisHardAuthority, {}))
       .rejects.toThrow("QUOTA_HARD_GENESIS_NOT_EMPTY");
 
+    const maintenanceDirty = convexTest(schema, modules);
+    await maintenanceDirty.run(async (ctx) => await ctx.db.insert("maintenanceState", {
+      key: "retention",
+      nextCategory: "auth_attempts",
+      updatedAt: 1,
+    }));
+    await expect(maintenanceDirty.mutation(genesisHardAuthority, {}))
+      .rejects.toThrow("QUOTA_HARD_GENESIS_NOT_EMPTY");
+
     const historicalShadow = convexTest(schema, modules);
     await historicalShadow.run(async (ctx) => await ctx.db.insert("storageUsageService", {
       enforcement: "shadow",

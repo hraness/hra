@@ -7,6 +7,7 @@ import { isIdentityInviteCapability } from "../src/cloud/authCredentials";
 import {
   digestInviteCapability,
   generateInviteAuthority,
+  invitePublicIdFromCapabilityDigest,
   maximumInviteLifetimeMs,
   minimumInviteLifetimeMs,
 } from "./authInvites";
@@ -25,7 +26,6 @@ type Reservation = Readonly<{
   inviteBinding: "bound" | "not_required" | "replay";
 }>;
 type IssueResult = Readonly<{
-  capability: string;
   expiresAt: number;
   publicId: string;
   purpose: "device" | "identity";
@@ -33,8 +33,7 @@ type IssueResult = Readonly<{
   state: "issued";
 }>;
 
-const issue = makeFunctionReference<"action", Args, IssueResult>("authInvites:issue");
-const recordIssue = makeFunctionReference<"mutation", Args, Omit<IssueResult, "capability">>(
+const recordIssue = makeFunctionReference<"mutation", Args, IssueResult>(
   "authInvites:recordIssue",
 );
 const inviteStatus = makeFunctionReference<"query", Args, unknown>("authInvites:status");
@@ -56,7 +55,7 @@ const emailA = "a".repeat(64);
 const emailB = "b".repeat(64);
 
 async function preparedIdentityInvite() {
-  const authority = generateInviteAuthority("identity");
+  const authority = await generateInviteAuthority("identity");
   return {
     ...authority,
     capabilityDigest: await digestInviteCapability(authority.capability, "identity"),
@@ -93,11 +92,9 @@ async function hardRuntime() {
 describe("identity invitation admission", () => {
   test("issues 256-bit capabilities, stores only their digest, and exposes bounded status", async () => {
     const testRuntime = await hardRuntime();
-    const issued = await testRuntime.action(issue, {
-      lifetimeMs: minimumInviteLifetimeMs,
-      purpose: "identity",
-    });
-    expect(isIdentityInviteCapability(issued.capability)).toBe(true);
+    const authority = await preparedIdentityInvite();
+    const issued = await recordPrepared(testRuntime, authority);
+    expect(isIdentityInviteCapability(authority.capability)).toBe(true);
     expect(issued).toMatchObject({ purpose: "identity", replay: false, state: "issued" });
     expect(issued.expiresAt).toBeGreaterThan(Date.now());
     expect(issued.expiresAt).toBeLessThanOrEqual(Date.now() + maximumInviteLifetimeMs);
@@ -105,7 +102,10 @@ describe("identity invitation admission", () => {
     const stored = await testRuntime.run(async (ctx) =>
       await ctx.db.query("authInvites").first());
     expect(stored?.capabilityDigest).toMatch(/^[0-9a-f]{64}$/u);
-    expect(JSON.stringify(stored)).not.toContain(issued.capability);
+    expect(issued.publicId).toBe(
+      invitePublicIdFromCapabilityDigest(stored?.capabilityDigest ?? ""),
+    );
+    expect(JSON.stringify(stored)).not.toContain(authority.capability);
     expect(await testRuntime.query(inviteStatus, { publicId: issued.publicId }))
       .toMatchObject({
         bound: false,

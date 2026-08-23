@@ -1,15 +1,15 @@
 # HRA
 
 ```sh
-bun add --global github:hraness/hra#v0.1.0
-```
-
-```sh
-hra init
+bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
 ```
 
 ```sh
 hra doctor --offline
+```
+
+```sh
+hra init
 ```
 
 > **Beta not yet live.** The `v0.1.0` tag and hosted sync service are beta-not-yet-live. The install command becomes usable when the beta tag is published.
@@ -17,6 +17,36 @@ hra doctor --offline
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
 
 [GitHub](https://github.com/hraness/hra) · [Documentation](https://github.com/hraness/hra#command-reference) · [Security](https://github.com/hraness/hra/blob/main/SECURITY.md) · [Privacy](https://github.com/hraness/hra/blob/main/PRIVACY.md)
+
+## Install, update, and remove
+
+HRA requires Bun 1.3.14. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Install one reviewed immutable tag, then verify the binary before initialization:
+
+```text
+bun --version
+bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
+hra --version
+hra doctor --offline
+```
+
+Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace both v0.1.0 occurrences in the URL with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:
+
+```text
+hra daemon stop
+hra daemon status --json
+bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
+hra --version
+hra doctor --offline
+hra daemon start
+```
+
+Removing the package does not remove HRA's local profiles, session history, recovery evidence, or cloud account. Log out each Codex profile and complete any intended cloud-account deletion before uninstalling. Then stop the daemon, confirm that it is stopped, and remove the installed command:
+
+```text
+hra daemon stop
+hra daemon status --json
+bun remove --global hra
+```
 
 ## First account
 
@@ -34,7 +64,7 @@ HRA cloud identity is separate from every Codex account. Use the email-code flow
 
 ## Cloud sign-in and device pairing
 
-The hosted endpoint is beta-not-yet-live. Until it is published, these commands require an explicit deployment URL in `HRA_CONVEX_URL` before the daemon starts. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
+The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
 
 ```text
 hra auth login --input-stdin
@@ -170,11 +200,17 @@ Cloud sync is optional. Local account profiles, Codex credentials, and local exe
 
 The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key.
 
+HRA uses Convex to authenticate the HRA identity and store server-visible metadata plus encrypted projections. Convex receives the verified email address and the service metadata described above, but not the keys required to decrypt session content.
+
+HRA uses Resend to deliver verification email. Resend receives the recipient email address, sender identity, one-time verification code and message content, and ordinary delivery metadata. It receives no Codex credentials or encrypted session projection.
+
+Vercel serves hra.sh. GitHub hosts the source repository, releases, and release downloads. When you visit or download from either service, that provider receives ordinary web request metadata such as the requested URL, IP address, user agent, and time. HRA does not add analytics, cookies, remote fonts, or executable JavaScript to the site.
+
 Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked.
 
 Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion.
 
-The website uses no analytics, cookies, remote fonts, or executable JavaScript. Codex activity remains subject to OpenAI's own service and privacy terms.
+Codex activity remains subject to OpenAI's own service and privacy terms.
 
 > **Hosted sync status.** The hosted sync endpoint is beta-not-yet-live. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Fresh-deployment and live completion acceptance remain launch gates.
 

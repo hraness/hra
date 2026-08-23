@@ -38,6 +38,7 @@ export type {
   CodexApp,
   CodexAuthority,
   CodexCapabilitySnapshot,
+  CodexCredentialStores,
   CodexFact,
   CodexFeature,
   CodexMethod,

@@ -662,15 +662,41 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   readonly #isCurrent: (authority: ProfileAuthority) => boolean;
   readonly #observer: CodexRuntimeObserver;
   readonly #launchClient: typeof launchPinnedCodexAppServer;
+  readonly #prepareCodexHome: ((codexHome: string) => Promise<void>) | undefined;
+  readonly #codexEnvironment: ((
+    codexHome: string,
+  ) => Promise<Readonly<Record<string, string | undefined>> | undefined>) | undefined;
+  readonly #credentialStorePreflight: Readonly<{
+    readonly cliAuth: "file";
+    readonly cwd: string;
+    readonly mcpOauth: "file";
+  }> | null;
   readonly #now: () => number;
   #usageRevision = Date.now();
   #state: "open" | "closing" | "closed" = "open";
   #closeTask: Promise<void> | undefined;
 
-  constructor(input: { isCurrent: (authority: ProfileAuthority) => boolean; observer: CodexRuntimeObserver; launchClient?: typeof launchPinnedCodexAppServer; now?: () => number }) {
+  constructor(input: {
+    isCurrent: (authority: ProfileAuthority) => boolean;
+    observer: CodexRuntimeObserver;
+    launchClient?: typeof launchPinnedCodexAppServer;
+    prepareCodexHome?: (codexHome: string) => Promise<void>;
+    codexEnvironment?: (
+      codexHome: string,
+    ) => Promise<Readonly<Record<string, string | undefined>> | undefined>;
+    credentialStorePreflight?: Readonly<{
+      readonly cliAuth: "file";
+      readonly cwd: string;
+      readonly mcpOauth: "file";
+    }>;
+    now?: () => number;
+  }) {
     this.#isCurrent = input.isCurrent;
     this.#observer = input.observer;
     this.#launchClient = input.launchClient ?? launchPinnedCodexAppServer;
+    this.#prepareCodexHome = input.prepareCodexHome;
+    this.#codexEnvironment = input.codexEnvironment;
+    this.#credentialStorePreflight = input.credentialStorePreflight ?? null;
     this.#now = input.now ?? Date.now;
   }
 
@@ -728,7 +754,13 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }): Promise<CodexPluginCatalog> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      const catalog = await (await this.#client(input.authority)).listPlugins({
+      const client = await this.#client(input.authority);
+      if (this.#credentialStorePreflight !== null) {
+        await client.assertCredentialStores(
+          input.projectRoot ?? this.#credentialStorePreflight.cwd,
+        );
+      }
+      const catalog = await client.listPlugins({
         ...(input.projectRoot === undefined ? {} : { cwd: input.projectRoot }),
         forceRefetch: input.forceRefetch,
       });
@@ -1492,9 +1524,19 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       this.#clients.delete(authority.id);
       await existing.client.close();
     }
+    if (this.#prepareCodexHome !== undefined) {
+      await this.#prepareCodexHome(authority.codexHome);
+    }
+    const environment = this.#codexEnvironment === undefined
+      ? undefined
+      : await this.#codexEnvironment(authority.codexHome);
     const client = await this.#launchClient({
         authority: { profileId: authority.id, processGeneration: authority.generation },
         expectedCodexHome: authority.codexHome,
+        ...(environment === undefined ? {} : { environment }),
+        ...(this.#credentialStorePreflight === null
+          ? {}
+          : { credentialStorePreflight: this.#credentialStorePreflight }),
         experimentalApi: true,
         isAuthorityCurrent: () => this.#isCurrent(authority),
         onFact: async (value: FencedCodexValue<CodexFact>) => {
@@ -1568,6 +1610,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     preset: ResolvedPreset;
     profile: EffectiveRuntimeProfile;
   }> {
+    if (this.#credentialStorePreflight !== null) {
+      await running.client.assertCredentialStores(cwd);
+    }
     const capabilities = await running.client.discoverCapabilities({ cwd, ...(threadId === undefined ? {} : { threadId }), includeExperimental: true });
     const preset = running.client.resolvePreset(capabilities, alias, fast);
     const profile = compileEffectiveRuntimeProfile({

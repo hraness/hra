@@ -18,7 +18,7 @@ describe("public content contract", () => {
     expect(publicContent).toMatchObject({
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init",
-      installCommand: "bun add --global github:hraness/hra#v0.1.0",
+      installCommand: "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
       links: {
         github: "https://github.com/hraness/hra",
       },
@@ -36,12 +36,15 @@ describe("public content contract", () => {
       html.indexOf(publicContent.installCommand),
     );
     expect(html.indexOf(publicContent.installCommand)).toBeLessThan(
-      html.indexOf(publicContent.initCommand),
-    );
-    expect(html.indexOf(publicContent.initCommand)).toBeLessThan(
       html.indexOf(publicContent.doctorCommand),
     );
+    expect(html.indexOf(publicContent.doctorCommand)).toBeLessThan(
+      html.indexOf(publicContent.initCommand),
+    );
     expect(markdown.indexOf(publicContent.installCommand)).toBeLessThan(
+      markdown.indexOf(publicContent.doctorCommand),
+    );
+    expect(markdown.indexOf(publicContent.doctorCommand)).toBeLessThan(
       markdown.indexOf(publicContent.initCommand),
     );
   });
@@ -94,6 +97,12 @@ describe("public content contract", () => {
     expect(markdown).toContain("hra device approve <pending-device-id-or-prefix>");
     expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
     for (const surface of [markdown, html]) {
+      expect(surface).toContain("An unset");
+      expect(surface).toContain("hosted deployment");
+      expect(surface).toContain("explicit empty value");
+      expect(surface).toContain("self-managed Convex deployment");
+      expect(surface).toContain("permanently binds that local state root");
+      expect(surface).not.toContain("require an explicit deployment URL");
       expect(surface).toContain("automatically registers the current installation");
       expect(surface).toContain("registered as pending");
       expect(surface).toContain("no synchronized data, execution, or key authority");
@@ -233,7 +242,12 @@ describe("public content contract", () => {
       "Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
       "Email access alone does not recover that key.",
       "an uncontested, unrevoked copy can impersonate that device",
-      "The website uses no analytics, cookies, remote fonts, or executable JavaScript.",
+      "HRA uses Convex to authenticate the HRA identity",
+      "HRA uses Resend to deliver verification email.",
+      "one-time verification code and message content",
+      "Vercel serves hra.sh.",
+      "GitHub hosts the source repository, releases, and release downloads.",
+      "HRA does not add analytics, cookies, remote fonts, or executable JavaScript to the site.",
     ];
     const surfaces = [
       renderReadmeMarkdown(),
@@ -247,6 +261,34 @@ describe("public content contract", () => {
         expect(surface).toContain(claim.replaceAll("'", "&#39;"));
       }
     }
+  });
+
+  test("publishes exact beta prerequisites and package lifecycle limits", () => {
+    const markdown = renderReadmeMarkdown();
+    const surfaces = [markdown, renderSiteHtml()];
+    for (const surface of surfaces) {
+      expect(surface).toContain("HRA requires Bun 1.3.14");
+      expect(surface).toContain("support macOS and Linux");
+      expect(surface).toContain("bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz");
+      expect(surface).toContain("bun remove --global hra");
+      expect(surface).toContain("hra daemon stop");
+      expect(surface).toContain("hra daemon status --json");
+      expect(surface).toContain("hra daemon start");
+      expect(surface).toContain("Removing the package does not remove");
+      expect(surface).toContain("local profiles, session history, recovery evidence, or cloud account");
+      expect(surface).toContain("Do not install a moving branch");
+      expect(surface).toContain("verified repair installation of v0.1.0");
+      expect(surface).toContain("replace both v0.1.0 occurrences");
+    }
+    const updateStart = markdown.indexOf("Before updating");
+    const updateDoctor = markdown.indexOf("hra doctor --offline", updateStart);
+    const updateRestart = markdown.indexOf("hra daemon start", updateStart);
+    expect(updateDoctor).toBeGreaterThan(updateStart);
+    expect(updateRestart).toBeGreaterThan(updateDoctor);
+    const removalWarning = markdown.indexOf("Removing the package does not remove");
+    const removalCommand = markdown.indexOf("bun remove --global hra");
+    expect(removalWarning).toBeGreaterThan(-1);
+    expect(removalCommand).toBeGreaterThan(removalWarning);
   });
 
   test("publishes the local interaction deadline boundary", () => {

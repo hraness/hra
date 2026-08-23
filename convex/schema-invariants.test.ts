@@ -42,5 +42,12 @@ describe("hosted schema invariants", () => {
     expect(genesisTables).toEqual(chargedTables);
     expect(HOSTED_TABLE_LIFECYCLE.storageResourceUsageByUser.quota).toBeNull();
     expect(HOSTED_TABLE_LIFECYCLE.storageResourceUsageByAccount.quota).toBeNull();
+    expect(HOSTED_TABLE_LIFECYCLE.serviceControl).toEqual({
+      owner: "service",
+      quota: null,
+      retention: "service_permanent",
+      deletionOrder: null,
+      disposition: "service_reset",
+    });
   });
 });

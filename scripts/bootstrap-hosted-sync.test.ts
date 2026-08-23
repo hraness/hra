@@ -1,17 +1,36 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { getDocumentSize } from "convex/values";
+
+import {
+  digestInviteCapability,
+  identityInviteLifetimeMs,
+  invitePublicIdFromCapabilityDigest,
+} from "../src/cloud/inviteAuthority";
 
 import {
   bootstrapHostedSync,
   executeHostedBootstrap,
   parseBootstrapArguments,
+  readProtectedInviteCapability,
+  recoverHostedBootstrap,
   reserveCapabilityFile,
   type CapabilitySink,
 } from "./bootstrap-hosted-sync";
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
 import {
+  HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
   type ConvexTargetVerifier,
@@ -21,7 +40,7 @@ const target: ConvexTarget = {
   deploymentId: 7_654_321,
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
-  projectId: 1_234_567,
+  projectId: HRA_CONVEX_PROJECT_ID,
   teamId: HRA_CONVEX_TEAM_ID,
 };
 
@@ -43,28 +62,81 @@ const exactTargetVerifier: ConvexTargetVerifier = async (value) => {
 };
 
 const capability = `hra_invite_identity_v1_${"S".repeat(43)}`;
-const inviteResult = {
-  capability,
-  expiresAt: 1_800_000_000_000,
-  publicId: `invite_${"P".repeat(32)}`,
+const capabilityDigest = await digestInviteCapability(capability, "identity");
+const publicId = invitePublicIdFromCapabilityDigest(capabilityDigest);
+const authority = { capability, capabilityDigest, publicId } as const;
+const bootstrapAt = 1_799_913_600_000;
+const expiresAt = bootstrapAt + identityInviteLifetimeMs;
+const bootstrapInvite = {
+  _creationTime: bootstrapAt,
+  _id: "bootstrap_invite_row_1",
+  admissionExpiresAt: expiresAt,
+  capabilityDigest,
+  createdAt: bootstrapAt,
+  expiresAt,
+  publicId,
   purpose: "identity",
-  replay: false,
+  requestedLifetimeMs: identityInviteLifetimeMs,
   state: "issued",
+  updatedAt: bootstrapAt,
 } as const;
-const zeroAuthority = {
-  _creationTime: 1_799_999_999_000,
+const inviteLogicalBytes = getDocumentSize(bootstrapInvite);
+const hostedAuthority = {
+  _creationTime: bootstrapAt,
   _id: "authority_row_1",
   enforcement: "hard",
   identities: 0,
   key: "global",
-  logicalBytes: 0,
-  records: 0,
-  serviceLogicalBytes: 0,
-  serviceRecords: 0,
-  updatedAt: 1_799_999_999_000,
+  logicalBytes: inviteLogicalBytes,
+  records: 1,
+  serviceLogicalBytes: inviteLogicalBytes,
+  serviceRecords: 1,
+  updatedAt: bootstrapAt,
   userLogicalBytes: 0,
   userRecords: 0,
 } as const;
+const hostedControl = {
+  _creationTime: bootstrapAt,
+  _id: "control_row_1",
+  authAdmissionGeneration: 0,
+  authAdmissions: "open",
+  bootstrapCompletedAt: bootstrapAt,
+  bootstrapInviteCapabilityDigest: capabilityDigest,
+  bootstrapInviteLifetimeMs: identityInviteLifetimeMs,
+  bootstrapInvitePublicId: publicId,
+  key: "global",
+  updatedAt: bootstrapAt,
+} as const;
+const emptyAuthority = {
+  control: [],
+  invites: [],
+  maintenance: [],
+  quota: [],
+} as const;
+const authorityReadback = {
+  control: [hostedControl],
+  invites: [bootstrapInvite],
+  quota: [hostedAuthority],
+} as const;
+const genesisResult = {
+  enforcement: "hard",
+  invite: {
+    expiresAt,
+    publicId,
+    purpose: "identity",
+    state: "issued",
+  },
+  replay: false,
+} as const;
+const publicInviteResult = {
+  expiresAt,
+  publicId,
+  purpose: "identity",
+  replay: false,
+  state: "issued",
+} as const;
+const authorityQuery = "return {quota:await ctx.db.query(\"storageUsageService\").take(2),control:await ctx.db.query(\"serviceControl\").take(2),invites:await ctx.db.query(\"authInvites\").take(2)};";
+const preGenesisQuery = "return {quota:await ctx.db.query(\"storageUsageService\").take(2),control:await ctx.db.query(\"serviceControl\").take(2),maintenance:await ctx.db.query(\"maintenanceState\").take(2),invites:await ctx.db.query(\"authInvites\").take(2)};";
 
 const temporaryDirectories: string[] = [];
 
@@ -110,71 +182,90 @@ const makeFakeSink = (): FakeSink => {
   };
 };
 
-describe("fresh hosted bootstrap", () => {
-  test("runs genesis, proves the exact zero singleton, and protects the first invite without observable secrets", async () => {
-    const requests: CommandRequest[] = [];
-    const results = [
-      { exitCode: 0, stderr: capability, stdout: "[]\n" },
-      { exitCode: 0, stderr: capability, stdout: "{\n  \"enforcement\": \"hard\"\n}\n" },
-      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify([zeroAuthority])}\n` },
-      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(inviteResult)}\n` },
-    ] as const;
-    let resultIndex = 0;
-    const runner: CommandRunner = async (request) => {
+const sequenceRunner = (
+  results: readonly Readonly<{ exitCode: number; stderr: string; stdout: string }>[],
+  requests: CommandRequest[] = [],
+): Readonly<{ requests: CommandRequest[]; runner: CommandRunner }> => {
+  let index = 0;
+  return {
+    requests,
+    runner: async (request) => {
       requests.push(request);
-      return results[resultIndex++]!;
-    };
+      const result = results[index];
+      index += 1;
+      if (result === undefined) throw new Error("unexpected command");
+      return result;
+    },
+  };
+};
+
+describe("fresh hosted bootstrap", () => {
+  test("atomically creates exact authority and first invite without exposing capability custody", async () => {
+    const { requests, runner } = sequenceRunner([
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(emptyAuthority)}\n` },
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(genesisResult)}\n` },
+      { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(authorityReadback)}\n` },
+    ]);
     const fakeSink = makeFakeSink();
     const stdout: string[] = [];
     const stderr: string[] = [];
+    let verifications = 0;
 
     const exitCode = await executeHostedBootstrap({
-      arguments: [
-        ...targetArguments,
-        "--invite-output",
-        "/protected/new-invite",
-      ],
+      arguments: [...targetArguments, "--invite-output", "/protected/new-invite"],
+      authorityFactory: async () => authority,
       environment: {
         CONVEX_DEPLOY_KEY: capability,
         HOME: "/safe/operator",
         PATH: "/safe/bin",
+        TMPDIR: `/safe/${capability}`,
       },
       reserve: async () => fakeSink.sink,
       runner,
       stderr: outputWriter(stderr),
       stdout: outputWriter(stdout),
-      verifyTarget: exactTargetVerifier,
+      verifyTarget: async (value) => {
+        await exactTargetVerifier(value);
+        verifications += 1;
+      },
     });
 
     expect(exitCode).toBe(0);
     expect(fakeSink.commits()).toEqual([capability]);
     expect(fakeSink.aborts()).toBe(0);
-    expect(requests).toHaveLength(4);
+    expect(verifications).toBe(3);
     expect(requests.map((request) => request.arguments.slice(1))).toEqual([
       [
         "run",
         "--inline-query",
-        "return await ctx.db.query(\"storageUsageService\").take(2);",
+        preGenesisQuery,
         "--deployment",
         target.deploymentName,
       ],
-      ["run", "quota:genesisHardAuthority", "{}", "--deployment", target.deploymentName],
+      [
+        "run",
+        "quota:genesisHostedAuthority",
+        JSON.stringify({
+          capabilityDigest,
+          lifetimeMs: identityInviteLifetimeMs,
+          publicId,
+        }),
+        "--deployment",
+        target.deploymentName,
+      ],
       [
         "run",
         "--inline-query",
-        "return await ctx.db.query(\"storageUsageService\").take(2);",
-        "--deployment",
-        target.deploymentName,
-      ],
-      [
-        "run",
-        "authInvites:issue",
-        "{\"lifetimeMs\":86400000,\"purpose\":\"identity\"}",
+        authorityQuery,
         "--deployment",
         target.deploymentName,
       ],
     ]);
     expect(requests.every((request) => request.stdin === "")).toBe(true);
+    expect(requests.every((request) => request.outputMaximumBytes === 64 * 1_024))
+      .toBe(true);
+    expect(requests.every((request) => request.timeoutMs === 60_000)).toBe(true);
+    expect(requests.every((request) => request.environment.TMPDIR === undefined)).toBe(true);
     const observable = JSON.stringify({
       arguments: requests.map((request) => request.arguments),
       environments: requests.map((request) => request.environment),
@@ -182,19 +273,20 @@ describe("fresh hosted bootstrap", () => {
       stdout,
     });
     expect(observable).not.toContain(capability);
-    expect(stdout).toEqual([
-      "Hosted bootstrap verified hard zero authority and protected the first identity invite.\n",
-    ]);
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      invite: publicInviteResult,
+      operation: "bootstrap",
+    });
     expect(stderr).toEqual([]);
   });
 
-  test("refuses a dirty pre-genesis authority before reserving output or mutating", async () => {
-    const requests: CommandRequest[] = [];
+  test("refuses dirty authority before reserving output or mutating", async () => {
+    const { requests, runner } = sequenceRunner([{
+      exitCode: 0,
+      stderr: capability,
+      stdout: JSON.stringify({ ...emptyAuthority, quota: [hostedAuthority] }),
+    }]);
     let reserved = false;
-    const runner: CommandRunner = async (request) => {
-      requests.push(request);
-      return { exitCode: 0, stderr: capability, stdout: JSON.stringify([zeroAuthority]) };
-    };
 
     await expect(bootstrapHostedSync({
       inviteOutput: "/protected/new-invite",
@@ -210,39 +302,187 @@ describe("fresh hosted bootstrap", () => {
     expect(reserved).toBe(false);
   });
 
-  test("refuses an existing or symlink output before genesis", async () => {
-    const directory = await makeTemporaryDirectory();
-    const existing = join(directory, "existing-invite");
-    const linkTarget = join(directory, "target");
-    const link = join(directory, "linked-invite");
-    await writeFile(existing, "occupied", { mode: 0o600 });
-    await writeFile(linkTarget, "target", { mode: 0o600 });
-    await symlink(linkTarget, link);
+  test("reconciles a lost or malformed mutation response only through exact readback", async () => {
+    for (const mutation of [
+      { exitCode: 1, stderr: "transport lost", stdout: "" },
+      { exitCode: 0, stderr: "", stdout: "{malformed" },
+    ]) {
+      const { runner } = sequenceRunner([
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(emptyAuthority) },
+        mutation,
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(authorityReadback) },
+      ]);
+      const fakeSink = makeFakeSink();
+      const result = await bootstrapHostedSync({
+        authorityFactory: async () => authority,
+        inviteOutput: "/protected/new-invite",
+        reserve: async () => fakeSink.sink,
+        runner,
+        target,
+        verifyTarget: exactTargetVerifier,
+      });
+      expect(result).toEqual({
+        invite: { ...publicInviteResult, replay: true },
+        operation: "bootstrap",
+      });
+      expect(fakeSink.commits()).toEqual([capability]);
+      expect(fakeSink.aborts()).toBe(0);
+    }
+  });
 
-    await expect(reserveCapabilityFile(existing)).rejects.toThrow("invite_output_refused");
-    await expect(reserveCapabilityFile(link)).rejects.toThrow("invite_output_refused");
+  test("keeps committed custody and refuses empty, conflicting, or undercharged readback", async () => {
+    const scenarios = [
+      {
+        expected: "genesis_failed",
+        mutation: { exitCode: 1, stderr: "lost", stdout: "" },
+        readback: { control: [], invites: [], quota: [] },
+      },
+      {
+        expected: "genesis_result_invalid",
+        mutation: { exitCode: 0, stderr: "", stdout: "{malformed" },
+        readback: { control: [], invites: [], quota: [] },
+      },
+      {
+        expected: "bootstrap_authority_conflict",
+        mutation: { exitCode: 1, stderr: "refused", stdout: "" },
+        readback: {
+          ...authorityReadback,
+          quota: [{
+            ...hostedAuthority,
+            logicalBytes: inviteLogicalBytes - 1,
+            serviceLogicalBytes: inviteLogicalBytes - 1,
+          }],
+        },
+      },
+      {
+        expected: "bootstrap_authority_conflict",
+        mutation: { exitCode: 1, stderr: "refused", stdout: "" },
+        readback: {
+          ...authorityReadback,
+          control: [{ ...hostedControl, bootstrapInviteCapabilityDigest: "f".repeat(64) }],
+        },
+      },
+    ] as const;
 
-    const requests: CommandRequest[] = [];
-    const runner: CommandRunner = async (request) => {
-      requests.push(request);
-      return { exitCode: 0, stderr: "", stdout: "[]" };
-    };
-    await expect(bootstrapHostedSync({
-      inviteOutput: existing,
+    for (const scenario of scenarios) {
+      const { runner } = sequenceRunner([
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(emptyAuthority) },
+        scenario.mutation,
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(scenario.readback) },
+      ]);
+      const fakeSink = makeFakeSink();
+      await expect(bootstrapHostedSync({
+        authorityFactory: async () => authority,
+        inviteOutput: "/protected/new-invite",
+        reserve: async () => fakeSink.sink,
+        runner,
+        target,
+        verifyTarget: exactTargetVerifier,
+      })).rejects.toThrow(scenario.expected);
+      expect(fakeSink.commits()).toEqual([capability]);
+      expect(fakeSink.aborts()).toBe(0);
+    }
+  });
+});
+
+describe("bootstrap recovery", () => {
+  test("replays only the exact atomic bootstrap authority from the protected file", async () => {
+    const { requests, runner } = sequenceRunner([
+      {
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({ ...genesisResult, replay: true }),
+      },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(authorityReadback) },
+    ]);
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    const exitCode = await executeHostedBootstrap({
+      arguments: [
+        "recover",
+        ...targetArguments,
+        "--invite-file",
+        "/protected/bootstrap-invite",
+      ],
+      readCapability: async (value) => {
+        expect(value).toBe("/protected/bootstrap-invite");
+        return capability;
+      },
+      runner,
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: exactTargetVerifier,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.arguments).toContain("quota:genesisHostedAuthority");
+    expect(requests[0]?.arguments).not.toContain("authInvites:recordIssue");
+    expect(JSON.parse(stdout.join(""))).toEqual({
+      invite: { ...publicInviteResult, replay: true },
+      operation: "recover",
+    });
+    expect(JSON.stringify({ requests, stderr, stdout })).not.toContain(capability);
+  });
+
+  test("recovers a crash before mutation and reconciles a crash after mutation", async () => {
+    for (const mutation of [
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(genesisResult) },
+      { exitCode: 1, stderr: "transport lost", stdout: "" },
+    ]) {
+      const { runner } = sequenceRunner([
+        mutation,
+        { exitCode: 0, stderr: "", stdout: JSON.stringify(authorityReadback) },
+      ]);
+      const result = await recoverHostedBootstrap({
+        inviteFile: "/protected/bootstrap-invite",
+        readCapability: async () => capability,
+        runner,
+        target,
+        verifyTarget: exactTargetVerifier,
+      });
+      expect(result.operation).toBe("recover");
+      expect(result.invite.replay).toBe(mutation.exitCode !== 0);
+    }
+  });
+
+  test("refuses a concurrent winner with a different full bootstrap binding", async () => {
+    const otherDigest = "f".repeat(64);
+    const { runner } = sequenceRunner([
+      { exitCode: 1, stderr: "refused", stdout: "" },
+      {
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          ...authorityReadback,
+          control: [{
+            ...hostedControl,
+            bootstrapInviteCapabilityDigest: otherDigest,
+            bootstrapInvitePublicId: invitePublicIdFromCapabilityDigest(otherDigest),
+          }],
+        }),
+      },
+    ]);
+    await expect(recoverHostedBootstrap({
+      inviteFile: "/protected/loser-invite",
+      readCapability: async () => capability,
       runner,
       target,
       verifyTarget: exactTargetVerifier,
-    })).rejects.toThrow("invite_output_refused");
-    expect(requests).toHaveLength(1);
+    })).rejects.toThrow("bootstrap_authority_conflict");
   });
+});
 
-  test("writes only the capability to a new exclusive regular 0600 file", async () => {
+describe("bootstrap capability custody", () => {
+  test("writes and rereads only one capability in an owned private directory", async () => {
     const directory = await makeTemporaryDirectory();
     const output = join(directory, "identity-invite");
     const sink = await reserveCapabilityFile(output);
     await sink.commit(capability);
 
     expect(await readFile(output, "utf8")).toBe(`${capability}\n`);
+    expect(await readProtectedInviteCapability(output)).toBe(capability);
     const metadata = await stat(output);
     expect(metadata.isFile()).toBe(true);
     expect(metadata.nlink).toBe(1);
@@ -250,83 +490,96 @@ describe("fresh hosted bootstrap", () => {
     await expect(reserveCapabilityFile(output)).rejects.toThrow("invite_output_refused");
   });
 
-  test("closes on ambiguous genesis and authority results and removes the reserved output", async () => {
-    const scenarios = [
-      {
-        expected: "authority_readback_invalid",
-        results: [{ exitCode: 0, stderr: capability, stdout: "[]\n{}" }],
-      },
-      {
-        expected: "genesis_result_invalid",
-        results: [
-          { exitCode: 0, stderr: "", stdout: "[]" },
-          { exitCode: 0, stderr: capability, stdout: "{\"enforcement\":\"shadow\"}" },
-        ],
-      },
-      {
-        expected: "authority_readback_invalid",
-        results: [
-          { exitCode: 0, stderr: "", stdout: "[]" },
-          { exitCode: 0, stderr: "", stdout: "{\"enforcement\":\"hard\"}" },
-          { exitCode: 0, stderr: capability, stdout: JSON.stringify([zeroAuthority, zeroAuthority]) },
-        ],
-      },
-      {
-        expected: "authority_readback_invalid",
-        results: [
-          { exitCode: 0, stderr: "", stdout: "[]" },
-          { exitCode: 0, stderr: "", stdout: "{\"enforcement\":\"hard\"}" },
-          {
-            exitCode: 0,
-            stderr: capability,
-            stdout: JSON.stringify([{ ...zeroAuthority, userRecords: 1 }]),
-          },
-        ],
-      },
-      {
-        expected: "invite_result_invalid",
-        results: [
-          { exitCode: 0, stderr: "", stdout: "[]" },
-          { exitCode: 0, stderr: "", stdout: "{\"enforcement\":\"hard\"}" },
-          { exitCode: 0, stderr: "", stdout: JSON.stringify([zeroAuthority]) },
-          { exitCode: 0, stderr: capability, stdout: `${JSON.stringify(inviteResult)}\n{}` },
-        ],
-      },
-    ] as const;
+  test("refuses existing, symlinked, shared-parent, or weakened recovery paths", async () => {
+    const directory = await makeTemporaryDirectory();
+    const existing = join(directory, "existing-invite");
+    const linkTarget = join(directory, "target");
+    const link = join(directory, "linked-invite");
+    await writeFile(existing, `${capability}\n`, { mode: 0o600 });
+    await writeFile(linkTarget, `${capability}\n`, { mode: 0o600 });
+    await symlink(linkTarget, link);
 
-    for (const scenario of scenarios) {
-      let index = 0;
-      const fakeSink = makeFakeSink();
-      const runner: CommandRunner = async () => scenario.results[index++]!;
-      await expect(bootstrapHostedSync({
-        inviteOutput: "/protected/new-invite",
-        reserve: async () => fakeSink.sink,
-        runner,
-        target,
-        verifyTarget: exactTargetVerifier,
-      })).rejects.toThrow(scenario.expected);
-      if (scenario.expected === "authority_readback_invalid" && scenario.results.length === 1) {
-        expect(fakeSink.aborts()).toBe(0);
-      } else {
-        expect(fakeSink.aborts()).toBe(1);
-      }
-      expect(fakeSink.commits()).toEqual([]);
-    }
+    await expect(reserveCapabilityFile(existing)).rejects.toThrow("invite_output_refused");
+    await expect(reserveCapabilityFile(link)).rejects.toThrow("invite_output_refused");
+    await expect(readProtectedInviteCapability(link)).rejects.toThrow("invite_input_refused");
+
+    await chmod(existing, 0o644);
+    await expect(readProtectedInviteCapability(existing))
+      .rejects.toThrow("invite_input_refused");
+    await chmod(existing, 0o600);
+    await chmod(directory, 0o755);
+    await expect(readProtectedInviteCapability(existing))
+      .rejects.toThrow("invite_input_refused");
+    await expect(reserveCapabilityFile(join(directory, "new-invite")))
+      .rejects.toThrow("invite_output_refused");
   });
 
-  test("requires one explicit deployment and one absolute new output path", () => {
+  test("aborts an uncommitted reservation but preserves committed recovery custody", async () => {
+    const uncommitted = makeFakeSink();
+    const { runner: dirtyRunner } = sequenceRunner([{
+      exitCode: 0,
+      stderr: "",
+      stdout: JSON.stringify(emptyAuthority),
+    }]);
+    await expect(bootstrapHostedSync({
+      authorityFactory: async () => ({ ...authority, publicId: "invite_invalid" }),
+      inviteOutput: "/protected/new-invite",
+      reserve: async () => uncommitted.sink,
+      runner: dirtyRunner,
+      target,
+      verifyTarget: exactTargetVerifier,
+    })).rejects.toThrow("invite_result_invalid");
+    expect(uncommitted.aborts()).toBe(1);
+    expect(uncommitted.commits()).toEqual([]);
+
+    const committed = makeFakeSink();
+    const { runner: failedRunner } = sequenceRunner([
+      { exitCode: 0, stderr: "", stdout: JSON.stringify(emptyAuthority) },
+      { exitCode: 1, stderr: "lost", stdout: "" },
+      { exitCode: 0, stderr: "", stdout: JSON.stringify({ control: [], invites: [], quota: [] }) },
+    ]);
+    await expect(bootstrapHostedSync({
+      authorityFactory: async () => authority,
+      inviteOutput: "/protected/new-invite",
+      reserve: async () => committed.sink,
+      runner: failedRunner,
+      target,
+      verifyTarget: exactTargetVerifier,
+    })).rejects.toThrow("genesis_failed");
+    expect(committed.aborts()).toBe(0);
+    expect(committed.commits()).toEqual([capability]);
+  });
+});
+
+describe("bootstrap command grammar", () => {
+  test("requires an exact target and one absolute initialize or recovery path", () => {
     expect(parseBootstrapArguments([
       ...targetArguments,
       "--invite-output",
       "/protected/new-invite",
     ])).toEqual({
-      inviteOutput: "/protected/new-invite",
+      operation: { inviteOutput: "/protected/new-invite", kind: "initialize" },
+      target,
+    });
+    expect(parseBootstrapArguments([
+      "recover",
+      ...targetArguments,
+      "--invite-file",
+      "/protected/bootstrap-invite",
+    ])).toEqual({
+      operation: { inviteFile: "/protected/bootstrap-invite", kind: "recover" },
       target,
     });
     expect(() => parseBootstrapArguments([
       ...targetArguments,
       "--invite-output",
       "relative-invite",
+    ])).toThrow("usage_invalid");
+    expect(() => parseBootstrapArguments([
+      ...targetArguments,
+      "recover",
+      "--invite-file",
+      `/protected/${capability}`,
     ])).toThrow("usage_invalid");
     expect(() => parseBootstrapArguments([
       ...targetArguments.slice(0, 3),

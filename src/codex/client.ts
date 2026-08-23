@@ -30,6 +30,7 @@ import {
   parseAccountUsage,
   parseAppPage,
   parseBrokeredCodexServerRequest,
+  parseCredentialStores,
   parseFact,
   parseFeaturePage,
   parseInitialize,
@@ -114,6 +115,11 @@ export interface CodexAppServerClientOptions {
   readonly process: CodexProcess;
   readonly authority: CodexAuthority;
   readonly expectedCodexHome: string;
+  readonly credentialStorePreflight?: Readonly<{
+    readonly cliAuth: "file";
+    readonly cwd: string;
+    readonly mcpOauth: "file";
+  }>;
   readonly experimentalApi?: boolean;
   readonly isAuthorityCurrent: (authority: CodexAuthority) => boolean | Promise<boolean>;
   readonly onFact?: (fact: FencedCodexValue<CodexFact>) => void | Promise<void>;
@@ -181,6 +187,7 @@ export class CodexAppServerClient {
   readonly #process: CodexProcess;
   readonly #authority: CodexAuthority;
   readonly #expectedCodexHome: string;
+  readonly #credentialStorePreflight: CodexAppServerClientOptions["credentialStorePreflight"];
   readonly #experimentalApi: boolean;
   readonly #isAuthorityCurrent: CodexAppServerClientOptions["isAuthorityCurrent"];
   readonly #onFact: NonNullable<CodexAppServerClientOptions["onFact"]>;
@@ -210,6 +217,13 @@ export class CodexAppServerClient {
       throw new CodexError("INVALID_INPUT", "expected CODEX_HOME must be absolute");
     }
     this.#expectedCodexHome = resolve(options.expectedCodexHome);
+    this.#credentialStorePreflight = options.credentialStorePreflight === undefined
+      ? undefined
+      : {
+          cliAuth: options.credentialStorePreflight.cliAuth,
+          cwd: canonicalAbsolute(options.credentialStorePreflight.cwd, "credential-store preflight cwd"),
+          mcpOauth: options.credentialStorePreflight.mcpOauth,
+        };
     this.#experimentalApi = options.experimentalApi ?? false;
     this.#isAuthorityCurrent = options.isAuthorityCurrent;
     this.#onFact = options.onFact ?? (() => undefined);
@@ -291,6 +305,9 @@ export class CodexAppServerClient {
       await this.#writeFrame({ method: "initialized" });
       await this.#assertAuthority();
       this.#state = "ready";
+      if (this.#credentialStorePreflight !== undefined) {
+        await this.assertCredentialStores(this.#credentialStorePreflight.cwd);
+      }
       void this.#enqueueFact({
         type: "providerConnected",
         connectionId: this.#connectionId,
@@ -311,6 +328,28 @@ export class CodexAppServerClient {
 
   async accountRead(refreshToken = false): Promise<FencedCodexValue<AccountReadResult>> {
     return this.#closedRequest("account/read", { refreshToken }, parseAccountRead);
+  }
+
+  /** Rechecks project-layer effective custody before a project-scoped effect. */
+  async assertCredentialStores(cwd: string): Promise<void> {
+    if (this.#credentialStorePreflight === undefined) return;
+    const stores = await this.#closedRequest(
+      "config/read",
+      {
+        includeLayers: false,
+        cwd: canonicalAbsolute(cwd, "credential-store preflight cwd"),
+      },
+      parseCredentialStores,
+    );
+    if (
+      stores.value.cliAuth !== this.#credentialStorePreflight.cliAuth
+      || stores.value.mcpOauth !== this.#credentialStorePreflight.mcpOauth
+    ) {
+      throw new CodexError(
+        "RUNTIME_MISMATCH",
+        "Codex did not apply the required file-backed credential stores",
+      );
+    }
   }
 
   async startManagedLogin(mode: "browser" | "device-code"): Promise<FencedCodexValue<ManagedLoginResult>> {
