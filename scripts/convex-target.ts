@@ -19,6 +19,8 @@ const hasControlCharacter = (value: string): boolean => {
 
 export const HRA_V0_CONVEX_PROJECT_ID = 2_680_173;
 export const HRA_V0_CONVEX_DEPLOYMENT_ID = 4_677_913;
+export const HRA_CONVEX_TEAM_ID = 513_923;
+export const HRA_CONVEX_TEAM_SLUG = "cclrte";
 
 const generatedDeploymentNameSchema = z.string()
   .min(5)
@@ -48,7 +50,7 @@ const expectedTargetSchema = z.object({
   deploymentName: generatedDeploymentNameSchema,
   deploymentUrl: deploymentUrlSchema,
   projectId: numericIdentifierSchema,
-  teamId: numericIdentifierSchema,
+  teamId: z.literal(HRA_CONVEX_TEAM_ID),
 }).strict().superRefine((target, context) => {
   if (target.projectId === HRA_V0_CONVEX_PROJECT_ID) {
     context.addIssue({ code: "custom", message: "HRA v0 project is forbidden." });
@@ -61,8 +63,8 @@ const expectedTargetSchema = z.object({
 const teamAndProjectSchema = z.object({
   project: z.string().min(1).max(256),
   projectId: numericIdentifierSchema,
-  team: z.string().min(1).max(256),
-  teamId: numericIdentifierSchema,
+  team: z.literal(HRA_CONVEX_TEAM_SLUG),
+  teamId: z.literal(HRA_CONVEX_TEAM_ID),
 }).passthrough();
 
 const deploymentReadbackSchema = z.object({
@@ -315,7 +317,6 @@ export async function verifyConvexTarget(
   if (
     !teamAndProject.success
     || !deployment.success
-    || teamAndProject.data.teamId !== target.teamId
     || teamAndProject.data.projectId !== target.projectId
     || deployment.data.id !== target.deploymentId
     || deployment.data.name !== target.deploymentName

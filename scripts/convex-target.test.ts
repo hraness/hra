@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  HRA_CONVEX_TEAM_ID,
+  HRA_CONVEX_TEAM_SLUG,
   HRA_V0_CONVEX_DEPLOYMENT_ID,
   HRA_V0_CONVEX_PROJECT_ID,
+  parseConvexTarget,
   parseConvexTargetArguments,
   readConvexAccessToken,
   verifyConvexTarget,
@@ -18,7 +21,7 @@ const target: ConvexTarget = {
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
   projectId: 1_234_567,
-  teamId: 765_432,
+  teamId: HRA_CONVEX_TEAM_ID,
 };
 
 const targetArguments = [
@@ -65,7 +68,7 @@ describe("numeric Convex target guard", () => {
         return new Response(JSON.stringify({
           project: "hra",
           projectId: target.projectId,
-          team: "hraness",
+          team: HRA_CONVEX_TEAM_SLUG,
           teamId: target.teamId,
         }), { status: 200 });
       }
@@ -89,6 +92,54 @@ describe("numeric Convex target guard", () => {
       expect(request.init.method).toBe("GET");
       expect(request.init.redirect).toBe("error");
       expect(request.init.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  test("rejects every wrong or missing provider team identity before mutation", async () => {
+    const { configPath } = await makeConfig();
+    const scenarios: readonly unknown[] = [
+      {
+        project: "hra",
+        projectId: target.projectId,
+        team: "wrong-team",
+        teamId: target.teamId,
+      },
+      {
+        project: "hra",
+        projectId: target.projectId,
+        teamId: target.teamId,
+      },
+      {
+        project: "hra",
+        projectId: target.projectId,
+        team: HRA_CONVEX_TEAM_SLUG,
+        teamId: target.teamId + 1,
+      },
+      {
+        project: "hra",
+        projectId: target.projectId,
+        team: HRA_CONVEX_TEAM_SLUG,
+      },
+    ];
+
+    for (const teamAndProject of scenarios) {
+      let deploymentReadbackCalls = 0;
+      const fetcher: ConvexManagementFetch = async (input) => {
+        if (String(input).includes("/team_and_project")) {
+          return new Response(JSON.stringify(teamAndProject), { status: 200 });
+        }
+        deploymentReadbackCalls += 1;
+        return new Response(JSON.stringify({
+          deploymentType: "prod",
+          deploymentUrl: target.deploymentUrl,
+          id: target.deploymentId,
+          name: target.deploymentName,
+          projectId: target.projectId,
+        }), { status: 200 });
+      };
+      await expect(verifyConvexTarget(target, { configPath, fetch: fetcher }))
+        .rejects.toThrow("target_mismatch");
+      expect(deploymentReadbackCalls).toBe(1);
     }
   });
 
@@ -124,7 +175,7 @@ describe("numeric Convex target guard", () => {
           return new Response(JSON.stringify({
             project: "hra",
             projectId: target.projectId,
-            team: "hraness",
+            team: HRA_CONVEX_TEAM_SLUG,
             teamId: target.teamId,
           }), { status: 200 });
         }
@@ -162,6 +213,15 @@ describe("numeric Convex target guard", () => {
     expect(() => parseConvexTargetArguments(withDeployment("local"))).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments(withDeployment("team:project:prod")))
       .toThrow("target_invalid");
+    expect(() => parseConvexTarget({
+      ...target,
+      teamId: HRA_CONVEX_TEAM_ID + 1,
+    })).toThrow("target_invalid");
+    expect(() => parseConvexTargetArguments([
+      ...targetArguments.slice(0, 3),
+      String(HRA_CONVEX_TEAM_ID + 1),
+      ...targetArguments.slice(4),
+    ])).toThrow("target_invalid");
     expect(() => parseConvexTargetArguments([
       ...targetArguments.slice(0, 5),
       String(HRA_V0_CONVEX_PROJECT_ID),

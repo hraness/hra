@@ -15,7 +15,11 @@ import {
   executeHostedDeploy,
   parseDeployArguments,
 } from "./deploy-hosted-sync";
-import type { ConvexTarget, ConvexTargetVerifier } from "./convex-target";
+import {
+  HRA_CONVEX_TEAM_ID,
+  type ConvexTarget,
+  type ConvexTargetVerifier,
+} from "./convex-target";
 
 const sourceCommit = "a".repeat(40);
 const target: ConvexTarget = {
@@ -23,7 +27,7 @@ const target: ConvexTarget = {
   deploymentName: "steady-otter-321",
   deploymentUrl: "https://steady-otter-321.convex.cloud",
   projectId: 1_234_567,
-  teamId: 765_432,
+  teamId: HRA_CONVEX_TEAM_ID,
 };
 const targetArguments = [
   "--deployment",
@@ -214,6 +218,13 @@ describe("verified hosted deployment", () => {
       .toEqual({ sourceCommit, target });
     expect(() => parseDeployArguments([...targetArguments, "--source-commit", "HEAD"]))
       .toThrow("usage_invalid");
+    expect(() => parseDeployArguments([
+      ...targetArguments.slice(0, 3),
+      String(HRA_CONVEX_TEAM_ID + 1),
+      ...targetArguments.slice(4),
+      "--source-commit",
+      sourceCommit,
+    ])).toThrow("usage_invalid");
     expect(() => parseDeployArguments([
       ...targetArguments,
       "--source-commit",
