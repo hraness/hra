@@ -3,8 +3,23 @@ import { makeFunctionReference } from "convex/server";
 import type { GenericId as Id, Value } from "convex/values";
 import { convexTest } from "convex-test";
 
+import { USAGE_POLL_MIN_INTERVAL_MS } from "../src/daemon/usage-poller";
+import {
+  parseUsageEncryptedEnvelope,
+  USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS,
+} from "../src/cloud/usage";
+import {
+  USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+  USAGE_LOCAL_RETAIN_BYTES,
+  USAGE_LOCAL_SNAPSHOT_MAX_BYTES,
+} from "../src/storage/state-store";
+import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
 import schema from "./schema";
 import { modules } from "./test.setup";
+import {
+  USAGE_ADMISSION_EXPIRY_RELEASE_LIMIT,
+  USAGE_SERVER_ADMISSION_MIN_INTERVAL_MS,
+} from "./usage";
 import {
   ACCOUNT_RESOURCE_QUOTAS,
   CATEGORY_QUOTAS,
@@ -201,6 +216,64 @@ describe("hosted quota authority", () => {
     expect(nextResourceRecords(accountLimit - 1, 1, accountLimit)).toBe(accountLimit);
     expect(() => nextResourceRecords(accountLimit, 1, accountLimit))
       .toThrow("QUOTA_EXCEEDED");
+  });
+
+  test("usage cadence reaches cleanup with conservative boundary headroom", () => {
+    const maximumSourcesPerAccount = USER_RESOURCE_QUOTAS.device;
+    expect(USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS)
+      .toBe(USAGE_SERVER_ADMISSION_MIN_INTERVAL_MS);
+    const recordsPerSourceBeforeCleanup = Math.floor(
+      CLOUD_USAGE_SNAPSHOT_RETENTION_MS / USAGE_SERVER_ADMISSION_MIN_INTERVAL_MS,
+    ) + 1;
+    const conservativeAccountRecords = maximumSourcesPerAccount
+      * recordsPerSourceBeforeCleanup;
+    expect(recordsPerSourceBeforeCleanup).toBe(91);
+    expect(conservativeAccountRecords).toBe(1_456);
+    expect(conservativeAccountRecords)
+      .toBeLessThan(ACCOUNT_RESOURCE_QUOTAS.usage_snapshot);
+    expect(conservativeAccountRecords * USER_RESOURCE_QUOTAS.codex_account)
+      .toBeLessThan(CATEGORY_QUOTAS.usage.records);
+    expect(USAGE_ADMISSION_EXPIRY_RELEASE_LIMIT)
+      .toBeGreaterThanOrEqual(maximumSourcesPerAccount);
+
+    const maximumEnvelope = {
+      algorithm: "A256GCM" as const,
+      ciphertext: "A".repeat(USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS),
+      keyVersion: Number.MAX_SAFE_INTEGER,
+      nonce: "A".repeat(16),
+    };
+    expect(parseUsageEncryptedEnvelope(maximumEnvelope)).toEqual(maximumEnvelope);
+    const conservativeIdentifier = "i".repeat(96);
+    const maximumUsageDocument = {
+      accountId: conservativeIdentifier,
+      createdAt: Number.MAX_SAFE_INTEGER,
+      digest: "f".repeat(64),
+      envelope: maximumEnvelope,
+      observedAt: Number.MAX_SAFE_INTEGER,
+      receivedAt: Number.MAX_SAFE_INTEGER,
+      sourceDeviceId: conservativeIdentifier,
+      sourceDevicePublicId: "d".repeat(96),
+      sourceRevision: Number.MAX_SAFE_INTEGER,
+      userId: conservativeIdentifier,
+    };
+    const maximumLogicalBytes = logicalDocumentBytes(maximumUsageDocument);
+    expect(maximumLogicalBytes).toBe(11_599);
+    const conservativeUserRecords = conservativeAccountRecords
+      * USER_RESOURCE_QUOTAS.codex_account;
+    const conservativeUserUsageBytes = conservativeUserRecords * maximumLogicalBytes;
+    expect(conservativeUserRecords).toBe(46_592);
+    expect(conservativeUserUsageBytes).toBe(540_420_608);
+    expect(conservativeUserUsageBytes * 10).toBeLessThan(USER_TOTAL_QUOTA.logicalBytes * 3);
+    expect(conservativeUserUsageBytes).toBeLessThan(CATEGORY_QUOTAS.usage.logicalBytes);
+
+    const minimumByteBoundSamples = Math.floor(
+      USAGE_LOCAL_RETAIN_BYTES / USAGE_LOCAL_SNAPSHOT_MAX_BYTES,
+    );
+    const maximumVelocityWindowSamples = Math.ceil(
+      (15 * 60_000 * 1.2) / USAGE_POLL_MIN_INTERVAL_MS,
+    ) + 1;
+    expect(minimumByteBoundSamples).toBe(64);
+    expect(minimumByteBoundSamples).toBeGreaterThan(maximumVelocityWindowSamples);
   });
 
   test("hard genesis requires a pristine deployment and is one-shot under races", async () => {

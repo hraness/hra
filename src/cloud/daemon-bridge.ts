@@ -38,6 +38,7 @@ import {
   type CloudDaemonJournalPort,
   type CloudDaemonJournalState,
   type CloudProjectionRecoveryAppliedResponse,
+  type CloudProjectionRecoveryBaselineInteraction,
   type CloudProjectionRecoveryJournalEntry,
   type CloudProjectionRecoveryTerminalReceipt,
   type CloudUsageAccountCursor,
@@ -53,7 +54,9 @@ import {
   hasUnsettledCompactProjectionRecoveryForProfile,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudProjectionRecoveryEntry,
+  providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
+  supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudCommandJournalEntry,
   transitionCloudProjectionRecovery,
@@ -85,6 +88,7 @@ const maximumLocalSessions = 25;
 const maximumRemoteSessions = 25;
 const maximumEventsPerChunk = 128;
 const maximumChunksPerRemoteSession = 8;
+const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumCommandsPerCycle = 32;
 const maximumJournalRecoveriesPerCycle = 4;
 const maximumUsageAccounts = 32;
@@ -98,6 +102,10 @@ const minimumPresenceCycleTtlMs = 15_000;
 const maximumPresenceTtlMs = 120_000;
 const authLogoutCustodySlot = "cloud-auth-logout";
 const unreservedPreparedCommandResultCode = "LOCAL_JOURNAL_CAPACITY_BEFORE_EFFECT";
+
+function isRuntimeArray(value: unknown): boolean {
+  return Array.isArray(value);
+}
 
 export type ActiveCloudIdentity = Readonly<{
   accountKey: Uint8Array;
@@ -157,6 +165,7 @@ export type CloudLocalCommandAuthority = Readonly<{
 export interface CloudDaemonLocalSourcePort {
   activateCompactProjectionRecovery?(input: Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
+    baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[];
     boundaryHeadSequence: number;
     boundaryTailDigest: string;
     compactStreamEpoch: number;
@@ -173,16 +182,23 @@ export interface CloudDaemonLocalSourcePort {
     signal: AbortSignal;
     sourceCacheId: string | null;
   }>): Promise<void>;
+  discardCompactProjectionRecovery?(input: Readonly<{
+    idempotencyKey: string;
+    sessionPublicId: string;
+  }>): Promise<void>;
+  isSessionTerminal?(sessionPublicId: string): boolean | Promise<boolean>;
   listSessions(input: Readonly<{
     limit: number;
     signal: AbortSignal;
   }>): Promise<readonly CloudLocalSessionHead[]>;
   planCompactProjectionRecovery?(input: Readonly<{
     idempotencyKey: string;
+    observedInteractionIds: readonly string[];
     sessionPublicId: string;
     signal: AbortSignal;
   }>): Promise<Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
+    baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[];
     localAuthority: Readonly<{
       profileGeneration: number;
       profileId: string;
@@ -196,6 +212,7 @@ export interface CloudDaemonLocalSourcePort {
   }>>;
   stageCompactProjectionRecovery?(input: Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
+    baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[];
     boundaryHeadSequence: number;
     boundaryTailDigest: string;
     compactStreamEpoch: number;
@@ -375,6 +392,10 @@ export interface CloudDaemonBridge {
   }>>;
   isCompactProjectionRecoveryUnsettledForProfile?(profileId: string): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled?(sessionPublicId: string): Promise<boolean>;
+  supersedeCompactProjectionRecoveryForProviderDeletion?(
+    sessionPublicId: string,
+  ): Promise<{ superseded: boolean }>;
+  supersedeTerminalCompactProjectionRecoveries?(): Promise<{ superseded: number }>;
   pullRemoteSessions(signal: AbortSignal): Promise<readonly RemoteCloudSession[]>;
   recoverCompactProjection?(input: Readonly<{
     acknowledgeGap: true;
@@ -476,6 +497,7 @@ type CloudUsageAccountBinding = Readonly<{
     encryptedLocalReference: EncryptedEnvelope;
     sourceGeneration: number;
     state: "present" | "removed";
+    usageSourceRevision: number;
   }>;
   encryptedMetadata: EncryptedEnvelope;
   matchKey: string;
@@ -1128,6 +1150,7 @@ function parseCloudUsageAccountBinding(value: unknown): CloudUsageAccountBinding
     "encryptedLocalReference",
     "sourceGeneration",
     "state",
+    "usageSourceRevision",
   ])) throw new Error("Cloud usage account response is invalid.");
   const encryptedLocalReference = parseEncryptedEnvelope(
     value.binding.encryptedLocalReference,
@@ -1136,6 +1159,7 @@ function parseCloudUsageAccountBinding(value: unknown): CloudUsageAccountBinding
   if (
     encryptedLocalReference === null
     || !isSafePositiveInteger(value.binding.sourceGeneration)
+    || !isSafeNonNegativeInteger(value.binding.usageSourceRevision)
     || (value.binding.state !== "present" && value.binding.state !== "removed")
   ) throw new Error("Cloud usage account response is invalid.");
   return {
@@ -1143,6 +1167,7 @@ function parseCloudUsageAccountBinding(value: unknown): CloudUsageAccountBinding
       encryptedLocalReference,
       sourceGeneration: value.binding.sourceGeneration,
       state: value.binding.state,
+      usageSourceRevision: value.binding.usageSourceRevision,
     },
     encryptedMetadata,
     matchKey: value.matchKey,
@@ -1216,6 +1241,7 @@ function parseUsageSnapshotReceipt(
     || !hasExactKeys(value, ["disposition", "sourceRevision"])
     || (value.disposition !== "replace"
       && value.disposition !== "store"
+      && value.disposition !== "coalesced"
       && value.disposition !== "replay")
     || value.sourceRevision !== sourceRevision
   ) throw new Error("Cloud usage snapshot receipt is invalid.");
@@ -1519,6 +1545,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   #closed = false;
   #optionalTask: OptionalCloudSyncTask | null = null;
   #presenceState: CloudPresenceState | null = null;
+  readonly #projectionRecoverySupersededSessions = new Set<string>();
   #tail: Promise<unknown> = Promise.resolve();
 
   constructor(options: LocalCloudDaemonBridgeOptions) {
@@ -1685,20 +1712,19 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
                 optionalController.signal,
               );
               abortBeforeEffect(optionalController.signal);
-              if (
-                await this.#appendCompact(
-                  identity,
-                  session,
-                  head,
-                  lease,
-                  optionalController.signal,
-                )
-              ) {
+              const compact = await this.#appendCompact(
+                identity,
+                session,
+                head,
+                lease,
+                optionalController.signal,
+              );
+              if (compact.uploaded) {
                 optionalResult.sessionsUploaded += 1;
               }
               if (head.state !== session.state && head.state !== "orphaned" && head.state !== "terminal") {
                 if (session.state === "terminal") {
-                  terminalUpdates.push({ head, lease, session });
+                  if (compact.complete) terminalUpdates.push({ head, lease, session });
                 } else {
                   abortBeforeEffect(optionalController.signal);
                   await this.#mutation("sessions:updateState", {
@@ -1830,6 +1856,82 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return hasUnsettledCompactProjectionRecoveryForProfile(observed.state, profileId);
   }
 
+  async supersedeCompactProjectionRecoveryForProviderDeletion(
+    sessionPublicId: string,
+  ): Promise<{ superseded: boolean }> {
+    if (!isOpaqueIdentifier(sessionPublicId)) {
+      throw new Error("Cloud projection recovery session authority is invalid.");
+    }
+    this.#projectionRecoverySupersededSessions.add(sessionPublicId);
+    const committed = await this.#mutateJournal((state) =>
+      supersedeCloudProjectionRecoveryForProviderDeletion(
+        state,
+        sessionPublicId,
+        this.#now(),
+      ));
+    const receipts = committed.state.projectionRecoveryReceipts.filter((receipt) =>
+      receipt.sessionPublicId === sessionPublicId
+      && receipt.phase === "rejected"
+      && receipt.rejectionCode === providerDeletionProjectionRecoveryCode);
+    if (this.#local.discardCompactProjectionRecovery !== undefined) {
+      for (const receipt of receipts) {
+        await this.#local.discardCompactProjectionRecovery({
+          idempotencyKey: receipt.idempotencyKey,
+          sessionPublicId,
+        });
+      }
+    }
+    await this.#assertDaemonCurrent();
+    return { superseded: receipts.length > 0 };
+  }
+
+  async supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    if (this.#local.isSessionTerminal === undefined) return { superseded: 0 };
+    const observed = await this.#journal.read();
+    await this.#assertDaemonCurrent();
+    const candidates = new Set([
+      ...observed.state.projectionRecoveries.map((entry) => entry.sessionPublicId),
+      ...observed.state.projectionRecoveryReceipts.flatMap((receipt) =>
+        receipt.phase === "rejected"
+          && receipt.rejectionCode === providerDeletionProjectionRecoveryCode
+          ? [receipt.sessionPublicId]
+          : []),
+    ]);
+    const terminal: string[] = [];
+    for (const sessionPublicId of [...candidates].sort((left, right) =>
+      left.localeCompare(right))) {
+      if (await this.#local.isSessionTerminal(sessionPublicId)) {
+        this.#projectionRecoverySupersededSessions.add(sessionPublicId);
+        terminal.push(sessionPublicId);
+      }
+    }
+    if (terminal.length === 0) return { superseded: 0 };
+    const committed = await this.#mutateJournal((state) => terminal.reduce(
+      (next, sessionPublicId) => supersedeCloudProjectionRecoveryForProviderDeletion(
+        next,
+        sessionPublicId,
+        this.#now(),
+      ),
+      state,
+    ));
+    if (this.#local.discardCompactProjectionRecovery !== undefined) {
+      for (const receipt of committed.state.projectionRecoveryReceipts) {
+        if (
+          terminal.includes(receipt.sessionPublicId)
+          && receipt.phase === "rejected"
+          && receipt.rejectionCode === providerDeletionProjectionRecoveryCode
+        ) {
+          await this.#local.discardCompactProjectionRecovery({
+            idempotencyKey: receipt.idempotencyKey,
+            sessionPublicId: receipt.sessionPublicId,
+          });
+        }
+      }
+    }
+    await this.#assertDaemonCurrent();
+    return { superseded: terminal.length };
+  }
+
   async recoverCompactProjection(input: Readonly<{
     acknowledgeGap: boolean;
     idempotencyKey: string;
@@ -1842,7 +1944,18 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       || !isOpaqueIdentifier(input.sessionPublicId)
     ) throw new Error("Cloud projection recovery input is invalid.");
     if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
-    return await this.#exclusive(async () => {
+    try {
+      return await this.#exclusive(async () => {
+        if (await this.#projectionRecoveryIsSuperseded(input.sessionPublicId)) {
+          await this.supersedeCompactProjectionRecoveryForProviderDeletion(
+            input.sessionPublicId,
+          );
+          await this.#discardSupersededProjectionRecovery(
+            input.sessionPublicId,
+            input.idempotencyKey,
+          );
+          return this.#providerDeletionRecoveryResult(input);
+        }
       await this.#assertDaemonCurrent(input.signal);
       await this.#quiesceOptionalSync(input.signal);
       await this.#assertDaemonCurrent(input.signal);
@@ -1924,12 +2037,30 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       ) {
         throw new Error("Cloud projection recovery is unavailable in this daemon.");
       }
+      const recoverable = (await this.#pullHeads(identity, [head], input.signal))[0];
+      await this.#assertDaemonCurrent(input.signal);
+      if (recoverable === undefined || recoverable.publicId !== input.sessionPublicId) {
+        throw new Error("Cloud projection recovery baseline is unavailable.");
+      }
+      const observedInteractionIds = [...new Set(recoverable.events.flatMap((event) =>
+        event.kind === "interaction_state" ? [event.interactionId] : []))]
+        .sort((left, right) => left.localeCompare(right));
+      if (observedInteractionIds.length > maximumProjectionRecoveryBaselineInteractions) {
+        throw new Error("Cloud projection recovery interaction baseline is too large.");
+      }
       const plan = await this.#local.planCompactProjectionRecovery({
         idempotencyKey: input.idempotencyKey,
+        observedInteractionIds,
         sessionPublicId: input.sessionPublicId,
         signal: input.signal,
       });
       await this.#assertDaemonCurrent(input.signal);
+      if (
+        !isRuntimeArray(plan.baselineInteractions)
+        || plan.baselineInteractions.length !== observedInteractionIds.length
+        || plan.baselineInteractions.some((interaction, index) =>
+          interaction.interactionId !== observedInteractionIds[index])
+      ) throw new Error("Cloud projection recovery interaction baseline is incomplete.");
       const refreshedValue = await this.#transport.query("sessions:getHead", {
         publicId: input.sessionPublicId,
       });
@@ -1957,6 +2088,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         JSON.stringify({
           authority,
           baselineCompletedTurns: plan.baselineCompletedTurns,
+          baselineInteractions: plan.baselineInteractions,
           epochPublicId,
           expectedCompactStreamEpoch: head.compactStreamEpoch,
           expectedHeadSequence: head.compactHeadSequence,
@@ -1989,6 +2121,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       const prepared = parseCloudProjectionRecoveryEntry({
         ...request,
         baselineCompletedTurns: plan.baselineCompletedTurns,
+        baselineInteractions: plan.baselineInteractions,
         localAuthority: plan.localAuthority,
         phase: "prepared",
         replacementCacheId: plan.replacementCacheId,
@@ -2009,8 +2142,19 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       await this.#assertDaemonCurrent(input.signal);
       await this.#addProjectionRecovery(prepared);
       await this.#assertDaemonCurrent(input.signal);
-      return await this.#resumeCompactProjectionRecovery(identity, prepared, input.signal);
-    });
+        return await this.#resumeCompactProjectionRecovery(identity, prepared, input.signal);
+      });
+    } catch (error: unknown) {
+      if (!await this.#projectionRecoveryIsSuperseded(input.sessionPublicId)) throw error;
+      await this.supersedeCompactProjectionRecoveryForProviderDeletion(
+        input.sessionPublicId,
+      );
+      await this.#discardSupersededProjectionRecovery(
+        input.sessionPublicId,
+        input.idempotencyKey,
+      );
+      return this.#providerDeletionRecoveryResult(input);
+    }
   }
 
   async pullRemoteSessions(signal: AbortSignal): Promise<readonly RemoteCloudSession[]> {
@@ -2049,6 +2193,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     compactStreamEpoch: number,
   ): Readonly<{
     baselineCompletedTurns: readonly Readonly<{ bodyDigest: string; turnId: string }>[];
+    baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[];
     boundaryHeadSequence: number;
     boundaryTailDigest: string;
     compactStreamEpoch: number;
@@ -2060,6 +2205,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   }> {
     return {
       baselineCompletedTurns: entry.baselineCompletedTurns,
+      baselineInteractions: entry.baselineInteractions ?? [],
       boundaryHeadSequence: entry.expectedHeadSequence,
       boundaryTailDigest: entry.expectedTailDigest,
       compactStreamEpoch,
@@ -2071,12 +2217,46 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     };
   }
 
+  async #projectionRecoveryIsSuperseded(sessionPublicId: string): Promise<boolean> {
+    if (this.#projectionRecoverySupersededSessions.has(sessionPublicId)) return true;
+    if (this.#local.isSessionTerminal === undefined) return false;
+    const terminal = await this.#local.isSessionTerminal(sessionPublicId);
+    if (terminal) this.#projectionRecoverySupersededSessions.add(sessionPublicId);
+    return terminal;
+  }
+
+  #providerDeletionRecoveryResult(input: Readonly<{
+    idempotencyKey: string;
+    sessionPublicId: string;
+  }>): CompactProjectionRecoveryResult {
+    return {
+      idempotencyKey: input.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: providerDeletionProjectionRecoveryCode,
+      sessionPublicId: input.sessionPublicId,
+    };
+  }
+
+  async #discardSupersededProjectionRecovery(
+    sessionPublicId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    if (this.#local.discardCompactProjectionRecovery === undefined) return;
+    await this.#local.discardCompactProjectionRecovery({
+      idempotencyKey,
+      sessionPublicId,
+    });
+  }
+
   async #resumeCompactProjectionRecovery(
     identity: ActiveCloudIdentity,
     original: CloudProjectionRecoveryJournalEntry,
     signal: AbortSignal,
   ): Promise<CompactProjectionRecoveryResult> {
     let entry = original;
+    if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+      return await this.#finishProviderDeletionProjectionRecovery(entry);
+    }
     if (entry.phase === "prepared" || entry.phase === "effect_started") {
       if (this.#local.stageCompactProjectionRecovery === undefined) {
         throw new Error("Cloud projection recovery is unavailable in this daemon.");
@@ -2100,6 +2280,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       entry = effectStarted;
     }
     if (entry.phase === "effect_started") {
+      if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+        return await this.#finishProviderDeletionProjectionRecovery(entry);
+      }
       abortBeforeEffect(signal);
       let response: CloudProjectionRecoveryAppliedResponse;
       try {
@@ -2117,6 +2300,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
           }),
         );
       } catch (error: unknown) {
+        if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+          return await this.#finishProviderDeletionProjectionRecovery(entry);
+        }
         await this.#assertDaemonCurrent(signal);
         const rejectionCode = projectionRecoveryRejectionCode(error);
         if (rejectionCode === null) throw error;
@@ -2127,6 +2313,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         await this.#replaceProjectionRecovery(entry, rejected);
         await this.#assertDaemonCurrent(signal);
         return cloudProjectionRecoveryReceiptResult(rejected);
+      }
+      if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+        return await this.#finishProviderDeletionProjectionRecovery(entry);
       }
       await this.#assertDaemonCurrent(signal);
       const applied = parseCloudProjectionRecoveryEntry({
@@ -2148,11 +2337,17 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     if (this.#local.activateCompactProjectionRecovery === undefined) {
       throw new Error("Cloud projection recovery is unavailable in this daemon.");
     }
+    if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+      return await this.#finishProviderDeletionProjectionRecovery(entry);
+    }
     await this.#assertProjectionRecoveryActivationAuthority(identity, entry, signal);
     await this.#local.activateCompactProjectionRecovery({
       ...this.#projectionRecoveryInstallation(entry, entry.response.compactStreamEpoch),
       signal,
     });
+    if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
+      return await this.#finishProviderDeletionProjectionRecovery(entry);
+    }
     await this.#assertDaemonCurrent(signal);
     await this.#assertProjectionRecoveryActivationAuthority(identity, entry, signal);
     const activated = createCloudProjectionRecoveryTerminalReceipt(entry, {
@@ -2161,6 +2356,19 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     await this.#replaceProjectionRecovery(entry, activated);
     await this.#assertDaemonCurrent(signal);
     return cloudProjectionRecoveryReceiptResult(activated);
+  }
+
+  async #finishProviderDeletionProjectionRecovery(
+    entry: CloudProjectionRecoveryJournalEntry,
+  ): Promise<CompactProjectionRecoveryResult> {
+    await this.supersedeCompactProjectionRecoveryForProviderDeletion(
+      entry.sessionPublicId,
+    );
+    await this.#discardSupersededProjectionRecovery(
+      entry.sessionPublicId,
+      entry.idempotencyKey,
+    );
+    return this.#providerDeletionRecoveryResult(entry);
   }
 
   async #assertProjectionRecoveryActivationAuthority(
@@ -2284,7 +2492,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     head: CloudSessionHead,
     lease: CloudLease,
     signal: AbortSignal,
-  ): Promise<boolean> {
+  ): Promise<Readonly<{ complete: boolean; uploaded: boolean }>> {
     const local = await this.#local.readCompactEvents({
       afterSequence: head.compactHeadSequence,
       limit: maximumEventsPerChunk,
@@ -2303,7 +2511,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     ) {
       throw new Error("Local compact projection response is invalid.");
     }
-    if (local.events.length === 0) return false;
+    if (local.events.length === 0) {
+      return { complete: local.complete, uploaded: false };
+    }
     const parsed = parseCompactSessionEvents(local.events);
     if (
       parsed === null
@@ -2376,7 +2586,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     ) throw new Error("Cloud session append receipt is invalid.");
     abortBeforeEffect(signal);
     await this.#local.acknowledgeCompactUpload?.(checkpoint);
-    return true;
+    return { complete: local.complete, uploaded: true };
   }
 
   async #ensureLease(
@@ -2435,12 +2645,18 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   async #completePendingUsageAccount(
     pending: PendingCloudUsageAccount,
     sourceGeneration: number = pending.sourceGeneration,
+    sourceRevision: number = pending.sourceRevision,
   ): Promise<Readonly<{ generation: number | null; state: CloudDaemonJournalState }>> {
     return await this.#mutateJournal((state) => {
       if (!samePendingUsageAccount(state.pendingUsageAccount, pending)) {
         throw new Error("Cloud usage account outbox changed concurrently.");
       }
-      return completePendingCloudUsageAccount(state, pending, sourceGeneration);
+      return completePendingCloudUsageAccount(
+        state,
+        pending,
+        sourceGeneration,
+        sourceRevision,
+      );
     });
   }
 
@@ -2465,15 +2681,26 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         && JSON.stringify(binding.encryptedLocalReference)
           === JSON.stringify(pending.encryptedLocalReference)
       ) {
-        return await this.#completePendingUsageAccount(pending);
+        if (binding.usageSourceRevision < pending.sourceRevision) {
+          throw new Error("Cloud usage account recovery regressed its snapshot cursor.");
+        }
+        return await this.#completePendingUsageAccount(
+          pending,
+          binding.sourceGeneration,
+          binding.usageSourceRevision,
+        );
       }
       if (binding !== null && binding.sourceGeneration > pending.sourceGeneration) {
         // A strictly newer binding from this exact device makes the old intent
         // obsolete. Preserve the remote generation in the cursor while
         // clearing only the exact aged outbox value.
+        if (binding.usageSourceRevision < pending.sourceRevision) {
+          throw new Error("Cloud usage account recovery regressed its snapshot cursor.");
+        }
         return await this.#completePendingUsageAccount(
           pending,
           binding.sourceGeneration,
+          binding.usageSourceRevision,
         );
       }
       if (binding !== null) {
@@ -2580,7 +2807,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
               const recovered = {
                 accountPublicId,
                 sourceGeneration: remote.binding.sourceGeneration,
-                sourceRevision: 0,
+                sourceRevision: remote.binding.usageSourceRevision,
               } as const;
               journal = await this.#mutateJournal((state) => {
                 const current = state.usageAccounts.find((entry) =>
@@ -2754,6 +2981,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             digest,
             envelope,
             observedAt: snapshot.observedAt,
+            sourceGeneration: snapshot.sourceGeneration,
             sourceRevision: snapshot.sourceRevision,
           });
           parseUsageSnapshotReceipt(receipt, snapshot.sourceRevision);

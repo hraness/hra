@@ -41,10 +41,14 @@ jobs:
           if (process.env.GITHUB_REF_NAME !== expected)
           throw new Error(`tag ${process.env.GITHUB_REF_NAME ?? "<missing>"} does not match ${expected}`);'
 
-      - name: Verify release ancestry and ordering
+      - name: Verify exact release head and ordering
         run: |
           git fetch --force origin main --tags
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          tagged_commit="$(git rev-parse "$GITHUB_REF_NAME^{commit}")"
+          checked_out_commit="$(git rev-parse 'HEAD^{commit}')"
+          main_commit="$(git rev-parse 'origin/main^{commit}')"
+          test "$tagged_commit" = "$checked_out_commit"
+          test "$tagged_commit" = "$main_commit"
           newest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           test "$newest" = "$GITHUB_REF_NAME"
 

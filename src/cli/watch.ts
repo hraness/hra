@@ -16,12 +16,32 @@ export type SessionEventFollowResult = Readonly<{
   pages: number;
 }>;
 
-export const writeSessionEventPageJsonl = (
+type SessionEventJsonlOutput = Pick<Output, "writeStdout" | "writeStdoutAsync">;
+
+const nonAbortedSignal = new AbortController().signal;
+
+const writeJsonlLine = async (
+  output: SessionEventJsonlOutput,
+  value: string,
+  signal: AbortSignal,
+): Promise<void> => {
+  if (signal.aborted) {
+    throw signal.reason ?? new DOMException("Session event output was aborted.", "AbortError");
+  }
+  if (output.writeStdoutAsync !== undefined) {
+    await output.writeStdoutAsync(value, signal);
+    return;
+  }
+  output.writeStdout(value);
+};
+
+export const writeSessionEventPageJsonl = async (
   page: SessionEventPage,
-  output: Pick<Output, "writeStdout">,
-): void => {
+  output: SessionEventJsonlOutput,
+  signal: AbortSignal = nonAbortedSignal,
+): Promise<void> => {
   if (page.gap !== null) {
-    output.writeStdout(`${safeJson({
+    await writeJsonlLine(output, `${safeJson({
       version: 1,
       kind: "gap",
       sessionId: page.sessionId,
@@ -29,17 +49,17 @@ export const writeSessionEventPageJsonl = (
       retentionFloorCursor: page.retentionFloorCursor,
       observedThroughCursor: page.observedThroughCursor,
       gap: page.gap,
-    })}\n`);
+    })}\n`, signal);
   }
   for (const event of page.events) {
-    output.writeStdout(`${safeJson({
+    await writeJsonlLine(output, `${safeJson({
       version: 1,
       kind: "event",
       sessionId: page.sessionId,
       event,
-    })}\n`);
+    })}\n`, signal);
   }
-  output.writeStdout(`${safeJson({
+  await writeJsonlLine(output, `${safeJson({
     version: 1,
     kind: "checkpoint",
     sessionId: page.sessionId,
@@ -47,14 +67,14 @@ export const writeSessionEventPageJsonl = (
     retentionFloorCursor: page.retentionFloorCursor,
     observedThroughCursor: page.observedThroughCursor,
     eventCount: page.events.length,
-  })}\n`);
+  })}\n`, signal);
 };
 
 export const followSessionEvents = async (input: Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
   fetchPage: SessionEventPageFetcher;
   maxPages?: number;
-  output: Pick<Output, "writeStdout">;
+  output: SessionEventJsonlOutput;
   retryFetchError?: (
     error: unknown,
     consecutiveFailures: number,
@@ -117,7 +137,7 @@ export const followSessionEvents = async (input: Readonly<{
       }
       lastEvent = { sequence: event.sequence, streamEpoch: event.streamEpoch };
     }
-    writeSessionEventPageJsonl(page, input.output);
+    await writeSessionEventPageJsonl(page, input.output, input.signal);
     pages += 1;
     events += page.events.length;
     const didAdvance = page.nextCursor !== cursor;

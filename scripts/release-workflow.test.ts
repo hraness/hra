@@ -46,8 +46,12 @@ describe("release workflow", () => {
     }
     const verifySteps = verify.steps.map((step, index) => asRecord(step, `verify step ${index}`));
     const checkout = verifySteps.find((step) => step.name === "Check out the tagged source");
+    const exactHead = verifySteps.find((step) => step.name === "Verify exact release head and ordering");
     const generated = verifySteps.find((step) => step.name === "Verify generated public documents");
     expect(asRecord(checkout, "release checkout step").with).toEqual({ "fetch-depth": 0 });
+    expect(exactHead?.run).toContain("tagged_commit=\"$(git rev-parse \"$GITHUB_REF_NAME^{commit}\")\"");
+    expect(exactHead?.run).toContain("test \"$tagged_commit\" = \"$main_commit\"");
+    expect(exactHead?.run).not.toContain("merge-base --is-ancestor");
     expect(asRecord(generated, "release generated-documents step").run)
       .toBe("bun run build:site -- --check");
   });

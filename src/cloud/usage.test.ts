@@ -1,6 +1,42 @@
 import { describe, expect, test } from "bun:test";
 
-import { parseUsageProjection, usageSnapshotDisposition } from "./usage";
+import {
+  parseUsageEncryptedEnvelope,
+  parseUsageProjection,
+  USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS,
+  USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES,
+  USAGE_CLOUD_PROJECTION_MAX_DAILY_ROWS,
+  USAGE_CLOUD_PROJECTION_MAX_LIMITS,
+  usageSnapshotDisposition,
+} from "./usage";
+
+function maximumUsageProjection() {
+  const window = {
+    resetsAt: Number.MAX_VALUE,
+    usedPercent: 2.2250738585072014e-308,
+    windowDurationMinutes: 365 * 24 * 60,
+  } as const;
+  return {
+    data: {
+      currentStreakDays: Number.MAX_SAFE_INTEGER,
+      daily: [{ startDate: "9999-99-99", tokens: Number.MAX_SAFE_INTEGER }],
+      lifetimeTokens: Number.MAX_SAFE_INTEGER,
+      limits: Array.from({ length: USAGE_CLOUD_PROJECTION_MAX_LIMITS }, (_, index) => ({
+        id: `${index}${"x".repeat(95)}`,
+        individual: false,
+        name: "\0".repeat(96),
+        primary: window,
+        reached: false,
+        secondary: window,
+        unlimited: false,
+      })),
+      longestRunningTurnSeconds: Number.MAX_SAFE_INTEGER,
+      longestStreakDays: Number.MAX_SAFE_INTEGER,
+      peakDailyTokens: Number.MAX_SAFE_INTEGER,
+    },
+    state: "ready",
+  } as const;
+}
 
 const ready = {
   data: {
@@ -24,12 +60,30 @@ const ready = {
 } as const;
 
 describe("usage projection laws", () => {
+  test("has an exact maximum plaintext boundary", () => {
+    const maximum = maximumUsageProjection();
+    expect(new TextEncoder().encode(JSON.stringify(maximum)).byteLength)
+      .toBe(USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES);
+    expect(parseUsageProjection(maximum)).toEqual(maximum);
+    const envelope = {
+      algorithm: "A256GCM" as const,
+      ciphertext: "A".repeat(USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS),
+      keyVersion: 1,
+      nonce: "A".repeat(16),
+    };
+    expect(parseUsageEncryptedEnvelope(envelope)).toEqual(envelope);
+    expect(parseUsageEncryptedEnvelope({
+      ...envelope,
+      ciphertext: `${envelope.ciphertext}A`,
+    })).toBeNull();
+  });
+
   test("keeps unavailable distinct from a ready zero", () => {
     expect(parseUsageProjection({ state: "unavailable" })).toEqual({ state: "unavailable" });
     expect(parseUsageProjection(ready)).toEqual(ready);
   });
 
-  test("rejects duplicate limit IDs, duplicate days, and oversized history", () => {
+  test("rejects duplicate IDs and projections wider than the daily hosted contract", () => {
     expect(parseUsageProjection({
       ...ready,
       data: { ...ready.data, limits: [ready.data.limits[0], ready.data.limits[0]] },
@@ -42,9 +96,19 @@ describe("usage projection laws", () => {
       ...ready,
       data: {
         ...ready.data,
-        daily: Array.from({ length: 367 }, (_, index) => ({
+        daily: Array.from({ length: USAGE_CLOUD_PROJECTION_MAX_DAILY_ROWS + 1 }, (_, index) => ({
           startDate: `2025-01-${String((index % 28) + 1).padStart(2, "0")}`,
           tokens: index,
+        })),
+      },
+    })).toBeNull();
+    expect(parseUsageProjection({
+      ...ready,
+      data: {
+        ...ready.data,
+        limits: Array.from({ length: USAGE_CLOUD_PROJECTION_MAX_LIMITS + 1 }, (_, index) => ({
+          ...ready.data.limits[0],
+          id: `limit_${index}`,
         })),
       },
     })).toBeNull();

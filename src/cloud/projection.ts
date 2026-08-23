@@ -19,9 +19,38 @@ export type GitAction = Readonly<{
   label?: string;
 }>;
 
+export type CompactInteractionKind =
+  | "command_approval"
+  | "file_change_approval"
+  | "permission_approval"
+  | "user_input"
+  | "mcp_elicitation";
+
+export type CompactInteractionState =
+  | "pending"
+  | "response_prepared"
+  | "response_written"
+  | "resolved"
+  | "declined"
+  | "canceled"
+  | "expired"
+  | "resolution_unknown";
+
+export type CompactInteractionEvent = Readonly<{
+  blocking: boolean;
+  interactionId: string;
+  interactionKind: CompactInteractionKind;
+  kind: "interaction_state";
+  revision: number;
+  sequence: number;
+  state: CompactInteractionState;
+  summary: string;
+}>;
+
 export type CompactSessionEvent =
   | Readonly<{ kind: "user_message"; sequence: number; text: string; turnId: string }>
   | Readonly<{ kind: "assistant_message"; sequence: number; text: string; turnId: string }>
+  | CompactInteractionEvent
   | Readonly<{
       fast?: boolean;
       filesTouched: readonly string[];
@@ -47,6 +76,25 @@ export type SessionChunkAuthority = Readonly<{
 }>;
 
 const commitPattern = /^[0-9a-f]{7,64}$/u;
+const interactionIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const compactInteractionKinds = new Set<CompactInteractionKind>([
+  "command_approval",
+  "file_change_approval",
+  "permission_approval",
+  "user_input",
+  "mcp_elicitation",
+]);
+const compactInteractionStates = new Set<CompactInteractionState>([
+  "pending",
+  "response_prepared",
+  "response_written",
+  "resolved",
+  "declined",
+  "canceled",
+  "expired",
+  "resolution_unknown",
+]);
 const forbiddenDetailKeyPattern =
   /^(?:approval_secret|credential|env|environment|provider_token|raw_reasoning|tool_arguments|tool_output)$/iu;
 const forbiddenSecretValuePattern =
@@ -120,6 +168,44 @@ export function parseCompactSessionEvent(value: unknown): CompactSessionEvent | 
       sequence: value.sequence,
       text: value.text,
       turnId: value.turnId,
+    };
+  }
+  if (
+    value.kind === "interaction_state"
+    && hasExactKeys(value, [
+      "blocking",
+      "interactionId",
+      "interactionKind",
+      "kind",
+      "revision",
+      "sequence",
+      "state",
+      "summary",
+    ])
+    && typeof value.blocking === "boolean"
+    && typeof value.interactionId === "string"
+    && interactionIdPattern.test(value.interactionId)
+    && typeof value.interactionKind === "string"
+    && compactInteractionKinds.has(value.interactionKind as CompactInteractionKind)
+    && isSafePositiveInteger(value.revision)
+    && isSafePositiveInteger(value.sequence)
+    && typeof value.state === "string"
+    && compactInteractionStates.has(value.state as CompactInteractionState)
+    && typeof value.summary === "string"
+    && value.summary.length <= 512
+    && !containsAbsolutePath(value.summary)
+    && !containsUnsafeTerminalScalar(value.summary, true)
+    && !forbiddenSecretValuePattern.test(value.summary)
+  ) {
+    return {
+      blocking: value.blocking,
+      interactionId: value.interactionId,
+      interactionKind: value.interactionKind as CompactInteractionKind,
+      kind: value.kind,
+      revision: value.revision,
+      sequence: value.sequence,
+      state: value.state as CompactInteractionState,
+      summary: value.summary,
     };
   }
   if (

@@ -1,4 +1,4 @@
-import { v } from "convex/values";
+import { v, type GenericId as Id } from "convex/values";
 
 import {
   cloudLimits,
@@ -10,6 +10,7 @@ import {
 } from "../src/cloud/contracts";
 import {
   usageSnapshotDisposition,
+  parseUsageEncryptedEnvelope,
   type UsageSnapshotOrder,
 } from "../src/cloud/usage";
 import {
@@ -23,17 +24,49 @@ import {
 import {
   adjustQuotaForPatch,
   initializeAccountUsageQuotaAuthority,
+  releaseAccountUsageSnapshotQuotaForDelete,
   reserveAccountUsageSnapshotQuotaForInsert,
   reserveCodexAccountQuotaForInsert,
   reserveQuotaForInsert,
 } from "./quota";
-import { mutation, query } from "./server";
-import { encryptedEnvelope } from "./validators";
+import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
+import { mutation, query, type MutationCtx } from "./server";
+import { encryptedEnvelope, usageEncryptedEnvelope } from "./validators";
 
 type AccountSummary = Readonly<{
   publicId: string;
   sourceGeneration: number;
 }>;
+
+export const USAGE_ADMISSION_EXPIRY_RELEASE_LIMIT = 20;
+export const USAGE_SERVER_ADMISSION_MIN_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+
+async function releaseExpiredAccountUsage(
+  ctx: MutationCtx,
+  input: Readonly<{
+    accountId: Id<"codexAccounts">;
+    now: number;
+    userId: Id<"users">;
+  }>,
+): Promise<void> {
+  const expired = await ctx.db.query("accountUsageSnapshots")
+    .withIndex("by_account_and_received_at", (builder) => builder
+      .eq("accountId", input.accountId)
+      .lt("receivedAt", input.now - CLOUD_USAGE_SNAPSHOT_RETENTION_MS))
+    .take(USAGE_ADMISSION_EXPIRY_RELEASE_LIMIT);
+  for (const snapshot of expired) {
+    if (snapshot.userId !== input.userId || snapshot.accountId !== input.accountId) {
+      rejectAuthority();
+    }
+    await releaseAccountUsageSnapshotQuotaForDelete(
+      ctx,
+      input.userId,
+      input.accountId,
+      snapshot,
+    );
+    await ctx.db.delete(snapshot._id);
+  }
+}
 
 function parseAccountSummary(value: unknown): AccountSummary | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
@@ -194,6 +227,21 @@ export const getAccountBinding = query({
       .take(2);
     if (bindings.length > 1) rejectAuthority();
     const binding = bindings[0];
+    const legacyUsageHead = binding === undefined || binding.usageAdmission !== undefined
+      ? null
+      : (await ctx.db.query("accountUsageSnapshots")
+          .withIndex("by_source_revision", (builder) => builder
+            .eq("accountId", account._id)
+            .eq("sourceDeviceId", authority.deviceId))
+          .order("desc")
+          .take(1))[0] ?? null;
+    if (
+      legacyUsageHead !== null
+      && (
+        legacyUsageHead.userId !== authority.userId
+        || legacyUsageHead.sourceDevicePublicId !== authority.device.publicId
+      )
+    ) rejectAuthority();
     return {
       ...(binding === undefined
         ? { binding: null }
@@ -202,6 +250,9 @@ export const getAccountBinding = query({
               encryptedLocalReference: binding.encryptedLocalReference,
               sourceGeneration: binding.sourceGeneration,
               state: binding.state,
+              usageSourceRevision: binding.usageAdmission?.cursor.sourceRevision
+                ?? legacyUsageHead?.sourceRevision
+                ?? 0,
             },
           }),
       encryptedMetadata: account.encryptedMetadata,
@@ -249,8 +300,9 @@ export const upsertSnapshot = mutation({
   args: {
     accountPublicId: v.string(),
     digest: v.string(),
-    envelope: encryptedEnvelope,
+    envelope: usageEncryptedEnvelope,
     observedAt: v.number(),
+    sourceGeneration: v.number(),
     sourceRevision: v.number(),
   },
   handler: async (ctx, args) => {
@@ -260,8 +312,9 @@ export const upsertSnapshot = mutation({
       !isOpaqueIdentifier(args.accountPublicId)
       || !isDigest(args.digest)
       || !isFiniteTimestamp(args.observedAt)
+      || !isSafePositiveInteger(args.sourceGeneration)
       || !isSafePositiveInteger(args.sourceRevision)
-      || parseEncryptedEnvelope(args.envelope) === null
+      || parseUsageEncryptedEnvelope(args.envelope) === null
     ) rejectAuthority();
     const accounts = await ctx.db
       .query("codexAccounts")
@@ -271,6 +324,20 @@ export const upsertSnapshot = mutation({
       .take(2);
     const account = accounts[0];
     if (accounts.length !== 1 || account === undefined) rejectAuthority();
+    const bindings = await ctx.db
+      .query("deviceAccountBindings")
+      .withIndex("by_device_and_account", (builder) => builder
+        .eq("deviceId", authority.deviceId)
+        .eq("accountId", account._id))
+      .take(2);
+    const binding = bindings[0];
+    if (
+      bindings.length !== 1
+      || binding === undefined
+      || binding.userId !== authority.userId
+      || binding.state !== "present"
+      || binding.sourceGeneration !== args.sourceGeneration
+    ) rejectAuthority();
     const exact = await ctx.db
       .query("accountUsageSnapshots")
       .withIndex("by_source_revision", (builder) => builder
@@ -286,12 +353,6 @@ export const upsertSnapshot = mutation({
         .eq("sourceDeviceId", authority.deviceId))
       .order("desc")
       .take(1);
-    const current = await ctx.db
-      .query("accountUsageSnapshots")
-      .withIndex("by_account_and_winner", (builder) =>
-        builder.eq("accountId", account._id))
-      .order("desc")
-      .take(1);
     const candidate = snapshotOrder({
       digest: args.digest,
       observedAt: args.observedAt,
@@ -299,18 +360,116 @@ export const upsertSnapshot = mutation({
       sourceRevision: args.sourceRevision,
     });
     const existingExact = exact[0];
-    const currentSnapshot = current[0];
     if (
-      (currentSnapshot !== undefined
-        && (
-          currentSnapshot.userId !== authority.userId
-          || !isOpaqueIdentifier(currentSnapshot.sourceDevicePublicId)
-        ))
-      || (existingExact !== undefined
+      existingExact !== undefined
         && (
           existingExact.userId !== authority.userId
           || existingExact.sourceDevicePublicId !== authority.device.publicId
-        ))
+        )
+    ) rejectAuthority();
+    if (existingExact !== undefined) {
+      if (
+        existingExact.digest === args.digest
+        && existingExact.observedAt === args.observedAt
+      ) return { disposition: "replay" as const, sourceRevision: args.sourceRevision };
+      throw new Error("USAGE_SNAPSHOT_CONFLICT");
+    }
+    const latest = latestForSource[0];
+    if (
+      latest !== undefined
+      && (
+        latest.userId !== authority.userId
+        || latest.sourceDevicePublicId !== authority.device.publicId
+      )
+    ) rejectAuthority();
+    const storedFallback = latest === undefined
+      ? null
+      : {
+          cursor: {
+            digest: latest.digest,
+            disposition: "stored" as const,
+            observedAt: latest.observedAt,
+            sourceRevision: latest.sourceRevision,
+          },
+          lastAcceptedAt: latest.receivedAt,
+        };
+    const usageAdmission = binding.usageAdmission ?? storedFallback;
+    if (
+      usageAdmission !== null
+      && (
+        !isFiniteTimestamp(usageAdmission.lastAcceptedAt)
+        || !isDigest(usageAdmission.cursor.digest)
+        || !isFiniteTimestamp(usageAdmission.cursor.observedAt)
+        || !isSafePositiveInteger(usageAdmission.cursor.sourceRevision)
+        || (
+          latest !== undefined
+          && latest.sourceRevision > usageAdmission.cursor.sourceRevision
+        )
+      )
+    ) rejectAuthority();
+    if (
+      usageAdmission !== null
+      && args.sourceRevision === usageAdmission.cursor.sourceRevision
+    ) {
+      if (
+        args.digest !== usageAdmission.cursor.digest
+        || args.observedAt !== usageAdmission.cursor.observedAt
+      ) throw new Error("USAGE_SNAPSHOT_CONFLICT");
+      return {
+        disposition: usageAdmission.cursor.disposition === "coalesced"
+          ? "coalesced" as const
+          : "replay" as const,
+        sourceRevision: args.sourceRevision,
+      };
+    }
+    if (
+      (usageAdmission !== null
+        && args.sourceRevision < usageAdmission.cursor.sourceRevision)
+      || (latest !== undefined && args.sourceRevision <= latest.sourceRevision)
+    ) {
+      throw new Error("USAGE_SNAPSHOT_STALE");
+    }
+    if (args.observedAt > now + 5 * 60 * 1_000) {
+      throw new Error("USAGE_SNAPSHOT_FUTURE");
+    }
+    if (
+      usageAdmission !== null
+      && now - usageAdmission.lastAcceptedAt < USAGE_SERVER_ADMISSION_MIN_INTERVAL_MS
+    ) {
+      const bindingPatch = {
+        updatedAt: now,
+        usageAdmission: {
+          cursor: {
+            digest: args.digest,
+            disposition: "coalesced" as const,
+            observedAt: args.observedAt,
+            sourceRevision: args.sourceRevision,
+          },
+          lastAcceptedAt: usageAdmission.lastAcceptedAt,
+        },
+      } as const;
+      await adjustQuotaForPatch(ctx, authority.userId, "account", binding, bindingPatch);
+      await ctx.db.patch(binding._id, bindingPatch);
+      return { disposition: "coalesced" as const, sourceRevision: args.sourceRevision };
+    }
+    await releaseExpiredAccountUsage(ctx, {
+      accountId: account._id,
+      now,
+      userId: authority.userId,
+    });
+    const current = await ctx.db
+      .query("accountUsageSnapshots")
+      .withIndex("by_account_and_winner", (builder) =>
+        builder.eq("accountId", account._id))
+      .order("desc")
+      .take(1);
+    const currentSnapshot = current[0];
+    if (
+      currentSnapshot !== undefined
+      && (
+        currentSnapshot.userId !== authority.userId
+        || !isOpaqueIdentifier(currentSnapshot.sourceDevicePublicId)
+      )
     ) rejectAuthority();
     const disposition = usageSnapshotDisposition(
       currentSnapshot === undefined
@@ -321,24 +480,12 @@ export const upsertSnapshot = mutation({
           sourceDeviceId: currentSnapshot.sourceDevicePublicId,
           sourceRevision: currentSnapshot.sourceRevision,
         }),
-      existingExact === undefined
-        ? null
-        : snapshotOrder({
-          digest: existingExact.digest,
-          observedAt: existingExact.observedAt,
-          sourceDeviceId: existingExact.sourceDevicePublicId,
-          sourceRevision: existingExact.sourceRevision,
-        }),
+      null,
       candidate,
       now,
     );
-    if (disposition === "replay") return { disposition, sourceRevision: args.sourceRevision };
-    if (disposition === "conflict" || disposition === "future") {
+    if (disposition === "conflict" || disposition === "future" || disposition === "stale") {
       throw new Error(`USAGE_SNAPSHOT_${disposition.toUpperCase()}`);
-    }
-    const latest = latestForSource[0];
-    if (latest !== undefined && args.sourceRevision < latest.sourceRevision) {
-      throw new Error("USAGE_SNAPSHOT_STALE");
     }
     const snapshotDocument = {
       accountId: account._id,
@@ -359,6 +506,20 @@ export const upsertSnapshot = mutation({
       snapshotDocument,
     );
     await ctx.db.insert("accountUsageSnapshots", snapshotDocument);
+    const bindingPatch = {
+      updatedAt: now,
+      usageAdmission: {
+        cursor: {
+          digest: args.digest,
+          disposition: "stored" as const,
+          observedAt: args.observedAt,
+          sourceRevision: args.sourceRevision,
+        },
+        lastAcceptedAt: now,
+      },
+    } as const;
+    await adjustQuotaForPatch(ctx, authority.userId, "account", binding, bindingPatch);
+    await ctx.db.patch(binding._id, bindingPatch);
     return { disposition, sourceRevision: args.sourceRevision };
   },
 });

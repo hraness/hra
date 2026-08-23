@@ -26,6 +26,7 @@ export {
   boundedIdentifier,
   boundedPageLimit,
   boundedText,
+  validateMcpFormSubmission,
   resolvePreset,
   validateAuthority,
 } from "./protocol.ts";
@@ -58,6 +59,7 @@ export type {
   ExperimentalFeatureStage,
   FencedCodexValue,
   ManagedLoginResult,
+  ManagedLoginCancelResult,
   Page,
   PermissionProfile,
   PresetAlias,

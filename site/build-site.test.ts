@@ -43,6 +43,7 @@ describe("static-site build", () => {
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
       "dist/site/.well-known/security.txt",
+      "dist/site/.well-known/hra.json",
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/styles.css",
@@ -51,6 +52,51 @@ describe("static-site build", () => {
     for (const path of expectedPaths) {
       expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
     }
+
+    expect(JSON.parse(
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
+    )).toEqual({
+      generation: 1,
+      product: "HRA",
+      repository: {
+        id: 1_343_008_607,
+        path: "hraness/hra",
+      },
+      schemaVersion: 2,
+      source: {
+        commit: "local",
+      },
+      version: "0.1.0",
+    });
+  });
+
+  test("binds hosted identity to one exact source commit", async () => {
+    const root = await createFixtureRoot();
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    await buildSite({ check: false, releaseCommit: commit, repositoryRoot: root });
+    const identity = JSON.parse(
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
+    ) as { source?: { commit?: unknown } };
+
+    expect(identity.source?.commit).toBe(commit);
+    await expect(buildSite({
+      check: false,
+      releaseCommit: "not-a-commit",
+      repositoryRoot: root,
+    })).rejects.toThrow("Release commit");
+  });
+
+  test("keeps the deployment identity version aligned with the package", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const identity = JSON.parse(
+      await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
+    ) as { version?: unknown };
+    const packageJson = JSON.parse(
+      await readFile(join(import.meta.dir, "..", "package.json"), "utf8"),
+    ) as { version?: unknown };
+
+    expect(identity.version).toBe(packageJson.version);
   });
 
   test("passes check mode in a clean clone without ignored build output", async () => {

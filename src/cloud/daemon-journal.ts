@@ -13,15 +13,21 @@ import {
   type EncryptedEnvelope,
 } from "./contracts";
 import type { CloudSecretCustodyPort } from "./local-control";
+import {
+  parseCompactSessionEvent,
+  type CompactInteractionEvent,
+} from "./projection";
 
 const journalSlot = "cloud-daemon-journal";
 const maximumJournalCommands = 100;
 const maximumJournalProjectionRecoveries = 25;
 const maximumProjectionRecoveryBaselineTurns = 128;
+const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumSerializedJournalBytes = 65_536;
 const utf8Encoder = new TextEncoder();
 
 export const cloudProjectionRecoveryWindowMs = 7 * 24 * 60 * 60 * 1_000;
+export const providerDeletionProjectionRecoveryCode = "PROVIDER_THREAD_DELETED";
 
 function assertSerializedJournalBound(serialized: string): void {
   if (utf8Encoder.encode(serialized).byteLength > maximumSerializedJournalBytes) {
@@ -81,6 +87,10 @@ export type CloudProjectionRecoveryBaselineTurn = Readonly<{
   turnId: string;
 }>;
 
+export type CloudProjectionRecoveryBaselineInteraction = Readonly<
+  Omit<CompactInteractionEvent, "kind" | "sequence">
+>;
+
 export type CloudProjectionRecoveryAppliedResponse = Readonly<{
   boundaryHeadSequence: number;
   boundaryTailDigest: string;
@@ -104,6 +114,7 @@ export type CloudProjectionRecoveryIdentity =
 type CloudProjectionRecoveryBaseFields = Readonly<{
   authority: AuthorityTuple;
   baselineCompletedTurns: readonly CloudProjectionRecoveryBaselineTurn[];
+  baselineInteractions?: readonly CloudProjectionRecoveryBaselineInteraction[];
   epochPublicId: string;
   expectedCompactStreamEpoch: number;
   expectedHeadSequence: number;
@@ -121,7 +132,10 @@ type CloudProjectionRecoveryBaseFields = Readonly<{
 type CloudProjectionRecoveryBase = CloudProjectionRecoveryBaseFields
   & CloudProjectionRecoveryIdentity;
 
-type LegacyCloudProjectionRecoveryBase = CloudProjectionRecoveryBaseFields;
+type LegacyCloudProjectionRecoveryBase = Omit<
+  CloudProjectionRecoveryBaseFields,
+  "baselineInteractions"
+>;
 
 export type CloudProjectionRecoveryJournalEntry = CloudProjectionRecoveryBase & (
   | Readonly<{ phase: "prepared" | "effect_started" }>
@@ -432,6 +446,7 @@ export function completePendingCloudUsageAccount(
   state: CloudDaemonJournalState,
   expected: PendingCloudUsageAccount,
   sourceGeneration: number = expected.sourceGeneration,
+  sourceRevision: number = expected.sourceRevision,
 ): CloudDaemonJournalState {
   const canonical = parseCloudDaemonJournal(state);
   const canonicalExpected = parsePendingUsageAccount(expected);
@@ -440,11 +455,17 @@ export function completePendingCloudUsageAccount(
     || canonical.pendingUsageAccount === null
     || JSON.stringify(canonical.pendingUsageAccount) !== JSON.stringify(canonicalExpected)
   ) throw new Error("Cloud usage account outbox changed concurrently.");
+  if (
+    !isSafePositiveInteger(sourceGeneration)
+    || sourceGeneration < canonicalExpected.sourceGeneration
+    || !isSafeNonNegativeInteger(sourceRevision)
+    || sourceRevision < canonicalExpected.sourceRevision
+  ) throw new Error("Cloud usage account cursor regressed.");
 
   const completed = {
     accountPublicId: canonicalExpected.accountPublicId,
     sourceGeneration,
-    sourceRevision: canonicalExpected.sourceRevision,
+    sourceRevision,
   };
   let usageAccounts = canonical.usageAccounts.filter((entry) =>
     entry.accountPublicId !== completed.accountPublicId);
@@ -490,15 +511,52 @@ export function hasUnsettledCompactProjectionRecoveryForProfile(
     entry.localAuthority.profileId === profileId);
 }
 
+export function supersedeCloudProjectionRecoveryForProviderDeletion(
+  state: CloudDaemonJournalState,
+  sessionPublicId: string,
+  now: number,
+): CloudDaemonJournalState {
+  if (!isOpaqueIdentifier(sessionPublicId)) {
+    throw new Error("Cloud projection recovery session authority is invalid.");
+  }
+  assertProjectionRecoveryNow(now);
+  const canonical = pruneExpiredCloudProjectionRecoveryReceipts(state, now);
+  const current = canonical.projectionRecoveries.find((entry) =>
+    entry.sessionPublicId === sessionPublicId);
+  if (current === undefined) return canonical;
+  const receipt = parseCloudProjectionRecoveryTerminalReceipt({
+    idempotencyKey: current.idempotencyKey,
+    phase: "rejected",
+    rejectionCode: providerDeletionProjectionRecoveryCode,
+    requestedAt: Math.max(current.requestedAt, now),
+    sessionPublicId: current.sessionPublicId,
+    sourceDevicePublicId: current.sourceDevicePublicId,
+    userPublicId: current.userPublicId,
+  });
+  return parseCloudDaemonJournal({
+    ...canonical,
+    projectionRecoveries: canonical.projectionRecoveries.filter((entry) =>
+      entry.idempotencyKey !== current.idempotencyKey),
+    projectionRecoveryReceipts: [...canonical.projectionRecoveryReceipts, receipt],
+  });
+}
+
 /**
  * Read-only admission authority that remains available when cloud transport is not.
  * It never owns, clears, or advances recovery evidence.
  */
 export class CloudDaemonJournalRecoveryBlocker {
   readonly #journal: CloudDaemonJournalPort;
+  readonly #isSessionTerminal: ((sessionPublicId: string) => boolean | Promise<boolean>) | undefined;
 
-  constructor(journal: CloudDaemonJournalPort) {
+  constructor(
+    journal: CloudDaemonJournalPort,
+    options: Readonly<{
+      isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
+    }> = {},
+  ) {
     this.#journal = journal;
+    this.#isSessionTerminal = options.isSessionTerminal;
   }
 
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: string): Promise<boolean> {
@@ -509,6 +567,50 @@ export class CloudDaemonJournalRecoveryBlocker {
   async isCompactProjectionRecoveryUnsettledForProfile(profileId: string): Promise<boolean> {
     const observed = await this.#journal.read();
     return hasUnsettledCompactProjectionRecoveryForProfile(observed.state, profileId);
+  }
+
+  async supersedeCompactProjectionRecoveryForProviderDeletion(
+    sessionPublicId: string,
+  ): Promise<{ superseded: boolean }> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const observed = await this.#journal.read();
+      const superseded = observed.state.projectionRecoveries.some((entry) =>
+        entry.sessionPublicId === sessionPublicId);
+      const next = supersedeCloudProjectionRecoveryForProviderDeletion(
+        observed.state,
+        sessionPublicId,
+        Date.now(),
+      );
+      if (!superseded) return { superseded: false };
+      const committed = await this.#journal.compareAndSwap(observed.generation, next);
+      if (committed !== null) return { superseded: true };
+    }
+    throw new Error("Cloud projection recovery journal changed concurrently.");
+  }
+
+  async supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    if (this.#isSessionTerminal === undefined) return { superseded: 0 };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const observed = await this.#journal.read();
+      const terminal: string[] = [];
+      for (const entry of observed.state.projectionRecoveries) {
+        if (await this.#isSessionTerminal(entry.sessionPublicId)) {
+          terminal.push(entry.sessionPublicId);
+        }
+      }
+      if (terminal.length === 0) return { superseded: 0 };
+      const next = terminal.reduce(
+        (state, sessionPublicId) => supersedeCloudProjectionRecoveryForProviderDeletion(
+          state,
+          sessionPublicId,
+          Date.now(),
+        ),
+        observed.state,
+      );
+      const committed = await this.#journal.compareAndSwap(observed.generation, next);
+      if (committed !== null) return { superseded: terminal.length };
+    }
+    throw new Error("Cloud projection recovery journal changed concurrently.");
   }
 }
 
@@ -681,6 +783,38 @@ function parseProjectionRecoveryBaselineTurn(
   return { bodyDigest: value.bodyDigest, turnId: value.turnId };
 }
 
+function parseProjectionRecoveryBaselineInteraction(
+  value: unknown,
+): CloudProjectionRecoveryBaselineInteraction {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "blocking",
+      "interactionId",
+      "interactionKind",
+      "revision",
+      "state",
+      "summary",
+    ])
+  ) throw new Error("Cloud daemon journal is corrupt.");
+  const parsed = parseCompactSessionEvent({
+    ...value,
+    kind: "interaction_state",
+    sequence: 1,
+  });
+  if (parsed?.kind !== "interaction_state") {
+    throw new Error("Cloud daemon journal is corrupt.");
+  }
+  return {
+    blocking: parsed.blocking,
+    interactionId: parsed.interactionId,
+    interactionKind: parsed.interactionKind,
+    revision: parsed.revision,
+    state: parsed.state,
+    summary: parsed.summary,
+  };
+}
+
 function parseProjectionRecoveryAppliedResponse(
   value: unknown,
 ): CloudProjectionRecoveryAppliedResponse {
@@ -734,6 +868,13 @@ const legacyProjectionRecoveryBaseKeys = [
 
 const projectionRecoveryBaseKeys = [
   ...legacyProjectionRecoveryBaseKeys,
+  "baselineInteractions",
+  "sourceDevicePublicId",
+  "userPublicId",
+] as const;
+
+const projectionRecoveryBaseKeysWithoutInteractions = [
+  ...legacyProjectionRecoveryBaseKeys,
   "sourceDevicePublicId",
   "userPublicId",
 ] as const;
@@ -760,11 +901,17 @@ function parseProjectionRecoveryBaseFields(
   if (
     !Array.isArray(value.baselineCompletedTurns)
     || value.baselineCompletedTurns.length > maximumProjectionRecoveryBaselineTurns
+    || (value.baselineInteractions !== undefined
+      && (!Array.isArray(value.baselineInteractions)
+        || value.baselineInteractions.length > maximumProjectionRecoveryBaselineInteractions))
   ) throw new Error("Cloud daemon journal is corrupt.");
   const authority = parseAuthorityTuple(value.authority);
   const baselineCompletedTurns = value.baselineCompletedTurns.map(
     parseProjectionRecoveryBaselineTurn,
   );
+  const baselineInteractions = value.baselineInteractions === undefined
+    ? []
+    : value.baselineInteractions.map(parseProjectionRecoveryBaselineInteraction);
   const localAuthority = parseProjectionRecoveryLocalAuthority(value.localAuthority);
   if (
     authority === null
@@ -782,10 +929,13 @@ function parseProjectionRecoveryBaseFields(
     || (value.sourceCacheId !== null && !isOpaqueIdentifier(value.sourceCacheId))
     || new Set(baselineCompletedTurns.map((turn) => turn.turnId)).size
       !== baselineCompletedTurns.length
+    || new Set(baselineInteractions.map((interaction) => interaction.interactionId)).size
+      !== baselineInteractions.length
   ) throw new Error("Cloud daemon journal is corrupt.");
   return {
     authority,
     baselineCompletedTurns,
+    ...(value.baselineInteractions === undefined ? {} : { baselineInteractions }),
     epochPublicId: value.epochPublicId,
     expectedCompactStreamEpoch: value.expectedCompactStreamEpoch,
     expectedHeadSequence: value.expectedHeadSequence,
@@ -808,8 +958,11 @@ export function parseCloudProjectionRecoveryEntry(
   const expectedKeys = value.phase === "applied"
     ? [...projectionRecoveryBaseKeys, "cacheActivated", "response"]
     : projectionRecoveryBaseKeys;
+  const legacyExpectedKeys = value.phase === "applied"
+    ? [...projectionRecoveryBaseKeysWithoutInteractions, "cacheActivated", "response"]
+    : projectionRecoveryBaseKeysWithoutInteractions;
   if (
-    !hasExactKeys(value, expectedKeys)
+    (!hasExactKeys(value, expectedKeys) && !hasExactKeys(value, legacyExpectedKeys))
     || (value.phase !== "prepared"
       && value.phase !== "effect_started"
       && value.phase !== "applied")
@@ -1021,6 +1174,17 @@ function sameCloudProjectionRecoveryBase(
       return candidate === undefined
         || candidate.bodyDigest !== turn.bodyDigest
         || candidate.turnId !== turn.turnId;
+    })
+    && (left.baselineInteractions ?? []).length === (right.baselineInteractions ?? []).length
+    && !(left.baselineInteractions ?? []).some((interaction, index) => {
+      const candidate = (right.baselineInteractions ?? [])[index];
+      return candidate === undefined
+        || candidate.blocking !== interaction.blocking
+        || candidate.interactionId !== interaction.interactionId
+        || candidate.interactionKind !== interaction.interactionKind
+        || candidate.revision !== interaction.revision
+        || candidate.state !== interaction.state
+        || candidate.summary !== interaction.summary;
     });
 }
 
@@ -1090,7 +1254,11 @@ function migrateLegacyProjectionRecovery(
     };
   }
   if (entry.phase === "applied") {
-    return { ...entry, ...identity, cacheActivated: false };
+    return {
+      ...entry,
+      ...identity,
+      cacheActivated: false,
+    };
   }
   return { ...entry, ...identity };
 }
@@ -1185,9 +1353,11 @@ function parseCloudDaemonJournalStructure(value: unknown): CloudDaemonJournalSta
 function legacyProjectionRecoveryForStorage(
   entry: CloudProjectionRecoveryJournalEntry,
 ): LegacyCloudProjectionRecoveryJournalEntry | null {
-  if (entry.userPublicId !== null) return null;
+  if (entry.userPublicId !== null || (entry.baselineInteractions ?? []).length > 0) return null;
   return Object.fromEntries(Object.entries(entry).filter(([key]) =>
-    key !== "sourceDevicePublicId" && key !== "userPublicId")) as
+    key !== "baselineInteractions"
+    && key !== "sourceDevicePublicId"
+    && key !== "userPublicId")) as
     LegacyCloudProjectionRecoveryJournalEntry;
 }
 

@@ -26,6 +26,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.add"), label: labelSchema }).strict(),
   z.object({ kind: z.literal("account.show"), account: selectorSchema }).strict(),
   z.object({ kind: z.literal("account.login"), account: selectorSchema, deviceCode: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("account.login-cancel"), account: selectorSchema }).strict(),
   z.object({ kind: z.literal("account.logout"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.usage"), account: selectorSchema.optional(), refresh: z.boolean() }).strict(),
   z.object({ kind: z.literal("account.switch"), account: selectorSchema, idempotencyKey: requiredIdempotencyKeySchema }).strict(),

@@ -45,6 +45,19 @@ describe("CLI entry point", () => {
     expect(await main(["--help"], captured.output)).toBe(0);
     expect(captured.read().stdout).toContain("hra session");
     expect(captured.read().stderr).toBe("");
+
+    const group = capture();
+    expect(await main(["session", "--help"], group.output)).toBe(0);
+    expect(group.read().stdout).toContain("HRA session");
+    expect(group.read().stdout).toContain("hra session events");
+    expect(group.read().stdout).not.toContain("hra device pair");
+    expect(group.read().stderr).toBe("");
+
+    const protectedGroup = capture();
+    expect(await main(["interaction", "answer", "--help"], protectedGroup.output)).toBe(0);
+    expect(protectedGroup.read().stdout).toContain("--input-stdin|--input-fd");
+    expect(protectedGroup.read().stdout).toContain("Protected values");
+    expect(protectedGroup.read().stderr).toBe("");
   });
 
   test("offline doctor returns one JSON value", async () => {
@@ -61,11 +74,250 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("refresh-all skips signed-out accounts, bounds concurrency, and reports every outcome", async () => {
+    const accounts = Array.from({ length: 7 }, (_, index) => ({
+      id: `acct_${String(index).padStart(32, "0")}`,
+      label: `Account ${String(index)}`,
+      processGeneration: index === 0 ? 0 : 1,
+      providerEmail: undefined,
+      providerPlan: undefined,
+      state: index === 0 ? "signed_out" as const : "signed_in" as const,
+      updatedAt: index,
+    }));
+    let active = 0;
+    let maximumActive = 0;
+    let releaseWave!: () => void;
+    const firstWave = new Promise<void>((resolve) => { releaseWave = resolve; });
+    const commands: LocalCommand[] = [];
+    const captured = capture();
+    expect(await main(["account", "usage", "--refresh", "--json"], captured.output, {
+      callDaemon: async (command) => {
+        commands.push(command);
+        if (command.kind === "account.list") {
+          return { ok: true, version: 1, requestId: crypto.randomUUID(), data: { accounts: [...accounts].reverse() } };
+        }
+        if (command.kind === "account.usage" && command.refresh && command.account !== undefined) {
+          active += 1;
+          maximumActive = Math.max(maximumActive, active);
+          if (maximumActive === 4) releaseWave();
+          await firstWave;
+          active -= 1;
+          if (command.account === accounts[3]?.id) {
+            return {
+              ok: false,
+              version: 1,
+              requestId: crypto.randomUUID(),
+              error: {
+                code: "UNAVAILABLE",
+                message: "provider token=do-not-return failed at /private/account",
+              },
+            };
+          }
+          return {
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: { usage: [{ account: { id: command.account } }] },
+          };
+        }
+        if (command.kind === "account.usage" && !command.refresh && command.account === undefined) {
+          return {
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              usage: [...accounts].reverse().map((account) => ({
+                account,
+                poll: { state: "never_observed" },
+                snapshot: null,
+                velocity: {},
+              })),
+            },
+          };
+        }
+        throw new Error("Unexpected refresh-all command.");
+      },
+    })).toBe(0);
+    expect(maximumActive).toBe(4);
+    expect(commands.filter((command) => command.kind === "account.usage" && command.refresh)).toHaveLength(6);
+    expect(commands.some((command) =>
+      command.kind === "account.usage" && command.refresh && command.account === accounts[0]?.id)).toBe(false);
+    const payload = JSON.parse(captured.read().stdout) as {
+      data: {
+        refresh: { outcomes: Array<{ accountId: string; code?: string; state: string }> };
+        usage: Array<{ account: { id: string } }>;
+      };
+    };
+    expect(payload.data.refresh.outcomes.map((outcome) => outcome.accountId)).toEqual(
+      accounts.map((account) => account.id),
+    );
+    expect(payload.data.refresh.outcomes[0]).toMatchObject({ state: "skipped" });
+    expect(payload.data.refresh.outcomes[3]).toMatchObject({ code: "UNAVAILABLE", state: "failed" });
+    expect(payload.data.usage.map((entry) => entry.account.id)).toEqual(accounts.map((account) => account.id));
+    expect(captured.read().stdout).not.toContain("do-not-return");
+    expect(captured.read().stdout).not.toContain("/private/account");
+    expect(captured.read().stderr).toBe("");
+  });
+
+  test("refresh-all rejects an oversized account set before any usage effect", async () => {
+    const accounts = Array.from({ length: 33 }, (_, index) => ({
+      id: `acct_${index.toString(16).padStart(32, "0")}`,
+      label: `Account ${String(index)}`,
+      processGeneration: 1,
+      state: "signed_in" as const,
+      updatedAt: index,
+    }));
+    const commands: LocalCommand[] = [];
+    const captured = capture();
+    expect(await main(["account", "usage", "--refresh", "--json"], captured.output, {
+      callDaemon: (command) => {
+        commands.push(command);
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: { accounts },
+        });
+      },
+    })).toBe(5);
+    expect(commands).toEqual([{ kind: "account.list" }]);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: {
+        code: "UNAVAILABLE",
+        details: { accountCount: 33, accountLimit: 32 },
+      },
+    });
+  });
+
+  test("refresh-all retains every outcome when the post-effect usage view is unavailable", async () => {
+    const accounts = [
+      {
+        id: `acct_${"1".repeat(32)}`,
+        label: "Signed in",
+        processGeneration: 1,
+        state: "signed_in" as const,
+        updatedAt: 1,
+      },
+      {
+        id: `acct_${"2".repeat(32)}`,
+        label: "Signed out",
+        processGeneration: 0,
+        state: "signed_out" as const,
+        updatedAt: 2,
+      },
+    ];
+    const secret = "POST_REFRESH_HISTORY_SENTINEL_DO_NOT_RETURN";
+    for (const historyFailure of ["invalid_response", "internal_failure"] as const) {
+      const captured = capture();
+      let refreshEffects = 0;
+      expect(await main(["account", "usage", "--refresh", "--json"], captured.output, {
+        callDaemon: async (command) => {
+          if (command.kind === "account.list") {
+            return {
+              data: { accounts: [...accounts].reverse() },
+              ok: true,
+              requestId: crypto.randomUUID(),
+              version: 1,
+            };
+          }
+          if (command.kind === "account.usage" && command.refresh && command.account === accounts[0]?.id) {
+            refreshEffects += 1;
+            return {
+              data: { usage: [{ account: { id: command.account } }] },
+              ok: true,
+              requestId: crypto.randomUUID(),
+              version: 1,
+            };
+          }
+          if (command.kind === "account.usage" && !command.refresh && command.account === undefined) {
+            return historyFailure === "invalid_response"
+              ? {
+                  data: { diagnostic: secret, usage: "malformed" },
+                  ok: true,
+                  requestId: crypto.randomUUID(),
+                  version: 1,
+                }
+              : {
+                  error: {
+                    code: "INTERNAL" as const,
+                    details: { diagnostic: secret },
+                    message: `provider unavailable ${secret}`,
+                  },
+                  ok: false,
+                  requestId: crypto.randomUUID(),
+                  version: 1,
+                };
+          }
+          throw new Error("Unexpected refresh-all command.");
+        },
+      })).toBe(5);
+      expect(refreshEffects).toBe(1);
+      const payload = JSON.parse(captured.read().stdout) as {
+        error: {
+          code: string;
+          details: {
+            refresh: {
+              accountLimit: number;
+              concurrency: number;
+              outcomes: Array<{ accountId: string; state: string }>;
+            };
+            usageView: { reasonCode: string; state: string };
+          };
+          message: string;
+        };
+      };
+      expect(payload.error).toMatchObject({
+        code: "UNAVAILABLE",
+        details: {
+          refresh: {
+            accountLimit: 32,
+            concurrency: 4,
+            outcomes: [
+              { accountId: accounts[0]?.id, state: "refreshed" },
+              { accountId: accounts[1]?.id, state: "skipped" },
+            ],
+          },
+          usageView: {
+            reasonCode: historyFailure === "invalid_response" ? "INVALID_RESPONSE" : "INTERNAL",
+            state: "unavailable",
+          },
+        },
+        message: "Refresh outcomes were recorded, but the final usage view is unavailable.",
+      });
+      expect(captured.read().stdout).not.toContain(secret);
+      expect(captured.read().stderr).toBe("");
+    }
+  });
+
   test("invalid input writes diagnostics only to stderr", async () => {
     const captured = capture();
     expect(await main(["session", "fast", "x", "maybe"], captured.output)).toBe(2);
     expect(captured.read().stdout).toBe("");
     expect(captured.read().stderr).toContain("Fast must be");
+  });
+
+  test("argv and unexpected runtime failures never echo foreign diagnostics", async () => {
+    const attack = "token=do-not-echo\u001b]52;c;attack\u0007";
+    const usage = capture();
+    expect(await main(["account", "list", attack], usage.output)).toBe(2);
+    expect(usage.read().stderr).not.toContain("do-not-echo");
+    expect(usage.read().stderr).not.toContain("\u001b");
+
+    const runtime = capture();
+    expect(await main(["account", "list", "--json"], runtime.output, {
+      callDaemon: () => { throw new Error(`/private/runtime ${attack}`); },
+    })).toBe(1);
+    expect(JSON.parse(runtime.read().stdout)).toEqual({
+      ok: false,
+      version: 1,
+      error: {
+        code: "INTERNAL",
+        message: "HRA could not complete the request safely.",
+      },
+    });
+    expect(runtime.read().stdout).not.toContain("do-not-echo");
+    expect(runtime.read().stdout).not.toContain("/private/runtime");
   });
 
   test("json intent survives parser and startup failures as one machine value", async () => {
@@ -109,6 +361,7 @@ describe("CLI entry point", () => {
           data: { accepted: true },
         });
       },
+      isTerminalDescriptor: () => false,
       readProtectedDocument: () => Promise.resolve({
         answers: { question_1: { answers: [secretAnswer] } },
       }),
@@ -141,6 +394,7 @@ describe("CLI entry point", () => {
           version: 1,
         });
       },
+      isTerminalDescriptor: () => false,
       readProtectedDocument: () => Promise.resolve({
         email: "reader@example.com",
         invite,
@@ -152,6 +406,55 @@ describe("CLI entry point", () => {
       kind: "auth.login",
     }]);
     expect(JSON.stringify(captured.read())).not.toContain(invite);
+  });
+
+  test("json protected commands refuse terminal input before reading or prompting", async () => {
+    const interaction = "018bcfe5-6800-7000-8000-000000000777";
+    for (const argv of [
+      ["auth", "login", "--input-stdin", "--json"],
+      [
+        "interaction",
+        "answer",
+        interaction,
+        "--revision",
+        "4",
+        "--input-stdin",
+        "--json",
+      ],
+    ] as const) {
+      const captured = capture();
+      let reads = 0;
+      let daemonCalls = 0;
+      expect(await main(argv, captured.output, {
+        callDaemon: () => {
+          daemonCalls += 1;
+          throw new Error("Daemon must not be called.");
+        },
+        isTerminalDescriptor: (fd) => {
+          expect(fd).toBe(0);
+          return true;
+        },
+        readProtectedDocument: () => {
+          reads += 1;
+          throw new Error("Protected input must not be read.");
+        },
+      })).toBe(6);
+      expect(reads).toBe(0);
+      expect(daemonCalls).toBe(0);
+      expect(captured.read().stderr).toBe("");
+      const response = JSON.parse(captured.read().stdout) as {
+        error: { code: string; details: { nextCommand: string } };
+        ok: boolean;
+      };
+      expect(response).toMatchObject({
+        ok: false,
+        error: {
+          code: "INTERACTION_REQUIRED",
+          details: { nextCommand: expect.stringContaining("--input-stdin --json") },
+        },
+      });
+      expect(captured.read().stdout).not.toContain("hidden");
+    }
   });
 
   test("starts the persistent shell on no-argument interactive use and carries exact selections", async () => {
@@ -457,11 +760,21 @@ describe("CLI entry point", () => {
       events: [
         { kind: "assistant_message", sequence: 1, text: attack, turnId: "turn_12345678" },
         {
+          blocking: true,
+          interactionId: "70000000-0000-4000-8000-000000000001",
+          interactionKind: "permission_approval",
+          kind: "interaction_state",
+          revision: 3,
+          sequence: 2,
+          state: "pending",
+          summary: `Review ${attack}`,
+        },
+        {
           filesTouched: [`src/${attack}.ts`],
           gitActions: [{ kind: "status", label: attack }],
           kind: "turn_summary",
           runtimeMs: 1,
-          sequence: 2,
+          sequence: 3,
           turnId: "turn_12345678",
         },
       ],
@@ -478,6 +791,81 @@ describe("CLI entry point", () => {
     expect(rendered).toContain("\\u{001b}");
     expect(rendered).toContain("\\u{0007}");
     expect(rendered).toContain("\\u{202e}");
+    expect(rendered).toContain("Interaction 70000000-0000-4000-8000-000000000001  permission approval");
+    expect(rendered).toContain("pending  revision 3  blocking");
+    expect(rendered).toContain("Resolve on the execution device. Remote interaction responses are not enabled.");
+  });
+
+  test("remote human output reduces recovered interactions to the safest latest revision", () => {
+    const interactionId = "70000000-0000-4000-8000-000000000099";
+    const data = {
+      compactHasRecoveryGap: true,
+      compactHeadSequence: 4,
+      compactStreamEpoch: 4,
+      complete: true,
+      createdAt: 1,
+      events: [
+        {
+          blocking: true,
+          interactionId,
+          interactionKind: "command_approval" as const,
+          kind: "interaction_state" as const,
+          revision: 1,
+          sequence: 1,
+          state: "pending" as const,
+          summary: "Interaction state updated",
+        },
+        {
+          blocking: true,
+          interactionId,
+          interactionKind: "command_approval" as const,
+          kind: "interaction_state" as const,
+          revision: 2,
+          sequence: 2,
+          state: "expired" as const,
+          summary: "Interaction state updated",
+        },
+        {
+          blocking: true,
+          interactionId,
+          interactionKind: "command_approval" as const,
+          kind: "interaction_state" as const,
+          revision: 2,
+          sequence: 3,
+          state: "pending" as const,
+          summary: "Conflicting stale recovery row",
+        },
+        {
+          blocking: true,
+          interactionId: "70000000-0000-4000-8000-000000000100",
+          interactionKind: "user_input" as const,
+          kind: "interaction_state" as const,
+          revision: 1,
+          sequence: 4,
+          state: "pending" as const,
+          summary: "Pre-baseline pending state",
+        },
+      ],
+      executionDevicePublicId: "device_12345678",
+      metadata: { name: "Recovered", note: null },
+      publicId: "session_12345678",
+      recoveryGap: { kind: "projection_cache_recovery" as const, streamEpoch: 4 },
+      state: "idle" as const,
+      updatedAt: 2,
+    };
+    const human = capture();
+    renderRemoteSuccess({ kind: "remote.show", session: "session_12345678" }, data, false, human.output);
+    const rendered = human.read().stdout;
+    expect(rendered).toContain("Recovery gap: compact projection cache recovery at stream epoch 4.");
+    expect(rendered.match(new RegExp(interactionId, "gu"))).toHaveLength(1);
+    expect(rendered).toContain("expired  revision 2");
+    expect(rendered).not.toContain("Resolve on the execution device");
+    expect(rendered).toContain("Interaction action guidance is suppressed while remote recovery settles.");
+
+    const json = capture();
+    renderRemoteSuccess({ kind: "remote.show", session: "session_12345678" }, data, true, json.output);
+    const payload = JSON.parse(json.read().stdout) as { data: { events: unknown[] } };
+    expect(payload.data.events).toHaveLength(4);
   });
 
   test("stopping an absent daemon does not initialize or autostart it", async () => {

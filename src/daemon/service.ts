@@ -6,12 +6,19 @@ import {
   CodexError,
   IndeterminateCodexEffectError,
   resolvePinnedCodexRuntime,
+  validateMcpFormSubmission,
   type CodexFact,
   type CodexPluginCatalog,
   type CodexPluginSummary,
 } from "../codex/index";
 import type { LocalCommand } from "../domain/contracts";
-import type { InteractionRecord, InteractionResolution } from "../domain/interactions";
+import {
+  publicInteractionSchema,
+  type InteractionRecord,
+  type InteractionIntendedTerminalState,
+  type InteractionResolution,
+  type PublicInteraction,
+} from "../domain/interactions";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
 import {
@@ -33,11 +40,14 @@ import {
   type StateStore,
 } from "../storage/state-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
-import type { CloudControlPort, CodexAccountProjection, CodexRuntimePort, CodexSessionProjection, DesktopSwitchPort, ProfileAuthority, RuntimeStartReview } from "./ports";
+import { commandFailureBrand } from "./local-transport";
+import type { CloudControlPort, CodexAccountProjection, CodexLoginOutcome, CodexRuntimePort, CodexSessionProjection, DesktopSwitchPort, ProfileAuthority, RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec, SessionEventCursorError } from "./session-event-cursor";
 import { SessionEventWaiterLimitError, SessionEventWaiters } from "./session-event-waiters";
 
 export class CommandFailure extends Error {
+  readonly [commandFailureBrand] = true as const;
+
   constructor(
     readonly code: "INVALID_INPUT" | "NOT_FOUND" | "AMBIGUOUS" | "CONFLICT" | "INTERACTION_REQUIRED" | "UNAVAILABLE" | "RECOVERY_REQUIRED" | "INTERNAL",
     message: string,
@@ -60,10 +70,16 @@ const authorityFor = (paths: StatePaths, profile: ProfileRecord): ProfileAuthori
   return { id: profile.id, generation: profile.processGeneration, codexHome: owned.codexHome, desktopUserData: owned.desktopUserData };
 };
 
-const loginReceiptSchema = z.object({
-  status: z.enum(["pending", "signed_in"]),
-  account: z.object({ signedIn: z.boolean(), email: z.string().optional(), plan: z.string().optional() }).strict().optional(),
-}).strict();
+const loginReceiptSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("pending"),
+    loginId: z.string().min(1).max(512).refine((value) => !/\p{Cc}/u.test(value)),
+  }).strict(),
+  z.object({
+    status: z.literal("signed_in"),
+    account: z.object({ signedIn: z.literal(true), email: z.string().optional(), plan: z.string().optional() }).strict(),
+  }).strict(),
+]);
 const logoutReceiptSchema = z.object({ loggedOut: z.literal(true) }).strict();
 const sessionStartReceiptSchema = z.object({
   sessionId: sessionIdSchema,
@@ -84,25 +100,9 @@ const stoppedReceiptSchema = z.discriminatedUnion("stopped", [
 const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
-const canonicalJson = (value: unknown): string => {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("Interaction resolution contains a non-finite number.");
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value === "object") {
-    const record = value as Readonly<Record<string, unknown>>;
-    return `{${Object.keys(record).sort().map((key) =>
-      `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
-  }
-  throw new Error("Interaction resolution is not canonical JSON.");
-};
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
 
-type LoginOutcome = { status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection };
+type LoginOutcome = CodexLoginOutcome;
 type BoundSessionRecord = SessionRecord & { providerThreadId: string };
 type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.send"
@@ -115,15 +115,14 @@ type RemoteSessionCommand = Extract<LocalCommand, { kind:
 }>;
 const restoreLoginReceipt = (value: unknown): LoginOutcome => {
   const parsed = loginReceiptSchema.parse(value);
+  if (parsed.status === "pending") return { status: "pending", loginId: parsed.loginId };
   return {
-    status: parsed.status,
-    ...(parsed.account === undefined ? {} : {
-      account: {
-        signedIn: parsed.account.signedIn,
-        ...(parsed.account.email === undefined ? {} : { email: parsed.account.email }),
-        ...(parsed.account.plan === undefined ? {} : { plan: parsed.account.plan }),
-      },
-    }),
+    status: "signed_in",
+    account: {
+      signedIn: true,
+      ...(parsed.account.email === undefined ? {} : { email: parsed.account.email }),
+      ...(parsed.account.plan === undefined ? {} : { plan: parsed.account.plan }),
+    },
   };
 };
 
@@ -147,6 +146,9 @@ export class HraService {
   readonly #sessionProviderConnections = new Map<string, string>();
   readonly #queuePreEffectRetryCounts = new Map<string, number>();
   readonly #queuePreEffectRetryScheduled = new Set<string>();
+  readonly #interactionDeadlineAbort = new AbortController();
+  #interactionDeadlineTask: Promise<void> | undefined;
+  #interactionDeadlineWake: (() => void) | undefined;
   #state: "open" | "closing" | "closed" = "open";
   #closeTask: Promise<void> | undefined;
 
@@ -200,6 +202,7 @@ export class HraService {
         case "account.add": return await this.#addAccount(command.label);
         case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#showAccount(profile.id, context.signal)); }
         case "account.login": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#login(profile.id, command.deviceCode, command.idempotencyKey, context.signal)); }
+        case "account.login-cancel": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#cancelLogin(profile.id, context.signal)); }
         case "account.logout": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#logout(profile.id, command.idempotencyKey, context.signal)); }
         case "account.usage": {
           if (command.account === undefined) return await this.#usage(undefined, command.refresh, context.signal);
@@ -357,7 +360,9 @@ export class HraService {
       if (error instanceof Error && error.message === "SESSION_EVENT_CURSOR_AHEAD") {
         throw new CommandFailure("CONFLICT", "The session event cursor is ahead of the current stream.");
       }
-      if (error instanceof Error && /unavailable|not configured/iu.test(error.message)) throw new CommandFailure("UNAVAILABLE", error.message);
+      if (error instanceof Error && /unavailable|not configured/iu.test(error.message)) {
+        throw new CommandFailure("UNAVAILABLE", "A required local or provider capability is unavailable.");
+      }
       throw error;
     }
   }
@@ -434,6 +439,9 @@ export class HraService {
   close(): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask;
     this.#state = "closing";
+    this.#interactionDeadlineAbort.abort(new Error("HRA service is closing."));
+    this.#interactionDeadlineWake?.();
+    this.#interactionDeadlineWake = undefined;
     this.#daemonAuthority.close();
     this.#closeTask = this.#closeAdmittedService();
     return this.#closeTask;
@@ -451,6 +459,8 @@ export class HraService {
   }
 
   async #recoverAdmitted(): Promise<void> {
+    await this.#cloud.supersedeTerminalCompactProjectionRecoveries();
+    await this.#daemonAuthority.assertCurrent();
     const recoveredMutations = this.#store.recoverEffectStartedMutations();
     if (recoveredMutations.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredMutations.unresolved.length)} effect-started mutation authorities.`);
@@ -471,12 +481,171 @@ export class HraService {
       const profile = this.#store.requireProfile(session.profileId);
       if (profile.state === "signed_in") this.#scheduleQueueDispatch(session);
     }
+    this.#wakeInteractionDeadlinePump();
   }
 
   async settled(): Promise<void> {
     while (this.#mutationTails.size > 0 || this.#background.size > 0) {
       await Promise.allSettled([...this.#mutationTails.values(), ...this.#background]);
     }
+  }
+
+  /** Runs one bounded deadline batch. Exposed for deterministic daemon tests. */
+  async maintainInteractionDeadlines(): Promise<{ examined: number; failed: number }> {
+    if (this.#interactionDeadlineMaintenanceStopped()) {
+      return { examined: 0, failed: 0 };
+    }
+    const due = this.#store.listDueInteractions({ now: this.#now(), limit: 32 });
+    let failed = 0;
+    for (const interaction of due) {
+      if (this.#interactionDeadlineMaintenanceStopped()) break;
+      await this.#serialize(`interaction:${interaction.publicId}`, async () => {
+        const current = this.#store.requireInteraction(interaction.publicId);
+        if (current.state !== "pending" || current.deadlineAt > this.#now()) return;
+        await this.#expireInteractionAtDeadline(
+          current,
+          this.#interactionDeadlineAbort.signal,
+        );
+      }).catch(() => { failed += 1; });
+    }
+    return { examined: due.length, failed };
+  }
+
+  #interactionDeadlineMaintenanceStopped(): boolean {
+    return this.#state !== "open" || this.#interactionDeadlineAbort.signal.aborted;
+  }
+
+  #wakeInteractionDeadlinePump(): void {
+    if (this.#state !== "open" || this.#interactionDeadlineAbort.signal.aborted) return;
+    if (this.#interactionDeadlineTask === undefined) {
+      const task = this.#runInteractionDeadlinePump();
+      this.#interactionDeadlineTask = task;
+      void task.finally(() => {
+        if (this.#interactionDeadlineTask === task) this.#interactionDeadlineTask = undefined;
+      }).catch(() => undefined);
+      return;
+    }
+    this.#interactionDeadlineWake?.();
+  }
+
+  async #runInteractionDeadlinePump(): Promise<void> {
+    const signal = this.#interactionDeadlineAbort.signal;
+    while (this.#state === "open" && !signal.aborted) {
+      const processed = await this.maintainInteractionDeadlines();
+      if (processed.failed > 0) {
+        await this.#waitForInteractionDeadline(1_000, signal);
+        continue;
+      }
+      if (processed.examined >= 32) continue;
+      const next = this.#store.nextInteractionDeadlineAt();
+      await this.#waitForInteractionDeadline(
+        next === null ? null : Math.max(0, next - this.#now()),
+        signal,
+      );
+    }
+  }
+
+  async #waitForInteractionDeadline(
+    delayMs: number | null,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        signal.removeEventListener("abort", finish);
+        if (this.#interactionDeadlineWake === finish) this.#interactionDeadlineWake = undefined;
+        resolve();
+      };
+      this.#interactionDeadlineWake = finish;
+      signal.addEventListener("abort", finish, { once: true });
+      if (delayMs !== null) {
+        timer = setTimeout(finish, delayMs);
+        timer.unref();
+      }
+    });
+  }
+
+  async #expireInteractionAtDeadline(
+    current: InteractionRecord,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const profile = this.#store.requireProfileById(current.authority.profileId);
+    let responseDigest: string;
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      const validated = await this.#codex.validateInteractionTimeout({
+        authority: authorityFor(this.#paths, profile),
+        provider: current.authority,
+        signal,
+      });
+      responseDigest = validated.responseDigest;
+    } catch (error: unknown) {
+      if (signal.aborted) return;
+      const latest = this.#store.requireInteraction(current.publicId);
+      if (latest.state !== "pending" || latest.revision !== current.revision) return;
+      const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        ? this.#store.markInteractionResolutionUnknown({
+            id: latest.publicId,
+            expectedRevision: latest.revision,
+          })
+        : this.#store.expireInteraction({
+            id: latest.publicId,
+            expectedRevision: latest.revision,
+          });
+      this.#appendInteractionState(terminal);
+      return;
+    }
+    const prepared = this.#store.prepareInteractionResponse({
+      id: current.publicId,
+      expectedRevision: current.revision,
+      responseDigest,
+      intendedTerminalState: "expired",
+    });
+    this.#appendInteractionState(prepared);
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      await this.#codex.timeoutInteraction({
+        authority: authorityFor(this.#paths, profile),
+        provider: prepared.authority,
+        signal,
+      });
+    } catch (error: unknown) {
+      if (signal.aborted) return;
+      const latest = this.#store.requireInteraction(prepared.publicId);
+      if (latest.state !== "response_prepared" || latest.revision !== prepared.revision) return;
+      const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+        ? this.#store.markInteractionResolutionUnknown({
+            id: latest.publicId,
+            expectedRevision: latest.revision,
+            responseDigest,
+          })
+        : this.#store.expireInteraction({
+            id: latest.publicId,
+            expectedRevision: latest.revision,
+          });
+      this.#appendInteractionState(terminal);
+      return;
+    }
+    const written = this.#store.markInteractionResponseWritten({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      responseDigest,
+    });
+    if (written.state === "response_written") this.#appendInteractionState(written);
+    if (written.state !== "response_written") return;
+    const terminal = this.#store.settleInteraction({
+      id: written.publicId,
+      expectedRevision: written.revision,
+      state: "expired",
+      authority: written.authority,
+      responseDigest,
+    });
+    this.#appendInteractionState(terminal);
   }
 
   async observeCodexFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
@@ -521,6 +690,7 @@ export class HraService {
           .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
         await this.#daemonAuthority.assertCurrent();
         if (blocked || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
+        if (!account.signedIn && current.state === "login_pending") return;
         this.#store.setProfileState(
           current.id,
           current.processGeneration,
@@ -553,12 +723,21 @@ export class HraService {
       this.#store.advanceProfileGeneration(authority.id, authority.generation);
       return;
     }
+    if (fact.type === "notificationIgnored") return;
     if (fact.type === "interactionRequested") {
       if (
         fact.provider.profileId !== authority.id
         || fact.provider.processGeneration !== authority.generation
         || fact.provider.connectionId !== fact.connectionId
       ) throw new Error("INTERACTION_FACT_AUTHORITY_MISMATCH");
+      if (
+        fact.kind === "mcp_elicitation"
+        && (
+          fact.display.kind !== "mcp_elicitation"
+          || fact.display.mode !== "form"
+          || fact.display.fields === undefined
+        )
+      ) throw new Error("MCP_FORM_DISPLAY_CONTRACT_MISSING");
       const session = fact.provider.threadId === null
         ? null
         : this.#store.findSessionByProviderThread(authority.id, fact.provider.threadId);
@@ -570,6 +749,9 @@ export class HraService {
         kind: fact.kind,
         blocking: fact.blocking,
         display: fact.display,
+        ...(fact.timeoutMs === undefined ? {} : { timeoutMs: fact.timeoutMs }),
+        ...(fact.requestedAt === undefined ? {} : { requestedAt: fact.requestedAt }),
+        ...(fact.deadlineAt === undefined ? {} : { deadlineAt: fact.deadlineAt }),
       });
       if (!admitted.replayed && admitted.record.sessionId !== null) {
         this.#appendSessionEvent(authority, admitted.record.sessionId, fact.connectionId, {
@@ -581,26 +763,31 @@ export class HraService {
           summary: admitted.record.display.summary,
         });
       }
+      this.#wakeInteractionDeadlinePump();
       return;
     }
     if (fact.type === "interactionResolved") {
-      const current = this.#store.findInteractionByAuthority(fact.provider);
-      if (
-        current === null
-        || current.state === "resolved"
-        || current.state === "declined"
-        || current.state === "canceled"
-        || current.state === "expired"
-        || current.state === "resolution_unknown"
-      ) return;
-      const settled = this.#store.settleInteraction({
-        id: current.publicId,
-        expectedRevision: current.revision,
-        state: "resolved",
-        authority: fact.provider,
-        ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
+      const observed = this.#store.findInteractionByAuthority(fact.provider);
+      if (observed === null) return;
+      await this.#serialize(`interaction:${observed.publicId}`, async () => {
+        const current = this.#store.findInteractionByAuthority(fact.provider);
+        if (
+          current === null
+          || current.state === "resolved"
+          || current.state === "declined"
+          || current.state === "canceled"
+          || current.state === "expired"
+          || current.state === "resolution_unknown"
+        ) return;
+        const settled = this.#store.settleInteraction({
+          id: current.publicId,
+          expectedRevision: current.revision,
+          state: current.intendedTerminalState ?? "resolved",
+          authority: fact.provider,
+          ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
+        });
+        this.#appendInteractionState(settled);
       });
-      this.#appendInteractionState(settled);
       return;
     }
     if (fact.type === "protocolNotice") {
@@ -619,8 +806,16 @@ export class HraService {
     }
     if (!("threadId" in fact) || typeof fact.threadId !== "string") return;
     const session = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
-    if (session === null || session.state === "recovery_required" || session.state === "terminal") return;
+    if (
+      session === null
+      || (session.state === "terminal" && fact.type !== "threadDeleted")
+      || (session.state === "recovery_required" && fact.type !== "threadDeleted")
+    ) return;
     this.#ensureSessionProviderConnection(authority, session, fact.connectionId);
+    if (fact.type === "threadDeleted") {
+      await this.#applyProviderThreadDeletion(authority, fact, session);
+      return;
+    }
     const event = this.#eventBodyForCodexFact(fact, session);
     if (event !== null) {
       this.#appendSessionEvent(authority, session.id, fact.connectionId ?? null, event);
@@ -650,6 +845,27 @@ export class HraService {
       this.#background.add(tracked);
       void tracked.then(() => this.#background.delete(tracked));
     }
+  }
+
+  async #applyProviderThreadDeletion(
+    authority: ProfileAuthority,
+    fact: Extract<CodexFact, { type: "threadDeleted" }>,
+    expected: SessionRecord,
+  ): Promise<void> {
+    const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
+    if (current === null || current.id !== expected.id) return;
+    this.#sessionFactEpochs.set(current.id, (this.#sessionFactEpochs.get(current.id) ?? 0) + 1);
+    const terminal = this.#store.terminalizeSessionFromProviderDeletion({
+      accountId: authority.id,
+      providerConnectionId: fact.connectionId ?? null,
+      providerGeneration: authority.generation,
+      sessionId: current.id,
+    });
+    if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
+    for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
+    this.#sessionProviderConnections.delete(current.id);
+    await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
+    await this.#daemonAuthority.assertCurrent();
   }
 
   #appendSessionEvent(
@@ -748,6 +964,7 @@ export class HraService {
             : fact.status.type,
         activeTurnId: fact.status.type === "active" ? session.activeTurnId ?? null : null,
       };
+      case "threadDeleted": return null;
       case "itemStarted": return {
         type: "item_started",
         turnId: fact.turnId,
@@ -822,6 +1039,7 @@ export class HraService {
       case "accountUpdated":
       case "loginCompleted":
       case "serverRequestResolved":
+      case "notificationIgnored":
       case "threadNameUpdated":
         return null;
     }
@@ -836,11 +1054,12 @@ export class HraService {
     if (
       current === null
       || current.id !== expected.id
-      || current.state === "recovery_required"
       || current.state === "terminal"
+      || (current.state === "recovery_required" && fact.type !== "threadDeleted")
       || this.#projectionRecoveriesInFlight.has(current.id)
     ) return false;
     this.#sessionFactEpochs.set(current.id, (this.#sessionFactEpochs.get(current.id) ?? 0) + 1);
+    if (fact.type === "threadDeleted") return false;
     if (fact.type === "turnStarted") {
       this.#store.reconcileSessionFromProvider({ sessionId: current.id, state: "active", activeTurnId: fact.turn.id });
       return false;
@@ -873,6 +1092,9 @@ export class HraService {
   async #closeAdmittedService(): Promise<void> {
     let runtimeError: unknown;
     try {
+      if (this.#interactionDeadlineTask !== undefined) {
+        await this.#interactionDeadlineTask.catch(() => undefined);
+      }
       await this.#codex.close();
     } catch (error: unknown) {
       runtimeError = error;
@@ -937,8 +1159,8 @@ export class HraService {
     try {
       const runtime = await resolvePinnedCodexRuntime();
       codex = { status: "ready", version: runtime.packageVersion };
-    } catch (error: unknown) {
-      const diagnostic = error instanceof Error ? error.message : "The pinned Codex runtime is unavailable.";
+    } catch {
+      const diagnostic = "The pinned Codex runtime check failed without exposing its runtime diagnostic.";
       codex = { status: "invalid", diagnostic };
       problems.push(diagnostic);
     }
@@ -948,7 +1170,7 @@ export class HraService {
         cloud = await this.#fencedEffect(async () => await this.#cloud.status(signal));
       } catch (error: unknown) {
         if (error instanceof DaemonAuthoritySafetyError) throw error;
-        const diagnostic = error instanceof Error ? error.message : "Cloud status is unavailable.";
+        const diagnostic = "Cloud status failed without exposing its runtime diagnostic.";
         cloud = { configured: true, status: "unavailable", diagnostic };
         problems.push(diagnostic);
       }
@@ -969,7 +1191,7 @@ export class HraService {
         }
       } catch (error: unknown) {
         if (error instanceof DaemonAuthoritySafetyError) throw error;
-        const diagnostic = error instanceof Error ? error.message : "Desktop switch recovery state is unreadable.";
+        const diagnostic = "Desktop switch recovery failed without exposing its runtime diagnostic.";
         desktopRecovery = { status: "invalid", diagnostic };
         problems.push(diagnostic);
       }
@@ -1130,6 +1352,24 @@ export class HraService {
       });
       return { account: this.#publicProfile(reconciled), providerProjection: account, idempotencyKey: attempt.idempotencyKey, recovery: { required: false, cleared: true, resolution: applied ? "proven_applied" : "provider_state_reconciled" } };
     }
+    if (profile.state === "login_pending" && !account.signedIn) {
+      const authority = this.#store.readPendingLoginAuthority(profile.id, profile.processGeneration);
+      return {
+        account: this.#publicProfile(profile),
+        providerProjection: account,
+        login: authority === null
+          ? {
+              status: "pending",
+              recoveryRequired: true,
+              diagnostic: "The pending login has no exact durable provider login authority.",
+            }
+          : {
+              status: "pending",
+              loginId: authority.loginId,
+              next: `hra account login-cancel ${profile.id}`,
+            },
+      };
+    }
     if (!this.#store.setProfileState(profile.id, profile.processGeneration, account.signedIn ? "signed_in" : "signed_out", {
       ...(account.email === undefined ? {} : { email: account.email }),
       ...(account.plan === undefined ? {} : { plan: account.plan }),
@@ -1151,9 +1391,14 @@ export class HraService {
     if (prior === null && (current.state === "login_pending" || current.state === "recovery_required")) {
       throw new CommandFailure("RECOVERY_REQUIRED", "This account already has an unsettled login. Reuse its idempotency key or inspect the account before starting another login.");
     }
+    const reboundAuthority = current.state === "login_pending"
+      ? this.#store.readPendingLoginAuthority(current.id, current.processGeneration)
+      : null;
     const targetGeneration = prior?.authorityGeneration ?? current.processGeneration + 1;
     const canBegin = current.processGeneration + 1 === targetGeneration && (prior === null || prior.state === "prepared");
-    if (current.processGeneration !== targetGeneration && !canBegin) {
+    const canReplayReboundPending = prior?.state === "applied"
+      && reboundAuthority?.attemptId === prior.id;
+    if (current.processGeneration !== targetGeneration && !canBegin && !canReplayReboundPending) {
       throw new CommandFailure("CONFLICT", "The login attempt belongs to a stale account generation.");
     }
     const authority = { ...current, processGeneration: targetGeneration };
@@ -1173,13 +1418,29 @@ export class HraService {
           });
         },
         effect: async () => await this.#fencedEffect(async () => await this.#codex.login({ authority: authorityFor(this.#paths, authority), method: deviceCode ? "device_code" : "browser", signal })),
-        receipt: (value) => loginReceiptSchema.parse({ status: value.status, ...(value.account === undefined ? {} : { account: value.account }) }),
+        receipt: (value) => loginReceiptSchema.parse(value.status === "pending"
+          ? { status: "pending", loginId: value.loginId }
+          : { status: "signed_in", account: value.account }),
         restore: restoreLoginReceipt,
+        commit: (attemptId, _value, receipt) => {
+          this.#store.completeAccountLoginMutation({
+            attemptId,
+            profileId: current.id,
+            processGeneration: targetGeneration,
+            receipt: loginReceiptSchema.parse(receipt),
+          });
+        },
       });
-      if (result.status === "signed_in" && result.account !== undefined) {
-        this.#store.setProfileState(current.id, targetGeneration, "signed_in", { ...(result.account.email === undefined ? {} : { email: result.account.email }), ...(result.account.plan === undefined ? {} : { plan: result.account.plan }) });
-      }
-      return { account: this.#publicProfile(this.#store.requireProfile(current.id)), login: result, idempotencyKey: key };
+      return {
+        account: this.#publicProfile(this.#store.requireProfile(current.id)),
+        login: result.status === "pending"
+          ? {
+              ...result,
+              next: `hra account login-cancel ${current.id}`,
+            }
+          : result,
+        idempotencyKey: key,
+      };
     } catch (error: unknown) {
       if (error instanceof DaemonAuthoritySafetyError) throw error;
       const observed = this.#store.requireProfile(current.id);
@@ -1193,6 +1454,74 @@ export class HraService {
       }
       throw error;
     }
+  }
+
+  async #cancelLogin(selector: string, signal: AbortSignal): Promise<unknown> {
+    const profile = this.#store.requireProfile(selector);
+    await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
+    if (profile.state === "recovery_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "This login has no safely replayable cancellation authority. Inspect the account before changing provider state.",
+      );
+    }
+    if (profile.state === "signed_in") {
+      return { account: this.#publicProfile(profile), status: "signed_in" };
+    }
+    if (profile.state === "signed_out") {
+      return { account: this.#publicProfile(profile), status: "already_settled" };
+    }
+    if (profile.state !== "login_pending") {
+      throw new CommandFailure("CONFLICT", "This account cannot cancel a login in its current state.");
+    }
+    const login = this.#store.readPendingLoginAuthority(profile.id, profile.processGeneration);
+    if (login === null) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The pending login has no exact durable provider login authority and cannot be canceled automatically.",
+      );
+    }
+    const authority = authorityFor(this.#paths, profile);
+    const canceled = await this.#fencedEffect(async () => await this.#codex.cancelLogin({
+      authority,
+      loginId: login.loginId,
+      signal,
+    }));
+    const provider = await this.#fencedEffect(async () => await this.#codex.readAccount({
+      authority,
+      signal,
+    }));
+    const observed = this.#store.requireProfileById(profile.id);
+    if (observed.processGeneration !== profile.processGeneration) {
+      throw new CommandFailure("CONFLICT", "The login cancellation belongs to a stale account generation.");
+    }
+    if (observed.state === "signed_in") {
+      return { account: this.#publicProfile(observed), loginId: login.loginId, status: "signed_in" };
+    }
+    if (observed.state === "signed_out") {
+      return { account: this.#publicProfile(observed), loginId: login.loginId, status: "already_settled" };
+    }
+    let settled: ProfileRecord;
+    try {
+      settled = this.#store.settlePendingLogin({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        loginId: login.loginId,
+        providerStatus: canceled.status,
+        provider,
+      });
+    } catch {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The exact login cancellation could not be committed under its original authority.",
+      );
+    }
+    return {
+      account: this.#publicProfile(settled),
+      loginId: login.loginId,
+      providerStatus: canceled.status,
+      status: provider.signedIn ? "signed_in" : "canceled",
+    };
   }
 
   async #logout(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
@@ -1506,8 +1835,8 @@ export class HraService {
     return sessionEventPageSchema.parse(page);
   }
 
-  #publicInteraction(interaction: InteractionRecord): unknown {
-    return {
+  #publicInteraction(interaction: InteractionRecord): PublicInteraction {
+    return publicInteractionSchema.parse({
       version: interaction.version,
       id: interaction.publicId,
       sessionId: interaction.sessionId,
@@ -1522,9 +1851,10 @@ export class HraService {
         itemId: interaction.authority.itemId,
       },
       requestedAt: interaction.requestedAt,
+      deadlineAt: interaction.deadlineAt,
       updatedAt: interaction.updatedAt,
       terminalAt: interaction.terminalAt,
-    };
+    });
   }
 
   #appendInteractionState(interaction: InteractionRecord): void {
@@ -1548,17 +1878,32 @@ export class HraService {
     interaction: InteractionRecord,
     resolution: InteractionResolution,
   ): void {
-    const expected = interaction.kind === "permission_approval"
-      ? "permission_grant"
-      : interaction.kind === "user_input"
+    const expected = interaction.kind === "user_input"
         ? "user_answers"
         : interaction.kind === "mcp_elicitation"
           ? "mcp_submission"
           : "approval_decision";
-    if (resolution.kind !== expected) {
+    const permissionDecision = interaction.kind === "permission_approval"
+      && resolution.kind === "approval_decision"
+      && (resolution.decision === "decline" || resolution.decision === "cancel");
+    const permissionGrant = interaction.kind === "permission_approval"
+      && resolution.kind === "permission_grant";
+    if (!permissionDecision && !permissionGrant && resolution.kind !== expected) {
       throw new CommandFailure(
         "INVALID_INPUT",
-        `A ${interaction.kind} interaction requires a ${expected} resolution.`,
+        interaction.kind === "permission_approval"
+          ? "A permission approval requires an exact permission grant, decline, or cancel resolution."
+          : `A ${interaction.kind} interaction requires a ${expected} resolution.`,
+      );
+    }
+    if (
+      interaction.kind === "permission_approval"
+      && resolution.kind === "approval_decision"
+      && !permissionDecision
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "Permission approvals can be declined or canceled, but broad once or session approval is not allowed.",
       );
     }
     if (
@@ -1575,7 +1920,7 @@ export class HraService {
       && interaction.display.kind === "permission_approval"
     ) {
       const requested = new Set(interaction.display.requested.map((permission) => permission.name));
-      if (Object.keys(resolution.permissions).some((name) => !requested.has(name))) {
+      if (resolution.permissions.some((name) => !requested.has(name))) {
         throw new CommandFailure("INVALID_INPUT", "Granted permissions must be a subset of the request.");
       }
       if (resolution.scope === "session" && !interaction.display.allowsSessionScope) {
@@ -1589,6 +1934,40 @@ export class HraService {
         throw new CommandFailure("INVALID_INPUT", "User answers must match the provider's exact question IDs.");
       }
     }
+    if (resolution.kind === "mcp_submission" && interaction.display.kind === "mcp_elicitation") {
+      if (interaction.display.mode !== "form" || interaction.display.fields === undefined) {
+        throw new CommandFailure("INVALID_INPUT", "This MCP form cannot be safely completed through HRA.");
+      }
+      if (resolution.action !== "accept") {
+        if (resolution.content !== undefined) {
+          throw new CommandFailure("INVALID_INPUT", "Declined or canceled MCP forms cannot include content.");
+        }
+        return;
+      }
+      try {
+        validateMcpFormSubmission(interaction.display.fields, resolution.content ?? {});
+      } catch {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "Protected MCP form content does not match the requested field contract.",
+        );
+      }
+    }
+  }
+
+  #intendedInteractionTerminalState(
+    resolution: InteractionResolution,
+  ): InteractionIntendedTerminalState {
+    if (resolution.kind === "approval_decision") {
+      if (resolution.decision === "decline") return "declined";
+      if (resolution.decision === "cancel") return "canceled";
+      return "resolved";
+    }
+    if (resolution.kind === "mcp_submission") {
+      if (resolution.action === "decline") return "declined";
+      if (resolution.action === "cancel") return "canceled";
+    }
+    return "resolved";
   }
 
   async #resolveInteraction(
@@ -1605,29 +1984,55 @@ export class HraService {
         );
       }
       this.#assertResolutionMatches(current, command.resolution);
-      const responseDigest = digestText(canonicalJson(command.resolution));
+      const profile = this.#store.requireProfileById(current.authority.profileId);
+      let responseDigest: string;
+      try {
+        await this.#daemonAuthority.assertCurrent();
+        const validated = await this.#codex.validateInteractionResolution({
+          authority: authorityFor(this.#paths, profile),
+          provider: current.authority,
+          kind: current.kind,
+          resolution: command.resolution,
+          signal,
+        });
+        responseDigest = validated.responseDigest;
+      } catch (error: unknown) {
+        if (error instanceof CodexError && error.code === "INVALID_INPUT") {
+          throw new CommandFailure("INVALID_INPUT", error.message);
+        }
+        const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+          ? this.#store.markInteractionResolutionUnknown({
+              id: current.publicId,
+              expectedRevision: current.revision,
+            })
+          : this.#store.expireInteraction({
+              id: current.publicId,
+              expectedRevision: current.revision,
+            });
+        this.#appendInteractionState(terminal);
+        if (error instanceof CodexError && error.code === "INDETERMINATE_EFFECT") {
+          throw new CommandFailure(
+            "RECOVERY_REQUIRED",
+            "The interaction response may already have reached Codex; its resolution is unknown.",
+            { interaction: this.#publicInteraction(terminal) },
+          );
+        }
+        throw new CommandFailure(
+          "CONFLICT",
+          "The interaction's exact provider connection is no longer available.",
+          { interaction: this.#publicInteraction(terminal) },
+        );
+      }
       const prepared = this.#store.prepareInteractionResponse({
         id: current.publicId,
         expectedRevision: current.revision,
         responseDigest,
+        intendedTerminalState: this.#intendedInteractionTerminalState(command.resolution),
       });
       this.#appendInteractionState(prepared);
-      const resolve = this.#codex.resolveInteraction?.bind(this.#codex);
-      if (resolve === undefined) {
-        const expired = this.#store.expireInteraction({
-          id: prepared.publicId,
-          expectedRevision: prepared.revision,
-        });
-        this.#appendInteractionState(expired);
-        throw new CommandFailure(
-          "UNAVAILABLE",
-          "Interaction response routing is unavailable for this provider runtime.",
-        );
-      }
-      const profile = this.#store.requireProfileById(prepared.authority.profileId);
       try {
         await this.#daemonAuthority.assertCurrent();
-        await resolve.call(this.#codex, {
+        await this.#codex.resolveInteraction({
           authority: authorityFor(this.#paths, profile),
           provider: prepared.authority,
           kind: prepared.kind,

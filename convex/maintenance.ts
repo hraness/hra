@@ -2,6 +2,7 @@ import { v } from "convex/values";
 
 import { isSafePositiveInteger } from "../src/cloud/contracts";
 import { commandTerminalRetentionMs } from "./commands";
+import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
 import {
   adjustCommandQuotaForPatch,
   adjustQuotaForPatch,
@@ -44,7 +45,7 @@ export const cloudRetentionMs = Object.freeze({
   otpChallengeMaximum: 10 * 60 * 1_000,
   securityEvent: 90 * 24 * 60 * 60 * 1_000,
   terminalCommand: commandTerminalRetentionMs,
-  usageSnapshot: 90 * 24 * 60 * 60 * 1_000,
+  usageSnapshot: CLOUD_USAGE_SNAPSHOT_RETENTION_MS,
 } as const);
 
 type CleanupCounts = {
@@ -292,12 +293,63 @@ async function deleteExpiredUsage(ctx: MutationCtx, now: number, limit: number):
       .lt("receivedAt", now - cloudRetentionMs.usageSnapshot))
     .take(limit);
   for (const record of records) {
-    await releaseAccountUsageSnapshotQuotaForDelete(
-      ctx,
-      record.userId,
-      record.accountId,
-      record,
-    );
+    let snapshotQuotaReleased = false;
+    const bindings = await ctx.db.query("deviceAccountBindings")
+      .withIndex("by_device_and_account", (builder) => builder
+        .eq("deviceId", record.sourceDeviceId)
+        .eq("accountId", record.accountId))
+      .take(2);
+    if (bindings.length > 1) throw new Error("USAGE_RETENTION_AUTHORITY_CORRUPT");
+    const binding = bindings[0];
+    if (binding !== undefined && binding.usageAdmission === undefined) {
+      if (binding.userId !== record.userId) {
+        throw new Error("USAGE_RETENTION_AUTHORITY_CORRUPT");
+      }
+      const latest = (await ctx.db.query("accountUsageSnapshots")
+        .withIndex("by_source_revision", (builder) => builder
+          .eq("accountId", record.accountId)
+          .eq("sourceDeviceId", record.sourceDeviceId))
+        .order("desc")
+        .take(1))[0];
+      if (
+        latest !== undefined
+        && latest._id === record._id
+      ) {
+        if (
+          latest.userId !== record.userId
+          || latest.sourceDevicePublicId !== record.sourceDevicePublicId
+        ) throw new Error("USAGE_RETENTION_AUTHORITY_CORRUPT");
+        const patch = {
+          updatedAt: Math.max(binding.updatedAt, now),
+          usageAdmission: {
+            cursor: {
+              digest: latest.digest,
+              disposition: "stored" as const,
+              observedAt: latest.observedAt,
+              sourceRevision: latest.sourceRevision,
+            },
+            lastAcceptedAt: latest.receivedAt,
+          },
+        } as const;
+        await releaseAccountUsageSnapshotQuotaForDelete(
+          ctx,
+          record.userId,
+          record.accountId,
+          record,
+        );
+        snapshotQuotaReleased = true;
+        await adjustQuotaForPatch(ctx, record.userId, "account", binding, patch);
+        await ctx.db.patch(binding._id, patch);
+      }
+    }
+    if (!snapshotQuotaReleased) {
+      await releaseAccountUsageSnapshotQuotaForDelete(
+        ctx,
+        record.userId,
+        record.accountId,
+        record,
+      );
+    }
     await ctx.db.delete(record._id);
   }
   return records.length;

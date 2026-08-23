@@ -21,7 +21,14 @@ const getSessionHead = makeFunctionReference<"query", Args, unknown>("sessions:g
 const updateSessionState = makeFunctionReference<"mutation", Args, unknown>(
   "sessions:updateState",
 );
+const appendSessionChunk = makeFunctionReference<"mutation", Args, unknown>(
+  "sessions:appendChunk",
+);
+const beginCompactEpoch = makeFunctionReference<"mutation", Args, unknown>(
+  "sessions:beginCompactEpoch",
+);
 const acquireLease = makeFunctionReference<"mutation", Args, unknown>("leases:acquire");
+const heartbeatLease = makeFunctionReference<"mutation", Args, unknown>("leases:heartbeat");
 const enqueueCommand = makeFunctionReference<"mutation", Args, unknown>("commands:enqueue");
 const acknowledgeCommand = makeFunctionReference<"mutation", Args, unknown>(
   "commands:acknowledgeReceipt",
@@ -396,7 +403,7 @@ describe("cloud transactions", () => {
     }), "Cloud authority is not current");
   });
 
-  test("atomically refuses terminal state while any command effect remains unsettled", async () => {
+  test("closes terminal commands and state while exact-origin compact tails remain appendable", async () => {
     const world = await authenticatedWorld();
     const now = Date.now();
     await world.runtime.mutation(register, {
@@ -475,6 +482,142 @@ describe("cloud transactions", () => {
     expect(await world.runtime.query(getSessionHead, {
       publicId: "session_terminal1",
     })).toMatchObject({ state: "terminal" });
+
+    const terminalTailDigest = "e".repeat(64);
+    expect(await world.runtime.mutation(appendSessionChunk, {
+      authority,
+      digest: terminalTailDigest,
+      envelope: encryptedEnvelope,
+      expectedHeadSequence: 0,
+      expectedStreamEpoch: 0,
+      firstSequence: 1,
+      lastSequence: 1,
+      sessionPublicId: "session_terminal1",
+      stream: "compact",
+    })).toEqual({
+      digest: terminalTailDigest,
+      headSequence: 1,
+      replay: false,
+      streamEpoch: 0,
+    });
+    expect(await world.runtime.mutation(heartbeatLease, {
+      authority,
+      fingerprint: "f".repeat(64),
+      leaseDurationMs: 30_000,
+      sequence: 1,
+      sessionPublicId: "session_terminal1",
+    })).toMatchObject({ heartbeatSequence: 1 });
+    expect(await world.runtime.mutation(acquireLease, {
+      bootGeneration: authority.bootGeneration,
+      bootId: authority.bootId,
+      leaseDurationMs: 30_000,
+      sessionPublicId: "session_terminal1",
+    })).toMatchObject({
+      bootGeneration: authority.bootGeneration,
+      bootId: authority.bootId,
+      fence: authority.fence,
+    });
+
+    await expectPromiseToReject(world.runtime.mutation(updateSessionState, {
+      authority,
+      expectedState: "idle",
+      sessionPublicId: "session_terminal1",
+      state: "active",
+    }), "SESSION_STATE_CONFLICT");
+    await expectPromiseToReject(world.runtime.mutation(enqueueCommand, {
+      deadline: now + 60_000,
+      expectedTargetDevicePublicId: "device_terminal1",
+      idempotencyKey: uuidV7(now, "75"),
+      kind: "stop",
+      payload: encryptedEnvelope,
+      publicId: uuidV7(now, "76"),
+      requestDigest: "6".repeat(64),
+      sessionPublicId: "session_terminal1",
+    }), "Cloud authority is not current");
+    await expectPromiseToReject(world.runtime.mutation(appendSessionChunk, {
+      authority,
+      digest: "7".repeat(64),
+      envelope: encryptedEnvelope,
+      expectedHeadSequence: 0,
+      expectedStreamEpoch: 0,
+      firstSequence: 1,
+      lastSequence: 1,
+      sessionPublicId: "session_terminal1",
+      stream: "detail",
+    }), "Cloud authority is not current");
+    await expectPromiseToReject(world.runtime.mutation(beginCompactEpoch, {
+      authority,
+      epochPublicId: uuidV7(now, "77"),
+      expectedCompactStreamEpoch: 0,
+      expectedHeadSequence: 1,
+      expectedTailDigest: terminalTailDigest,
+      idempotencyKey: uuidV7(now, "78"),
+      lineageCommitment: "terminal_lineage_commitment",
+      requestDigest: "8".repeat(64),
+      sessionPublicId: "session_terminal1",
+    }), "Cloud authority is not current");
+
+    await world.testRuntime.run(async (ctx) => {
+      const leases = await ctx.db.query("executionLeases").collect();
+      const terminalLease = leases[0];
+      if (leases.length !== 1 || terminalLease === undefined) {
+        throw new Error("missing terminal lease fixture");
+      }
+      await ctx.db.patch(terminalLease._id, { leaseUntil: Date.now() - 1 });
+    });
+    const reacquired = await world.runtime.mutation(acquireLease, {
+      bootGeneration: 2,
+      bootId: "boot_terminal2",
+      leaseDurationMs: 30_000,
+      sessionPublicId: "session_terminal1",
+    }) as Readonly<{ bootGeneration: number; bootId: string; fence: number }>;
+    const recoveryAuthority = {
+      bootGeneration: reacquired.bootGeneration,
+      bootId: reacquired.bootId,
+      fence: reacquired.fence,
+    };
+    expect(recoveryAuthority.fence).toBeGreaterThan(authority.fence);
+    const finalTailDigest = "9".repeat(64);
+    expect(await world.runtime.mutation(appendSessionChunk, {
+      authority: recoveryAuthority,
+      digest: finalTailDigest,
+      envelope: encryptedEnvelope,
+      expectedHeadSequence: 1,
+      expectedStreamEpoch: 0,
+      expectedTailDigest: terminalTailDigest,
+      firstSequence: 2,
+      lastSequence: 2,
+      previousDigest: terminalTailDigest,
+      sessionPublicId: "session_terminal1",
+      stream: "compact",
+    })).toMatchObject({ headSequence: 2, replay: false });
+    await expectPromiseToReject(world.runtime.mutation(appendSessionChunk, {
+      authority,
+      digest: "0".repeat(64),
+      envelope: encryptedEnvelope,
+      expectedHeadSequence: 2,
+      expectedStreamEpoch: 0,
+      expectedTailDigest: finalTailDigest,
+      firstSequence: 3,
+      lastSequence: 3,
+      previousDigest: finalTailDigest,
+      sessionPublicId: "session_terminal1",
+      stream: "compact",
+    }), "Cloud authority is not current");
+    expect(await world.runtime.mutation(heartbeatLease, {
+      authority: recoveryAuthority,
+      fingerprint: "1".repeat(64),
+      leaseDurationMs: 30_000,
+      sequence: 1,
+      sessionPublicId: "session_terminal1",
+    })).toMatchObject({ heartbeatSequence: 1 });
+    expect(await world.runtime.query(getSessionHead, {
+      publicId: "session_terminal1",
+    })).toMatchObject({
+      compactHeadSequence: 2,
+      compactTailDigest: finalTailDigest,
+      state: "terminal",
+    });
   });
 
   test("a newer same-daemon fence closes an effect-started command as ambiguous without replay", async () => {

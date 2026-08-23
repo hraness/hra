@@ -22,7 +22,11 @@ const canonicalPayload = (payload: SessionEventCursorPayload): string => JSON.st
 const decodeBase64Url = (value: string, label: string): Buffer => {
   if (!/^[A-Za-z0-9_-]+$/u.test(value)) throw new SessionEventCursorError(`${label} is malformed.`);
   try {
-    return Buffer.from(value, "base64url");
+    const decoded = Buffer.from(value, "base64url");
+    if (decoded.toString("base64url") !== value) {
+      throw new SessionEventCursorError(`${label} is not canonical.`);
+    }
+    return decoded;
   } catch {
     throw new SessionEventCursorError(`${label} is malformed.`);
   }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { HRA_VERSION } from "../version.ts";
 import { CodexAppServerClient } from "./client.ts";
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
@@ -63,6 +64,7 @@ class FakeProcess implements CodexProcess {
   readonly stderr = this.stderrQueue;
   readonly writes: unknown[] = [];
   readonly signals: ("SIGTERM" | "SIGKILL")[] = [];
+  writeError: Error | undefined;
   readonly exited: Promise<number>;
   #resolveExit!: (code: number) => void;
 
@@ -81,6 +83,11 @@ class FakeProcess implements CodexProcess {
   write(bytes: Uint8Array): Promise<void> {
     const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     this.writes.push(parsed);
+    if (this.writeError !== undefined) {
+      const error = this.writeError;
+      this.writeError = undefined;
+      return Promise.reject(error);
+    }
     this.onWrite(parsed as Record<string, unknown>, this);
     return Promise.resolve();
   }
@@ -140,6 +147,43 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 }
 
 describe("CodexAppServerClient", () => {
+  test("sends the exact pinned login cancellation authority", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/login/cancel") {
+        expect(message.params).toEqual({ loginId: "provider-login-exact" });
+        runtime.respond({ id: message.id, result: { status: "notFound" } });
+      }
+    });
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    await expect(client.cancelManagedLogin("provider-login-exact")).resolves.toEqual({
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      value: { status: "notFound" },
+    });
+    expect(process.writes).toContainEqual({
+      id: 2,
+      method: "account/login/cancel",
+      params: { loginId: "provider-login-exact" },
+    });
+    await client.close();
+  });
+
   test("initializes once and fences returned identity", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: FencedCodexValue<CodexFact>[] = [];
@@ -154,6 +198,18 @@ describe("CodexAppServerClient", () => {
       },
     });
     await client.initialize();
+    expect(process.writes[0]).toEqual({
+      id: 1,
+      method: "initialize",
+      params: {
+        clientInfo: { name: "hra", title: "HRA", version: HRA_VERSION },
+        capabilities: {
+          experimentalApi: false,
+          extensions: { "openai/standard-form-input": {} },
+        },
+      },
+    });
+    expect(JSON.stringify(process.writes[0])).not.toContain("openai/form");
     const result = await client.accountRead();
     expect(result.authority).toEqual({ profileId: "profile-a", processGeneration: 7 });
     expect(result.value.account).toEqual({
@@ -264,6 +320,224 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("classifies MCP URL elicitation as unsupported without admitting or echoing its URL", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const diagnostics: string[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+    });
+    await client.initialize();
+    const sentinel = "MCP_CLIENT_URL_SECRET_SENTINEL";
+    process.respond({
+      id: 901,
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        serverName: "example",
+        mode: "url",
+        _meta: null,
+        message: "Authorize Example",
+        url: `https://example.com/oauth?access_token=${sentinel}#${sentinel}`,
+        elicitationId: "elicit-url",
+      },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "protocolNotice"));
+    expect(process.writes.at(-1)).toEqual({
+      id: 901,
+      error: {
+        code: -32_601,
+        message: "HRA cannot broker this server request capability",
+        data: { code: "UNSUPPORTED_CAPABILITY" },
+      },
+    });
+    expect(facts.some((fact) => fact.type === "interactionRequested")).toBe(false);
+    expect(diagnostics).toEqual([
+      "Codex requested an unsupported capability for mcpServer/elicitation/request",
+    ]);
+    expect(JSON.stringify({ writes: process.writes, facts, diagnostics })).not.toContain(sentinel);
+    await client.close();
+  });
+
+  test("fails closed on opaque and unsupported MCP forms without admitting or echoing their schemas", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const diagnostics: string[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+    });
+    await client.initialize();
+    const sentinel = "MCP_CLIENT_SCHEMA_SECRET_SENTINEL";
+    const requests = [
+      {
+        mode: "openai/form",
+        requestedSchema: {
+          type: "object",
+          properties: { picker: { type: "openai/imagePicker", title: sentinel } },
+        },
+      },
+      {
+        mode: "form",
+        requestedSchema: {
+          type: "object",
+          properties: { token: { type: "string", pattern: sentinel } },
+        },
+      },
+      {
+        mode: "form",
+        _meta: {
+          codex_approval_kind: "tool_suggestion",
+          persist: "always",
+          tool_type: "plugin",
+          suggest_type: "install",
+          install_url: `https://example.com/install?secret=${sentinel}`,
+        },
+        requestedSchema: { type: "object", properties: {} },
+      },
+    ] as const;
+    for (const [index, request] of requests.entries()) {
+      process.respond({
+        id: 910 + index,
+        method: "mcpServer/elicitation/request",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          serverName: "example",
+          _meta: null,
+          message: "Configure Example",
+          ...request,
+        },
+      });
+      await waitFor(() => process.writes.some((write) =>
+        (write as { id?: unknown }).id === 910 + index));
+      expect(process.writes.at(-1)).toEqual({
+        id: 910 + index,
+        error: {
+          code: -32_601,
+          message: "HRA cannot broker this server request capability",
+          data: { code: "UNSUPPORTED_CAPABILITY" },
+        },
+      });
+    }
+    expect(facts.some((fact) => fact.type === "interactionRequested")).toBe(false);
+    expect(diagnostics).toEqual([
+      "Codex requested an unsupported capability for mcpServer/elicitation/request",
+      "Codex requested an unsupported capability for mcpServer/elicitation/request",
+      "Codex requested an unsupported capability for mcpServer/elicitation/request",
+    ]);
+    expect(JSON.stringify({ writes: process.writes, facts, diagnostics })).not.toContain(sentinel);
+    await client.close();
+  });
+
+  test("brokers a standard MCP form and writes only a schema-valid exact response", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: FencedCodexValue<CodexFact>[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 4 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: (fact) => { facts.push(fact); },
+    });
+    await client.initialize();
+    const schemaOnlySentinel = "MCP_CLIENT_PRIVATE_SCHEMA_SENTINEL";
+    process.respond({
+      id: 911,
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        serverName: "example",
+        mode: "form",
+        _meta: null,
+        message: "Configure Example",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            channel: {
+              type: "string",
+              title: schemaOnlySentinel,
+              enum: ["stable", "fast"],
+              enumNames: [schemaOnlySentinel, schemaOnlySentinel],
+            },
+            confirmed: { type: "boolean" },
+          },
+          required: ["channel", "confirmed"],
+        },
+      },
+    });
+    await waitFor(() => facts.some((fact) => fact.value.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.value.type === "interactionRequested")?.value;
+    if (requested?.type !== "interactionRequested") throw new Error("MCP form was not admitted.");
+    expect(requested.display).toMatchObject({
+      kind: "mcp_elicitation",
+      mode: "form",
+      fields: [
+        { name: "channel", type: "single_select", required: true, choices: ["stable", "fast"] },
+        { name: "confirmed", type: "boolean", required: true },
+      ],
+    });
+    expect(JSON.stringify(requested.display)).not.toContain(schemaOnlySentinel);
+    await Bun.sleep(1);
+    const writesBeforeInvalid = process.writes.length;
+    const submittedSentinel = "MCP_CLIENT_SUBMISSION_SECRET_SENTINEL";
+    await expect(client.validateInteractionResolution({
+      provider: requested.provider,
+      kind: requested.kind,
+      resolution: {
+        kind: "mcp_submission",
+        action: "accept",
+        content: { channel: submittedSentinel, confirmed: true },
+      },
+    })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(process.writes).toHaveLength(writesBeforeInvalid);
+    await expect(client.validateInteractionResolution({
+      provider: requested.provider,
+      kind: requested.kind,
+      resolution: {
+        kind: "mcp_submission",
+        action: "accept",
+        content: { channel: "fast", confirmed: true },
+      },
+    })).resolves.toEqual({
+      responseDigest: "78cc323d0067a51b626d7e1a37704ffd9f002346cb0707dd3d28c327546510e2",
+    });
+    expect(process.writes).toHaveLength(writesBeforeInvalid);
+    await client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      resolution: {
+        kind: "mcp_submission",
+        action: "accept",
+        content: { channel: "fast", confirmed: true },
+      },
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: 911,
+      result: {
+        action: "accept",
+        content: { channel: "fast", confirmed: true },
+        _meta: null,
+      },
+    });
+    expect(JSON.stringify(process.writes)).not.toContain(submittedSentinel);
+    await client.close();
+  });
+
   test("admits a typed interaction and routes an exact response without granting through text", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: FencedCodexValue<CodexFact>[] = [];
@@ -314,6 +588,89 @@ describe("CodexAppServerClient", () => {
       params: { threadId: "thread-1", requestId: 41 },
     });
     await waitFor(() => facts.some((fact) => fact.value.type === "interactionResolved"));
+    await client.close();
+  });
+
+  test("anchors callback deadlines at receipt and writes one provider-neutral timeout error", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    let now = 10_000;
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      now: () => now,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({
+      id: "deadline-request",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-deadline",
+        isBlocking: true,
+        autoResolutionMs: 5_000,
+        questions: [{
+          id: "choice",
+          header: "Choice",
+          question: "Choose",
+          isOther: true,
+          isSecret: false,
+          options: null,
+        }],
+      },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    now = 14_000;
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested") throw new Error("Missing deadline interaction.");
+    expect(requested).toMatchObject({ requestedAt: 10_000, deadlineAt: 15_000, timeoutMs: 5_000 });
+    const validated = await client.validateInteractionTimeout({ provider: requested.provider });
+    expect(validated.responseDigest).toMatch(/^[a-f0-9]{64}$/u);
+    await expect(client.timeoutInteraction({ provider: requested.provider }))
+      .resolves.toEqual({ responseWritten: true });
+    expect(process.writes.at(-1)).toEqual({
+      id: "deadline-request",
+      error: { code: -32_008, message: "HRA interaction deadline expired" },
+    });
+    process.respond({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: "deadline-request" },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionResolved"));
+    await client.close();
+  });
+
+  test("quarantines the provider generation when a timeout write may have escaped", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({ id: 52, method: "item/commandExecution/requestApproval", params: commandApprovalParams() });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested") throw new Error("Missing interaction.");
+    await client.validateInteractionTimeout({ provider: requested.provider });
+    process.writeError = new Error("uncertain private pipe write");
+    await expect(client.timeoutInteraction({ provider: requested.provider }))
+      .rejects.toMatchObject({ code: "INDETERMINATE_EFFECT" });
+    expect(client.state).toBe("failed");
+    expect(process.signals).toContain("SIGTERM");
+    await waitFor(() => facts.some((fact) =>
+      fact.type === "providerDisconnected" && fact.reason === "protocol_fault"));
+    await expect(client.timeoutInteraction({ provider: requested.provider }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await client.close();
   });
 

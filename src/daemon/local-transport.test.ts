@@ -9,6 +9,7 @@ import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import {
   callLocalDaemon,
   callWithSafeAutostart,
+  commandFailureBrand,
   LocalDaemonIndeterminateError,
   LocalDaemonServer,
   LocalDaemonShutdownTimeoutError,
@@ -46,11 +47,116 @@ describe("local daemon transport", () => {
     expect((await readFile(paths.capability, "utf8")).trim()).toHaveLength(43);
   });
 
+  test("closes unexpected daemon failures without returning runtime diagnostics", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const secret = "OPAQUE_RUNTIME_SENTINEL_DO_NOT_RETURN";
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: () => {
+        throw Object.assign(
+          new Error(`provider unavailable ${secret} at /private/runtime\u001b]52;c;attack\u0007`),
+          { code: "UNAVAILABLE", details: { diagnostic: secret } },
+        );
+      },
+    });
+    servers.push(server);
+    const response = await callLocalDaemon({ paths, command: { kind: "daemon.status" } });
+    expect(response).toMatchObject({
+      ok: false,
+      error: {
+        code: "INTERNAL",
+        message: "The local request failed before a safe diagnostic was available.",
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain(secret);
+    expect(JSON.stringify(response)).not.toContain("/private/runtime");
+    expect(JSON.stringify(response)).not.toContain("\u001b");
+  });
+
+  test("maps declared command failures to closed messages without echoing their diagnostic", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const secret = "DECLARED_FAILURE_SENTINEL_DO_NOT_RETURN";
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: () => {
+        throw Object.assign(new Error(`provider unavailable ${secret}`), {
+          [commandFailureBrand]: true as const,
+          code: "UNAVAILABLE" as const,
+          details: { nextCommand: "hra doctor" },
+        });
+      },
+    });
+    servers.push(server);
+    const response = await callLocalDaemon({ paths, command: { kind: "daemon.status" } });
+    expect(response).toMatchObject({
+      ok: false,
+      error: {
+        code: "UNAVAILABLE",
+        details: { nextCommand: "hra doctor" },
+        message: "A required local or provider capability is unavailable.",
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain(secret);
+  });
+
   test("uses an absolute client deadline", async () => {
     const { paths } = await fixture(5_000);
     const started = Date.now();
     await expect(callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 20 })).resolves.toMatchObject({ ok: true });
     expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  test("rejects an already-aborted client request before opening daemon dispatch", async () => {
+    const { paths } = await fixture();
+    const controller = new AbortController();
+    const reason = new Error("cancelled before dispatch");
+    controller.abort(reason);
+    await expect(callLocalDaemon({
+      paths,
+      command: { kind: "daemon.status" },
+      signal: controller.signal,
+    })).rejects.toBe(reason);
+  });
+
+  test("destroys the client socket on abort so the daemon handler is canceled", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let resolveEntered!: () => void;
+    const entered = new Promise<void>((resolve) => { resolveEntered = resolve; });
+    let resolveHandlerAbort!: () => void;
+    const handlerAborted = new Promise<void>((resolve) => { resolveHandlerAbort = resolve; });
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: async (_command, context) => {
+        resolveEntered();
+        await new Promise<void>((resolve) => {
+          const aborted = () => {
+            resolveHandlerAbort();
+            resolve();
+          };
+          if (context.signal.aborted) aborted();
+          else context.signal.addEventListener("abort", aborted, { once: true });
+        });
+        return { canceled: true };
+      },
+    });
+    servers.push(server);
+    const controller = new AbortController();
+    const call = callLocalDaemon({
+      paths,
+      command: { kind: "daemon.status" },
+      deadlineMs: 5_000,
+      signal: controller.signal,
+    });
+    await entered;
+    controller.abort(new Error("stop following"));
+    await expect(call).rejects.toBeInstanceOf(LocalDaemonIndeterminateError);
+    await handlerAborted;
   });
 
   test("closes admission and removes endpoint authority", async () => {

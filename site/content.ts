@@ -74,8 +74,10 @@ const privacyBlocks: readonly ContentBlock[] = [
   list(
     [text("User messages and final assistant display text.")],
     [text("Session names, notes, queued messages, and steering input.")],
+    [text("Codex account labels and observed provider email and plan metadata when cloud sync is enabled.")],
     [text("Turn timing, observed model and tier, and provider usage summaries.")],
     [text("Bounded observed file and Git metadata, without unbounded filesystem paths.")],
+    [text("Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.")],
     [text("Remote-command input and results that fit the closed command protocol.")],
   ),
   { kind: "subheading", text: "Never uploaded" },
@@ -83,10 +85,14 @@ const privacyBlocks: readonly ContentBlock[] = [
     [text("Codex credentials, profile files, plugin credentials, or OAuth material.")],
     [text("Raw app-server requests or responses.")],
     [text("Raw reasoning, hidden chain of thought, or approval secrets.")],
+    [text("Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.")],
     [text("Environment variables, arbitrary command output, or unbounded filesystem paths.")],
   ),
   paragraph(
     text("The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key."),
+  ),
+  paragraph(
+    text("Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked."),
   ),
   paragraph(
     text("Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion."),
@@ -163,6 +169,13 @@ export const publicContent: PublicContent = {
           text("."),
         ),
         paragraph(
+          text("If the first pending-login handoff is lost or the daemon restarts before completion, "),
+          code("hra account show personal"),
+          text(" reports the pending attempt. Then run "),
+          code("hra account login-cancel personal"),
+          text(". A caller that retained the idempotency key may also retry it without redispatching. HRA cancels only that profile's exact current-generation provider login before allowing a fresh login. Verification URLs, device codes, and provider credentials are never retained."),
+        ),
+        paragraph(
           text("HRA cloud identity is separate from every Codex account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured."),
         ),
       ],
@@ -215,6 +228,9 @@ export const publicContent: PublicContent = {
           text(" on the new machine to retrieve and unwrap its encryption-key envelope. Use "),
           code("hra device revoke <device-id-or-prefix>"),
           text(" from a different active machine to revoke a device."),
+        ),
+        paragraph(
+          text("Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked."),
         ),
         paragraph(
           text("Cloud-account erasure is explicit and irreversible. Run "),
@@ -275,7 +291,7 @@ export const publicContent: PublicContent = {
           ],
         },
         paragraph(
-          text("JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded event pages, and durable interaction records keep approvals, questions, permission grants, and MCP elicitation visible until they are explicitly resolved."),
+          text("JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded event pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved."),
         ),
       ],
     },
@@ -321,7 +337,7 @@ export const publicContent: PublicContent = {
           text("Plugin commands are read-only discovery. They report the exact installed, enabled, availability, authorization, and capability state exposed by the selected isolated Codex profile."),
         ),
         paragraph(
-          text("Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface: its available lifecycle path can combine installation with enablement and may then open browser authorization. HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects. Those actions fail with an explicit protocol-boundary error."),
+          text("Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface: its available lifecycle path can combine installation with enablement and may then open browser authorization. HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects. The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission. Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract. The interaction exposes bounded field names, types, requiredness, constraints, and allowed choices; titles, descriptions, defaults, and answers stay off the public and durable display. Protected submissions are checked for exact required fields, types, bounds, formats, choices, and the absence of additional properties before response preparation. Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission and receive a safe unsupported-capability response with no schema, submitted value, or URL echo. The schema-11 security migration terminalizes and replaces any prerelease URL record before interaction reads. HRA will keep extended-form and URL handoff unavailable until each has a closed protected path."),
         ),
       ],
     },
@@ -358,6 +374,10 @@ export const publicContent: PublicContent = {
         ),
         paragraph(
           text("Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, and Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer."),
+        ),
+        paragraph(
+          code("hra remote show"),
+          text(" includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. Resolve a pending callback on its execution device; remote interaction responses are unavailable in v1."),
         ),
         {
           kind: "commands",
@@ -430,6 +450,7 @@ export const publicContent: PublicContent = {
             "hra device approve|revoke <device-id-or-prefix>",
             "hra account add <label>",
             "hra account login <profile> [--device-code]",
+            "hra account login-cancel <profile>",
             "hra account logout <profile>",
             "hra account list",
             "hra account show <profile>",
@@ -480,6 +501,24 @@ export const publicContent: PublicContent = {
           text(" to reuse one after a lost response. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With "),
           code("--json"),
           text(", stdout contains one versioned object; diagnostics stay on stderr."),
+        ),
+        paragraph(
+          code("interaction show"),
+          text(" lists each requested permission category and each exact question ID. A permission grant reads "),
+          code('{"permissions":["<requested-name>"]}'),
+          text(" and a question response reads "),
+          code('{"answers":{"<question-id>":{"answers":["<answer>"]}}}'),
+          text(" through protected input. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync."),
+        ),
+        paragraph(
+          text("Every admitted callback carries a local deadline anchored when Codex delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. "),
+          code("interaction show"),
+          text(" displays the safe local deadline; encrypted remote interaction metadata does not include it."),
+        ),
+        paragraph(
+          text("For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as "),
+          code('{"content":{...}}'),
+          text(" from nonterminal stdin or a file descriptor. Decline and cancel accept no content. JSON mode never prompts, and validation failures identify the contract failure without echoing a submitted value."),
         ),
         paragraph(
           text("Projection recovery uses the local-session selector rules. It requires "),

@@ -57,20 +57,65 @@ async function publishCapability(paths: StatePaths, capability: string): Promise
   await validateOwnedFile(paths.capability, "file", 0o600);
 }
 
-const safeResponse = (requestId: string, error: unknown): CommandResponse => ({
-  ok: false,
-  version: 1,
-  requestId,
-  error: {
-    code:
-      typeof error === "object" && error !== null && "code" in error &&
-      ["INVALID_INPUT", "NOT_FOUND", "AMBIGUOUS", "CONFLICT", "INTERACTION_REQUIRED", "UNAVAILABLE", "RECOVERY_REQUIRED", "INTERNAL"].includes(String(error.code))
-        ? (error.code as "INVALID_INPUT" | "NOT_FOUND" | "AMBIGUOUS" | "CONFLICT" | "INTERACTION_REQUIRED" | "UNAVAILABLE" | "RECOVERY_REQUIRED" | "INTERNAL")
-        : "INTERNAL",
-    message: error instanceof Error ? error.message.slice(0, 1_000) : "The local request failed.",
-    ...(typeof error === "object" && error !== null && "details" in error && error.details !== undefined ? { details: error.details } : {}),
-  },
-});
+const publicFailureCodes = [
+  "INVALID_INPUT",
+  "NOT_FOUND",
+  "AMBIGUOUS",
+  "CONFLICT",
+  "INTERACTION_REQUIRED",
+  "UNAVAILABLE",
+  "RECOVERY_REQUIRED",
+  "INTERNAL",
+] as const;
+
+type PublicFailureCode = typeof publicFailureCodes[number];
+
+export const commandFailureBrand = Symbol("hra.command-failure");
+
+const publicFailureMessages = {
+  INVALID_INPUT: "The local command was rejected as invalid.",
+  NOT_FOUND: "No matching object was found.",
+  AMBIGUOUS: "The selector matches more than one object.",
+  CONFLICT: "The local command conflicts with current authority.",
+  INTERACTION_REQUIRED: "The local command requires an explicit interaction.",
+  UNAVAILABLE: "A required local or provider capability is unavailable.",
+  RECOVERY_REQUIRED: "The local command requires recovery before it can continue.",
+  INTERNAL: "The local request failed before a safe diagnostic was available.",
+} as const satisfies Readonly<Record<PublicFailureCode, string>>;
+
+type DeclaredCommandFailure = Error & Readonly<{
+  [commandFailureBrand]: true;
+  code: PublicFailureCode;
+  details?: unknown;
+}>;
+
+const declaredCommandFailure = (error: unknown): error is DeclaredCommandFailure =>
+  error instanceof Error
+  && commandFailureBrand in error
+  && error[commandFailureBrand] === true
+  && "code" in error
+  && publicFailureCodes.includes(error.code as PublicFailureCode);
+
+const safeResponse = (requestId: string, error: unknown): CommandResponse => {
+  const publicFailure = declaredCommandFailure(error);
+  const code = publicFailure
+    ? error.code
+    : "INTERNAL";
+  return {
+    ok: false,
+    version: 1,
+    requestId,
+    error: {
+      code,
+      message: publicFailureMessages[code],
+      ...(publicFailure
+        && code !== "INTERNAL"
+        && error.details !== undefined
+        ? { details: error.details }
+        : {}),
+    },
+  };
+};
 
 export class LocalDaemonServer {
   readonly #paths: StatePaths;
@@ -138,12 +183,22 @@ export class LocalDaemonServer {
       this.#controllers.delete(controller);
     };
     socket.once("close", settleSocket);
+    socket.once("end", () => {
+      controller.abort(new Error("Local client disconnected."));
+      if (!socket.destroyed) socket.destroy();
+    });
     socket.on("data", (chunk) => {
       if (!this.#accepting) {
         socket.destroy();
         return;
       }
-      if (handled) return;
+      if (handled) {
+        const trailing = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (trailing.some((byte) => byte !== 0x0a && byte !== 0x0d && byte !== 0x20 && byte !== 0x09)) {
+          socket.destroy(new Error("Local connection must carry exactly one request."));
+        }
+        return;
+      }
       received = Buffer.concat([received, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
       if (received.byteLength > maximumRequestBytes) {
         socket.destroy(new Error("Local request exceeds the byte limit."));
@@ -152,7 +207,6 @@ export class LocalDaemonServer {
       const newline = received.indexOf(0x0a);
       if (newline < 0) return;
       handled = true;
-      socket.pause();
       const trailing = received.subarray(newline + 1);
       if (trailing.some((byte) => byte !== 0x0a && byte !== 0x0d && byte !== 0x20 && byte !== 0x09)) {
         socket.destroy(new Error("Local connection must carry exactly one request."));
@@ -257,7 +311,19 @@ async function readCapability(path: string): Promise<string> {
   }
 }
 
-export async function callLocalDaemon(input: { paths: StatePaths; command: LocalCommand; deadlineMs?: number }): Promise<CommandResponse> {
+const throwIfClientAborted = (signal: AbortSignal | undefined): void => {
+  if (signal?.aborted === true) {
+    throw signal.reason ?? new DOMException("The local daemon request was aborted.", "AbortError");
+  }
+};
+
+export async function callLocalDaemon(input: {
+  paths: StatePaths;
+  command: LocalCommand;
+  deadlineMs?: number;
+  signal?: AbortSignal;
+}): Promise<CommandResponse> {
+  throwIfClientAborted(input.signal);
   let capability: string;
   try {
     capability = await readCapability(input.paths.capability);
@@ -266,6 +332,7 @@ export async function callLocalDaemon(input: { paths: StatePaths; command: Local
     if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new LocalDaemonUnavailableError("The local daemon endpoint is absent.", error);
     throw error;
   }
+  throwIfClientAborted(input.signal);
   const requestId = randomUUID();
   const request = `${JSON.stringify({ version: 1, capability, requestId, command: input.command })}\n`;
   return await new Promise<CommandResponse>((resolvePromise, rejectPromise) => {
@@ -273,22 +340,40 @@ export async function callLocalDaemon(input: { paths: StatePaths; command: Local
     let connected = false;
     let received = Buffer.alloc(0);
     const socket = createConnection(input.paths.socket);
-    const deadline = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      rejectPromise(connected
-        ? new LocalDaemonIndeterminateError("The HRA daemon did not respond before the deadline.")
-        : new LocalDaemonUnavailableError("The HRA daemon was unavailable before the request deadline."));
-    }, input.deadlineMs ?? defaultDeadlineMs);
-    deadline.unref();
+    const destroyImmediately = (): void => {
+      if (typeof socket.resetAndDestroy === "function") socket.resetAndDestroy();
+      else socket.destroy();
+    };
     const settle = (operation: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadline);
+      input.signal?.removeEventListener("abort", onAbort);
       operation();
     };
+    const deadline = setTimeout(() => {
+      settle(() => rejectPromise(connected
+        ? new LocalDaemonIndeterminateError("The HRA daemon did not respond before the deadline.")
+        : new LocalDaemonUnavailableError("The HRA daemon was unavailable before the request deadline.")));
+      destroyImmediately();
+    }, input.deadlineMs ?? defaultDeadlineMs);
+    deadline.unref();
+    const onAbort = () => {
+      settle(() => rejectPromise(connected
+        ? new LocalDaemonIndeterminateError("The local daemon request was aborted after dispatch became possible.", input.signal?.reason)
+        : input.signal?.reason ?? new DOMException("The local daemon request was aborted.", "AbortError")));
+      destroyImmediately();
+    };
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    if (input.signal?.aborted === true) {
+      onAbort();
+      return;
+    }
     socket.once("connect", () => {
+      if (settled) {
+        socket.destroy();
+        return;
+      }
       connected = true;
       socket.write(request);
     });

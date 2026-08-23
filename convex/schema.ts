@@ -24,6 +24,8 @@ import {
   quotaUserResource,
   sessionStatus,
   syncStream,
+  usageAdmissionAuthority,
+  usageEncryptedEnvelope,
   wrappedKeyEnvelope,
 } from "./validators";
 
@@ -321,6 +323,7 @@ export default defineSchema({
     sourceGeneration: v.number(),
     state: accountBindingState,
     updatedAt: v.number(),
+    usageAdmission: v.optional(usageAdmissionAuthority),
     userId: v.id("users"),
   })
     .index("by_device_and_account", ["deviceId", "accountId"])
@@ -330,7 +333,7 @@ export default defineSchema({
     accountId: v.id("codexAccounts"),
     createdAt: v.number(),
     digest: v.string(),
-    envelope: encryptedEnvelope,
+    envelope: usageEncryptedEnvelope,
     observedAt: v.number(),
     receivedAt: v.number(),
     sourceDeviceId: v.id("devices"),
@@ -339,6 +342,7 @@ export default defineSchema({
     userId: v.id("users"),
   })
     .index("by_account_and_observed_at", ["accountId", "observedAt"])
+    .index("by_account_and_received_at", ["accountId", "receivedAt"])
     .index("by_observed_at", ["observedAt"])
     .index("by_received_at", ["receivedAt"])
     .index("by_account_and_winner", [

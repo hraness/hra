@@ -28,6 +28,8 @@ hra account usage personal --refresh
 
 Use `hra account login personal --device-code` when you want the provider's supported device-code path. Otherwise, follow the interactive instructions printed by the CLI. HRA keeps the resulting provider state inside that profile's isolated `CODEX_HOME` without copying `auth.json`.
 
+If the first pending-login handoff is lost or the daemon restarts before completion, `hra account show personal` reports the pending attempt. Then run `hra account login-cancel personal`. A caller that retained the idempotency key may also retry it without redispatching. HRA cancels only that profile's exact current-generation provider login before allowing a fresh login. Verification URLs, device codes, and provider credentials are never retained.
+
 HRA cloud identity is separate from every Codex account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured.
 
 ## Cloud sign-in and device pairing
@@ -54,6 +56,8 @@ hra device approve <pending-device-id-or-prefix>
 
 After approval, run `hra device pair` on the new machine to retrieve and unwrap its encryption-key envelope. Use `hra device revoke <device-id-or-prefix>` from a different active machine to revoke a device.
 
+Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked.
+
 Cloud-account erasure is explicit and irreversible. Run `hra auth delete --acknowledge-erasure` to disable every cloud effect before bounded server-side removal begins. `hra auth status` recovers capability-only progress after authentication records disappear. Erasure does not delete local Codex accounts, local sessions, or local encryption custody.
 
 ## Features
@@ -77,7 +81,7 @@ hra session events <session> --cursor <cursor> --wait-ms 30000 --follow
 hra session interactions <session> --pending --json
 ```
 
-JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded event pages, and durable interaction records keep approvals, questions, permission grants, and MCP elicitation visible until they are explicitly resolved.
+JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded event pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved.
 
 ## Presets and permissions
 
@@ -99,7 +103,7 @@ hra plugin show <account> <plugin> [--project <project>] [--refresh]
 
 Plugin commands are read-only discovery. They report the exact installed, enabled, availability, authorization, and capability state exposed by the selected isolated Codex profile.
 
-Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface: its available lifecycle path can combine installation with enablement and may then open browser authorization. HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects. Those actions fail with an explicit protocol-boundary error.
+Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface: its available lifecycle path can combine installation with enablement and may then open browser authorization. HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects. The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission. Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract. The interaction exposes bounded field names, types, requiredness, constraints, and allowed choices; titles, descriptions, defaults, and answers stay off the public and durable display. Protected submissions are checked for exact required fields, types, bounds, formats, choices, and the absence of additional properties before response preparation. Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission and receive a safe unsupported-capability response with no schema, submitted value, or URL echo. The schema-11 security migration terminalizes and replaces any prerelease URL record before interaction reads. HRA will keep extended-form and URL handoff unavailable until each has a closed protected path.
 
 ## Desktop account switching
 
@@ -114,6 +118,8 @@ HRA never copies `auth.json`, swaps one token, changes Keychain blindly, rotates
 The machine that created a provider session remains its only executor in v1. It must be online with its HRA daemon running and must hold the current execution lease before a remote command can affect Codex. Other paired machines never execute that provider session through their own local Codex profile.
 
 Paired machines can read the encrypted projection and submit bounded send, queue, steer, stop, preset, and Fast commands. The origin daemon claims each command by lease generation and idempotency key. Commands remain pending within their deadline while the origin machine is offline; another machine cannot take over or become a second provider writer.
+
+`hra remote show` includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary. Provider request IDs, permission values, MCP fields, protected answers, and response digests remain local. Resolve a pending callback on its execution device; remote interaction responses are unavailable in v1.
 
 ```text
 hra remote list
@@ -148,8 +154,10 @@ Cloud sync is optional. Local account profiles, Codex credentials, and local exe
 
 - User messages and final assistant display text.
 - Session names, notes, queued messages, and steering input.
+- Codex account labels and observed provider email and plan metadata when cloud sync is enabled.
 - Turn timing, observed model and tier, and provider usage summaries.
 - Bounded observed file and Git metadata, without unbounded filesystem paths.
+- Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.
 - Remote-command input and results that fit the closed command protocol.
 
 ### Never uploaded
@@ -157,9 +165,12 @@ Cloud sync is optional. Local account profiles, Codex credentials, and local exe
 - Codex credentials, profile files, plugin credentials, or OAuth material.
 - Raw app-server requests or responses.
 - Raw reasoning, hidden chain of thought, or approval secrets.
+- Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.
 - Environment variables, arbitrary command output, or unbounded filesystem paths.
 
 The sync service necessarily sees the verified HRA email address, device identifiers, record types, revisions, ciphertext sizes, timestamps, and execution-lease or command lifecycle metadata. It cannot decrypt session content without a paired device key. Email access alone does not recover that key.
+
+Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked.
 
 Compact-projection recovery is append-only. It preserves every older encrypted cloud chunk, opens a new stream epoch, and keeps the acknowledged unsynced interval visible as a recovery gap until authenticated account deletion.
 
@@ -179,6 +190,7 @@ hra device list|pair
 hra device approve|revoke <device-id-or-prefix>
 hra account add <label>
 hra account login <profile> [--device-code]
+hra account login-cancel <profile>
 hra account logout <profile>
 hra account list
 hra account show <profile>
@@ -224,6 +236,12 @@ hra daemon start|status|stop|run
 ```
 
 Account, project, and local-session selectors accept an exact ID or an unambiguous case-insensitive label. Cloud-session selectors accept an exact public ID, a unique public-ID prefix, or an exact synced name. Device selectors accept an exact ID or unique prefix. Ambiguity lists candidates and performs no effect. The CLI creates and sends an idempotency key before every provider effect; pass `--idempotency-key <uuid>` to reuse one after a lost response. session recover accepts only exact, kind-specific provider proof. session abandon never retries or deletes provider state and releases only the local recovery authority. Remote mutations require a current UUIDv7 when this option is supplied. With `--json`, stdout contains one versioned object; diagnostics stay on stderr.
+
+`interaction show` lists each requested permission category and each exact question ID. A permission grant reads `{"permissions":["<requested-name>"]}` and a question response reads `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` through protected input. The live Codex adapter rehydrates selected permission names to their exact private provider values immediately before the response write; those values never enter display, storage, logs, or sync.
+
+Every admitted callback carries a local deadline anchored when Codex delivered it. HRA caps the pending interval at 30 minutes and honors a shorter valid provider interval, including an immediate zero interval. At the deadline it writes one provider-neutral timeout error through the same write-ahead ledger, never invents an answer or grant, and quarantines the provider generation if the write may have escaped. `interaction show` displays the safe local deadline; encrypted remote interaction metadata does not include it.
+
+For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as `{"content":{...}}` from nonterminal stdin or a file descriptor. Decline and cancel accept no content. JSON mode never prompts, and validation failures identify the contract failure without echoing a submitted value.
 
 Projection recovery uses the local-session selector rules. It requires `--acknowledge-gap` and a current UUIDv7, generated by the CLI when omitted. The same-key command is safe to replay after a lost response; a changed key cannot overtake unsettled recovery authority.
 

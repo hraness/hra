@@ -7,8 +7,10 @@ import { join } from "node:path";
 import {
   CodexError,
   IndeterminateCodexEffectError,
+  type CodexFact,
   type CodexPluginCatalog,
 } from "../codex";
+import { parseFact } from "../codex/protocol";
 import {
   CloudDaemonJournalRecoveryBlocker,
   createCloudProjectionRecoveryTerminalReceipt,
@@ -16,13 +18,16 @@ import {
   transitionCloudProjectionRecovery,
   type CloudProjectionRecoveryJournalEntry,
 } from "../cloud/daemon-journal";
+import { renderSuccess } from "../cli/render";
+import type { LocalCommand } from "../domain/contracts";
+import { publicInteractionSchema, type PublicInteraction } from "../domain/interactions";
 import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
 import { storedAccountUsageSnapshotSchema } from "../domain/usage-metrics";
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
-import { UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { HraService } from "./service";
 
 const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile => ({
@@ -68,7 +73,13 @@ class FakeCodex implements CodexRuntimePort {
   runtimeProfileOverride?: EffectiveRuntimeProfile;
   closeCalls = 0;
   resolveInteractionError?: Error;
+  validateInteractionResolutionError?: Error;
+  validateInteractionTimeoutError?: Error;
+  timeoutInteractionError?: Error;
+  readonly validatedInteractions: Array<Parameters<CodexRuntimePort["validateInteractionResolution"]>[0]> = [];
   readonly resolvedInteractions: Array<Parameters<NonNullable<CodexRuntimePort["resolveInteraction"]>>[0]> = [];
+  readonly validatedInteractionTimeouts: Array<Parameters<CodexRuntimePort["validateInteractionTimeout"]>[0]> = [];
+  readonly timedOutInteractions: Array<Parameters<CodexRuntimePort["timeoutInteraction"]>[0]> = [];
   accountProjection: CodexAccountProjection = { signedIn: true, email: "person@example.com", plan: "Plus" };
   usageResult: { revision: number; observedAt: number; payload: unknown } = { revision: 1, observedAt: 2_000, payload: { primary: { usedPercent: 25 } } };
   usageError: Error | undefined;
@@ -109,8 +120,10 @@ class FakeCodex implements CodexRuntimePort {
   };
   readProjection: CodexSessionProjection = { providerThreadId: "provider-thread", title: "New session", status: "idle", providerUpdatedAt: 10, messages: [{ role: "user", text: "hello" }, { role: "assistant", text: "hi" }] };
   listedProjections: readonly CodexSessionProjection[] = [];
-  loginResult: { status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection } = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
-  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<{ status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection }> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); return this.loginResult; }
+  loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
+  cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
+  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); return this.loginResult; }
+  async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); return this.cancelLoginResult; }
   async logout(): Promise<void> { this.calls.push("logout"); await this.beforeLogoutReturn?.(); if (this.logoutError !== undefined) throw this.logoutError; }
   async readAccount(): Promise<CodexAccountProjection> { this.calls.push("readAccount"); return this.accountProjection; }
   async listPlugins(input: Parameters<CodexRuntimePort["listPlugins"]>[0]): Promise<CodexPluginCatalog> {
@@ -223,6 +236,29 @@ class FakeCodex implements CodexRuntimePort {
     if (this.resolveInteractionError !== undefined) throw this.resolveInteractionError;
     return { responseWritten: true };
   }
+  async validateInteractionResolution(
+    input: Parameters<CodexRuntimePort["validateInteractionResolution"]>[0],
+  ): Promise<{ responseDigest: string }> {
+    this.validatedInteractions.push(input);
+    if (this.validateInteractionResolutionError !== undefined) {
+      throw this.validateInteractionResolutionError;
+    }
+    return { responseDigest: createHash("sha256").update(JSON.stringify(input.resolution)).digest("hex") };
+  }
+  async validateInteractionTimeout(
+    input: Parameters<CodexRuntimePort["validateInteractionTimeout"]>[0],
+  ): Promise<{ responseDigest: string }> {
+    this.validatedInteractionTimeouts.push(input);
+    if (this.validateInteractionTimeoutError !== undefined) throw this.validateInteractionTimeoutError;
+    return { responseDigest: "e".repeat(64) };
+  }
+  async timeoutInteraction(
+    input: Parameters<CodexRuntimePort["timeoutInteraction"]>[0],
+  ): Promise<{ responseWritten: true }> {
+    this.timedOutInteractions.push(input);
+    if (this.timeoutInteractionError !== undefined) throw this.timeoutInteractionError;
+    return { responseWritten: true };
+  }
   async close(): Promise<void> { this.closeCalls += 1; }
 }
 
@@ -258,13 +294,23 @@ class FakeCloud implements CloudControlPort {
   projectionRecoveryBlocker?: CompactProjectionRecoveryBlocker;
   readonly unsettledProjectionProfiles = new Set<string>();
   readonly unsettledProjectionSessions = new Set<string>();
+  readonly providerDeletionSupersessions: string[] = [];
+  readonly providerDeletionSupersededSessions = new Set<string>();
   authResult: unknown = { requested: true };
   deleteAccountResult: unknown = {
     daemonRestartRequired: true,
     deletion: { effectsDisabled: true, state: "pending", statusFresh: true },
   };
   deleteAccountCalls = 0;
-  async status(): Promise<unknown> { return { configured: true }; }
+  statusError?: unknown;
+  async status(): Promise<unknown> {
+    if (this.statusError !== undefined) {
+      throw this.statusError instanceof Error
+        ? this.statusError
+        : new Error("Fake cloud status failed.");
+    }
+    return { configured: true };
+  }
   async sync(): Promise<unknown> { return { synced: true }; }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
     return this.projectionRecoveryBlocker === undefined
@@ -281,7 +327,31 @@ class FakeCloud implements CloudControlPort {
   async recoverCompactProjection(input: { sessionPublicId: `sess_${string}`; idempotencyKey: string; acknowledgeGap: true; signal: AbortSignal }): Promise<unknown> {
     this.projectionRecoveries.push(input);
     await this.beforeProjectionRecoveryReturn?.();
+    if (this.providerDeletionSupersededSessions.has(input.sessionPublicId)) {
+      return {
+        idempotencyKey: input.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: "PROVIDER_THREAD_DELETED",
+        sessionPublicId: input.sessionPublicId,
+      };
+    }
     return this.projectionRecoveryResult;
+  }
+  async supersedeCompactProjectionRecoveryForProviderDeletion(
+    sessionPublicId: `sess_${string}`,
+  ): Promise<{ superseded: boolean }> {
+    this.providerDeletionSupersessions.push(sessionPublicId);
+    this.providerDeletionSupersededSessions.add(sessionPublicId);
+    this.unsettledProjectionSessions.delete(sessionPublicId);
+    return this.projectionRecoveryBlocker === undefined
+      ? { superseded: true }
+      : await this.projectionRecoveryBlocker
+        .supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId);
+  }
+  async supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    return this.projectionRecoveryBlocker === undefined
+      ? { superseded: 0 }
+      : await this.projectionRecoveryBlocker.supersedeTerminalCompactProjectionRecoveries();
   }
   async auth(): Promise<unknown> { return this.authResult; }
   async logout(): Promise<void> {}
@@ -307,6 +377,7 @@ class FakeDesktop implements DesktopSwitchPort {
     resolvedAt: 2_000,
   };
   current: unknown = { status: "none" };
+  currentError?: unknown;
 
   async switchAccount(input: { idempotencyKey: string }): Promise<{ status: "applied"; idempotencyKey: string }> {
     this.calls.push("switch");
@@ -320,6 +391,11 @@ class FakeDesktop implements DesktopSwitchPort {
 
   currentRecovery(): unknown {
     this.calls.push("current");
+    if (this.currentError !== undefined) {
+      throw this.currentError instanceof Error
+        ? this.currentError
+        : new Error("Fake desktop recovery failed.");
+    }
     return this.current;
   }
 }
@@ -336,6 +412,7 @@ async function fixture(
   desktop?: DesktopSwitchPort,
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
+  now: () => number = Date.now,
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
@@ -343,11 +420,11 @@ async function fixture(
   const documents = join(home, "Documents");
   await mkdir(documents, { recursive: true });
   await initializeStatePaths(paths);
-  const store = new StateStore(paths);
+  const store = new StateStore(paths, { now });
   stores.push(store);
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), requestStop }), store, codex, cloud, daemonAuthority, documents, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, paths };
 }
 
 async function createIdleSession(
@@ -366,6 +443,24 @@ const providerMutationCalls = (codex: FakeCodex): readonly string[] => codex.cal
 );
 
 const signal = new AbortController().signal;
+
+const renderHuman = (command: LocalCommand, data: unknown): string => {
+  let stdout = "";
+  renderSuccess(command, data, false, {
+    writeStdout: (value) => { stdout += value; },
+    writeStderr: () => undefined,
+  });
+  return stdout;
+};
+
+const renderJson = (command: LocalCommand, data: unknown): string => {
+  let stdout = "";
+  renderSuccess(command, data, true, {
+    writeStdout: (value) => { stdout += value; },
+    writeStderr: () => undefined,
+  });
+  return stdout;
+};
 
 describe("HraService", () => {
   test("defers identity-switch and account-erasure shutdown until after the response boundary", async () => {
@@ -431,6 +526,34 @@ describe("HraService", () => {
     expect(desktop.calls).toEqual(["recover", "current"]);
     expect(doctor.desktop.recovery).toBe(desktop.current);
     expect(doctor.problems).toContain("A desktop switch is unresolved. Run `hra account switch-recover`.");
+  });
+
+  test("doctor closes dependency failures without repeating arbitrary runtime diagnostics", async () => {
+    const privatePath = ["", "Users", "operator", "private"].join("/");
+    const secret = `sk-live-secret ${privatePath}\u001b[31m`;
+    const cloud = new FakeCloud();
+    cloud.statusError = new Error(secret);
+    const desktop = new FakeDesktop();
+    desktop.currentError = new Error(secret);
+    const { service } = await fixture(desktop, cloud);
+
+    const doctor = await service.execute({ kind: "doctor", offline: false }, { signal });
+    const serialized = JSON.stringify(doctor);
+    expect(serialized).not.toContain("sk-live-secret");
+    expect(serialized).not.toContain(privatePath);
+    expect(serialized).not.toContain("\u001b");
+    expect(doctor).toMatchObject({
+      cloud: {
+        diagnostic: "Cloud status failed without exposing its runtime diagnostic.",
+        status: "unavailable",
+      },
+      desktop: {
+        recovery: {
+          diagnostic: "Desktop switch recovery failed without exposing its runtime diagnostic.",
+          status: "invalid",
+        },
+      },
+    });
   });
 
   test("creates and signs in an isolated account generation", async () => {
@@ -961,6 +1084,184 @@ describe("HraService", () => {
     expect(value.store.listQueue(session.id).find((entry) => entry.id === pending.id))
       .toMatchObject({ state: "pending" });
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+  });
+
+  test("provider deletion supersedes an in-flight recovery and terminalizes local authority exactly once", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId } = await createIdleSession(value, "Projection deletion race");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
+    const authority: ProfileAuthority = {
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    };
+    const connectionId = "32000000-0000-4000-8000-000000000099";
+    let entered!: () => void;
+    const recoveryEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const recoveryGate = new Promise<void>((resolve) => { release = resolve; });
+    cloud.beforeProjectionRecoveryReturn = async () => {
+      entered();
+      await recoveryGate;
+    };
+    const providerWritesBefore = providerMutationCalls(value.codex);
+    const recovery = value.service.execute({
+      acknowledgeGap: true,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000899",
+      kind: "sync.projection-recover",
+      session: sessionId,
+    }, { signal });
+    await recoveryEntered;
+
+    const pendingQueue = value.store.enqueue(sessionId, "must be cancelled");
+    await value.service.observeCodexFact(authority, {
+      blocking: true,
+      connectionId,
+      display: {
+        allowsSessionApproval: false,
+        commandClass: "test",
+        kind: "command_approval",
+        reason: null,
+        summary: "Must expire on deletion",
+        workingDirectory: null,
+      },
+      kind: "command_approval",
+      provider: {
+        approvalId: null,
+        connectionId,
+        itemId: "item-delete-race",
+        method: "item/commandExecution/requestApproval",
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        requestDigest: "9".repeat(64),
+        requestId: { type: "number", value: 99 },
+        threadId: session.providerThreadId,
+        turnId: "turn-delete-race",
+      },
+      type: "interactionRequested",
+    });
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("thread/deleted", { threadId: session.providerThreadId }),
+      connectionId,
+    });
+
+    expect(value.store.requireSession(sessionId)).toMatchObject({ state: "terminal" });
+    expect(value.store.requireQueue(pendingQueue.id)).toMatchObject({ state: "cancelled" });
+    expect(value.store.listInteractions({ pendingOnly: true, sessionId })).toEqual([]);
+    expect(cloud.providerDeletionSupersessions).toEqual([sessionId]);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+
+    release();
+    await expect(recovery).resolves.toMatchObject({
+      phase: "rejected",
+      rejectionCode: "PROVIDER_THREAD_DELETED",
+      sessionPublicId: sessionId,
+    });
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("thread/deleted", { threadId: session.providerThreadId }),
+      connectionId,
+    });
+    const terminalEvents = value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId,
+    }).events.filter((event) =>
+      event.body.type === "session_status" && event.body.status === "terminal");
+    expect(terminalEvents).toHaveLength(1);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+  });
+
+  test("reopened recovery supersedes crash-left journal authority for a terminal session", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Projection deletion restart");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound recovery session.");
+    const active: CloudProjectionRecoveryJournalEntry = {
+      authority: { bootGeneration: 1, bootId: "boot_delete_restart_12345678", fence: 1 },
+      baselineCompletedTurns: [],
+      epochPublicId: "018bcfe5-6800-7000-8000-000000000892",
+      expectedCompactStreamEpoch: 0,
+      expectedHeadSequence: 300,
+      expectedTailDigest: "a".repeat(64),
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000891",
+      lineageCommitment: "b".repeat(64),
+      localAuthority: {
+        profileGeneration: profile.processGeneration,
+        profileId: profile.id,
+        providerThreadId: session.providerThreadId,
+        providerUpdatedAt: session.providerUpdatedAt ?? null,
+        sessionRevision: session.revision,
+      },
+      phase: "effect_started",
+      replacementCacheId: "cache_delete_restart_12345678",
+      requestDigest: "c".repeat(64),
+      requestedAt: 1_700_000_000_000,
+      sessionPublicId: session.id,
+      sourceCacheId: "cache_source_delete_restart_12345678",
+      sourceDevicePublicId: "device_delete_restart_12345678",
+      userPublicId: "user_delete_restart_12345678",
+    };
+    const journal = new MemoryCloudDaemonJournal();
+    expect(await journal.compareAndSwap(null, {
+      commands: [],
+      pendingUsageAccount: null,
+      projectionRecoveries: [active],
+      projectionRecoveryReceipts: [],
+      usageAccounts: [],
+      version: 3,
+    })).not.toBeNull();
+    expect(value.store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    }).changed).toBe(true);
+    await value.service.close();
+    const blocker = new CloudDaemonJournalRecoveryBlocker(journal, {
+      isSessionTerminal: (sessionPublicId) =>
+        value.store.requireSession(sessionPublicId).state === "terminal",
+    });
+    const reopened = new HraService({
+      cloud: new UnavailableCloudControl(blocker),
+      codex: value.codex,
+      daemonAuthority: new FakeDaemonAuthority(),
+      paths: value.paths,
+      requestStop: () => undefined,
+      store: value.store,
+    });
+    const providerWritesBefore = providerMutationCalls(value.codex);
+
+    await reopened.recover();
+    const recovered = (await journal.read()).state;
+    expect(recovered.projectionRecoveries).toEqual([]);
+    expect(recovered.projectionRecoveryReceipts).toEqual([
+      expect.objectContaining({
+        idempotencyKey: active.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: "PROVIDER_THREAD_DELETED",
+        sessionPublicId: session.id,
+      }),
+    ]);
+    await reopened.recover();
+    expect((await journal.read()).state).toEqual(recovered);
+    await expect(reopened.execute({
+      acknowledgeGap: true,
+      idempotencyKey: active.idempotencyKey,
+      kind: "sync.projection-recover",
+      session: session.id,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(value.store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: session.id,
+    }).events.filter((event) =>
+      event.body.type === "session_status" && event.body.status === "terminal"))
+      .toHaveLength(1);
+    expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+    await reopened.close();
   });
 
   test("reopened service keeps custody recovery blocking without cloud transport and same-key restore unblocks", async () => {
@@ -1534,15 +1835,168 @@ describe("HraService", () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Login replay" }, { signal }) as { account: { id: string } };
     const idempotencyKey = "00000000-0000-4000-8000-000000000101";
-    codex.loginResult = { status: "pending", verificationUrl: "https://example.test/device?secret=1", userCode: "ABCD-EFGH" };
+    codex.loginResult = { status: "pending", loginId: "provider-login-1", verificationUrl: "https://example.test/device?secret=1", userCode: "ABCD-EFGH" };
     const first = await service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }) as { login: { userCode?: string }; account: { processGeneration: number } };
-    const replay = await service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }) as { login: { status: string; userCode?: string; verificationUrl?: string }; account: { processGeneration: number } };
+    const replay = await service.execute({ kind: "account.login", account: added.account.id, deviceCode: true, idempotencyKey }, { signal }) as { login: { status: string; loginId?: string; next?: string; userCode?: string; verificationUrl?: string }; account: { processGeneration: number } };
     expect(first.login.userCode).toBe("ABCD-EFGH");
-    expect(replay.login).toEqual({ status: "pending" });
+    expect(replay.login).toEqual({
+      status: "pending",
+      loginId: "provider-login-1",
+      next: `hra account login-cancel ${added.account.id}`,
+    });
     expect(replay.account.processGeneration).toBe(1);
     expect(codex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(1);
     expect(JSON.stringify(store.readMutation(idempotencyKey)?.result)).not.toContain("ABCD-EFGH");
     expect(JSON.stringify(store.readMutation(idempotencyKey)?.result)).not.toContain("secret=1");
+  });
+
+  test("recovers a lost pending-login response across daemon generation rollover by exact cancellation and fresh login", async () => {
+    const { service, codex, store, paths } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Restart login" }, { signal }) as { account: { id: `acct_${string}` } };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000119";
+    codex.loginResult = {
+      status: "pending",
+      loginId: "provider-login-restart",
+      verificationUrl: "https://example.test/login?private=handoff",
+      userCode: "PRIVATE-CODE",
+    };
+    const first = await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: true,
+      idempotencyKey,
+    }, { signal }) as { login: { loginId: string; userCode: string } };
+    expect(first.login).toMatchObject({ loginId: "provider-login-restart", userCode: "PRIVATE-CODE" });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toMatchObject({
+      idempotencyKey,
+      loginId: "provider-login-restart",
+      processGeneration: 1,
+    });
+
+    store.nextDaemonGeneration(`boot_${"a".repeat(32)}`);
+    const rebound = store.readPendingLoginAuthority(added.account.id, 2);
+    expect(rebound).toMatchObject({ loginId: "provider-login-restart", processGeneration: 2 });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+
+    const restartedCodex = new FakeCodex();
+    restartedCodex.accountProjection = { signedIn: false };
+    restartedCodex.cancelLoginResult = { status: "not_found" };
+    const restarted = new HraService({
+      store,
+      paths,
+      codex: restartedCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      requestStop: () => undefined,
+    });
+    expect(await restarted.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal })).toMatchObject({
+      account: { processGeneration: 2, state: "login_pending" },
+      login: {
+        status: "pending",
+        loginId: "provider-login-restart",
+        next: `hra account login-cancel ${added.account.id}`,
+      },
+    });
+    const replay = await restarted.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: true,
+      idempotencyKey,
+    }, { signal }) as { account: { processGeneration: number }; login: Record<string, unknown> };
+    expect(replay.account.processGeneration).toBe(2);
+    expect(replay.login).toEqual({
+      status: "pending",
+      loginId: "provider-login-restart",
+      next: `hra account login-cancel ${added.account.id}`,
+    });
+    expect(JSON.stringify(replay)).not.toContain("PRIVATE-CODE");
+    expect(JSON.stringify(replay)).not.toContain("private=handoff");
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login:"))).toHaveLength(0);
+
+    expect(() => store.settlePendingLogin({
+      profileId: added.account.id,
+      processGeneration: 2,
+      loginId: "wrong-provider-login",
+      providerStatus: "not_found",
+      provider: { signedIn: false },
+    })).toThrow("LOGIN_CANCEL_AUTHORITY_MISMATCH");
+
+    const canceled = await restarted.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal }) as { account: { state: string }; providerStatus: string; status: string };
+    expect(canceled).toMatchObject({
+      account: { state: "signed_out" },
+      providerStatus: "not_found",
+      status: "canceled",
+    });
+    expect(restartedCodex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-restart`);
+    expect(await restarted.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal })).toMatchObject({ status: "already_settled" });
+    expect(restartedCodex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+
+    restartedCodex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
+    };
+    const fresh = await restarted.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal }) as { account: { processGeneration: number; state: string } };
+    expect(fresh.account).toMatchObject({ processGeneration: 3, state: "signed_in" });
+  });
+
+  test("rejects login cancellation after an unbound profile generation change", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Stale login" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-stale" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    store.nextProfileGeneration(added.account.id);
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal })).rejects.toMatchObject({ code: "RECOVERY_REQUIRED" });
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(0);
+  });
+
+  test("preserves exact pending-login cancellation authority across an unexpected provider disconnect", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Disconnected login" }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-disconnected" };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.observeCodexFact({
+      id: added.account.id,
+      generation: 1,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "providerDisconnected",
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      reason: "process_exit",
+    });
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "login_pending",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toMatchObject({
+      loginId: "provider-login-disconnected",
+    });
+    codex.accountProjection = { signedIn: false };
+    codex.cancelLoginResult = { status: "not_found" };
+    await expect(service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      account: { state: "signed_out" },
+      status: "canceled",
+    });
+    expect(codex.calls).toContain(`login-cancel:${added.account.id}:2:provider-login-disconnected`);
   });
 
   test("rejects an idempotency key reused across account authorities without mutating the second account", async () => {
@@ -2133,6 +2587,153 @@ describe("HraService", () => {
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
+  test("routes provider close and delete lifecycle without leaving a mutable stale session", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Provider lifecycle");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "32000000-0000-4000-8000-000000000001";
+    await value.service.observeCodexFact(authority, {
+      type: "turnStarted",
+      connectionId,
+      threadId: session.providerThreadId,
+      turn: {
+        id: "turn-lifecycle",
+        items: [],
+        status: "inProgress",
+        startedAt: 1,
+        completedAt: null,
+        durationMs: null,
+      },
+    });
+    expect(value.store.requireSession(sessionId)).toMatchObject({
+      activeTurnId: "turn-lifecycle",
+      state: "active",
+    });
+
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("thread/closed", { threadId: session.providerThreadId }),
+      connectionId,
+    });
+    expect(value.store.requireSession(sessionId)).toMatchObject({ state: "idle" });
+    expect(value.store.requireSession(sessionId).activeTurnId).toBeUndefined();
+    const afterClose = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    });
+    expect(afterClose.events.at(-1)?.body).toEqual({
+      type: "session_status",
+      status: "not_loaded",
+      activeTurnId: null,
+    });
+
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("skills/changed", { paths: ["/private/discarded"] }),
+      connectionId,
+    });
+    expect(value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events)
+      .toHaveLength(afterClose.events.length);
+
+    await value.service.observeCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "number", value: 41 },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "4".repeat(64),
+        threadId: session.providerThreadId,
+        turnId: "turn-deleted",
+        itemId: "item-deleted",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Approval cannot survive provider deletion",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        allowsSessionApproval: false,
+      },
+    });
+    expect(value.store.listInteractions({ sessionId, pendingOnly: true })).toHaveLength(1);
+    const pendingQueue = value.store.enqueue(session.id, "must not dispatch after deletion");
+    expect(value.store.quarantineSession(session.id)).toMatchObject({ state: "recovery_required" });
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("thread/deleted", { threadId: session.providerThreadId }),
+      connectionId,
+    });
+    expect(value.store.requireSession(sessionId)).toMatchObject({ state: "terminal" });
+    expect(value.store.requireQueue(pendingQueue.id)).toMatchObject({ state: "cancelled" });
+    expect(value.store.listInteractions({ sessionId, pendingOnly: true })).toEqual([]);
+    expect(value.store.listInteractions({ sessionId, pendingOnly: false })).toEqual([
+      expect.objectContaining({ state: "expired", revision: 2 }),
+    ]);
+    const afterDelete = value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+    expect(afterDelete.filter((event) =>
+      event.body.type === "session_status" && event.body.status === "terminal")
+      .map((event) => event.body))
+      .toEqual([{ type: "session_status", status: "terminal", activeTurnId: null }]);
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "must fail closed",
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  test("keeps provider diagnostic secrets out of the durable stream and CLI", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Safe diagnostics");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const privatePath = ["", "Users", "alice", "private", "key"].join("/");
+    const sentinel = `Bearer PROVIDER_EVENT_SECRET at ${privatePath}`;
+    const parsed = parseFact("warning", {
+      threadId: session.providerThreadId,
+      message: sentinel,
+    });
+    await value.service.observeCodexFact(authority, {
+      ...parsed,
+      connectionId: "31000000-0000-4000-8000-000000000001",
+    });
+    const command = {
+      kind: "session.events",
+      session: sessionId,
+      limit: 200,
+      waitMs: 0,
+    } satisfies LocalCommand;
+    const page = await value.service.execute(command, { signal });
+    const durable = JSON.stringify(value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }));
+    const human = renderHuman(command, page);
+    const json = renderJson(command, page);
+    for (const output of [durable, human, json]) {
+      expect(output).not.toContain("PROVIDER_EVENT_SECRET");
+      expect(output).not.toContain(privatePath);
+    }
+    expect(human).toContain("Codex reported a provider warning.");
+  });
+
   test("durably admits, privately routes, and settles an exact provider interaction", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Interaction broker");
@@ -2172,27 +2773,67 @@ describe("HraService", () => {
         allowsSessionApproval: true,
       },
     });
-    const listed = await value.service.execute({
+    const sessionInteractionsCommand = {
       kind: "session.interactions",
       session: sessionId,
       pending: true,
       limit: 10,
-    }, { signal }) as { interactions: Array<{ id: string; revision: number }> };
+    } satisfies LocalCommand;
+    const listed = await value.service.execute(
+      sessionInteractionsCommand,
+      { signal },
+    ) as { interactions: PublicInteraction[] };
     expect(listed.interactions).toHaveLength(1);
     expect(JSON.stringify(listed)).not.toContain("approval-request-1");
     expect(JSON.stringify(listed)).not.toContain(provider.requestDigest);
     const interaction = listed.interactions[0];
     if (interaction === undefined) throw new Error("Expected an admitted interaction.");
-    const resolved = await value.service.execute({
+    expect(publicInteractionSchema.parse(interaction)).toEqual(interaction);
+
+    const interactionListCommand = {
+      kind: "interaction.list",
+      pending: true,
+      limit: 10,
+    } satisfies LocalCommand;
+    const interactionList = await value.service.execute(interactionListCommand, { signal });
+    const interactionShowCommand = {
+      kind: "interaction.show",
+      interaction: interaction.id,
+    } satisfies LocalCommand;
+    const interactionShow = await value.service.execute(interactionShowCommand, { signal });
+    const statusCommand = { kind: "session.status", session: sessionId } satisfies LocalCommand;
+    const status = await value.service.execute(statusCommand, { signal });
+    for (const [command, result] of [
+      [sessionInteractionsCommand, listed],
+      [interactionListCommand, interactionList],
+      [interactionShowCommand, interactionShow],
+      [statusCommand, status],
+    ] as const) {
+      const human = renderHuman(command, result);
+      expect(human).toContain("Run the reviewed command");
+      expect(human).toContain(interaction.id);
+      expect(human).not.toContain("unavailable");
+      const json = renderJson(command, result);
+      expect(json).not.toContain("approval-request-1");
+      expect(json).not.toContain(provider.requestDigest);
+      expect(json).not.toContain("requestDigest");
+      expect(json).not.toContain("responseDigest");
+      expect(json).not.toContain("authority");
+    }
+
+    const resolveCommand = {
       kind: "interaction.resolve",
       interaction: interaction.id,
       expectedRevision: interaction.revision,
       resolution: { kind: "approval_decision", decision: "once" },
-    }, { signal });
+    } satisfies LocalCommand;
+    const resolved = await value.service.execute(resolveCommand, { signal });
     expect(resolved).toMatchObject({
       responseWritten: true,
       interaction: { id: interaction.id, state: "response_written", revision: 3 },
     });
+    expect(renderHuman(resolveCommand, resolved)).toContain("State: response_written");
+    expect(renderJson(resolveCommand, resolved)).not.toContain("responseDigest");
     expect(value.codex.resolvedInteractions).toHaveLength(1);
     expect(value.codex.resolvedInteractions[0]).toMatchObject({
       provider,
@@ -2209,6 +2850,463 @@ describe("HraService", () => {
       state: "resolved",
       revision: 4,
     });
+
+    const mcpFormProvider = {
+      ...provider,
+      requestId: { type: "string" as const, value: "mcp-form-request-1" },
+      method: "mcpServer/elicitation/request",
+      requestDigest: "b".repeat(64),
+      itemId: null,
+      approvalId: null,
+    };
+    await value.service.observeCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId: provider.connectionId,
+      provider: mcpFormProvider,
+      kind: "mcp_elicitation",
+      blocking: true,
+      display: {
+        kind: "mcp_elicitation",
+        summary: "Configure the MCP server",
+        serverName: "example",
+        mode: "form",
+        url: null,
+        mayContainSecrets: true,
+        fields: [
+          {
+            name: "token",
+            type: "string",
+            required: true,
+            minLength: 8,
+            maxLength: 64,
+            format: null,
+          },
+          { name: "confirmed", type: "boolean", required: true },
+        ],
+      },
+    });
+    const mcpForm = value.store.listInteractions({ sessionId, pendingOnly: true, limit: 10 })
+      .find((record) => record.authority.requestId.value === "mcp-form-request-1");
+    if (mcpForm === undefined) throw new Error("Expected a standard MCP form interaction.");
+    const submittedSentinel = "MCP_SERVICE_SUBMISSION_SECRET_SENTINEL";
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: mcpForm.publicId,
+      expectedRevision: mcpForm.revision,
+      resolution: {
+        kind: "mcp_submission",
+        action: "accept",
+        content: { token: submittedSentinel, confirmed: "yes" },
+      },
+    }, { signal })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+    });
+    expect(value.store.requireInteraction(mcpForm.publicId)).toMatchObject({
+      state: "pending",
+      revision: 1,
+      responseDigest: null,
+    });
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    const completedMcpForm = await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: mcpForm.publicId,
+      expectedRevision: mcpForm.revision,
+      resolution: {
+        kind: "mcp_submission",
+        action: "accept",
+        content: { token: "protected-value", confirmed: true },
+      },
+    }, { signal });
+    expect(completedMcpForm).toMatchObject({
+      interaction: { id: mcpForm.publicId, state: "response_written", revision: 3 },
+    });
+    expect(value.codex.resolvedInteractions).toHaveLength(2);
+    await value.service.observeCodexFact(authority, {
+      type: "interactionResolved",
+      connectionId: provider.connectionId,
+      provider: mcpFormProvider,
+      kind: "mcp_elicitation",
+    });
+    expect(value.store.requireInteraction(mcpForm.publicId)).toMatchObject({
+      state: "resolved",
+      revision: 4,
+    });
+    expect(JSON.stringify(value.store.listInteractions({ limit: 100 })))
+      .not.toContain(submittedSentinel);
+    expect(JSON.stringify(value.store.listInteractions({ limit: 100 })))
+      .not.toContain("protected-value");
+
+    const missingFieldsProvider = {
+      ...mcpFormProvider,
+      requestId: { type: "string" as const, value: "mcp-missing-fields-request" },
+      requestDigest: "d".repeat(64),
+    };
+    await expect(value.service.observeCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId: provider.connectionId,
+      provider: missingFieldsProvider,
+      kind: "mcp_elicitation",
+      blocking: true,
+      display: {
+        kind: "mcp_elicitation",
+        summary: "Incomplete MCP form",
+        serverName: "example",
+        mode: "form",
+        url: null,
+        mayContainSecrets: true,
+      },
+    })).rejects.toThrow("MCP_FORM_DISPLAY_CONTRACT_MISSING");
+    expect(value.store.listInteractions({ limit: 100 }).some((record) =>
+      record.authority.requestId.value === "mcp-missing-fields-request")).toBe(false);
+
+    const secretUrl = "https://example.com/authorize?token=SECRET_SENTINEL";
+    const mcpProvider = {
+      ...provider,
+      requestId: { type: "string" as const, value: "mcp-request-1" },
+      method: "mcpServer/elicitation/request",
+      requestDigest: "c".repeat(64),
+      itemId: null,
+      approvalId: null,
+    };
+    const unsafeUrlFact = {
+      type: "interactionRequested",
+      connectionId: provider.connectionId,
+      provider: mcpProvider,
+      kind: "mcp_elicitation",
+      blocking: true,
+      display: {
+        kind: "mcp_elicitation",
+        summary: "Authorize the MCP server",
+        serverName: "example",
+        mode: "url",
+        url: secretUrl,
+        mayContainSecrets: true,
+      },
+    } as unknown as CodexFact;
+    await expect(value.service.observeCodexFact(authority, unsafeUrlFact)).rejects.toThrow();
+    const mcpRecord = value.store.listInteractions({
+      sessionId,
+      pendingOnly: true,
+      limit: 10,
+    }).find((record) => record.kind === "mcp_elicitation");
+    expect(mcpRecord).toBeUndefined();
+    expect(JSON.stringify(value.store.listInteractions({ limit: 100 })))
+      .not.toContain("SECRET_SENTINEL");
+  });
+
+  test("expires all callback kinds exactly at their receipt-anchored deadline", async () => {
+    let now = 50_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Interaction deadlines");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "42000000-0000-4000-8000-000000000001";
+    const requests = [
+      {
+        kind: "command_approval" as const,
+        method: "item/commandExecution/requestApproval",
+        display: {
+          kind: "command_approval" as const,
+          summary: "Allow command",
+          reason: null,
+          commandClass: "test",
+          workingDirectory: null,
+          allowsSessionApproval: false,
+        },
+      },
+      {
+        kind: "file_change_approval" as const,
+        method: "item/fileChange/requestApproval",
+        display: {
+          kind: "file_change_approval" as const,
+          summary: "Allow files",
+          reason: null,
+          grantRoot: null,
+          allowsSessionApproval: false,
+        },
+      },
+      {
+        kind: "permission_approval" as const,
+        method: "item/permissions/requestApproval",
+        display: {
+          kind: "permission_approval" as const,
+          summary: "Allow permissions",
+          reason: null,
+          requested: [{ name: "network" }],
+          allowsSessionScope: false,
+        },
+      },
+      {
+        kind: "user_input" as const,
+        method: "item/tool/requestUserInput",
+        display: {
+          kind: "user_input" as const,
+          summary: "Codex needs one answer",
+          blocking: true,
+          questions: [{
+            id: "choice",
+            header: "Choice",
+            question: "Choose",
+            options: null,
+            allowsOther: true,
+            secret: false,
+          }],
+        },
+      },
+      {
+        kind: "mcp_elicitation" as const,
+        method: "mcpServer/elicitation/request",
+        display: {
+          kind: "mcp_elicitation" as const,
+          summary: "Configure MCP",
+          serverName: "example",
+          mode: "form" as const,
+          url: null,
+          mayContainSecrets: true as const,
+          fields: [],
+        },
+      },
+    ];
+    for (const [index, request] of requests.entries()) {
+      await value.service.observeCodexFact(authority, {
+        type: "interactionRequested",
+        connectionId,
+        provider: {
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          connectionId,
+          requestId: { type: "number", value: index + 1 },
+          method: request.method,
+          requestDigest: createHash("sha256").update(request.method).digest("hex"),
+          threadId: session.providerThreadId,
+          turnId: "turn-deadline",
+          itemId: `item-${String(index + 1)}`,
+          approvalId: null,
+        },
+        kind: request.kind,
+        blocking: true,
+        display: request.display,
+        timeoutMs: 1_000,
+        requestedAt: 50_000,
+        deadlineAt: 51_000,
+      });
+    }
+    now = 50_999;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 0, failed: 0 });
+    expect(value.codex.timedOutInteractions).toHaveLength(0);
+    now = 51_000;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 5, failed: 0 });
+    expect(value.codex.validatedInteractionTimeouts).toHaveLength(5);
+    expect(value.codex.timedOutInteractions).toHaveLength(5);
+    expect(value.store.listInteractions({ sessionId, limit: 10 })).toHaveLength(5);
+    for (const interaction of value.store.listInteractions({ sessionId, limit: 10 })) {
+      expect(interaction).toMatchObject({
+        state: "expired",
+        revision: 4,
+        intendedTerminalState: "expired",
+        deadlineAt: 51_000,
+      });
+    }
+    expect(value.store.nextInteractionDeadlineAt()).toBeNull();
+    await value.service.close();
+  });
+
+  test("backs off a persistent deadline maintenance fault and later recovers", async () => {
+    const now = 60_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const { sessionId } = await createIdleSession(value, "Deadline retry");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const originalExpire = value.store.expireInteraction.bind(value.store);
+    (value.store as unknown as { expireInteraction: StateStore["expireInteraction"] }).expireInteraction = () => {
+      throw new Error("injected durable terminalization fault");
+    };
+    value.codex.validateInteractionTimeoutError = new CodexError(
+      "AUTHORITY_STALE",
+      "injected stale provider",
+    );
+    const connectionId = "43000000-0000-4000-8000-000000000001";
+    await value.service.observeCodexFact(authority, {
+      type: "interactionRequested",
+      connectionId,
+      provider: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "number", value: 1 },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "f".repeat(64),
+        threadId: session.providerThreadId,
+        turnId: "turn-retry",
+        itemId: "item-retry",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Allow retry test",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        allowsSessionApproval: false,
+      },
+      timeoutMs: 0,
+      requestedAt: now,
+      deadlineAt: now,
+    });
+    await Bun.sleep(25);
+    expect(value.codex.validatedInteractionTimeouts.length).toBeLessThanOrEqual(1);
+    (value.store as unknown as { expireInteraction: StateStore["expireInteraction"] }).expireInteraction = originalExpire;
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({ examined: 1, failed: 0 });
+    expect(value.store.listInteractions({ sessionId, pendingOnly: true })).toEqual([]);
+    await value.service.close();
+  });
+
+  test("keeps invalid permission grants pending and supports the fail-safe decline path", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Permission broker");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "45000000-0000-4000-8000-000000000001";
+    const request = async (requestId: string) => {
+      const provider = {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string" as const, value: requestId },
+        method: "item/permissions/requestApproval",
+        requestDigest: createHash("sha256").update(requestId).digest("hex"),
+        threadId: session.providerThreadId as string,
+        turnId: "turn-permission",
+        itemId: `item-${requestId}`,
+        approvalId: null,
+      };
+      await value.service.observeCodexFact(authority, {
+        type: "interactionRequested",
+        connectionId,
+        provider,
+        kind: "permission_approval",
+        blocking: true,
+        display: {
+          kind: "permission_approval",
+          summary: "Allow requested permissions",
+          reason: "The provider needs a bounded capability",
+          requested: [{ name: "network" }, { name: "fileSystem" }],
+          allowsSessionScope: true,
+        },
+      });
+      const interaction = value.store.listInteractions({
+        sessionId,
+        pendingOnly: true,
+        limit: 10,
+      }).find((candidate) => candidate.authority.requestId.value === requestId);
+      if (interaction === undefined) throw new Error("Expected a permission interaction.");
+      return interaction;
+    };
+
+    const grant = await request("permission-grant-1");
+    value.codex.validateInteractionResolutionError = new CodexError(
+      "INVALID_INPUT",
+      "selected permissions exceed the requested profile",
+    );
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: grant.publicId,
+      expectedRevision: grant.revision,
+      resolution: {
+        kind: "permission_grant",
+        permissions: ["fileSystem"],
+        scope: "turn",
+      },
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(value.store.requireInteraction(grant.publicId)).toMatchObject({
+      state: "pending",
+      revision: 1,
+      responseDigest: null,
+    });
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+
+    delete value.codex.validateInteractionResolutionError;
+    const corrected = await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: grant.publicId,
+      expectedRevision: grant.revision,
+      resolution: {
+        kind: "permission_grant",
+        permissions: ["network"],
+        scope: "turn",
+      },
+    }, { signal });
+    expect(corrected).toMatchObject({
+      interaction: { id: grant.publicId, state: "response_written", revision: 3 },
+    });
+
+    const declined = await request("permission-decline-1");
+    const declineResult = await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: declined.publicId,
+      expectedRevision: declined.revision,
+      resolution: { kind: "approval_decision", decision: "decline" },
+    }, { signal });
+    expect(declineResult).toMatchObject({
+      interaction: { id: declined.publicId, state: "response_written", revision: 3 },
+    });
+    expect(value.codex.resolvedInteractions.at(-1)?.resolution).toEqual({
+      kind: "approval_decision",
+      decision: "decline",
+    });
+    await value.service.observeCodexFact(authority, {
+      type: "interactionResolved",
+      connectionId,
+      provider: declined.authority,
+      kind: "permission_approval",
+    });
+    expect(value.store.requireInteraction(declined.publicId)).toMatchObject({
+      state: "declined",
+      intendedTerminalState: "declined",
+      revision: 4,
+    });
+    const canceled = await request("permission-cancel-1");
+    await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: canceled.publicId,
+      expectedRevision: canceled.revision,
+      resolution: { kind: "approval_decision", decision: "cancel" },
+    }, { signal });
+    await value.service.observeCodexFact(authority, {
+      type: "interactionResolved",
+      connectionId,
+      provider: canceled.authority,
+      kind: "permission_approval",
+    });
+    expect(value.store.requireInteraction(canceled.publicId)).toMatchObject({
+      state: "canceled",
+      intendedTerminalState: "canceled",
+      revision: 4,
+    });
+    expect(value.codex.validatedInteractions).toHaveLength(4);
   });
 
   test("marks a response-write failure unknown and expires untouched prompts on disconnect", async () => {

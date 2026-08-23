@@ -4,6 +4,8 @@ import {
   isRecord,
   isSafeNonNegativeInteger,
   isSafePositiveInteger,
+  parseEncryptedEnvelope,
+  type EncryptedEnvelope,
 } from "./contracts";
 
 export type UsageWindow = Readonly<{
@@ -44,6 +46,15 @@ export type UsageSnapshotOrder = Readonly<{
   sourceDeviceId: string;
   sourceRevision: number;
 }>;
+
+export const USAGE_CLOUD_PROJECTION_MAX_DAILY_ROWS = 1;
+export const USAGE_CLOUD_PROJECTION_MAX_LIMITS = 8;
+// Eight maximally wide limits, one daily row, maximal safe counters, maximal
+// finite window scalars, and 96 JSON six-byte escape sequences per name encode
+// to exactly 8,120 UTF-8 bytes. AES-GCM adds its 16-byte authentication tag;
+// unpadded base64url therefore requires exactly 10,848 characters.
+export const USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES = 8_120;
+export const USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS = 10_848;
 
 const datePattern = /^\d{4}-\d{2}-\d{2}$/u;
 const identifierPattern = /^[A-Za-z0-9_.:-]{1,96}$/u;
@@ -122,13 +133,19 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
     "longestStreakDays",
     "peakDailyTokens",
   ])) return null;
-  if (!Array.isArray(value.data.limits) || value.data.limits.length > 32) return null;
+  if (
+    !Array.isArray(value.data.limits)
+    || value.data.limits.length > USAGE_CLOUD_PROJECTION_MAX_LIMITS
+  ) return null;
   const limits = value.data.limits.map(parseLimit);
   if (limits.some((limit) => limit === null)) return null;
   const limitIds = limits.map((limit) => limit?.id);
   if (new Set(limitIds).size !== limitIds.length) return null;
 
-  if (!Array.isArray(value.data.daily) || value.data.daily.length > 366) return null;
+  if (
+    !Array.isArray(value.data.daily)
+    || value.data.daily.length > USAGE_CLOUD_PROJECTION_MAX_DAILY_ROWS
+  ) return null;
   const daily: { startDate: string; tokens: number }[] = [];
   for (const row of value.data.daily) {
     if (
@@ -149,7 +166,7 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
     || !isSafeNonNegativeInteger(value.data.longestStreakDays)
     || !isSafeNonNegativeInteger(value.data.peakDailyTokens)
   ) return null;
-  return {
+  const projection = {
     data: {
       currentStreakDays: value.data.currentStreakDays,
       daily,
@@ -160,7 +177,16 @@ export function parseUsageProjection(value: unknown): UsageProjection | null {
       peakDailyTokens: value.data.peakDailyTokens,
     },
     state: "ready",
-  };
+  } as const;
+  if (
+    new TextEncoder().encode(JSON.stringify(projection)).byteLength
+      > USAGE_CLOUD_PROJECTION_MAX_PLAINTEXT_BYTES
+  ) return null;
+  return projection;
+}
+
+export function parseUsageEncryptedEnvelope(value: unknown): EncryptedEnvelope | null {
+  return parseEncryptedEnvelope(value, USAGE_CLOUD_ENVELOPE_MAX_CIPHERTEXT_CHARACTERS);
 }
 
 function compareSnapshotOrder(left: UsageSnapshotOrder, right: UsageSnapshotOrder): number {

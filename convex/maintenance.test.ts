@@ -6,6 +6,7 @@ import { convexTest } from "convex-test";
 import {
   initializeAccountUsageQuotaAuthority,
   initializeUserQuotaAuthority,
+  logicalDocumentBytes,
   reserveAccountUsageSnapshotQuotaForInsert,
   reserveCodexAccountQuotaForInsert,
   reserveDeviceQuotaForInsert,
@@ -14,6 +15,7 @@ import {
   reserveQuotaForStoredIdentity,
   reserveServiceQuotaForInsert,
   reserveSessionHeadQuotaForInsert,
+  USER_TOTAL_QUOTA,
 } from "./quota";
 import schema from "./schema";
 import { modules } from "./test.setup";
@@ -42,6 +44,181 @@ const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, un
 );
 
 describe("bounded cloud retention", () => {
+  test("materializes a legacy usage cursor before deleting its final source row", async () => {
+    const runtime = convexTest(schema, modules);
+    await runtime.mutation(genesisQuota, {});
+    const now = Date.now();
+    const fixture = await runtime.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { email: "legacy-usage-retention@example.com" });
+      await initializeUserQuotaAuthority(ctx, userId);
+      const user = await ctx.db.get(userId);
+      if (user === null) throw new Error("missing legacy usage retention user");
+      await reserveQuotaForStoredIdentity(ctx, userId, user);
+      const device = {
+        activatedAt: now,
+        authEpoch: 1,
+        createdAt: now,
+        encryptedLabel: {
+          algorithm: "A256GCM" as const,
+          ciphertext: "A".repeat(32),
+          keyVersion: 1,
+          nonce: "A".repeat(16),
+        },
+        keyVersion: 1,
+        publicId: "device_legacy_usage_retention",
+        revision: 1,
+        signingPublicKey: "{}",
+        status: "active" as const,
+        updatedAt: now,
+        userId,
+        wrappingPublicKey: "{}",
+      };
+      await reserveDeviceQuotaForInsert(ctx, userId, device);
+      const deviceId = await ctx.db.insert("devices", device);
+      const encrypted = {
+        algorithm: "A256GCM" as const,
+        ciphertext: "B".repeat(32),
+        keyVersion: 1,
+        nonce: "B".repeat(16),
+      };
+      const account = {
+        createdAt: now,
+        encryptedMetadata: encrypted,
+        matchKey: "b".repeat(64),
+        publicId: "codex_legacy_usage_retention",
+        updatedAt: now,
+        userId,
+      };
+      await reserveCodexAccountQuotaForInsert(ctx, userId, account);
+      const accountId = await ctx.db.insert("codexAccounts", account);
+      await initializeAccountUsageQuotaAuthority(ctx, userId, accountId);
+      const binding = {
+        accountId,
+        deviceId,
+        encryptedLocalReference: encrypted,
+        lastSeenAt: now,
+        sourceGeneration: 1,
+        state: "present" as const,
+        updatedAt: now,
+        userId,
+      };
+      await reserveQuotaForInsert(ctx, userId, "account", binding);
+      const bindingId = await ctx.db.insert("deviceAccountBindings", binding);
+      for (const sourceRevision of [1, 2]) {
+        const receivedAt = now - (93 - sourceRevision) * 24 * 60 * 60 * 1_000;
+        const snapshot = {
+          accountId,
+          createdAt: receivedAt,
+          digest: sourceRevision.toString(16).padStart(64, "0"),
+          envelope: encrypted,
+          observedAt: receivedAt - 1_000,
+          receivedAt,
+          sourceDeviceId: deviceId,
+          sourceDevicePublicId: device.publicId,
+          sourceRevision,
+          userId,
+        };
+        await reserveAccountUsageSnapshotQuotaForInsert(ctx, userId, accountId, snapshot);
+        await ctx.db.insert("accountUsageSnapshots", snapshot);
+      }
+      const categoryRows = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder.eq("userId", userId))
+        .collect();
+      const chunk = categoryRows.find((row) => row.category === "chunk");
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      if (chunk === undefined || service === null) throw new Error("missing near-ceiling quota authority");
+      const currentUserBytes = categoryRows.reduce((total, row) => total + row.logicalBytes, 0);
+      const fillerBytes = USER_TOTAL_QUOTA.logicalBytes - 1 - currentUserBytes;
+      if (fillerBytes <= 0) throw new Error("invalid near-ceiling quota fixture");
+      await ctx.db.patch(chunk._id, {
+        logicalBytes: fillerBytes,
+        records: 1,
+        updatedAt: now,
+      });
+      await ctx.db.patch(service._id, {
+        logicalBytes: service.logicalBytes + fillerBytes,
+        records: service.records + 1,
+        updatedAt: now,
+        userLogicalBytes: service.userLogicalBytes + fillerBytes,
+        userRecords: service.userRecords + 1,
+      });
+      return { accountId, bindingId, userId };
+    });
+
+    expect(await runtime.mutation(cleanupExpired, { limit: 200 }))
+      .toMatchObject({ usageSnapshots: 2 });
+    expect(await runtime.run(async (ctx) => {
+      const binding = await ctx.db.get(fixture.bindingId);
+      const usageQuota = await ctx.db.query("storageResourceUsageByAccount")
+        .withIndex("by_account_and_resource", (builder) => builder
+          .eq("accountId", fixture.accountId)
+          .eq("resource", "usage_snapshot"))
+        .unique();
+      return {
+        remaining: (await ctx.db.query("accountUsageSnapshots").collect()).length,
+        usageAdmission: binding?.usageAdmission,
+        usageRecords: usageQuota?.records ?? 0,
+      };
+    })).toEqual({
+      remaining: 0,
+      usageAdmission: {
+        cursor: {
+          digest: "2".padStart(64, "0"),
+          disposition: "stored",
+          observedAt: now - 91 * 24 * 60 * 60 * 1_000 - 1_000,
+          sourceRevision: 2,
+        },
+        lastAcceptedAt: now - 91 * 24 * 60 * 60 * 1_000,
+      },
+      usageRecords: 0,
+    });
+    const accounting = await runtime.run(async (ctx) => {
+      const account = await ctx.db.get(fixture.accountId);
+      const binding = await ctx.db.get(fixture.bindingId);
+      const quota = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder
+          .eq("userId", fixture.userId)
+          .eq("category", "account"))
+        .unique();
+      return {
+        actual: quota?.logicalBytes,
+        expected: (account === null ? 0 : logicalDocumentBytes(account))
+          + (binding === null ? 0 : logicalDocumentBytes(binding)),
+      };
+    });
+    expect(accounting.actual).toBe(accounting.expected);
+    const initialAccounting = await runtime.run(async (ctx) => {
+      const categories = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder.eq("userId", fixture.userId))
+        .collect();
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      return {
+        serviceUserBytes: service?.userLogicalBytes,
+        userBytes: categories.reduce((total, row) => total + row.logicalBytes, 0),
+      };
+    });
+    expect(initialAccounting.userBytes).toBeGreaterThan(0);
+    expect(initialAccounting.serviceUserBytes).toBe(initialAccounting.userBytes);
+    const nearCeiling = await runtime.run(async (ctx) => {
+      const categories = await ctx.db.query("storageUsageByUser")
+        .withIndex("by_user_and_category", (builder) => builder.eq("userId", fixture.userId))
+        .collect();
+      const service = await ctx.db.query("storageUsageService")
+        .withIndex("by_key", (builder) => builder.eq("key", "global"))
+        .unique();
+      return {
+        serviceUserBytes: service?.userLogicalBytes ?? -1,
+        userBytes: categories.reduce((total, row) => total + row.logicalBytes, 0),
+      };
+    });
+    expect(nearCeiling.userBytes).toBeLessThan(USER_TOTAL_QUOTA.logicalBytes);
+    expect(nearCeiling.serviceUserBytes).toBe(nearCeiling.userBytes);
+  });
+
   test("shares one hard batch budget across categories", async () => {
     const runtime = convexTest(schema, modules);
     await runtime.mutation(genesisQuota, {});

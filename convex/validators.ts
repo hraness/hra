@@ -38,6 +38,10 @@ export const commandState = v.union(
   v.literal("expired"),
 );
 export const accountBindingState = v.union(v.literal("present"), v.literal("removed"));
+export const usageAdmissionDisposition = v.union(
+  v.literal("stored"),
+  v.literal("coalesced"),
+);
 export const accountDeletionState = v.union(
   v.literal("pending"),
   v.literal("draining"),
@@ -123,6 +127,20 @@ export const encryptedEnvelope = v.object({
   ciphertext: v.string(),
   keyVersion: v.number(),
   nonce: v.string(),
+});
+
+// Usage applies its tighter ciphertext-character bound in the mutation parser.
+// The named validator keeps that distinct contract visible in the table schema.
+export const usageEncryptedEnvelope = encryptedEnvelope;
+
+export const usageAdmissionAuthority = v.object({
+  cursor: v.object({
+    digest: v.string(),
+    disposition: usageAdmissionDisposition,
+    observedAt: v.number(),
+    sourceRevision: v.number(),
+  }),
+  lastAcceptedAt: v.number(),
 });
 
 export const wrappedKeyEnvelope = v.object({

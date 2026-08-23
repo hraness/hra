@@ -28,6 +28,18 @@ export type CodexAccountProjection = {
   plan?: string;
 };
 
+export type CodexLoginOutcome =
+  | {
+      status: "pending";
+      loginId: string;
+      verificationUrl?: string;
+      userCode?: string;
+    }
+  | {
+      status: "signed_in";
+      account: CodexAccountProjection & { signedIn: true };
+    };
+
 export type ProjectionTextOmission = {
   originalUtf8Bytes: number;
   returnedUtf8Bytes: number;
@@ -80,7 +92,8 @@ export type CodexSessionProjection = {
 };
 
 export interface CodexRuntimePort {
-  login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<{ status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection }>;
+  login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome>;
+  cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }>;
   logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void>;
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   readUsage(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<{ revision: number; observedAt: number; payload: unknown }>;
@@ -95,11 +108,28 @@ export interface CodexRuntimePort {
   interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
   rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
   inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
-  resolveInteraction?(input: {
+  validateInteractionResolution(input: {
     authority: ProfileAuthority;
     provider: ProviderInteractionAuthority;
     kind: InteractionKind;
     resolution: InteractionResolution;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }>;
+  resolveInteraction(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    resolution: InteractionResolution;
+    signal: AbortSignal;
+  }): Promise<{ responseWritten: true }>;
+  validateInteractionTimeout(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }>;
+  timeoutInteraction(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
     signal: AbortSignal;
   }): Promise<{ responseWritten: true }>;
   close(): Promise<void>;
@@ -116,6 +146,8 @@ export interface CloudControlPort {
   sync(signal: AbortSignal): Promise<unknown>;
   isCompactProjectionRecoveryUnsettledForProfile(profileId: ProfileId): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean>;
+  supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId: SessionId): Promise<{ superseded: boolean }>;
+  supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }>;
   recoverCompactProjection(input: { sessionPublicId: SessionId; idempotencyKey: string; acknowledgeGap: true; signal: AbortSignal }): Promise<unknown>;
   auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown>;
   logout(signal: AbortSignal): Promise<void>;
@@ -128,12 +160,16 @@ export interface CloudControlPort {
 
 export type CompactProjectionRecoveryBlocker = Pick<
   CloudControlPort,
-  "isCompactProjectionRecoveryUnsettled" | "isCompactProjectionRecoveryUnsettledForProfile"
+  | "isCompactProjectionRecoveryUnsettled"
+  | "isCompactProjectionRecoveryUnsettledForProfile"
+  | "supersedeCompactProjectionRecoveryForProviderDeletion"
+  | "supersedeTerminalCompactProjectionRecoveries"
 >;
 
 export class UnavailableCodexRuntime implements CodexRuntimePort {
   #unavailable(): never { throw new Error("The Codex runtime is unavailable on this machine."); }
   login(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  cancelLogin(): Promise<never> { return Promise.reject(this.#unavailable()); }
   logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readUsage(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -148,7 +184,10 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
   rename(): Promise<never> { return Promise.reject(this.#unavailable()); }
   inspectTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
   resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  timeoutInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
   async close(): Promise<void> {}
 }
 
@@ -167,6 +206,15 @@ export class UnavailableCloudControl implements CloudControlPort {
   }
   isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean> {
     return this.#projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettled(sessionPublicId);
+  }
+  supersedeCompactProjectionRecoveryForProviderDeletion(
+    sessionPublicId: SessionId,
+  ): Promise<{ superseded: boolean }> {
+    return this.#projectionRecoveryBlocker
+      .supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId);
+  }
+  supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    return this.#projectionRecoveryBlocker.supersedeTerminalCompactProjectionRecoveries();
   }
   recoverCompactProjection(): Promise<never> { return Promise.reject(this.#unavailable()); }
   auth(): Promise<never> { return Promise.reject(this.#unavailable()); }

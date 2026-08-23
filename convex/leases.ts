@@ -94,7 +94,6 @@ export const acquire = mutation({
       sessions.length !== 1
       || session?.executionDeviceId !== authority.deviceId
       || session.state === "orphaned"
-      || session.state === "terminal"
     ) rejectAuthority();
     const existing = await leaseForSession(ctx, session._id);
     const now = Date.now();

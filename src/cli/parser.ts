@@ -59,7 +59,7 @@ export type SessionEventFollowCliInvocation = Readonly<{
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
 
 export type CliInvocation =
-  | { kind: "help" }
+  | { group?: string; kind: "help" }
   | { kind: "version" }
   | { kind: "init"; yes: boolean; json: boolean }
   | { kind: "daemon.start"; json: boolean }
@@ -94,7 +94,7 @@ Usage:
   hra init [--yes] [--json]
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
-  hra account add|list|show|login|logout|usage|switch|switch-recover
+  hra account add|list|show|login|login-cancel|logout|usage|switch|switch-recover
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
@@ -121,6 +121,171 @@ Recommended profiles:
   ultra   Sol Ultra
 
 Run ‘hra <group> --help’ for command examples.`;
+
+const groupUsage = {
+  init: `HRA init
+
+Usage:
+  hra init [--yes] [--json]
+
+Examples:
+  hra init
+  hra init --yes --json`,
+  doctor: `HRA doctor
+
+Usage:
+  hra doctor [--offline] [--json]
+
+Examples:
+  hra doctor --offline
+  hra doctor --json`,
+  daemon: `HRA daemon
+
+Usage:
+  hra daemon start [--json]
+  hra daemon status|stop [--json]
+  hra daemon run
+
+Examples:
+  hra daemon start
+  hra daemon status --json`,
+  account: `HRA account
+
+Usage:
+  hra account add <label>
+  hra account login <profile> [--device-code]
+  hra account login-cancel <profile>
+  hra account logout <profile>
+  hra account list
+  hra account show <profile>
+  hra account usage [profile] [--refresh]
+  hra account switch <profile>
+  hra account switch-recover
+
+Examples:
+  hra account add personal
+  hra account login personal --device-code
+  hra account login-cancel personal
+  hra account usage personal --refresh`,
+  plugin: `HRA plugin
+
+Usage:
+  hra plugin list <account> [--project <project>] [--refresh]
+  hra plugin show <account> <plugin> [--project <project>] [--refresh]
+
+Plugin commands are discovery-only. Installation, enablement, and OAuth stay in Codex.
+
+Examples:
+  hra plugin list personal --refresh
+  hra plugin show personal github --project jungle`,
+  project: `HRA project
+
+Usage:
+  hra project add --path <directory> [--name <name>]
+  hra project list
+  hra project use <project>
+
+Examples:
+  hra project add --path . --name jungle
+  hra project use jungle`,
+  session: `HRA session
+
+Usage:
+  hra session list [--account <profile>] [--limit <1..100>]
+  hra session show <session> [--detail]
+  hra session status <session>
+  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow]
+  hra session interactions <session> [--pending] [--limit <1..100>]
+  hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
+  hra session send|queue|steer <session> <message>
+  hra session stop|recover|abandon <session>
+  hra session rename <session> <name>
+  hra session note get|edit|clear <session>
+  hra session note set <session> <note>
+  hra session preset <session> <low|high|ultra>
+  hra session fast <session> <on|off>
+  hra session project <session> <project>
+
+Examples:
+  hra session start personal --project jungle --preset high
+  hra session events my-session --wait-ms 30000 --follow
+  hra session send my-session -- "run --help exactly"`,
+  interaction: `HRA interaction
+
+Usage:
+  hra interaction list [session] [--pending] [--limit <1..100>]
+  hra interaction show <interaction-id>
+  hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>
+  hra interaction grant|answer <interaction-id> --revision <n> --input-stdin|--input-fd <fd>
+  hra interaction submit <interaction-id> --revision <n> --action <accept|decline|cancel> [--input-stdin|--input-fd <fd>]
+
+Protected values are accepted only through stdin or an explicit file descriptor.
+Permission grant document: {"permissions":["<requested-name>"]}
+Question answer document: {"answers":{"<question-id>":{"answers":["<answer>"]}}}
+
+Examples:
+  hra interaction decide <id> --revision 1 --decision once
+  hra interaction answer <id> --revision 1 --input-stdin`,
+  remote: `HRA remote
+
+Usage:
+  hra remote list [--limit <1..100>]
+  hra remote show <cloud-session>
+  hra remote command <uuidv7>
+  hra remote send|queue|steer <cloud-session> <message>
+  hra remote stop <cloud-session>
+  hra remote preset <cloud-session> <low|high|ultra>
+  hra remote fast <cloud-session> <on|off>
+
+Examples:
+  hra remote list
+  hra remote send synced-session -- "continue the migration"
+  hra remote command <uuidv7>`,
+  turn: `HRA turn
+
+Usage:
+  hra turn inspect <session> <turn> [--json]
+
+Example:
+  hra turn inspect my-session turn_123 --json`,
+  auth: `HRA auth
+
+Usage:
+  hra auth login --input-stdin|--input-fd <fd>
+  hra auth status|logout
+  hra auth delete --acknowledge-erasure
+
+Examples:
+  hra auth login --input-stdin
+  hra auth status --json`,
+  device: `HRA device
+
+Usage:
+  hra device list
+  hra device pair
+  hra device approve|revoke <device-id-or-prefix>
+
+Examples:
+  hra device pair
+  hra device approve <pending-device-prefix>`,
+  sync: `HRA sync
+
+Usage:
+  hra sync status|now
+  hra sync projection recover <local-session> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]
+
+Examples:
+  hra sync status
+  hra sync projection recover my-session --acknowledge-gap`,
+} as const satisfies Readonly<Record<string, string>>;
+
+export function usageForGroup(group: string | undefined): string {
+  if (group === undefined) return usage;
+  const selected: string | undefined = (
+    groupUsage as Readonly<Partial<Record<string, string>>>
+  )[group];
+  return selected ?? usage;
+}
 
 export function requestsJsonOutput(argv: readonly string[]): boolean {
   const delimiter = argv.indexOf("--");
@@ -226,13 +391,13 @@ const protectedInput = (cursor: Cursor, required: boolean): ProtectedInputSource
 const remainder = (cursor: Cursor, label: string): string => {
   if (cursor.values.length === 0) throw new CliUsageError(`Missing ${label}.`);
   const unknown = cursor.values.find(isOption);
-  if (unknown !== undefined) throw new CliUsageError(`Unknown option: ${unknown}`);
+  if (unknown !== undefined) throw new CliUsageError("Unknown option. Run `hra --help` for the supported command shape.");
   return cursor.values.splice(0).map(decode).join(" ");
 };
 
 const finish = (cursor: Cursor): void => {
   const unexpected = cursor.values[0];
-  if (unexpected !== undefined) throw new CliUsageError(`Unexpected argument: ${unexpected}`);
+  if (unexpected !== undefined) throw new CliUsageError("Unexpected argument. Run `hra --help` for the supported command shape.");
 };
 
 const shellArgument = (value: string): string => {
@@ -331,11 +496,12 @@ const parseAccount = (cursor: Cursor): LocalCommand => {
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.show", account }; }
     case "login": { const deviceCode = flag(cursor, "--device-code"); const account = take(cursor, "account"); finish(cursor); return { kind: "account.login", account, deviceCode }; }
+    case "login-cancel": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.login-cancel", account }; }
     case "logout": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.logout", account }; }
     case "usage": { const refresh = flag(cursor, "--refresh"); const account = takeOptional(cursor); finish(cursor); return command({ kind: "account.usage", account, refresh }); }
     case "switch": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.switch", account, idempotencyKey: randomUUID() }; }
     case "switch-recover": finish(cursor); return { kind: "account.switch-recover" };
-    default: throw new CliUsageError(`Unknown account action: ${action}`);
+    default: throw new CliUsageError("Unknown account action. Run `hra account --help` for supported actions.");
   }
 };
 
@@ -359,7 +525,7 @@ const parsePlugin = (cursor: Cursor): LocalCommand => {
       "Pinned Codex 0.149.0 has no safe separated plugin lifecycle effect. Use `plugin list` or `plugin show` to inspect the exact boundary.",
     );
   }
-  throw new CliUsageError(`Unknown plugin action: ${action}`);
+  throw new CliUsageError("Unknown plugin action. Run `hra plugin --help` for supported actions.");
 };
 
 const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
@@ -368,7 +534,7 @@ const parseProject = (cursor: Cursor, cwd: string): LocalCommand => {
     case "list": finish(cursor); return { kind: "project.list" };
     case "add": { const requestedPath = option(cursor, "--path") ?? take(cursor, "project directory"); const label = option(cursor, "--name") ?? takeOptional(cursor) ?? requestedPath.split("/").filter(Boolean).at(-1) ?? "Project"; finish(cursor); return command({ kind: "project.add", label, path: resolve(cwd, requestedPath) }); }
     case "use": { const project = take(cursor, "project"); finish(cursor); return { kind: "project.use", project }; }
-    default: throw new CliUsageError(`Unknown project action: ${action}`);
+    default: throw new CliUsageError("Unknown project action. Run `hra project --help` for supported actions.");
   }
 };
 
@@ -380,7 +546,7 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
     case "edit": finish(cursor); return { kind: "session.note.edit", session };
     case "set": return command({ kind: "session.note.set", session, note: remainder(cursor, "note") });
     case "clear": finish(cursor); return { kind: "session.note.clear", session };
-    default: throw new CliUsageError(`Unknown note action: ${action}`);
+    default: throw new CliUsageError("Unknown note action. Run `hra session --help` for supported actions.");
   }
 };
 
@@ -437,7 +603,7 @@ const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvoc
     case "preset": { const session = take(cursor, "session"); const preset = take(cursor, "preset"); finish(cursor); return command({ kind: "session.preset", session, preset }); }
     case "fast": { const session = take(cursor, "session"); const value = take(cursor, "on or off"); finish(cursor); if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`."); return { kind: "session.fast", session, enabled: value === "on" }; }
     case "project": { const session = take(cursor, "session"); const project = take(cursor, "project"); finish(cursor); return { kind: "session.project", session, project }; }
-    default: throw new CliUsageError(`Unknown session action: ${action}`);
+    default: throw new CliUsageError("Unknown session action. Run `hra session --help` for supported actions.");
   }
 };
 
@@ -553,7 +719,7 @@ const parseInteraction = (cursor: Cursor, json: boolean): ParsedInteraction => {
       resolution: { action: "accept", kind: "mcp_submission" },
     };
   }
-  throw new CliUsageError(`Unknown interaction action: ${action}`);
+  throw new CliUsageError("Unknown interaction action. Run `hra interaction --help` for supported actions.");
 };
 
 const parseRemote = (cursor: Cursor): RemoteCliCommand => {
@@ -609,7 +775,7 @@ const parseRemote = (cursor: Cursor): RemoteCliCommand => {
       if (value !== "on" && value !== "off") throw new CliUsageError("Fast must be `on` or `off`.");
       return { enabled: value === "on", kind: "remote.fast", session };
     }
-    default: throw new CliUsageError(`Unknown remote action: ${action}`);
+    default: throw new CliUsageError("Unknown remote action. Run `hra remote --help` for supported actions.");
   }
 };
 
@@ -620,7 +786,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   const cursor: Cursor = { values: regular };
   const json = flag(cursor, "--json");
   const idempotencyKey = option(cursor, "--idempotency-key");
-  if (flag(cursor, "--help") || flag(cursor, "-h") || (cursor.values.length === 0 && literalTail.length === 0)) return { kind: "help" };
+  if (flag(cursor, "--help") || flag(cursor, "-h") || (cursor.values.length === 0 && literalTail.length === 0)) {
+    const group = cursor.values[0];
+    return { kind: "help", ...(group === undefined ? {} : { group }) };
+  }
   if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
@@ -635,7 +804,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       return { kind: "daemon.run" };
     }
     if (action === "status" || action === "stop") return { kind: "command", command: { kind: `daemon.${action}` }, json };
-    throw new CliUsageError(`Unknown daemon action: ${action}`);
+    throw new CliUsageError("Unknown daemon action. Run `hra daemon --help` for supported actions.");
   }
   if (group === "remote") {
     const remote = parseRemote(cursor);
@@ -662,6 +831,9 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "session") {
     const sessionCommand = parseSession(cursor);
     if (sessionCommand.kind === "session.events.follow") {
+      if (json) {
+        throw new CliUsageError("Event following is already JSON Lines and cannot be combined with --json.");
+      }
       if (idempotencyKey !== undefined) {
         throw new CliUsageError("--idempotency-key is not supported by session.events.");
       }
@@ -669,7 +841,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     }
     parsed = sessionCommand;
   }
-  else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError(`Unknown turn action: ${action}`); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
+  else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError("Unknown turn action. Run `hra turn --help` for supported actions."); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
   else if (group === "interaction") {
     const interaction = parseInteraction(cursor, json);
     if (interaction.kind === "interaction.resolve-protected") {
@@ -705,10 +877,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       finish(cursor);
       parsed = { kind: `auth.${action}` };
     } else {
-      throw new CliUsageError(`Unknown auth action: ${action}`);
+      throw new CliUsageError("Unknown auth action. Run `hra auth --help` for supported actions.");
     }
   }
-  else if (group === "device") { const action = take(cursor, "device action"); if (action === "list" || action === "pair") { finish(cursor); parsed = { kind: `device.${action}` }; } else if (action === "approve" || action === "revoke") { const device = take(cursor, "device"); finish(cursor); parsed = { kind: `device.${action}`, device }; } else throw new CliUsageError(`Unknown device action: ${action}`); }
+  else if (group === "device") { const action = take(cursor, "device action"); if (action === "list" || action === "pair") { finish(cursor); parsed = { kind: `device.${action}` }; } else if (action === "approve" || action === "revoke") { const device = take(cursor, "device"); finish(cursor); parsed = { kind: `device.${action}`, device }; } else throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions."); }
   else if (group === "sync") {
     const action = take(cursor, "sync action");
     if (action === "status" || action === "now") {
@@ -717,7 +889,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     } else if (action === "projection") {
       const projectionAction = take(cursor, "projection action");
       if (projectionAction !== "recover") {
-        throw new CliUsageError(`Unknown projection action: ${projectionAction}`);
+        throw new CliUsageError("Unknown projection action. Run `hra sync --help` for supported actions.");
       }
       const acknowledgeGap = flag(cursor, "--acknowledge-gap");
       const session = take(cursor, "local session");
@@ -762,10 +934,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         replayCommand,
       };
     } else {
-      throw new CliUsageError(`Unknown sync action: ${action}`);
+      throw new CliUsageError("Unknown sync action. Run `hra sync --help` for supported actions.");
     }
   }
-  else throw new CliUsageError(`Unknown command: ${group}`);
+  else throw new CliUsageError("Unknown command. Run `hra --help` for supported commands.");
   if (idempotencyKey !== undefined && !idempotentCommandKinds.has(parsed.kind)) {
     throw new CliUsageError(`--idempotency-key is not supported by ${parsed.kind}.`);
   }

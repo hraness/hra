@@ -97,6 +97,7 @@ describe("public content contract", () => {
       expect(surface).toContain("automatically registers the current installation");
       expect(surface).toContain("registered as pending");
       expect(surface).toContain("no synchronized data, execution, or key authority");
+      expect(surface).toContain("an uncontested, unrevoked copy can impersonate that device");
       expect(surface).not.toContain("device pair` to create a pending device request");
       expect(surface).not.toContain("device pair</code> to create a pending device request");
     }
@@ -107,6 +108,18 @@ describe("public content contract", () => {
     }
   });
 
+  test("publishes exact lost-login recovery without retaining provider credentials", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    for (const surface of [markdown, html]) {
+      expect(surface).toContain("the daemon restarts before completion");
+      expect(surface).toContain("hra account show personal");
+      expect(surface).toContain("hra account login-cancel");
+      expect(surface).toContain("exact current-generation provider login");
+      expect(surface).toContain("Verification URLs, device codes, and provider credentials are never retained");
+    }
+  });
+
   test("publishes an explicit read-only plugin boundary", () => {
     const claims = [
       "hra plugin list <account> [--project <project>] [--refresh]",
@@ -114,13 +127,41 @@ describe("public content contract", () => {
       "Plugin commands are read-only discovery.",
       "Pinned Codex 0.149.0 has no safely separated install, enablement, and OAuth lifecycle surface",
       "HRA therefore does not expose plugin install, enable, disable, OAuth, or permission effects.",
+      "The pinned tool-suggestion form that can invoke that compound plugin or connector lifecycle is also rejected before admission.",
+      "Other standard MCP forms are brokered only when their pinned schema fits HRA's closed primitive-field contract.",
+      "Opaque openai/form, unsupported schema constructs, and URL elicitation fail before durable admission",
     ];
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     for (const claim of claims) {
       expect(markdown).toContain(claim);
       expect(html).toContain(
-        claim.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"),
+        claim
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("'", "&#39;"),
+      );
+    }
+  });
+
+  test("publishes the protected standard MCP form contract", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    for (const claim of [
+      "interaction show returns the exact public field contract without defaults or answers",
+      '{"content":{...}}',
+      "Decline and cancel accept no content.",
+      "validation failures identify the contract failure without echoing a submitted value",
+    ]) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(
+        claim
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;"),
       );
     }
   });
@@ -133,6 +174,8 @@ describe("public content contract", () => {
       "hra remote send <cloud-session> <message>",
       "hra remote command <uuidv7>",
       "--idempotency-key <current-uuidv7>",
+      "includes observation-only interaction events with a public interaction ID, kind, state, revision, blocking status, and bounded safe summary",
+      "Resolve a pending callback on its execution device; remote interaction responses are unavailable in v1.",
       "Transcript upload is bound to a durable local stream ledger",
       "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
       "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]",
@@ -183,9 +226,13 @@ describe("public content contract", () => {
 
   test("keeps the full privacy boundary on the readme, site, and policy page", () => {
     const sentinelClaims = [
+      "Codex account labels and observed provider email and plan metadata when cloud sync is enabled.",
       "Codex credentials, profile files, plugin credentials, or OAuth material.",
       "Raw reasoning, hidden chain of thought, or approval secrets.",
+      "Observation-only interaction IDs, kinds, states, revisions, blocking status, and bounded safe summaries.",
+      "Provider login and request IDs, permission values, MCP field contracts, protected answers, or response digests.",
       "Email access alone does not recover that key.",
+      "an uncontested, unrevoked copy can impersonate that device",
       "The website uses no analytics, cookies, remote fonts, or executable JavaScript.",
     ];
     const surfaces = [
@@ -199,6 +246,16 @@ describe("public content contract", () => {
       for (const surface of surfaces) {
         expect(surface).toContain(claim.replaceAll("'", "&#39;"));
       }
+    }
+  });
+
+  test("publishes the local interaction deadline boundary", () => {
+    const surfaces = [renderReadmeMarkdown(), renderSiteHtml()];
+    for (const surface of surfaces) {
+      expect(surface).toContain("anchored when Codex delivered it");
+      expect(surface).toContain("caps the pending interval at 30 minutes");
+      expect(surface).toContain("never invents an answer or grant");
+      expect(surface).toContain("encrypted remote interaction metadata does not include it");
     }
   });
 

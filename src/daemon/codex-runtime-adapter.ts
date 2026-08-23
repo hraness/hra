@@ -23,6 +23,7 @@ import type {
 } from "../domain/interactions";
 import type {
   CodexAccountProjection,
+  CodexLoginOutcome,
   CodexProjectedMessage,
   CodexRuntimePort,
   CodexSessionProjection,
@@ -673,16 +674,24 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     this.#now = input.now ?? Date.now;
   }
 
-  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<{ status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection }> {
+  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome> {
     return await this.#admit(async () => {
       const client = await this.#client(input.authority);
       const before = accountProjection((await client.accountRead()).value);
-      if (before.signedIn) return { status: "signed_in", account: before };
+      if (before.signedIn) return { status: "signed_in", account: { ...before, signedIn: true } };
       if (input.signal.aborted) throw input.signal.reason;
       const login = (await client.startManagedLogin(input.method === "device_code" ? "device-code" : "browser")).value;
       return login.type === "chatgptDeviceCode"
-        ? { status: "pending", verificationUrl: login.verificationUrl, userCode: login.userCode }
-        : { status: "pending", verificationUrl: login.authUrl };
+        ? { status: "pending", loginId: login.loginId, verificationUrl: login.verificationUrl, userCode: login.userCode }
+        : { status: "pending", loginId: login.loginId, verificationUrl: login.authUrl };
+    });
+  }
+
+  async cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      const result = (await (await this.#client(input.authority)).cancelManagedLogin(input.loginId)).value;
+      return { status: result.status === "notFound" ? "not_found" : "canceled" };
     });
   }
 
@@ -940,6 +949,91 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         kind: input.kind,
         resolution: input.resolution,
       });
+    });
+  }
+
+  async validateInteractionResolution(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    resolution: InteractionResolution;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      if (
+        input.provider.profileId !== input.authority.id
+        || input.provider.processGeneration !== input.authority.generation
+        || !this.#isCurrent(input.authority)
+      ) {
+        throw new CodexError(
+          "AUTHORITY_STALE",
+          "The interaction belongs to another account process generation.",
+        );
+      }
+      const running = this.#clients.get(input.authority.id);
+      if (
+        running === undefined
+        || running.authority.generation !== input.authority.generation
+        || running.client.state !== "ready"
+        || running.client.connectionId !== input.provider.connectionId
+      ) {
+        throw new CodexError(
+          "AUTHORITY_STALE",
+          "The interaction's exact provider connection is no longer live.",
+        );
+      }
+      return await running.client.validateInteractionResolution({
+        provider: input.provider,
+        kind: input.kind,
+        resolution: input.resolution,
+      });
+    });
+  }
+
+  async validateInteractionTimeout(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    signal: AbortSignal;
+  }): Promise<{ responseDigest: string }> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      if (
+        input.provider.profileId !== input.authority.id
+        || input.provider.processGeneration !== input.authority.generation
+        || !this.#isCurrent(input.authority)
+      ) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
+      const running = this.#clients.get(input.authority.id);
+      if (
+        running === undefined
+        || running.authority.generation !== input.authority.generation
+        || running.client.state !== "ready"
+        || running.client.connectionId !== input.provider.connectionId
+      ) throw new CodexError("AUTHORITY_STALE", "The interaction's exact provider connection is no longer live.");
+      return await running.client.validateInteractionTimeout({ provider: input.provider });
+    });
+  }
+
+  async timeoutInteraction(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    signal: AbortSignal;
+  }): Promise<{ responseWritten: true }> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      if (
+        input.provider.profileId !== input.authority.id
+        || input.provider.processGeneration !== input.authority.generation
+        || !this.#isCurrent(input.authority)
+      ) throw new CodexError("AUTHORITY_STALE", "The interaction belongs to another account process generation.");
+      const running = this.#clients.get(input.authority.id);
+      if (
+        running === undefined
+        || running.authority.generation !== input.authority.generation
+        || running.client.state !== "ready"
+        || running.client.connectionId !== input.provider.connectionId
+      ) throw new CodexError("AUTHORITY_STALE", "The interaction's exact provider connection is no longer live.");
+      return await running.client.timeoutInteraction({ provider: input.provider });
     });
   }
 

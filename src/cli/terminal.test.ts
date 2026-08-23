@@ -159,7 +159,7 @@ describe("terminal-safe CLI boundaries", () => {
     const parsedFailure = JSON.parse(failureOutput) as { error: { message: string } };
     expect(Object.keys((JSON.parse(failureOutput) as { error: Record<string, unknown> }).error).sort())
       .toEqual(["code", "message"]);
-    expect(parsedFailure.error.message).toContain("[redacted token-like diagnostic containing terminal controls]");
+    expect(parsedFailure.error.message).toBe("HRA could not complete the request safely.");
     expect(parsedFailure.error.message).not.toContain(localPath);
     expect(failureOutput.length).toBeLessThan(2_048);
     expect(failureOutput).not.toContain(failureSentinel);
@@ -176,8 +176,7 @@ describe("terminal-safe CLI boundaries", () => {
       },
     })).toBe(1);
     const thrownFailure = JSON.parse(thrown.read().stdout) as { error: { message: string } };
-    expect(thrownFailure.error.message).toContain("[local-path]");
-    expect(thrownFailure.error.message).toContain("Bearer [redacted]");
+    expect(thrownFailure.error.message).toBe("HRA could not complete the request safely.");
     expect(thrown.read().stdout).not.toContain(localPath);
     expect(thrown.read().stdout).not.toContain("failure-secret-value-123456789");
     expect(thrown.read().stderr).toBe("");
@@ -470,7 +469,8 @@ describe("terminal-safe CLI boundaries", () => {
     expect(rejectedText.length).toBeLessThan(2_048);
     expect(Object.keys((JSON.parse(rejectedText) as { error: Record<string, unknown> }).error).sort())
       .toEqual(["code", "message"]);
-    expect(rejectedText).toContain("[redacted token-like diagnostic containing terminal controls]");
+    expect((JSON.parse(rejectedText) as { error: { message: string } }).error.message)
+      .toBe("HRA could not complete the request safely.");
     expect(rejectedText).not.toContain(localPath);
     expect(rejectedText).not.toContain("projection-secret-token-123456789");
     expect(rejectedText).not.toContain("baselineCompletedTurns");
@@ -595,7 +595,8 @@ describe("terminal-safe CLI boundaries", () => {
         version: 1,
       }),
     })).toBe(1);
-    expect(target.read().stdout).toContain("invalid projection-recovery summary");
+    expect((JSON.parse(target.read().stdout) as { error: { message: string } }).error.message)
+      .toBe("HRA could not complete the request safely.");
     expect(target.read().stdout).not.toContain(secret);
     expect(target.read().stdout).not.toContain("device_private123");
     expect(target.read().stdout).not.toContain("user_private1234");

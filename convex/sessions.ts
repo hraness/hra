@@ -651,7 +651,7 @@ export const appendChunk = mutation({
       sessions.length !== 1
       || session?.executionDeviceId !== current.deviceId
       || session.state === "orphaned"
-      || session.state === "terminal"
+      || (session.state === "terminal" && args.stream !== "compact")
     ) rejectAuthority();
     await requireLiveExecutionLease(ctx, {
       authority: args.authority,

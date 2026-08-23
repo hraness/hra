@@ -8,7 +8,11 @@ import {
   type EncryptedEnvelope,
 } from "./contracts";
 import { decryptBytes, encryptBytes } from "./crypto";
-import { parseUsageProjection, type UsageProjection } from "./usage";
+import {
+  parseUsageEncryptedEnvelope,
+  parseUsageProjection,
+  type UsageProjection,
+} from "./usage";
 
 export type RemoteCommandPayload =
   | Readonly<{ kind: "send" | "queue" | "steer"; message: string }>
@@ -168,7 +172,11 @@ export async function encryptUsageProjection(
   if (authority.kind !== "usage" || parseUsageProjection(payload) === null) {
     throw new Error("Invalid usage projection.");
   }
-  return await encryptJson(payload, key, authority);
+  const envelope = await encryptJson(payload, key, authority);
+  if (parseUsageEncryptedEnvelope(envelope) === null) {
+    throw new Error("Encrypted usage projection exceeds its closed envelope bound.");
+  }
+  return envelope;
 }
 
 export async function decryptUsageProjection(
@@ -176,7 +184,10 @@ export async function decryptUsageProjection(
   key: Uint8Array,
   authority: CloudPayloadAuthority,
 ): Promise<UsageProjection> {
-  if (authority.kind !== "usage") throw new Error("Invalid usage authority.");
+  if (
+    authority.kind !== "usage"
+    || parseUsageEncryptedEnvelope(envelope) === null
+  ) throw new Error("Invalid usage authority.");
   const parsed = parseUsageProjection(await decryptJson(envelope, key, authority));
   if (parsed === null) throw new Error("Invalid usage projection.");
   return parsed;

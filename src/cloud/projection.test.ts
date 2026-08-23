@@ -105,6 +105,37 @@ describe("encrypted session projections", () => {
     }
   });
 
+  test("admits only the bounded observation-only interaction shape", () => {
+    const interaction = {
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000001",
+      interactionKind: "permission_approval",
+      kind: "interaction_state",
+      revision: 3,
+      sequence: 1,
+      state: "pending",
+      summary: "Allow the requested additional permissions",
+    } as const;
+    expect(parseCompactSessionEvents([interaction])).toEqual([interaction]);
+    for (const privateField of [
+      { providerRequestId: "request-private" },
+      { permissions: { workspace: { roots: ["private"] } } },
+      { fields: [{ name: "token" }] },
+      { answers: { password: "secret" } },
+      { responseDigest: "a".repeat(64) },
+    ]) {
+      expect(parseCompactSessionEvents([{ ...interaction, ...privateField }])).toBeNull();
+    }
+    expect(parseCompactSessionEvents([{
+      ...interaction,
+      summary: `Open ${["", "Users", "person", "private"].join("/")}`,
+    }])).toBeNull();
+    expect(parseCompactSessionEvents([{
+      ...interaction,
+      summary: ["Bearer", "secret-token-value"].join(" "),
+    }])).toBeNull();
+  });
+
   test("round trips only under the full session authority tuple", async () => {
     const key = randomKeyBytes();
     const authority = {

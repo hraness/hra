@@ -16,13 +16,13 @@ import {
   parseCli,
   projectionRecoveryReplayCommand,
   requestsJsonOutput,
-  usage,
+  usageForGroup,
   type CliInvocation,
   type ProjectionRecoveryCliInvocation,
   type ProtectedInputSource,
   type RemoteCliCommand,
 } from "./cli/parser";
-import { renderFailure, renderSuccess, safeJson, terminalSafe, type Output } from "./cli/render";
+import { renderFailure, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
 import { compileShellLine, formatShellPrompt, shellHelp, type ShellSelection } from "./cli/shell";
 import { ShellLiveObserver } from "./cli/shell-live";
 import { followSessionEvents } from "./cli/watch";
@@ -50,7 +50,7 @@ import {
 } from "./cloud/index";
 import { resolvePinnedCodexRuntime } from "./codex/index";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
-import { sessionIdSchema } from "./domain/values";
+import { profileIdSchema, sessionIdSchema } from "./domain/values";
 import {
   LocalDaemonServer,
   LocalDaemonIndeterminateError,
@@ -77,8 +77,34 @@ import { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { HRA_VERSION } from "./version";
 
+const writeProcessStdoutAsync = (value: string, signal: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      if (error === undefined || error === null) resolve();
+      else reject(error);
+    };
+    const onAbort = (): void => finish(
+      signal.reason ?? new DOMException("Session event output was aborted.", "AbortError"),
+    );
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      process.stdout.write(value, (error) => finish(error));
+    } catch (error: unknown) {
+      finish(error);
+    }
+  });
+
 const processOutput: Output = {
   writeStdout: (value) => process.stdout.write(value),
+  writeStdoutAsync: writeProcessStdoutAsync,
   writeStderr: (value) => process.stderr.write(value),
 };
 
@@ -242,9 +268,10 @@ type ProjectionRecoverySummary =
 
 type CliMainInput = Readonly<{
   statePaths?: StatePaths;
-  callDaemon?: (command: LocalCommand) => Promise<CommandResponse>;
+  callDaemon?: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>;
   getRemoteCommandStatus?: CloudRemoteControlPort["getRemoteCommandStatus"];
   interactive?: boolean;
+  isTerminalDescriptor?: (fd: number) => boolean;
   readProtectedDocument?: (source: ProtectedInputSource) => Promise<unknown>;
   readShellLine?: (prompt: string) => Promise<string | null>;
 }>;
@@ -527,10 +554,13 @@ async function startDaemonProcess(): Promise<void> {
   });
 }
 
-async function callWithAutostart(command: LocalCommand): Promise<Awaited<ReturnType<typeof callLocalDaemon>>> {
+async function callWithAutostart(
+  command: LocalCommand,
+  signal?: AbortSignal,
+): Promise<Awaited<ReturnType<typeof callLocalDaemon>>> {
   const paths = resolveStatePaths();
   return await callWithSafeAutostart(
-    async () => await callLocalDaemon({ paths, command }),
+    async () => await callLocalDaemon({ paths, command, ...(signal === undefined ? {} : { signal }) }),
     startDaemonProcess,
   );
 }
@@ -592,17 +622,17 @@ async function offlineDoctor(json: boolean, output: Output, paths: StatePaths): 
       } finally {
         store.close();
       }
-    } catch (error: unknown) {
+    } catch {
       database = "invalid";
-      problems.push(error instanceof Error ? error.message : "The local database is unavailable.");
+      problems.push("The local database check failed without exposing its runtime diagnostic.");
     }
   }
   let codexRuntime: { status: "ready"; version: string } | { status: "invalid"; diagnostic: string };
   try {
     const runtime = await resolvePinnedCodexRuntime();
     codexRuntime = { status: "ready", version: runtime.packageVersion };
-  } catch (error: unknown) {
-    const diagnostic = error instanceof Error ? error.message : "The pinned Codex runtime is unavailable.";
+  } catch {
+    const diagnostic = "The pinned Codex runtime check failed without exposing its runtime diagnostic.";
     codexRuntime = { status: "invalid", diagnostic };
     problems.push(diagnostic);
   }
@@ -663,7 +693,18 @@ function remoteFailure(error: unknown, json: boolean, output: Output): number {
           : /auth|configured|device|pair|unavailable/iu.test(message)
             ? "UNAVAILABLE"
             : "INTERNAL";
-  return renderFailure({ code, message }, json, output);
+  const closedMessage = code === "NOT_FOUND"
+    ? "The requested remote object was not found."
+    : code === "AMBIGUOUS"
+      ? "The remote selector is ambiguous."
+      : code === "CONFLICT"
+        ? "Remote authority changed before the operation could complete."
+        : code === "INVALID_INPUT"
+          ? "The remote request is invalid."
+          : code === "UNAVAILABLE"
+            ? "Remote control is unavailable."
+            : "The remote operation failed before a safe diagnostic was available.";
+  return renderFailure({ code, message: closedMessage }, json, output);
 }
 
 function remoteSessionName(head: CloudRemoteSessionHead): string {
@@ -683,6 +724,48 @@ function remotePayload(command: RemoteCliCommand): RemoteCommandPayload | null {
     case "remote.fast": return { enabled: command.enabled, kind: "set_fast" };
   }
 }
+
+type RemoteSessionProjection = Awaited<ReturnType<CloudRemoteControlPort["pullRemoteSession"]>>;
+type RemoteInteractionEvent = Extract<RemoteSessionProjection["events"][number], { kind: "interaction_state" }>;
+
+const remoteInteractionSafetyRank: Readonly<Record<RemoteInteractionEvent["state"], number>> = {
+  pending: 0,
+  response_prepared: 1,
+  response_written: 2,
+  resolution_unknown: 3,
+  resolved: 4,
+  declined: 4,
+  canceled: 4,
+  expired: 4,
+};
+
+const laterRemoteInteraction = (
+  candidate: RemoteInteractionEvent,
+  current: RemoteInteractionEvent,
+): boolean => {
+  if (candidate.revision !== current.revision) return candidate.revision > current.revision;
+  const candidateRank = remoteInteractionSafetyRank[candidate.state];
+  const currentRank = remoteInteractionSafetyRank[current.state];
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  if (candidate.sequence !== current.sequence) return candidate.sequence > current.sequence;
+  const candidateTie = `${candidate.state}\u0000${candidate.interactionKind}\u0000${candidate.summary}`;
+  const currentTie = `${current.state}\u0000${current.interactionKind}\u0000${current.summary}`;
+  return candidateTie > currentTie;
+};
+
+const latestRemoteInteractions = (
+  events: RemoteSessionProjection["events"],
+): ReadonlyMap<string, RemoteInteractionEvent> => {
+  const latest = new Map<string, RemoteInteractionEvent>();
+  for (const event of events) {
+    if (event.kind !== "interaction_state") continue;
+    const current = latest.get(event.interactionId);
+    if (current === undefined || laterRemoteInteraction(event, current)) {
+      latest.set(event.interactionId, event);
+    }
+  }
+  return latest;
+};
 
 export function renderRemoteSuccess(
   command: RemoteCliCommand,
@@ -752,10 +835,45 @@ export function renderRemoteSuccess(
       `Device: ${terminalSafe(session.executionDevicePublicId)}`,
       "",
     ];
+    if (session.recoveryGap !== undefined) {
+      rows.push(
+        `Recovery gap: compact projection cache recovery at stream epoch ${String(session.recoveryGap.streamEpoch)}.`,
+        "  Remote interaction state is incomplete while recovery settles. Do not act until a committed baseline is available.",
+        "",
+      );
+    } else if (session.compactHasRecoveryGap) {
+      rows.push(
+        "Recovery gap: the compact projection reports an incomplete recovery boundary.",
+        "",
+      );
+    }
+    const currentInteractions = latestRemoteInteractions(session.events);
+    const interactionGuidanceAvailable = session.recoveryGap === undefined
+      && !session.compactHasRecoveryGap;
     for (const event of session.events) {
       if (event.kind === "user_message" || event.kind === "assistant_message") {
         rows.push(`${event.kind === "user_message" ? "You" : "Codex"}  ${terminalSafe(event.turnId)}`);
         rows.push(...terminalSafe(event.text, true).split("\n").map((line) => `  ${line}`), "");
+      } else if (event.kind === "interaction_state") {
+        if (currentInteractions.get(event.interactionId) !== event) continue;
+        const kind = event.interactionKind.replaceAll("_", " ");
+        rows.push(`Interaction ${terminalSafe(event.interactionId)}  ${terminalSafe(kind)}`);
+        rows.push(`  ${terminalSafe(event.state)}  revision ${String(event.revision)}  ${event.blocking ? "blocking" : "nonblocking"}`);
+        rows.push(
+          ...terminalSafe(event.summary, true).split("\n").map((line) => `  ${line}`),
+        );
+        if (!interactionGuidanceAvailable) {
+          rows.push("  Interaction action guidance is suppressed while remote recovery settles.");
+        } else if (event.state === "pending") {
+          rows.push("  Resolve on the execution device. Remote interaction responses are not enabled.");
+        } else if (event.state === "response_prepared") {
+          rows.push("  A response is durably prepared on the execution device. Do not submit another response.");
+        } else if (event.state === "response_written") {
+          rows.push("  The provider response write began on the execution device. Do not submit another response.");
+        } else if (event.state === "resolution_unknown") {
+          rows.push("  Provider delivery is uncertain. Do not retry; recover on the execution device.");
+        }
+        rows.push("");
       } else {
         const runtimeProfile = event.model === undefined
           ? "model/Fast unknown"
@@ -930,7 +1048,6 @@ async function runDaemon(): Promise<number> {
     if (usagePoller !== undefined) usagePollerShutdown ??= usagePoller.close();
     if (service !== undefined) serviceShutdown = service.close();
     else daemonAuthority?.close();
-    cloudRequestController?.abort(new Error("Daemon shutdown was requested."));
     server?.beginShutdown(new Error("Daemon shutdown was requested."));
     resolveStop();
   };
@@ -973,7 +1090,15 @@ async function runDaemon(): Promise<number> {
     const cloudSecretCustody = await IdentityScopedCloudSecretCustody.open(secretCustody);
     const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
     const cloudJournal = new CustodyCloudDaemonJournal(cloudSecretCustody);
-    const projectionRecoveryBlocker = new CloudDaemonJournalRecoveryBlocker(cloudJournal);
+    const projectionRecoveryBlocker = new CloudDaemonJournalRecoveryBlocker(cloudJournal, {
+      isSessionTerminal: (sessionPublicId) => {
+        try {
+          return activeStore.requireSession(sessionPublicId).state === "terminal";
+        } catch {
+          return false;
+        }
+      },
+    });
     cloudRequestController = new AbortController();
     const localCloudControl = createLocalCloudControlFromEnvironment({
       lifetimeSignal: cloudRequestController.signal,
@@ -1095,7 +1220,6 @@ async function runDaemon(): Promise<number> {
     if (service !== undefined) serviceShutdown ??= service.close();
     else daemonAuthority?.close();
     server?.beginShutdown(new Error("Daemon lifetime ended."));
-    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
 
@@ -1120,6 +1244,7 @@ async function runDaemon(): Promise<number> {
         else cleanupErrors.push(error);
       }
     }
+    cloudRequestController?.abort(new Error("Cloud daemon transport is closing."));
     if (!(runError instanceof DaemonJoinDeadlineError) && !(runError instanceof LocalDaemonShutdownTimeoutError) && cloudAdapter !== undefined) {
       try { cloudAdapter.close(); } catch (error: unknown) { cleanupErrors.push(error); }
     }
@@ -1165,7 +1290,53 @@ async function runDaemon(): Promise<number> {
 
 const commandCaller = (
   input: CliMainInput,
-): ((command: LocalCommand) => Promise<CommandResponse>) => input.callDaemon ?? callWithAutostart;
+): ((command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>) =>
+  input.callDaemon ?? callWithAutostart;
+
+const protectedInputDescriptor = (source: ProtectedInputSource): number =>
+  source.kind === "stdin" ? 0 : source.fd;
+
+const protectedInputReplayCommand = (
+  invocation: Extract<CliInvocation, {
+    kind: "auth.login-protected" | "interaction.resolve-protected";
+  }>,
+): string => {
+  if (invocation.kind === "auth.login-protected") {
+    return "hra auth login --input-stdin --json < /path/to/protected.json";
+  }
+  const common = `${invocation.interaction} --revision ${String(invocation.expectedRevision)}`;
+  if (invocation.resolution.kind === "user_answers") {
+    return `hra interaction answer ${common} --input-stdin --json < /path/to/protected.json`;
+  }
+  if (invocation.resolution.kind === "permission_grant") {
+    const scope = invocation.resolution.scope === null
+      ? ""
+      : ` --scope ${invocation.resolution.scope}`;
+    return `hra interaction grant ${common}${scope} --input-stdin --json < /path/to/protected.json`;
+  }
+  return `hra interaction submit ${common} --action accept --input-stdin --json < /path/to/protected.json`;
+};
+
+const rejectJsonTerminalProtectedInput = (
+  invocation: Extract<CliInvocation, {
+    kind: "auth.login-protected" | "interaction.resolve-protected";
+  }>,
+  output: Output,
+  input: CliMainInput,
+): number | null => {
+  if (!invocation.json) return null;
+  const fd = protectedInputDescriptor(invocation.input);
+  const terminal = (input.isTerminalDescriptor ?? isatty)(fd);
+  if (!terminal) return null;
+  return renderFailure({
+    code: "INTERACTION_REQUIRED",
+    details: {
+      nextCommand: protectedInputReplayCommand(invocation),
+      protectedInput: "non_terminal_stdin_or_fd",
+    },
+    message: "JSON mode never prompts. Redirect one protected JSON document from a non-terminal stdin or file descriptor.",
+  }, true, output);
+};
 
 const renderJsonlFailure = (
   error: { code: string; message: string; details?: unknown },
@@ -1175,11 +1346,20 @@ const renderJsonlFailure = (
   writeStderr: (value) => output.writeStderr(value),
 });
 
+const isClosedStdout = (error: unknown): boolean => {
+  const code = error !== null && typeof error === "object" && "code" in error
+    ? String(error.code)
+    : "";
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED" || code === "ERR_STREAM_WRITE_AFTER_END";
+};
+
 async function executeProtectedInteraction(
   invocation: Extract<CliInvocation, { kind: "interaction.resolve-protected" }>,
   output: Output,
   input: CliMainInput,
 ): Promise<number> {
+  const terminalRefusal = rejectJsonTerminalProtectedInput(invocation, output, input);
+  if (terminalRefusal !== null) return terminalRefusal;
   const document = await (input.readProtectedDocument ?? ((source) =>
     readProtectedDocument(source, output)))(invocation.input);
   const command = completeProtectedInteraction(invocation, document);
@@ -1194,6 +1374,8 @@ async function executeProtectedAuthLogin(
   output: Output,
   input: CliMainInput,
 ): Promise<number> {
+  const terminalRefusal = rejectJsonTerminalProtectedInput(invocation, output, input);
+  if (terminalRefusal !== null) return terminalRefusal;
   const document = await (input.readProtectedDocument ?? ((source) =>
     readProtectedDocument(source, output)))(invocation.input);
   const command = completeProtectedAuthLogin(invocation, document);
@@ -1215,8 +1397,8 @@ async function executeSessionEventFollow(
   try {
     await followSessionEvents({
       command: invocation.command,
-      fetchPage: async (command) => {
-        const response = await commandCaller(input)(command);
+      fetchPage: async (command, signal) => {
+        const response = await commandCaller(input)(command, signal);
         if (!response.ok) throw Object.assign(new Error(response.error.message), {
           commandError: response.error,
         });
@@ -1259,6 +1441,7 @@ async function executeSessionEventFollow(
     return 0;
   } catch (error: unknown) {
     if (controller.signal.aborted) return 0;
+    if (isClosedStdout(error)) return 0;
     const commandError = error !== null && typeof error === "object" && "commandError" in error
       ? (error as { commandError?: unknown }).commandError
       : undefined;
@@ -1370,7 +1553,7 @@ export async function runPersistentShell(
         await main(intent.argv, output, input);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Shell command failed.";
-        output.writeStderr(`hra: ${terminalSafe(message)}\n`);
+        output.writeStderr(`hra: ${safeDiagnostic(message)}\n`);
       }
     }
   } finally {
@@ -1378,12 +1561,208 @@ export async function runPersistentShell(
   }
 }
 
+const usageRefreshAllAccountLimit = 32;
+const usageRefreshAllConcurrency = 4;
+
+type UsageRefreshAccount = Readonly<{
+  id: string;
+  state: "signed_out" | "login_pending" | "signed_in" | "recovery_required" | "removed";
+}>;
+
+type UsageRefreshOutcome = Readonly<{
+  accountId: string;
+  state: "refreshed";
+}> | Readonly<{
+  accountId: string;
+  accountState: UsageRefreshAccount["state"];
+  reason: "not_signed_in";
+  state: "skipped";
+}> | Readonly<{
+  accountId: string;
+  code: "INVALID_INPUT" | "NOT_FOUND" | "AMBIGUOUS" | "CONFLICT" | "INTERACTION_REQUIRED" | "UNAVAILABLE" | "RECOVERY_REQUIRED" | "INTERNAL" | "INVALID_RESPONSE" | "TRANSPORT_FAILURE";
+  state: "failed";
+}>;
+
+const orderedByAccountId = <T extends { accountId: string }>(left: T, right: T): number =>
+  left.accountId < right.accountId ? -1 : left.accountId > right.accountId ? 1 : 0;
+
+const refreshAllAccounts = (data: unknown): readonly UsageRefreshAccount[] | null => {
+  if (!isRecord(data) || !Array.isArray(data.accounts)) return null;
+  const accounts: UsageRefreshAccount[] = [];
+  for (const value of data.accounts) {
+    if (!isRecord(value)) return null;
+    const id = profileIdSchema.safeParse(value.id);
+    if (!id.success || !["signed_out", "login_pending", "signed_in", "recovery_required", "removed"].includes(String(value.state))) {
+      return null;
+    }
+    accounts.push({ id: id.data, state: value.state as UsageRefreshAccount["state"] });
+  }
+  accounts.sort((left, right) => orderedByAccountId(
+    { accountId: left.id },
+    { accountId: right.id },
+  ));
+  if (new Set(accounts.map((account) => account.id)).size !== accounts.length) return null;
+  return accounts;
+};
+
+const usageResponseContains = (data: unknown, accountId: string): boolean =>
+  isRecord(data)
+  && Array.isArray(data.usage)
+  && data.usage.some((value) =>
+    isRecord(value) && isRecord(value.account) && value.account.id === accountId);
+
+const deterministicUsageData = (
+  data: unknown,
+  outcomes: readonly UsageRefreshOutcome[],
+): Readonly<Record<string, unknown>> | null => {
+  if (!isRecord(data) || !Array.isArray(data.usage)) return null;
+  const rawUsage: readonly unknown[] = data.usage;
+  const usage = [...rawUsage].sort((left, right) => {
+    const leftId = isRecord(left) && isRecord(left.account) && typeof left.account.id === "string"
+      ? left.account.id
+      : "";
+    const rightId = isRecord(right) && isRecord(right.account) && typeof right.account.id === "string"
+      ? right.account.id
+      : "";
+    return orderedByAccountId({ accountId: leftId }, { accountId: rightId });
+  });
+  return {
+    usage,
+    refresh: {
+      accountLimit: usageRefreshAllAccountLimit,
+      concurrency: usageRefreshAllConcurrency,
+      outcomes: [...outcomes].sort(orderedByAccountId),
+    },
+  };
+};
+
+const renderUsageRefreshAllPostEffectFailure = (
+  outcomes: readonly UsageRefreshOutcome[],
+  reasonCode: Extract<UsageRefreshOutcome, { state: "failed" }>["code"],
+  json: boolean,
+  output: Output,
+): number => renderFailure({
+  code: "UNAVAILABLE",
+  details: {
+    refresh: {
+      accountLimit: usageRefreshAllAccountLimit,
+      concurrency: usageRefreshAllConcurrency,
+      outcomes: [...outcomes].sort(orderedByAccountId),
+    },
+    usageView: { reasonCode, state: "unavailable" },
+  },
+  message: "Refresh outcomes were recorded, but the final usage view is unavailable.",
+}, json, output);
+
+async function executeUsageRefreshAll(
+  command: Extract<LocalCommand, { kind: "account.usage" }>,
+  json: boolean,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const callDaemon = commandCaller(input);
+  const listed = await callDaemon({ kind: "account.list" });
+  if (!listed.ok) return renderFailure(listed.error, json, output);
+  const accounts = refreshAllAccounts(listed.data);
+  if (accounts === null) {
+    return renderFailure({
+      code: "INTERNAL",
+      message: "The daemon returned an invalid account list.",
+    }, json, output);
+  }
+  if (accounts.length > usageRefreshAllAccountLimit) {
+    return renderFailure({
+      code: "UNAVAILABLE",
+      details: {
+        accountCount: accounts.length,
+        accountLimit: usageRefreshAllAccountLimit,
+        nextCommand: "hra account usage <account> --refresh",
+      },
+      message: "Refresh-all exceeds the bounded account limit. Refresh one explicit account instead.",
+    }, json, output);
+  }
+
+  const outcomes: UsageRefreshOutcome[] = accounts.map((account) => account.state === "signed_in"
+    ? { accountId: account.id, code: "TRANSPORT_FAILURE", state: "failed" }
+    : {
+        accountId: account.id,
+        accountState: account.state,
+        reason: "not_signed_in",
+        state: "skipped",
+      });
+  const signedIn = accounts
+    .map((account, index) => ({ account, index }))
+    .filter((entry) => entry.account.state === "signed_in");
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const workIndex = next;
+      next += 1;
+      const entry = signedIn[workIndex];
+      if (entry === undefined) return;
+      try {
+        const response = await callDaemon({
+          kind: "account.usage",
+          account: entry.account.id,
+          refresh: true,
+        });
+        outcomes[entry.index] = response.ok
+          ? usageResponseContains(response.data, entry.account.id)
+            ? { accountId: entry.account.id, state: "refreshed" }
+            : { accountId: entry.account.id, code: "INVALID_RESPONSE", state: "failed" }
+          : { accountId: entry.account.id, code: response.error.code, state: "failed" };
+      } catch {
+        outcomes[entry.index] = {
+          accountId: entry.account.id,
+          code: "TRANSPORT_FAILURE",
+          state: "failed",
+        };
+      }
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(usageRefreshAllConcurrency, signedIn.length) },
+    worker,
+  ));
+
+  let history: CommandResponse;
+  try {
+    history = await callDaemon({ kind: "account.usage", refresh: false });
+  } catch {
+    return renderUsageRefreshAllPostEffectFailure(
+      outcomes,
+      "TRANSPORT_FAILURE",
+      json,
+      output,
+    );
+  }
+  if (!history.ok) {
+    return renderUsageRefreshAllPostEffectFailure(
+      outcomes,
+      history.error.code,
+      json,
+      output,
+    );
+  }
+  const data = deterministicUsageData(history.data, outcomes);
+  if (data === null) {
+    return renderUsageRefreshAllPostEffectFailure(
+      outcomes,
+      "INVALID_RESPONSE",
+      json,
+      output,
+    );
+  }
+  renderSuccess(command, data, json, output);
+  return 0;
+}
+
 async function executeInvocation(
   invocation: CliInvocation,
   output: Output,
   input: CliMainInput = {},
 ): Promise<number> {
-  if (invocation.kind === "help") { output.writeStdout(`${usage}\n`); return 0; }
+  if (invocation.kind === "help") { output.writeStdout(`${usageForGroup(invocation.group)}\n`); return 0; }
   if (invocation.kind === "version") { output.writeStdout(`hra ${HRA_VERSION}\n`); return 0; }
   if (invocation.kind === "init") return await initialize(invocation.yes, invocation.json, output);
   if (invocation.kind === "daemon.run") return await runDaemon();
@@ -1427,6 +1806,13 @@ async function executeInvocation(
   }
   if (invocation.command.kind === "doctor" && invocation.command.offline) {
     return await offlineDoctor(invocation.json, output, input.statePaths ?? resolveStatePaths());
+  }
+  if (
+    invocation.command.kind === "account.usage"
+    && invocation.command.refresh
+    && invocation.command.account === undefined
+  ) {
+    return await executeUsageRefreshAll(invocation.command, invocation.json, output, input);
   }
   if (invocation.command.kind === "session.note.edit") return await editSessionNote(invocation.command.session, invocation.json, output);
   if (invocation.command.kind === "daemon.status" || invocation.command.kind === "daemon.stop") {
@@ -1504,7 +1890,7 @@ export async function main(
         : message;
     if (error instanceof CliUsageError) {
       if (json) return renderFailure({ code: "INVALID_INPUT", message: error.message }, true, output);
-      output.writeStderr(`hra: ${error.message}\n\n${usage}\n`);
+      output.writeStderr(`hra: ${safeDiagnostic(error.message)}\n\n${usageForGroup(undefined)}\n`);
       return 2;
     }
     if (error instanceof LocalDaemonIndeterminateError) {
@@ -1533,13 +1919,10 @@ export async function main(
     if (json) {
       return renderFailure({
         code: "INTERNAL",
-        message: error instanceof Error
-          ? sanitizeDaemonDiagnostic(error.message)
-          : "Unexpected failure.",
+        message: "HRA failed before a safe command response was available.",
       }, true, output);
     }
-    const message = error instanceof Error ? error.message : "Unexpected failure.";
-    output.writeStderr(`hra: ${sanitizeDaemonDiagnostic(message)}\n`);
+    output.writeStderr("hra: HRA failed before a safe command response was available.\n");
     return 1;
   }
 }

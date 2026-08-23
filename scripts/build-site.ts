@@ -11,6 +11,7 @@ import { renderPrivacyHtml, renderSiteHtml } from "../site/template.ts";
 
 interface BuildOptions {
   readonly check: boolean;
+  readonly releaseCommit?: string;
   readonly repositoryRoot: string;
 }
 
@@ -33,7 +34,10 @@ const trackedTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
   },
 ];
 
-const siteTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
+const siteTextOutputs = (
+  repositoryRoot: string,
+  releaseCommit: string,
+): readonly TextOutput[] => [
   {
     path: join(repositoryRoot, "dist/site/index.html"),
     content: renderSiteHtml(),
@@ -57,6 +61,22 @@ const siteTextOutputs = (repositoryRoot: string): readonly TextOutput[] => [
   {
     path: join(repositoryRoot, "dist/site/.well-known/security.txt"),
     content: `Contact: ${publicContent.links.privateSecurityReport}\nCanonical: ${publicContent.siteUrl}/.well-known/security.txt\nPolicy: ${publicContent.links.security}\nExpires: 2027-08-22T23:59:59Z\nPreferred-Languages: en\n`,
+  },
+  {
+    path: join(repositoryRoot, "dist/site/.well-known/hra.json"),
+    content: JSON.stringify({
+      generation: 1,
+      product: "HRA",
+      repository: {
+        id: 1_343_008_607,
+        path: "hraness/hra",
+      },
+      schemaVersion: 2,
+      source: {
+        commit: releaseCommit,
+      },
+      version: "0.1.0",
+    }, null, 2),
   },
 ];
 
@@ -91,7 +111,11 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
 
   if (options.check) return mismatches;
 
-  for (const output of siteTextOutputs(options.repositoryRoot)) {
+  const releaseCommit = options.releaseCommit ?? "local";
+  if (releaseCommit !== "local" && !/^[0-9a-f]{40}$/u.test(releaseCommit)) {
+    throw new Error("Release commit must be a lowercase 40-character Git SHA.");
+  }
+  for (const output of siteTextOutputs(options.repositoryRoot, releaseCommit)) {
     const content = withFinalNewline(output.content);
     await mkdir(dirname(output.path), { recursive: true });
     await writeFile(output.path, content, { encoding: "utf8" });
@@ -110,7 +134,19 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
 if (import.meta.main) {
   const repositoryRoot = resolve(import.meta.dir, "..");
   const check = Bun.argv.slice(2).includes("--check");
-  const mismatches = await buildSite({ check, repositoryRoot });
+  const providerCommit = process.env.VERCEL_GIT_COMMIT_SHA
+    ?? process.env.HRA_RELEASE_COMMIT;
+  if (
+    process.env.VERCEL === "1"
+    && (providerCommit === undefined || !/^[0-9a-f]{40}$/u.test(providerCommit))
+  ) {
+    throw new Error("A Vercel build requires an exact source commit marker.");
+  }
+  const mismatches = await buildSite({
+    check,
+    ...(providerCommit === undefined ? {} : { releaseCommit: providerCommit }),
+    repositoryRoot,
+  });
   if (mismatches.length > 0) {
     console.error(`Generated public files are stale:\n${mismatches.map((path) => relative(repositoryRoot, path)).join("\n")}`);
     process.exitCode = 1;

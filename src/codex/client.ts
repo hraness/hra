@@ -18,6 +18,7 @@ import type { CodexProcess } from "./process.ts";
 import {
   OPERATIONS,
   PINNED_CODEX_VERSION,
+  assertPinnedCodexNotificationMatrix,
   assertPinnedCodexServerRequestMatrix,
   boundedIdentifier,
   boundedPageLimit,
@@ -33,6 +34,7 @@ import {
   parseFeaturePage,
   parseInitialize,
   parseManagedLogin,
+  parseManagedLoginCancel,
   parseModelPage,
   parsePermissionProfilePage,
   parsePluginCatalog,
@@ -80,6 +82,12 @@ import {
 
 type ClientState = "new" | "initializing" | "ready" | "closing" | "closed" | "failed";
 
+const STANDARD_MCP_FORM_INPUT_EXTENSION = "openai/standard-form-input";
+const INTERACTION_DEADLINE_ERROR = Object.freeze({
+  code: -32_008,
+  message: "HRA interaction deadline expired",
+});
+
 interface PendingRequest {
   readonly id: number;
   readonly descriptor: CodexOperationDescriptor;
@@ -96,7 +104,10 @@ interface PendingServerRequest {
   admissionTask?: Promise<void>;
   state: ServerRequestState;
   responseDigest?: string;
-  responseFrame?: Readonly<{ id: number | string; result: unknown }>;
+  responseFrame?: Readonly<
+    { id: number | string; result: unknown }
+    | { id: number | string; error: Readonly<{ code: number; message: string }> }
+  >;
 }
 
 export interface CodexAppServerClientOptions {
@@ -110,6 +121,7 @@ export interface CodexAppServerClientOptions {
   readonly maxJsonLineBytes?: number;
   readonly shutdownTermGraceMs?: number;
   readonly shutdownSettlementMs?: number;
+  readonly now?: () => number;
   /** Deterministic tests only. Production always accepts the generated UUID. */
   readonly connectionId?: string;
 }
@@ -177,6 +189,7 @@ export class CodexAppServerClient {
   readonly #connectionId: string;
   readonly #shutdownTermGraceMs: number;
   readonly #shutdownSettlementMs: number;
+  readonly #now: () => number;
   readonly #encoder = new TextEncoder();
   readonly #pending = new Map<number, PendingRequest>();
   readonly #serverRequests = new Map<string, PendingServerRequest>();
@@ -189,6 +202,7 @@ export class CodexAppServerClient {
   #closeTask: Promise<void> | null = null;
 
   constructor(options: CodexAppServerClientOptions) {
+    assertPinnedCodexNotificationMatrix();
     assertPinnedCodexServerRequestMatrix();
     this.#process = options.process;
     this.#authority = validateAuthority(options.authority);
@@ -217,6 +231,7 @@ export class CodexAppServerClient {
       options.shutdownSettlementMs ?? 1_000,
       "Codex shutdown settlement",
     );
+    this.#now = options.now ?? Date.now;
   }
 
   get authority(): CodexAuthority {
@@ -249,7 +264,10 @@ export class CodexAppServerClient {
             title: "HRA",
             version: HRA_VERSION,
           },
-          capabilities: { experimentalApi: this.#experimentalApi },
+          capabilities: {
+            experimentalApi: this.#experimentalApi,
+            extensions: { [STANDARD_MCP_FORM_INPUT_EXTENSION]: {} },
+          },
         },
         parseInitialize,
         true,
@@ -301,6 +319,14 @@ export class CodexAppServerClient {
         ? { type: "chatgpt", useHostedLoginSuccessPage: true, appBrand: "chatgpt" }
         : { type: "chatgptDeviceCode" };
     return this.#closedRequest("account/login/start", params, parseManagedLogin);
+  }
+
+  async cancelManagedLogin(loginId: string): Promise<FencedCodexValue<{ readonly status: "canceled" | "notFound" }>> {
+    return this.#closedRequest(
+      "account/login/cancel",
+      { loginId: boundedIdentifier(loginId, "login id") },
+      parseManagedLoginCancel,
+    );
   }
 
   async logout(): Promise<FencedCodexValue<Readonly<Record<string, never>>>> {
@@ -567,16 +593,127 @@ export class CodexAppServerClient {
     );
   }
 
+  async validateInteractionResolution(input: {
+    readonly provider: ProviderInteractionAuthority;
+    readonly kind: InteractionKind;
+    readonly resolution: InteractionResolution;
+  }): Promise<{ readonly responseDigest: string }> {
+    const { responseDigest } = await this.#compileInteractionResolution(input);
+    return { responseDigest };
+  }
+
   async resolveInteraction(input: {
     readonly provider: ProviderInteractionAuthority;
     readonly kind: InteractionKind;
     readonly resolution: InteractionResolution;
   }): Promise<{ readonly responseWritten: true }> {
+    const { pending, responseDigest, result } = await this.#compileInteractionResolution(input);
+    if (pending.state === "responded") return { responseWritten: true };
+    const responseFrame = {
+      id: rawProviderRequestId(input.provider.requestId),
+      result,
+    } as const;
+    pending.responseDigest = responseDigest;
+    pending.responseFrame = responseFrame;
+    pending.state = "writing";
+    try {
+      await this.#writeFrame(responseFrame);
+      pending.state = "responded";
+      return { responseWritten: true };
+    } catch (error) {
+      pending.state = "resolution_unknown";
+      this.#quarantineConnection("Codex interaction response write became indeterminate");
+      throw new CodexError(
+        "INDETERMINATE_EFFECT",
+        "the provider response may have reached Codex; reconcile before another attempt",
+        { cause: error },
+      );
+    }
+  }
+
+  async validateInteractionTimeout(input: {
+    readonly provider: ProviderInteractionAuthority;
+  }): Promise<{ readonly responseDigest: string }> {
+    const { responseDigest } = await this.#compileInteractionTimeout(input.provider);
+    return { responseDigest };
+  }
+
+  async timeoutInteraction(input: {
+    readonly provider: ProviderInteractionAuthority;
+  }): Promise<{ readonly responseWritten: true }> {
+    const { pending, responseDigest } = await this.#compileInteractionTimeout(input.provider);
+    if (pending.state === "responded") return { responseWritten: true };
+    const responseFrame = {
+      id: rawProviderRequestId(input.provider.requestId),
+      error: INTERACTION_DEADLINE_ERROR,
+    } as const;
+    pending.responseDigest = responseDigest;
+    pending.responseFrame = responseFrame;
+    pending.state = "writing";
+    try {
+      await this.#writeFrame(responseFrame);
+      pending.state = "responded";
+      return { responseWritten: true };
+    } catch (error) {
+      pending.state = "resolution_unknown";
+      this.#quarantineConnection("Codex interaction deadline response write became indeterminate");
+      throw new CodexError(
+        "INDETERMINATE_EFFECT",
+        "the provider timeout response may have reached Codex; reconcile before another attempt",
+        { cause: error },
+      );
+    }
+  }
+
+  async #compileInteractionTimeout(provider: ProviderInteractionAuthority): Promise<{
+    readonly pending: PendingServerRequest;
+    readonly responseDigest: string;
+  }> {
+    const pending = await this.#requirePendingServerRequest(provider);
+    const responseDigest = digestCodexJson(INTERACTION_DEADLINE_ERROR);
+    if (pending.state === "responded" && pending.responseDigest !== responseDigest) {
+      throw new CodexError("AUTHORITY_STALE", "the provider request already has a different response");
+    }
+    return { pending, responseDigest };
+  }
+
+  async #compileInteractionResolution(input: {
+    readonly provider: ProviderInteractionAuthority;
+    readonly kind: InteractionKind;
+    readonly resolution: InteractionResolution;
+  }): Promise<{
+    readonly pending: PendingServerRequest;
+    readonly responseDigest: string;
+    readonly result: unknown;
+  }> {
+    const provider = input.provider;
+    const pending = await this.#requirePendingServerRequest(provider);
+    if (pending.admission.kind !== input.kind) {
+      throw new CodexError("INVALID_INPUT", "the interaction kind does not match the provider request");
+    }
+    const result = compileCodexInteractionResponse({
+      method: provider.method as BrokeredCodexServerRequestMethod,
+      kind: input.kind,
+      privateParams: pending.admission.privateParams,
+      resolution: input.resolution,
+    });
+    const responseDigest = digestCodexJson(result);
+    if (pending.state === "responded") {
+      if (pending.responseDigest !== responseDigest) {
+        throw new CodexError("AUTHORITY_STALE", "the provider request already has a different response");
+      }
+      return { pending, responseDigest, result };
+    }
+    return { pending, responseDigest, result };
+  }
+
+  async #requirePendingServerRequest(
+    provider: ProviderInteractionAuthority,
+  ): Promise<PendingServerRequest> {
     if (this.#state !== "ready") {
       throw new CodexError("AUTHORITY_STALE", "the Codex provider connection is no longer live");
     }
     await this.#assertAuthority();
-    const provider = input.provider;
     if (
       provider.profileId !== this.#authority.profileId
       || provider.processGeneration !== this.#authority.processGeneration
@@ -593,9 +730,6 @@ export class CodexAppServerClient {
     if (!pending.admitted) {
       throw new CodexError("AUTHORITY_STALE", "the provider request has not completed durable admission");
     }
-    if (pending.admission.kind !== input.kind) {
-      throw new CodexError("INVALID_INPUT", "the interaction kind does not match the provider request");
-    }
     if (pending.state === "resolved") {
       throw new CodexError("AUTHORITY_STALE", "the provider request is already resolved");
     }
@@ -605,38 +739,7 @@ export class CodexAppServerClient {
         "the provider response may already have been written; wait for reconciliation",
       );
     }
-    const result = compileCodexInteractionResponse({
-      method: provider.method as BrokeredCodexServerRequestMethod,
-      kind: input.kind,
-      privateParams: pending.admission.privateParams,
-      resolution: input.resolution,
-    });
-    const responseDigest = digestCodexJson(result);
-    if (pending.state === "responded") {
-      if (pending.responseDigest !== responseDigest) {
-        throw new CodexError("AUTHORITY_STALE", "the provider request already has a different response");
-      }
-      return { responseWritten: true };
-    }
-    const responseFrame = {
-      id: rawProviderRequestId(provider.requestId),
-      result,
-    } as const;
-    pending.responseDigest = responseDigest;
-    pending.responseFrame = responseFrame;
-    pending.state = "writing";
-    try {
-      await this.#writeFrame(responseFrame);
-      pending.state = "responded";
-      return { responseWritten: true };
-    } catch (error) {
-      pending.state = "resolution_unknown";
-      throw new CodexError(
-        "INDETERMINATE_EFFECT",
-        "the provider response may have reached Codex; reconcile before another attempt",
-        { cause: error },
-      );
-    }
+    return pending;
   }
 
   async close(): Promise<void> {
@@ -876,6 +979,7 @@ export class CodexAppServerClient {
   }
 
   async #handleServerRequest(idValue: unknown, method: string, params: unknown): Promise<void> {
+    const requestedAt = this.#now();
     const requestId = parseProviderRequestId(idValue);
     const disposition = codexServerRequestDisposition(method);
     if (disposition !== "brokered_interaction") {
@@ -901,12 +1005,22 @@ export class CodexAppServerClient {
         method: method as BrokeredCodexServerRequestMethod,
         params,
       });
-    } catch {
+    } catch (error: unknown) {
+      const unsupportedCapability = error instanceof CodexError
+        && error.code === "UNSUPPORTED_CAPABILITY";
       await this.#writeFrame({
         id: rawProviderRequestId(requestId),
-        error: { code: -32_602, message: "Invalid server request params" },
+        error: unsupportedCapability
+          ? {
+              code: -32_601,
+              message: "HRA cannot broker this server request capability",
+              data: { code: "UNSUPPORTED_CAPABILITY" },
+            }
+          : { code: -32_602, message: "Invalid server request params" },
       });
-      this.#onSafeDiagnostic(`Codex sent invalid params for ${method}`);
+      this.#onSafeDiagnostic(unsupportedCapability
+        ? `Codex requested an unsupported capability for ${method}`
+        : `Codex sent invalid params for ${method}`);
       void this.#enqueueFact({ type: "protocolNotice", method, connectionId: this.#connectionId });
       return;
     }
@@ -947,6 +1061,9 @@ export class CodexAppServerClient {
       kind: admission.kind,
       blocking: admission.blocking,
       display: admission.display,
+      timeoutMs: admission.timeoutMs,
+      requestedAt,
+      deadlineAt: Math.min(Number.MAX_SAFE_INTEGER, requestedAt + admission.timeoutMs),
       connectionId: this.#connectionId,
     });
     pending.admissionTask = task;

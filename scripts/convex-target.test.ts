@@ -1,0 +1,176 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  HRA_V0_CONVEX_DEPLOYMENT_ID,
+  HRA_V0_CONVEX_PROJECT_ID,
+  parseConvexTargetArguments,
+  readConvexAccessToken,
+  verifyConvexTarget,
+  type ConvexManagementFetch,
+  type ConvexTarget,
+} from "./convex-target";
+
+const target: ConvexTarget = {
+  deploymentId: 7_654_321,
+  deploymentName: "steady-otter-321",
+  deploymentUrl: "https://steady-otter-321.convex.cloud",
+  projectId: 1_234_567,
+  teamId: 765_432,
+};
+
+const targetArguments = [
+  "--deployment",
+  target.deploymentName,
+  "--team-id",
+  String(target.teamId),
+  "--project-id",
+  String(target.projectId),
+  "--deployment-id",
+  String(target.deploymentId),
+  "--deployment-url",
+  target.deploymentUrl,
+] as const;
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map(async (directory) => {
+    await rm(directory, { force: true, recursive: true });
+  }));
+});
+
+const makeConfig = async (mode = 0o600): Promise<Readonly<{
+  configPath: string;
+  token: string;
+}>> => {
+  const directory = await mkdtemp(join(tmpdir(), "hra-convex-target-test-"));
+  temporaryDirectories.push(directory);
+  const configPath = join(directory, "config.json");
+  const token = ["fixture", "access", "token"].join("-");
+  await writeFile(configPath, JSON.stringify({ accessToken: token }), { mode });
+  return { configPath, token };
+};
+
+describe("numeric Convex target guard", () => {
+  test("reads both management identities with protected credentials and accepts only the exact prod target", async () => {
+    const { configPath, token } = await makeConfig();
+    const requests: Readonly<{ init: RequestInit; url: string }>[] = [];
+    const fetcher: ConvexManagementFetch = async (input, init) => {
+      const url = String(input);
+      requests.push({ init, url });
+      if (url.includes("/team_and_project")) {
+        return new Response(JSON.stringify({
+          project: "hra",
+          projectId: target.projectId,
+          team: "hraness",
+          teamId: target.teamId,
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        deploymentType: "prod",
+        deploymentUrl: target.deploymentUrl,
+        id: target.deploymentId,
+        name: target.deploymentName,
+        projectId: target.projectId,
+      }), { status: 200 });
+    };
+
+    await verifyConvexTarget(target, { configPath, fetch: fetcher });
+
+    expect(requests.map((request) => request.url).sort()).toEqual([
+      `https://api.convex.dev/api/deployment/${target.deploymentName}/team_and_project`,
+      `https://api.convex.dev/v1/deployments/${target.deploymentName}`,
+    ].sort());
+    for (const request of requests) {
+      expect(new Headers(request.init.headers).get("Authorization")).toBe(`Bearer ${token}`);
+      expect(request.init.method).toBe("GET");
+      expect(request.init.redirect).toBe("error");
+      expect(request.init.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  test("rejects a numeric mismatch, a non-prod deployment, and ambiguous provider output", async () => {
+    const { configPath } = await makeConfig();
+    const scenarios = [
+      {
+        deployment: {
+          deploymentType: "prod",
+          deploymentUrl: target.deploymentUrl,
+          id: target.deploymentId + 1,
+          name: target.deploymentName,
+          projectId: target.projectId,
+        },
+        expected: "target_mismatch",
+      },
+      {
+        deployment: {
+          deploymentType: "dev",
+          deploymentUrl: target.deploymentUrl,
+          id: target.deploymentId,
+          name: target.deploymentName,
+          projectId: target.projectId,
+        },
+        expected: "target_mismatch",
+      },
+      { deployment: "{}\n{}", expected: "target_query_failed" },
+    ] as const;
+
+    for (const scenario of scenarios) {
+      const fetcher: ConvexManagementFetch = async (input) => {
+        if (String(input).includes("/team_and_project")) {
+          return new Response(JSON.stringify({
+            project: "hra",
+            projectId: target.projectId,
+            team: "hraness",
+            teamId: target.teamId,
+          }), { status: 200 });
+        }
+        const body = typeof scenario.deployment === "string"
+          ? scenario.deployment
+          : JSON.stringify(scenario.deployment);
+        return new Response(body, { status: 200 });
+      };
+      await expect(verifyConvexTarget(target, { configPath, fetch: fetcher }))
+        .rejects.toThrow(scenario.expected);
+    }
+  });
+
+  test("requires a no-follow single-link 0600 bounded config file", async () => {
+    const permissive = await makeConfig(0o644);
+    await expect(readConvexAccessToken(permissive.configPath))
+      .rejects.toThrow("target_credentials_refused");
+
+    const protectedConfig = await makeConfig();
+    const link = join(protectedConfig.configPath, "..", "config-link.json");
+    await symlink(protectedConfig.configPath, link);
+    await expect(readConvexAccessToken(link)).rejects.toThrow("target_credentials_refused");
+  });
+
+  test("accepts only a generated deployment name and all exact numeric flags", () => {
+    expect(parseConvexTargetArguments([...targetArguments, "--operator-option"]))
+      .toEqual({ otherArguments: ["--operator-option"], target });
+
+    const withDeployment = (deployment: string): readonly string[] => [
+      "--deployment",
+      deployment,
+      ...targetArguments.slice(2),
+    ];
+    expect(() => parseConvexTargetArguments(withDeployment("prod"))).toThrow("target_invalid");
+    expect(() => parseConvexTargetArguments(withDeployment("local"))).toThrow("target_invalid");
+    expect(() => parseConvexTargetArguments(withDeployment("team:project:prod")))
+      .toThrow("target_invalid");
+    expect(() => parseConvexTargetArguments([
+      ...targetArguments.slice(0, 5),
+      String(HRA_V0_CONVEX_PROJECT_ID),
+      ...targetArguments.slice(6),
+    ])).toThrow("target_invalid");
+    expect(() => parseConvexTargetArguments([
+      ...targetArguments.slice(0, 7),
+      String(HRA_V0_CONVEX_DEPLOYMENT_ID),
+      ...targetArguments.slice(8),
+    ])).toThrow("target_invalid");
+  });
+});

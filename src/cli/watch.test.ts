@@ -40,9 +40,9 @@ const page = (input: {
 });
 
 describe("session event watch", () => {
-  test("writes safe event lines followed by a resumable checkpoint", () => {
+  test("writes safe event lines followed by a resumable checkpoint", async () => {
     const stdout: string[] = [];
-    writeSessionEventPageJsonl(page({
+    await writeSessionEventPageJsonl(page({
       requestedCursor: "c0",
       nextCursor: "c1",
       events: [event(1, "visible\u001b]0;hidden\u0007")],
@@ -126,9 +126,9 @@ describe("session event watch", () => {
     expect(result).toEqual({ events: 2, lastCursor: "c2", pages: 2 });
   });
 
-  test("emits a typed gap before retained events and its checkpoint", () => {
+  test("emits a typed gap before retained events and its checkpoint", async () => {
     const stdout: string[] = [];
-    writeSessionEventPageJsonl(page({
+    await writeSessionEventPageJsonl(page({
       requestedCursor: "old",
       nextCursor: "new",
       gap: { reason: "retention_age", requestedSequence: 1, retainedFromSequence: 9 },
@@ -241,5 +241,50 @@ describe("session event watch", () => {
     });
     expect(yields).toBe(1);
     expect(result).toEqual({ events: 0, lastCursor: "c1", pages: 1 });
+  });
+
+  test("does not advance or fetch the next cursor until every JSONL line drains", async () => {
+    const requested: Array<string | undefined> = [];
+    const stdout: string[] = [];
+    let releaseFirstLine!: () => void;
+    const firstLineDrained = new Promise<void>((resolve) => { releaseFirstLine = resolve; });
+    let firstWrite = true;
+    const following = followSessionEvents({
+      command: { kind: "session.events", session: "release", limit: 20, waitMs: 30_000 },
+      fetchPage: (command) => {
+        requested.push(command.cursor);
+        return Promise.resolve(command.cursor === undefined
+          ? page({ requestedCursor: null, nextCursor: "c1", events: [event(1)] })
+          : page({ requestedCursor: "c1", nextCursor: "c2", events: [event(2)] }));
+      },
+      maxPages: 2,
+      output: {
+        writeStdout: () => { throw new Error("The async JSONL writer must own follow output."); },
+        writeStdoutAsync: async (value) => {
+          stdout.push(value);
+          if (firstWrite) {
+            firstWrite = false;
+            await firstLineDrained;
+          }
+        },
+      },
+      signal: new AbortController().signal,
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(requested).toEqual([undefined]);
+    expect(stdout.map((line) => (JSON.parse(line) as { kind: string }).kind)).toEqual(["event"]);
+
+    releaseFirstLine();
+    const result = await following;
+    expect(requested).toEqual([undefined, "c1"]);
+    expect(result).toEqual({ events: 2, lastCursor: "c2", pages: 2 });
+    expect(stdout.map((line) => (JSON.parse(line) as { kind: string }).kind)).toEqual([
+      "event",
+      "checkpoint",
+      "event",
+      "checkpoint",
+    ]);
   });
 });

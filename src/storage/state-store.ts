@@ -6,12 +6,15 @@ import { Database } from "bun:sqlite";
 import { z } from "zod";
 
 import {
+  INTERACTION_MAX_PENDING_MS,
   interactionDisplaySchema,
+  interactionIntendedTerminalStateSchema,
   interactionKindSchema,
   interactionRecordSchema,
   interactionStateSchema,
   providerInteractionAuthoritySchema,
   type InteractionDisplay,
+  type InteractionIntendedTerminalState,
   type InteractionKind,
   type InteractionRecord,
   type ProviderInteractionAuthority,
@@ -21,6 +24,9 @@ import {
   effectiveRuntimeProfileSchema,
   type EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
+import {
+  storedAccountUsageSnapshotSchema,
+} from "../domain/usage-metrics";
 import {
   SESSION_EVENT_MAX_BYTES,
   SESSION_EVENT_PAGE_BYTES,
@@ -238,6 +244,14 @@ export type MutationAttemptRecord = {
   sessionStartId?: SessionId;
 };
 
+export type PendingLoginAuthority = {
+  attemptId: AttemptId;
+  idempotencyKey: string;
+  profileId: ProfileId;
+  processGeneration: number;
+  loginId: string;
+};
+
 export type SessionProviderBaseline = {
   providerUpdatedAt: number | null;
   status: "active" | "idle" | "terminal";
@@ -316,6 +330,14 @@ const desktopAccountKeySchema = z
 const positiveGenerationSchema = z.number().int().positive();
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
 const providerThreadIdSchema = z.string().min(1).max(200);
+const providerLoginIdSchema = z.string().min(1).max(512).refine(
+  (value) => !/\p{Cc}/u.test(value),
+  "Provider login ID contains control characters.",
+);
+const pendingLoginReceiptAuthoritySchema = z.object({
+  status: z.literal("pending"),
+  loginId: providerLoginIdSchema,
+}).passthrough();
 const providerBaselineSchema = z.object({
   providerUpdatedAt: z.number().nonnegative().nullable(),
   status: z.enum(["active", "idle", "terminal"]),
@@ -396,7 +418,17 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 10;
+const currentSchemaVersion = 17;
+const stateBusyTimeoutMs = 5_000;
+const securityScrubBusyTimeoutMs = 250;
+
+export const USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS = 24 * 60 * 60_000;
+export const USAGE_CLOUD_UPLOAD_ANCHOR_COUNT = 128;
+export const USAGE_LOCAL_RETAIN_AGE_MS = 24 * 60 * 60_000;
+export const USAGE_LOCAL_RETAIN_SUCCESS_COUNT = 2_048;
+export const USAGE_LOCAL_RETAIN_FAILURE_COUNT = 2_048;
+export const USAGE_LOCAL_RETAIN_BYTES = 16 * 1_024 * 1_024;
+export const USAGE_LOCAL_SNAPSHOT_MAX_BYTES = 262_144;
 
 const schemaVersion1 = `
 CREATE TABLE IF NOT EXISTS migrations (
@@ -916,15 +948,287 @@ CREATE INDEX IF NOT EXISTS usage_poll_failures_recent
   ON usage_poll_failures(profile_id, observed_at DESC, source_revision DESC);
 `;
 
+const schemaVersion11 = `
+CREATE TRIGGER IF NOT EXISTS provider_interactions_mcp_url_guard_insert
+BEFORE INSERT ON provider_interactions
+WHEN NEW.kind='mcp_elicitation' AND (
+  json_extract(NEW.display_json,'$.mode')='url'
+  OR COALESCE(json_type(NEW.display_json,'$.url'),'null')!='null'
+)
+BEGIN SELECT RAISE(ABORT, 'MCP URL interaction cannot enter durable state'); END;
+CREATE TRIGGER IF NOT EXISTS provider_interactions_mcp_url_guard_update
+BEFORE UPDATE OF kind,display_json ON provider_interactions
+WHEN NEW.kind='mcp_elicitation' AND (
+  json_extract(NEW.display_json,'$.mode')='url'
+  OR COALESCE(json_type(NEW.display_json,'$.url'),'null')!='null'
+)
+BEGIN SELECT RAISE(ABORT, 'MCP URL interaction cannot enter durable state'); END;
+`;
+
+const schemaVersion12 = `
+CREATE TABLE IF NOT EXISTS usage_cloud_upload_anchors (
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+  received_at INTEGER NOT NULL CHECK(received_at >= 0),
+  PRIMARY KEY(profile_id, source_revision)
+) STRICT;
+CREATE INDEX IF NOT EXISTS usage_cloud_upload_anchors_recent
+  ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
+`;
+
+const schemaVersion13 = `
+CREATE TABLE IF NOT EXISTS security_scrub_authority (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  reason TEXT NOT NULL CHECK(reason='mcp_url_redaction'),
+  required_at INTEGER NOT NULL CHECK(required_at >= 0)
+) STRICT;
+`;
+
+const schemaVersion14 = `
+CREATE TABLE IF NOT EXISTS queue_sequence_authority (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  next_sequence INTEGER NOT NULL CHECK(next_sequence BETWEEN 1 AND 9007199254740991)
+) STRICT;
+INSERT INTO queue_sequence_authority(singleton,next_sequence)
+SELECT 1,1 WHERE NOT EXISTS(SELECT 1 FROM queue_sequence_authority WHERE singleton=1);
+CREATE UNIQUE INDEX IF NOT EXISTS queue_enqueue_sequence_unique
+  ON queue_entries(enqueue_sequence);
+CREATE INDEX IF NOT EXISTS queue_pending_sequence
+  ON queue_entries(session_id,enqueue_sequence) WHERE state='pending';
+CREATE TRIGGER IF NOT EXISTS queue_enqueue_sequence_required
+BEFORE INSERT ON queue_entries
+WHEN NEW.enqueue_sequence IS NULL
+BEGIN SELECT RAISE(ABORT, 'queue enqueue sequence required'); END;
+CREATE TRIGGER IF NOT EXISTS queue_enqueue_identity_insert_once
+BEFORE INSERT ON queue_entries
+WHEN EXISTS(
+  SELECT 1 FROM queue_entries
+  WHERE id=NEW.id OR enqueue_sequence=NEW.enqueue_sequence
+)
+BEGIN SELECT RAISE(ABORT, 'queue enqueue identity already exists'); END;
+CREATE TRIGGER IF NOT EXISTS queue_enqueue_sequence_immutable
+BEFORE UPDATE OF enqueue_sequence ON queue_entries
+WHEN NEW.enqueue_sequence IS NOT OLD.enqueue_sequence
+BEGIN SELECT RAISE(ABORT, 'queue enqueue sequence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS queue_sequence_authority_no_delete
+BEFORE DELETE ON queue_sequence_authority
+BEGIN SELECT RAISE(ABORT, 'queue sequence authority cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS queue_sequence_authority_insert_once
+BEFORE INSERT ON queue_sequence_authority
+WHEN EXISTS(SELECT 1 FROM queue_sequence_authority WHERE singleton=1)
+BEGIN SELECT RAISE(ABORT, 'queue sequence authority already exists'); END;
+CREATE TRIGGER IF NOT EXISTS queue_sequence_authority_singleton_immutable
+BEFORE UPDATE OF singleton ON queue_sequence_authority
+WHEN NEW.singleton IS NOT OLD.singleton
+BEGIN SELECT RAISE(ABORT, 'queue sequence authority singleton is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS queue_sequence_authority_monotonic
+BEFORE UPDATE OF next_sequence ON queue_sequence_authority
+WHEN NEW.next_sequence<OLD.next_sequence
+BEGIN SELECT RAISE(ABORT, 'queue sequence authority cannot regress'); END;
+`;
+
+const schemaVersion15 = `
+CREATE TRIGGER IF NOT EXISTS provider_interactions_permission_value_guard_insert
+BEFORE INSERT ON provider_interactions
+WHEN NEW.kind='permission_approval' AND EXISTS(
+  SELECT 1 FROM json_each(json_extract(NEW.display_json,'$.requested'))
+  WHERE json_type(value,'$.value') IS NOT NULL
+)
+BEGIN SELECT RAISE(ABORT, 'permission values cannot enter durable interaction display state'); END;
+CREATE TRIGGER IF NOT EXISTS provider_interactions_permission_value_guard_update
+BEFORE UPDATE OF kind,display_json ON provider_interactions
+WHEN NEW.kind='permission_approval' AND EXISTS(
+  SELECT 1 FROM json_each(json_extract(NEW.display_json,'$.requested'))
+  WHERE json_type(value,'$.value') IS NOT NULL
+)
+BEGIN SELECT RAISE(ABORT, 'permission values cannot enter durable interaction display state'); END;
+`;
+
+const schemaVersion16 = `
+CREATE INDEX IF NOT EXISTS provider_interactions_due
+  ON provider_interactions(deadline_at,public_id)
+  WHERE state='pending';
+DROP TRIGGER IF EXISTS provider_interactions_authority_immutable;
+CREATE TRIGGER provider_interactions_authority_immutable
+BEFORE UPDATE OF session_id,profile_id,process_generation,connection_id,
+  request_id_type,request_id_number,request_id_text,method,request_digest,
+  thread_id,turn_id,item_id,approval_id,kind,blocking,display_json,requested_at,deadline_at
+ON provider_interactions
+BEGIN SELECT RAISE(ABORT, 'provider interaction authority is immutable'); END;
+DROP TRIGGER IF EXISTS provider_interactions_transition_guard;
+CREATE TRIGGER provider_interactions_transition_guard
+BEFORE UPDATE OF state ON provider_interactions
+WHEN NOT (
+  NEW.revision=OLD.revision+1
+  AND (
+    (OLD.state='pending' AND NEW.state IN ('response_prepared','resolved','declined','canceled','expired','resolution_unknown'))
+    OR (OLD.state='response_prepared' AND NEW.state IN ('response_written','resolved','declined','canceled','expired','resolution_unknown'))
+    OR (OLD.state='response_written' AND NEW.state IN ('resolved','declined','canceled','expired','resolution_unknown'))
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'illegal provider interaction transition'); END;
+CREATE TRIGGER IF NOT EXISTS provider_interactions_intent_insert_guard
+BEFORE INSERT ON provider_interactions
+WHEN NEW.intended_terminal_state IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'pending provider interaction cannot have terminal intent'); END;
+CREATE TRIGGER IF NOT EXISTS provider_interactions_intent_immutable
+BEFORE UPDATE OF intended_terminal_state ON provider_interactions
+WHEN OLD.intended_terminal_state IS NOT NULL
+  OR NEW.intended_terminal_state IS NULL
+  OR OLD.state!='pending'
+BEGIN SELECT RAISE(ABORT, 'provider interaction terminal intent is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_interactions_intent_state_guard
+BEFORE UPDATE OF state,intended_terminal_state ON provider_interactions
+WHEN
+  (NEW.state IN ('response_prepared','response_written') AND NEW.intended_terminal_state IS NULL)
+  OR (
+    OLD.state='response_written'
+    AND NEW.state IN ('resolved','declined','canceled','expired')
+    AND NEW.state IS NOT OLD.intended_terminal_state
+  )
+BEGIN SELECT RAISE(ABORT, 'provider interaction terminal state contradicts prepared intent'); END;
+`;
+
+const schemaVersion17 = `
+CREATE TABLE IF NOT EXISTS provider_login_authorities (
+  attempt_id TEXT PRIMARY KEY REFERENCES mutation_attempts(id),
+  profile_id TEXT NOT NULL REFERENCES profiles(id),
+  process_generation INTEGER NOT NULL CHECK(process_generation > 0),
+  login_id TEXT NOT NULL CHECK(length(login_id) BETWEEN 1 AND 512),
+  state TEXT NOT NULL CHECK(state IN ('active','settled')),
+  settlement TEXT CHECK(settlement IS NULL OR settlement IN ('canceled','not_found','signed_in','provider_disconnected')),
+  recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= recorded_at),
+  CHECK((state='active' AND settlement IS NULL) OR (state='settled' AND settlement IS NOT NULL))
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS provider_login_authority_active_profile
+  ON provider_login_authorities(profile_id) WHERE state='active';
+CREATE TRIGGER IF NOT EXISTS provider_login_authority_identity_immutable
+BEFORE UPDATE OF attempt_id,profile_id,login_id,recorded_at ON provider_login_authorities
+BEGIN SELECT RAISE(ABORT, 'provider login identity is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS provider_login_authority_generation_guard
+BEFORE UPDATE OF process_generation ON provider_login_authorities
+WHEN OLD.state!='active' OR NEW.state!='active' OR NEW.process_generation!=OLD.process_generation+1
+BEGIN SELECT RAISE(ABORT, 'illegal provider login generation transition'); END;
+CREATE TRIGGER IF NOT EXISTS provider_login_authority_state_guard
+BEFORE UPDATE OF state,settlement ON provider_login_authorities
+WHEN NOT (
+  OLD.state='active' AND NEW.state='settled' AND OLD.settlement IS NULL AND NEW.settlement IS NOT NULL
+)
+BEGIN SELECT RAISE(ABORT, 'illegal provider login settlement transition'); END;
+CREATE TRIGGER IF NOT EXISTS provider_login_authority_immutable_delete
+BEFORE DELETE ON provider_login_authorities
+BEGIN SELECT RAISE(ABORT, 'provider login authority is append-only'); END;
+`;
+
 const userVersionSchema = z.object({ user_version: z.number().int().nonnegative() }).strict();
+
+const securityScrubAuthorityRowSchema = z.object({
+  reason: z.literal("mcp_url_redaction"),
+  required_at: unixMillisecondsSchema,
+}).strict();
+
+const walCheckpointRowSchema = z.object({
+  busy: z.number().int().min(0).max(1),
+  log: z.number().int().nonnegative(),
+  checkpointed: z.number().int().nonnegative(),
+}).strict();
+
+const journalModeRowSchema = z.object({ journal_mode: z.string() }).strict();
+
+const requireWalMode = (database: Database, configure = false): void => {
+  const row = journalModeRowSchema.parse(
+    database.query(configure ? "PRAGMA journal_mode=WAL" : "PRAGMA journal_mode").get(),
+  );
+  if (row.journal_mode.toLowerCase() !== "wal") throw new Error("STATE_WAL_REQUIRED");
+};
 
 const readUserVersion = (database: Database): number =>
   userVersionSchema.parse(database.query("PRAGMA user_version").get()).user_version;
+
+const hasPendingSecurityScrub = (database: Database): boolean => {
+  const row = database.query(
+    "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
+  ).get();
+  if (row === null) return false;
+  securityScrubAuthorityRowSchema.parse(row);
+  return true;
+};
+
+const requireSecurityScrub = (database: Database, requiredAt: number): void => {
+  database.query(
+    `INSERT OR IGNORE INTO security_scrub_authority(singleton,reason,required_at)
+     VALUES (1,'mcp_url_redaction',?)`,
+  ).run(unixMillisecondsSchema.parse(requiredAt));
+};
+
+const completePendingSecurityScrub = (database: Database): void => {
+  if (!hasPendingSecurityScrub(database)) return;
+  database.exec(`PRAGMA busy_timeout = ${securityScrubBusyTimeoutMs}`);
+  try {
+    const truncateWal = (): void => {
+      requireWalMode(database);
+      const checkpoint = walCheckpointRowSchema.parse(
+        database.query("PRAGMA wal_checkpoint(TRUNCATE)").get(),
+      );
+      if (checkpoint.busy !== 0 || checkpoint.log !== 0 || checkpoint.checkpointed !== 0) {
+        throw new Error("SQLite could not truncate every WAL frame.");
+      }
+    };
+
+    // The first truncation makes the durable marker and latest logical rows the
+    // sole main-file truth. VACUUM then rebuilds every page, including free
+    // space left by an earlier secure_delete=OFF migration. The final truncation
+    // removes pages emitted by the rebuild before the authority can be cleared.
+    truncateWal();
+    database.exec("VACUUM");
+    truncateWal();
+    database.transaction(() => {
+      database.query("DELETE FROM security_scrub_authority WHERE singleton=1").run();
+    }).immediate();
+  } catch (cause) {
+    throw new Error("STATE_SECURITY_SCRUB_REQUIRED", { cause });
+  } finally {
+    database.exec(`PRAGMA busy_timeout = ${stateBusyTimeoutMs}`);
+  }
+};
 
 const hasTableColumn = (database: Database, table: string, column: string): boolean => {
   const columnSchema = z.object({ name: z.string() }).passthrough();
   if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
   return database.query(`PRAGMA table_info(${table})`).all().some((row) => columnSchema.parse(row).name === column);
+};
+
+const ensureStableQueueSequence = (database: Database): void => {
+  if (!hasTableColumn(database, "queue_entries", "enqueue_sequence")) {
+    database.exec(
+      "ALTER TABLE queue_entries ADD COLUMN enqueue_sequence INTEGER CHECK(enqueue_sequence IS NULL OR enqueue_sequence BETWEEN 1 AND 9007199254740990)",
+    );
+  }
+  database.exec(`
+    WITH ordered AS (
+      SELECT rowid,ROW_NUMBER() OVER (ORDER BY rowid) AS enqueue_sequence
+      FROM queue_entries
+    )
+    UPDATE queue_entries
+    SET enqueue_sequence=(
+      SELECT ordered.enqueue_sequence FROM ordered WHERE ordered.rowid=queue_entries.rowid
+    )
+    WHERE enqueue_sequence IS NULL;
+  `);
+  database.exec(schemaVersion14);
+  const exhausted = database.query(
+    "SELECT 1 FROM queue_entries WHERE enqueue_sequence>=9007199254740991 LIMIT 1",
+  ).get();
+  if (exhausted !== null) throw new Error("QUEUE_SEQUENCE_EXHAUSTED");
+  database.query(
+    `UPDATE queue_sequence_authority
+     SET next_sequence=MAX(
+       next_sequence,
+       COALESCE((SELECT MAX(enqueue_sequence) FROM queue_entries),0)+1
+     )
+     WHERE singleton=1`,
+  ).run();
 };
 
 const backfillExactTurnRuntimeProfiles = (database: Database, now: number): void => {
@@ -1012,14 +1316,256 @@ const backfillSchemaVersion10 = (database: Database): void => {
                  )`);
 };
 
+const migratedMcpUrlDisplayJson = JSON.stringify(interactionDisplaySchema.parse({
+  kind: "mcp_elicitation",
+  summary: "Unsupported MCP browser handoff canceled during security migration",
+  serverName: "redacted",
+  mode: "form",
+  url: null,
+  mayContainSecrets: true,
+}));
+
+const legacyMcpUrlInteractionRowSchema = z.object({
+  public_id: z.string().uuid(),
+  state: interactionStateSchema,
+  revision: z.number().int().positive(),
+  requested_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const redactLegacyMcpUrlInteractions = (database: Database, migratedAt: number): boolean => {
+  const rows = database.query(
+    `SELECT public_id,state,revision,requested_at,updated_at
+     FROM provider_interactions
+     WHERE kind='mcp_elicitation' AND (
+       json_extract(display_json,'$.mode')='url'
+       OR COALESCE(json_type(display_json,'$.url'),'null')!='null'
+     )
+     ORDER BY public_id`,
+  ).all().map((row) => legacyMcpUrlInteractionRowSchema.parse(row));
+  if (rows.length === 0) return false;
+
+  database.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
+  for (const row of rows) {
+    const terminalAt = Math.max(migratedAt, row.requested_at, row.updated_at);
+    if (row.state === "pending" || row.state === "response_prepared" || row.state === "response_written") {
+      database.query(
+        `UPDATE provider_interactions
+         SET state='resolution_unknown',revision=revision+1,display_json=?,updated_at=?,terminal_at=?
+         WHERE public_id=? AND revision=?`,
+      ).run(migratedMcpUrlDisplayJson, terminalAt, terminalAt, row.public_id, row.revision);
+      const migrated = legacyMcpUrlInteractionRowSchema.parse(database.query(
+        `SELECT public_id,state,revision,requested_at,updated_at
+         FROM provider_interactions WHERE public_id=?`,
+      ).get(row.public_id));
+      database.query(
+        `INSERT INTO provider_interaction_transitions(
+           public_id,revision,state,response_digest,recorded_at
+         ) SELECT public_id,revision,state,response_digest,?
+           FROM provider_interactions WHERE public_id=?`,
+      ).run(migrated.updated_at, migrated.public_id);
+    } else {
+      database.query(
+        "UPDATE provider_interactions SET display_json=? WHERE public_id=? AND revision=?",
+      ).run(migratedMcpUrlDisplayJson, row.public_id, row.revision);
+    }
+  }
+  database.exec(schemaVersion9);
+  return true;
+};
+
+const legacyPermissionDisplaySchema = z.object({
+  kind: z.literal("permission_approval"),
+  summary: z.string().max(4_096),
+  reason: z.string().max(4_096).nullable(),
+  requested: z.array(z.object({
+    name: z.string().min(1).max(256),
+    value: z.unknown(),
+  }).strict()).max(100),
+  allowsSessionScope: z.boolean(),
+}).strict();
+
+const legacyPermissionInteractionRowSchema = z.object({
+  public_id: z.string().uuid(),
+  display_json: z.string(),
+}).strict();
+
+const redactLegacyPermissionValues = (database: Database): boolean => {
+  const rows = database.query(
+    `SELECT public_id,display_json
+     FROM provider_interactions
+     WHERE kind='permission_approval' AND EXISTS(
+       SELECT 1 FROM json_each(json_extract(display_json,'$.requested'))
+       WHERE json_type(value,'$.value') IS NOT NULL
+     )
+     ORDER BY public_id`,
+  ).all().map((row) => legacyPermissionInteractionRowSchema.parse(row));
+  if (rows.length === 0) return false;
+
+  database.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
+  for (const row of rows) {
+    const legacy = legacyPermissionDisplaySchema.parse(JSON.parse(row.display_json));
+    const display = interactionDisplaySchema.parse({
+      ...legacy,
+      requested: legacy.requested.map(({ name }) => ({ name })),
+    });
+    database.query(
+      "UPDATE provider_interactions SET display_json=? WHERE public_id=?",
+    ).run(JSON.stringify(display), row.public_id);
+  }
+  database.exec(schemaVersion9);
+  return true;
+};
+
+const usageSnapshotReceivedAt = (snapshot: UsageSnapshotRecord): number => {
+  const parsed = storedAccountUsageSnapshotSchema.safeParse(snapshot.payload);
+  return parsed.success ? parsed.data.observation.receivedAt : snapshot.observedAt;
+};
+
+const recordUsageCloudUploadAnchor = (
+  database: Database,
+  profileId: ProfileId,
+  sourceRevision: number,
+  receivedAt: number,
+): void => {
+  const latest = database.query(
+    `SELECT source_revision,received_at FROM usage_cloud_upload_anchors
+     WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1`,
+  ).get(profileId) as { source_revision: number; received_at: number } | null;
+  if (
+    latest !== null
+    && (
+      sourceRevision <= latest.source_revision
+      || receivedAt < latest.received_at + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS
+    )
+  ) return;
+  database.query(
+    `INSERT OR IGNORE INTO usage_cloud_upload_anchors(
+       profile_id,source_revision,received_at
+     ) VALUES (?,?,?)`,
+  ).run(profileId, sourceRevision, receivedAt);
+  database.query(
+    `DELETE FROM usage_cloud_upload_anchors WHERE rowid IN (
+       SELECT rowid FROM usage_cloud_upload_anchors WHERE profile_id=?
+       ORDER BY source_revision DESC
+       LIMIT -1 OFFSET ${USAGE_CLOUD_UPLOAD_ANCHOR_COUNT}
+     )`,
+  ).run(profileId);
+};
+
+const backfillUsageCloudUploadAnchors = (database: Database): void => {
+  const profiles = database.query("SELECT id FROM profiles ORDER BY id").all();
+  for (const row of profiles) {
+    const profileId = z.object({ id: profileIdSchema }).strict().parse(row).id;
+    const snapshots = database.query(
+      `SELECT source_revision,observed_at,payload_json FROM usage_snapshots
+       WHERE profile_id=? ORDER BY source_revision`,
+    ).all(profileId);
+    for (const snapshotRow of snapshots) {
+      const parsed = z.object({
+        source_revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        observed_at: unixMillisecondsSchema,
+        payload_json: z.string(),
+      }).strict().parse(snapshotRow);
+      recordUsageCloudUploadAnchor(
+        database,
+        profileId,
+        parsed.source_revision,
+        usageSnapshotReceivedAt({
+          observedAt: parsed.observed_at,
+          payload: JSON.parse(parsed.payload_json) as unknown,
+          sourceRevision: parsed.source_revision,
+        }),
+      );
+    }
+  }
+};
+
+const pruneProfileUsageHistory = (
+  database: Database,
+  profileId: ProfileId,
+  now: number,
+): void => {
+  const cutoff = Math.max(0, now - USAGE_LOCAL_RETAIN_AGE_MS);
+  database.query(
+    `DELETE FROM usage_snapshots
+     WHERE profile_id=?
+       AND CASE
+         WHEN json_type(payload_json,'$.observation.receivedAt')='integer'
+           THEN json_extract(payload_json,'$.observation.receivedAt')
+         ELSE observed_at
+       END<?`,
+  ).run(profileId, cutoff);
+  database.query(
+    "DELETE FROM usage_poll_failures WHERE profile_id=? AND observed_at<?",
+  ).run(profileId, cutoff);
+  database.query(
+    `DELETE FROM usage_snapshots WHERE rowid IN (
+       SELECT rowid FROM usage_snapshots WHERE profile_id=?
+       ORDER BY CASE
+         WHEN json_type(payload_json,'$.observation.receivedAt')='integer'
+           THEN json_extract(payload_json,'$.observation.receivedAt')
+         ELSE observed_at
+       END DESC,source_revision DESC
+       LIMIT -1 OFFSET ${USAGE_LOCAL_RETAIN_SUCCESS_COUNT}
+     )`,
+  ).run(profileId);
+  database.query(
+    `DELETE FROM usage_poll_failures WHERE rowid IN (
+       SELECT rowid FROM usage_poll_failures WHERE profile_id=?
+       ORDER BY observed_at DESC,source_revision DESC
+       LIMIT -1 OFFSET ${USAGE_LOCAL_RETAIN_FAILURE_COUNT}
+     )`,
+  ).run(profileId);
+  database.query(
+    `DELETE FROM usage_snapshots WHERE rowid IN (
+       SELECT rowid FROM (
+         SELECT
+           rowid,
+           SUM(length(CAST(payload_json AS BLOB))) OVER (
+             ORDER BY CASE
+               WHEN json_type(payload_json,'$.observation.receivedAt')='integer'
+                 THEN json_extract(payload_json,'$.observation.receivedAt')
+               ELSE observed_at
+             END DESC,source_revision DESC
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           ) AS retained_bytes
+         FROM usage_snapshots
+         WHERE profile_id=?
+       )
+       WHERE retained_bytes>?
+     )`,
+  ).run(profileId, USAGE_LOCAL_RETAIN_BYTES);
+};
+
+const pruneAllUsageHistory = (database: Database, now: number): void => {
+  const rows = database.query("SELECT id FROM profiles ORDER BY id").all();
+  for (const row of rows) {
+    const profileId = z.object({ id: profileIdSchema }).strict().parse(row).id;
+    pruneProfileUsageHistory(database, profileId, now);
+  }
+};
+
 const migrateWritableDatabase = (database: Database, now: () => number): void => {
   const initialVersion = readUserVersion(database);
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
 
-  database.transaction(() => {
+  // Security migrations may replace secret-bearing legacy records. SQLite must
+  // overwrite superseded cell content instead of leaving it in free pages.
+  database.exec("PRAGMA secure_delete = ON");
+  const securityScrubPending = database.transaction(() => {
+    let redacted = false;
     let version = initialVersion;
+    // v9-v12 databases may have committed URL-bearing MCP records or their
+    // superseded bytes without retaining evidence that WAL truncation finished.
+    // Materializing the v13 authority inside this transaction makes the byte
+    // purge independently retryable from the interaction state transition.
+    // v14 also forces previously stamped v13 databases through this authority
+    // and installs stable queue ordering before the physical rebuild.
+    database.exec(schemaVersion13);
+    if (initialVersion >= 9 && initialVersion < 14) requireSecurityScrub(database, now());
     if (version < 1) {
       database.exec(schemaVersion1);
       database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(1, now());
@@ -1137,6 +1683,113 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       backfillSchemaVersion10(database);
       database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(10, now());
       database.exec("PRAGMA user_version = 10");
+      version = 10;
+    }
+
+    if (version < 11) {
+      const migratedAt = now();
+      redacted = redactLegacyMcpUrlInteractions(database, migratedAt);
+      database.exec(schemaVersion11);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(11, migratedAt);
+      database.exec("PRAGMA user_version = 11");
+      version = 11;
+    }
+
+    if (version < 12) {
+      database.exec(schemaVersion12);
+      backfillUsageCloudUploadAnchors(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(12, now());
+      database.exec("PRAGMA user_version = 12");
+      version = 12;
+    }
+
+    if (version < 13) {
+      database.exec(schemaVersion13);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(13, now());
+      database.exec("PRAGMA user_version = 13");
+      version = 13;
+    }
+
+    if (version < 14) {
+      ensureStableQueueSequence(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(14, now());
+      database.exec("PRAGMA user_version = 14");
+      version = 14;
+    }
+
+    if (version < 15) {
+      redacted = redactLegacyPermissionValues(database) || redacted;
+      if (redacted) requireSecurityScrub(database, now());
+      database.exec(schemaVersion15);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(15, now());
+      database.exec("PRAGMA user_version = 15");
+      version = 15;
+    }
+
+    if (version < 16) {
+      if (!hasTableColumn(database, "provider_interactions", "deadline_at")) {
+        database.exec("ALTER TABLE provider_interactions ADD COLUMN deadline_at INTEGER NOT NULL DEFAULT 9007199254740991 CHECK(deadline_at>=requested_at AND deadline_at<=9007199254740991)");
+      }
+      if (!hasTableColumn(database, "provider_interactions", "intended_terminal_state")) {
+        database.exec("ALTER TABLE provider_interactions ADD COLUMN intended_terminal_state TEXT CHECK(intended_terminal_state IS NULL OR intended_terminal_state IN ('resolved','declined','canceled','expired'))");
+      }
+      database.query(
+        "UPDATE provider_interactions SET deadline_at=MIN(requested_at+?,9007199254740991) WHERE deadline_at=9007199254740991",
+      ).run(INTERACTION_MAX_PENDING_MS);
+      database.exec(
+        "UPDATE provider_interactions SET intended_terminal_state=state WHERE intended_terminal_state IS NULL AND state IN ('resolved','declined','canceled','expired')",
+      );
+      database.exec(schemaVersion16);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(16, now());
+      database.exec("PRAGMA user_version = 16");
+      version = 16;
+    }
+
+    if (version < 17) {
+      database.exec(schemaVersion17);
+      const legacyLoginResolutionEvidence = JSON.stringify({
+        source: "schema17",
+        reason: "missing_provider_login_id",
+      });
+      database.query(`INSERT OR IGNORE INTO mutation_resolutions(
+                        attempt_id,resolution_kind,evidence_json,receipt_json,created_at
+                      )
+                      SELECT m.id,'abandoned',?,NULL,?
+                      FROM mutation_attempts m
+                      JOIN profiles p ON p.id=m.authority_id
+                      LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+                      WHERE m.kind='account.login'
+                        AND m.state='applied'
+                        AND p.state='login_pending'
+                        AND p.process_generation=m.authority_generation
+                        AND r.attempt_id IS NULL
+                        AND json_extract(
+                          CASE WHEN json_valid(m.result_json) THEN m.result_json ELSE '{}' END,
+                          '$.status'
+                        )='pending'
+                        AND json_extract(
+                          CASE WHEN json_valid(m.result_json) THEN m.result_json ELSE '{}' END,
+                          '$.loginId'
+                        ) IS NULL`).run(
+        legacyLoginResolutionEvidence,
+        now(),
+      );
+      database.query(`UPDATE profiles
+                      SET state='signed_out',provider_email=NULL,provider_plan=NULL,updated_at=MAX(updated_at,?)
+                      WHERE state='login_pending'
+                        AND EXISTS(
+                          SELECT 1
+                          FROM mutation_attempts m
+                          JOIN mutation_resolutions r ON r.attempt_id=m.id
+                          WHERE m.kind='account.login'
+                            AND m.authority_id=profiles.id
+                            AND m.authority_generation=profiles.process_generation
+                            AND r.resolution_kind='abandoned'
+                            AND r.evidence_json=?
+                        )`).run(now(), legacyLoginResolutionEvidence);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(17, now());
+      database.exec("PRAGMA user_version = 17");
+      version = 17;
     }
 
     // Reapplying additive objects and idempotent authority backfills makes a
@@ -1145,7 +1798,20 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     database.exec(schemaVersion10);
     backfillSchemaVersion9(database, now());
     backfillSchemaVersion10(database);
+    redacted = redactLegacyMcpUrlInteractions(database, now()) || redacted;
+    redacted = redactLegacyPermissionValues(database) || redacted;
+    if (redacted) requireSecurityScrub(database, now());
+    database.exec(schemaVersion11);
+    database.exec(schemaVersion12);
+    database.exec(schemaVersion13);
+    ensureStableQueueSequence(database);
+    database.exec(schemaVersion15);
+    database.exec(schemaVersion16);
+    database.exec(schemaVersion17);
+    pruneAllUsageHistory(database, now());
+    return hasPendingSecurityScrub(database);
   })();
+  if (securityScrubPending) completePendingSecurityScrub(database);
 };
 
 const mapProfile = (row: unknown): ProfileRecord => {
@@ -1227,7 +1893,9 @@ const interactionRowSchema = z.object({
   display_json: z.string().min(2).max(65_536),
   response_digest: sha256Schema.nullable(),
   response_expected_revision: z.number().int().positive().nullable(),
+  intended_terminal_state: interactionIntendedTerminalStateSchema.nullable(),
   requested_at: unixMillisecondsSchema,
+  deadline_at: unixMillisecondsSchema,
   updated_at: unixMillisecondsSchema,
   terminal_at: unixMillisecondsSchema.nullable(),
 }).strict();
@@ -1260,7 +1928,9 @@ const mapInteraction = (row: unknown): InteractionRecord => {
     blocking: parsed.blocking === 1,
     display,
     responseDigest: parsed.response_digest,
+    intendedTerminalState: parsed.intended_terminal_state,
     requestedAt: parsed.requested_at,
+    deadlineAt: parsed.deadline_at,
     updatedAt: parsed.updated_at,
     terminalAt: parsed.terminal_at,
   });
@@ -1420,14 +2090,16 @@ export class StateStore {
     this.#readonly = options.readonly === true;
     this.#database = new Database(paths.database, options.readonly ? { readonly: true } : { create: true, strict: true });
     try {
-      this.#database.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+      this.#database.exec(`PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${stateBusyTimeoutMs};`);
       if (!options.readonly) {
-        this.#database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
+        requireWalMode(this.#database, true);
+        this.#database.exec("PRAGMA synchronous = FULL;");
         migrateWritableDatabase(this.#database, this.#now);
       } else {
         const version = readUserVersion(this.#database);
         if (version > currentSchemaVersion) throw new Error(`STATE_SCHEMA_NEWER:${version}:${currentSchemaVersion}`);
         if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
+        if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
     } catch (error) {
       this.#database.close(false);
@@ -1481,17 +2153,49 @@ export class StateStore {
 
   advanceProfileGeneration(profileId: ProfileId, expectedGeneration: number): ProfileRecord {
     const now = this.#now();
-    const result = this.#database
-      .query("UPDATE profiles SET process_generation = ?, updated_at = ? WHERE id = ? AND process_generation = ? AND state != 'removed'")
-      .run(expectedGeneration + 1, now, profileId, expectedGeneration);
-    if (result.changes !== 1) throw new Error("Profile generation authority changed.");
+    const advance = this.#database.transaction(() => {
+      const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=? AND state!='removed'").get(profileId));
+      if (current.processGeneration !== expectedGeneration) {
+        throw new Error("Profile generation authority changed.");
+      }
+      const activeLogin = this.#database.query(`SELECT attempt_id,process_generation
+                                                FROM provider_login_authorities
+                                                WHERE profile_id=? AND state='active'`).all(profileId) as {
+        attempt_id: string;
+        process_generation: number;
+      }[];
+      if (activeLogin.length > 1) throw new Error("LOGIN_GENERATION_AUTHORITY_AMBIGUOUS");
+      if (activeLogin.length === 1) {
+        if (
+          current.state !== "login_pending"
+          || activeLogin[0]?.process_generation !== expectedGeneration
+        ) throw new Error("LOGIN_GENERATION_AUTHORITY_MISMATCH");
+        const rebound = this.#database.query(`UPDATE provider_login_authorities
+                                              SET process_generation=?,updated_at=MAX(updated_at,?)
+                                              WHERE attempt_id=? AND process_generation=? AND state='active'`).run(
+          expectedGeneration + 1,
+          now,
+          activeLogin[0].attempt_id,
+          expectedGeneration,
+        );
+        if (rebound.changes !== 1) throw new Error("LOGIN_GENERATION_AUTHORITY_CAS_CONFLICT");
+      }
+      const state = current.state === "login_pending" && activeLogin.length === 0
+        ? "recovery_required"
+        : current.state;
+      const result = this.#database
+        .query("UPDATE profiles SET process_generation = ?, state=?, updated_at = ? WHERE id = ? AND process_generation = ? AND state != 'removed'")
+        .run(expectedGeneration + 1, state, now, profileId, expectedGeneration);
+      if (result.changes !== 1) throw new Error("Profile generation authority changed.");
+    });
+    advance.immediate();
     return this.requireProfile(profileId);
   }
 
   setProfileState(profileId: ProfileId, expectedGeneration: number, state: z.infer<typeof profileStateSchema>, identity?: { email?: string; plan?: string }): boolean {
     const now = this.#now();
-    const result = this.#database
-      .query(
+    const update = this.#database.transaction(() => {
+      const result = this.#database.query(
         `UPDATE profiles
          SET state=?,provider_email=?,provider_plan=?,updated_at=?
          WHERE id=?
@@ -1500,7 +2204,19 @@ export class StateStore {
            AND (state!='recovery_required' OR ?='recovery_required')`,
       )
       .run(state, identity?.email ?? null, identity?.plan ?? null, now, profileId, expectedGeneration, state);
-    return result.changes === 1;
+      if (result.changes === 1 && (state === "signed_in" || state === "signed_out")) {
+        this.#database.query(`UPDATE provider_login_authorities
+                              SET state='settled',settlement=?,updated_at=?
+                              WHERE profile_id=? AND process_generation=? AND state='active'`).run(
+          state === "signed_in" ? "signed_in" : "provider_disconnected",
+          now,
+          profileId,
+          expectedGeneration,
+        );
+      }
+      return result.changes === 1;
+    });
+    return update.immediate();
   }
 
   removeProfile(profileId: ProfileId): void {
@@ -1939,6 +2655,115 @@ export class StateStore {
     return this.requireSession(current.id);
   }
 
+  terminalizeSessionFromProviderDeletion(input: Readonly<{
+    accountId: ProfileId;
+    providerConnectionId: string | null;
+    providerGeneration: number;
+    sessionId: SessionId;
+  }>): Readonly<{
+    changed: boolean;
+    event?: SessionEvent;
+    interactions: readonly InteractionRecord[];
+    session: SessionRecord;
+  }> {
+    const parsedSessionId = sessionIdSchema.parse(input.sessionId);
+    const accountId = profileIdSchema.parse(input.accountId);
+    const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.providerGeneration);
+    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const terminalize = this.#database.transaction(() => {
+      const current = this.requireSession(parsedSessionId);
+      let sessionChanged = false;
+      let event: SessionEvent | undefined;
+      if (current.state !== "terminal") {
+        const changed = this.#database.query(
+          `UPDATE sessions
+           SET state='terminal',active_turn_id=NULL,revision=revision+1,updated_at=?
+           WHERE id=? AND revision=? AND state!='terminal'`,
+        ).run(now, current.id, current.revision);
+        if (changed.changes !== 1) throw new Error("SESSION_PROVIDER_DELETION_CONFLICT");
+        sessionChanged = true;
+        event = this.appendSessionEvent({
+          accountId,
+          body: {
+            activeTurnId: null,
+            status: "terminal",
+            type: "session_status",
+          },
+          providerConnectionId,
+          providerGeneration,
+          sessionId: current.id,
+        });
+      }
+      this.#database.query(
+        "UPDATE queue_entries SET state='cancelled',updated_at=? WHERE session_id=? AND state='pending'",
+      ).run(now, current.id);
+      this.#database.query(
+        "UPDATE queue_entries SET state='ambiguous',updated_at=? WHERE session_id=? AND state='dispatching'",
+      ).run(now, current.id);
+      const providerDeletionEvidence = JSON.stringify({ source: "provider_thread_deleted" });
+      this.#database.query(
+        `INSERT OR IGNORE INTO queue_effect_resolutions(
+           queue_id,resolution_kind,evidence_json,receipt_json,created_at
+         )
+         SELECT q.id,'abandoned',?,NULL,?
+         FROM queue_entries q
+         JOIN queue_effect_evidence e ON e.queue_id=q.id
+         LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
+         WHERE q.session_id=? AND q.state='ambiguous' AND r.queue_id IS NULL`,
+      ).run(providerDeletionEvidence, now, current.id);
+      this.#database.query(
+        `UPDATE mutation_attempts
+         SET state='cancelled',updated_at=?
+         WHERE state='prepared'
+           AND (
+             authority_id=? OR id IN (
+               SELECT attempt_id FROM session_start_attempts WHERE session_id=?
+             )
+           )`,
+      ).run(now, current.id, current.id);
+      this.#database.query(
+        `INSERT OR IGNORE INTO mutation_resolutions(
+           attempt_id,resolution_kind,evidence_json,receipt_json,created_at
+         )
+         SELECT m.id,'abandoned',?,NULL,?
+         FROM mutation_attempts m
+         LEFT JOIN session_start_attempts s ON s.attempt_id=m.id
+         LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+         WHERE (m.authority_id=? OR s.session_id=?)
+           AND m.state IN ('effect_started','ambiguous')
+           AND r.attempt_id IS NULL`,
+      ).run(providerDeletionEvidence, now, current.id, current.id);
+      const rows = this.#database.query(
+        `SELECT * FROM provider_interactions
+         WHERE session_id=? AND state IN ('pending','response_prepared','response_written')
+         ORDER BY requested_at,public_id`,
+      ).all(current.id);
+      const interactions: InteractionRecord[] = [];
+      for (const value of rows) {
+        const interaction = interactionRowSchema.parse(value);
+        const state = interaction.state === "pending" ? "expired" : "resolution_unknown";
+        const settled = this.#database.query(
+          `UPDATE provider_interactions
+           SET state=?,revision=revision+1,updated_at=MAX(updated_at,?),terminal_at=MAX(requested_at,?)
+           WHERE public_id=? AND revision=? AND state=?`,
+        ).run(state, now, now, interaction.public_id, interaction.revision, interaction.state);
+        if (settled.changes !== 1) throw new Error("INTERACTION_PROVIDER_DELETION_CONFLICT");
+        const terminal = this.#requireInteractionRow(interaction.public_id);
+        this.#recordInteractionTransition(terminal, now);
+        interactions.push(mapInteraction(terminal));
+      }
+      return {
+        changed: sessionChanged,
+        ...(event === undefined ? {} : { event }),
+        interactions,
+        session: this.requireSession(current.id),
+      };
+    });
+    return terminalize.immediate();
+  }
+
   quarantineSession(sessionId: SessionId): SessionRecord {
     const parsedSessionId = sessionIdSchema.parse(sessionId);
     const now = this.#now();
@@ -2041,12 +2866,32 @@ export class StateStore {
     return this.requireSession(sessionId);
   }
 
-  enqueue(sessionId: SessionId, message: string): QueueRecord {
+  #enqueuePrepared(sessionId: SessionId, message: string): QueueRecord {
     const id = createQueueId();
     const now = this.#now();
+    const sequenceRow = this.#database.query(
+      `UPDATE queue_sequence_authority
+       SET next_sequence=next_sequence+1
+       WHERE singleton=1 AND next_sequence<9007199254740991
+       RETURNING next_sequence-1 AS enqueue_sequence`,
+    ).get();
+    if (sequenceRow === null) throw new Error("QUEUE_SEQUENCE_EXHAUSTED");
+    const enqueueSequence = z.object({
+      enqueue_sequence: z.number().int().positive().safe(),
+    }).strict().parse(sequenceRow).enqueue_sequence;
+    this.#database.query("INSERT INTO queue_entries(id,session_id,message,state,enqueue_sequence,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, sessionId, message, "pending", enqueueSequence, now, now);
+    return { id, sessionId, message, state: "pending", createdAt: now, updatedAt: now };
+  }
+
+  enqueue(sessionId: SessionId, message: string): QueueRecord {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
     const parsedMessage = z.string().min(1).max(262_144).parse(message);
-    this.#database.query("INSERT INTO queue_entries(id,session_id,message,state,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, sessionId, parsedMessage, "pending", now, now);
-    return { id, sessionId, message: parsedMessage, state: "pending", createdAt: now, updatedAt: now };
+    let queued: QueueRecord | undefined;
+    this.#database.transaction(() => {
+      queued = this.#enqueuePrepared(parsedSessionId, parsedMessage);
+    }).immediate();
+    if (queued === undefined) throw new Error("Queue transaction lost its durable row.");
+    return queued;
   }
 
   enqueueIdempotent(input: { sessionId: SessionId; profileGeneration: number; message: string; idempotencyKey?: string }): QueueRecord {
@@ -2075,7 +2920,7 @@ export class StateStore {
       if (authority.process_generation !== parsedGeneration || authority.session_state === "recovery_required" || authority.session_state === "terminal") {
         throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
-      const queued = this.enqueue(parsedSessionId, parsedMessage);
+      const queued = this.#enqueuePrepared(parsedSessionId, parsedMessage);
       queueId = queued.id;
       if (!this.transitionMutation(attempt.id, "prepared", "effect_started")) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       if (!this.transitionMutation(attempt.id, "effect_started", "applied", { queueId: queued.id })) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
@@ -2086,7 +2931,7 @@ export class StateStore {
   }
 
   listQueue(sessionId: SessionId): readonly QueueRecord[] {
-    const rows = this.#database.query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE session_id=? ORDER BY rowid").all(sessionId);
+    const rows = this.#database.query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE session_id=? ORDER BY enqueue_sequence").all(sessionId);
     return rows.map((row) => {
       const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
       return { id: parsed.id, sessionId: parsed.session_id, message: parsed.message, state: parsed.state, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
@@ -2106,7 +2951,7 @@ export class StateStore {
 
   listRecoverableQueue(): readonly QueueRecord[] {
     const rows = this.#database
-      .query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE state IN ('pending','dispatching') ORDER BY rowid")
+      .query("SELECT id,session_id,message,state,created_at,updated_at FROM queue_entries WHERE state IN ('pending','dispatching') ORDER BY enqueue_sequence")
       .all();
     return rows.map((row) => {
       const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema, message: z.string(), state: queueStateSchema, created_at: unixMillisecondsSchema, updated_at: unixMillisecondsSchema }).strict().parse(row);
@@ -2213,7 +3058,7 @@ export class StateStore {
                                        JOIN queue_effect_evidence e ON e.queue_id=q.id
                                        LEFT JOIN queue_effect_resolutions r ON r.queue_id=q.id
                                        WHERE q.session_id=? AND q.state IN ('dispatching','ambiguous') AND r.queue_id IS NULL
-                                       ORDER BY q.rowid`).all(sessionId);
+                                       ORDER BY q.enqueue_sequence`).all(sessionId);
     return rows.map((row) => {
       const id = z.object({ id: queueIdSchema }).strict().parse(row).id;
       const record = this.readQueueEffect(id);
@@ -2226,7 +3071,7 @@ export class StateStore {
     const recovered: QueueId[] = [];
     const unresolved: QueueId[] = [];
     const recover = this.#database.transaction(() => {
-      const rows = this.#database.query("SELECT id,session_id FROM queue_entries WHERE state='dispatching' ORDER BY rowid").all();
+      const rows = this.#database.query("SELECT id,session_id FROM queue_entries WHERE state='dispatching' ORDER BY enqueue_sequence").all();
       for (const row of rows) {
         const parsed = z.object({ id: queueIdSchema, session_id: sessionIdSchema }).strict().parse(row);
         const record = this.readQueueEffect(parsed.id);
@@ -2453,6 +3298,162 @@ export class StateStore {
       ...(evidence === undefined ? {} : { evidence }),
       ...(row.session_start_id === null ? {} : { sessionStartId: sessionIdSchema.parse(row.session_start_id) }),
     };
+  }
+
+  readPendingLoginAuthority(profileId: ProfileId, processGeneration: number): PendingLoginAuthority | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedGeneration = z.number().int().nonnegative().parse(processGeneration);
+    const rows = this.#database.query(`SELECT a.attempt_id,m.idempotency_key,a.login_id
+                                       FROM provider_login_authorities a
+                                       JOIN mutation_attempts m ON m.id=a.attempt_id
+                                       WHERE a.profile_id=? AND a.process_generation=? AND a.state='active'
+                                       ORDER BY a.recorded_at,a.attempt_id`).all(parsedProfileId, parsedGeneration) as {
+      attempt_id: string;
+      idempotency_key: string;
+      login_id: string;
+    }[];
+    const pending = rows.map((row) => ({
+        attemptId: attemptIdSchema.parse(row.attempt_id),
+        idempotencyKey: z.string().uuid().parse(row.idempotency_key),
+        profileId: parsedProfileId,
+        processGeneration: parsedGeneration,
+        loginId: providerLoginIdSchema.parse(row.login_id),
+      } satisfies PendingLoginAuthority));
+    if (pending.length > 1) throw new Error("LOGIN_CANCEL_AUTHORITY_AMBIGUOUS");
+    return pending[0] ?? null;
+  }
+
+  completeAccountLoginMutation(input: {
+    attemptId: AttemptId;
+    profileId: ProfileId;
+    processGeneration: number;
+    receipt:
+      | { status: "pending"; loginId: string }
+      | { status: "signed_in"; account: { signedIn: true; email?: string | undefined; plan?: string | undefined } };
+  }): ProfileRecord {
+    const attemptId = attemptIdSchema.parse(input.attemptId);
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().positive().parse(input.processGeneration);
+    const receipt = z.discriminatedUnion("status", [
+      pendingLoginReceiptAuthoritySchema.strict(),
+      z.object({
+        status: z.literal("signed_in"),
+        account: z.object({
+          signedIn: z.literal(true),
+          email: z.string().max(1_024).optional(),
+          plan: z.string().max(128).optional(),
+        }).strict(),
+      }).strict(),
+    ]).parse(input.receipt);
+    const now = this.#now();
+    const complete = this.#database.transaction(() => {
+      const authority = z.object({
+        kind: z.literal("account.login"),
+        authority_id: profileIdSchema,
+        authority_generation: z.number().int().positive(),
+        mutation_state: z.literal("effect_started"),
+        profile_generation: z.number().int().positive(),
+        profile_state: z.literal("login_pending"),
+        evidence_kind: z.literal("account.login"),
+      }).strict().parse(this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state AS mutation_state,
+                                                     p.process_generation AS profile_generation,p.state AS profile_state,
+                                                     e.kind AS evidence_kind
+                                              FROM mutation_attempts m
+                                              JOIN profiles p ON p.id=m.authority_id
+                                              JOIN mutation_effect_evidence e ON e.attempt_id=m.id
+                                              WHERE m.id=?`).get(attemptId));
+      if (
+        authority.authority_id !== profileId
+        || authority.authority_generation !== processGeneration
+        || authority.profile_generation !== processGeneration
+      ) throw new Error("LOGIN_MUTATION_AUTHORITY_CHANGED");
+      if (receipt.status === "pending") {
+        this.#database.query(`INSERT INTO provider_login_authorities(
+          attempt_id,profile_id,process_generation,login_id,state,recorded_at,updated_at
+        ) VALUES (?,?,?,?,'active',?,?)`).run(
+          attemptId,
+          profileId,
+          processGeneration,
+          receipt.loginId,
+          now,
+          now,
+        );
+      } else {
+        const profileChanged = this.#database.query(`UPDATE profiles
+                                                     SET state='signed_in',provider_email=?,provider_plan=?,updated_at=?
+                                                     WHERE id=? AND process_generation=? AND state='login_pending'`).run(
+          receipt.account.email ?? null,
+          receipt.account.plan ?? null,
+          now,
+          profileId,
+          processGeneration,
+        );
+        if (profileChanged.changes !== 1) throw new Error("LOGIN_MUTATION_PROFILE_CAS_CONFLICT");
+      }
+      const changed = this.#database.query("UPDATE mutation_attempts SET state='applied',result_json=?,updated_at=? WHERE id=? AND state='effect_started'").run(
+        JSON.stringify(receipt),
+        now,
+        attemptId,
+      );
+      if (changed.changes !== 1) throw new Error("LOGIN_MUTATION_CAS_CONFLICT");
+    });
+    complete.immediate();
+    return this.requireProfileById(profileId);
+  }
+
+  settlePendingLogin(input: {
+    profileId: ProfileId;
+    processGeneration: number;
+    loginId: string;
+    providerStatus: "canceled" | "not_found";
+    provider: { signedIn: boolean; email?: string; plan?: string };
+  }): ProfileRecord {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().nonnegative().parse(input.processGeneration);
+    const loginId = providerLoginIdSchema.parse(input.loginId);
+    const providerStatus = z.enum(["canceled", "not_found"]).parse(input.providerStatus);
+    const provider = z.object({
+      signedIn: z.boolean(),
+      email: z.string().max(1_024).optional(),
+      plan: z.string().max(128).optional(),
+    }).strict().parse(input.provider);
+    const settle = this.#database.transaction(() => {
+      const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=?").get(profileId));
+      if (current.processGeneration !== processGeneration) {
+        throw new Error("LOGIN_CANCEL_GENERATION_MISMATCH");
+      }
+      if (current.state === "signed_in" || current.state === "signed_out") return current;
+      if (current.state !== "login_pending") throw new Error("LOGIN_CANCEL_PROFILE_STATE_MISMATCH");
+      const authority = this.readPendingLoginAuthority(profileId, processGeneration);
+      if (authority === null || authority.loginId !== loginId) {
+        throw new Error("LOGIN_CANCEL_AUTHORITY_MISMATCH");
+      }
+      const now = this.#now();
+      const changed = this.#database.query(`UPDATE profiles
+                                            SET state=?,provider_email=?,provider_plan=?,updated_at=?
+                                            WHERE id=? AND process_generation=? AND state='login_pending'`).run(
+        provider.signedIn ? "signed_in" : "signed_out",
+        provider.signedIn ? provider.email ?? null : null,
+        provider.signedIn ? provider.plan ?? null : null,
+        now,
+        profileId,
+        processGeneration,
+      );
+      if (changed.changes !== 1) throw new Error("LOGIN_CANCEL_PROFILE_CAS_CONFLICT");
+      const authorityChanged = this.#database.query(`UPDATE provider_login_authorities
+                                                     SET state='settled',settlement=?,updated_at=?
+                                                     WHERE attempt_id=? AND profile_id=? AND process_generation=? AND login_id=? AND state='active'`).run(
+        provider.signedIn ? "signed_in" : providerStatus,
+        now,
+        authority.attemptId,
+        profileId,
+        processGeneration,
+        loginId,
+      );
+      if (authorityChanged.changes !== 1) throw new Error("LOGIN_CANCEL_AUTHORITY_CAS_CONFLICT");
+      return mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=?").get(profileId));
+    });
+    return settle.immediate();
   }
 
   prepareMutation(input: { kind: string; authorityId: string; authorityGeneration: number; request: unknown; idempotencyKey?: string | undefined }): { id: AttemptId; state: MutationState; replay: boolean; result?: unknown } {
@@ -4095,6 +5096,9 @@ export class StateStore {
     kind: InteractionKind;
     blocking: boolean;
     display: InteractionDisplay;
+    timeoutMs?: number;
+    requestedAt?: number;
+    deadlineAt?: number;
   }): { record: InteractionRecord; replayed: boolean } {
     const publicId = z.string().uuid().parse(input.publicId);
     const sessionId = sessionIdSchema.nullable().parse(input.sessionId);
@@ -4102,12 +5106,20 @@ export class StateStore {
     const kind = interactionKindSchema.parse(input.kind);
     const blocking = z.boolean().parse(input.blocking);
     const display = interactionDisplaySchema.parse(input.display);
+    const timeoutMs = z.number().int().min(0).max(INTERACTION_MAX_PENDING_MS)
+      .parse(input.timeoutMs ?? INTERACTION_MAX_PENDING_MS);
     if (display.kind !== kind) throw new Error("INTERACTION_DISPLAY_KIND_MISMATCH");
     const displayJson = JSON.stringify(display);
     if (new TextEncoder().encode(displayJson).byteLength > 65_536) {
       throw new Error("INTERACTION_DISPLAY_EXCEEDS_BOUND");
     }
     const now = unixMillisecondsSchema.parse(this.#now());
+    const requestedAt = unixMillisecondsSchema.parse(input.requestedAt ?? now);
+    const deadlineAt = unixMillisecondsSchema.parse(input.deadlineAt
+      ?? Math.min(Number.MAX_SAFE_INTEGER, requestedAt + timeoutMs));
+    if (requestedAt > now || deadlineAt < requestedAt) {
+      throw new Error("INTERACTION_DEADLINE_AUTHORITY_INVALID");
+    }
     let result: { record: InteractionRecord; replayed: boolean } | undefined;
     const admit = this.#database.transaction(() => {
       const profile = z.object({
@@ -4143,6 +5155,8 @@ export class StateStore {
           || JSON.stringify(existing.authority) !== JSON.stringify(authority)
           || existing.kind !== kind
           || existing.blocking !== blocking
+          || (input.requestedAt !== undefined && existing.requestedAt !== requestedAt)
+          || (input.deadlineAt !== undefined && existing.deadlineAt !== deadlineAt)
         ) throw new Error("INTERACTION_REQUEST_REPLAY_CONFLICT");
         result = { record: existing, replayed: true };
         return;
@@ -4155,8 +5169,9 @@ export class StateStore {
            public_id,session_id,profile_id,process_generation,connection_id,
            request_id_type,request_id_number,request_id_text,method,request_digest,
            thread_id,turn_id,item_id,approval_id,kind,state,revision,blocking,
-           display_json,response_digest,response_expected_revision,requested_at,updated_at,terminal_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',1,?,?,NULL,NULL,?,?,NULL)`,
+           display_json,response_digest,response_expected_revision,intended_terminal_state,
+           requested_at,deadline_at,updated_at,terminal_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',1,?,?,NULL,NULL,NULL,?,?,?,NULL)`,
       ).run(
         publicId,
         sessionId,
@@ -4175,7 +5190,8 @@ export class StateStore {
         kind,
         blocking ? 1 : 0,
         displayJson,
-        now,
+        requestedAt,
+        deadlineAt,
         now,
       );
       const inserted = this.#requireInteractionRow(publicId);
@@ -4244,14 +5260,37 @@ export class StateStore {
     ).all(...parameters).map(mapInteraction);
   }
 
+  listDueInteractions(input: { now?: number; limit?: number } = {}): readonly InteractionRecord[] {
+    const now = unixMillisecondsSchema.parse(input.now ?? this.#now());
+    const limit = z.number().int().min(1).max(128).parse(input.limit ?? 32);
+    return this.#database.query(
+      `SELECT * FROM provider_interactions
+       WHERE state='pending' AND deadline_at<=?
+       ORDER BY deadline_at,public_id LIMIT ?`,
+    ).all(now, limit).map(mapInteraction);
+  }
+
+  nextInteractionDeadlineAt(): number | null {
+    const row = z.object({ deadline_at: unixMillisecondsSchema }).strict().nullable().parse(
+      this.#database.query(
+        `SELECT deadline_at FROM provider_interactions
+         WHERE state='pending' ORDER BY deadline_at,public_id LIMIT 1`,
+      ).get(),
+    );
+    return row?.deadline_at ?? null;
+  }
+
   prepareInteractionResponse(input: {
     id: string;
     expectedRevision: number;
     responseDigest: string;
+    intendedTerminalState?: InteractionIntendedTerminalState;
   }): InteractionRecord {
     const id = z.string().uuid().parse(input.id);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
     const responseDigest = sha256Schema.parse(input.responseDigest);
+    const intendedTerminalState = interactionIntendedTerminalStateSchema
+      .parse(input.intendedTerminalState ?? "resolved");
     const now = unixMillisecondsSchema.parse(this.#now());
     const prepare = this.#database.transaction(() => {
       const current = this.#requireInteractionRow(id);
@@ -4269,6 +5308,7 @@ export class StateStore {
         if (
           current.response_expected_revision === expectedRevision
           && current.response_digest === responseDigest
+          && current.intended_terminal_state === intendedTerminalState
         ) return mapInteraction(current);
         if (current.response_expected_revision === expectedRevision) {
           throw new Error("INTERACTION_RESPONSE_CONFLICT");
@@ -4279,9 +5319,9 @@ export class StateStore {
       const changed = this.#database.query(
         `UPDATE provider_interactions
          SET state='response_prepared',revision=revision+1,response_digest=?,
-             response_expected_revision=?,updated_at=MAX(updated_at,?)
+             response_expected_revision=?,intended_terminal_state=?,updated_at=MAX(updated_at,?)
          WHERE public_id=? AND revision=? AND state='pending' AND response_digest IS NULL`,
-      ).run(responseDigest, expectedRevision, now, id, expectedRevision);
+      ).run(responseDigest, expectedRevision, intendedTerminalState, now, id, expectedRevision);
       if (changed.changes !== 1) throw new Error("INTERACTION_REVISION_CONFLICT");
       const prepared = this.#requireInteractionRow(id);
       this.#recordInteractionTransition(prepared, now);
@@ -4330,13 +5370,13 @@ export class StateStore {
   settleInteraction(input: {
     id: string;
     expectedRevision: number;
-    state: "resolved" | "declined" | "canceled";
+    state: InteractionIntendedTerminalState;
     authority: ProviderInteractionAuthority;
     responseDigest?: string;
   }): InteractionRecord {
     const id = z.string().uuid().parse(input.id);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
-    const state = z.enum(["resolved", "declined", "canceled"]).parse(input.state);
+    const state = interactionIntendedTerminalStateSchema.parse(input.state);
     const authority = providerInteractionAuthoritySchema.parse(input.authority);
     const responseDigest = input.responseDigest === undefined ? undefined : sha256Schema.parse(input.responseDigest);
     const now = unixMillisecondsSchema.parse(this.#now());
@@ -4358,6 +5398,10 @@ export class StateStore {
       if (responseDigest !== undefined && current.response_digest !== responseDigest) {
         throw new Error("INTERACTION_RESPONSE_CONFLICT");
       }
+      if (
+        current.intended_terminal_state !== null
+        && current.intended_terminal_state !== state
+      ) throw new Error("INTERACTION_TERMINAL_INTENT_CONFLICT");
       if (current.state === state && current.revision === expectedRevision + 1) return mapInteraction(current);
       if (current.revision !== expectedRevision) throw new Error("INTERACTION_REVISION_CONFLICT");
       if (!["pending", "response_prepared", "response_written"].includes(current.state)) {
@@ -4520,7 +5564,9 @@ export class StateStore {
     const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(sourceRevision);
     const parsedObservedAt = unixMillisecondsSchema.parse(observedAt);
     const json = JSON.stringify(payload);
-    if (new TextEncoder().encode(json).byteLength > 262_144) throw new Error("Usage snapshot exceeds the local bound.");
+    if (new TextEncoder().encode(json).byteLength > USAGE_LOCAL_SNAPSHOT_MAX_BYTES) {
+      throw new Error("Usage snapshot exceeds the local bound.");
+    }
     const digest = createHash("sha256").update(json).digest("hex");
     const record = this.#database.transaction(() => {
       const existing = this.#database.query("SELECT digest FROM usage_snapshots WHERE profile_id=? AND source_revision=?").get(parsedProfileId, parsedRevision) as { digest: string } | null;
@@ -4534,6 +5580,17 @@ export class StateStore {
         `INSERT INTO usage_revision_authority(profile_id,next_revision) VALUES (?,?)
          ON CONFLICT(profile_id) DO UPDATE SET next_revision=MAX(next_revision,excluded.next_revision)`,
       ).run(parsedProfileId, Math.min(Number.MAX_SAFE_INTEGER, parsedRevision + 1));
+      recordUsageCloudUploadAnchor(
+        this.#database,
+        parsedProfileId,
+        parsedRevision,
+        usageSnapshotReceivedAt({
+          observedAt: parsedObservedAt,
+          payload,
+          sourceRevision: parsedRevision,
+        }),
+      );
+      pruneProfileUsageHistory(this.#database, parsedProfileId, this.#now());
     });
     record.immediate();
   }
@@ -4570,6 +5627,7 @@ export class StateStore {
         `INSERT INTO usage_revision_authority(profile_id,next_revision) VALUES (?,?)
          ON CONFLICT(profile_id) DO UPDATE SET next_revision=MAX(next_revision,excluded.next_revision)`,
       ).run(parsedProfileId, Math.min(Number.MAX_SAFE_INTEGER, parsedRevision + 1));
+      pruneProfileUsageHistory(this.#database, parsedProfileId, this.#now());
     });
     record.immediate();
   }
@@ -4663,11 +5721,14 @@ export class StateStore {
       .parse(input.afterSourceRevision);
     const limit = z.number().int().min(1).max(10_000).parse(input.limit);
     const rows = this.#database.query(
-      `SELECT source_revision,observed_at,payload_json FROM usage_snapshots
-       WHERE profile_id=? AND source_revision>?
-       ORDER BY source_revision LIMIT ?`,
+      `SELECT u.source_revision,u.observed_at,u.payload_json
+       FROM usage_cloud_upload_anchors a
+       JOIN usage_snapshots u
+         ON u.profile_id=a.profile_id AND u.source_revision=a.source_revision
+       WHERE a.profile_id=? AND a.source_revision>?
+       ORDER BY a.source_revision LIMIT ?`,
     ).all(profileId, afterSourceRevision, limit);
-    return rows.map((row) => {
+    const mapRow = (row: unknown): UsageSnapshotRecord => {
       const parsed = z.object({
         source_revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
         observed_at: unixMillisecondsSchema,
@@ -4678,7 +5739,8 @@ export class StateStore {
         observedAt: parsed.observed_at,
         payload: JSON.parse(parsed.payload_json) as unknown,
       };
-    });
+    };
+    return rows.map(mapRow);
   }
 
   latestUsage(profileId: ProfileId): UsageSnapshotRecord | null {
@@ -4724,6 +5786,18 @@ export class StateStore {
         if (changed.changes !== 1) throw new Error("INTERACTION_DAEMON_RESTART_CONFLICT");
         this.#recordInteractionTransition(this.#requireInteractionRow(interaction.public_id), now);
       }
+      const invalidLoginAuthority = this.#database.query(`SELECT a.attempt_id
+                                                          FROM provider_login_authorities a
+                                                          LEFT JOIN profiles p ON p.id=a.profile_id
+                                                          WHERE a.state='active'
+                                                            AND (p.id IS NULL OR p.state!='login_pending' OR p.process_generation!=a.process_generation)
+                                                          LIMIT 1`).get();
+      if (invalidLoginAuthority !== null) {
+        throw new Error("LOGIN_RESTART_AUTHORITY_MISMATCH");
+      }
+      this.#database.query(`UPDATE provider_login_authorities
+                            SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
+                            WHERE state='active'`).run(now);
       this.#database.query(
         `UPDATE profiles
          SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)

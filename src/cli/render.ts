@@ -1,7 +1,7 @@
 import type { LocalCommand } from "../domain/contracts";
 import {
-  interactionRecordSchema,
-  type InteractionRecord,
+  publicInteractionSchema,
+  type PublicInteraction,
 } from "../domain/interactions";
 import {
   sessionEventPageSchema,
@@ -9,7 +9,11 @@ import {
   type SessionEventPage,
 } from "../domain/session-events";
 
-export type Output = { writeStdout(value: string): void; writeStderr(value: string): void };
+export type Output = {
+  writeStdout(value: string): void;
+  writeStderr(value: string): void;
+  writeStdoutAsync?(value: string, signal: AbortSignal): Promise<void>;
+};
 
 const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
 
@@ -49,6 +53,49 @@ export const safeJson = (value: unknown, space?: number): string => {
         : scalar;
   }
   return output;
+};
+
+const diagnosticMaximumBytes = 2_048;
+const diagnosticMaximumDepth = 4;
+const diagnosticMaximumEntries = 64;
+const privateKeyDiagnostic = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/iu;
+const bearerDiagnostic = /\bBearer\s+[^\s,;]+/giu;
+const assignedSecretDiagnostic = /\b(token|secret|password|invite|otp|authorization|cookie|api[-_ ]?key)(\s*[:=]\s*)[^\s,;]+/giu;
+const jwtDiagnostic = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu;
+const unixAbsolutePathDiagnostic = /(^|[\s(=[{])\/(?:[^/\s)'"`]+\/)+[^/\s)'"`]*/gu;
+const windowsAbsolutePathDiagnostic = /\b[A-Za-z]:\\(?:[^\\\s)'"`]+\\)*[^\\\s)'"`]*/gu;
+
+const boundedDiagnostic = (value: string): string => {
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.byteLength <= diagnosticMaximumBytes) return value;
+  return `${new TextDecoder().decode(encoded.subarray(0, diagnosticMaximumBytes))}[truncated]`;
+};
+
+export const safeDiagnostic = (value: string): string => {
+  if (privateKeyDiagnostic.test(value)) return "[redacted private key diagnostic]";
+  const bounded = boundedDiagnostic(value)
+    .replace(bearerDiagnostic, "Bearer [redacted]")
+    .replace(assignedSecretDiagnostic, (_match, label: string, separator: string) =>
+      `${label}${separator}[redacted]`)
+    .replace(jwtDiagnostic, "[redacted-token]")
+    .replace(unixAbsolutePathDiagnostic, (_match, prefix: string) => `${prefix}[local-path]`)
+    .replace(windowsAbsolutePathDiagnostic, "[local-path]");
+  return terminalSafe(bounded);
+};
+
+const safeDiagnosticDetails = (value: unknown, depth = 0): unknown => {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return safeDiagnostic(value);
+  if (depth >= diagnosticMaximumDepth) return "[detail omitted]";
+  if (Array.isArray(value)) {
+    return value.slice(0, diagnosticMaximumEntries).map((entry) => safeDiagnosticDetails(entry, depth + 1));
+  }
+  if (typeof value !== "object") return "[detail omitted]";
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, diagnosticMaximumEntries)
+      .map(([key, entry]) => [safeDiagnostic(key), safeDiagnosticDetails(entry, depth + 1)]),
+  );
 };
 
 const line = (value: unknown): string => {
@@ -307,7 +354,7 @@ const sessionEventPage = (data: unknown): SessionEventPage | null => {
   return nested.success ? nested.data : null;
 };
 
-const interactionRecords = (data: unknown): readonly InteractionRecord[] => {
+const interactionRecords = (data: unknown): readonly PublicInteraction[] => {
   const root = object(data);
   const source = Array.isArray(data)
     ? data
@@ -315,47 +362,43 @@ const interactionRecords = (data: unknown): readonly InteractionRecord[] => {
       ? root.interactions
       : [];
   return source.flatMap((value) => {
-    const parsed = interactionRecordSchema.safeParse(value);
+    const parsed = publicInteractionSchema.safeParse(value);
     return parsed.success ? [parsed.data] : [];
   });
 };
 
-const interactionRecord = (data: unknown): InteractionRecord | null => {
-  const direct = interactionRecordSchema.safeParse(data);
+const interactionRecord = (data: unknown): PublicInteraction | null => {
+  const direct = publicInteractionSchema.safeParse(data);
   if (direct.success) return direct.data;
   const root = object(data);
-  const nested = interactionRecordSchema.safeParse(root?.interaction);
+  const nested = publicInteractionSchema.safeParse(root?.interaction);
   if (nested.success) return nested.data;
-  const recorded = interactionRecordSchema.safeParse(root?.record);
+  const recorded = publicInteractionSchema.safeParse(root?.record);
   return recorded.success ? recorded.data : null;
 };
 
-export const publicInteractionRecord = (record: InteractionRecord): Record<string, unknown> => {
-  const display = record.display.kind === "mcp_elicitation" && record.display.mayContainSecrets
-    ? { ...record.display, url: null }
-    : record.display;
-  return {
-    version: record.version,
-    publicId: record.publicId,
-    sessionId: record.sessionId,
-    kind: record.kind,
-    state: record.state,
-    revision: record.revision,
-    blocking: record.blocking,
-    display,
-    requestedAt: record.requestedAt,
-    updatedAt: record.updatedAt,
-    terminalAt: record.terminalAt,
-  };
-};
-
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
-  if (command.kind === "interaction.show" || command.kind === "interaction.resolve") {
+  if (command.kind === "interaction.show") {
     const record = interactionRecord(data);
-    return { interaction: record === null ? null : publicInteractionRecord(record) };
+    return { interaction: record };
+  }
+  if (command.kind === "interaction.resolve") {
+    const root = object(data);
+    return {
+      interaction: interactionRecord(data),
+      responseWritten: root?.responseWritten === true,
+    };
   }
   if (command.kind === "interaction.list" || command.kind === "session.interactions") {
-    return { interactions: interactionRecords(data).map(publicInteractionRecord) };
+    return { interactions: interactionRecords(data) };
+  }
+  if (command.kind === "session.status") {
+    const root = object(data);
+    if (root === null) return data;
+    return {
+      ...root,
+      pendingInteractions: interactionRecords(root.pendingInteractions),
+    };
   }
   if (command.kind === "session.events") return sessionEventPage(data);
   return data;
@@ -367,14 +410,15 @@ const renderInteractionList = (data: unknown): string => {
     state: record.state,
     kind: record.kind,
     summary: record.display.summary,
+    deadline: instant(record.deadlineAt),
     revision: record.revision,
-    id: record.publicId,
-  })), ["state", "kind", "summary", "revision", "id"]);
+    id: record.id,
+  })), ["state", "kind", "summary", "deadline", "revision", "id"]);
 };
 
-const renderInteraction = (record: InteractionRecord): string => {
+const renderInteraction = (record: PublicInteraction): string => {
   const rows = [
-    `Interaction ${line(record.publicId)}`,
+    `Interaction ${line(record.id)}`,
     `State: ${line(record.state)}`,
     `Type: ${line(record.kind)}`,
     `Revision: ${String(record.revision)}`,
@@ -382,6 +426,15 @@ const renderInteraction = (record: InteractionRecord): string => {
     `Session: ${line(record.sessionId)}`,
     `Summary: ${line(record.display.summary)}`,
   ];
+  if (record.state === "pending") {
+    const remainingMs = record.deadlineAt - Date.now();
+    rows.push(
+      `Deadline: ${instant(record.deadlineAt)}`,
+      remainingMs <= 0
+        ? "Remaining: deadline reached; waiting for deterministic expiry"
+        : `Remaining: ${duration(remainingMs)}`,
+    );
+  }
   const display = record.display;
   switch (display.kind) {
     case "command_approval":
@@ -396,19 +449,58 @@ const renderInteraction = (record: InteractionRecord): string => {
     case "permission_approval":
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       rows.push(`Permissions: ${display.requested.length === 0 ? "none" : display.requested.map((permission) => line(permission.name)).join(", ")}`);
+      if (display.requested.length === 0) {
+        rows.push("No permission category can be granted. Decline or cancel this interaction.");
+      } else {
+        rows.push(`Protected grant document: ${line(JSON.stringify({
+          permissions: display.requested.map((permission) => permission.name),
+        }))}`);
+      }
       break;
     case "user_input":
       for (const question of display.questions) {
-        rows.push("", `${line(question.header)}${question.secret ? " (protected input)" : ""}`, `  ${line(question.question)}`);
+        rows.push(
+          "",
+          `${line(question.header)}${question.secret ? " (protected input)" : ""}`,
+          `  ID: ${line(question.id)}`,
+          `  ${line(question.question)}`,
+        );
         if (question.options !== null) {
           rows.push(...question.options.map((option) => `  ${line(option.label)}: ${line(option.description)}`));
         }
       }
+      rows.push("", `Protected answer document: ${line(JSON.stringify({
+        answers: Object.fromEntries(display.questions.map((question) => [
+          question.id,
+          { answers: ["<answer>"] },
+        ])),
+      }))}`);
       break;
     case "mcp_elicitation":
       rows.push(`Server: ${line(display.serverName)}`, `Mode: ${line(display.mode)}`);
-      if (display.url !== null) {
-        rows.push(display.mayContainSecrets ? "URL: protected" : `URL: ${line(display.url)}`);
+      rows.push("Input: protected");
+      if (display.mode === "form") {
+        const fields = display.fields ?? [];
+        rows.push(`Fields: ${fields.length === 0 ? "none" : String(fields.length)}`);
+        for (const field of fields) {
+          const requirement = field.required ? "required" : "optional";
+          if (field.type === "string") {
+            const format = field.format === null ? "" : `, format ${line(field.format)}`;
+            rows.push(`  ${line(field.name)}: string, ${requirement}, ${String(field.minLength)}..${String(field.maxLength)} characters${format}`);
+          } else if (field.type === "number" || field.type === "integer") {
+            const minimum = field.minimum === null ? "unbounded" : String(field.minimum);
+            const maximum = field.maximum === null ? "unbounded" : String(field.maximum);
+            rows.push(`  ${line(field.name)}: ${field.type}, ${requirement}, ${minimum}..${maximum}`);
+          } else if (field.type === "boolean") {
+            rows.push(`  ${line(field.name)}: boolean, ${requirement}`);
+          } else if (field.type === "single_select") {
+            rows.push(`  ${line(field.name)}: single select, ${requirement}, choices ${field.choices.map(line).join(", ")}`);
+          } else {
+            const multiSelect = field as Extract<typeof field, { readonly type: "multi_select" }>;
+            rows.push(`  ${line(multiSelect.name)}: multi select, ${requirement}, ${String(multiSelect.minItems)}..${String(multiSelect.maxItems)} choices from ${multiSelect.choices.map(line).join(", ")}`);
+          }
+        }
+        rows.push("Submit one protected JSON document shaped as {\"content\":{...}}.");
       }
       break;
   }
@@ -425,8 +517,13 @@ const renderSessionStatus = (data: unknown): string => {
   ];
   if (session.activeTurnId !== undefined) rows.push(`Active turn: ${line(session.activeTurnId)}`);
   if (typeof session.revision === "number") rows.push(`Revision: ${String(session.revision)}`);
-  if (typeof root?.observedThroughSequence === "number" && typeof root.floorSequence === "number") {
-    rows.push(`Events: through ${String(root.observedThroughSequence)}, retained from ${String(root.floorSequence)}`);
+  const eventStream = object(root?.eventStream) ?? root;
+  if (typeof eventStream?.observedThroughSequence === "number" && typeof eventStream.floorSequence === "number") {
+    rows.push(`Events: through ${String(eventStream.observedThroughSequence)}, retained from ${String(eventStream.floorSequence)}`);
+  }
+  const pendingInteractions = interactionRecords(root?.pendingInteractions);
+  if (pendingInteractions.length > 0) {
+    rows.push("", "Pending interactions", renderInteractionList(pendingInteractions));
   }
   return rows.join("\n");
 };
@@ -528,36 +625,50 @@ const usagePercent = (payload: unknown): number | null => {
 
 const renderAccountUsage = (data: unknown): string => {
   const root = object(data);
-  if (!Array.isArray(root?.usage) || root.usage.length === 0) return "No account usage observations.";
-  return root.usage.map((value): string => {
-    const entry = object(value);
-    const account = object(entry?.account);
-    const poll = object(entry?.poll);
-    const snapshot = object(entry?.snapshot);
-    const velocity = object(entry?.velocity);
-    const payload = snapshot?.payload;
-    const label = typeof account?.label === "string"
-      ? account.label
-      : typeof account?.id === "string"
-        ? account.id
-        : "Unknown account";
-    const rows = [line(label)];
-    if (poll?.state === "failed") {
-      rows.push(`  poll: failed at ${instant(poll.observedAt)} (${line(poll.reasonCode)})`);
-    } else if (poll?.state === "observed") {
-      rows.push(`  observed: ${instant(poll.observedAt)}`);
-    } else {
-      rows.push("  observed: never");
+  const usage = !Array.isArray(root?.usage) || root.usage.length === 0
+    ? "No account usage observations."
+    : root.usage.map((value): string => {
+      const entry = object(value);
+      const account = object(entry?.account);
+      const poll = object(entry?.poll);
+      const snapshot = object(entry?.snapshot);
+      const velocity = object(entry?.velocity);
+      const payload = snapshot?.payload;
+      const label = typeof account?.label === "string"
+        ? account.label
+        : typeof account?.id === "string"
+          ? account.id
+          : "Unknown account";
+      const rows = [line(label)];
+      if (poll?.state === "failed") {
+        rows.push(`  poll: failed at ${instant(poll.observedAt)} (${line(poll.reasonCode)})`);
+      } else if (poll?.state === "observed") {
+        rows.push(`  observed: ${instant(poll.observedAt)}`);
+      } else {
+        rows.push("  observed: never");
+      }
+      const lifetimeTokens = usageLifetimeTokens(payload);
+      if (lifetimeTokens !== null) rows.push(`  lifetime tokens: ${lifetimeTokens.toLocaleString("en-US")}`);
+      const usedPercent = usagePercent(payload);
+      if (usedPercent !== null) rows.push(`  primary limit used: ${usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}%`);
+      rows.push(
+        `  velocity: 1m ${usageVelocity(velocity?.["1m"])}; 5m ${usageVelocity(velocity?.["5m"])}; 15m ${usageVelocity(velocity?.["15m"])}`,
+      );
+      return rows.join("\n");
+    }).join("\n\n");
+  const refresh = object(root?.refresh);
+  if (!Array.isArray(refresh?.outcomes)) return usage;
+  const outcomes = refresh.outcomes.map((value): string => {
+    const outcome = object(value);
+    if (outcome === null) return "unknown account: failed (invalid response)";
+    const accountId = line(outcome.accountId);
+    if (outcome.state === "refreshed") return `${accountId}: refreshed`;
+    if (outcome.state === "skipped") {
+      return `${accountId}: skipped (${line(outcome.accountState)})`;
     }
-    const lifetimeTokens = usageLifetimeTokens(payload);
-    if (lifetimeTokens !== null) rows.push(`  lifetime tokens: ${lifetimeTokens.toLocaleString("en-US")}`);
-    const usedPercent = usagePercent(payload);
-    if (usedPercent !== null) rows.push(`  primary limit used: ${usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}%`);
-    rows.push(
-      `  velocity: 1m ${usageVelocity(velocity?.["1m"])}; 5m ${usageVelocity(velocity?.["5m"])}; 15m ${usageVelocity(velocity?.["15m"])}`,
-    );
-    return rows.join("\n");
-  }).join("\n\n");
+    return `${accountId}: failed (${line(outcome.code)})`;
+  });
+  return [usage, "", "Refresh outcomes", ...outcomes.map((outcome) => `  ${outcome}`)].join("\n");
 };
 
 export function renderSuccess(command: LocalCommand, data: unknown, json: boolean, output: Output): void {
@@ -593,6 +704,14 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {
     output.writeStdout(value.running === true ? `HRA daemon is running (pid ${line(value.pid)}).\n` : "HRA daemon is stopped.\n");
+  } else if (command.kind === "account.login-cancel") {
+    if (value.status === "signed_in") {
+      output.writeStdout("The account completed sign-in before cancellation.\n");
+    } else if (value.status === "already_settled") {
+      output.writeStdout("No login is pending for this account.\n");
+    } else {
+      output.writeStdout(`Canceled the pending login (${line(value.providerStatus)}). You can start a fresh login now.\n`);
+    }
   } else if (command.kind === "account.switch-recover") {
     if (value.status === "none") {
       output.writeStdout("No desktop switch requires recovery.\n");
@@ -617,11 +736,20 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
 }
 
 export function renderFailure(error: { code: string; message: string; details?: unknown }, json: boolean, output: Output): number {
+  const safeError = {
+    code: error.code,
+    message: error.code === "INTERNAL"
+      ? "HRA could not complete the request safely."
+      : safeDiagnostic(error.message),
+    ...(error.code === "INTERNAL" || error.details === undefined
+      ? {}
+      : { details: safeDiagnosticDetails(error.details) }),
+  };
   if (json) {
-    output.writeStdout(`${safeJson({ ok: false, version: 1, error })}\n`);
+    output.writeStdout(`${safeJson({ ok: false, version: 1, error: safeError })}\n`);
   } else {
-    output.writeStderr(`hra: ${terminalSafe(error.message)}\n`);
-    if (error.details !== undefined) output.writeStderr(`${safeJson(error.details, 2)}\n`);
+    output.writeStderr(`hra: ${safeError.message}\n`);
+    if (safeError.details !== undefined) output.writeStderr(`${safeJson(safeError.details, 2)}\n`);
   }
   return error.code === "INVALID_INPUT" ? 2 : error.code === "NOT_FOUND" ? 4 : error.code === "INTERACTION_REQUIRED" ? 6 : error.code === "RECOVERY_REQUIRED" ? 7 : error.code === "UNAVAILABLE" ? 5 : 1;
 }

@@ -27,7 +27,14 @@ describe("SessionEventCursorCodec", () => {
       sequence: 0,
     });
     expect(() => second.decode(cursor)).toThrow(SessionEventCursorError);
-    expect(() => first.decode(`${cursor.slice(0, -1)}A`)).toThrow(SessionEventCursorError);
+    const base64UrlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = cursor.at(-1);
+    const lastIndex = last === undefined ? -1 : base64UrlAlphabet.indexOf(last);
+    if (lastIndex < 0 || lastIndex % 4 !== 0) throw new Error("Expected a canonical SHA-256 signature.");
+    const noncanonicalAlias = base64UrlAlphabet[lastIndex + 1];
+    if (noncanonicalAlias === undefined) throw new Error("Expected a base64url alias.");
+    expect(() => first.decode(`${cursor.slice(0, -1)}${noncanonicalAlias}`))
+      .toThrow(SessionEventCursorError);
     expect(() => first.decode(`hra1.${Buffer.from('{"sequence":0,"version":1}', "utf8").toString("base64url")}.x`)).toThrow(SessionEventCursorError);
     expect(() => first.decode(`hra1.${"a".repeat(3_000)}.x`)).toThrow(SessionEventCursorError);
   });

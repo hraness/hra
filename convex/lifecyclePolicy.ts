@@ -1,7 +1,9 @@
+export const CLOUD_USAGE_SNAPSHOT_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
+
 export type HostedTableLifecycle = Readonly<{
   owner: "user" | "parent" | "email_digest" | "capability" | "service";
   quota: "identity" | "device" | "account" | "session" | "chunk" | "usage" | "command" | "custody" | "receipt" | "security" | "job" | null;
-  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "lease_expiry" | "command_recovery" | "usage_90d" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
+  retention: "auth_library" | "challenge_expiry" | "invite_expiry" | "active" | "encrypted_history" | "lease_expiry" | "command_recovery" | "usage_90d_daily" | "receipt_expiry" | "security_90d" | "job_until_complete" | "service_permanent";
   deletionOrder: number | null;
   disposition: "erase" | "expire" | "complete_receipt" | "service_reset";
 }>;
@@ -31,7 +33,7 @@ export const HOSTED_TABLE_LIFECYCLE = {
   sessionCommands: { owner: "user", quota: "command", retention: "command_recovery", deletionOrder: 10, disposition: "erase" },
   codexAccounts: { owner: "user", quota: "account", retention: "active", deletionOrder: 50, disposition: "erase" },
   deviceAccountBindings: { owner: "user", quota: "account", retention: "active", deletionOrder: 40, disposition: "erase" },
-  accountUsageSnapshots: { owner: "user", quota: "usage", retention: "usage_90d", deletionOrder: 40, disposition: "erase" },
+  accountUsageSnapshots: { owner: "user", quota: "usage", retention: "usage_90d_daily", deletionOrder: 40, disposition: "erase" },
   idempotencyReceipts: { owner: "user", quota: "receipt", retention: "receipt_expiry", deletionOrder: 80, disposition: "erase" },
   securityEvents: { owner: "user", quota: "security", retention: "security_90d", deletionOrder: 80, disposition: "erase" },
   accountDeletionJobs: { owner: "user", quota: "job", retention: "job_until_complete", deletionOrder: 150, disposition: "complete_receipt" },

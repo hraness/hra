@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { renderSuccess, type Output } from "./render";
-import type { InteractionRecord } from "../domain/interactions";
+import { renderFailure, renderSuccess, type Output } from "./render";
+import type { PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
 
 const capture = (): { output: Output; stdout: string[]; stderr: string[] } => {
@@ -53,6 +53,20 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("renders pending-login cancellation as a fresh-start handoff", () => {
+    const canceled = capture();
+    renderSuccess({ kind: "account.login-cancel", account: "personal" }, {
+      status: "canceled",
+      providerStatus: "not_found",
+    }, false, canceled.output);
+    expect(canceled.stdout.join("")).toBe("Canceled the pending login (not_found). You can start a fresh login now.\n");
+    const settled = capture();
+    renderSuccess({ kind: "account.login-cancel", account: "personal" }, {
+      status: "already_settled",
+    }, false, settled.output);
+    expect(settled.stdout.join("")).toBe("No login is pending for this account.\n");
+  });
+
   test("renders session show as an ergonomic transcript and bounded turn summaries", () => {
     const target = capture();
     renderSuccess(command, data, false, target.output);
@@ -254,8 +268,33 @@ describe("CLI rendering", () => {
           activeTurnId: "turn-1",
           revision: 4,
         },
-        floorSequence: 2,
-        observedThroughSequence: 9,
+        eventStream: {
+          floorSequence: 2,
+          observedThroughSequence: 9,
+        },
+        pendingInteractions: [{
+          version: 1,
+          id: "a0000000-0000-4000-8000-000000000009",
+          sessionId: "sess_00000000000000000000000000000000",
+          kind: "command_approval",
+          state: "pending",
+          revision: 2,
+          blocking: true,
+          display: {
+            kind: "command_approval",
+            summary: "Run release verification",
+            reason: null,
+            commandClass: "test",
+            workingDirectory: null,
+            allowsSessionApproval: false,
+          },
+          responseRecorded: false,
+          context: { turnId: "turn-1", itemId: "item-1" },
+          requestedAt: 1_000,
+          deadlineAt: 61_000,
+          updatedAt: 1_000,
+          terminalAt: null,
+        }],
       },
       false,
       status.output,
@@ -266,6 +305,10 @@ describe("CLI rendering", () => {
       "Active turn: turn-1",
       "Revision: 4",
       "Events: through 9, retained from 2",
+      "",
+      "Pending interactions",
+      "STATE    KIND              SUMMARY                   DEADLINE                  REVISION  ID",
+      "pending  command_approval  Run release verification  1970-01-01T00:01:01.000Z  2         a0000000-0000-4000-8000-000000000009",
       "",
     ].join("\n"));
 
@@ -310,23 +353,11 @@ describe("CLI rendering", () => {
     expect(events.stdout.join("")).not.toContain("started");
   });
 
-  test("renders interaction lists and details without private callback authority", () => {
-    const record: InteractionRecord = {
+  test("renders public interaction lists and details without private callback authority", () => {
+    const record: PublicInteraction = {
       version: 1,
-      publicId: "a0000000-0000-4000-8000-000000000001",
+      id: "a0000000-0000-4000-8000-000000000001",
       sessionId: "sess_00000000000000000000000000000000",
-      authority: {
-        profileId: "acct_00000000000000000000000000000000",
-        processGeneration: 3,
-        connectionId: "a0000000-0000-4000-8000-000000000002",
-        requestId: { type: "string", value: "private-request" },
-        method: "item/tool/requestUserInput",
-        requestDigest: "a".repeat(64),
-        threadId: "thread-private",
-        turnId: "turn-private",
-        itemId: "item-private",
-        approvalId: null,
-      },
       kind: "user_input",
       state: "pending",
       revision: 2,
@@ -344,8 +375,10 @@ describe("CLI rendering", () => {
           secret: true,
         }],
       },
-      responseDigest: null,
+      responseRecorded: false,
+      context: { turnId: "turn-visible", itemId: "item-visible" },
       requestedAt: 1_000,
+      deadlineAt: Date.now() + 60_000,
       updatedAt: 1_001,
       terminalAt: null,
     };
@@ -358,26 +391,31 @@ describe("CLI rendering", () => {
     );
     const listText = list.stdout.join("");
     expect(listText).toContain("Choose a release channel");
-    expect(listText).toContain(record.publicId);
+    expect(listText).toContain(record.id);
     expect(listText).not.toContain("private-request");
     expect(listText).not.toContain("requestDigest");
 
     const show = capture();
     renderSuccess(
-      { kind: "interaction.show", interaction: record.publicId },
+      { kind: "interaction.show", interaction: record.id },
       { interaction: record },
       false,
       show.output,
     );
     const showText = show.stdout.join("");
     expect(showText).toContain("Channel (protected input)");
+    expect(showText).toContain("ID: release-channel");
     expect(showText).toContain("Where should this go?");
+    expect(showText).toContain("Deadline:");
+    expect(showText).toContain("Remaining:");
+    expect(showText).toContain(
+      'Protected answer document: {"answers":{"release-channel":{"answers":["<answer>"]}}}',
+    );
     expect(showText).not.toContain("thread-private");
-    expect(showText).not.toContain(record.authority.requestDigest);
 
     const json = capture();
     renderSuccess(
-      { kind: "interaction.show", interaction: record.publicId },
+      { kind: "interaction.show", interaction: record.id },
       { interaction: record },
       true,
       json.output,
@@ -386,29 +424,40 @@ describe("CLI rendering", () => {
     expect(payload.data.interaction).not.toHaveProperty("authority");
     expect(payload.data.interaction).not.toHaveProperty("responseDigest");
     expect(payload.data.interaction).toMatchObject({
-      publicId: record.publicId,
+      id: record.id,
       revision: 2,
       state: "pending",
     });
+
+    const permission: PublicInteraction = {
+      ...record,
+      id: "a0000000-0000-4000-8000-000000000002",
+      kind: "permission_approval",
+      display: {
+        allowsSessionScope: true,
+        kind: "permission_approval",
+        reason: "Needed for the requested task",
+        requested: [{ name: "network" }, { name: "fileSystem" }],
+        summary: "Allow requested permissions",
+      },
+    };
+    const permissionShow = capture();
+    renderSuccess(
+      { kind: "interaction.show", interaction: permission.id },
+      { interaction: permission },
+      false,
+      permissionShow.output,
+    );
+    expect(permissionShow.stdout.join("")).toContain(
+      'Protected grant document: {"permissions":["network","fileSystem"]}',
+    );
   });
 
-  test("redacts secret-bearing MCP URLs from human interaction output", () => {
-    const record: InteractionRecord = {
+  test("renders brokered MCP form input as protected", () => {
+    const record: PublicInteraction = {
       version: 1,
-      publicId: "b0000000-0000-4000-8000-000000000001",
+      id: "b0000000-0000-4000-8000-000000000001",
       sessionId: null,
-      authority: {
-        profileId: "acct_00000000000000000000000000000000",
-        processGeneration: 1,
-        connectionId: "b0000000-0000-4000-8000-000000000002",
-        requestId: { type: "number", value: 1 },
-        method: "mcpServer/elicitation/request",
-        requestDigest: "b".repeat(64),
-        threadId: null,
-        turnId: null,
-        itemId: null,
-        approvalId: null,
-      },
       kind: "mcp_elicitation",
       state: "pending",
       revision: 1,
@@ -417,35 +466,68 @@ describe("CLI rendering", () => {
         kind: "mcp_elicitation",
         summary: "Authorize the server",
         serverName: "example",
-        mode: "url",
-        url: "https://example.com/authorize?secret=SENTINEL",
+        mode: "form",
+        url: null,
         mayContainSecrets: true,
+        fields: [
+          {
+            name: "email",
+            type: "string",
+            required: true,
+            minLength: 3,
+            maxLength: 320,
+            format: "email",
+          },
+          {
+            name: "channel",
+            type: "single_select",
+            required: false,
+            choices: ["stable", "fast"],
+          },
+        ],
       },
-      responseDigest: null,
+      responseRecorded: false,
+      context: { turnId: null, itemId: null },
       requestedAt: 1,
+      deadlineAt: Date.now() + 60_000,
       updatedAt: 1,
       terminalAt: null,
     };
     const target = capture();
     renderSuccess(
-      { kind: "interaction.show", interaction: record.publicId },
+      { kind: "interaction.show", interaction: record.id },
       record,
       false,
       target.output,
     );
-    expect(target.stdout.join("")).toContain("URL: protected");
+    expect(target.stdout.join("")).toContain("Input: protected");
+    expect(target.stdout.join("")).toContain("email: string, required, 3..320 characters, format email");
+    expect(target.stdout.join("")).toContain("channel: single select, optional, choices stable, fast");
+    expect(target.stdout.join("")).toContain('{"content":{...}}');
     expect(target.stdout.join("")).not.toContain("SENTINEL");
     const json = capture();
     renderSuccess(
-      { kind: "interaction.show", interaction: record.publicId },
+      { kind: "interaction.show", interaction: record.id },
       record,
       true,
       json.output,
     );
     expect(json.stdout.join("")).not.toContain("SENTINEL");
-    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
-      data: { interaction: { display: { url: null, mayContainSecrets: true } } },
+    const payload = JSON.parse(json.stdout.join("")) as {
+      data: { interaction: { display: { fields?: unknown; url: unknown; mayContainSecrets: unknown } } };
+    };
+    expect(payload).toMatchObject({
+      data: {
+        interaction: {
+          display: {
+            url: null,
+            mayContainSecrets: true,
+          },
+        },
+      },
     });
+    if (record.display.kind !== "mcp_elicitation") throw new Error("Expected MCP display.");
+    expect(payload.data.interaction.display.fields).toEqual(record.display.fields);
   });
 
   test("serializes undefined output as JSON null instead of throwing", () => {
@@ -454,11 +536,52 @@ describe("CLI rendering", () => {
     expect(target.stdout).toEqual(["null\n"]);
   });
 
+  test("bounds and redacts error diagnostics in human and JSON output", () => {
+    const secret = "token=do-not-print";
+    const attack = `provider failed at /private/runtime ${secret}\u001b]52;c;attack\u0007`;
+    for (const json of [false, true]) {
+      const target = capture();
+      renderFailure({
+        code: "UNAVAILABLE",
+        message: attack,
+        details: { diagnostic: attack },
+      }, json, target.output);
+      const rendered = [...target.stdout, ...target.stderr].join("");
+      expect(rendered).not.toContain("do-not-print");
+      expect(rendered).not.toContain("/private/runtime");
+      expect(rendered).not.toContain("\u001b");
+      expect(rendered).not.toContain("\u0007");
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).toContain("[local-path]");
+    }
+
+    const internal = capture();
+    renderFailure({ code: "INTERNAL", message: attack, details: { secret: attack } }, true, internal.output);
+    const payload = JSON.parse(internal.stdout.join("")) as { error: Record<string, unknown> };
+    expect(payload.error).toEqual({
+      code: "INTERNAL",
+      message: "HRA could not complete the request safely.",
+    });
+  });
+
   test("renders historical usage health and velocity without dumping provider payloads", () => {
     const target = capture();
     renderSuccess(
       { account: "work", kind: "account.usage", refresh: false },
       {
+        refresh: {
+          accountLimit: 32,
+          concurrency: 4,
+          outcomes: [
+            { accountId: "acct_00000000000000000000000000000000", state: "refreshed" },
+            {
+              accountId: "acct_11111111111111111111111111111111",
+              accountState: "signed_out",
+              reason: "not_signed_in",
+              state: "skipped",
+            },
+          ],
+        },
         usage: [{
           account: { id: "acct_00000000000000000000000000000000", label: "Work" },
           poll: { observedAt: 1_700_000_000_000, sourceRevision: 4, state: "observed" },
@@ -485,6 +608,9 @@ describe("CLI rendering", () => {
     expect(rendered).toContain("lifetime tokens: 12,345");
     expect(rendered).toContain("primary limit used: 27.5%");
     expect(rendered).toContain("1m 42.3 tokens/min");
+    expect(rendered).toContain("Refresh outcomes");
+    expect(rendered).toContain("acct_00000000000000000000000000000000: refreshed");
+    expect(rendered).toContain("acct_11111111111111111111111111111111: skipped (signed_out)");
     expect(rendered).toContain("5m unavailable (insufficient_history)");
     expect(rendered).not.toContain("must-not-render");
   });

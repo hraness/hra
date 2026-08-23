@@ -10,6 +10,16 @@ import {
 } from "./parser";
 
 describe("CLI parser", () => {
+  test("parses exact pending-login cancellation without accepting provider authority on argv", () => {
+    expect(parseCli(["account", "login-cancel", "personal", "--json"])).toEqual({
+      command: { kind: "account.login-cancel", account: "personal" },
+      json: true,
+      kind: "command",
+    });
+    expect(() => parseCli(["account", "login-cancel", "personal", "provider-login-id"]))
+      .toThrow(CliUsageError);
+  });
+
   test("maps the recommended session controls", () => {
     expect(parseCli(["session", "start", "work", "--preset", "ultra", "--fast"])).toMatchObject({ kind: "command", command: { kind: "session.start", account: "work", preset: "ultra", fast: true } });
     expect(() => parseCli(["session", "start", "work", "--message", "ship it"])).toThrow("Unexpected argument");
@@ -71,6 +81,26 @@ describe("CLI parser", () => {
 
   test("rejects unknown flags instead of ignoring them", () => {
     expect(() => parseCli(["account", "list", "--surprise"])).toThrow(CliUsageError);
+  });
+
+  test("never repeats unknown argv values in usage errors", () => {
+    const protectedLookingValue = "token=do-not-repeat\u001b]52;c;attack\u0007";
+    for (const argv of [
+      [protectedLookingValue],
+      ["account", protectedLookingValue],
+      ["account", "list", protectedLookingValue],
+      ["account", "add", "work", `--${protectedLookingValue}`],
+    ]) {
+      try {
+        parseCli(argv);
+        throw new Error("Expected argv rejection.");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(CliUsageError);
+        expect((error as Error).message).not.toContain("do-not-repeat");
+        expect((error as Error).message).not.toContain("\u001b");
+        expect((error as Error).message).not.toContain("\u0007");
+      }
+    }
   });
 
   test("keeps destructive local profile and project deletion out of the beta surface", () => {
@@ -399,10 +429,8 @@ describe("CLI parser", () => {
       jsonl: true,
       kind: "session.events.follow",
     });
-    expect(parseCli(["session", "events", "release", "--follow", "--json"])).toMatchObject({
-      jsonl: true,
-      kind: "session.events.follow",
-    });
+    expect(() => parseCli(["session", "events", "release", "--follow", "--json"]))
+      .toThrow("already JSON Lines");
     expect(parseCli(["session", "interactions", "release", "--pending", "--limit", "12"]))
       .toEqual({
         command: {
@@ -562,17 +590,27 @@ describe("CLI parser", () => {
       throw new Error("Expected protected permission resolution.");
     }
     expect(completeProtectedInteraction(grant, {
-      permissions: { filesystem: { write: true } },
+      permissions: ["filesystem"],
     })).toEqual({
       expectedRevision: 7,
       interaction,
       kind: "interaction.resolve",
       resolution: {
         kind: "permission_grant",
-        permissions: { filesystem: { write: true } },
+        permissions: ["filesystem"],
         scope: "session",
       },
     });
+    for (const document of [
+      null,
+      {},
+      { permissions: {} },
+      { permissions: [] },
+      { permissions: ["filesystem", "filesystem"] },
+      { permissions: ["filesystem"], extra: true },
+    ]) {
+      expect(() => completeProtectedInteraction(grant, document)).toThrow(CliUsageError);
+    }
 
     const answer = parseCli([
       "interaction",
@@ -622,7 +660,6 @@ describe("CLI parser", () => {
       null,
       {},
       { answers: {}, extra: true },
-      { permissions: {} },
       { answers: { question_1: { answers: [1] } } },
     ]) {
       expect(() => completeProtectedInteraction(answer, document)).toThrow(CliUsageError);

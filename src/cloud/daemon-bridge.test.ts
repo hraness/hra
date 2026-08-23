@@ -27,14 +27,16 @@ import {
   type CloudDaemonJournalInputState,
   type CloudDaemonJournalObservation,
   type CloudDaemonJournalPort,
+  type CloudProjectionRecoveryBaselineInteraction,
 } from "./daemon-journal";
 import type { CloudSecretCustodyPort } from "./local-control";
 import { PollingCloudDaemonLifecycle } from "./daemon-lifecycle";
 import { hmacSha256Hex, sha256Hex } from "./crypto";
 import { encryptRemoteCommand, type RemoteCommandPayload } from "./payloads";
-import type { CompactSessionEvent } from "./projection";
+import { encryptCompactEvents, type CompactSessionEvent } from "./projection";
 
 const fixedNow = 1_900_000_000_000;
+const usageServerAdmissionMinIntervalMs = 24 * 60 * 60 * 1_000;
 const userPublicId = "user_12345678";
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
 
@@ -114,6 +116,7 @@ class FakeCloud {
   failUsageAccountAfterEffectOnce = false;
   failUsageAccountBeforeEffectOnce = false;
   failUsageSnapshotAfterEffectOnce = false;
+  failUsageSnapshotAfterEffectRevision: number | null = null;
   failPresenceAfterEffectOnce = false;
   failPresenceBeforeEffectOnce = false;
   stallPresenceDisconnect = false;
@@ -147,6 +150,13 @@ class FakeCloud {
     sourceGeneration: number;
   }>();
   readonly snapshots = new Map<string, { digest: string; sourceRevision: number }>();
+  readonly usageAdmissions = new Map<string, {
+    digest: string;
+    disposition: "coalesced" | "stored";
+    lastAcceptedAt: number;
+    observedAt: number;
+    sourceRevision: number;
+  }>();
   readonly snapshotAttempts: Array<Readonly<{
     accountPublicId: string;
     sourceRevision: number;
@@ -494,30 +504,70 @@ class FakeCloud {
         }
         if (name === "usage:upsertSnapshot") {
           const accountPublicId = args.accountPublicId as string;
+          const sourceGeneration = args.sourceGeneration as number;
           const sourceRevision = args.sourceRevision as number;
           const digest = args.digest as string;
           const observedAt = args.observedAt as number;
+          if (this.accounts.get(accountPublicId)?.sourceGeneration !== sourceGeneration) {
+            throw new Error("usage snapshot generation conflict");
+          }
           this.snapshotAttempts.push({ accountPublicId, sourceRevision });
-          const exactKey = `${accountPublicId}:${sourceRevision}`;
+          const admissionKey = `${accountPublicId}:${devicePublicId}`;
+          const exactKey = `${admissionKey}:${sourceRevision}`;
           const exact = this.snapshotCommits.get(exactKey);
           if (
             exact !== undefined
             && (exact.digest !== digest || exact.observedAt !== observedAt)
           ) throw new Error("usage snapshot conflict");
-          if (exact === undefined) {
-            const latest = this.snapshots.get(accountPublicId);
-            if (latest !== undefined && sourceRevision < latest.sourceRevision) {
+          const admission = this.usageAdmissions.get(admissionKey);
+          let disposition: "coalesced" | "replace" | "replay";
+          if (exact !== undefined) {
+            disposition = "replay";
+          } else if (admission !== undefined && sourceRevision === admission.sourceRevision) {
+            if (admission.digest !== digest || admission.observedAt !== observedAt) {
+              throw new Error("usage snapshot conflict");
+            }
+            disposition = admission.disposition === "coalesced" ? "coalesced" : "replay";
+          } else {
+            if (admission !== undefined && sourceRevision < admission.sourceRevision) {
               throw new Error("usage snapshot stale");
             }
-            this.snapshotCommits.set(exactKey, { digest, observedAt });
-            this.snapshots.set(accountPublicId, { digest, sourceRevision });
+            if (
+              admission !== undefined
+              && this.now - admission.lastAcceptedAt < usageServerAdmissionMinIntervalMs
+            ) {
+              this.usageAdmissions.set(admissionKey, {
+                digest,
+                disposition: "coalesced",
+                lastAcceptedAt: admission.lastAcceptedAt,
+                observedAt,
+                sourceRevision,
+              });
+              disposition = "coalesced";
+            } else {
+              const lastAcceptedAt = this.now;
+              this.usageAdmissions.set(admissionKey, {
+                digest,
+                disposition: "stored",
+                lastAcceptedAt,
+                observedAt,
+                sourceRevision,
+              });
+              this.snapshotCommits.set(exactKey, { digest, observedAt });
+              this.snapshots.set(accountPublicId, { digest, sourceRevision });
+              disposition = "replace";
+            }
           }
-          if (this.failUsageSnapshotAfterEffectOnce) {
+          if (
+            this.failUsageSnapshotAfterEffectOnce
+            || this.failUsageSnapshotAfterEffectRevision === sourceRevision
+          ) {
             this.failUsageSnapshotAfterEffectOnce = false;
+            this.failUsageSnapshotAfterEffectRevision = null;
             throw new Error("lost usage snapshot response");
           }
           return {
-            disposition: exact === undefined ? "replace" : "replay",
+            disposition,
             sourceRevision,
           };
         }
@@ -675,6 +725,8 @@ class FakeCloud {
                   encryptedLocalReference: account.encryptedLocalReference,
                   sourceGeneration: account.sourceGeneration,
                   state: "present",
+                  usageSourceRevision: this.usageAdmissions
+                    .get(`${publicId}:${devicePublicId}`)?.sourceRevision ?? 0,
                 },
                 encryptedMetadata: account.encryptedMetadata,
                 matchKey: account.matchKey,
@@ -919,19 +971,27 @@ type RecoveryActivateInput = Parameters<NonNullable<
 >>[0];
 
 class RecoveryLocal extends EmptyLocal {
+  afterStage?: () => Promise<void>;
   activateCalls = 0;
   activated = false;
+  baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[] = [];
+  expectedBoundaryHeadSequence = 3;
   failActivationAfterEffectOnce = false;
+  observedInteractionIds: readonly string[] = [];
   planCalls = 0;
   stageCalls = 0;
   stageAuthorityCurrent = true;
   staged = false;
+  terminal = false;
+  readonly discardedRecoveryKeys: string[] = [];
 
   async planCompactProjectionRecovery(input: RecoveryPlanInput) {
     this.planCalls += 1;
     if (input.sessionPublicId !== this.sessionPublicId) throw new Error("wrong session");
+    this.observedInteractionIds = input.observedInteractionIds;
     return {
       baselineCompletedTurns: [{ bodyDigest: "a".repeat(64), turnId: "turn_12345678" }],
+      baselineInteractions: this.baselineInteractions,
       localAuthority: {
         profileGeneration: 1,
         profileId: "account_12345678",
@@ -950,10 +1010,11 @@ class RecoveryLocal extends EmptyLocal {
     if (!this.stageAuthorityCurrent) throw new Error("recovery local authority changed");
     if (
       input.sessionPublicId !== this.sessionPublicId
-      || input.boundaryHeadSequence !== 3
+      || input.boundaryHeadSequence !== this.expectedBoundaryHeadSequence
       || input.compactStreamEpoch !== 1
     ) throw new Error("invalid recovery stage");
     this.staged = true;
+    await this.afterStage?.();
   }
 
   async activateCompactProjectionRecovery(input: RecoveryActivateInput) {
@@ -966,6 +1027,16 @@ class RecoveryLocal extends EmptyLocal {
       this.failActivationAfterEffectOnce = false;
       throw new Error("lost cache activation acknowledgement");
     }
+  }
+
+  discardCompactProjectionRecovery(input: { idempotencyKey: string }): Promise<void> {
+    this.discardedRecoveryKeys.push(input.idempotencyKey);
+    this.staged = false;
+    return Promise.resolve();
+  }
+
+  isSessionTerminal(sessionPublicId: string): boolean {
+    return sessionPublicId === this.sessionPublicId && this.terminal;
   }
 }
 
@@ -1209,9 +1280,39 @@ const events: CompactSessionEvent[] = [
   },
 ];
 
-function installRecoverableHead(cloud: FakeCloud, sessionPublicId: string): void {
+async function installRecoverableHead(
+  cloud: FakeCloud,
+  sessionPublicId: string,
+  compactEvents: readonly CompactSessionEvent[] = events,
+): Promise<void> {
+  const authority = {
+    bootGeneration: 1,
+    bootId: "boot_12345678",
+    fence: 1,
+  } as const;
+  cloud.chunks.set(sessionPublicId, [{
+    authority,
+    createdAt: fixedNow,
+    digest: "f".repeat(64),
+    envelope: await encryptCompactEvents(compactEvents, key, {
+      firstSequence: 1,
+      keyVersion: 1,
+      lastSequence: compactEvents.length,
+      sessionPublicId,
+      sourceBootId: authority.bootId,
+      sourceDevicePublicId: "device_11111111",
+      sourceFence: authority.fence,
+      stream: "compact",
+      userPublicId,
+    }),
+    firstSequence: 1,
+    lastSequence: compactEvents.length,
+    sourceDevicePublicId: "device_11111111",
+    stream: "compact",
+    streamEpoch: 0,
+  }]);
   cloud.heads.set(sessionPublicId, {
-    compactHeadSequence: 3,
+    compactHeadSequence: compactEvents.length,
     compactTailDigest: "f".repeat(64),
     createdAt: fixedNow,
     detailHeadSequence: 0,
@@ -1805,7 +1906,7 @@ describe("cloud daemon bridge", () => {
   test("begins one compact epoch, activates its cache, and replays the same key exactly", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0001";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const daemon = bridge({ cloud, device: "device_11111111", local });
     const input = {
@@ -1845,7 +1946,7 @@ describe("cloud daemon bridge", () => {
   test("appends post-recovery events at the global sequence under the new epoch", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0005";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryUploadingLocal(sessionPublicId);
     const daemon = bridge({ cloud, device: "device_11111111", local });
     await daemon.recoverCompactProjection({
@@ -1878,7 +1979,7 @@ describe("cloud daemon bridge", () => {
   test("recovers a prepared journal acknowledgement loss without rebaselining", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0002";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const journal = new CommitThenThrowPreparedRecoveryJournal();
     const daemon = bridge({ cloud, device: "device_11111111", journal, local });
@@ -1899,11 +2000,158 @@ describe("cloud daemon bridge", () => {
     expect(cloud.epochBegins).toBe(1);
   });
 
+  test("provider deletion fences recovery between staging and journal admission", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_recover_delete_race_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new MemoryCloudDaemonJournal();
+    const daemon = bridge({ cloud, device: "device_11111111", journal, local });
+    let entered!: () => void;
+    const staged = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    local.afterStage = async () => {
+      entered();
+      await gate;
+    };
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(912),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+    const recovery = daemon.recoverCompactProjection(input);
+    await staged;
+    local.terminal = true;
+
+    expect(await daemon.supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId))
+      .toEqual({ superseded: false });
+    release();
+    await expect(recovery).resolves.toEqual({
+      idempotencyKey: input.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: "PROVIDER_THREAD_DELETED",
+      sessionPublicId,
+    });
+    expect(cloud.epochMutationCalls).toBe(0);
+    expect(local.activateCalls).toBe(0);
+    expect(local.discardedRecoveryKeys).toContain(input.idempotencyKey);
+    expect((await journal.read()).state).toMatchObject({
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [{
+        idempotencyKey: input.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: "PROVIDER_THREAD_DELETED",
+        sessionPublicId,
+      }],
+    });
+  });
+
+  test("reopened terminal authority supersedes an effect-started recovery without replay", async () => {
+    const cloud = new FakeCloud();
+    cloud.failEpochAfterEffectOnce = true;
+    const sessionPublicId = "session_recover_delete_restart_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new MemoryCloudDaemonJournal();
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(913),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+    const original = bridge({ cloud, device: "device_11111111", journal, local });
+    await expect(original.recoverCompactProjection(input)).rejects.toThrow(
+      "lost compact epoch response",
+    );
+    expect((await journal.read()).state.projectionRecoveries[0]?.phase)
+      .toBe("effect_started");
+    const mutationCalls = cloud.epochMutationCalls;
+    local.terminal = true;
+    const restarted = bridge({ cloud, device: "device_11111111", journal, local });
+
+    expect(await restarted.supersedeTerminalCompactProjectionRecoveries())
+      .toEqual({ superseded: 1 });
+    expect(await restarted.recoverCompactProjection(input)).toEqual({
+      idempotencyKey: input.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: "PROVIDER_THREAD_DELETED",
+      sessionPublicId,
+    });
+    expect(cloud.epochMutationCalls).toBe(mutationCalls);
+    expect(local.activateCalls).toBe(0);
+    expect((await journal.read()).state.projectionRecoveries).toEqual([]);
+  });
+
+  test("crash-replays a terminal local revision for an interaction observed only in old cloud", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_recover_interaction_0001";
+    const interactionId = "70000000-0000-4000-8000-000000000201";
+    await installRecoverableHead(cloud, sessionPublicId, [
+      ...events,
+      {
+        blocking: true,
+        interactionId,
+        interactionKind: "user_input",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 4,
+        state: "pending",
+        summary: "Codex needs user input",
+      },
+    ]);
+    const local = new RecoveryLocal(sessionPublicId);
+    local.expectedBoundaryHeadSequence = 4;
+    local.baselineInteractions = [{
+      blocking: true,
+      interactionId,
+      interactionKind: "user_input",
+      revision: 2,
+      state: "resolved",
+      summary: "Interaction state updated",
+    }];
+    const journal = new CommitThenThrowPreparedRecoveryJournal();
+    const daemon = bridge({ cloud, device: "device_11111111", journal, local });
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(911),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+
+    await expect(daemon.recoverCompactProjection(input)).rejects.toThrow(
+      "lost prepared journal acknowledgement",
+    );
+    expect(local.observedInteractionIds).toEqual([interactionId]);
+    const prepared = (await journal.read()).state.projectionRecoveries[0];
+    expect(prepared).toMatchObject({
+      baselineInteractions: local.baselineInteractions,
+      phase: "prepared",
+    });
+    const privatePath = ["", "Users", "alice", "private"].join("/");
+    for (const privateValue of [
+      privatePath,
+      "provider/request/private",
+      "secret answer",
+      "https://private.example/mcp",
+      "f".repeat(64),
+    ]) expect(JSON.stringify(prepared?.baselineInteractions)).not.toContain(privateValue);
+
+    expect(await daemon.recoverCompactProjection(input)).toMatchObject({
+      boundaryHeadSequence: 4,
+      phase: "applied",
+    });
+    expect(local.planCalls).toBe(1);
+    expect(local.stageCalls).toBe(2);
+    expect(cloud.epochBegins).toBe(1);
+  });
+
   test("reconciles a lost epoch response with the exact request and one server epoch", async () => {
     const cloud = new FakeCloud();
     cloud.failEpochAfterEffectOnce = true;
     const sessionPublicId = "session_recover_0003";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const journal = new MemoryCloudDaemonJournal();
     const daemon = bridge({ cloud, device: "device_11111111", journal, local });
@@ -1937,7 +2185,7 @@ describe("cloud daemon bridge", () => {
     const cloud = new FakeCloud();
     cloud.failEpochAfterEffectOnce = true;
     const sessionPublicId = "session_recover_authority_0001";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const journal = new MemoryCloudDaemonJournal();
     const daemon = bridge({ cloud, device: "device_11111111", journal, local });
@@ -1969,7 +2217,7 @@ describe("cloud daemon bridge", () => {
       const cloud = new FakeCloud();
       cloud.failEpochAfterEffectOnce = true;
       const sessionPublicId = `session_recover_identity_${mismatch}_0001`;
-      installRecoverableHead(cloud, sessionPublicId);
+      await installRecoverableHead(cloud, sessionPublicId);
       const local = new RecoveryLocal(sessionPublicId);
       const journal = new MemoryCloudDaemonJournal();
       const original = bridge({ cloud, device: "device_11111111", journal, local });
@@ -2012,7 +2260,7 @@ describe("cloud daemon bridge", () => {
     const cloud = new FakeCloud();
     cloud.failEpochAfterEffectOnce = true;
     const sessionPublicId = "session_recover_0006";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const executor = new RecordingExecutor();
     const daemon = bridge({
@@ -2054,7 +2302,7 @@ describe("cloud daemon bridge", () => {
   test("replays cache activation after its acknowledgement is lost without reopening the epoch", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0004";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     local.failActivationAfterEffectOnce = true;
     const journal = new CommitThenThrowTerminalRecoveryJournal();
@@ -2139,6 +2387,105 @@ describe("cloud daemon bridge", () => {
       sessionPublicId,
     }]);
     expect(cloud.requireCommand(commandPublicId).state).toBe("applied");
+  });
+
+  test("defers terminal state until a late interaction revision clears the compact backlog", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_terminal_backlog";
+    const interactionId = "70000000-0000-4000-8000-000000000001";
+    const backlog: CompactSessionEvent[] = [
+      {
+        blocking: true,
+        interactionId,
+        interactionKind: "user_input",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 1,
+        state: "pending",
+        summary: "Codex needs user input",
+      },
+      ...Array.from({ length: 127 }, (_, index): CompactSessionEvent => ({
+        kind: "assistant_message",
+        sequence: index + 2,
+        text: `Backlog event ${String(index + 1)}`,
+        turnId: `turn_backlog_${String(index + 1).padStart(4, "0")}`,
+      })),
+      {
+        blocking: true,
+        interactionId,
+        interactionKind: "user_input",
+        kind: "interaction_state",
+        revision: 2,
+        sequence: 129,
+        state: "resolved",
+        summary: "Codex needs user input",
+      },
+    ];
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new FakeLocal(sessionPublicId, backlog, "terminal"),
+    });
+
+    const first = await daemon.cycle(new AbortController().signal);
+    expect(first.errors).toEqual([]);
+    expect(first.sessionsUploaded).toBe(1);
+    expect(cloud.requireHead(sessionPublicId)).toMatchObject({
+      compactHeadSequence: 128,
+      state: "active",
+    });
+
+    const second = await daemon.cycle(new AbortController().signal);
+    expect(second.errors).toEqual([]);
+    expect(second.sessionsUploaded).toBe(1);
+    expect(cloud.requireHead(sessionPublicId)).toMatchObject({
+      compactHeadSequence: 129,
+      state: "terminal",
+    });
+    expect(second.remoteSessions[0]?.events.at(-1)).toMatchObject({
+      interactionId,
+      kind: "interaction_state",
+      revision: 2,
+      sequence: 129,
+      state: "resolved",
+    });
+
+    const lateInteractionId = "70000000-0000-4000-8000-000000000002";
+    backlog.push(
+      {
+        blocking: true,
+        interactionId: lateInteractionId,
+        interactionKind: "permission_approval",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 130,
+        state: "pending",
+        summary: "Codex requests additional permissions",
+      },
+      {
+        blocking: true,
+        interactionId: lateInteractionId,
+        interactionKind: "permission_approval",
+        kind: "interaction_state",
+        revision: 2,
+        sequence: 131,
+        state: "expired",
+        summary: "Codex requests additional permissions",
+      },
+    );
+    const third = await daemon.cycle(new AbortController().signal);
+    expect(third.errors).toEqual([]);
+    expect(third.sessionsUploaded).toBe(1);
+    expect(cloud.requireHead(sessionPublicId)).toMatchObject({
+      compactHeadSequence: 131,
+      state: "terminal",
+    });
+    expect(third.remoteSessions[0]?.events.at(-1)).toMatchObject({
+      interactionId: lateInteractionId,
+      revision: 2,
+      sequence: 131,
+      state: "expired",
+    });
   });
 
   test("resolves a local session by exact ID beyond the newest 25 cloud heads", async () => {
@@ -2369,10 +2716,53 @@ describe("cloud daemon bridge", () => {
     expect((await restarted.cycle(new AbortController().signal)).errors).toEqual([]);
 
     expect(cloud.usageAccountAttempts).toHaveLength(1);
-    expect((await replacementJournal.read()).state.usageAccounts).toHaveLength(1);
+    expect((await replacementJournal.read()).state.usageAccounts).toEqual([
+      expect.objectContaining({ sourceGeneration: 1, sourceRevision: 1 }),
+    ]);
+    expect(cloud.snapshotAttempts.map((attempt) => attempt.sourceRevision)).toEqual([1]);
   });
 
-  test("drains more than 200 offline usage samples in exact order across restart and a lost response", async () => {
+  test("retries a lost coalesced receipt without storing or rotating its revision", async () => {
+    const cloud = new FakeCloud();
+    const journal = new MemoryCloudDaemonJournal();
+    const local = new UsageBacklogLocal([{
+      localReference: "account_local_coalesced",
+      matchReference: "coalesced@example.com",
+      revisions: 2,
+    }]);
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      journal,
+      local,
+    });
+    cloud.failUsageSnapshotAfterEffectRevision = 2;
+
+    const lost = await daemon.cycle(new AbortController().signal);
+
+    expect(lost.usageUploaded).toBe(1);
+    expect(lost.errors.join(" ")).toContain("lost usage snapshot response");
+    expect((await journal.read()).state.usageAccounts).toEqual([
+      expect.objectContaining({ sourceRevision: 1 }),
+    ]);
+    expect([...cloud.usageAdmissions.values()].map((entry) => ({
+      disposition: entry.disposition,
+      sourceRevision: entry.sourceRevision,
+    }))).toEqual([{ disposition: "coalesced", sourceRevision: 2 }]);
+
+    const replayed = await daemon.cycle(new AbortController().signal);
+
+    expect(replayed.errors).toEqual([]);
+    expect(replayed.usageUploaded).toBe(1);
+    expect(cloud.snapshotAttempts.map((attempt) => attempt.sourceRevision)).toEqual([1, 2, 2]);
+    expect(cloud.snapshotCommits.size).toBe(1);
+    expect((await journal.read()).state.usageAccounts).toEqual([
+      expect.objectContaining({ sourceRevision: 2 }),
+    ]);
+    await daemon.close();
+  });
+
+  test("drains and coalesces more than 200 offline usage samples across restart and a lost response", async () => {
     const cloud = new FakeCloud();
     const journal = new MemoryCloudDaemonJournal();
     const local = new UsageBacklogLocal([{
@@ -2417,7 +2807,11 @@ describe("cloud daemon bridge", () => {
       1,
       ...Array.from({ length: 205 }, (_, index) => index + 1),
     ]);
-    expect(cloud.snapshotCommits.size).toBe(205);
+    expect(cloud.snapshotCommits.size).toBe(1);
+    expect([...cloud.usageAdmissions.values()].map((entry) => ({
+      disposition: entry.disposition,
+      sourceRevision: entry.sourceRevision,
+    }))).toEqual([{ disposition: "coalesced", sourceRevision: 205 }]);
     expect((await journal.read()).state.usageAccounts).toEqual([
       expect.objectContaining({ sourceGeneration: 1, sourceRevision: 205 }),
     ]);
@@ -2508,7 +2902,7 @@ describe("cloud daemon bridge", () => {
   test("rejects a saturated command journal before prepare or local provider effect", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_capacity_0001";
-    installRecoverableHead(cloud, sessionPublicId);
+    await installRecoverableHead(cloud, sessionPublicId);
     const commandPublicId = uuidV7(4_200);
     await cloud.enqueue(
       "device_requester_12345678",

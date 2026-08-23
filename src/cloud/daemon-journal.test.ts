@@ -19,9 +19,11 @@ import {
   parseCloudDaemonJournal,
   parseCloudProjectionRecoveryEntry,
   parseCloudProjectionRecoveryTerminalReceipt,
+  providerDeletionProjectionRecoveryCode,
   pruneExpiredCloudProjectionRecoveryReceipts,
   sameCloudProjectionRecoveryEntry,
   sameCloudProjectionRecoveryTerminalReceipt,
+  supersedeCloudProjectionRecoveryForProviderDeletion,
   terminalizeUnreservedPreparedCloudCommands,
   transitionCloudProjectionRecovery,
   transitionCloudCommandJournalEntry,
@@ -472,6 +474,60 @@ describe("cloud daemon journal", () => {
     ));
   });
 
+  test("crash-journals only the bounded public interaction baseline exactly", () => {
+    const baselineInteraction = {
+      blocking: true,
+      interactionId: "70000000-0000-4000-8000-000000000001",
+      interactionKind: "mcp_elicitation",
+      revision: 2,
+      state: "expired",
+      summary: "Interaction state updated",
+    } as const;
+    const prepared = {
+      ...recovery(70, "prepared"),
+      baselineInteractions: [baselineInteraction],
+    } as const;
+    const persisted = parseCloudDaemonJournal(jsonClone(stateWith([prepared])));
+    expect(persisted.projectionRecoveries).toEqual([prepared]);
+    expect(parseCloudProjectionRecoveryEntry(
+      jsonClone(persisted.projectionRecoveries[0]),
+    )).toEqual(prepared);
+
+    const privatePath = ["", "Users", "alice", "private"].join("/");
+    const privateValues = [
+      "provider_thread_private",
+      "https://private.example/mcp",
+      "sk_secret_answer",
+      privatePath,
+      digest("f"),
+    ];
+    expect(privateValues.every((value) =>
+      !JSON.stringify(persisted.projectionRecoveries[0]?.baselineInteractions).includes(value)))
+      .toBe(true);
+
+    for (const corrupt of [
+      { ...baselineInteraction, providerPath: privatePath },
+      { ...baselineInteraction, summary: privatePath },
+      { ...baselineInteraction, summary: "Bearer sk_secret_answer" },
+      { ...baselineInteraction, revision: 0 },
+    ]) {
+      expect(() => parseCloudProjectionRecoveryEntry({
+        ...prepared,
+        baselineInteractions: [corrupt],
+      })).toThrow("Cloud daemon journal is corrupt.");
+    }
+    expect(() => parseCloudProjectionRecoveryEntry({
+      ...prepared,
+      baselineInteractions: Array.from(
+        { length: 201 },
+        (_, index) => ({
+          ...baselineInteraction,
+          interactionId: `70000000-0000-4000-8000-${index.toString().padStart(12, "0")}`,
+        }),
+      ),
+    })).toThrow("Cloud daemon journal is corrupt.");
+  });
+
   test("round-trips compact terminal receipts", () => {
     for (const phase of ["applied", "rejected"] as const) {
       const original = terminalReceipt(7, phase);
@@ -804,6 +860,33 @@ describe("cloud daemon journal", () => {
         sessionPublicId: rejectedActive.sessionPublicId,
       }),
     );
+  });
+
+  test("terminal provider deletion supersedes every active recovery phase idempotently", () => {
+    for (const phase of ["prepared", "effect_started", "applied"] as const) {
+      const active = recovery(230 + phase.length, phase);
+      const superseded = supersedeCloudProjectionRecoveryForProviderDeletion(
+        stateWith([active]),
+        active.sessionPublicId,
+        fixedNow + 500,
+      );
+      expect(superseded.projectionRecoveries).toEqual([]);
+      expect(superseded.projectionRecoveryReceipts).toEqual([
+        expect.objectContaining({
+          idempotencyKey: active.idempotencyKey,
+          phase: "rejected",
+          rejectionCode: providerDeletionProjectionRecoveryCode,
+          sessionPublicId: active.sessionPublicId,
+        }),
+      ]);
+      expect(supersedeCloudProjectionRecoveryForProviderDeletion(
+        superseded,
+        active.sessionPublicId,
+        fixedNow + 501,
+      )).toEqual(superseded);
+      expect(parseCloudDaemonJournal(JSON.parse(JSON.stringify(superseded))))
+        .toEqual(superseded);
+    }
   });
 
   test("retains an aged active recovery result for a full window after terminal CAS", () => {
@@ -1283,6 +1366,19 @@ describe("cloud daemon journal", () => {
       entry.accountPublicId === pending.accountPublicId)).toBe(true);
     expect(completed.usageAccounts.some((entry) =>
       entry.accountPublicId === "account_00000000")).toBe(false);
+
+    const advancedPending = { ...pending, sourceGeneration: 2, sourceRevision: 5 };
+    const advancedState = parseCloudDaemonJournal({
+      ...legacy,
+      pendingUsageAccount: advancedPending,
+    });
+    expect(completePendingCloudUsageAccount(advancedState, advancedPending, 3, 8)
+      .usageAccounts.find((entry) => entry.accountPublicId === pending.accountPublicId))
+      .toMatchObject({ sourceGeneration: 3, sourceRevision: 8 });
+    expect(() => completePendingCloudUsageAccount(advancedState, advancedPending, 1, 8))
+      .toThrow("Cloud usage account cursor regressed.");
+    expect(() => completePendingCloudUsageAccount(advancedState, advancedPending, 3, 4))
+      .toThrow("Cloud usage account cursor regressed.");
   });
 
   test("rejects custody payloads above the production byte bound before decoding", async () => {
@@ -1344,5 +1440,31 @@ describe("cloud daemon journal", () => {
     expect(await reopened.isCompactProjectionRecoveryUnsettledForProfile(
       pending.localAuthority.profileId,
     )).toBe(false);
+  });
+
+  test("a reopened blocker supersedes only recoveries whose local session is terminal", async () => {
+    const custody = new MemoryCustody();
+    const writer = new CustodyCloudDaemonJournal(custody);
+    const terminal = recovery(240, "effect_started");
+    const active = recovery(241, "prepared");
+    expect(await writer.compareAndSwap(null, stateWith([terminal, active])))
+      .not.toBeNull();
+
+    const reopened = new CloudDaemonJournalRecoveryBlocker(
+      new CustodyCloudDaemonJournal(custody),
+      { isSessionTerminal: (sessionPublicId) => sessionPublicId === terminal.sessionPublicId },
+    );
+    expect(await reopened.supersedeTerminalCompactProjectionRecoveries())
+      .toEqual({ superseded: 1 });
+    const observed = (await writer.read()).state;
+    expect(observed.projectionRecoveries).toEqual([active]);
+    expect(observed.projectionRecoveryReceipts).toEqual([
+      expect.objectContaining({
+        idempotencyKey: terminal.idempotencyKey,
+        rejectionCode: providerDeletionProjectionRecoveryCode,
+      }),
+    ]);
+    expect(await reopened.supersedeTerminalCompactProjectionRecoveries())
+      .toEqual({ superseded: 0 });
   });
 });

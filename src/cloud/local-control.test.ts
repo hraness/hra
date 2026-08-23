@@ -1442,6 +1442,7 @@ describe("local cloud control", () => {
     const sessionPublicId = "session_12345678";
     const accountPublicId = "account_12345678";
     const digest = "a".repeat(64);
+    const interactionId = "70000000-0000-4000-8000-000000000001";
     const events = [
       {
         kind: "user_message",
@@ -1449,11 +1450,21 @@ describe("local cloud control", () => {
         text: "hello",
         turnId: "turn_12345678",
       },
+      {
+        blocking: true,
+        interactionId,
+        interactionKind: "user_input",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 2,
+        state: "pending",
+        summary: "Codex needs one answer",
+      },
     ] as const;
     const sessionEnvelope = await encryptCompactEvents(events, key, {
       firstSequence: 1,
       keyVersion: 1,
-      lastSequence: 1,
+      lastSequence: 2,
       sessionPublicId,
       sourceBootId: "boot_12345678",
       sourceDevicePublicId: pair.device.publicId,
@@ -1468,7 +1479,7 @@ describe("local cloud control", () => {
       userPublicId,
     });
     cloud.heads = [{
-      compactHeadSequence: 1,
+      compactHeadSequence: 2,
       compactTailDigest: digest,
       createdAt: fixedNow,
       detailHeadSequence: 0,
@@ -1486,7 +1497,7 @@ describe("local cloud control", () => {
       digest,
       envelope: sessionEnvelope,
       firstSequence: 1,
-      lastSequence: 1,
+      lastSequence: 2,
       sourceDevicePublicId: pair.device.publicId,
       stream: "compact",
     }]);
@@ -1519,6 +1530,8 @@ describe("local cloud control", () => {
     const state = custody.values.get("cloud-state")?.value ?? "";
     expect(state).not.toContain("hello");
     expect(state).not.toContain("t".repeat(32));
+    expect(JSON.stringify(sessionEnvelope)).not.toContain(interactionId);
+    expect(JSON.stringify(sessionEnvelope)).not.toContain("Codex needs one answer");
     expect(await adapter.status(signal)).toMatchObject({
       lastSync: { accountCount: 1, sessionCount: 1, usageSnapshotCount: 1 },
     });
@@ -1530,7 +1543,7 @@ describe("local cloud control", () => {
     expect(await adapter.listRemoteSessionHeads({ limit: 25, signal })).toEqual({
       sessions: [{
         compactHasRecoveryGap: false,
-        compactHeadSequence: 1,
+        compactHeadSequence: 2,
         compactStreamEpoch: 0,
         createdAt: fixedNow,
         executionDevicePublicId: pair.device.publicId,
@@ -1560,7 +1573,7 @@ describe("local cloud control", () => {
       publicId: "session_history_0100_end",
     });
     cloud.heads = [cloud.heads[0]!, {
-      compactHeadSequence: 1,
+      compactHeadSequence: 2,
       compactTailDigest: digest,
       createdAt: fixedNow,
       detailHeadSequence: 0,

@@ -2834,6 +2834,14 @@ export class LocalCloudControl implements CloudControlPort {
     return Promise.resolve(false);
   }
 
+  supersedeCompactProjectionRecoveryForProviderDeletion(): Promise<{ superseded: boolean }> {
+    return Promise.resolve({ superseded: false });
+  }
+
+  supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
+    return Promise.resolve({ superseded: 0 });
+  }
+
   async sync(signal: AbortSignal): Promise<unknown> {
     return await this.#exclusive(async () => {
       abortBeforeEffect(signal);

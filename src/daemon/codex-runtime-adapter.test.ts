@@ -57,6 +57,62 @@ const makeThread = (turns: readonly CodexTurn[]): CodexThread => ({
 });
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("preserves the provider login ID and cancels only that exact current-generation login", async () => {
+    const canceled: string[] = [];
+    const fake = {
+      state: "ready",
+      accountRead: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: { account: null, requiresOpenaiAuth: true },
+      }),
+      startManagedLogin: async () => ({
+        authority: { profileId: authority.id, processGeneration: authority.generation },
+        value: {
+          type: "chatgptDeviceCode" as const,
+          loginId: "provider-login-exact",
+          verificationUrl: "https://example.test/device",
+          userCode: "CODE-1234",
+        },
+      }),
+      cancelManagedLogin: async (loginId: string) => {
+        canceled.push(loginId);
+        return {
+          authority: { profileId: authority.id, processGeneration: authority.generation },
+          value: { status: "canceled" as const },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = new PinnedCodexRuntimeManager({
+      isCurrent: (candidate) => candidate.generation === authority.generation,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    await expect(manager.login({
+      authority,
+      method: "device_code",
+      signal: new AbortController().signal,
+    })).resolves.toEqual({
+      status: "pending",
+      loginId: "provider-login-exact",
+      verificationUrl: "https://example.test/device",
+      userCode: "CODE-1234",
+    });
+    await expect(manager.cancelLogin({
+      authority,
+      loginId: "provider-login-exact",
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ status: "canceled" });
+    expect(canceled).toEqual(["provider-login-exact"]);
+    await expect(manager.cancelLogin({
+      authority: { ...authority, generation: authority.generation + 1 },
+      loginId: "wrong-generation",
+      signal: new AbortController().signal,
+    })).rejects.toThrow("Codex account generation is stale.");
+    expect(canceled).toEqual(["provider-login-exact"]);
+    await manager.close();
+  });
+
   test("never relaunches a failed app-server process under its ended generation", async () => {
     let state: CodexAppServerClient["state"] = "ready";
     let launches = 0;
@@ -118,6 +174,7 @@ describe("PinnedCodexRuntimeManager", () => {
   test("routes interaction responses only to the exact live connection and generation", async () => {
     const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
     const calls: unknown[] = [];
+    const validations: unknown[] = [];
     const fake = {
       state: "ready",
       connectionId,
@@ -126,6 +183,18 @@ describe("PinnedCodexRuntimeManager", () => {
         value: { account: { type: "chatgpt", email: "person@example.com", planType: "pro" }, requiresOpenaiAuth: true },
       }),
       resolveInteraction: async (input: unknown) => {
+        calls.push(input);
+        return { responseWritten: true as const };
+      },
+      validateInteractionResolution: async (input: unknown) => {
+        validations.push(input);
+        return { responseDigest: "a".repeat(64) };
+      },
+      validateInteractionTimeout: async (input: unknown) => {
+        validations.push(input);
+        return { responseDigest: "b".repeat(64) };
+      },
+      timeoutInteraction: async (input: unknown) => {
         calls.push(input);
         return { responseWritten: true as const };
       },
@@ -149,6 +218,14 @@ describe("PinnedCodexRuntimeManager", () => {
       itemId: "item-1",
       approvalId: null,
     };
+    await expect(manager.validateInteractionResolution({
+      authority,
+      provider,
+      kind: "file_change_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ responseDigest: "a".repeat(64) });
+    expect(validations).toHaveLength(1);
     await expect(manager.resolveInteraction({
       authority,
       provider,
@@ -157,6 +234,24 @@ describe("PinnedCodexRuntimeManager", () => {
       signal: new AbortController().signal,
     })).resolves.toEqual({ responseWritten: true });
     expect(calls).toHaveLength(1);
+    await expect(manager.validateInteractionTimeout({
+      authority,
+      provider,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ responseDigest: "b".repeat(64) });
+    await expect(manager.timeoutInteraction({
+      authority,
+      provider,
+      signal: new AbortController().signal,
+    })).resolves.toEqual({ responseWritten: true });
+    expect(calls).toHaveLength(2);
+    await expect(manager.validateInteractionResolution({
+      authority,
+      provider: { ...provider, connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c" },
+      kind: "file_change_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await expect(manager.resolveInteraction({
       authority,
       provider: { ...provider, connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c" },
@@ -171,7 +266,7 @@ describe("PinnedCodexRuntimeManager", () => {
       resolution: { kind: "approval_decision", decision: "once" },
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     await manager.close();
   });
 

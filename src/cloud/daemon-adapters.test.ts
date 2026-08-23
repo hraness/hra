@@ -20,7 +20,10 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 import type { LocalCommand } from "../domain/contracts";
-import { createStoredAccountUsageSnapshot } from "../domain/usage-metrics";
+import {
+  createStoredAccountUsageSnapshot,
+  storedAccountUsageSnapshotSchema,
+} from "../domain/usage-metrics";
 import type {
   CodexAccountProjection,
   CodexRuntimePort,
@@ -29,7 +32,10 @@ import type {
   ProfileAuthority,
 } from "../daemon/ports";
 import { initializeStatePaths, resolveStatePaths, type StatePaths } from "../storage/paths";
-import { StateStore } from "../storage/state-store";
+import {
+  USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+  StateStore,
+} from "../storage/state-store";
 import { cloudLimits } from "./contracts";
 import type {
   CloudDaemonBridge,
@@ -64,7 +70,8 @@ class FakeCodex implements CodexRuntimePort {
   };
   usageCalls = 0;
 
-  login(): Promise<{ status: "pending" | "signed_in"; verificationUrl?: string; userCode?: string; account?: CodexAccountProjection }> { return Promise.reject(new Error("unused")); }
+  login(): Promise<never> { return Promise.reject(new Error("unused")); }
+  cancelLogin(): Promise<never> { return Promise.reject(new Error("unused")); }
   logout(): Promise<void> { return Promise.reject(new Error("unused")); }
   readAccount(): Promise<CodexAccountProjection> { return Promise.reject(new Error("unused")); }
   listPlugins(): Promise<never> { return Promise.reject(new Error("unused")); }
@@ -77,6 +84,10 @@ class FakeCodex implements CodexRuntimePort {
   interrupt(): Promise<void> { return Promise.reject(new Error("unused")); }
   rename(): Promise<void> { return Promise.reject(new Error("unused")); }
   inspectTurn(): Promise<unknown> { return Promise.reject(new Error("unused")); }
+  validateInteractionResolution(): Promise<{ responseDigest: string }> { return Promise.reject(new Error("unused")); }
+  resolveInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(new Error("unused")); }
+  validateInteractionTimeout(): Promise<{ responseDigest: string }> { return Promise.reject(new Error("unused")); }
+  timeoutInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(new Error("unused")); }
   close(): Promise<void> { return Promise.resolve(); }
 
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
@@ -302,10 +313,127 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
+  test("projects only bounded public interaction state and follows its terminal revision", async () => {
+    const value = await fixture();
+    const session = value.store.requireSession(value.sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const interactionId = "70000000-0000-4000-8000-000000000001";
+    const providerRequestId = "provider_request_private_12345678";
+    const providerTurnId = "provider_turn_private_12345678";
+    const providerItemId = "provider_item_private_12345678";
+    const providerApprovalId = "provider_approval_private_12345678";
+    const privateFieldName = "provider_token_private";
+    const privateChoice = ["sk", "secret_choice_12345678"].join("_");
+    value.store.admitInteraction({
+      authority: {
+        approvalId: providerApprovalId,
+        connectionId: "80000000-0000-4000-8000-000000000001",
+        itemId: providerItemId,
+        method: "mcp/elicitation/create",
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        requestDigest: "d".repeat(64),
+        requestId: { type: "string", value: providerRequestId },
+        threadId: session.providerThreadId ?? null,
+        turnId: providerTurnId,
+      },
+      blocking: true,
+      display: {
+        fields: [{
+          choices: [privateChoice],
+          name: privateFieldName,
+          required: true,
+          type: "single_select",
+        }],
+        kind: "mcp_elicitation",
+        mayContainSecrets: true,
+        mode: "form",
+        serverName: "private_provider_server",
+        summary: `Review ${bearerFixture} at ${privateRootFixture}`,
+        url: null,
+      },
+      kind: "mcp_elicitation",
+      publicId: interactionId,
+      sessionId: value.sessionId as `sess_${string}`,
+    });
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      const first = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(first.events.at(-1)).toEqual({
+        blocking: true,
+        interactionId,
+        interactionKind: "mcp_elicitation",
+        kind: "interaction_state",
+        revision: 1,
+        sequence: 4,
+        state: "pending",
+        summary: "An MCP server requests protected form input",
+      });
+      const serialized = JSON.stringify(first.events.at(-1));
+      for (const privateValue of [
+        providerRequestId,
+        providerTurnId,
+        providerItemId,
+        providerApprovalId,
+        privateFieldName,
+        privateChoice,
+        privateRootFixture,
+        bearerFixture,
+        "private_provider_server",
+        "d".repeat(64),
+      ]) expect(serialized).not.toContain(privateValue);
+
+      value.store.expireInteraction({ id: interactionId, expectedRevision: 1 });
+      await adapter.listSessions({ limit: 25, signal });
+      const terminal = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(terminal.events.at(-1)).toEqual({
+        blocking: true,
+        interactionId,
+        interactionKind: "mcp_elicitation",
+        kind: "interaction_state",
+        revision: 2,
+        sequence: 5,
+        state: "expired",
+        summary: "An MCP server requests protected form input",
+      });
+      await adapter.listSessions({ limit: 25, signal });
+      expect((await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).events).toEqual(terminal.events);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
   test("pages upload history by source revision with bounded redacted projections", async () => {
     const value = await fixture();
     const profile = value.store.listProfiles()[0];
     if (profile === undefined) throw new Error("missing profile fixture");
+    const head = value.store.latestUsage(profile.id);
+    if (head === null) throw new Error("missing usage fixture");
+    const firstReceivedAt = storedAccountUsageSnapshotSchema.parse(head.payload)
+      .observation.receivedAt;
     for (const [sourceSequence, observedAt] of [[2, 9_000], [3, 8_000]] as const) {
       const provider = await value.codex.readUsage();
       value.store.recordUsage(profile.id, sourceSequence, observedAt, createStoredAccountUsageSnapshot({
@@ -315,7 +443,8 @@ describe("state-backed cloud daemon adapter", () => {
         previousPayload: null,
         providerGeneration: profile.processGeneration,
         providerPayload: provider.payload,
-        receivedAt: observedAt,
+        receivedAt: firstReceivedAt
+          + (sourceSequence - 1) * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
         sourceSequence,
       }));
     }
@@ -683,11 +812,159 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       });
       expect(future.events.map((event) => event.sequence)).toEqual([301, 302, 303]);
-      expect(future.events.map((event) => event.turnId)).toEqual([
+      expect(future.events.map((event) => "turnId" in event ? event.turnId : null)).toEqual([
         "turn_0002",
         "turn_0002",
         "turn_0002",
       ]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("replays recovery with the current terminal revision of an old cloud interaction", async () => {
+    const value = await fixture();
+    const session = value.store.requireSession(value.sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const interactionId = "70000000-0000-4000-8000-000000000101";
+    const privateRequestId = "provider_request_private_recovery";
+    value.store.admitInteraction({
+      authority: {
+        approvalId: "provider_approval_private_recovery",
+        connectionId: "80000000-0000-4000-8000-000000000101",
+        itemId: "provider_item_private_recovery",
+        method: "mcp/elicitation/create",
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        requestDigest: "d".repeat(64),
+        requestId: { type: "string", value: privateRequestId },
+        threadId: session.providerThreadId ?? null,
+        turnId: "provider_turn_private_recovery",
+      },
+      blocking: true,
+      display: {
+        fields: [{
+          choices: ["sk_secret_answer"],
+          name: "provider_token_private",
+          required: true,
+          type: "single_select",
+        }],
+        kind: "mcp_elicitation",
+        mayContainSecrets: true,
+        mode: "form",
+        serverName: "private_provider_server",
+        summary: `Review ${bearerFixture} at ${privateRootFixture}`,
+        url: null,
+      },
+      kind: "mcp_elicitation",
+      publicId: interactionId,
+      sessionId: value.sessionId as `sess_${string}`,
+    });
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      expect((await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).events.at(-1)).toMatchObject({
+        interactionId,
+        revision: 1,
+        state: "pending",
+      });
+      value.store.expireInteraction({ id: interactionId, expectedRevision: 1 });
+
+      const idempotencyKey = "00000000-0000-7000-8000-000000000711";
+      const plan = await adapter.planCompactProjectionRecovery({
+        idempotencyKey,
+        observedInteractionIds: [interactionId],
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(plan.baselineInteractions).toEqual([{
+        blocking: true,
+        interactionId,
+        interactionKind: "mcp_elicitation",
+        revision: 2,
+        state: "expired",
+        summary: "An MCP server requests protected form input",
+      }]);
+      const installation = {
+        ...plan,
+        boundaryHeadSequence: 300,
+        boundaryTailDigest: "b".repeat(64),
+        compactStreamEpoch: 1,
+        idempotencyKey,
+        signal,
+      } as const;
+      await adapter.stageCompactProjectionRecovery(installation);
+
+      adapter.close();
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      await adapter.stageCompactProjectionRecovery(installation);
+      await adapter.activateCompactProjectionRecovery(installation);
+      await adapter.listSessions({ limit: 25, signal });
+      const recovered = await adapter.readCompactEvents({
+        afterSequence: 300,
+        limit: 128,
+        remoteStreamEpoch: 1,
+        remoteTailDigest: "b".repeat(64),
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(recovered).toMatchObject({ complete: true });
+      expect(recovered.events).toEqual([{
+        blocking: true,
+        interactionId,
+        interactionKind: "mcp_elicitation",
+        kind: "interaction_state",
+        revision: 2,
+        sequence: 301,
+        state: "expired",
+        summary: "An MCP server requests protected form input",
+      }]);
+
+      adapter.close();
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      const replay = await adapter.readCompactEvents({
+        afterSequence: 300,
+        limit: 128,
+        remoteStreamEpoch: 1,
+        remoteTailDigest: "b".repeat(64),
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(replay.events).toEqual(recovered.events);
+      for (const privateValue of [
+        privateRequestId,
+        "provider_approval_private_recovery",
+        "provider_item_private_recovery",
+        "provider_turn_private_recovery",
+        "provider_token_private",
+        "sk_secret_answer",
+        "private_provider_server",
+        privateRootFixture,
+        bearerFixture,
+        "d".repeat(64),
+      ]) expect(JSON.stringify(replay.events)).not.toContain(privateValue);
     } finally {
       adapter.close();
       value.store.close();
@@ -948,6 +1225,13 @@ describe("state-backed cloud daemon adapter", () => {
         name.includes(`quarantine-${idempotencyKey}`))).toBe(false);
       expect((await readdir(value.paths.root)).some((name) =>
         name.includes(`recovery-${idempotencyKey}`))).toBe(true);
+      await adapter.discardCompactProjectionRecovery({
+        idempotencyKey,
+        sessionPublicId: value.sessionId,
+      });
+      expect((await readdir(value.paths.root)).some((name) =>
+        name.includes(`recovery-${idempotencyKey}`))).toBe(false);
+      expect((await lstat(cachePath)).ino).toBe(replacementIdentity.ino);
     } finally {
       adapter.close();
       value.store.close();
@@ -1435,6 +1719,10 @@ describe("bridged cloud control", () => {
       enqueueRemoteCommand: unused,
       isCompactProjectionRecoveryUnsettled: () => Promise.resolve(false),
       isCompactProjectionRecoveryUnsettledForProfile: () => Promise.resolve(false),
+      supersedeCompactProjectionRecoveryForProviderDeletion: () =>
+        Promise.resolve({ superseded: false }),
+      supersedeTerminalCompactProjectionRecoveries: () =>
+        Promise.resolve({ superseded: 0 }),
       recoverCompactProjection: unused,
       sync: () => {
         calls.push("control");

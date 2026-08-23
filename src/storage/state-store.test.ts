@@ -7,9 +7,23 @@ import { Database } from "bun:sqlite";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
 import { SESSION_EVENT_RETAIN_AGE_MS } from "../domain/session-events";
+import {
+  accountUsageCounterSamples,
+  createStoredAccountUsageSnapshot,
+  observedAccountTokenVelocity,
+  type StoredAccountUsageSnapshot,
+} from "../domain/usage-metrics";
 import { canTransitionQueue, queueStateSchema, type QueueState } from "../domain/transitions";
 import { initializeProfilePaths, initializeStatePaths, resolveStatePaths } from "./paths";
-import { SelectionError, StateStore } from "./state-store";
+import {
+  USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+  USAGE_CLOUD_UPLOAD_ANCHOR_COUNT,
+  USAGE_LOCAL_RETAIN_AGE_MS,
+  USAGE_LOCAL_RETAIN_BYTES,
+  USAGE_LOCAL_RETAIN_SUCCESS_COUNT,
+  SelectionError,
+  StateStore,
+} from "./state-store";
 
 const stores: StateStore[] = [];
 
@@ -36,6 +50,252 @@ function signInProfile(store: StateStore, label: string, email: string) {
     }),
   ).toBe(true);
   return store.requireProfile(current.id);
+}
+
+const usageFingerprint = "a".repeat(64);
+
+function usageSnapshot(input: Readonly<{
+  fillerBytes?: number;
+  lifetimeTokens: number;
+  observedAt: number;
+  previous: StoredAccountUsageSnapshot | null;
+  receivedAt: number;
+  sourceSequence: number;
+}>): StoredAccountUsageSnapshot {
+  return createStoredAccountUsageSnapshot({
+    accountFingerprint: usageFingerprint,
+    daemonGeneration: 1,
+    observedAt: input.observedAt,
+    previousPayload: input.previous,
+    providerGeneration: 1,
+    providerPayload: {
+      usage: { summary: { lifetimeTokens: input.lifetimeTokens } },
+      ...(input.fillerBytes === undefined ? {} : { filler: "x".repeat(input.fillerBytes) }),
+    },
+    receivedAt: input.receivedAt,
+    sourceSequence: input.sourceSequence,
+  });
+}
+
+function seedLegacyMcpUrlInteraction(input: Readonly<{
+  interactionId: string;
+  paths: ReturnType<typeof resolveStatePaths>;
+  processGeneration: number;
+  profileId: string;
+  sentinel: string;
+  sessionId: string;
+}>): void {
+  const legacy = new Database(input.paths.database, { create: false, strict: true });
+  legacy.exec(`
+    DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_insert;
+    DROP TRIGGER IF EXISTS provider_interactions_mcp_url_guard_update;
+    DROP TABLE IF EXISTS usage_cloud_upload_anchors;
+    DROP TABLE IF EXISTS security_scrub_authority;
+    DELETE FROM migrations WHERE version>10;
+    PRAGMA user_version=10;
+  `);
+  const displayJson = JSON.stringify({
+    kind: "mcp_elicitation",
+    summary: "Authorize the legacy MCP server",
+    serverName: "legacy",
+    mode: "url",
+    url: `https://example.com/oauth?access_token=${input.sentinel}#${input.sentinel}`,
+    mayContainSecrets: false,
+  });
+  legacy.query(
+    `INSERT INTO provider_interactions(
+       public_id,session_id,profile_id,process_generation,connection_id,
+       request_id_type,request_id_number,request_id_text,method,request_digest,
+       thread_id,turn_id,item_id,approval_id,kind,state,revision,blocking,
+       display_json,response_digest,response_expected_revision,requested_at,updated_at,terminal_at
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    input.interactionId,
+    input.sessionId,
+    input.profileId,
+    input.processGeneration,
+    "028f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+    "string",
+    null,
+    "legacy-url-request",
+    "mcpServer/elicitation/request",
+    "d".repeat(64),
+    "legacy-thread",
+    "legacy-turn",
+    null,
+    null,
+    "mcp_elicitation",
+    "pending",
+    1,
+    1,
+    displayJson,
+    null,
+    null,
+    5_000,
+    5_000,
+    null,
+  );
+  legacy.query(
+    `INSERT INTO provider_interaction_transitions(
+       public_id,revision,state,response_digest,recorded_at
+     ) VALUES (?,1,'pending',NULL,5000)`,
+  ).run(input.interactionId);
+  legacy.close(false);
+}
+
+function seedLegacyPermissionValueInteraction(input: Readonly<{
+  interactionId: string;
+  paths: ReturnType<typeof resolveStatePaths>;
+  processGeneration: number;
+  profileId: string;
+  sentinel: string;
+  sessionId: string;
+}>): void {
+  const legacy = new Database(input.paths.database, { create: false, strict: true });
+  legacy.exec(`
+    PRAGMA secure_delete=OFF;
+    DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_insert;
+    DROP TRIGGER IF EXISTS provider_interactions_permission_value_guard_update;
+    DELETE FROM migrations WHERE version=15;
+    PRAGMA user_version=14;
+  `);
+  const legacyPrivatePath = ["", "Users", "alice", "private"].join("/");
+  const displayJson = JSON.stringify({
+    kind: "permission_approval",
+    summary: "Allow legacy permissions",
+    reason: null,
+    requested: [{
+      name: "fileSystem",
+      value: { read: [`${legacyPrivatePath}/${input.sentinel}${"x".repeat(1_536)}`] },
+    }],
+    allowsSessionScope: true,
+  });
+  legacy.query(
+    `INSERT INTO provider_interactions(
+       public_id,session_id,profile_id,process_generation,connection_id,
+       request_id_type,request_id_number,request_id_text,method,request_digest,
+       thread_id,turn_id,item_id,approval_id,kind,state,revision,blocking,
+       display_json,response_digest,response_expected_revision,requested_at,updated_at,terminal_at
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  ).run(
+    input.interactionId,
+    input.sessionId,
+    input.profileId,
+    input.processGeneration,
+    "038f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+    "string",
+    null,
+    "legacy-permission-request",
+    "item/permissions/requestApproval",
+    "e".repeat(64),
+    "legacy-thread",
+    "legacy-turn",
+    "legacy-item",
+    null,
+    "permission_approval",
+    "pending",
+    1,
+    1,
+    displayJson,
+    null,
+    null,
+    5_000,
+    5_000,
+    null,
+  );
+  legacy.query(
+    `INSERT INTO provider_interaction_transitions(
+       public_id,revision,state,response_digest,recorded_at
+     ) VALUES (?,1,'pending',NULL,5000)`,
+  ).run(input.interactionId);
+  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
+    busy: 0,
+    log: 0,
+    checkpointed: 0,
+  });
+  legacy.close(false);
+}
+
+function simulateLogicallyRedactedMcpDatabase(input: Readonly<{
+  interactionId: string;
+  paths: ReturnType<typeof resolveStatePaths>;
+  targetVersion: 11 | 12 | 13;
+}>): void {
+  const legacy = new Database(input.paths.database, { create: false, strict: true });
+  legacy.exec(`
+    PRAGMA secure_delete=OFF;
+    DROP TRIGGER IF EXISTS provider_interactions_authority_immutable;
+  `);
+  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
+    busy: 0,
+    log: 0,
+    checkpointed: 0,
+  });
+  legacy.query(
+    `UPDATE provider_interactions
+     SET state='resolution_unknown',revision=revision+1,display_json=?,updated_at=9000,terminal_at=9000
+     WHERE public_id=? AND revision=1`,
+  ).run(JSON.stringify({
+    kind: "mcp_elicitation",
+    summary: "Unsupported MCP browser handoff canceled during security migration",
+    serverName: "redacted",
+    mode: "form",
+    url: null,
+    mayContainSecrets: true,
+  }), input.interactionId);
+  legacy.query(
+    `INSERT INTO provider_interaction_transitions(
+       public_id,revision,state,response_digest,recorded_at
+     ) SELECT public_id,revision,state,response_digest,9000
+       FROM provider_interactions WHERE public_id=?`,
+  ).run(input.interactionId);
+  legacy.query("INSERT INTO migrations(version,applied_at) VALUES (11,9000)").run();
+  if (input.targetVersion >= 12) {
+    legacy.exec(`
+      CREATE TABLE usage_cloud_upload_anchors (
+        profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+        source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+        received_at INTEGER NOT NULL CHECK(received_at >= 0),
+        PRIMARY KEY(profile_id, source_revision)
+      ) STRICT;
+      CREATE INDEX usage_cloud_upload_anchors_recent
+        ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
+      INSERT INTO migrations(version,applied_at) VALUES (12,9000);
+    `);
+  }
+  if (input.targetVersion === 13) {
+    legacy.exec(`
+      CREATE TABLE security_scrub_authority (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        reason TEXT NOT NULL CHECK(reason='mcp_url_redaction'),
+        required_at INTEGER NOT NULL CHECK(required_at >= 0)
+      ) STRICT;
+      INSERT INTO migrations(version,applied_at) VALUES (13,9000);
+      PRAGMA user_version=13;
+    `);
+  } else if (input.targetVersion === 12) {
+    legacy.exec("PRAGMA user_version=12");
+  } else {
+    legacy.exec("PRAGMA user_version=11");
+  }
+  expect(legacy.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual({
+    busy: 0,
+    log: 0,
+    checkpointed: 0,
+  });
+  legacy.close(false);
+}
+
+async function stateFileSuffixesContaining(databasePath: string, value: string): Promise<string[]> {
+  const matches: string[] = [];
+  for (const suffix of ["", "-wal", "-shm"] as const) {
+    const file = Bun.file(`${databasePath}${suffix}`);
+    if (
+      await file.exists()
+      && Buffer.from(await file.arrayBuffer()).includes(Buffer.from(value))
+    ) matches.push(suffix);
+  }
+  return matches;
 }
 
 function moveQueueTo(store: StateStore, queueId: ReturnType<StateStore["enqueue"]>["id"], state: QueueState): void {
@@ -300,6 +560,145 @@ describe("StateStore", () => {
     expect(store.requireSession(session.id)).toMatchObject({ state: "recovery_required" });
   });
 
+  test("provider deletion atomically terminalizes pending and in-flight session authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Provider deletion", "deleted@example.com");
+    const created = store.createSession({
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+    });
+    const session = store.bindSession({
+      expectedRevision: created.revision,
+      providerThreadId: "thread-provider-deleted",
+      sessionId: created.id,
+      state: "idle",
+    });
+    store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000603",
+      kind: "session.rename",
+      request: { name: "never dispatched" },
+    });
+    const effect = store.prepareMutation({
+      authorityGeneration: profile.processGeneration,
+      authorityId: session.id,
+      idempotencyKey: "00000000-0000-4000-8000-000000000604",
+      kind: "session.rename",
+      request: { name: "possibly dispatched" },
+    });
+    store.beginSessionMutationEffect({
+      attemptId: effect.id,
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+        kind: "session.rename",
+        providerThreadId: "thread-provider-deleted",
+        requestedName: "possibly dispatched",
+      },
+      profileGeneration: profile.processGeneration,
+      sessionId: session.id,
+    });
+    const runtime = {
+      approvalPolicy: "on-request" as const,
+      computerUse: true as const,
+      enabledApps: [],
+      fast: false,
+      model: "gpt-5.6-sol",
+      permissionProfile: ":workspace" as const,
+      pluginCapability: true as const,
+      preset: "high" as const,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      reasoningEffort: "max" as const,
+      reviewMode: "auto_review" as const,
+      serviceTier: null,
+      observedAt: 2_000,
+    };
+    const queued = store.enqueue(session.id, "possibly dispatched queue");
+    store.beginQueueEffect({
+      queueId: queued.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        baseline: { activeTurnId: null, providerUpdatedAt: 10, status: "idle" },
+        clientMessageId: queued.id,
+        kind: "queue.dispatch",
+        messageDigest: new Bun.CryptoHasher("sha256")
+          .update("possibly dispatched queue")
+          .digest("hex"),
+        profileGeneration: profile.processGeneration,
+        providerThreadId: "thread-provider-deleted",
+        queueId: queued.id,
+        runtimeProfile: runtime,
+        sessionId: session.id,
+      },
+    });
+
+    expect(() => store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration + 1,
+      sessionId: session.id,
+    })).toThrow("SESSION_EVENT_AUTHORITY_CHANGED");
+    expect(store.requireSession(session.id)).toMatchObject({ state: "idle" });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000603"))
+      .toMatchObject({ state: "prepared" });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000604"))
+      .toMatchObject({ state: "effect_started" });
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "dispatching" });
+
+    const terminal = store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    });
+    expect(terminal).toMatchObject({
+      changed: true,
+      event: {
+        body: { activeTurnId: null, status: "terminal", type: "session_status" },
+      },
+      session: { state: "terminal" },
+    });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000603"))
+      .toMatchObject({ state: "cancelled" });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000604"))
+      .toMatchObject({
+      originalState: "effect_started",
+      resolution: {
+        evidence: { source: "provider_thread_deleted" },
+        kind: "abandoned",
+      },
+      state: "reconciled",
+      });
+    expect(store.requireQueue(queued.id)).toMatchObject({ state: "ambiguous" });
+    expect(store.readQueueEffect(queued.id)).toMatchObject({
+      resolution: {
+        evidence: { source: "provider_thread_deleted" },
+        kind: "abandoned",
+      },
+    });
+    expect(store.listUnsettledMutations({ sessionId: session.id })).toEqual([]);
+    expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
+    expect(store.terminalizeSessionFromProviderDeletion({
+      accountId: profile.id,
+      providerConnectionId: null,
+      providerGeneration: profile.processGeneration,
+      sessionId: session.id,
+    })).toMatchObject({
+      changed: false,
+      interactions: [],
+      session: { state: "terminal" },
+    });
+    expect(store.listSessionEvents({
+      afterSequence: 0,
+      sessionId: session.id,
+    }).events.filter((event) =>
+      event.body.type === "session_status" && event.body.status === "terminal"))
+      .toHaveLength(1);
+  });
+
   test("atomically binds a session-start placeholder before its provider effect is admitted", async () => {
     const { store, home } = await fixture();
     const profile = signInProfile(store, "Bound start", "bound-start@example.com");
@@ -532,6 +931,50 @@ describe("StateStore", () => {
     expect(store.transitionQueue(first.id, "pending", "dispatching")).toBe(true);
     expect(store.transitionQueue(first.id, "dispatching", "failed")).toBe(true);
     expect(store.nextPendingQueue(session.id)?.id).toBe(second.id);
+    expect(() => store.enqueue(`sess_${"f".repeat(32)}`, "must roll back"))
+      .toThrow("FOREIGN KEY constraint failed");
+    const third = store.enqueue(session.id, "third");
+
+    const inspector = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT id,enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
+      ).all()).toEqual([
+        { enqueue_sequence: 1, id: first.id },
+        { enqueue_sequence: 2, id: second.id },
+        { enqueue_sequence: 3, id: third.id },
+      ]);
+      expect(() => inspector.query(
+        "UPDATE queue_entries SET enqueue_sequence=enqueue_sequence+100 WHERE id=?",
+      ).run(second.id)).toThrow("queue enqueue sequence is immutable");
+      expect(() => inspector.query(
+        `INSERT OR REPLACE INTO queue_entries(
+           id,session_id,message,state,created_at,updated_at,enqueue_sequence
+         ) VALUES(?,?,?,?,?,?,?)`,
+      ).run(second.id, session.id, "replace existing id", "pending", 1_000, 1_000, 100))
+        .toThrow("queue enqueue identity already exists");
+      expect(() => inspector.query(
+        `INSERT OR REPLACE INTO queue_entries(
+           id,session_id,message,state,created_at,updated_at,enqueue_sequence
+         ) VALUES(?,?,?,?,?,?,?)`,
+      ).run(`queue_${"f".repeat(32)}`, session.id, "steal sequence", "pending", 1_000, 1_000, 2))
+        .toThrow("queue enqueue identity already exists");
+      expect(inspector.query(
+        "SELECT id,enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
+      ).all()).toEqual([
+        { enqueue_sequence: 1, id: first.id },
+        { enqueue_sequence: 2, id: second.id },
+        { enqueue_sequence: 3, id: third.id },
+      ]);
+      expect(() => inspector.query(
+        "UPDATE queue_sequence_authority SET next_sequence=1 WHERE singleton=1",
+      ).run()).toThrow("queue sequence authority cannot regress");
+      expect(() => inspector.query(
+        "INSERT OR REPLACE INTO queue_sequence_authority(singleton,next_sequence) VALUES(1,1)",
+      ).run()).toThrow("queue sequence authority already exists");
+    } finally {
+      inspector.close(false);
+    }
   });
 
   test("binds, journals, applies, and exactly replays a desktop switch", async () => {
@@ -1340,6 +1783,99 @@ describe("StateStore", () => {
     }
   });
 
+  test("anchors immutable interaction deadlines and terminal intent across delayed admission", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-deadline-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 10_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = signInProfile(store, "Deadline", "deadline@example.com");
+    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const authority = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      connectionId: "21000000-0000-4000-8000-000000000001",
+      requestId: { type: "number" as const, value: 1 },
+      method: "item/fileChange/requestApproval",
+      requestDigest: "a".repeat(64),
+      threadId: "thread-deadline",
+      turnId: "turn-deadline",
+      itemId: "item-deadline",
+      approvalId: null,
+    };
+    const display = {
+      kind: "file_change_approval" as const,
+      summary: "Allow bounded changes",
+      reason: null,
+      grantRoot: null,
+      allowsSessionApproval: false,
+    };
+    now = 15_000;
+    const admitted = store.admitInteraction({
+      publicId: "21000000-0000-4000-8000-000000000002",
+      sessionId: session.id,
+      authority,
+      kind: "file_change_approval",
+      blocking: true,
+      display,
+      requestedAt: 10_000,
+      deadlineAt: 16_000,
+    });
+    expect(admitted.record).toMatchObject({ requestedAt: 10_000, deadlineAt: 16_000 });
+    expect(store.nextInteractionDeadlineAt()).toBe(16_000);
+    expect(store.listDueInteractions({ now: 15_999 })).toEqual([]);
+    expect(store.listDueInteractions({ now: 16_000 })).toEqual([admitted.record]);
+    now = 16_000;
+    expect(store.admitInteraction({
+      publicId: "21000000-0000-4000-8000-000000000003",
+      sessionId: session.id,
+      authority,
+      kind: "file_change_approval",
+      blocking: true,
+      display,
+      requestedAt: 10_000,
+      deadlineAt: 16_000,
+    })).toEqual({ record: admitted.record, replayed: true });
+    expect(() => store.admitInteraction({
+      publicId: "21000000-0000-4000-8000-000000000004",
+      sessionId: session.id,
+      authority,
+      kind: "file_change_approval",
+      blocking: true,
+      display,
+      requestedAt: 10_000,
+      deadlineAt: 16_001,
+    })).toThrow("INTERACTION_REQUEST_REPLAY_CONFLICT");
+
+    const digest = "b".repeat(64);
+    const prepared = store.prepareInteractionResponse({
+      id: admitted.record.publicId,
+      expectedRevision: admitted.record.revision,
+      responseDigest: digest,
+      intendedTerminalState: "declined",
+    });
+    const written = store.markInteractionResponseWritten({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      responseDigest: digest,
+    });
+    expect(() => store.settleInteraction({
+      id: written.publicId,
+      expectedRevision: written.revision,
+      state: "resolved",
+      authority,
+      responseDigest: digest,
+    })).toThrow("INTERACTION_TERMINAL_INTENT_CONFLICT");
+    expect(store.settleInteraction({
+      id: written.publicId,
+      expectedRevision: written.revision,
+      state: "declined",
+      authority,
+      responseDigest: digest,
+    })).toMatchObject({ state: "declined", intendedTerminalState: "declined", deadlineAt: 16_000 });
+  });
+
   test("expires untouched generation interactions and quarantines write-adjacent responses", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Interaction restart", "interaction-restart@example.com");
@@ -1427,26 +1963,243 @@ describe("StateStore", () => {
   test("pages successful usage by exact source revision independent of observation time", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Usage upload ledger");
-    store.recordUsage(profile.id, 1, 30_000, { totalTokens: 100 });
-    store.recordUsage(profile.id, 2, 10_000, { totalTokens: 200 });
+    const first = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 30_000,
+      previous: null,
+      receivedAt: 1_000,
+      sourceSequence: 1,
+    });
+    const second = usageSnapshot({
+      lifetimeTokens: 200,
+      observedAt: 10_000,
+      previous: first,
+      receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 2,
+    });
+    const fourth = usageSnapshot({
+      lifetimeTokens: 400,
+      observedAt: 20_000,
+      previous: second,
+      receivedAt: 1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 4,
+    });
+    store.recordUsage(profile.id, 1, 30_000, first);
+    store.recordUsage(profile.id, 2, 10_000, second);
     store.recordUsagePollFailure(profile.id, 3, 40_000);
-    store.recordUsage(profile.id, 4, 20_000, { totalTokens: 400 });
+    store.recordUsage(profile.id, 4, 20_000, fourth);
 
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
       limit: 2,
       profileId: profile.id,
     })).toEqual([
-      { sourceRevision: 2, observedAt: 10_000, payload: { totalTokens: 200 } },
-      { sourceRevision: 4, observedAt: 20_000, payload: { totalTokens: 400 } },
+      { sourceRevision: 2, observedAt: 10_000, payload: second },
+      { sourceRevision: 4, observedAt: 20_000, payload: fourth },
     ]);
     expect(store.usageAfterRevision({
       afterSourceRevision: 2,
       limit: 1,
       profileId: profile.id,
     })).toEqual([
-      { sourceRevision: 4, observedAt: 20_000, payload: { totalTokens: 400 } },
+      { sourceRevision: 4, observedAt: 20_000, payload: fourth },
     ]);
+  });
+
+  test("coalesces cloud upload history at the durable received-time cadence", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Usage upload cadence");
+    let previous: StoredAccountUsageSnapshot | null = null;
+    const received = [
+      1_000,
+      1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS - 1,
+      1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS - 1,
+      1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+    ];
+    for (const [index, receivedAt] of received.entries()) {
+      const sourceSequence = index + 1;
+      const snapshot = usageSnapshot({
+        lifetimeTokens: sourceSequence * 100,
+        observedAt: receivedAt + 10_000,
+        previous,
+        receivedAt,
+        sourceSequence,
+      });
+      store.recordUsage(profile.id, sourceSequence, snapshot.observation.observedAt, snapshot);
+      previous = snapshot;
+    }
+
+    expect(store.usageAfterRevision({
+      afterSourceRevision: 0,
+      limit: 10,
+      profileId: profile.id,
+    }).map((snapshot) => snapshot.sourceRevision)).toEqual([1, 3, 5]);
+    expect(store.usageAfterRevision({
+      afterSourceRevision: 1,
+      limit: 10,
+      profileId: profile.id,
+    }).map((snapshot) => snapshot.sourceRevision)).toEqual([3, 5]);
+  });
+
+  test("keeps daily upload cadence when the uploaded payload row is byte-pruned", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-anchor-retention-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    let now = 100_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = store.createProfile("Usage durable anchor");
+    let previous: StoredAccountUsageSnapshot | null = null;
+    for (let sourceSequence = 1; sourceSequence <= 70; sourceSequence += 1) {
+      now = 100_000 + (sourceSequence - 1) * 50_000;
+      const snapshot = usageSnapshot({
+        fillerBytes: 249 * 1_024,
+        lifetimeTokens: sourceSequence * 100,
+        observedAt: now,
+        previous,
+        receivedAt: now,
+        sourceSequence,
+      });
+      store.recordUsage(profile.id, sourceSequence, now, snapshot);
+      previous = snapshot;
+    }
+
+    expect(store.usageRange({ profileId: profile.id, limit: 10_000 })[0]?.sourceRevision)
+      .toBeGreaterThan(1);
+    expect(store.usageAfterRevision({
+      afterSourceRevision: 1,
+      limit: 10,
+      profileId: profile.id,
+    })).toEqual([]);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT source_revision,received_at FROM usage_cloud_upload_anchors
+         WHERE profile_id=? ORDER BY source_revision`,
+      ).all(profile.id)).toEqual([{ received_at: 100_000, source_revision: 1 }]);
+    } finally {
+      inspector.close(false);
+    }
+
+    now = 100_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS;
+    const next = usageSnapshot({
+      fillerBytes: 249 * 1_024,
+      lifetimeTokens: 7_100,
+      observedAt: now,
+      previous,
+      receivedAt: now,
+      sourceSequence: 71,
+    });
+    store.recordUsage(profile.id, 71, now, next);
+    expect(store.usageAfterRevision({
+      afterSourceRevision: 1,
+      limit: 10,
+      profileId: profile.id,
+    }).map((snapshot) => snapshot.sourceRevision)).toEqual([71]);
+  });
+
+  test("bounds compact upload anchors independently of payload retention", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-anchor-bound-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = store.createProfile("Usage anchor bound");
+    for (
+      let sourceRevision = 1;
+      sourceRevision <= USAGE_CLOUD_UPLOAD_ANCHOR_COUNT + 2;
+      sourceRevision += 1
+    ) {
+      now = 1_000 + (sourceRevision - 1) * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS;
+      store.recordUsage(profile.id, sourceRevision, now, { totalTokens: sourceRevision });
+    }
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      const anchors = inspector.query(
+        `SELECT source_revision FROM usage_cloud_upload_anchors
+         WHERE profile_id=? ORDER BY source_revision`,
+      ).all(profile.id) as { source_revision: number }[];
+      expect(anchors).toHaveLength(USAGE_CLOUD_UPLOAD_ANCHOR_COUNT);
+      expect(anchors[0]?.source_revision).toBe(3);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("bounds local usage bytes while preserving the live velocity window", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-retention-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = store.createProfile("Usage byte retention");
+    let previous: StoredAccountUsageSnapshot | null = null;
+    for (let sourceSequence = 1; sourceSequence <= 100; sourceSequence += 1) {
+      now = 100_000 + sourceSequence * 50_000;
+      const snapshot = usageSnapshot({
+        fillerBytes: 240_000,
+        lifetimeTokens: sourceSequence * 100,
+        observedAt: now,
+        previous,
+        receivedAt: now,
+        sourceSequence,
+      });
+      store.recordUsage(profile.id, sourceSequence, now, snapshot);
+      previous = snapshot;
+    }
+
+    const ledger = store.usageRange({ profileId: profile.id, limit: 10_000 });
+    const retainedBytes = ledger.reduce(
+      (total, snapshot) => total + new TextEncoder().encode(JSON.stringify(snapshot.payload)).byteLength,
+      0,
+    );
+    expect(ledger.length).toBeLessThan(100);
+    expect(retainedBytes).toBeLessThanOrEqual(USAGE_LOCAL_RETAIN_BYTES);
+    expect(observedAccountTokenVelocity({
+      samples: accountUsageCounterSamples(ledger),
+      window: "15m",
+      now,
+    })).toMatchObject({
+      available: true,
+      throughSourceSequence: 100,
+    });
+  });
+
+  test("bounds local usage rows and removes observations past the age contract", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-usage-row-retention-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "linux" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = store.createProfile("Usage row retention");
+    for (
+      let sourceRevision = 1;
+      sourceRevision <= USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 2;
+      sourceRevision += 1
+    ) {
+      now += 1;
+      store.recordUsage(profile.id, sourceRevision, now, { totalTokens: sourceRevision });
+    }
+    const bounded = store.usageRange({ profileId: profile.id, limit: 10_000 });
+    expect(bounded).toHaveLength(USAGE_LOCAL_RETAIN_SUCCESS_COUNT);
+    expect(bounded[0]?.sourceRevision).toBe(3);
+
+    now += USAGE_LOCAL_RETAIN_AGE_MS + 1;
+    store.recordUsage(
+      profile.id,
+      USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3,
+      now,
+      { totalTokens: USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3 },
+    );
+    expect(store.usageRange({ profileId: profile.id, limit: 10_000 })).toEqual([{
+      observedAt: now,
+      payload: { totalTokens: USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3 },
+      sourceRevision: USAGE_LOCAL_RETAIN_SUCCESS_COUNT + 3,
+    }]);
   });
 
   test("reopens v9 event and interaction state read-only without rotating authority", async () => {
@@ -1503,15 +2256,433 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 10 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at", type: "REAL" }));
       expect(inspector.query("PRAGMA table_info(desktop_switches)").all()).toContainEqual(expect.objectContaining({ name: "switch_generation", type: "INTEGER" }));
       expect(inspector.query("PRAGMA table_info(usage_poll_failures)").all()).toContainEqual(expect.objectContaining({ name: "reason_code", type: "TEXT" }));
+      expect(inspector.query("PRAGMA table_info(usage_cloud_upload_anchors)").all())
+        .toContainEqual(expect.objectContaining({ name: "received_at", type: "INTEGER" }));
+      expect(inspector.query("PRAGMA table_info(provider_interactions)").all())
+        .toContainEqual(expect.objectContaining({ name: "deadline_at", type: "INTEGER", notnull: 1 }));
+      expect(inspector.query("PRAGMA table_info(provider_interactions)").all())
+        .toContainEqual(expect.objectContaining({ name: "intended_terminal_state", type: "TEXT" }));
+      expect(inspector.query("PRAGMA table_info(provider_login_authorities)").all())
+        .toContainEqual(expect.objectContaining({ name: "login_id", type: "TEXT", notnull: 1 }));
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'provider_interactions_mcp_url_guard_%' ORDER BY name",
+      ).all()).toEqual([
+        { name: "provider_interactions_mcp_url_guard_insert" },
+        { name: "provider_interactions_mcp_url_guard_update" },
+      ]);
     } finally {
       inspector.close(false);
     }
   });
+
+  test("migrates a v16 pending login without a provider login ID to an explicit fresh-login state", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Legacy pending login");
+    const idempotencyKey = "00000000-0000-4000-8000-000000000981";
+    const attempt = store.prepareMutation({
+      kind: "account.login",
+      authorityId: profile.id,
+      authorityGeneration: 1,
+      request: { deviceCode: false },
+      idempotencyKey,
+    });
+    store.beginAccountMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: 1,
+      evidence: { kind: "account.login", method: "browser" },
+    });
+    expect(store.transitionMutation(attempt.id, "effect_started", "applied", { status: "pending" })).toBe(true);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP TRIGGER IF EXISTS provider_login_authority_identity_immutable;
+      DROP TRIGGER IF EXISTS provider_login_authority_generation_guard;
+      DROP TRIGGER IF EXISTS provider_login_authority_state_guard;
+      DROP TRIGGER IF EXISTS provider_login_authority_immutable_delete;
+      DROP TABLE provider_login_authorities;
+      DELETE FROM migrations WHERE version=17;
+      PRAGMA user_version=16;
+    `);
+    legacy.close(false);
+
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireProfile(profile.id)).toMatchObject({
+      processGeneration: 1,
+      state: "signed_out",
+    });
+    expect(migrated.readMutation(idempotencyKey)).toMatchObject({
+      originalState: "applied",
+      resolution: {
+        kind: "abandoned",
+        evidence: { source: "schema17", reason: "missing_provider_login_id" },
+      },
+      state: "reconciled",
+    });
+    expect(migrated.readPendingLoginAuthority(profile.id, 1)).toBeNull();
+    expect(migrated.prepareMutation({
+      kind: "account.login",
+      authorityId: profile.id,
+      authorityGeneration: 2,
+      request: { deviceCode: false },
+      idempotencyKey: "00000000-0000-4000-8000-000000000982",
+    })).toMatchObject({ replay: false, state: "prepared" });
+  });
+
+  test("redacts and terminalizes secret-bearing MCP URL interactions when upgrading v10", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy URL profile", "legacy-url@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      title: "Legacy URL session",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const sentinel = "MCP_V10_URL_SECRET_SENTINEL";
+    const interactionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    seedLegacyMcpUrlInteraction({
+      interactionId,
+      paths,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sentinel,
+      sessionId: session.id,
+    });
+
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireInteraction(interactionId)).toMatchObject({
+      publicId: interactionId,
+      state: "resolution_unknown",
+      revision: 2,
+      display: {
+        kind: "mcp_elicitation",
+        summary: "Unsupported MCP browser handoff canceled during security migration",
+        serverName: "redacted",
+        mode: "form",
+        url: null,
+        mayContainSecrets: true,
+      },
+      updatedAt: 9_000,
+      terminalAt: 9_000,
+    });
+    expect(migrated.listInteractions({ sessionId: session.id })).toHaveLength(1);
+    expect(migrated.listInteractions({ sessionId: session.id, pendingOnly: true })).toEqual([]);
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(interactionId)).toEqual([
+        { revision: 1, state: "pending" },
+        { revision: 2, state: "resolution_unknown" },
+      ]);
+      expect(JSON.stringify(inspector.query(
+        "SELECT display_json FROM provider_interactions WHERE public_id=?",
+      ).get(interactionId))).not.toContain(sentinel);
+    } finally {
+      inspector.close(false);
+    }
+    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
+  });
+
+  test("redacts and physically scrubs permission values when upgrading v14", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy permission profile", "legacy-permission@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      title: "Legacy permission session",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const sentinel = "PERMISSION_V14_VALUE_SENTINEL";
+    const interactionId = "118f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    seedLegacyPermissionValueInteraction({
+      interactionId,
+      paths,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sentinel,
+      sessionId: session.id,
+    });
+    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toContain("");
+
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireInteraction(interactionId)).toMatchObject({
+      state: "pending",
+      revision: 1,
+      responseDigest: null,
+      display: {
+        kind: "permission_approval",
+        requested: [{ name: "fileSystem" }],
+      },
+    });
+    migrated.close();
+    stores.splice(stores.indexOf(migrated), 1);
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
+      expect(JSON.stringify(inspector.query(
+        "SELECT display_json FROM provider_interactions WHERE public_id=?",
+      ).get(interactionId))).not.toContain(sentinel);
+    } finally {
+      inspector.close(false);
+    }
+    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
+  });
+
+  for (const targetVersion of [11, 12, 13] as const) {
+    test(`physically scrubs logically safe v${targetVersion} state without changing queue FIFO`, async () => {
+      const home = await realpath(await mkdtemp(join(tmpdir(), `hra-store-v${targetVersion}-physical-scrub-`)));
+      const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+      await initializeStatePaths(paths);
+      const store = new StateStore(paths, { now: () => 5_000 });
+      const profile = signInProfile(store, `Physical v${targetVersion}`, `physical-v${targetVersion}@example.com`);
+      const session = store.createSession({
+        profileId: profile.id,
+        title: `Physical v${targetVersion} session`,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const queue = ["first", "deleted", "third", "fourth"].map((message) => store.enqueue(session.id, message));
+      store.close();
+
+      const legacyQueue = new Database(paths.database, { create: false, strict: true });
+      legacyQueue.exec(`
+        DROP TRIGGER IF EXISTS queue_enqueue_sequence_required;
+        DROP TRIGGER IF EXISTS queue_enqueue_identity_insert_once;
+        DROP TRIGGER IF EXISTS queue_enqueue_sequence_immutable;
+        DROP TRIGGER IF EXISTS queue_sequence_authority_no_delete;
+        DROP TRIGGER IF EXISTS queue_sequence_authority_singleton_immutable;
+        DROP INDEX IF EXISTS queue_pending_sequence;
+        DROP INDEX IF EXISTS queue_enqueue_sequence_unique;
+        DROP TABLE IF EXISTS queue_sequence_authority;
+        ALTER TABLE queue_entries DROP COLUMN enqueue_sequence;
+      `);
+      legacyQueue.query("DELETE FROM queue_entries WHERE id=?").run(queue[1]!.id);
+      legacyQueue.close(false);
+
+      const sentinelNeedle = `MCP_V${targetVersion}_PHYSICAL_SECRET_SENTINEL`;
+      const interactionId = `${targetVersion === 11 ? "218" : targetVersion === 12 ? "318" : "418"}f1f55-3f10-7c1a-8f7b-c6dc608bcd3b`;
+      seedLegacyMcpUrlInteraction({
+        interactionId,
+        paths,
+        processGeneration: profile.processGeneration,
+        profileId: profile.id,
+        sentinel: `${sentinelNeedle}${"x".repeat(1_536)}`,
+        sessionId: session.id,
+      });
+      simulateLogicallyRedactedMcpDatabase({ interactionId, paths, targetVersion });
+
+      const logicalInspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(JSON.stringify(logicalInspector.query(
+          "SELECT display_json FROM provider_interactions WHERE public_id=?",
+        ).get(interactionId))).not.toContain(sentinelNeedle);
+        expect(logicalInspector.query(
+          "SELECT id FROM queue_entries ORDER BY rowid",
+        ).all()).toEqual([
+          { id: queue[0]!.id },
+          { id: queue[2]!.id },
+          { id: queue[3]!.id },
+        ]);
+      } finally {
+        logicalInspector.close(false);
+      }
+      expect(await stateFileSuffixesContaining(paths.database, sentinelNeedle)).toEqual([""]);
+
+      const migrated = new StateStore(paths, { now: () => 10_000 });
+      expect(migrated.listQueue(session.id).map((entry) => entry.id)).toEqual([
+        queue[0]!.id,
+        queue[2]!.id,
+        queue[3]!.id,
+      ]);
+      expect(migrated.listRecoverableQueue().map((entry) => entry.id)).toEqual([
+        queue[0]!.id,
+        queue[2]!.id,
+        queue[3]!.id,
+      ]);
+      migrated.close();
+
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+        expect(inspector.query(
+          "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
+        ).all()).toEqual([
+          { enqueue_sequence: 1 },
+          { enqueue_sequence: 2 },
+          { enqueue_sequence: 3 },
+        ]);
+        expect(inspector.query(
+          "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
+        ).get()).toBeNull();
+        expect(inspector.query(
+          "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+        ).all(interactionId)).toEqual([
+          { revision: 1, state: "pending" },
+          { revision: 2, state: "resolution_unknown" },
+        ]);
+      } finally {
+        inspector.close(false);
+      }
+      expect(await stateFileSuffixesContaining(paths.database, sentinelNeedle)).toEqual([]);
+    });
+  }
+
+  test("keeps a busy-reader MCP scrub unavailable until WAL truncation can finish", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Pinned legacy URL", "pinned-legacy-url@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      title: "Pinned legacy URL session",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const sentinel = "MCP_PINNED_READER_SECRET_SENTINEL";
+    const interactionId = "118f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+    seedLegacyMcpUrlInteraction({
+      interactionId,
+      paths,
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      sentinel,
+      sessionId: session.id,
+    });
+
+    const pinnedReader = new Database(paths.database, { readonly: true, strict: true });
+    pinnedReader.exec("BEGIN");
+    expect(JSON.stringify(pinnedReader.query(
+      "SELECT display_json FROM provider_interactions WHERE public_id=?",
+    ).get(interactionId))).toContain(sentinel);
+    try {
+      // Reproduce the buggy v12 boundary: the durable interaction transition
+      // commits, its checkpoint reports busy, and no scrub-completion marker
+      // survives to distinguish the schema stamp from a byte purge.
+      const buggyMigration = new Database(paths.database, { create: false, strict: true });
+      buggyMigration.exec(`
+        PRAGMA secure_delete=OFF;
+        DROP TRIGGER IF EXISTS provider_interactions_authority_immutable;
+      `);
+      buggyMigration.query(
+        `UPDATE provider_interactions
+         SET state='resolution_unknown',revision=revision+1,display_json=?,updated_at=9000,terminal_at=9000
+         WHERE public_id=? AND revision=1`,
+      ).run(JSON.stringify({
+        kind: "mcp_elicitation",
+        summary: "Unsupported MCP browser handoff canceled during security migration",
+        serverName: "redacted",
+        mode: "form",
+        url: null,
+        mayContainSecrets: true,
+      }), interactionId);
+      buggyMigration.query(
+        `INSERT INTO provider_interaction_transitions(
+           public_id,revision,state,response_digest,recorded_at
+         ) SELECT public_id,revision,state,response_digest,9000
+           FROM provider_interactions WHERE public_id=?`,
+      ).run(interactionId);
+      buggyMigration.exec(`
+        CREATE TABLE usage_cloud_upload_anchors (
+          profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+          source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+          received_at INTEGER NOT NULL CHECK(received_at >= 0),
+          PRIMARY KEY(profile_id, source_revision)
+        ) STRICT;
+        CREATE INDEX usage_cloud_upload_anchors_recent
+          ON usage_cloud_upload_anchors(profile_id, source_revision DESC);
+        INSERT INTO migrations(version,applied_at) VALUES (11,9000),(12,9000);
+        PRAGMA user_version=12;
+      `);
+      expect(buggyMigration.query("PRAGMA wal_checkpoint(TRUNCATE)").get())
+        .toEqual(expect.objectContaining({ busy: 1 }));
+      buggyMigration.close(false);
+
+      expect(() => {
+        const unexpectedlyOpened = new StateStore(paths, { now: () => 9_000 });
+        unexpectedlyOpened.close();
+      }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
+
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+        expect(inspector.query(
+          "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
+        ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
+        expect(inspector.query(
+          "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+        ).all(interactionId)).toEqual([
+          { revision: 1, state: "pending" },
+          { revision: 2, state: "resolution_unknown" },
+        ]);
+      } finally {
+        inspector.close(false);
+      }
+      expect(() => {
+        const unexpectedlyReadable = new StateStore(paths, { readonly: true });
+        unexpectedlyReadable.close();
+      }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
+      expect(await stateFileSuffixesContaining(paths.database, sentinel)).not.toEqual([]);
+    } finally {
+      pinnedReader.exec("COMMIT");
+      pinnedReader.close(false);
+    }
+
+    const recovered = new StateStore(paths, { now: () => 10_000 });
+    stores.push(recovered);
+    expect(recovered.requireInteraction(interactionId)).toMatchObject({
+      revision: 2,
+      state: "resolution_unknown",
+      updatedAt: 9_000,
+    });
+    recovered.close();
+    stores.splice(stores.indexOf(recovered), 1);
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
+      ).get()).toBeNull();
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(interactionId)).toEqual([
+        { revision: 1, state: "pending" },
+        { revision: 2, state: "resolution_unknown" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
+  }, 20_000);
 
   test("opens and transactionally migrates a real v1 database without losing sessions", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-v1-")));
@@ -1576,7 +2747,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 10 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -1588,6 +2759,13 @@ describe("StateStore", () => {
         { version: 8, applied_at: 2000 },
         { version: 9, applied_at: 2000 },
         { version: 10, applied_at: 2000 },
+        { version: 11, applied_at: 2000 },
+        { version: 12, applied_at: 2000 },
+        { version: 13, applied_at: 2000 },
+        { version: 14, applied_at: 2000 },
+        { version: 15, applied_at: 2000 },
+        { version: 16, applied_at: 2000 },
+        { version: 17, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
     } finally {
@@ -1630,7 +2808,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 10 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -1650,8 +2828,8 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 11");
+    newer.exec("PRAGMA user_version = 18");
     newer.close(false);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:11:10");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:18:17");
   });
 });
