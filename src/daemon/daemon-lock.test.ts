@@ -109,6 +109,30 @@ describe("DaemonLock", () => {
     await replacement.release();
   });
 
+  test("retries an atomic receipt publication between path validation and descriptor open", async () => {
+    const paths = await pathsFixture();
+    const lock = await DaemonLock.acquire(paths);
+    let published = false;
+    const receipt = await readDaemonAuthorityReceipt(paths, {
+      afterNamedValidation: async () => {
+        if (published) return;
+        published = true;
+        await lock.publish({
+          state: "ready",
+          generation: 1,
+          bootId: "boot_55555555555555555555555555555555",
+        });
+      },
+    });
+    expect(published).toBe(true);
+    expect(receipt).toMatchObject({
+      state: "ready",
+      generation: 1,
+      bootId: "boot_55555555555555555555555555555555",
+    });
+    await lock.release();
+  });
+
   test("a closeable generation and boot fence rejects replacement lifetimes", async () => {
     const paths = await pathsFixture();
     const lock = await DaemonLock.acquire(paths);

@@ -184,26 +184,45 @@ export class DaemonAuthorityFence {
   }
 }
 
-export async function readDaemonAuthorityReceipt(paths: StatePaths): Promise<DaemonAuthorityReceipt | null> {
-  try {
-    const before = await validateOwnedRegularFile(paths.daemonLock, 4_096);
-    const handle = await open(paths.daemonLock, constants.O_RDONLY | constants.O_NOFOLLOW);
+export async function readDaemonAuthorityReceipt(
+  paths: StatePaths,
+  hooks: Readonly<{ afterNamedValidation?(): void | Promise<void> }> = {},
+): Promise<DaemonAuthorityReceipt | null> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
-      const metadata = await handle.stat();
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.size > 4_096
-        || metadata.dev !== before.dev || metadata.ino !== before.ino) {
-        throw new DaemonAuthoritySafetyError("Daemon authority receipt changed while it was opened.");
+      const before = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+      await hooks.afterNamedValidation?.();
+      const handle = await open(paths.daemonLock, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const metadata = await handle.stat();
+        const uid = currentUid();
+        if (
+          !metadata.isFile()
+          || metadata.isSymbolicLink()
+          || metadata.nlink !== 1
+          || metadata.size > 4_096
+          || (metadata.mode & 0o777) !== 0o600
+          || (uid !== undefined && metadata.uid !== uid)
+        ) {
+          throw new DaemonAuthoritySafetyError("Daemon authority receipt became unsafe while it was opened.");
+        }
+        if (metadata.dev !== before.dev || metadata.ino !== before.ino) {
+          continue;
+        }
+        const value = JSON.parse(await handle.readFile("utf8")) as unknown;
+        const parsed = daemonAuthorityReceiptSchema.safeParse(value);
+        return parsed.success ? parsed.data : null;
+      } finally {
+        await handle.close();
       }
-      const value = JSON.parse(await handle.readFile("utf8")) as unknown;
-      const parsed = daemonAuthorityReceiptSchema.safeParse(value);
-      return parsed.success ? parsed.data : null;
-    } finally {
-      await handle.close();
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return null;
+      throw error;
     }
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return null;
-    throw error;
   }
+  throw new DaemonAuthoritySafetyError(
+    "Daemon authority receipt changed repeatedly while it was opened.",
+  );
 }
 
 export class DaemonLock {

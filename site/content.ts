@@ -287,6 +287,11 @@ export const publicContent: PublicContent = {
           text(". The document is never an argument."),
         ),
         paragraph(
+          text("The CLI stores HRA's revocable device credential, workspace encryption key, and local signing authority as immutable generations below its private state root. Custody directories are current-user-owned mode-0700 directories, values are single-link mode-0600 files, and reads use bounded no-follow descriptors. The detached Bun daemon never opens a Keychain prompt. HRA forces both pinned Codex credential stores to file mode and verifies their effective settings, so Codex credentials remain separately owned by each profile's isolated "),
+          code("CODEX_HOME"),
+          text("."),
+        ),
+        paragraph(
           text("After successful email verification, the daemon automatically registers the current installation before it reads cloud data. The first registered device becomes active and creates the client-side encryption key. A later verified installation is registered as pending and may report presence, but it has no synchronized data, execution, or key authority."),
         ),
         paragraph(

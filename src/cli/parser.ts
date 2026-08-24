@@ -652,7 +652,13 @@ const parsePlugin = (cursor: Cursor): LocalCommand => {
     finish(cursor);
     return command({ kind: "plugin.show", account, plugin, project, refresh });
   }
-  if (action === "install" || action === "enable" || action === "disable") {
+  if (
+    action === "install"
+    || action === "enable"
+    || action === "disable"
+    || action === "oauth"
+    || action === "authorize"
+  ) {
     throw new CliUsageError(
       "Pinned Codex 0.149.0 has no safe separated plugin lifecycle effect. Use `plugin list` or `plugin show` to inspect the exact boundary.",
     );

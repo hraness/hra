@@ -9,6 +9,7 @@ import {
   executeDomainCutover,
   parseArguments,
   parseCutoverPlan,
+  preflightCutoverPlan,
   VercelCutoverProvider,
   type AliasReadback,
   type CutoverEndpoint,
@@ -398,6 +399,10 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("<deployment-id>");
     expect(runbook).toContain("<bare-automatic-hostname>.vercel.app");
     expect(runbook).toContain("hosted:domain-cutover");
+    expect(runbook).toContain("hosted:domain-cutover preflight");
+    expect(runbook).toContain("It never sets an alias, moves domain ownership");
+    expect(runbook).toContain("exception while reading any managed alias");
+    expect(runbook).toContain("leaves stdout empty, and performs no mutation");
     expect(runbook).toContain("/v4/aliases/hra.sh");
     expect(runbook).toContain("deploymentId");
     expect(runbook).toContain("source.commit");
@@ -472,6 +477,260 @@ describe("domain cutover operator", () => {
     ))).toHaveLength(2);
     expect(provider.operations.at(-1)).toBe(`read-domains:${newProjectId}`);
   });
+
+  for (const scenario of [
+    { description: "archive", plan: archivePlan },
+    { description: "forward", plan: forwardPlan },
+    { description: "reverse", plan: reversePlan },
+  ] as const) {
+    test(`preflights exact ${scenario.description} source and target states without mutation`, async () => {
+      const provider = new FakeCutoverProvider(scenario.plan);
+      const source = await preflightCutoverPlan(scenario.plan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+
+      expect(source).toEqual({
+        nextAction: "execute_plan",
+        observedOwner: "source",
+        observedState: "source",
+        observedTraffic: "source",
+        reason: "exact_source",
+        status: "ready",
+      });
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+      expect(provider.operations).toContain(`read-project:${oldProjectId}`);
+      expect(provider.operations).toContain(`read-project:${newProjectId}`);
+      expect(provider.operations).toContain(
+        `read-deployment:${scenario.plan.source.deploymentId}`,
+      );
+      expect(provider.operations).toContain(
+        `read-deployment:${scenario.plan.target.deploymentId}`,
+      );
+
+      placeAtTarget(provider);
+      const target = await preflightCutoverPlan(scenario.plan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+      expect(target).toEqual({
+        nextAction: "replay_plan_for_receipt",
+        observedOwner: scenario.plan.direction === "archive" ? "source" : "target",
+        observedState: "target",
+        observedTraffic: "target",
+        reason: "exact_target",
+        status: "already_committed",
+      });
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+    });
+  }
+
+  test("preflight blocks partial, ambiguous, and non-authoritative states without repair", async () => {
+    const cases = [
+      {
+        expectedReason: "partial_state",
+        prepare(provider: FakeCutoverProvider) {
+          provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+        },
+      },
+      {
+        expectedReason: "ambiguous_state",
+        prepare(provider: FakeCutoverProvider) {
+          provider.owner = "ambiguous";
+        },
+      },
+      {
+        expectedReason: "source_not_authoritative",
+        prepare(provider: FakeCutoverProvider) {
+          provider.markerBrokenAliases.add(fallbackAlias);
+        },
+      },
+      {
+        expectedReason: "target_not_authoritative",
+        prepare(provider: FakeCutoverProvider) {
+          placeAtTarget(provider);
+          provider.markerBrokenAliases.add(canonicalAlias);
+        },
+      },
+    ] as const;
+
+    for (const scenario of cases) {
+      const provider = new FakeCutoverProvider(forwardPlan);
+      scenario.prepare(provider);
+      const before = {
+        aliases: { ...provider.aliasEndpoints },
+        owner: provider.owner,
+      };
+      const outcome = await preflightCutoverPlan(forwardPlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+
+      expect(outcome).toMatchObject({
+        nextAction: "stop_and_investigate",
+        reason: scenario.expectedReason,
+        status: "blocked",
+      });
+      expect(provider.aliasEndpoints).toEqual(before.aliases);
+      expect(provider.owner).toBe(before.owner);
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+    }
+  });
+
+  for (const failure of [
+    {
+      code: "alias_readback_invalid",
+      description: "canonical alias",
+      path: `/v4/aliases/${canonicalAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "alias_readback_invalid",
+      description: "archive fallback alias",
+      path: `/v4/aliases/${fallbackAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "alias_readback_invalid",
+      description: "new staging alias",
+      path: `/v4/aliases/${newStagingAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "command_output_invalid",
+      description: "archive project domain list",
+      path: `/v9/projects/${oldProjectId}/domains?limit=20`,
+      type: "provider" as const,
+    },
+    {
+      code: "command_output_invalid",
+      description: "new project domain list",
+      path: `/v9/projects/${newProjectId}/domains?limit=20`,
+      type: "provider" as const,
+    },
+    {
+      aliasName: canonicalAlias,
+      code: "command_output_invalid",
+      description: "canonical marker",
+      type: "marker" as const,
+    },
+    {
+      aliasName: fallbackAlias,
+      code: "command_output_invalid",
+      description: "archive fallback marker",
+      type: "marker" as const,
+    },
+    {
+      aliasName: newStagingAlias,
+      code: "command_output_invalid",
+      description: "new staging marker",
+      type: "marker" as const,
+    },
+  ] as const) {
+    test(`preflight refuses an exception from the ${failure.description} without mutation`, async () => {
+      const requests: VercelCommandRequest[] = [];
+      let mutationCalls = 0;
+      const aliases: Record<ManagedAlias, CutoverEndpoint> = {
+        [canonicalAlias]: oldEndpoint,
+        [fallbackAlias]: oldEndpoint,
+        [newStagingAlias]: newEndpoint,
+      };
+      const runner: VercelCommandRunner = async (request) => {
+        requests.push(request);
+        const [command, path] = request.arguments;
+        if (command === "--version") {
+          return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+        }
+        if (
+          command === "alias"
+          || (command === "api" && path?.endsWith(`/domains/${canonicalAlias}/move`))
+        ) {
+          mutationCalls += 1;
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (failure.type === "provider" && path === failure.path) {
+          throw new Error("injected provider read failure");
+        }
+        if (path === `/v9/projects/${oldProjectId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(projectFor(oldProjectId)) };
+        }
+        if (path === `/v9/projects/${newProjectId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(projectFor(newProjectId)) };
+        }
+        if (path === `/v13/deployments/${oldEndpoint.deploymentId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(deploymentFor(oldEndpoint)) };
+        }
+        if (path === `/v13/deployments/${newEndpoint.deploymentId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(deploymentFor(newEndpoint)) };
+        }
+        if (path === `/v9/projects/${oldProjectId}/domains?limit=20`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(domainPage([canonicalAlias])) };
+        }
+        if (path === `/v9/projects/${newProjectId}/domains?limit=20`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(domainPage([])) };
+        }
+        for (const aliasName of [canonicalAlias, fallbackAlias, newStagingAlias] as const) {
+          if (path === `/v4/aliases/${aliasName}`) {
+            return {
+              exitCode: 0,
+              stderr: "",
+              stdout: JSON.stringify(aliasFor(aliases[aliasName], aliasName)),
+            };
+          }
+        }
+        return { exitCode: 1, stderr: "", stdout: "" };
+      };
+      const fetcher = async (input: string | URL | Request): Promise<Response> => {
+        const url = new URL(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        if (failure.type === "marker" && url.hostname === failure.aliasName) {
+          throw new Error("injected marker read failure");
+        }
+        return new Response(
+          JSON.stringify(markerFor(aliases[url.hostname as ManagedAlias])),
+          { status: 200 },
+        );
+      };
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const output = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
+        write: ((chunk: string | Uint8Array) => {
+          chunks.push(String(chunk));
+          return true;
+        }) as NodeJS.WriteStream["write"],
+      });
+
+      expect(await executeDomainCutover({
+        arguments: ["preflight", "--vercel-cli", "/safe/vercel"],
+        environment: { HOME: "/safe/home", PATH: "/safe/bin" },
+        fetcher,
+        inputDocument: JSON.stringify(forwardPlan),
+        runner,
+        stderr: output(stderr),
+        stdout: output(stdout),
+      })).toBe(1);
+      expect(stdout).toEqual([]);
+      expect(stderr).toEqual([
+        `${JSON.stringify({
+          code: failure.code,
+          schemaVersion: 1,
+          status: "refused",
+        })}\n`,
+      ]);
+      expect(mutationCalls).toBe(0);
+      expect(requests.some((request) => request.arguments[0] === "alias")).toBe(false);
+      expect(requests.some((request) => request.arguments[1]?.endsWith(
+        `/domains/${canonicalAlias}/move`,
+      ))).toBe(false);
+    });
+  }
 
   for (const scenario of [
     { description: "archive", plan: archivePlan },
@@ -1308,7 +1567,20 @@ describe("domain cutover operator", () => {
       "/safe/vercel",
       "--plan-fd",
       "3",
-    ])).toEqual({ execute: true, planFd: 3, vercelCli: "/safe/vercel" });
+    ])).toEqual({ operation: "execute", planFd: 3, vercelCli: "/safe/vercel" });
+    expect(parseArguments([
+      "preflight",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--plan-fd",
+      "3",
+    ])).toEqual({ operation: "preflight", planFd: 3, vercelCli: "/safe/vercel" });
+    expect(() => parseArguments([
+      "preflight",
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+    ])).toThrow("usage_invalid");
   });
 
   test("emits changed and replayed outcomes for a fresh archive and its exact retry", async () => {
@@ -1317,12 +1589,14 @@ describe("domain cutover operator", () => {
       [fallbackAlias]: baselineEndpoint,
       [newStagingAlias]: newEndpoint,
     };
+    let mutationCalls = 0;
     const runner: VercelCommandRunner = async (request) => {
       const [command, path] = request.arguments;
       if (command === "--version") {
         return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
       }
       if (command === "alias" && path === "set") {
+        mutationCalls += 1;
         const deploymentUrl = request.arguments[2];
         const aliasName = request.arguments[3] as ManagedAlias;
         const endpoint = [baselineEndpoint, oldEndpoint, newEndpoint]
@@ -1397,15 +1671,66 @@ describe("domain cutover operator", () => {
         return true;
       }) as NodeJS.WriteStream["write"],
     });
-    const execute = async (): Promise<number> => await executeDomainCutover({
-      arguments: ["--execute", "--vercel-cli", "/safe/vercel"],
-      environment: { HOME: "/safe/home", PATH: "/safe/bin" },
-      fetcher,
-      inputDocument: JSON.stringify(archivePlan),
-      runner,
-      stderr: output(stderr),
-      stdout: output(stdout),
+    const run = async (arguments_: readonly string[]): Promise<number> =>
+      await executeDomainCutover({
+        arguments: arguments_,
+        environment: { HOME: "/safe/home", PATH: "/safe/bin" },
+        fetcher,
+        inputDocument: JSON.stringify(archivePlan),
+        runner,
+        stderr: output(stderr),
+        stdout: output(stdout),
+      });
+    const execute = async (): Promise<number> => await run([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+    ]);
+    const preflight = async (): Promise<number> => await run([
+      "preflight",
+      "--vercel-cli",
+      "/safe/vercel",
+    ]);
+
+    expect(await preflight()).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(mutationCalls).toBe(0);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      direction: "archive",
+      mode: "traffic-only",
+      nextAction: "execute_plan",
+      observedOwner: "source",
+      observedState: "source",
+      observedTraffic: "source",
+      reason: "exact_source",
+      schemaVersion: 1,
+      sourceDeploymentId: baselineEndpoint.deploymentId,
+      sourceProjectId: oldProjectId,
+      status: "ready",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
     });
+
+    aliases[fallbackAlias] = oldEndpoint;
+    expect(await preflight()).toBe(1);
+    expect(stderr).toEqual([]);
+    expect(mutationCalls).toBe(0);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      direction: "archive",
+      mode: "traffic-only",
+      nextAction: "stop_and_investigate",
+      observedOwner: "source",
+      observedState: "partial",
+      observedTraffic: "partial",
+      reason: "partial_state",
+      schemaVersion: 1,
+      sourceDeploymentId: baselineEndpoint.deploymentId,
+      sourceProjectId: oldProjectId,
+      status: "blocked",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
+    });
+    aliases[fallbackAlias] = baselineEndpoint;
 
     expect(await execute()).toBe(0);
     expect(stderr).toEqual([]);

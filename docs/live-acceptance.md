@@ -28,7 +28,7 @@ cli_auth_credentials_store = "file"
 mcp_oauth_credentials_store = "file"
 ```
 
-The daemon proves both effective values through the pinned Codex `config/read` preflight before login or plugin discovery. It assigns a distinct private `TMPDIR` below each `CODEX_HOME`. HRA secret custody uses `FileSecretBackend` below the corresponding state root. The acceptance composition cannot construct the production `BunSecretBackend`, and it disables desktop switching.
+The production and acceptance launchers force both values through pinned process arguments, and the daemon proves their effective values through Codex `config/read` before login, plugin discovery, or session work. Acceptance also fixes the account-level file so the fixture fails if a project layer attempts to change custody. It assigns a distinct private `TMPDIR` below each `CODEX_HOME`. HRA secret custody uses `FileSecretBackend` below the corresponding state root, matching the production CLI custody boundary, and the acceptance composition disables desktop switching.
 
 Before the daemon starts, each worker changes its process working directory to its verified isolated project. Codex therefore loads its account-level credential policy from the same project boundary used by the effective `config/read` checks. The repository checkout and another device's project cannot contribute a startup project layer.
 

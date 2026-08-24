@@ -58,6 +58,12 @@ const status = (
 ): unknown => ({
   version: 1,
   session: { id: sessionId },
+  providerObservation: {
+    connectionId: "90000000-0000-4000-8000-000000000099",
+    mode: "resubscribed",
+    profileGeneration: 2,
+    state: "live",
+  },
   eventStream: { cursor },
   pendingInteractions,
   pendingInteractionsNextCursor,
@@ -153,7 +159,7 @@ describe("persistent shell live observation", () => {
           ])));
         }
         if (request > 2) return new Promise<CommandResponse>(() => undefined);
-        return Promise.resolve(ok(page(sessionOne, "c1", "c8", [
+        return Promise.resolve(ok(page(sessionOne, "c1", "c12", [
           event(sessionOne, 3, { type: "assistant_delta", turnId: "turn-1", itemId: "assistant-1", text: `and verified ${privateUserPath} ` }),
           event(sessionOne, 4, { type: "item_started", turnId: "turn-1", itemId: "reason-1", itemKind: "reasoning" }),
           event(sessionOne, 5, { type: "reasoning_summary_delta", turnId: "turn-1", itemId: "reason-1", text: "Checking " }),
@@ -163,12 +169,29 @@ describe("persistent shell live observation", () => {
             turnId: "turn-1",
             itemId: "tool-1",
             toolKind: "command",
-            server: "/private/raw/server",
-            tool: "raw-tool-result-must-not-render",
+            server: "local",
+            tool: "shell_exec",
             status: "completed",
             outputBytesObserved: 99_999,
           }),
           event(sessionOne, 8, {
+            type: "item_started",
+            turnId: "turn-1",
+            itemId: "mcp-1",
+            itemKind: "mcpToolCall",
+            server: "github",
+            tool: "create_issue",
+          }),
+          event(sessionOne, 9, {
+            type: "item_completed",
+            turnId: "turn-1",
+            itemId: "mcp-1",
+            itemKind: "mcpToolCall",
+            server: "github",
+            tool: "create_issue",
+            status: "completed",
+          }),
+          event(sessionOne, 10, {
             type: "file_change",
             turnId: "turn-1",
             itemId: "files-1",
@@ -176,8 +199,8 @@ describe("persistent shell live observation", () => {
             paths: [{ kind: "modified", path: "/private/raw/secret.ts" }],
             omittedPaths: 0,
           }),
-          event(sessionOne, 9, { type: "warning", code: "NOTICE", message: "token=abcd1234 at /tmp/private" }),
-          event(sessionOne, 10, { type: "turn_completed", turnId: "turn-1", status: "completed" }),
+          event(sessionOne, 11, { type: "warning", code: "NOTICE", message: "token=abcd1234 at /tmp/private" }),
+          event(sessionOne, 12, { type: "turn_completed", turnId: "turn-1", status: "completed" }),
         ])));
       },
       coalesceMs: 5,
@@ -192,12 +215,13 @@ describe("persistent shell live observation", () => {
     expect(rendered).toContain("done and verified [local-path]");
     expect(rendered.match(/Reasoning summary\n/gu)).toHaveLength(1);
     expect(rendered).toContain("Checking the release.");
-    expect(rendered).toContain("Tool: command, completed.");
+    expect(rendered).toContain("Tool: command local/shell_exec, completed.");
+    expect(rendered).toContain("Item started: mcpToolCall github/create_issue.");
+    expect(rendered).toContain("Item completed: mcpToolCall github/create_issue (completed).");
     expect(rendered).toContain("Files: completed, 1 visible change.");
     expect(rendered).toContain("[protected] at [local-path]");
     expect(rendered).not.toContain(privateUserPath);
     expect(rendered).not.toContain("/private/raw");
-    expect(rendered).not.toContain("raw-tool-result-must-not-render");
     expect(rendered).not.toContain("99999");
     expect(rendered).not.toContain("{\"version\"");
     expect(requestedCursors.slice(0, 2)).toEqual(["c0", "c1"]);

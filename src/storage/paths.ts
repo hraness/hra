@@ -49,6 +49,10 @@ export async function ensurePrivateDirectory(path: string): Promise<string> {
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || metadata.nlink < 1) {
     throw new Error(`Private path is not a regular directory: ${path}`);
   }
+  const owner = process.getuid?.();
+  if (owner !== undefined && metadata.uid !== owner) {
+    throw new Error(`Private directory is not owned by the current user: ${path}`);
+  }
   if (canonical !== resolve(path)) {
     throw new Error(`Private directory must not traverse a symbolic link: ${path}`);
   }

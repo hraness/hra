@@ -92,6 +92,28 @@ export type CodexSessionProjection = {
   turns?: readonly unknown[];
 };
 
+export type CodexSessionObservation = {
+  readonly connectionId: string;
+  readonly projection: CodexSessionProjection;
+  /** False only when this exact client created the thread and is already subscribed. */
+  readonly resumed: boolean;
+};
+
+export class CodexSessionObservationError extends Error {
+  readonly reason: "resume_unavailable" | "thread_mismatch";
+
+  constructor(reason: CodexSessionObservationError["reason"], options?: ErrorOptions) {
+    super(
+      reason === "thread_mismatch"
+        ? "Codex resumed a different provider thread."
+        : "Codex session observation is temporarily unavailable.",
+      options,
+    );
+    this.name = "CodexSessionObservationError";
+    this.reason = reason;
+  }
+}
+
 export type CodexSessionPage = {
   readonly sessions: readonly CodexSessionProjection[];
   readonly nextCursor: string | null;
@@ -112,6 +134,7 @@ export interface CodexRuntimePort {
   }): Promise<CodexSessionPage>;
   reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
+  observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
   reviewTurnStart(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
   startTurn(input: { authority: ProfileAuthority; providerThreadId: string; projectRoot?: string; review: RuntimeStartReview; message: string; clientMessageId: string; signal: AbortSignal }): Promise<{ turnId: string; status: CodexTurnStatus; effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
@@ -195,6 +218,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  observeSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readSession(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewTurnStart(): Promise<never> { return Promise.reject(this.#unavailable()); }
   startTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }

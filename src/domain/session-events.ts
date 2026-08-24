@@ -12,6 +12,15 @@ export const SESSION_EVENT_RETAIN_BYTES = 64 * 1024 * 1024;
 
 const boundedText = (maximum: number) => z.string().max(maximum);
 const providerIdentifierSchema = z.string().min(1).max(512);
+const providerToolLabelMaximumUtf8Bytes = 256;
+const utf8Encoder = new TextEncoder();
+const providerToolLabelSchema = z.string()
+  .min(1)
+  .max(providerToolLabelMaximumUtf8Bytes)
+  .refine(
+    (value) => utf8Encoder.encode(value).byteLength <= providerToolLabelMaximumUtf8Bytes,
+    { message: `Must be at most ${providerToolLabelMaximumUtf8Bytes} UTF-8 bytes` },
+  );
 const eventSequenceSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const streamEpochSchema = z.string().uuid();
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -79,6 +88,8 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     turnId: providerIdentifierSchema,
     itemId: providerIdentifierSchema,
     itemKind: boundedText(128),
+    server: providerToolLabelSchema.optional(),
+    tool: providerToolLabelSchema.optional(),
     liveAcceptanceCommandDigest: digestSchema.optional(),
   }).strict(),
   z.object({
@@ -86,6 +97,8 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     turnId: providerIdentifierSchema,
     itemId: providerIdentifierSchema,
     itemKind: boundedText(128),
+    server: providerToolLabelSchema.optional(),
+    tool: providerToolLabelSchema.optional(),
     liveAcceptanceCommandDigest: digestSchema.optional(),
     status: boundedText(128).optional(),
   }).strict(),

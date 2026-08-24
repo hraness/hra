@@ -3,9 +3,9 @@
 import { dlopen } from "bun:ffi";
 import { randomUUID } from "node:crypto";
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
-import { constants, readSync } from "node:fs";
+import { constants, readSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { isatty } from "node:tty";
 
 import {
@@ -84,6 +84,7 @@ import { DaemonAuthorityBusyError, DaemonAuthorityFence, DaemonLock } from "./da
 import {
   daemonStatusIdentity,
   identityFromReceipt,
+  terminateDaemonStartupChild,
   waitForDaemonAuthorityRelease,
   waitForDaemonReady,
 } from "./daemon/daemon-startup";
@@ -1069,6 +1070,7 @@ export type CliMainInput = Readonly<{
   isTerminalDescriptor?: (fd: number) => boolean;
   readProtectedDocument?: (source: ProtectedInputSource) => Promise<unknown>;
   readShellLine?: (prompt: string) => Promise<string | null>;
+  offlineDoctorOwnerUid?: number;
 }>;
 
 export function selectDaemonCloudControl(
@@ -1554,15 +1556,27 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
     exitCode = code;
     exited = true;
   });
-  await waitForDaemonReady({
-    paths,
-    queryStatus: async () => await callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 750 }),
-    observeChild: () => ({
-      pid: child.pid,
-      exited,
-      ...(exitCode === undefined ? {} : { exitCode }),
-    }),
-  });
+  try {
+    await waitForDaemonReady({
+      paths,
+      queryStatus: async () => await callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 750 }),
+      observeChild: () => ({
+        pid: child.pid,
+        exited,
+        ...(exitCode === undefined ? {} : { exitCode }),
+      }),
+    });
+  } catch (error: unknown) {
+    try {
+      await terminateDaemonStartupChild(child);
+    } catch (cleanupError: unknown) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Daemon startup failed and exact child cleanup was incomplete.",
+      );
+    }
+    throw error;
+  }
 }
 
 async function callWithAutostart(
@@ -1613,19 +1627,57 @@ export async function initialize(
   }
 }
 
-async function offlineDoctor(json: boolean, output: Output, paths: StatePaths): Promise<number> {
+async function offlineDoctor(
+  json: boolean,
+  output: Output,
+  paths: StatePaths,
+  ownerUid = process.getuid?.(),
+): Promise<number> {
   let initialized = false;
+  let rootReady = false;
   const problems: string[] = [];
   let database: "not_initialized" | "ready" | "invalid" = "not_initialized";
   let projectCount = 0;
+  let rootMetadata: Stats | undefined;
   try {
-    const metadata = await lstat(paths.root);
-    initialized = metadata.isDirectory() && !metadata.isSymbolicLink() && (metadata.mode & 0o077) === 0;
-    if (!initialized) problems.push("The state root is not a private canonical directory.");
+    rootMetadata = await lstat(paths.root);
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  if (initialized) {
+  if (rootMetadata !== undefined) {
+    try {
+      const canonical = await realpath(paths.root);
+      const after = await lstat(paths.root);
+      rootReady = rootMetadata.isDirectory()
+        && !rootMetadata.isSymbolicLink()
+        && rootMetadata.nlink >= 1
+        && (rootMetadata.mode & 0o777) === 0o700
+        && (ownerUid === undefined || rootMetadata.uid === ownerUid)
+        && canonical === resolve(paths.root)
+        && after.dev === rootMetadata.dev
+        && after.ino === rootMetadata.ino;
+    } catch {
+      rootReady = false;
+    }
+    if (!rootReady) problems.push("The state root is not a private canonical directory.");
+  }
+  if (rootReady) {
+    try {
+      const metadata = await lstat(paths.database);
+      initialized = metadata.isFile()
+        && !metadata.isSymbolicLink()
+        && metadata.nlink === 1
+        && (metadata.mode & 0o777) === 0o600
+        && (ownerUid === undefined || metadata.uid === ownerUid);
+      if (!initialized) throw new Error("Unsafe local database file.");
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        database = "invalid";
+        problems.push("The local database check failed without exposing its runtime diagnostic.");
+      }
+    }
+  }
+  if (initialized && database !== "invalid") {
     try {
       const store = new StateStore(paths, { readonly: true });
       try {
@@ -2104,9 +2156,7 @@ export async function runDaemon(
             prepareCodexHome: installation.prepareCodexHome,
           }
         : {}),
-      ...(installation.credentialStorePreflight === null
-        ? {}
-        : { credentialStorePreflight: installation.credentialStorePreflight }),
+      credentialStorePreflight: installation.credentialStorePreflight,
       isCurrent: (authority) => {
         try {
           const profile = activeStore.requireProfile(authority.id);
@@ -3301,7 +3351,12 @@ async function executeInvocation(
     return 0;
   }
   if (invocation.command.kind === "doctor" && invocation.command.offline) {
-    return await offlineDoctor(invocation.json, output, input.statePaths ?? installation.paths);
+    return await offlineDoctor(
+      invocation.json,
+      output,
+      input.statePaths ?? installation.paths,
+      input.offlineDoctorOwnerUid,
+    );
   }
   if (
     invocation.command.kind === "account.usage"

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -34,7 +35,7 @@ import {
   storedAccountUsageSnapshotSchema,
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
-import { profileIdSchema, sessionIdSchema } from "../domain/values";
+import { canonicalLabelKey, profileIdSchema, sessionIdSchema } from "../domain/values";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import {
   SelectionError,
@@ -48,7 +49,18 @@ import {
 } from "../storage/state-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
 import { commandFailureBrand } from "./local-transport";
-import type { CloudControlPort, CodexAccountProjection, CodexLoginOutcome, CodexRuntimePort, CodexSessionProjection, DesktopSwitchPort, ProfileAuthority, RuntimeStartReview } from "./ports";
+import {
+  CodexSessionObservationError,
+  type CloudControlPort,
+  type CodexAccountProjection,
+  type CodexLoginOutcome,
+  type CodexRuntimePort,
+  type CodexSessionObservation,
+  type CodexSessionProjection,
+  type DesktopSwitchPort,
+  type ProfileAuthority,
+  type RuntimeStartReview,
+} from "./ports";
 import {
   SessionEventCursorCodec,
   SessionEventCursorError,
@@ -122,8 +134,34 @@ const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
 
+const isSqliteUniqueConstraint = (error: unknown): boolean =>
+  error instanceof Error
+  && (error as Error & { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE";
+
 type LoginOutcome = CodexLoginOutcome;
 type BoundSessionRecord = SessionRecord & { providerThreadId: string };
+type PublicProviderObservation =
+  | Readonly<{
+      connectionId: string;
+      mode: "connected" | "resubscribed";
+      profileGeneration: number;
+      state: "live";
+    }>
+  | Readonly<{
+      code: "account_signed_out" | "resume_unavailable";
+      profileGeneration: number;
+      state: "unavailable";
+    }>
+  | Readonly<{
+      code: "session_quarantined" | "thread_mismatch";
+      profileGeneration: number;
+      state: "recovery_required";
+    }>
+  | Readonly<{
+      profileGeneration: number;
+      reason: "terminal" | "unbound";
+      state: "not_applicable";
+    }>;
 type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.send"
   | "session.queue"
@@ -166,6 +204,9 @@ export class HraService {
   readonly #projectionRecoveriesInFlight = new Set<string>();
   readonly #sessionFactEpochs = new Map<string, number>();
   readonly #sessionProviderConnections = new Map<string, string>();
+  readonly #sessionObservationFailures = new Map<string, string>();
+  readonly #sessionResubscriptionConnections = new Map<string, string>();
+  readonly #sessionsAwaitingResubscription = new Set<string>();
   readonly #queuePreEffectRetryCounts = new Map<string, number>();
   readonly #queuePreEffectRetryScheduled = new Set<string>();
   readonly #interactionDeadlineAbort = new AbortController();
@@ -269,7 +310,7 @@ export class HraService {
             ));
         }
         case "project.list": return { projects: this.#store.listProjects() };
-        case "project.add": return { project: await this.#store.createProject(command.label, command.path, this.#store.listProjects().length === 0) };
+        case "project.add": return { project: await this.#addProject(command.label, command.path) };
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
         case "session.list": {
           if (command.account === undefined) {
@@ -289,7 +330,14 @@ export class HraService {
           ));
         }
         case "session.show": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#showSession(session.id, command.detail, context.signal), { allowDuringProjectionRecovery: true }); }
-        case "session.status": return this.#sessionStatus(command.session);
+        case "session.status": {
+          const session = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthority(
+            session,
+            async () => await this.#sessionStatus(session.id, context.signal),
+            { allowDuringProjectionRecovery: true },
+          );
+        }
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
           const session = this.#store.requireSession(command.session);
@@ -321,7 +369,13 @@ export class HraService {
           this.#scheduleIdleQueue(session);
           return { session };
         }
-        case "turn.inspect": return await this.#inspectTurn(command.session, command.turn, context.signal);
+        case "turn.inspect": {
+          const session = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthority(
+            session,
+            async () => await this.#inspectTurn(session.id, command.turn, context.signal),
+          );
+        }
         case "interaction.list": {
           const sessionId = command.session === undefined
             ? undefined
@@ -556,6 +610,25 @@ export class HraService {
       const profile = this.#store.requireProfile(session.profileId);
       if (profile.state === "signed_in") this.#scheduleQueueDispatch(session);
     }
+    let continueAfterId: string | null = null;
+    const activeSessions: SessionRecord[] = [];
+    for (;;) {
+      const page = this.#store.listCloudSessionPage({
+        afterId: continueAfterId,
+        limit: 100,
+      });
+      for (const session of page.sessions) {
+        if (session.providerThreadId === undefined || session.state === "terminal") continue;
+        this.#sessionsAwaitingResubscription.add(session.id);
+        const profile = this.#store.requireProfile(session.profileId);
+        if (session.state === "active" && profile.state === "signed_in") {
+          activeSessions.push(session);
+        }
+      }
+      if (page.isDone || page.continueAfterId === null) break;
+      continueAfterId = page.continueAfterId;
+    }
+    this.#scheduleRecoverySessionObservations(activeSessions);
     this.#wakeInteractionDeadlinePump();
   }
 
@@ -951,6 +1024,9 @@ export class HraService {
     if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
     for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
     this.#sessionProviderConnections.delete(current.id);
+    this.#sessionObservationFailures.delete(current.id);
+    this.#sessionResubscriptionConnections.delete(current.id);
+    this.#sessionsAwaitingResubscription.delete(current.id);
     await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
     await this.#daemonAuthority.assertCurrent();
   }
@@ -999,10 +1075,27 @@ export class HraService {
       });
     }
     this.#sessionProviderConnections.set(session.id, connectionId);
+    const resubscribed = previous !== undefined
+      || this.#sessionsAwaitingResubscription.has(session.id)
+      || this.#lastSessionEventIsProviderGap(session.id);
+    this.#sessionsAwaitingResubscription.delete(session.id);
+    if (resubscribed) this.#sessionResubscriptionConnections.set(session.id, connectionId);
     this.#appendSessionEvent(authority, session.id, connectionId, {
       type: "connection",
-      state: previous === undefined ? "connected" : "resubscribed",
+      state: resubscribed ? "resubscribed" : "connected",
     });
+  }
+
+  #lastSessionEventIsProviderGap(sessionId: SessionRecord["id"]): boolean {
+    const position = this.#store.eventStreamPosition(sessionId);
+    if (position.observedThroughSequence === 0) return false;
+    const latest = this.#store.listSessionEvents({
+      sessionId,
+      afterSequence: position.observedThroughSequence - 1,
+      limit: 1,
+    }).events[0];
+    return latest?.body.type === "gap"
+      && (latest.body.reason === "provider_restart" || latest.body.reason === "provider_disconnect");
   }
 
   #handleProviderDisconnected(
@@ -1033,6 +1126,9 @@ export class HraService {
         throughSequence: position.observedThroughSequence + 1,
       });
       this.#sessionProviderConnections.delete(session.id);
+      this.#sessionObservationFailures.delete(session.id);
+      this.#sessionResubscriptionConnections.delete(session.id);
+      this.#sessionsAwaitingResubscription.add(session.id);
     }
   }
 
@@ -1063,6 +1159,8 @@ export class HraService {
         turnId: fact.turnId,
         itemId: fact.itemId,
         itemKind: fact.itemKind,
+        ...(fact.server === undefined ? {} : { server: fact.server }),
+        ...(fact.tool === undefined ? {} : { tool: fact.tool }),
         ...(fact.liveAcceptanceCommandDigest === undefined
           ? {}
           : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
@@ -1072,6 +1170,8 @@ export class HraService {
         turnId: fact.turnId,
         itemId: fact.itemId,
         itemKind: fact.itemKind,
+        ...(fact.server === undefined ? {} : { server: fact.server }),
+        ...(fact.tool === undefined ? {} : { tool: fact.tool }),
         ...(fact.liveAcceptanceCommandDigest === undefined
           ? {}
           : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
@@ -1149,6 +1249,13 @@ export class HraService {
     fact: CodexFact & Readonly<{ threadId: string }>,
     expected: SessionRecord,
   ): boolean {
+    let profile: ProfileRecord;
+    try {
+      profile = this.#store.requireProfileById(authority.id);
+    } catch {
+      return false;
+    }
+    if (profile.processGeneration !== authority.generation || profile.state !== "signed_in") return false;
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (
       current === null
@@ -1252,6 +1359,9 @@ export class HraService {
         } catch (error: unknown) {
           projectionErrors.push(error);
           this.#sessionProviderConnections.delete(sessionId);
+          this.#sessionObservationFailures.delete(sessionId);
+          this.#sessionResubscriptionConnections.delete(sessionId);
+          this.#sessionsAwaitingResubscription.delete(sessionId);
           continue;
         }
         if (session.profileId !== profile.id) continue;
@@ -1272,6 +1382,9 @@ export class HraService {
           projectionErrors.push(error);
         } finally {
           this.#sessionProviderConnections.delete(sessionId);
+          this.#sessionObservationFailures.delete(sessionId);
+          this.#sessionResubscriptionConnections.delete(sessionId);
+          this.#sessionsAwaitingResubscription.delete(sessionId);
         }
       }
       try {
@@ -1281,6 +1394,9 @@ export class HraService {
       }
     }
     this.#sessionProviderConnections.clear();
+    this.#sessionObservationFailures.clear();
+    this.#sessionResubscriptionConnections.clear();
+    this.#sessionsAwaitingResubscription.clear();
     if (projectionErrors.length > 0) {
       throw new AggregateError(
         projectionErrors,
@@ -1391,7 +1507,18 @@ export class HraService {
   }
 
   async #addAccount(label: string): Promise<unknown> {
-    const profile = this.#store.createProfile(label);
+    let profile: ProfileRecord;
+    try {
+      profile = this.#store.createProfile(label);
+    } catch (error: unknown) {
+      const normalizedLabel = canonicalLabelKey(label);
+      const duplicate = this.#store.listProfiles().some((candidate) =>
+        canonicalLabelKey(candidate.label) === normalizedLabel);
+      if (duplicate && isSqliteUniqueConstraint(error)) {
+        throw new CommandFailure("CONFLICT", "An active account already uses that label.");
+      }
+      throw error;
+    }
     try {
       await initializeProfilePaths(this.#paths, profile.id);
       await this.#daemonAuthority.assertCurrent();
@@ -1401,6 +1528,31 @@ export class HraService {
       throw error;
     }
     return { account: this.#publicProfile(profile), next: `hra account login ${profile.id}` };
+  }
+
+  async #addProject(label: string, path: string): Promise<unknown> {
+    try {
+      return await this.#store.createProject(
+        label,
+        path,
+        this.#store.listProjects().length === 0,
+      );
+    } catch (error: unknown) {
+      const normalizedLabel = canonicalLabelKey(label);
+      const requestedRoot = resolve(path);
+      const projects = this.#store.listProjects();
+      const duplicateLabel = projects.some((candidate) =>
+        canonicalLabelKey(candidate.label) === normalizedLabel);
+      const duplicateRoot = projects.some((candidate) =>
+        candidate.rootPath === requestedRoot);
+      if (isSqliteUniqueConstraint(error) && duplicateLabel) {
+        throw new CommandFailure("CONFLICT", "A project already uses that label.");
+      }
+      if (isSqliteUniqueConstraint(error) && duplicateRoot) {
+        throw new CommandFailure("CONFLICT", "A project already uses that directory.");
+      }
+      throw error;
+    }
   }
 
   async #readPluginCatalog(
@@ -1489,6 +1641,9 @@ export class HraService {
 
   async #showAccount(selector: string, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
+    if (profile.state === "signed_out" && profile.processGeneration === 0) {
+      return { account: this.#publicProfile(profile) };
+    }
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettledForProfile(profile.id);
     await this.#daemonAuthority.assertCurrent();
@@ -2018,7 +2173,249 @@ export class HraService {
     });
   }
 
-  #sessionStatus(selector: string): unknown {
+  async #ensureSessionObservedLocked(
+    selector: string,
+    signal: AbortSignal,
+  ): Promise<PublicProviderObservation> {
+    let session = this.#store.requireSession(selector);
+    const profile = this.#store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) {
+      return {
+        profileGeneration: profile.processGeneration,
+        reason: "unbound",
+        state: "not_applicable",
+      };
+    }
+    if (session.state === "terminal") {
+      return {
+        profileGeneration: profile.processGeneration,
+        reason: "terminal",
+        state: "not_applicable",
+      };
+    }
+    if (session.state === "recovery_required") {
+      return {
+        code: "session_quarantined",
+        profileGeneration: profile.processGeneration,
+        state: "recovery_required",
+      };
+    }
+    if (profile.state !== "signed_in") {
+      return {
+        code: "account_signed_out",
+        profileGeneration: profile.processGeneration,
+        state: "unavailable",
+      };
+    }
+    if (this.#lastSessionEventIsProviderGap(session.id)) {
+      this.#sessionsAwaitingResubscription.add(session.id);
+    }
+    const projectionRecoveryUnsettled = await this.#cloud
+      .isCompactProjectionRecoveryUnsettled(session.id);
+    await this.#daemonAuthority.assertCurrent();
+    const observationFactEpoch = this.#sessionFactEpochs.get(session.id) ?? 0;
+    const providerThreadId = session.providerThreadId;
+    const authority = authorityFor(this.#paths, profile);
+    let observation: CodexSessionObservation;
+    try {
+      observation = await this.#fencedEffect(async () => await this.#codex.observeSession({
+        authority,
+        providerThreadId,
+        signal,
+      }));
+    } catch (error: unknown) {
+      if (signal.aborted) throw signal.reason;
+      const exact = this.#currentObservationSession(
+        authority,
+        session.id,
+        providerThreadId,
+      );
+      if (exact === null) {
+        return {
+          code: "resume_unavailable",
+          profileGeneration: this.#currentProfileGeneration(authority),
+          state: "unavailable",
+        };
+      }
+      if (
+        error instanceof CodexSessionObservationError
+        && error.reason === "thread_mismatch"
+      ) {
+        return this.#quarantineObservationMismatch(authority, exact);
+      }
+      if (!(error instanceof CodexSessionObservationError)) throw error;
+      this.#recordSessionObservationFailure(authority, exact, "resume_unavailable", false);
+      return {
+        code: "resume_unavailable",
+        profileGeneration: profile.processGeneration,
+        state: "unavailable",
+      };
+    }
+    await this.#daemonAuthority.assertCurrent();
+    session = this.#store.requireSession(session.id);
+    const currentProfile = this.#store.requireProfileById(profile.id);
+    if (
+      session.profileId !== profile.id
+      || session.providerThreadId === undefined
+      || session.providerThreadId !== observation.projection.providerThreadId
+      || currentProfile.processGeneration !== profile.processGeneration
+      || currentProfile.state !== "signed_in"
+    ) {
+      if (
+        this.#currentObservationSession(authority, session.id, providerThreadId) !== null
+        && observation.projection.providerThreadId !== providerThreadId
+      ) return this.#quarantineObservationMismatch(authority, session);
+      return {
+        code: "resume_unavailable",
+        profileGeneration: currentProfile.processGeneration,
+        state: "unavailable",
+      };
+    }
+    z.string().uuid().parse(observation.connectionId);
+    this.#sessionObservationFailures.delete(session.id);
+    this.#ensureSessionProviderConnection(authority, session, observation.connectionId);
+    const projection = observation.projection;
+    if (
+      !projectionRecoveryUnsettled
+      && !this.#projectionRecoveriesInFlight.has(session.id)
+      && (this.#sessionFactEpochs.get(session.id) ?? 0) === observationFactEpoch
+    ) {
+      const beforeState = session.state;
+      const beforeActiveTurnId = session.activeTurnId ?? null;
+      const reconciled = this.#store.reconcileSessionFromProvider({
+        sessionId: session.id,
+        state: projection.status,
+        activeTurnId: projection.status === "active"
+          ? projection.activeTurnId ?? null
+          : null,
+        title: projection.title,
+      });
+      if (
+        reconciled.state !== beforeState
+        || (reconciled.activeTurnId ?? null) !== beforeActiveTurnId
+      ) {
+        this.#appendSessionEvent(authority, reconciled.id, observation.connectionId, {
+          type: "session_status",
+          status: projection.status,
+          activeTurnId: reconciled.activeTurnId ?? null,
+        });
+      }
+    }
+    const mode = this.#sessionResubscriptionConnections.get(session.id) === observation.connectionId
+      ? "resubscribed"
+      : "connected";
+    return {
+      connectionId: observation.connectionId,
+      mode,
+      profileGeneration: profile.processGeneration,
+      state: "live",
+    };
+  }
+
+  #currentObservationSession(
+    authority: ProfileAuthority,
+    sessionId: SessionRecord["id"],
+    providerThreadId: string,
+  ): SessionRecord | null {
+    try {
+      const profile = this.#store.requireProfileById(authority.id);
+      const session = this.#store.requireSession(sessionId);
+      return profile.processGeneration === authority.generation
+        && profile.state === "signed_in"
+        && session.profileId === authority.id
+        && session.providerThreadId === providerThreadId
+        && session.state !== "terminal"
+        ? session
+        : null;
+    } catch (error: unknown) {
+      if (error instanceof SelectionError && error.code === "NOT_FOUND") return null;
+      throw error;
+    }
+  }
+
+  #currentProfileGeneration(authority: ProfileAuthority): number {
+    try {
+      return this.#store.requireProfileById(authority.id).processGeneration;
+    } catch (error: unknown) {
+      if (error instanceof SelectionError && error.code === "NOT_FOUND") {
+        return authority.generation;
+      }
+      throw error;
+    }
+  }
+
+  #recordSessionObservationFailure(
+    authority: ProfileAuthority,
+    session: SessionRecord,
+    code: "resume_unavailable",
+    terminal: boolean,
+  ): void {
+    const marker = `${String(authority.generation)}:${code}`;
+    if (this.#sessionObservationFailures.get(session.id) === marker) return;
+    this.#sessionObservationFailures.set(session.id, marker);
+    this.#appendSessionEvent(authority, session.id, null, terminal
+      ? {
+          type: "error",
+          code: "provider_resume_unavailable",
+          message: "Provider observation is unavailable; HRA will not follow a stale event stream.",
+          terminal: true,
+        }
+      : {
+          type: "warning",
+          code: "provider_resume_unavailable",
+          message: "Provider observation is unavailable; HRA will not follow a stale event stream.",
+        });
+  }
+
+  #quarantineObservationMismatch(
+    authority: ProfileAuthority,
+    session: SessionRecord,
+  ): PublicProviderObservation {
+    this.#quarantineSession(session.id);
+    const marker = `${String(authority.generation)}:thread_mismatch`;
+    if (this.#sessionObservationFailures.get(session.id) !== marker) {
+      this.#sessionObservationFailures.set(session.id, marker);
+      this.#appendSessionEvent(authority, session.id, null, {
+        type: "error",
+        code: "provider_thread_mismatch",
+        message: "Provider observation returned a different thread; the session is quarantined.",
+        terminal: true,
+      });
+    }
+    return {
+      code: "thread_mismatch",
+      profileGeneration: authority.generation,
+      state: "recovery_required",
+    };
+  }
+
+  #requireLiveProviderObservation(observation: PublicProviderObservation): void {
+    if (observation.state === "live") return;
+    if (observation.state === "recovery_required") {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The provider thread could not be observed under this session's exact authority; the session is quarantined.",
+        { providerObservation: observation },
+      );
+    }
+    if (observation.state === "unavailable") {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "The provider thread is not currently observable; HRA will not use stale session state.",
+        { providerObservation: observation },
+      );
+    }
+    throw new CommandFailure(
+      observation.reason === "terminal" ? "CONFLICT" : "RECOVERY_REQUIRED",
+      observation.reason === "terminal"
+        ? "The session is terminal and has no live provider observation."
+        : "The session has no proven provider binding.",
+      { providerObservation: observation },
+    );
+  }
+
+  async #sessionStatus(selector: string, signal: AbortSignal): Promise<unknown> {
+    const providerObservation = await this.#ensureSessionObservedLocked(selector, signal);
     const session = this.#store.requireSession(selector);
     const snapshot = this.#store.readSessionSnapshotWithEventPosition(session.id);
     const pending = this.#interactionPage({
@@ -2029,6 +2426,7 @@ export class HraService {
     return {
       version: 1,
       session: snapshot.session,
+      providerObservation,
       eventStream: {
         cursor: this.#encodeEventCursor({
           sessionId: session.id,
@@ -2107,21 +2505,29 @@ export class HraService {
     command: Extract<LocalCommand, { kind: "session.events" }>,
     signal: AbortSignal,
   ): Promise<SessionEventPage> {
-    const session = this.#store.requireSession(command.session);
+    const selected = this.#store.requireSession(command.session);
+    const decodedCursor = command.cursor === undefined
+      ? undefined
+      : this.#eventCursors.decode(command.cursor);
+    if (decodedCursor !== undefined && decodedCursor.sessionId !== selected.id) {
+      throw new CommandFailure("INVALID_INPUT", "The session event cursor belongs to another session.");
+    }
+    const providerObservation = await this.#serializeSessionAuthority(
+      selected,
+      async () => await this.#ensureSessionObservedLocked(selected.id, signal),
+      { allowDuringProjectionRecovery: true },
+    );
+    const session = this.#store.requireSession(selected.id);
     let requestedSequence: number | null = null;
     let restoredRequestedSequence: number | null = null;
     let streamRestored = false;
-    if (command.cursor !== undefined) {
-      const cursor = this.#eventCursors.decode(command.cursor);
+    if (decodedCursor !== undefined) {
       const current = this.#store.eventStreamPosition(session.id);
-      if (cursor.sessionId !== session.id) {
-        throw new CommandFailure("INVALID_INPUT", "The session event cursor belongs to another session.");
-      }
-      if (cursor.streamEpoch !== current.streamEpoch) {
+      if (decodedCursor.streamEpoch !== current.streamEpoch) {
         streamRestored = true;
-        restoredRequestedSequence = cursor.sequence;
+        restoredRequestedSequence = decodedCursor.sequence;
       } else {
-        requestedSequence = cursor.sequence;
+        requestedSequence = decodedCursor.sequence;
       }
     }
 
@@ -2130,7 +2536,12 @@ export class HraService {
       afterSequence: requestedSequence,
       limit: command.limit,
     });
-    if (!streamRestored && listed.events.length === 0 && command.waitMs > 0) {
+    if (
+      providerObservation.state === "live"
+      && !streamRestored
+      && listed.events.length === 0
+      && command.waitMs > 0
+    ) {
       await this.#eventWaiters.wait({
         sessionId: session.id,
         expectedObservedThrough: listed.observedThroughSequence,
@@ -2144,6 +2555,9 @@ export class HraService {
         afterSequence: requestedSequence,
         limit: command.limit,
       });
+    }
+    if (listed.events.length === 0 && providerObservation.state !== "live") {
+      this.#requireLiveProviderObservation(providerObservation);
     }
     const nextSequence = listed.events.at(-1)?.sequence
       ?? requestedSequence
@@ -2755,6 +3169,11 @@ export class HraService {
     const providerThreadId = session.providerThreadId;
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    if (session.state !== "terminal" && session.state !== "recovery_required") {
+      this.#requireLiveProviderObservation(
+        await this.#ensureSessionObservedLocked(session.id, signal),
+      );
+    }
     const projectionRecoveryUnsettled = await this.#cloud
       .isCompactProjectionRecoveryUnsettled(session.id);
     await this.#daemonAuthority.assertCurrent();
@@ -2869,6 +3288,7 @@ export class HraService {
         if (localSessionId !== undefined) this.#quarantineSession(localSessionId);
       },
     });
+    await this.#ensureSessionObservedLocked(outcome.sessionId, signal);
     return {
       session: this.#store.requireSession(outcome.sessionId),
       effectiveRuntimeProfile: outcome.effectiveRuntimeProfile
@@ -2882,6 +3302,9 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    this.#requireLiveProviderObservation(
+      await this.#ensureSessionObservedLocked(session.id, signal),
+    );
     const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
@@ -2943,6 +3366,9 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    this.#requireLiveProviderObservation(
+      await this.#ensureSessionObservedLocked(session.id, signal),
+    );
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | undefined;
@@ -2988,6 +3414,31 @@ export class HraService {
     if (this.#state !== "open") return;
     const profile = this.#store.requireProfile(session.profileId);
     const task = this.#serializeSessionAuthority(session, async () => this.#dispatchNextQueue(session.id, authorityFor(this.#paths, profile)));
+    const tracked = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
+  }
+
+  #scheduleRecoverySessionObservations(sessions: readonly SessionRecord[]): void {
+    if (this.#state !== "open" || sessions.length === 0) return;
+    const task = (async () => {
+      for (const session of sessions) {
+        if (this.#state !== "open") return;
+        await this.#serializeSessionAuthority(
+          session,
+          async () => {
+            await this.#ensureSessionObservedLocked(
+              session.id,
+              new AbortController().signal,
+            );
+          },
+          { allowDuringProjectionRecovery: true },
+        ).catch(() => undefined);
+      }
+    })();
     const tracked = task.then(
       () => undefined,
       () => undefined,
@@ -3047,6 +3498,9 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    this.#requireLiveProviderObservation(
+      await this.#ensureSessionObservedLocked(session.id, signal),
+    );
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let activeTurnId: string | null = null;
@@ -3356,6 +3810,9 @@ export class HraService {
     const session = this.#requireBoundSession(sessionSelector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    this.#requireLiveProviderObservation(
+      await this.#ensureSessionObservedLocked(session.id, signal),
+    );
     return await this.#fencedEffect(async () => await this.#codex.inspectTurn({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, turnId, signal }));
   }
 
@@ -3434,6 +3891,9 @@ export class HraService {
     try {
       const signal = new AbortController().signal;
       const profile = this.#store.requireProfile(session.profileId);
+      this.#requireLiveProviderObservation(
+        await this.#ensureSessionObservedLocked(session.id, signal),
+      );
       const baseline = await this.#readExactSessionProjection(boundSession, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) return;
       const review = await this.#fencedEffect(async () => await this.#codex.reviewTurnStart({

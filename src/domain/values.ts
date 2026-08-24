@@ -46,6 +46,9 @@ export const createAttemptId = (): AttemptId => attemptIdSchema.parse(createId("
 export const unixMillisecondsSchema = z.number().int().nonnegative().finite();
 export const positiveRevisionSchema = z.number().int().positive().finite();
 
+export const canonicalLabelKey = (value: string): string =>
+  value.normalize("NFKC").toLocaleLowerCase("en-US");
+
 export function selectByIdOrLabel<T extends { id: string; label: string }>(
   values: readonly T[],
   selector: string,
@@ -54,9 +57,9 @@ export function selectByIdOrLabel<T extends { id: string; label: string }>(
   if (exactId !== undefined) {
     return { kind: "found", value: exactId };
   }
-  const normalized = selector.normalize("NFKC").toLocaleLowerCase("en-US");
+  const normalized = canonicalLabelKey(selector);
   const matches = values.filter(
-    (value) => value.label.normalize("NFKC").toLocaleLowerCase("en-US") === normalized,
+    (value) => canonicalLabelKey(value.label) === normalized,
   );
   if (matches.length === 1) {
     const only = matches[0];

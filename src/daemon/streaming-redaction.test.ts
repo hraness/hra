@@ -58,6 +58,49 @@ const texts = (writes: readonly SessionEventWrite[], itemId: string): string =>
       : []).join("");
 
 describe("SessionEventStreamRedactor", () => {
+  test("sanitizes and UTF-8 bounds tool lifecycle identity without dropping it", () => {
+    const redactor = new SessionEventStreamRedactor();
+    const started = redactor.accept(write({
+      type: "item_started",
+      turnId: "turn-tool",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: `${privatePathRoot}/mcp\u001b${"界".repeat(300)}`,
+      tool: "api_key=TOOL-IDENTITY-SECRET-1234",
+    }));
+    const completed = redactor.accept(write({
+      type: "item_completed",
+      turnId: "turn-tool",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: "github",
+      tool: "create_issue",
+      status: "completed",
+    }));
+
+    expect(started).toHaveLength(1);
+    expect(completed).toHaveLength(1);
+    const startBody = started[0]?.body;
+    const completeBody = completed[0]?.body;
+    expect(startBody).toMatchObject({
+      type: "item_started",
+      tool: "[protected]",
+    });
+    expect(completeBody).toMatchObject({
+      type: "item_completed",
+      server: "github",
+      tool: "create_issue",
+    });
+    if (startBody?.type !== "item_started" || startBody.server === undefined) {
+      throw new Error("Expected sanitized tool lifecycle identity.");
+    }
+    expect(new TextEncoder().encode(startBody.server).byteLength).toBeLessThanOrEqual(256);
+    expect(startBody.server).toContain("[local-path]");
+    expect(startBody.server).not.toContain(privatePathRoot);
+    expect(startBody.server).not.toContain("\u001b");
+    expect(JSON.stringify([...started, ...completed])).not.toContain("TOOL-IDENTITY-SECRET-1234");
+  });
+
   test("redacts split authorization, device-code, token, and key assignments before release", () => {
     const redactor = new SessionEventStreamRedactor();
     const output: SessionEventWrite[] = [];

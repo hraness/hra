@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, realpath, symlink } from "node:fs/promises";
+import { renameSync, symlinkSync } from "node:fs";
+import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Database } from "bun:sqlite";
+import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
@@ -313,6 +314,82 @@ function moveQueueTo(store: StateStore, queueId: ReturnType<StateStore["enqueue"
 }
 
 describe("StateStore", () => {
+  test("creates the main database as an exact private single-link file", async () => {
+    const { store } = await fixture();
+    const metadata = await lstat(store.paths.database);
+
+    expect(metadata.isFile()).toBe(true);
+    expect(metadata.isSymbolicLink()).toBe(false);
+    expect(metadata.nlink).toBe(1);
+    expect(metadata.mode & 0o777).toBe(0o600);
+    const owner = process.getuid?.();
+    if (owner !== undefined) expect(metadata.uid).toBe(owner);
+  });
+
+  test("fails closed without chmod when an existing database is permission-unsafe", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    await chmod(paths.database, 0o644);
+
+    expect(() => new StateStore(paths)).toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect((await lstat(paths.database)).mode & 0o777).toBe(0o644);
+  });
+
+  test("refuses a symlink at the main database boundary before SQLite opens it", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-link-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const target = join(paths.root, "database-target");
+    await writeFile(target, "not-a-database", { mode: 0o600 });
+    await symlink(target, paths.database);
+
+    expect(() => new StateStore(paths)).toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect(await Bun.file(target).text()).toBe("not-a-database");
+  });
+
+  test("refuses a symlink swapped in after the main database precheck", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const original = `${paths.database}.validated`;
+    const target = `${paths.database}.target`;
+    await writeFile(target, "target-must-remain-untouched", { mode: 0o600 });
+    let observedFlags = 0;
+
+    let failure: unknown;
+    try {
+      new StateStore(paths, {
+        beforeDatabaseOpen: ({ flags, path }) => {
+          observedFlags = flags;
+          renameSync(path, original);
+          symlinkSync(target, path);
+        },
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(observedFlags).toBe(
+      sqliteConstants.SQLITE_OPEN_READWRITE
+        | sqliteConstants.SQLITE_OPEN_CREATE
+        | sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+    );
+    expect(failure).toMatchObject({
+      code: "SQLITE_CANTOPEN_SYMLINK",
+      errno: 1_550,
+    });
+    expect(await Bun.file(target).text()).toBe("target-must-remain-untouched");
+    const originalMetadata = await lstat(original);
+    expect(originalMetadata.isFile()).toBe(true);
+    expect(originalMetadata.nlink).toBe(1);
+    expect(originalMetadata.mode & 0o777).toBe(0o600);
+  });
+
   test("isolates profiles and fences process generations", async () => {
     const { store } = await fixture();
     const work = store.createProfile("Work");
@@ -404,10 +481,19 @@ describe("StateStore", () => {
     expect(store.requireProfile(profile.id)).toMatchObject({ state: "recovery_required", providerEmail: "profile@example.com" });
   });
 
-  test("rejects ambiguous labels without effects", async () => {
-    const { store } = await fixture();
-    store.createProfile("Alpha");
-    expect(() => store.createProfile("alpha")).toThrow();
+  test("enforces the selector's Unicode label identity without effects", async () => {
+    const { store, home } = await fixture();
+    const account = store.createProfile("Équipe");
+    expect(() => store.createProfile("équipe")).toThrow();
+    expect(store.requireProfile("e\u0301QUIPE").id).toBe(account.id);
+
+    const firstRoot = join(home, "Café");
+    const secondRoot = join(home, "Cafe-decomposed");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const project = await store.createProject("Café", firstRoot);
+    await expect(store.createProject("Cafe\u0301", secondRoot)).rejects.toThrow();
+    expect(store.requireProject("CAFE\u0301").id).toBe(project.id);
     expect(() => store.requireProfile("missing")).toThrow(SelectionError);
   });
 
@@ -1401,7 +1487,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS queue_message_scrub_authority_record;
       DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
       DROP TABLE IF EXISTS queue_message_scrub_authority;
-      DELETE FROM migrations WHERE version IN (21,22,23);
+      DELETE FROM migrations WHERE version IN (21,22,23,24);
       PRAGMA user_version=20;
     `);
     legacy.query(
@@ -1451,7 +1537,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -3168,8 +3254,18 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }]);
+      expect(inspector.query("PRAGMA table_info(profiles)").all())
+        .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
+      expect(inspector.query("PRAGMA table_info(projects)").all())
+        .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%label_key%' ORDER BY name",
+      ).all()).toEqual([
+        { name: "profiles_label_key_active" },
+        { name: "projects_label_key_unique" },
+      ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at", type: "REAL" }));
       expect(inspector.query("PRAGMA table_info(desktop_switches)").all()).toContainEqual(expect.objectContaining({ name: "switch_generation", type: "INTEGER" }));
       expect(inspector.query("PRAGMA table_info(usage_poll_failures)").all()).toContainEqual(expect.objectContaining({ name: "reason_code", type: "TEXT" }));
@@ -3216,6 +3312,173 @@ describe("StateStore", () => {
     }
   });
 
+  test("repairs a same-name nonunique v24 Unicode label index while readonly refuses it", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.createProfile("Équipe");
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    stale.exec(`
+      DROP INDEX profiles_label_key_active;
+      CREATE INDEX profiles_label_key_active
+        ON profiles(label_key) WHERE state!='removed';
+    `);
+    stale.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(unchanged.query(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='profiles_label_key_active'",
+      ).get()).toEqual({
+        sql: "CREATE INDEX profiles_label_key_active\n        ON profiles(label_key) WHERE state!='removed'",
+      });
+    } finally {
+      unchanged.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 2_000 });
+    stores.push(repaired);
+    expect(() => repaired.createProfile("équipe")).toThrow();
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT "unique" AS is_unique,partial
+         FROM pragma_index_list('profiles') WHERE name='profiles_label_key_active'`,
+      ).get()).toEqual({ is_unique: 1, partial: 1 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("repairs a stale same-name v24 guard while readonly leaves it untouched", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    stale.exec(`
+      DROP TRIGGER profiles_label_key_insert_guard;
+      CREATE TRIGGER profiles_label_key_insert_guard
+      BEFORE INSERT ON profiles
+      BEGIN SELECT 1; END;
+    `);
+    stale.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(unchanged.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
+      ).get()).toEqual({
+        sql: "CREATE TRIGGER profiles_label_key_insert_guard\n      BEFORE INSERT ON profiles\n      BEGIN SELECT 1; END",
+      });
+    } finally {
+      unchanged.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 2_000 });
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const writer = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(() => writer.query(
+        `INSERT INTO profiles(
+           id,label,label_key,state,process_generation,created_at,updated_at
+         ) VALUES ('acct_00000000000000000000000000000025','Unsafe',NULL,'signed_out',0,1000,1000)`,
+      ).run()).toThrow("invalid profile label key");
+      expect(writer.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
+      ).get()).toEqual({
+        sql: "CREATE TRIGGER profiles_label_key_insert_guard\nBEFORE INSERT ON profiles\nWHEN NEW.label_key IS NULL\n  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096\nBEGIN SELECT RAISE(ABORT, 'invalid profile label key'); END",
+      });
+    } finally {
+      writer.close(false);
+    }
+  });
+
+  test("fails closed when a v23 account state contains a Unicode label collision", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.createProfile("Équipe");
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP INDEX profiles_label_key_active;
+      DROP TRIGGER profiles_label_key_insert_guard;
+      DROP TRIGGER profiles_label_key_immutable;
+      DELETE FROM migrations WHERE version=24;
+      PRAGMA user_version=23;
+    `);
+    legacy.query(
+      `INSERT INTO profiles(
+         id,label,label_key,state,process_generation,created_at,updated_at
+       ) VALUES (?,?,NULL,'signed_out',0,1000,1000)`,
+    ).run("acct_00000000000000000000000000000024", "équipe");
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_ACCOUNT_LABEL_COLLISION");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
+      expect(inspector.query(
+        "SELECT label_key FROM profiles WHERE id='acct_00000000000000000000000000000024'",
+      ).get()).toEqual({ label_key: null });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("fails closed when a v23 project state contains canonically equivalent labels", async () => {
+    const { store, home } = await fixture();
+    const paths = store.paths;
+    const firstRoot = join(home, "project-composed");
+    const secondRoot = join(home, "project-decomposed");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    await store.createProject("Café", firstRoot);
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP INDEX projects_label_key_unique;
+      DROP TRIGGER projects_label_key_insert_guard;
+      DROP TRIGGER projects_label_key_immutable;
+      DELETE FROM migrations WHERE version=24;
+      PRAGMA user_version=23;
+    `);
+    legacy.query(
+      `INSERT INTO projects(
+         id,label,label_key,root_path,is_default,created_at,updated_at
+       ) VALUES (?,?,NULL,?,0,1000,1000)`,
+    ).run("proj_00000000000000000000000000000024", "Cafe\u0301", secondRoot);
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_PROJECT_LABEL_COLLISION");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
+      expect(inspector.query(
+        "SELECT label_key FROM projects WHERE id='proj_00000000000000000000000000000024'",
+      ).get()).toEqual({ label_key: null });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("migrates v18 databases to the exact prepared-response supersession guards", async () => {
     const { store } = await fixture();
     const paths = store.paths;
@@ -3234,7 +3497,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -3342,7 +3605,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -3457,7 +3720,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -3514,7 +3777,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -3602,7 +3865,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -3705,7 +3968,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -3807,6 +4070,7 @@ describe("StateStore", () => {
       PRAGMA user_version = 1;
     `);
     legacy.close(false);
+    await chmod(paths.database, 0o600);
 
     const store = new StateStore(paths, { now: () => 2000 });
     stores.push(store);
@@ -3818,7 +4082,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -3843,8 +4107,13 @@ describe("StateStore", () => {
         { version: 21, applied_at: 2000 },
         { version: 22, applied_at: 2000 },
         { version: 23, applied_at: 2000 },
+        { version: 24, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
+      expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
+        label: "Legacy",
+        label_key: "legacy",
+      });
     } finally {
       inspector.close(false);
     }
@@ -3885,7 +4154,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -3905,8 +4174,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 24");
+    newer.exec("PRAGMA user_version = 25");
     newer.close(false);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:24:23");
+    await chmod(paths.database, 0o600);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:25:24");
   });
 });

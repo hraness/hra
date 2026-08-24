@@ -24,21 +24,33 @@ import type {
   LiveInteractionApprovalAuthority,
   ProviderInteractionAuthority,
 } from "../domain/interactions";
-import type {
-  CodexAccountProjection,
-  CodexLoginOutcome,
-  CodexProjectedMessage,
-  CodexRuntimePort,
-  CodexSessionPage,
-  CodexSessionProjection,
-  CodexTurnSummary,
-  ProfileAuthority,
-  ProjectionTextOmission,
-  RuntimeStartReview,
+import {
+  CodexSessionObservationError,
+  type CodexAccountProjection,
+  type CodexLoginOutcome,
+  type CodexProjectedMessage,
+  type CodexRuntimePort,
+  type CodexSessionObservation,
+  type CodexSessionPage,
+  type CodexSessionProjection,
+  type CodexTurnSummary,
+  type ProfileAuthority,
+  type ProjectionTextOmission,
+  type RuntimeStartReview,
 } from "./ports";
 import { compileEffectiveRuntimeProfile } from "./recommended-capabilities";
 
 type RunningClient = { authority: ProfileAuthority; client: CodexAppServerClient };
+type SessionObservationProof = {
+  readonly resumed: boolean;
+};
+type SessionObservationEntry = {
+  readonly connectionId: string;
+  readonly generation: number;
+  readonly profileId: string;
+  readonly providerThreadId: string;
+  readonly task: Promise<SessionObservationProof>;
+};
 type PendingRuntimeReview = {
   readonly review: RuntimeStartReview;
   readonly running: RunningClient;
@@ -672,6 +684,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   readonly #accountRefreshDirty = new Set<string>();
   readonly #endedGenerationByProfile = new Map<string, number>();
   readonly #runtimeReviews = new Map<string, PendingRuntimeReview>();
+  readonly #sessionObservations = new Map<string, SessionObservationEntry>();
   readonly #operations = new Set<Promise<void>>();
   readonly #isCurrent: (authority: ProfileAuthority) => boolean;
   readonly #observer: CodexRuntimeObserver;
@@ -684,7 +697,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     readonly cliAuth: "file";
     readonly cwd: string;
     readonly mcpOauth: "file";
-  }> | null;
+  }>;
   readonly #now: () => number;
   #usageRevision = Date.now();
   #state: "open" | "closing" | "closed" = "open";
@@ -698,7 +711,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     codexEnvironment?: (
       codexHome: string,
     ) => Promise<Readonly<Record<string, string | undefined>> | undefined>;
-    credentialStorePreflight?: Readonly<{
+    credentialStorePreflight: Readonly<{
       readonly cliAuth: "file";
       readonly cwd: string;
       readonly mcpOauth: "file";
@@ -710,7 +723,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     this.#launchClient = input.launchClient ?? launchPinnedCodexAppServer;
     this.#prepareCodexHome = input.prepareCodexHome;
     this.#codexEnvironment = input.codexEnvironment;
-    this.#credentialStorePreflight = input.credentialStorePreflight ?? null;
+    this.#credentialStorePreflight = input.credentialStorePreflight;
     this.#now = input.now ?? Date.now;
   }
 
@@ -769,11 +782,9 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
       const client = await this.#client(input.authority);
-      if (this.#credentialStorePreflight !== null) {
-        await client.assertCredentialStores(
-          input.projectRoot ?? this.#credentialStorePreflight.cwd,
-        );
-      }
+      await client.assertCredentialStores(
+        input.projectRoot ?? this.#credentialStorePreflight.cwd,
+      );
       const catalog = await client.listPlugins({
         ...(input.projectRoot === undefined ? {} : { cwd: input.projectRoot }),
         forceRefetch: input.forceRefetch,
@@ -845,17 +856,33 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
             "The new thread's exact capability context differs from its reviewed runtime profile.",
           );
         }
+        const projection = projectBoundedThread(started.thread, false);
+        this.#rememberSessionObservation(running, projection, false);
+        return { ...projection, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
       } catch (error: unknown) {
         throw new IndeterminateCodexEffectError("thread/start", 0, error);
       }
-      return { ...projectBoundedThread(started.thread, false), effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
+    });
+  }
+
+  async observeSession(input: { authority: ProfileAuthority; providerThreadId: string; signal: AbortSignal }): Promise<CodexSessionObservation> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      const running = await this.#running(input.authority);
+      const proof = await this.#ensureSessionObserved(running, input.providerThreadId);
+      const observation = await this.#readSessionObservation(running, input.providerThreadId, proof);
+      input.signal.throwIfAborted();
+      this.#assertObservedClientCurrent(running);
+      return observation;
     });
   }
 
   async readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      const client = await this.#client(input.authority);
+      const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
+      const client = running.client;
       const [metadata, turns] = await Promise.all([
         client.readThread(input.providerThreadId, false),
         client.listThreadTurns({
@@ -894,6 +921,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a turn.");
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
       const reviewed = await this.#reviewedPreset(running, input.preset, input.fast, input.projectRoot, input.providerThreadId);
       return this.#rememberReview({ kind: "turn_start", running, projectRoot: input.projectRoot, providerThreadId: input.providerThreadId, ...reviewed });
     });
@@ -910,6 +938,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         providerThreadId: input.providerThreadId,
       });
       const running = reviewed.running;
+      await this.#ensureSessionObserved(running, input.providerThreadId);
       const preset = reviewed.preset;
       const value = await running.client.startTurn({ threadId: input.providerThreadId, clientMessageId: input.clientMessageId, text: input.message, preset, cwd: input.projectRoot, policy: this.#policy(input.projectRoot) });
       return { turnId: value.value.turn.id, status: value.value.turn.status, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
@@ -919,28 +948,36 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   async steer(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; message: string; clientMessageId: string; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      await (await this.#client(input.authority)).steerTurn({ threadId: input.providerThreadId, expectedTurnId: input.activeTurnId, clientMessageId: input.clientMessageId, text: input.message });
+      const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
+      await running.client.steerTurn({ threadId: input.providerThreadId, expectedTurnId: input.activeTurnId, clientMessageId: input.clientMessageId, text: input.message });
     });
   }
 
   async interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      await (await this.#client(input.authority)).interruptTurn(input.providerThreadId, input.activeTurnId);
+      const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
+      await running.client.interruptTurn(input.providerThreadId, input.activeTurnId);
     });
   }
 
   async rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void> {
     await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      await (await this.#client(input.authority)).renameThread(input.providerThreadId, input.name);
+      const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
+      await running.client.renameThread(input.providerThreadId, input.name);
     });
   }
 
   async inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      const client = await this.#client(input.authority);
+      const running = await this.#running(input.authority);
+      await this.#ensureSessionObserved(running, input.providerThreadId);
+      const client = running.client;
       const [metadata, turn, itemPage] = await Promise.all([
         client.readThread(input.providerThreadId, false),
         this.#findTurn(client, input.providerThreadId, input.turnId, input.signal),
@@ -1175,6 +1212,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     if (this.#closeTask !== undefined) return this.#closeTask;
     this.#state = "closing";
     this.#runtimeReviews.clear();
+    this.#sessionObservations.clear();
     this.#accountRefreshDirty.clear();
     this.#closeTask = this.#closeOwnedRuntime();
     return this.#closeTask;
@@ -1189,6 +1227,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     this.#accountRefreshes.clear();
     this.#accountRefreshDirty.clear();
     this.#runtimeReviews.clear();
+    this.#sessionObservations.clear();
     this.#state = "closed";
   }
 
@@ -1227,6 +1266,153 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
   }
 
   async #client(authority: ProfileAuthority): Promise<CodexAppServerClient> { return (await this.#running(authority)).client; }
+
+  #observationKey(running: RunningClient, providerThreadId: string): string {
+    return JSON.stringify([
+      running.authority.id,
+      running.authority.generation,
+      running.client.connectionId,
+      providerThreadId,
+    ]);
+  }
+
+  #rememberSessionObservation(
+    running: RunningClient,
+    projection: CodexSessionProjection,
+    resumed: boolean,
+  ): SessionObservationProof {
+    this.#assertObservedClientCurrent(running);
+    const proof = { resumed } satisfies SessionObservationProof;
+    const task = Promise.resolve(proof);
+    this.#sessionObservations.set(this.#observationKey(running, projection.providerThreadId), {
+      connectionId: running.client.connectionId,
+      generation: running.authority.generation,
+      profileId: running.authority.id,
+      providerThreadId: projection.providerThreadId,
+      task,
+    });
+    return proof;
+  }
+
+  async #ensureSessionObserved(
+    running: RunningClient,
+    providerThreadId: string,
+  ): Promise<SessionObservationProof> {
+    this.#assertObservedClientCurrent(running);
+    const key = this.#observationKey(running, providerThreadId);
+    const existing = this.#sessionObservations.get(key);
+    if (existing !== undefined) {
+      const proof = await existing.task;
+      this.#assertObservedClientCurrent(running);
+      return proof;
+    }
+    const task = (async (): Promise<SessionObservationProof> => {
+      try {
+        const resumed = (await running.client.resumeThread(providerThreadId)).value;
+        if (resumed.id !== providerThreadId) {
+          throw new CodexSessionObservationError("thread_mismatch");
+        }
+        this.#assertObservedClientCurrent(running);
+        return { resumed: true };
+      } catch (error: unknown) {
+        if (error instanceof CodexSessionObservationError) throw error;
+        if (error instanceof IndeterminateCodexEffectError) {
+          await this.#retireIndeterminateObservation(running);
+          throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+        }
+        if (error instanceof CodexError) {
+          throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+        }
+        throw error;
+      }
+    })();
+    const entry: SessionObservationEntry = {
+      connectionId: running.client.connectionId,
+      generation: running.authority.generation,
+      profileId: running.authority.id,
+      providerThreadId,
+      task,
+    };
+    this.#sessionObservations.set(key, entry);
+    try {
+      const proof = await task;
+      this.#assertObservedClientCurrent(running);
+      return proof;
+    } catch (error: unknown) {
+      const deterministicUnavailable = error instanceof CodexSessionObservationError
+        && error.reason === "resume_unavailable"
+        && this.#clients.get(running.authority.id) === running;
+      if (!deterministicUnavailable && this.#sessionObservations.get(key) === entry) {
+        this.#sessionObservations.delete(key);
+      }
+      throw error;
+    }
+  }
+
+  async #readSessionObservation(
+    running: RunningClient,
+    providerThreadId: string,
+    proof: SessionObservationProof,
+  ): Promise<CodexSessionObservation> {
+    const metadata = (await running.client.readThread(providerThreadId, false)).value;
+    if (metadata.id !== providerThreadId) {
+      throw new CodexSessionObservationError("thread_mismatch");
+    }
+    const recentTurns = metadata.status.type === "active"
+      ? (await running.client.listThreadTurns({
+          threadId: providerThreadId,
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        })).value.data
+      : [];
+    this.#assertObservedClientCurrent(running);
+    return {
+      connectionId: running.client.connectionId,
+      projection: projectBoundedThread({ ...metadata, turns: recentTurns }, false),
+      resumed: proof.resumed,
+    };
+  }
+
+  #assertObservedClientCurrent(running: RunningClient): void {
+    const current = this.#clients.get(running.authority.id);
+    if (
+      current !== running
+      || current.authority.generation !== running.authority.generation
+      || current.client.connectionId !== running.client.connectionId
+      || current.client.state !== "ready"
+      || !this.#isCurrent(running.authority)
+    ) {
+      throw new CodexError("AUTHORITY_STALE", "The exact Codex observation authority is no longer current.");
+    }
+  }
+
+  #clearSessionObservations(running: RunningClient): void {
+    for (const [key, entry] of this.#sessionObservations) {
+      if (
+        entry.profileId === running.authority.id
+        && entry.generation === running.authority.generation
+        && entry.connectionId === running.client.connectionId
+      ) this.#sessionObservations.delete(key);
+    }
+  }
+
+  async #retireIndeterminateObservation(running: RunningClient): Promise<void> {
+    await this.#serializeLifecycle(running.authority.id, async () => {
+      const current = this.#clients.get(running.authority.id);
+      if (current !== running) return;
+      this.#clients.delete(running.authority.id);
+      this.#clearSessionObservations(running);
+      this.#endedGenerationByProfile.set(
+        running.authority.id,
+        Math.max(
+          this.#endedGenerationByProfile.get(running.authority.id) ?? 0,
+          running.authority.generation,
+        ),
+      );
+      await running.client.close();
+    });
+  }
 
   async #hydrateRecentTurns(
     client: CodexAppServerClient,
@@ -1624,6 +1810,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     const existing = this.#clients.get(authority.id);
     if (existing !== undefined) {
       this.#clients.delete(authority.id);
+      this.#clearSessionObservations(existing);
       await existing.client.close();
     }
     if (this.#prepareCodexHome !== undefined) {
@@ -1636,14 +1823,17 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         authority: { profileId: authority.id, processGeneration: authority.generation },
         expectedCodexHome: authority.codexHome,
         ...(environment === undefined ? {} : { environment }),
-        ...(this.#credentialStorePreflight === null
-          ? {}
-          : { credentialStorePreflight: this.#credentialStorePreflight }),
+        credentialStorePreflight: this.#credentialStorePreflight,
         experimentalApi: true,
         isAuthorityCurrent: () => this.#isCurrent(authority),
         now: this.#now,
         onFact: async (value: FencedCodexValue<CodexFact>) => {
           if (value.value.type === "providerDisconnected") {
+            const disconnected = this.#clients.get(authority.id);
+            if (
+              disconnected?.authority.generation === authority.generation
+              && disconnected.client.connectionId === value.value.connectionId
+            ) this.#clearSessionObservations(disconnected);
             this.#endedGenerationByProfile.set(
               authority.id,
               Math.max(
@@ -1713,9 +1903,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     preset: ResolvedPreset;
     profile: EffectiveRuntimeProfile;
   }> {
-    if (this.#credentialStorePreflight !== null) {
-      await running.client.assertCredentialStores(cwd);
-    }
+    await running.client.assertCredentialStores(cwd);
     const capabilities = await running.client.discoverCapabilities({ cwd, ...(threadId === undefined ? {} : { threadId }), includeExperimental: true });
     const preset = running.client.resolvePreset(capabilities, alias, fast);
     const profile = compileEffectiveRuntimeProfile({

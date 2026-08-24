@@ -47,8 +47,33 @@ const pendingInteractionSchema = z.object({
   }).passthrough(),
 }).passthrough();
 
+const providerObservationSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("live"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    connectionId: z.string().uuid(),
+    mode: z.enum(["connected", "resubscribed"]),
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    code: z.enum(["account_signed_out", "resume_unavailable"]),
+  }).strict(),
+  z.object({
+    state: z.literal("recovery_required"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    code: z.enum(["session_quarantined", "thread_mismatch"]),
+  }).strict(),
+  z.object({
+    state: z.literal("not_applicable"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    reason: z.enum(["terminal", "unbound"]),
+  }).strict(),
+]);
+
 const shellLiveStatusSchema = z.object({
   session: z.object({ id: sessionIdSchema }).passthrough(),
+  providerObservation: providerObservationSchema,
   eventStream: z.object({
     cursor: z.string().min(1).max(2_048),
   }).passthrough(),
@@ -185,6 +210,14 @@ const interactionFromEvent = (
   display: { summary: body.summary },
 });
 
+const liveToolTarget = (
+  server: string | undefined,
+  tool: string | undefined,
+  fallback: string,
+): string => server === undefined && tool === undefined
+  ? ""
+  : ` ${safeLiveText(server ?? "local")}/${safeLiveText(tool ?? fallback)}`;
+
 const renderNonDeltaEvent = (event: SessionEvent): string | null => {
   const body = event.body;
   switch (body.type) {
@@ -197,9 +230,9 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "session_status": return `Session: ${safeLiveText(body.status)}.`;
     case "turn_started": return "Turn started.";
     case "turn_completed": return `Turn ${safeLiveText(body.status)}${body.errorCode === undefined ? "." : ` (${safeLiveText(body.errorCode)}).`}`;
-    case "item_started": return `Item started: ${safeLiveText(body.itemKind)}.`;
-    case "item_completed": return `Item completed: ${safeLiveText(body.itemKind)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
-    case "tool_progress": return `Tool: ${safeLiveText(body.toolKind)}${body.status === undefined ? "." : `, ${safeLiveText(body.status)}.`}`;
+    case "item_started": return `Item started: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}.`;
+    case "item_completed": return `Item completed: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
+    case "tool_progress": return `Tool: ${safeLiveText(body.toolKind)}${liveToolTarget(body.server, body.tool, body.toolKind)}${body.status === undefined ? "." : `, ${safeLiveText(body.status)}.`}`;
     case "file_change": return `Files: ${safeLiveText(body.status)}, ${String(body.paths.length)} visible change${body.paths.length === 1 ? "" : "s"}${body.omittedPaths === 0 ? "." : `, ${String(body.omittedPaths)} omitted.`}`;
     case "plan_updated": return `Plan updated: ${String(body.steps.length)} step${body.steps.length === 1 ? "" : "s"}.`;
     case "diff_updated": return `Diff updated: ${String(body.changedFiles)} file${body.changedFiles === 1 ? "" : "s"}.`;

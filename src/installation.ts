@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { resolveStatePaths, type StatePaths } from "./storage/paths";
 import { GenerationalSecretCustody } from "./storage/secret-custody";
@@ -7,6 +7,11 @@ import { GenerationalSecretCustody } from "./storage/secret-custody";
 type HraInstallationCommon = Readonly<{
   cloudEnvironment: Readonly<{ HRA_CONVEX_URL?: string }>;
   codexEnvironment(codexHome: string): Promise<Readonly<Record<string, string | undefined>> | undefined>;
+  credentialStorePreflight: Readonly<{
+    readonly cliAuth: "file";
+    readonly cwd: string;
+    readonly mcpOauth: "file";
+  }>;
   documentsDirectory: string;
   paths: StatePaths;
   createSecretCustody(): GenerationalSecretCustody;
@@ -15,17 +20,11 @@ type HraInstallationCommon = Readonly<{
 
 export type HraInstallation = HraInstallationCommon & (
   | Readonly<{
-      credentialStorePreflight: null;
       desktopSwitching: true;
       expectedHomeDirectory: null;
       kind: "production";
     }>
   | Readonly<{
-      credentialStorePreflight: Readonly<{
-        readonly cliAuth: "file";
-        readonly cwd: string;
-        readonly mcpOauth: "file";
-      }>;
       desktopSwitching: false;
       expectedHomeDirectory: string;
       kind: "live_acceptance";
@@ -43,7 +42,11 @@ export function createProductionInstallation(): HraInstallation {
       ? {}
       : { HRA_CONVEX_URL: cloudDeploymentUrl },
     codexEnvironment: defaultCodexEnvironment,
-    credentialStorePreflight: null,
+    credentialStorePreflight: {
+      cliAuth: "file",
+      cwd: resolve(process.cwd()),
+      mcpOauth: "file",
+    },
     createSecretCustody: () => new GenerationalSecretCustody(paths),
     desktopSwitching: true,
     documentsDirectory: join(homedir(), "Documents"),

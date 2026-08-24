@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "./paths";
-import { HRA_KEYCHAIN_SERVICE } from "./secret-custody";
+import { GenerationalSecretCustody } from "./secret-custody";
 
 describe("HRA v1 local namespace", () => {
   test("initializes beside HRA v0 custody without reading or changing it", async () => {
@@ -23,10 +23,10 @@ describe("HRA v1 local namespace", () => {
     expect(paths.root).toBe(join(applicationSupport, "HRA Control Plane v1"));
     expect(paths.root).not.toBe(legacyState);
     expect(paths.root).not.toBe(legacyWindowState);
-    expect(HRA_KEYCHAIN_SERVICE).toBe("sh.hra.control-plane.v1");
-    expect(HRA_KEYCHAIN_SERVICE).not.toStartWith("kitchen.hraness");
-
     await initializeStatePaths(paths);
+    const custody = new GenerationalSecretCustody(paths);
+    await custody.compareAndSwap("namespace-sentinel", null, "v1-secret");
+    expect(await readdir(join(paths.root, "secret-values"))).toHaveLength(1);
     expect(await readFile(legacyStateSentinel, "utf8")).toBe("v0-state");
     expect(await readFile(legacyWindowSentinel, "utf8")).toBe("v0-window");
   });

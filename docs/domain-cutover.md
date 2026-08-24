@@ -93,7 +93,7 @@ Require the tuple to identify new project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS` 
 
 ## Checked operator
 
-`hosted:domain-cutover` reads one strict schema-version-1 JSON plan from protected stdin or `--plan-fd`, emits one JSON result, and requires `--execute`. Each endpoint contains:
+`hosted:domain-cutover` reads one strict schema-version-1 JSON plan from protected stdin or `--plan-fd` and emits one JSON result. Read-only inspection uses the `preflight` operation. The mutating path requires `--execute`. Each endpoint contains:
 
 ```json
 {
@@ -114,6 +114,18 @@ Plans add `schemaVersion`, `direction`, `mode`, `source`, and `target`. Only the
 | `archive` | `traffic-only` | P, old project, `generation: null` | Q, old project, generation 0 |
 | `forward` | `domain` | Q, old project, generation 0 | N, new project, generation 1 |
 | `reverse` | `domain` | N, new project, generation 1 | Q, old project, generation 0 |
+
+Read the complete provider state without changing it before every rehearsal or cutover:
+
+```sh
+bun run hosted:domain-cutover preflight --vercel-cli /absolute/path/to/vercel < cutover-plan.json
+```
+
+`preflight` parses the same protected plan and requires the same pinned Vercel CLI version, fixed project identities, disabled automatic domain assignment, exact source and target deployments, managed alias tuples, public generation markers, and terminally paginated project-domain ownership. It never sets an alias, moves domain ownership, enters compensation, invokes a DNS provider, or performs another provider mutation.
+
+The command emits one schema-version-1 JSON result. Exact source authority returns `status: "ready"` with `nextAction: "execute_plan"`. Exact target authority returns `status: "already_committed"` with `nextAction: "replay_plan_for_receipt"`. A successfully read, schema-valid but partial, ambiguous, contradictory, or marker-inexact observation returns exit 1 with `status: "blocked"` and `nextAction: "stop_and_investigate"`; it does not repair the state. An exception while reading any managed alias, either complete project-domain list, or any required public marker returns one bounded `status: "refused"` result on stderr, leaves stdout empty, and performs no mutation. Invalid input or structurally invalid provider evidence is refused the same way. A successful or blocked result includes only the plan's public source and target IDs plus the closed observed owner, traffic, state, and reason fields.
+
+A successful preflight is a point-in-time observation, not a provider lock. Run it immediately before the checked execution. The execution repeats every identity and state read instead of trusting the earlier result.
 
 Run a checked plan with Bun 1.3.14:
 

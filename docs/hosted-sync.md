@@ -10,6 +10,28 @@ Never copy HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC 
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. HRA v0 owns Convex project ID `2680173` and production deployment ID `4677913`; neither may be renamed into or selected by this runbook. The new source repository has GitHub repository ID `1343008607`, and the new web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Project and deployment names may change during cutover. The team identity and numeric resource IDs do not.
 
+## Migrate staged prerelease secret pointers
+
+This compatibility operator is only for repository checkouts that ran an unpublished prerelease HRA v1 build on macOS when the default secret backend was Keychain. No HRA v1 beta containing that default was published. This command is therefore a repository-operator migration for staged prerelease state, not an installed-product feature, a daemon fallback, or a reason to make the daemon read Keychain.
+
+Run the read-only inspection from the exact source checkout first:
+
+```sh
+bun run operator:migrate-legacy-secrets preflight
+```
+
+Preflight reads the private pointer metadata and current `secret-values` files only. It does not acquire daemon authority, create a directory or file, read Keychain, copy a value, delete an entry, or perform another mutation. `ready` with `nextAction: "execute_migration"` means at least one current pointer still lacks its exact file-backed value. `already_complete` and `not_required` need no migration. Unsafe, unknown, locked, malformed, non-owned, multiply linked, permission-inexact, oversized, replaced, or digest-conflicting metadata is a refusal. Output contains counts and a closed status only. It never contains a secret value, digest, slot, Keychain account, nonce, or local path.
+
+Stop every HRA process, then run the explicit foreground mutation:
+
+```sh
+bun run operator:migrate-legacy-secrets --execute
+```
+
+Execution first acquires and holds HRA's exact daemon lifecycle authority in maintenance state. A live or starting daemon causes `daemon_running` before any Keychain access. While that authority remains held, the operator re-reads every current pointer, reads only missing values from Bun's legacy `sh.hra.control-plane.v1` service, checks each value against the pointer digest, and validates all missing values before copying any. It publishes each value at the unchanged immutable account name through the current `FileSecretBackend`, then reopens every required file through the protected descriptor boundary and proves all pointer digests again before releasing authority and reporting success.
+
+The operation is safe to replay after a crash or refusal. Exact copies are accepted without another Keychain read, missing copies resume, and an existing conflicting or unsafe file stops the run without overwrite. A pointer change during execution is a refusal even when an earlier copy succeeded; stop HRA and replay so the current complete pointer set can be proved. The operator never deletes or changes an entry in the legacy Keychain service. Keep those entries as recovery evidence until the prerelease installation is no longer needed, then review any manual cleanup separately.
+
 ## Create fresh state
 
 1. Create a new Convex project and production deployment in Convex team `cclrte` with numeric team ID `513923`.

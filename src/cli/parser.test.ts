@@ -322,7 +322,7 @@ describe("CLI parser", () => {
         kind: "command",
       });
 
-    for (const action of ["install", "enable", "disable"]) {
+    for (const action of ["install", "enable", "disable", "oauth", "authorize"]) {
       expect(() => parseCli(["plugin", action, "work", "files@official"]))
         .toThrow("no safe separated plugin lifecycle effect");
     }

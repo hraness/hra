@@ -78,6 +78,7 @@ class FakeCodex implements CodexRuntimePort {
   listSessions(): ReturnType<CodexRuntimePort["listSessions"]> { return Promise.reject(new Error("unused")); }
   reviewSessionStart(): Promise<never> { return Promise.reject(new Error("unused")); }
   startSession(): Promise<never> { return Promise.reject(new Error("unused")); }
+  observeSession(): ReturnType<CodexRuntimePort["observeSession"]> { return Promise.reject(new Error("unused")); }
   reviewTurnStart(): Promise<never> { return Promise.reject(new Error("unused")); }
   startTurn(): Promise<never> { return Promise.reject(new Error("unused")); }
   steer(): Promise<void> { return Promise.reject(new Error("unused")); }

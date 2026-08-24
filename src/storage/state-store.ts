@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  type Stats,
+} from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { Database } from "bun:sqlite";
+import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
 import {
@@ -51,6 +61,7 @@ import {
 } from "../domain/transitions";
 import {
   attemptIdSchema,
+  canonicalLabelKey,
   createAttemptId,
   createProfileId,
   createProjectId,
@@ -65,6 +76,7 @@ import {
   sessionIdSchema,
   titleSchema,
   unixMillisecondsSchema,
+  utf8Bytes,
   type AttemptId,
   type ProfileId,
   type ProjectId,
@@ -100,6 +112,7 @@ export type InteractionListPage = Readonly<{
 const profileRowSchema = z.object({
   id: profileIdSchema,
   label: labelSchema,
+  label_key: z.string().min(1),
   state: profileStateSchema,
   process_generation: z.number().int().nonnegative(),
   provider_email: z.string().nullable(),
@@ -111,6 +124,7 @@ const profileRowSchema = z.object({
 const projectRowSchema = z.object({
   id: projectIdSchema,
   label: labelSchema,
+  label_key: z.string().min(1),
   root_path: z.string().min(1),
   is_default: z.union([z.literal(0), z.literal(1)]),
   created_at: unixMillisecondsSchema,
@@ -449,9 +463,88 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 23;
+const currentSchemaVersion = 24;
 const stateBusyTimeoutMs = 5_000;
 const securityScrubBusyTimeoutMs = 250;
+
+type StateDatabaseFileIdentity = Readonly<{ device: number; inode: number }>;
+
+const stateDatabaseFileIsSafe = (metadata: Stats): boolean => {
+  const owner = process.getuid?.();
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.nlink === 1
+    && (metadata.mode & 0o777) === 0o600
+    && (owner === undefined || metadata.uid === owner);
+};
+
+const assertStateDatabaseFile = (
+  path: string,
+  expected?: StateDatabaseFileIdentity,
+): StateDatabaseFileIdentity => {
+  try {
+    const metadata = lstatSync(path);
+    if (
+      !stateDatabaseFileIsSafe(metadata)
+      || realpathSync(path) !== resolve(path)
+      || (expected !== undefined
+        && (metadata.dev !== expected.device || metadata.ino !== expected.inode))
+    ) throw new Error("STATE_DATABASE_FILE_UNSAFE");
+    return { device: metadata.dev, inode: metadata.ino };
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === "STATE_DATABASE_FILE_UNSAFE") throw error;
+    throw new Error("STATE_DATABASE_FILE_UNSAFE", { cause: error });
+  }
+};
+
+const prepareStateDatabaseFile = (
+  path: string,
+  readonly: boolean,
+): StateDatabaseFileIdentity => {
+  let descriptor: number | undefined;
+  let created = false;
+  try {
+    if (!readonly) {
+      try {
+        descriptor = openSync(
+          path,
+          constants.O_CREAT
+            | constants.O_EXCL
+            | constants.O_RDWR
+            | constants.O_NOFOLLOW
+            | constants.O_NONBLOCK,
+          0o600,
+        );
+        created = true;
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    descriptor ??= openSync(
+      path,
+      (readonly ? constants.O_RDONLY : constants.O_RDWR)
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
+    );
+    if (created) fchmodSync(descriptor, 0o600);
+    const opened = fstatSync(descriptor);
+    if (!stateDatabaseFileIsSafe(opened)) throw new Error("STATE_DATABASE_FILE_UNSAFE");
+    const identity = { device: opened.dev, inode: opened.ino };
+    assertStateDatabaseFile(path, identity);
+    return identity;
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === "STATE_DATABASE_FILE_UNSAFE") throw error;
+    throw new Error("STATE_DATABASE_FILE_UNSAFE", { cause: error });
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+};
+
+const stateDatabaseOpenFlags = (readonly: boolean): number =>
+  sqliteConstants.SQLITE_OPEN_NOFOLLOW
+  | (readonly
+    ? sqliteConstants.SQLITE_OPEN_READONLY
+    : sqliteConstants.SQLITE_OPEN_READWRITE | sqliteConstants.SQLITE_OPEN_CREATE);
 
 export const USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS = 24 * 60 * 60_000;
 export const USAGE_CLOUD_UPLOAD_ANCHOR_COUNT = 128;
@@ -1414,6 +1507,105 @@ CREATE INDEX IF NOT EXISTS queue_entries_message_scrub_candidates
   WHERE message!='[queue message removed after settlement]';
 `;
 
+const schemaVersion24Objects = [
+  {
+    name: "profiles_label_key_active",
+    table: "profiles",
+    type: "index",
+    sql: `CREATE UNIQUE INDEX profiles_label_key_active
+  ON profiles(label_key) WHERE state!='removed'`,
+  },
+  {
+    name: "projects_label_key_unique",
+    table: "projects",
+    type: "index",
+    sql: `CREATE UNIQUE INDEX projects_label_key_unique
+  ON projects(label_key)`,
+  },
+  {
+    name: "profiles_label_key_insert_guard",
+    table: "profiles",
+    type: "trigger",
+    sql: `CREATE TRIGGER profiles_label_key_insert_guard
+BEFORE INSERT ON profiles
+WHEN NEW.label_key IS NULL
+  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096
+BEGIN SELECT RAISE(ABORT, 'invalid profile label key'); END`,
+  },
+  {
+    name: "profiles_label_key_immutable",
+    table: "profiles",
+    type: "trigger",
+    sql: `CREATE TRIGGER profiles_label_key_immutable
+BEFORE UPDATE OF label,label_key ON profiles
+WHEN NEW.label IS NOT OLD.label OR NEW.label_key IS NOT OLD.label_key
+BEGIN SELECT RAISE(ABORT, 'profile label identity is immutable'); END`,
+  },
+  {
+    name: "projects_label_key_insert_guard",
+    table: "projects",
+    type: "trigger",
+    sql: `CREATE TRIGGER projects_label_key_insert_guard
+BEFORE INSERT ON projects
+WHEN NEW.label_key IS NULL
+  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096
+BEGIN SELECT RAISE(ABORT, 'invalid project label key'); END`,
+  },
+  {
+    name: "projects_label_key_immutable",
+    table: "projects",
+    type: "trigger",
+    sql: `CREATE TRIGGER projects_label_key_immutable
+BEFORE UPDATE OF label,label_key ON projects
+WHEN NEW.label IS NOT OLD.label OR NEW.label_key IS NOT OLD.label_key
+BEGIN SELECT RAISE(ABORT, 'project label identity is immutable'); END`,
+  },
+] as const;
+
+const schemaVersion24 = schemaVersion24Objects
+  .map((object) => `${object.sql};`)
+  .join("\n");
+
+const dropSchemaVersion24 = [...schemaVersion24Objects]
+  .reverse()
+  .map((object) => `DROP ${object.type.toUpperCase()} IF EXISTS ${object.name};`)
+  .join("\n");
+
+const rebuildSchemaVersion24 = (database: Database): void => {
+  database.exec(dropSchemaVersion24);
+  database.exec(schemaVersion24);
+};
+
+const sqliteSchemaObjectRowSchema = z.object({
+  name: z.string(),
+  sql: z.string(),
+  tbl_name: z.string(),
+  type: z.enum(["index", "trigger"]),
+}).strict();
+
+const normalizeSqlStructure = (sql: string): string =>
+  sql.replace(/\s+/gu, " ").trim().replace(/;$/u, "");
+
+const assertSchemaVersion24Objects = (database: Database): void => {
+  const names = schemaVersion24Objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion24Objects.length) {
+    throw new Error("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion24Objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observed.sql) !== normalizeSqlStructure(expected.sql)
+    ) throw new Error("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+  }
+};
+
 const ensureQueueMessageScrubGeneration = (database: Database): void => {
   if (!hasTableColumn(database, "queue_message_scrub_authority", "generation")) {
     database.exec(
@@ -1609,6 +1801,126 @@ const hasTableColumn = (database: Database, table: string, column: string): bool
   const columnSchema = z.object({ name: z.string() }).passthrough();
   if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
   return database.query(`PRAGMA table_info(${table})`).all().some((row) => columnSchema.parse(row).name === column);
+};
+
+type LabelIdentityKind = "ACCOUNT" | "PROJECT";
+
+class StateLabelInvariantError extends Error {
+  constructor(kind: LabelIdentityKind, reason: "COLLISION" | "INVALID" | "KEY_INVALID") {
+    super(`STATE_${kind}_LABEL_${reason}`);
+    this.name = "StateLabelInvariantError";
+  }
+}
+
+const canonicalLabelIdentity = (
+  value: unknown,
+  kind: LabelIdentityKind,
+): Readonly<{ key: string; label: string }> => {
+  const parsed = labelSchema.safeParse(value);
+  if (!parsed.success || parsed.data !== value) {
+    throw new StateLabelInvariantError(kind, "INVALID");
+  }
+  const key = canonicalLabelKey(parsed.data);
+  if (key.length === 0 || utf8Bytes(key) > 4_096) {
+    throw new StateLabelInvariantError(kind, "KEY_INVALID");
+  }
+  return { key, label: parsed.data };
+};
+
+const assertUniqueLabelKeys = (
+  keys: readonly string[],
+  kind: LabelIdentityKind,
+): void => {
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (seen.has(key)) throw new StateLabelInvariantError(kind, "COLLISION");
+    seen.add(key);
+  }
+};
+
+const profileLabelMigrationRowSchema = z.object({
+  id: profileIdSchema,
+  label: z.unknown(),
+  state: profileStateSchema,
+}).strict();
+const projectLabelMigrationRowSchema = z.object({
+  id: projectIdSchema,
+  label: z.unknown(),
+}).strict();
+const profileLabelInvariantRowSchema = profileLabelMigrationRowSchema.extend({
+  label_key: z.unknown(),
+}).strict();
+const projectLabelInvariantRowSchema = projectLabelMigrationRowSchema.extend({
+  label_key: z.unknown(),
+}).strict();
+
+const backfillCanonicalLabelKeys = (database: Database): void => {
+  if (!hasTableColumn(database, "profiles", "label_key")) {
+    database.exec("ALTER TABLE profiles ADD COLUMN label_key TEXT");
+  }
+  if (!hasTableColumn(database, "projects", "label_key")) {
+    database.exec("ALTER TABLE projects ADD COLUMN label_key TEXT");
+  }
+
+  const profiles = database.query(
+    "SELECT id,label,state FROM profiles ORDER BY id",
+  ).all().map((row) => {
+    const parsed = profileLabelMigrationRowSchema.parse(row);
+    return { ...parsed, ...canonicalLabelIdentity(parsed.label, "ACCOUNT") };
+  });
+  assertUniqueLabelKeys(
+    profiles.filter((profile) => profile.state !== "removed").map((profile) => profile.key),
+    "ACCOUNT",
+  );
+
+  const projects = database.query(
+    "SELECT id,label FROM projects ORDER BY id",
+  ).all().map((row) => {
+    const parsed = projectLabelMigrationRowSchema.parse(row);
+    return { ...parsed, ...canonicalLabelIdentity(parsed.label, "PROJECT") };
+  });
+  assertUniqueLabelKeys(projects.map((project) => project.key), "PROJECT");
+
+  const updateProfile = database.query("UPDATE profiles SET label_key=? WHERE id=?");
+  for (const profile of profiles) updateProfile.run(profile.key, profile.id);
+  const updateProject = database.query("UPDATE projects SET label_key=? WHERE id=?");
+  for (const project of projects) updateProject.run(project.key, project.id);
+};
+
+const assertCanonicalLabelKeys = (database: Database): void => {
+  if (!hasTableColumn(database, "profiles", "label_key")) {
+    throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+  }
+  if (!hasTableColumn(database, "projects", "label_key")) {
+    throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+  }
+
+  const profileKeys = database.query(
+    "SELECT label,label_key,state FROM profiles ORDER BY id",
+  ).all().map((row) => {
+    const parsed = profileLabelInvariantRowSchema.omit({ id: true }).parse(row);
+    const identity = canonicalLabelIdentity(parsed.label, "ACCOUNT");
+    if (parsed.label_key !== identity.key) {
+      throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+    }
+    return { key: identity.key, state: parsed.state };
+  });
+  assertUniqueLabelKeys(
+    profileKeys.filter((profile) => profile.state !== "removed").map((profile) => profile.key),
+    "ACCOUNT",
+  );
+
+  const projectKeys = database.query(
+    "SELECT label,label_key FROM projects ORDER BY id",
+  ).all().map((row) => {
+    const parsed = projectLabelInvariantRowSchema.omit({ id: true }).parse(row);
+    const identity = canonicalLabelIdentity(parsed.label, "PROJECT");
+    if (parsed.label_key !== identity.key) {
+      throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+    }
+    return identity.key;
+  });
+  assertUniqueLabelKeys(projectKeys, "PROJECT");
 };
 
 const ensureStableQueueSequence = (database: Database): void => {
@@ -2011,6 +2323,7 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
+  if (initialVersion === currentSchemaVersion) assertCanonicalLabelKeys(database);
 
   // Security migrations may replace secret-bearing legacy records. SQLite must
   // overwrite superseded cell content instead of leaving it in free pages.
@@ -2309,6 +2622,16 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 23;
     }
 
+    if (version < 24) {
+      database.exec(dropSchemaVersion24);
+      backfillCanonicalLabelKeys(database);
+      rebuildSchemaVersion24(database);
+      assertSchemaVersion24Objects(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(24, now());
+      database.exec("PRAGMA user_version = 24");
+      version = 24;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -2332,6 +2655,8 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     ensureQueueMessageScrubGeneration(database);
     database.exec(schemaVersion22);
     database.exec(schemaVersion23);
+    rebuildSchemaVersion24(database);
+    assertSchemaVersion24Objects(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -2343,6 +2668,9 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
 
 const mapProfile = (row: unknown): ProfileRecord => {
   const parsed = profileRowSchema.parse(row);
+  if (parsed.label_key !== canonicalLabelIdentity(parsed.label, "ACCOUNT").key) {
+    throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+  }
   return {
     id: parsed.id,
     label: parsed.label,
@@ -2357,6 +2685,9 @@ const mapProfile = (row: unknown): ProfileRecord => {
 
 const mapProject = (row: unknown): ProjectRecord => {
   const parsed = projectRowSchema.parse(row);
+  if (parsed.label_key !== canonicalLabelIdentity(parsed.label, "PROJECT").key) {
+    throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+  }
   return { id: parsed.id, label: parsed.label, rootPath: parsed.root_path, default: parsed.is_default === 1, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
 };
 
@@ -2621,12 +2952,24 @@ export class StateStore {
   readonly #readonly: boolean;
   readonly paths: StatePaths;
 
-  constructor(paths: StatePaths, options: { readonly?: boolean; now?: () => number } = {}) {
+  constructor(paths: StatePaths, options: {
+    readonly?: boolean;
+    now?: () => number;
+    beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
+  } = {}) {
     this.paths = paths;
     this.#now = options.now ?? Date.now;
     this.#readonly = options.readonly === true;
-    this.#database = new Database(paths.database, options.readonly ? { readonly: true } : { create: true, strict: true });
+    const databaseFile = prepareStateDatabaseFile(paths.database, this.#readonly);
+    const databaseOpenFlags = stateDatabaseOpenFlags(this.#readonly);
+    options.beforeDatabaseOpen?.({ flags: databaseOpenFlags, path: paths.database });
+    // Bun's object options do not expose SQLITE_OPEN_NOFOLLOW. Numeric flags are
+    // therefore the actual SQLite open boundary. This store binds positionally,
+    // so dropping Bun's JavaScript-only `strict` binding option does not change
+    // its statement contract; SQLite STRICT tables remain schema-enforced.
+    this.#database = new Database(paths.database, databaseOpenFlags);
     try {
+      assertStateDatabaseFile(paths.database, databaseFile);
       this.#database.exec(`PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${stateBusyTimeoutMs};`);
       if (!options.readonly) {
         requireWalMode(this.#database, true);
@@ -2638,6 +2981,9 @@ export class StateStore {
         if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
+      assertSchemaVersion24Objects(this.#database);
+      assertCanonicalLabelKeys(this.#database);
+      assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
       throw error;
@@ -2651,15 +2997,16 @@ export class StateStore {
   createProfile(label: string): ProfileRecord {
     const id = createProfileId();
     const parsedLabel = labelSchema.parse(label);
+    const labelKey = canonicalLabelIdentity(parsedLabel, "ACCOUNT").key;
     const now = this.#now();
-    this.#database.query("INSERT INTO profiles(id,label,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, parsedLabel, "signed_out", 0, now, now);
+    this.#database.query("INSERT INTO profiles(id,label,label_key,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, "signed_out", 0, now, now);
     return this.requireProfile(id);
   }
 
   listProfiles(options: { includeRemoved?: boolean } = {}): readonly ProfileRecord[] {
     const rows = options.includeRemoved
-      ? this.#database.query("SELECT * FROM profiles ORDER BY lower(label), id").all()
-      : this.#database.query("SELECT * FROM profiles WHERE state != 'removed' ORDER BY lower(label), id").all();
+      ? this.#database.query("SELECT * FROM profiles ORDER BY label_key, id").all()
+      : this.#database.query("SELECT * FROM profiles WHERE state != 'removed' ORDER BY label_key, id").all();
     return rows.map(mapProfile);
   }
 
@@ -2772,17 +3119,18 @@ export class StateStore {
     }
     const id = createProjectId();
     const parsedLabel = labelSchema.parse(label);
+    const labelKey = canonicalLabelIdentity(parsedLabel, "PROJECT").key;
     const now = this.#now();
     const insert = this.#database.transaction(() => {
       if (makeDefault) this.#database.query("UPDATE projects SET is_default=0, updated_at=? WHERE is_default=1").run(now);
-      this.#database.query("INSERT INTO projects(id,label,root_path,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, parsedLabel, canonical, makeDefault ? 1 : 0, now, now);
+      this.#database.query("INSERT INTO projects(id,label,label_key,root_path,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, canonical, makeDefault ? 1 : 0, now, now);
     });
     insert.immediate();
     return this.requireProject(id);
   }
 
   listProjects(): readonly ProjectRecord[] {
-    return this.#database.query("SELECT * FROM projects ORDER BY is_default DESC, lower(label), id").all().map(mapProject);
+    return this.#database.query("SELECT * FROM projects ORDER BY is_default DESC, label_key, id").all().map(mapProject);
   }
 
   requireProject(selector: string): ProjectRecord {

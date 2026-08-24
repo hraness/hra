@@ -82,13 +82,22 @@ import {
   type TurnStartResult,
 } from "./protocol.ts";
 
-type ClientState = "new" | "initializing" | "ready" | "closing" | "closed" | "failed";
+type ClientState =
+  | "new"
+  | "initializing"
+  | "preflighting"
+  | "ready"
+  | "closing"
+  | "closed"
+  | "failed";
 
 const STANDARD_MCP_FORM_INPUT_EXTENSION = "openai/standard-form-input";
 const INTERACTION_DEADLINE_ERROR = Object.freeze({
   code: -32_008,
   message: "HRA interaction deadline expired",
 });
+const PRE_READY_FACT_LIMIT = 128;
+const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
 
 interface PendingRequest {
   readonly id: number;
@@ -124,7 +133,7 @@ export interface CodexAppServerClientOptions {
   readonly process: CodexProcess;
   readonly authority: CodexAuthority;
   readonly expectedCodexHome: string;
-  readonly credentialStorePreflight?: Readonly<{
+  readonly credentialStorePreflight: Readonly<{
     readonly cliAuth: "file";
     readonly cwd: string;
     readonly mcpOauth: "file";
@@ -212,6 +221,10 @@ export class CodexAppServerClient {
   #factTail: Promise<void> = Promise.resolve();
   #writeTail: Promise<void> = Promise.resolve();
   #disconnectEmitted = false;
+  #connectionAnnounced = false;
+  #preReadyFactBytes = 0;
+  readonly #preReadyFacts: CodexFact[] = [];
+  #preReadyInboundCount = 0;
   #state: ClientState = "new";
   #nextRequestId = 1;
   #readTask: Promise<void> | null = null;
@@ -225,14 +238,15 @@ export class CodexAppServerClient {
     if (!isAbsolute(options.expectedCodexHome)) {
       throw new CodexError("INVALID_INPUT", "expected CODEX_HOME must be absolute");
     }
+    if (!Object.hasOwn(options, "credentialStorePreflight")) {
+      throw new CodexError("INVALID_INPUT", "credential-store preflight is required");
+    }
     this.#expectedCodexHome = resolve(options.expectedCodexHome);
-    this.#credentialStorePreflight = options.credentialStorePreflight === undefined
-      ? undefined
-      : {
-          cliAuth: options.credentialStorePreflight.cliAuth,
-          cwd: canonicalAbsolute(options.credentialStorePreflight.cwd, "credential-store preflight cwd"),
-          mcpOauth: options.credentialStorePreflight.mcpOauth,
-        };
+    this.#credentialStorePreflight = {
+      cliAuth: options.credentialStorePreflight.cliAuth,
+      cwd: canonicalAbsolute(options.credentialStorePreflight.cwd, "credential-store preflight cwd"),
+      mcpOauth: options.credentialStorePreflight.mcpOauth,
+    };
     this.#experimentalApi = options.experimentalApi ?? false;
     this.#isAuthorityCurrent = options.isAuthorityCurrent;
     this.#onFact = options.onFact ?? (() => undefined);
@@ -269,6 +283,10 @@ export class CodexAppServerClient {
     return this.#connectionId;
   }
 
+  #requireState(expected: ClientState, message: string): void {
+    if (this.#state !== expected) throw new CodexError("PROCESS_EXITED", message);
+  }
+
   async initialize(): Promise<FencedCodexValue<{ readonly userAgent: string; readonly platformOs: string }>> {
     if (this.#state !== "new") {
       throw new CodexError("PROTOCOL_ERROR", "Codex app-server can only be initialized once");
@@ -293,7 +311,7 @@ export class CodexAppServerClient {
           },
         },
         parseInitialize,
-        true,
+        "initializing",
       );
       const versionToken = new RegExp(
         `(?:^|/)${PINNED_CODEX_VERSION.replaceAll(".", "\\.")}(?:[ (]|$)`,
@@ -313,14 +331,13 @@ export class CodexAppServerClient {
       }
       await this.#writeFrame({ method: "initialized" });
       await this.#assertAuthority();
-      this.#state = "ready";
-      if (this.#credentialStorePreflight !== undefined) {
-        await this.assertCredentialStores(this.#credentialStorePreflight.cwd);
-      }
-      void this.#enqueueFact({
-        type: "providerConnected",
-        connectionId: this.#connectionId,
-      });
+      this.#requireState("initializing", "Codex stopped during initialization");
+      this.#state = "preflighting";
+      await this.#assertCredentialStores(
+        this.#credentialStorePreflight.cwd,
+        "preflighting",
+      );
+      await this.#activateProvenConnection();
       return {
         authority: this.#authority,
         value: {
@@ -328,9 +345,19 @@ export class CodexAppServerClient {
           platformOs: initialized.value.platformOs,
         },
       };
-    } catch (error) {
+    } catch (error: unknown) {
+      this.#preReadyFacts.length = 0;
+      this.#preReadyFactBytes = 0;
       this.#state = "failed";
-      this.#process.terminate();
+      try {
+        this.#process.terminate();
+      } catch (cleanupError: unknown) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Codex initialization failed and process termination could not be requested.",
+          { cause: error },
+        );
+      }
       throw error;
     }
   }
@@ -341,14 +368,21 @@ export class CodexAppServerClient {
 
   /** Rechecks project-layer effective custody before a project-scoped effect. */
   async assertCredentialStores(cwd: string): Promise<void> {
-    if (this.#credentialStorePreflight === undefined) return;
-    const stores = await this.#closedRequest(
-      "config/read",
+    await this.#assertCredentialStores(cwd, "ready");
+  }
+
+  async #assertCredentialStores(
+    cwd: string,
+    requestState: "preflighting" | "ready",
+  ): Promise<void> {
+    const stores = await this.#request(
+      OPERATIONS["config/read"],
       {
         includeLayers: false,
         cwd: canonicalAbsolute(cwd, "credential-store preflight cwd"),
       },
       parseCredentialStores,
+      requestState,
     );
     if (
       stores.value.cliAuth !== this.#credentialStorePreflight.cliAuth
@@ -955,23 +989,25 @@ export class CodexAppServerClient {
         `${method} requires the pinned experimental API capability`,
       );
     }
-    return this.#request(descriptor, params, parse, false);
+    return this.#request(descriptor, params, parse, "ready");
   }
 
   async #request<T>(
     descriptor: CodexOperationDescriptor,
     params: unknown,
     parse: (value: unknown) => T,
-    initializing: boolean,
+    requestState: "initializing" | "preflighting" | "ready",
   ): Promise<FencedCodexValue<T>> {
-    if (!initializing && this.#state !== "ready") {
-      throw new CodexError("PROTOCOL_ERROR", "Codex app-server is not ready");
+    if (this.#state !== requestState) {
+      throw new CodexError(
+        "PROTOCOL_ERROR",
+        requestState === "ready"
+          ? "Codex app-server is not ready"
+          : "Codex app-server initialization phase changed",
+      );
     }
     await this.#assertAuthority();
-    if (
-      (initializing && this.#state !== "initializing") ||
-      (!initializing && this.#state !== "ready")
-    ) {
+    if (this.#state !== requestState) {
       throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
     }
     const id = this.#allocateRequestId();
@@ -1040,6 +1076,76 @@ export class CodexAppServerClient {
     throw new CodexError("PROTOCOL_LIMIT", `${method} exceeded its page limit`);
   }
 
+  async #activateProvenConnection(): Promise<void> {
+    this.#requireState("preflighting", "Codex stopped during credential-store preflight");
+    await this.#assertAuthority();
+    this.#requireState("preflighting", "Codex stopped during credential-store preflight");
+
+    // This is one run-to-completion activation commit. The read loop cannot
+    // append another pre-ready fact between the snapshot and the ready state,
+    // and no observer task can begin before ready is visible.
+    const bufferedFacts = this.#preReadyFacts.splice(0);
+    this.#preReadyFactBytes = 0;
+    this.#preReadyInboundCount = 0;
+    this.#state = "ready";
+    this.#connectionAnnounced = true;
+    void this.#enqueueFact({
+      type: "providerConnected",
+      connectionId: this.#connectionId,
+    });
+    for (const fact of bufferedFacts) {
+      this.#enqueueBufferedFact(fact);
+    }
+  }
+
+  #enqueueBufferedFact(fact: CodexFact): void {
+    if (fact.type === "serverRequestResolved") {
+      void this.#enqueueFact({
+        type: "protocolNotice",
+        method: "serverRequest/resolved",
+        connectionId: this.#connectionId,
+      });
+      return;
+    }
+    void this.#enqueueFact({ ...fact, connectionId: this.#connectionId });
+  }
+
+  async #handlePreReadyMessage(
+    message: Record<string, unknown>,
+    method: string,
+  ): Promise<void> {
+    if (message.id !== undefined) {
+      const requestId = parseProviderRequestId(message.id);
+      await this.#writeFrame({
+        id: rawProviderRequestId(requestId),
+        error: {
+          code: -32_001,
+          message: "HRA has not activated this provider connection",
+        },
+      });
+      return;
+    }
+    const fact = parseFact(method, message.params ?? {});
+    const bytes = this.#encoder.encode(JSON.stringify(fact)).byteLength;
+    if (bytes > PRE_READY_FACT_BYTES - this.#preReadyFactBytes) {
+      throw new CodexError(
+        "PROTOCOL_LIMIT",
+        "Codex emitted too much data before credential-store preflight completed",
+      );
+    }
+    this.#preReadyFactBytes += bytes;
+    this.#preReadyFacts.push(fact);
+  }
+
+  async #handleParsedFact(fact: CodexFact): Promise<void> {
+    if (!(await this.#authorityIsCurrent())) return;
+    if (fact.type === "serverRequestResolved") {
+      await this.#handleServerRequestResolved(fact);
+      return;
+    }
+    void this.#enqueueFact({ ...fact, connectionId: this.#connectionId });
+  }
+
   async #readLoop(): Promise<void> {
     try {
       for await (const chunk of this.#process.stdout) {
@@ -1083,28 +1189,51 @@ export class CodexAppServerClient {
 
   async #handleMessage(value: unknown): Promise<void> {
     const message = record(value, "JSON-RPC message");
+    const preReady = this.#state === "initializing" || this.#state === "preflighting";
+    if (preReady) this.#countPreReadyInboundFrame();
     if (message.id !== undefined && message.method === undefined) {
-      await this.#handleResponse(message);
+      await this.#handleResponse(message, preReady);
       return;
     }
     const method = string(message.method, "JSON-RPC method", { min: 1, max: 512 });
+    if (preReady) {
+      await this.#handlePreReadyMessage(message, method);
+      return;
+    }
+    if (this.#state !== "ready") return;
     if (message.id !== undefined) {
       await this.#handleServerRequest(message.id, method, message.params ?? {});
       return;
     }
     const fact = parseFact(method, message.params ?? {});
-    if (!(await this.#authorityIsCurrent())) return;
-    if (fact.type === "serverRequestResolved") {
-      await this.#handleServerRequestResolved(fact);
-      return;
-    }
-    void this.#enqueueFact({ ...fact, connectionId: this.#connectionId });
+    await this.#handleParsedFact(fact);
   }
 
-  async #handleResponse(message: Record<string, unknown>): Promise<void> {
+  #countPreReadyInboundFrame(): void {
+    this.#preReadyInboundCount += 1;
+    if (this.#preReadyInboundCount > PRE_READY_FACT_LIMIT) {
+      throw new CodexError(
+        "PROTOCOL_LIMIT",
+        "Codex emitted too many messages before credential-store preflight completed",
+      );
+    }
+  }
+
+  async #handleResponse(
+    message: Record<string, unknown>,
+    preReady: boolean,
+  ): Promise<void> {
     const id = safeInteger(message.id, "JSON-RPC response id");
     const pending = this.#pending.get(id);
-    if (pending === undefined) return;
+    if (pending === undefined) {
+      if (preReady) {
+        throw new CodexError(
+          "PROTOCOL_ERROR",
+          "Codex emitted an unexpected response during initialization",
+        );
+      }
+      return;
+    }
     this.#pending.delete(id);
     clearTimeout(pending.timeout);
     if (!(await this.#authorityIsCurrent())) {
@@ -1291,7 +1420,7 @@ export class CodexAppServerClient {
   }
 
   #emitDisconnected(reason: "eof" | "process_exit" | "closed" | "protocol_fault"): void {
-    if (this.#disconnectEmitted) return;
+    if (!this.#connectionAnnounced || this.#disconnectEmitted) return;
     this.#disconnectEmitted = true;
     void this.#enqueueFact({
       type: "providerDisconnected",

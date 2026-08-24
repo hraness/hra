@@ -14,7 +14,8 @@ export async function assertProductionPackageOnly(root: string): Promise<void> {
         || /(?:^|\/)\.github(?:\/|$)/u.test(packagePath)
         || /(?:^|\/)docs\/live-acceptance(?:\/|\.|$)/u.test(packagePath)
         || /(?:^|\/)live-acceptance[^/]*\.ts$/u.test(packagePath)
-        || packagePath === "src/cloud/inviteAuthority.ts"
+        || /(?:^|\/)src\/cloud\/inviteAuthority\.ts$/u.test(packagePath)
+        || /(?:^|\/)src\/storage\/legacy-secret-migration\.ts$/u.test(packagePath)
       ) {
         throw new Error("The install artifact contains repository-only source.");
       }

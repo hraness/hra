@@ -60,15 +60,17 @@ describe("domain laws", () => {
     );
   });
 
-  test("selection is exact-id first and otherwise unambiguous case-insensitive label", () => {
+  test("selection is exact-id first and otherwise uses one canonical Unicode label key", () => {
     const values = [
       { id: "acct_a", label: "Work" },
       { id: "acct_b", label: "work" },
       { id: "acct_c", label: "Personal" },
+      { id: "acct_d", label: "Café" },
     ];
     expect(selectByIdOrLabel(values, "acct_b")).toEqual({ kind: "found", value: values[1]! });
     expect(selectByIdOrLabel(values, "WORK").kind).toBe("ambiguous");
     expect(selectByIdOrLabel(values, "personal")).toEqual({ kind: "found", value: values[2]! });
+    expect(selectByIdOrLabel(values, "CAFE\u0301")).toEqual({ kind: "found", value: values[3]! });
   });
 
   test("UTF-8 byte accounting does not confuse code points with bytes", () => {

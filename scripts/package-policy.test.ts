@@ -39,6 +39,7 @@ describe("production package policy", () => {
       ["src", "cli.test.ts"],
       ["src", "cloud", "inviteAuthority.ts"],
       ["src", "cloud", "testAssertions.ts"],
+      ["src", "storage", "legacy-secret-migration.ts"],
       ["src", "live-acceptance-private.ts"],
     ] as const;
     for (const components of forbidden) {
@@ -49,5 +50,13 @@ describe("production package policy", () => {
       await expect(assertProductionPackageOnly(root))
         .rejects.toThrow(/repository-only|development-only/u);
     }
+  });
+
+  test("rejects operator-only source below the package archive wrapper", async () => {
+    const root = await fixture();
+    const path = join(root, "package", "src", "storage", "legacy-secret-migration.ts");
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, "forbidden\n");
+    await expect(assertProductionPackageOnly(root)).rejects.toThrow("repository-only source");
   });
 });

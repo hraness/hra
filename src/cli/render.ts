@@ -343,6 +343,14 @@ export const coalesceSessionEvents = (events: readonly SessionEvent[]): readonly
 const eventBytes = (value: number | undefined): string =>
   value === undefined ? "" : `, ${String(value)} bytes observed`;
 
+const eventToolTarget = (
+  server: string | undefined,
+  tool: string | undefined,
+  fallback: string,
+): string => server === undefined && tool === undefined
+  ? ""
+  : ` ${line(server ?? "local")}/${line(tool ?? fallback)}`;
+
 const renderSingleEvent = (event: SessionEvent): string => {
   const body = event.body;
   switch (body.type) {
@@ -351,14 +359,12 @@ const renderSingleEvent = (event: SessionEvent): string => {
     case "session_status": return `Session: ${line(body.status)}${body.activeTurnId === null ? "" : `, active turn ${line(body.activeTurnId)}`}`;
     case "turn_started": return `Turn started: ${line(body.turnId)}`;
     case "turn_completed": return `Turn ${line(body.turnId)}: ${line(body.status)}${body.errorCode === undefined ? "" : ` (${line(body.errorCode)})`}`;
-    case "item_started": return `Item started: ${line(body.itemKind)} ${line(body.itemId)}`;
-    case "item_completed": return `Item completed: ${line(body.itemKind)} ${line(body.itemId)}${body.status === undefined ? "" : ` (${line(body.status)})`}`;
+    case "item_started": return `Item started: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}`;
+    case "item_completed": return `Item completed: ${line(body.itemKind)}${eventToolTarget(body.server, body.tool, body.itemKind)} ${line(body.itemId)}${body.status === undefined ? "" : ` (${line(body.status)})`}`;
     case "assistant_delta": return `Codex\n${indented(body.text)}`;
     case "reasoning_summary_delta": return `Reasoning summary\n${indented(body.text)}`;
     case "tool_progress": {
-      const target = body.server === undefined && body.tool === undefined
-        ? ""
-        : ` ${line(body.server ?? "local")}/${line(body.tool ?? body.toolKind)}`;
+      const target = eventToolTarget(body.server, body.tool, body.toolKind);
       return `Tool: ${line(body.toolKind)}${target}${body.status === undefined ? "" : `, ${line(body.status)}`}${eventBytes(body.outputBytesObserved)}`;
     }
     case "file_change": {
@@ -749,6 +755,16 @@ const renderSessionStatus = (data: unknown): string => {
   ];
   if (session.activeTurnId !== undefined) rows.push(`Active turn: ${line(session.activeTurnId)}`);
   if (typeof session.revision === "number") rows.push(`Revision: ${String(session.revision)}`);
+  const providerObservation = object(root?.providerObservation);
+  if (providerObservation?.state === "live") {
+    rows.push(`Provider: live (${line(providerObservation.mode)}, generation ${line(providerObservation.profileGeneration)}, connection ${line(providerObservation.connectionId)})`);
+  } else if (providerObservation?.state === "unavailable") {
+    rows.push(`Provider: unavailable (${line(providerObservation.code)}, generation ${line(providerObservation.profileGeneration)})`);
+  } else if (providerObservation?.state === "recovery_required") {
+    rows.push(`Provider: recovery required (${line(providerObservation.code)}, generation ${line(providerObservation.profileGeneration)})`);
+  } else if (providerObservation?.state === "not_applicable") {
+    rows.push(`Provider: not applicable (${line(providerObservation.reason)}, generation ${line(providerObservation.profileGeneration)})`);
+  }
   const eventStream = object(root?.eventStream) ?? root;
   if (typeof eventStream?.observedThroughSequence === "number" && typeof eventStream.floorSequence === "number") {
     rows.push(`Events: through ${String(eventStream.observedThroughSequence)}, retained from ${String(eventStream.floorSequence)}`);

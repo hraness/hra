@@ -1,12 +1,27 @@
 import { describe, expect, test } from "bun:test";
 
 import { HRA_VERSION } from "../version.ts";
-import { CodexAppServerClient } from "./client.ts";
+import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client.ts";
 import { CodexError } from "./errors.ts";
 import type { CodexProcess } from "./process.ts";
 import type { CodexFact, FencedCodexValue } from "./protocol.ts";
 
 const CONNECTION_ID = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
+const CREDENTIAL_STORE_PREFLIGHT = Object.freeze({
+  cliAuth: "file",
+  cwd: "/tmp/hra-control-plane/project",
+  mcpOauth: "file",
+} as const);
+
+type TestClientOptions = Omit<CodexAppServerClientOptions, "credentialStorePreflight">
+  & Partial<Pick<CodexAppServerClientOptions, "credentialStorePreflight">>;
+
+function createClient(options: TestClientOptions): CodexAppServerClient {
+  return new CodexAppServerClient({
+    credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
+    ...options,
+  });
+}
 
 const commandApprovalParams = (reason = "Need network access") => ({
   threadId: "thread-1",
@@ -67,11 +82,13 @@ class FakeProcess implements CodexProcess {
   writeError: Error | undefined;
   writeSettlementGate: Promise<void> | undefined;
   readonly exited: Promise<number>;
+  #responseCount = 0;
   #resolveExit!: (code: number) => void;
 
   constructor(
     readonly onWrite: (message: Record<string, unknown>, process: FakeProcess) => void,
     readonly shutdown: {
+      readonly autoCredentialStorePreflight?: boolean;
       readonly ignoreTerm?: boolean;
       readonly leaveStreamsOpenAfterKill?: boolean;
     } = {},
@@ -89,13 +106,31 @@ class FakeProcess implements CodexProcess {
       this.writeError = undefined;
       throw error;
     }
+    const responseCountBeforeWrite = this.#responseCount;
     this.onWrite(parsed as Record<string, unknown>, this);
+    if (
+      (parsed as Record<string, unknown>).method === "config/read"
+      && this.shutdown.autoCredentialStorePreflight !== false
+      && this.#responseCount === responseCountBeforeWrite
+    ) {
+      this.respond({
+        id: (parsed as Record<string, unknown>).id,
+        result: {
+          config: {
+            cli_auth_credentials_store: "file",
+            mcp_oauth_credentials_store: "file",
+          },
+          origins: {},
+        },
+      });
+    }
     const gate = this.writeSettlementGate;
     this.writeSettlementGate = undefined;
     if (gate !== undefined) await gate;
   }
 
   respond(value: unknown): void {
+    this.#responseCount += 1;
     this.stdoutQueue.push(`${JSON.stringify(value)}\n`);
   }
 
@@ -149,7 +184,34 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   throw new Error("condition did not settle");
 }
 
+function deferred<T>(): Readonly<{
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}> {
+  let resolvePromise!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
 describe("CodexAppServerClient", () => {
+  test("requires credential-store proof at the client boundary", () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const options = {
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+    } as unknown as CodexAppServerClientOptions;
+
+    expect(() => new CodexAppServerClient(options)).toThrow(
+      "credential-store preflight is required",
+    );
+    expect(process.writes).toEqual([]);
+    expect(process.signals).toEqual([]);
+  });
+
   test("preflights both effective credential stores before becoming available", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     let configReads = 0;
@@ -183,8 +245,8 @@ describe("CodexAppServerClient", () => {
           },
         });
       }
-    });
-    const client = new CodexAppServerClient({
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 7 },
       credentialStorePreflight: {
@@ -240,7 +302,7 @@ describe("CodexAppServerClient", () => {
         });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 7 },
       credentialStorePreflight: {
@@ -256,6 +318,444 @@ describe("CodexAppServerClient", () => {
     expect(error).toMatchObject({ code: "RUNTIME_MISMATCH" });
     expect(client.state).toBe("failed");
     expect(process.signals).toEqual(["SIGTERM"]);
+  });
+
+  test("admits no provider facts or interactions before credential-store proof", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const facts: CodexFact[] = [];
+    let configRequestId: unknown;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        configRequestId = message.id;
+        runtime.respond({
+          method: "account/updated",
+          params: { authMode: "chatgpt", planType: "pro" },
+        });
+        runtime.respond({
+          id: 91,
+          method: "item/commandExecution/requestApproval",
+          params: commandApprovalParams(),
+        });
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => configRequestId !== undefined);
+    await waitFor(() => process.writes.some((value) =>
+      (value as { id?: unknown }).id === 91));
+    expect(client.state).toBe("preflighting");
+    expect(facts).toEqual([]);
+
+    process.respond({
+      id: configRequestId,
+      result: {
+        config: {
+          cli_auth_credentials_store: "file",
+          mcp_oauth_credentials_store: "keyring",
+        },
+        origins: {},
+      },
+    });
+    await expect(initialization).rejects.toMatchObject({ code: "RUNTIME_MISMATCH" });
+    await Bun.sleep(1);
+    expect(facts).toEqual([]);
+    expect(process.writes).toContainEqual({
+      id: 91,
+      error: {
+        code: -32_001,
+        message: "HRA has not activated this provider connection",
+      },
+    });
+  });
+
+  test("replays bounded preflight notifications only after the connection is proven", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const facts: CodexFact[] = [];
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        runtime.respond({
+          method: "account/updated",
+          params: { authMode: "chatgpt", planType: "pro" },
+        });
+        runtime.respond({
+          method: "serverRequest/resolved",
+          params: { threadId: "thread-1", requestId: 91 },
+        });
+        runtime.respond({
+          id: message.id,
+          result: {
+            config: {
+              cli_auth_credentials_store: "file",
+              mcp_oauth_credentials_store: "file",
+            },
+            origins: {},
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      credentialStorePreflight: {
+        cliAuth: "file",
+        cwd: "/private/tmp/hra-acceptance/project-a",
+        mcpOauth: "file",
+      },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+
+    await client.initialize();
+    await waitFor(() => facts.length === 3);
+    expect(facts).toEqual([
+      { type: "providerConnected", connectionId: CONNECTION_ID },
+      {
+        type: "accountUpdated",
+        authMode: "chatgpt",
+        planType: "pro",
+        connectionId: CONNECTION_ID,
+      },
+      {
+        type: "protocolNotice",
+        method: "serverRequest/resolved",
+        connectionId: CONNECTION_ID,
+      },
+    ]);
+    await client.close();
+  });
+
+  test("commits ready before providerConnected and preserves a notification at the activation boundary", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const activationGate = deferred<boolean>();
+    const facts: Array<Readonly<{ state: string; value: CodexFact }>> = [];
+    let authorityChecks = 0;
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => {
+        authorityChecks += 1;
+        return authorityChecks === 6 ? activationGate.promise : true;
+      },
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push({ state: client.state, value }); },
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => authorityChecks === 6);
+    expect(client.state).toBe("preflighting");
+    process.respond({
+      method: "account/updated",
+      params: { authMode: "chatgpt", planType: "pro" },
+    });
+    await Bun.sleep(1);
+    expect(facts).toEqual([]);
+
+    activationGate.resolve(true);
+    await initialization;
+    await waitFor(() => facts.length === 2);
+    expect(facts).toEqual([
+      {
+        state: "ready",
+        value: { type: "providerConnected", connectionId: CONNECTION_ID },
+      },
+      {
+        state: "ready",
+        value: {
+          type: "accountUpdated",
+          authMode: "chatgpt",
+          planType: "pro",
+          connectionId: CONNECTION_ID,
+        },
+      },
+    ]);
+    await client.close();
+  });
+
+  test("emits no connection facts when authority becomes stale at the activation commit", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const activationGate = deferred<boolean>();
+    const facts: CodexFact[] = [];
+    let authorityChecks = 0;
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => {
+        authorityChecks += 1;
+        return authorityChecks === 6 ? activationGate.promise : true;
+      },
+      onFact: ({ value }) => { facts.push(value); },
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => authorityChecks === 6);
+    activationGate.resolve(false);
+    await expect(initialization).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    await Bun.sleep(1);
+    expect(facts).toEqual([]);
+  });
+
+  test("emits no buffered facts when the process exits before the activation commit", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const activationGate = deferred<boolean>();
+    const facts: CodexFact[] = [];
+    let authorityChecks = 0;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        runtime.respond({
+          method: "account/updated",
+          params: { authMode: "chatgpt", planType: "pro" },
+        });
+        runtime.respond({
+          id: message.id,
+          result: {
+            config: {
+              cli_auth_credentials_store: "file",
+              mcp_oauth_credentials_store: "file",
+            },
+            origins: {},
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => {
+        authorityChecks += 1;
+        return authorityChecks === 6 ? activationGate.promise : true;
+      },
+      onFact: ({ value }) => { facts.push(value); },
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => authorityChecks === 6);
+    process.terminate();
+    await waitFor(() => client.state === "failed");
+    activationGate.resolve(true);
+    await expect(initialization).rejects.toMatchObject({ code: "PROCESS_EXITED" });
+    await Bun.sleep(1);
+    expect(facts).toEqual([]);
+  });
+
+  test("fails closed on an unknown response id during credential-store preflight", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configRequestId: unknown;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        configRequestId = message.id;
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => configRequestId !== undefined);
+    process.respond({ id: 999, result: {} });
+    await expect(initialization).rejects.toMatchObject({ code: "PROTOCOL_ERROR" });
+    expect(client.state).toBe("failed");
+  });
+
+  test("keeps a colliding preflight server-request id distinct from the config response", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configRequestId: number | undefined;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        configRequestId = message.id as number;
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => configRequestId !== undefined);
+    process.respond({
+      id: configRequestId,
+      method: "item/commandExecution/requestApproval",
+      params: commandApprovalParams(),
+    });
+    await waitFor(() => process.writes.some((frame) => {
+      const value = frame as { error?: unknown; id?: unknown };
+      return value.id === configRequestId && value.error !== undefined;
+    }));
+    process.respond({
+      id: configRequestId,
+      result: {
+        config: {
+          cli_auth_credentials_store: "file",
+          mcp_oauth_credentials_store: "file",
+        },
+        origins: {},
+      },
+    });
+
+    await expect(initialization).resolves.toMatchObject({
+      authority: { profileId: "profile-a", processGeneration: 7 },
+    });
+    expect(process.writes).toContainEqual({
+      id: configRequestId,
+      error: {
+        code: -32_001,
+        message: "HRA has not activated this provider connection",
+      },
+    });
+    await client.close();
+  });
+
+  test("bounds every inbound frame while credential-store proof is pending", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configRequestId: unknown;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        configRequestId = message.id;
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => configRequestId !== undefined);
+    for (let index = 0; index < 128; index += 1) {
+      process.respond({
+        method: "account/updated",
+        params: { authMode: "chatgpt", planType: "pro" },
+      });
+    }
+    await expect(initialization).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
+    expect(client.state).toBe("failed");
+  });
+
+  test("bounds projected notification bytes while credential-store proof is pending", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configRequestId: unknown;
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "config/read") {
+        configRequestId = message.id;
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+
+    const initialization = client.initialize();
+    await waitFor(() => configRequestId !== undefined);
+    const delta = "x".repeat(32_768);
+    for (let index = 0; index < 33; index += 1) {
+      process.respond({
+        method: "item/agentMessage/delta",
+        params: {
+          threadId: "thread-1",
+          turnId: "turn-1",
+          itemId: `item-${String(index)}`,
+          delta,
+        },
+      });
+    }
+    await expect(initialization).rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
+    expect(client.state).toBe("failed");
   });
 
   test("sends the exact pinned login cancellation authority", async () => {
@@ -276,7 +776,7 @@ describe("CodexAppServerClient", () => {
         runtime.respond({ id: message.id, result: { status: "notFound" } });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 7 },
       expectedCodexHome: codexHome,
@@ -288,7 +788,7 @@ describe("CodexAppServerClient", () => {
       value: { status: "notFound" },
     });
     expect(process.writes).toContainEqual({
-      id: 2,
+      id: 3,
       method: "account/login/cancel",
       params: { loginId: "provider-login-exact" },
     });
@@ -298,7 +798,7 @@ describe("CodexAppServerClient", () => {
   test("initializes once and fences returned identity", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: FencedCodexValue<CodexFact>[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 7 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -339,7 +839,7 @@ describe("CodexAppServerClient", () => {
 
   test("rejects a CODEX_HOME mismatch before becoming ready", async () => {
     const process = successfulFake("/tmp/wrong-home");
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/expected-home",
@@ -351,7 +851,7 @@ describe("CodexAppServerClient", () => {
 
   test("accepts the pinned desktop user agent and rejects protocol version drift", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
-    const pinned = new CodexAppServerClient({
+    const pinned = createClient({
       process: successfulFake(codexHome, "Codex Desktop/0.149.0 (Mac OS 26.5; arm64) dumb (hra; 0.1.0)"),
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -360,7 +860,7 @@ describe("CodexAppServerClient", () => {
     await expect(pinned.initialize()).resolves.toMatchObject({ value: { platformOs: "macos" } });
     await pinned.close();
 
-    const drifted = new CodexAppServerClient({
+    const drifted = createClient({
       process: successfulFake(codexHome, "Codex Desktop/0.149.1 (Mac OS 26.5; arm64)"),
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -373,7 +873,7 @@ describe("CodexAppServerClient", () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = successfulFake(codexHome);
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -396,7 +896,7 @@ describe("CodexAppServerClient", () => {
   test("refuses dispatch after the generation becomes stale", async () => {
     let current = true;
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 2 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -406,13 +906,13 @@ describe("CodexAppServerClient", () => {
     current = false;
     const error = await client.accountRead().catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(CodexError);
-    expect(process.writes).toHaveLength(2);
+    expect(process.writes).toHaveLength(3);
     await client.close();
   });
 
   test("rejects unsupported legacy prompts instead of treating them as interactions", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -435,7 +935,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
     const diagnostics: string[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -475,7 +975,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
     const diagnostics: string[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -521,7 +1021,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
     const diagnostics: string[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -609,7 +1109,7 @@ describe("CodexAppServerClient", () => {
   test("brokers a standard MCP form and writes only a schema-valid exact response", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: FencedCodexValue<CodexFact>[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 4 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -706,7 +1206,7 @@ describe("CodexAppServerClient", () => {
   test("admits a typed interaction and routes an exact response without granting through text", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: FencedCodexValue<CodexFact>[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 4 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -786,7 +1286,7 @@ describe("CodexAppServerClient", () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
     let now = 10_000;
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -840,7 +1340,7 @@ describe("CodexAppServerClient", () => {
     let now = 10_000;
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -897,7 +1397,7 @@ describe("CodexAppServerClient", () => {
     let now = 30_000;
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -932,7 +1432,7 @@ describe("CodexAppServerClient", () => {
     let now = 20_000;
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -986,7 +1486,7 @@ describe("CodexAppServerClient", () => {
   test("does not write a queued timeout after the provider resolves the request", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1028,7 +1528,7 @@ describe("CodexAppServerClient", () => {
     let arrivals = 0;
     let releaseRace!: () => void;
     const raceGate = new Promise<void>((resolve) => { releaseRace = resolve; });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1068,7 +1568,7 @@ describe("CodexAppServerClient", () => {
   test("keeps an admitted manual write rejection unknown without dispatching a timeout", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1101,7 +1601,7 @@ describe("CodexAppServerClient", () => {
   test("quarantines the provider generation when a timeout write may have escaped", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1130,7 +1630,7 @@ describe("CodexAppServerClient", () => {
   test("keeps numeric and string server request ids distinct", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1155,7 +1655,7 @@ describe("CodexAppServerClient", () => {
     let releaseAdmission!: () => void;
     const admissionGate = new Promise<void>((resolve) => { releaseAdmission = resolve; });
     let admissionStarted = false;
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1178,7 +1678,7 @@ describe("CodexAppServerClient", () => {
 
   test("quarantines a mutated same-id replay while accepting canonical key reordering", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1210,7 +1710,7 @@ describe("CodexAppServerClient", () => {
         target.respond({ id: message.id, result: { data: [], nextCursor: null } });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -1219,11 +1719,11 @@ describe("CodexAppServerClient", () => {
     });
     await client.initialize();
     await client.discoverCapabilities({ cwd: "/workspace/project", threadId: "thread-1", includeExperimental: true });
-    expect(process.writes.slice(2)).toEqual([
-      { id: 2, method: "model/list", params: { includeHidden: true, limit: 100, cursor: null } },
-      { id: 3, method: "experimentalFeature/list", params: { limit: 100, threadId: "thread-1", cursor: null } },
-      { id: 4, method: "permissionProfile/list", params: { limit: 100, cwd: "/workspace/project", cursor: null } },
-      { id: 5, method: "app/list", params: { limit: 100, forceRefetch: true, threadId: "thread-1", cursor: null } },
+    expect(process.writes.slice(3)).toEqual([
+      { id: 3, method: "model/list", params: { includeHidden: true, limit: 100, cursor: null } },
+      { id: 4, method: "experimentalFeature/list", params: { limit: 100, threadId: "thread-1", cursor: null } },
+      { id: 5, method: "permissionProfile/list", params: { limit: 100, cwd: "/workspace/project", cursor: null } },
+      { id: 6, method: "app/list", params: { limit: 100, forceRefetch: true, threadId: "thread-1", cursor: null } },
     ]);
     await client.close();
   });
@@ -1269,7 +1769,7 @@ describe("CodexAppServerClient", () => {
         });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -1279,8 +1779,8 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     expect((await client.listPlugins({ cwd: "/workspace/project", forceRefetch: true })).value)
       .toMatchObject({ marketplaces: [{ plugins: [{ id: "files@official" }] }] });
-    expect(process.writes.slice(2)).toEqual([{
-      id: 2,
+    expect(process.writes.slice(3)).toEqual([{
+      id: 3,
       method: "plugin/list",
       params: { cwds: ["/workspace/project"], forceRefetch: true },
     }]);
@@ -1309,7 +1809,7 @@ describe("CodexAppServerClient", () => {
         target.respond({ id: message.id, result: { data: [], nextCursor: null, backwardsCursor: "back" } });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -1319,9 +1819,9 @@ describe("CodexAppServerClient", () => {
     await client.initialize();
     await client.listThreadTurns({ threadId: "thread-1", cursor: "cursor", limit: 24, sortDirection: "desc", itemsView: "summary" });
     await client.listThreadItems({ threadId: "thread-1", turnId: "turn-1", cursor: null, limit: 64, sortDirection: "asc" });
-    expect(process.writes.slice(2)).toEqual([
-      { id: 2, method: "thread/turns/list", params: { threadId: "thread-1", cursor: "cursor", limit: 24, sortDirection: "desc", itemsView: "summary" } },
-      { id: 3, method: "thread/items/list", params: { threadId: "thread-1", turnId: "turn-1", cursor: null, limit: 64, sortDirection: "asc" } },
+    expect(process.writes.slice(3)).toEqual([
+      { id: 3, method: "thread/turns/list", params: { threadId: "thread-1", cursor: "cursor", limit: 24, sortDirection: "desc", itemsView: "summary" } },
+      { id: 4, method: "thread/items/list", params: { threadId: "thread-1", turnId: "turn-1", cursor: null, limit: 64, sortDirection: "asc" } },
     ]);
     await expect(client.listThreadTurns({ threadId: "thread-1", limit: 1 }))
       .rejects.toMatchObject({ code: "PROTOCOL_LIMIT" });
@@ -1330,7 +1830,7 @@ describe("CodexAppServerClient", () => {
 
   test("fails closed on paginated history when experimental API was not negotiated", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
@@ -1338,7 +1838,7 @@ describe("CodexAppServerClient", () => {
     });
     await client.initialize();
     await expect(client.listThreadTurns({ threadId: "thread-1", limit: 24 })).rejects.toMatchObject({ code: "UNSUPPORTED_CAPABILITY" });
-    expect(process.writes).toHaveLength(2);
+    expect(process.writes).toHaveLength(3);
     await client.close();
   });
 
@@ -1379,7 +1879,7 @@ describe("CodexAppServerClient", () => {
         });
       }
     });
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 1 },
       expectedCodexHome: codexHome,
@@ -1394,7 +1894,7 @@ describe("CodexAppServerClient", () => {
     });
     expect(result.value.activePermissionProfile?.id).toBe(":workspace");
     expect(process.writes.at(-1)).toEqual({
-      id: 2,
+      id: 3,
       method: "thread/start",
       params: {
         model: "gpt-5.6-sol",
@@ -1432,7 +1932,7 @@ describe("CodexAppServerClient", () => {
         } });
       }
     });
-    const client = new CodexAppServerClient({ process, authority: { profileId: "profile-a", processGeneration: 1 }, expectedCodexHome: codexHome, experimentalApi: true, isAuthorityCurrent: () => true });
+    const client = createClient({ process, authority: { profileId: "profile-a", processGeneration: 1 }, expectedCodexHome: codexHome, experimentalApi: true, isAuthorityCurrent: () => true });
     await client.initialize();
     await expect(client.startThread({
       cwd: "/workspace/project",
@@ -1461,7 +1961,7 @@ describe("CodexAppServerClient", () => {
       { ignoreTerm: true, leaveStreamsOpenAfterKill: true },
     );
     const diagnostics: string[] = [];
-    const client = new CodexAppServerClient({
+    const client = createClient({
       process,
       authority: { profileId: "profile-a", processGeneration: 3 },
       expectedCodexHome: codexHome,

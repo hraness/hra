@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -40,6 +40,7 @@ import { LocalDaemonIndeterminateError } from "./daemon/local-transport";
 import { createAcceptanceInstallation } from "../scripts/live-acceptance-installation";
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
 import { FileSecretBackend, GenerationalSecretCustody } from "./storage/secret-custody";
+import { StateStore } from "./storage/state-store";
 
 const capture = () => {
   let stdout = "";
@@ -669,6 +670,125 @@ describe("CLI entry point", () => {
       expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(0);
       const parsed = JSON.parse(captured.read().stdout) as { ok: boolean; data: { networkChecks: string } };
       expect(parsed).toMatchObject({ ok: true, data: { networkChecks: "skipped" } });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor treats a private pre-initialization root without a database as not initialized", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-preinit-")));
+    try {
+      const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+      await mkdir(statePaths.root, { recursive: true, mode: 0o700 });
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(0);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: true,
+          state: { database: "not_initialized", initialized: false },
+        },
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor rejects a state root not owned by the invoking user", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-owner-")));
+    try {
+      const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
+      await mkdir(statePaths.root, { recursive: true, mode: 0o700 });
+      const metadata = await lstat(statePaths.root);
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, {
+        offlineDoctorOwnerUid: metadata.uid + 1,
+        statePaths,
+      })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: false,
+          problems: ["The state root is not a private canonical directory."],
+          state: { database: "not_initialized", initialized: false },
+        },
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor rejects a state root reached through a symbolic-link ancestor", async () => {
+    const temporary = await mkdtemp(join(tmpdir(), "hra-doctor-symlink-"));
+    try {
+      const actualParent = join(temporary, "actual");
+      const linkedParent = join(temporary, "linked");
+      await mkdir(join(actualParent, "state"), { recursive: true, mode: 0o700 });
+      await symlink(actualParent, linkedParent);
+      const statePaths = resolveStatePaths({ rootDirectory: join(linkedParent, "state") });
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, {
+        statePaths,
+      })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: false,
+          problems: ["The state root is not a private canonical directory."],
+        },
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor rejects a group-readable local database", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-database-mode-")));
+    try {
+      const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
+      await initializeStatePaths(statePaths);
+      const store = new StateStore(statePaths);
+      store.close();
+      await chmod(statePaths.database, 0o640);
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, {
+        statePaths,
+      })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: false,
+          problems: ["The local database check failed without exposing its runtime diagnostic."],
+          state: { database: "invalid", initialized: false },
+        },
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor rejects a dangling state-root symbolic link instead of treating it as absent", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-dangling-root-")));
+    try {
+      const statePaths = resolveStatePaths({ rootDirectory: join(temporary, "state") });
+      await symlink(join(temporary, "missing-target"), statePaths.root);
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, {
+        statePaths,
+      })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: false,
+          problems: ["The state root is not a private canonical directory."],
+          state: { database: "not_initialized", initialized: false },
+        },
+      });
       expect(captured.read().stderr).toBe("");
     } finally {
       await rm(temporary, { force: true, recursive: true });
@@ -2028,6 +2148,12 @@ describe("CLI entry point", () => {
             data: {
               version: 1,
               session: { id: sessionId, profileId: accountId },
+              providerObservation: {
+                connectionId: "90000000-0000-4000-8000-000000000099",
+                mode: "resubscribed",
+                profileGeneration: 1,
+                state: "live",
+              },
               eventStream: { cursor: "head-0" },
               pendingInteractionsNextCursor: null,
               pendingInteractions: [{

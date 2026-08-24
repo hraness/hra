@@ -330,6 +330,12 @@ describe("CLI rendering", () => {
           activeTurnId: "turn-1",
           revision: 4,
         },
+        providerObservation: {
+          connectionId: "90000000-0000-4000-8000-000000000099",
+          mode: "resubscribed",
+          profileGeneration: 2,
+          state: "live",
+        },
         eventStream: {
           floorSequence: 2,
           observedThroughSequence: 9,
@@ -361,11 +367,13 @@ describe("CLI rendering", () => {
       false,
       status.output,
     );
+    expect(status.stdout.join("")).toContain("Provider: live (resubscribed, generation 2");
     expect(status.stdout.join("")).toBe([
       "Release",
       "State: active",
       "Active turn: turn-1",
       "Revision: 4",
+      "Provider: live (resubscribed, generation 2, connection 90000000-0000-4000-8000-000000000099)",
       "Events: through 9, retained from 2",
       "",
       "Pending interactions",
@@ -397,8 +405,10 @@ describe("CLI rendering", () => {
       events: [
         { ...base, sequence: 2, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "done " } },
         { ...base, sequence: 3, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "and verified" } },
-        { ...base, sequence: 4, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "started", outputBytesObserved: 0 } },
-        { ...base, sequence: 5, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "completed", outputBytesObserved: 120 } },
+        { ...base, sequence: 4, body: { type: "item_started", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue" } },
+        { ...base, sequence: 5, body: { type: "item_completed", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue", status: "completed" } },
+        { ...base, sequence: 6, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "started", outputBytesObserved: 0 } },
+        { ...base, sequence: 7, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "completed", outputBytesObserved: 120 } },
       ],
     };
     const events = capture();
@@ -411,8 +421,10 @@ describe("CLI rendering", () => {
     expect(events.stdout.join("")).toContain("Event gap: retention_count");
     expect(events.stdout.join("")).toContain("Codex\n  done and verified");
     expect(events.stdout.join("").match(/Codex/gu)).toHaveLength(1);
+    expect(events.stdout.join("")).toContain("Item started: mcpToolCall github/create_issue mcp-1");
+    expect(events.stdout.join("")).toContain("Item completed: mcpToolCall github/create_issue mcp-1 (completed)");
     expect(events.stdout.join("")).toContain("Tool: command, completed, 120 bytes observed");
-    expect(events.stdout.join("")).not.toContain("started");
+    expect(events.stdout.join("")).not.toContain("Tool: command, started");
   });
 
   test("renders public interaction lists and details without private callback authority", () => {

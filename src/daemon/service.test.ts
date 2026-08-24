@@ -39,7 +39,7 @@ import {
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
-import { UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
+import { CodexSessionObservationError, UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
@@ -65,7 +65,16 @@ const runtimeProfile = (authority: ProfileAuthority): EffectiveRuntimeProfile =>
 
 class FakeCodex implements CodexRuntimePort {
   readonly calls: string[] = [];
+  readonly observedThreads: string[] = [];
+  readonly freshThreads = new Set<string>();
   readonly turnEffectTrace: string[] = [];
+  beforeObserveReturn?: () => Promise<void>;
+  observeError?: Error;
+  observeErrorOnce?: Error;
+  observationConnectionId = "30000000-0000-4000-8000-000000000001";
+  observationThreadIdOverride?: string;
+  activeObservations = 0;
+  maximumConcurrentObservations = 0;
   beforeStartTurnEffect?: () => Promise<void>;
   beforeStartTurnReturn?: () => Promise<void>;
   beforeReadSessionReturn?: () => Promise<void>;
@@ -196,7 +205,34 @@ class FakeCodex implements CodexRuntimePort {
       status: "idle",
       providerUpdatedAt: 10,
     };
+    this.freshThreads.add(this.readProjection.providerThreadId);
     return { ...this.readProjection, effectiveRuntimeProfile: input.review.effectiveRuntimeProfile };
+  }
+  async observeSession(input: Parameters<CodexRuntimePort["observeSession"]>[0]): ReturnType<CodexRuntimePort["observeSession"]> {
+    this.calls.push("observe");
+    this.observedThreads.push(input.providerThreadId);
+    this.activeObservations += 1;
+    this.maximumConcurrentObservations = Math.max(
+      this.maximumConcurrentObservations,
+      this.activeObservations,
+    );
+    const oneShotError = this.observeErrorOnce;
+    delete this.observeErrorOnce;
+    try {
+      await this.beforeObserveReturn?.();
+      if (oneShotError !== undefined) throw oneShotError;
+      if (this.observeError !== undefined) throw this.observeError;
+      return {
+        connectionId: this.observationConnectionId,
+        projection: {
+          ...this.readProjection,
+          providerThreadId: this.observationThreadIdOverride ?? input.providerThreadId,
+        },
+        resumed: !this.freshThreads.has(input.providerThreadId),
+      };
+    } finally {
+      this.activeObservations -= 1;
+    }
   }
   async readSession(): Promise<CodexSessionProjection> {
     this.calls.push("read");
@@ -336,6 +372,7 @@ class FakeCloud implements CloudControlPort {
     signal: AbortSignal;
   }> = [];
   beforeProjectionRecoveryReturn?: () => Promise<void>;
+  beforeProjectionUnsettledSessionReturn?: (sessionPublicId: `sess_${string}`) => Promise<void>;
   projectionRecoveryResult: unknown = { phase: "applied", compactStreamEpoch: 1 };
   projectionRecoveryBlocker?: CompactProjectionRecoveryBlocker;
   readonly unsettledProjectionProfiles = new Set<string>();
@@ -376,6 +413,7 @@ class FakeCloud implements CloudControlPort {
   }
   async sync(): Promise<unknown> { return { synced: true }; }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
+    await this.beforeProjectionUnsettledSessionReturn?.(sessionPublicId);
     return this.projectionRecoveryBlocker === undefined
       ? this.unsettledProjectionSessions.has(sessionPublicId)
       : await this.projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettled(sessionPublicId);
@@ -758,6 +796,97 @@ describe("HraService", () => {
     const result = await service.execute({ kind: "account.login", account: added.account.id, deviceCode: true }, { signal }) as { account: { state: string; processGeneration: number } };
     expect(result.account).toMatchObject({ state: "signed_in", processGeneration: 1 });
     expect(codex.calls[0]).toContain(":1:device_code");
+  });
+
+  test("shows a pristine signed-out account without touching Codex", async () => {
+    const { service, codex } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Pristine" },
+      { signal },
+    ) as { account: { id: string } };
+
+    await expect(service.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      account: {
+        id: added.account.id,
+        label: "Pristine",
+        processGeneration: 0,
+        state: "signed_out",
+      },
+    });
+    expect(codex.calls).toEqual([]);
+  });
+
+  test("returns a stable conflict for a duplicate non-ASCII case-insensitive account label", async () => {
+    const { service, store } = await fixture();
+    await service.execute({ kind: "account.add", label: "Équipe" }, { signal });
+
+    const failure = await service.execute(
+      { kind: "account.add", label: "équipe" },
+      { signal },
+    ).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "CONFLICT",
+      message: "An active account already uses that label.",
+      name: "CommandFailure",
+    });
+    expect(String(failure)).not.toContain("SQLite");
+    expect(String(failure)).not.toContain("UNIQUE");
+    expect(String(failure)).not.toContain("profiles_label_active");
+    expect(String(failure)).not.toContain("profiles_label_key_active");
+    expect(store.listProfiles()).toHaveLength(1);
+  });
+
+  test("returns a stable conflict for a canonically equivalent project label", async () => {
+    const { service, store, documents } = await fixture();
+    const secondRoot = join(documents, "Other");
+    await mkdir(secondRoot, { recursive: true });
+    await service.execute({
+      kind: "project.add",
+      label: "Café",
+      path: documents,
+    }, { signal });
+
+    const failure = await service.execute({
+      kind: "project.add",
+      label: "Cafe\u0301",
+      path: secondRoot,
+    }, { signal }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "CONFLICT",
+      message: "A project already uses that label.",
+      name: "CommandFailure",
+    });
+    expect(String(failure)).not.toContain("SQLite");
+    expect(String(failure)).not.toContain("UNIQUE");
+    expect(String(failure)).not.toContain("projects_label_unique");
+    expect(String(failure)).not.toContain("projects_label_key_unique");
+    expect(store.listProjects()).toHaveLength(1);
+  });
+
+  test("returns a stable conflict when another label names the same project directory", async () => {
+    const { service, store, documents } = await fixture();
+    await service.execute({
+      kind: "project.add",
+      label: "Primary",
+      path: documents,
+    }, { signal });
+
+    const failure = await service.execute({
+      kind: "project.add",
+      label: "Same directory",
+      path: documents,
+    }, { signal }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({
+      code: "CONFLICT",
+      message: "A project already uses that directory.",
+      name: "CommandFailure",
+    });
+    expect(String(failure)).not.toContain("SQLite");
+    expect(String(failure)).not.toContain("UNIQUE");
+    expect(store.listProjects()).toHaveLength(1);
   });
 
   test("imports every requested Codex session page and binds continuations to the resolved account filter", async () => {
@@ -1625,6 +1754,92 @@ describe("HraService", () => {
     expect(value.store.listQueue(session.id).find((entry) => entry.id === pending.id))
       .toMatchObject({ state: "pending" });
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
+  });
+
+  test("drops a provider fact when its profile generation advances during the recovery-state read", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId } = await createIdleSession(value, "Stale fact generation");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    let signalRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    cloud.beforeProjectionUnsettledSessionReturn = async (observedSessionId) => {
+      if (observedSessionId !== session.id) return;
+      signalRead();
+      await readGate;
+    };
+    const staleFact = value.service.observeCodexFact({
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    }, {
+      threadId: session.providerThreadId,
+      turn: {
+        completedAt: null,
+        durationMs: null,
+        id: "stale-generation-turn",
+        items: [],
+        startedAt: 1,
+        status: "inProgress",
+      },
+      type: "turnStarted",
+    });
+
+    await readStarted;
+    value.store.advanceProfileGeneration(profile.id, profile.processGeneration);
+    releaseRead();
+    await staleFact;
+
+    expect(value.store.requireProfileById(profile.id).processGeneration).toBe(
+      profile.processGeneration + 1,
+    );
+    const after = value.store.requireSession(session.id);
+    expect(after.state).toBe("idle");
+    expect(after.activeTurnId).toBeUndefined();
+  });
+
+  test("drops a provider fact when its same-generation profile signs out during the recovery-state read", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId } = await createIdleSession(value, "Signed-out fact authority");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    let signalRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    cloud.beforeProjectionUnsettledSessionReturn = async (observedSessionId) => {
+      if (observedSessionId !== session.id) return;
+      signalRead();
+      await readGate;
+    };
+    const staleFact = value.service.observeCodexFact({
+      codexHome: "unused",
+      desktopUserData: "unused",
+      generation: profile.processGeneration,
+      id: profile.id,
+    }, {
+      name: "must not apply after logout",
+      threadId: session.providerThreadId,
+      type: "threadNameUpdated",
+    });
+
+    await readStarted;
+    expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+    releaseRead();
+    await staleFact;
+
+    expect(value.store.requireProfileById(profile.id)).toMatchObject({
+      processGeneration: profile.processGeneration,
+      state: "signed_out",
+    });
+    expect(value.store.requireSession(session.id).title).toBe(session.title);
   });
 
   test("provider deletion supersedes an in-flight recovery and terminalizes local authority exactly once", async () => {
@@ -3015,6 +3230,57 @@ describe("HraService", () => {
     expect(store.listQueue(started.session.id)[0]).toMatchObject({ state: "applied" });
   });
 
+  test("pages recovery across the session quota and bounds eager active observations", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Paged active recovery",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const project = await service.execute({
+      kind: "project.add",
+      label: "Paged recovery docs",
+      path: documents,
+    }, { signal }) as { project: { id: `proj_${string}` } };
+    const created = Array.from({ length: 103 }, (_, index) => {
+      const session = store.createSession({
+        profileId: added.account.id,
+        projectId: project.project.id,
+        title: `Recovery ${String(index)}`,
+        preset: "high",
+        fastEnabled: false,
+      });
+      return { index, session };
+    }).toSorted((left, right) => left.session.id.localeCompare(right.session.id));
+    const active = new Set(created.slice(-3).map(({ session }) => session.id));
+    for (const { index, session } of created) {
+      store.bindSession({
+        sessionId: session.id,
+        expectedRevision: session.revision,
+        providerThreadId: `provider-recovery-${String(index)}`,
+        state: active.has(session.id) ? "active" : "idle",
+        ...(active.has(session.id) ? { activeTurnId: `turn-${String(index)}` } : {}),
+      });
+    }
+    codex.beforeObserveReturn = async () => await Bun.sleep(2);
+
+    const readiness = await Promise.race([
+      service.recover().then(() => "ready" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    expect(readiness).toBe("ready");
+    await service.settled();
+    for (const { index, session } of created.slice(-3)) {
+      expect(codex.observedThreads).toContain(`provider-recovery-${String(index)}`);
+      expect(active.has(session.id)).toBe(true);
+    }
+    expect(codex.maximumConcurrentObservations).toBe(1);
+  });
+
   test("dispatches a durable queue immediately for an idle session", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Idle queue" }, { signal }) as { account: { id: string } };
@@ -3315,6 +3581,7 @@ describe("HraService", () => {
       desktopUserData: "unused",
     };
     const connectionId = "30000000-0000-4000-8000-000000000001";
+    value.codex.observationConnectionId = connectionId;
     await value.service.observeCodexFact(authority, {
       type: "itemStarted",
       connectionId,
@@ -3417,6 +3684,193 @@ describe("HraService", () => {
       limit: 10,
       waitMs: 0,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  test("fails an unavailable event follow closed after surfacing one durable warning", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Unavailable observation");
+    const position = value.store.eventStreamPosition(sessionId);
+    const cursor = value.eventCursors.encode({
+      version: 1,
+      sessionId,
+      streamEpoch: position.streamEpoch,
+      sequence: position.observedThroughSequence,
+    });
+    const observationsBeforeInvalidCursor = value.codex.observedThreads.length;
+    await expect(value.service.execute({
+      kind: "session.events",
+      session: sessionId,
+      cursor: `${cursor}tampered`,
+      limit: 200,
+      waitMs: 1_000,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(value.codex.observedThreads).toHaveLength(observationsBeforeInvalidCursor);
+    value.codex.observeError = new CodexSessionObservationError("resume_unavailable");
+
+    const startedAt = Date.now();
+    const warningPage = await value.service.execute({
+      kind: "session.events",
+      session: sessionId,
+      cursor,
+      limit: 200,
+      waitMs: 1_000,
+    }, { signal }) as { events: Array<{ body: { type: string; code?: string } }>; nextCursor: string };
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(warningPage.events).toHaveLength(1);
+    expect(warningPage.events[0]?.body).toMatchObject({
+      code: "provider_resume_unavailable",
+      type: "warning",
+    });
+    await expect(value.service.execute({
+      kind: "session.events",
+      session: sessionId,
+      cursor: warningPage.nextCursor,
+      limit: 200,
+      waitMs: 1_000,
+    }, { signal })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+
+    await expect(value.service.execute({
+      kind: "session.send",
+      session: sessionId,
+      message: "must not dispatch",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000711",
+    }, { signal })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(value.codex.calls).not.toContain("send");
+    await expect(value.service.execute({
+      kind: "session.queue",
+      session: sessionId,
+      message: "dispatch after reconnect",
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000712",
+    }, { signal })).resolves.toMatchObject({ queued: { state: "pending" } });
+  });
+
+  test("quarantines a mismatched resumed thread and exposes the closed status", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Mismatched observation");
+    value.codex.observationThreadIdOverride = "provider-thread-foreign";
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        code: "thread_mismatch",
+        state: "recovery_required",
+      },
+      session: { state: "recovery_required" },
+    });
+    const mismatch = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events.find((event) => event.body.type === "error");
+    expect(mismatch?.body).toMatchObject({
+      code: "provider_thread_mismatch",
+      terminal: true,
+      type: "error",
+    });
+  });
+
+  test("does not append an old-generation warning when resume retirement advances authority", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Retired observation generation");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const before = value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events;
+    value.codex.beforeObserveReturn = async () => {
+      delete value.codex.beforeObserveReturn;
+      value.store.advanceProfileGeneration(profile.id, profile.processGeneration);
+    };
+    value.codex.observeErrorOnce = new CodexSessionObservationError("resume_unavailable");
+
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        code: "resume_unavailable",
+        profileGeneration: profile.processGeneration + 1,
+        state: "unavailable",
+      },
+    });
+    expect(value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events).toEqual(before);
+  });
+
+  test("preserves parsed MCP tool identity through safe events and human rendering", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "MCP lifecycle stream");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    };
+    const connectionId = "30000000-0000-4000-8000-000000000002";
+    const providerArgumentsSecret = "MCP-ARGUMENT-SECRET-MUST-NOT-PERSIST";
+    const providerResultSecret = "MCP-RESULT-SECRET-MUST-NOT-PERSIST";
+    const providerItem = {
+      type: "mcpToolCall",
+      id: "mcp-item-1",
+      server: "github",
+      tool: "create_issue",
+      status: "inProgress",
+      arguments: { token: providerArgumentsSecret },
+      result: { content: providerResultSecret },
+    };
+
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("item/started", {
+        threadId: session.providerThreadId,
+        turnId: "turn-mcp",
+        item: providerItem,
+      }),
+      connectionId,
+    });
+    await value.service.observeCodexFact(authority, {
+      ...parseFact("item/completed", {
+        threadId: session.providerThreadId,
+        turnId: "turn-mcp",
+        item: { ...providerItem, status: "completed" },
+      }),
+      connectionId,
+    });
+
+    const command = {
+      kind: "session.events",
+      session: sessionId,
+      limit: 200,
+      waitMs: 0,
+    } satisfies LocalCommand;
+    const page = await value.service.execute(command, { signal }) as {
+      events: Array<{ body: Record<string, unknown> }>;
+    };
+    const lifecycle = page.events
+      .map((event) => event.body)
+      .filter((body) => body.type === "item_started" || body.type === "item_completed");
+    expect(lifecycle).toHaveLength(2);
+    expect(lifecycle[0]).toMatchObject({
+      type: "item_started",
+      itemKind: "mcpToolCall",
+      server: "github",
+      tool: "create_issue",
+    });
+    expect(lifecycle[1]).toMatchObject({
+      type: "item_completed",
+      itemKind: "mcpToolCall",
+      server: "github",
+      tool: "create_issue",
+      status: "completed",
+    });
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain(providerArgumentsSecret);
+    expect(serialized).not.toContain(providerResultSecret);
+    expect(serialized).not.toContain('"arguments"');
+    expect(serialized).not.toContain('"result"');
+    expect(renderHuman(command, page)).toContain("mcpToolCall github/create_issue");
+    expect(renderJson(command, page)).toContain('"server":"github"');
+    expect(renderJson(command, page)).toContain('"tool":"create_issue"');
   });
 
   test("turns a valid prior-epoch cursor into one resumable stream-restored gap", async () => {
@@ -5388,9 +5842,37 @@ describe("HraService", () => {
     }
     expect(restartedCodex.validatedInteractions).toHaveLength(0);
     expect(restartedCodex.resolvedInteractions).toHaveLength(0);
-    expect(restartedStore.listSessionEvents({ sessionId, afterSequence: 0 }).events
-      .some((event) => event.body.type === "gap" && event.body.reason === "provider_restart"))
-      .toBe(true);
+    const restartStatus = await restarted.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal }) as { eventStream: { cursor: string }; providerObservation: unknown };
+    expect(restartStatus).toMatchObject({
+      providerObservation: {
+        connectionId: restartedCodex.observationConnectionId,
+        mode: "resubscribed",
+        state: "live",
+      },
+    });
+    await expect(restarted.execute({
+      kind: "session.events",
+      session: sessionId,
+      cursor: restartStatus.eventStream.cursor,
+      limit: 200,
+      waitMs: 0,
+    }, { signal })).resolves.toMatchObject({ events: [] });
+    const restartEvents = restartedStore.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events;
+    expect(restartEvents.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_restart"))
+      .toHaveLength(1);
+    const resubscribed = restartEvents.find((event) =>
+      event.body.type === "connection" && event.body.state === "resubscribed");
+    expect(resubscribed).toMatchObject({
+      body: { type: "connection", state: "resubscribed" },
+      providerConnectionId: restartedCodex.observationConnectionId,
+    });
     await restarted.close();
   });
 

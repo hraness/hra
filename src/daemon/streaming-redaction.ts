@@ -43,6 +43,8 @@ type ActiveItem = Readonly<{
 }>;
 
 const publicControlScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const providerToolLabelMaximumUtf8Bytes = 256;
+const textEncoder = new TextEncoder();
 
 /**
  * Reduce provider prose before it can cross a public or durable boundary.
@@ -64,6 +66,19 @@ export const sanitizeProviderProse = (
       : publicControlScalar.test(scalar)
         ? "�"
         : scalar;
+  }
+  return output;
+};
+
+const sanitizeProviderToolLabel = (value: string): string => {
+  const sanitized = sanitizeProviderProse(value, false);
+  let output = "";
+  let bytes = 0;
+  for (const scalar of sanitized) {
+    const scalarBytes = textEncoder.encode(scalar).byteLength;
+    if (bytes + scalarBytes > providerToolLabelMaximumUtf8Bytes) break;
+    output += scalar;
+    bytes += scalarBytes;
   }
   return output;
 };
@@ -187,18 +202,22 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
     case "item_started": return {
       ...body,
       itemKind: safeInline(body.itemKind),
+      ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
+      ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
     };
     case "item_completed": return {
       ...body,
       itemKind: safeInline(body.itemKind),
       ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
+      ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
+      ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
     };
     case "tool_progress": return {
       ...body,
       toolKind: safeInline(body.toolKind),
       ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
-      ...(body.server === undefined ? {} : { server: safeInline(body.server) }),
-      ...(body.tool === undefined ? {} : { tool: safeInline(body.tool) }),
+      ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
+      ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
     };
     case "file_change": return {
       ...body,

@@ -5,6 +5,52 @@ import { createProfileId, createSessionId } from "./values";
 import { sessionEventBodySchema, sessionEventSchema } from "./session-events";
 
 describe("session events", () => {
+  test("keeps tool lifecycle identity optional, bounded, and backwards compatible", () => {
+    const exactUtf8Boundary = `${"界".repeat(85)}a`;
+    const overUtf8Boundary = `${exactUtf8Boundary}b`;
+    expect(new TextEncoder().encode(exactUtf8Boundary).byteLength).toBe(256);
+    expect(new TextEncoder().encode(overUtf8Boundary).byteLength).toBe(257);
+    expect(sessionEventBodySchema.parse({
+      type: "item_started",
+      turnId: "turn-1",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: exactUtf8Boundary,
+      tool: "create_issue",
+    })).toMatchObject({ server: exactUtf8Boundary, tool: "create_issue" });
+    expect(sessionEventBodySchema.parse({
+      type: "item_completed",
+      turnId: "turn-1",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      status: "completed",
+    })).not.toHaveProperty("server");
+    expect(() => sessionEventBodySchema.parse({
+      type: "item_started",
+      turnId: "turn-1",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: "s".repeat(257),
+      tool: "create_issue",
+    })).toThrow();
+    expect(() => sessionEventBodySchema.parse({
+      type: "item_completed",
+      turnId: "turn-1",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: "github",
+      tool: "",
+    })).toThrow();
+    expect(() => sessionEventBodySchema.parse({
+      type: "item_completed",
+      turnId: "turn-1",
+      itemId: "item-tool",
+      itemKind: "mcpToolCall",
+      server: "github",
+      tool: overUtf8Boundary,
+    })).toThrow();
+  });
+
   test("accepts provider-visible summary deltas and excludes raw reasoning or command output fields", () => {
     const safe = sessionEventBodySchema.parse({
       type: "reasoning_summary_delta",
