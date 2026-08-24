@@ -760,6 +760,8 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       })).rejects.toThrow("explicit, potentially history-discarding reseed");
       expect(adapter.projectionCacheStatus()).toMatchObject({
+        affectedSessions: [value.sessionId],
+        affectedSessionsTruncated: false,
         code: "STREAM_RECOVERY_REQUIRED",
         sessions: 1,
         state: "degraded",

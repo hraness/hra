@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rename, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,6 +13,7 @@ import {
   type CodexPluginCatalog,
 } from "../codex";
 import { parseFact } from "../codex/protocol";
+import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import {
   CloudDaemonJournalRecoveryBlocker,
   createCloudProjectionRecoveryTerminalReceipt,
@@ -41,7 +42,7 @@ import { StateStore } from "../storage/state-store";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
 import { CodexSessionObservationError, UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
-import { HraService } from "./service";
+import { CommandFailure, HraService } from "./service";
 import { USAGE_HISTORY_CURSOR_TTL_MS } from "./usage-history-cursor";
 
 const privatePathRoot = ["", "Users", "private"].join("/");
@@ -185,6 +186,7 @@ class FakeCodex implements CodexRuntimePort {
     return { sessions: this.listedProjections, nextCursor: this.listedNextCursor };
   }
   async reviewSessionStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+    this.calls.push("review-session");
     const base = runtimeProfile(input.authority);
     const effectiveRuntimeProfile = this.runtimeProfileOverride ?? {
       ...base,
@@ -244,6 +246,7 @@ class FakeCodex implements CodexRuntimePort {
     return this.readProjection;
   }
   async reviewTurnStart(input: { authority: ProfileAuthority; preset: Preset; fast: boolean }): Promise<RuntimeStartReview> {
+    this.calls.push("review-turn");
     this.turnEffectTrace.push("review");
     const error = this.reviewTurnErrorOnce;
     delete this.reviewTurnErrorOnce;
@@ -379,6 +382,7 @@ class FakeCloud implements CloudControlPort {
   readonly unsettledProjectionSessions = new Set<string>();
   readonly providerDeletionSupersessions: string[] = [];
   readonly providerDeletionSupersededSessions = new Set<string>();
+  projectionRecoveryError?: CloudProjectionRecoveryAdmissionError;
   authResult: unknown = { requested: true };
   deleteAccountResult: unknown = {
     daemonRestartRequired: true,
@@ -403,13 +407,14 @@ class FakeCloud implements CloudControlPort {
     }>;
   }>>();
   statusError?: unknown;
+  statusResult: unknown = { configured: true };
   async status(): Promise<unknown> {
     if (this.statusError !== undefined) {
       throw this.statusError instanceof Error
         ? this.statusError
         : new Error("Fake cloud status failed.");
     }
-    return { configured: true };
+    return this.statusResult;
   }
   async sync(): Promise<unknown> { return { synced: true }; }
   async isCompactProjectionRecoveryUnsettled(sessionPublicId: `sess_${string}`): Promise<boolean> {
@@ -426,6 +431,7 @@ class FakeCloud implements CloudControlPort {
       : await this.projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettledForProfile(profileId);
   }
   async recoverCompactProjection(input: { sessionPublicId: `sess_${string}`; idempotencyKey: string; acknowledgeGap: true; signal: AbortSignal }): Promise<unknown> {
+    if (this.projectionRecoveryError !== undefined) throw this.projectionRecoveryError;
     this.projectionRecoveries.push(input);
     await this.beforeProjectionRecoveryReturn?.();
     if (this.providerDeletionSupersededSessions.has(input.sessionPublicId)) {
@@ -819,6 +825,169 @@ describe("HraService", () => {
     expect(codex.calls).toEqual([]);
   });
 
+  test("returns ID-only signed-out recovery guidance for provider operations", async () => {
+    const { service, codex } = await fixture();
+    const privateLabel = "Private provider account";
+    const added = await service.execute(
+      { kind: "account.add", label: privateLabel },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+
+    const failure = await service.execute({
+      account: added.account.id,
+      kind: "plugin.list",
+      refresh: false,
+    }, { signal }).catch((error: unknown) => error);
+    if (!(failure instanceof CommandFailure)) throw new Error("Expected a signed-out CommandFailure.");
+    expect(failure).toMatchObject({
+      code: "INTERACTION_REQUIRED",
+      details: {
+        accountSelector: added.account.id,
+        accountState: "signed_out",
+        nextCommand: `hra account login ${added.account.id}`,
+      },
+      name: "CommandFailure",
+    });
+    expect(failure.message).not.toContain(privateLabel);
+    expect(JSON.stringify(failure.details)).not.toContain(privateLabel);
+    expect(codex.calls).toEqual([]);
+  });
+
+  test("lists a selected signed-out account's locally stored sessions without provider access", async () => {
+    const { service, codex, documents } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Offline sessions" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await service.execute({
+      kind: "project.add",
+      label: "Offline docs",
+      path: documents,
+    }, { signal });
+    const started = await service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal }) as { session: { id: `sess_${string}` } };
+    await service.execute({
+      kind: "account.logout",
+      account: added.account.id,
+    }, { signal });
+    const providerCallsBeforeList = codex.calls.length;
+
+    const unfiltered = await service.execute({
+      kind: "session.list",
+      limit: 100,
+    }, { signal }) as { sessions: readonly { id: string; profileId: string }[] };
+    const selected = await service.execute({
+      kind: "session.list",
+      account: added.account.id,
+      limit: 100,
+    }, { signal });
+
+    expect(selected).toEqual({
+      accountId: added.account.id,
+      sessions: unfiltered.sessions.filter((session) => session.profileId === added.account.id),
+      nextCursor: null,
+      listing: {
+        accountSelector: added.account.id,
+        accountState: "signed_out",
+        scope: "local_only",
+        freshness: "stale",
+        localCompleteness: "complete",
+        providerAccess: "not_attempted",
+        providerCompleteness: "unknown",
+        nextCommand: `hra account login ${added.account.id}`,
+      },
+    });
+    expect(selected).toMatchObject({ sessions: [{ id: started.session.id }] });
+    expect(codex.calls).toHaveLength(providerCallsBeforeList);
+  });
+
+  test("pages every signed-out local session with account-bound tamper-evident continuations", async () => {
+    const { service, store, codex } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Retained local history" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    for (let index = 0; index < 105; index += 1) {
+      store.createSession({
+        profileId: added.account.id,
+        title: `Local retained ${String(index).padStart(3, "0")}`,
+        preset: "high",
+        fastEnabled: false,
+      });
+    }
+
+    const ids: string[] = [];
+    let cursor: string | undefined;
+    let firstCursor: string | undefined;
+    let finalListing: unknown;
+    do {
+      const page = await service.execute({
+        kind: "session.list",
+        account: added.account.id,
+        limit: 37,
+        ...(cursor === undefined ? {} : { cursor }),
+      }, { signal }) as {
+        sessions: readonly { id: string }[];
+        nextCursor: string | null;
+        listing: unknown;
+      };
+      ids.push(...page.sessions.map((session) => session.id));
+      firstCursor ??= page.nextCursor ?? undefined;
+      cursor = page.nextCursor ?? undefined;
+      finalListing = page.listing;
+    } while (cursor !== undefined);
+
+    expect(ids).toHaveLength(105);
+    expect(new Set(ids).size).toBe(105);
+    expect(firstCursor).toStartWith("hra1.");
+    expect(finalListing).toEqual({
+      accountSelector: added.account.id,
+      accountState: "signed_out",
+      scope: "local_only",
+      freshness: "stale",
+      localCompleteness: "complete",
+      providerAccess: "not_attempted",
+      providerCompleteness: "unknown",
+      nextCommand: `hra account login ${added.account.id}`,
+    });
+    expect(codex.calls).toEqual([]);
+
+    if (firstCursor === undefined) throw new Error("Expected a local continuation.");
+    const other = await service.execute(
+      { kind: "account.add", label: "Other retained history" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    await expect(service.execute({
+      kind: "session.list",
+      account: other.account.id,
+      limit: 37,
+      cursor: firstCursor,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(service.execute({
+      kind: "session.list",
+      account: added.account.id,
+      limit: 36,
+      cursor: firstCursor,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const replacement = firstCursor.at(-1) === "A" ? "B" : "A";
+    await expect(service.execute({
+      kind: "session.list",
+      account: added.account.id,
+      limit: 37,
+      cursor: `${firstCursor.slice(0, -1)}${replacement}`,
+    }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(codex.calls).toEqual([]);
+  });
+
   test("returns a stable conflict for a duplicate non-ASCII case-insensitive account label", async () => {
     const { service, store } = await fixture();
     await service.execute({ kind: "account.add", label: "Équipe" }, { signal });
@@ -887,6 +1056,240 @@ describe("HraService", () => {
     expect(String(failure)).not.toContain("SQLite");
     expect(String(failure)).not.toContain("UNIQUE");
     expect(store.listProjects()).toHaveLength(1);
+  });
+
+  test("maps an existing but noncanonical project root to actionable unavailability", async () => {
+    const { service, store, documents } = await fixture();
+    const linkedRoot = `${documents}-linked-private`;
+    await symlink(documents, linkedRoot, "dir");
+
+    await expect(service.execute({
+      kind: "project.add",
+      label: "Linked project",
+      path: linkedRoot,
+    }, { signal })).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      details: {
+        nextCommand: "hra doctor",
+        repair: "repair_or_select_project",
+      },
+      message: "The project directory is missing, unsafe, or not readable, writable, traversable, and canonical. Repair it or choose another directory before retrying.",
+    });
+    expect(store.listProjects()).toHaveLength(0);
+  });
+
+  test("rejects a post-registration project symlink swap before Codex and reports it in both doctor modes", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute(
+      { kind: "account.add", label: "Project custody" },
+      { signal },
+    ) as { account: { id: `acct_${string}` } };
+    expect(store.setProfileState(added.account.id, 0, "signed_in")).toBe(true);
+    await service.execute({
+      kind: "project.add",
+      label: "Custody docs",
+      path: documents,
+    }, { signal });
+    const relocated = `${documents}-relocated-private`;
+    await rename(documents, relocated);
+    await symlink(relocated, documents, "dir");
+    expect(codex.calls).toEqual([]);
+
+    await expect(service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal })).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      details: {
+        nextCommand: "hra doctor",
+        repair: "repair_or_select_project",
+      },
+    });
+    expect(codex.calls).toEqual([]);
+    expect(codex.calls).not.toContain("review-session");
+    expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(0);
+    expect(store.listSessions()).toHaveLength(0);
+
+    const expectedProblem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
+    for (const offline of [true, false]) {
+      const doctor = await service.execute({ kind: "doctor", offline }, { signal }) as {
+        healthy: boolean;
+        problems: readonly string[];
+        state: { database: string; projects: number };
+      };
+      expect(doctor).toMatchObject({
+        healthy: false,
+        offline,
+        state: { database: "ready", projects: 1 },
+      });
+      expect(doctor.problems).toContain(expectedProblem);
+      expect(JSON.stringify(doctor)).not.toContain(documents);
+      expect(JSON.stringify(doctor)).not.toContain(relocated);
+    }
+  });
+
+  test("turns bounded projection and deployment status into actionable doctor health", async () => {
+    const cloud = new FakeCloud();
+    const { service, documents } = await fixture(undefined, cloud);
+    await service.execute({ kind: "project.add", label: "Doctor docs", path: documents }, { signal });
+
+    cloud.statusResult = {
+      configured: true,
+      projectionCache: {
+        code: "CACHE_CORRUPT_OR_UNREADABLE",
+        state: "unavailable",
+      },
+    };
+    const unavailable = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(unavailable.healthy).toBe(false);
+    expect(unavailable.problems).toContain(
+      "The cloud projection cache is corrupt or unreadable. Run `hra session list`, choose each affected local session, then explicitly run `hra sync projection recover <session> --acknowledge-gap`.",
+    );
+
+    const affectedSession = `sess_${"3".repeat(32)}`;
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000703";
+    cloud.statusResult = {
+      configured: true,
+      projectionCache: {
+        affectedSessions: [affectedSession],
+        affectedSessionsTruncated: false,
+        code: "STREAM_RECOVERY_REQUIRED",
+        sessions: 1,
+        state: "degraded",
+      },
+      projectionRecovery: {
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey,
+          phase: "effect_started",
+          sessionPublicId: affectedSession,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      },
+    };
+    const unsettled = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(unsettled.healthy).toBe(false);
+    expect(unsettled.problems).not.toContain(
+      `Cloud transcript projection requires recovery for 1 session(s). Run \`hra sync projection recover ${affectedSession} --acknowledge-gap\`.`,
+    );
+    expect(unsettled.problems).toContain(
+      `Cloud projection recovery is unsettled. Retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+    );
+
+    cloud.statusResult = {
+      configured: true,
+      projectionCache: { state: "ready" },
+      projectionRecovery: {
+        recoveries: Array.from({ length: 128 }, (_, index) => ({
+          idempotencyKey: `018bcfe5-6800-7000-8000-${index.toString(16).padStart(12, "0")}`,
+          phase: "rejected",
+          sessionPublicId: `sess_${index.toString(16).padStart(32, "0")}`,
+        })),
+        recoveriesTruncated: true,
+        totalRecoveries: 150,
+      },
+    };
+    const boundedHistory = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(boundedHistory).toMatchObject({ healthy: true, problems: [] });
+
+    cloud.statusResult = {
+      configured: true,
+      projectionCache: { state: "ready" },
+      projectionRecovery: {
+        recoveries: [],
+        recoveriesTruncated: true,
+        totalRecoveries: 150,
+      },
+    };
+    const impossibleShortPage = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(impossibleShortPage.healthy).toBe(false);
+    expect(impossibleShortPage.problems).toContain(
+      "Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `hra doctor`.",
+    );
+
+    cloud.statusResult = {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      projectionRecovery: {
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey,
+          phase: "effect_started",
+          sessionPublicId: affectedSession,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      },
+      reenable: { kind: "use_hosted_default" },
+      signedIn: false,
+      unavailability: "disabled",
+    };
+    const disabledRecovery = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(disabledRecovery.healthy).toBe(false);
+    expect(disabledRecovery.problems).toContain(
+      `Cloud projection recovery is unsettled. Unset HRA_CONVEX_URL and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+    );
+
+    cloud.statusResult = {
+      ...(cloud.statusResult as Record<string, unknown>),
+      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.",
+      reenable: {
+        deploymentUrl: "https://bound.convex.cloud",
+        kind: "restore_bound_deployment",
+      },
+    };
+    const selfManagedRecovery = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(selfManagedRecovery.healthy).toBe(false);
+    expect(selfManagedRecovery.problems).toContain(
+      `Cloud projection recovery is unsettled. Set HRA_CONVEX_URL to https://bound.convex.cloud and restart the daemon first. After restart, retry \`hra sync projection recover ${affectedSession} --acknowledge-gap --idempotency-key ${idempotencyKey}\`.`,
+    );
+
+    cloud.statusResult = {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      reenable: { kind: "use_hosted_default" },
+      signedIn: false,
+      unavailability: "disabled",
+    };
+    const intentionallyDisabled = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+    };
+    expect(intentionallyDisabled.healthy).toBe(true);
+
+    cloud.statusResult = {
+      configured: false,
+      diagnostic: "Cloud sync is unavailable because deployment custody requires recovery.",
+      signedIn: false,
+    };
+    const custody = await service.execute({ kind: "doctor", offline: false }, { signal }) as {
+      healthy: boolean;
+      problems: readonly string[];
+    };
+    expect(custody.healthy).toBe(false);
+    expect(custody.problems).toContain(
+      "Cloud deployment custody is unavailable. Run `hra sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.",
+    );
   });
 
   test("imports every requested Codex session page and binds continuations to the resolved account filter", async () => {
@@ -1601,6 +2004,36 @@ describe("HraService", () => {
     expect(providerMutationCalls(value.codex)).toEqual(providerWritesBefore);
   });
 
+  test("classifies absent old keys and changed-key recovery authority without opaque internal failures", async () => {
+    const cloud = new FakeCloud();
+    const value = await fixture(undefined, cloud);
+    const { sessionId } = await createIdleSession(value, "Projection admission guidance");
+    const command = {
+      acknowledgeGap: true as const,
+      idempotencyKey: "018bcfe5-6800-7000-8000-000000000809",
+      kind: "sync.projection-recover" as const,
+      session: sessionId,
+    };
+
+    cloud.projectionRecoveryError = new CloudProjectionRecoveryAdmissionError(
+      "idempotency_authority_invalid",
+    );
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      message: expect.stringContaining("Omit `--idempotency-key`"),
+    });
+
+    cloud.projectionRecoveryError = new CloudProjectionRecoveryAdmissionError(
+      "unsettled_session",
+    );
+    await expect(value.service.execute(command, { signal })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: { nextCommand: "hra sync status --json" },
+      message: expect.stringContaining("replay the exact idempotency key"),
+    });
+    expect(cloud.projectionRecoveries).toEqual([]);
+  });
+
   test("durably blocks provider and metadata mutations until an unsettled recovery resolves", async () => {
     const cloud = new FakeCloud();
     const value = await fixture(undefined, cloud);
@@ -2009,7 +2442,13 @@ describe("HraService", () => {
       idempotencyKey: active.idempotencyKey,
       kind: "sync.projection-recover",
       session: session.id,
-    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    }, { signal })).resolves.toEqual({
+      idempotencyKey: active.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: "PROVIDER_THREAD_DELETED",
+      sessionPublicId: session.id,
+    });
+    expect((await journal.read()).state).toEqual(recovered);
     expect(value.store.listSessionEvents({
       afterSequence: 0,
       sessionId: session.id,

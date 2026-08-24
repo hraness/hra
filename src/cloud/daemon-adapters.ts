@@ -22,6 +22,7 @@ import { parseAccountUsage, parseRateLimits, type RateLimitSnapshot } from "../c
 import type { LocalCommand } from "../domain/contracts";
 import type { InteractionRecord } from "../domain/interactions";
 import { providerUsagePayload } from "../domain/usage-metrics";
+import { sessionIdSchema } from "../domain/values";
 import type {
   CodexRuntimePort,
   CodexSessionProjection,
@@ -81,6 +82,7 @@ const maximumProjectionReadBytes = cloudLimits.detailChunkBytes;
 const projectionCacheFileName = "cloud-projection.sqlite";
 const projectionSidecarSuffixes = ["", "-journal", "-shm", "-wal"] as const;
 const maximumProjectionRecoveryBaselineInteractions = 200;
+const maximumProjectionRecoveryStatusSessions = 20;
 
 type ProviderRemoteLocalCommand = Extract<LocalCommand, Readonly<{
   kind: "session.send" | "session.queue" | "session.steer" | "session.stop" | "session.rename" | "session.preset" | "session.fast";
@@ -1271,7 +1273,14 @@ export type StateBackedCloudDaemonAdapterOptions = Readonly<{
 
 export type CloudProjectionCacheStatus = Readonly<
   | { state: "ready" }
-  | { code: "STREAM_RECOVERY_REQUIRED"; diagnostic: string; sessions: number; state: "degraded" }
+  | {
+      affectedSessions: readonly string[];
+      affectedSessionsTruncated: boolean;
+      code: "STREAM_RECOVERY_REQUIRED";
+      diagnostic: string;
+      sessions: number;
+      state: "degraded";
+    }
   | {
       code: "CACHE_CORRUPT_OR_UNREADABLE" | "CACHE_NEWER_VERSION" | "CACHE_RECOVERY_IN_PROGRESS" | "CACHE_SYMLINK" | "CACHE_UNSAFE_AUTHORITY";
       diagnostic: string;
@@ -1356,7 +1365,13 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
 
   projectionCacheStatus(): CloudProjectionCacheStatus {
     if (this.#projectionRecoveryErrors.size > 0) {
+      const affectedSessions = [...this.#projectionRecoveryErrors]
+        .filter((sessionPublicId) => sessionIdSchema.safeParse(sessionPublicId).success)
+        .sort((left, right) => left.localeCompare(right))
+        .slice(0, maximumProjectionRecoveryStatusSessions);
       return {
+        affectedSessions,
+        affectedSessionsTruncated: affectedSessions.length < this.#projectionRecoveryErrors.size,
         code: "STREAM_RECOVERY_REQUIRED",
         diagnostic: "Cloud transcript upload is paused for a mismatched stream. Local sessions, usage sync, remote reads, and remote commands remain available. Repair requires an explicit reseed that may discard cloud transcript history.",
         sessions: this.#projectionRecoveryErrors.size,
@@ -2166,6 +2181,14 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
       return Promise.reject(new Error("Cloud projection recovery supersession is unavailable."));
     }
     return this.#bridge.supersedeTerminalCompactProjectionRecoveries();
+  }
+  readCompactProjectionRecoveryReceipt(
+    input: Parameters<NonNullable<CloudControlPort["readCompactProjectionRecoveryReceipt"]>>[0],
+  ): ReturnType<NonNullable<CloudControlPort["readCompactProjectionRecoveryReceipt"]>> {
+    if (this.#bridge.readCompactProjectionRecoveryReceipt === undefined) {
+      return Promise.resolve({ status: "absent" });
+    }
+    return this.#bridge.readCompactProjectionRecoveryReceipt(input);
   }
   recoverCompactProjection(
     input: Parameters<CloudControlPort["recoverCompactProjection"]>[0],

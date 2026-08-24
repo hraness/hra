@@ -1097,8 +1097,11 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       const session = take(cursor, "local session");
       finish(cursor);
       const recoveryKey = idempotencyKey ?? createCloudUuidV7();
-      if (!isCurrentUuidV7(recoveryKey)) {
-        throw new CliUsageError("Projection recovery --idempotency-key must be a current UUIDv7.");
+      if (
+        (idempotencyKey === undefined && !isCurrentUuidV7(recoveryKey))
+        || (idempotencyKey !== undefined && !isUuidV7(recoveryKey))
+      ) {
+        throw new CliUsageError("Projection recovery --idempotency-key must be a canonical UUIDv7.");
       }
       const recoveryCommand = command({
         acknowledgeGap: true,

@@ -552,12 +552,14 @@ describe("terminal-safe CLI boundaries", () => {
       data: Record<string, unknown>;
     };
     expect(response.data).toMatchObject({
+      nextCommand: "hra sync status --json",
       phase: "rejected",
       rejectionCode: "HEAD_CHANGED",
       session: "sess_1234567890abcdef1234567890abcdef",
     });
     expect(Object.keys(response.data).sort()).toEqual([
       "idempotencyKey",
+      "nextCommand",
       "phase",
       "rejectionCode",
       "sameKeyReplay",

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 
 import { z } from "zod";
 
+import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
 import {
   CodexError,
   IndeterminateCodexEffectError,
@@ -12,7 +13,10 @@ import {
   type CodexPluginCatalog,
   type CodexPluginSummary,
 } from "../codex/index";
-import type { LocalCommand } from "../domain/contracts";
+import {
+  signedOutSessionListMetadataSchema,
+  type LocalCommand,
+} from "../domain/contracts";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -37,9 +41,11 @@ import {
 } from "../domain/usage-metrics";
 import { canonicalLabelKey, profileIdSchema, sessionIdSchema } from "../domain/values";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
+import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
 import {
   SelectionError,
   StateSecurityScrubRequiredError,
+  UnusableProjectRootError,
   USAGE_LOCAL_RETAIN_AGE_MS,
   type MutationAttemptRecord,
   type MutationEffectEvidence,
@@ -89,6 +95,171 @@ export class CommandFailure extends Error {
     this.name = "CommandFailure";
   }
 }
+
+const doctorProjectionCacheSchema = z.discriminatedUnion("state", [
+  z.object({ state: z.literal("ready") }).passthrough(),
+  z.object({
+    state: z.literal("degraded"),
+    code: z.literal("STREAM_RECOVERY_REQUIRED"),
+    sessions: z.number().int().nonnegative(),
+    affectedSessions: z.array(z.unknown()).optional(),
+  }).passthrough(),
+  z.object({
+    state: z.literal("unavailable"),
+    code: z.enum([
+      "CACHE_CORRUPT_OR_UNREADABLE",
+      "CACHE_NEWER_VERSION",
+      "CACHE_RECOVERY_IN_PROGRESS",
+      "CACHE_SYMLINK",
+      "CACHE_UNSAFE_AUTHORITY",
+    ]),
+  }).passthrough(),
+]);
+
+const doctorProjectionRecoveryEntrySchema = z.object({
+  cacheActivated: z.boolean().optional(),
+  idempotencyKey: z.string().regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  ),
+  phase: z.enum(["prepared", "effect_started", "applied", "rejected"]),
+  sessionPublicId: sessionIdSchema,
+}).passthrough();
+
+const doctorProjectionRecoveryStatusSchema = z.object({
+  recoveries: z.array(doctorProjectionRecoveryEntrySchema).max(128),
+  recoveriesTruncated: z.boolean(),
+  totalRecoveries: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).passthrough();
+
+const isCanonicalCloudDeploymentUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    const localHttp = url.protocol === "http:"
+      && (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]");
+    return (url.protocol === "https:" || localHttp)
+      && url.username === ""
+      && url.password === ""
+      && url.pathname === "/"
+      && url.search === ""
+      && url.hash === ""
+      && url.origin === value;
+  } catch {
+    return false;
+  }
+};
+
+const doctorCloudReenableSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("use_hosted_default") }).strict(),
+  z.object({
+    deploymentUrl: z.string().max(2_048).refine(isCanonicalCloudDeploymentUrl),
+    kind: z.literal("restore_bound_deployment"),
+  }).strict(),
+]);
+
+const doctorRecord = (value: unknown): Record<string, unknown> | null =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+
+const cloudReenableAction = (root: Record<string, unknown>): string => {
+  const parsed = doctorCloudReenableSchema.safeParse(root.reenable);
+  if (parsed.success && parsed.data.kind === "restore_bound_deployment") {
+    return `Set HRA_CONVEX_URL to ${parsed.data.deploymentUrl} and restart the daemon`;
+  }
+  if (parsed.success) return "Unset HRA_CONVEX_URL and restart the daemon";
+  return "Restore this state root's bound cloud deployment selection and restart the daemon";
+};
+
+const cloudProjectionRecoveryAction = (
+  root: Record<string, unknown>,
+  action: string,
+): string => root.unavailability === "disabled"
+  ? `${cloudReenableAction(root)} first. After restart, ${action}`
+  : `${action.slice(0, 1).toUpperCase()}${action.slice(1)}`;
+
+const cloudDoctorProblems = (status: unknown): readonly string[] => {
+  const root = doctorRecord(status);
+  if (root === null) {
+    return ["Cloud status returned an invalid local shape. Restart the daemon, then rerun `hra doctor`."];
+  }
+  const problems: string[] = [];
+  if (typeof root.configured !== "boolean") {
+    problems.push("Cloud status omitted its configuration state. Restart the daemon, then rerun `hra doctor`.");
+  }
+  if (
+    root.configured === false
+    && typeof root.diagnostic === "string"
+    && root.unavailability !== "disabled"
+  ) {
+    problems.push("Cloud deployment custody is unavailable. Run `hra sync status --json`, correct the reported deployment configuration or custody state, then restart the daemon.");
+  }
+  if (
+    root.unavailability === "disabled"
+    && !doctorCloudReenableSchema.safeParse(root.reenable).success
+  ) {
+    problems.push("Cloud sync is disabled, but its restart configuration is invalid. Run `hra sync status --json`, restore this state root's bound deployment selection, then restart the daemon.");
+  }
+
+  const parsedProjectionRecovery = root.projectionRecovery === undefined
+    ? null
+    : doctorProjectionRecoveryStatusSchema.safeParse(root.projectionRecovery);
+  const coherentProjectionRecovery = parsedProjectionRecovery !== null
+    && parsedProjectionRecovery.success
+    && parsedProjectionRecovery.data.recoveries.length
+      === Math.min(parsedProjectionRecovery.data.totalRecoveries, 128)
+    && parsedProjectionRecovery.data.recoveriesTruncated
+      === (parsedProjectionRecovery.data.totalRecoveries > 128);
+  const unsettledProjectionRecovery = coherentProjectionRecovery
+    ? parsedProjectionRecovery.data.recoveries.find((recovery) =>
+        recovery.phase === "prepared"
+        || recovery.phase === "effect_started"
+        || (recovery.phase === "applied" && recovery.cacheActivated !== true))
+    : undefined;
+
+  if (root.projectionCache !== undefined) {
+    const parsed = doctorProjectionCacheSchema.safeParse(root.projectionCache);
+    if (!parsed.success) {
+      problems.push("Cloud projection cache status is invalid. Restart the daemon, then rerun `hra doctor`.");
+    } else if (parsed.data.state === "unavailable") {
+      switch (parsed.data.code) {
+        case "CACHE_CORRUPT_OR_UNREADABLE":
+          if (unsettledProjectionRecovery === undefined) {
+            problems.push(`The cloud projection cache is corrupt or unreadable. ${cloudProjectionRecoveryAction(root, "run `hra session list`, choose each affected local session, then explicitly run `hra sync projection recover <session> --acknowledge-gap`.")}`);
+          }
+          break;
+        case "CACHE_NEWER_VERSION":
+          problems.push(`The cloud projection cache was created by a newer HRA version. ${cloudProjectionRecoveryAction(root, "upgrade or reinstall HRA, restart the daemon, then rerun `hra doctor`.")}`);
+          break;
+        case "CACHE_RECOVERY_IN_PROGRESS":
+          if (unsettledProjectionRecovery === undefined) {
+            problems.push(`Cloud projection recovery is incomplete. ${cloudProjectionRecoveryAction(root, "restart the daemon, then run `hra sync status --json` and retry the exact same-key recovery it reports.")}`);
+          }
+          break;
+        case "CACHE_SYMLINK":
+        case "CACHE_UNSAFE_AUTHORITY":
+          problems.push(`The cloud projection cache has unsafe filesystem authority. ${cloudProjectionRecoveryAction(root, "stop HRA, repair the cache entry reported by `hra sync status --json`, then restart the daemon.")}`);
+          break;
+      }
+    } else if (parsed.data.state === "degraded" && unsettledProjectionRecovery === undefined) {
+      const firstSession = (parsed.data.affectedSessions ?? [])
+        .slice(0, 20)
+        .map((value) => sessionIdSchema.safeParse(value))
+        .find((value) => value.success);
+      problems.push(firstSession?.success === true
+        ? `Cloud transcript projection requires recovery for ${String(parsed.data.sessions)} session(s). ${cloudProjectionRecoveryAction(root, `run \`hra sync projection recover ${firstSession.data} --acknowledge-gap\`.`)}`
+        : `Cloud transcript projection requires recovery. ${cloudProjectionRecoveryAction(root, "run `hra sync status --json` and use the exact affected session it reports.")}`);
+    }
+  }
+
+  if (parsedProjectionRecovery !== null) {
+    if (!coherentProjectionRecovery) {
+      problems.push("Cloud projection recovery status is invalid or exceeds its local bound. Restart the daemon, then rerun `hra doctor`.");
+    } else if (unsettledProjectionRecovery !== undefined) {
+      problems.push(`Cloud projection recovery is unsettled. ${cloudProjectionRecoveryAction(root, `retry \`hra sync projection recover ${unsettledProjectionRecovery.sessionPublicId} --acknowledge-gap --idempotency-key ${unsettledProjectionRecovery.idempotencyKey}\`.`)}`);
+    }
+  }
+  return problems;
+};
 
 class IndeterminateLocalCommitError extends Error {
   constructor(message: string, cause: unknown) {
@@ -275,7 +446,10 @@ export class HraService {
       switch (command.kind) {
         case "doctor": return await this.#doctor(command.offline, context.signal);
         case "daemon.status": return { running: true, pid: process.pid };
-        case "daemon.stop": (context.afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop); return { stopping: true };
+        case "daemon.stop": throw new CommandFailure(
+          "INVALID_INPUT",
+          "Daemon stop commands must be admitted by the exact local authority boundary.",
+        );
         case "account.list": return { accounts: this.#store.listProfiles().map((profile) => this.#publicProfile(profile)) };
         case "account.add": return await this.#addAccount(command.label);
         case "account.show": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#showAccount(profile.id, context.signal)); }
@@ -433,11 +607,28 @@ export class HraService {
         case "sync.status": return await this.#fencedEffect(async () => await this.#cloud.status(context.signal));
         case "sync.now": return await this.#fencedEffect(async () => await this.#cloud.sync(context.signal));
         case "sync.projection-recover": {
-          const session = this.#requireBoundSession(command.session);
-          const profile = this.#store.requireProfile(session.profileId);
-          return await this.#serializeSessionAuthority(session, async () => {
-            this.#projectionRecoveriesInFlight.add(session.id);
+          const selected = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthority(selected, async () => {
+            this.#projectionRecoveriesInFlight.add(selected.id);
             try {
+              await this.#daemonAuthority.assertCurrent();
+              const replay = await this.#cloud.readCompactProjectionRecoveryReceipt?.({
+                idempotencyKey: command.idempotencyKey,
+                sessionPublicId: selected.id,
+                signal: context.signal,
+              });
+              await this.#daemonAuthority.assertCurrent();
+              if (replay !== undefined) {
+                if (replay.status === "conflict") {
+                  throw new CommandFailure(
+                    "CONFLICT",
+                    "The projection recovery idempotency key belongs to another session.",
+                  );
+                }
+                if (replay.status === "found") return replay.result;
+              }
+              const session = this.#requireBoundSession(selected.id);
+              const profile = this.#store.requireProfile(session.profileId);
               return await this.#recoverCompactProjection({
                 acknowledgeGap: command.acknowledgeGap,
                 idempotencyKey: command.idempotencyKey,
@@ -447,7 +638,7 @@ export class HraService {
                 sessionId: session.id,
               }, context.signal);
             } finally {
-              this.#projectionRecoveriesInFlight.delete(session.id);
+              this.#projectionRecoveriesInFlight.delete(selected.id);
             }
           }, { allowDuringProjectionRecovery: true });
         }
@@ -466,6 +657,32 @@ export class HraService {
       }
       if (error instanceof SessionEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
+      }
+      if (error instanceof CloudProjectionRecoveryAdmissionError) {
+        switch (error.code) {
+          case "identity_or_session_conflict":
+            throw new CommandFailure(
+              "CONFLICT",
+              "The projection recovery idempotency key belongs to another HRA identity or session.",
+            );
+          case "idempotency_authority_invalid":
+            throw new CommandFailure(
+              "INVALID_INPUT",
+              "No retained projection recovery matches this expired or future idempotency key. Omit `--idempotency-key` to create a fresh recovery attempt.",
+            );
+          case "journal_capacity":
+            throw new CommandFailure(
+              "UNAVAILABLE",
+              "Projection recovery capacity is full. Run `hra sync status --json` and settle an existing recovery before retrying.",
+              { nextCommand: "hra sync status --json" },
+            );
+          case "unsettled_session":
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "Another projection recovery already owns this session. Run `hra sync status --json` and replay the exact idempotency key it reports.",
+              { nextCommand: "hra sync status --json" },
+            );
+        }
       }
       if (error instanceof SelectionError) throw new CommandFailure(error.code, error.message, { candidates: error.candidates });
       if (
@@ -1467,6 +1684,7 @@ export class HraService {
     if (!offline) {
       try {
         cloud = await this.#fencedEffect(async () => await this.#cloud.status(signal));
+        problems.push(...cloudDoctorProblems(cloud));
       } catch (error: unknown) {
         if (error instanceof DaemonAuthoritySafetyError) throw error;
         const diagnostic = "Cloud status failed without exposing its runtime diagnostic.";
@@ -1474,8 +1692,16 @@ export class HraService {
         problems.push(diagnostic);
       }
     }
-    const projectReady = this.#store.listProjects().length > 0;
+    const projects = this.#store.listProjects();
+    const projectReady = projects.length > 0;
     if (!projectReady) problems.push("No project directory is configured. Run `hra init --yes` or add a project.");
+    if (projectReady) {
+      const usable = await Promise.all(projects.map(async (project) =>
+        await resolveUsableCanonicalProjectDirectory(project.rootPath)));
+      if (usable.some((projectRoot) => projectRoot === null)) {
+        problems.push("A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.");
+      }
+    }
     let desktopRecovery: unknown = { status: "unavailable" };
     if (this.#desktop !== undefined) {
       try {
@@ -1499,7 +1725,7 @@ export class HraService {
       healthy: problems.length === 0,
       offline,
       runtime: { bun: Bun.version, requiredBun: "1.3.14", bunReady, codex, platform: process.platform, architecture: process.arch },
-      state: { database: "ready", profiles: this.#store.listProfiles().length, projects: this.#store.listProjects().length, unsettledMutations: this.#store.listUnsettledMutations().length },
+      state: { database: "ready", profiles: this.#store.listProfiles().length, projects: projects.length, unsettledMutations: this.#store.listUnsettledMutations().length },
       cloud,
       desktop: { supportedPlatform: process.platform === "darwin", configured: this.#desktop !== undefined, recovery: desktopRecovery },
       problems,
@@ -1551,8 +1777,37 @@ export class HraService {
       if (isSqliteUniqueConstraint(error) && duplicateRoot) {
         throw new CommandFailure("CONFLICT", "A project already uses that directory.");
       }
+      if (error instanceof UnusableProjectRootError) {
+        throw new CommandFailure(
+          "UNAVAILABLE",
+          "The project directory is missing, unsafe, or not readable, writable, traversable, and canonical. Repair it or choose another directory before retrying.",
+          {
+            nextCommand: "hra doctor",
+            repair: "repair_or_select_project",
+          },
+        );
+      }
       throw error;
     }
+  }
+
+  async #requireUsableProjectRoot(projectRoot: string): Promise<string> {
+    const canonical = await resolveUsableCanonicalProjectDirectory(projectRoot);
+    if (canonical === null) {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "The selected project directory is missing, unsafe, or not readable, writable, and traversable. Repair it or select another project before retrying.",
+        {
+          nextCommand: "hra doctor",
+          repair: "repair_or_select_project",
+        },
+      );
+    }
+    // Filesystem validation awaits several operations. Recheck daemon authority
+    // after that await boundary so the following provider call cannot escape a
+    // concurrent service shutdown on a formerly valid root.
+    await this.#daemonAuthority.assertCurrent();
+    return canonical;
   }
 
   async #readPluginCatalog(
@@ -1566,12 +1821,17 @@ export class HraService {
     const project = projectSelector === undefined
       ? undefined
       : this.#store.requireProject(projectSelector);
-    const catalog = await this.#fencedEffect(async () => await this.#codex.listPlugins({
-      authority: authorityFor(this.#paths, profile),
-      ...(project === undefined ? {} : { projectRoot: project.rootPath }),
-      forceRefetch: refresh,
-      signal,
-    }));
+    const catalog = await this.#fencedEffect(async () => {
+      const projectRoot = project === undefined
+        ? undefined
+        : await this.#requireUsableProjectRoot(project.rootPath);
+      return await this.#codex.listPlugins({
+        authority: authorityFor(this.#paths, profile),
+        ...(projectRoot === undefined ? {} : { projectRoot }),
+        forceRefetch: refresh,
+        signal,
+      });
+    });
     return { catalog, profile: this.#store.requireProfile(profile.id) };
   }
 
@@ -3096,6 +3356,48 @@ export class HraService {
       };
     }
     const profile = this.#store.requireProfile(account);
+    if (profile.state === "signed_out") {
+      const cursorFilter = {
+        accountId: profile.id,
+        accountGeneration: profile.processGeneration,
+        limit,
+      } as const;
+      const decodedCursor = cursor === undefined
+        ? undefined
+        : this.#eventCursors.decodeLocalSessionList(cursor, cursorFilter);
+      const page = this.#store.listLocalSessionPage({
+        profileId: profile.id,
+        after: decodedCursor === undefined
+          ? null
+          : {
+              createdAt: decodedCursor.afterCreatedAt,
+              sessionId: decodedCursor.afterSessionId,
+            },
+        limit,
+      });
+      const nextCursor = page.nextPosition === null
+        ? null
+        : this.#eventCursors.encodeLocalSessionList({
+            ...cursorFilter,
+            afterCreatedAt: page.nextPosition.createdAt,
+            afterSessionId: page.nextPosition.sessionId,
+          });
+      return {
+        accountId: profile.id,
+        sessions: page.sessions,
+        nextCursor,
+        listing: signedOutSessionListMetadataSchema.parse({
+          accountSelector: profile.id,
+          accountState: "signed_out",
+          scope: "local_only",
+          freshness: "stale",
+          localCompleteness: nextCursor === null ? "complete" : "partial",
+          providerAccess: "not_attempted",
+          providerCompleteness: "unknown",
+          nextCommand: `hra account login ${profile.id}`,
+        }),
+      };
+    }
     this.#assertSignedIn(profile);
     const cursorFilter = {
       accountId: profile.id,
@@ -3210,6 +3512,7 @@ export class HraService {
     this.#assertSignedIn(profile);
     const project = command.project === undefined ? this.#store.listProjects().find((candidate) => candidate.default) : this.#store.requireProject(command.project);
     if (project === undefined) throw new CommandFailure("INTERACTION_REQUIRED", "Add or select a project directory before starting a session.");
+    await this.#requireUsableProjectRoot(project.rootPath);
     const key = command.idempotencyKey ?? randomUUID();
     let localSessionId: SessionRecord["id"] | undefined;
     let clientMessageId: string | undefined;
@@ -3223,13 +3526,16 @@ export class HraService {
       idempotencyKey: key,
       beginEffect: async (attemptId) => {
         clientMessageId = attemptId;
-        review = await this.#fencedEffect(async () => await this.#codex.reviewSessionStart({
-          authority: authorityFor(this.#paths, profile),
-          projectRoot: project.rootPath,
-          preset: command.preset,
-          fast: command.fast,
-          signal,
-        }));
+        review = await this.#fencedEffect(async () => {
+          const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+          return await this.#codex.reviewSessionStart({
+            authority: authorityFor(this.#paths, profile),
+            projectRoot,
+            preset: command.preset,
+            fast: command.fast,
+            signal,
+          });
+        });
         const local = this.#store.beginSessionStartEffect({
           attemptId,
           profileId: profile.id,
@@ -3252,7 +3558,15 @@ export class HraService {
         const runtimeReview = review;
         const local = this.#store.requireSession(localSessionId);
         try {
-          startedProjection = await this.#fencedEffect(async () => await this.#codex.startSession({ authority: authorityFor(this.#paths, profile), projectRoot: project.rootPath, review: runtimeReview, signal }));
+          startedProjection = await this.#fencedEffect(async () => {
+            const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+            return await this.#codex.startSession({
+              authority: authorityFor(this.#paths, profile),
+              projectRoot,
+              review: runtimeReview,
+              signal,
+            });
+          });
         } catch (error: unknown) {
           await this.#daemonAuthority.assertCurrent();
           if (error instanceof IndeterminateCodexEffectError) {
@@ -3302,10 +3616,11 @@ export class HraService {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
+    const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
+    if (project !== undefined) await this.#requireUsableProjectRoot(project.rootPath);
     this.#requireLiveProviderObservation(
       await this.#ensureSessionObservedLocked(session.id, signal),
     );
-    const project = session.projectId === undefined ? undefined : this.#store.requireProject(session.projectId);
     const key = idempotencyKey ?? randomUUID();
     let baseline: CodexSessionProjection | undefined;
     let review: RuntimeStartReview | undefined;
@@ -3316,19 +3631,37 @@ export class HraService {
       if (baseline === undefined || review === undefined) throw new Error("Session send lost its exact pre-effect provider baseline or runtime review.");
       const runtimeReview = review;
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
-      startedResult = await this.#fencedEffect(async () => await this.#codex.startTurn({ authority: authorityFor(this.#paths, profile), providerThreadId: session.providerThreadId, ...(project === undefined ? {} : { projectRoot: project.rootPath }), review: runtimeReview, message, clientMessageId: attemptId, signal }));
+      startedResult = await this.#fencedEffect(async () => {
+        const projectRoot = project === undefined
+          ? undefined
+          : await this.#requireUsableProjectRoot(project.rootPath);
+        return await this.#codex.startTurn({
+          authority: authorityFor(this.#paths, profile),
+          providerThreadId: session.providerThreadId,
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          review: runtimeReview,
+          message,
+          clientMessageId: attemptId,
+          signal,
+        });
+      });
       return { ...startedResult, sourceId: attemptId };
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) throw new CommandFailure("CONFLICT", "The session already has an active turn. Use `session steer` or `session queue`.");
-      review = await this.#fencedEffect(async () => await this.#codex.reviewTurnStart({
-        authority: authorityFor(this.#paths, profile),
-        providerThreadId: session.providerThreadId,
-        ...(project === undefined ? {} : { projectRoot: project.rootPath }),
-        preset: session.preset,
-        fast: session.fastEnabled,
-        signal,
-      }));
+      review = await this.#fencedEffect(async () => {
+        const projectRoot = project === undefined
+          ? undefined
+          : await this.#requireUsableProjectRoot(project.rootPath);
+        return await this.#codex.reviewTurnStart({
+          authority: authorityFor(this.#paths, profile),
+          providerThreadId: session.providerThreadId,
+          ...(projectRoot === undefined ? {} : { projectRoot }),
+          preset: session.preset,
+          fast: session.fastEnabled,
+          signal,
+        });
+      });
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
@@ -3828,6 +4161,17 @@ export class HraService {
     if (profile.state === "recovery_required") {
       throw new CommandFailure("RECOVERY_REQUIRED", `Run \`hra account show ${profile.id}\` to reconcile this account before another provider operation.`);
     }
+    if (profile.state === "signed_out") {
+      throw new CommandFailure(
+        "INTERACTION_REQUIRED",
+        `Sign in with \`hra account login ${profile.id}\` before using this account's Codex runtime.`,
+        {
+          accountSelector: profile.id,
+          accountState: "signed_out",
+          nextCommand: `hra account login ${profile.id}`,
+        },
+      );
+    }
     if (profile.state !== "signed_in") {
       throw new CommandFailure("INTERACTION_REQUIRED", `Sign in to ${profile.label} with \`hra account login ${profile.id}\` before using its Codex runtime.`);
     }
@@ -3891,19 +4235,23 @@ export class HraService {
     try {
       const signal = new AbortController().signal;
       const profile = this.#store.requireProfile(session.profileId);
+      await this.#requireUsableProjectRoot(project.rootPath);
       this.#requireLiveProviderObservation(
         await this.#ensureSessionObservedLocked(session.id, signal),
       );
       const baseline = await this.#readExactSessionProjection(boundSession, profile, false, signal);
       if (baseline.status === "active" || baseline.activeTurnId !== undefined) return;
-      const review = await this.#fencedEffect(async () => await this.#codex.reviewTurnStart({
-        authority,
-        providerThreadId: boundSession.providerThreadId,
-        projectRoot: project.rootPath,
-        preset: session.preset,
-        fast: session.fastEnabled,
-        signal,
-      }));
+      const review = await this.#fencedEffect(async () => {
+        const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+        return await this.#codex.reviewTurnStart({
+          authority,
+          providerThreadId: boundSession.providerThreadId,
+          projectRoot,
+          preset: session.preset,
+          fast: session.fastEnabled,
+          signal,
+        });
+      });
       evidence = this.#store.beginQueueEffect({
         queueId: queued.id,
         sessionId: session.id,
@@ -3923,7 +4271,18 @@ export class HraService {
       this.#queuePreEffectRetryCounts.delete(queued.id);
       const dispatchRevision = this.#store.requireSession(session.id).revision;
       const dispatchFactEpoch = this.#sessionFactEpochs.get(session.id) ?? 0;
-      const result = await this.#fencedEffect(async () => await this.#codex.startTurn({ authority, providerThreadId: boundSession.providerThreadId, projectRoot: project.rootPath, review, message: queued.message, clientMessageId: queued.id, signal }));
+      const result = await this.#fencedEffect(async () => {
+        const projectRoot = await this.#requireUsableProjectRoot(project.rootPath);
+        return await this.#codex.startTurn({
+          authority,
+          providerThreadId: boundSession.providerThreadId,
+          projectRoot,
+          review,
+          message: queued.message,
+          clientMessageId: queued.id,
+          signal,
+        });
+      });
       providerApplied = true;
       this.#store.completeQueueEffect({
         queueId: queued.id,

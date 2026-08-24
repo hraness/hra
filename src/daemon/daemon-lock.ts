@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { chmod, lstat, open, rename, unlink } from "node:fs/promises";
+import { lstat, open, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
-import { Database } from "bun:sqlite";
+import { Database, type SQLiteError } from "bun:sqlite";
 import { z } from "zod";
 
 import { ensurePrivateDirectory, type StatePaths } from "../storage/paths";
@@ -40,12 +40,48 @@ export const daemonAuthorityReceiptSchema = z.object({
 
 export type DaemonAuthorityReceipt = z.infer<typeof daemonAuthorityReceiptSchema>;
 
+export type DaemonAuthorityDatabaseInspection =
+  | Readonly<{ custody: "absent" }>
+  | Readonly<{ custody: "safe"; authority: "held" | "released" }>
+  | Readonly<{ custody: "unsafe" }>
+  | Readonly<{ custody: "invalid" }>
+  | Readonly<{ custody: "indeterminate" }>;
+
+export type DaemonAuthorityReceiptInspection =
+  | Readonly<{ custody: "absent" }>
+  | Readonly<{ custody: "safe"; state: DaemonAuthorityReceipt["state"] }>
+  | Readonly<{ custody: "invalid" }>
+  | Readonly<{ custody: "unsafe" }>
+  | Readonly<{ custody: "indeterminate" }>;
+
+export type DaemonAuthorityInspection = Readonly<{
+  state:
+    | "absent"
+    | "held"
+    | "releasing"
+    | "released"
+    | "stale_recoverable"
+    | "unsafe_receipt"
+    | "unsafe_database"
+    | "invalid_database"
+    | "indeterminate";
+  database: DaemonAuthorityDatabaseInspection;
+  receipt: DaemonAuthorityReceiptInspection;
+}>;
+
 export class DaemonAuthoritySafetyError extends Error {
   readonly code = "DAEMON_AUTHORITY_UNSAFE" as const;
 
   constructor(message: string) {
     super(message);
     this.name = "DaemonAuthoritySafetyError";
+  }
+}
+
+class DaemonAuthorityObservationRaceError extends DaemonAuthoritySafetyError {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonAuthorityObservationRaceError";
   }
 }
 
@@ -95,34 +131,110 @@ async function validateReplaceableReceipt(path: string): Promise<Stats | null> {
   }
 }
 
-async function writeReceipt(path: string, receipt: DaemonAuthorityReceipt): Promise<void> {
+const sameFileIdentity = (left: Stats, right: Stats): boolean =>
+  left.dev === right.dev && left.ino === right.ino;
+
+const sameReceipt = (left: DaemonAuthorityReceipt, right: DaemonAuthorityReceipt): boolean =>
+  left.pid === right.pid
+  && left.nonce === right.nonce
+  && left.state === right.state
+  && left.acquiredAt === right.acquiredAt
+  && left.updatedAt === right.updatedAt
+  && left.generation === right.generation
+  && left.bootId === right.bootId
+  && left.failure === right.failure;
+
+type ExpectedReceiptPublication = Readonly<{
+  receipt: DaemonAuthorityReceipt;
+  device: number;
+  inode: number;
+}>;
+
+async function writeReceipt(
+  paths: StatePaths,
+  receipt: DaemonAuthorityReceipt,
+  expected?: ExpectedReceiptPublication,
+): Promise<Stats> {
+  const path = paths.daemonLock;
   const parsed = daemonAuthorityReceiptSchema.parse(receipt);
   const replaced = await validateReplaceableReceipt(path);
-  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
-  const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(parsed)}\n`, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
+  if (
+    expected !== undefined
+    && (
+      replaced === null
+      || replaced.dev !== expected.device
+      || replaced.ino !== expected.inode
+    )
+  ) {
+    throw new DaemonAuthoritySafetyError(
+      "The named daemon authority receipt changed before publication began.",
+    );
   }
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   try {
+    const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    let temporaryMetadata: Stats;
+    try {
+      await handle.chmod(0o600);
+      await handle.writeFile(`${JSON.stringify(parsed)}\n`, "utf8");
+      await handle.sync();
+      temporaryMetadata = await handle.stat();
+    } finally {
+      await handle.close();
+    }
+    const uid = currentUid();
+    if (
+      !temporaryMetadata.isFile()
+      || temporaryMetadata.isSymbolicLink()
+      || temporaryMetadata.nlink !== 1
+      || temporaryMetadata.size > 4_096
+      || (temporaryMetadata.mode & 0o777) !== 0o600
+      || (uid !== undefined && temporaryMetadata.uid !== uid)
+    ) {
+      throw new DaemonAuthoritySafetyError(
+        "The prepared daemon authority receipt is unsafe for publication.",
+      );
+    }
+    if (expected !== undefined) {
+      const observed = await readDaemonAuthorityReceipt(paths);
+      if (observed === null || !sameReceipt(observed, expected.receipt)) {
+        throw new DaemonAuthoritySafetyError(
+          "The daemon authority receipt contents changed before publication.",
+        );
+      }
+    }
     const current = await validateReplaceableReceipt(path);
     if ((replaced === null) !== (current === null)
-      || (replaced !== null && current !== null && (replaced.dev !== current.dev || replaced.ino !== current.ino))) {
+      || (replaced !== null && current !== null && !sameFileIdentity(replaced, current))) {
       throw new DaemonAuthoritySafetyError("Daemon authority receipt changed before atomic publication.");
     }
+
+    // Portable Node/Bun filesystem APIs do not offer rename-if-the-target-still-
+    // names-this-inode. The SQLite authority plus DaemonLock's publication queue
+    // exclude legitimate concurrent writers; exact checks on both sides of this
+    // single rename detect replacement outside the irreducible syscall gap.
     await rename(temporary, path);
-    await chmod(path, 0o600);
-    await validateOwnedRegularFile(path, 4_096);
+    const published = await validateOwnedRegularFile(path, 4_096);
+    if (!sameFileIdentity(published, temporaryMetadata)) {
+      throw new DaemonAuthoritySafetyError(
+        "The daemon authority receipt changed immediately after publication.",
+      );
+    }
+    return published;
   } catch (error: unknown) {
     await unlink(temporary).catch(() => undefined);
     throw error;
   }
 }
 
-function isBusy(error: unknown): boolean {
-  return error instanceof Error && /database is locked|database is busy/iu.test(error.message);
+function isSqliteBusy(error: unknown): error is SQLiteError {
+  if (error instanceof DaemonAuthoritySafetyError) return false;
+  if (!(error instanceof Error) || error.name !== "SQLiteError") return false;
+  const sqlite = error as SQLiteError;
+  return Number.isInteger(sqlite.errno)
+    && (sqlite.errno & 0xff) === 5
+    && typeof sqlite.code === "string"
+    && (sqlite.code === "SQLITE_BUSY" || sqlite.code.startsWith("SQLITE_BUSY_"));
 }
 
 export class DaemonAuthorityBusyError extends Error {
@@ -186,43 +298,265 @@ export class DaemonAuthorityFence {
 
 export async function readDaemonAuthorityReceipt(
   paths: StatePaths,
-  hooks: Readonly<{ afterNamedValidation?(): void | Promise<void> }> = {},
+  hooks: Readonly<{
+    afterDescriptorRead?(): void | Promise<void>;
+    afterNamedValidation?(): void | Promise<void>;
+    afterDescriptorOpen?(): void | Promise<void>;
+  }> = {},
 ): Promise<DaemonAuthorityReceipt | null> {
+  const observation = await observeDaemonAuthorityReceipt(paths, hooks);
+  return observation.kind === "valid" ? observation.receipt : null;
+}
+
+type DaemonAuthorityReceiptObservation =
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "valid"; receipt: DaemonAuthorityReceipt }>
+  | Readonly<{ kind: "invalid" }>;
+
+async function observeDaemonAuthorityReceipt(
+  paths: StatePaths,
+  hooks: Readonly<{
+    afterDescriptorRead?(): void | Promise<void>;
+    afterNamedValidation?(): void | Promise<void>;
+    afterDescriptorOpen?(): void | Promise<void>;
+  }> = {},
+): Promise<DaemonAuthorityReceiptObservation> {
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
       const before = await validateOwnedRegularFile(paths.daemonLock, 4_096);
       await hooks.afterNamedValidation?.();
       const handle = await open(paths.daemonLock, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
+        await hooks.afterDescriptorOpen?.();
         const metadata = await handle.stat();
         const uid = currentUid();
         if (
           !metadata.isFile()
           || metadata.isSymbolicLink()
-          || metadata.nlink !== 1
           || metadata.size > 4_096
           || (metadata.mode & 0o777) !== 0o600
           || (uid !== undefined && metadata.uid !== uid)
         ) {
           throw new DaemonAuthoritySafetyError("Daemon authority receipt became unsafe while it was opened.");
         }
+        if (metadata.nlink !== 1) {
+          if (metadata.nlink !== 0) {
+            throw new DaemonAuthoritySafetyError("Daemon authority receipt became unsafe while it was opened.");
+          }
+          let current: Stats;
+          try {
+            current = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+          } catch (error: unknown) {
+            if (error instanceof DaemonAuthoritySafetyError) throw error;
+            throw new DaemonAuthorityObservationRaceError(
+              "The unlinked daemon authority receipt has no safe named replacement.",
+            );
+          }
+          if (current.dev === metadata.dev && current.ino === metadata.ino) {
+            throw new DaemonAuthoritySafetyError(
+              "The unlinked daemon authority receipt still names its opened inode.",
+            );
+          }
+          continue;
+        }
         if (metadata.dev !== before.dev || metadata.ino !== before.ino) {
           continue;
         }
-        const value = JSON.parse(await handle.readFile("utf8")) as unknown;
+        const contents = await handle.readFile("utf8");
+        await hooks.afterDescriptorRead?.();
+        const afterRead = await handle.stat();
+        let current: Stats;
+        try {
+          current = await validateOwnedRegularFile(paths.daemonLock, 4_096);
+        } catch (error: unknown) {
+          if (error instanceof DaemonAuthoritySafetyError) throw error;
+          throw new DaemonAuthorityObservationRaceError(
+            "The opened daemon authority receipt has no safe named identity after reading.",
+          );
+        }
+        if (current.dev !== afterRead.dev || current.ino !== afterRead.ino) {
+          continue;
+        }
+        if (
+          !afterRead.isFile()
+          || afterRead.isSymbolicLink()
+          || afterRead.nlink !== 1
+          || afterRead.size > 4_096
+          || Buffer.byteLength(contents, "utf8") > 4_096
+          || (afterRead.mode & 0o777) !== 0o600
+          || (uid !== undefined && afterRead.uid !== uid)
+        ) {
+          throw new DaemonAuthoritySafetyError(
+            "Daemon authority receipt became unsafe while its contents were read.",
+          );
+        }
+        const value = JSON.parse(contents) as unknown;
         const parsed = daemonAuthorityReceiptSchema.safeParse(value);
-        return parsed.success ? parsed.data : null;
+        return parsed.success
+          ? { kind: "valid", receipt: parsed.data }
+          : { kind: "invalid" };
       } finally {
         await handle.close();
       }
     } catch (error: unknown) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || error instanceof SyntaxError) return null;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "absent" };
+      if (error instanceof SyntaxError) return { kind: "invalid" };
       throw error;
     }
   }
-  throw new DaemonAuthoritySafetyError(
+  throw new DaemonAuthorityObservationRaceError(
     "Daemon authority receipt changed repeatedly while it was opened.",
   );
+}
+
+async function inspectReceiptCustody(paths: StatePaths): Promise<Readonly<{
+  public: DaemonAuthorityReceiptInspection;
+  receipt?: DaemonAuthorityReceipt;
+}>> {
+  try {
+    const observation = await observeDaemonAuthorityReceipt(paths);
+    if (observation.kind === "valid") {
+      return {
+        public: Object.freeze({ custody: "safe", state: observation.receipt.state }),
+        receipt: observation.receipt,
+      };
+    }
+    return { public: Object.freeze({ custody: observation.kind }) };
+  } catch (error: unknown) {
+    if (error instanceof DaemonAuthorityObservationRaceError) {
+      return { public: Object.freeze({ custody: "indeterminate" }) };
+    }
+    if (error instanceof DaemonAuthoritySafetyError) {
+      return { public: Object.freeze({ custody: "unsafe" }) };
+    }
+    return { public: Object.freeze({ custody: "indeterminate" }) };
+  }
+}
+
+async function inspectDatabaseCustody(paths: StatePaths): Promise<DaemonAuthorityDatabaseInspection> {
+  const databasePath = daemonAuthorityDatabasePath(paths);
+  let before: Stats;
+  try {
+    before = await validateOwnedRegularFile(databasePath);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return Object.freeze({ custody: "absent" });
+    }
+    if (error instanceof DaemonAuthoritySafetyError) {
+      return Object.freeze({ custody: "unsafe" });
+    }
+    return Object.freeze({ custody: "indeterminate" });
+  }
+
+  let database: Database | undefined;
+  let result: DaemonAuthorityDatabaseInspection = Object.freeze({ custody: "indeterminate" });
+  try {
+    database = new Database(databasePath, { readonly: true, create: false, strict: true });
+    const opened = await validateOwnedRegularFile(databasePath);
+    if (sameFileIdentity(opened, before)) {
+      // A bounded wait prevents another short-lived read-only inspector from
+      // being mistaken for the long-lived daemon owner.
+      database.exec("PRAGMA busy_timeout = 10; BEGIN EXCLUSIVE");
+      database.exec("SELECT rootpage FROM sqlite_schema LIMIT 1");
+      database.exec("ROLLBACK");
+      const final = await validateOwnedRegularFile(databasePath);
+      result = sameFileIdentity(final, opened)
+        ? Object.freeze({ custody: "safe", authority: "released" })
+        : Object.freeze({ custody: "indeterminate" });
+    }
+  } catch (error: unknown) {
+    if (error instanceof DaemonAuthoritySafetyError) {
+      result = Object.freeze({ custody: "unsafe" });
+    } else if (isSqliteBusy(error)) {
+      try {
+        const final = await validateOwnedRegularFile(databasePath);
+        result = sameFileIdentity(final, before)
+          ? Object.freeze({ custody: "safe", authority: "held" })
+          : Object.freeze({ custody: "indeterminate" });
+      } catch (validationError: unknown) {
+        result = validationError instanceof DaemonAuthoritySafetyError
+          ? Object.freeze({ custody: "unsafe" })
+          : Object.freeze({ custody: "indeterminate" });
+      }
+    } else if (error instanceof Error && error.name === "SQLiteError") {
+      try {
+        const final = await validateOwnedRegularFile(databasePath);
+        result = sameFileIdentity(final, before)
+          ? Object.freeze({ custody: "invalid" })
+          : Object.freeze({ custody: "indeterminate" });
+      } catch (validationError: unknown) {
+        result = validationError instanceof DaemonAuthoritySafetyError
+          ? Object.freeze({ custody: "unsafe" })
+          : Object.freeze({ custody: "indeterminate" });
+      }
+    }
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      result = Object.freeze({ custody: "indeterminate" });
+    }
+  }
+  return result;
+}
+
+function sameReceiptObservation(
+  left: Awaited<ReturnType<typeof inspectReceiptCustody>>,
+  right: Awaited<ReturnType<typeof inspectReceiptCustody>>,
+): boolean {
+  if (left.public.custody !== right.public.custody) return false;
+  if (left.receipt === undefined || right.receipt === undefined) {
+    return left.receipt === right.receipt;
+  }
+  return sameReceipt(left.receipt, right.receipt);
+}
+
+const terminalReceiptStates = new Set<DaemonAuthorityReceipt["state"]>(["stopped", "failed"]);
+
+function summarizeAuthorityInspection(
+  database: DaemonAuthorityDatabaseInspection,
+  receipt: DaemonAuthorityReceiptInspection,
+): DaemonAuthorityInspection["state"] {
+  if (database.custody === "unsafe") return "unsafe_database";
+  if (database.custody === "invalid") return "invalid_database";
+  if (database.custody === "indeterminate") return "indeterminate";
+  if (receipt.custody === "unsafe") return "unsafe_receipt";
+  if (receipt.custody === "indeterminate") return "indeterminate";
+
+  if (database.custody === "absent") {
+    return receipt.custody === "absent" ? "absent" : "indeterminate";
+  }
+  if (database.authority === "held") {
+    if (receipt.custody !== "safe") return "indeterminate";
+    return terminalReceiptStates.has(receipt.state) ? "releasing" : "held";
+  }
+  if (receipt.custody === "absent") return "released";
+  if (receipt.custody === "invalid") return "stale_recoverable";
+  return terminalReceiptStates.has(receipt.state) ? "released" : "stale_recoverable";
+}
+
+/**
+ * Observes local daemon authority without creating, repairing, or writing any
+ * state. SQLite lock ownership is authoritative; the receipt contributes only
+ * bounded, path-free custody and lifecycle evidence.
+ */
+export async function inspectDaemonAuthority(paths: StatePaths): Promise<DaemonAuthorityInspection> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const receiptBefore = await inspectReceiptCustody(paths);
+    const database = await inspectDatabaseCustody(paths);
+    const receiptAfter = await inspectReceiptCustody(paths);
+    if (!sameReceiptObservation(receiptBefore, receiptAfter)) continue;
+    return Object.freeze({
+      state: summarizeAuthorityInspection(database, receiptAfter.public),
+      database,
+      receipt: receiptAfter.public,
+    });
+  }
+  return Object.freeze({
+    state: "indeterminate",
+    database: Object.freeze({ custody: "indeterminate" }),
+    receipt: Object.freeze({ custody: "indeterminate" }),
+  });
 }
 
 export class DaemonLock {
@@ -232,15 +566,25 @@ export class DaemonLock {
   readonly #authorityDevice: number;
   readonly #authorityInode: number;
   #receipt: DaemonAuthorityReceipt;
+  #receiptDevice: number;
+  #receiptInode: number;
+  #publicationTail: Promise<void> = Promise.resolve();
   #released = false;
 
-  private constructor(paths: StatePaths, database: Database, authority: { path: string; device: number; inode: number }, receipt: DaemonAuthorityReceipt) {
+  private constructor(
+    paths: StatePaths,
+    database: Database,
+    authority: { path: string; device: number; inode: number },
+    receipt: { value: DaemonAuthorityReceipt; device: number; inode: number },
+  ) {
     this.#paths = paths;
     this.#database = database;
     this.#authorityPath = authority.path;
     this.#authorityDevice = authority.device;
     this.#authorityInode = authority.inode;
-    this.#receipt = receipt;
+    this.#receipt = receipt.value;
+    this.#receiptDevice = receipt.device;
+    this.#receiptInode = receipt.inode;
   }
 
   get receipt(): DaemonAuthorityReceipt {
@@ -254,7 +598,23 @@ export class DaemonLock {
     }
   }
 
-  async assertCurrent(): Promise<void> {
+  async #serializePublication<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#publicationTail;
+    let release!: () => void;
+    this.#publicationTail = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  async assertCurrent(
+    hooks: Readonly<{ afterTransactionProbe?(): void | Promise<void> }> = {},
+  ): Promise<void> {
     if (this.#released) throw new DaemonAuthoritySafetyError("The daemon authority has already been released.");
     await this.#validateAuthorityName();
     try {
@@ -262,6 +622,8 @@ export class DaemonLock {
     } catch (error: unknown) {
       throw new DaemonAuthoritySafetyError(`The daemon authority transaction is unavailable${error instanceof Error ? ` (${error.name})` : ""}.`);
     }
+    await hooks.afterTransactionProbe?.();
+    await this.#validateAuthorityName();
   }
 
   static async acquire(
@@ -278,7 +640,16 @@ export class DaemonLock {
       database.exec("PRAGMA busy_timeout = 0; PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE");
     } catch (error: unknown) {
       database.close();
-      if (isBusy(error)) throw new DaemonAuthorityBusyError(await readDaemonAuthorityReceipt(paths).catch(() => null));
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      if (isSqliteBusy(error)) {
+        const currentAuthority = await validateOwnedRegularFile(authority.path);
+        if (!sameFileIdentity(currentAuthority, authority.metadata)) {
+          throw new DaemonAuthoritySafetyError(
+            "The named daemon authority database changed while busy authority was inspected.",
+          );
+        }
+        throw new DaemonAuthorityBusyError(await readDaemonAuthorityReceipt(paths));
+      }
       throw new Error("The daemon authority database is invalid and requires manual recovery.", { cause: error });
     }
     const now = input.now ?? Date.now();
@@ -296,12 +667,22 @@ export class DaemonLock {
       if (named.dev !== authority.metadata.dev || named.ino !== authority.metadata.ino) {
         throw new DaemonAuthoritySafetyError("The named daemon authority database changed during acquisition.");
       }
-      await writeReceipt(paths.daemonLock, receipt);
+      const publishedReceipt = await writeReceipt(paths, receipt);
+      const finalAuthority = await validateOwnedRegularFile(authority.path);
+      if (!sameFileIdentity(finalAuthority, authority.metadata)) {
+        throw new DaemonAuthoritySafetyError(
+          "The named daemon authority database changed while its receipt was published.",
+        );
+      }
       return new DaemonLock(paths, database, {
         path: authority.path,
         device: authority.metadata.dev,
         inode: authority.metadata.ino,
-      }, receipt);
+      }, {
+        value: receipt,
+        device: publishedReceipt.dev,
+        inode: publishedReceipt.ino,
+      });
     } catch (error: unknown) {
       try { database.exec("ROLLBACK"); } catch { /* Closing still releases the OS lock. */ }
       database.close();
@@ -309,7 +690,12 @@ export class DaemonLock {
     }
   }
 
-  static async isAuthorityHeld(paths: StatePaths): Promise<boolean> {
+  static async isAuthorityHeld(
+    paths: StatePaths,
+    input: Readonly<{
+      openDatabase?: (path: string) => Pick<Database, "close" | "exec">;
+    }> = {},
+  ): Promise<boolean> {
     const databasePath = daemonAuthorityDatabasePath(paths);
     let before: Stats;
     try {
@@ -318,20 +704,37 @@ export class DaemonLock {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
       throw error;
     }
-    const database = new Database(databasePath, { create: false, strict: true });
+    let database: Pick<Database, "close" | "exec"> | undefined;
     try {
+      database = input.openDatabase?.(databasePath)
+        ?? new Database(databasePath, { create: false, strict: true });
       const opened = await validateOwnedRegularFile(databasePath);
       if (opened.dev !== before.dev || opened.ino !== before.ino) {
         throw new DaemonAuthoritySafetyError("The named daemon authority database changed while it was inspected.");
       }
       database.exec("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE");
       database.exec("ROLLBACK");
+      const final = await validateOwnedRegularFile(databasePath);
+      if (!sameFileIdentity(final, opened)) {
+        throw new DaemonAuthoritySafetyError(
+          "The named daemon authority database changed while its release was inspected.",
+        );
+      }
       return false;
     } catch (error: unknown) {
-      if (isBusy(error)) return true;
+      if (error instanceof DaemonAuthoritySafetyError) throw error;
+      if (isSqliteBusy(error)) {
+        const final = await validateOwnedRegularFile(databasePath);
+        if (!sameFileIdentity(final, before)) {
+          throw new DaemonAuthoritySafetyError(
+            "The named daemon authority database changed while busy authority was inspected.",
+          );
+        }
+        return true;
+      }
       throw new Error("The daemon authority database is invalid and requires manual recovery.", { cause: error });
     } finally {
-      database.close();
+      database?.close();
     }
   }
 
@@ -343,43 +746,64 @@ export class DaemonLock {
     now?: number;
   }): Promise<DaemonAuthorityReceipt> {
     if (this.#released) throw new Error("The daemon authority has already been released.");
-    await this.#validateAuthorityName();
-    const next = daemonAuthorityReceiptSchema.parse({
-      ...this.#receipt,
-      state: input.state,
-      updatedAt: Math.max(input.now ?? Date.now(), this.#receipt.updatedAt),
-      ...(input.generation === undefined ? {} : { generation: input.generation }),
-      ...(input.bootId === undefined ? {} : { bootId: input.bootId }),
-      ...(input.failure === undefined ? {} : { failure: input.failure.slice(0, 1_000) }),
+    return await this.#serializePublication(async () => {
+      if (this.#released) throw new Error("The daemon authority has already been released.");
+      await this.#validateAuthorityName();
+      const previous = this.#receipt;
+      const next = daemonAuthorityReceiptSchema.parse({
+        ...previous,
+        state: input.state,
+        updatedAt: Math.max(input.now ?? Date.now(), previous.updatedAt),
+        ...(input.generation === undefined ? {} : { generation: input.generation }),
+        ...(input.bootId === undefined ? {} : { bootId: input.bootId }),
+        ...(input.failure === undefined ? {} : { failure: input.failure.slice(0, 1_000) }),
+      });
+      const published = await writeReceipt(this.#paths, next, {
+        receipt: previous,
+        device: this.#receiptDevice,
+        inode: this.#receiptInode,
+      });
+      await this.#validateAuthorityName();
+      this.#receipt = next;
+      this.#receiptDevice = published.dev;
+      this.#receiptInode = published.ino;
+      return next;
     });
-    await writeReceipt(this.#paths.daemonLock, next);
-    this.#receipt = next;
-    return next;
   }
 
   async release(input: { state?: "stopped" | "failed"; failure?: string; now?: number } = {}): Promise<void> {
     if (this.#released) return;
     this.#released = true;
-    const errors: unknown[] = [];
-    try {
-      await this.#validateAuthorityName();
-      const state = input.state ?? (this.#receipt.state === "failed" ? "failed" : "stopped");
-      const failure = state === "failed"
-        ? input.failure ?? this.#receipt.failure ?? "Daemon authority released after an unspecified failure."
-        : undefined;
-      const next = daemonAuthorityReceiptSchema.parse({
-        ...this.#receipt,
-        state,
-        updatedAt: Math.max(input.now ?? Date.now(), this.#receipt.updatedAt),
-        ...(failure === undefined ? {} : { failure: failure.slice(0, 1_000) }),
-      });
-      await writeReceipt(this.#paths.daemonLock, next);
-      this.#receipt = next;
-    } catch (error: unknown) {
-      errors.push(error);
-    }
-    try { this.#database.exec("ROLLBACK"); } catch (error: unknown) { errors.push(error); }
-    try { this.#database.close(); } catch (error: unknown) { errors.push(error); }
-    if (errors.length > 0) throw new AggregateError(errors, "Daemon authority release was incomplete.");
+    await this.#serializePublication(async () => {
+      const errors: unknown[] = [];
+      try {
+        await this.#validateAuthorityName();
+        const previous = this.#receipt;
+        const state = input.state ?? (previous.state === "failed" ? "failed" : "stopped");
+        const failure = state === "failed"
+          ? input.failure ?? previous.failure ?? "Daemon authority released after an unspecified failure."
+          : undefined;
+        const next = daemonAuthorityReceiptSchema.parse({
+          ...previous,
+          state,
+          updatedAt: Math.max(input.now ?? Date.now(), previous.updatedAt),
+          ...(failure === undefined ? {} : { failure: failure.slice(0, 1_000) }),
+        });
+        const published = await writeReceipt(this.#paths, next, {
+          receipt: previous,
+          device: this.#receiptDevice,
+          inode: this.#receiptInode,
+        });
+        await this.#validateAuthorityName();
+        this.#receipt = next;
+        this.#receiptDevice = published.dev;
+        this.#receiptInode = published.ino;
+      } catch (error: unknown) {
+        errors.push(error);
+      }
+      try { this.#database.exec("ROLLBACK"); } catch (error: unknown) { errors.push(error); }
+      try { this.#database.close(); } catch (error: unknown) { errors.push(error); }
+      if (errors.length > 0) throw new AggregateError(errors, "Daemon authority release was incomplete.");
+    });
   }
 }

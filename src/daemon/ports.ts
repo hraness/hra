@@ -189,6 +189,14 @@ export interface CloudControlPort {
   isCompactProjectionRecoveryUnsettled(sessionPublicId: SessionId): Promise<boolean>;
   supersedeCompactProjectionRecoveryForProviderDeletion(sessionPublicId: SessionId): Promise<{ superseded: boolean }>;
   supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }>;
+  readCompactProjectionRecoveryReceipt?(input: {
+    sessionPublicId: SessionId;
+    idempotencyKey: string;
+    signal: AbortSignal;
+  }): Promise<
+    | Readonly<{ status: "absent" | "conflict" }>
+    | Readonly<{ status: "found"; result: unknown }>
+  >;
   recoverCompactProjection(input: { sessionPublicId: SessionId; idempotencyKey: string; acknowledgeGap: true; signal: AbortSignal }): Promise<unknown>;
   auth(input: { email: string; code?: string; invite?: string; signal: AbortSignal }): Promise<unknown>;
   logout(signal: AbortSignal): Promise<void>;
@@ -205,7 +213,7 @@ export type CompactProjectionRecoveryBlocker = Pick<
   | "isCompactProjectionRecoveryUnsettledForProfile"
   | "supersedeCompactProjectionRecoveryForProviderDeletion"
   | "supersedeTerminalCompactProjectionRecoveries"
->;
+> & Pick<CloudControlPort, "readCompactProjectionRecoveryReceipt">;
 
 export class UnavailableCodexRuntime implements CodexRuntimePort {
   #unavailable(): never { throw new Error("The Codex runtime is unavailable on this machine."); }
@@ -258,6 +266,12 @@ export class UnavailableCloudControl implements CloudControlPort {
   }
   supersedeTerminalCompactProjectionRecoveries(): Promise<{ superseded: number }> {
     return this.#projectionRecoveryBlocker.supersedeTerminalCompactProjectionRecoveries();
+  }
+  readCompactProjectionRecoveryReceipt(
+    input: Parameters<NonNullable<CloudControlPort["readCompactProjectionRecoveryReceipt"]>>[0],
+  ): ReturnType<NonNullable<CloudControlPort["readCompactProjectionRecoveryReceipt"]>> {
+    return this.#projectionRecoveryBlocker.readCompactProjectionRecoveryReceipt?.(input)
+      ?? Promise.resolve({ status: "absent" });
   }
   recoverCompactProjection(): Promise<never> { return Promise.reject(this.#unavailable()); }
   auth(): Promise<never> { return Promise.reject(this.#unavailable()); }

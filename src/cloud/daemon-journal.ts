@@ -37,6 +37,8 @@ const remoteSessionCursorDigestPattern = /^[0-9a-f]{64}$/u;
 
 export const cloudProjectionRecoveryWindowMs = 7 * 24 * 60 * 60 * 1_000;
 export const providerDeletionProjectionRecoveryCode = "PROVIDER_THREAD_DELETED";
+export const invalidIdempotencyProjectionRecoveryCode =
+  "IDEMPOTENCY_AUTHORITY_INVALID_BEFORE_EFFECT";
 
 function assertSerializedJournalBound(serialized: string): void {
   if (utf8Encoder.encode(serialized).byteLength > maximumSerializedJournalBytes) {
@@ -726,6 +728,14 @@ export function hasUnsettledCompactProjectionRecoveryForProfile(
     entry.localAuthority.profileId === profileId);
 }
 
+function assertProjectionRecoveryReceiptReadNotAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("Cloud projection recovery receipt read was aborted.");
+  }
+}
+
 export function supersedeCloudProjectionRecoveryForProviderDeletion(
   state: CloudDaemonJournalState,
   sessionPublicId: string,
@@ -782,6 +792,30 @@ export class CloudDaemonJournalRecoveryBlocker {
   async isCompactProjectionRecoveryUnsettledForProfile(profileId: string): Promise<boolean> {
     const observed = await this.#journal.read();
     return hasUnsettledCompactProjectionRecoveryForProfile(observed.state, profileId);
+  }
+
+  async readCompactProjectionRecoveryReceipt(input: Readonly<{
+    idempotencyKey: string;
+    sessionPublicId: string;
+    signal: AbortSignal;
+  }>): Promise<
+    | Readonly<{ status: "absent" | "conflict" }>
+    | Readonly<{ status: "found"; result: CloudProjectionRecoveryReceiptResult }>
+  > {
+    assertProjectionRecoveryReceiptReadNotAborted(input.signal);
+    if (!isUuidV7(input.idempotencyKey) || !isOpaqueIdentifier(input.sessionPublicId)) {
+      throw new Error("Cloud projection recovery receipt selector is invalid.");
+    }
+    const observed = await this.#journal.read();
+    assertProjectionRecoveryReceiptReadNotAborted(input.signal);
+    const receipt = observed.state.projectionRecoveryReceipts.find((entry) =>
+      entry.idempotencyKey === input.idempotencyKey);
+    if (receipt === undefined) return { status: "absent" };
+    if (receipt.sessionPublicId !== input.sessionPublicId) return { status: "conflict" };
+    return {
+      result: cloudProjectionRecoveryReceiptResult(receipt),
+      status: "found",
+    };
   }
 
   async supersedeCompactProjectionRecoveryForProviderDeletion(
@@ -1403,6 +1437,24 @@ function sameCloudProjectionRecoveryBase(
     });
 }
 
+function samePreparedProjectionRecoveryRebindAuthority(
+  left: CloudProjectionRecoveryJournalEntry,
+  right: CloudProjectionRecoveryJournalEntry,
+): boolean {
+  if (left.phase !== "prepared" || right.phase !== "prepared") return false;
+  if (
+    sameAuthority(left.authority, right.authority)
+    || left.lineageCommitment === right.lineageCommitment
+    || left.requestDigest === right.requestDigest
+  ) return false;
+  return sameCloudProjectionRecoveryBase(left, {
+    ...right,
+    authority: left.authority,
+    lineageCommitment: left.lineageCommitment,
+    requestDigest: left.requestDigest,
+  });
+}
+
 export function sameCloudProjectionRecoveryEntry(
   left: CloudProjectionRecoveryJournalEntry,
   right: CloudProjectionRecoveryJournalEntry,
@@ -1683,7 +1735,13 @@ export function createCloudProjectionRecoveryTerminalReceipt(
     userPublicId: entry.userPublicId,
   };
   if (outcome.phase === "rejected") {
-    if (entry.phase !== "effect_started") {
+    if (
+      entry.phase !== "effect_started"
+      && !(
+        entry.phase === "prepared"
+        && outcome.rejectionCode === invalidIdempotencyProjectionRecoveryCode
+      )
+    ) {
       throw new Error("Cloud projection recovery terminal transition is invalid.");
     }
     return parseCloudProjectionRecoveryTerminalReceipt({
@@ -1832,16 +1890,26 @@ export function transitionCloudProjectionRecovery(
 
   const projectionRecoveries = [...canonical.projectionRecoveries];
   let projectionRecoveryReceipts = canonical.projectionRecoveryReceipts;
+  const expectedIdempotencyTimestamp = uuidV7Timestamp(canonicalExpected.idempotencyKey);
+  const expectedIdempotencyExpired = expectedIdempotencyTimestamp !== null
+    && expectedIdempotencyTimestamp < now - cloudProjectionRecoveryWindowMs;
   if ("localAuthority" in canonicalReplacement) {
-    if (
-      !sameCloudProjectionRecoveryBase(canonicalExpected, canonicalReplacement)
-      || !(
+    const advancesPhase = sameCloudProjectionRecoveryBase(
+      canonicalExpected,
+      canonicalReplacement,
+    ) && (
         (canonicalExpected.phase === "prepared"
           && canonicalReplacement.phase === "effect_started")
         || (canonicalExpected.phase === "effect_started"
           && canonicalReplacement.phase === "applied")
-      )
-    ) throw new Error("Cloud projection recovery terminal transition is invalid.");
+      );
+    const rebindsPreparedAuthority = samePreparedProjectionRecoveryRebindAuthority(
+      canonicalExpected,
+      canonicalReplacement,
+    ) && !expectedIdempotencyExpired;
+    if (!advancesPhase && !rebindsPreparedAuthority) {
+      throw new Error("Cloud projection recovery terminal transition is invalid.");
+    }
     projectionRecoveries[index] = canonicalReplacement;
   } else {
     if (
@@ -1849,6 +1917,11 @@ export function transitionCloudProjectionRecovery(
       || !(
         (canonicalExpected.phase === "effect_started"
           && canonicalReplacement.phase === "rejected")
+        || (canonicalExpected.phase === "prepared"
+          && canonicalReplacement.phase === "rejected"
+          && canonicalReplacement.rejectionCode
+            === invalidIdempotencyProjectionRecoveryCode
+          && expectedIdempotencyExpired)
         || (canonicalExpected.phase === "applied"
           && canonicalReplacement.phase === "applied"
           && canonicalExpected.response.boundaryHeadSequence

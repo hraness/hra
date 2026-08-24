@@ -148,7 +148,14 @@ describe("SessionEventCursorCodec", () => {
     });
     expectCursorRejection(() => second.decodeInteraction(cursor, filter), "invalid_signature");
 
-    const replacement = cursor.at(-1) === "A" ? "B" : "A";
+    const base64UrlAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = cursor.at(-1);
+    const lastIndex = last === undefined ? -1 : base64UrlAlphabet.indexOf(last);
+    if (lastIndex < 0 || lastIndex % 4 !== 0) {
+      throw new Error("Expected a canonical SHA-256 signature.");
+    }
+    const replacement = base64UrlAlphabet[(lastIndex + 4) % base64UrlAlphabet.length];
+    if (replacement === undefined) throw new Error("Expected a signature replacement.");
     expectCursorRejection(
       () => first.decodeInteraction(`${cursor.slice(0, -1)}${replacement}`, filter),
       "invalid_signature",
@@ -310,6 +317,77 @@ describe("SessionEventCursorCodec", () => {
     ]) {
       expectCursorRejection(() => codec.decodeSessionList(cursor, mismatch), "filter_mismatch");
     }
+  });
+
+  test("round trips local-only session-list positions bound to the exact signed-out account filter", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const filter = {
+      accountId: "acct_00000000000000000000000000000000" as const,
+      accountGeneration: 0,
+      limit: 37,
+    };
+    const cursor = codec.encodeLocalSessionList({
+      ...filter,
+      afterCreatedAt: 12_345,
+      afterSessionId: "sess_11111111111111111111111111111111",
+    });
+    expect(codec.decodeLocalSessionList(cursor, filter)).toEqual({
+      version: 1,
+      type: "session_list_local",
+      ...filter,
+      afterCreatedAt: 12_345,
+      afterSessionId: "sess_11111111111111111111111111111111",
+    });
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+
+    for (const mismatch of [
+      { ...filter, accountId: "acct_22222222222222222222222222222222" as const },
+      { ...filter, accountGeneration: 1 },
+      { ...filter, limit: 36 },
+    ]) {
+      expectCursorRejection(
+        () => codec.decodeLocalSessionList(cursor, mismatch),
+        "filter_mismatch",
+      );
+    }
+    const parts = cursor.split(".");
+    const encodedPayload = parts[1];
+    const signature = parts[2];
+    if (encodedPayload === undefined || signature === undefined) {
+      throw new Error("Expected a signed local session-list cursor.");
+    }
+    const replacement = signature[0] === "A" ? "B" : "A";
+    expectCursorRejection(
+      () => codec.decodeLocalSessionList(
+        `hra1.${encodedPayload}.${replacement}${signature.slice(1)}`,
+        filter,
+      ),
+      "invalid_signature",
+    );
+  });
+
+  test("keeps provider and local session-list cursor authorities disjoint", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const accountId = "acct_00000000000000000000000000000000" as const;
+    const localFilter = { accountId, accountGeneration: 2, limit: 10 };
+    const providerFilter = { accountId, providerGeneration: 2, limit: 10 };
+    const local = codec.encodeLocalSessionList({
+      ...localFilter,
+      afterCreatedAt: 1,
+      afterSessionId: "sess_11111111111111111111111111111111",
+    });
+    const provider = codec.advanceSessionList({
+      ...providerFilter,
+      providerCursor: "provider-next",
+    });
+    expectCursorRejection(
+      () => codec.decodeSessionList(local, providerFilter),
+      "type_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeLocalSessionList(provider, localFilter),
+      "type_mismatch",
+    );
   });
 
   test("permits more than 32 advancing pages with constant-size Brent state", () => {

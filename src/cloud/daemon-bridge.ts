@@ -7,6 +7,7 @@ import {
 } from "./client";
 import {
   cloudLimits,
+  CloudProjectionRecoveryAdmissionError,
   containsAbsolutePath,
   containsUnsafeTerminalScalar,
   hasExactKeys,
@@ -56,6 +57,7 @@ import {
   CustodyCloudSessionSyncCursor,
   hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
+  invalidIdempotencyProjectionRecoveryCode,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudProjectionRecoveryEntry,
   providerDeletionProjectionRecoveryCode,
@@ -401,23 +403,69 @@ type CloudPresenceState = {
   response: CloudPresenceResponse | null;
 };
 
+const maximumProjectionRecoveryStatusEntries = 128;
+
+export type CloudProjectionRecoveryStatus = Readonly<{
+  recoveries: readonly Readonly<{
+    cacheActivated?: boolean;
+    idempotencyKey: string;
+    phase: "prepared" | "effect_started" | "applied" | "rejected";
+    sessionPublicId: string;
+  }>[];
+  recoveriesTruncated: boolean;
+  totalRecoveries: number;
+}>;
+
+export function projectionRecoveryStatusFromJournalState(
+  state: CloudDaemonJournalState,
+): CloudProjectionRecoveryStatus {
+  const active = state.projectionRecoveries.map((entry) => ({
+    ...(entry.phase === "applied" ? { cacheActivated: false } : {}),
+    idempotencyKey: entry.idempotencyKey,
+    phase: entry.phase,
+    sessionPublicId: entry.sessionPublicId,
+  }));
+  const receiptCapacity = Math.max(0, maximumProjectionRecoveryStatusEntries - active.length);
+  const retainedReceipts = receiptCapacity === 0
+    ? []
+    : [...state.projectionRecoveryReceipts]
+      .sort((left, right) => left.requestedAt - right.requestedAt
+        || left.idempotencyKey.localeCompare(right.idempotencyKey))
+      .slice(-receiptCapacity);
+  const totalRecoveries = active.length + state.projectionRecoveryReceipts.length;
+  return {
+    recoveries: [
+      ...active,
+      ...retainedReceipts.map((receipt) => ({
+        ...(receipt.phase === "applied" ? { cacheActivated: true } : {}),
+        idempotencyKey: receipt.idempotencyKey,
+        phase: receipt.phase,
+        sessionPublicId: receipt.sessionPublicId,
+      })),
+    ],
+    recoveriesTruncated: totalRecoveries > maximumProjectionRecoveryStatusEntries,
+    totalRecoveries,
+  };
+}
+
 export interface CloudDaemonBridge {
   close?(): Promise<void>;
   cycle(signal: AbortSignal): Promise<CloudDaemonCycleResult>;
-  projectionRecoveryStatus?(): Promise<Readonly<{
-    recoveries: readonly Readonly<{
-      cacheActivated?: boolean;
-      idempotencyKey: string;
-      phase: "prepared" | "effect_started" | "applied" | "rejected";
-      sessionPublicId: string;
-    }>[];
-  }>>;
+  projectionRecoveryStatus?(): Promise<CloudProjectionRecoveryStatus>;
   isCompactProjectionRecoveryUnsettledForProfile?(profileId: string): Promise<boolean>;
   isCompactProjectionRecoveryUnsettled?(sessionPublicId: string): Promise<boolean>;
   supersedeCompactProjectionRecoveryForProviderDeletion?(
     sessionPublicId: string,
   ): Promise<{ superseded: boolean }>;
   supersedeTerminalCompactProjectionRecoveries?(): Promise<{ superseded: number }>;
+  readCompactProjectionRecoveryReceipt?(input: Readonly<{
+    idempotencyKey: string;
+    sessionPublicId: string;
+    signal: AbortSignal;
+  }>): Promise<
+    | Readonly<{ status: "absent" | "conflict" }>
+    | Readonly<{ status: "found"; result: CompactProjectionRecoveryResult }>
+  >;
   pullRemoteSessions(signal: AbortSignal): Promise<readonly RemoteCloudSession[]>;
   recoverCompactProjection?(input: Readonly<{
     acknowledgeGap: true;
@@ -1305,6 +1353,67 @@ function sameAuthority(left: AuthorityTuple, right: AuthorityTuple): boolean {
     && left.fence === right.fence;
 }
 
+type ProjectionRecoveryProofInput = Readonly<Pick<
+  CloudProjectionRecoveryJournalEntry,
+  | "authority"
+  | "baselineCompletedTurns"
+  | "baselineInteractions"
+  | "epochPublicId"
+  | "expectedCompactStreamEpoch"
+  | "expectedHeadSequence"
+  | "expectedTailDigest"
+  | "idempotencyKey"
+  | "localAuthority"
+  | "replacementCacheId"
+  | "sessionPublicId"
+  | "sourceCacheId"
+  | "sourceDevicePublicId"
+  | "userPublicId"
+>>;
+
+async function projectionRecoveryProofs(
+  accountKey: Uint8Array,
+  input: ProjectionRecoveryProofInput,
+): Promise<Readonly<{ lineageCommitment: string; requestDigest: string }>> {
+  const lineageCommitment = await hmacSha256Hex(
+    accountKey,
+    "projection-epoch-lineage",
+    JSON.stringify({
+      authority: input.authority,
+      baselineCompletedTurns: input.baselineCompletedTurns,
+      baselineInteractions: input.baselineInteractions ?? [],
+      epochPublicId: input.epochPublicId,
+      expectedCompactStreamEpoch: input.expectedCompactStreamEpoch,
+      expectedHeadSequence: input.expectedHeadSequence,
+      expectedTailDigest: input.expectedTailDigest,
+      localAuthority: input.localAuthority,
+      replacementCacheId: input.replacementCacheId,
+      sessionPublicId: input.sessionPublicId,
+      sourceDevicePublicId: input.sourceDevicePublicId,
+      sourceCacheId: input.sourceCacheId,
+      userPublicId: input.userPublicId,
+    }),
+  );
+  const request = {
+    authority: input.authority,
+    epochPublicId: input.epochPublicId,
+    expectedCompactStreamEpoch: input.expectedCompactStreamEpoch,
+    expectedHeadSequence: input.expectedHeadSequence,
+    expectedTailDigest: input.expectedTailDigest,
+    idempotencyKey: input.idempotencyKey,
+    lineageCommitment,
+    sessionPublicId: input.sessionPublicId,
+  } as const;
+  return {
+    lineageCommitment,
+    requestDigest: await hmacSha256Hex(
+      accountKey,
+      "projection-epoch-request",
+      JSON.stringify(request),
+    ),
+  };
+}
+
 function samePendingUsageAccount(
   left: PendingCloudUsageAccount | null,
   right: PendingCloudUsageAccount,
@@ -1512,7 +1621,7 @@ function uuidV7Timestamp(value: string): number | null {
 
 function idempotencyExpired(value: string, now: number): boolean {
   const timestamp = uuidV7Timestamp(value);
-  return timestamp === null || timestamp <= now - maximumIdempotencyLifetimeMs;
+  return timestamp === null || timestamp < now - maximumIdempotencyLifetimeMs;
 }
 
 function normalizeError(error: unknown): string {
@@ -1534,6 +1643,9 @@ function projectionRecoveryRejectionCode(error: unknown): string | null {
   if (error.message.includes("IDEMPOTENCY_CONFLICT")) return "IDEMPOTENCY_CONFLICT";
   if (error.message.includes("Cloud authority is not current")) {
     return "AUTHORITY_NOT_CURRENT";
+  }
+  if (error.message.includes("Invalid idempotency authority")) {
+    return invalidIdempotencyProjectionRecoveryCode;
   }
   return null;
 }
@@ -1949,30 +2061,36 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     });
   }
 
-  async projectionRecoveryStatus(): Promise<Readonly<{
-    recoveries: readonly Readonly<{
-      cacheActivated?: boolean;
-      idempotencyKey: string;
-      phase: "prepared" | "effect_started" | "applied" | "rejected";
-      sessionPublicId: string;
-    }>[];
-  }>> {
+  async projectionRecoveryStatus(): Promise<CloudProjectionRecoveryStatus> {
     const observed = await this.#journal.read();
+    return projectionRecoveryStatusFromJournalState(observed.state);
+  }
+
+  async readCompactProjectionRecoveryReceipt(input: Readonly<{
+    idempotencyKey: string;
+    sessionPublicId: string;
+    signal: AbortSignal;
+  }>): Promise<
+    | Readonly<{ status: "absent" | "conflict" }>
+    | Readonly<{ status: "found"; result: CompactProjectionRecoveryResult }>
+  > {
+    if (!isUuidV7(input.idempotencyKey) || !isOpaqueIdentifier(input.sessionPublicId)) {
+      throw new Error("Cloud projection recovery receipt selector is invalid.");
+    }
+    if (this.#closed) throw new Error("The cloud daemon bridge is closed.");
+    await this.#assertDaemonCurrent(input.signal);
+    // The journal is already fenced to the daemon's bound deployment and
+    // identity namespace. Exact terminal replay is therefore a local receipt
+    // read; it must remain available after logout or while transport is down.
+    const observed = await this.#journal.read();
+    await this.#assertDaemonCurrent(input.signal);
+    const receipt = observed.state.projectionRecoveryReceipts.find((entry) =>
+      entry.idempotencyKey === input.idempotencyKey);
+    if (receipt === undefined) return { status: "absent" };
+    if (receipt.sessionPublicId !== input.sessionPublicId) return { status: "conflict" };
     return {
-      recoveries: [
-        ...observed.state.projectionRecoveries.map((entry) => ({
-          ...(entry.phase === "applied" ? { cacheActivated: false } : {}),
-          idempotencyKey: entry.idempotencyKey,
-          phase: entry.phase,
-          sessionPublicId: entry.sessionPublicId,
-        })),
-        ...observed.state.projectionRecoveryReceipts.map((receipt) => ({
-          ...(receipt.phase === "applied" ? { cacheActivated: true } : {}),
-          idempotencyKey: receipt.idempotencyKey,
-          phase: receipt.phase,
-          sessionPublicId: receipt.sessionPublicId,
-        })),
-      ],
+      result: cloudProjectionRecoveryReceiptResult(receipt),
+      status: "found",
     };
   }
 
@@ -2095,7 +2213,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       await this.#assertDaemonCurrent(input.signal);
       const requestedAt = this.#now();
       if (!isSafeNonNegativeInteger(requestedAt)) {
-        throw new Error("Cloud projection recovery idempotency authority is invalid.");
+        throw new CloudProjectionRecoveryAdmissionError("idempotency_authority_invalid");
       }
       const currentState = pruneExpiredCloudProjectionRecoveryReceipts(
         observed.state,
@@ -2111,7 +2229,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             identity.userPublicId,
             identity.devicePublicId,
           )
-        ) throw new Error("Cloud projection recovery belongs to a different HRA identity or session.");
+        ) throw new CloudProjectionRecoveryAdmissionError("identity_or_session_conflict");
         return cloudProjectionRecoveryReceiptResult(receipt);
       }
       const existing = observed.state.projectionRecoveries.find((entry) =>
@@ -2124,12 +2242,16 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             identity.userPublicId,
             identity.devicePublicId,
           )
-        ) throw new Error("Cloud projection recovery belongs to a different HRA identity or session.");
+        ) throw new CloudProjectionRecoveryAdmissionError("identity_or_session_conflict");
         return await this.#resumeCompactProjectionRecovery(
           identity,
           existing,
           input.signal,
         );
+      }
+      if (observed.state.projectionRecoveries.some((entry) =>
+        entry.sessionPublicId === input.sessionPublicId)) {
+        throw new CloudProjectionRecoveryAdmissionError("unsettled_session");
       }
       const idempotencyTimestamp = uuidV7Timestamp(input.idempotencyKey);
       if (
@@ -2137,13 +2259,9 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         || idempotencyTimestamp < requestedAt - maximumIdempotencyLifetimeMs
         || idempotencyTimestamp > requestedAt + maximumIdempotencyFutureSkewMs
         || !isSafeNonNegativeInteger(requestedAt)
-      ) throw new Error("Cloud projection recovery idempotency authority is invalid.");
+      ) throw new CloudProjectionRecoveryAdmissionError("idempotency_authority_invalid");
       if (observed.state.projectionRecoveries.length >= 25) {
-        throw new Error("Cloud projection recovery journal is full.");
-      }
-      if (observed.state.projectionRecoveries.some((entry) =>
-        entry.sessionPublicId === input.sessionPublicId)) {
-        throw new Error("Another cloud projection recovery is unsettled for this session.");
+        throw new CloudProjectionRecoveryAdmissionError("journal_capacity");
       }
       const headValue = await this.#transport.query("sessions:getHead", {
         publicId: input.sessionPublicId,
@@ -2212,54 +2330,29 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
       ) throw new Error("Cloud projection recovery session changed during baseline read.");
       const authority = authorityOf(lease);
       const epochPublicId = validateUuid(this.#randomUuid());
-      const lineageCommitment = await hmacSha256Hex(
-        identity.accountKey,
-        "projection-epoch-lineage",
-        JSON.stringify({
-          authority,
-          baselineCompletedTurns: plan.baselineCompletedTurns,
-          baselineInteractions: plan.baselineInteractions,
-          epochPublicId,
-          expectedCompactStreamEpoch: head.compactStreamEpoch,
-          expectedHeadSequence: head.compactHeadSequence,
-          expectedTailDigest: head.compactTailDigest,
-          localAuthority: plan.localAuthority,
-          replacementCacheId: plan.replacementCacheId,
-          sessionPublicId: input.sessionPublicId,
-          sourceDevicePublicId: identity.devicePublicId,
-          sourceCacheId: plan.sourceCacheId,
-          userPublicId: identity.userPublicId,
-        }),
-      );
-      await this.#assertDaemonCurrent(input.signal);
-      const request = {
+      const proofInput = {
         authority,
+        baselineCompletedTurns: plan.baselineCompletedTurns,
+        baselineInteractions: plan.baselineInteractions,
         epochPublicId,
         expectedCompactStreamEpoch: head.compactStreamEpoch,
         expectedHeadSequence: head.compactHeadSequence,
         expectedTailDigest: head.compactTailDigest,
         idempotencyKey: input.idempotencyKey,
-        lineageCommitment,
-        sessionPublicId: input.sessionPublicId,
-      } as const;
-      const requestDigest = await hmacSha256Hex(
-        identity.accountKey,
-        "projection-epoch-request",
-        JSON.stringify(request),
-      );
-      await this.#assertDaemonCurrent(input.signal);
-      const prepared = parseCloudProjectionRecoveryEntry({
-        ...request,
-        baselineCompletedTurns: plan.baselineCompletedTurns,
-        baselineInteractions: plan.baselineInteractions,
         localAuthority: plan.localAuthority,
-        phase: "prepared",
         replacementCacheId: plan.replacementCacheId,
-        requestDigest,
-        requestedAt,
+        sessionPublicId: input.sessionPublicId,
         sourceCacheId: plan.sourceCacheId,
         sourceDevicePublicId: identity.devicePublicId,
         userPublicId: identity.userPublicId,
+      } as const;
+      const proofs = await projectionRecoveryProofs(identity.accountKey, proofInput);
+      await this.#assertDaemonCurrent(input.signal);
+      const prepared = parseCloudProjectionRecoveryEntry({
+        ...proofInput,
+        ...proofs,
+        phase: "prepared",
+        requestedAt,
       });
       const installation = this.#projectionRecoveryInstallation(
         prepared,
@@ -2402,6 +2495,12 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     if (await this.#projectionRecoveryIsSuperseded(entry.sessionPublicId)) {
       return await this.#finishProviderDeletionProjectionRecovery(entry);
     }
+    if (entry.phase === "prepared") {
+      if (idempotencyExpired(entry.idempotencyKey, this.#now())) {
+        return await this.#finishInvalidPreparedProjectionRecovery(entry, signal);
+      }
+      entry = await this.#rebindPreparedProjectionRecovery(identity, entry, signal);
+    }
     if (entry.phase === "prepared" || entry.phase === "effect_started") {
       if (this.#local.stageCompactProjectionRecovery === undefined) {
         throw new Error("Cloud projection recovery is unavailable in this daemon.");
@@ -2451,6 +2550,14 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         await this.#assertDaemonCurrent(signal);
         const rejectionCode = projectionRecoveryRejectionCode(error);
         if (rejectionCode === null) throw error;
+        if (this.#local.discardCompactProjectionRecovery === undefined) {
+          throw new Error("Cloud projection recovery cleanup is unavailable in this daemon.");
+        }
+        await this.#local.discardCompactProjectionRecovery({
+          idempotencyKey: entry.idempotencyKey,
+          sessionPublicId: entry.sessionPublicId,
+        });
+        await this.#assertDaemonCurrent(signal);
         const rejected = createCloudProjectionRecoveryTerminalReceipt(entry, {
           phase: "rejected",
           rejectionCode,
@@ -2501,6 +2608,62 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     await this.#replaceProjectionRecovery(entry, activated);
     await this.#assertDaemonCurrent(signal);
     return cloudProjectionRecoveryReceiptResult(activated);
+  }
+
+  async #rebindPreparedProjectionRecovery(
+    identity: ActiveCloudIdentity,
+    entry: CloudProjectionRecoveryJournalEntry,
+    signal: AbortSignal,
+  ): Promise<CloudProjectionRecoveryJournalEntry> {
+    if (
+      entry.phase !== "prepared"
+      || !matchesCloudProjectionRecoveryIdentity(
+        entry,
+        identity.userPublicId,
+        identity.devicePublicId,
+      )
+    ) throw new Error("Cloud projection recovery prepared authority changed.");
+    const lease = await this.#ensureLease(entry.sessionPublicId, identity);
+    await this.#assertDaemonCurrent(signal);
+    const authority = authorityOf(lease);
+    if (sameAuthority(authority, entry.authority)) return entry;
+    const proofs = await projectionRecoveryProofs(identity.accountKey, {
+      ...entry,
+      authority,
+    });
+    await this.#assertDaemonCurrent(signal);
+    const rebound = parseCloudProjectionRecoveryEntry({
+      ...entry,
+      ...proofs,
+      authority,
+    });
+    await this.#replaceProjectionRecovery(entry, rebound);
+    await this.#assertDaemonCurrent(signal);
+    return rebound;
+  }
+
+  async #finishInvalidPreparedProjectionRecovery(
+    entry: CloudProjectionRecoveryJournalEntry,
+    signal: AbortSignal,
+  ): Promise<CompactProjectionRecoveryResult> {
+    if (entry.phase !== "prepared") {
+      throw new Error("Cloud projection recovery no-effect authority changed.");
+    }
+    if (this.#local.discardCompactProjectionRecovery === undefined) {
+      throw new Error("Cloud projection recovery cleanup is unavailable in this daemon.");
+    }
+    await this.#local.discardCompactProjectionRecovery({
+      idempotencyKey: entry.idempotencyKey,
+      sessionPublicId: entry.sessionPublicId,
+    });
+    await this.#assertDaemonCurrent(signal);
+    const rejected = createCloudProjectionRecoveryTerminalReceipt(entry, {
+      phase: "rejected",
+      rejectionCode: invalidIdempotencyProjectionRecoveryCode,
+    });
+    await this.#replaceProjectionRecovery(entry, rejected);
+    await this.#assertDaemonCurrent(signal);
+    return cloudProjectionRecoveryReceiptResult(rejected);
   }
 
   async #finishProviderDeletionProjectionRecovery(

@@ -264,7 +264,13 @@ export const publicContent: PublicContent = {
         paragraph(
           text("The hosted endpoint is beta-not-yet-live. An unset "),
           code("HRA_CONVEX_URL"),
-          text(" selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:"),
+          text(" selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, "),
+          code("hra sync status"),
+          text(" and "),
+          code("hra doctor"),
+          text(" report its exact restart prerequisite: unset "),
+          code("HRA_CONVEX_URL"),
+          text(" for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:"),
         ),
         {
           kind: "commands",
@@ -411,7 +417,7 @@ export const publicContent: PublicContent = {
           code("hra init"),
           text(" reports the required confirmation without changing local state; "),
           code("hra init --yes"),
-          text(" explicitly accepts your canonical Documents directory as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects "),
+          text(" creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects "),
           code("/init"),
           text(" because its running daemon already owns local state. Turns use Codex's "),
           code("auto_review"),
@@ -506,7 +512,7 @@ export const publicContent: PublicContent = {
         {
           kind: "commands",
           commands: [
-            "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]",
+            "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
           ],
         },
         paragraph(
@@ -521,7 +527,11 @@ export const publicContent: PublicContent = {
           text(" is the exact remote compact head, and baselines only completed turns currently visible in the bounded local projection. Any possibly unsynced interval remains visible to remote readers as a recovery gap."),
         ),
         paragraph(
-          text("The CLI creates a current UUIDv7 before daemon transport. Success reports the phase, local session, old and new epochs, boundary head, persistent gap, and an exact same-key replay command. Reuse that command after a lost response. Changed-key retry remains closed while the first recovery is unsettled."),
+          text("The CLI creates a current UUIDv7 before daemon transport. Success reports the phase, local session, old and new epochs, boundary head, persistent gap, and an exact same-key replay command. A prepared recovery inside the seven-day server window renews its execution lease and keeps the same exact key. Changed-key retry remains closed while that recovery is unsettled. After the window, exact-key replay first reconciles an already committed effect from immutable lineage. If no effect began, it discards local staging, settles the old attempt as rejected, and clears its authority. Run "),
+          code("hra sync status --json"),
+          text(", then start a fresh recovery without "),
+          code("--idempotency-key"),
+          text(" if recovery is still required."),
         ),
         paragraph(
           text("Session names and notes sync as encrypted metadata, but v1 does not execute remote rename or note commands. Project directories are local-only and are neither synced nor remotely changed."),
@@ -592,7 +602,7 @@ export const publicContent: PublicContent = {
             "hra remote fast <cloud-session> <on|off>",
             "hra turn inspect <session> <turn> [--json]",
             "hra sync status|now",
-            "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]",
+            "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
             "hra daemon start|status|stop|run",
           ],
         },
@@ -628,7 +638,7 @@ export const publicContent: PublicContent = {
         paragraph(
           text("Projection recovery uses the local-session selector rules. It requires "),
           code("--acknowledge-gap"),
-          text(" and a current UUIDv7, generated by the CLI when omitted. The same-key command is safe to replay after a lost response; a changed key cannot overtake unsettled recovery authority."),
+          text(" and a canonical UUIDv7; the CLI generates a current key when it is omitted. A stored exact key remains the only admissible replay while recovery is unsettled. Inside the seven-day window, a prepared replay renews its lease and can apply. After the window, replay reconciles immutable committed lineage or safely settles known-no-effect authority as rejected; status then determines whether to retry with a fresh generated key."),
         ),
         paragraph(
           text("The beta does not expose destructive local profile or project deletion. "),

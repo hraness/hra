@@ -2,8 +2,8 @@
 
 import { dlopen } from "bun:ffi";
 import { randomUUID } from "node:crypto";
-import { access, lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
-import { constants, readSync, type Stats } from "node:fs";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
+import { readSync, type Stats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isatty } from "node:tty";
@@ -50,6 +50,7 @@ import {
   CloudDeploymentAuthorityError,
   createLocalCloudControlFromEnvironment,
   createLocalCloudDaemonBridgeFromEnvironment,
+  DEFAULT_CLOUD_DEPLOYMENT_URL,
   DeploymentScopedCloudSecretCustody,
   IdentityScopedCloudSecretCustody,
   isRecord,
@@ -57,6 +58,7 @@ import {
   isSafePositiveInteger,
   isUuidV7,
   hasExactKeys,
+  projectionRecoveryStatusFromJournalState,
   readCloudDeploymentAuthority,
   redactAbsolutePaths,
   type CloudRemoteControlPort,
@@ -64,6 +66,7 @@ import {
   type RemoteCommandPayload,
   type CloudDaemonLifecycle,
   type CloudDeploymentAuthority,
+  type CloudProjectionRecoveryStatus,
   type CloudSecretCustodyPort,
 } from "./cloud/index";
 import { resolvePinnedCodexRuntime } from "./codex/index";
@@ -80,18 +83,29 @@ import {
   callWithSafeAutostart,
   isLocalDaemonUnavailable,
 } from "./daemon/local-transport";
-import { DaemonAuthorityBusyError, DaemonAuthorityFence, DaemonLock } from "./daemon/daemon-lock";
+import {
+  DaemonAuthorityBusyError,
+  DaemonAuthorityFence,
+  DaemonAuthoritySafetyError,
+  DaemonLock,
+  inspectDaemonAuthority,
+  readDaemonAuthorityReceipt,
+  type DaemonAuthorityInspection,
+  type DaemonAuthorityReceipt,
+} from "./daemon/daemon-lock";
 import {
   daemonStatusIdentity,
   identityFromReceipt,
+  sameDaemonIdentity,
   terminateDaemonStartupChild,
   waitForDaemonAuthorityRelease,
   waitForDaemonReady,
+  type DaemonIdentity,
 } from "./daemon/daemon-startup";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
 import { UnavailableCloudControl, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
-import { HraService } from "./daemon/service";
+import { CommandFailure, HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
 import { UsageHistoryCursorCodec } from "./daemon/usage-history-cursor";
 import { ExactChatGptBundlePort, LocalDesktopSwitchPort, PidBoundDesktopAccountRuntime } from "./desktop/index";
@@ -101,6 +115,7 @@ import {
   type HraInstallation,
 } from "./installation";
 import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./storage/paths";
+import { resolveUsableCanonicalProjectDirectory } from "./storage/project-directory";
 import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
 import { HRA_VERSION } from "./version";
@@ -1051,6 +1066,7 @@ type ProjectionRecoverySummary =
     }>
   | Readonly<{
       idempotencyKey: string;
+      nextCommand: "hra sync status --json";
       phase: "rejected";
       rejectionCode: string;
       sameKeyReplay: Readonly<{
@@ -1060,11 +1076,37 @@ type ProjectionRecoverySummary =
       session: string;
     }>;
 
+type DaemonStopCommand = Extract<LocalCommand, { kind: "daemon.stop" }>;
+type BoundDaemonStopCommand = DaemonStopCommand & Readonly<{ expected: DaemonIdentity }>;
+type DaemonStopResponseError = Extract<CommandResponse, { ok: false }>["error"];
+type DaemonReleaseObservation = Awaited<ReturnType<typeof waitForDaemonAuthorityRelease>>;
+
+export type DaemonStopDependencies = Readonly<{
+  requestStop(input: Readonly<{
+    paths: StatePaths;
+    command: BoundDaemonStopCommand;
+    deadlineMs: number;
+  }>): Promise<CommandResponse>;
+  observeReceipt(paths: StatePaths): Promise<DaemonAuthorityReceipt | null>;
+  waitForRelease(input: Readonly<{
+    paths: StatePaths;
+    expected: DaemonIdentity;
+  }>): Promise<DaemonReleaseObservation>;
+  inspectAuthority(paths: StatePaths): Promise<DaemonAuthorityInspection>;
+  authorityHeld(paths: StatePaths): Promise<boolean>;
+  sleep(milliseconds: number): Promise<void>;
+}>;
+
+export type DaemonStopResult =
+  | Readonly<{ kind: "success"; data: Readonly<Record<string, unknown>> }>
+  | Readonly<{ kind: "failure"; error: DaemonStopResponseError }>;
+
 export type CliMainInput = Readonly<{
   installation?: HraInstallation;
   startDaemon?: (installation: HraInstallation) => Promise<void>;
   statePaths?: StatePaths;
   callDaemon?: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>;
+  daemonStopDependencies?: DaemonStopDependencies;
   getRemoteCommandStatus?: CloudRemoteControlPort["getRemoteCommandStatus"];
   interactive?: boolean;
   isTerminalDescriptor?: (fd: number) => boolean;
@@ -1073,30 +1115,321 @@ export type CliMainInput = Readonly<{
   offlineDoctorOwnerUid?: number;
 }>;
 
+const daemonStopRequestDeadlineMs = 5_000;
+const daemonReleaseSettleIntervalMs = 25;
+const invalidDaemonAuthorityMessage = "The daemon authority database is invalid and requires manual recovery.";
+
+const defaultDaemonStopDependencies: DaemonStopDependencies = {
+  requestStop: async (input) => await callLocalDaemon(input),
+  observeReceipt: async (paths) => await readDaemonAuthorityReceipt(paths),
+  waitForRelease: async (input) => await waitForDaemonAuthorityRelease(input),
+  inspectAuthority: async (paths) => await inspectDaemonAuthority(paths),
+  authorityHeld: async (paths) => await DaemonLock.isAuthorityHeld(paths),
+  sleep: async (milliseconds) => { await Bun.sleep(milliseconds); },
+};
+
+type DaemonReleaseProof =
+  | Readonly<{ kind: "stopped"; reconciledAfterObservationError: boolean }>
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "failed" }>
+  | Readonly<{ kind: "replacement" }>
+  | Readonly<{ kind: "unproven" }>;
+
+const daemonStopRecovery = (
+  kind: Exclude<DaemonReleaseProof["kind"], "stopped" | "absent">,
+): Extract<DaemonStopResult, { kind: "failure" }> => {
+  if (kind === "failed") {
+    return {
+      kind: "failure",
+      error: {
+        code: "RECOVERY_REQUIRED",
+        message: "The daemon released authority in a failed state. Run `hra doctor --offline` before restarting it.",
+        details: { nextCommand: "hra doctor --offline" },
+      },
+    };
+  }
+  if (kind === "replacement") {
+    return {
+      kind: "failure",
+      error: {
+        code: "RECOVERY_REQUIRED",
+        message: "The daemon authority changed while HRA was confirming shutdown. The replacement was not stopped; inspect `hra daemon status --json` before retrying.",
+        details: { nextCommand: "hra daemon status --json" },
+      },
+    };
+  }
+  return {
+    kind: "failure",
+    error: {
+      code: "RECOVERY_REQUIRED",
+      message: "HRA could not prove that the exact daemon authority stopped and released. Inspect `hra daemon status --json` before retrying.",
+      details: { nextCommand: "hra daemon status --json" },
+    },
+  };
+};
+
+const daemonStopAuthorityRecovery = (): Extract<DaemonStopResult, { kind: "failure" }> => ({
+  kind: "failure",
+  error: {
+    code: "RECOVERY_REQUIRED",
+    message: "The local daemon authority is unsafe or invalid. Run `hra doctor --offline` before changing daemon state.",
+    details: { nextCommand: "hra doctor --offline" },
+  },
+});
+
+const isImmediateDaemonAuthorityError = (error: unknown): boolean =>
+  error instanceof DaemonAuthoritySafetyError
+  || (error instanceof Error && error.message === invalidDaemonAuthorityMessage);
+
+const daemonReceiptIsLive = (receipt: DaemonAuthorityReceipt): boolean =>
+  receipt.state !== "stopped" && receipt.state !== "failed";
+
+const receiptNamesIdentity = (
+  receipt: DaemonAuthorityReceipt,
+  identity: DaemonIdentity,
+): boolean => receipt.pid === identity.pid
+  && receipt.nonce === identity.nonce
+  && (receipt.generation === undefined || receipt.generation === identity.generation)
+  && (receipt.bootId === undefined || receipt.bootId === identity.bootId);
+
+const releaseProofFromReceipt = (
+  expected: DaemonIdentity,
+  receipt: DaemonAuthorityReceipt | null,
+): DaemonReleaseProof => {
+  if (receipt === null) return { kind: "unproven" };
+  if (!receiptNamesIdentity(receipt, expected)) return { kind: "replacement" };
+  const identity = identityFromReceipt(receipt);
+  if (identity === null) return { kind: "unproven" };
+  if (!sameDaemonIdentity(identity, expected)) return { kind: "replacement" };
+  if (receipt.state === "failed") return { kind: "failed" };
+  return receipt.state === "stopped"
+    ? { kind: "stopped", reconciledAfterObservationError: false }
+    : { kind: "unproven" };
+};
+
+const reconcileTerminalDaemonRelease = async (
+  paths: StatePaths,
+  expected: DaemonIdentity,
+  dependencies: DaemonStopDependencies,
+): Promise<DaemonReleaseProof> => {
+  let terminal: DaemonAuthorityReceipt | null;
+  try {
+    terminal = await dependencies.observeReceipt(paths);
+  } catch (error: unknown) {
+    if (isImmediateDaemonAuthorityError(error)) throw error;
+    return { kind: "unproven" };
+  }
+  const published = releaseProofFromReceipt(expected, terminal);
+  if (published.kind !== "stopped" && published.kind !== "failed") return published;
+
+  // DaemonLock.release publishes the terminal receipt before releasing SQLite.
+  // Allow exactly one ordinary poll interval for that documented sequence.
+  await dependencies.sleep(daemonReleaseSettleIntervalMs);
+  let held: boolean;
+  let finalReceipt: DaemonAuthorityReceipt | null;
+  try {
+    held = await dependencies.authorityHeld(paths);
+    finalReceipt = await dependencies.observeReceipt(paths);
+  } catch (error: unknown) {
+    if (isImmediateDaemonAuthorityError(error)) throw error;
+    return { kind: "unproven" };
+  }
+  const finalProof = releaseProofFromReceipt(expected, finalReceipt);
+  if (finalProof.kind !== "stopped" && finalProof.kind !== "failed") return finalProof;
+  if (held) return { kind: "unproven" };
+  return finalProof.kind === "failed"
+    ? finalProof
+    : { kind: "stopped", reconciledAfterObservationError: true };
+};
+
+const confirmExactDaemonRelease = async (
+  paths: StatePaths,
+  expected: DaemonIdentity,
+  dependencies: DaemonStopDependencies,
+): Promise<DaemonReleaseProof> => {
+  try {
+    const released = await dependencies.waitForRelease({ paths, expected });
+    if (released.replacement !== null) return { kind: "replacement" };
+    return releaseProofFromReceipt(expected, released.finalReceipt);
+  } catch (error: unknown) {
+    if (isImmediateDaemonAuthorityError(error)) throw error;
+    return await reconcileTerminalDaemonRelease(paths, expected, dependencies);
+  }
+};
+
+const confirmNoDaemonAuthority = async (
+  paths: StatePaths,
+  dependencies: DaemonStopDependencies,
+): Promise<DaemonReleaseProof> => {
+  let inspection: DaemonAuthorityInspection;
+  try {
+    inspection = await dependencies.inspectAuthority(paths);
+  } catch (error: unknown) {
+    if (isImmediateDaemonAuthorityError(error)) throw error;
+    return { kind: "unproven" };
+  }
+  if (
+    inspection.state === "unsafe_receipt"
+    || inspection.state === "unsafe_database"
+    || inspection.state === "invalid_database"
+    || inspection.state === "indeterminate"
+  ) {
+    throw new DaemonAuthoritySafetyError(
+      "The local daemon authority requires offline recovery before stop can be proved.",
+    );
+  }
+  if (inspection.state === "absent") return { kind: "absent" };
+  if (
+    inspection.database.custody === "safe"
+    && inspection.database.authority === "released"
+    && (inspection.state === "released" || inspection.state === "stale_recoverable")
+  ) {
+    if (inspection.receipt.custody === "safe" && inspection.receipt.state === "failed") {
+      return { kind: "failed" };
+    }
+    return { kind: "absent" };
+  }
+  return { kind: "unproven" };
+};
+
+const completedDaemonStop = (
+  expected: DaemonIdentity,
+  proof: Extract<DaemonReleaseProof, { kind: "stopped" }>,
+  acknowledgedData: unknown,
+  requestWasAcknowledged: boolean,
+): Extract<DaemonStopResult, { kind: "success" }> => ({
+  kind: "success",
+  data: {
+    ...(typeof acknowledgedData === "object" && acknowledgedData !== null ? acknowledgedData : {}),
+    stopping: false,
+    running: false,
+    daemon: expected,
+    released: true,
+    ...(!requestWasAcknowledged || proof.reconciledAfterObservationError ? { reconciled: true } : {}),
+  },
+});
+
+async function stopDaemonWithExactAuthorityInner(
+  paths: StatePaths,
+  dependencies: DaemonStopDependencies = defaultDaemonStopDependencies,
+): Promise<DaemonStopResult> {
+  const preStopReceipt = await dependencies.observeReceipt(paths);
+  const initialProof = await confirmNoDaemonAuthority(paths, dependencies);
+  if (initialProof.kind === "failed") return daemonStopRecovery("failed");
+  if (initialProof.kind === "absent") {
+    return { kind: "success", data: { stopping: false, running: false, released: false } };
+  }
+  if (preStopReceipt === null || !daemonReceiptIsLive(preStopReceipt)) {
+    return daemonStopRecovery(initialProof.kind === "stopped" ? "unproven" : initialProof.kind);
+  }
+  const capturedAuthority = identityFromReceipt(preStopReceipt);
+  if (capturedAuthority === null) return daemonStopRecovery("unproven");
+
+  let response: CommandResponse;
+  try {
+    response = await dependencies.requestStop({
+      paths,
+      command: { kind: "daemon.stop", expected: capturedAuthority },
+      deadlineMs: daemonStopRequestDeadlineMs,
+    });
+  } catch (error: unknown) {
+    if (error instanceof LocalDaemonIndeterminateError) {
+      const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+      return proof.kind === "stopped"
+        ? completedDaemonStop(capturedAuthority, proof, undefined, false)
+        : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
+    }
+    if (!isLocalDaemonUnavailable(error)) throw error;
+    const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+    return proof.kind === "stopped"
+      ? completedDaemonStop(capturedAuthority, proof, undefined, false)
+      : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
+  }
+
+  if (!response.ok) return { kind: "failure", error: response.error };
+  let acknowledgedAuthority: DaemonIdentity;
+  try {
+    acknowledgedAuthority = daemonStatusIdentity(response);
+  } catch {
+    const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+    return proof.kind === "stopped"
+      ? completedDaemonStop(capturedAuthority, proof, undefined, false)
+      : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
+  }
+  if (!sameDaemonIdentity(capturedAuthority, acknowledgedAuthority)) {
+    return daemonStopRecovery("replacement");
+  }
+  const proof = await confirmExactDaemonRelease(paths, capturedAuthority, dependencies);
+  return proof.kind === "stopped"
+    ? completedDaemonStop(capturedAuthority, proof, response.data, true)
+    : daemonStopRecovery(proof.kind === "absent" ? "unproven" : proof.kind);
+}
+
+export async function stopDaemonWithExactAuthority(
+  paths: StatePaths,
+  dependencies: DaemonStopDependencies = defaultDaemonStopDependencies,
+): Promise<DaemonStopResult> {
+  try {
+    return await stopDaemonWithExactAuthorityInner(paths, dependencies);
+  } catch (error: unknown) {
+    if (isImmediateDaemonAuthorityError(error)) return daemonStopAuthorityRecovery();
+    throw error;
+  }
+}
+
 export function selectDaemonCloudControl(
   configured: CloudControlPort | null,
   projectionRecoveryBlocker: CompactProjectionRecoveryBlocker,
   diagnostic?: string,
+  unavailability: "disabled" | "recovery_required" = "recovery_required",
+  projectionRecoveryStatus?: () => Promise<CloudProjectionRecoveryStatus>,
+  reenable?: CloudReenableConfiguration,
 ): CloudControlPort {
   if (configured !== null) return configured;
   if (diagnostic === undefined) return new UnavailableCloudControl(projectionRecoveryBlocker);
-  return new DiagnosedUnavailableCloudControl(projectionRecoveryBlocker, diagnostic);
+  return new DiagnosedUnavailableCloudControl(
+    projectionRecoveryBlocker,
+    diagnostic,
+    unavailability,
+    projectionRecoveryStatus,
+    reenable,
+  );
 }
 
 class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
   readonly #diagnostic: string;
+  readonly #projectionRecoveryStatus: (() => Promise<CloudProjectionRecoveryStatus>) | undefined;
+  readonly #reenable: CloudReenableConfiguration | undefined;
+  readonly #unavailability: "disabled" | "recovery_required";
 
-  constructor(projectionRecoveryBlocker: CompactProjectionRecoveryBlocker, diagnostic: string) {
+  constructor(
+    projectionRecoveryBlocker: CompactProjectionRecoveryBlocker,
+    diagnostic: string,
+    unavailability: "disabled" | "recovery_required",
+    projectionRecoveryStatus?: () => Promise<CloudProjectionRecoveryStatus>,
+    reenable?: CloudReenableConfiguration,
+  ) {
     super(projectionRecoveryBlocker);
     this.#diagnostic = diagnostic;
+    this.#projectionRecoveryStatus = projectionRecoveryStatus;
+    this.#reenable = reenable;
+    this.#unavailability = unavailability;
   }
 
   #unavailable(): never {
     throw new Error(this.#diagnostic);
   }
 
-  override status(): Promise<unknown> {
-    return Promise.resolve({ configured: false, diagnostic: this.#diagnostic, signedIn: false });
+  override async status(): Promise<unknown> {
+    const projectionRecovery = await this.#projectionRecoveryStatus?.();
+    return {
+      configured: false,
+      diagnostic: this.#diagnostic,
+      ...(projectionRecovery === undefined ? {} : { projectionRecovery }),
+      ...(this.#reenable === undefined ? {} : { reenable: this.#reenable }),
+      signedIn: false,
+      unavailability: this.#unavailability,
+    };
   }
 
   override sync(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -1138,12 +1471,36 @@ function cloudBindingDiagnostic(error: unknown): string {
   }
 }
 
+type CloudReenableConfiguration =
+  | Readonly<{ kind: "use_hosted_default" }>
+  | Readonly<{
+      deploymentUrl: string;
+      kind: "restore_bound_deployment";
+    }>;
+
+const cloudReenableConfiguration = (
+  authority: CloudDeploymentAuthority | null,
+): CloudReenableConfiguration => authority === null
+  || authority.deploymentUrl === DEFAULT_CLOUD_DEPLOYMENT_URL
+  ? { kind: "use_hosted_default" }
+  : {
+      deploymentUrl: authority.deploymentUrl,
+      kind: "restore_bound_deployment",
+    };
+
+const disabledCloudDiagnostic = (reenable: CloudReenableConfiguration): string =>
+  reenable.kind === "use_hosted_default"
+    ? "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync."
+    : "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.";
+
 type DaemonCloudStartup = Readonly<{
   deploymentAuthority: CloudDeploymentAuthority | null;
   identityNamespace: string | null;
   journal: CustodyCloudDaemonJournal | null;
   projectionRecoveryBlocker: CompactProjectionRecoveryBlocker;
   diagnostic?: string;
+  reenable?: CloudReenableConfiguration;
+  unavailability?: "disabled" | "recovery_required";
 }>;
 
 class FailClosedProjectionRecoveryBlocker implements CompactProjectionRecoveryBlocker {
@@ -1179,6 +1536,17 @@ class FailClosedProjectionRecoveryBlocker implements CompactProjectionRecoveryBl
     }
   }
 
+  readCompactProjectionRecoveryReceipt(
+    input: Parameters<NonNullable<CompactProjectionRecoveryBlocker[
+      "readCompactProjectionRecoveryReceipt"
+    ]>>[0],
+  ): ReturnType<NonNullable<CompactProjectionRecoveryBlocker[
+    "readCompactProjectionRecoveryReceipt"
+  ]>> {
+    return this.#delegate?.readCompactProjectionRecoveryReceipt?.(input)
+      ?? Promise.resolve({ status: "absent" });
+  }
+
   async supersedeCompactProjectionRecoveryForProviderDeletion(
     sessionPublicId: Parameters<CompactProjectionRecoveryBlocker[
       "supersedeCompactProjectionRecoveryForProviderDeletion"
@@ -1208,6 +1576,8 @@ class FailClosedProjectionRecoveryBlocker implements CompactProjectionRecoveryBl
 function daemonCloudStartupResult(input: Readonly<{
   deploymentAuthority: CloudDeploymentAuthority | null;
   diagnostic?: string;
+  reenable?: CloudReenableConfiguration;
+  unavailability?: "disabled" | "recovery_required";
   identityNamespace: string | null;
   isSessionTerminal?: (sessionPublicId: string) => boolean | Promise<boolean>;
   journal: CustodyCloudDaemonJournal | null;
@@ -1228,7 +1598,12 @@ function daemonCloudStartupResult(input: Readonly<{
   };
   return input.diagnostic === undefined
     ? result
-    : { ...result, diagnostic: input.diagnostic };
+    : {
+        ...result,
+        diagnostic: input.diagnostic,
+        ...(input.reenable === undefined ? {} : { reenable: input.reenable }),
+        unavailability: input.unavailability ?? "recovery_required",
+      };
 }
 
 export async function resolveDaemonCloudStartup(input: Readonly<{
@@ -1238,16 +1613,19 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
 }>): Promise<DaemonCloudStartup> {
   let deploymentAuthority: CloudDeploymentAuthority | null = null;
   let diagnostic: string | undefined;
+  let unavailability: "disabled" | "recovery_required" | undefined;
   try {
     deploymentAuthority = await cloudDeploymentAuthorityFromEnvironment(
       input.secretCustody,
       input.environment,
     );
     if (deploymentAuthority === null) {
-      diagnostic = "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL to use hosted sync.";
+      diagnostic = disabledCloudDiagnostic({ kind: "use_hosted_default" });
+      unavailability = "disabled";
     }
   } catch (error: unknown) {
     diagnostic = cloudBindingDiagnostic(error);
+    unavailability = "recovery_required";
   }
 
   let recoveryAuthority = deploymentAuthority;
@@ -1257,7 +1635,8 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
     } catch (error: unknown) {
       return daemonCloudStartupResult({
         deploymentAuthority: null,
-        diagnostic: diagnostic ?? cloudBindingDiagnostic(error),
+        diagnostic: cloudBindingDiagnostic(error),
+        unavailability: "recovery_required",
         identityNamespace: null,
         ...(input.isSessionTerminal === undefined
           ? {}
@@ -1266,6 +1645,11 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
       });
     }
   }
+
+  const reenable = unavailability === "disabled"
+    ? cloudReenableConfiguration(recoveryAuthority)
+    : undefined;
+  if (reenable !== undefined) diagnostic = disabledCloudDiagnostic(reenable);
 
   try {
     const deploymentCustody = recoveryAuthority === null
@@ -1277,6 +1661,8 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
     return daemonCloudStartupResult({
       deploymentAuthority,
       ...(diagnostic === undefined ? {} : { diagnostic }),
+      ...(reenable === undefined ? {} : { reenable }),
+      ...(unavailability === undefined ? {} : { unavailability }),
       identityNamespace: identityCustody.cacheNamespace,
       ...(input.isSessionTerminal === undefined
         ? {}
@@ -1286,7 +1672,8 @@ export async function resolveDaemonCloudStartup(input: Readonly<{
   } catch (error: unknown) {
     return daemonCloudStartupResult({
       deploymentAuthority: null,
-      diagnostic: diagnostic ?? cloudBindingDiagnostic(error),
+      diagnostic: cloudBindingDiagnostic(error),
+      unavailability: "recovery_required",
       identityNamespace: null,
       ...(input.isSessionTerminal === undefined
         ? {}
@@ -1475,6 +1862,7 @@ function parseProjectionRecoverySummary(
   ) return null;
   return {
     idempotencyKey: invocation.command.idempotencyKey,
+    nextCommand: "hra sync status --json",
     phase: "rejected",
     rejectionCode: boundedUtf8Text(sanitizeSyncDiagnostic(value.rejectionCode), 128),
     sameKeyReplay,
@@ -1509,6 +1897,7 @@ function renderProjectionRecoverySuccess(
       `Reason: ${terminalSafe(summary.rejectionCode)}`,
       "Encrypted cloud history and provider/app state were unchanged.",
       `Same-key replay: ${terminalSafe(summary.sameKeyReplay.command)}`,
+      `Next: ${summary.nextCommand}`,
     ].join("\n")}\n`);
     return 0;
   }
@@ -1524,13 +1913,24 @@ function renderProjectionRecoverySuccess(
 }
 
 function renderProjectionRecoveryFailure(
-  error: Readonly<{ code: string; message: string }>,
+  error: Readonly<{ code: string; message: string; details?: unknown }>,
   invocation: ProjectionRecoveryCliInvocation,
   output: Output,
 ): number {
+  const nextCommand = (() => {
+    if (!isRecord(error.details)) return null;
+    try {
+      return error.details.nextCommand === "hra sync status --json"
+        ? "hra sync status --json" as const
+        : null;
+    } catch {
+      return null;
+    }
+  })();
   return renderFailure({
     code: error.code,
     message: sanitizeSyncDiagnostic(error.message),
+    ...(nextCommand === null ? {} : { details: { nextCommand } }),
   }, invocation.json, output);
 }
 
@@ -1610,16 +2010,51 @@ export async function initialize(
   const authority = await DaemonLock.acquire(paths, { state: "maintenance" });
   let store: StateStore | undefined;
   try {
+    const documents = input.documentsDirectory ?? join(homedir(), "Documents");
+    const prepareDocuments = async (): Promise<number | null> => {
+      try {
+        await mkdir(documents, { mode: 0o700 });
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          return renderFailure({
+            code: "UNAVAILABLE",
+            message: "The default Documents project could not be created. Create a readable, writable, and traversable canonical Documents directory, then run `hra init --yes` again.",
+          }, json, output);
+        }
+      }
+      if (await resolveUsableCanonicalProjectDirectory(documents) === null) {
+        return renderFailure({
+          code: "UNAVAILABLE",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+        }, json, output);
+      }
+      return null;
+    };
+    let databaseExists = true;
+    try {
+      await lstat(paths.database);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") databaseExists = false;
+      else throw error;
+    }
+    let documentsReady = false;
+    if (!databaseExists) {
+      const failure = await prepareDocuments();
+      if (failure !== null) return failure;
+      documentsReady = true;
+    }
     store = new StateStore(paths);
     let projectCreated = false;
-    const documents = input.documentsDirectory ?? join(homedir(), "Documents");
     if (store.listProjects().length === 0) {
-      await access(documents, constants.R_OK | constants.W_OK);
+      if (!documentsReady) {
+        const failure = await prepareDocuments();
+        if (failure !== null) return failure;
+      }
       await store.createProject("Documents", documents, true);
       projectCreated = true;
     }
     const data = { initialized: true, stateRoot: paths.root, defaultProjectCreated: projectCreated, next: "hra account add Personal" };
-    if (json) output.writeStdout(`${JSON.stringify({ ok: true, version: 1, data })}\n`);
+    if (json) output.writeStdout(`${safeJson({ ok: true, version: 1, data })}\n`);
     else output.writeStdout(`HRA is ready.\n\nNext: ${data.next}\n`);
     return 0;
   } finally {
@@ -1634,6 +2069,7 @@ async function offlineDoctor(
   ownerUid = process.getuid?.(),
 ): Promise<number> {
   let initialized = false;
+  let databaseFileReady = false;
   let rootReady = false;
   const problems: string[] = [];
   let database: "not_initialized" | "ready" | "invalid" = "not_initialized";
@@ -1661,15 +2097,49 @@ async function offlineDoctor(
     }
     if (!rootReady) problems.push("The state root is not a private canonical directory.");
   }
+  let daemonAuthority: DaemonAuthorityInspection = rootMetadata === undefined
+    ? {
+        state: "absent",
+        database: { custody: "absent" },
+        receipt: { custody: "absent" },
+      }
+    : {
+        state: "indeterminate",
+        database: { custody: "indeterminate" },
+        receipt: { custody: "indeterminate" },
+      };
+  if (rootReady) {
+    daemonAuthority = await inspectDaemonAuthority(paths);
+    switch (daemonAuthority.state) {
+      case "unsafe_receipt":
+        problems.push("The daemon authority receipt has unsafe file custody. Verify that no HRA daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `hra doctor --offline`.");
+        break;
+      case "unsafe_database":
+        problems.push("The daemon authority database has unsafe file custody. Verify that no HRA daemon is running, restore it as a current-user-owned single-link mode-0600 regular file, then rerun `hra doctor --offline`.");
+        break;
+      case "invalid_database":
+        problems.push("The daemon authority database is invalid. Stop every HRA process, preserve the invalid authority file for recovery, then repair its SQLite state before restarting HRA.");
+        break;
+      case "indeterminate":
+        problems.push("The daemon authority changed or could not be proved safe during inspection. Do not change authority files; wait for any daemon transition to settle, then rerun `hra doctor --offline`.");
+        break;
+      case "absent":
+      case "held":
+      case "releasing":
+      case "released":
+      case "stale_recoverable":
+        break;
+    }
+  }
   if (rootReady) {
     try {
       const metadata = await lstat(paths.database);
-      initialized = metadata.isFile()
+      databaseFileReady = metadata.isFile()
         && !metadata.isSymbolicLink()
         && metadata.nlink === 1
         && (metadata.mode & 0o777) === 0o600
         && (ownerUid === undefined || metadata.uid === ownerUid);
-      if (!initialized) throw new Error("Unsafe local database file.");
+      if (!databaseFileReady) throw new Error("Unsafe local database file.");
     } catch (error: unknown) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         database = "invalid";
@@ -1677,19 +2147,36 @@ async function offlineDoctor(
       }
     }
   }
-  if (initialized && database !== "invalid") {
+  let projectRoots: readonly string[] = [];
+  if (databaseFileReady && database !== "invalid") {
     try {
       const store = new StateStore(paths, { readonly: true });
       try {
-        projectCount = store.listProjects().length;
-        for (const project of store.listProjects()) await access(project.rootPath, constants.R_OK | constants.W_OK);
+        const projects = store.listProjects();
+        projectCount = projects.length;
+        projectRoots = projects.map((project) => project.rootPath);
         database = "ready";
+        initialized = projectCount > 0;
       } finally {
         store.close();
       }
     } catch {
       database = "invalid";
       problems.push("The local database check failed without exposing its runtime diagnostic.");
+    }
+  }
+  if (database === "ready") {
+    if (projectCount === 0) {
+      problems.push("No project directory is configured. Run `hra init --yes` or add a project.");
+    }
+    let unusableProjectRoots = 0;
+    for (const projectRoot of projectRoots) {
+      if (await resolveUsableCanonicalProjectDirectory(projectRoot) === null) {
+        unusableProjectRoots += 1;
+      }
+    }
+    if (unusableProjectRoots > 0) {
+      problems.push("A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.");
     }
   }
   let codexRuntime: { status: "ready"; version: string } | { status: "invalid"; diagnostic: string };
@@ -1707,12 +2194,31 @@ async function offlineDoctor(
     healthy: problems.length === 0,
     offline: true,
     runtime: { bun: Bun.version, requiredBun: "1.3.14", bunReady, codex: codexRuntime, platform: process.platform, architecture: process.arch },
-    state: { initialized, database, projectCount },
+    state: { initialized, database, projectCount, daemonAuthority },
     networkChecks: "skipped",
     problems,
   };
-  if (json) output.writeStdout(`${JSON.stringify({ ok: true, version: 1, data })}\n`);
-  else if (data.healthy) output.writeStdout(`HRA offline checks passed. Bun ${Bun.version}; Codex ${codexRuntime.status}; ${process.platform} ${process.arch}; state ${initialized ? database : "not initialized"}.\n`);
+  if (json) output.writeStdout(`${safeJson({ ok: true, version: 1, data })}\n`);
+  else if (data.healthy) {
+    const daemonAuthoritySummary = (() => {
+      switch (daemonAuthority.state) {
+        case "absent": return "not initialized";
+        case "held": return "held by a running HRA process";
+        case "releasing": return "release in progress; wait before restarting";
+        case "released":
+          return daemonAuthority.receipt.custody === "safe"
+            && daemonAuthority.receipt.state === "failed"
+            ? "released after a failed daemon; safe to restart after these checks"
+            : "released";
+        case "stale_recoverable": return "released with recoverable stale evidence";
+        case "unsafe_receipt": return "unsafe receipt";
+        case "unsafe_database": return "unsafe database";
+        case "invalid_database": return "invalid database";
+        case "indeterminate": return "indeterminate";
+      }
+    })();
+    output.writeStdout(`HRA offline checks passed. Bun ${Bun.version}; Codex ${codexRuntime.status}; ${process.platform} ${process.arch}; state ${initialized ? database : "not initialized"}; daemon authority ${daemonAuthoritySummary}.\n`);
+  }
   else output.writeStderr(`hra: offline checks failed\n${problems.map((problem) => `- ${problem}`).join("\n")}\n`);
   return data.healthy ? 0 : 1;
 }
@@ -2083,6 +2589,28 @@ function safeDaemonFailure(error: unknown): string {
   return "Daemon startup or shutdown failed before a safe readiness boundary.";
 }
 
+export function admitExactDaemonStop(input: Readonly<{
+  command: DaemonStopCommand;
+  receipt: DaemonAuthorityReceipt;
+  afterResponse(callback: () => void): void;
+  requestStop(): void;
+}>): Readonly<{ stopping: true; running: true; daemon: DaemonIdentity }> {
+  const daemon = identityFromReceipt(input.receipt);
+  if (
+    daemon === null
+    || input.command.expected === undefined
+    || !sameDaemonIdentity(daemon, input.command.expected)
+  ) {
+    throw new CommandFailure(
+      "CONFLICT",
+      "The daemon stop authority changed before dispatch. No daemon was stopped.",
+      { nextCommand: "hra daemon status --json" },
+    );
+  }
+  input.afterResponse(input.requestStop);
+  return { stopping: true, running: true, daemon };
+}
+
 async function joinBeforeDeadline<T>(operation: string, promise: Promise<T>, deadlineMs = 5_000): Promise<T> {
   let deadline: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -2188,15 +2716,23 @@ export async function runDaemon(
     const cloudDeploymentAuthority = cloudStartup.deploymentAuthority;
     const cloudIdentityNamespace = cloudStartup.identityNamespace;
     let cloudStartupDiagnostic = cloudStartup.diagnostic;
+    let cloudStartupUnavailability = cloudStartup.unavailability;
     const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
     const usageHistoryCursors = await resolveUsageHistoryCursorCodec(secretCustody);
     const cloudJournal = cloudStartup.journal;
     const projectionRecoveryBlocker = cloudStartup.projectionRecoveryBlocker;
+    const unavailableProjectionRecoveryStatus = cloudJournal === null
+      ? undefined
+      : async (): Promise<CloudProjectionRecoveryStatus> =>
+          projectionRecoveryStatusFromJournalState((await cloudJournal.read()).state);
     cloudRequestController = new AbortController();
     let cloud = selectDaemonCloudControl(
       null,
       projectionRecoveryBlocker,
       cloudStartupDiagnostic,
+      cloudStartupUnavailability,
+      unavailableProjectionRecoveryStatus,
+      cloudStartup.reenable,
     );
     if (cloudDeploymentAuthority !== null && cloudJournal !== null) {
       let candidateAdapter: StateBackedCloudDaemonAdapter | undefined;
@@ -2285,10 +2821,13 @@ export async function runDaemon(
           }
         }
         cloudStartupDiagnostic = cloudBindingDiagnostic(error);
+        cloudStartupUnavailability = "recovery_required";
         cloud = selectDaemonCloudControl(
           null,
           projectionRecoveryBlocker,
           cloudStartupDiagnostic,
+          cloudStartupUnavailability,
+          unavailableProjectionRecoveryStatus,
         );
       }
     }
@@ -2345,8 +2884,16 @@ export async function runDaemon(
       paths,
       handler: async (command, context) => {
         await daemonLock.assertCurrent();
+        if (command.kind === "daemon.stop") {
+          return admitExactDaemonStop({
+            command,
+            receipt: daemonLock.receipt,
+            afterResponse: (callback) => context.afterResponse(callback),
+            requestStop,
+          });
+        }
         const data = await activeService.execute(command, { signal: context.signal, afterResponse: (callback) => context.afterResponse(callback) });
-        if (command.kind !== "daemon.status" && command.kind !== "daemon.stop") return data;
+        if (command.kind !== "daemon.status") return data;
         const daemon = identityFromReceipt(daemonLock.receipt);
         if (daemon === null) throw new Error("Daemon authority identity is not published.");
         return {
@@ -3368,44 +3915,45 @@ async function executeInvocation(
   if (invocation.command.kind === "session.note.edit") {
     return await editSessionNote(invocation.command.session, invocation.json, output, callDaemon);
   }
-  if (invocation.command.kind === "daemon.status" || invocation.command.kind === "daemon.stop") {
+  if (invocation.command.kind === "daemon.status") {
     try {
       const paths = installation.paths;
       const response = await callLocalDaemon({ paths, command: invocation.command, deadlineMs: 500 });
       if (!response.ok) return renderFailure(response.error, invocation.json, output);
-      const identity = daemonStatusIdentity(response);
-      let data = response.data;
-      if (invocation.command.kind === "daemon.stop") {
-        const released = await waitForDaemonAuthorityRelease({ paths, expected: identity });
-        if (released.finalReceipt?.nonce === identity.nonce && released.finalReceipt.state === "failed") {
-          return renderFailure({
-            code: "RECOVERY_REQUIRED",
-            message: `The daemon released authority with recovery required: ${released.finalReceipt.failure ?? "bounded shutdown failed"}`,
-          }, invocation.json, output);
-        }
-        data = {
-          ...(typeof response.data === "object" && response.data !== null ? response.data : {}),
-          released: true,
-          ...(released.replacement === null ? {} : { replacement: released.replacement }),
-        };
-      }
-      renderSuccess(invocation.command, data, invocation.json, output);
+      daemonStatusIdentity(response);
+      renderSuccess(invocation.command, response.data, invocation.json, output);
     } catch (error: unknown) {
       if (!isLocalDaemonUnavailable(error)) throw error;
-      renderSuccess(
-        invocation.command,
-        invocation.command.kind === "daemon.stop"
-          ? { stopping: false, running: false }
-          : { running: false },
-        invocation.json,
-        output,
-      );
+      renderSuccess(invocation.command, { running: false }, invocation.json, output);
     }
     return 0;
   }
-  const command = invocation.command.kind === "project.add"
-    ? { ...invocation.command, path: await realpath(invocation.command.path) }
-    : invocation.command;
+  if (invocation.command.kind === "daemon.stop") {
+    const result = await stopDaemonWithExactAuthority(
+      installation.paths,
+      input.daemonStopDependencies ?? defaultDaemonStopDependencies,
+    );
+    if (result.kind === "failure") return renderFailure(result.error, invocation.json, output);
+    renderSuccess(invocation.command, result.data, invocation.json, output);
+    return 0;
+  }
+  let command = invocation.command;
+  if (invocation.command.kind === "project.add") {
+    let canonicalProjectRoot: string | null = null;
+    try {
+      const canonical = await realpath(invocation.command.path);
+      canonicalProjectRoot = await resolveUsableCanonicalProjectDirectory(canonical);
+    } catch {
+      canonicalProjectRoot = null;
+    }
+    if (canonicalProjectRoot === null) {
+      return renderFailure({
+        code: "INVALID_INPUT",
+        message: "The project directory does not exist or is not readable, writable, traversable, and canonical. Restore access or choose another directory, then retry.",
+      }, invocation.json, output);
+    }
+    command = { ...invocation.command, path: canonicalProjectRoot };
+  }
   const response = await callDaemon(command);
   if (!response.ok) {
     return command.kind === "sync.now"
@@ -3416,7 +3964,13 @@ async function executeInvocation(
     return renderSyncNowSuccess(response.data, invocation.json, output);
   }
   renderSuccess(command, response.data, invocation.json, output);
-  return 0;
+  if (command.kind !== "doctor") return 0;
+  const doctor = isRecord(response.data) ? response.data : null;
+  return doctor?.healthy === true
+    && Array.isArray(doctor.problems)
+    && doctor.problems.length === 0
+    ? 0
+    : 1;
 }
 
 export async function main(

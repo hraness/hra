@@ -373,7 +373,6 @@ try {
   await mkdir(packageDirectory, { recursive: true, mode: 0o700 });
   await mkdir(consumerDirectory, { recursive: true, mode: 0o700 });
   await mkdir(consumerHome, { recursive: true, mode: 0o700 });
-  await mkdir(join(consumerHome, "Documents"), { recursive: true, mode: 0o700 });
   await mkdir(consumerTemporaryDirectory, { recursive: true, mode: 0o700 });
   await mkdir(globalInstallRoot, { recursive: true, mode: 0o700 });
 
@@ -507,6 +506,10 @@ try {
     }).passthrough().parse(assertExactlyOneJsonValue(initialized.stdout));
     if (initialized.stderr !== "") {
       throw new Error("Globally installed CLI initialization wrote diagnostics.");
+    }
+    const initializedDocuments = await lstat(join(consumerHome, "Documents"));
+    if (!initializedDocuments.isDirectory() || initializedDocuments.isSymbolicLink()) {
+      throw new Error("Globally installed CLI initialization did not create a safe default Documents directory in an empty home.");
     }
 
     ownedDaemon = await launchOwnedInstalledDaemon({
