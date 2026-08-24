@@ -9,6 +9,7 @@ import { DAEMON_PROTOCOL, DaemonLock } from "./daemon-lock";
 import {
   daemonStatusIdentity,
   identityFromReceipt,
+  terminateDaemonStartupChild,
   waitForDaemonAuthorityRelease,
   waitForDaemonReady,
   type DaemonIdentity,
@@ -31,6 +32,105 @@ function status(identity: DaemonIdentity): CommandResponse {
 }
 
 describe("daemon startup receipts", () => {
+  test("force-reaps a real detached child that ignores TERM and releases its authority", async () => {
+    const paths = await pathsFixture();
+    const daemonLockModule = new URL("./daemon-lock.ts", import.meta.url).href;
+    const script = [
+      `import { DaemonLock } from ${JSON.stringify(daemonLockModule)};`,
+      "const paths = JSON.parse(Bun.argv[1]);",
+      'process.on("SIGTERM", () => undefined);',
+      "await DaemonLock.acquire(paths);",
+      'process.stdout.write("locked\\n");',
+      "await new Promise(() => undefined);",
+    ].join("");
+    const child = Bun.spawn([process.execPath, "-e", script, JSON.stringify(paths)], {
+      detached: true,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const reader = child.stdout.getReader();
+      const ready = await reader.read();
+      reader.releaseLock();
+      expect(new TextDecoder().decode(ready.value)).toContain("locked");
+      expect(await DaemonLock.isAuthorityHeld(paths)).toBe(true);
+
+      await expect(terminateDaemonStartupChild(child, { deadlineMs: 100 }))
+        .resolves.toBeUndefined();
+      expect(await child.exited).not.toBe(0);
+      expect(() => process.kill(child.pid, 0)).toThrow();
+      expect(await DaemonLock.isAuthorityHeld(paths)).toBe(false);
+      const replacement = await DaemonLock.acquire(paths);
+      await replacement.release();
+    } finally {
+      try { child.kill("SIGKILL"); } catch { /* The child was already reaped. */ }
+      await child.exited.catch(() => 1);
+    }
+  });
+
+  test("terminates and force-reaps the exact failed startup child", async () => {
+    const signals: string[] = [];
+    const child = {
+      exited: new Promise<number>(() => undefined),
+      kill: (signal: "SIGKILL" | "SIGTERM") => { signals.push(signal); },
+    };
+    const outcomes = [false, true];
+    await expect(terminateDaemonStartupChild(child, {
+      waitForExit: () => Promise.resolve(outcomes.shift() ?? false),
+    })).resolves.toBeUndefined();
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("reports an unreaped failed startup child after both exact signals", async () => {
+    const signals: string[] = [];
+    const child = {
+      exited: new Promise<number>(() => undefined),
+      kill: (signal: "SIGKILL" | "SIGTERM") => { signals.push(signal); },
+    };
+    await expect(terminateDaemonStartupChild(child, {
+      waitForExit: () => Promise.resolve(false),
+    })).rejects.toThrow("could not be reaped");
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("force-reaps after a failed TERM request without masking successful cleanup", async () => {
+    const signals: string[] = [];
+    const termError = new Error("TERM failed");
+    const child = {
+      exited: new Promise<number>(() => undefined),
+      kill: (signal: "SIGKILL" | "SIGTERM") => {
+        signals.push(signal);
+        if (signal === "SIGTERM") throw termError;
+      },
+    };
+    const outcomes = [false, true];
+    await expect(terminateDaemonStartupChild(child, {
+      waitForExit: () => Promise.resolve(outcomes.shift() ?? false),
+    })).resolves.toBeUndefined();
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  test("retains signal failures when the failed startup child cannot be reaped", async () => {
+    const termError = new Error("TERM failed");
+    const killError = new Error("KILL failed");
+    const child = {
+      exited: new Promise<number>(() => undefined),
+      kill: (signal: "SIGKILL" | "SIGTERM") => {
+        throw signal === "SIGTERM" ? termError : killError;
+      },
+    };
+    const error = await terminateDaemonStartupChild(child, {
+      waitForExit: () => Promise.resolve(false),
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors).toEqual([
+      termError,
+      killError,
+      expect.objectContaining({ message: expect.stringContaining("could not be reaped") }),
+    ]);
+  });
+
   test("waits beyond the old five-second blind poll for a verified ready identity", async () => {
     const paths = await pathsFixture();
     const lock = await DaemonLock.acquire(paths, { pid: 42, now: 0 });

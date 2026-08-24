@@ -37,6 +37,20 @@ export const interactionStateSchema = z.enum([
 
 export type InteractionState = z.infer<typeof interactionStateSchema>;
 
+export const interactionDecisionSchema = z.enum(["once", "session", "decline", "cancel"]);
+
+export type InteractionDecision = z.infer<typeof interactionDecisionSchema>;
+
+const availableInteractionDecisionsSchema = z.array(interactionDecisionSchema).min(1).max(4)
+  .superRefine((decisions, context) => {
+    if (new Set(decisions).size !== decisions.length) {
+      context.addIssue({
+        code: "custom",
+        message: "Available interaction decisions must be unique.",
+      });
+    }
+  });
+
 export const interactionIntendedTerminalStateSchema = z.enum([
   "resolved",
   "declined",
@@ -182,14 +196,14 @@ export const interactionDisplaySchema = z.discriminatedUnion("kind", [
     reason: safeDisplayTextSchema.nullable(),
     commandClass: z.string().min(1).max(256),
     workingDirectory: z.string().max(1_024).nullable(),
-    allowsSessionApproval: z.boolean(),
+    availableDecisions: availableInteractionDecisionsSchema,
   }).strict(),
   z.object({
     kind: z.literal("file_change_approval"),
     summary: safeDisplayTextSchema,
     reason: safeDisplayTextSchema.nullable(),
     grantRoot: z.string().max(1_024).nullable(),
-    allowsSessionApproval: z.boolean(),
+    availableDecisions: availableInteractionDecisionsSchema,
   }).strict(),
   z.object({
     kind: z.literal("permission_approval"),
@@ -287,7 +301,110 @@ export const publicInteractionSchema = z.object({
 
 export type PublicInteraction = z.infer<typeof publicInteractionSchema>;
 
-export const interactionDecisionSchema = z.enum(["once", "session", "decline", "cancel"]);
+export type ProtectedInteractionJson =
+  | null
+  | boolean
+  | number
+  | string
+  | ProtectedInteractionJson[]
+  | { readonly [key: string]: ProtectedInteractionJson };
+
+/** Complete live approval authority plus its public binding must fit this document. */
+export const PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES = 3 * 1024 * 1024;
+export const PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES = 64 * 1024;
+
+const isProtectedInteractionJson = (value: unknown): value is ProtectedInteractionJson => {
+  const pending: Array<{ readonly depth: number; readonly value: unknown }> = [{ depth: 0, value }];
+  let visited = 0;
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || ++visited > 100_000 || current.depth > 64) return false;
+    const entry = current.value;
+    if (entry === null || typeof entry === "string" || typeof entry === "boolean") continue;
+    if (typeof entry === "number") {
+      if (!Number.isFinite(entry)) return false;
+      continue;
+    }
+    if (Array.isArray(entry)) {
+      for (const child of entry) pending.push({ depth: current.depth + 1, value: child });
+      continue;
+    }
+    if (typeof entry !== "object") return false;
+    const objectEntry = entry as Record<string, unknown>;
+    const prototype: unknown = Object.getPrototypeOf(objectEntry);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    for (const child of Object.values(objectEntry)) {
+      pending.push({ depth: current.depth + 1, value: child });
+    }
+  }
+  return true;
+};
+
+const protectedInteractionJsonSchema = z.custom<ProtectedInteractionJson>(
+  isProtectedInteractionJson,
+  "Expected bounded JSON interaction authority.",
+);
+
+export const liveInteractionApprovalAuthoritySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("command_approval"),
+    command: z.string().min(1).max(1_000_000),
+    reason: z.string().max(4_096).nullable(),
+    availableDecisions: protectedInteractionJsonSchema,
+    workingDirectory: z.string().max(16_384).nullable(),
+    environmentId: z.string().min(1).max(512).nullable(),
+    commandActions: protectedInteractionJsonSchema.nullable(),
+    networkApprovalContext: protectedInteractionJsonSchema.nullable(),
+    additionalPermissions: protectedInteractionJsonSchema.nullable(),
+    proposedExecpolicyAmendment: protectedInteractionJsonSchema.nullable(),
+    proposedNetworkPolicyAmendments: protectedInteractionJsonSchema.nullable(),
+  }).strict(),
+  z.object({
+    kind: z.literal("permission_approval"),
+    permissions: protectedInteractionJsonSchema,
+    reason: z.string().max(4_096).nullable(),
+    workingDirectory: z.string().min(1).max(16_384),
+    environmentId: z.string().min(1).max(512).nullable(),
+  }).strict(),
+]);
+
+export type LiveInteractionApprovalAuthority = z.infer<
+  typeof liveInteractionApprovalAuthoritySchema
+>;
+
+const protectedInteractionBindingSchema = z.object({
+  interactionId: z.string().uuid(),
+  revision: z.number().int().positive(),
+  kind: z.enum(["command_approval", "permission_approval"]),
+  sessionId: sessionIdSchema.nullable(),
+  profileId: profileIdSchema,
+  processGeneration: z.number().int().nonnegative(),
+  connectionId: z.string().uuid(),
+}).strict();
+
+export const protectedInteractionDetailDocumentSchema = z.object({
+  type: z.literal("hra_protected_interaction_detail"),
+  version: z.literal(1),
+  binding: protectedInteractionBindingSchema,
+  authority: liveInteractionApprovalAuthoritySchema,
+}).strict().superRefine((document, context) => {
+  if (document.binding.kind !== document.authority.kind) {
+    context.addIssue({
+      code: "custom",
+      message: "The protected authority kind must match its interaction binding.",
+      path: ["authority", "kind"],
+    });
+  }
+});
+
+export type ProtectedInteractionDetailDocument = z.infer<
+  typeof protectedInteractionDetailDocumentSchema
+>;
+
+/** The newline is part of the protected document contract and every byte bound. */
+export const encodeProtectedInteractionDetailDocument = (
+  document: ProtectedInteractionDetailDocument,
+): Uint8Array => new TextEncoder().encode(`${JSON.stringify(document)}\n`);
 
 export const interactionResolutionSchema = z.discriminatedUnion("kind", [
   z.object({

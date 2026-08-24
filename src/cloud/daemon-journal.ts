@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   hasExactKeys,
   isDigest,
@@ -19,12 +21,19 @@ import {
 } from "./projection";
 
 const journalSlot = "cloud-daemon-journal";
+// Session scan cursors are reconstructable read/projection progress. Keeping
+// them in a separate bounded CAS slot prevents an opaque provider cursor from
+// consuming the effect-recovery journal's reserved terminal capacity.
+const sessionSyncCursorSlot = "cloud-session-sync-cursor";
 const maximumJournalCommands = 100;
 const maximumJournalProjectionRecoveries = 25;
 const maximumProjectionRecoveryBaselineTurns = 128;
 const maximumProjectionRecoveryBaselineInteractions = 200;
 const maximumSerializedJournalBytes = 65_536;
+const maximumSerializedSessionSyncCursorBytes = 20_480;
+const maximumRemoteSessionCursorCharacters = 16_384;
 const utf8Encoder = new TextEncoder();
+const remoteSessionCursorDigestPattern = /^[0-9a-f]{64}$/u;
 
 export const cloudProjectionRecoveryWindowMs = 7 * 24 * 60 * 60 * 1_000;
 export const providerDeletionProjectionRecoveryCode = "PROVIDER_THREAD_DELETED";
@@ -245,6 +254,212 @@ export interface CloudDaemonJournalPort {
     expectedGeneration: number | null,
     state: CloudDaemonJournalInputState,
   ): Promise<CloudDaemonJournalObservation | null>;
+}
+
+export type CloudSessionRemoteCursorCycle = Readonly<{
+  checkpointDigest: string;
+  pageCount: number;
+  power: number;
+  span: number;
+}>;
+
+type LegacyCloudSessionSyncCursorState = Readonly<{
+  localAfterPublicId: string | null;
+  remoteContinueCursor: string | null;
+  version: 1;
+}>;
+
+export type CloudSessionSyncCursorState = Readonly<{
+  localAfterPublicId: string | null;
+  remoteContinueCursor: string | null;
+  remoteCycle: CloudSessionRemoteCursorCycle | null;
+  version: 2;
+}>;
+
+export type CloudSessionSyncCursorObservation = Readonly<{
+  generation: number | null;
+  state: CloudSessionSyncCursorState;
+}>;
+
+export interface CloudSessionSyncCursorPort {
+  read(): Promise<CloudSessionSyncCursorObservation>;
+  compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudSessionSyncCursorState,
+  ): Promise<CloudSessionSyncCursorObservation | null>;
+}
+
+export function emptyCloudSessionSyncCursor(): CloudSessionSyncCursorState {
+  return {
+    localAfterPublicId: null,
+    remoteContinueCursor: null,
+    remoteCycle: null,
+    version: 2,
+  };
+}
+
+const remoteSessionCursorDigest = (cursor: string): string =>
+  createHash("sha256").update("hra-cloud-session-cursor\0").update(cursor).digest("hex");
+
+const remoteSessionCursorBrentPower = (pageCount: number): number => {
+  let power = 1;
+  while (power <= Math.floor(pageCount / 2)) power *= 2;
+  return power;
+};
+
+const validRemoteSessionCursor = (value: unknown): value is string =>
+  typeof value === "string"
+  && value.length >= 1
+  && value.length <= maximumRemoteSessionCursorCharacters;
+
+const initialRemoteSessionCursorCycle = (
+  cursor: string,
+): CloudSessionRemoteCursorCycle => ({
+  checkpointDigest: remoteSessionCursorDigest(cursor),
+  pageCount: 1,
+  power: 1,
+  span: 0,
+});
+
+const parseRemoteSessionCursorCycle = (
+  value: unknown,
+  cursor: string | null,
+): CloudSessionRemoteCursorCycle | null => {
+  if (cursor === null) {
+    if (value !== null) throw new Error("Cloud session sync cursor is corrupt.");
+    return null;
+  }
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["checkpointDigest", "pageCount", "power", "span"])
+    || typeof value.checkpointDigest !== "string"
+    || !remoteSessionCursorDigestPattern.test(value.checkpointDigest)
+    || !isSafePositiveInteger(value.pageCount)
+    || !isSafePositiveInteger(value.power)
+    || !isSafeNonNegativeInteger(value.span)
+  ) throw new Error("Cloud session sync cursor is corrupt.");
+  const expectedPower = remoteSessionCursorBrentPower(value.pageCount);
+  const currentDigest = remoteSessionCursorDigest(cursor);
+  if (
+    value.power !== expectedPower
+    || value.span !== value.pageCount - expectedPower
+    || (value.span === 0
+      ? value.checkpointDigest !== currentDigest
+      : value.checkpointDigest === currentDigest)
+  ) throw new Error("Cloud session sync cursor is corrupt.");
+  return {
+    checkpointDigest: value.checkpointDigest,
+    pageCount: value.pageCount,
+    power: value.power,
+    span: value.span,
+  };
+};
+
+export function parseCloudSessionSyncCursor(
+  value: unknown,
+): CloudSessionSyncCursorState {
+  if (
+    isRecord(value)
+    && hasExactKeys(value, [
+      "localAfterPublicId",
+      "remoteContinueCursor",
+      "version",
+    ])
+    && value.version === 1
+  ) {
+    const legacy = value as LegacyCloudSessionSyncCursorState;
+    if (
+      (legacy.localAfterPublicId !== null
+        && !isOpaqueIdentifier(legacy.localAfterPublicId))
+      || (legacy.remoteContinueCursor !== null
+        && !validRemoteSessionCursor(legacy.remoteContinueCursor))
+    ) throw new Error("Cloud session sync cursor is corrupt.");
+    return parseCloudSessionSyncCursor({
+      localAfterPublicId: legacy.localAfterPublicId,
+      remoteContinueCursor: legacy.remoteContinueCursor,
+      remoteCycle: legacy.remoteContinueCursor === null
+        ? null
+        : initialRemoteSessionCursorCycle(legacy.remoteContinueCursor),
+      version: 2,
+    });
+  }
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "localAfterPublicId",
+      "remoteContinueCursor",
+      "remoteCycle",
+      "version",
+    ])
+    || value.version !== 2
+    || (value.localAfterPublicId !== null
+      && !isOpaqueIdentifier(value.localAfterPublicId))
+    || (value.remoteContinueCursor !== null
+      && !validRemoteSessionCursor(value.remoteContinueCursor))
+  ) throw new Error("Cloud session sync cursor is corrupt.");
+  const remoteContinueCursor = value.remoteContinueCursor;
+  const remoteCycle = parseRemoteSessionCursorCycle(
+    value.remoteCycle,
+    remoteContinueCursor,
+  );
+  const parsed: CloudSessionSyncCursorState = {
+    localAfterPublicId: value.localAfterPublicId,
+    remoteContinueCursor,
+    remoteCycle,
+    version: 2,
+  };
+  if (utf8Encoder.encode(JSON.stringify(parsed)).byteLength > maximumSerializedSessionSyncCursorBytes) {
+    throw new Error("Cloud session sync cursor is corrupt.");
+  }
+  return parsed;
+}
+
+export function advanceCloudSessionRemoteCursor(
+  state: CloudSessionSyncCursorState,
+  next: string | null,
+): CloudSessionSyncCursorState {
+  const current = parseCloudSessionSyncCursor(state);
+  if (next === null) {
+    return parseCloudSessionSyncCursor({
+      ...current,
+      remoteContinueCursor: null,
+      remoteCycle: null,
+    });
+  }
+  if (!validRemoteSessionCursor(next)) {
+    throw new Error("Cloud session page returned an invalid continuation cursor.");
+  }
+  if (current.remoteContinueCursor === null) {
+    return parseCloudSessionSyncCursor({
+      ...current,
+      remoteContinueCursor: next,
+      remoteCycle: initialRemoteSessionCursorCycle(next),
+    });
+  }
+  const prior = current.remoteCycle;
+  if (prior === null) throw new Error("Cloud session sync cursor is corrupt.");
+  const digest = remoteSessionCursorDigest(next);
+  if (
+    next === current.remoteContinueCursor
+    || digest === prior.checkpointDigest
+  ) throw new Error("Cloud session pagination entered a deterministic cursor cycle.");
+  if (prior.pageCount >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Cloud session pagination exhausted its safe page count.");
+  }
+  const pageCount = prior.pageCount + 1;
+  let power = prior.power;
+  let span = prior.span + 1;
+  let checkpointDigest = prior.checkpointDigest;
+  if (span === power) {
+    checkpointDigest = digest;
+    power *= 2;
+    span = 0;
+  }
+  return parseCloudSessionSyncCursor({
+    ...current,
+    remoteContinueCursor: next,
+    remoteCycle: { checkpointDigest, pageCount, power, span },
+  });
 }
 
 export function emptyCloudDaemonJournal(): CloudDaemonJournalState {
@@ -1725,6 +1940,70 @@ export class MemoryCloudDaemonJournal implements CloudDaemonJournalPort {
   ): Promise<CloudDaemonJournalObservation | null> {
     if (expectedGeneration !== this.#generation) return null;
     this.#state = structuredClone(parseCloudDaemonJournal(state));
+    this.#generation = this.#generation === null ? 0 : this.#generation + 1;
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+}
+
+export class CustodyCloudSessionSyncCursor implements CloudSessionSyncCursorPort {
+  readonly #custody: CloudSecretCustodyPort;
+
+  constructor(custody: CloudSecretCustodyPort) {
+    this.#custody = custody;
+  }
+
+  async read(): Promise<CloudSessionSyncCursorObservation> {
+    const observation = await this.#custody.read(sessionSyncCursorSlot);
+    if (observation === null) {
+      return { generation: null, state: emptyCloudSessionSyncCursor() };
+    }
+    if (
+      utf8Encoder.encode(observation.value).byteLength
+      > maximumSerializedSessionSyncCursorBytes
+    ) throw new Error("Cloud session sync cursor is corrupt.");
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(observation.value) as unknown;
+    } catch {
+      throw new Error("Cloud session sync cursor is corrupt.");
+    }
+    return {
+      generation: observation.generation,
+      state: parseCloudSessionSyncCursor(decoded),
+    };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudSessionSyncCursorState,
+  ): Promise<CloudSessionSyncCursorObservation | null> {
+    const parsed = parseCloudSessionSyncCursor(state);
+    const serialized = JSON.stringify(parsed);
+    const committed = await this.#custody.compareAndSwap(
+      sessionSyncCursorSlot,
+      expectedGeneration,
+      serialized,
+    );
+    return committed === null
+      ? null
+      : { generation: committed.generation, state: parsed };
+  }
+}
+
+export class MemoryCloudSessionSyncCursor implements CloudSessionSyncCursorPort {
+  #generation: number | null = null;
+  #state = emptyCloudSessionSyncCursor();
+
+  async read(): Promise<CloudSessionSyncCursorObservation> {
+    return { generation: this.#generation, state: structuredClone(this.#state) };
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudSessionSyncCursorState,
+  ): Promise<CloudSessionSyncCursorObservation | null> {
+    if (expectedGeneration !== this.#generation) return null;
+    this.#state = structuredClone(parseCloudSessionSyncCursor(state));
     this.#generation = this.#generation === null ? 0 : this.#generation + 1;
     return { generation: this.#generation, state: structuredClone(this.#state) };
   }

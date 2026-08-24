@@ -49,7 +49,11 @@ describe("HRA installation composition", () => {
     const installation = createProductionInstallation();
     expect(installation.kind).toBe("production");
     expect(installation.desktopSwitching).toBe(true);
-    expect(installation.credentialStorePreflight).toBeNull();
+    expect(installation.credentialStorePreflight).toEqual({
+      cliAuth: "file",
+      cwd: process.cwd(),
+      mcpOauth: "file",
+    });
     expect(installation.paths).toEqual(resolveStatePaths());
   });
 

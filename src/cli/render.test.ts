@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { renderFailure, renderSuccess, type Output } from "./render";
-import type { PublicInteraction } from "../domain/interactions";
+import { renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, type Output } from "./render";
+import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
 
 const capture = (): { output: Output; stdout: string[]; stderr: string[] } => {
@@ -65,6 +65,68 @@ describe("CLI rendering", () => {
       status: "already_settled",
     }, false, settled.output);
     expect(settled.stdout.join("")).toBe("No login is pending for this account.\n");
+  });
+
+  test("generic account-login rendering strips provider handoff secrets in every mode", () => {
+    const command = {
+      account: "personal",
+      deviceCode: true,
+      idempotencyKey: "00000000-0000-4000-8000-000000000101",
+      kind: "account.login" as const,
+    };
+    const secret = "RENDER-LOGIN-SECRET";
+    const attacked = {
+      account: {
+        id: `acct_${"1".repeat(32)}`,
+        label: "Personal",
+        processGeneration: 1,
+        state: "login_pending",
+        updatedAt: 1,
+      },
+      idempotencyKey: command.idempotencyKey,
+      login: {
+        loginId: secret,
+        next: secret,
+        status: "pending",
+        userCode: secret,
+        verificationUrl: `https://example.test/?secret=${secret}`,
+        unexpected: secret,
+      },
+      unexpected: secret,
+    };
+    for (const json of [false, true]) {
+      const target = capture();
+      renderSuccess(command, attacked, json, target.output);
+      const rendered = `${target.stdout.join("")}${target.stderr.join("")}`;
+      expect(rendered).not.toContain(secret);
+      if (json) {
+        expect(JSON.parse(rendered)).toMatchObject({
+          data: { login: { status: "pending" } },
+        });
+      }
+    }
+  });
+
+  test("renders a same-key signed-out login settlement as terminal", () => {
+    const target = capture();
+    renderSuccess({
+      account: `acct_${"1".repeat(32)}`,
+      deviceCode: true,
+      idempotencyKey: "00000000-0000-4000-8000-000000000101",
+      kind: "account.login",
+    }, {
+      account: {
+        id: `acct_${"1".repeat(32)}`,
+        label: "Personal",
+        processGeneration: 1,
+        state: "signed_out",
+        updatedAt: 2,
+      },
+      idempotencyKey: "00000000-0000-4000-8000-000000000101",
+      login: { status: "settled" },
+    }, false, target.output);
+    expect(target.stdout.join("")).toContain("settled");
+    expect(target.stdout.join("")).toContain("signed out");
   });
 
   test("renders session show as an ergonomic transcript and bounded turn summaries", () => {
@@ -268,6 +330,12 @@ describe("CLI rendering", () => {
           activeTurnId: "turn-1",
           revision: 4,
         },
+        providerObservation: {
+          connectionId: "90000000-0000-4000-8000-000000000099",
+          mode: "resubscribed",
+          profileGeneration: 2,
+          state: "live",
+        },
         eventStream: {
           floorSequence: 2,
           observedThroughSequence: 9,
@@ -286,7 +354,7 @@ describe("CLI rendering", () => {
             reason: null,
             commandClass: "test",
             workingDirectory: null,
-            allowsSessionApproval: false,
+            availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
           },
           responseRecorded: false,
           context: { turnId: "turn-1", itemId: "item-1" },
@@ -299,11 +367,13 @@ describe("CLI rendering", () => {
       false,
       status.output,
     );
+    expect(status.stdout.join("")).toContain("Provider: live (resubscribed, generation 2");
     expect(status.stdout.join("")).toBe([
       "Release",
       "State: active",
       "Active turn: turn-1",
       "Revision: 4",
+      "Provider: live (resubscribed, generation 2, connection 90000000-0000-4000-8000-000000000099)",
       "Events: through 9, retained from 2",
       "",
       "Pending interactions",
@@ -335,8 +405,10 @@ describe("CLI rendering", () => {
       events: [
         { ...base, sequence: 2, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "done " } },
         { ...base, sequence: 3, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "and verified" } },
-        { ...base, sequence: 4, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "started", outputBytesObserved: 0 } },
-        { ...base, sequence: 5, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "completed", outputBytesObserved: 120 } },
+        { ...base, sequence: 4, body: { type: "item_started", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue" } },
+        { ...base, sequence: 5, body: { type: "item_completed", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue", status: "completed" } },
+        { ...base, sequence: 6, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "started", outputBytesObserved: 0 } },
+        { ...base, sequence: 7, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "completed", outputBytesObserved: 120 } },
       ],
     };
     const events = capture();
@@ -349,8 +421,10 @@ describe("CLI rendering", () => {
     expect(events.stdout.join("")).toContain("Event gap: retention_count");
     expect(events.stdout.join("")).toContain("Codex\n  done and verified");
     expect(events.stdout.join("").match(/Codex/gu)).toHaveLength(1);
+    expect(events.stdout.join("")).toContain("Item started: mcpToolCall github/create_issue mcp-1");
+    expect(events.stdout.join("")).toContain("Item completed: mcpToolCall github/create_issue mcp-1 (completed)");
     expect(events.stdout.join("")).toContain("Tool: command, completed, 120 bytes observed");
-    expect(events.stdout.join("")).not.toContain("started");
+    expect(events.stdout.join("")).not.toContain("Tool: command, started");
   });
 
   test("renders public interaction lists and details without private callback authority", () => {
@@ -453,6 +527,171 @@ describe("CLI rendering", () => {
     );
   });
 
+  test("renders private approval authority only through the explicit protected renderer", () => {
+    const privateCommand = "git reset --hard RENDER-PRIVATE-AUTHORITY";
+    const document: ProtectedInteractionDetailDocument = {
+      type: "hra_protected_interaction_detail",
+      version: 1,
+      binding: {
+        interactionId: "40000000-0000-4000-8000-000000000001",
+        revision: 2,
+        kind: "command_approval",
+        sessionId: null,
+        profileId: `acct_${"1".repeat(32)}`,
+        processGeneration: 7,
+        connectionId: "40000000-0000-4000-8000-000000000002",
+      },
+      authority: {
+        kind: "command_approval",
+        command: privateCommand,
+        reason: "Apply the exact command",
+        availableDecisions: ["accept", "decline", "cancel"],
+        workingDirectory: "/private/workspace",
+        environmentId: null,
+        commandActions: [{ type: "unknown", command: privateCommand }],
+        networkApprovalContext: null,
+        additionalPermissions: null,
+        proposedExecpolicyAmendment: null,
+        proposedNetworkPolicyAmendments: null,
+      },
+    };
+    const protectedRendered = renderProtectedInteractionDetail(document);
+    expect(protectedRendered).toContain(privateCommand);
+    expect(protectedRendered).toContain("/private/workspace");
+
+    for (const json of [false, true]) {
+      const rendered = capture();
+      renderSuccess({
+        kind: "interaction.inspect",
+        interaction: document.binding.interactionId,
+        expectedRevision: document.binding.revision,
+      }, document, json, rendered.output);
+      const generic = `${rendered.stdout.join("")}${rendered.stderr.join("")}`;
+      expect(generic).not.toContain(privateCommand);
+      expect(generic).not.toContain("/private/workspace");
+    }
+  });
+
+  test("renders interaction continuations with the resolved immutable session ID and preserves cursors in JSON", () => {
+    const sessionId = "sess_00000000000000000000000000000000";
+    const cursor = "hra1.eyJ0eXBlIjoiaW50ZXJhY3Rpb24ifQ.signature";
+    const data = { sessionId, interactions: [], nextCursor: cursor };
+    const human = capture();
+    renderSuccess(
+      { kind: "session.interactions", session: "mutable-label", pending: true, limit: 37 },
+      data,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toContain(
+      `Continue: hra session interactions ${sessionId} --pending --limit 37 --cursor ${cursor}\n`,
+    );
+    expect(human.stdout.join("")).not.toContain("mutable-label");
+
+    const status = capture();
+    renderSuccess(
+      { kind: "session.status", session: "mutable-label" },
+      {
+        session: { id: sessionId, state: "idle" },
+        eventStream: {},
+        pendingInteractions: [],
+        pendingInteractionsNextCursor: cursor,
+      },
+      false,
+      status.output,
+    );
+    expect(status.stdout.join("")).toContain(
+      `Continue pending interactions: hra session interactions ${sessionId} --pending --limit 100 --cursor ${cursor}\n`,
+    );
+    expect(status.stdout.join("")).not.toContain("mutable-label");
+    const statusJson = capture();
+    renderSuccess(
+      { kind: "session.status", session: "mutable-label" },
+      {
+        session: { id: sessionId, state: "idle" },
+        eventStream: {},
+        pendingInteractions: [],
+        pendingInteractionsNextCursor: cursor,
+      },
+      true,
+      statusJson.output,
+    );
+    expect(JSON.parse(statusJson.stdout.join(""))).toMatchObject({
+      data: { pendingInteractionsNextCursor: cursor },
+    });
+
+    const global = capture();
+    renderSuccess(
+      { kind: "interaction.list", pending: false, limit: 100 },
+      { sessionId: null, interactions: [], nextCursor: cursor },
+      false,
+      global.output,
+    );
+    expect(global.stdout.join("")).toContain(
+      `Continue: hra interaction list --limit 100 --cursor ${cursor}\n`,
+    );
+
+    const json = capture();
+    renderSuccess(
+      { kind: "interaction.list", session: "mutable-label", pending: true, limit: 37 },
+      data,
+      true,
+      json.output,
+    );
+    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
+      data: { interactions: [], nextCursor: cursor, sessionId },
+    });
+  });
+
+  test("renders session-list continuations with the resolved account ID and preserves cursors in JSON", () => {
+    const accountId = "acct_00000000000000000000000000000000";
+    const cursor = "hra1.eyJ0eXBlIjoic2Vzc2lvbl9saXN0In0.signature";
+    const listing = {
+      accountId,
+      sessions: [{
+        id: "sess_00000000000000000000000000000000",
+        title: "Older imported thread",
+        state: "idle",
+        preset: "high",
+        fastEnabled: false,
+      }],
+      nextCursor: cursor,
+    };
+    const human = capture();
+    renderSuccess(
+      { kind: "session.list", account: "mutable-label", limit: 37, cursor: "earlier" },
+      listing,
+      false,
+      human.output,
+    );
+    expect(human.stdout.join("")).toContain("Older imported thread");
+    expect(human.stdout.join("")).toContain(
+      `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
+    );
+    expect(human.stdout.join("")).not.toContain("mutable-label");
+
+    const json = capture();
+    renderSuccess(
+      { kind: "session.list", account: "mutable-label", limit: 37 },
+      listing,
+      true,
+      json.output,
+    );
+    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
+      data: { accountId, nextCursor: cursor, sessions: listing.sessions },
+    });
+
+    const malformed = capture();
+    renderSuccess(
+      { kind: "session.list", account: "mutable-label", limit: 37 },
+      { ...listing, nextCursor: "provider-cursor-must-not-render" },
+      false,
+      malformed.output,
+    );
+    expect(malformed.stdout.join("")).not.toContain("Continue:");
+    expect(malformed.stdout.join("")).not.toContain("provider-cursor-must-not-render");
+  });
+
   test("renders brokered MCP form input as protected", () => {
     const record: PublicInteraction = {
       version: 1,
@@ -552,8 +791,8 @@ describe("CLI rendering", () => {
       expect(rendered).not.toContain("\u001b");
       expect(rendered).not.toContain("\u0007");
       expect(rendered).toContain("[redacted]");
-      expect(rendered).toContain("[local-path]");
     }
+    expect(safeDiagnostic("provider failed at /private/runtime")).toContain("[local-path]");
 
     const internal = capture();
     renderFailure({ code: "INTERNAL", message: attack, details: { secret: attack } }, true, internal.output);
@@ -561,6 +800,186 @@ describe("CLI rendering", () => {
     expect(payload.error).toEqual({
       code: "INTERNAL",
       message: "HRA could not complete the request safely.",
+    });
+  });
+
+  test("redacts complete credential grammars before diagnostic bounding", () => {
+    const amazonKey = "AKIA".concat("ABCDEFGHIJKLMNOP");
+    const secrets = [
+      ["Authorization: Basic dTpw", "dTpw"],
+      ["Basic dTpw", "dTpw"],
+      ["HTTP_AUTHORIZATION=Basic dTpw", "dTpw"],
+      ["client_secret=topsecret123", "topsecret123"],
+      ["AWS_SECRET_ACCESS_KEY=AWSOPAQUESECRET123", "AWSOPAQUESECRET123"],
+      ["OPENAI_API_KEY=opaque123", "opaque123"],
+      ["MY_PASSWORD=myPasswordSecret123", "myPasswordSecret123"],
+      ["clientSecret=camelClientSecret123", "camelClientSecret123"],
+      ["apiKey=camelApiKey123", "camelApiKey123"],
+      ["accessToken=camelAccessToken123", "camelAccessToken123"],
+      ["refreshToken=camelRefreshToken123", "camelRefreshToken123"],
+      ["secretAccessKey=camelSecretAccessKey123", "camelSecretAccessKey123"],
+      ["api key=spaced123", "spaced123"],
+      ["provider sk-proj-ABCDEFGH123456 failed", "sk-proj-ABCDEFGH123456"],
+      ["github_pat_ABCDEFGH123456", "github_pat_ABCDEFGH123456"],
+      ["xoxb-12345678-secret", "xoxb-12345678-secret"],
+      [amazonKey, amazonKey],
+    ] as const;
+    for (const [source, secret] of secrets) {
+      const rendered = safeDiagnostic(source);
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).not.toContain(secret);
+    }
+    for (const source of [
+      "access_token=Bearer SUPERSECRET123",
+      "password=`secret tail`",
+      'password="secret tail',
+      "password=alpha,beta;gamma",
+    ]) {
+      expect(safeDiagnostic(source)).toBe("[redacted]");
+    }
+    for (const source of [
+      "pass\u001bword=hunter2",
+      "github_\u001bpat_ABCDEFGH123456",
+      "sk-\u200bproj-ABCDEFGH123456",
+      "Bearer\u001b]0;owned\u0007 abc123",
+      "pass\ufe0fword=VARIATIONSECRET123",
+      "pass\u034fword=CGJSECRET456",
+    ]) {
+      expect(safeDiagnostic(source)).toBe("[redacted]");
+    }
+    for (const source of [
+      "password\u00a0=\u00a0hunter2",
+      "password\u2009=\u2009hunter2",
+      "password\u202f=\u202fhunter2",
+    ]) {
+      expect(safeDiagnostic(source)).toBe("[redacted]");
+    }
+    for (const source of [
+      '{"client_secret":"jsonClientSecret123","access_token":"jsonAccessToken456"}',
+      "{'apiKey':'singleQuotedSecret123'}",
+      "{`refreshToken`:`backtickSecret456`}",
+    ]) {
+      const rendered = safeDiagnostic(source);
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).not.toContain("Secret123");
+      expect(rendered).not.toContain("Token456");
+      expect(rendered).not.toContain("Secret456");
+    }
+    for (const source of [
+      '{\n  "client_secret":\n  "prettyJsonSecret123"\n}',
+      "password=\n multilineSecret456",
+    ]) {
+      const rendered = safeDiagnostic(source);
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).not.toContain("prettyJsonSecret123");
+      expect(rendered).not.toContain("multilineSecret456");
+    }
+    const cutoffJwt = `prefix ${"x".repeat(2_025)} eyJ${"A".repeat(80)}`;
+    const renderedJwt = safeDiagnostic(cutoffJwt);
+    expect(renderedJwt).toContain("[redacted]");
+    expect(renderedJwt).not.toContain(`eyJ${"A".repeat(8)}`);
+  });
+
+  test("redacts values associated with sensitive structured diagnostic keys", () => {
+    for (const json of [false, true]) {
+      const target = capture();
+      renderFailure({
+        code: "UNAVAILABLE",
+        message: "provider failed",
+        details: {
+          client_secret: "hunter2",
+          nested: {
+            apiKey: "opaque123",
+            entries: [{ Authorization: "Basic dTpw" }],
+          },
+          "pass\u001bword": "controlBypass456",
+          "config.apiKey": "flattenedApiSecret789",
+          "auth/token": "flattenedTokenSecret123",
+          "credentials:client_secret": "flattenedClientSecret456",
+          $password: "sigilPasswordSecret123",
+          "config\\apiKey": "backslashApiSecret456",
+          "credentials password": "spacedPasswordSecret789",
+        },
+      }, json, target.output);
+      const rendered = [...target.stdout, ...target.stderr].join("");
+      expect(rendered).toContain("[redacted]");
+      expect(rendered).not.toContain("hunter2");
+      expect(rendered).not.toContain("opaque123");
+      expect(rendered).not.toContain("dTpw");
+      expect(rendered).not.toContain("controlBypass456");
+      expect(rendered).not.toContain("flattenedApiSecret789");
+      expect(rendered).not.toContain("flattenedTokenSecret123");
+      expect(rendered).not.toContain("flattenedClientSecret456");
+      expect(rendered).not.toContain("sigilPasswordSecret123");
+      expect(rendered).not.toContain("backslashApiSecret456");
+      expect(rendered).not.toContain("spacedPasswordSecret789");
+    }
+  });
+
+  test("renders source-ordered account usage-history pages and safe continuations", () => {
+    const command = {
+      kind: "account.usage-history" as const,
+      account: "work",
+      limit: 2,
+    };
+    const data = {
+      account: {
+        id: `acct_${"1".repeat(32)}`,
+        label: "Work",
+      },
+      range: {
+        fromObservedAt: 1_700_000_000_000,
+        throughObservedAt: 1_700_000_300_000,
+      },
+      entries: [
+        {
+          state: "observed",
+          sourceRevision: 7,
+          observedAt: 1_700_000_060_000,
+          receivedAt: 1_700_000_061_000,
+          lifetimeTokens: 12_345,
+          gapBefore: false,
+        },
+        {
+          state: "failed",
+          sourceRevision: 8,
+          observedAt: 1_700_000_120_000,
+          reasonCode: "account_usage_read_failed",
+        },
+      ],
+      nextCursor: "hrau1.abc.def",
+    };
+    const human = capture();
+    renderSuccess(command, data, false, human.output);
+    const rendered = human.stdout.join("");
+    expect(rendered).toContain("Usage history for Work");
+    expect(rendered).toContain("12,345");
+    expect(rendered).toContain("account_usage_read_failed");
+    expect(rendered).toContain("Continue: hra account usage-history acct_");
+    expect(rendered).toContain("--cursor hrau1.abc.def");
+
+    const json = capture();
+    renderSuccess(command, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
+      ok: true,
+      command: "account.usage-history",
+      data: {
+        entries: [
+          { sourceRevision: 7, state: "observed" },
+          { sourceRevision: 8, state: "failed" },
+        ],
+        nextCursor: "hrau1.abc.def",
+      },
+    });
+
+    const attacked = capture();
+    renderSuccess(command, {
+      ...data,
+      providerPayload: { access_token: "PRIVATE-USAGE-SENTINEL" },
+    }, true, attacked.output);
+    expect(attacked.stdout.join("")).not.toContain("PRIVATE-USAGE-SENTINEL");
+    expect(JSON.parse(attacked.stdout.join(""))).toMatchObject({
+      data: { account: null, entries: [], nextCursor: null, range: null },
     });
   });
 

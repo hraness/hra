@@ -31,6 +31,7 @@ import {
   parseThreadMetadataRead,
   parseThreadTurnsPage,
   resolvePreset,
+  safeLiveAcceptanceCommandDigest,
   type BrokeredCodexServerRequestMethod,
   type CodexCapabilitySnapshot,
 } from "./protocol.ts";
@@ -41,6 +42,9 @@ const brokeredFixtures: Readonly<Record<BrokeredCodexServerRequestMethod, unknow
   "item/commandExecution/requestApproval": {
     threadId: "thread-1", turnId: "turn-1", itemId: "item-1", startedAtMs: 1,
     approvalId: null, environmentId: null, reason: "network", command: "git push origin main",
+    commandActions: [{ type: "unknown", command: "git push origin main" }],
+    networkApprovalContext: { host: "github.com", protocol: "https" },
+    additionalPermissions: { network: { enabled: true } },
     cwd: "/workspace", availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
   },
   "item/fileChange/requestApproval": {
@@ -362,6 +366,7 @@ describe("pinned server requests and safe notifications", () => {
 
   test("parses every brokered method into a bounded display and exact private authority", () => {
     for (const [method, params] of Object.entries(brokeredFixtures) as [BrokeredCodexServerRequestMethod, unknown][]) {
+      if (method === "item/fileChange/requestApproval") continue;
       const parsed = parseBrokeredCodexServerRequest({
         authority: { profileId: "profile-a", processGeneration: 9 },
         connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
@@ -378,6 +383,14 @@ describe("pinned server requests and safe notifications", () => {
       expect(parsed.provider.requestDigest).toMatch(/^[a-f0-9]{64}$/u);
       expect(JSON.stringify(parsed.display)).not.toContain("git push origin main");
     }
+
+    expect(() => parseBrokeredCodexServerRequest({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "file" },
+      method: "item/fileChange/requestApproval",
+      params: brokeredFixtures["item/fileChange/requestApproval"],
+    })).toThrow(expect.objectContaining({ code: "UNSUPPORTED_CAPABILITY" }));
 
     const urlSecret = "URL_SECRET_SENTINEL";
     try {
@@ -415,6 +428,196 @@ describe("pinned server requests and safe notifications", () => {
     });
     expect(secretCommand.display).toMatchObject({ commandClass: "git push" });
     expect(JSON.stringify(secretCommand.display)).not.toContain("SECRET");
+    expect(secretCommand.privateApprovalAuthority).toMatchObject({
+      kind: "command_approval",
+      command: "git -c credential.helper=SECRET push origin main",
+      reason: "network",
+      availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+      commandActions: [{ type: "unknown", command: "git push origin main" }],
+      networkApprovalContext: { host: "github.com", protocol: "https" },
+      additionalPermissions: { network: { enabled: true } },
+    });
+
+    const reset = (command: string) => parseBrokeredCodexServerRequest({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: command },
+      method: "item/commandExecution/requestApproval",
+      params: {
+        ...(brokeredFixtures["item/commandExecution/requestApproval"] as Record<string, unknown>),
+        command,
+      },
+    });
+    const hard = reset("git reset --hard HEAD");
+    const soft = reset("git reset --soft HEAD^");
+    expect(hard.display).toEqual(soft.display);
+    expect(hard.privateApprovalAuthority).not.toEqual(soft.privateApprovalAuthority);
+
+    const permission = parseBrokeredCodexServerRequest({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "permission" },
+      method: "item/permissions/requestApproval",
+      params: brokeredFixtures["item/permissions/requestApproval"],
+    });
+    expect(permission.privateApprovalAuthority).toEqual({
+      kind: "permission_approval",
+      permissions: {
+        fileSystem: { read: [permissionPrivatePath] },
+        network: { enabled: true },
+      },
+      reason: "network",
+      workingDirectory: "/workspace",
+      environmentId: null,
+    });
+    expect(JSON.stringify(permission.display)).not.toContain(permissionPrivatePath);
+    for (const invalidCwd of [undefined, null, "relative/workspace"] as const) {
+      const params: Record<string, unknown> = {
+        ...(brokeredFixtures["item/permissions/requestApproval"] as Record<string, unknown>),
+      };
+      if (invalidCwd === undefined) delete params.cwd;
+      else params.cwd = invalidCwd;
+      expect(() => parseBrokeredCodexServerRequest({
+        authority: { profileId: "profile-a", processGeneration: 9 },
+        connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+        requestId: { type: "string", value: `permission-cwd-${String(invalidCwd)}` },
+        method: "item/permissions/requestApproval",
+        params,
+      })).toThrow(CodexError);
+    }
+
+    expect(() => reset("   ")).toThrow(expect.objectContaining({
+      code: "UNSUPPORTED_CAPABILITY",
+    }));
+  });
+
+  test("preserves the exact representable command approval decisions and rejects unsupported contracts", () => {
+    const parseCommand = (availableDecisions: unknown, includeDecisions = true) => {
+      const params = {
+        ...(brokeredFixtures["item/commandExecution/requestApproval"] as Record<string, unknown>),
+        ...(includeDecisions ? { availableDecisions } : {}),
+      };
+      if (!includeDecisions) delete params.availableDecisions;
+      return parseBrokeredCodexServerRequest({
+        authority: { profileId: "profile-a", processGeneration: 9 },
+        connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+        requestId: { type: "string", value: "command-decisions" },
+        method: "item/commandExecution/requestApproval",
+        params,
+      });
+    };
+    const amendment = {
+      acceptWithExecpolicyAmendment: {
+        execpolicy_amendment: { safeOpaqueProviderValue: true },
+      },
+    };
+
+    const acceptAndCancel = parseCommand(["accept", "cancel", "accept"]);
+    expect(acceptAndCancel.display).toMatchObject({
+      kind: "command_approval",
+      availableDecisions: ["once", "cancel"],
+    });
+    expect(compileCodexInteractionResponse({
+      method: "item/commandExecution/requestApproval",
+      kind: acceptAndCancel.kind,
+      privateParams: acceptAndCancel.privateParams,
+      resolution: { kind: "approval_decision", decision: "once" },
+    })).toEqual({ decision: "accept" });
+    expect(compileCodexInteractionResponse({
+      method: "item/commandExecution/requestApproval",
+      kind: acceptAndCancel.kind,
+      privateParams: acceptAndCancel.privateParams,
+      resolution: { kind: "approval_decision", decision: "cancel" },
+    })).toEqual({ decision: "cancel" });
+    for (const unavailable of ["session", "decline"] as const) {
+      expect(() => compileCodexInteractionResponse({
+        method: "item/commandExecution/requestApproval",
+        kind: acceptAndCancel.kind,
+        privateParams: acceptAndCancel.privateParams,
+        resolution: { kind: "approval_decision", decision: unavailable },
+      })).toThrow("does not offer");
+    }
+
+    const rejectionOnly = parseCommand([amendment, "decline", "cancel"]);
+    expect(rejectionOnly.display).toMatchObject({
+      kind: "command_approval",
+      availableDecisions: ["decline", "cancel"],
+    });
+
+    const full = parseCommand(["accept", "acceptForSession", "decline", "cancel"]);
+    expect(full.display).toMatchObject({
+      kind: "command_approval",
+      availableDecisions: ["once", "session", "decline", "cancel"],
+    });
+    for (const [decision, providerDecision] of [
+      ["once", "accept"],
+      ["session", "acceptForSession"],
+      ["decline", "decline"],
+      ["cancel", "cancel"],
+    ] as const) {
+      expect(compileCodexInteractionResponse({
+        method: "item/commandExecution/requestApproval",
+        kind: full.kind,
+        privateParams: full.privateParams,
+        resolution: { kind: "approval_decision", decision },
+      })).toEqual({ decision: providerDecision });
+    }
+
+    for (const [availableDecisions, includeDecisions] of [
+      [undefined, false],
+      [null, true],
+      [[], true],
+      [[amendment], true],
+      [["futureDecision", "cancel"], true],
+      [[{ unexpectedAmendment: {} }, "cancel"], true],
+    ] as const) {
+      try {
+        parseCommand(availableDecisions, includeDecisions);
+        throw new Error("Expected the command decision contract to be rejected.");
+      } catch (error: unknown) {
+        expect(error).toBeInstanceOf(CodexError);
+        expect((error as CodexError).code).toBe("UNSUPPORTED_CAPABILITY");
+      }
+    }
+  });
+
+  test("rejects ambiguous user-input question IDs and rendered option labels", () => {
+    const parseQuestions = (questions: unknown) => parseBrokeredCodexServerRequest({
+      authority: { profileId: "profile-a", processGeneration: 9 },
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      requestId: { type: "string", value: "ambiguous-questions" },
+      method: "item/tool/requestUserInput",
+      params: {
+        ...(brokeredFixtures["item/tool/requestUserInput"] as Record<string, unknown>),
+        questions,
+      },
+    });
+    const question = {
+      id: "confirm",
+      header: "Confirm",
+      question: "Continue?",
+      isOther: false,
+      isSecret: false,
+      options: [{ label: "Yes", description: "Continue" }],
+    };
+    expect(() => parseQuestions([
+      question,
+      { ...question, header: "Confirm again", question: "Really continue?" },
+    ])).toThrow("question ids must be unique");
+    expect(() => parseQuestions([{
+      ...question,
+      options: [
+        { label: "same", description: "First meaning" },
+        { label: "same", description: "Second meaning" },
+      ],
+    }])).toThrow("option labels must be unique");
+    expect(() => parseQuestions([{
+      ...question,
+      options: [
+        { label: "\u0001", description: "First control" },
+        { label: "\u0002", description: "Second control" },
+      ],
+    }])).toThrow("option labels must be unique");
   });
 
   test("caps valid provider auto-resolution intervals and rejects malformed authority", () => {
@@ -462,6 +665,18 @@ describe("pinned server requests and safe notifications", () => {
         scope: "session",
       },
     })).toThrow("exceed");
+    expect(compileCodexInteractionResponse({
+      method: "item/permissions/requestApproval",
+      kind: parsed.kind,
+      privateParams: parsed.privateParams,
+      resolution: { kind: "approval_decision", decision: "decline" },
+    })).toEqual({ permissions: {}, scope: "turn" });
+    expect(() => compileCodexInteractionResponse({
+      method: "item/permissions/requestApproval",
+      kind: parsed.kind,
+      privateParams: parsed.privateParams,
+      resolution: { kind: "approval_decision", decision: "cancel" },
+    })).toThrow("supports");
     expect(compileCodexInteractionResponse({
       method: "item/permissions/requestApproval",
       kind: parsed.kind,
@@ -667,6 +882,25 @@ describe("pinned server requests and safe notifications", () => {
       {
         ...base,
         mode: "form",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          codex_request_type: "approval_request",
+          connector_name: schemaSentinel,
+          tool_name: "delete_records",
+          tool_params: { target: schemaSentinel },
+          persist: "always",
+        },
+        requestedSchema: { type: "object", properties: {} },
+      },
+      {
+        ...base,
+        mode: "form",
+        _meta: { codex_approval_kind: "future_side_effect", detail: schemaSentinel },
+        requestedSchema: { type: "object", properties: {} },
+      },
+      {
+        ...base,
+        mode: "form",
         requestedSchema: { Type: "object", properties: {} },
       },
       {
@@ -775,6 +1009,68 @@ describe("pinned server requests and safe notifications", () => {
         modelContextWindow: 200_000,
       },
     })).toMatchObject({ type: "tokenUsageUpdated", totalTokens: 15, reasoningOutputTokens: 2, modelContextWindow: 200_000 });
+  });
+
+  test("projects an exact non-secret live command digest and no arbitrary command oracle", () => {
+    const command = "/bin/echo hra-live-tool-progress | /usr/bin/tee ./.hra-live-command-proof-00000000-0000-4000-8000-000000000001.txt";
+    const expectedDigest = createHash("sha256")
+      .update("hra:live-acceptance-command:v1\0", "utf8")
+      .update(command, "utf8")
+      .digest("hex");
+    expect(safeLiveAcceptanceCommandDigest(command)).toBe(expectedDigest);
+    expect(parseFact("item/started", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        type: "commandExecution",
+        id: "command-1",
+        command,
+        cwd: "/workspace",
+        status: "inProgress",
+      },
+    })).toMatchObject({
+      type: "itemStarted",
+      itemKind: "commandExecution",
+      liveAcceptanceCommandDigest: expectedDigest,
+    });
+    expect(parseFact("item/completed", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        type: "commandExecution",
+        id: "command-1",
+        command,
+        cwd: "/workspace",
+        status: "completed",
+      },
+    })).toMatchObject({
+      type: "itemCompleted",
+      itemKind: "commandExecution",
+      liveAcceptanceCommandDigest: expectedDigest,
+    });
+
+    const secret = "TOKEN=private /bin/sh -c 'do-sensitive-work'";
+    const arbitrary = parseFact("item/started", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        type: "commandExecution",
+        id: "command-2",
+        command: secret,
+        cwd: "/workspace",
+        status: "inProgress",
+      },
+    });
+    expect(safeLiveAcceptanceCommandDigest(secret)).toBeUndefined();
+    expect(arbitrary).not.toHaveProperty("liveAcceptanceCommandDigest");
+    expect(JSON.stringify(arbitrary)).not.toContain("private");
+    for (const lookalike of [
+      `${command} `,
+      command.replace("/bin/echo", "echo"),
+      command.replace("hra-live-tool-progress", "other"),
+      command.replace(".hra-live-command-proof-", ".other-"),
+      command.replace("00000000-0000-4000-8000-000000000001", "NOT-A-UUID"),
+    ]) expect(safeLiveAcceptanceCommandDigest(lookalike)).toBeUndefined();
   });
 });
 

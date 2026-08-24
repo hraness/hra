@@ -5,6 +5,7 @@ import type { CloudSecretCustodyPort } from "./local-control";
 import {
   addCloudCommandJournalEntry,
   addCloudProjectionRecovery,
+  advanceCloudSessionRemoteCursor,
   assertCloudDaemonJournalFutureCapacity,
   cloudProjectionRecoveryReceiptResult,
   cloudProjectionRecoveryWindowMs,
@@ -12,11 +13,14 @@ import {
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
+  CustodyCloudSessionSyncCursor,
   emptyCloudDaemonJournal,
+  emptyCloudSessionSyncCursor,
   hasUnsettledCompactProjectionRecoveryForProfile,
   isIdentityBoundCloudProjectionRecovery,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudDaemonJournal,
+  parseCloudSessionSyncCursor,
   parseCloudProjectionRecoveryEntry,
   parseCloudProjectionRecoveryTerminalReceipt,
   providerDeletionProjectionRecoveryCode,
@@ -1002,6 +1006,65 @@ describe("cloud daemon journal", () => {
     expect(JSON.parse((await custody.read("cloud-daemon-journal"))?.value ?? "null")).toEqual(
       emptyCloudDaemonJournal(),
     );
+  });
+
+  test("persists bounded session pagination cursors with exact restart CAS", async () => {
+    const custody = new MemoryCustody();
+    const writer = new CustodyCloudSessionSyncCursor(custody);
+    expect(await writer.read()).toEqual({
+      generation: null,
+      state: emptyCloudSessionSyncCursor(),
+    });
+    const first = await writer.compareAndSwap(null, advanceCloudSessionRemoteCursor({
+      ...emptyCloudSessionSyncCursor(),
+      localAfterPublicId: "session_12345678",
+    }, "opaque-remote-cursor"));
+    expect(first?.generation).toBe(0);
+    if (first === null) throw new Error("Session sync cursor CAS did not commit.");
+    expect(await writer.compareAndSwap(null, emptyCloudSessionSyncCursor())).toBeNull();
+    expect(await new CustodyCloudSessionSyncCursor(custody).read()).toEqual(first);
+    expect(parseCloudSessionSyncCursor({
+      localAfterPublicId: "session_12345678",
+      remoteContinueCursor: "opaque-remote-cursor",
+      version: 1,
+    })).toEqual(first.state);
+  });
+
+  test("carries bounded cycle authority through long advancing remote cursor sequences", () => {
+    let state = emptyCloudSessionSyncCursor();
+    for (let page = 1; page <= 10_000; page += 1) {
+      state = advanceCloudSessionRemoteCursor(state, `page-${String(page)}`);
+    }
+    expect(state).toMatchObject({
+      remoteContinueCursor: "page-10000",
+      remoteCycle: { pageCount: 10_000 },
+      version: 2,
+    });
+    expect(JSON.stringify(state).length).toBeLessThan(1_024);
+  });
+
+  test("rejects malformed or unbounded session pagination cursors", () => {
+    expect(() => parseCloudSessionSyncCursor({
+      localAfterPublicId: "short",
+      remoteContinueCursor: null,
+      version: 1,
+    })).toThrow("Cloud session sync cursor is corrupt.");
+    expect(() => parseCloudSessionSyncCursor({
+      localAfterPublicId: null,
+      remoteContinueCursor: "x".repeat(16_385),
+      version: 1,
+    })).toThrow("Cloud session sync cursor is corrupt.");
+    expect(() => parseCloudSessionSyncCursor({
+      localAfterPublicId: null,
+      remoteContinueCursor: "😀".repeat(6_000),
+      version: 1,
+    })).toThrow("Cloud session sync cursor is corrupt.");
+    expect(() => parseCloudSessionSyncCursor({
+      extra: true,
+      localAfterPublicId: null,
+      remoteContinueCursor: null,
+      version: 1,
+    })).toThrow("Cloud session sync cursor is corrupt.");
   });
 
   test("accepts the exact canonical custody byte bound with exact CAS", async () => {

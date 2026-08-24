@@ -1,5 +1,6 @@
 export type CodexFailureCode =
   | "AUTHORITY_STALE"
+  | "DEADLINE_EXPIRED"
   | "HOME_MISMATCH"
   | "INDETERMINATE_EFFECT"
   | "INVALID_INPUT"

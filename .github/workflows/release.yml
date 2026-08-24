@@ -1,13 +1,21 @@
 name: Release
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('HRA publication lease {0}', inputs.publication_lease) || format('Release {0}', github.ref_name) }}
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      publication_lease:
+        description: Unique local publication lease holder
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: hra-release-publication-v0.1.0
   cancel-in-progress: false
+  queue: max
 
 permissions:
   actions: read
@@ -16,6 +24,7 @@ permissions:
 jobs:
   verify:
     name: Verify release
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -23,6 +32,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -45,13 +55,27 @@ jobs:
         run: printf 'HRA_RELEASE_VERSION=%s\n' "${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
       - name: Verify exact release head and ordering
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch --force origin main --tags
           tagged_commit="$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")"
           checked_out_commit="$(git rev-parse 'HEAD^{commit}')"
           main_commit="$(git rev-parse 'origin/main^{commit}')"
+          remote_tagged_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
           test "$tagged_commit" = "$checked_out_commit"
-          test "$tagged_commit" = "$main_commit"
+          test "$tagged_commit" = "$GITHUB_SHA"
+          test "$remote_tagged_commit" = "$tagged_commit"
+          git merge-base --is-ancestor "$tagged_commit" "$main_commit"
+          comparison="$(gh api "repos/$GH_REPO/compare/$tagged_commit...main")"
+          printf '%s' "$comparison" | jq -e --arg commit "$tagged_commit" \
+            '(.status == "ahead" or .status == "identical") and .base_commit.sha == $commit and .merge_base_commit.sha == $commit' \
+            > /dev/null
+          ruleset="$(gh api "repos/$GH_REPO/rulesets/21213369")"
+          printf '%s' "$ruleset" | jq -e \
+            '.id == 21213369 and .name == "Immutable version tags" and .target == "tag" and .source_type == "Repository" and .source == "hraness/hra" and .enforcement == "active" and .conditions.ref_name.exclude == [] and .conditions.ref_name.include == ["refs/tags/v*"] and ([.rules[].type] | sort) == ["deletion", "update"] and (.rules | length) == 2' \
+            > /dev/null
           newest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)"
           test "$newest" = "$GITHUB_REF_NAME"
 
@@ -74,7 +98,7 @@ jobs:
       - name: Pack the source artifact
         run: |
           mkdir release
-          bun pm pack --destination release
+          bun pm pack --ignore-scripts --destination release
           mv "release/hra-${GITHUB_REF_NAME#v}.tgz" "release/hra-${GITHUB_REF_NAME}.tgz"
 
       - name: Accept the exact packed installation
@@ -151,7 +175,7 @@ jobs:
       - name: Preserve verified release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hra-release-${{ github.ref_name }}
+          name: hra-release-${{ github.ref_name }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: |
             release/hra-${{ github.ref_name }}.tgz
             release/hra-${{ github.ref_name }}.artifact.spdx.json
@@ -164,6 +188,7 @@ jobs:
 
   stage:
     name: Stage verified release draft
+    if: ${{ github.event_name == 'push' }}
     needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -173,7 +198,7 @@ jobs:
       - name: Download verified release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: hra-release-${{ github.ref_name }}
+          name: hra-release-${{ github.ref_name }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: release
 
       - name: Create or resume the accepted release draft
@@ -185,10 +210,16 @@ jobs:
           grep -Eq '^[0-9a-f]{40}$' release/RELEASE_COMMIT
           accepted_commit="$(tr -d '\n' < release/RELEASE_COMMIT)"
           tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
-          main_commit="$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')"
           test "$accepted_commit" = "$GITHUB_SHA"
           test "$tag_commit" = "$accepted_commit"
-          test "$main_commit" = "$accepted_commit"
+          comparison="$(gh api "repos/$GH_REPO/compare/$accepted_commit...main")"
+          printf '%s' "$comparison" | jq -e --arg commit "$accepted_commit" \
+            '(.status == "ahead" or .status == "identical") and .base_commit.sha == $commit and .merge_base_commit.sha == $commit' \
+            > /dev/null
+          ruleset="$(gh api "repos/$GH_REPO/rulesets/21213369")"
+          printf '%s' "$ruleset" | jq -e \
+            '.id == 21213369 and .name == "Immutable version tags" and .target == "tag" and .source_type == "Repository" and .source == "hraness/hra" and .enforcement == "active" and .conditions.ref_name.exclude == [] and .conditions.ref_name.include == ["refs/tags/v*"] and ([.rules[].type] | sort) == ["deletion", "update"] and (.rules | length) == 2' \
+            > /dev/null
           marker_status="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             --connect-timeout 10 --max-time 30 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 60 \
             --header 'Cache-Control: no-cache, no-store, max-age=0' --header 'Pragma: no-cache' \
@@ -257,10 +288,16 @@ jobs:
           cd ..
           accepted_commit="$(tr -d '\n' < release/RELEASE_COMMIT)"
           tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
-          main_commit="$(gh api "repos/$GH_REPO/git/ref/heads/main" --jq '.object.sha')"
           test "$accepted_commit" = "$GITHUB_SHA"
           test "$tag_commit" = "$accepted_commit"
-          test "$main_commit" = "$accepted_commit"
+          comparison="$(gh api "repos/$GH_REPO/compare/$accepted_commit...main")"
+          printf '%s' "$comparison" | jq -e --arg commit "$accepted_commit" \
+            '(.status == "ahead" or .status == "identical") and .base_commit.sha == $commit and .merge_base_commit.sha == $commit' \
+            > /dev/null
+          ruleset="$(gh api "repos/$GH_REPO/rulesets/21213369")"
+          printf '%s' "$ruleset" | jq -e \
+            '.id == 21213369 and .name == "Immutable version tags" and .target == "tag" and .source_type == "Repository" and .source == "hraness/hra" and .enforcement == "active" and .conditions.ref_name.exclude == [] and .conditions.ref_name.include == ["refs/tags/v*"] and ([.rules[].type] | sort) == ["deletion", "update"] and (.rules | length) == 2' \
+            > /dev/null
           marker_status="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
             --connect-timeout 10 --max-time 30 --retry 2 --retry-all-errors --retry-delay 1 --retry-max-time 60 \
             --header 'Cache-Control: no-cache, no-store, max-age=0' --header 'Pragma: no-cache' \
@@ -271,3 +308,85 @@ jobs:
           jq -e --arg commit "$accepted_commit" \
             'type == "object" and .schemaVersion == 2 and .generation == 1 and .product == "HRA" and .repository.id == 1343008607 and .repository.path == "hraness/hra" and .version == "0.1.0" and .source.commit == $commit' \
             canonical-marker-publish.json > /dev/null
+
+  publication_lease:
+    name: Hold local publication lease
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Hold the exact release mutation lease until publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PUBLICATION_LEASE: ${{ inputs.publication_lease }}
+        run: |
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF_NAME" = v0.1.0
+          test "$GITHUB_SHA" != ""
+          printf '%s' "$PUBLICATION_LEASE" | grep -Eq '^[0-9a-f]{32}$'
+          while true; do
+            if ! release_rows="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.id, .draft, .immutable] | @tsv")"; then
+              sleep 5
+              continue
+            fi
+            if test "$(printf '%s\n' "$release_rows" | sed '/^$/d' | wc -l | tr -d ' ')" != 1; then
+              sleep 5
+              continue
+            fi
+            IFS=$'\t' read -r release_id draft immutable <<< "$release_rows"
+            if ! printf '%s' "$release_id" | grep -Eq '^[1-9][0-9]*$'; then
+              sleep 5
+              continue
+            fi
+            case "$draft:$immutable" in
+              true:false) sleep 5 ;;
+              false:true) break ;;
+              *) sleep 5 ;;
+            esac
+          done
+
+      - name: Check out the exact published source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Bun for public acceptance
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Accept the exact immutable public URL
+        env:
+          BUN_INSTALL: ${{ runner.temp }}/hra-public-global
+          HOME: ${{ runner.temp }}/hra-public-home
+          XDG_CACHE_HOME: ${{ runner.temp }}/hra-public-xdg/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/hra-public-xdg/config
+          XDG_DATA_HOME: ${{ runner.temp }}/hra-public-xdg/data
+          XDG_STATE_HOME: ${{ runner.temp }}/hra-public-xdg/state
+        run: |
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
+          bun add --global --ignore-scripts "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.tgz"
+          bun ./scripts/check-installed-package.ts "$BUN_INSTALL/install/global/node_modules/hra"
+          test "$("$BUN_INSTALL/bin/hra" --version)" = "hra ${GITHUB_REF_NAME#v}"
+          "$BUN_INSTALL/bin/hra" doctor --offline --json | bun -e 'const value = JSON.parse(await Bun.stdin.text()); if (value?.ok !== true || value?.data?.offline !== true) throw new Error("offline doctor failed");'
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 60 --retry 2 --retry-all-errors --retry-delay 1 \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json" \
+            --output "${RUNNER_TEMP}/public-runtime.spdx.json"
+          PUBLIC_NODE_MODULES="$BUN_INSTALL/install/global/node_modules" \
+            PUBLIC_RUNTIME_SBOM="${RUNNER_TEMP}/public-runtime.spdx.json" \
+            bun -e 'import { readdir } from "node:fs/promises"; import { join } from "node:path";
+            const root = process.env.PUBLIC_NODE_MODULES; const sbomPath = process.env.PUBLIC_RUNTIME_SBOM;
+            if (!root || !sbomPath) throw new Error("public runtime paths are missing");
+            const installed = new Set();
+            const addPackage = async (directory) => { const manifest = await Bun.file(join(directory, "package.json")).json(); if (typeof manifest?.name !== "string" || typeof manifest?.version !== "string") throw new Error("installed package identity is missing"); installed.add(JSON.stringify([manifest.name, manifest.version])); try { await scanModules(join(directory, "node_modules")); } catch (error) { if (error?.code !== "ENOENT") throw error; } };
+            const scanModules = async (directory) => { for (const entry of await readdir(directory, { withFileTypes: true })) { if (!entry.isDirectory() || entry.name === ".bin") continue; const child = join(directory, entry.name); if (entry.name.startsWith("@")) { for (const scoped of await readdir(child, { withFileTypes: true })) if (scoped.isDirectory()) await addPackage(join(child, scoped.name)); } else await addPackage(child); } };
+            await scanModules(root);
+            const value = await Bun.file(sbomPath).json(); if (!Array.isArray(value?.packages)) throw new Error("public runtime SPDX packages are missing");
+            const recorded = new Set(value.packages.map((entry) => JSON.stringify([entry?.name, entry?.versionInfo])));
+            const normalize = (set) => JSON.stringify([...set].sort()); if (normalize(recorded) !== normalize(installed)) throw new Error("public runtime SPDX does not match the installed package inventory");'

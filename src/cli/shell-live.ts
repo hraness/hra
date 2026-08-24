@@ -9,9 +9,18 @@ import {
   type SessionEventPage,
 } from "../domain/session-events";
 import { sessionIdSchema } from "../domain/values";
+import { StreamingSensitiveRedactor } from "../streaming-sensitive-text";
 import { terminalSafe } from "./render";
 
+export { StreamingSensitiveRedactor };
+
+const liveRedactorStreamLimit = 32;
+const liveTrustedItemLimit = 128;
+
 const livePageLimit = 100;
+const liveInteractionPageLimit = 100;
+const liveInteractionPageCeiling = 128;
+const liveInteractionItemCeiling = 10_000;
 const liveWaitMs = 1_000;
 const liveEmptyPageDelayMs = 25;
 const liveCoalesceMs = 35;
@@ -30,7 +39,7 @@ const interactionKindSchema = z.enum([
 const pendingInteractionSchema = z.object({
   id: z.string().uuid(),
   kind: interactionKindSchema,
-  state: z.literal("pending"),
+  state: z.enum(["pending", "response_prepared", "response_written"]),
   revision: z.number().int().positive(),
   blocking: z.boolean(),
   display: z.object({
@@ -38,21 +47,62 @@ const pendingInteractionSchema = z.object({
   }).passthrough(),
 }).passthrough();
 
+const providerObservationSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("live"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    connectionId: z.string().uuid(),
+    mode: z.enum(["connected", "resubscribed"]),
+  }).strict(),
+  z.object({
+    state: z.literal("unavailable"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    code: z.enum(["account_signed_out", "resume_unavailable"]),
+  }).strict(),
+  z.object({
+    state: z.literal("recovery_required"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    code: z.enum(["session_quarantined", "thread_mismatch"]),
+  }).strict(),
+  z.object({
+    state: z.literal("not_applicable"),
+    profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    reason: z.enum(["terminal", "unbound"]),
+  }).strict(),
+]);
+
 const shellLiveStatusSchema = z.object({
   session: z.object({ id: sessionIdSchema }).passthrough(),
+  providerObservation: providerObservationSchema,
   eventStream: z.object({
     cursor: z.string().min(1).max(2_048),
   }).passthrough(),
   pendingInteractions: z.array(pendingInteractionSchema).max(100),
+  pendingInteractionsNextCursor: z.string().min(1).max(2_048).nullable(),
 }).passthrough();
+
+const shellLiveInteractionPageSchema = z.object({
+  sessionId: sessionIdSchema,
+  interactions: z.array(pendingInteractionSchema).max(liveInteractionPageLimit),
+  nextCursor: z.string().min(1).max(2_048).nullable(),
+}).strict();
 
 type PendingInteraction = z.infer<typeof pendingInteractionSchema>;
 
 type PendingDelta = Readonly<{
   itemId: string;
   kind: "assistant" | "reasoning";
+  summaryPart: number | null;
   text: string;
   truncated: boolean;
+  turnId: string;
+}>;
+
+type ActiveDeltaStream = Readonly<{
+  itemId: string;
+  kind: PendingDelta["kind"];
+  redactor: StreamingSensitiveRedactor;
+  summaryPart: number | null;
   turnId: string;
 }>;
 
@@ -61,7 +111,10 @@ type RaceResult<T> =
   | Readonly<{ error: unknown; kind: "error" }>
   | Readonly<{ kind: "value"; value: T }>;
 
-export type ShellLiveDaemonCaller = (command: LocalCommand) => Promise<CommandResponse>;
+export type ShellLiveDaemonCaller = (
+  command: LocalCommand,
+  signal?: AbortSignal,
+) => Promise<CommandResponse>;
 
 export type ShellLiveObserverInput = Readonly<{
   callDaemon: ShellLiveDaemonCaller;
@@ -78,35 +131,40 @@ export type ShellLiveSelection = Readonly<{
   statusData: unknown;
 }>;
 
-const secretPatterns: readonly RegExp[] = [
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/gu,
-  /\b(?:sk|re)_[A-Za-z0-9_-]{8,}/gu,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/giu,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/gu,
-  /\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|authorization)\s*[:=]\s*[A-Za-z0-9._~+/=-]{4,}/giu,
-];
-
-const boundedCharacters = (value: string, maximum: number): string => {
+const boundedCharacters = (
+  value: string,
+  maximum: number,
+): Readonly<{ text: string; truncated: boolean }> => {
   const scalars = Array.from(value);
-  if (scalars.length <= maximum) return value;
-  return `${scalars.slice(0, Math.max(0, maximum - 14)).join("")} [truncated]`;
+  if (scalars.length <= maximum) return { text: value, truncated: false };
+  return {
+    text: `${scalars.slice(0, Math.max(0, maximum - 14)).join("")} [truncated]`,
+    truncated: true,
+  };
 };
+
+const sanitizeNonSecretLiveText = (value: string, preserveLineFeeds: boolean): string =>
+  terminalSafe(redactAbsolutePaths(value), preserveLineFeeds);
+
+const sanitizeCompleteLiveText = (value: string, preserveLineFeeds: boolean): string => {
+  const redactor = new StreamingSensitiveRedactor();
+  return sanitizeNonSecretLiveText(redactor.push(value, true), preserveLineFeeds);
+};
+
+const deltaItemKey = (turnId: string, itemId: string): string =>
+  JSON.stringify([turnId, itemId]);
 
 const safeLiveText = (
   value: string,
   maximum = liveDiagnosticMaximumCharacters,
   preserveLineFeeds = false,
 ): string => {
-  let redacted = boundedCharacters(value, maximum);
-  for (const pattern of secretPatterns) {
-    redacted = redacted.replace(pattern, "[protected]");
-  }
-  return terminalSafe(redactAbsolutePaths(redacted), preserveLineFeeds);
+  const sanitized = sanitizeCompleteLiveText(value, preserveLineFeeds);
+  return boundedCharacters(sanitized, maximum).text;
 };
 
 const indentedLiveText = (value: string): string =>
-  safeLiveText(value, liveDeltaMaximumCharacters, true)
-    .split("\n")
+  value.split("\n")
     .map((line) => `  ${line}`)
     .join("\n");
 
@@ -116,16 +174,30 @@ const interactionLabel = (kind: PendingInteraction["kind"]): string => {
     case "file_change_approval": return "file change approval";
     case "permission_approval": return "permission approval";
     case "user_input": return "user input";
-    case "mcp_elicitation": return "plugin input";
+    case "mcp_elicitation": return "MCP form input";
   }
 };
 
-const renderPendingInteraction = (interaction: PendingInteraction): string => [
-  `Interaction required: ${interactionLabel(interaction.kind)} ${interaction.id}`,
-  `  revision ${String(interaction.revision)}${interaction.blocking ? ", blocking" : ""}`,
-  `  ${safeLiveText(interaction.display.summary)}`,
-  "  Use /interactions to inspect it.",
-].join("\n");
+const renderPendingInteraction = (interaction: PendingInteraction): string => {
+  const detail = [
+    `  revision ${String(interaction.revision)}${interaction.blocking ? ", blocking" : ""}`,
+    `  ${safeLiveText(interaction.display.summary)}`,
+  ];
+  if (interaction.state === "pending") {
+    return [
+      `Interaction required: ${interactionLabel(interaction.kind)} ${interaction.id}`,
+      ...detail,
+      "  Use /interactions to inspect it.",
+    ].join("\n");
+  }
+  return [
+    `Interaction in progress: ${interactionLabel(interaction.kind)} ${interaction.id}`,
+    ...detail,
+    interaction.state === "response_prepared"
+      ? "  A response is prepared. Do not resubmit it."
+      : "  The response was sent and is awaiting provider acknowledgement. Do not resubmit it.",
+  ].join("\n");
+};
 
 const interactionFromEvent = (
   body: Extract<SessionEventBody, { type: "interaction_requested" }>,
@@ -137,6 +209,14 @@ const interactionFromEvent = (
   blocking: body.blocking,
   display: { summary: body.summary },
 });
+
+const liveToolTarget = (
+  server: string | undefined,
+  tool: string | undefined,
+  fallback: string,
+): string => server === undefined && tool === undefined
+  ? ""
+  : ` ${safeLiveText(server ?? "local")}/${safeLiveText(tool ?? fallback)}`;
 
 const renderNonDeltaEvent = (event: SessionEvent): string | null => {
   const body = event.body;
@@ -150,9 +230,9 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "session_status": return `Session: ${safeLiveText(body.status)}.`;
     case "turn_started": return "Turn started.";
     case "turn_completed": return `Turn ${safeLiveText(body.status)}${body.errorCode === undefined ? "." : ` (${safeLiveText(body.errorCode)}).`}`;
-    case "item_started": return `Item started: ${safeLiveText(body.itemKind)}.`;
-    case "item_completed": return `Item completed: ${safeLiveText(body.itemKind)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
-    case "tool_progress": return `Tool: ${safeLiveText(body.toolKind)}${body.status === undefined ? "." : `, ${safeLiveText(body.status)}.`}`;
+    case "item_started": return `Item started: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}.`;
+    case "item_completed": return `Item completed: ${safeLiveText(body.itemKind)}${liveToolTarget(body.server, body.tool, body.itemKind)}${body.status === undefined ? "." : ` (${safeLiveText(body.status)}).`}`;
+    case "tool_progress": return `Tool: ${safeLiveText(body.toolKind)}${liveToolTarget(body.server, body.tool, body.toolKind)}${body.status === undefined ? "." : `, ${safeLiveText(body.status)}.`}`;
     case "file_change": return `Files: ${safeLiveText(body.status)}, ${String(body.paths.length)} visible change${body.paths.length === 1 ? "" : "s"}${body.omittedPaths === 0 ? "." : `, ${String(body.omittedPaths)} omitted.`}`;
     case "plan_updated": return `Plan updated: ${String(body.steps.length)} step${body.steps.length === 1 ? "" : "s"}.`;
     case "diff_updated": return `Diff updated: ${String(body.changedFiles)} file${body.changedFiles === 1 ? "" : "s"}.`;
@@ -200,10 +280,14 @@ const raceWithAbort = async <T>(promise: Promise<T>, signal: AbortSignal): Promi
 class ShellLivePresenter {
   readonly #write: (value: string) => void;
   readonly #coalesceMs: number;
+  readonly #deltaStreams = new Map<string, ActiveDeltaStream>();
+  readonly #trustedDeltaItems = new Map<string, Readonly<{ itemId: string; turnId: string }>>();
+  #deltaRedactionQuarantined = false;
+  #unknownDeltaNoticeWritten = false;
   #pendingDelta: PendingDelta | null = null;
   #flushTimer: ReturnType<typeof setTimeout> | null = null;
-  #lastStatusSignature: string | null = null;
-  readonly #seenInteractionStates = new Set<string>();
+  #lastRenderedEventIdentity: string | null = null;
+  readonly #seenInteractionRevisions = new Map<string, number>();
 
   constructor(write: (value: string) => void, coalesceMs: number) {
     this.#write = write;
@@ -216,75 +300,113 @@ class ShellLivePresenter {
 
   acceptPage(page: SessionEventPage): void {
     if (page.gap !== null) {
-      this.#flushDelta();
+      this.#discardDeltaStreams(
+        "Live delta tail omitted at the event gap because its redaction boundary was incomplete.",
+      );
+      this.#trustedDeltaItems.clear();
+      this.#deltaRedactionQuarantined = false;
+      this.#unknownDeltaNoticeWritten = false;
       this.#emit(`Live event gap: ${safeLiveText(page.gap.reason)}. Updates resume at the retained boundary.`);
     }
     for (const event of page.events) this.#acceptEvent(event);
   }
 
   close(): void {
-    this.#flushDelta();
+    this.#discardDeltaStreams(
+      "Trailing live delta text omitted because observation ended before its redaction boundary completed.",
+    );
+    this.#trustedDeltaItems.clear();
   }
 
   #acceptEvent(event: SessionEvent): void {
     const body = event.body;
+    if (body.type === "item_started") {
+      this.#observeItemStart(body.turnId, body.itemId);
+    }
     if (body.type === "assistant_delta" || body.type === "reasoning_summary_delta") {
+      if (this.#deltaRedactionQuarantined) return;
+      if (!this.#trustedDeltaItems.has(deltaItemKey(body.turnId, body.itemId))) {
+        if (!this.#unknownDeltaNoticeWritten) {
+          this.#unknownDeltaNoticeWritten = true;
+          this.#emit(
+            "Live delta text omitted until HRA observes a trustworthy item-start boundary.",
+          );
+        }
+        return;
+      }
       const kind = body.type === "assistant_delta" ? "assistant" : "reasoning";
-      const pending = this.#pendingDelta;
-      if (
-        pending !== null
-        && pending.kind === kind
-        && pending.itemId === body.itemId
-        && pending.turnId === body.turnId
-      ) {
-        const combined = boundedCharacters(pending.text + body.text, liveDeltaMaximumCharacters);
-        this.#pendingDelta = {
-          ...pending,
-          text: combined,
-          truncated: pending.truncated || combined.length < pending.text.length + body.text.length,
-        };
-      } else {
-        this.#flushDelta();
-        this.#pendingDelta = {
+      const summaryPart = body.type === "reasoning_summary_delta"
+        ? body.summaryPart ?? null
+        : null;
+      const key = JSON.stringify([body.turnId, body.itemId, kind, summaryPart]);
+      let stream = this.#deltaStreams.get(key);
+      if (stream === undefined) {
+        if (this.#deltaStreams.size >= liveRedactorStreamLimit) {
+          this.#quarantineDeltaRedaction();
+          return;
+        }
+        stream = {
           itemId: body.itemId,
           kind,
-          text: boundedCharacters(body.text, liveDeltaMaximumCharacters),
-          truncated: body.text.length > liveDeltaMaximumCharacters,
+          redactor: new StreamingSensitiveRedactor(),
+          summaryPart,
           turnId: body.turnId,
         };
+        this.#deltaStreams.set(key, stream);
       }
-      this.#scheduleDeltaFlush();
+      const sanitized = sanitizeNonSecretLiveText(stream.redactor.push(body.text), true);
+      this.#appendDelta(stream, sanitized);
       return;
     }
 
-    this.#flushDelta();
+    if (body.type === "gap") {
+      this.#discardDeltaStreams(
+        "Live delta tail omitted at the event gap because its redaction boundary was incomplete.",
+      );
+      this.#trustedDeltaItems.clear();
+      this.#deltaRedactionQuarantined = false;
+      this.#unknownDeltaNoticeWritten = false;
+    } else if (body.type === "item_completed") {
+      this.#finalizeDeltaStreams((stream) =>
+        stream.itemId === body.itemId && stream.turnId === body.turnId);
+      this.#trustedDeltaItems.delete(deltaItemKey(body.turnId, body.itemId));
+    } else if (body.type === "turn_completed") {
+      this.#finalizeDeltaStreams((stream) => stream.turnId === body.turnId);
+      for (const [key, item] of this.#trustedDeltaItems) {
+        if (item.turnId === body.turnId) this.#trustedDeltaItems.delete(key);
+      }
+    } else {
+      this.#flushDelta();
+    }
     if (body.type === "interaction_requested") {
       this.#showInteraction(interactionFromEvent(body));
       return;
     }
     if (body.type === "interaction_state") {
-      const signature = `${body.interactionId}:${String(body.revision)}:${body.state}`;
-      if (this.#seenInteractionStates.has(signature)) return;
-      this.#rememberInteractionState(signature);
+      if (!this.#observeInteractionRevision(body.interactionId, body.revision)) return;
     }
     const rendered = renderNonDeltaEvent(event);
     if (rendered === null) return;
-    const signature = `${body.type}:${rendered}`;
-    if (signature === this.#lastStatusSignature) return;
-    this.#lastStatusSignature = signature;
+    const identity = `${event.streamEpoch}:${String(event.sequence)}`;
+    if (identity === this.#lastRenderedEventIdentity) return;
+    this.#lastRenderedEventIdentity = identity;
     this.#emit(rendered);
   }
 
   #showInteraction(interaction: PendingInteraction): void {
-    const signature = `${interaction.id}:${String(interaction.revision)}:pending`;
-    if (this.#seenInteractionStates.has(signature)) return;
-    this.#rememberInteractionState(signature);
+    if (!this.#observeInteractionRevision(interaction.id, interaction.revision)) return;
     this.#emit(renderPendingInteraction(interaction));
   }
 
-  #rememberInteractionState(signature: string): void {
-    if (this.#seenInteractionStates.size >= 256) this.#seenInteractionStates.clear();
-    this.#seenInteractionStates.add(signature);
+  #observeInteractionRevision(id: string, revision: number): boolean {
+    const observed = this.#seenInteractionRevisions.get(id);
+    if (observed !== undefined && revision <= observed) return false;
+    if (
+      observed === undefined
+      && this.#seenInteractionRevisions.size >= liveInteractionItemCeiling
+    ) this.#seenInteractionRevisions.clear();
+    this.#seenInteractionRevisions.set(id, revision);
+    return true;
   }
 
   #scheduleDeltaFlush(): void {
@@ -294,6 +416,81 @@ class ShellLivePresenter {
       this.#flushDelta();
     }, this.#coalesceMs);
     this.#flushTimer.unref();
+  }
+
+  #appendDelta(stream: ActiveDeltaStream, value: string): void {
+    if (value.length === 0) return;
+    const pending = this.#pendingDelta;
+    if (pending !== null) {
+      if (
+        pending.kind !== stream.kind
+        || pending.itemId !== stream.itemId
+        || pending.summaryPart !== stream.summaryPart
+        || pending.turnId !== stream.turnId
+      ) {
+        this.#flushDelta();
+        this.#appendDelta(stream, value);
+        return;
+      }
+      if (!pending.truncated) {
+        const combined = boundedCharacters(pending.text + value, liveDeltaMaximumCharacters);
+        this.#pendingDelta = { ...pending, ...combined };
+      }
+    } else {
+      const bounded = boundedCharacters(value, liveDeltaMaximumCharacters);
+      this.#pendingDelta = {
+        itemId: stream.itemId,
+        kind: stream.kind,
+        summaryPart: stream.summaryPart,
+        ...bounded,
+        turnId: stream.turnId,
+      };
+    }
+    this.#scheduleDeltaFlush();
+  }
+
+  #finalizeDeltaStreams(predicate: (stream: ActiveDeltaStream) => boolean): void {
+    for (const [key, stream] of this.#deltaStreams) {
+      if (!predicate(stream)) continue;
+      this.#deltaStreams.delete(key);
+      const tail = sanitizeNonSecretLiveText(stream.redactor.push("", true), true);
+      if (tail.trim().length > 0) this.#appendDelta(stream, tail);
+    }
+    this.#flushDelta();
+  }
+
+  #quarantineDeltaRedaction(): void {
+    this.#flushDelta();
+    this.#deltaStreams.clear();
+    this.#trustedDeltaItems.clear();
+    this.#deltaRedactionQuarantined = true;
+    this.#emit(
+      "Live delta text paused because the bounded redaction state was exhausted. HRA will resume after a new item-start boundary or session reselection.",
+    );
+  }
+
+  #observeItemStart(turnId: string, itemId: string): void {
+    let discardedPriorState = false;
+    for (const [key, stream] of this.#deltaStreams) {
+      if (stream.turnId !== turnId || stream.itemId !== itemId) continue;
+      this.#deltaStreams.delete(key);
+      discardedPriorState = true;
+    }
+    if (discardedPriorState) {
+      this.#flushDelta();
+      this.#emit(
+        "Live delta tail omitted because the provider repeated an item-start boundary.",
+      );
+    }
+    if (this.#trustedDeltaItems.size >= liveTrustedItemLimit) this.#quarantineDeltaRedaction();
+    this.#deltaRedactionQuarantined = false;
+    this.#trustedDeltaItems.set(deltaItemKey(turnId, itemId), { itemId, turnId });
+  }
+
+  #discardDeltaStreams(notice: string): void {
+    this.#flushDelta();
+    if (this.#deltaStreams.size > 0) this.#emit(notice);
+    this.#deltaStreams.clear();
   }
 
   #flushDelta(): void {
@@ -338,19 +535,37 @@ export class ShellLiveObserver {
     await this.stop();
     const parsed = shellLiveStatusSchema.safeParse(selection.statusData);
     if (!parsed.success || parsed.data.session.id !== selection.session) {
-      this.#write("\nLive updates unavailable: session status did not include a matching resumable event cursor.\n");
+      this.#safeWrite("\nLive updates unavailable: session status did not include a matching resumable event cursor.\n");
       return;
     }
     const controller = new AbortController();
-    const presenter = new ShellLivePresenter(this.#write, this.#coalesceMs);
+    let displayFailed = false;
+    const write = (value: string): void => {
+      if (displayFailed) return;
+      if (!this.#safeWrite(value)) {
+        displayFailed = true;
+        controller.abort(new Error("Shell live display is unavailable."));
+      }
+    };
+    const presenter = new ShellLivePresenter(write, this.#coalesceMs);
+    const initialInteractionIds = new Set<string>();
+    for (const interaction of parsed.data.pendingInteractions) {
+      if (initialInteractionIds.has(interaction.id)) {
+        this.#safeWrite("\nLive updates unavailable: session status repeated a pending interaction.\n");
+        return;
+      }
+      initialInteractionIds.add(interaction.id);
+    }
     presenter.showInitialInteractions(parsed.data.pendingInteractions);
     this.#controller = controller;
     this.#task = this.#observe({
       controller,
       cursor: parsed.data.eventStream.cursor,
+      initialInteractionIds,
+      interactionCursor: parsed.data.pendingInteractionsNextCursor,
       presenter,
-      session: selection.session,
-    });
+      session: parsed.data.session.id,
+    }).catch(() => undefined);
   }
 
   async stop(): Promise<void> {
@@ -359,12 +574,29 @@ export class ShellLiveObserver {
     this.#controller = null;
     this.#task = null;
     controller?.abort(new Error("Shell live observation stopped."));
-    if (task !== null) await task;
+    if (task !== null) {
+      try {
+        await task;
+      } catch {
+        // Live display is advisory and must never poison the foreground shell.
+      }
+    }
+  }
+
+  #safeWrite(value: string): boolean {
+    try {
+      this.#write(value);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async #observe(input: Readonly<{
     controller: AbortController;
     cursor: string;
+    initialInteractionIds: ReadonlySet<string>;
+    interactionCursor: string | null;
     presenter: ShellLivePresenter;
     session: string;
   }>): Promise<void> {
@@ -375,6 +607,14 @@ export class ShellLiveObserver {
     let lastEvent: Readonly<{ sequence: number; streamEpoch: string }> | null = null;
     try {
       await waitFor(this.#startDelayMs, signal);
+      const interactionsDrained = await this.#drainPendingInteractions({
+        cursor: input.interactionCursor,
+        initialInteractionIds: input.initialInteractionIds,
+        presenter: input.presenter,
+        session: input.session,
+        signal,
+      });
+      if (!interactionsDrained) return;
       while (!signal.aborted) {
         const command: Extract<LocalCommand, { kind: "session.events" }> = {
           kind: "session.events",
@@ -384,7 +624,7 @@ export class ShellLiveObserver {
           waitMs: this.#waitMs,
         };
         const raced = await raceWithAbort(
-          Promise.resolve().then(async () => await this.#callDaemon(command)),
+          Promise.resolve().then(async () => await this.#callDaemon(command, signal)),
           signal,
         );
         if (raced.kind === "aborted") break;
@@ -439,5 +679,62 @@ export class ShellLiveObserver {
     } finally {
       input.presenter.close();
     }
+  }
+
+  async #drainPendingInteractions(input: Readonly<{
+    cursor: string | null;
+    initialInteractionIds: ReadonlySet<string>;
+    presenter: ShellLivePresenter;
+    session: string;
+    signal: AbortSignal;
+  }>): Promise<boolean> {
+    let cursor = input.cursor;
+    if (cursor === null) return true;
+    const seen = new Set(input.initialInteractionIds);
+    const seenCursors = new Set([cursor]);
+    let pageCount = 0;
+    let itemCount = seen.size;
+    const fail = (): false => {
+      this.#write(
+        "\nLive updates paused because HRA could not safely enumerate every pending interaction. Reselect the session to resume.\n",
+      );
+      return false;
+    };
+    while (cursor !== null && !input.signal.aborted) {
+      if (pageCount >= liveInteractionPageCeiling || itemCount >= liveInteractionItemCeiling) {
+        return fail();
+      }
+      const command: Extract<LocalCommand, { kind: "session.interactions" }> = {
+        kind: "session.interactions",
+        session: input.session,
+        pending: true,
+        limit: liveInteractionPageLimit,
+        cursor,
+      };
+      const raced = await raceWithAbort(
+        Promise.resolve().then(async () => await this.#callDaemon(command, input.signal)),
+        input.signal,
+      );
+      if (raced.kind === "aborted") return false;
+      if (raced.kind === "error" || !raced.value.ok) return fail();
+      const parsed = shellLiveInteractionPageSchema.safeParse(raced.value.data);
+      if (
+        !parsed.success
+        || parsed.data.sessionId !== input.session
+        || (parsed.data.nextCursor !== null && seenCursors.has(parsed.data.nextCursor))
+        || (parsed.data.interactions.length === 0 && parsed.data.nextCursor !== null)
+      ) return fail();
+      for (const interaction of parsed.data.interactions) {
+        if (seen.has(interaction.id)) return fail();
+        seen.add(interaction.id);
+      }
+      itemCount += parsed.data.interactions.length;
+      if (itemCount > liveInteractionItemCeiling) return fail();
+      input.presenter.showInitialInteractions(parsed.data.interactions);
+      pageCount += 1;
+      cursor = parsed.data.nextCursor;
+      if (cursor !== null) seenCursors.add(cursor);
+    }
+    return !input.signal.aborted;
   }
 }

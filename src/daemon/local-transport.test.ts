@@ -181,6 +181,48 @@ describe("local daemon transport", () => {
     expect(acknowledged).toBe(true);
   });
 
+  test("runs response callbacks once after a disconnected response becomes impossible", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let releaseHandler!: () => void;
+    let signalHandlerEntered!: () => void;
+    let signalCallbackRan!: () => void;
+    const handlerGate = new Promise<void>((resolve) => { releaseHandler = resolve; });
+    const handlerEntered = new Promise<void>((resolve) => { signalHandlerEntered = resolve; });
+    const callbackRan = new Promise<void>((resolve) => { signalCallbackRan = resolve; });
+    let callbackCalls = 0;
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: async (_command, context) => {
+        context.afterResponse(() => {
+          callbackCalls += 1;
+          signalCallbackRan();
+        });
+        signalHandlerEntered();
+        await handlerGate;
+        return { stopping: true };
+      },
+    });
+    servers.push(server);
+    const controller = new AbortController();
+    const call = callLocalDaemon({
+      paths,
+      command: { kind: "daemon.stop" },
+      deadlineMs: 5_000,
+      signal: controller.signal,
+    });
+    await handlerEntered;
+    controller.abort(new Error("disconnect before the response"));
+    await expect(call).rejects.toBeInstanceOf(LocalDaemonIndeterminateError);
+    expect(callbackCalls).toBe(0);
+
+    releaseHandler();
+    await callbackRan;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(callbackCalls).toBe(1);
+  });
+
   test("classifies an absent endpoint as unavailable before dispatch", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });

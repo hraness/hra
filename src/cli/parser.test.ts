@@ -10,6 +10,43 @@ import {
 } from "./parser";
 
 describe("CLI parser", () => {
+  test("keeps the protected login handoff path at the CLI boundary", () => {
+    const idempotencyKey = "00000000-0000-4000-8000-000000000101";
+    expect(parseCli([
+      "account",
+      "login",
+      "personal account",
+      "--device-code",
+      "--handoff-file",
+      "/private/login/handoff.json",
+      "--idempotency-key",
+      idempotencyKey,
+      "--json",
+    ])).toEqual({
+      command: {
+        account: "personal account",
+        deviceCode: true,
+        idempotencyKey,
+        kind: "account.login",
+      },
+      handoffFile: "/private/login/handoff.json",
+      json: true,
+      kind: "account.login-handoff",
+      replayCommand: `hra account login 'personal account' --device-code --idempotency-key ${idempotencyKey} --handoff-file /private/login/handoff.json --json`,
+    });
+    expect(() => parseCli([
+      "account",
+      "login",
+      "personal",
+      "--handoff-file",
+      "relative.json",
+    ])).toThrow(CliUsageError);
+    expect(parseCli(["account", "login", "personal", "--json"])).toMatchObject({
+      kind: "account.login-handoff",
+      replayCommand: expect.stringContaining("--handoff-file /absolute/path/to/empty-protected-login.json"),
+    });
+  });
+
   test("parses exact pending-login cancellation without accepting provider authority on argv", () => {
     expect(parseCli(["account", "login-cancel", "personal", "--json"])).toEqual({
       command: { kind: "account.login-cancel", account: "personal" },
@@ -20,11 +57,85 @@ describe("CLI parser", () => {
       .toThrow(CliUsageError);
   });
 
+  test("parses bounded UTC account usage-history pages", () => {
+    const cursor = `hrau1.${"a".repeat(128)}.${"b".repeat(43)}`;
+    expect(parseCli([
+      "account",
+      "usage-history",
+      "personal",
+      "--from",
+      "2026-08-23T12:00:00Z",
+      "--through",
+      "2026-08-23T12:05:00.125Z",
+      "--limit",
+      "37",
+      "--cursor",
+      cursor,
+      "--json",
+    ])).toEqual({
+      command: {
+        kind: "account.usage-history",
+        account: "personal",
+        fromObservedAt: Date.parse("2026-08-23T12:00:00Z"),
+        throughObservedAt: Date.parse("2026-08-23T12:05:00.125Z"),
+        limit: 37,
+        cursor,
+      },
+      json: true,
+      kind: "command",
+    });
+    expect(parseCli(["account", "usage-history", "personal"])).toEqual({
+      command: {
+        kind: "account.usage-history",
+        account: "personal",
+        limit: 50,
+      },
+      json: false,
+      kind: "command",
+    });
+    for (const argv of [
+      ["account", "usage-history"],
+      ["account", "usage-history", "personal", "--limit", "0"],
+      ["account", "usage-history", "personal", "--limit", "101"],
+      ["account", "usage-history", "personal", "--from", "2026-02-30T00:00:00Z"],
+      ["account", "usage-history", "personal", "--through", "2026-08-23T12:00:00+00:00"],
+      ["account", "usage-history", "personal", "--cursor", "x".repeat(2_049)],
+    ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
+  });
+
   test("maps the recommended session controls", () => {
     expect(parseCli(["session", "start", "work", "--preset", "ultra", "--fast"])).toMatchObject({ kind: "command", command: { kind: "session.start", account: "work", preset: "ultra", fast: true } });
     expect(() => parseCli(["session", "start", "work", "--message", "ship it"])).toThrow("Unexpected argument");
     expect(parseCli(["session", "fast", "session", "off", "--json"])).toEqual({ kind: "command", command: { kind: "session.fast", session: "session", enabled: false }, json: true });
     expect(parseCli(["session", "send", "session", "hello", "from", "the", "CLI"])).toMatchObject({ command: { message: "hello from the CLI" } });
+  });
+
+  test("parses bounded opaque session-list continuations", () => {
+    const cursor = `hra1.${"a".repeat(128)}.${"b".repeat(43)}`;
+    expect(parseCli([
+      "session",
+      "list",
+      "--account",
+      "mutable-label",
+      "--limit",
+      "37",
+      "--cursor",
+      cursor,
+      "--json",
+    ])).toEqual({
+      kind: "command",
+      command: {
+        kind: "session.list",
+        account: "mutable-label",
+        limit: 37,
+        cursor,
+      },
+      json: true,
+    });
+    expect(() => parseCli(["session", "list", "--cursor", "x".repeat(2_049)]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "list", "--limit", "1.5"]))
+      .toThrow("session limit must be an integer from 1 to 100");
   });
 
   test("maps cloud session reads and the closed remote command set", () => {
@@ -211,7 +322,7 @@ describe("CLI parser", () => {
         kind: "command",
       });
 
-    for (const action of ["install", "enable", "disable"]) {
+    for (const action of ["install", "enable", "disable", "oauth", "authorize"]) {
       expect(() => parseCli(["plugin", action, "work", "files@official"]))
         .toThrow("no safe separated plugin lifecycle effect");
     }
@@ -269,6 +380,12 @@ describe("CLI parser", () => {
     ] as const;
     for (const argv of commands) {
       const invocation = parseCli(argv);
+      if (invocation.kind === "account.login-handoff") {
+        expect(invocation.command.idempotencyKey).toMatch(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        );
+        continue;
+      }
       if (invocation.kind !== "command" || !("idempotencyKey" in invocation.command)) {
         throw new Error(`Expected ${argv.join(" ")} to carry a key.`);
       }
@@ -276,6 +393,35 @@ describe("CLI parser", () => {
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
       );
     }
+  });
+
+  test("generates and preserves one current UUIDv7 for each device mutation", () => {
+    const generated = parseCli(["device", "approve", "device_target"]);
+    if (generated.kind !== "command" || generated.command.kind !== "device.approve") {
+      throw new Error("Expected a device approval command.");
+    }
+    expect(generated.command.idempotencyKey).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+
+    const explicit = generated.command.idempotencyKey;
+    expect(parseCli([
+      "device",
+      "revoke",
+      "device_target",
+      "--idempotency-key",
+      explicit,
+    ])).toMatchObject({
+      command: { device: "device_target", idempotencyKey: explicit, kind: "device.revoke" },
+      kind: "command",
+    });
+    expect(() => parseCli([
+      "device",
+      "approve",
+      "device_target",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000001",
+    ])).toThrow("current UUIDv7");
   });
 
   test("admits append-only projection recovery only with an explicit gap acknowledgement", () => {
@@ -439,9 +585,19 @@ describe("CLI parser", () => {
     });
     expect(() => parseCli(["session", "events", "release", "--follow", "--json"]))
       .toThrow("already JSON Lines");
-    expect(parseCli(["session", "interactions", "release", "--pending", "--limit", "12"]))
+    expect(parseCli([
+      "session",
+      "interactions",
+      "release",
+      "--pending",
+      "--limit",
+      "12",
+      "--cursor",
+      "hra1.page.signature",
+    ]))
       .toEqual({
         command: {
+          cursor: "hra1.page.signature",
           kind: "session.interactions",
           limit: 12,
           pending: true,
@@ -460,21 +616,78 @@ describe("CLI parser", () => {
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
     expect(() => parseCli(["session", "events", "release", "--cursor", "x".repeat(2_049)]))
       .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "interactions", "release", "--cursor", "x".repeat(2_049)]))
+      .toThrow(CliUsageError);
   });
 
   test("parses safe interaction decisions and keeps protected values out of argv", () => {
     const interaction = "50000000-0000-4000-8000-000000000001";
-    expect(parseCli(["interaction", "list", "release", "--pending", "--limit", "20", "--json"]))
+    expect(parseCli([
+      "interaction",
+      "list",
+      "release",
+      "--pending",
+      "--limit",
+      "20",
+      "--cursor",
+      "hra1.page.signature",
+      "--json",
+    ]))
       .toEqual({
-        command: { kind: "interaction.list", limit: 20, pending: true, session: "release" },
+        command: {
+          cursor: "hra1.page.signature",
+          kind: "interaction.list",
+          limit: 20,
+          pending: true,
+          session: "release",
+        },
         json: true,
         kind: "command",
       });
+    expect(() => parseCli(["interaction", "list", "--cursor", "x".repeat(2_049)]))
+      .toThrow(CliUsageError);
     expect(parseCli(["interaction", "show", interaction])).toEqual({
       command: { interaction, kind: "interaction.show" },
       json: false,
       kind: "command",
     });
+    expect(parseCli([
+      "interaction",
+      "inspect",
+      interaction,
+      "--revision",
+      "3",
+      "--handoff-file",
+      "/tmp/protected-approval.json",
+      "--json",
+    ])).toEqual({
+      command: {
+        expectedRevision: 3,
+        interaction,
+        kind: "interaction.inspect",
+      },
+      handoffFile: "/tmp/protected-approval.json",
+      json: true,
+      kind: "interaction.inspect-protected",
+    });
+    expect(() => parseCli([
+      "interaction",
+      "inspect",
+      interaction,
+      "--revision",
+      "3",
+      "--handoff-file",
+      "relative.json",
+    ])).toThrow(CliUsageError);
+    expect(() => parseCli([
+      "interaction",
+      "inspect",
+      interaction,
+      "--revision",
+      "3",
+      "--idempotency-key",
+      crypto.randomUUID(),
+    ])).toThrow(CliUsageError);
     expect(parseCli([
       "interaction",
       "decide",

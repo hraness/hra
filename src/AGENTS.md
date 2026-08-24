@@ -15,6 +15,7 @@
 - Parse all filesystem, database, socket, provider, cloud, and JSON values from `unknown`.
 - Store a prepared receipt before every mutation. Bind it to the exact authority generation and reconcile indeterminate outcomes without replay.
 - Use absolute, canonical, no-follow paths for durable state and profile roots. Require user-only permissions.
-- Keep secrets in `Bun.secrets` when available. The file fallback is mode 0600, generation-bound, and never silently overwrites or deletes recovery evidence.
+- Keep CLI and detached-daemon secret custody noninteractive. Use current-user-owned mode-0700 directories and descriptor-read mode-0600 immutable values; never silently overwrite or delete recovery evidence. Do not depend on a Keychain prompt from an unsigned interpreter process.
+- Force both pinned Codex credential stores to file mode at the process boundary and prove their effective values before account, plugin, or session effects.
 - Preserve stdout for requested data. Send diagnostics to stderr. Never print secrets, provider payloads, environment values, or raw local paths in cloud-facing output.
 - Bound lines, frames, pages, bytes, timers, retries, queues, and retained records.

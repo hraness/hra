@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import fc from "fast-check";
 
-import { localCommandSchema } from "./contracts";
+import { commandEnvelopeSchema, localCommandSchema } from "./contracts";
 import { presetRequirements } from "./presets";
 import { canTransitionMutation, mutationStateSchema } from "./transitions";
 import { selectByIdOrLabel, utf8Bytes } from "./values";
@@ -25,6 +25,33 @@ describe("domain laws", () => {
     );
   });
 
+  test("requires one UUIDv7 caller key for device mutations in commands and envelopes", () => {
+    const capability = "a".repeat(43);
+    const requestId = "00000000-0000-4000-8000-000000000001";
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000001";
+    const command = { device: "device_target", idempotencyKey, kind: "device.approve" };
+
+    expect(localCommandSchema.safeParse(command).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse({ capability, command, requestId, version: 1 }).success)
+      .toBe(true);
+    for (const invalidCommand of [
+      { device: "device_target", kind: "device.approve" },
+      {
+        device: "device_target",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
+        kind: "device.revoke",
+      },
+    ]) {
+      expect(localCommandSchema.safeParse(invalidCommand).success).toBe(false);
+      expect(commandEnvelopeSchema.safeParse({
+        capability,
+        command: invalidCommand,
+        requestId,
+        version: 1,
+      }).success).toBe(false);
+    }
+  });
+
   test("terminal mutation states are absorbing", () => {
     fc.assert(
       fc.property(fc.constantFrom("applied", "failed", "ambiguous", "cancelled", "reconciled"), fc.constantFrom(...mutationStateSchema.options), (from, to) => {
@@ -33,15 +60,17 @@ describe("domain laws", () => {
     );
   });
 
-  test("selection is exact-id first and otherwise unambiguous case-insensitive label", () => {
+  test("selection is exact-id first and otherwise uses one canonical Unicode label key", () => {
     const values = [
       { id: "acct_a", label: "Work" },
       { id: "acct_b", label: "work" },
       { id: "acct_c", label: "Personal" },
+      { id: "acct_d", label: "Café" },
     ];
     expect(selectByIdOrLabel(values, "acct_b")).toEqual({ kind: "found", value: values[1]! });
     expect(selectByIdOrLabel(values, "WORK").kind).toBe("ambiguous");
     expect(selectByIdOrLabel(values, "personal")).toEqual({ kind: "found", value: values[2]! });
+    expect(selectByIdOrLabel(values, "CAFE\u0301")).toEqual({ kind: "found", value: values[3]! });
   });
 
   test("UTF-8 byte accounting does not confuse code points with bytes", () => {

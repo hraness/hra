@@ -17,6 +17,8 @@ const newStagingAlias = "try-hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
 const commandTimeoutMs = 30_000;
 const convergenceTimeoutMs = 60_000;
+const domainPageLimit = 20;
+const maximumDomainPages = 64;
 const outputMaximumBytes = 128 * 1_024;
 const inputMaximumBytes = 32 * 1_024;
 
@@ -78,6 +80,10 @@ const cutoverPlanSchema = z.object({
 
 export type CutoverEndpoint = z.infer<typeof endpointSchema>;
 export type CutoverPlan = z.infer<typeof cutoverPlanSchema>;
+export type CutoverOutcome = Readonly<{
+  changed: boolean;
+  replayed: boolean;
+}>;
 
 const managedAliasSchema = z.enum([canonicalAlias, fallbackAlias, newStagingAlias]);
 
@@ -110,8 +116,21 @@ const projectReadbackSchema = z.object({
   id: projectIdSchema,
 });
 
+const paginationCursorSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const domainsReadbackSchema = z.object({
-  domains: z.array(z.object({ name: z.string().min(1).max(253) })).max(1_024),
+  domains: z.array(z.object({ name: z.string().min(1).max(253) })).max(domainPageLimit),
+  pagination: z.object({
+    count: z.number().int().nonnegative().max(domainPageLimit),
+    next: paginationCursorSchema.nullable(),
+    prev: paginationCursorSchema.nullable(),
+  }).strict(),
+}).strict().superRefine((page, context) => {
+  if (page.pagination.count !== page.domains.length) {
+    context.addIssue({ code: "custom", message: "pagination_count_mismatch" });
+  }
+  if (page.domains.length === 0 && page.pagination.next !== null) {
+    context.addIssue({ code: "custom", message: "empty_page_has_next" });
+  }
 });
 
 const markerRepositorySchema = z.object({
@@ -144,11 +163,53 @@ export type ManagedAlias = z.infer<typeof managedAliasSchema>;
 export type ProjectReadback = z.infer<typeof projectReadbackSchema>;
 
 type DomainOwner = "ambiguous" | "source" | "target";
+type CutoverState = "ambiguous" | "partial" | "source" | "target";
+type TrafficState = "ambiguous" | "partial" | "source" | "target";
+
+export type CutoverPreflightOutcome = Readonly<{
+  nextAction: "execute_plan" | "replay_plan_for_receipt" | "stop_and_investigate";
+  observedOwner: DomainOwner;
+  observedState: CutoverState;
+  observedTraffic: TrafficState;
+  reason:
+    | "ambiguous_state"
+    | "exact_source"
+    | "exact_target"
+    | "partial_state"
+    | "source_not_authoritative"
+    | "target_not_authoritative";
+  status: "already_committed" | "blocked" | "ready";
+}>;
+
+type StateClassification = Readonly<{
+  owner: DomainOwner;
+  state: CutoverState;
+  traffic: TrafficState;
+}>;
+
+type ProviderReadFailureMode = "ambiguous" | "refuse";
+
+type AliasExpectation = Readonly<{
+  aliasName: ManagedAlias;
+  endpoint: CutoverEndpoint;
+}>;
+
+type OwnerExpectation = Readonly<{
+  expected: Exclude<DomainOwner, "ambiguous">;
+  sourceProjectId: typeof oldProjectId | typeof newProjectId;
+  targetProjectId: typeof oldProjectId | typeof newProjectId;
+}>;
+
+type ExactStateExpectation = Readonly<{
+  aliases: readonly AliasExpectation[];
+  owner: OwnerExpectation;
+}>;
 
 export interface CutoverProvider {
   moveDomain(sourceProjectId: string, targetProjectId: string): Promise<void>;
   readAlias(aliasName: ManagedAlias): Promise<AliasReadback>;
   readDeployment(deploymentId: string): Promise<DeploymentReadback>;
+  /** Return the complete domain-name set only after proving terminal pagination. */
   readDomainNames(projectId: string): Promise<readonly string[]>;
   readMarker(aliasName: ManagedAlias): Promise<unknown>;
   readProject(projectId: string): Promise<ProjectReadback>;
@@ -246,6 +307,245 @@ const readOwner = async (
   return "ambiguous";
 };
 
+const readOwnerSafely = async (
+  provider: CutoverProvider,
+  sourceProjectId: string,
+  targetProjectId: string,
+): Promise<DomainOwner> => {
+  try {
+    return await readOwner(provider, sourceProjectId, targetProjectId);
+  } catch {
+    return "ambiguous";
+  }
+};
+
+const acceptedArchiveEndpoint = (plan: CutoverPlan): CutoverEndpoint =>
+  plan.direction === "forward" ? plan.source : plan.target;
+
+const acceptedNewEndpoint = (plan: CutoverPlan): CutoverEndpoint =>
+  plan.direction === "forward" ? plan.target : plan.source;
+
+const stateExpectation = (
+  plan: CutoverPlan,
+  state: "source" | "target",
+): ExactStateExpectation => {
+  if (plan.direction === "archive") {
+    const endpoint = state === "source" ? plan.source : plan.target;
+    return {
+      aliases: [
+        { aliasName: canonicalAlias, endpoint },
+        { aliasName: fallbackAlias, endpoint },
+      ],
+      owner: {
+        expected: "source",
+        sourceProjectId: oldProjectId,
+        targetProjectId: newProjectId,
+      },
+    };
+  }
+  return {
+    aliases: [
+      {
+        aliasName: canonicalAlias,
+        endpoint: state === "source" ? plan.source : plan.target,
+      },
+      { aliasName: fallbackAlias, endpoint: acceptedArchiveEndpoint(plan) },
+      { aliasName: newStagingAlias, endpoint: acceptedNewEndpoint(plan) },
+    ],
+    owner: {
+      expected: state,
+      sourceProjectId: plan.source.projectId,
+      targetProjectId: plan.target.projectId,
+    },
+  };
+};
+
+const readTrafficState = async (
+  provider: CutoverProvider,
+  plan: CutoverPlan,
+): Promise<TrafficState> => {
+  if (plan.direction !== "archive") {
+    const [canonical, fallback, staging] = await Promise.all([
+      provider.readAlias(canonicalAlias),
+      provider.readAlias(fallbackAlias),
+      provider.readAlias(newStagingAlias),
+    ]);
+    const canonicalState = aliasMatches(canonical, plan.source, canonicalAlias)
+      ? "source"
+      : aliasMatches(canonical, plan.target, canonicalAlias)
+        ? "target"
+        : "ambiguous";
+    const fallbackExpected = acceptedArchiveEndpoint(plan);
+    const stagingExpected = acceptedNewEndpoint(plan);
+    const fallbackExact = aliasMatches(fallback, fallbackExpected, fallbackAlias);
+    const stagingExact = aliasMatches(staging, stagingExpected, newStagingAlias);
+    if (canonicalState === "ambiguous") return "ambiguous";
+    if (fallbackExact && stagingExact) return canonicalState;
+    const fallbackKnown = aliasMatches(fallback, plan.source, fallbackAlias)
+      || aliasMatches(fallback, plan.target, fallbackAlias);
+    const stagingKnown = aliasMatches(staging, plan.source, newStagingAlias)
+      || aliasMatches(staging, plan.target, newStagingAlias);
+    return fallbackKnown && stagingKnown ? "partial" : "ambiguous";
+  }
+  const [canonical, fallback] = await Promise.all([
+    provider.readAlias(canonicalAlias),
+    provider.readAlias(fallbackAlias),
+  ]);
+  const canonicalState = aliasMatches(canonical, plan.source, canonicalAlias)
+    ? "source"
+    : aliasMatches(canonical, plan.target, canonicalAlias)
+      ? "target"
+      : "ambiguous";
+  const fallbackState = aliasMatches(fallback, plan.source, fallbackAlias)
+    ? "source"
+    : aliasMatches(fallback, plan.target, fallbackAlias)
+      ? "target"
+      : "ambiguous";
+  if (canonicalState === "ambiguous" || fallbackState === "ambiguous") return "ambiguous";
+  return canonicalState === fallbackState ? canonicalState : "partial";
+};
+
+const readStateClassification = async (
+  provider: CutoverProvider,
+  plan: CutoverPlan,
+  failureMode: ProviderReadFailureMode = "ambiguous",
+): Promise<StateClassification> => {
+  const ownerExpectation = stateExpectation(plan, "source").owner;
+  const read = async (): Promise<StateClassification> => {
+    const [traffic, owner] = await Promise.all([
+      readTrafficState(provider, plan),
+      failureMode === "refuse"
+        ? readOwner(
+            provider,
+            ownerExpectation.sourceProjectId,
+            ownerExpectation.targetProjectId,
+          )
+        : readOwnerSafely(
+            provider,
+            ownerExpectation.sourceProjectId,
+            ownerExpectation.targetProjectId,
+          ),
+    ]);
+    if (traffic === "ambiguous" || owner === "ambiguous") {
+      return { owner, state: "ambiguous", traffic };
+    }
+    if (plan.direction === "archive") {
+      return owner === "source"
+        ? { owner, state: traffic, traffic }
+        : { owner, state: "ambiguous", traffic };
+    }
+    if (traffic === "partial") return { owner, state: "partial", traffic };
+    return traffic === owner
+      ? { owner, state: traffic, traffic }
+      : { owner, state: "partial", traffic };
+  };
+  if (failureMode === "refuse") return await read();
+  try {
+    return await read();
+  } catch {
+    return { owner: "ambiguous", state: "ambiguous", traffic: "ambiguous" };
+  }
+};
+
+const classifyCutoverState = async (
+  provider: CutoverProvider,
+  plan: CutoverPlan,
+  clock: CutoverClock,
+  timeoutMs: number,
+  failureMode: ProviderReadFailureMode = "ambiguous",
+): Promise<StateClassification> => {
+  const deadline = clock.now() + timeoutMs;
+  let latest: StateClassification = {
+    owner: "ambiguous",
+    state: "ambiguous",
+    traffic: "ambiguous",
+  };
+  do {
+    latest = await readStateClassification(provider, plan, failureMode);
+    if (latest.state !== "ambiguous") return latest;
+    if (clock.now() >= deadline) break;
+    await clock.sleep(Math.min(1_000, Math.max(1, deadline - clock.now())));
+  } while (clock.now() <= deadline);
+  return latest;
+};
+
+const readExactTraffic = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+): Promise<boolean> => {
+  const aliases = await Promise.all(
+    expectation.aliases.map(async ({ aliasName, endpoint }) => {
+      const [aliasValue, markerValue] = await Promise.all([
+        provider.readAlias(aliasName),
+        endpoint.generation === null
+          ? Promise.resolve(null)
+          : provider.readMarker(aliasName),
+      ]);
+      return aliasMatches(aliasValue, endpoint, aliasName)
+        && markerMatches(markerValue, endpoint);
+    }),
+  );
+  return aliases.every(Boolean);
+};
+
+const readExactState = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+): Promise<boolean> => {
+  const [traffic, owner] = await Promise.all([
+    readExactTraffic(provider, expectation),
+    readOwner(
+      provider,
+      expectation.owner.sourceProjectId,
+      expectation.owner.targetProjectId,
+    ),
+  ]);
+  return traffic && owner === expectation.owner.expected;
+};
+
+const probeExactTraffic = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+  clock: CutoverClock,
+  timeoutMs: number,
+): Promise<boolean> => {
+  const deadline = clock.now() + timeoutMs;
+  do {
+    try {
+      if (await readExactTraffic(provider, expectation)) return true;
+    } catch {
+      // A provider or public read can be transient inside the bounded window.
+    }
+    if (clock.now() >= deadline) break;
+    await clock.sleep(Math.min(1_000, Math.max(1, deadline - clock.now())));
+  } while (clock.now() <= deadline);
+  return false;
+};
+
+const probeExactState = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+  clock: CutoverClock,
+  timeoutMs: number,
+  failureMode: ProviderReadFailureMode = "ambiguous",
+): Promise<boolean> => {
+  const deadline = clock.now() + timeoutMs;
+  do {
+    if (failureMode === "refuse") {
+      if (await readExactState(provider, expectation)) return true;
+    } else {
+      try {
+        if (await readExactState(provider, expectation)) return true;
+      } catch {
+        // A provider or public read can be transient inside the bounded window.
+      }
+    }
+    if (clock.now() >= deadline) break;
+    await clock.sleep(Math.min(1_000, Math.max(1, deadline - clock.now())));
+  } while (clock.now() <= deadline);
+  return false;
+};
+
 const probeEndpoint = async (
   provider: CutoverProvider,
   endpoint: CutoverEndpoint,
@@ -292,17 +592,56 @@ const restoreTraffic = async (
   }
 };
 
+const restoreExactTraffic = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+  clock: CutoverClock,
+  timeoutMs: number,
+): Promise<void> => {
+  const results = await Promise.allSettled(
+    expectation.aliases.map(async ({ aliasName, endpoint }) =>
+      await restoreTraffic(provider, endpoint, aliasName, clock, timeoutMs)),
+  );
+  if (results.some((result) => result.status === "rejected")) {
+    throw new DomainCutoverError("compensation_failed");
+  }
+};
+
+const reconcileExactSource = async (
+  provider: CutoverProvider,
+  expectation: ExactStateExpectation,
+  proof: "state" | "traffic",
+  clock: CutoverClock,
+  timeoutMs: number,
+): Promise<boolean> => {
+  const deadline = clock.now() + timeoutMs;
+  const readProof = async (): Promise<boolean> => proof === "state"
+    ? await readExactState(provider, expectation)
+    : await readExactTraffic(provider, expectation);
+  do {
+    try {
+      const remainingMs = Math.max(0, deadline - clock.now());
+      await restoreExactTraffic(provider, expectation, clock, remainingMs);
+      if (await readProof() && await readProof()) return true;
+    } catch {
+      // Reconcile again while the single bounded window remains.
+    }
+    if (clock.now() >= deadline) break;
+    await clock.sleep(Math.min(1_000, Math.max(1, deadline - clock.now())));
+  } while (clock.now() <= deadline);
+  return false;
+};
+
 const restoreArchiveTraffic = async (
   provider: CutoverProvider,
-  source: CutoverEndpoint,
+  plan: CutoverPlan,
   clock: CutoverClock,
   timeoutMs: number,
 ): Promise<never> => {
-  const results = await Promise.allSettled([
-    restoreTraffic(provider, source, canonicalAlias, clock, timeoutMs),
-    restoreTraffic(provider, source, fallbackAlias, clock, timeoutMs),
-  ]);
-  if (results.some((result) => result.status === "rejected")) {
+  const source = stateExpectation(plan, "source");
+  if (!await reconcileExactSource(provider, source, "state", clock, timeoutMs)) {
+    const finalOwner = await readOwnerSafely(provider, oldProjectId, newProjectId);
+    if (finalOwner !== "source") throw new DomainCutoverError("cutover_ambiguous");
     throw new DomainCutoverError("compensation_failed");
   }
   throw new DomainCutoverError("cutover_reverted");
@@ -311,8 +650,21 @@ const restoreArchiveTraffic = async (
 const reverseMetadataIfExact = async (
   provider: CutoverProvider,
   plan: CutoverPlan,
+  clock: CutoverClock,
+  timeoutMs: number,
 ): Promise<"ambiguous" | "restored"> => {
-  const owner = await readOwner(provider, plan.source.projectId, plan.target.projectId);
+  const preMoveDeadline = clock.now() + timeoutMs;
+  let owner: DomainOwner = "ambiguous";
+  do {
+    owner = await readOwnerSafely(
+      provider,
+      plan.source.projectId,
+      plan.target.projectId,
+    );
+    if (owner !== "ambiguous") break;
+    if (clock.now() >= preMoveDeadline) return "ambiguous";
+    await clock.sleep(Math.min(1_000, Math.max(1, preMoveDeadline - clock.now())));
+  } while (clock.now() <= preMoveDeadline);
   if (owner === "source") return "restored";
   if (owner !== "target") return "ambiguous";
   try {
@@ -320,9 +672,18 @@ const reverseMetadataIfExact = async (
   } catch {
     // Readback below determines whether the reverse request committed.
   }
-  return await readOwner(provider, plan.source.projectId, plan.target.projectId) === "source"
-    ? "restored"
-    : "ambiguous";
+  const postMoveDeadline = clock.now() + timeoutMs;
+  do {
+    owner = await readOwnerSafely(
+      provider,
+      plan.source.projectId,
+      plan.target.projectId,
+    );
+    if (owner === "source") return "restored";
+    if (clock.now() >= postMoveDeadline) break;
+    await clock.sleep(Math.min(1_000, Math.max(1, postMoveDeadline - clock.now())));
+  } while (clock.now() <= postMoveDeadline);
+  return "ambiguous";
 };
 
 const compensateDomainMove = async (
@@ -331,27 +692,34 @@ const compensateDomainMove = async (
   clock: CutoverClock,
   timeoutMs: number,
 ): Promise<never> => {
-  await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
-  const metadata = await reverseMetadataIfExact(provider, plan);
-  if (metadata !== "restored") throw new DomainCutoverError("cutover_ambiguous");
+  const source = stateExpectation(plan, "source");
+  await restoreExactTraffic(provider, source, clock, timeoutMs);
+  if (!await probeExactTraffic(provider, source, clock, timeoutMs)) {
+    throw new DomainCutoverError("compensation_failed");
+  }
+  const metadata = await reverseMetadataIfExact(provider, plan, clock, timeoutMs);
+  if (metadata !== "restored") {
+    if (!await reconcileExactSource(provider, source, "traffic", clock, timeoutMs)) {
+      throw new DomainCutoverError("compensation_failed");
+    }
+    throw new DomainCutoverError("cutover_ambiguous");
+  }
+  if (!await reconcileExactSource(provider, source, "state", clock, timeoutMs)) {
+    const owner = await readOwnerSafely(
+      provider,
+      plan.source.projectId,
+      plan.target.projectId,
+    );
+    if (owner !== "source") throw new DomainCutoverError("cutover_ambiguous");
+    throw new DomainCutoverError("compensation_failed");
+  }
   throw new DomainCutoverError("cutover_reverted");
 };
 
-export async function executeCutoverPlan(
-  planInput: CutoverPlan,
+const verifyCutoverIdentityAuthority = async (
+  plan: CutoverPlan,
   provider: CutoverProvider,
-  options: Readonly<{
-    clock?: CutoverClock;
-    convergenceTimeoutMs?: number;
-  }> = {},
-): Promise<void> {
-  const plan = cutoverPlanSchema.parse(planInput);
-  const clock = options.clock ?? defaultClock;
-  const timeoutMs = options.convergenceTimeoutMs ?? convergenceTimeoutMs;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > convergenceTimeoutMs) {
-    throw new DomainCutoverError("usage_invalid");
-  }
-
+): Promise<void> => {
   const projects = await Promise.all([
     provider.readProject(oldProjectId),
     provider.readProject(newProjectId),
@@ -376,34 +744,181 @@ export async function executeCutoverPlan(
     !deploymentMatches(sourceDeployment, plan.source)
     || !deploymentMatches(targetDeployment, plan.target)
   ) throw new DomainCutoverError("deployment_readback_invalid");
+};
 
-  if (!await probeEndpoint(provider, plan.source, canonicalAlias, clock, timeoutMs)) {
-    throw new DomainCutoverError("source_not_authoritative");
-  }
-  const acceptedArchive = plan.direction === "forward" ? plan.source : plan.target;
-  const fallbackSource = plan.direction === "archive" ? plan.source : acceptedArchive;
-  if (!await probeEndpoint(provider, fallbackSource, fallbackAlias, clock, timeoutMs)) {
-    throw new DomainCutoverError("source_not_authoritative");
-  }
-  const acceptedNew = plan.direction === "forward" ? plan.target : plan.source;
-  if (plan.mode === "domain") {
-    if (!await probeEndpoint(provider, acceptedNew, newStagingAlias, clock, timeoutMs)) {
-      throw new DomainCutoverError("source_not_authoritative");
+const refuseProviderRead = (error: unknown, fallback: CutoverFailureCode): never => {
+  if (error instanceof DomainCutoverError) throw error;
+  throw new DomainCutoverError(fallback);
+};
+
+const preflightReadProvider = (provider: CutoverProvider): CutoverProvider => ({
+  async moveDomain(): Promise<void> {
+    throw new DomainCutoverError("usage_invalid");
+  },
+  async readAlias(aliasName): Promise<AliasReadback> {
+    try {
+      return await provider.readAlias(aliasName);
+    } catch (error: unknown) {
+      return refuseProviderRead(error, "alias_readback_invalid");
     }
+  },
+  async readDeployment(deploymentId): Promise<DeploymentReadback> {
+    try {
+      return await provider.readDeployment(deploymentId);
+    } catch (error: unknown) {
+      return refuseProviderRead(error, "deployment_readback_invalid");
+    }
+  },
+  async readDomainNames(projectId): Promise<readonly string[]> {
+    try {
+      return await provider.readDomainNames(projectId);
+    } catch (error: unknown) {
+      return refuseProviderRead(error, "command_output_invalid");
+    }
+  },
+  async readMarker(aliasName): Promise<unknown> {
+    try {
+      return await provider.readMarker(aliasName);
+    } catch (error: unknown) {
+      return refuseProviderRead(error, "command_output_invalid");
+    }
+  },
+  async readProject(projectId): Promise<ProjectReadback> {
+    try {
+      return await provider.readProject(projectId);
+    } catch (error: unknown) {
+      return refuseProviderRead(error, "automatic_domain_assignment_unsafe");
+    }
+  },
+  async setAlias(): Promise<void> {
+    throw new DomainCutoverError("usage_invalid");
+  },
+});
+
+export async function preflightCutoverPlan(
+  planInput: CutoverPlan,
+  provider: CutoverProvider,
+  options: Readonly<{
+    clock?: CutoverClock;
+    convergenceTimeoutMs?: number;
+  }> = {},
+): Promise<CutoverPreflightOutcome> {
+  const plan = cutoverPlanSchema.parse(planInput);
+  const clock = options.clock ?? defaultClock;
+  const timeoutMs = options.convergenceTimeoutMs ?? convergenceTimeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > convergenceTimeoutMs) {
+    throw new DomainCutoverError("usage_invalid");
   }
-  if (
-    plan.mode === "domain"
-    && await readOwner(provider, plan.source.projectId, plan.target.projectId) !== "source"
-  ) throw new DomainCutoverError("source_not_authoritative");
+
+  const readProvider = preflightReadProvider(provider);
+  await verifyCutoverIdentityAuthority(plan, readProvider);
+  const classification = await classifyCutoverState(
+    readProvider,
+    plan,
+    clock,
+    timeoutMs,
+    "refuse",
+  );
+  const outcome = (
+    status: CutoverPreflightOutcome["status"],
+    reason: CutoverPreflightOutcome["reason"],
+    nextAction: CutoverPreflightOutcome["nextAction"],
+  ): CutoverPreflightOutcome => ({
+    nextAction,
+    observedOwner: classification.owner,
+    observedState: classification.state,
+    observedTraffic: classification.traffic,
+    reason,
+    status,
+  });
+
+  if (classification.state === "source") {
+    return await probeExactState(
+      readProvider,
+      stateExpectation(plan, "source"),
+      clock,
+      timeoutMs,
+      "refuse",
+    )
+      ? outcome("ready", "exact_source", "execute_plan")
+      : outcome("blocked", "source_not_authoritative", "stop_and_investigate");
+  }
+  if (classification.state === "target") {
+    return await probeExactState(
+      readProvider,
+      stateExpectation(plan, "target"),
+      clock,
+      timeoutMs,
+      "refuse",
+    )
+      ? outcome("already_committed", "exact_target", "replay_plan_for_receipt")
+      : outcome("blocked", "target_not_authoritative", "stop_and_investigate");
+  }
+  return classification.state === "partial"
+    ? outcome("blocked", "partial_state", "stop_and_investigate")
+    : outcome("blocked", "ambiguous_state", "stop_and_investigate");
+}
+
+export async function executeCutoverPlan(
+  planInput: CutoverPlan,
+  provider: CutoverProvider,
+  options: Readonly<{
+    clock?: CutoverClock;
+    convergenceTimeoutMs?: number;
+  }> = {},
+): Promise<CutoverOutcome> {
+  const plan = cutoverPlanSchema.parse(planInput);
+  const clock = options.clock ?? defaultClock;
+  const timeoutMs = options.convergenceTimeoutMs ?? convergenceTimeoutMs;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > convergenceTimeoutMs) {
+    throw new DomainCutoverError("usage_invalid");
+  }
+
+  await verifyCutoverIdentityAuthority(plan, provider);
+
+  const classification = await classifyCutoverState(provider, plan, clock, timeoutMs);
+  if (classification.state === "target") {
+    if (await probeExactState(provider, stateExpectation(plan, "target"), clock, timeoutMs)) {
+      return { changed: false, replayed: true };
+    }
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
+    }
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  }
+  if (classification.state === "partial") {
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
+    }
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  }
+  if (classification.state === "ambiguous") {
+    if (classification.traffic === "source" && plan.direction === "archive") {
+      throw new DomainCutoverError("cutover_ambiguous");
+    }
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
+    }
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  }
+  if (!await probeExactState(provider, stateExpectation(plan, "source"), clock, timeoutMs)) {
+    if (plan.direction === "archive") {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
+    }
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  }
 
   if (plan.direction === "archive") {
     try {
       await provider.setAlias(plan.target.deploymentUrl, fallbackAlias);
     } catch {
-      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
     if (!await probeEndpoint(provider, plan.target, fallbackAlias, clock, timeoutMs)) {
-      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
+    }
+    if (await readOwnerSafely(provider, oldProjectId, newProjectId) !== "source") {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
   }
 
@@ -411,23 +926,21 @@ export async function executeCutoverPlan(
     await provider.setAlias(plan.target.deploymentUrl, canonicalAlias);
   } catch {
     if (plan.direction === "archive") {
-      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
-    await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
-    throw new DomainCutoverError("cutover_reverted");
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
   }
   if (!await probeEndpoint(provider, plan.target, canonicalAlias, clock, timeoutMs)) {
     if (plan.direction === "archive") {
-      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
-    await restoreTraffic(provider, plan.source, canonicalAlias, clock, timeoutMs);
-    throw new DomainCutoverError("cutover_reverted");
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
   }
   if (plan.mode === "traffic-only") {
-    if (!await probeEndpoint(provider, plan.target, fallbackAlias, clock, timeoutMs)) {
-      return await restoreArchiveTraffic(provider, plan.source, clock, timeoutMs);
+    if (!await probeExactState(provider, stateExpectation(plan, "target"), clock, timeoutMs)) {
+      return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
-    return;
+    return { changed: true, replayed: false };
   }
 
   try {
@@ -436,34 +949,10 @@ export async function executeCutoverPlan(
     // Exact alias and ownership readback below resolve an ambiguous API result.
   }
 
-  const deadline = clock.now() + timeoutMs;
-  do {
-    try {
-      const [aliasValue, owner] = await Promise.all([
-        provider.readAlias(canonicalAlias),
-        readOwner(provider, plan.source.projectId, plan.target.projectId),
-      ]);
-      if (aliasMatches(aliasValue, plan.target, canonicalAlias) && owner === "target") {
-        if (
-          !await probeEndpoint(provider, plan.target, canonicalAlias, clock, timeoutMs)
-          || !await probeEndpoint(provider, acceptedArchive, fallbackAlias, clock, timeoutMs)
-          || !await probeEndpoint(provider, acceptedNew, newStagingAlias, clock, timeoutMs)
-        ) {
-          return await compensateDomainMove(provider, plan, clock, timeoutMs);
-        }
-        return;
-      }
-      if (aliasMatches(aliasValue, plan.source, canonicalAlias) && owner === "target") {
-        return await compensateDomainMove(provider, plan, clock, timeoutMs);
-      }
-    } catch {
-      // Resolve transient provider reads only inside the bounded window.
-    }
-    if (clock.now() >= deadline) break;
-    await clock.sleep(Math.min(1_000, Math.max(1, deadline - clock.now())));
-  } while (clock.now() <= deadline);
-
-  return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  if (!await probeExactState(provider, stateExpectation(plan, "target"), clock, timeoutMs)) {
+    return await compensateDomainMove(provider, plan, clock, timeoutMs);
+  }
+  return { changed: true, replayed: false };
 }
 
 export function parseCutoverPlan(document: string): CutoverPlan {
@@ -657,15 +1146,27 @@ export class VercelCutoverProvider implements CutoverProvider {
     if (!projectIdSchema.safeParse(projectId).success) {
       throw new DomainCutoverError("command_output_invalid");
     }
-    const parsed = domainsReadbackSchema.safeParse(parseProviderJson(await this.#invoke([
-      "api",
-      `/v9/projects/${projectId}/domains`,
-      "--scope",
-      team,
-      "--raw",
-    ])));
-    if (!parsed.success) throw new DomainCutoverError("command_output_invalid");
-    return parsed.data.domains.map((domain) => domain.name);
+    const names: string[] = [];
+    const seenCursors = new Set<number>();
+    let until: number | null = null;
+    for (let pageIndex = 0; pageIndex < maximumDomainPages; pageIndex += 1) {
+      const cursor = until === null ? "" : `&until=${until}`;
+      const parsed = domainsReadbackSchema.safeParse(parseProviderJson(await this.#invoke([
+        "api",
+        `/v9/projects/${projectId}/domains?limit=${domainPageLimit}${cursor}`,
+        "--scope",
+        team,
+        "--raw",
+      ])));
+      if (!parsed.success) throw new DomainCutoverError("command_output_invalid");
+      names.push(...parsed.data.domains.map((domain) => domain.name));
+      const next = parsed.data.pagination.next;
+      if (next === null) return names;
+      if (seenCursors.has(next)) throw new DomainCutoverError("command_output_invalid");
+      seenCursors.add(next);
+      until = next;
+    }
+    throw new DomainCutoverError("command_output_invalid");
   }
 
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
@@ -768,16 +1269,24 @@ export class VercelCutoverProvider implements CutoverProvider {
   }
 }
 
-type ParsedArguments = Readonly<{ execute: true; planFd: number; vercelCli: string }>;
+type ParsedArguments = Readonly<{
+  operation: "execute" | "preflight";
+  planFd: number;
+  vercelCli: string;
+}>;
 
 export function parseArguments(arguments_: readonly string[]): ParsedArguments {
-  let execute = false;
+  let operation: ParsedArguments["operation"] | undefined;
   let planFd = 0;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
-    if (argument === "--execute" && !execute) {
-      execute = true;
+    if (argument === "--execute" && operation === undefined) {
+      operation = "execute";
+      continue;
+    }
+    if (argument === "preflight" && operation === undefined) {
+      operation = "preflight";
       continue;
     }
     if (argument === "--plan-fd" && planFd === 0) {
@@ -803,8 +1312,10 @@ export function parseArguments(arguments_: readonly string[]): ParsedArguments {
     }
     throw new DomainCutoverError("usage_invalid");
   }
-  if (!execute || vercelCli === undefined) throw new DomainCutoverError("usage_invalid");
-  return { execute: true, planFd, vercelCli };
+  if (operation === undefined || vercelCli === undefined) {
+    throw new DomainCutoverError("usage_invalid");
+  }
+  return { operation, planFd, vercelCli };
 }
 
 export async function readPlanInput(fd: number, timeoutMs = 15_000): Promise<string> {
@@ -858,9 +1369,30 @@ export async function executeDomainCutover(options: ExecuteOptions): Promise<num
       vercelCli: arguments_.vercelCli,
     });
     await provider.verifyVersion();
-    await executeCutoverPlan(plan, provider);
+    if (arguments_.operation === "preflight") {
+      const outcome = await preflightCutoverPlan(plan, provider);
+      options.stdout.write(`${JSON.stringify({
+        direction: plan.direction,
+        mode: plan.mode,
+        nextAction: outcome.nextAction,
+        observedOwner: outcome.observedOwner,
+        observedState: outcome.observedState,
+        observedTraffic: outcome.observedTraffic,
+        reason: outcome.reason,
+        schemaVersion: 1,
+        sourceDeploymentId: plan.source.deploymentId,
+        sourceProjectId: plan.source.projectId,
+        status: outcome.status,
+        targetDeploymentId: plan.target.deploymentId,
+        targetProjectId: plan.target.projectId,
+      })}\n`);
+      return outcome.status === "blocked" ? 1 : 0;
+    }
+    const outcome = await executeCutoverPlan(plan, provider);
     options.stdout.write(`${JSON.stringify({
+      changed: outcome.changed,
       direction: plan.direction,
+      replayed: outcome.replayed,
       schemaVersion: 1,
       status: "committed",
       targetDeploymentId: plan.target.deploymentId,

@@ -39,6 +39,14 @@ const page = (input: {
   events: input.events ?? [],
 });
 
+const waitFor = async (predicate: () => boolean): Promise<void> => {
+  const deadline = Date.now() + 1_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for event follow output.");
+    await Bun.sleep(1);
+  }
+};
+
 describe("session event watch", () => {
   test("writes safe event lines followed by a resumable checkpoint", async () => {
     const stdout: string[] = [];
@@ -139,6 +147,63 @@ describe("session event watch", () => {
       "event",
       "checkpoint",
     ]);
+  });
+
+  test("continues across a restored stream after the typed gap drains", async () => {
+    const restoredEpoch = "80000000-0000-4000-8000-000000000099";
+    const requested: Array<string | undefined> = [];
+    const stdout: string[] = [];
+    let releaseGap!: () => void;
+    const gapDrained = new Promise<void>((resolve) => { releaseGap = resolve; });
+    const pages = [
+      page({ requestedCursor: null, nextCursor: "old-1", events: [event(1)] }),
+      page({
+        requestedCursor: "old-1",
+        nextCursor: "restored-1",
+        gap: { reason: "stream_restored", requestedSequence: 1, retainedFromSequence: 1 },
+        events: [event(1, "restored", restoredEpoch)],
+      }),
+      page({
+        requestedCursor: "restored-1",
+        nextCursor: "restored-2",
+        events: [event(2, "continued", restoredEpoch)],
+      }),
+    ];
+    const following = followSessionEvents({
+      command: { kind: "session.events", session: "release", limit: 20, waitMs: 30_000 },
+      fetchPage: (command) => {
+        requested.push(command.cursor);
+        const next = pages.shift();
+        if (next === undefined) throw new Error("No restored-stream page fixture.");
+        return Promise.resolve(next);
+      },
+      maxPages: 3,
+      output: {
+        writeStdout: () => { throw new Error("The async JSONL writer must own follow output."); },
+        writeStdoutAsync: async (value) => {
+          stdout.push(value);
+          const parsed = JSON.parse(value) as { kind?: string };
+          if (parsed.kind === "gap") await gapDrained;
+        },
+      },
+      signal: new AbortController().signal,
+    });
+
+    await waitFor(() => stdout.some((line) =>
+      (JSON.parse(line) as { kind?: string }).kind === "gap"));
+    expect(requested).toEqual([undefined, "old-1"]);
+    releaseGap();
+    const result = await following;
+
+    expect(requested).toEqual([undefined, "old-1", "restored-1"]);
+    expect(result).toEqual({ events: 3, lastCursor: "restored-2", pages: 3 });
+    const parsed = stdout.map((line) => JSON.parse(line) as {
+      event?: { streamEpoch?: string };
+      kind: string;
+    });
+    expect(parsed.filter((entry) => entry.kind === "gap")).toHaveLength(1);
+    expect(parsed.filter((entry) => entry.kind === "event").map((entry) =>
+      entry.event?.streamEpoch)).toEqual([streamEpoch, restoredEpoch, restoredEpoch]);
   });
 
   test("fails closed on cursor mismatch, non-advancing events, and zero-wait follow", async () => {

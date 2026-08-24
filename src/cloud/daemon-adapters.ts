@@ -50,6 +50,7 @@ import type {
   CloudDaemonLocalSourcePort,
   CloudLocalCommandAuthority,
   CloudLocalSessionHead,
+  CloudLocalSessionPage,
   CloudLocalUsageSnapshot,
 } from "./daemon-bridge";
 import type {
@@ -1775,12 +1776,19 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
     return { profile, session: session as SessionRecord & { providerThreadId: string } };
   }
 
-  async listSessions(input: Readonly<{ limit: number; signal: AbortSignal }>): Promise<readonly CloudLocalSessionHead[]> {
+  async listSessions(input: Readonly<{
+    afterPublicId?: string | null;
+    limit: number;
+    signal: AbortSignal;
+  }>): Promise<CloudLocalSessionPage> {
     if (input.signal.aborted) throw input.signal.reason;
     const cache = this.#cache;
-    const sessions = this.#store.listSessions(input.limit);
+    const page = this.#store.listCloudSessionPage({
+      afterId: input.afterPublicId ?? null,
+      limit: input.limit,
+    });
     const heads: CloudLocalSessionHead[] = [];
-    for (const session of sessions) {
+    for (const session of page.sessions) {
       const state = terminalSessionState(session);
       if (state === null || session.providerThreadId === undefined) continue;
       const profile = this.#store.requireProfileById(session.profileId);
@@ -1818,7 +1826,11 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
         updatedAt: session.updatedAt,
       });
     }
-    return heads;
+    return {
+      continueAfterPublicId: page.continueAfterId,
+      isDone: page.isDone,
+      sessions: heads,
+    };
   }
 
   readCompactEvents(input: Readonly<{
@@ -2095,8 +2107,12 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   }
   listDevices(signal: AbortSignal): Promise<unknown> { return this.#control.listDevices(signal); }
   pairDevice(signal: AbortSignal): Promise<unknown> { return this.#control.pairDevice(signal); }
-  approveDevice(device: string, signal: AbortSignal): Promise<unknown> { return this.#control.approveDevice(device, signal); }
-  revokeDevice(device: string, signal: AbortSignal): Promise<unknown> { return this.#control.revokeDevice(device, signal); }
+  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
+    return this.#control.approveDevice(device, idempotencyKey, signal);
+  }
+  revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
+    return this.#control.revokeDevice(device, idempotencyKey, signal);
+  }
   listRemoteSessionHeads(input: Readonly<{ limit: number; signal: AbortSignal }>): Promise<Readonly<{
     sessions: readonly CloudRemoteSessionHead[];
     truncated: boolean;

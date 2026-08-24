@@ -14,6 +14,7 @@ import {
 } from "./identity-custody";
 import {
   createLocalCloudControlFromEnvironment,
+  createCloudUuidV7,
   deploymentFencedCloudTransport,
   LocalCloudControl,
   type CloudSecretCustodyPort,
@@ -38,6 +39,14 @@ const testDeploymentAuthority = {
   generation: 0,
   scopeCustodySlot: (slot: string) => slot,
 };
+
+function deviceMutationKey(now = fixedNow): string {
+  return createCloudUuidV7(now);
+}
+
+function indexedDeviceMutationKey(index: number): string {
+  return `018bcfe5-6800-7000-8000-${index.toString(16).padStart(12, "0")}`;
+}
 
 class MemoryCustody implements CloudSecretCustodyPort {
   readonly reads: string[] = [];
@@ -122,6 +131,7 @@ class FakeCloud {
   failNextAckAfterEffect = false;
   failNextRegisterAfterEffect = false;
   failNextRegistrationRecovery = false;
+  failNextRevokeAfterEffect = false;
   failNextRevokeBeforeEffect = false;
   failNextSignOutAfterEffect = false;
   failNextSignOutBeforeEffect = false;
@@ -326,6 +336,10 @@ class FakeCloud {
           if (target === undefined) throw new Error("missing device");
           target.status = "revoked";
           target.revision += 1;
+          if (this.failNextRevokeAfterEffect) {
+            this.failNextRevokeAfterEffect = false;
+            throw new Error("lost revocation response");
+          }
           return { publicId: target.publicId, revision: target.revision, status: target.status };
         }
         if (name === "devices:beginBind") {
@@ -594,6 +608,28 @@ function accountKeyIsProvisional(custody: MemoryCustody): boolean {
   return decoded.provisional;
 }
 
+function deviceMutationCustody(custody: MemoryCustody): Readonly<{
+  pending: unknown;
+  receipts: readonly Readonly<Record<string, unknown>>[];
+  userPublicId: unknown;
+  version: unknown;
+}> {
+  const serialized = custody.values.get("cloud-device-mutation")?.value;
+  if (serialized === undefined) throw new Error("missing device-mutation custody fixture");
+  const decoded: unknown = JSON.parse(serialized) as unknown;
+  if (
+    !isRecord(decoded)
+    || !Array.isArray(decoded.receipts)
+    || !decoded.receipts.every(isRecord)
+  ) throw new Error("invalid device-mutation custody fixture");
+  return {
+    pending: decoded.pending,
+    receipts: decoded.receipts,
+    userPublicId: decoded.userPublicId,
+    version: decoded.version,
+  };
+}
+
 function expectSignedOutCustody(custody: MemoryCustody): void {
   const value = custody.values.get("cloud-auth")?.value;
   expect(value).toBeString();
@@ -604,6 +640,17 @@ function expectSignedOutCustody(custody: MemoryCustody): void {
 }
 
 describe("local cloud control", () => {
+  test("rejects a non-UUIDv7 caller key before a device mutation can reach cloud state", async () => {
+    const cloud = new FakeCloud();
+    const adapter = control(cloud, new MemoryCustody());
+    await expect(adapter.approveDevice("device_target", "not-a-uuid", signal))
+      .rejects.toThrow("idempotency key is invalid");
+    await expect(adapter.revokeDevice("device_target", "not-a-uuid", signal))
+      .rejects.toThrow("idempotency key is invalid");
+    expect(cloud.approvalAttempts).toHaveLength(0);
+    expect(cloud.revocationAttempts).toHaveLength(0);
+  });
+
   test("rejects account erasure without acknowledgement before cloud access", async () => {
     const cloud = new FakeCloud();
     const adapter = control(cloud, new MemoryCustody());
@@ -1173,7 +1220,7 @@ describe("local cloud control", () => {
     });
     expect(accountKeyIsProvisional(pendingCustody)).toBe(true);
     expect(accountKey(pendingCustody)).not.toEqual(accountKey(firstCustody));
-    await first.approveDevice(registration.device.publicId, signal);
+    await first.approveDevice(registration.device.publicId, deviceMutationKey(), signal);
     expect(await pending.ensureDeviceRegistered(signal)).toMatchObject({
       device: { status: "active" },
       registered: true,
@@ -1267,16 +1314,25 @@ describe("local cloud control", () => {
     await authenticate(second);
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
     expect(secondPair).toMatchObject({ paired: false, device: { status: "pending" } });
+    const approvalKey = deviceMutationKey();
     cloud.failNextApproveAfterEffect = true;
-    await expect(first.approveDevice(secondPair.device.publicId.slice(0, 16), signal))
+    await expect(first.approveDevice(
+      secondPair.device.publicId.slice(0, 16),
+      approvalKey,
+      signal,
+    ))
       .rejects.toThrow("lost approval response");
-    expect(await first.approveDevice(secondPair.device.publicId.slice(0, 16), signal))
+    expect(await first.approveDevice(
+      secondPair.device.publicId.slice(0, 16),
+      approvalKey,
+      signal,
+    ))
       .toMatchObject({
         device: { publicId: secondPair.device.publicId, status: "active" },
         replay: true,
       });
     expect(await second.pairDevice(signal)).toMatchObject({ paired: true });
-    expect(await first.revokeDevice(secondPair.device.publicId, signal))
+    expect(await first.revokeDevice(secondPair.device.publicId, deviceMutationKey(), signal))
       .toMatchObject({ device: { status: "revoked" } });
     expect(await first.listDevices(signal)).toMatchObject({
       currentDevicePublicId: firstPair.device.publicId,
@@ -1284,6 +1340,229 @@ describe("local cloud control", () => {
         expect.objectContaining({ publicId: secondPair.device.publicId, status: "revoked" }),
       ]),
     });
+  });
+
+  test("recovers a lost approval response before settlement and replays its receipt after restart", async () => {
+    const cloud = new FakeCloud();
+    const firstCustody = new MemoryCustody();
+    const first = control(cloud, firstCustody);
+    const second = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    const approvalKey = deviceMutationKey();
+
+    cloud.failNextApproveAfterEffect = true;
+    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+      .rejects.toThrow("lost approval response");
+    expect(deviceMutationCustody(firstCustody))
+      .toMatchObject({
+        pending: { idempotencyKey: approvalKey, kind: "approve" },
+        receipts: [],
+        userPublicId,
+        version: 2,
+      });
+
+    const restarted = control(cloud, firstCustody);
+    await restarted.pairDevice(signal);
+    const recovered = await restarted.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      signal,
+    ) as { device: unknown; replay: boolean };
+    expect(recovered).toMatchObject({
+      device: { publicId: secondPair.device.publicId, revision: 2, status: "active" },
+      replay: true,
+    });
+    const settled = deviceMutationCustody(firstCustody);
+    expect(settled).toMatchObject({
+      pending: null,
+      receipts: [{
+        idempotencyKey: approvalKey,
+        kind: "approve",
+        result: recovered.device,
+        targetPublicId: secondPair.device.publicId,
+      }],
+      userPublicId,
+      version: 2,
+    });
+
+    const responseLostAfterSettlement = control(cloud, firstCustody);
+    await responseLostAfterSettlement.pairDevice(signal);
+    expect(await responseLostAfterSettlement.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      signal,
+    )).toEqual(recovered);
+    expect(cloud.approvalAttempts).toHaveLength(1);
+  });
+
+  test("migrates a legacy single device-mutation outbox into identity-scoped receipt custody", async () => {
+    const cloud = new FakeCloud();
+    const firstCustody = new MemoryCustody();
+    const first = control(cloud, firstCustody);
+    const second = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    const approvalKey = deviceMutationKey();
+    cloud.failNextApproveBeforeEffect = true;
+    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+      .rejects.toThrow("approval unavailable before effect");
+    const observation = firstCustody.values.get("cloud-device-mutation");
+    const pending = deviceMutationCustody(firstCustody).pending;
+    if (observation === undefined || !isRecord(pending)) {
+      throw new Error("missing pending mutation fixture");
+    }
+    firstCustody.values.set("cloud-device-mutation", {
+      generation: observation.generation + 1,
+      value: JSON.stringify(pending),
+    });
+
+    const restarted = control(cloud, firstCustody);
+    await restarted.pairDevice(signal);
+    expect(await restarted.approveDevice(
+      secondPair.device.publicId,
+      approvalKey,
+      signal,
+    )).toMatchObject({
+      device: { publicId: secondPair.device.publicId, status: "active" },
+      replay: true,
+    });
+    expect(deviceMutationCustody(firstCustody)).toMatchObject({
+      pending: null,
+      receipts: [{ idempotencyKey: approvalKey, kind: "approve" }],
+      userPublicId,
+      version: 2,
+    });
+  });
+
+  test("recovers a lost revocation response before settlement and replays its receipt after restart", async () => {
+    const cloud = new FakeCloud();
+    const firstCustody = new MemoryCustody();
+    const first = control(cloud, firstCustody);
+    const second = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    await first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal);
+    const revokeKey = deviceMutationKey();
+
+    cloud.failNextRevokeAfterEffect = true;
+    await expect(first.revokeDevice(secondPair.device.publicId, revokeKey, signal))
+      .rejects.toThrow("lost revocation response");
+
+    const restarted = control(cloud, firstCustody);
+    await restarted.pairDevice(signal);
+    const recovered = await restarted.revokeDevice(
+      secondPair.device.publicId,
+      revokeKey,
+      signal,
+    ) as { device: unknown; replay: boolean };
+    expect(recovered).toMatchObject({
+      device: { publicId: secondPair.device.publicId, revision: 3, status: "revoked" },
+      replay: true,
+    });
+    const settled = deviceMutationCustody(firstCustody);
+    expect(settled.pending).toBeNull();
+    expect(settled.receipts.find((receipt) =>
+      receipt.idempotencyKey === revokeKey)).toMatchObject({
+      idempotencyKey: revokeKey,
+      kind: "revoke",
+      result: recovered.device,
+      targetPublicId: secondPair.device.publicId,
+    });
+
+    const responseLostAfterSettlement = control(cloud, firstCustody);
+    await responseLostAfterSettlement.pairDevice(signal);
+    expect(await responseLostAfterSettlement.revokeDevice(
+      secondPair.device.publicId,
+      revokeKey,
+      signal,
+    )).toEqual(recovered);
+    expect(cloud.revocationAttempts).toHaveLength(1);
+  });
+
+  test("rejects caller-key collisions across device targets and operations", async () => {
+    const cloud = new FakeCloud();
+    const first = control(cloud, new MemoryCustody());
+    const second = control(cloud, new MemoryCustody());
+    const third = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    await authenticate(third);
+    const thirdPair = await third.pairDevice(signal) as { device: { publicId: string } };
+    const callerKey = deviceMutationKey();
+    const approved = await first.approveDevice(
+      secondPair.device.publicId,
+      callerKey,
+      signal,
+    ) as { device: unknown };
+
+    await expect(first.revokeDevice(secondPair.device.publicId, callerKey, signal))
+      .rejects.toThrow("reused for a different request");
+    await expect(first.approveDevice(thirdPair.device.publicId, callerKey, signal))
+      .rejects.toThrow("reused for a different request");
+    expect(cloud.revocationAttempts).toHaveLength(0);
+    expect(cloud.devices.get(thirdPair.device.publicId)?.status).toBe("pending");
+
+    await first.revokeDevice(secondPair.device.publicId, deviceMutationKey(), signal);
+    expect(await first.approveDevice(secondPair.device.publicId, callerKey, signal)).toEqual({
+      device: approved.device,
+      replay: true,
+    });
+  });
+
+  test("bounds device-mutation receipt count and serialized custody bytes", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const first = control(cloud, custody);
+    const second = control(cloud, new MemoryCustody());
+    await authenticate(first);
+    await first.pairDevice(signal);
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    const receipts = Array.from({ length: 128 }, (_, index) => {
+      const targetPublicId = `device_r${String(index).padStart(4, "0")}`;
+      return {
+        completedAt: fixedNow,
+        idempotencyKey: indexedDeviceMutationKey(index + 1),
+        kind: "approve",
+        requestDigest: "a".repeat(64),
+        result: { publicId: targetPublicId, revision: 2, status: "active" },
+        targetPublicId,
+      };
+    });
+    custody.values.set("cloud-device-mutation", {
+      generation: 0,
+      value: JSON.stringify({
+        pending: null,
+        receipts,
+        userPublicId,
+        version: 2,
+      }),
+    });
+    const newestKey = deviceMutationKey();
+    await first.approveDevice(secondPair.device.publicId, newestKey, signal);
+    const bounded = deviceMutationCustody(custody);
+    expect(bounded.receipts).toHaveLength(128);
+    expect(bounded.receipts.some((receipt) =>
+      receipt.idempotencyKey === indexedDeviceMutationKey(1))).toBe(false);
+    expect(bounded.receipts.some((receipt) =>
+      receipt.idempotencyKey === newestKey)).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(bounded)).byteLength).toBeLessThanOrEqual(64 * 1_024);
+
+    custody.values.set("cloud-device-mutation", {
+      generation: (custody.values.get("cloud-device-mutation")?.generation ?? 0) + 1,
+      value: JSON.stringify({ padding: "x".repeat(64 * 1_024) }),
+    });
+    await expect(first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal))
+      .rejects.toThrow("custody is corrupt");
   });
 
   test("explicitly replaces a revoked local device after reauthentication", async () => {
@@ -1297,9 +1576,9 @@ describe("local cloud control", () => {
     await authenticate(second);
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
     const retiredPublicId = secondPair.device.publicId;
-    await first.approveDevice(retiredPublicId, signal);
+    await first.approveDevice(retiredPublicId, deviceMutationKey(), signal);
     await second.pairDevice(signal);
-    await first.revokeDevice(retiredPublicId, signal);
+    await first.revokeDevice(retiredPublicId, deviceMutationKey(), signal);
 
     expect(await second.pairDevice(signal)).toMatchObject({
       device: { publicId: retiredPublicId, status: "revoked" },
@@ -1329,7 +1608,7 @@ describe("local cloud control", () => {
     expect(history).not.toContain("signingPrivateKey");
     expect(history).not.toContain("wrappingPrivateKey");
 
-    await first.approveDevice(replacement.device.publicId, signal);
+    await first.approveDevice(replacement.device.publicId, deviceMutationKey(), signal);
     expect(await second.pairDevice(signal)).toMatchObject({
       device: { publicId: replacement.device.publicId, status: "active" },
       paired: true,
@@ -1360,42 +1639,60 @@ describe("local cloud control", () => {
     expect(secondCustody.values.has("cloud-device-registration")).toBe(false);
   });
 
-  test("rerolls aged uncommitted approvals and revocations with exact outbox CAS", async () => {
+  test("expires aged uncommitted caller keys before accepting a fresh exact key", async () => {
     const cloud = new FakeCloud();
     let localNow = fixedNow;
-    const first = control(cloud, new MemoryCustody(), () => localNow);
+    const firstCustody = new MemoryCustody();
+    const first = control(cloud, firstCustody, () => localNow);
     const second = control(cloud, new MemoryCustody());
     await authenticate(first);
     await first.pairDevice(signal);
     await authenticate(second);
     const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+    const approvalKey = deviceMutationKey(localNow);
     cloud.failNextApproveBeforeEffect = true;
 
-    await expect(first.approveDevice(secondPair.device.publicId, signal)).rejects.toThrow(
-      "approval unavailable before effect",
-    );
-    const oldKey = cloud.approvalAttempts[0]?.idempotencyKey;
+    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+      .rejects.toThrow("approval unavailable before effect");
+    expect(cloud.approvalAttempts[0]?.idempotencyKey).toBe(approvalKey);
     localNow += 7 * 24 * 60 * 60 * 1_000 + 1;
 
-    expect(await first.approveDevice(secondPair.device.publicId, signal)).toMatchObject({
+    await expect(first.approveDevice(secondPair.device.publicId, approvalKey, signal))
+      .rejects.toThrow("idempotency key is expired");
+    expect(cloud.approvalAttempts).toHaveLength(1);
+    const freshApprovalKey = deviceMutationKey(localNow);
+    expect(await first.approveDevice(
+      secondPair.device.publicId,
+      freshApprovalKey,
+      signal,
+    )).toMatchObject({
       device: { publicId: secondPair.device.publicId, status: "active" },
-      replay: true,
     });
     expect(cloud.approvalAttempts).toHaveLength(2);
-    expect(cloud.approvalAttempts[1]?.idempotencyKey).not.toBe(oldKey);
+    expect(cloud.approvalAttempts[1]?.idempotencyKey).toBe(freshApprovalKey);
 
+    const revokeKey = deviceMutationKey(localNow);
     cloud.failNextRevokeBeforeEffect = true;
-    await expect(first.revokeDevice(secondPair.device.publicId, signal)).rejects.toThrow(
-      "revocation unavailable before effect",
-    );
-    const oldRevokeKey = cloud.revocationAttempts[0]?.idempotencyKey;
+    await expect(first.revokeDevice(secondPair.device.publicId, revokeKey, signal))
+      .rejects.toThrow("revocation unavailable before effect");
+    expect(cloud.revocationAttempts[0]?.idempotencyKey).toBe(revokeKey);
     localNow += 7 * 24 * 60 * 60 * 1_000 + 1;
-    expect(await first.revokeDevice(secondPair.device.publicId, signal)).toMatchObject({
+    await expect(first.revokeDevice(secondPair.device.publicId, revokeKey, signal))
+      .rejects.toThrow("idempotency key is expired");
+    expect(cloud.revocationAttempts).toHaveLength(1);
+    const freshRevokeKey = deviceMutationKey(localNow);
+    expect(await first.revokeDevice(
+      secondPair.device.publicId,
+      freshRevokeKey,
+      signal,
+    )).toMatchObject({
       device: { publicId: secondPair.device.publicId, status: "revoked" },
-      replay: true,
     });
     expect(cloud.revocationAttempts).toHaveLength(2);
-    expect(cloud.revocationAttempts[1]?.idempotencyKey).not.toBe(oldRevokeKey);
+    expect(cloud.revocationAttempts[1]?.idempotencyKey).toBe(freshRevokeKey);
+    expect(deviceMutationCustody(firstCustody).receipts).toEqual([
+      expect.objectContaining({ idempotencyKey: freshRevokeKey, kind: "revoke" }),
+    ]);
   });
 
   test("paginates every device and resolves an exact device beyond the first page", async () => {
@@ -1419,7 +1716,11 @@ describe("local cloud control", () => {
 
     const listed = await adapter.listDevices(signal) as { devices: unknown[] };
     expect(listed.devices).toHaveLength(126);
-    expect(await adapter.approveDevice("device_bulk_0124", signal)).toMatchObject({
+    expect(await adapter.approveDevice(
+      "device_bulk_0124",
+      deviceMutationKey(),
+      signal,
+    )).toMatchObject({
       device: { publicId: "device_bulk_0124", status: "active" },
     });
   });
@@ -1511,7 +1812,7 @@ describe("local cloud control", () => {
     const pendingDevice = [...cloud.devices.values()].find((device) =>
       device.status === "pending");
     if (pendingDevice === undefined) throw new Error("missing pending device fixture");
-    await first.approveDevice(pendingDevice.publicId, signal);
+    await first.approveDevice(pendingDevice.publicId, deviceMutationKey(), signal);
 
     await second.logout(signal);
     await authenticate(second);

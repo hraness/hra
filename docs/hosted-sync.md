@@ -1,10 +1,36 @@
 # Hosted sync deployment
 
+Do not perform any provider write in this runbook until the user supplies the exact authorization phrase `approve both`. That phrase authorizes the paired hosted setup only: Resend GitHub OAuth and creation of the sending-only Resend key, followed by the checked hosted secret and bootstrap writes described here.
+
+`approve both` does not authorize DNS. Do not add, change, or remove any DNS record, domain assignment, or production alias until the user separately confirms the exact record-level change. Keep `hra.sh`, the HRA v0 project, and every rollback route unchanged meanwhile.
+
 Use this sequence only for a new HRA Convex project and production deployment. The setup helper refuses an existing HRA environment by default. It does not support overwrite.
 
 Never copy HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the new project. Keep the old project and deployment unchanged for rollback.
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. HRA v0 owns Convex project ID `2680173` and production deployment ID `4677913`; neither may be renamed into or selected by this runbook. The new source repository has GitHub repository ID `1343008607`, and the new web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Project and deployment names may change during cutover. The team identity and numeric resource IDs do not.
+
+## Migrate staged prerelease secret pointers
+
+This compatibility operator is only for repository checkouts that ran an unpublished prerelease HRA v1 build on macOS when the default secret backend was Keychain. No HRA v1 beta containing that default was published. This command is therefore a repository-operator migration for staged prerelease state, not an installed-product feature, a daemon fallback, or a reason to make the daemon read Keychain.
+
+Run the read-only inspection from the exact source checkout first:
+
+```sh
+bun run operator:migrate-legacy-secrets preflight
+```
+
+Preflight reads the private pointer metadata and current `secret-values` files only. It does not acquire daemon authority, create a directory or file, read Keychain, copy a value, delete an entry, or perform another mutation. `ready` with `nextAction: "execute_migration"` means at least one current pointer still lacks its exact file-backed value. `already_complete` and `not_required` need no migration. Unsafe, unknown, locked, malformed, non-owned, multiply linked, permission-inexact, oversized, replaced, or digest-conflicting metadata is a refusal. Output contains counts and a closed status only. It never contains a secret value, digest, slot, Keychain account, nonce, or local path.
+
+Stop every HRA process, then run the explicit foreground mutation:
+
+```sh
+bun run operator:migrate-legacy-secrets --execute
+```
+
+Execution first acquires and holds HRA's exact daemon lifecycle authority in maintenance state. A live or starting daemon causes `daemon_running` before any Keychain access. While that authority remains held, the operator re-reads every current pointer, reads only missing values from Bun's legacy `sh.hra.control-plane.v1` service, checks each value against the pointer digest, and validates all missing values before copying any. It publishes each value at the unchanged immutable account name through the current `FileSecretBackend`, then reopens every required file through the protected descriptor boundary and proves all pointer digests again before releasing authority and reporting success.
+
+The operation is safe to replay after a crash or refusal. Exact copies are accepted without another Keychain read, missing copies resume, and an existing conflicting or unsafe file stops the run without overwrite. A pointer change during execution is a refusal even when an earlier copy succeeded; stop HRA and replay so the current complete pointer set can be proved. The operator never deletes or changes an entry in the legacy Keychain service. Keep those entries as recovery evidence until the prerelease installation is no longer needed, then review any manual cleanup separately.
 
 ## Create fresh state
 
@@ -119,7 +145,7 @@ If no populated capability file exists and every pre-bootstrap authority remains
 
 Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled and do not move `hra.sh` until every live acceptance and rollback gate in the release plan passes.
+Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. After exact-source live acceptance and Q rollback readiness pass, the checked domain operator may move `hra.sh` for the required forward and reverse rehearsal. The production forward move remains prohibited until that rehearsal and every other rollback gate in the release plan pass.
 
 ## Operate friend-beta invitations
 

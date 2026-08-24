@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 
-import { IndeterminateCodexEffectError } from "../codex/index";
+import { CodexError, IndeterminateCodexEffectError } from "../codex/index";
 import type {
   CodexAppServerClient,
   CodexCapabilitySnapshot,
@@ -20,7 +20,7 @@ import {
   projectBoundedThread,
   projectUtf8Text,
 } from "./codex-runtime-adapter";
-import type { CodexAccountProjection } from "./ports";
+import type { CodexAccountProjection, CodexSessionObservationError } from "./ports";
 
 const authority = {
   id: "acct_00000000000000000000000000000000",
@@ -28,6 +28,52 @@ const authority = {
   codexHome: join(tmpdir(), "hra-fake"),
   desktopUserData: join(tmpdir(), "hra-fake-desktop"),
 } as const;
+
+const CREDENTIAL_STORE_PREFLIGHT = Object.freeze({
+  cliAuth: "file",
+  cwd: "/tmp/hra-control-plane/project",
+  mcpOauth: "file",
+} as const);
+
+type RuntimeManagerOptions = ConstructorParameters<typeof PinnedCodexRuntimeManager>[0];
+type TestRuntimeManagerOptions = Omit<RuntimeManagerOptions, "credentialStorePreflight">
+  & Partial<Pick<RuntimeManagerOptions, "credentialStorePreflight">>;
+
+let fakeConnectionSequence = 0;
+
+function createRuntimeManager(input: TestRuntimeManagerOptions): PinnedCodexRuntimeManager {
+  const launchClient = input.launchClient;
+  return new PinnedCodexRuntimeManager({
+    credentialStorePreflight: CREDENTIAL_STORE_PREFLIGHT,
+    ...input,
+    ...(launchClient === undefined
+      ? {}
+      : {
+          launchClient: async (options) => {
+            const client = await launchClient(options);
+            const mutable = client as unknown as {
+              connectionId?: string;
+              resumeThread?: CodexAppServerClient["resumeThread"];
+            };
+            if (typeof mutable.connectionId !== "string") {
+              fakeConnectionSequence += 1;
+              Object.defineProperty(mutable, "connectionId", {
+                configurable: true,
+                value: `70000000-0000-4000-8000-${String(fakeConnectionSequence).padStart(12, "0")}`,
+              });
+            }
+            mutable.resumeThread ??= async (threadId: string) => ({
+              authority: {
+                profileId: options.authority.profileId,
+                processGeneration: options.authority.processGeneration,
+              },
+              value: makeThread([], threadId),
+            });
+            return client;
+          },
+        }),
+  });
+}
 
 const makeTurn = (
   id: string,
@@ -42,9 +88,9 @@ const makeTurn = (
   durationMs: status === "inProgress" ? null : 1_000,
 });
 
-const makeThread = (turns: readonly CodexTurn[]): CodexThread => ({
-  id: "thread-1",
-  sessionId: "thread-1",
+const makeThread = (turns: readonly CodexTurn[], id = "thread-1"): CodexThread => ({
+  id,
+  sessionId: id,
   preview: "Preview",
   ephemeral: false,
   modelProvider: "openai",
@@ -57,8 +103,297 @@ const makeThread = (turns: readonly CodexTurn[]): CodexThread => ({
 });
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("single-flights an exact resumed thread observation by generation and connection", async () => {
+    let resumeCalls = 0;
+    let releaseResume!: () => void;
+    let markResumeEntered!: () => void;
+    const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });
+    const resumeEntered = new Promise<void>((resolve) => { markResumeEntered = resolve; });
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const connectionId = "71000000-0000-4000-8000-000000000001";
+    const fake = {
+      state: "ready",
+      connectionId,
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        markResumeEntered();
+        await resumeGate;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string, includeTurns: boolean) => {
+        expect(includeTurns).toBe(false);
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const first = manager.observeSession({
+      authority,
+      providerThreadId: "thread-resume",
+      signal: new AbortController().signal,
+    });
+    const second = manager.observeSession({
+      authority,
+      providerThreadId: "thread-resume",
+      signal: new AbortController().signal,
+    });
+    await resumeEntered;
+    expect(resumeCalls).toBe(1);
+    releaseResume();
+    const observations = await Promise.all([first, second]);
+    expect(observations).toHaveLength(2);
+    expect(observations[0]).toMatchObject({ connectionId, resumed: true });
+    expect(observations[1]).toMatchObject({ connectionId, resumed: true });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-resume",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ connectionId, resumed: true });
+    expect(resumeCalls).toBe(1);
+    await manager.close();
+  });
+
+  test("refreshes a cached observation across idle, active, and idle provider states", async () => {
+    let resumeCalls = 0;
+    let readCalls = 0;
+    let turnListCalls = 0;
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const connectionId = "71000000-0000-4000-8000-000000000004";
+    const providerThreadId = "thread-refresh";
+    let current = makeThread([], providerThreadId);
+    const fake = {
+      state: "ready",
+      connectionId,
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string, includeTurns: boolean) => {
+        readCalls += 1;
+        expect(threadId).toBe(providerThreadId);
+        expect(includeTurns).toBe(false);
+        return { authority: providerAuthority, value: { ...current, turns: [] } };
+      },
+      listThreadTurns: async (options: unknown) => {
+        turnListCalls += 1;
+        expect(options).toEqual({
+          threadId: providerThreadId,
+          limit: 1,
+          sortDirection: "desc",
+          itemsView: "notLoaded",
+        });
+        return {
+          authority: providerAuthority,
+          value: { data: current.turns.slice(-1).reverse(), nextCursor: null, backwardsCursor: null },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    const observe = async () => await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+
+    await expect(observe()).resolves.toMatchObject({
+      connectionId,
+      projection: { providerThreadId, status: "idle" },
+      resumed: true,
+    });
+    current = {
+      ...makeThread([makeTurn("turn-active", [], "inProgress")], providerThreadId),
+      status: { type: "active", activeFlags: [] },
+    };
+    await expect(observe()).resolves.toMatchObject({
+      projection: {
+        activeTurnId: "turn-active",
+        providerThreadId,
+        status: "active",
+      },
+    });
+    current = makeThread([makeTurn("turn-active", [])], providerThreadId);
+    const returnedIdle = await observe();
+    expect(returnedIdle.projection).toMatchObject({ providerThreadId, status: "idle" });
+    expect(returnedIdle.projection).not.toHaveProperty("activeTurnId");
+    expect(resumeCalls).toBe(1);
+    expect(readCalls).toBe(3);
+    expect(turnListCalls).toBe(1);
+    await manager.close();
+  });
+
+  test("propagates a fresh projection-read error without replaying the cached resume", async () => {
+    let resumeCalls = 0;
+    let readCalls = 0;
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const providerThreadId = "thread-read-failure";
+    const readError = new CodexError("REMOTE_ERROR", "Codex rejected thread/read.");
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000005",
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      readThread: async (threadId: string) => {
+        readCalls += 1;
+        if (readCalls === 1) throw readError;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+    const observe = async () => await manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    });
+
+    await expect(observe()).rejects.toBe(readError);
+    await expect(observe()).resolves.toMatchObject({
+      projection: { providerThreadId, status: "idle" },
+      resumed: true,
+    });
+    expect(resumeCalls).toBe(1);
+    expect(readCalls).toBe(2);
+    await manager.close();
+  });
+
+  test("retires an indeterminate resume without retrying it under the same generation", async () => {
+    let resumeCalls = 0;
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000002",
+      resumeThread: async () => {
+        resumeCalls += 1;
+        throw new IndeterminateCodexEffectError("thread/resume", 17);
+      },
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-resume",
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      name: "CodexSessionObservationError",
+      reason: "resume_unavailable",
+    } satisfies Partial<CodexSessionObservationError>);
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-resume",
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(resumeCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+    await manager.close();
+  });
+
+  test("caches a determinate resume rejection without retiring or retrying the client", async () => {
+    let resumeCalls = 0;
+    let closeCalls = 0;
+    const fake = {
+      state: "ready",
+      connectionId: "71000000-0000-4000-8000-000000000003",
+      resumeThread: async () => {
+        resumeCalls += 1;
+        throw new CodexError("REMOTE_ERROR", "Codex rejected thread/resume.");
+      },
+      close: async () => { closeCalls += 1; },
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(manager.observeSession({
+        authority,
+        providerThreadId: "thread-resume",
+        signal: new AbortController().signal,
+      })).rejects.toMatchObject({
+        name: "CodexSessionObservationError",
+        reason: "resume_unavailable",
+      });
+    }
+    expect(resumeCalls).toBe(1);
+    expect(closeCalls).toBe(0);
+    await manager.close();
+    expect(closeCalls).toBe(1);
+  });
+
+  test("forwards Codex thread-list cursors and preserves the provider continuation", async () => {
+    let requested: Parameters<CodexAppServerClient["listThreads"]>[0] | undefined;
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      listThreads: async (options: Parameters<CodexAppServerClient["listThreads"]>[0]) => {
+        requested = options;
+        return {
+          authority: providerAuthority,
+          value: {
+            data: [makeThread([])],
+            nextCursor: "provider-page-3",
+            backwardsCursor: null,
+          },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.listSessions({
+      authority,
+      cursor: "provider-page-2",
+      limit: 17,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      nextCursor: "provider-page-3",
+      sessions: [{ providerThreadId: "thread-1", title: "Projection test" }],
+    });
+    expect(requested).toEqual({ cursor: "provider-page-2", limit: 17 });
+    await manager.close();
+  });
+
   test("prepares each isolated Codex home and threads its bounded launch policy", async () => {
     const steps: string[] = [];
+    const now = () => 12_345;
     let launched: LaunchPinnedCodexOptions | undefined;
     const fake = {
       state: "ready",
@@ -68,7 +403,7 @@ describe("PinnedCodexRuntimeManager", () => {
       }),
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       codexEnvironment: async (codexHome) => {
         steps.push(`environment:${codexHome}`);
         return { HOME: "/Users/person", TMPDIR: `${codexHome}/tmp` };
@@ -85,6 +420,7 @@ describe("PinnedCodexRuntimeManager", () => {
         return fake;
       },
       observer: { account: () => undefined, fact: () => undefined },
+      now,
       prepareCodexHome: async (codexHome) => {
         steps.push(`prepare:${codexHome}`);
       },
@@ -107,6 +443,7 @@ describe("PinnedCodexRuntimeManager", () => {
         TMPDIR: `${authority.codexHome}/tmp`,
       },
       expectedCodexHome: authority.codexHome,
+      now,
     });
     await manager.close();
   });
@@ -137,7 +474,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: (candidate) => candidate.generation === authority.generation,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -183,7 +520,7 @@ describe("PinnedCodexRuntimeManager", () => {
       }),
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: {
         account: () => undefined,
@@ -229,8 +566,15 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
     const calls: unknown[] = [];
     const validations: unknown[] = [];
+    const inspections: unknown[] = [];
+    let clientState: "failed" | "ready" = "ready";
+    let delayInspection = false;
+    let releaseInspection!: () => void;
+    let markInspectionStarted!: () => void;
+    const inspectionGate = new Promise<void>((resolve) => { releaseInspection = resolve; });
+    const startedInspection = new Promise<void>((resolve) => { markInspectionStarted = resolve; });
     const fake = {
-      state: "ready",
+      get state() { return clientState; },
       connectionId,
       accountRead: async () => ({
         authority: { profileId: authority.id, processGeneration: authority.generation },
@@ -244,6 +588,26 @@ describe("PinnedCodexRuntimeManager", () => {
         validations.push(input);
         return { responseDigest: "a".repeat(64) };
       },
+      inspectInteractionAuthority: async (input: unknown) => {
+        inspections.push(input);
+        if (delayInspection) {
+          markInspectionStarted();
+          await inspectionGate;
+        }
+        return {
+          kind: "command_approval" as const,
+          command: "git reset --hard HEAD",
+          reason: "Apply exact reset",
+          availableDecisions: ["accept", "decline", "cancel"],
+          workingDirectory: "/workspace",
+          environmentId: null,
+          commandActions: [],
+          networkApprovalContext: null,
+          additionalPermissions: null,
+          proposedExecpolicyAmendment: null,
+          proposedNetworkPolicyAmendments: null,
+        };
+      },
       validateInteractionTimeout: async (input: unknown) => {
         validations.push(input);
         return { responseDigest: "b".repeat(64) };
@@ -254,7 +618,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -272,6 +636,17 @@ describe("PinnedCodexRuntimeManager", () => {
       itemId: "item-1",
       approvalId: null,
     };
+    const commandProvider = {
+      ...provider,
+      method: "item/commandExecution/requestApproval",
+    } as const;
+    await expect(manager.inspectInteractionAuthority({
+      authority,
+      provider: commandProvider,
+      kind: "command_approval",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ command: "git reset --hard HEAD" });
+    expect(inspections).toEqual([{ provider: commandProvider, kind: "command_approval" }]);
     await expect(manager.validateInteractionResolution({
       authority,
       provider,
@@ -285,9 +660,11 @@ describe("PinnedCodexRuntimeManager", () => {
       provider,
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).resolves.toEqual({ responseWritten: true });
     expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ deadlineAt: Number.MAX_SAFE_INTEGER });
     await expect(manager.validateInteractionTimeout({
       authority,
       provider,
@@ -298,6 +675,15 @@ describe("PinnedCodexRuntimeManager", () => {
       provider,
       signal: new AbortController().signal,
     })).resolves.toEqual({ responseWritten: true });
+    expect(calls).toHaveLength(2);
+    await expect(manager.resolveInteraction({
+      authority,
+      provider,
+      kind: "file_change_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: 0,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "DEADLINE_EXPIRED" });
     expect(calls).toHaveLength(2);
     await expect(manager.validateInteractionResolution({
       authority,
@@ -311,6 +697,7 @@ describe("PinnedCodexRuntimeManager", () => {
       provider: { ...provider, connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c" },
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await expect(manager.resolveInteraction({
@@ -318,9 +705,22 @@ describe("PinnedCodexRuntimeManager", () => {
       provider: { ...provider, processGeneration: authority.generation + 1 },
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     expect(calls).toHaveLength(2);
+    delayInspection = true;
+    const staleInspection = manager.inspectInteractionAuthority({
+      authority,
+      provider: commandProvider,
+      kind: "command_approval",
+      signal: new AbortController().signal,
+    });
+    await startedInspection;
+    clientState = "failed";
+    releaseInspection();
+    await expect(staleInspection).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(inspections).toHaveLength(2);
     await manager.close();
   });
 
@@ -383,19 +783,23 @@ describe("PinnedCodexRuntimeManager", () => {
       },
     };
     const requests: unknown[] = [];
+    const credentialStoreChecks: string[] = [];
     const providerAuthority = {
       profileId: authority.id,
       processGeneration: authority.generation,
     };
     const fake = {
       state: "ready",
+      assertCredentialStores: async (cwd: string) => {
+        credentialStoreChecks.push(cwd);
+      },
       listPlugins: async (options: unknown) => {
         requests.push(options);
         return { authority: providerAuthority, value: catalog };
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -407,6 +811,7 @@ describe("PinnedCodexRuntimeManager", () => {
       projectRoot: "/workspace/project",
       signal: new AbortController().signal,
     });
+    expect(credentialStoreChecks).toEqual(["/workspace/project"]);
     expect(requests).toEqual([{ cwd: "/workspace/project", forceRefetch: true }]);
     expect(projected.marketplaces.map(({ name }) => name)).toEqual([
       "a",
@@ -431,7 +836,9 @@ describe("PinnedCodexRuntimeManager", () => {
   test("reviews fresh same-generation capabilities immediately before each provider dispatch", async () => {
     const events: string[] = [];
     let discovery = 0;
+    const credentialStoreChecks: string[] = [];
     let ephemeral = false;
+    let resumeCalls = 0;
     let sandboxWritableRoots = ["/workspace/project"];
     const providerAuthority = { profileId: authority.id, processGeneration: authority.generation };
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
@@ -456,6 +863,9 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     const fake = {
       state: "ready",
+      assertCredentialStores: async (cwd: string) => {
+        credentialStoreChecks.push(cwd);
+      },
       discoverCapabilities: async (options: unknown) => {
         discovery += 1;
         events.push(`discover:${String(discovery)}:${JSON.stringify(options)}`);
@@ -490,6 +900,10 @@ describe("PinnedCodexRuntimeManager", () => {
           },
         };
       },
+      resumeThread: async (threadId: string) => {
+        resumeCalls += 1;
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
       startTurn: async (input: unknown) => {
         events.push(`turn:${JSON.stringify(input)}`);
         return { authority: providerAuthority, value: { turn: makeTurn("turn-1", [], "inProgress") } };
@@ -497,7 +911,7 @@ describe("PinnedCodexRuntimeManager", () => {
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
     let now = 100;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -509,7 +923,13 @@ describe("PinnedCodexRuntimeManager", () => {
     const turnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: new AbortController().signal });
     const turned = await manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: turnReview, message: "continue", clientMessageId: "client-1", signal: new AbortController().signal });
 
+    expect(credentialStoreChecks).toEqual([
+      "/workspace/project",
+      "/workspace/project",
+      "/workspace/project",
+    ]);
     expect(events.map((event) => event.split(":", 1)[0])).toEqual(["discover", "resolve", "thread", "discover", "resolve", "discover", "resolve", "turn"]);
+    expect(resumeCalls).toBe(0);
     expect(events[0]).toContain('"cwd":"/workspace/project"');
     expect(events[0]).not.toContain('"threadId"');
     expect(events[3]).toContain('"threadId":"thread-1"');
@@ -564,6 +984,44 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(detail?.items[1]).toMatchObject({ text: safe });
     expect(detail?.items[2]).toMatchObject({ summary: [{ text: safe }] });
     expect(detail?.items[3]).toMatchObject({ paths: [`src/${safe}.ts`] });
+  });
+
+  test("redacts complete transcript secrets and local paths before compact cloud projection", () => {
+    const privatePath = ["", "Users", "alice", "private", "token.txt"].join("/");
+    const thread = makeThread([makeTurn("turn-private", [
+      {
+        type: "userMessage",
+        id: "user-private",
+        clientId: "client-private",
+        text: [
+          "Before Authorization: Bearer USER-PROJECTION-SECRET-11",
+          `Read ${privatePath}`,
+        ],
+      },
+      {
+        type: "reasoning",
+        id: "reason-private",
+        summary: ["device_code=REASONING-PROJECTION-SECRET-22 while checking"],
+      },
+      {
+        type: "agentMessage",
+        id: "agent-private",
+        text: "Result api_key=ASSISTANT-PROJECTION-SECRET-33 complete",
+      },
+    ])]);
+    const projection = projectBoundedThread(thread, true);
+    const serialized = JSON.stringify(projection);
+    expect(serialized).not.toContain("PROJECTION-SECRET");
+    expect(serialized).not.toContain(privatePath);
+    expect(serialized).toContain("[protected]");
+    expect(serialized).toContain("[local-path]");
+    expect(projection.messages?.map((message) => message.text)).toEqual([
+      "Before [protected]",
+      "Result [protected] complete",
+    ]);
+    const detail = (projection.turns as { items: Record<string, unknown>[] }[])[0];
+    expect(JSON.stringify(detail?.items)).not.toContain("PROJECTION-SECRET");
+    expect(JSON.stringify(detail?.items)).not.toContain(privatePath);
   });
 
   test("UTF-8 truncation is a scalar-safe prefix with exact byte accounting", () => {
@@ -811,7 +1269,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -879,7 +1337,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -981,7 +1439,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -1058,7 +1516,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -1154,7 +1612,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -1211,7 +1669,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -1264,7 +1722,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async () => fake,
@@ -1305,7 +1763,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: (_authority, account) => { observed.push(account); }, fact: () => undefined },
       launchClient: async (options) => {
@@ -1347,7 +1805,7 @@ describe("PinnedCodexRuntimeManager", () => {
       accountRateLimits: async () => ({ authority: providerAuthority, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
       close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: {
         account: (_authority, account) => { observedAccounts.push(account); },
@@ -1397,7 +1855,7 @@ describe("PinnedCodexRuntimeManager", () => {
       },
       close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: (_authority, account) => { observed.push(account); }, fact: () => undefined },
       launchClient: async (options) => {
@@ -1430,7 +1888,7 @@ describe("PinnedCodexRuntimeManager", () => {
       listThreads: async () => ({ authority: { profileId: authority.id, processGeneration: 1 }, value: { data: [], nextCursor: null, backwardsCursor: null } }),
       close: async () => undefined,
     } as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async (options: LaunchPinnedCodexOptions) => { void options; launches += 1; await gate; return fake; },
@@ -1457,7 +1915,7 @@ describe("PinnedCodexRuntimeManager", () => {
       accountRateLimits: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
       close: async () => { closed.push(generation); },
     }) as unknown as CodexAppServerClient;
-    const manager = new PinnedCodexRuntimeManager({
+    const manager = createRuntimeManager({
       isCurrent: (candidate) => candidate.generation === currentGeneration,
       observer: { account: () => undefined, fact: () => undefined },
       launchClient: async (options: LaunchPinnedCodexOptions) => {

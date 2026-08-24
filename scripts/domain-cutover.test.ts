@@ -6,8 +6,10 @@ import {
   buildVercelEnvironment,
   DomainCutoverError,
   executeCutoverPlan,
+  executeDomainCutover,
   parseArguments,
   parseCutoverPlan,
+  preflightCutoverPlan,
   VercelCutoverProvider,
   type AliasReadback,
   type CutoverEndpoint,
@@ -140,15 +142,53 @@ const markerFor = (endpoint: CutoverEndpoint): unknown => {
     : { ...shared, version: endpoint.version };
 };
 
-type MoveBehavior = "ambiguous" | "commit" | "move-and-source-alias" | "noop";
+const domainPage = (
+  names: readonly string[],
+  next: number | null = null,
+  prev: number | null = null,
+): unknown => ({
+  domains: names.map((name) => ({ name })),
+  pagination: { count: names.length, next, prev },
+});
+
+type MoveBehavior = "ambiguous" | "commit" | "commit-and-throw" | "move-and-source-alias" | "noop";
 
 class FakeCutoverProvider implements CutoverProvider {
   readonly aliasEndpoints: Record<ManagedAlias, CutoverEndpoint>;
+  driftAfterAliasRead: Readonly<{
+    aliasName: ManagedAlias;
+    endpoint: CutoverEndpoint;
+    remainingMatches?: number;
+    triggerAlias: ManagedAlias;
+    triggerEndpoint: CutoverEndpoint;
+  }> | undefined;
+  driftAfterMarkerRead: Readonly<{
+    aliasName: ManagedAlias;
+    endpoint: CutoverEndpoint;
+    remainingMatches?: number;
+    triggerAlias: ManagedAlias;
+    triggerEndpoint: CutoverEndpoint;
+  }> | undefined;
+  readonly markerBrokenAliases = new Set<ManagedAlias>();
   markerBrokenForTargetAlias: ManagedAlias | undefined;
   markerOverrideForTargetAlias: Readonly<{ alias: ManagedAlias; value: unknown }> | undefined;
   moveBehavior: MoveBehavior = "commit";
   owner: "ambiguous" | "source" | "target" = "source";
+  ownerReadOverride: "ambiguous" | "source" | "target" | undefined;
+  ownerReadOverrideDomainReads = 0;
+  readonly ownerReadOverrides: Array<"ambiguous" | "source" | "target"> = [];
+  ownerAfterTargetAliasSet: Readonly<{
+    alias: ManagedAlias;
+    owner: "ambiguous" | "source" | "target";
+  }> | undefined;
+  reverseMoveAliasPerturbation: Readonly<{
+    aliasName: ManagedAlias;
+    endpoint: CutoverEndpoint;
+  }> | undefined;
+  reverseMoveCommitAndThrow = false;
+  reverseMoveStaleDomainReads = 0;
   sourceAliasSetFailure: ManagedAlias | undefined;
+  staleOwnerDomainReads = 0;
   targetAliasSetFailure: ManagedAlias | undefined;
   readonly operations: string[] = [];
   readonly plan: CutoverPlan;
@@ -179,7 +219,25 @@ class FakeCutoverProvider implements CutoverProvider {
   async readAlias(aliasName: ManagedAlias): Promise<AliasReadback> {
     const endpoint = this.aliasEndpoints[aliasName];
     this.operations.push(`read-alias:${aliasName}:${endpoint.deploymentId}`);
-    return aliasFor(endpoint, aliasName);
+    const value = aliasFor(endpoint, aliasName);
+    const drift = this.driftAfterAliasRead;
+    if (
+      drift !== undefined
+      && drift.triggerAlias === aliasName
+      && drift.triggerEndpoint === endpoint
+    ) {
+      const remainingMatches = drift.remainingMatches ?? 1;
+      if (remainingMatches === 1) {
+        this.driftAfterAliasRead = undefined;
+        this.aliasEndpoints[drift.aliasName] = drift.endpoint;
+        this.operations.push(
+          `drift-alias:${drift.aliasName}:${drift.endpoint.deploymentUrl}`,
+        );
+      } else {
+        this.driftAfterAliasRead = { ...drift, remainingMatches: remainingMatches - 1 };
+      }
+    }
+    return value;
   }
 
   async readDeployment(deploymentId: string): Promise<DeploymentReadback> {
@@ -192,24 +250,61 @@ class FakeCutoverProvider implements CutoverProvider {
 
   async readDomainNames(projectId: string): Promise<readonly string[]> {
     this.operations.push(`read-domains:${projectId}`);
-    if (this.owner === "ambiguous") return ["hra.sh"];
-    if (this.owner === "source") {
-      return projectId === this.plan.source.projectId ? ["hra.sh"] : [];
+    if (this.ownerReadOverrideDomainReads === 0 && this.ownerReadOverrides.length > 0) {
+      this.ownerReadOverride = this.ownerReadOverrides.shift();
+      this.ownerReadOverrideDomainReads = 2;
     }
-    return projectId === this.plan.target.projectId ? ["hra.sh"] : [];
+    const owner = this.ownerReadOverride
+      ?? (this.staleOwnerDomainReads > 0 ? "target" : this.owner);
+    if (this.ownerReadOverrideDomainReads > 0) {
+      this.ownerReadOverrideDomainReads -= 1;
+      if (this.ownerReadOverrideDomainReads === 0) this.ownerReadOverride = undefined;
+    } else if (this.staleOwnerDomainReads > 0) this.staleOwnerDomainReads -= 1;
+    if (owner === "ambiguous") return ["hra.sh"];
+    const sourceProjectId = this.plan.direction === "archive"
+      ? oldProjectId
+      : this.plan.source.projectId;
+    const targetProjectId = this.plan.direction === "archive"
+      ? newProjectId
+      : this.plan.target.projectId;
+    if (owner === "source") {
+      return projectId === sourceProjectId ? ["hra.sh"] : [];
+    }
+    return projectId === targetProjectId ? ["hra.sh"] : [];
   }
 
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
     const endpoint = this.aliasEndpoints[aliasName];
     this.operations.push(`read-marker:${aliasName}:${endpoint.deploymentId}`);
+    let value: unknown;
     if (
       this.markerOverrideForTargetAlias?.alias === aliasName
       && endpoint === this.plan.target
-    ) return this.markerOverrideForTargetAlias.value;
-    if (this.markerBrokenForTargetAlias === aliasName && endpoint === this.plan.target) {
-      return { ...markerFor(endpoint) as object, source: { commit: "0".repeat(40) } };
+    ) value = this.markerOverrideForTargetAlias.value;
+    else if (
+      this.markerBrokenAliases.has(aliasName)
+      || (this.markerBrokenForTargetAlias === aliasName && endpoint === this.plan.target)
+    ) {
+      value = { ...markerFor(endpoint) as object, source: { commit: "0".repeat(40) } };
+    } else value = markerFor(endpoint);
+    const drift = this.driftAfterMarkerRead;
+    if (
+      drift !== undefined
+      && drift.triggerAlias === aliasName
+      && drift.triggerEndpoint === endpoint
+    ) {
+      const remainingMatches = drift.remainingMatches ?? 1;
+      if (remainingMatches === 1) {
+        this.driftAfterMarkerRead = undefined;
+        this.aliasEndpoints[drift.aliasName] = drift.endpoint;
+        this.operations.push(
+          `drift-alias:${drift.aliasName}:${drift.endpoint.deploymentUrl}`,
+        );
+      } else {
+        this.driftAfterMarkerRead = { ...drift, remainingMatches: remainingMatches - 1 };
+      }
     }
-    return markerFor(endpoint);
+    return value;
   }
 
   async readProject(projectId: string): Promise<ProjectReadback> {
@@ -233,6 +328,10 @@ class FakeCutoverProvider implements CutoverProvider {
       throw new Error("ambiguous alias mutation");
     }
     this.aliasEndpoints[aliasName] = endpoint;
+    if (
+      endpoint === this.plan.target
+      && this.ownerAfterTargetAliasSet?.alias === aliasName
+    ) this.owner = this.ownerAfterTargetAliasSet.owner;
   }
 
   async moveDomain(sourceProjectId: string, targetProjectId: string): Promise<void> {
@@ -242,16 +341,38 @@ class FakeCutoverProvider implements CutoverProvider {
       && targetProjectId === this.plan.source.projectId
     ) {
       this.owner = "source";
+      this.staleOwnerDomainReads = this.reverseMoveStaleDomainReads;
+      const perturbation = this.reverseMoveAliasPerturbation;
+      if (perturbation !== undefined) {
+        this.aliasEndpoints[perturbation.aliasName] = perturbation.endpoint;
+        this.operations.push(
+          `perturb-alias:${perturbation.aliasName}:${perturbation.endpoint.deploymentUrl}`,
+        );
+      }
+      if (this.reverseMoveCommitAndThrow) throw new Error("lost reverse move response");
       return;
     }
-    if (this.moveBehavior === "commit") this.owner = "target";
+    if (this.moveBehavior === "commit" || this.moveBehavior === "commit-and-throw") {
+      this.owner = "target";
+    }
     if (this.moveBehavior === "ambiguous") this.owner = "ambiguous";
     if (this.moveBehavior === "move-and-source-alias") {
       this.owner = "target";
       this.aliasEndpoints[canonicalAlias] = this.plan.source;
     }
+    if (this.moveBehavior === "commit-and-throw") throw new Error("lost move response");
   }
 }
+
+const placeAtTarget = (provider: FakeCutoverProvider): void => {
+  provider.aliasEndpoints[canonicalAlias] = provider.plan.target;
+  if (provider.plan.direction === "archive") {
+    provider.aliasEndpoints[fallbackAlias] = provider.plan.target;
+    provider.owner = "source";
+  } else {
+    provider.owner = "target";
+  }
+};
 
 const immediateClock = () => {
   let now = 0;
@@ -278,6 +399,10 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("<deployment-id>");
     expect(runbook).toContain("<bare-automatic-hostname>.vercel.app");
     expect(runbook).toContain("hosted:domain-cutover");
+    expect(runbook).toContain("hosted:domain-cutover preflight");
+    expect(runbook).toContain("It never sets an alias, moves domain ownership");
+    expect(runbook).toContain("exception while reading any managed alias");
+    expect(runbook).toContain("leaves stdout empty, and performs no mutation");
     expect(runbook).toContain("/v4/aliases/hra.sh");
     expect(runbook).toContain("deploymentId");
     expect(runbook).toContain("source.commit");
@@ -322,11 +447,12 @@ describe("domain cutover runbook", () => {
 describe("domain cutover operator", () => {
   test("requires both fixed projects to disable automatic domains before switching traffic", async () => {
     const provider = new FakeCutoverProvider(forwardPlan);
-    await executeCutoverPlan(forwardPlan, provider, {
+    const outcome = await executeCutoverPlan(forwardPlan, provider, {
       clock: immediateClock(),
       convergenceTimeoutMs: 2,
     });
 
+    expect(outcome).toEqual({ changed: true, replayed: false });
     expect(provider.aliasEndpoint).toBe(newEndpoint);
     expect(provider.owner).toBe("target");
     const aliasMutation = provider.operations.indexOf(
@@ -349,9 +475,478 @@ describe("domain cutover operator", () => {
     expect(provider.operations.filter((operation) => operation === (
       `read-marker:${newStagingAlias}:${newEndpoint.deploymentId}`
     ))).toHaveLength(2);
-    expect(provider.operations.at(-1)).toBe(
-      `read-marker:${newStagingAlias}:${newEndpoint.deploymentId}`,
-    );
+    expect(provider.operations.at(-1)).toBe(`read-domains:${newProjectId}`);
+  });
+
+  for (const scenario of [
+    { description: "archive", plan: archivePlan },
+    { description: "forward", plan: forwardPlan },
+    { description: "reverse", plan: reversePlan },
+  ] as const) {
+    test(`preflights exact ${scenario.description} source and target states without mutation`, async () => {
+      const provider = new FakeCutoverProvider(scenario.plan);
+      const source = await preflightCutoverPlan(scenario.plan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+
+      expect(source).toEqual({
+        nextAction: "execute_plan",
+        observedOwner: "source",
+        observedState: "source",
+        observedTraffic: "source",
+        reason: "exact_source",
+        status: "ready",
+      });
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+      expect(provider.operations).toContain(`read-project:${oldProjectId}`);
+      expect(provider.operations).toContain(`read-project:${newProjectId}`);
+      expect(provider.operations).toContain(
+        `read-deployment:${scenario.plan.source.deploymentId}`,
+      );
+      expect(provider.operations).toContain(
+        `read-deployment:${scenario.plan.target.deploymentId}`,
+      );
+
+      placeAtTarget(provider);
+      const target = await preflightCutoverPlan(scenario.plan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+      expect(target).toEqual({
+        nextAction: "replay_plan_for_receipt",
+        observedOwner: scenario.plan.direction === "archive" ? "source" : "target",
+        observedState: "target",
+        observedTraffic: "target",
+        reason: "exact_target",
+        status: "already_committed",
+      });
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+    });
+  }
+
+  test("preflight blocks partial, ambiguous, and non-authoritative states without repair", async () => {
+    const cases = [
+      {
+        expectedReason: "partial_state",
+        prepare(provider: FakeCutoverProvider) {
+          provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+        },
+      },
+      {
+        expectedReason: "ambiguous_state",
+        prepare(provider: FakeCutoverProvider) {
+          provider.owner = "ambiguous";
+        },
+      },
+      {
+        expectedReason: "source_not_authoritative",
+        prepare(provider: FakeCutoverProvider) {
+          provider.markerBrokenAliases.add(fallbackAlias);
+        },
+      },
+      {
+        expectedReason: "target_not_authoritative",
+        prepare(provider: FakeCutoverProvider) {
+          placeAtTarget(provider);
+          provider.markerBrokenAliases.add(canonicalAlias);
+        },
+      },
+    ] as const;
+
+    for (const scenario of cases) {
+      const provider = new FakeCutoverProvider(forwardPlan);
+      scenario.prepare(provider);
+      const before = {
+        aliases: { ...provider.aliasEndpoints },
+        owner: provider.owner,
+      };
+      const outcome = await preflightCutoverPlan(forwardPlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+
+      expect(outcome).toMatchObject({
+        nextAction: "stop_and_investigate",
+        reason: scenario.expectedReason,
+        status: "blocked",
+      });
+      expect(provider.aliasEndpoints).toEqual(before.aliases);
+      expect(provider.owner).toBe(before.owner);
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+    }
+  });
+
+  for (const failure of [
+    {
+      code: "alias_readback_invalid",
+      description: "canonical alias",
+      path: `/v4/aliases/${canonicalAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "alias_readback_invalid",
+      description: "archive fallback alias",
+      path: `/v4/aliases/${fallbackAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "alias_readback_invalid",
+      description: "new staging alias",
+      path: `/v4/aliases/${newStagingAlias}`,
+      type: "provider" as const,
+    },
+    {
+      code: "command_output_invalid",
+      description: "archive project domain list",
+      path: `/v9/projects/${oldProjectId}/domains?limit=20`,
+      type: "provider" as const,
+    },
+    {
+      code: "command_output_invalid",
+      description: "new project domain list",
+      path: `/v9/projects/${newProjectId}/domains?limit=20`,
+      type: "provider" as const,
+    },
+    {
+      aliasName: canonicalAlias,
+      code: "command_output_invalid",
+      description: "canonical marker",
+      type: "marker" as const,
+    },
+    {
+      aliasName: fallbackAlias,
+      code: "command_output_invalid",
+      description: "archive fallback marker",
+      type: "marker" as const,
+    },
+    {
+      aliasName: newStagingAlias,
+      code: "command_output_invalid",
+      description: "new staging marker",
+      type: "marker" as const,
+    },
+  ] as const) {
+    test(`preflight refuses an exception from the ${failure.description} without mutation`, async () => {
+      const requests: VercelCommandRequest[] = [];
+      let mutationCalls = 0;
+      const aliases: Record<ManagedAlias, CutoverEndpoint> = {
+        [canonicalAlias]: oldEndpoint,
+        [fallbackAlias]: oldEndpoint,
+        [newStagingAlias]: newEndpoint,
+      };
+      const runner: VercelCommandRunner = async (request) => {
+        requests.push(request);
+        const [command, path] = request.arguments;
+        if (command === "--version") {
+          return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+        }
+        if (
+          command === "alias"
+          || (command === "api" && path?.endsWith(`/domains/${canonicalAlias}/move`))
+        ) {
+          mutationCalls += 1;
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (failure.type === "provider" && path === failure.path) {
+          throw new Error("injected provider read failure");
+        }
+        if (path === `/v9/projects/${oldProjectId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(projectFor(oldProjectId)) };
+        }
+        if (path === `/v9/projects/${newProjectId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(projectFor(newProjectId)) };
+        }
+        if (path === `/v13/deployments/${oldEndpoint.deploymentId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(deploymentFor(oldEndpoint)) };
+        }
+        if (path === `/v13/deployments/${newEndpoint.deploymentId}`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(deploymentFor(newEndpoint)) };
+        }
+        if (path === `/v9/projects/${oldProjectId}/domains?limit=20`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(domainPage([canonicalAlias])) };
+        }
+        if (path === `/v9/projects/${newProjectId}/domains?limit=20`) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(domainPage([])) };
+        }
+        for (const aliasName of [canonicalAlias, fallbackAlias, newStagingAlias] as const) {
+          if (path === `/v4/aliases/${aliasName}`) {
+            return {
+              exitCode: 0,
+              stderr: "",
+              stdout: JSON.stringify(aliasFor(aliases[aliasName], aliasName)),
+            };
+          }
+        }
+        return { exitCode: 1, stderr: "", stdout: "" };
+      };
+      const fetcher = async (input: string | URL | Request): Promise<Response> => {
+        const url = new URL(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        );
+        if (failure.type === "marker" && url.hostname === failure.aliasName) {
+          throw new Error("injected marker read failure");
+        }
+        return new Response(
+          JSON.stringify(markerFor(aliases[url.hostname as ManagedAlias])),
+          { status: 200 },
+        );
+      };
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const output = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
+        write: ((chunk: string | Uint8Array) => {
+          chunks.push(String(chunk));
+          return true;
+        }) as NodeJS.WriteStream["write"],
+      });
+
+      expect(await executeDomainCutover({
+        arguments: ["preflight", "--vercel-cli", "/safe/vercel"],
+        environment: { HOME: "/safe/home", PATH: "/safe/bin" },
+        fetcher,
+        inputDocument: JSON.stringify(forwardPlan),
+        runner,
+        stderr: output(stderr),
+        stdout: output(stdout),
+      })).toBe(1);
+      expect(stdout).toEqual([]);
+      expect(stderr).toEqual([
+        `${JSON.stringify({
+          code: failure.code,
+          schemaVersion: 1,
+          status: "refused",
+        })}\n`,
+      ]);
+      expect(mutationCalls).toBe(0);
+      expect(requests.some((request) => request.arguments[0] === "alias")).toBe(false);
+      expect(requests.some((request) => request.arguments[1]?.endsWith(
+        `/domains/${canonicalAlias}/move`,
+      ))).toBe(false);
+    });
+  }
+
+  for (const scenario of [
+    { description: "archive", plan: archivePlan },
+    { description: "forward", plan: forwardPlan },
+    { description: "reverse", plan: reversePlan },
+  ] as const) {
+    test(`accepts an already-committed ${scenario.description} plan without mutations`, async () => {
+      const provider = new FakeCutoverProvider(scenario.plan);
+      placeAtTarget(provider);
+
+      const outcome = await executeCutoverPlan(scenario.plan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      });
+
+      expect(outcome).toEqual({ changed: false, replayed: true });
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+      expect(provider.operations).toContain(`read-domains:${oldProjectId}`);
+      expect(provider.operations).toContain(`read-domains:${newProjectId}`);
+      expect(provider.operations).toContain(
+        `read-marker:${canonicalAlias}:${scenario.plan.target.deploymentId}`,
+      );
+      if (scenario.plan.mode === "domain") {
+        expect(provider.operations).toContain(
+          `read-marker:${fallbackAlias}:${oldEndpoint.deploymentId}`,
+        );
+        expect(provider.operations).toContain(
+          `read-marker:${newStagingAlias}:${newEndpoint.deploymentId}`,
+        );
+      } else {
+        expect(provider.operations).toContain(
+          `read-marker:${fallbackAlias}:${oldEndpoint.deploymentId}`,
+        );
+      }
+    });
+  }
+
+  for (const scenario of [
+    {
+      canonical: baselineEndpoint,
+      description: "fallback changed first",
+      fallback: oldEndpoint,
+    },
+    {
+      canonical: oldEndpoint,
+      description: "canonical changed without fallback",
+      fallback: baselineEndpoint,
+    },
+  ] as const) {
+    test(`restores an archive mutation-boundary partial state when ${scenario.description}`, async () => {
+      const provider = new FakeCutoverProvider(archivePlan);
+      provider.aliasEndpoints[canonicalAlias] = scenario.canonical;
+      provider.aliasEndpoints[fallbackAlias] = scenario.fallback;
+
+      await expect(executeCutoverPlan(archivePlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+      expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.owner).toBe("source");
+      expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    });
+  }
+
+  for (const owner of ["target", "ambiguous"] as const) {
+    test(`refuses an archive source state when domain ownership is ${owner}`, async () => {
+      const provider = new FakeCutoverProvider(archivePlan);
+      provider.owner = owner;
+
+      await expect(executeCutoverPlan(archivePlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_ambiguous" });
+
+      expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.operations.some((operation) => (
+        operation.startsWith("set-alias:") || operation.startsWith("move:")
+      ))).toBe(false);
+    });
+
+    test(`restores archive target traffic but escalates ${owner} domain ownership`, async () => {
+      const provider = new FakeCutoverProvider(archivePlan);
+      placeAtTarget(provider);
+      provider.owner = owner;
+
+      await expect(executeCutoverPlan(archivePlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_ambiguous" });
+
+      expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    });
+  }
+
+  for (const owner of ["target", "ambiguous"] as const) {
+    test(`stops archive before canonical mutation when ownership becomes ${owner}`, async () => {
+      const provider = new FakeCutoverProvider(archivePlan);
+      provider.ownerAfterTargetAliasSet = { alias: fallbackAlias, owner };
+
+      await expect(executeCutoverPlan(archivePlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_ambiguous" });
+
+      expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+      expect(provider.operations).not.toContain(
+        `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+      );
+      expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    });
+  }
+
+  for (const plan of [forwardPlan, reversePlan] as const) {
+    test(`classifies ${plan.direction} target traffic with every ownership state`, async () => {
+      for (const owner of ["source", "target", "ambiguous"] as const) {
+        const provider = new FakeCutoverProvider(plan);
+        provider.aliasEndpoints[canonicalAlias] = plan.target;
+        provider.owner = owner;
+
+        if (owner === "target") {
+          await expect(executeCutoverPlan(plan, provider, {
+            clock: immediateClock(),
+            convergenceTimeoutMs: 2,
+          })).resolves.toEqual({ changed: false, replayed: true });
+          expect(provider.aliasEndpoint).toBe(plan.target);
+          expect(provider.operations.some((operation) => (
+            operation.startsWith("set-alias:") || operation.startsWith("move:")
+          ))).toBe(false);
+        } else {
+          await expect(executeCutoverPlan(plan, provider, {
+            clock: immediateClock(),
+            convergenceTimeoutMs: 2,
+          })).rejects.toMatchObject({
+            code: owner === "source" ? "cutover_reverted" : "cutover_ambiguous",
+          });
+          expect(provider.aliasEndpoint).toBe(plan.source);
+          expect(provider.owner).toBe(owner);
+        }
+      }
+    });
+  }
+
+  for (const aliasName of [fallbackAlias, newStagingAlias] as const) {
+    test(`never accepts target replay with a broken ${aliasName} marker`, async () => {
+      const provider = new FakeCutoverProvider(forwardPlan);
+      placeAtTarget(provider);
+      provider.markerBrokenAliases.add(aliasName);
+
+      await expect(executeCutoverPlan(forwardPlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "compensation_failed" });
+
+      expect(provider.aliasEndpoint).toBe(oldEndpoint);
+      expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
+      expect(provider.aliasEndpoints[newStagingAlias]).toBe(newEndpoint);
+      expect(provider.owner).toBe("target");
+      expect(provider.operations).toContain(
+        `set-alias:${fallbackAlias}:${oldEndpoint.deploymentUrl}`,
+      );
+      expect(provider.operations).toContain(
+        `set-alias:${newStagingAlias}:${newEndpoint.deploymentUrl}`,
+      );
+      expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    });
+  }
+
+  test("recovers a lost domain-move response and makes the next retry read-only", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.moveBehavior = "commit-and-throw";
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).resolves.toEqual({ changed: true, replayed: false });
+    expect(provider.aliasEndpoint).toBe(newEndpoint);
+    expect(provider.owner).toBe("target");
+
+    provider.operations.length = 0;
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).resolves.toEqual({ changed: false, replayed: true });
+    expect(provider.operations.some((operation) => (
+      operation.startsWith("set-alias:") || operation.startsWith("move:")
+    ))).toBe(false);
+  });
+
+  test("restores a lost canonical-alias response and lets the retry start from exact source", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.targetAliasSetFailure = canonicalAlias;
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
+    expect(provider.aliasEndpoints[newStagingAlias]).toBe(newEndpoint);
+    expect(provider.owner).toBe("source");
+
+    provider.operations.length = 0;
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).resolves.toEqual({ changed: true, replayed: false });
+    expect(provider.aliasEndpoint).toBe(newEndpoint);
+    expect(provider.owner).toBe("target");
   });
 
   const unsafeProjectReadbacks = [
@@ -447,18 +1042,53 @@ describe("domain cutover operator", () => {
     );
   });
 
-  test("refuses forward traffic if the fixed new staging alias is not exact N", async () => {
-    const provider = new FakeCutoverProvider(forwardPlan);
-    provider.aliasEndpoints[newStagingAlias] = oldEndpoint;
+  for (const scenario of [
+    {
+      aliasName: fallbackAlias,
+      description: "Q fallback points at the N project",
+      initial: newEndpoint,
+      restored: oldEndpoint,
+    },
+    {
+      aliasName: newStagingAlias,
+      description: "N staging points at the Q project",
+      initial: oldEndpoint,
+      restored: newEndpoint,
+    },
+    {
+      aliasName: fallbackAlias,
+      description: "Q fallback points at an unknown old-project deployment",
+      initial: {
+        ...oldEndpoint,
+        deploymentId: "dpl_UnknownAccepted1234567890",
+        deploymentUrl: "hra-unknown-hraness.vercel.app",
+      },
+      restored: oldEndpoint,
+    },
+  ] as const) {
+    test(`repairs and refuses a partial source when ${scenario.description}`, async () => {
+      const provider = new FakeCutoverProvider(forwardPlan);
+      provider.aliasEndpoints[scenario.aliasName] = scenario.initial;
 
-    await expect(executeCutoverPlan(forwardPlan, provider, {
-      clock: immediateClock(),
-      convergenceTimeoutMs: 2,
-    })).rejects.toMatchObject({ code: "source_not_authoritative" });
-    expect(provider.aliasEndpoint).toBe(oldEndpoint);
-    expect(provider.operations.some((operation) => operation.startsWith("set-alias:")))
-      .toBe(false);
-  });
+      await expect(executeCutoverPlan(forwardPlan, provider, {
+        clock: immediateClock(),
+        convergenceTimeoutMs: 2,
+      })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+      expect(provider.aliasEndpoint).toBe(oldEndpoint);
+      expect(provider.aliasEndpoints[scenario.aliasName]).toBe(scenario.restored);
+      expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
+      expect(provider.aliasEndpoints[newStagingAlias]).toBe(newEndpoint);
+      expect(provider.owner).toBe("source");
+      expect(provider.operations).toContain(
+        `set-alias:${scenario.aliasName}:${scenario.restored.deploymentUrl}`,
+      );
+      expect(provider.operations).not.toContain(
+        `set-alias:${canonicalAlias}:${newEndpoint.deploymentUrl}`,
+      );
+      expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    });
+  }
 
   test("restores traffic when the domain move remains on its source", async () => {
     const provider = new FakeCutoverProvider(forwardPlan);
@@ -497,13 +1127,292 @@ describe("domain cutover operator", () => {
     expect(provider.owner).toBe("ambiguous");
   });
 
+  test("restores every alias before escalating partial traffic with ambiguous ownership", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.aliasEndpoints[newStagingAlias] = oldEndpoint;
+    provider.owner = "ambiguous";
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_ambiguous" });
+
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
+    expect(provider.aliasEndpoints[newStagingAlias]).toBe(newEndpoint);
+    expect(provider.operations).toContain(
+      `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+    );
+    expect(provider.operations).toContain(
+      `set-alias:${fallbackAlias}:${oldEndpoint.deploymentUrl}`,
+    );
+    expect(provider.operations).toContain(
+      `set-alias:${newStagingAlias}:${newEndpoint.deploymentUrl}`,
+    );
+    expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+  });
+
+  test("restores and proves exact source traffic before reporting ambiguous ownership", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.owner = "ambiguous";
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_ambiguous" });
+
+    for (const [aliasName, endpoint] of [
+      [canonicalAlias, oldEndpoint],
+      [fallbackAlias, oldEndpoint],
+      [newStagingAlias, newEndpoint],
+    ] as const) {
+      const mutation = `set-alias:${aliasName}:${endpoint.deploymentUrl}`;
+      const proof = `read-marker:${aliasName}:${endpoint.deploymentId}`;
+      expect(provider.operations).toContain(mutation);
+      expect(provider.operations.lastIndexOf(proof)).toBeGreaterThan(
+        provider.operations.indexOf(mutation),
+      );
+    }
+    expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+  });
+
+  test("refuses ownership reversal if restored traffic drifts after an early proof", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.driftAfterMarkerRead = {
+      aliasName: canonicalAlias,
+      endpoint: newEndpoint,
+      triggerAlias: canonicalAlias,
+      triggerEndpoint: oldEndpoint,
+    };
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "compensation_failed" });
+
+    expect(provider.operations).toContain(
+      `drift-alias:${canonicalAlias}:${newEndpoint.deploymentUrl}`,
+    );
+    expect(provider.operations.some((operation) => operation.startsWith("move:"))).toBe(false);
+    expect(provider.owner).toBe("target");
+  });
+
+  test("restores traffic again when it drifts after the aggregate pre-move proof", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.driftAfterMarkerRead = {
+      aliasName: canonicalAlias,
+      endpoint: newEndpoint,
+      remainingMatches: 2,
+      triggerAlias: canonicalAlias,
+      triggerEndpoint: oldEndpoint,
+    };
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    const drift = provider.operations.indexOf(
+      `drift-alias:${canonicalAlias}:${newEndpoint.deploymentUrl}`,
+    );
+    const reverseMove = provider.operations.indexOf(`move:${newProjectId}->${oldProjectId}`);
+    const finalRestore = provider.operations.lastIndexOf(
+      `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+    );
+    expect(drift).toBeGreaterThan(-1);
+    expect(reverseMove).toBeGreaterThan(drift);
+    expect(finalRestore).toBeGreaterThan(reverseMove);
+    for (const [aliasName, endpoint] of [
+      [canonicalAlias, oldEndpoint],
+      [fallbackAlias, oldEndpoint],
+      [newStagingAlias, newEndpoint],
+    ] as const) {
+      const proof = `read-marker:${aliasName}:${endpoint.deploymentId}`;
+      expect(provider.operations.slice(reverseMove + 1).filter((operation) => (
+        operation === proof
+      ))).toHaveLength(3);
+    }
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
+  test("reconciles a delayed domain alias write during the final full-state proof", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.driftAfterAliasRead = {
+      aliasName: canonicalAlias,
+      endpoint: newEndpoint,
+      remainingMatches: 4,
+      triggerAlias: canonicalAlias,
+      triggerEndpoint: oldEndpoint,
+    };
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    const reverseMove = provider.operations.indexOf(`move:${newProjectId}->${oldProjectId}`);
+    const drift = provider.operations.indexOf(
+      `drift-alias:${canonicalAlias}:${newEndpoint.deploymentUrl}`,
+      reverseMove,
+    );
+    const repair = provider.operations.indexOf(
+      `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+      drift,
+    );
+    expect(reverseMove).toBeGreaterThan(-1);
+    expect(drift).toBeGreaterThan(reverseMove);
+    expect(repair).toBeGreaterThan(drift);
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
+  test("reconciles a delayed archive alias write during the final full-state proof", async () => {
+    const provider = new FakeCutoverProvider(archivePlan);
+    provider.aliasEndpoints[canonicalAlias] = oldEndpoint;
+    provider.driftAfterAliasRead = {
+      aliasName: canonicalAlias,
+      endpoint: oldEndpoint,
+      remainingMatches: 2,
+      triggerAlias: canonicalAlias,
+      triggerEndpoint: baselineEndpoint,
+    };
+
+    await expect(executeCutoverPlan(archivePlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    const drift = provider.operations.indexOf(
+      `drift-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+    );
+    const repair = provider.operations.indexOf(
+      `set-alias:${canonicalAlias}:${baselineEndpoint.deploymentUrl}`,
+      drift,
+    );
+    expect(drift).toBeGreaterThan(-1);
+    expect(repair).toBeGreaterThan(drift);
+    expect(provider.aliasEndpoint).toBe(baselineEndpoint);
+    expect(provider.fallbackAliasEndpoint).toBe(baselineEndpoint);
+    expect(provider.owner).toBe("source");
+  });
+
+  test("repairs alias perturbation caused by the reverse ownership move", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.reverseMoveAliasPerturbation = {
+      aliasName: canonicalAlias,
+      endpoint: newEndpoint,
+    };
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    const reverseMove = provider.operations.indexOf(`move:${newProjectId}->${oldProjectId}`);
+    const perturbation = provider.operations.indexOf(
+      `perturb-alias:${canonicalAlias}:${newEndpoint.deploymentUrl}`,
+    );
+    const finalRestore = provider.operations.lastIndexOf(
+      `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+    );
+    expect(perturbation).toBeGreaterThan(reverseMove);
+    expect(finalRestore).toBeGreaterThan(perturbation);
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
+  test("converges after a lost reverse-move response and stale ownership readback", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.reverseMoveCommitAndThrow = true;
+    provider.reverseMoveStaleDomainReads = 2;
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    expect(provider.operations.filter((operation) => (
+      operation === `move:${newProjectId}->${oldProjectId}`
+    ))).toHaveLength(1);
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
+  test("gives stale post-move ownership a fresh window after pre-move convergence", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.owner = "target";
+    provider.ownerReadOverrides.push("target", "ambiguous", "target");
+    provider.reverseMoveCommitAndThrow = true;
+    provider.reverseMoveStaleDomainReads = 2;
+    const clock = immediateClock();
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock,
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    expect(provider.operations.filter((operation) => (
+      operation === `move:${newProjectId}->${oldProjectId}`
+    ))).toHaveLength(1);
+    expect(clock.now()).toBe(4);
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
+  test("proves canonical, Q, and N restoration before reversing exact target ownership", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    provider.aliasEndpoints[canonicalAlias] = newEndpoint;
+    provider.aliasEndpoints[fallbackAlias] = newEndpoint;
+    provider.aliasEndpoints[newStagingAlias] = oldEndpoint;
+    provider.owner = "target";
+
+    await expect(executeCutoverPlan(forwardPlan, provider, {
+      clock: immediateClock(),
+      convergenceTimeoutMs: 2,
+    })).rejects.toMatchObject({ code: "cutover_reverted" });
+
+    const reverseMove = provider.operations.indexOf(`move:${newProjectId}->${oldProjectId}`);
+    expect(reverseMove).toBeGreaterThan(-1);
+    for (const mutation of [
+      `set-alias:${canonicalAlias}:${oldEndpoint.deploymentUrl}`,
+      `set-alias:${fallbackAlias}:${oldEndpoint.deploymentUrl}`,
+      `set-alias:${newStagingAlias}:${newEndpoint.deploymentUrl}`,
+    ]) {
+      expect(provider.operations.indexOf(mutation)).toBeLessThan(reverseMove);
+    }
+    expect(provider.aliasEndpoint).toBe(oldEndpoint);
+    expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
+    expect(provider.aliasEndpoints[newStagingAlias]).toBe(newEndpoint);
+    expect(provider.owner as "ambiguous" | "source" | "target").toBe("source");
+  });
+
   test("reverses N to Q while preserving both fixed staging aliases", async () => {
     const provider = new FakeCutoverProvider(reversePlan);
 
-    await executeCutoverPlan(reversePlan, provider, {
+    const outcome = await executeCutoverPlan(reversePlan, provider, {
       clock: immediateClock(),
       convergenceTimeoutMs: 2,
     });
+    expect(outcome).toEqual({ changed: true, replayed: false });
     expect(provider.aliasEndpoint).toBe(oldEndpoint);
     expect(provider.owner).toBe("target");
     expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
@@ -529,10 +1438,11 @@ describe("domain cutover operator", () => {
   test("updates the archive deployment without moving project ownership", async () => {
     const provider = new FakeCutoverProvider(archivePlan);
 
-    await executeCutoverPlan(archivePlan, provider, {
+    const outcome = await executeCutoverPlan(archivePlan, provider, {
       clock: immediateClock(),
       convergenceTimeoutMs: 2,
     });
+    expect(outcome).toEqual({ changed: true, replayed: false });
     expect(provider.aliasEndpoint).toBe(oldEndpoint);
     expect(provider.fallbackAliasEndpoint).toBe(oldEndpoint);
     const fallbackMutation = provider.operations.indexOf(
@@ -657,7 +1567,194 @@ describe("domain cutover operator", () => {
       "/safe/vercel",
       "--plan-fd",
       "3",
-    ])).toEqual({ execute: true, planFd: 3, vercelCli: "/safe/vercel" });
+    ])).toEqual({ operation: "execute", planFd: 3, vercelCli: "/safe/vercel" });
+    expect(parseArguments([
+      "preflight",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--plan-fd",
+      "3",
+    ])).toEqual({ operation: "preflight", planFd: 3, vercelCli: "/safe/vercel" });
+    expect(() => parseArguments([
+      "preflight",
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+    ])).toThrow("usage_invalid");
+  });
+
+  test("emits changed and replayed outcomes for a fresh archive and its exact retry", async () => {
+    const aliases: Record<ManagedAlias, CutoverEndpoint> = {
+      [canonicalAlias]: baselineEndpoint,
+      [fallbackAlias]: baselineEndpoint,
+      [newStagingAlias]: newEndpoint,
+    };
+    let mutationCalls = 0;
+    const runner: VercelCommandRunner = async (request) => {
+      const [command, path] = request.arguments;
+      if (command === "--version") {
+        return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+      }
+      if (command === "alias" && path === "set") {
+        mutationCalls += 1;
+        const deploymentUrl = request.arguments[2];
+        const aliasName = request.arguments[3] as ManagedAlias;
+        const endpoint = [baselineEndpoint, oldEndpoint, newEndpoint]
+          .find((candidate) => candidate.deploymentUrl === deploymentUrl);
+        if (endpoint === undefined) return { exitCode: 1, stderr: "", stdout: "" };
+        aliases[aliasName] = endpoint;
+        return { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (command !== "api") return { exitCode: 1, stderr: "", stdout: "" };
+      if (path === `/v9/projects/${oldProjectId}`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(projectFor(oldProjectId)),
+        };
+      }
+      if (path === `/v9/projects/${newProjectId}`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(projectFor(newProjectId)),
+        };
+      }
+      if (path === `/v13/deployments/${baselineEndpoint.deploymentId}`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(deploymentFor(baselineEndpoint)),
+        };
+      }
+      if (path === `/v13/deployments/${oldEndpoint.deploymentId}`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(deploymentFor(oldEndpoint)),
+        };
+      }
+      if (path === `/v9/projects/${oldProjectId}/domains?limit=20`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(domainPage([canonicalAlias])),
+        };
+      }
+      if (path === `/v9/projects/${newProjectId}/domains?limit=20`) {
+        return { exitCode: 0, stderr: "", stdout: JSON.stringify(domainPage([])) };
+      }
+      for (const aliasName of [canonicalAlias, fallbackAlias, newStagingAlias] as const) {
+        if (path === `/v4/aliases/${aliasName}`) {
+          return {
+            exitCode: 0,
+            stderr: "",
+            stdout: JSON.stringify(aliasFor(aliases[aliasName], aliasName)),
+          };
+        }
+      }
+      return { exitCode: 1, stderr: "", stdout: "" };
+    };
+    const fetcher = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+      );
+      return new Response(JSON.stringify(markerFor(aliases[url.hostname as ManagedAlias])), {
+        status: 200,
+      });
+    };
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const output = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
+      write: ((chunk: string | Uint8Array) => {
+        chunks.push(String(chunk));
+        return true;
+      }) as NodeJS.WriteStream["write"],
+    });
+    const run = async (arguments_: readonly string[]): Promise<number> =>
+      await executeDomainCutover({
+        arguments: arguments_,
+        environment: { HOME: "/safe/home", PATH: "/safe/bin" },
+        fetcher,
+        inputDocument: JSON.stringify(archivePlan),
+        runner,
+        stderr: output(stderr),
+        stdout: output(stdout),
+      });
+    const execute = async (): Promise<number> => await run([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+    ]);
+    const preflight = async (): Promise<number> => await run([
+      "preflight",
+      "--vercel-cli",
+      "/safe/vercel",
+    ]);
+
+    expect(await preflight()).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(mutationCalls).toBe(0);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      direction: "archive",
+      mode: "traffic-only",
+      nextAction: "execute_plan",
+      observedOwner: "source",
+      observedState: "source",
+      observedTraffic: "source",
+      reason: "exact_source",
+      schemaVersion: 1,
+      sourceDeploymentId: baselineEndpoint.deploymentId,
+      sourceProjectId: oldProjectId,
+      status: "ready",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
+    });
+
+    aliases[fallbackAlias] = oldEndpoint;
+    expect(await preflight()).toBe(1);
+    expect(stderr).toEqual([]);
+    expect(mutationCalls).toBe(0);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      direction: "archive",
+      mode: "traffic-only",
+      nextAction: "stop_and_investigate",
+      observedOwner: "source",
+      observedState: "partial",
+      observedTraffic: "partial",
+      reason: "partial_state",
+      schemaVersion: 1,
+      sourceDeploymentId: baselineEndpoint.deploymentId,
+      sourceProjectId: oldProjectId,
+      status: "blocked",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
+    });
+    aliases[fallbackAlias] = baselineEndpoint;
+
+    expect(await execute()).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      changed: true,
+      direction: "archive",
+      replayed: false,
+      schemaVersion: 1,
+      status: "committed",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
+    });
+
+    expect(await execute()).toBe(0);
+    expect(stderr).toEqual([]);
+    expect(JSON.parse(stdout.at(-1) ?? "null")).toEqual({
+      changed: false,
+      direction: "archive",
+      replayed: true,
+      schemaVersion: 1,
+      status: "committed",
+      targetDeploymentId: oldEndpoint.deploymentId,
+      targetProjectId: oldProjectId,
+    });
   });
 
   test("uses exact Vercel API paths, pinned CLI version, and sanitized environment", async () => {
@@ -692,8 +1789,19 @@ describe("domain cutover operator", () => {
       if (path === `/v9/projects/${oldProjectId}`) {
         return { exitCode: 0, stderr: "", stdout: JSON.stringify(projectFor(oldProjectId)) };
       }
-      if (path === `/v9/projects/${oldProjectId}/domains`) {
-        return { exitCode: 0, stderr: "", stdout: JSON.stringify({ domains: [{ name: "hra.sh" }] }) };
+      if (path === `/v9/projects/${oldProjectId}/domains?limit=20`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(domainPage(["other.example"], 1_612_264_332_000)),
+        };
+      }
+      if (path === `/v9/projects/${oldProjectId}/domains?limit=20&until=1612264332000`) {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(domainPage([canonicalAlias], null, 1_612_264_332_001)),
+        };
       }
       return { exitCode: 0, stderr: "", stdout: "" };
     };
@@ -723,7 +1831,7 @@ describe("domain cutover operator", () => {
       deploymentFor(oldEndpoint),
     );
     expect(await provider.readProject(oldProjectId)).toEqual(projectFor(oldProjectId));
-    expect(await provider.readDomainNames(oldProjectId)).toEqual(["hra.sh"]);
+    expect(await provider.readDomainNames(oldProjectId)).toEqual(["other.example", "hra.sh"]);
     expect(await provider.readMarker(canonicalAlias)).toEqual(markerFor(oldEndpoint));
     expect(await provider.readMarker(fallbackAlias)).toEqual(markerFor(oldEndpoint));
     await provider.setAlias(oldEndpoint.deploymentUrl, canonicalAlias);
@@ -767,6 +1875,20 @@ describe("domain cutover operator", () => {
     ]);
     expect(requests.map((request) => request.arguments)).toContainEqual([
       "api",
+      `/v9/projects/${oldProjectId}/domains?limit=20`,
+      "--scope",
+      "hraness",
+      "--raw",
+    ]);
+    expect(requests.map((request) => request.arguments)).toContainEqual([
+      "api",
+      `/v9/projects/${oldProjectId}/domains?limit=20&until=1612264332000`,
+      "--scope",
+      "hraness",
+      "--raw",
+    ]);
+    expect(requests.map((request) => request.arguments)).toContainEqual([
+      "api",
       `/v1/projects/${oldProjectId}/domains/hra.sh/move`,
       "--scope",
       "hraness",
@@ -782,6 +1904,97 @@ describe("domain cutover operator", () => {
     ))).toBe(true);
     expect(buildVercelEnvironment({ HOME: "/safe/home", VERCEL_TOKEN: "no" }))
       .toEqual({ HOME: "/safe/home", NO_COLOR: "1", TERM: "dumb" });
+  });
+
+  test("refuses a domain page that omits terminal pagination proof", async () => {
+    const provider = new VercelCutoverProvider({
+      runner: async () => ({
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({ domains: [{ name: canonicalAlias }] }),
+      }),
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readDomainNames(oldProjectId)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+  });
+
+  test("refuses a repeated domain cursor instead of accepting an incomplete list", async () => {
+    const requests: VercelCommandRequest[] = [];
+    const provider = new VercelCutoverProvider({
+      runner: async (request) => {
+        requests.push(request);
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(domainPage(["not-hra.example"], 42)),
+        };
+      },
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readDomainNames(oldProjectId)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+    expect(requests.map((request) => request.arguments[1])).toEqual([
+      `/v9/projects/${oldProjectId}/domains?limit=20`,
+      `/v9/projects/${oldProjectId}/domains?limit=20&until=42`,
+    ]);
+  });
+
+  test("refuses a domain page whose item count does not match pagination", async () => {
+    const provider = new VercelCutoverProvider({
+      runner: async () => ({
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({
+          domains: [{ name: canonicalAlias }],
+          pagination: { count: 0, next: null, prev: null },
+        }),
+      }),
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readDomainNames(oldProjectId)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+  });
+
+  test("refuses an empty nonterminal domain page", async () => {
+    const provider = new VercelCutoverProvider({
+      runner: async () => ({
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify(domainPage([], 42)),
+      }),
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readDomainNames(oldProjectId)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+  });
+
+  test("refuses ownership evidence that exceeds the bounded domain-page cap", async () => {
+    let pages = 0;
+    const provider = new VercelCutoverProvider({
+      runner: async () => {
+        pages += 1;
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify(domainPage([`domain-${pages}.example`], pages)),
+        };
+      },
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readDomainNames(oldProjectId)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+    expect(pages).toBe(64);
   });
 
   test("caps a chunked marker body even when content-length is absent", async () => {

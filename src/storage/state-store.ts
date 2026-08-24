@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  realpathSync,
+  type Stats,
+} from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { Database } from "bun:sqlite";
+import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
 import {
@@ -25,6 +35,7 @@ import {
   type EffectiveRuntimeProfile,
 } from "../domain/runtime-profile";
 import {
+  ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
 import {
@@ -50,6 +61,7 @@ import {
 } from "../domain/transitions";
 import {
   attemptIdSchema,
+  canonicalLabelKey,
   createAttemptId,
   createProfileId,
   createProjectId,
@@ -64,6 +76,7 @@ import {
   sessionIdSchema,
   titleSchema,
   unixMillisecondsSchema,
+  utf8Bytes,
   type AttemptId,
   type ProfileId,
   type ProjectId,
@@ -84,10 +97,22 @@ import type {
 const profileStateSchema = z.enum(["signed_out", "login_pending", "signed_in", "recovery_required", "removed"]);
 const sessionStateSchema = z.enum(["starting", "active", "idle", "terminal", "recovery_required"]);
 const runtimeProfileSourceKindSchema = z.enum(["session_start", "turn_start", "queue_start"]);
+const interactionListPositionSchema = z.object({
+  requestedAt: unixMillisecondsSchema,
+  publicId: z.string().uuid(),
+}).strict();
+
+export type InteractionListPosition = z.infer<typeof interactionListPositionSchema>;
+
+export type InteractionListPage = Readonly<{
+  interactions: readonly InteractionRecord[];
+  nextPosition: InteractionListPosition | null;
+}>;
 
 const profileRowSchema = z.object({
   id: profileIdSchema,
   label: labelSchema,
+  label_key: z.string().min(1),
   state: profileStateSchema,
   process_generation: z.number().int().nonnegative(),
   provider_email: z.string().nullable(),
@@ -99,6 +124,7 @@ const profileRowSchema = z.object({
 const projectRowSchema = z.object({
   id: projectIdSchema,
   label: labelSchema,
+  label_key: z.string().min(1),
   root_path: z.string().min(1),
   is_default: z.union([z.literal(0), z.literal(1)]),
   created_at: unixMillisecondsSchema,
@@ -219,6 +245,25 @@ export type UsagePollFailureRecord = {
   observedAt: number;
   reasonCode: "account_usage_read_failed";
 };
+
+export type UsageHistoryLedgerEntry =
+  | Readonly<{
+    state: "observed";
+    sourceRevision: number;
+    observedAt: number;
+    payload: unknown;
+  }>
+  | Readonly<{
+    state: "failed";
+    sourceRevision: number;
+    observedAt: number;
+    reasonCode: UsagePollFailureRecord["reasonCode"];
+  }>;
+
+export type UsageHistoryLedgerPage = Readonly<{
+  entries: readonly UsageHistoryLedgerEntry[];
+  nextSourceRevision: number | null;
+}>;
 
 export type QueueRecord = {
   id: QueueId;
@@ -418,9 +463,88 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 17;
+const currentSchemaVersion = 24;
 const stateBusyTimeoutMs = 5_000;
 const securityScrubBusyTimeoutMs = 250;
+
+type StateDatabaseFileIdentity = Readonly<{ device: number; inode: number }>;
+
+const stateDatabaseFileIsSafe = (metadata: Stats): boolean => {
+  const owner = process.getuid?.();
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.nlink === 1
+    && (metadata.mode & 0o777) === 0o600
+    && (owner === undefined || metadata.uid === owner);
+};
+
+const assertStateDatabaseFile = (
+  path: string,
+  expected?: StateDatabaseFileIdentity,
+): StateDatabaseFileIdentity => {
+  try {
+    const metadata = lstatSync(path);
+    if (
+      !stateDatabaseFileIsSafe(metadata)
+      || realpathSync(path) !== resolve(path)
+      || (expected !== undefined
+        && (metadata.dev !== expected.device || metadata.ino !== expected.inode))
+    ) throw new Error("STATE_DATABASE_FILE_UNSAFE");
+    return { device: metadata.dev, inode: metadata.ino };
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === "STATE_DATABASE_FILE_UNSAFE") throw error;
+    throw new Error("STATE_DATABASE_FILE_UNSAFE", { cause: error });
+  }
+};
+
+const prepareStateDatabaseFile = (
+  path: string,
+  readonly: boolean,
+): StateDatabaseFileIdentity => {
+  let descriptor: number | undefined;
+  let created = false;
+  try {
+    if (!readonly) {
+      try {
+        descriptor = openSync(
+          path,
+          constants.O_CREAT
+            | constants.O_EXCL
+            | constants.O_RDWR
+            | constants.O_NOFOLLOW
+            | constants.O_NONBLOCK,
+          0o600,
+        );
+        created = true;
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    descriptor ??= openSync(
+      path,
+      (readonly ? constants.O_RDONLY : constants.O_RDWR)
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
+    );
+    if (created) fchmodSync(descriptor, 0o600);
+    const opened = fstatSync(descriptor);
+    if (!stateDatabaseFileIsSafe(opened)) throw new Error("STATE_DATABASE_FILE_UNSAFE");
+    const identity = { device: opened.dev, inode: opened.ino };
+    assertStateDatabaseFile(path, identity);
+    return identity;
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === "STATE_DATABASE_FILE_UNSAFE") throw error;
+    throw new Error("STATE_DATABASE_FILE_UNSAFE", { cause: error });
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+};
+
+const stateDatabaseOpenFlags = (readonly: boolean): number =>
+  sqliteConstants.SQLITE_OPEN_NOFOLLOW
+  | (readonly
+    ? sqliteConstants.SQLITE_OPEN_READONLY
+    : sqliteConstants.SQLITE_OPEN_READWRITE | sqliteConstants.SQLITE_OPEN_CREATE);
 
 export const USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS = 24 * 60 * 60_000;
 export const USAGE_CLOUD_UPLOAD_ANCHOR_COUNT = 128;
@@ -1121,11 +1245,420 @@ BEFORE DELETE ON provider_login_authorities
 BEGIN SELECT RAISE(ABORT, 'provider login authority is append-only'); END;
 `;
 
+const schemaVersion19 = `
+DROP TRIGGER IF EXISTS provider_interactions_intent_immutable;
+CREATE TRIGGER provider_interactions_intent_immutable
+BEFORE UPDATE OF intended_terminal_state ON provider_interactions
+WHEN NOT (
+  (
+    OLD.state='pending'
+    AND NEW.state='response_prepared'
+    AND OLD.intended_terminal_state IS NULL
+    AND NEW.intended_terminal_state IS NOT NULL
+    AND OLD.response_digest IS NULL
+    AND NEW.response_digest IS NOT NULL
+    AND OLD.response_expected_revision IS NULL
+    AND NEW.response_expected_revision=OLD.revision
+    AND NEW.revision=OLD.revision+1
+  )
+  OR
+  (
+    OLD.state='response_prepared'
+    AND NEW.state='response_prepared'
+    AND OLD.intended_terminal_state IN ('resolved','declined','canceled')
+    AND NEW.intended_terminal_state='expired'
+    AND OLD.response_digest IS NOT NULL
+    AND NEW.response_digest IS NOT NULL
+    AND NEW.response_digest!=OLD.response_digest
+    AND NEW.response_expected_revision=OLD.response_expected_revision
+    AND NEW.revision=OLD.revision+1
+    AND NEW.terminal_at IS NULL
+    AND NEW.updated_at>=OLD.deadline_at
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'provider interaction terminal intent is immutable'); END;
+DROP TRIGGER IF EXISTS provider_interactions_response_fields_guard;
+CREATE TRIGGER provider_interactions_response_fields_guard
+BEFORE UPDATE OF response_digest,response_expected_revision ON provider_interactions
+WHEN NOT (
+  (
+    OLD.state='pending'
+    AND NEW.state='response_prepared'
+    AND OLD.response_digest IS NULL
+    AND NEW.response_digest IS NOT NULL
+    AND OLD.response_expected_revision IS NULL
+    AND NEW.response_expected_revision=OLD.revision
+    AND OLD.intended_terminal_state IS NULL
+    AND NEW.intended_terminal_state IS NOT NULL
+    AND NEW.revision=OLD.revision+1
+  )
+  OR
+  (
+    OLD.state='response_prepared'
+    AND NEW.state='response_prepared'
+    AND OLD.intended_terminal_state IN ('resolved','declined','canceled')
+    AND NEW.intended_terminal_state='expired'
+    AND OLD.response_digest IS NOT NULL
+    AND NEW.response_digest IS NOT NULL
+    AND NEW.response_digest!=OLD.response_digest
+    AND NEW.response_expected_revision=OLD.response_expected_revision
+    AND NEW.revision=OLD.revision+1
+    AND NEW.terminal_at IS NULL
+    AND NEW.updated_at>=OLD.deadline_at
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'provider interaction response authority is immutable'); END;
+DROP TRIGGER IF EXISTS provider_interactions_revision_guard;
+CREATE TRIGGER provider_interactions_revision_guard
+BEFORE UPDATE OF revision ON provider_interactions
+WHEN NOT (
+  NEW.revision=OLD.revision+1
+  AND (
+    NEW.state IS NOT OLD.state
+    OR (
+      OLD.state='response_prepared'
+      AND NEW.state='response_prepared'
+      AND OLD.intended_terminal_state IN ('resolved','declined','canceled')
+      AND NEW.intended_terminal_state='expired'
+      AND OLD.response_digest IS NOT NULL
+      AND NEW.response_digest IS NOT NULL
+      AND NEW.response_digest!=OLD.response_digest
+      AND NEW.response_expected_revision=OLD.response_expected_revision
+      AND NEW.terminal_at IS NULL
+      AND NEW.updated_at>=OLD.deadline_at
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'illegal provider interaction revision transition'); END;
+`;
+
+const schemaVersion20 = `
+CREATE INDEX IF NOT EXISTS provider_interactions_listing_global
+  ON provider_interactions(requested_at DESC,public_id ASC);
+CREATE INDEX IF NOT EXISTS provider_interactions_listing_session
+  ON provider_interactions(session_id,requested_at DESC,public_id ASC);
+CREATE INDEX IF NOT EXISTS provider_interactions_listing_pending_global
+  ON provider_interactions(requested_at DESC,public_id ASC)
+  WHERE state IN ('pending','response_prepared','response_written');
+CREATE INDEX IF NOT EXISTS provider_interactions_listing_pending_session
+  ON provider_interactions(session_id,requested_at DESC,public_id ASC)
+  WHERE state IN ('pending','response_prepared','response_written');
+`;
+
+const settledQueueMessage = "[queue message removed after settlement]";
+
+const schemaVersion21 = `
+DROP TRIGGER IF EXISTS queue_message_settlement_guard;
+CREATE TRIGGER queue_message_settlement_guard
+BEFORE UPDATE OF message ON queue_entries
+WHEN NOT (
+  NEW.message='[queue message removed after settlement]'
+  AND (
+    NEW.state IN ('applied','failed','cancelled')
+    OR EXISTS(
+      SELECT 1 FROM queue_effect_resolutions r WHERE r.queue_id=OLD.id
+    )
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'queue message is immutable except for settlement removal'); END;
+DROP TRIGGER IF EXISTS queue_message_terminal_insert_scrub;
+CREATE TRIGGER queue_message_terminal_insert_scrub
+AFTER INSERT ON queue_entries
+WHEN NEW.state IN ('applied','failed','cancelled')
+  AND NEW.message!='[queue message removed after settlement]'
+BEGIN
+  UPDATE queue_entries
+  SET message='[queue message removed after settlement]'
+  WHERE id=NEW.id;
+END;
+DROP TRIGGER IF EXISTS queue_message_terminal_transition_scrub;
+CREATE TRIGGER queue_message_terminal_transition_scrub
+AFTER UPDATE OF state ON queue_entries
+WHEN NEW.state IN ('applied','failed','cancelled')
+  AND NEW.message!='[queue message removed after settlement]'
+BEGIN
+  UPDATE queue_entries
+  SET message='[queue message removed after settlement]'
+  WHERE id=NEW.id;
+END;
+DROP TRIGGER IF EXISTS queue_message_resolution_scrub;
+CREATE TRIGGER queue_message_resolution_scrub
+AFTER INSERT ON queue_effect_resolutions
+WHEN EXISTS(
+  SELECT 1 FROM queue_entries q
+  WHERE q.id=NEW.queue_id
+    AND q.message!='[queue message removed after settlement]'
+)
+BEGIN
+  UPDATE queue_entries
+  SET message='[queue message removed after settlement]'
+  WHERE id=NEW.queue_id;
+END;
+`;
+
+const schemaVersion22 = `
+CREATE TABLE IF NOT EXISTS queue_message_scrub_authority (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  required_at INTEGER NOT NULL CHECK(required_at >= 0),
+  requires_vacuum INTEGER NOT NULL CHECK(requires_vacuum IN (0,1)),
+  generation INTEGER NOT NULL DEFAULT 1 CHECK(generation BETWEEN 1 AND 9007199254740991)
+) STRICT;
+DROP TRIGGER IF EXISTS queue_message_terminal_insert_scrub;
+CREATE TRIGGER queue_message_terminal_insert_scrub
+AFTER INSERT ON queue_entries
+WHEN NEW.state IN ('applied','failed','cancelled')
+BEGIN
+  INSERT INTO queue_message_scrub_authority(singleton,required_at,requires_vacuum,generation)
+  VALUES (1,NEW.updated_at,0,1)
+  ON CONFLICT(singleton) DO UPDATE SET
+    required_at=MIN(required_at,excluded.required_at),
+    requires_vacuum=MAX(requires_vacuum,excluded.requires_vacuum),
+    generation=CASE
+      WHEN generation<9007199254740991 THEN generation+1
+      ELSE RAISE(ABORT, 'queue message scrub generation exhausted')
+    END;
+END;
+DROP TRIGGER IF EXISTS queue_message_terminal_transition_scrub;
+CREATE TRIGGER queue_message_terminal_transition_scrub
+AFTER UPDATE OF state ON queue_entries
+WHEN NEW.state IN ('applied','failed','cancelled')
+BEGIN
+  INSERT INTO queue_message_scrub_authority(singleton,required_at,requires_vacuum,generation)
+  VALUES (1,NEW.updated_at,0,1)
+  ON CONFLICT(singleton) DO UPDATE SET
+    required_at=MIN(required_at,excluded.required_at),
+    requires_vacuum=MAX(requires_vacuum,excluded.requires_vacuum),
+    generation=CASE
+      WHEN generation<9007199254740991 THEN generation+1
+      ELSE RAISE(ABORT, 'queue message scrub generation exhausted')
+    END;
+END;
+DROP TRIGGER IF EXISTS queue_message_resolution_scrub;
+CREATE TRIGGER queue_message_resolution_scrub
+AFTER INSERT ON queue_effect_resolutions
+BEGIN
+  INSERT INTO queue_message_scrub_authority(singleton,required_at,requires_vacuum,generation)
+  VALUES (1,NEW.created_at,0,1)
+  ON CONFLICT(singleton) DO UPDATE SET
+    required_at=MIN(required_at,excluded.required_at),
+    requires_vacuum=MAX(requires_vacuum,excluded.requires_vacuum),
+    generation=CASE
+      WHEN generation<9007199254740991 THEN generation+1
+      ELSE RAISE(ABORT, 'queue message scrub generation exhausted')
+    END;
+END;
+DROP TRIGGER IF EXISTS queue_message_scrub_authority_record;
+DROP TRIGGER IF EXISTS queue_message_settlement_guard;
+CREATE TRIGGER queue_message_settlement_guard
+BEFORE UPDATE OF message ON queue_entries
+WHEN NOT (
+  NEW.message='[queue message removed after settlement]'
+  AND (
+    NEW.state IN ('applied','failed','cancelled')
+    OR EXISTS(
+      SELECT 1 FROM queue_effect_resolutions r WHERE r.queue_id=OLD.id
+    )
+  )
+  AND EXISTS(
+    SELECT 1 FROM queue_message_scrub_authority a WHERE a.singleton=1
+  )
+)
+BEGIN SELECT RAISE(ABORT, 'queue message is immutable except for settlement removal'); END;
+DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
+CREATE TRIGGER queue_effect_resolution_authority_guard
+BEFORE INSERT ON queue_effect_resolutions
+WHEN NOT EXISTS(
+  SELECT 1
+  FROM queue_entries q
+  JOIN queue_effect_evidence e ON e.queue_id=q.id
+  JOIN sessions s ON s.id=q.session_id
+  WHERE q.id=NEW.queue_id
+    AND q.state='ambiguous'
+    AND s.state!='recovery_required'
+)
+OR json_valid(NEW.evidence_json)!=1
+OR (
+  NEW.resolution_kind='proven_applied'
+  AND (
+    NEW.receipt_json IS NULL
+    OR json_valid(NEW.receipt_json)!=1
+    OR json_type(NEW.receipt_json)!='object'
+    OR json_type(NEW.receipt_json,'$.turnId')!='text'
+    OR length(json_extract(NEW.receipt_json,'$.turnId')) NOT BETWEEN 1 AND 200
+    OR NOT EXISTS(
+      SELECT 1
+      FROM queue_entries q
+      JOIN session_turn_runtime_profiles t
+        ON t.session_id=q.session_id
+       AND t.source_kind='queue_start'
+       AND t.source_id=q.id
+       AND t.turn_id=json_extract(NEW.receipt_json,'$.turnId')
+      WHERE q.id=NEW.queue_id
+    )
+  )
+)
+OR (NEW.resolution_kind='abandoned' AND NEW.receipt_json IS NOT NULL)
+BEGIN SELECT RAISE(ABORT, 'queue effect resolution authority mismatch'); END;
+`;
+
+const schemaVersion23 = `
+CREATE INDEX IF NOT EXISTS queue_entries_message_scrub_candidates
+  ON queue_entries(id)
+  WHERE message!='[queue message removed after settlement]';
+`;
+
+const schemaVersion24Objects = [
+  {
+    name: "profiles_label_key_active",
+    table: "profiles",
+    type: "index",
+    sql: `CREATE UNIQUE INDEX profiles_label_key_active
+  ON profiles(label_key) WHERE state!='removed'`,
+  },
+  {
+    name: "projects_label_key_unique",
+    table: "projects",
+    type: "index",
+    sql: `CREATE UNIQUE INDEX projects_label_key_unique
+  ON projects(label_key)`,
+  },
+  {
+    name: "profiles_label_key_insert_guard",
+    table: "profiles",
+    type: "trigger",
+    sql: `CREATE TRIGGER profiles_label_key_insert_guard
+BEFORE INSERT ON profiles
+WHEN NEW.label_key IS NULL
+  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096
+BEGIN SELECT RAISE(ABORT, 'invalid profile label key'); END`,
+  },
+  {
+    name: "profiles_label_key_immutable",
+    table: "profiles",
+    type: "trigger",
+    sql: `CREATE TRIGGER profiles_label_key_immutable
+BEFORE UPDATE OF label,label_key ON profiles
+WHEN NEW.label IS NOT OLD.label OR NEW.label_key IS NOT OLD.label_key
+BEGIN SELECT RAISE(ABORT, 'profile label identity is immutable'); END`,
+  },
+  {
+    name: "projects_label_key_insert_guard",
+    table: "projects",
+    type: "trigger",
+    sql: `CREATE TRIGGER projects_label_key_insert_guard
+BEFORE INSERT ON projects
+WHEN NEW.label_key IS NULL
+  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096
+BEGIN SELECT RAISE(ABORT, 'invalid project label key'); END`,
+  },
+  {
+    name: "projects_label_key_immutable",
+    table: "projects",
+    type: "trigger",
+    sql: `CREATE TRIGGER projects_label_key_immutable
+BEFORE UPDATE OF label,label_key ON projects
+WHEN NEW.label IS NOT OLD.label OR NEW.label_key IS NOT OLD.label_key
+BEGIN SELECT RAISE(ABORT, 'project label identity is immutable'); END`,
+  },
+] as const;
+
+const schemaVersion24 = schemaVersion24Objects
+  .map((object) => `${object.sql};`)
+  .join("\n");
+
+const dropSchemaVersion24 = [...schemaVersion24Objects]
+  .reverse()
+  .map((object) => `DROP ${object.type.toUpperCase()} IF EXISTS ${object.name};`)
+  .join("\n");
+
+const rebuildSchemaVersion24 = (database: Database): void => {
+  database.exec(dropSchemaVersion24);
+  database.exec(schemaVersion24);
+};
+
+const sqliteSchemaObjectRowSchema = z.object({
+  name: z.string(),
+  sql: z.string(),
+  tbl_name: z.string(),
+  type: z.enum(["index", "trigger"]),
+}).strict();
+
+const normalizeSqlStructure = (sql: string): string =>
+  sql.replace(/\s+/gu, " ").trim().replace(/;$/u, "");
+
+const assertSchemaVersion24Objects = (database: Database): void => {
+  const names = schemaVersion24Objects.map((object) => `'${object.name}'`).join(",");
+  const rows = database.query(
+    `SELECT type,name,tbl_name,sql FROM sqlite_master
+     WHERE name IN (${names}) ORDER BY name`,
+  ).all().map((row) => sqliteSchemaObjectRowSchema.parse(row));
+  if (rows.length !== schemaVersion24Objects.length) {
+    throw new Error("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+  }
+  for (const expected of schemaVersion24Objects) {
+    const observed = rows.find((row) => row.name === expected.name);
+    if (
+      observed === undefined
+      || observed.type !== expected.type
+      || observed.tbl_name !== expected.table
+      || normalizeSqlStructure(observed.sql) !== normalizeSqlStructure(expected.sql)
+    ) throw new Error("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+  }
+};
+
+const ensureQueueMessageScrubGeneration = (database: Database): void => {
+  if (!hasTableColumn(database, "queue_message_scrub_authority", "generation")) {
+    database.exec(
+      "ALTER TABLE queue_message_scrub_authority ADD COLUMN generation INTEGER NOT NULL DEFAULT 1 CHECK(generation BETWEEN 1 AND 9007199254740991)",
+    );
+  }
+};
+
+const hasSettledQueueMessagesToScrub = (database: Database): boolean =>
+  database.query(
+    `SELECT 1
+     FROM queue_entries
+     WHERE message!=?
+       AND (
+         state IN ('applied','failed','cancelled')
+         OR EXISTS(
+           SELECT 1 FROM queue_effect_resolutions r
+           WHERE r.queue_id=queue_entries.id
+         )
+       )
+     LIMIT 1`,
+  ).get(settledQueueMessage) !== null;
+
+const scrubSettledQueueMessages = (database: Database): boolean => {
+  const terminal = database.query(
+    `UPDATE queue_entries
+     SET message=?
+     WHERE message!=?
+       AND state IN ('applied','failed','cancelled')`,
+  ).run(settledQueueMessage, settledQueueMessage);
+  const resolved = database.query(
+    `UPDATE queue_entries
+     SET message=?
+     WHERE message!=?
+       AND EXISTS(
+         SELECT 1 FROM queue_effect_resolutions r
+         WHERE r.queue_id=queue_entries.id
+       )`,
+  ).run(settledQueueMessage, settledQueueMessage);
+  return terminal.changes + resolved.changes > 0;
+};
+
 const userVersionSchema = z.object({ user_version: z.number().int().nonnegative() }).strict();
 
 const securityScrubAuthorityRowSchema = z.object({
   reason: z.literal("mcp_url_redaction"),
   required_at: unixMillisecondsSchema,
+}).strict();
+
+const queueMessageScrubAuthorityRowSchema = z.object({
+  required_at: unixMillisecondsSchema,
+  requires_vacuum: z.union([z.literal(0), z.literal(1)]),
+  generation: z.number().int().positive().safe(),
 }).strict();
 
 const walCheckpointRowSchema = z.object({
@@ -1150,8 +1683,15 @@ const hasPendingSecurityScrub = (database: Database): boolean => {
   const row = database.query(
     "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
   ).get();
-  if (row === null) return false;
-  securityScrubAuthorityRowSchema.parse(row);
+  if (row !== null) {
+    securityScrubAuthorityRowSchema.parse(row);
+    return true;
+  }
+  const queueRow = database.query(
+    "SELECT required_at,requires_vacuum,generation FROM queue_message_scrub_authority WHERE singleton=1",
+  ).get();
+  if (queueRow === null) return false;
+  queueMessageScrubAuthorityRowSchema.parse(queueRow);
   return true;
 };
 
@@ -1162,7 +1702,32 @@ const requireSecurityScrub = (database: Database, requiredAt: number): void => {
   ).run(unixMillisecondsSchema.parse(requiredAt));
 };
 
-const completePendingSecurityScrub = (database: Database): void => {
+const requireQueueMessageScrub = (
+  database: Database,
+  requiredAt: number,
+  requiresVacuum: boolean,
+): void => {
+  const recorded = database.query(
+    `INSERT INTO queue_message_scrub_authority(singleton,required_at,requires_vacuum,generation)
+     VALUES (1,?,?,1)
+     ON CONFLICT(singleton) DO UPDATE SET
+       required_at=MIN(required_at,excluded.required_at),
+       requires_vacuum=MAX(requires_vacuum,excluded.requires_vacuum),
+       generation=generation+1
+     WHERE generation<9007199254740991`,
+  ).run(
+    unixMillisecondsSchema.parse(requiredAt),
+    requiresVacuum ? 1 : 0,
+  );
+  if (recorded.changes !== 1) {
+    throw new Error("QUEUE_MESSAGE_SCRUB_GENERATION_EXHAUSTED");
+  }
+};
+
+const completePendingSecurityScrub = (
+  database: Database,
+  operationCommitted = false,
+): void => {
   if (!hasPendingSecurityScrub(database)) return;
   database.exec(`PRAGMA busy_timeout = ${securityScrubBusyTimeoutMs}`);
   try {
@@ -1176,18 +1741,57 @@ const completePendingSecurityScrub = (database: Database): void => {
       }
     };
 
-    // The first truncation makes the durable marker and latest logical rows the
-    // sole main-file truth. VACUUM then rebuilds every page, including free
-    // space left by an earlier secure_delete=OFF migration. The final truncation
-    // removes pages emitted by the rebuild before the authority can be cleared.
-    truncateWal();
-    database.exec("VACUUM");
-    truncateWal();
-    database.transaction(() => {
-      database.query("DELETE FROM security_scrub_authority WHERE singleton=1").run();
-    }).immediate();
+    for (;;) {
+      const snapshot = database.transaction(() => {
+        const legacyRow = database.query(
+          "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
+        ).get();
+        const legacySecurityScrub = legacyRow === null
+          ? null
+          : securityScrubAuthorityRowSchema.parse(legacyRow);
+        const queueRow = database.query(
+          "SELECT required_at,requires_vacuum,generation FROM queue_message_scrub_authority WHERE singleton=1",
+        ).get();
+        if (queueRow === null) {
+          return { legacySecurityScrub, queueAuthority: null };
+        }
+        // The authority marker is committed before plaintext removal. This
+        // connection owns secure_delete=ON, so every body rewrite has known
+        // physical-deletion semantics even if the settling writer did not.
+        scrubSettledQueueMessages(database);
+        const queueAuthority = queueMessageScrubAuthorityRowSchema.parse(database.query(
+          "SELECT required_at,requires_vacuum,generation FROM queue_message_scrub_authority WHERE singleton=1",
+        ).get());
+        return { legacySecurityScrub, queueAuthority };
+      }).immediate();
+      const { legacySecurityScrub, queueAuthority } = snapshot;
+
+      if (legacySecurityScrub === null && queueAuthority === null) return;
+
+      // The first truncation removes superseded runtime frames. A legacy
+      // security migration or an explicitly uncertain queue migration also
+      // rebuilds the main file so bytes left in free pages cannot survive.
+      truncateWal();
+      if (legacySecurityScrub !== null || queueAuthority?.requires_vacuum === 1) {
+        database.exec("VACUUM");
+        truncateWal();
+      }
+      const cleared = database.transaction(() => {
+        if (legacySecurityScrub !== null) {
+          database.query("DELETE FROM security_scrub_authority WHERE singleton=1").run();
+        }
+        if (queueAuthority === null) return true;
+        return database.query(
+          "DELETE FROM queue_message_scrub_authority WHERE singleton=1 AND generation=?",
+        ).run(queueAuthority.generation).changes === 1;
+      }).immediate();
+      // A concurrent settlement advanced the generation after our checkpoint.
+      // Its authority remains durable and must be scrubbed in the next pass.
+      if (!cleared) continue;
+      if (!hasPendingSecurityScrub(database)) return;
+    }
   } catch (cause) {
-    throw new Error("STATE_SECURITY_SCRUB_REQUIRED", { cause });
+    throw new StateSecurityScrubRequiredError(operationCommitted, cause);
   } finally {
     database.exec(`PRAGMA busy_timeout = ${stateBusyTimeoutMs}`);
   }
@@ -1197,6 +1801,126 @@ const hasTableColumn = (database: Database, table: string, column: string): bool
   const columnSchema = z.object({ name: z.string() }).passthrough();
   if (!/^[a-z_]+$/u.test(table)) throw new Error("Unsafe SQLite table identifier.");
   return database.query(`PRAGMA table_info(${table})`).all().some((row) => columnSchema.parse(row).name === column);
+};
+
+type LabelIdentityKind = "ACCOUNT" | "PROJECT";
+
+class StateLabelInvariantError extends Error {
+  constructor(kind: LabelIdentityKind, reason: "COLLISION" | "INVALID" | "KEY_INVALID") {
+    super(`STATE_${kind}_LABEL_${reason}`);
+    this.name = "StateLabelInvariantError";
+  }
+}
+
+const canonicalLabelIdentity = (
+  value: unknown,
+  kind: LabelIdentityKind,
+): Readonly<{ key: string; label: string }> => {
+  const parsed = labelSchema.safeParse(value);
+  if (!parsed.success || parsed.data !== value) {
+    throw new StateLabelInvariantError(kind, "INVALID");
+  }
+  const key = canonicalLabelKey(parsed.data);
+  if (key.length === 0 || utf8Bytes(key) > 4_096) {
+    throw new StateLabelInvariantError(kind, "KEY_INVALID");
+  }
+  return { key, label: parsed.data };
+};
+
+const assertUniqueLabelKeys = (
+  keys: readonly string[],
+  kind: LabelIdentityKind,
+): void => {
+  const seen = new Set<string>();
+  for (const key of keys) {
+    if (seen.has(key)) throw new StateLabelInvariantError(kind, "COLLISION");
+    seen.add(key);
+  }
+};
+
+const profileLabelMigrationRowSchema = z.object({
+  id: profileIdSchema,
+  label: z.unknown(),
+  state: profileStateSchema,
+}).strict();
+const projectLabelMigrationRowSchema = z.object({
+  id: projectIdSchema,
+  label: z.unknown(),
+}).strict();
+const profileLabelInvariantRowSchema = profileLabelMigrationRowSchema.extend({
+  label_key: z.unknown(),
+}).strict();
+const projectLabelInvariantRowSchema = projectLabelMigrationRowSchema.extend({
+  label_key: z.unknown(),
+}).strict();
+
+const backfillCanonicalLabelKeys = (database: Database): void => {
+  if (!hasTableColumn(database, "profiles", "label_key")) {
+    database.exec("ALTER TABLE profiles ADD COLUMN label_key TEXT");
+  }
+  if (!hasTableColumn(database, "projects", "label_key")) {
+    database.exec("ALTER TABLE projects ADD COLUMN label_key TEXT");
+  }
+
+  const profiles = database.query(
+    "SELECT id,label,state FROM profiles ORDER BY id",
+  ).all().map((row) => {
+    const parsed = profileLabelMigrationRowSchema.parse(row);
+    return { ...parsed, ...canonicalLabelIdentity(parsed.label, "ACCOUNT") };
+  });
+  assertUniqueLabelKeys(
+    profiles.filter((profile) => profile.state !== "removed").map((profile) => profile.key),
+    "ACCOUNT",
+  );
+
+  const projects = database.query(
+    "SELECT id,label FROM projects ORDER BY id",
+  ).all().map((row) => {
+    const parsed = projectLabelMigrationRowSchema.parse(row);
+    return { ...parsed, ...canonicalLabelIdentity(parsed.label, "PROJECT") };
+  });
+  assertUniqueLabelKeys(projects.map((project) => project.key), "PROJECT");
+
+  const updateProfile = database.query("UPDATE profiles SET label_key=? WHERE id=?");
+  for (const profile of profiles) updateProfile.run(profile.key, profile.id);
+  const updateProject = database.query("UPDATE projects SET label_key=? WHERE id=?");
+  for (const project of projects) updateProject.run(project.key, project.id);
+};
+
+const assertCanonicalLabelKeys = (database: Database): void => {
+  if (!hasTableColumn(database, "profiles", "label_key")) {
+    throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+  }
+  if (!hasTableColumn(database, "projects", "label_key")) {
+    throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+  }
+
+  const profileKeys = database.query(
+    "SELECT label,label_key,state FROM profiles ORDER BY id",
+  ).all().map((row) => {
+    const parsed = profileLabelInvariantRowSchema.omit({ id: true }).parse(row);
+    const identity = canonicalLabelIdentity(parsed.label, "ACCOUNT");
+    if (parsed.label_key !== identity.key) {
+      throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+    }
+    return { key: identity.key, state: parsed.state };
+  });
+  assertUniqueLabelKeys(
+    profileKeys.filter((profile) => profile.state !== "removed").map((profile) => profile.key),
+    "ACCOUNT",
+  );
+
+  const projectKeys = database.query(
+    "SELECT label,label_key FROM projects ORDER BY id",
+  ).all().map((row) => {
+    const parsed = projectLabelInvariantRowSchema.omit({ id: true }).parse(row);
+    const identity = canonicalLabelIdentity(parsed.label, "PROJECT");
+    if (parsed.label_key !== identity.key) {
+      throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+    }
+    return identity.key;
+  });
+  assertUniqueLabelKeys(projectKeys, "PROJECT");
 };
 
 const ensureStableQueueSequence = (database: Database): void => {
@@ -1417,6 +2141,54 @@ const redactLegacyPermissionValues = (database: Database): boolean => {
   return true;
 };
 
+const legacyApprovalDisplaySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("command_approval"),
+    summary: z.string().max(4_096),
+    reason: z.string().max(4_096).nullable(),
+    commandClass: z.string().min(1).max(256),
+    workingDirectory: z.string().max(1_024).nullable(),
+    allowsSessionApproval: z.boolean(),
+  }).strict(),
+  z.object({
+    kind: z.literal("file_change_approval"),
+    summary: z.string().max(4_096),
+    reason: z.string().max(4_096).nullable(),
+    grantRoot: z.string().max(1_024).nullable(),
+    allowsSessionApproval: z.boolean(),
+  }).strict(),
+]);
+
+const backfillExactApprovalDecisions = (database: Database): void => {
+  const rows = database.query(
+    `SELECT public_id,display_json FROM provider_interactions
+     WHERE kind IN ('command_approval','file_change_approval')
+       AND json_type(display_json,'$.availableDecisions') IS NULL
+     ORDER BY public_id`,
+  ).all().map((row) => z.object({
+    public_id: z.string().uuid(),
+    display_json: z.string(),
+  }).strict().parse(row));
+  if (rows.length === 0) return;
+
+  database.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
+  for (const row of rows) {
+    const legacy = legacyApprovalDisplaySchema.parse(JSON.parse(row.display_json) as unknown);
+    const { allowsSessionApproval, ...display } = legacy;
+    const availableDecisions = [
+      "once" as const,
+      ...(allowsSessionApproval ? ["session" as const] : []),
+      "decline" as const,
+      "cancel" as const,
+    ];
+    const migrated = interactionDisplaySchema.parse({ ...display, availableDecisions });
+    database.query(
+      "UPDATE provider_interactions SET display_json=? WHERE public_id=?",
+    ).run(JSON.stringify(migrated), row.public_id);
+  }
+  database.exec(schemaVersion9);
+};
+
 const usageSnapshotReceivedAt = (snapshot: UsageSnapshotRecord): number => {
   const parsed = storedAccountUsageSnapshotSchema.safeParse(snapshot.payload);
   return parsed.success ? parsed.data.observation.receivedAt : snapshot.observedAt;
@@ -1551,6 +2323,7 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
   if (initialVersion > currentSchemaVersion) {
     throw new Error(`STATE_SCHEMA_NEWER:${initialVersion}:${currentSchemaVersion}`);
   }
+  if (initialVersion === currentSchemaVersion) assertCanonicalLabelKeys(database);
 
   // Security migrations may replace secret-bearing legacy records. SQLite must
   // overwrite superseded cell content instead of leaving it in free pages.
@@ -1792,6 +2565,73 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 17;
     }
 
+    if (version < 18) {
+      backfillExactApprovalDecisions(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(18, now());
+      database.exec("PRAGMA user_version = 18");
+      version = 18;
+    }
+
+    if (version < 19) {
+      database.exec(schemaVersion19);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(19, now());
+      database.exec("PRAGMA user_version = 19");
+      version = 19;
+    }
+
+    if (version < 20) {
+      database.exec(schemaVersion20);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(20, now());
+      database.exec("PRAGMA user_version = 20");
+      version = 20;
+    }
+
+    if (version < 21) {
+      database.exec(schemaVersion21);
+      scrubSettledQueueMessages(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(21, now());
+      database.exec("PRAGMA user_version = 21");
+      version = 21;
+    }
+
+    if (version < 22) {
+      database.exec(schemaVersion22);
+      // A pre-v22 database may already contain only tombstones while the
+      // superseded bodies remain in free pages or WAL. The durable marker makes
+      // the required rebuild independently retryable from the schema stamp.
+      if (initialVersion > 0) requireQueueMessageScrub(database, now(), true);
+      if (scrubSettledQueueMessages(database)) {
+        requireQueueMessageScrub(database, now(), true);
+      }
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(22, now());
+      database.exec("PRAGMA user_version = 22");
+      version = 22;
+    }
+
+    if (version < 23) {
+      ensureQueueMessageScrubGeneration(database);
+      database.exec(schemaVersion22);
+      database.exec(schemaVersion23);
+      // v22 shipped only in development, but its singleton authority had no
+      // generation fence and its trigger definitions could be stale. Rebuild
+      // every nonempty predecessor once, then let the generation-CAS loop own
+      // all future runtime purges.
+      if (initialVersion > 0) requireQueueMessageScrub(database, now(), true);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(23, now());
+      database.exec("PRAGMA user_version = 23");
+      version = 23;
+    }
+
+    if (version < 24) {
+      database.exec(dropSchemaVersion24);
+      backfillCanonicalLabelKeys(database);
+      rebuildSchemaVersion24(database);
+      assertSchemaVersion24Objects(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(24, now());
+      database.exec("PRAGMA user_version = 24");
+      version = 24;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -1808,6 +2648,18 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     database.exec(schemaVersion15);
     database.exec(schemaVersion16);
     database.exec(schemaVersion17);
+    backfillExactApprovalDecisions(database);
+    database.exec(schemaVersion19);
+    database.exec(schemaVersion20);
+    database.exec(schemaVersion21);
+    ensureQueueMessageScrubGeneration(database);
+    database.exec(schemaVersion22);
+    database.exec(schemaVersion23);
+    rebuildSchemaVersion24(database);
+    assertSchemaVersion24Objects(database);
+    if (hasSettledQueueMessagesToScrub(database)) {
+      requireQueueMessageScrub(database, now(), true);
+    }
     pruneAllUsageHistory(database, now());
     return hasPendingSecurityScrub(database);
   })();
@@ -1816,6 +2668,9 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
 
 const mapProfile = (row: unknown): ProfileRecord => {
   const parsed = profileRowSchema.parse(row);
+  if (parsed.label_key !== canonicalLabelIdentity(parsed.label, "ACCOUNT").key) {
+    throw new StateLabelInvariantError("ACCOUNT", "KEY_INVALID");
+  }
   return {
     id: parsed.id,
     label: parsed.label,
@@ -1830,6 +2685,9 @@ const mapProfile = (row: unknown): ProfileRecord => {
 
 const mapProject = (row: unknown): ProjectRecord => {
   const parsed = projectRowSchema.parse(row);
+  if (parsed.label_key !== canonicalLabelIdentity(parsed.label, "PROJECT").key) {
+    throw new StateLabelInvariantError("PROJECT", "KEY_INVALID");
+  }
   return { id: parsed.id, label: parsed.label, rootPath: parsed.root_path, default: parsed.is_default === 1, createdAt: parsed.created_at, updatedAt: parsed.updated_at };
 };
 
@@ -2078,18 +2936,40 @@ export class SelectionError extends Error {
   }
 }
 
+export class StateSecurityScrubRequiredError extends Error {
+  constructor(
+    readonly operationCommitted: boolean,
+    cause?: unknown,
+  ) {
+    super("STATE_SECURITY_SCRUB_REQUIRED", { cause });
+    this.name = "StateSecurityScrubRequiredError";
+  }
+}
+
 export class StateStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #readonly: boolean;
   readonly paths: StatePaths;
 
-  constructor(paths: StatePaths, options: { readonly?: boolean; now?: () => number } = {}) {
+  constructor(paths: StatePaths, options: {
+    readonly?: boolean;
+    now?: () => number;
+    beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
+  } = {}) {
     this.paths = paths;
     this.#now = options.now ?? Date.now;
     this.#readonly = options.readonly === true;
-    this.#database = new Database(paths.database, options.readonly ? { readonly: true } : { create: true, strict: true });
+    const databaseFile = prepareStateDatabaseFile(paths.database, this.#readonly);
+    const databaseOpenFlags = stateDatabaseOpenFlags(this.#readonly);
+    options.beforeDatabaseOpen?.({ flags: databaseOpenFlags, path: paths.database });
+    // Bun's object options do not expose SQLITE_OPEN_NOFOLLOW. Numeric flags are
+    // therefore the actual SQLite open boundary. This store binds positionally,
+    // so dropping Bun's JavaScript-only `strict` binding option does not change
+    // its statement contract; SQLite STRICT tables remain schema-enforced.
+    this.#database = new Database(paths.database, databaseOpenFlags);
     try {
+      assertStateDatabaseFile(paths.database, databaseFile);
       this.#database.exec(`PRAGMA foreign_keys = ON; PRAGMA busy_timeout = ${stateBusyTimeoutMs};`);
       if (!options.readonly) {
         requireWalMode(this.#database, true);
@@ -2101,6 +2981,9 @@ export class StateStore {
         if (version < currentSchemaVersion) throw new Error(`STATE_SCHEMA_MIGRATION_REQUIRED:${version}:${currentSchemaVersion}`);
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
+      assertSchemaVersion24Objects(this.#database);
+      assertCanonicalLabelKeys(this.#database);
+      assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
       this.#database.close(false);
       throw error;
@@ -2114,15 +2997,16 @@ export class StateStore {
   createProfile(label: string): ProfileRecord {
     const id = createProfileId();
     const parsedLabel = labelSchema.parse(label);
+    const labelKey = canonicalLabelIdentity(parsedLabel, "ACCOUNT").key;
     const now = this.#now();
-    this.#database.query("INSERT INTO profiles(id,label,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, parsedLabel, "signed_out", 0, now, now);
+    this.#database.query("INSERT INTO profiles(id,label,label_key,state,process_generation,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, "signed_out", 0, now, now);
     return this.requireProfile(id);
   }
 
   listProfiles(options: { includeRemoved?: boolean } = {}): readonly ProfileRecord[] {
     const rows = options.includeRemoved
-      ? this.#database.query("SELECT * FROM profiles ORDER BY lower(label), id").all()
-      : this.#database.query("SELECT * FROM profiles WHERE state != 'removed' ORDER BY lower(label), id").all();
+      ? this.#database.query("SELECT * FROM profiles ORDER BY label_key, id").all()
+      : this.#database.query("SELECT * FROM profiles WHERE state != 'removed' ORDER BY label_key, id").all();
     return rows.map(mapProfile);
   }
 
@@ -2235,17 +3119,18 @@ export class StateStore {
     }
     const id = createProjectId();
     const parsedLabel = labelSchema.parse(label);
+    const labelKey = canonicalLabelIdentity(parsedLabel, "PROJECT").key;
     const now = this.#now();
     const insert = this.#database.transaction(() => {
       if (makeDefault) this.#database.query("UPDATE projects SET is_default=0, updated_at=? WHERE is_default=1").run(now);
-      this.#database.query("INSERT INTO projects(id,label,root_path,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?)").run(id, parsedLabel, canonical, makeDefault ? 1 : 0, now, now);
+      this.#database.query("INSERT INTO projects(id,label,label_key,root_path,is_default,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(id, parsedLabel, labelKey, canonical, makeDefault ? 1 : 0, now, now);
     });
     insert.immediate();
     return this.requireProject(id);
   }
 
   listProjects(): readonly ProjectRecord[] {
-    return this.#database.query("SELECT * FROM projects ORDER BY is_default DESC, lower(label), id").all().map(mapProject);
+    return this.#database.query("SELECT * FROM projects ORDER BY is_default DESC, label_key, id").all().map(mapProject);
   }
 
   requireProject(selector: string): ProjectRecord {
@@ -2304,6 +3189,33 @@ export class StateStore {
       ? this.#database.query("SELECT * FROM sessions ORDER BY updated_at DESC,id LIMIT ?").all(bounded)
       : this.#database.query("SELECT * FROM sessions WHERE profile_id=? ORDER BY updated_at DESC,id LIMIT ?").all(profileId, bounded);
     return rows.map(mapSession);
+  }
+
+  listCloudSessionPage(input: Readonly<{
+    afterId: string | null;
+    limit: number;
+  }>): Readonly<{
+    continueAfterId: string | null;
+    isDone: boolean;
+    sessions: readonly SessionRecord[];
+  }> {
+    const limit = z.number().int().min(1).max(100).parse(input.limit);
+    const afterId = input.afterId === null ? null : sessionIdSchema.parse(input.afterId);
+    const rows = (afterId === null
+      ? this.#database.query(
+        "SELECT * FROM sessions ORDER BY id ASC LIMIT ?",
+      ).all(limit + 1)
+      : this.#database.query(
+        "SELECT * FROM sessions WHERE id > ? ORDER BY id ASC LIMIT ?",
+      ).all(afterId, limit + 1)).map(mapSession);
+    const isDone = rows.length <= limit;
+    const sessions = rows.slice(0, limit);
+    const last = sessions.at(-1);
+    return {
+      continueAfterId: isDone ? null : last?.id ?? null,
+      isDone,
+      sessions,
+    };
   }
 
   requireSession(selector: string): SessionRecord {
@@ -2666,6 +3578,7 @@ export class StateStore {
     interactions: readonly InteractionRecord[];
     session: SessionRecord;
   }> {
+    completePendingSecurityScrub(this.#database);
     const parsedSessionId = sessionIdSchema.parse(input.sessionId);
     const accountId = profileIdSchema.parse(input.accountId);
     const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
@@ -2761,7 +3674,9 @@ export class StateStore {
         session: this.requireSession(current.id),
       };
     });
-    return terminalize.immediate();
+    const result = terminalize.immediate();
+    completePendingSecurityScrub(this.#database, true);
+    return result;
   }
 
   quarantineSession(sessionId: SessionId): SessionRecord {
@@ -2795,6 +3710,7 @@ export class StateStore {
       expectedRevision: number;
       resolution: "abandoned";
     }): SessionRecord {
+    completePendingSecurityScrub(this.#database);
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
     const now = this.#now();
@@ -2863,6 +3779,7 @@ export class StateStore {
       if (changed.changes !== 1) throw new Error("SESSION_STATUS_RECOVERY_CAS_CONFLICT");
     });
     resolveRecovery.immediate();
+    completePendingSecurityScrub(this.#database, true);
     return this.requireSession(sessionId);
   }
 
@@ -2946,7 +3863,30 @@ export class StateStore {
   }
 
   nextPendingQueue(sessionId: SessionId): QueueRecord | null {
-    return this.listQueue(sessionId).find((entry) => entry.state === "pending") ?? null;
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const row = this.#database.query(
+      `SELECT id,session_id,message,state,created_at,updated_at
+       FROM queue_entries
+       WHERE session_id=? AND state='pending'
+       ORDER BY enqueue_sequence LIMIT 1`,
+    ).get(parsedSessionId);
+    if (row === null) return null;
+    const parsed = z.object({
+      id: queueIdSchema,
+      session_id: sessionIdSchema,
+      message: z.string(),
+      state: z.literal("pending"),
+      created_at: unixMillisecondsSchema,
+      updated_at: unixMillisecondsSchema,
+    }).strict().parse(row);
+    return {
+      id: parsed.id,
+      sessionId: parsed.session_id,
+      message: parsed.message,
+      state: parsed.state,
+      createdAt: parsed.created_at,
+      updatedAt: parsed.updated_at,
+    };
   }
 
   listRecoverableQueue(): readonly QueueRecord[] {
@@ -2960,14 +3900,22 @@ export class StateStore {
   }
 
   transitionQueue(id: QueueId, from: QueueState, to: QueueState): boolean {
+    completePendingSecurityScrub(this.#database);
     const parsedFrom = queueStateSchema.parse(from);
     const parsedTo = queueStateSchema.parse(to);
     if (!canTransitionQueue(parsedFrom, parsedTo)) {
       throw new Error(`Illegal queue transition: ${parsedFrom} -> ${parsedTo}`);
     }
     const now = this.#now();
-    const result = this.#database.query("UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=?").run(parsedTo, now, id, parsedFrom);
-    return result.changes === 1;
+    const changed = z.object({ id: queueIdSchema }).strict().nullable().parse(
+      this.#database.query(
+        "UPDATE queue_entries SET state=?,updated_at=? WHERE id=? AND state=? RETURNING id",
+      ).get(parsedTo, now, id, parsedFrom),
+    );
+    if (changed !== null && (parsedTo === "applied" || parsedTo === "failed" || parsedTo === "cancelled")) {
+      completePendingSecurityScrub(this.#database, true);
+    }
+    return changed !== null;
   }
 
   beginQueueEffect(input: {
@@ -3108,6 +4056,7 @@ export class StateStore {
     runtimeProfile: EffectiveRuntimeProfile;
     receipt: unknown;
   }): void {
+    completePendingSecurityScrub(this.#database);
     const queueId = queueIdSchema.parse(input.queueId);
     const evidenceDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const profile = effectiveRuntimeProfileSchema.parse(input.runtimeProfile);
@@ -3128,8 +4077,12 @@ export class StateStore {
         turnId: input.turnId,
         profile,
       }, now);
-      const queueChanged = this.#database.query("UPDATE queue_entries SET state='applied',updated_at=? WHERE id=? AND state='dispatching'").run(now, queueId);
-      if (queueChanged.changes !== 1) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
+      const queueChanged = z.object({ id: queueIdSchema }).strict().nullable().parse(
+        this.#database.query(
+          "UPDATE queue_entries SET state='applied',updated_at=? WHERE id=? AND state='dispatching' RETURNING id",
+        ).get(now, queueId),
+      );
+      if (queueChanged === null) throw new Error("QUEUE_EFFECT_CAS_CONFLICT");
       const nextState = input.turnStatus === "inProgress" ? "active" : "idle";
       if (input.applyResponseState) {
         const sessionChanged = this.#database.query(`UPDATE sessions SET state=?,active_turn_id=?,revision=revision+1,updated_at=?
@@ -3144,6 +4097,7 @@ export class StateStore {
       }
     });
     complete.immediate();
+    completePendingSecurityScrub(this.#database, true);
   }
 
   failQueueEffect(queueId: QueueId): boolean {
@@ -3180,6 +4134,7 @@ export class StateStore {
     receipt?: unknown;
     provider: { providerThreadId: string; title: string; status: "active" | "idle" | "terminal"; activeTurnId?: string; providerUpdatedAt?: number };
   }): SessionRecord {
+    completePendingSecurityScrub(this.#database);
     const queueId = queueIdSchema.parse(input.queueId);
     const expectedDigest = sha256Schema.parse(input.expectedEvidenceDigest);
     const now = this.#now();
@@ -3228,6 +4183,7 @@ export class StateStore {
       );
     });
     resolve.immediate();
+    completePendingSecurityScrub(this.#database, true);
     if (sessionId === undefined) throw new Error("Queue recovery lost its session authority.");
     return this.requireSession(sessionId);
   }
@@ -5243,21 +6199,44 @@ export class StateStore {
     pendingOnly?: boolean;
     limit?: number;
   } = {}): readonly InteractionRecord[] {
+    return this.listInteractionPage(input).interactions;
+  }
+
+  listInteractionPage(input: {
+    sessionId?: SessionId;
+    pendingOnly?: boolean;
+    limit?: number;
+    after?: InteractionListPosition;
+  } = {}): InteractionListPage {
     const sessionId = input.sessionId === undefined ? undefined : sessionIdSchema.parse(input.sessionId);
     const pendingOnly = input.pendingOnly ?? false;
     const limit = z.number().int().min(1).max(200).parse(input.limit ?? 100);
+    const after = input.after === undefined ? undefined : interactionListPositionSchema.parse(input.after);
     const predicates = [
       ...(sessionId === undefined ? [] : ["session_id=?"]),
       ...(pendingOnly ? ["state IN ('pending','response_prepared','response_written')"] : []),
+      ...(after === undefined
+        ? []
+        : ["(requested_at<? OR (requested_at=? AND public_id>?))"]),
     ];
     const where = predicates.length === 0 ? "" : ` WHERE ${predicates.join(" AND ")}`;
     const parameters: Array<string | number> = [
       ...(sessionId === undefined ? [] : [sessionId]),
-      limit,
+      ...(after === undefined ? [] : [after.requestedAt, after.requestedAt, after.publicId]),
+      limit + 1,
     ];
-    return this.#database.query(
-      `SELECT * FROM provider_interactions${where} ORDER BY requested_at DESC,public_id LIMIT ?`,
+    const records = this.#database.query(
+      `SELECT * FROM provider_interactions${where}
+       ORDER BY requested_at DESC,public_id ASC LIMIT ?`,
     ).all(...parameters).map(mapInteraction);
+    const interactions = records.slice(0, limit);
+    const last = interactions.at(-1);
+    return {
+      interactions,
+      nextPosition: records.length > limit && last !== undefined
+        ? { requestedAt: last.requestedAt, publicId: last.publicId }
+        : null,
+    };
   }
 
   listDueInteractions(input: { now?: number; limit?: number } = {}): readonly InteractionRecord[] {
@@ -5328,6 +6307,72 @@ export class StateStore {
       return mapInteraction(prepared);
     });
     return prepare.immediate();
+  }
+
+  supersedePreparedInteractionResponseWithTimeout(input: {
+    id: string;
+    expectedRevision: number;
+    manualResponseDigest: string;
+    timeoutResponseDigest: string;
+  }): InteractionRecord {
+    const id = z.string().uuid().parse(input.id);
+    const expectedRevision = z.number().int().positive().parse(input.expectedRevision);
+    const manualResponseDigest = sha256Schema.parse(input.manualResponseDigest);
+    const timeoutResponseDigest = sha256Schema.parse(input.timeoutResponseDigest);
+    if (manualResponseDigest === timeoutResponseDigest) {
+      throw new Error("INTERACTION_RESPONSE_CONFLICT");
+    }
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const supersede = this.#database.transaction(() => {
+      const preparedTransition = z.object({
+        state: interactionStateSchema,
+        response_digest: sha256Schema.nullable(),
+      }).strict().nullable().parse(this.#database.query(
+        `SELECT state,response_digest FROM provider_interaction_transitions
+         WHERE public_id=? AND revision=?`,
+      ).get(id, expectedRevision));
+      if (
+        preparedTransition === null
+        || preparedTransition.state !== "response_prepared"
+        || preparedTransition.response_digest !== manualResponseDigest
+      ) throw new Error("INTERACTION_RESPONSE_CONFLICT");
+
+      const current = this.#requireInteractionRow(id);
+      if (
+        current.state === "response_prepared"
+        && current.revision === expectedRevision + 1
+        && current.response_digest === timeoutResponseDigest
+        && current.intended_terminal_state === "expired"
+      ) return mapInteraction(current);
+      if (now < current.deadline_at) throw new Error("INTERACTION_DEADLINE_NOT_ELAPSED");
+      if (current.revision !== expectedRevision) throw new Error("INTERACTION_REVISION_CONFLICT");
+      if (current.state !== "response_prepared") throw new Error("INTERACTION_STATE_CONFLICT");
+      if (
+        current.response_digest !== manualResponseDigest
+        || current.intended_terminal_state === null
+        || current.intended_terminal_state === "expired"
+      ) throw new Error("INTERACTION_RESPONSE_CONFLICT");
+      const changed = this.#database.query(
+        `UPDATE provider_interactions
+         SET revision=revision+1,response_digest=?,intended_terminal_state='expired',
+             updated_at=MAX(updated_at,?)
+         WHERE public_id=? AND revision=? AND state='response_prepared'
+           AND response_digest=? AND intended_terminal_state IN ('resolved','declined','canceled')
+           AND terminal_at IS NULL AND deadline_at<=?`,
+      ).run(
+        timeoutResponseDigest,
+        now,
+        id,
+        expectedRevision,
+        manualResponseDigest,
+        now,
+      );
+      if (changed.changes !== 1) throw new Error("INTERACTION_REVISION_CONFLICT");
+      const replaced = this.#requireInteractionRow(id);
+      this.#recordInteractionTransition(replaced, now);
+      return mapInteraction(replaced);
+    });
+    return supersede.immediate();
   }
 
   markInteractionResponseWritten(input: {
@@ -5708,6 +6753,98 @@ export class StateStore {
     });
   }
 
+  usageHistoryPage(input: {
+    profileId: ProfileId;
+    fromObservedAt: number;
+    throughObservedAt: number;
+    afterSourceRevision?: number;
+    limit: number;
+  }): UsageHistoryLedgerPage {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const fromObservedAt = unixMillisecondsSchema.parse(input.fromObservedAt);
+    const throughObservedAt = unixMillisecondsSchema.parse(input.throughObservedAt);
+    if (fromObservedAt > throughObservedAt) throw new Error("USAGE_RANGE_INVALID");
+    const afterSourceRevision = z.number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .parse(input.afterSourceRevision ?? 0);
+    const limit = z.number()
+      .int()
+      .min(1)
+      .max(ACCOUNT_USAGE_HISTORY_PAGE_LIMIT)
+      .parse(input.limit);
+    const rows = this.#database.query(
+      `SELECT source_revision,observed_at,state,payload_json,reason_code FROM (
+         SELECT source_revision,observed_at,'observed' AS state,payload_json,NULL AS reason_code
+         FROM usage_snapshots
+         WHERE profile_id=? AND observed_at>=? AND observed_at<=? AND source_revision>?
+         UNION ALL
+         SELECT source_revision,observed_at,'failed' AS state,NULL AS payload_json,reason_code
+         FROM usage_poll_failures
+         WHERE profile_id=? AND observed_at>=? AND observed_at<=? AND source_revision>?
+       )
+       ORDER BY source_revision
+       LIMIT ?`,
+    ).all(
+      profileId,
+      fromObservedAt,
+      throughObservedAt,
+      afterSourceRevision,
+      profileId,
+      fromObservedAt,
+      throughObservedAt,
+      afterSourceRevision,
+      limit + 1,
+    ).map((row): UsageHistoryLedgerEntry => {
+      const parsed = z.object({
+        source_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        observed_at: unixMillisecondsSchema,
+        state: z.enum(["observed", "failed"]),
+        payload_json: z.string().nullable(),
+        reason_code: z.literal("account_usage_read_failed").nullable(),
+      }).strict().parse(row);
+      if (parsed.state === "observed") {
+        if (parsed.payload_json === null || parsed.reason_code !== null) {
+          throw new Error("USAGE_HISTORY_ROW_INVALID");
+        }
+        return {
+          state: "observed",
+          sourceRevision: parsed.source_revision,
+          observedAt: parsed.observed_at,
+          payload: JSON.parse(parsed.payload_json) as unknown,
+        };
+      }
+      if (parsed.payload_json !== null || parsed.reason_code === null) {
+        throw new Error("USAGE_HISTORY_ROW_INVALID");
+      }
+      return {
+        state: "failed",
+        sourceRevision: parsed.source_revision,
+        observedAt: parsed.observed_at,
+        reasonCode: parsed.reason_code,
+      };
+    });
+    for (let index = 1; index < rows.length; index += 1) {
+      const previous = rows[index - 1];
+      const current = rows[index];
+      if (
+        previous === undefined
+        || current === undefined
+        || previous.sourceRevision >= current.sourceRevision
+      ) {
+        throw new Error("USAGE_HISTORY_SOURCE_ORDER_INVALID");
+      }
+    }
+    const entries = rows.slice(0, limit);
+    return {
+      entries,
+      nextSourceRevision: rows.length > limit
+        ? entries.at(-1)?.sourceRevision ?? null
+        : null,
+    };
+  }
+
   usageAfterRevision(input: {
     profileId: ProfileId;
     afterSourceRevision: number;
@@ -5744,7 +6881,7 @@ export class StateStore {
   }
 
   latestUsage(profileId: ProfileId): UsageSnapshotRecord | null {
-    const row = this.#database.query("SELECT source_revision,observed_at,payload_json FROM usage_snapshots WHERE profile_id=? ORDER BY observed_at DESC,source_revision DESC LIMIT 1").get(profileId) as { source_revision: number; observed_at: number; payload_json: string } | null;
+    const row = this.#database.query("SELECT source_revision,observed_at,payload_json FROM usage_snapshots WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1").get(profileId) as { source_revision: number; observed_at: number; payload_json: string } | null;
     return row === null ? null : { sourceRevision: row.source_revision, observedAt: row.observed_at, payload: JSON.parse(row.payload_json) as unknown };
   }
 
@@ -5752,7 +6889,7 @@ export class StateStore {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const row = this.#database.query(
       `SELECT source_revision,observed_at,reason_code FROM usage_poll_failures
-       WHERE profile_id=? ORDER BY observed_at DESC,source_revision DESC LIMIT 1`,
+       WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1`,
     ).get(parsedProfileId) as {
       source_revision: number;
       observed_at: number;

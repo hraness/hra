@@ -82,6 +82,9 @@ const authSessionTotalDurationMs = 7 * 24 * 60 * 60 * 1_000;
 const maximumSyncedSessions = 25;
 const maximumChunksPerSession = 8;
 const maximumRemoteCommandLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
+const maximumDeviceMutationReceiptAgeMs = maximumRemoteCommandLifetimeMs;
+const maximumDeviceMutationReceiptCount = 128;
+const maximumDeviceMutationCustodyBytes = 64 * 1_024;
 
 class AccountDeletionStatusUnavailableError extends Error {
   constructor() {
@@ -427,6 +430,37 @@ type PendingDeviceMutation =
       kind: "revoke";
       requestDigest: string;
       targetPublicId: string;
+      version: 1;
+    }>;
+
+type DeviceMutationResult = Readonly<{
+  publicId: string;
+  revision: number;
+  status: "active" | "revoked";
+}>;
+
+type DeviceMutationReceipt = Readonly<{
+  completedAt: number;
+  idempotencyKey: string;
+  kind: PendingDeviceMutation["kind"];
+  requestDigest: string;
+  result: DeviceMutationResult;
+  targetPublicId: string;
+}>;
+
+type DeviceMutationCustody = Readonly<{
+  pending: PendingDeviceMutation | null;
+  receipts: readonly DeviceMutationReceipt[];
+  userPublicId: string;
+  version: 2;
+}>;
+
+type ParsedDeviceMutationCustody =
+  | DeviceMutationCustody
+  | Readonly<{
+      pending: PendingDeviceMutation;
+      receipts: readonly [];
+      userPublicId: null;
       version: 1;
     }>;
 
@@ -1008,6 +1042,111 @@ function parsePendingDeviceMutation(value: string): PendingDeviceMutation {
     targetPublicId: decoded.targetPublicId,
     version: decoded.version,
   };
+}
+
+function parseDeviceMutationReceipt(value: unknown): DeviceMutationReceipt {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      "completedAt",
+      "idempotencyKey",
+      "kind",
+      "requestDigest",
+      "result",
+      "targetPublicId",
+    ])
+    || !isFiniteTimestamp(value.completedAt)
+    || !isUuidV7(value.idempotencyKey)
+    || (value.kind !== "approve" && value.kind !== "revoke")
+    || !isDigest(value.requestDigest)
+    || !isOpaqueIdentifier(value.targetPublicId)
+    || !isRecord(value.result)
+    || !hasExactKeys(value.result, ["publicId", "revision", "status"])
+    || value.result.publicId !== value.targetPublicId
+    || !isSafePositiveInteger(value.result.revision)
+    || (value.kind === "approve" && value.result.status !== "active")
+    || (value.kind === "revoke" && value.result.status !== "revoked")
+  ) throw new Error("Cloud device-mutation custody is corrupt.");
+  return {
+    completedAt: value.completedAt,
+    idempotencyKey: value.idempotencyKey,
+    kind: value.kind,
+    requestDigest: value.requestDigest,
+    result: {
+      publicId: value.result.publicId,
+      revision: value.result.revision,
+      status: value.kind === "approve" ? "active" : "revoked",
+    },
+    targetPublicId: value.targetPublicId,
+  };
+}
+
+function parseDeviceMutationCustody(value: string): ParsedDeviceMutationCustody {
+  if (new TextEncoder().encode(value).byteLength > maximumDeviceMutationCustodyBytes) {
+    throw new Error("Cloud device-mutation custody is corrupt.");
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Cloud device-mutation custody is corrupt.");
+  }
+  if (isRecord(decoded) && decoded.version === 1) {
+    return {
+      pending: parsePendingDeviceMutation(value),
+      receipts: [],
+      userPublicId: null,
+      version: 1,
+    };
+  }
+  if (
+    !isRecord(decoded)
+    || !hasExactKeys(decoded, ["pending", "receipts", "userPublicId", "version"])
+    || decoded.version !== 2
+    || !isOpaqueIdentifier(decoded.userPublicId)
+    || !Array.isArray(decoded.receipts)
+    || decoded.receipts.length > maximumDeviceMutationReceiptCount
+  ) throw new Error("Cloud device-mutation custody is corrupt.");
+  const pending = decoded.pending === null
+    ? null
+    : parsePendingDeviceMutation(JSON.stringify(decoded.pending));
+  const receipts = decoded.receipts.map(parseDeviceMutationReceipt);
+  const receiptKeys = new Set(receipts.map((receipt) => receipt.idempotencyKey));
+  if (
+    receiptKeys.size !== receipts.length
+    || (pending !== null && receiptKeys.has(pending.idempotencyKey))
+  ) throw new Error("Cloud device-mutation custody is corrupt.");
+  return {
+    pending,
+    receipts,
+    userPublicId: decoded.userPublicId,
+    version: 2,
+  };
+}
+
+function boundedDeviceMutationCustody(
+  value: DeviceMutationCustody,
+  now: number,
+): Readonly<{ serialized: string; value: DeviceMutationCustody }> {
+  let receipts = value.receipts.filter((receipt) =>
+    receipt.completedAt > now - maximumDeviceMutationReceiptAgeMs);
+  if (receipts.length > maximumDeviceMutationReceiptCount) {
+    receipts = receipts.slice(-maximumDeviceMutationReceiptCount);
+  }
+  let bounded: DeviceMutationCustody = { ...value, receipts };
+  let serialized = JSON.stringify(bounded);
+  while (
+    receipts.length > 0
+    && new TextEncoder().encode(serialized).byteLength > maximumDeviceMutationCustodyBytes
+  ) {
+    receipts = receipts.slice(1);
+    bounded = { ...bounded, receipts };
+    serialized = JSON.stringify(bounded);
+  }
+  if (new TextEncoder().encode(serialized).byteLength > maximumDeviceMutationCustodyBytes) {
+    throw new Error("Cloud device-mutation custody exceeds its durable size bound.");
+  }
+  return { serialized, value: bounded };
 }
 
 function parsePendingDeviceRegistration(value: string): PendingDeviceRegistration {
@@ -1626,6 +1765,7 @@ function serializeSecret(
     | RetiredDeviceHistory
     | AccountKeySecret
     | LocalCloudState
+    | DeviceMutationCustody
     | PendingDeviceMutation
     | PendingDeviceRegistration
     | PendingRemoteCommand,
@@ -2364,227 +2504,197 @@ export class LocalCloudControl implements CloudControlPort {
     });
   }
 
-  async approveDevice(selector: string, signal: AbortSignal): Promise<unknown> {
+  async approveDevice(
+    selector: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (!isUuidV7(idempotencyKey)) {
+      throw new Error("Cloud device mutation idempotency key is invalid.");
+    }
+    return await this.#mutateDevice("approve", selector, idempotencyKey, signal);
+  }
+
+  async revokeDevice(
+    selector: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (!isUuidV7(idempotencyKey)) {
+      throw new Error("Cloud device mutation idempotency key is invalid.");
+    }
+    return await this.#mutateDevice("revoke", selector, idempotencyKey, signal);
+  }
+
+  async #mutateDevice(
+    kind: PendingDeviceMutation["kind"],
+    selector: string,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<unknown> {
     return await this.#exclusive(async () => {
       abortBeforeEffect(signal);
       const account = await this.#requireActiveDevice();
       const target = await this.#resolveDevice(selector);
       if (target.publicId === account.device.publicId) {
-        throw new Error("The current cloud device is already active.");
+        throw new Error(kind === "approve"
+          ? "The current cloud device is already active."
+          : "The current cloud device cannot revoke itself.");
       }
-      let pendingObservation = await this.#readPendingMutation();
-      if (pendingObservation !== null) {
-        let pending = pendingObservation.value;
-        if (pending.kind !== "approve" || pending.targetPublicId !== target.publicId) {
+
+      const custody = await this.#readDeviceMutationCustody(account.userPublicId);
+      const receipt = custody?.value.receipts.find((candidate) =>
+        candidate.idempotencyKey === idempotencyKey);
+      if (receipt !== undefined) {
+        if (receipt.kind !== kind || receipt.targetPublicId !== target.publicId) {
+          throw new Error("Cloud device mutation idempotency key was reused for a different request.");
+        }
+        return { device: receipt.result, replay: true };
+      }
+
+      if (custody?.value.pending !== null && custody?.value.pending !== undefined) {
+        const pending = custody.value.pending;
+        if (pending.idempotencyKey !== idempotencyKey) {
           throw new Error("A different cloud device mutation requires reconciliation.");
         }
-        if (target.status === "active" && target.revision === pending.expectedRevision + 1) {
-          await this.#clearExactSecret(mutationSlot, pendingObservation);
-          return {
-            device: {
-              publicId: target.publicId,
-              revision: target.revision,
-              status: target.status,
-            },
-            replay: true,
-          };
+        if (pending.kind !== kind || pending.targetPublicId !== target.publicId) {
+          throw new Error("Cloud device mutation idempotency key was reused for a different request.");
         }
-        if (target.status === "revoked") {
-          await this.#clearExactSecret(mutationSlot, pendingObservation);
+        const recovered = kind === "approve"
+          ? target.status === "active" && target.revision === pending.expectedRevision + 1
+          : target.status === "revoked" && target.revision === pending.expectedRevision + 1;
+        if (recovered) {
+          const result: DeviceMutationResult = {
+            publicId: target.publicId,
+            revision: target.revision,
+            status: kind === "approve" ? "active" : "revoked",
+          };
+          await this.#settlePendingDeviceMutation(account.userPublicId, custody, result);
+          return { device: result, replay: true };
+        }
+        if (kind === "approve" && target.status === "revoked") {
+          await this.#abandonPendingDeviceMutation(account.userPublicId, custody);
           throw new Error("Pending cloud device approval was abandoned because the device is revoked.");
         }
-        if (target.status !== "pending" || target.revision !== pending.expectedRevision) {
-          throw new Error("The pending cloud device approval requires recovery.");
+        if (
+          (kind === "approve" && target.status !== "pending")
+          || (kind === "revoke" && target.status === "revoked")
+          || target.revision !== pending.expectedRevision
+        ) {
+          throw new Error(kind === "approve"
+            ? "The pending cloud device approval requires recovery."
+            : "The pending cloud device revocation requires recovery.");
         }
-        if (outboxIdempotencyExpired(pending.idempotencyKey, this.#now())) {
-          const key = await this.#requireAccountKey(account.userPublicId);
-          const request = {
-            expectedRevision: pending.expectedRevision,
-            idempotencyKey: createCloudUuidV7(this.#now()),
-            keyEnvelope: pending.keyEnvelope,
-            targetPublicId: pending.targetPublicId,
-          };
-          const fresh: PendingDeviceMutation = {
+        if (outboxIdempotencyExpired(idempotencyKey, this.#now())) {
+          await this.#abandonPendingDeviceMutation(account.userPublicId, custody);
+          throw new Error("Cloud device mutation idempotency key is expired; retry with a new key.");
+        }
+        const device = await this.#sendPendingDeviceMutation(pending);
+        await this.#settlePendingDeviceMutation(account.userPublicId, custody, device);
+        return { device, replay: true };
+      }
+
+      if (outboxIdempotencyExpired(idempotencyKey, this.#now())) {
+        throw new Error("Cloud device mutation idempotency key is expired; retry with a new key.");
+      }
+      if (kind === "approve" && target.status !== "pending") {
+        throw new Error("The selected cloud device is not pending.");
+      }
+      if (kind === "revoke" && target.status === "revoked") {
+        throw new Error("The selected cloud device is already revoked.");
+      }
+      const key = await this.#requireAccountKey(account.userPublicId);
+      const keyEnvelope = kind === "approve"
+        ? await wrapAccountDataKey(key.bytes, target.wrappingPublicKey, {
+            accountKeyVersion: key.keyVersion,
+            devicePublicId: target.publicId,
+            userPublicId: account.userPublicId,
+          })
+        : null;
+      const request = {
+        expectedRevision: target.revision,
+        idempotencyKey,
+        ...(keyEnvelope === null ? {} : { keyEnvelope }),
+        targetPublicId: target.publicId,
+      };
+      const prepared: PendingDeviceMutation = kind === "approve"
+        ? {
             ...request,
-            kind: "approve",
+            keyEnvelope: keyEnvelope as WrappedKeyEnvelope,
+            kind,
             requestDigest: await hmacSha256Hex(
               key.bytes,
               "device-approve",
               JSON.stringify(request),
             ),
             version: 1,
-          };
-          const replacement = await this.#replaceExactSecret(
-            mutationSlot,
-            pendingObservation,
-            serializeSecret(fresh),
-          );
-          pendingObservation = { ...replacement, value: fresh };
-          pending = fresh;
-        }
-        const device = parseDeviceSummary(await this.#transport.mutation("devices:approve", {
-          expectedRevision: pending.expectedRevision,
-          idempotencyKey: pending.idempotencyKey,
-          keyEnvelope: pending.keyEnvelope,
-          requestDigest: pending.requestDigest,
-          targetPublicId: pending.targetPublicId,
-        }));
-        if (
-          device.publicId !== pending.targetPublicId
-          || device.revision !== pending.expectedRevision + 1
-          || device.status !== "active"
-        ) throw new Error("Cloud device approval response is inconsistent.");
-        await this.#clearExactSecret(mutationSlot, pendingObservation);
-        return { device, replay: true };
-      }
-      if (target.status !== "pending") throw new Error("The selected cloud device is not pending.");
-      const key = await this.#requireAccountKey(account.userPublicId);
-      const keyEnvelope = await wrapAccountDataKey(key.bytes, target.wrappingPublicKey, {
-        accountKeyVersion: key.keyVersion,
-        devicePublicId: target.publicId,
-        userPublicId: account.userPublicId,
-      });
-      const request = {
-        expectedRevision: target.revision,
-        idempotencyKey: createCloudUuidV7(this.#now()),
-        keyEnvelope,
-        targetPublicId: target.publicId,
-      };
-      const prepared: PendingDeviceMutation = {
-        ...request,
-        kind: "approve",
-        requestDigest: await hmacSha256Hex(
-          key.bytes,
-          "device-approve",
-          JSON.stringify(request),
-        ),
-        version: 1,
-      };
-      const claimed = await this.#claimPendingMutation(prepared);
-      if (!claimed.created) {
-        throw new Error("A concurrent cloud device mutation requires reconciliation.");
-      }
-      const device = parseDeviceSummary(await this.#transport.mutation("devices:approve", {
-        expectedRevision: claimed.pending.value.expectedRevision,
-        idempotencyKey: claimed.pending.value.idempotencyKey,
-        keyEnvelope: claimed.pending.value.kind === "approve"
-          ? claimed.pending.value.keyEnvelope
-          : prepared.keyEnvelope,
-        requestDigest: claimed.pending.value.requestDigest,
-        targetPublicId: claimed.pending.value.targetPublicId,
-      }));
-      if (
-        device.publicId !== prepared.targetPublicId
-        || device.revision !== prepared.expectedRevision + 1
-        || device.status !== "active"
-      ) throw new Error("Cloud device approval response is inconsistent.");
-      await this.#clearExactSecret(mutationSlot, claimed.pending);
-      return { device };
-    });
-  }
-
-  async revokeDevice(selector: string, signal: AbortSignal): Promise<unknown> {
-    return await this.#exclusive(async () => {
-      abortBeforeEffect(signal);
-      const account = await this.#requireActiveDevice();
-      const target = await this.#resolveDevice(selector);
-      if (target.publicId === account.device.publicId) {
-        throw new Error("The current cloud device cannot revoke itself.");
-      }
-      let pendingObservation = await this.#readPendingMutation();
-      if (pendingObservation !== null) {
-        let pending = pendingObservation.value;
-        if (pending.kind !== "revoke" || pending.targetPublicId !== target.publicId) {
-          throw new Error("A different cloud device mutation requires reconciliation.");
-        }
-        if (target.status === "revoked") {
-          await this.#clearExactSecret(mutationSlot, pendingObservation);
-          return {
-            device: {
-              publicId: target.publicId,
-              revision: target.revision,
-              status: target.status,
-            },
-            replay: true,
-          };
-        }
-        if (target.revision !== pending.expectedRevision) {
-          throw new Error("The pending cloud device revocation requires recovery.");
-        }
-        if (outboxIdempotencyExpired(pending.idempotencyKey, this.#now())) {
-          const key = await this.#requireAccountKey(account.userPublicId);
-          const request = {
-            expectedRevision: pending.expectedRevision,
-            idempotencyKey: createCloudUuidV7(this.#now()),
-            targetPublicId: pending.targetPublicId,
-          };
-          const fresh: PendingDeviceMutation = {
-            ...request,
-            kind: "revoke",
+          }
+        : {
+            expectedRevision: request.expectedRevision,
+            idempotencyKey: request.idempotencyKey,
+            kind,
             requestDigest: await hmacSha256Hex(
               key.bytes,
               "device-revoke",
               JSON.stringify(request),
             ),
+            targetPublicId: request.targetPublicId,
             version: 1,
-          };
-          const replacement = await this.#replaceExactSecret(
-            mutationSlot,
-            pendingObservation,
-            serializeSecret(fresh),
-          );
-          pendingObservation = { ...replacement, value: fresh };
-          pending = fresh;
-        }
-        const device = parseDeviceSummary(await this.#transport.mutation("devices:revoke", {
-          expectedRevision: pending.expectedRevision,
-          idempotencyKey: pending.idempotencyKey,
-          requestDigest: pending.requestDigest,
-          targetPublicId: pending.targetPublicId,
-        }));
-        if (
-          device.publicId !== pending.targetPublicId
-          || device.revision !== pending.expectedRevision + 1
-          || device.status !== "revoked"
-        ) throw new Error("Cloud device revocation response is inconsistent.");
-        await this.#clearExactSecret(mutationSlot, pendingObservation);
-        return { device, replay: true };
-      }
-      if (target.status === "revoked") throw new Error("The selected cloud device is already revoked.");
-      const key = await this.#requireAccountKey(account.userPublicId);
-      const request = {
-        expectedRevision: target.revision,
-        idempotencyKey: createCloudUuidV7(this.#now()),
-        targetPublicId: target.publicId,
       };
-      const prepared: PendingDeviceMutation = {
-        ...request,
-        kind: "revoke",
-        requestDigest: await hmacSha256Hex(
-          key.bytes,
-          "device-revoke",
-          JSON.stringify(request),
-        ),
-        version: 1,
-      };
-      const claimed = await this.#claimPendingMutation(prepared);
+      const claimed = await this.#claimPendingMutation(account.userPublicId, prepared);
       if (!claimed.created) {
+        const concurrentReceipt = claimed.custody.value.receipts.find((receipt) =>
+          receipt.idempotencyKey === idempotencyKey);
+        if (concurrentReceipt !== undefined) {
+          if (
+            concurrentReceipt.kind !== kind
+            || concurrentReceipt.targetPublicId !== target.publicId
+          ) {
+            throw new Error("Cloud device mutation idempotency key was reused for a different request.");
+          }
+          return { device: concurrentReceipt.result, replay: true };
+        }
+        const concurrent = claimed.custody.value.pending;
+        if (
+          concurrent?.idempotencyKey === idempotencyKey
+          && (concurrent.kind !== kind || concurrent.targetPublicId !== target.publicId)
+        ) {
+          throw new Error("Cloud device mutation idempotency key was reused for a different request.");
+        }
         throw new Error("A concurrent cloud device mutation requires reconciliation.");
       }
-      const device = parseDeviceSummary(await this.#transport.mutation("devices:revoke", {
-        expectedRevision: claimed.pending.value.expectedRevision,
-        idempotencyKey: claimed.pending.value.idempotencyKey,
-        requestDigest: claimed.pending.value.requestDigest,
-        targetPublicId: claimed.pending.value.targetPublicId,
-      }));
-      if (
-        device.publicId !== prepared.targetPublicId
-        || device.revision !== prepared.expectedRevision + 1
-        || device.status !== "revoked"
-      ) throw new Error("Cloud device revocation response is inconsistent.");
-      await this.#clearExactSecret(mutationSlot, claimed.pending);
+      const device = await this.#sendPendingDeviceMutation(prepared);
+      await this.#settlePendingDeviceMutation(account.userPublicId, claimed.custody, device);
       return { device };
     });
+  }
+
+  async #sendPendingDeviceMutation(
+    pending: PendingDeviceMutation,
+  ): Promise<DeviceMutationResult> {
+    const device = parseDeviceSummary(await this.#transport.mutation(
+      pending.kind === "approve" ? "devices:approve" : "devices:revoke",
+      {
+        expectedRevision: pending.expectedRevision,
+        idempotencyKey: pending.idempotencyKey,
+        ...(pending.kind === "approve" ? { keyEnvelope: pending.keyEnvelope } : {}),
+        requestDigest: pending.requestDigest,
+        targetPublicId: pending.targetPublicId,
+      },
+    ));
+    const expectedStatus = pending.kind === "approve" ? "active" : "revoked";
+    if (
+      device.publicId !== pending.targetPublicId
+      || device.revision !== pending.expectedRevision + 1
+      || device.status !== expectedStatus
+    ) throw new Error(pending.kind === "approve"
+      ? "Cloud device approval response is inconsistent."
+      : "Cloud device revocation response is inconsistent.");
+    return {
+      publicId: device.publicId,
+      revision: device.revision,
+      status: expectedStatus,
+    };
   }
 
   async listRemoteSessionHeads(input: Readonly<{
@@ -3725,46 +3835,160 @@ export class LocalCloudControl implements CloudControlPort {
       : parseLocalState(observation.value);
   }
 
-  async #readPendingMutation(): Promise<SecretObservation<PendingDeviceMutation> | null> {
-    const observation = await this.#secrets.read(mutationSlot);
-    return observation === null ? null : {
-      generation: observation.generation,
-      serialized: observation.value,
-      value: parsePendingDeviceMutation(observation.value),
-    };
+  async #readDeviceMutationCustody(
+    userPublicId: string,
+  ): Promise<SecretObservation<DeviceMutationCustody> | null> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const observation = await this.#secrets.read(mutationSlot);
+      if (observation === null) return null;
+      const parsed = parseDeviceMutationCustody(observation.value);
+      if (parsed.userPublicId !== null && parsed.userPublicId !== userPublicId) {
+        throw new Error("Cloud device-mutation custody belongs to a different identity.");
+      }
+      const bounded = boundedDeviceMutationCustody({
+        pending: parsed.pending,
+        receipts: parsed.receipts,
+        userPublicId,
+        version: 2,
+      }, this.#now());
+      if (parsed.version === 2 && bounded.serialized === observation.value) {
+        return {
+          generation: observation.generation,
+          serialized: observation.value,
+          value: bounded.value,
+        };
+      }
+      const committed = await this.#secrets.compareAndSwap(
+        mutationSlot,
+        observation.generation,
+        bounded.serialized,
+      );
+      if (committed !== null) {
+        return {
+          generation: committed.generation,
+          serialized: bounded.serialized,
+          value: bounded.value,
+        };
+      }
+    }
+    throw new Error("Cloud device-mutation custody changed concurrently.");
   }
 
-  async #claimPendingMutation(pending: PendingDeviceMutation): Promise<Readonly<{
+  async #claimPendingMutation(
+    userPublicId: string,
+    pending: PendingDeviceMutation,
+  ): Promise<Readonly<{
     created: boolean;
-    pending: SecretObservation<PendingDeviceMutation>;
+    custody: SecretObservation<DeviceMutationCustody>;
   }>> {
-    const current = await this.#secrets.read(mutationSlot);
-    if (current !== null) return {
-      created: false,
-      pending: {
-        generation: current.generation,
-        serialized: current.value,
-        value: parsePendingDeviceMutation(current.value),
-      },
-    };
-    const serialized = serializeSecret(pending);
-    const committed = await this.#secrets.compareAndSwap(mutationSlot, null, serialized);
-    if (committed === null) {
-      const concurrent = await this.#secrets.read(mutationSlot);
-      if (concurrent === null) throw new Error("Cloud device mutation outbox changed concurrently.");
-      return {
-        created: false,
-        pending: {
-          generation: concurrent.generation,
-          serialized: concurrent.value,
-          value: parsePendingDeviceMutation(concurrent.value),
-        },
-      };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await this.#readDeviceMutationCustody(userPublicId);
+      if (current?.value.pending !== null && current?.value.pending !== undefined) {
+        return { created: false, custody: current };
+      }
+      if (current?.value.receipts.some((receipt) =>
+        receipt.idempotencyKey === pending.idempotencyKey) === true) {
+        return { created: false, custody: current };
+      }
+      const bounded = boundedDeviceMutationCustody({
+        pending,
+        receipts: current?.value.receipts ?? [],
+        userPublicId,
+        version: 2,
+      }, this.#now());
+      const committed = await this.#secrets.compareAndSwap(
+        mutationSlot,
+        current?.generation ?? null,
+        bounded.serialized,
+      );
+      if (committed !== null) {
+        return {
+          created: true,
+          custody: {
+            generation: committed.generation,
+            serialized: bounded.serialized,
+            value: bounded.value,
+          },
+        };
+      }
     }
-    return {
-      created: true,
-      pending: { generation: committed.generation, serialized, value: pending },
+    throw new Error("Cloud device mutation outbox changed concurrently.");
+  }
+
+  async #abandonPendingDeviceMutation(
+    userPublicId: string,
+    custody: SecretObservation<DeviceMutationCustody>,
+  ): Promise<void> {
+    if (custody.value.userPublicId !== userPublicId || custody.value.pending === null) {
+      throw new Error("Cloud device-mutation custody changed authority.");
+    }
+    const bounded = boundedDeviceMutationCustody({
+      ...custody.value,
+      pending: null,
+    }, this.#now());
+    await this.#replaceExactSecret(mutationSlot, custody, bounded.serialized);
+  }
+
+  async #settlePendingDeviceMutation(
+    userPublicId: string,
+    original: SecretObservation<DeviceMutationCustody>,
+    result: DeviceMutationResult,
+  ): Promise<void> {
+    const expected = original.value.pending;
+    if (expected === null || original.value.userPublicId !== userPublicId) {
+      throw new Error("Cloud device-mutation custody changed authority.");
+    }
+    if (
+      result.publicId !== expected.targetPublicId
+      || result.status !== (expected.kind === "approve" ? "active" : "revoked")
+      || result.revision !== expected.expectedRevision + 1
+    ) throw new Error("Cloud device-mutation settlement result is inconsistent.");
+    const receipt: DeviceMutationReceipt = {
+      completedAt: this.#now(),
+      idempotencyKey: expected.idempotencyKey,
+      kind: expected.kind,
+      requestDigest: expected.requestDigest,
+      result,
+      targetPublicId: expected.targetPublicId,
     };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = attempt === 0
+        ? original
+        : await this.#readDeviceMutationCustody(userPublicId);
+      if (current === null || current.value.userPublicId !== userPublicId) {
+        throw new Error("Cloud device-mutation custody changed authority.");
+      }
+      const existing = current.value.receipts.find((candidate) =>
+        candidate.idempotencyKey === receipt.idempotencyKey);
+      if (existing !== undefined) {
+        if (
+          existing.kind !== receipt.kind
+          || existing.requestDigest !== receipt.requestDigest
+          || existing.targetPublicId !== receipt.targetPublicId
+          || JSON.stringify(existing.result) !== JSON.stringify(receipt.result)
+        ) {
+          throw new Error("Cloud device mutation idempotency key was reused for a different request.");
+        }
+        return;
+      }
+      if (
+        current.value.pending === null
+        || JSON.stringify(current.value.pending) !== JSON.stringify(expected)
+      ) throw new Error("Cloud device-mutation custody changed authority.");
+      const bounded = boundedDeviceMutationCustody({
+        pending: null,
+        receipts: [...current.value.receipts, receipt],
+        userPublicId,
+        version: 2,
+      }, this.#now());
+      const committed = await this.#secrets.compareAndSwap(
+        mutationSlot,
+        current.generation,
+        bounded.serialized,
+      );
+      if (committed !== null) return;
+    }
+    throw new Error("Cloud device-mutation custody changed concurrently.");
   }
 
   async #readPendingRegistration(): Promise<SecretObservation<PendingDeviceRegistration> | null> {

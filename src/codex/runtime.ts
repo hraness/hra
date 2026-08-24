@@ -11,7 +11,17 @@ export interface PinnedCodexRuntime {
   readonly packageRoot: string;
   readonly packageJsonPath: string;
   readonly packageVersion: typeof PINNED_CODEX_VERSION;
-  readonly launcherArgv: readonly [string, string, "app-server", "--listen", "stdio://"];
+  readonly launcherArgv: readonly [
+    string,
+    string,
+    "app-server",
+    "--listen",
+    "stdio://",
+    "--config",
+    'cli_auth_credentials_store="file"',
+    "--config",
+    'mcp_oauth_credentials_store="file"',
+  ];
 }
 
 export interface ResolvePinnedCodexRuntimeOptions {
@@ -82,7 +92,17 @@ export async function resolvePinnedCodexRuntime(
     packageRoot,
     packageJsonPath: canonicalPackageJson,
     packageVersion: PINNED_CODEX_VERSION,
-    launcherArgv: [bunExecutable, canonicalBin, "app-server", "--listen", "stdio://"],
+    launcherArgv: [
+      bunExecutable,
+      canonicalBin,
+      "app-server",
+      "--listen",
+      "stdio://",
+      "--config",
+      'cli_auth_credentials_store="file"',
+      "--config",
+      'mcp_oauth_credentials_store="file"',
+    ],
   };
 }
 
@@ -96,6 +116,80 @@ export interface LaunchPinnedCodexOptions
     readonly environment?: Readonly<Record<string, string | undefined>>;
   }) => CodexProcess;
 }
+
+type ProcessExitObservation =
+  | Readonly<{ state: "exited" }>
+  | Readonly<{ error: unknown; state: "rejected" }>
+  | Readonly<{ state: "pending" }>;
+
+const cleanupDuration = (value: number | undefined, fallback: number): number =>
+  value !== undefined && Number.isSafeInteger(value) && value >= 1 && value <= 30_000
+    ? value
+    : fallback;
+
+const observeProcessExit = async (
+  exited: Promise<number>,
+  timeoutMs: number,
+): Promise<ProcessExitObservation> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<ProcessExitObservation>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout({ state: "pending" }), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      exited.then<ProcessExitObservation, ProcessExitObservation>(
+        () => ({ state: "exited" }),
+        (error: unknown) => ({ error, state: "rejected" }),
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
+const closeSpawnedCodexProcess = async (
+  process: CodexProcess,
+  input: Readonly<{
+    settlementMs: number;
+    termGraceMs: number;
+    terminationAlreadyRequested: boolean;
+  }>,
+): Promise<readonly unknown[]> => {
+  const errors: unknown[] = [];
+  if (!input.terminationAlreadyRequested) {
+    try {
+      process.terminate();
+    } catch (error: unknown) {
+      errors.push(error);
+    }
+  }
+
+  const afterTerm = await observeProcessExit(process.exited, input.termGraceMs);
+  if (afterTerm.state === "exited") return errors;
+  if (afterTerm.state === "rejected") {
+    errors.push(new Error("Codex process exit observation failed during launch cleanup.", {
+      cause: afterTerm.error,
+    }));
+  }
+
+  try {
+    process.forceTerminate();
+  } catch (error: unknown) {
+    errors.push(error);
+  }
+  if (afterTerm.state === "rejected") return errors;
+
+  const afterForce = await observeProcessExit(process.exited, input.settlementMs);
+  if (afterForce.state === "rejected") {
+    errors.push(new Error("Codex process exit observation failed after forced launch cleanup.", {
+      cause: afterForce.error,
+    }));
+  } else if (afterForce.state === "pending") {
+    errors.push(new Error("Codex process did not exit within the bounded launch cleanup window."));
+  }
+  return errors;
+};
 
 export async function launchPinnedCodexAppServer(
   options: LaunchPinnedCodexOptions,
@@ -118,33 +212,47 @@ export async function launchPinnedCodexAppServer(
     codexHome: options.expectedCodexHome,
     ...(options.environment === undefined ? {} : { environment: options.environment }),
   });
-  const client = new CodexAppServerClient({
-    process,
-    authority: options.authority,
-    expectedCodexHome: options.expectedCodexHome,
-    isAuthorityCurrent: options.isAuthorityCurrent,
-    ...(options.credentialStorePreflight === undefined
-      ? {}
-      : { credentialStorePreflight: options.credentialStorePreflight }),
-    ...(options.experimentalApi === undefined
-      ? {}
-      : { experimentalApi: options.experimentalApi }),
-    ...(options.onFact === undefined ? {} : { onFact: options.onFact }),
-    ...(options.onSafeDiagnostic === undefined
-      ? {}
-      : { onSafeDiagnostic: options.onSafeDiagnostic }),
-    ...(options.maxJsonLineBytes === undefined
-      ? {}
-      : { maxJsonLineBytes: options.maxJsonLineBytes }),
-    ...(options.shutdownTermGraceMs === undefined
-      ? {}
-      : { shutdownTermGraceMs: options.shutdownTermGraceMs }),
-    ...(options.shutdownSettlementMs === undefined
-      ? {}
-      : { shutdownSettlementMs: options.shutdownSettlementMs }),
-  });
-  await client.initialize();
-  return client;
+  let client: CodexAppServerClient | undefined;
+  try {
+    client = new CodexAppServerClient({
+      process,
+      authority: options.authority,
+      credentialStorePreflight: options.credentialStorePreflight,
+      expectedCodexHome: options.expectedCodexHome,
+      isAuthorityCurrent: options.isAuthorityCurrent,
+      ...(options.experimentalApi === undefined
+        ? {}
+        : { experimentalApi: options.experimentalApi }),
+      ...(options.onFact === undefined ? {} : { onFact: options.onFact }),
+      ...(options.onSafeDiagnostic === undefined
+        ? {}
+        : { onSafeDiagnostic: options.onSafeDiagnostic }),
+      ...(options.maxJsonLineBytes === undefined
+        ? {}
+        : { maxJsonLineBytes: options.maxJsonLineBytes }),
+      ...(options.shutdownTermGraceMs === undefined
+        ? {}
+        : { shutdownTermGraceMs: options.shutdownTermGraceMs }),
+      ...(options.shutdownSettlementMs === undefined
+        ? {}
+        : { shutdownSettlementMs: options.shutdownSettlementMs }),
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+    await client.initialize();
+    return client;
+  } catch (error: unknown) {
+    const cleanupErrors = await closeSpawnedCodexProcess(process, {
+      settlementMs: cleanupDuration(options.shutdownSettlementMs, 1_000),
+      termGraceMs: cleanupDuration(options.shutdownTermGraceMs, 2_000),
+      terminationAlreadyRequested: client !== undefined,
+    });
+    if (cleanupErrors.length === 0) throw error;
+    throw new AggregateError(
+      [error, ...cleanupErrors],
+      "Codex app-server launch failed and process cleanup was incomplete.",
+      { cause: error },
+    );
+  }
 }
 
 async function locatePackageJson(options: ResolvePinnedCodexRuntimeOptions): Promise<string> {

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, realpath, symlink } from "node:fs/promises";
+import { renameSync, symlinkSync } from "node:fs";
+import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Database } from "bun:sqlite";
+import { Database, constants as sqliteConstants } from "bun:sqlite";
+import { z } from "zod";
 
 import { deriveDesktopProfilePaths } from "../desktop/profile";
 import { SESSION_EVENT_RETAIN_AGE_MS } from "../domain/session-events";
@@ -22,6 +24,7 @@ import {
   USAGE_LOCAL_RETAIN_BYTES,
   USAGE_LOCAL_RETAIN_SUCCESS_COUNT,
   SelectionError,
+  StateSecurityScrubRequiredError,
   StateStore,
 } from "./state-store";
 
@@ -311,6 +314,82 @@ function moveQueueTo(store: StateStore, queueId: ReturnType<StateStore["enqueue"
 }
 
 describe("StateStore", () => {
+  test("creates the main database as an exact private single-link file", async () => {
+    const { store } = await fixture();
+    const metadata = await lstat(store.paths.database);
+
+    expect(metadata.isFile()).toBe(true);
+    expect(metadata.isSymbolicLink()).toBe(false);
+    expect(metadata.nlink).toBe(1);
+    expect(metadata.mode & 0o777).toBe(0o600);
+    const owner = process.getuid?.();
+    if (owner !== undefined) expect(metadata.uid).toBe(owner);
+  });
+
+  test("fails closed without chmod when an existing database is permission-unsafe", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    await chmod(paths.database, 0o644);
+
+    expect(() => new StateStore(paths)).toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect((await lstat(paths.database)).mode & 0o777).toBe(0o644);
+  });
+
+  test("refuses a symlink at the main database boundary before SQLite opens it", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-link-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const target = join(paths.root, "database-target");
+    await writeFile(target, "not-a-database", { mode: 0o600 });
+    await symlink(target, paths.database);
+
+    expect(() => new StateStore(paths)).toThrow("STATE_DATABASE_FILE_UNSAFE");
+    expect(await Bun.file(target).text()).toBe("not-a-database");
+  });
+
+  test("refuses a symlink swapped in after the main database precheck", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const original = `${paths.database}.validated`;
+    const target = `${paths.database}.target`;
+    await writeFile(target, "target-must-remain-untouched", { mode: 0o600 });
+    let observedFlags = 0;
+
+    let failure: unknown;
+    try {
+      new StateStore(paths, {
+        beforeDatabaseOpen: ({ flags, path }) => {
+          observedFlags = flags;
+          renameSync(path, original);
+          symlinkSync(target, path);
+        },
+      });
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(observedFlags).toBe(
+      sqliteConstants.SQLITE_OPEN_READWRITE
+        | sqliteConstants.SQLITE_OPEN_CREATE
+        | sqliteConstants.SQLITE_OPEN_NOFOLLOW,
+    );
+    expect(failure).toMatchObject({
+      code: "SQLITE_CANTOPEN_SYMLINK",
+      errno: 1_550,
+    });
+    expect(await Bun.file(target).text()).toBe("target-must-remain-untouched");
+    const originalMetadata = await lstat(original);
+    expect(originalMetadata.isFile()).toBe(true);
+    expect(originalMetadata.nlink).toBe(1);
+    expect(originalMetadata.mode & 0o777).toBe(0o600);
+  });
+
   test("isolates profiles and fences process generations", async () => {
     const { store } = await fixture();
     const work = store.createProfile("Work");
@@ -358,7 +437,7 @@ describe("StateStore", () => {
         summary: "Apply bounded changes",
         reason: null,
         grantRoot: null,
-        allowsSessionApproval: false,
+        availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
       },
     }).record;
     const pending = admit("10000000-0000-4000-8000-000000000002", "a");
@@ -402,10 +481,19 @@ describe("StateStore", () => {
     expect(store.requireProfile(profile.id)).toMatchObject({ state: "recovery_required", providerEmail: "profile@example.com" });
   });
 
-  test("rejects ambiguous labels without effects", async () => {
-    const { store } = await fixture();
-    store.createProfile("Alpha");
-    expect(() => store.createProfile("alpha")).toThrow();
+  test("enforces the selector's Unicode label identity without effects", async () => {
+    const { store, home } = await fixture();
+    const account = store.createProfile("Équipe");
+    expect(() => store.createProfile("équipe")).toThrow();
+    expect(store.requireProfile("e\u0301QUIPE").id).toBe(account.id);
+
+    const firstRoot = join(home, "Café");
+    const secondRoot = join(home, "Cafe-decomposed");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    const project = await store.createProject("Café", firstRoot);
+    await expect(store.createProject("Cafe\u0301", secondRoot)).rejects.toThrow();
+    expect(store.requireProject("CAFE\u0301").id).toBe(project.id);
     expect(() => store.requireProfile("missing")).toThrow(SelectionError);
   });
 
@@ -841,6 +929,32 @@ describe("StateStore", () => {
     expect(store.requireSession(first.id).id).toBe(first.id);
   });
 
+  test("pages every cloud session by stable identifier beyond the recent-list bound", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Cloud pages");
+    const created = Array.from({ length: 53 }, (_, index) => store.createSession({
+      fastEnabled: false,
+      preset: "high",
+      profileId: profile.id,
+      title: `Cloud session ${index}`,
+    }));
+    const observed: string[] = [];
+    let afterId: string | null = null;
+    for (let pageNumber = 0; pageNumber < 4; pageNumber += 1) {
+      const page = store.listCloudSessionPage({ afterId, limit: 25 });
+      expect(page.sessions.length).toBeLessThanOrEqual(25);
+      observed.push(...page.sessions.map((session) => session.id));
+      afterId = page.continueAfterId;
+      if (page.isDone) break;
+    }
+    expect(observed).toEqual(created.map((session) => session.id).sort());
+    expect(afterId).toBeNull();
+    expect(() => store.listCloudSessionPage({
+      afterId: "not-a-session-id",
+      limit: 25,
+    })).toThrow();
+  });
+
   test("tombstones profiles while preserving exact historical session reads", async () => {
     const { store } = await fixture();
     const profile = signInProfile(store, "Archived", "archive@example.com");
@@ -975,6 +1089,639 @@ describe("StateStore", () => {
     } finally {
       inspector.close(false);
     }
+  });
+
+  test("selects the oldest pending queue row without scanning terminal history", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Bounded queue lookup");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    for (let index = 0; index < 2_000; index += 1) {
+      const terminal = store.enqueue(session.id, `terminal ${String(index)}`);
+      if (!store.transitionQueue(terminal.id, "pending", "cancelled")) {
+        throw new Error("Terminal queue fixture transition failed.");
+      }
+    }
+    const expected = store.enqueue(session.id, "bounded pending work");
+    const later = store.enqueue(session.id, "later pending work");
+
+    const originalListQueue = store.listQueue.bind(store);
+    (store as unknown as { listQueue: StateStore["listQueue"] }).listQueue = () => {
+      throw new Error("nextPendingQueue must not materialize terminal history");
+    };
+    try {
+      expect(store.nextPendingQueue(session.id)).toMatchObject({
+        id: expected.id,
+        message: "bounded pending work",
+        state: "pending",
+      });
+    } finally {
+      (store as unknown as { listQueue: StateStore["listQueue"] }).listQueue = originalListQueue;
+    }
+    expect(store.nextPendingQueue(session.id)?.id).not.toBe(later.id);
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const plan = inspector.query(
+        `EXPLAIN QUERY PLAN
+         SELECT id,session_id,message,state,created_at,updated_at
+         FROM queue_entries
+         WHERE session_id=? AND state='pending'
+         ORDER BY enqueue_sequence LIMIT 1`,
+      ).all(session.id) as Array<{ detail: string }>;
+      expect(plan.map((entry) => entry.detail).join(" ")).toContain("queue_pending_sequence");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("removes settled queue bodies without losing replay or recovery authority", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Queue body custody", "queue-body@example.com");
+    const created = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-queue-body-custody",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const removed = "[queue message removed after settlement]";
+    const pending = store.enqueue(session.id, "pending body remains available");
+    expect(store.requireQueue(pending.id).message).toBe("pending body remains available");
+
+    const replayKey = "00000000-0000-4000-8000-000000000801";
+    const sentinel = "QUEUE_TERMINAL_BODY_SENTINEL";
+    const maximumBody = `${sentinel}${"x".repeat(262_144 - sentinel.length)}`;
+    const cancelled = store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: maximumBody,
+      idempotencyKey: replayKey,
+    });
+    expect(store.transitionQueue(cancelled.id, "pending", "cancelled")).toBe(true);
+    expect(store.requireQueue(cancelled.id)).toMatchObject({
+      id: cancelled.id,
+      message: removed,
+      state: "cancelled",
+    });
+    expect(store.enqueueIdempotent({
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      message: maximumBody,
+      idempotencyKey: replayKey,
+    })).toMatchObject({
+      id: cancelled.id,
+      message: removed,
+      state: "cancelled",
+    });
+    expect(store.listQueue(session.id).filter((entry) => entry.id === cancelled.id))
+      .toHaveLength(1);
+    expect(await stateFileSuffixesContaining(store.paths.database, sentinel)).toEqual([]);
+
+    const begin = (message: string) => {
+      const queued = store.enqueue(session.id, message);
+      const evidence = store.beginQueueEffect({
+        queueId: queued.id,
+        sessionId: session.id,
+        profileGeneration: profile.processGeneration,
+        evidence: {
+          kind: "queue.dispatch",
+          queueId: queued.id,
+          sessionId: session.id,
+          providerThreadId: "thread-queue-body-custody",
+          profileGeneration: profile.processGeneration,
+          baseline: { providerUpdatedAt: 10, status: "idle" as const, activeTurnId: null },
+          clientMessageId: queued.id,
+          messageDigest: new Bun.CryptoHasher("sha256").update(message).digest("hex"),
+          runtimeProfile: runtime,
+        },
+      });
+      return { evidence, queued };
+    };
+
+    const applied = begin("applied queue body sentinel");
+    const invalidDispatchResolution = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => invalidDispatchResolution.query(
+        `INSERT INTO queue_effect_resolutions(
+           queue_id,resolution_kind,evidence_json,receipt_json,created_at
+         ) VALUES (?,?,?,?,?)`,
+      ).run(
+        applied.queued.id,
+        "abandoned",
+        JSON.stringify({ source: "invalid_dispatch_resolution" }),
+        null,
+        2_000,
+      )).toThrow("queue effect resolution authority mismatch");
+      expect(invalidDispatchResolution.query(
+        "SELECT message,state FROM queue_entries WHERE id=?",
+      ).get(applied.queued.id)).toEqual({
+        message: "applied queue body sentinel",
+        state: "dispatching",
+      });
+    } finally {
+      invalidDispatchResolution.close(false);
+    }
+    store.completeQueueEffect({
+      queueId: applied.queued.id,
+      expectedEvidenceDigest: applied.evidence.digest,
+      expectedSessionRevision: session.revision,
+      applyResponseState: false,
+      turnId: "turn-queue-body-custody",
+      turnStatus: "completed",
+      runtimeProfile: runtime,
+      receipt: { turnId: "turn-queue-body-custody" },
+    });
+    expect(store.requireQueue(applied.queued.id)).toMatchObject({
+      message: removed,
+      state: "applied",
+    });
+
+    const failed = begin("failed queue body sentinel");
+    expect(store.failQueueEffect(failed.queued.id)).toBe(true);
+    expect(store.requireQueue(failed.queued.id)).toMatchObject({
+      message: removed,
+      state: "failed",
+    });
+
+    const ambiguous = begin("ambiguous body retained until exact recovery");
+    store.markQueueEffectAmbiguous(ambiguous.queued.id, ambiguous.evidence.digest);
+    expect(store.requireQueue(ambiguous.queued.id)).toMatchObject({
+      message: "ambiguous body retained until exact recovery",
+      state: "ambiguous",
+    });
+    const invalidAmbiguousResolution = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      const insert = (kind: "abandoned" | "proven_applied", evidence: string, receipt: string | null) =>
+        invalidAmbiguousResolution.query(
+          `INSERT INTO queue_effect_resolutions(
+             queue_id,resolution_kind,evidence_json,receipt_json,created_at
+           ) VALUES (?,?,?,?,?)`,
+        ).run(ambiguous.queued.id, kind, evidence, receipt, 2_000);
+      expect(() => insert(
+        "proven_applied",
+        JSON.stringify({ source: "missing_receipt" }),
+        null,
+      )).toThrow("queue effect resolution authority mismatch");
+      expect(() => insert(
+        "abandoned",
+        JSON.stringify({ source: "unexpected_receipt" }),
+        JSON.stringify({ turnId: "turn-should-not-exist" }),
+      )).toThrow("queue effect resolution authority mismatch");
+      expect(() => insert("abandoned", "not-json", null))
+        .toThrow("queue effect resolution authority mismatch");
+      expect(() => insert(
+        "abandoned",
+        JSON.stringify({ source: "syntactically_valid_but_unauthorized" }),
+        null,
+      )).toThrow("queue effect resolution authority mismatch");
+      invalidAmbiguousResolution.exec("BEGIN IMMEDIATE");
+      try {
+        invalidAmbiguousResolution.query(
+          "UPDATE sessions SET state='idle',revision=revision+1,updated_at=updated_at+1 WHERE id=?",
+        ).run(session.id);
+        expect(() => insert(
+          "proven_applied",
+          JSON.stringify({ source: "missing_exact_turn_binding" }),
+          JSON.stringify({ turnId: "turn-without-queue-binding" }),
+        )).toThrow("queue effect resolution authority mismatch");
+      } finally {
+        invalidAmbiguousResolution.exec("ROLLBACK");
+      }
+      expect(invalidAmbiguousResolution.query(
+        "SELECT message,state FROM queue_entries WHERE id=?",
+      ).get(ambiguous.queued.id)).toEqual({
+        message: "ambiguous body retained until exact recovery",
+        state: "ambiguous",
+      });
+    } finally {
+      invalidAmbiguousResolution.close(false);
+    }
+    store.resolveQueueEffect({
+      queueId: ambiguous.queued.id,
+      expectedEvidenceDigest: ambiguous.evidence.digest,
+      resolution: "abandoned",
+      resolutionEvidence: { source: "test_provider_observation" },
+      provider: {
+        providerThreadId: "thread-queue-body-custody",
+        title: "Recovered queue body custody",
+        status: "idle",
+        providerUpdatedAt: 20,
+      },
+    });
+    expect(store.requireQueue(ambiguous.queued.id)).toMatchObject({
+      message: removed,
+      state: "ambiguous",
+    });
+    expect(store.readQueueEffect(ambiguous.queued.id)).toMatchObject({
+      digest: ambiguous.evidence.digest,
+      resolution: {
+        evidence: { source: "test_provider_observation" },
+        kind: "abandoned",
+      },
+    });
+    expect(store.listUnsettledQueueEffects(session.id)).toEqual([]);
+
+    const directTransitionSentinel = "DIRECT_SQL_TERMINAL_BODY_SENTINEL";
+    const terminalInsertSentinel = "DIRECT_SQL_TERMINAL_INSERT_SENTINEL";
+    const insertedId = `queue_${"e".repeat(32)}`;
+    const directTransition = store.enqueue(session.id, directTransitionSentinel);
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      inspector.query(
+        "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
+      ).run(directTransition.id);
+      expect(inspector.query("SELECT message,state FROM queue_entries WHERE id=?").get(
+        directTransition.id,
+      )).toEqual({ message: directTransitionSentinel, state: "cancelled" });
+      expect(() => inspector.query(
+        "UPDATE queue_entries SET message='restored raw body' WHERE id=?",
+      ).run(directTransition.id)).toThrow(
+        "queue message is immutable except for settlement removal",
+      );
+      expect(() => inspector.query(
+        "UPDATE queue_entries SET message='rewritten pending body' WHERE id=?",
+      ).run(pending.id)).toThrow(
+        "queue message is immutable except for settlement removal",
+      );
+
+      inspector.query(
+        `INSERT INTO queue_entries(
+           id,session_id,message,state,created_at,updated_at,enqueue_sequence
+         ) VALUES(?,?,?,?,?,?,?)`,
+      ).run(
+        insertedId,
+        session.id,
+        terminalInsertSentinel,
+        "cancelled",
+        1_000,
+        1_000,
+        900_000,
+      );
+      expect(inspector.query("SELECT message,state FROM queue_entries WHERE id=?").get(
+        insertedId,
+      )).toEqual({ message: terminalInsertSentinel, state: "cancelled" });
+      expect(JSON.stringify(inspector.query(
+        "SELECT message FROM queue_entries WHERE id IN (?,?) ORDER BY id",
+      ).all(directTransition.id, insertedId)))
+        .toContain(directTransitionSentinel);
+      expect(inspector.query(
+        "SELECT requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toEqual({ requires_vacuum: 0 });
+    } finally {
+      inspector.close(false);
+    }
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const reopened = new StateStore(paths, { now: () => 3_000 });
+    stores.push(reopened);
+    expect(reopened.requireQueue(directTransition.id)).toMatchObject({
+      message: removed,
+      state: "cancelled",
+    });
+    expect(reopened.requireQueue(insertedId as `queue_${string}`)).toMatchObject({
+      message: removed,
+      state: "cancelled",
+    });
+    expect(await stateFileSuffixesContaining(paths.database, directTransitionSentinel)).toEqual([]);
+    expect(await stateFileSuffixesContaining(paths.database, terminalInsertSentinel)).toEqual([]);
+    const scrubInspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(scrubInspector.query(
+        "SELECT required_at,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toBeNull();
+    } finally {
+      scrubInspector.close(false);
+    }
+  });
+
+  test("migrates and physically scrubs v20 terminal and resolved-ambiguous queue bodies", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy queue bodies", "legacy-queue@example.com");
+    const created = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-legacy-queue-bodies",
+      state: "idle",
+      providerUpdatedAt: 10,
+    });
+    const terminal = store.enqueue(session.id, "already terminal body");
+    expect(store.transitionQueue(terminal.id, "pending", "cancelled")).toBe(true);
+
+    const ambiguousMessage = "V20_RESOLVED_AMBIGUOUS_QUEUE_SENTINEL";
+    const ambiguous = store.enqueue(session.id, ambiguousMessage);
+    const runtime = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      observedAt: 2_000,
+      preset: "high" as const,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "max" as const,
+      serviceTier: null,
+      fast: false,
+      approvalPolicy: "on-request" as const,
+      reviewMode: "auto_review" as const,
+      permissionProfile: ":workspace" as const,
+      computerUse: true as const,
+      pluginCapability: true as const,
+      enabledApps: [],
+    };
+    const evidence = store.beginQueueEffect({
+      queueId: ambiguous.id,
+      sessionId: session.id,
+      profileGeneration: profile.processGeneration,
+      evidence: {
+        kind: "queue.dispatch",
+        queueId: ambiguous.id,
+        sessionId: session.id,
+        providerThreadId: "thread-legacy-queue-bodies",
+        profileGeneration: profile.processGeneration,
+        baseline: { providerUpdatedAt: 10, status: "idle", activeTurnId: null },
+        clientMessageId: ambiguous.id,
+        messageDigest: new Bun.CryptoHasher("sha256").update(ambiguousMessage).digest("hex"),
+        runtimeProfile: runtime,
+      },
+    });
+    store.markQueueEffectAmbiguous(ambiguous.id, evidence.digest);
+
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      PRAGMA secure_delete=OFF;
+      DROP TRIGGER IF EXISTS queue_message_settlement_guard;
+      DROP TRIGGER IF EXISTS queue_message_terminal_insert_scrub;
+      DROP TRIGGER IF EXISTS queue_message_terminal_transition_scrub;
+      DROP TRIGGER IF EXISTS queue_message_resolution_scrub;
+      DROP TRIGGER IF EXISTS queue_message_scrub_authority_record;
+      DROP TRIGGER IF EXISTS queue_effect_resolution_authority_guard;
+      DROP TABLE IF EXISTS queue_message_scrub_authority;
+      DELETE FROM migrations WHERE version IN (21,22,23,24);
+      PRAGMA user_version=20;
+    `);
+    legacy.query(
+      "UPDATE queue_entries SET message=? WHERE id=?",
+    ).run("V20_TERMINAL_QUEUE_SENTINEL", terminal.id);
+    legacy.query(
+      `INSERT INTO queue_effect_resolutions(
+         queue_id,resolution_kind,evidence_json,receipt_json,created_at
+       ) VALUES (?,?,?,?,?)`,
+    ).run(
+      ambiguous.id,
+      "abandoned",
+      JSON.stringify({ source: "legacy_provider_observation" }),
+      null,
+      2_000,
+    );
+    legacy.query(
+      `UPDATE sessions
+       SET state='idle',active_turn_id=NULL,revision=revision+1,updated_at=MAX(updated_at,2000)
+       WHERE id=? AND state='recovery_required'`,
+    ).run(session.id);
+    legacy.close(false);
+
+    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
+      .not.toEqual([]);
+    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).not.toEqual([]);
+
+    const migrated = new StateStore(paths, { now: () => 3_000 });
+    stores.push(migrated);
+    const removed = "[queue message removed after settlement]";
+    expect(migrated.requireQueue(terminal.id)).toMatchObject({
+      message: removed,
+      state: "cancelled",
+    });
+    expect(migrated.requireQueue(ambiguous.id)).toMatchObject({
+      message: removed,
+      state: "ambiguous",
+    });
+    expect(migrated.readQueueEffect(ambiguous.id)).toMatchObject({
+      digest: evidence.digest,
+      resolution: {
+        evidence: { source: "legacy_provider_observation" },
+        kind: "abandoned",
+      },
+    });
+    expect(migrated.listUnsettledQueueEffects(session.id)).toEqual([]);
+
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
+      expect(inspector.query(
+        "SELECT applied_at FROM migrations WHERE version=23",
+      ).get()).toEqual({ applied_at: 3_000 });
+      expect(JSON.stringify(inspector.query(
+        "SELECT id,message FROM queue_entries WHERE id IN (?,?) ORDER BY id",
+      ).all(terminal.id, ambiguous.id))).not.toContain("QUEUE_SENTINEL");
+      expect(inspector.query(
+        "SELECT required_at,requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+    expect(await stateFileSuffixesContaining(paths.database, "V20_TERMINAL_QUEUE_SENTINEL"))
+      .toEqual([]);
+    expect(await stateFileSuffixesContaining(paths.database, ambiguousMessage)).toEqual([]);
+  });
+
+  test("keeps a pinned-reader queue scrub unavailable until restart can truncate its WAL", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Pinned queue scrub", "pinned-queue@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const sentinel = `PINNED_QUEUE_BODY_SENTINEL_${"x".repeat(8_192)}`;
+    const queued = store.enqueue(session.id, sentinel);
+    const paths = store.paths;
+    const pinnedReader = new Database(paths.database, { readonly: true, strict: true });
+    pinnedReader.exec("BEGIN");
+    expect(pinnedReader.query("SELECT message FROM queue_entries WHERE id=?").get(queued.id))
+      .toEqual({ message: sentinel });
+    try {
+      let failure: unknown;
+      try {
+        store.transitionQueue(queued.id, "pending", "cancelled");
+      } catch (error: unknown) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(StateSecurityScrubRequiredError);
+      expect(failure).toMatchObject({
+        message: "STATE_SECURITY_SCRUB_REQUIRED",
+        operationCommitted: true,
+      });
+      expect(store.requireQueue(queued.id)).toMatchObject({
+        message: "[queue message removed after settlement]",
+        state: "cancelled",
+      });
+      const inspector = new Database(paths.database, { readonly: true, strict: true });
+      try {
+        expect(inspector.query(
+          "SELECT requires_vacuum FROM queue_message_scrub_authority WHERE singleton=1",
+        ).get()).toEqual({ requires_vacuum: 0 });
+      } finally {
+        inspector.close(false);
+      }
+      expect(() => {
+        const unexpectedlyReadable = new StateStore(paths, { readonly: true });
+        unexpectedlyReadable.close();
+      }).toThrow("STATE_SECURITY_SCRUB_REQUIRED");
+      expect(await stateFileSuffixesContaining(paths.database, "PINNED_QUEUE_BODY_SENTINEL"))
+        .not.toEqual([]);
+    } finally {
+      pinnedReader.exec("COMMIT");
+      pinnedReader.close(false);
+    }
+
+    // The same exact call first resumes the durable scrub. Its false result
+    // preserves CAS ownership instead of pretending the retry performed the
+    // already-committed transition.
+    expect(store.transitionQueue(queued.id, "pending", "cancelled")).toBe(false);
+    expect(await stateFileSuffixesContaining(paths.database, "PINNED_QUEUE_BODY_SENTINEL"))
+      .toEqual([]);
+
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const recovered = new StateStore(paths, { now: () => 4_000 });
+    stores.push(recovered);
+    expect(recovered.requireQueue(queued.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      state: "cancelled",
+    });
+    expect(await stateFileSuffixesContaining(paths.database, "PINNED_QUEUE_BODY_SENTINEL"))
+      .toEqual([]);
+  }, 20_000);
+
+  test("repairs stale current-version queue triggers before accepting more state", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Stale queue trigger", "stale-trigger@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const sentinel = "STALE_TRIGGER_QUEUE_BODY_SENTINEL";
+    const queued = store.enqueue(session.id, sentinel);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    stale.exec(`
+      DROP TRIGGER queue_message_terminal_transition_scrub;
+      CREATE TRIGGER queue_message_terminal_transition_scrub
+      AFTER UPDATE OF state ON queue_entries
+      BEGIN SELECT 1; END;
+    `);
+    stale.query(
+      "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
+    ).run(queued.id);
+    expect(stale.query(
+      "SELECT message,state FROM queue_entries WHERE id=?",
+    ).get(queued.id)).toEqual({ message: sentinel, state: "cancelled" });
+    expect(stale.query(
+      "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
+    ).get()).toBeNull();
+    stale.close(false);
+
+    const repaired = new StateStore(paths, { now: () => 5_000 });
+    stores.push(repaired);
+    expect(repaired.requireQueue(queued.id)).toMatchObject({
+      message: "[queue message removed after settlement]",
+      state: "cancelled",
+    });
+    expect(await stateFileSuffixesContaining(paths.database, sentinel)).toEqual([]);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get()).toBeNull();
+      const trigger = z.object({ sql: z.string() }).parse(inspector.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='queue_message_terminal_transition_scrub'",
+      ).get());
+      expect(trigger.sql).toContain("queue_message_scrub_authority");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("retains a newer scrub generation when a settlement follows a checkpoint snapshot", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Scrub generation", "scrub-generation@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const firstSentinel = "SCRUB_GENERATION_FIRST_SENTINEL";
+    const secondSentinel = "SCRUB_GENERATION_SECOND_SENTINEL";
+    const first = store.enqueue(session.id, firstSentinel);
+    const second = store.enqueue(session.id, secondSentinel);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const writer = new Database(paths.database, { create: false, strict: true });
+    writer.query(
+      "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
+    ).run(first.id);
+    const firstAuthority = z.object({ generation: z.number().int().positive() }).parse(
+      writer.query(
+        "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
+      ).get(),
+    );
+    expect(writer.query("PRAGMA wal_checkpoint(TRUNCATE)").get()).toEqual(
+      expect.objectContaining({ busy: 0 }),
+    );
+    writer.query(
+      "UPDATE queue_entries SET state='cancelled',updated_at=updated_at+1 WHERE id=?",
+    ).run(second.id);
+    expect(writer.query(
+      "DELETE FROM queue_message_scrub_authority WHERE singleton=1 AND generation=?",
+    ).run(firstAuthority.generation).changes).toBe(0);
+    expect(writer.query(
+      "SELECT generation FROM queue_message_scrub_authority WHERE singleton=1",
+    ).get()).toEqual({ generation: firstAuthority.generation + 1 });
+    writer.close(false);
+
+    const recovered = new StateStore(paths, { now: () => 6_000 });
+    stores.push(recovered);
+    expect(recovered.requireQueue(first.id).message).toBe("[queue message removed after settlement]");
+    expect(recovered.requireQueue(second.id).message).toBe("[queue message removed after settlement]");
+    expect(await stateFileSuffixesContaining(paths.database, firstSentinel)).toEqual([]);
+    expect(await stateFileSuffixesContaining(paths.database, secondSentinel)).toEqual([]);
   });
 
   test("binds, journals, applies, and exactly replays a desktop switch", async () => {
@@ -1667,7 +2414,7 @@ describe("StateStore", () => {
       reason: null,
       commandClass: "test",
       workingDirectory: null,
-      allowsSessionApproval: true,
+      availableDecisions: ["once" as const, "session" as const, "decline" as const, "cancel" as const],
     };
     const admitted = store.admitInteraction({
       publicId: "20000000-0000-4000-8000-000000000002",
@@ -1783,6 +2530,72 @@ describe("StateStore", () => {
     }
   });
 
+  test("paginates tied interactions exactly once in descending-time ascending-id order", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-interaction-page-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const store = new StateStore(paths, { now: () => 20_000 });
+    stores.push(store);
+    const profile = signInProfile(store, "Interaction pages", "interaction-pages@example.com");
+    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const display = {
+      kind: "command_approval" as const,
+      summary: "Resolve the paged interaction",
+      reason: null,
+      commandClass: "test",
+      workingDirectory: null,
+      availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
+    };
+    const publicIds: string[] = [];
+    for (let index = 0; index < 105; index += 1) {
+      const suffix = String(index).padStart(12, "0");
+      const publicId = `23000000-0000-4000-8000-${suffix}`;
+      publicIds.push(publicId);
+      store.admitInteraction({
+        publicId,
+        sessionId: session.id,
+        authority: {
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+          connectionId: "23000000-0000-4000-8000-999999999999",
+          requestId: { type: "number", value: index },
+          method: "item/commandExecution/requestApproval",
+          requestDigest: index.toString(16).padStart(64, "0"),
+          threadId: "thread-interaction-page",
+          turnId: `turn-${String(index)}`,
+          itemId: `item-${String(index)}`,
+          approvalId: null,
+        },
+        kind: "command_approval",
+        blocking: true,
+        display,
+        requestedAt: 10_000,
+        deadlineAt: 30_000,
+      });
+    }
+
+    const first = store.listInteractionPage({
+      sessionId: session.id,
+      pendingOnly: true,
+      limit: 100,
+    });
+    expect(first.interactions.map((interaction) => interaction.publicId)).toEqual(publicIds.slice(0, 100));
+    const firstPageLastId = publicIds[99];
+    if (firstPageLastId === undefined) throw new Error("Expected the first interaction page to be full.");
+    expect(first.nextPosition).toEqual({ requestedAt: 10_000, publicId: firstPageLastId });
+    if (first.nextPosition === null) throw new Error("Expected an interaction continuation.");
+    const second = store.listInteractionPage({
+      sessionId: session.id,
+      pendingOnly: true,
+      limit: 100,
+      after: first.nextPosition,
+    });
+    expect(second.interactions.map((interaction) => interaction.publicId)).toEqual(publicIds.slice(100));
+    expect(second.nextPosition).toBeNull();
+    expect(new Set([...first.interactions, ...second.interactions].map((interaction) => interaction.publicId)).size)
+      .toBe(105);
+  });
+
   test("anchors immutable interaction deadlines and terminal intent across delayed admission", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-deadline-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
@@ -1809,7 +2622,7 @@ describe("StateStore", () => {
       summary: "Allow bounded changes",
       reason: null,
       grantRoot: null,
-      allowsSessionApproval: false,
+      availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
     };
     now = 15_000;
     const admitted = store.admitInteraction({
@@ -1874,6 +2687,123 @@ describe("StateStore", () => {
       authority,
       responseDigest: digest,
     })).toMatchObject({ state: "declined", intendedTerminalState: "declined", deadlineAt: 16_000 });
+  });
+
+  test("supersedes only the exact elapsed prepared response with a durable timeout intent", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-timeout-cas-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 15_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const profile = signInProfile(store, "Timeout CAS", "timeout-cas@example.com");
+    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const authority = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      connectionId: "22000000-0000-4000-8000-000000000001",
+      requestId: { type: "string" as const, value: "timeout-cas" },
+      method: "item/commandExecution/requestApproval",
+      requestDigest: "a".repeat(64),
+      threadId: "thread-timeout-cas",
+      turnId: "turn-timeout-cas",
+      itemId: "item-timeout-cas",
+      approvalId: null,
+    };
+    const admitted = store.admitInteraction({
+      publicId: "22000000-0000-4000-8000-000000000002",
+      sessionId: session.id,
+      authority,
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Allow before the deadline",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+      requestedAt: 10_000,
+      deadlineAt: 16_000,
+    }).record;
+    const manualResponseDigest = "b".repeat(64);
+    const timeoutResponseDigest = "c".repeat(64);
+    const prepared = store.prepareInteractionResponse({
+      id: admitted.publicId,
+      expectedRevision: admitted.revision,
+      responseDigest: manualResponseDigest,
+      intendedTerminalState: "resolved",
+    });
+    expect(() => store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest,
+      timeoutResponseDigest,
+    })).toThrow("INTERACTION_DEADLINE_NOT_ELAPSED");
+
+    now = 16_000;
+    const superseded = store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest,
+      timeoutResponseDigest,
+    });
+    expect(superseded).toMatchObject({
+      state: "response_prepared",
+      revision: 3,
+      responseDigest: timeoutResponseDigest,
+      intendedTerminalState: "expired",
+    });
+    expect(store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest,
+      timeoutResponseDigest,
+    })).toEqual(superseded);
+    expect(() => store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest: "d".repeat(64),
+      timeoutResponseDigest,
+    })).toThrow("INTERACTION_RESPONSE_CONFLICT");
+    expect(() => store.markInteractionResponseWritten({
+      id: superseded.publicId,
+      expectedRevision: superseded.revision,
+      responseDigest: manualResponseDigest,
+    })).toThrow("INTERACTION_RESPONSE_CONFLICT");
+    const written = store.markInteractionResponseWritten({
+      id: superseded.publicId,
+      expectedRevision: superseded.revision,
+      responseDigest: timeoutResponseDigest,
+    });
+    expect(written).toMatchObject({ state: "response_written", revision: 4 });
+    expect(() => store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest,
+      timeoutResponseDigest: "e".repeat(64),
+    })).toThrow("INTERACTION_REVISION_CONFLICT");
+
+    const raw = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(() => raw.query(
+        "UPDATE provider_interactions SET response_digest=? WHERE public_id=?",
+      ).run("f".repeat(64), admitted.publicId)).toThrow(
+        "provider interaction response authority is immutable",
+      );
+      expect(raw.query(
+        `SELECT revision,state,response_digest FROM provider_interaction_transitions
+         WHERE public_id=? ORDER BY revision`,
+      ).all(admitted.publicId)).toEqual([
+        { revision: 1, state: "pending", response_digest: null },
+        { revision: 2, state: "response_prepared", response_digest: manualResponseDigest },
+        { revision: 3, state: "response_prepared", response_digest: timeoutResponseDigest },
+        { revision: 4, state: "response_written", response_digest: timeoutResponseDigest },
+      ]);
+    } finally {
+      raw.close(false);
+    }
   });
 
   test("expires untouched generation interactions and quarantines write-adjacent responses", async () => {
@@ -1957,6 +2887,74 @@ describe("StateStore", () => {
       sourceRevision: 2,
       observedAt: 20_000,
       payload: { totalTokens: 250 },
+    });
+  });
+
+  test("pages successful and failed usage observations in one exact source order", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Usage history page");
+    store.recordUsage(profile.id, 1, 30_000, { privateProviderPayload: "first" });
+    store.recordUsagePollFailure(profile.id, 2, 10_000);
+    store.recordUsage(profile.id, 3, 20_000, { privateProviderPayload: "third" });
+    store.recordUsagePollFailure(profile.id, 4, 50_000);
+
+    const first = store.usageHistoryPage({
+      profileId: profile.id,
+      fromObservedAt: 5_000,
+      throughObservedAt: 40_000,
+      limit: 2,
+    });
+    expect(first).toEqual({
+      entries: [
+        {
+          state: "observed",
+          sourceRevision: 1,
+          observedAt: 30_000,
+          payload: { privateProviderPayload: "first" },
+        },
+        {
+          state: "failed",
+          sourceRevision: 2,
+          observedAt: 10_000,
+          reasonCode: "account_usage_read_failed",
+        },
+      ],
+      nextSourceRevision: 2,
+    });
+    expect(store.usageHistoryPage({
+      profileId: profile.id,
+      fromObservedAt: 5_000,
+      throughObservedAt: 40_000,
+      afterSourceRevision: first.nextSourceRevision ?? 0,
+      limit: 2,
+    })).toEqual({
+      entries: [{
+        state: "observed",
+        sourceRevision: 3,
+        observedAt: 20_000,
+        payload: { privateProviderPayload: "third" },
+      }],
+      nextSourceRevision: null,
+    });
+  });
+
+  test("selects latest usage outcomes by durable source revision instead of provider time", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Usage source order");
+    store.recordUsage(profile.id, 1, 30_000, { totalTokens: 100 });
+    store.recordUsage(profile.id, 2, 10_000, { totalTokens: 200 });
+    store.recordUsagePollFailure(profile.id, 3, 40_000);
+    store.recordUsagePollFailure(profile.id, 4, 5_000);
+
+    expect(store.latestUsage(profile.id)).toEqual({
+      sourceRevision: 2,
+      observedAt: 10_000,
+      payload: { totalTokens: 200 },
+    });
+    expect(store.latestUsagePollFailure(profile.id)).toEqual({
+      sourceRevision: 4,
+      observedAt: 5_000,
+      reasonCode: "account_usage_read_failed",
     });
   });
 
@@ -2235,7 +3233,7 @@ describe("StateStore", () => {
         summary: "Apply safe changes",
         reason: null,
         grantRoot: null,
-        allowsSessionApproval: false,
+        availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
       },
     }).record;
     const paths = store.paths;
@@ -2256,8 +3254,18 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }]);
+      expect(inspector.query("PRAGMA table_info(profiles)").all())
+        .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
+      expect(inspector.query("PRAGMA table_info(projects)").all())
+        .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE '%label_key%' ORDER BY name",
+      ).all()).toEqual([
+        { name: "profiles_label_key_active" },
+        { name: "projects_label_key_unique" },
+      ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at", type: "REAL" }));
       expect(inspector.query("PRAGMA table_info(desktop_switches)").all()).toContainEqual(expect.objectContaining({ name: "switch_generation", type: "INTEGER" }));
       expect(inspector.query("PRAGMA table_info(usage_poll_failures)").all()).toContainEqual(expect.objectContaining({ name: "reason_code", type: "TEXT" }));
@@ -2269,12 +3277,338 @@ describe("StateStore", () => {
         .toContainEqual(expect.objectContaining({ name: "intended_terminal_state", type: "TEXT" }));
       expect(inspector.query("PRAGMA table_info(provider_login_authorities)").all())
         .toContainEqual(expect.objectContaining({ name: "login_id", type: "TEXT", notnull: 1 }));
+      const queueScrubPlan = inspector.query(
+        `EXPLAIN QUERY PLAN
+         SELECT 1
+         FROM queue_entries
+         WHERE message!='[queue message removed after settlement]'
+           AND (
+             state IN ('applied','failed','cancelled')
+             OR EXISTS(
+               SELECT 1 FROM queue_effect_resolutions r
+               WHERE r.queue_id=queue_entries.id
+             )
+           )
+         LIMIT 1`,
+      ).all() as Array<{ detail: string }>;
+      expect(queueScrubPlan.map((entry) => entry.detail).join(" "))
+        .toContain("queue_entries_message_scrub_candidates");
       expect(inspector.query(
         "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'provider_interactions_mcp_url_guard_%' ORDER BY name",
       ).all()).toEqual([
         { name: "provider_interactions_mcp_url_guard_insert" },
         { name: "provider_interactions_mcp_url_guard_update" },
       ]);
+      expect(inspector.query(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'provider_interactions_listing_%' ORDER BY name",
+      ).all()).toEqual([
+        { name: "provider_interactions_listing_global" },
+        { name: "provider_interactions_listing_pending_global" },
+        { name: "provider_interactions_listing_pending_session" },
+        { name: "provider_interactions_listing_session" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("repairs a same-name nonunique v24 Unicode label index while readonly refuses it", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.createProfile("Équipe");
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    stale.exec(`
+      DROP INDEX profiles_label_key_active;
+      CREATE INDEX profiles_label_key_active
+        ON profiles(label_key) WHERE state!='removed';
+    `);
+    stale.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(unchanged.query(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='profiles_label_key_active'",
+      ).get()).toEqual({
+        sql: "CREATE INDEX profiles_label_key_active\n        ON profiles(label_key) WHERE state!='removed'",
+      });
+    } finally {
+      unchanged.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 2_000 });
+    stores.push(repaired);
+    expect(() => repaired.createProfile("équipe")).toThrow();
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT "unique" AS is_unique,partial
+         FROM pragma_index_list('profiles') WHERE name='profiles_label_key_active'`,
+      ).get()).toEqual({ is_unique: 1, partial: 1 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("repairs a stale same-name v24 guard while readonly leaves it untouched", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const stale = new Database(paths.database, { create: false, strict: true });
+    stale.exec(`
+      DROP TRIGGER profiles_label_key_insert_guard;
+      CREATE TRIGGER profiles_label_key_insert_guard
+      BEFORE INSERT ON profiles
+      BEGIN SELECT 1; END;
+    `);
+    stale.close(false);
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V24_STRUCTURE_INVALID");
+    const unchanged = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(unchanged.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
+      ).get()).toEqual({
+        sql: "CREATE TRIGGER profiles_label_key_insert_guard\n      BEFORE INSERT ON profiles\n      BEGIN SELECT 1; END",
+      });
+    } finally {
+      unchanged.close(false);
+    }
+
+    const repaired = new StateStore(paths, { now: () => 2_000 });
+    stores.push(repaired);
+    repaired.close();
+    stores.splice(stores.indexOf(repaired), 1);
+    const writer = new Database(paths.database, { create: false, strict: true });
+    try {
+      expect(() => writer.query(
+        `INSERT INTO profiles(
+           id,label,label_key,state,process_generation,created_at,updated_at
+         ) VALUES ('acct_00000000000000000000000000000025','Unsafe',NULL,'signed_out',0,1000,1000)`,
+      ).run()).toThrow("invalid profile label key");
+      expect(writer.query(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='profiles_label_key_insert_guard'",
+      ).get()).toEqual({
+        sql: "CREATE TRIGGER profiles_label_key_insert_guard\nBEFORE INSERT ON profiles\nWHEN NEW.label_key IS NULL\n  OR length(CAST(NEW.label_key AS BLOB)) NOT BETWEEN 1 AND 4096\nBEGIN SELECT RAISE(ABORT, 'invalid profile label key'); END",
+      });
+    } finally {
+      writer.close(false);
+    }
+  });
+
+  test("fails closed when a v23 account state contains a Unicode label collision", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.createProfile("Équipe");
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP INDEX profiles_label_key_active;
+      DROP TRIGGER profiles_label_key_insert_guard;
+      DROP TRIGGER profiles_label_key_immutable;
+      DELETE FROM migrations WHERE version=24;
+      PRAGMA user_version=23;
+    `);
+    legacy.query(
+      `INSERT INTO profiles(
+         id,label,label_key,state,process_generation,created_at,updated_at
+       ) VALUES (?,?,NULL,'signed_out',0,1000,1000)`,
+    ).run("acct_00000000000000000000000000000024", "équipe");
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_ACCOUNT_LABEL_COLLISION");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
+      expect(inspector.query(
+        "SELECT label_key FROM profiles WHERE id='acct_00000000000000000000000000000024'",
+      ).get()).toEqual({ label_key: null });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("fails closed when a v23 project state contains canonically equivalent labels", async () => {
+    const { store, home } = await fixture();
+    const paths = store.paths;
+    const firstRoot = join(home, "project-composed");
+    const secondRoot = join(home, "project-decomposed");
+    await mkdir(firstRoot);
+    await mkdir(secondRoot);
+    await store.createProject("Café", firstRoot);
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP INDEX projects_label_key_unique;
+      DROP TRIGGER projects_label_key_insert_guard;
+      DROP TRIGGER projects_label_key_immutable;
+      DELETE FROM migrations WHERE version=24;
+      PRAGMA user_version=23;
+    `);
+    legacy.query(
+      `INSERT INTO projects(
+         id,label,label_key,root_path,is_default,created_at,updated_at
+       ) VALUES (?,?,NULL,?,0,1000,1000)`,
+    ).run("proj_00000000000000000000000000000024", "Cafe\u0301", secondRoot);
+    legacy.close(false);
+
+    expect(() => new StateStore(paths, { now: () => 2_000 }))
+      .toThrow("STATE_PROJECT_LABEL_COLLISION");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 23 });
+      expect(inspector.query("SELECT version FROM migrations WHERE version=24").get()).toBeNull();
+      expect(inspector.query(
+        "SELECT label_key FROM projects WHERE id='proj_00000000000000000000000000000024'",
+      ).get()).toEqual({ label_key: null });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates v18 databases to the exact prepared-response supersession guards", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec(`
+      DROP TRIGGER IF EXISTS provider_interactions_response_fields_guard;
+      DROP TRIGGER IF EXISTS provider_interactions_revision_guard;
+      DELETE FROM migrations WHERE version=19;
+      PRAGMA user_version=18;
+    `);
+    legacy.close(false);
+
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
+      expect(inspector.query(
+        `SELECT name FROM sqlite_master
+         WHERE type='trigger' AND name IN (
+           'provider_interactions_intent_immutable',
+           'provider_interactions_response_fields_guard',
+           'provider_interactions_revision_guard'
+         ) ORDER BY name`,
+      ).all()).toEqual([
+        { name: "provider_interactions_intent_immutable" },
+        { name: "provider_interactions_response_fields_guard" },
+        { name: "provider_interactions_revision_guard" },
+      ]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("migrates legacy approval scope booleans into exact ordered decisions", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Legacy approvals", "legacy-approvals@example.com");
+    const session = store.createSession({ profileId: profile.id, preset: "high", fastEnabled: false });
+    const connectionId = "50000000-0000-4000-8000-000000000001";
+    const admit = (input: {
+      publicId: string;
+      method: "item/commandExecution/requestApproval" | "item/fileChange/requestApproval";
+      kind: "command_approval" | "file_change_approval";
+      display: Parameters<StateStore["admitInteraction"]>[0]["display"];
+    }) => store.admitInteraction({
+      publicId: input.publicId,
+      sessionId: session.id,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string", value: input.publicId },
+        method: input.method,
+        requestDigest: input.publicId.endsWith("1") ? "1".repeat(64) : "2".repeat(64),
+        threadId: "thread-legacy-approvals",
+        turnId: "turn-legacy-approvals",
+        itemId: input.publicId,
+        approvalId: null,
+      },
+      kind: input.kind,
+      blocking: true,
+      display: input.display,
+    }).record;
+    const command = admit({
+      publicId: "50000000-0000-4000-8000-000000000011",
+      method: "item/commandExecution/requestApproval",
+      kind: "command_approval",
+      display: {
+        kind: "command_approval",
+        summary: "Allow legacy command",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "session", "decline", "cancel"],
+      },
+    });
+    const files = admit({
+      publicId: "50000000-0000-4000-8000-000000000012",
+      method: "item/fileChange/requestApproval",
+      kind: "file_change_approval",
+      display: {
+        kind: "file_change_approval",
+        summary: "Allow legacy files",
+        reason: null,
+        grantRoot: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    });
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    legacy.exec("DROP TRIGGER IF EXISTS provider_interactions_authority_immutable");
+    legacy.query("UPDATE provider_interactions SET display_json=? WHERE public_id=?").run(JSON.stringify({
+      kind: "command_approval",
+      summary: "Allow legacy command",
+      reason: null,
+      commandClass: "test",
+      workingDirectory: null,
+      allowsSessionApproval: true,
+    }), command.publicId);
+    legacy.query("UPDATE provider_interactions SET display_json=? WHERE public_id=?").run(JSON.stringify({
+      kind: "file_change_approval",
+      summary: "Allow legacy files",
+      reason: null,
+      grantRoot: null,
+      allowsSessionApproval: false,
+    }), files.publicId);
+    legacy.exec("DELETE FROM migrations WHERE version=18; PRAGMA user_version=17");
+    legacy.close(false);
+
+    const migrated = new StateStore(paths, { now: () => 9_000 });
+    stores.push(migrated);
+    expect(migrated.requireInteraction(command.publicId).display).toMatchObject({
+      kind: "command_approval",
+      availableDecisions: ["once", "session", "decline", "cancel"],
+    });
+    expect(migrated.requireInteraction(files.publicId).display).toMatchObject({
+      kind: "file_change_approval",
+      availableDecisions: ["once", "decline", "cancel"],
+    });
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
+      expect(JSON.stringify(inspector.query(
+        "SELECT display_json FROM provider_interactions ORDER BY public_id",
+      ).all())).not.toContain("allowsSessionApproval");
     } finally {
       inspector.close(false);
     }
@@ -2309,7 +3643,7 @@ describe("StateStore", () => {
       DROP TRIGGER IF EXISTS provider_login_authority_state_guard;
       DROP TRIGGER IF EXISTS provider_login_authority_immutable_delete;
       DROP TABLE provider_login_authorities;
-      DELETE FROM migrations WHERE version=17;
+      DELETE FROM migrations WHERE version>=17;
       PRAGMA user_version=16;
     `);
     legacy.close(false);
@@ -2386,7 +3720,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -2443,7 +3777,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -2531,7 +3865,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -2634,7 +3968,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -2736,6 +4070,7 @@ describe("StateStore", () => {
       PRAGMA user_version = 1;
     `);
     legacy.close(false);
+    await chmod(paths.database, 0o600);
 
     const store = new StateStore(paths, { now: () => 2000 });
     stores.push(store);
@@ -2747,7 +4082,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -2766,8 +4101,19 @@ describe("StateStore", () => {
         { version: 15, applied_at: 2000 },
         { version: 16, applied_at: 2000 },
         { version: 17, applied_at: 2000 },
+        { version: 18, applied_at: 2000 },
+        { version: 19, applied_at: 2000 },
+        { version: 20, applied_at: 2000 },
+        { version: 21, applied_at: 2000 },
+        { version: 22, applied_at: 2000 },
+        { version: 23, applied_at: 2000 },
+        { version: 24, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
+      expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
+        label: "Legacy",
+        label_key: "legacy",
+      });
     } finally {
       inspector.close(false);
     }
@@ -2808,7 +4154,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 17 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 24 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -2828,8 +4174,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 18");
+    newer.exec("PRAGMA user_version = 25");
     newer.close(false);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:18:17");
+    await chmod(paths.database, 0o600);
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:25:24");
   });
 });

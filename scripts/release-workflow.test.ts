@@ -28,6 +28,7 @@ describe("release workflow", () => {
     const jobs = asRecord(document.jobs, "release workflow jobs");
     const verify = asRecord(jobs.verify, "verify job");
     const stage = asRecord(jobs.stage, "stage job");
+    const publicationLease = asRecord(jobs.publication_lease, "publication lease job");
     const steps = stage.steps;
 
     if (!Array.isArray(steps)) {
@@ -43,14 +44,26 @@ describe("release workflow", () => {
     const environment = asRecord(releaseStep.env, "GitHub release environment");
 
     expect(stage.needs).toBe("verify");
+    expect(verify.if).toBe("${{ github.event_name == 'push' }}");
+    expect(stage.if).toBe("${{ github.event_name == 'push' }}");
+    expect(document["run-name"]).toContain("HRA publication lease {0}");
+    expect(asRecord(document.concurrency, "release concurrency")).toEqual({
+      "cancel-in-progress": false,
+      group: "hra-release-publication-v0.1.0",
+      queue: "max",
+    });
     expect(environment.GH_REPO).toBe("${{ github.repository }}");
     expect(environment.GH_TOKEN).toBe("${{ github.token }}");
     expect(releaseStep.run).toContain(
       'gh release create "$GITHUB_REF_NAME"',
     );
     expect(releaseStep.run).toContain('tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME"');
-    expect(releaseStep.run).toContain('main_commit="$(gh api "repos/$GH_REPO/git/ref/heads/main"');
-    expect(releaseStep.run).toContain('test "$main_commit" = "$accepted_commit"');
+    expect(releaseStep.run).toContain('repos/$GH_REPO/compare/$accepted_commit...main');
+    expect(releaseStep.run).toContain('.merge_base_commit.sha == $commit');
+    expect(releaseStep.run).toContain('repos/$GH_REPO/rulesets/21213369');
+    expect(releaseStep.run).not.toContain("bypass_actors");
+    expect(releaseStep.run).not.toContain("current_user_can_bypass");
+    expect(releaseStep.run).not.toContain('test "$main_commit" = "$accepted_commit"');
     expect(releaseStep.run).toContain('test "$accepted_commit" = "$GITHUB_SHA"');
     expect(releaseStep.run).toContain("https://hra.sh/.well-known/hra.json?release-check=");
     expect(releaseStep.run).not.toContain("--location");
@@ -79,7 +92,10 @@ describe("release workflow", () => {
     expect(stagedDraft?.run).toContain(".ubuntu-24.04-x64.runtime.spdx.json");
     expect(stagedDraft?.run).toContain('test "$tag_commit" = "$accepted_commit"');
     expect(stagedDraft?.run).toContain('commits/refs/tags/$GITHUB_REF_NAME');
-    expect(stagedDraft?.run).toContain('test "$main_commit" = "$accepted_commit"');
+    expect(stagedDraft?.run).toContain('repos/$GH_REPO/compare/$accepted_commit...main');
+    expect(stagedDraft?.run).toContain('.merge_base_commit.sha == $commit');
+    expect(stagedDraft?.run).toContain('repos/$GH_REPO/rulesets/21213369');
+    expect(stagedDraft?.run).not.toContain('test "$main_commit" = "$accepted_commit"');
     expect(stagedDraft?.run).toContain("canonical-marker-publish.json");
     expect(stagedDraft?.run).toContain("--jq '.immutable')\" = false");
     expect(stagedDraft?.run).toContain('.source.commit == $commit');
@@ -87,11 +103,63 @@ describe("release workflow", () => {
     expect(stagedDraft?.run).not.toContain("--draft=false");
     expect(jobs.publish).toBeUndefined();
     expect(jobs.accept).toBeUndefined();
+    expect(publicationLease.if).toBe("${{ github.event_name == 'workflow_dispatch' }}");
+    expect(publicationLease["timeout-minutes"]).toBe(360);
+    const leaseSteps = publicationLease.steps;
+    if (!Array.isArray(leaseSteps)) {
+      throw new TypeError("publication lease steps must be an array");
+    }
+    const parsedLeaseSteps = leaseSteps
+      .map((step, index) => asRecord(step, `publication lease step ${index}`));
+    const holdLease = parsedLeaseSteps
+      .find((step) => step.name === "Hold the exact release mutation lease until publication");
+    expect(holdLease?.run).toContain("^[0-9a-f]{32}$");
+    expect(holdLease?.run).toContain("true:false) sleep 5");
+    expect(holdLease?.run).toContain("false:true) break");
+    expect(holdLease?.run).toContain("*) sleep 5");
+    expect(holdLease?.run).toContain('if ! release_rows="$(gh api');
+    expect(holdLease?.run).toContain("releases?per_page=100");
+    const leaseCheckout = parsedLeaseSteps.find((step) =>
+      step.name === "Check out the exact published source");
+    const leaseSetupBun = parsedLeaseSteps.find((step) =>
+      step.name === "Install Bun for public acceptance");
+    const publicAcceptance = parsedLeaseSteps.find((step) =>
+      step.name === "Accept the exact immutable public URL");
+    expect(parsedLeaseSteps
+      .map((step) => step.uses)
+      .filter((value): value is string => typeof value === "string"))
+      .toEqual([reviewedActions.checkout, reviewedActions.setupBun]);
+    expect(asRecord(leaseCheckout, "publication lease checkout step").with).toEqual({
+      "fetch-depth": 0,
+      "persist-credentials": false,
+    });
+    expect(asRecord(leaseSetupBun, "publication lease Bun setup step").with).toEqual({
+      "bun-version-file": ".bun-version",
+    });
+    expect(publicAcceptance?.run).toContain(
+      'bun add --global --ignore-scripts "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.tgz"',
+    );
+    expect(publicAcceptance?.run).toContain("check-installed-package.ts");
+    expect(publicAcceptance?.run).toContain('hra" --version');
+    expect(publicAcceptance?.run).toContain("doctor --offline --json");
+    expect(publicAcceptance?.run).toContain("public-runtime.spdx.json");
+    expect(publicAcceptance?.run).toContain(
+      "public runtime SPDX does not match the installed package inventory",
+    );
 
     if (!Array.isArray(verify.steps)) {
       throw new TypeError("verify job steps must be an array");
     }
     const verifySteps = verify.steps.map((step, index) => asRecord(step, `verify step ${index}`));
+    const upload = verifySteps.find((step) => step.name === "Preserve verified release artifacts");
+    const download = stageSteps.find((step) => step.name === "Download verified release artifacts");
+    const exactArtifactName = "hra-release-${{ github.ref_name }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}";
+    expect(asRecord(upload, "release artifact upload step").with).toMatchObject({
+      name: exactArtifactName,
+    });
+    expect(asRecord(download, "release artifact download step").with).toMatchObject({
+      name: exactArtifactName,
+    });
     const actionUses = [...verifySteps, ...stageSteps]
       .map((step) => step.uses)
       .filter((value): value is string => typeof value === "string");
@@ -120,16 +188,52 @@ describe("release workflow", () => {
       step.name === "Verify the Ubuntu 24.04 x64 runtime SPDX SBOM");
     const releaseMetadata = verifySteps.find((step) =>
       step.name === "Preserve the reviewed release metadata");
-    expect(asRecord(checkout, "release checkout step").with).toEqual({ "fetch-depth": 0 });
+    expect(asRecord(checkout, "release checkout step").with).toEqual({
+      "fetch-depth": 0,
+      "persist-credentials": false,
+    });
     expect(exactHead?.run).toContain("tagged_commit=\"$(git rev-parse \"refs/tags/$GITHUB_REF_NAME^{commit}\")\"");
     expect(workflow).not.toContain('commits/$GITHUB_REF_NAME');
-    expect(exactHead?.run).toContain("test \"$tagged_commit\" = \"$main_commit\"");
-    expect(exactHead?.run).not.toContain("merge-base --is-ancestor");
+    expect(exactHead?.run).toContain('test "$remote_tagged_commit" = "$tagged_commit"');
+    expect(exactHead?.run).toContain('git merge-base --is-ancestor "$tagged_commit" "$main_commit"');
+    expect(exactHead?.run).toContain('repos/$GH_REPO/compare/$tagged_commit...main');
+    expect(exactHead?.run).toContain('repos/$GH_REPO/rulesets/21213369');
+    expect(exactHead?.run).toContain('.conditions.ref_name.include == ["refs/tags/v*"]');
+    expect(exactHead?.run).toContain('([.rules[].type] | sort) == ["deletion", "update"]');
+    expect(exactHead?.run).not.toContain('test "$tagged_commit" = "$main_commit"');
+    expect(asRecord(exactHead, "release head step").env).toEqual({
+      GH_REPO: "${{ github.repository }}",
+      GH_TOKEN: "${{ github.token }}",
+    });
+    expect(workflow).not.toContain("bypass_actors");
+    expect(workflow).not.toContain("current_user_can_bypass");
+    const localPublisher = await readFile(
+      join(import.meta.dir, "publish-beta-release.ts"),
+      "utf8",
+    );
+    expect(localPublisher).toContain("bypass_actors: z.tuple([])");
+    expect(localPublisher).toContain('current_user_can_bypass: z.literal("never")');
+    expect(localPublisher).toContain("actions/workflows/${workflowFile}/dispatches");
+    expect(localPublisher).toContain('"return_run_details=true"');
+    expect(localPublisher).toContain("workflow_run_id: positiveIntegerSchema");
+    expect(localPublisher).toContain("scanPublicationLeaseCandidates(");
+    expect(localPublisher).toContain("publicationLeaseAcquireTimeoutMs = 45 * 60 * 1_000");
+    expect(localPublisher).toContain("head_sha=${expectedCommit}&per_page=${String(publicationLeaseCandidatePageSize)}");
+    expect(localPublisher).toContain("publicationLeaseCandidatePageSize = 100");
+    expect(localPublisher).toContain("publicationLeaseRunSchema");
+    expect(localPublisher).toContain("await provider.assertPublicationLease");
+    expect(localPublisher).toContain("await provider.publishDraft(release.id, accepted.notes)");
+    expect(localPublisher).toContain("`tag_name=${releaseTag}`");
+    expect(localPublisher).toContain("`name=${title}`");
+    expect(localPublisher).toContain("`body=${notes}`");
+    expect(localPublisher).toContain('"make_latest=false"');
+    expect(localPublisher).not.toContain("If-Match");
     expect(asRecord(generated, "release generated-documents step").run)
       .toBe("bun run build:site -- --check");
     expect(availability?.run).toContain('publicReleaseState !== "release-ready"');
     expect(availability?.run).toContain('endpoints.hostedSync !== "live"');
     expect(packedInstall?.run).toContain("./release/hra-${GITHUB_REF_NAME}.tgz");
+    expect(packedInstall?.run).toContain("bun add --global --ignore-scripts");
     expect(packedInstall?.run).toContain("check-installed-package.ts");
     expect(packedInstall?.run).not.toContain("github:${GITHUB_REPOSITORY}");
     const artifactSbomStep = asRecord(artifactSbom, "artifact identity SBOM step");

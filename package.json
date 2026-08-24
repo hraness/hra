@@ -16,6 +16,7 @@
     "!src/**/AGENTS.md",
     "!src/cloud/inviteAuthority.ts",
     "!src/cloud/testAssertions.ts",
+    "!src/storage/legacy-secret-migration.ts",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
@@ -51,6 +52,7 @@
     "hosted:deploy": "bun ./scripts/deploy-hosted-sync.ts",
     "hosted:domain-cutover": "bun ./scripts/domain-cutover.ts",
     "hosted:invites": "bun ./scripts/manage-hosted-invites.ts",
+    "operator:migrate-legacy-secrets": "bun ./scripts/migrate-legacy-secrets.ts",
     "release:publish": "bun ./scripts/publish-beta-release.ts",
     "lint": "eslint .",
     "start": "bun ./src/cli.ts",
