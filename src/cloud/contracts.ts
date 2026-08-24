@@ -49,6 +49,22 @@ export type CommandState =
 
 export type SyncStream = "compact" | "detail";
 
+export type CloudProjectionRecoveryAdmissionFailure =
+  | "identity_or_session_conflict"
+  | "idempotency_authority_invalid"
+  | "journal_capacity"
+  | "unsettled_session";
+
+export class CloudProjectionRecoveryAdmissionError extends Error {
+  readonly code: CloudProjectionRecoveryAdmissionFailure;
+
+  constructor(code: CloudProjectionRecoveryAdmissionFailure) {
+    super(`Cloud projection recovery admission failed: ${code}.`);
+    this.name = "CloudProjectionRecoveryAdmissionError";
+    this.code = code;
+  }
+}
+
 const base64UrlPattern = /^[A-Za-z0-9_-]+$/u;
 const digestPattern = /^[0-9a-f]{64}$/u;
 const opaqueIdentifierPattern = /^[A-Za-z0-9_-]{8,96}$/u;

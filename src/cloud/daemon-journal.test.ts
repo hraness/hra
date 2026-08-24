@@ -17,6 +17,7 @@ import {
   emptyCloudDaemonJournal,
   emptyCloudSessionSyncCursor,
   hasUnsettledCompactProjectionRecoveryForProfile,
+  invalidIdempotencyProjectionRecoveryCode,
   isIdentityBoundCloudProjectionRecovery,
   matchesCloudProjectionRecoveryIdentity,
   parseCloudDaemonJournal,
@@ -864,6 +865,69 @@ describe("cloud daemon journal", () => {
         sessionPublicId: rejectedActive.sessionPublicId,
       }),
     );
+  });
+
+  test("rebinds only prepared lease proofs and safely settles expired no-effect authority", () => {
+    const prepared = recovery(212, "prepared");
+    const rebound = parseCloudProjectionRecoveryEntry({
+      ...prepared,
+      authority: { ...prepared.authority, fence: prepared.authority.fence + 1 },
+      lineageCommitment: digest("d"),
+      requestDigest: digest("e"),
+    });
+    const reboundState = transitionCloudProjectionRecovery(
+      stateWith([prepared]),
+      prepared,
+      rebound,
+      fixedNow + 212,
+    );
+    expect(reboundState.projectionRecoveries).toEqual([rebound]);
+    expect(() => transitionCloudProjectionRecovery(
+      stateWith([prepared]),
+      prepared,
+      rebound,
+      fixedNow + cloudProjectionRecoveryWindowMs + 212,
+    )).toThrow("Cloud projection recovery terminal transition is invalid.");
+
+    for (const invalid of [
+      { ...rebound, expectedHeadSequence: rebound.expectedHeadSequence + 1 },
+      {
+        ...rebound,
+        localAuthority: {
+          ...rebound.localAuthority,
+          sessionRevision: rebound.localAuthority.sessionRevision + 1,
+        },
+      },
+      { ...rebound, phase: "effect_started" as const, requestDigest: digest("f") },
+    ]) {
+      expect(() => transitionCloudProjectionRecovery(
+        reboundState,
+        rebound,
+        parseCloudProjectionRecoveryEntry(invalid),
+        fixedNow + 213,
+      )).toThrow("Cloud projection recovery terminal transition is invalid.");
+    }
+
+    const rejected = createCloudProjectionRecoveryTerminalReceipt(rebound, {
+      phase: "rejected",
+      rejectionCode: invalidIdempotencyProjectionRecoveryCode,
+    });
+    const settled = transitionCloudProjectionRecovery(
+      reboundState,
+      rebound,
+      rejected,
+      fixedNow + cloudProjectionRecoveryWindowMs + 212,
+    );
+    expect(settled.projectionRecoveries).toEqual([]);
+    expect(settled.projectionRecoveryReceipts).toMatchObject([{
+      idempotencyKey: rebound.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: invalidIdempotencyProjectionRecoveryCode,
+    }]);
+    expect(() => createCloudProjectionRecoveryTerminalReceipt(prepared, {
+      phase: "rejected",
+      rejectionCode: "AUTHORITY_NOT_CURRENT",
+    })).toThrow("Cloud projection recovery terminal transition is invalid.");
   });
 
   test("terminal provider deletion supersedes every active recovery phase idempotently", () => {

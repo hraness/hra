@@ -53,6 +53,525 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("renders account add and show as state-first summaries with bounded next actions", () => {
+    const accountId = `acct_${"1".repeat(32)}`;
+    const account = {
+      id: accountId,
+      label: "Personal",
+      processGeneration: 0,
+      providerEmail: null,
+      providerPlan: null,
+      state: "signed_out",
+      updatedAt: 1_000,
+    };
+    const added = capture();
+    renderSuccess(
+      { kind: "account.add", label: "Personal" },
+      { account, next: `hra account login ${accountId}` },
+      false,
+      added.output,
+    );
+    expect(added.stdout.join("")).toBe([
+      "Account: signed out",
+      "Label: Personal",
+      `ID: ${accountId}`,
+      "Provider generation: 0",
+      "Updated: 1970-01-01T00:00:01.000Z",
+      `Next: hra account login ${accountId}`,
+      "",
+    ].join("\n"));
+
+    const shown = capture();
+    renderSuccess(
+      { kind: "account.show", account: "Personal" },
+      {
+        account: {
+          ...account,
+          processGeneration: 2,
+          providerEmail: "person@example.com",
+          providerPlan: "Plus",
+          state: "login_pending",
+          updatedAt: 2_000,
+        },
+        login: {
+          loginId: "PRIVATE-LOGIN-AUTHORITY",
+          next: `hra account login-cancel ${accountId}`,
+          status: "pending",
+        },
+        providerProjection: { signedIn: false },
+        unexpectedPath: "/private/provider/profile",
+      },
+      false,
+      shown.output,
+    );
+    expect(shown.stdout.join("")).toBe([
+      "Account: login pending",
+      "Label: Personal",
+      `ID: ${accountId}`,
+      "Email: person@example.com",
+      "Plan: Plus",
+      "Provider generation: 2",
+      "Updated: 1970-01-01T00:00:02.000Z",
+      "Provider: signed out",
+      "Login: pending",
+      `Next: hra account login-cancel ${accountId}`,
+      "",
+    ].join("\n"));
+    expect(shown.stdout.join("")).not.toContain("PRIVATE-LOGIN-AUTHORITY");
+    expect(shown.stdout.join("")).not.toContain("/private/provider/profile");
+  });
+
+  test("renders auth status as a state-first device handoff without changing JSON", () => {
+    const pendingDeviceId = `device_${"A".repeat(24)}`;
+    const localDeviceId = `device_${"B".repeat(24)}`;
+    const data = {
+      automaticRegistrationPending: false,
+      authEpoch: 3,
+      configured: true,
+      device: {
+        keyVersion: 2,
+        publicId: pendingDeviceId,
+        revision: 4,
+        status: "pending",
+      },
+      email: "reader@example.com",
+      lastSync: null,
+      pairingRequired: false,
+      signedIn: true,
+    };
+    const human = capture();
+    renderSuccess({ kind: "auth.status" }, data, false, human.output);
+    expect(human.stdout.join("")).toBe([
+      "Cloud account: signed in",
+      "Email: reader@example.com",
+      `Device: pending (${pendingDeviceId})`,
+      "Last sync: never",
+      `Next: on an active device, run hra device approve ${pendingDeviceId}`,
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    renderSuccess({ kind: "auth.status" }, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "auth.status",
+      data,
+      ok: true,
+      version: 1,
+    });
+
+    const signedOut = capture();
+    renderSuccess({ kind: "auth.status" }, {
+      configured: true,
+      device: { publicId: localDeviceId },
+      lastSync: null,
+      signedIn: false,
+    }, false, signedOut.output);
+    expect(signedOut.stdout.join("")).toBe([
+      "Cloud account: signed out",
+      `Device: known locally (${localDeviceId})`,
+      "Last sync: never",
+      "Next: hra auth login --input-stdin",
+      "",
+    ].join("\n"));
+  });
+
+  test("renders sync status with last-sync and projection health while redacting diagnostics", () => {
+    const secret = "token=SYNC-STATUS-SECRET";
+    const activeDeviceId = `device_${"C".repeat(24)}`;
+    const data = {
+      automaticRegistrationPending: false,
+      configured: true,
+      device: {
+        keyVersion: 1,
+        publicId: activeDeviceId,
+        revision: 2,
+        status: "active",
+      },
+      lastSync: {
+        accountCount: 2,
+        at: 3_000,
+        sessionCount: 7,
+        usageSnapshotCount: 2,
+      },
+      pairingRequired: false,
+      projectionCache: {
+        affectedSessions: ["sess_11111111111111111111111111111111"],
+        affectedSessionsTruncated: false,
+        code: "STREAM_RECOVERY_REQUIRED",
+        diagnostic: `Recovery failed at /private/cache ${secret}`,
+        sessions: 1,
+        state: "degraded",
+      },
+      projectionRecovery: {
+        recoveries: [
+          { idempotencyKey: "private-key-1", phase: "prepared", sessionPublicId: "private-session-1" },
+          { cacheActivated: true, idempotencyKey: "private-key-2", phase: "applied", sessionPublicId: "private-session-2" },
+        ],
+        recoveriesTruncated: true,
+        totalRecoveries: 150,
+      },
+      signedIn: true,
+    };
+    const target = capture();
+    renderSuccess({ kind: "sync.status" }, data, false, target.output);
+    expect(target.stdout.join("")).toBe([
+      "Cloud sync: degraded (projection cache)",
+      `Device: active (${activeDeviceId})`,
+      "Last sync: 1970-01-01T00:00:03.000Z (2 accounts, 7 sessions, 2 usage snapshots)",
+      "Projection cache: degraded (STREAM_RECOVERY_REQUIRED)",
+      "Projection sessions needing recovery: 1",
+      "  Recover: sess_11111111111111111111111111111111",
+      "Projection detail: Recovery failed at [local-path] [redacted]",
+      "Projection recoveries: 2 of 150 shown (prepared 1, applied 1)",
+      "Next: hra doctor",
+      "",
+    ].join("\n"));
+    expect(target.stdout.join("")).not.toContain("SYNC-STATUS-SECRET");
+    expect(target.stdout.join("")).not.toContain("/private/cache");
+    expect(target.stdout.join("")).not.toContain("private-key");
+    expect(target.stdout.join("")).not.toContain("private-session");
+  });
+
+  test("keeps projection failures and unsettled recoveries out of the ready sync state", () => {
+    const base = {
+      automaticRegistrationPending: false,
+      configured: true,
+      device: {
+        publicId: `device_${"B".repeat(24)}`,
+        status: "active",
+      },
+      lastSync: null,
+      pairingRequired: false,
+      signedIn: true,
+    };
+    const cases = [
+      {
+        data: {
+          ...base,
+          projectionCache: {
+            code: "CACHE_CORRUPT_OR_UNREADABLE",
+            state: "unavailable",
+          },
+        },
+        state: "Cloud sync: unavailable (projection cache)",
+        next: "Next: hra doctor",
+      },
+      {
+        data: {
+          ...base,
+          projectionCache: { state: "ready" },
+          projectionRecovery: {
+            recoveries: [{
+              phase: "effect_started",
+              cacheActivated: false,
+              idempotencyKey: "018bcfe5-6800-7000-8000-000000000702",
+              sessionPublicId: `sess_${"2".repeat(32)}`,
+            }],
+            recoveriesTruncated: false,
+            totalRecoveries: 1,
+          },
+        },
+        state: "Cloud sync: recovery required (projection)",
+        next: `Next: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
+      },
+      {
+        data: {
+          ...base,
+          projectionCache: {
+            affectedSessions: [`sess_${"2".repeat(32)}`],
+            code: "STREAM_RECOVERY_REQUIRED",
+            sessions: 1,
+            state: "degraded",
+          },
+          projectionRecovery: {
+            recoveries: [{
+              phase: "effect_started",
+              cacheActivated: false,
+              idempotencyKey: "018bcfe5-6800-7000-8000-000000000702",
+              sessionPublicId: `sess_${"2".repeat(32)}`,
+            }],
+            recoveriesTruncated: false,
+            totalRecoveries: 1,
+          },
+        },
+        state: "Cloud sync: degraded (projection cache)",
+        next: `Next: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702`,
+      },
+    ];
+    for (const entry of cases) {
+      const target = capture();
+      renderSuccess({ kind: "sync.status" }, entry.data, false, target.output);
+      expect(target.stdout.join("")).toContain(`${entry.state}\n`);
+      expect(target.stdout.join("")).toContain(`${entry.next}\n`);
+      expect(target.stdout.join("")).not.toContain("Cloud sync: ready");
+    }
+  });
+
+  test("treats intentionally disabled cloud as optional without a circular doctor action", () => {
+    const target = capture();
+    renderSuccess({ kind: "sync.status" }, {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon.",
+      reenable: { kind: "use_hosted_default" },
+      signedIn: false,
+      unavailability: "disabled",
+    }, false, target.output);
+    expect(target.stdout.join("")).toContain("Cloud sync: unavailable\n");
+    expect(target.stdout.join("")).toContain("Next: unset HRA_CONVEX_URL and restart the daemon\n");
+
+    const ordinarySelfManaged = capture();
+    renderSuccess({ kind: "sync.status" }, {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon.",
+      reenable: {
+        deploymentUrl: "https://self-managed.convex.cloud",
+        kind: "restore_bound_deployment",
+      },
+      signedIn: false,
+      unavailability: "disabled",
+    }, false, ordinarySelfManaged.output);
+    expect(ordinarySelfManaged.stdout.join("")).toContain(
+      "Next: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+    );
+
+    const recovery = capture();
+    renderSuccess({ kind: "sync.status" }, {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon.",
+      projectionRecovery: {
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000702",
+          phase: "effect_started",
+          sessionPublicId: `sess_${"2".repeat(32)}`,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      },
+      reenable: { kind: "use_hosted_default" },
+      signedIn: false,
+      unavailability: "disabled",
+    }, false, recovery.output);
+    expect(recovery.stdout.join("")).toContain("Cloud sync: unavailable (projection recovery pending)\n");
+    expect(recovery.stdout.join("")).toContain("Recovery prerequisite: unset HRA_CONVEX_URL and restart the daemon.\n");
+    expect(recovery.stdout.join("")).toContain(
+      `Next after restart: hra sync projection recover sess_${"2".repeat(32)} --acknowledge-gap --idempotency-key 018bcfe5-6800-7000-8000-000000000702\n`,
+    );
+    expect(recovery.stdout.join("")).not.toContain("Next: hra sync projection recover");
+
+    const selfManaged = capture();
+    renderSuccess({ kind: "sync.status" }, {
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon.",
+      projectionRecovery: {
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000702",
+          phase: "effect_started",
+          sessionPublicId: `sess_${"2".repeat(32)}`,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      },
+      reenable: {
+        deploymentUrl: "https://self-managed.convex.cloud",
+        kind: "restore_bound_deployment",
+      },
+      signedIn: false,
+      unavailability: "disabled",
+    }, false, selfManaged.output);
+    expect(selfManaged.stdout.join("")).toContain(
+      "Recovery prerequisite: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon.\n",
+    );
+  });
+
+  test("renders doctor results as concise human checks", () => {
+    const healthy = capture();
+    renderSuccess({ kind: "doctor", offline: false }, { healthy: true, problems: [] }, false, healthy.output);
+    expect(healthy.stdout.join("")).toBe("HRA checks passed.\n");
+
+    const disabledSelfManaged = capture();
+    renderSuccess({ kind: "doctor", offline: false }, {
+      cloud: {
+        configured: false,
+        reenable: {
+          deploymentUrl: "https://self-managed.convex.cloud",
+          kind: "restore_bound_deployment",
+        },
+        unavailability: "disabled",
+      },
+      healthy: true,
+      problems: [],
+    }, false, disabledSelfManaged.output);
+    expect(disabledSelfManaged.stdout.join("")).toBe(
+      "HRA checks passed.\nCloud sync: disabled (optional)\nNext: set HRA_CONVEX_URL to https://self-managed.convex.cloud and restart the daemon\n",
+    );
+
+    const unhealthy = capture();
+    renderSuccess({ kind: "doctor", offline: false }, {
+      healthy: false,
+      problems: ["Repair the local projection cache."],
+    }, false, unhealthy.output);
+    expect(unhealthy.stdout.join("")).toBe("HRA checks found 1 problem:\n- Repair the local projection cache.\n");
+
+    const unhealthyDisabled = capture();
+    renderSuccess({ kind: "doctor", offline: false }, {
+      cloud: {
+        configured: false,
+        reenable: { kind: "use_hosted_default" },
+        unavailability: "disabled",
+      },
+      healthy: false,
+      problems: ["Repair the local projection cache."],
+    }, false, unhealthyDisabled.output);
+    expect(unhealthyDisabled.stdout.join("")).toBe([
+      "HRA checks found 1 problem:",
+      "- Repair the local projection cache.",
+      "",
+      "Cloud sync: disabled (optional)",
+      "Next: unset HRA_CONVEX_URL and restart the daemon",
+      "",
+    ].join("\n"));
+
+    const malformed = capture();
+    renderSuccess({ kind: "doctor", offline: false }, {
+      healthy: true,
+      problems: [1],
+    }, false, malformed.output);
+    expect(malformed.stdout.join("")).toBe("HRA checks returned an invalid local result.\n");
+  });
+
+  test("never interpolates a noncanonical or hostile device ID into an approval command", () => {
+    const attack = "device_AAAAAAAAAAAAAAAAAAAAAAAA; touch /tmp/HRA-DEVICE-INJECTION";
+    const target = capture();
+    renderSuccess({ kind: "auth.status" }, {
+      configured: true,
+      device: { publicId: attack, status: "pending" },
+      lastSync: null,
+      signedIn: true,
+    }, false, target.output);
+    expect(target.stdout.join("")).toContain("Next: hra device list");
+    expect(target.stdout.join("")).not.toContain("hra device approve");
+    expect(target.stdout.join("")).not.toContain("touch /tmp/HRA-DEVICE-INJECTION");
+  });
+
+  test("renders a bound signed-out failure next command without changing JSON details", () => {
+    const accountId = `acct_${"2".repeat(32)}`;
+    const error = {
+      code: "INTERACTION_REQUIRED",
+      details: {
+        accountSelector: accountId,
+        accountState: "signed_out",
+        nextCommand: `hra account login ${accountId}`,
+      },
+      message: `Sign in with \`hra account login ${accountId}\` before using this account's Codex runtime.`,
+    };
+    const human = capture();
+    expect(renderFailure(error, false, human.output)).toBe(6);
+    expect(human.stderr.join("")).toBe([
+      `hra: Sign in with \`hra account login ${accountId}\` before using this account's Codex runtime.`,
+      `Next: hra account login ${accountId}`,
+      "",
+    ].join("\n"));
+    expect(human.stderr.join("")).not.toContain("accountState");
+
+    const json = capture();
+    expect(renderFailure(error, true, json.output)).toBe(6);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      error: {
+        code: error.code,
+        details: error.details,
+        message: error.message,
+      },
+      ok: false,
+      version: 1,
+    });
+
+    const malformed = capture();
+    renderFailure({
+      ...error,
+      details: { ...error.details, nextCommand: `hra account login ${accountId} --unexpected` },
+    }, false, malformed.output);
+    expect(malformed.stderr.join("")).not.toContain("\nNext:");
+    expect(malformed.stderr.join("")).toContain('"accountState": "signed_out"');
+  });
+
+  test("renders only the exact bounded project repair action while preserving JSON details", () => {
+    const error = {
+      code: "UNAVAILABLE",
+      details: {
+        nextCommand: "hra doctor",
+        repair: "repair_or_select_project",
+      },
+      message: "The selected project directory is unavailable.",
+    };
+    const human = capture();
+    expect(renderFailure(error, false, human.output)).toBe(5);
+    expect(human.stderr.join("")).toBe([
+      "hra: The selected project directory is unavailable.",
+      "Next: hra doctor",
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    expect(renderFailure(error, true, json.output)).toBe(5);
+    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
+      error: { details: error.details },
+    });
+
+    const injected = capture();
+    renderFailure({
+      ...error,
+      details: { ...error.details, extra: "provider-secret" },
+    }, false, injected.output);
+    expect(injected.stderr.join("")).not.toContain("\nNext:");
+  });
+
+  test("renders daemon stop outcomes and only exact recovery commands", () => {
+    const stopped = capture();
+    renderSuccess(
+      { kind: "daemon.stop" },
+      { released: true, running: false },
+      false,
+      stopped.output,
+    );
+    expect(stopped.stdout.join("")).toBe("HRA daemon stopped.\n");
+
+    const absent = capture();
+    renderSuccess(
+      { kind: "daemon.stop" },
+      { released: false, running: false },
+      false,
+      absent.output,
+    );
+    expect(absent.stdout.join("")).toBe("HRA daemon is already stopped.\n");
+
+    for (const nextCommand of ["hra daemon status --json", "hra doctor --offline"] as const) {
+      const recovery = capture();
+      renderFailure({
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand },
+        message: "The exact daemon shutdown result requires inspection.",
+      }, false, recovery.output);
+      expect(recovery.stderr.join("")).toBe([
+        "hra: The exact daemon shutdown result requires inspection.",
+        `Next: ${nextCommand}`,
+        "",
+      ].join("\n"));
+    }
+
+    const injected = capture();
+    renderFailure({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        nextCommand: "hra daemon status --json; touch /tmp/unsafe",
+      },
+      message: "The exact daemon shutdown result requires inspection.",
+    }, false, injected.output);
+    expect(injected.stderr.join("")).not.toContain("\nNext:");
+    expect(injected.stderr.join("")).not.toContain("touch /tmp/unsafe\nNext:");
+  });
+
   test("renders pending-login cancellation as a fresh-start handoff", () => {
     const canceled = capture();
     renderSuccess({ kind: "account.login-cancel", account: "personal" }, {
@@ -648,6 +1167,16 @@ describe("CLI rendering", () => {
     const cursor = "hra1.eyJ0eXBlIjoic2Vzc2lvbl9saXN0In0.signature";
     const listing = {
       accountId,
+      listing: {
+        accountSelector: accountId,
+        accountState: "signed_out",
+        scope: "local_only",
+        freshness: "stale",
+        localCompleteness: "partial",
+        providerAccess: "not_attempted",
+        providerCompleteness: "unknown",
+        nextCommand: `hra account login ${accountId}`,
+      },
       sessions: [{
         id: "sess_00000000000000000000000000000000",
         title: "Older imported thread",
@@ -664,6 +1193,12 @@ describe("CLI rendering", () => {
       false,
       human.output,
     );
+    expect(human.stdout.join("")).toContain(`Scope: local-only cache for ${accountId}`);
+    expect(human.stdout.join("")).toContain("Freshness: stale; provider not contacted");
+    expect(human.stdout.join("")).toContain(
+      "Completeness: partial local cache; more pages available; provider completeness unknown",
+    );
+    expect(human.stdout.join("")).toContain(`Sign in to refresh: hra account login ${accountId}`);
     expect(human.stdout.join("")).toContain("Older imported thread");
     expect(human.stdout.join("")).toContain(
       `Continue: hra session list --account ${accountId} --limit 37 --cursor ${cursor}\n`,
@@ -678,7 +1213,12 @@ describe("CLI rendering", () => {
       json.output,
     );
     expect(JSON.parse(json.stdout.join(""))).toMatchObject({
-      data: { accountId, nextCursor: cursor, sessions: listing.sessions },
+      data: {
+        accountId,
+        listing: listing.listing,
+        nextCursor: cursor,
+        sessions: listing.sessions,
+      },
     });
 
     const malformed = capture();
@@ -690,6 +1230,22 @@ describe("CLI rendering", () => {
     );
     expect(malformed.stdout.join("")).not.toContain("Continue:");
     expect(malformed.stdout.join("")).not.toContain("provider-cursor-must-not-render");
+
+    const unsafeMetadata = capture();
+    renderSuccess(
+      { kind: "session.list", account: "mutable-label", limit: 37 },
+      {
+        ...listing,
+        listing: {
+          ...listing.listing,
+          nextCommand: `hra account login ${accountId}; touch /tmp/unsafe`,
+        },
+      },
+      false,
+      unsafeMetadata.output,
+    );
+    expect(unsafeMetadata.stdout.join("")).not.toContain("Sign in to refresh:");
+    expect(unsafeMetadata.stdout.join("")).not.toContain("touch /tmp/unsafe");
   });
 
   test("renders brokered MCP form input as protected", () => {
@@ -771,7 +1327,7 @@ describe("CLI rendering", () => {
 
   test("serializes undefined output as JSON null instead of throwing", () => {
     const target = capture();
-    renderSuccess({ kind: "daemon.stop" }, undefined, false, target.output);
+    renderSuccess({ kind: "project.use", project: "Documents" }, undefined, false, target.output);
     expect(target.stdout).toEqual(["null\n"]);
   });
 

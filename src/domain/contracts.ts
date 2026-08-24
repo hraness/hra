@@ -13,6 +13,7 @@ import {
   labelSchema,
   messageSchema,
   noteSchema,
+  profileIdSchema,
   titleSchema,
   unixMillisecondsSchema,
 } from "./values";
@@ -28,11 +29,41 @@ const projectPathSchema = z.string().min(1).max(4096).refine(
   (value) => isAbsolute(value) && normalize(value) === value,
   "Project path must be absolute and normalized.",
 );
+const daemonStopAuthoritySchema = z.object({
+  protocol: z.literal("hra-control-plane-local-v1"),
+  pid: z.number().int().positive(),
+  nonce: z.string().uuid(),
+  generation: z.number().int().positive(),
+  bootId: z.string().regex(/^boot_[a-f0-9]{32}$/u),
+}).strict();
+
+export const signedOutSessionListMetadataSchema = z.object({
+  accountSelector: profileIdSchema,
+  accountState: z.literal("signed_out"),
+  scope: z.literal("local_only"),
+  freshness: z.literal("stale"),
+  localCompleteness: z.enum(["partial", "complete"]),
+  providerAccess: z.literal("not_attempted"),
+  providerCompleteness: z.literal("unknown"),
+  nextCommand: z.string().min(1).max(256),
+}).strict().superRefine((value, context) => {
+  if (value.nextCommand !== `hra account login ${value.accountSelector}`) {
+    context.addIssue({
+      code: "custom",
+      path: ["nextCommand"],
+      message: "Signed-out session-list recovery must bind the exact account selector.",
+    });
+  }
+});
+
+export type SignedOutSessionListMetadata = z.infer<typeof signedOutSessionListMetadataSchema>;
 
 export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("doctor"), offline: z.boolean() }).strict(),
   z.object({ kind: z.literal("daemon.status") }).strict(),
-  z.object({ kind: z.literal("daemon.stop") }).strict(),
+  // The parser emits an unbound stop request. The CLI must bind it to the
+  // observed daemon authority before it crosses the local transport boundary.
+  z.object({ kind: z.literal("daemon.stop"), expected: daemonStopAuthoritySchema.optional() }).strict(),
   z.object({ kind: z.literal("account.list") }).strict(),
   z.object({ kind: z.literal("account.add"), label: labelSchema }).strict(),
   z.object({ kind: z.literal("account.show"), account: selectorSchema }).strict(),

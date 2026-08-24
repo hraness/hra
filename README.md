@@ -75,7 +75,7 @@ HRA cloud identity is separate from every Codex account. Use the email-code flow
 
 ## Cloud sign-in and device pairing
 
-The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
+The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
 
 ```text
 hra auth login --input-stdin
@@ -142,7 +142,7 @@ HRA refreshes the requested model, reasoning effort, Fast service tier, permissi
 - `ultra`: Sol Ultra, currently `gpt-5.6-sol` with `ultra` reasoning.
 - `fast on|off`: an explicit per-turn Fast or Standard overlay. A prior Fast value cannot leak into the next turn.
 
-`hra init` reports the required confirmation without changing local state; `hra init --yes` explicitly accepts your canonical Documents directory as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox and network policy and computer use.
+`hra init` reports the required confirmation without changing local state; `hra init --yes` creates your Documents directory when it is absent, verifies that it is a readable, writable, and traversable canonical directory, and accepts it as the default project. Initialization is a one-shot maintenance command: run it before opening the persistent shell. The shell rejects `/init` because its running daemon already owns local state. Turns use Codex's `auto_review` path, the exact advertised `:workspace` permission profile, and the selected project as the runtime workspace root. Codex remains authoritative for the profile's effective sandbox and network policy and computer use.
 
 ## Plugin discovery
 
@@ -187,12 +187,12 @@ A cloud-session selector accepts an exact public ID, a unique public-ID prefix, 
 Transcript upload is bound to a durable local stream ledger and the exact remote head and tail. Missing or mismatched evidence pauses upload for only that session. Remote reads, commands, and usage continue, while `hra sync status` keeps the recovery condition visible. HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.
 
 ```text
-hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]
+hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]
 ```
 
 Projection recovery is an explicit append-only operation. Running it without `--acknowledge-gap` performs no daemon call and returns `INTERACTION_REQUIRED` with the exact safe next command. JSON mode never prompts. The acknowledged operation preserves all older encrypted cloud history and changes no provider or app state. It opens the next compact stream epoch at sequence `H+1`, where `H` is the exact remote compact head, and baselines only completed turns currently visible in the bounded local projection. Any possibly unsynced interval remains visible to remote readers as a recovery gap.
 
-The CLI creates a current UUIDv7 before daemon transport. Success reports the phase, local session, old and new epochs, boundary head, persistent gap, and an exact same-key replay command. Reuse that command after a lost response. Changed-key retry remains closed while the first recovery is unsettled.
+The CLI creates a current UUIDv7 before daemon transport. Success reports the phase, local session, old and new epochs, boundary head, persistent gap, and an exact same-key replay command. A prepared recovery inside the seven-day server window renews its execution lease and keeps the same exact key. Changed-key retry remains closed while that recovery is unsettled. After the window, exact-key replay first reconciles an already committed effect from immutable lineage. If no effect began, it discards local staging, settles the old attempt as rejected, and clears its authority. Run `hra sync status --json`, then start a fresh recovery without `--idempotency-key` if recovery is still required.
 
 Session names and notes sync as encrypted metadata, but v1 does not execute remote rename or note commands. Project directories are local-only and are neither synced nor remotely changed.
 
@@ -289,7 +289,7 @@ hra remote preset <cloud-session> <low|high|ultra>
 hra remote fast <cloud-session> <on|off>
 hra turn inspect <session> <turn> [--json]
 hra sync status|now
-hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]
+hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]
 hra daemon start|status|stop|run
 ```
 
@@ -301,7 +301,7 @@ Every admitted callback carries a local deadline anchored when Codex delivered i
 
 For a standard MCP form, interaction show returns the exact public field contract without defaults or answers. Accept reads one protected document shaped as `{"content":{...}}` from nonterminal stdin or a file descriptor. Decline and cancel accept no content. JSON mode never prompts, and validation failures identify the contract failure without echoing a submitted value.
 
-Projection recovery uses the local-session selector rules. It requires `--acknowledge-gap` and a current UUIDv7, generated by the CLI when omitted. The same-key command is safe to replay after a lost response; a changed key cannot overtake unsettled recovery authority.
+Projection recovery uses the local-session selector rules. It requires `--acknowledge-gap` and a canonical UUIDv7; the CLI generates a current key when it is omitted. A stored exact key remains the only admissible replay while recovery is unsettled. Inside the seven-day window, a prepared replay renews its lease and can apply. After the window, replay reconciles immutable committed lineage or safely settles known-no-effect authority as rejected; status then determines whether to retry with a fresh generated key.
 
 The beta does not expose destructive local profile or project deletion. `account logout` asks Codex app-server to remove that profile's provider login while HRA preserves its local session history.
 

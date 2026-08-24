@@ -72,7 +72,9 @@ export async function assertPublicTree(root: string): Promise<void> {
     for (const entry of await readdir(path, { withFileTypes: true })) {
       const child = join(path, entry.name);
       const label = relative(root, child);
-      if (entry.isDirectory()) {
+      if (label === ".git" && (entry.isDirectory() || entry.isFile())) {
+        continue;
+      } else if (entry.isDirectory()) {
         if (!excludedDirectories.has(entry.name)) await visit(child);
       } else if (entry.isFile() && textFile.test(child)) {
         const value = await readFile(child, "utf8");

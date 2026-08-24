@@ -80,4 +80,15 @@ describe("public text policy", () => {
       await rm(root, { force: true, recursive: true });
     }
   });
+
+  test("ignores the regular .git pointer used by linked worktrees", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-worktree-"));
+    try {
+      await writeFile(join(root, ".git"), "gitdir: /private/tmp/repository/.git/worktrees/review\n", "utf8");
+      await writeFile(join(root, "README.md"), "# Public package\n", "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
 });

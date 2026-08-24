@@ -104,6 +104,8 @@ describe("public content contract", () => {
       expect(surface).toContain("explicit empty value");
       expect(surface).toContain("self-managed Convex deployment");
       expect(surface).toContain("permanently binds that local state root");
+      expect(surface).toContain("report its exact restart prerequisite");
+      expect(surface).toContain("restore the bound URL for a self-managed deployment");
       expect(surface).not.toContain("require an explicit deployment URL");
       expect(surface).toContain("automatically registers the current installation");
       expect(surface).toContain("registered as pending");
@@ -237,7 +239,7 @@ describe("public content contract", () => {
       "Resolve a pending callback on its execution device; remote interaction responses are unavailable in v1.",
       "Transcript upload is bound to a durable local stream ledger",
       "HRA never resets, aliases, overwrites, or destructively reseeds encrypted history.",
-      "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]",
+      "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]",
       "performs no daemon call and returns",
       "JSON mode never prompts.",
       "preserves all older encrypted cloud history and changes no provider or app state.",
@@ -258,7 +260,7 @@ describe("public content contract", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     const privacy = renderPrivacyMarkdown();
-    const command = "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <current-uuidv7>] [--json]";
+    const command = "hra sync projection recover <local-session-selector> --acknowledge-gap [--idempotency-key <uuidv7>] [--json]";
 
     expect(markdown).toContain(command);
     expect(html).toContain(

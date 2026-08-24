@@ -336,7 +336,7 @@ describe("compact projection stream epochs", () => {
     }
   });
 
-  test("reconciles immutable lineage beyond receipt retention and a newer fence", async () => {
+  test("reconciles immutable lineage before expired-key validation and rejects expired no-lineage authority", async () => {
     const world = await sessionWorld();
     const request = epochRequest(world.now, world.authority, "60");
     const committed = await world.runtime.mutation(beginCompactEpoch, request);

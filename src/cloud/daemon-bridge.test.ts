@@ -18,6 +18,7 @@ import {
   createLocalCloudDaemonBridgeFromEnvironment,
   CustodyCloudDaemonIdentity,
   LocalCloudDaemonBridge,
+  projectionRecoveryStatusFromJournalState,
   type RegisteredCloudIdentity,
 } from "./daemon-bridge";
 import {
@@ -398,6 +399,13 @@ class FakeCloud {
               throw new Error("IDEMPOTENCY_CONFLICT");
             }
             return existing.response;
+          }
+          const idempotencyTimestamp = Number.parseInt(
+            idempotencyKey.replaceAll("-", "").slice(0, 12),
+            16,
+          );
+          if (idempotencyTimestamp < this.now - (7 * 24 * 60 * 60 * 1_000)) {
+            throw new Error("Invalid idempotency authority.");
           }
           const head = this.requireHead(args.sessionPublicId);
           const lease = this.requireLease(args.sessionPublicId);
@@ -1070,6 +1078,7 @@ class RecoveryLocal extends EmptyLocal {
   baselineInteractions: readonly CloudProjectionRecoveryBaselineInteraction[] = [];
   expectedBoundaryHeadSequence = 3;
   failActivationAfterEffectOnce = false;
+  failDiscardOnce = false;
   observedInteractionIds: readonly string[] = [];
   planCalls = 0;
   stageCalls = 0;
@@ -1123,6 +1132,10 @@ class RecoveryLocal extends EmptyLocal {
   }
 
   discardCompactProjectionRecovery(input: { idempotencyKey: string }): Promise<void> {
+    if (this.failDiscardOnce) {
+      this.failDiscardOnce = false;
+      return Promise.reject(new Error("lost recovery discard acknowledgement"));
+    }
     this.discardedRecoveryKeys.push(input.idempotencyKey);
     this.staged = false;
     return Promise.resolve();
@@ -1186,6 +1199,65 @@ class CommitThenThrowPreparedRecoveryJournal implements CloudDaemonJournalPort {
     ) {
       this.#thrown = true;
       throw new Error("lost prepared journal acknowledgement");
+    }
+    return committed;
+  }
+}
+
+class CommitThenThrowEffectStartedRecoveryJournal implements CloudDaemonJournalPort {
+  readonly inner = new MemoryCloudDaemonJournal();
+  #thrown = false;
+
+  read(): Promise<CloudDaemonJournalObservation> {
+    return this.inner.read();
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudDaemonJournalInputState,
+  ): Promise<CloudDaemonJournalObservation | null> {
+    const committed = await this.inner.compareAndSwap(expectedGeneration, state);
+    if (
+      committed !== null
+      && !this.#thrown
+      && committed.state.projectionRecoveries.some((entry) => entry.phase === "effect_started")
+    ) {
+      this.#thrown = true;
+      throw new Error("lost effect-started journal acknowledgement");
+    }
+    return committed;
+  }
+}
+
+class CommitThenThrowPreparedAndTerminalRecoveryJournal implements CloudDaemonJournalPort {
+  readonly inner = new MemoryCloudDaemonJournal();
+  #preparedThrown = false;
+  #terminalThrown = false;
+
+  read(): Promise<CloudDaemonJournalObservation> {
+    return this.inner.read();
+  }
+
+  async compareAndSwap(
+    expectedGeneration: number | null,
+    state: CloudDaemonJournalInputState,
+  ): Promise<CloudDaemonJournalObservation | null> {
+    const committed = await this.inner.compareAndSwap(expectedGeneration, state);
+    if (
+      committed !== null
+      && !this.#preparedThrown
+      && committed.state.projectionRecoveries.some((entry) => entry.phase === "prepared")
+    ) {
+      this.#preparedThrown = true;
+      throw new Error("lost prepared journal acknowledgement");
+    }
+    if (
+      committed !== null
+      && !this.#terminalThrown
+      && committed.state.projectionRecoveryReceipts.length > 0
+    ) {
+      this.#terminalThrown = true;
+      throw new Error("lost terminal recovery acknowledgement");
     }
     return committed;
   }
@@ -2264,12 +2336,18 @@ describe("cloud daemon bridge", () => {
     });
   });
 
-  test("begins one compact epoch, activates its cache, and replays the same key exactly", async () => {
+  test("begins one compact epoch and reads its exact terminal receipt after cloud identity becomes unavailable", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0001";
     await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
-    const daemon = bridge({ cloud, device: "device_11111111", local });
+    const mutableIdentity = new MutableIdentity(activeIdentity());
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      identity: mutableIdentity,
+      local,
+    });
     const input = {
       acknowledgeGap: true as const,
       idempotencyKey: uuidV7(900),
@@ -2294,6 +2372,20 @@ describe("cloud daemon bridge", () => {
     expect(cloud.epochMutationCalls).toBe(1);
     expect(local.planCalls).toBe(1);
     expect(local.activateCalls).toBe(1);
+    cloud.now = fixedNow + (8 * 24 * 60 * 60 * 1_000);
+    mutableIdentity.current = pendingIdentity();
+    expect(await daemon.readCompactProjectionRecoveryReceipt(input)).toEqual({
+      result: first,
+      status: "found",
+    });
+    expect(await daemon.readCompactProjectionRecoveryReceipt({
+      ...input,
+      sessionPublicId: "session_recover_0002",
+    })).toEqual({ status: "conflict" });
+    expect(await daemon.readCompactProjectionRecoveryReceipt({
+      ...input,
+      idempotencyKey: uuidV7(901),
+    })).toEqual({ status: "absent" });
     expect(await daemon.projectionRecoveryStatus()).toEqual({
       recoveries: [{
         cacheActivated: true,
@@ -2301,7 +2393,63 @@ describe("cloud daemon bridge", () => {
         phase: "applied",
         sessionPublicId,
       }],
+      recoveriesTruncated: false,
+      totalRecoveries: 1,
     });
+  });
+
+  test("bounds projection recovery status while retaining the newest terminal receipts", () => {
+    const receipts = Array.from({ length: 150 }, (_, index) => ({
+      idempotencyKey: uuidV7(10_000 + index),
+      phase: "rejected" as const,
+      rejectionCode: "TEST_REJECTION",
+      requestedAt: fixedNow + index,
+      sessionPublicId: `session_recovery_status_${String(index).padStart(4, "0")}`,
+      sourceDevicePublicId: null,
+      userPublicId: null,
+    }));
+    const status = projectionRecoveryStatusFromJournalState({
+      commands: [],
+      pendingUsageAccount: null,
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: receipts,
+      usageAccounts: [],
+      version: 3,
+    });
+
+    expect(status.recoveries).toHaveLength(128);
+    expect(status).toMatchObject({
+      recoveriesTruncated: true,
+      totalRecoveries: 150,
+    });
+    expect(status.recoveries[0]).toMatchObject({
+      idempotencyKey: receipts[22]?.idempotencyKey,
+      sessionPublicId: receipts[22]?.sessionPublicId,
+    });
+    expect(status.recoveries.at(-1)).toMatchObject({
+      idempotencyKey: receipts[149]?.idempotencyKey,
+      sessionPublicId: receipts[149]?.sessionPublicId,
+    });
+  });
+
+  test("rejects an old absent recovery key with typed fresh-attempt guidance", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_recover_old_absent_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const daemon = bridge({ cloud, device: "device_11111111", local });
+
+    await expect(daemon.recoverCompactProjection({
+      acknowledgeGap: true,
+      idempotencyKey: uuidV7(903, fixedNow - (8 * 24 * 60 * 60 * 1_000)),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({
+      code: "idempotency_authority_invalid",
+      name: "CloudProjectionRecoveryAdmissionError",
+    });
+    expect(local.planCalls).toBe(0);
+    expect(cloud.epochMutationCalls).toBe(0);
   });
 
   test("appends post-recovery events at the global sequence under the new epoch", async () => {
@@ -2337,13 +2485,20 @@ describe("cloud daemon bridge", () => {
     });
   });
 
-  test("recovers a prepared journal acknowledgement loss without rebaselining", async () => {
+  test("rebinds a prepared recovery to a renewed lease before starting its effect", async () => {
     const cloud = new FakeCloud();
     const sessionPublicId = "session_recover_0002";
     await installRecoverableHead(cloud, sessionPublicId);
     const local = new RecoveryLocal(sessionPublicId);
     const journal = new CommitThenThrowPreparedRecoveryJournal();
-    const daemon = bridge({ cloud, device: "device_11111111", journal, local });
+    let observedNow = fixedNow;
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      journal,
+      local,
+      now: () => observedNow,
+    });
     const input = {
       acknowledgeGap: true as const,
       idempotencyKey: uuidV7(901),
@@ -2355,10 +2510,136 @@ describe("cloud daemon bridge", () => {
       "lost prepared journal acknowledgement",
     );
     expect(cloud.epochBegins).toBe(0);
-    expect((await journal.read()).state.projectionRecoveries[0]?.phase).toBe("prepared");
+    const original = (await journal.read()).state.projectionRecoveries[0];
+    expect(original?.phase).toBe("prepared");
+    observedNow = fixedNow + 10_000;
+    cloud.now = observedNow;
+    await expect(daemon.recoverCompactProjection({
+      ...input,
+      idempotencyKey: uuidV7(902, observedNow),
+    })).rejects.toMatchObject({
+      code: "unsettled_session",
+      name: "CloudProjectionRecoveryAdmissionError",
+    });
     expect(await daemon.recoverCompactProjection(input)).toMatchObject({ phase: "applied" });
+    const receipt = (await journal.read()).state.projectionRecoveryReceipts[0];
+    expect(receipt).toMatchObject({
+      idempotencyKey: input.idempotencyKey,
+      phase: "applied",
+    });
+    expect(cloud.requireLease(sessionPublicId).fence).toBe(2);
+    expect(cloud.epochReceipts.get(input.idempotencyKey)?.requestDigest)
+      .not.toBe(original?.requestDigest);
     expect(local.planCalls).toBe(1);
     expect(cloud.epochBegins).toBe(1);
+  });
+
+  test("settles an expired prepared no-effect recovery before admitting a fresh key", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_recover_expired_prepared_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new CommitThenThrowPreparedAndTerminalRecoveryJournal();
+    let observedNow = fixedNow;
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      journal,
+      local,
+      now: () => observedNow,
+    });
+    const oldInput = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(903),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+
+    await expect(daemon.recoverCompactProjection(oldInput)).rejects.toThrow(
+      "lost prepared journal acknowledgement",
+    );
+    observedNow = fixedNow + (8 * 24 * 60 * 60 * 1_000);
+    cloud.now = observedNow;
+    const freshKey = uuidV7(904, observedNow);
+    await expect(daemon.recoverCompactProjection({
+      ...oldInput,
+      idempotencyKey: freshKey,
+    })).rejects.toMatchObject({
+      code: "unsettled_session",
+      name: "CloudProjectionRecoveryAdmissionError",
+    });
+
+    local.failDiscardOnce = true;
+    await expect(daemon.recoverCompactProjection(oldInput)).rejects.toThrow(
+      "lost recovery discard acknowledgement",
+    );
+    expect((await journal.read()).state.projectionRecoveries[0]?.phase).toBe("prepared");
+    await expect(daemon.recoverCompactProjection(oldInput)).rejects.toThrow(
+      "lost terminal recovery acknowledgement",
+    );
+    expect(local.discardedRecoveryKeys).toContain(oldInput.idempotencyKey);
+    expect(await daemon.recoverCompactProjection(oldInput)).toEqual({
+      idempotencyKey: oldInput.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: "IDEMPOTENCY_AUTHORITY_INVALID_BEFORE_EFFECT",
+      sessionPublicId,
+    });
+    expect(cloud.epochMutationCalls).toBe(0);
+    expect((await journal.read()).state).toMatchObject({
+      projectionRecoveries: [],
+      projectionRecoveryReceipts: [{
+        idempotencyKey: oldInput.idempotencyKey,
+        phase: "rejected",
+        rejectionCode: "IDEMPOTENCY_AUTHORITY_INVALID_BEFORE_EFFECT",
+        sessionPublicId,
+      }],
+    });
+
+    expect(await daemon.recoverCompactProjection({
+      ...oldInput,
+      idempotencyKey: freshKey,
+    })).toMatchObject({ phase: "applied" });
+    expect(local.planCalls).toBe(2);
+    expect(cloud.epochBegins).toBe(1);
+  });
+
+  test("settles expired effect-started no-lineage authority after server validation", async () => {
+    const cloud = new FakeCloud();
+    const sessionPublicId = "session_recover_expired_started_0001";
+    await installRecoverableHead(cloud, sessionPublicId);
+    const local = new RecoveryLocal(sessionPublicId);
+    const journal = new CommitThenThrowEffectStartedRecoveryJournal();
+    let observedNow = fixedNow;
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      journal,
+      local,
+      now: () => observedNow,
+    });
+    const input = {
+      acknowledgeGap: true as const,
+      idempotencyKey: uuidV7(905),
+      sessionPublicId,
+      signal: new AbortController().signal,
+    };
+
+    await expect(daemon.recoverCompactProjection(input)).rejects.toThrow(
+      "lost effect-started journal acknowledgement",
+    );
+    expect(cloud.epochMutationCalls).toBe(0);
+    observedNow = fixedNow + (8 * 24 * 60 * 60 * 1_000);
+    cloud.now = observedNow;
+
+    expect(await daemon.recoverCompactProjection(input)).toEqual({
+      idempotencyKey: input.idempotencyKey,
+      phase: "rejected",
+      rejectionCode: "IDEMPOTENCY_AUTHORITY_INVALID_BEFORE_EFFECT",
+      sessionPublicId,
+    });
+    expect(cloud.epochMutationCalls).toBe(1);
+    expect(local.discardedRecoveryKeys).toContain(input.idempotencyKey);
+    expect((await journal.read()).state.projectionRecoveries).toEqual([]);
   });
 
   test("provider deletion fences recovery between staging and journal admission", async () => {
@@ -2608,9 +2889,10 @@ describe("cloud daemon bridge", () => {
         local,
       });
 
-      await expect(restarted.recoverCompactProjection(input)).rejects.toThrow(
-        "different HRA identity",
-      );
+      await expect(restarted.recoverCompactProjection(input)).rejects.toMatchObject({
+        code: "identity_or_session_conflict",
+        name: "CloudProjectionRecoveryAdmissionError",
+      });
       expect(cloud.epochMutationCalls).toBe(mutationCalls);
       expect((await journal.read()).state.projectionRecoveries[0]?.phase)
         .toBe("effect_started");

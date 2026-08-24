@@ -475,7 +475,7 @@ describe("CLI parser", () => {
     });
   });
 
-  test("generates a UUIDv7 before projection-recovery transport and preserves exact selectors", () => {
+  test("generates a current UUIDv7 and preserves an older canonical projection-recovery key", () => {
     const invocation = parseCli([
       "sync",
       "projection",
@@ -500,6 +500,19 @@ describe("CLI parser", () => {
     );
     expect(invocation.replayCommand).toContain(invocation.command.idempotencyKey);
     expect(invocation.replayCommand).toContain("sess_12345678");
+    const explicit = "018bcfe5-6800-7000-8000-000000000001";
+    expect(parseCli([
+      "sync",
+      "projection",
+      "recover",
+      "sess_12345678",
+      "--acknowledge-gap",
+      "--idempotency-key",
+      explicit,
+    ])).toMatchObject({
+      command: { idempotencyKey: explicit, kind: "sync.projection-recover" },
+      kind: "sync.projection-recover",
+    });
     expect(() => parseCli([
       "sync",
       "projection",
@@ -508,7 +521,7 @@ describe("CLI parser", () => {
       "--acknowledge-gap",
       "--idempotency-key",
       "00000000-0000-4000-8000-000000000001",
-    ])).toThrow("current UUIDv7");
+    ])).toThrow("UUIDv7");
     expect(() => parseCli([
       "sync",
       "projection",
@@ -516,8 +529,8 @@ describe("CLI parser", () => {
       "sess_12345678",
       "--acknowledge-gap",
       "--idempotency-key",
-      "00000000-0000-7000-8000-000000000001",
-    ])).toThrow("current UUIDv7");
+      "not-a-uuid",
+    ])).toThrow("UUIDv7");
   });
 
   test("shell-quotes the acknowledgement command without admitting unknown recovery options", () => {

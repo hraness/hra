@@ -85,8 +85,12 @@ describe("local daemon transport", () => {
       handler: () => {
         throw Object.assign(new Error(`provider unavailable ${secret}`), {
           [commandFailureBrand]: true as const,
-          code: "UNAVAILABLE" as const,
-          details: { nextCommand: "hra doctor" },
+          code: "INTERACTION_REQUIRED" as const,
+          details: {
+            accountSelector: "acct_11111111111111111111111111111111",
+            accountState: "signed_out",
+            nextCommand: "hra account login acct_11111111111111111111111111111111",
+          },
         });
       },
     });
@@ -95,9 +99,13 @@ describe("local daemon transport", () => {
     expect(response).toMatchObject({
       ok: false,
       error: {
-        code: "UNAVAILABLE",
-        details: { nextCommand: "hra doctor" },
-        message: "A required local or provider capability is unavailable.",
+        code: "INTERACTION_REQUIRED",
+        details: {
+          accountSelector: "acct_11111111111111111111111111111111",
+          accountState: "signed_out",
+          nextCommand: "hra account login acct_11111111111111111111111111111111",
+        },
+        message: "The local command requires an explicit interaction.",
       },
     });
     expect(JSON.stringify(response)).not.toContain(secret);

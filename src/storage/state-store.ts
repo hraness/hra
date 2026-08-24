@@ -9,7 +9,6 @@ import {
   realpathSync,
   type Stats,
 } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { Database, constants as sqliteConstants } from "bun:sqlite";
@@ -83,6 +82,7 @@ import {
   type QueueId,
   type SessionId,
 } from "../domain/values";
+import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
 import type { StatePaths } from "./paths";
 import type {
   DesktopSwitchGeneration,
@@ -2946,6 +2946,13 @@ export class StateSecurityScrubRequiredError extends Error {
   }
 }
 
+export class UnusableProjectRootError extends Error {
+  constructor() {
+    super("Project root must be an existing readable, writable, traversable canonical directory without symbolic links.");
+    this.name = "UnusableProjectRootError";
+  }
+}
+
 export class StateStore {
   readonly #database: Database;
   readonly #now: () => number;
@@ -3112,10 +3119,9 @@ export class StateStore {
   }
 
   async createProject(label: string, requestedRoot: string, makeDefault = false): Promise<ProjectRecord> {
-    const requested = resolve(requestedRoot);
-    const [metadata, canonical] = await Promise.all([lstat(requested), realpath(requested)]);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink() || canonical !== requested) {
-      throw new Error("Project root must be an existing canonical directory without symbolic links.");
+    const canonical = await resolveUsableCanonicalProjectDirectory(requestedRoot);
+    if (canonical === null) {
+      throw new UnusableProjectRootError();
     }
     const id = createProjectId();
     const parsedLabel = labelSchema.parse(label);
@@ -3189,6 +3195,47 @@ export class StateStore {
       ? this.#database.query("SELECT * FROM sessions ORDER BY updated_at DESC,id LIMIT ?").all(bounded)
       : this.#database.query("SELECT * FROM sessions WHERE profile_id=? ORDER BY updated_at DESC,id LIMIT ?").all(profileId, bounded);
     return rows.map(mapSession);
+  }
+
+  listLocalSessionPage(input: Readonly<{
+    profileId: ProfileId;
+    after: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+    limit: number;
+  }>): Readonly<{
+    sessions: readonly SessionRecord[];
+    nextPosition: Readonly<{ createdAt: number; sessionId: SessionId }> | null;
+  }> {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const limit = z.number().int().min(1).max(100).parse(input.limit);
+    const after = input.after === null
+      ? null
+      : {
+          createdAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER).parse(input.after.createdAt),
+          sessionId: sessionIdSchema.parse(input.after.sessionId),
+        };
+    const rows = (after === null
+      ? this.#database.query(
+        `SELECT * FROM sessions
+         WHERE profile_id=?
+         ORDER BY created_at DESC,id ASC
+         LIMIT ?`,
+      ).all(profileId, limit + 1)
+      : this.#database.query(
+        `SELECT * FROM sessions
+         WHERE profile_id=?
+           AND (created_at < ? OR (created_at = ? AND id > ?))
+         ORDER BY created_at DESC,id ASC
+         LIMIT ?`,
+      ).all(profileId, after.createdAt, after.createdAt, after.sessionId, limit + 1))
+      .map(mapSession);
+    const sessions = rows.slice(0, limit);
+    const last = sessions.at(-1);
+    return {
+      sessions,
+      nextPosition: rows.length > limit && last !== undefined
+        ? { createdAt: last.createdAt, sessionId: last.id }
+        : null,
+    };
   }
 
   listCloudSessionPage(input: Readonly<{

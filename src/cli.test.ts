@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 
 import {
+  admitExactDaemonStop,
   initialize,
   main,
   protectedTerminalControlLibrariesForPlatform,
@@ -14,7 +15,9 @@ import {
   resolveDaemonCloudStartup,
   resolveSessionEventCursorCodec,
   selectDaemonCloudControl,
+  stopDaemonWithExactAuthority,
   withProtectedTerminalLifecycle,
+  type DaemonStopDependencies,
 } from "./cli";
 import { ShellTerminalCoordinator } from "./cli/shell-terminal";
 import {
@@ -35,8 +38,18 @@ import {
   type ProtectedInteractionDetailDocument,
 } from "./domain/interactions";
 import { renderProtectedInteractionDetail } from "./cli/render";
-import { DAEMON_PROTOCOL, DaemonLock } from "./daemon/daemon-lock";
-import { LocalDaemonIndeterminateError } from "./daemon/local-transport";
+import {
+  DAEMON_PROTOCOL,
+  DaemonAuthoritySafetyError,
+  DaemonLock,
+  daemonAuthorityDatabasePath,
+  readDaemonAuthorityReceipt,
+  type DaemonAuthorityReceipt,
+} from "./daemon/daemon-lock";
+import {
+  LocalDaemonIndeterminateError,
+  LocalDaemonUnavailableError,
+} from "./daemon/local-transport";
 import { createAcceptanceInstallation } from "../scripts/live-acceptance-installation";
 import { initializeStatePaths, resolveStatePaths } from "./storage/paths";
 import { FileSecretBackend, GenerationalSecretCustody } from "./storage/secret-custody";
@@ -133,6 +146,54 @@ const runningDaemonResponse = () => ({
       bootId: `boot_${"a".repeat(32)}`,
     },
   },
+});
+
+const stopDaemonIdentity = runningDaemonResponse().data.daemon;
+
+const daemonAuthorityReceipt = (
+  state: DaemonAuthorityReceipt["state"],
+  identity = stopDaemonIdentity,
+): DaemonAuthorityReceipt => ({
+  version: 2,
+  protocol: DAEMON_PROTOCOL,
+  pid: identity.pid,
+  nonce: identity.nonce,
+  state,
+  acquiredAt: 1,
+  updatedAt: 2,
+  generation: identity.generation,
+  bootId: identity.bootId,
+  ...(state === "failed" ? { failure: "bounded shutdown failure" } : {}),
+});
+
+const acknowledgedDaemonStopResponse = (): CommandResponse => ({
+  ok: true,
+  version: 1,
+  requestId: crypto.randomUUID(),
+  data: {
+    stopping: true,
+    running: true,
+    daemon: stopDaemonIdentity,
+  },
+});
+
+const exactStopDependencies = (
+  overrides: Partial<DaemonStopDependencies> = {},
+): DaemonStopDependencies => ({
+  requestStop: () => Promise.resolve(acknowledgedDaemonStopResponse()),
+  observeReceipt: () => Promise.resolve(daemonAuthorityReceipt("ready")),
+  waitForRelease: () => Promise.resolve({
+    replacement: null,
+    finalReceipt: daemonAuthorityReceipt("stopped"),
+  }),
+  inspectAuthority: () => Promise.resolve({
+    state: "held",
+    database: { authority: "held", custody: "safe" },
+    receipt: { custody: "safe", state: "ready" },
+  }),
+  authorityHeld: () => Promise.resolve(false),
+  sleep: () => Promise.resolve(),
+  ...overrides,
 });
 
 describe("CLI entry point", () => {
@@ -693,6 +754,121 @@ describe("CLI entry point", () => {
       expect(captured.read().stderr).toBe("");
     } finally {
       await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor makes a released failed daemon receipt an explicit restart-safe observation", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-daemon-failed-")));
+    const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    try {
+      await initializeStatePaths(statePaths);
+      const authority = await DaemonLock.acquire(statePaths, { state: "maintenance" });
+      await authority.release({ state: "failed", failure: "bounded test failure" });
+      expect(await stopDaemonWithExactAuthority(statePaths)).toMatchObject({
+        error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "hra doctor --offline" } },
+        kind: "failure",
+      });
+
+      const json = capture();
+      expect(await main(["doctor", "--offline", "--json"], json.output, { statePaths })).toBe(0);
+      expect(JSON.parse(json.read().stdout)).toMatchObject({
+        data: {
+          healthy: true,
+          state: {
+            daemonAuthority: {
+              database: { authority: "released", custody: "safe" },
+              receipt: { custody: "safe", state: "failed" },
+              state: "released",
+            },
+          },
+        },
+        ok: true,
+      });
+
+      const human = capture();
+      expect(await main(["doctor", "--offline"], human.output, { statePaths })).toBe(0);
+      expect(human.read().stdout).toContain(
+        "daemon authority released after a failed daemon; safe to restart after these checks.",
+      );
+      expect(human.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor refuses restart when a live receipt outlives its named authority database", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-daemon-missing-authority-")));
+    const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    try {
+      await initializeStatePaths(statePaths);
+      const authority = await DaemonLock.acquire(statePaths, { state: "maintenance" });
+      await authority.publish({
+        bootId: `boot_${"1".repeat(32)}`,
+        generation: 1,
+        state: "ready",
+      });
+      await authority.release();
+      const receipt = await readDaemonAuthorityReceipt(statePaths);
+      if (receipt === null) throw new Error("Expected a daemon receipt fixture.");
+      await writeFile(statePaths.daemonLock, `${JSON.stringify({ ...receipt, state: "ready" })}\n`);
+      await unlink(daemonAuthorityDatabasePath(statePaths));
+
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        data: {
+          healthy: false,
+          state: {
+            daemonAuthority: {
+              database: { custody: "absent" },
+              receipt: { custody: "safe", state: "ready" },
+              state: "indeterminate",
+            },
+          },
+        },
+        ok: true,
+      });
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor diagnoses every immediate daemon-stop authority recovery without leaking paths", async () => {
+    for (const scenario of ["unsafe_receipt", "unsafe_database", "invalid_database"] as const) {
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-daemon-${scenario}-`)));
+      const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+      try {
+        await initializeStatePaths(statePaths);
+        const authority = await DaemonLock.acquire(statePaths, { state: "maintenance" });
+        await authority.release();
+        if (scenario === "unsafe_receipt") {
+          await chmod(statePaths.daemonLock, 0o640);
+        } else if (scenario === "unsafe_database") {
+          await chmod(daemonAuthorityDatabasePath(statePaths), 0o640);
+        } else {
+          await writeFile(daemonAuthorityDatabasePath(statePaths), "not a sqlite database");
+        }
+
+        expect(await stopDaemonWithExactAuthority(statePaths)).toMatchObject({
+          error: { code: "RECOVERY_REQUIRED", details: { nextCommand: "hra doctor --offline" } },
+          kind: "failure",
+        });
+        const captured = capture();
+        expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths })).toBe(1);
+        const result = JSON.parse(captured.read().stdout) as unknown;
+        expect(result).toMatchObject({
+          data: {
+            healthy: false,
+            state: { daemonAuthority: { state: scenario } },
+          },
+          ok: true,
+        });
+        expect(JSON.stringify(result)).not.toContain(temporary);
+        expect(captured.read().stderr).toBe("");
+      } finally {
+        await rm(temporary, { force: true, recursive: true });
+      }
     }
   });
 
@@ -1578,6 +1754,178 @@ describe("CLI entry point", () => {
       .toBe(`hra device approve device_pending --idempotency-key ${generatedKey} --json`);
   });
 
+  test("keeps rejected projection recovery as an immutable receipt with one status action", async () => {
+    const session = `sess_${"6".repeat(32)}`;
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000700";
+    for (const json of [false, true]) {
+      const captured = capture();
+      expect(await main([
+        "sync",
+        "projection",
+        "recover",
+        session,
+        "--acknowledge-gap",
+        "--idempotency-key",
+        idempotencyKey,
+        ...(json ? ["--json"] : []),
+      ], captured.output, {
+        callDaemon: () => Promise.resolve({
+          data: {
+            idempotencyKey,
+            phase: "rejected",
+            rejectionCode: "REMOTE_HEAD_CHANGED",
+            sessionPublicId: session,
+          },
+          ok: true,
+          requestId: crypto.randomUUID(),
+          version: 1,
+        }),
+      })).toBe(0);
+      const rendered = captured.read();
+      const replayCommand = [
+        "hra sync projection recover",
+        session,
+        "--acknowledge-gap --idempotency-key",
+        idempotencyKey,
+        ...(json ? ["--json"] : []),
+      ].join(" ");
+      if (json) {
+        expect(JSON.parse(rendered.stdout)).toEqual({
+          command: "sync.projection-recover",
+          data: {
+            idempotencyKey,
+            nextCommand: "hra sync status --json",
+            phase: "rejected",
+            rejectionCode: "REMOTE_HEAD_CHANGED",
+            sameKeyReplay: { command: replayCommand, supported: true },
+            session,
+          },
+          ok: true,
+          version: 1,
+        });
+      } else {
+        expect(rendered.stdout).toBe([
+          `Projection recovery rejected for ${session}.`,
+          "Reason: REMOTE_HEAD_CHANGED",
+          "Encrypted cloud history and provider/app state were unchanged.",
+          `Same-key replay: ${replayCommand}`,
+          "Next: hra sync status --json",
+          "",
+        ].join("\n"));
+      }
+      expect(rendered.stderr).toBe("");
+    }
+  });
+
+  test("preserves only the exact projection-status recovery action across human and JSON failures", async () => {
+    const session = `sess_${"7".repeat(32)}`;
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000701";
+    const providerSentinel = "PRIVATE-PROVIDER-PROJECTION-DETAIL";
+    for (const json of [false, true]) {
+      const captured = capture();
+      expect(await main([
+        "sync",
+        "projection",
+        "recover",
+        session,
+        "--acknowledge-gap",
+        "--idempotency-key",
+        idempotencyKey,
+        ...(json ? ["--json"] : []),
+      ], captured.output, {
+        callDaemon: () => Promise.resolve({
+          error: {
+            code: "RECOVERY_REQUIRED",
+            details: {
+              nextCommand: "hra sync status --json",
+              providerDetail: providerSentinel,
+              providerPath: "/private/provider/projection",
+            },
+            message: "Projection recovery requires local status inspection.",
+          },
+          ok: false,
+          requestId: crypto.randomUUID(),
+          version: 1,
+        }),
+      })).toBe(7);
+      const rendered = captured.read();
+      expect(rendered.stdout).not.toContain(providerSentinel);
+      expect(rendered.stderr).not.toContain(providerSentinel);
+      expect(rendered.stdout).not.toContain("/private/provider/projection");
+      expect(rendered.stderr).not.toContain("/private/provider/projection");
+      if (json) {
+        expect(JSON.parse(rendered.stdout)).toEqual({
+          error: {
+            code: "RECOVERY_REQUIRED",
+            details: { nextCommand: "hra sync status --json" },
+            message: "Projection recovery requires local status inspection.",
+          },
+          ok: false,
+          version: 1,
+        });
+        expect(rendered.stderr).toBe("");
+      } else {
+        expect(rendered.stdout).toBe("");
+        expect(rendered.stderr).toBe([
+          "hra: Projection recovery requires local status inspection.",
+          "Next: hra sync status --json",
+          "",
+        ].join("\n"));
+      }
+    }
+  });
+
+  test("drops every unrecognized projection-recovery failure detail", async () => {
+    const session = `sess_${"8".repeat(32)}`;
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000702";
+    const providerSentinel = "PRIVATE-PROVIDER-FAILURE-DETAIL";
+    for (const details of [
+      { nextCommand: "hra sync status --json; touch /tmp/unsafe", providerDetail: providerSentinel },
+      { nextCommand: "hra doctor", providerDetail: providerSentinel },
+      { providerDetail: providerSentinel },
+    ]) {
+      for (const json of [false, true]) {
+        const captured = capture();
+        expect(await main([
+          "sync",
+          "projection",
+          "recover",
+          session,
+          "--acknowledge-gap",
+          "--idempotency-key",
+          idempotencyKey,
+          ...(json ? ["--json"] : []),
+        ], captured.output, {
+          callDaemon: () => Promise.resolve({
+            error: {
+              code: "RECOVERY_REQUIRED",
+              details,
+              message: "Projection recovery requires local status inspection.",
+            },
+            ok: false,
+            requestId: crypto.randomUUID(),
+            version: 1,
+          }),
+        })).toBe(7);
+        const rendered = captured.read();
+        expect(rendered.stdout).not.toContain(providerSentinel);
+        expect(rendered.stderr).not.toContain(providerSentinel);
+        expect(rendered.stdout).not.toContain("touch /tmp/unsafe");
+        expect(rendered.stderr).not.toContain("touch /tmp/unsafe");
+        if (json) {
+          const document = JSON.parse(rendered.stdout) as { error: Record<string, unknown> };
+          expect(document.error).not.toHaveProperty("details");
+          expect(rendered.stderr).toBe("");
+        } else {
+          expect(rendered.stdout).toBe("");
+          expect(rendered.stderr).toBe(
+            "hra: Projection recovery requires local status inspection.\n",
+          );
+        }
+      }
+    }
+  });
+
   test("surfaces same-key replay arguments for every indeterminate local mutation without echoing its payload", async () => {
     const privatePayload = "message-private-sentinel";
     const commands = [
@@ -2443,6 +2791,7 @@ describe("CLI entry point", () => {
       configured: false,
       diagnostic,
       signedIn: false,
+      unavailability: "recovery_required",
     });
     expect(await control.isCompactProjectionRecoveryUnsettled("sess_33333333"))
       .toBe(true);
@@ -2450,6 +2799,122 @@ describe("CLI entry point", () => {
       .toThrow(diagnostic);
     expect(() => control.sync(new AbortController().signal)).toThrow(diagnostic);
     expect(() => control.listDevices(new AbortController().signal)).toThrow(diagnostic);
+  });
+
+  test("marks an explicitly disabled cloud deployment as optional machine state", async () => {
+    const startup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "" },
+      secretCustody: new MemoryCloudCustody(),
+    });
+    expect(startup).toMatchObject({
+      deploymentAuthority: null,
+      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      reenable: { kind: "use_hosted_default" },
+      unavailability: "disabled",
+    });
+    const control = selectDaemonCloudControl(
+      null,
+      startup.projectionRecoveryBlocker,
+      startup.diagnostic,
+      startup.unavailability,
+      () => Promise.resolve({
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000895",
+          phase: "effect_started",
+          sessionPublicId: `sess_${"7".repeat(32)}`,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      }),
+      startup.reenable,
+    );
+    expect(await control.status(new AbortController().signal)).toEqual({
+      configured: false,
+      diagnostic: "Cloud sync is disabled for this daemon. Unset HRA_CONVEX_URL and restart the daemon to use hosted sync.",
+      projectionRecovery: {
+        recoveries: [{
+          cacheActivated: false,
+          idempotencyKey: "018bcfe5-6800-7000-8000-000000000895",
+          phase: "effect_started",
+          sessionPublicId: `sess_${"7".repeat(32)}`,
+        }],
+        recoveriesTruncated: false,
+        totalRecoveries: 1,
+      },
+      reenable: { kind: "use_hosted_default" },
+      signedIn: false,
+      unavailability: "disabled",
+    });
+  });
+
+  test("preserves a self-managed binding when cloud transport is explicitly disabled", async () => {
+    const raw = new MemoryCloudCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(raw, {
+      HRA_CONVEX_URL: "https://self-managed.convex.cloud",
+    });
+    if (authority === null) throw new Error("Expected a deployment authority fixture.");
+
+    const startup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "" },
+      secretCustody: raw,
+    });
+    expect(startup).toMatchObject({
+      deploymentAuthority: null,
+      diagnostic: "Cloud sync is disabled for this daemon. Restore this state root's bound HRA_CONVEX_URL deployment and restart the daemon.",
+      reenable: {
+        deploymentUrl: "https://self-managed.convex.cloud",
+        kind: "restore_bound_deployment",
+      },
+      unavailability: "disabled",
+    });
+  });
+
+  test("overrides disabled mode when deployment or journal custody requires recovery", async () => {
+    const corruptAuthority = new MemoryCloudCustody();
+    expect(await corruptAuthority.compareAndSwap("cloud-deployment-authority", null, "corrupt"))
+      .not.toBeNull();
+    const authorityStartup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "" },
+      secretCustody: corruptAuthority,
+    });
+    expect(authorityStartup).toMatchObject({
+      deploymentAuthority: null,
+      diagnostic: "Cloud sync is unavailable because deployment custody requires recovery.",
+      journal: null,
+      unavailability: "recovery_required",
+    });
+    expect(authorityStartup).not.toHaveProperty("reenable");
+    expect(await authorityStartup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettled(`sess_${"8".repeat(32)}`)).toBe(true);
+
+    const corruptJournal = new MemoryCloudCustody();
+    const authority = await cloudDeploymentAuthorityFromEnvironment(corruptJournal, {
+      HRA_CONVEX_URL: "https://self-managed.convex.cloud",
+    });
+    if (authority === null) throw new Error("Expected a deployment authority fixture.");
+    const deploymentCustody = new DeploymentScopedCloudSecretCustody(corruptJournal, authority);
+    const unselected = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    await unselected.activateIdentity("user_cli_corrupt_journal_12345678");
+    const identityCustody = await IdentityScopedCloudSecretCustody.open(deploymentCustody);
+    expect(await identityCustody.compareAndSwap(
+      "cloud-daemon-journal",
+      null,
+      "corrupt",
+    )).not.toBeNull();
+    const journalStartup = await resolveDaemonCloudStartup({
+      environment: { HRA_CONVEX_URL: "" },
+      secretCustody: corruptJournal,
+    });
+    expect(journalStartup).toMatchObject({
+      deploymentAuthority: null,
+      diagnostic: "Cloud sync is unavailable because local cloud custody requires recovery.",
+      journal: null,
+      unavailability: "recovery_required",
+    });
+    expect(journalStartup).not.toHaveProperty("reenable");
+    expect(await journalStartup.projectionRecoveryBlocker
+      .isCompactProjectionRecoveryUnsettled(`sess_${"9".repeat(32)}`)).toBe(true);
   });
 
   test("remote sessions render stable human and JSON output", () => {
@@ -2630,6 +3095,465 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("stops only after the acknowledged authority is exactly released and gives the request a bounded five-second response window", async () => {
+    const captured = capture();
+    let deadlineMs = 0;
+    let requestedAuthority: unknown;
+    const dependencies = exactStopDependencies({
+      requestStop: (input) => {
+        deadlineMs = input.deadlineMs;
+        requestedAuthority = input.command.expected;
+        return Promise.resolve(acknowledgedDaemonStopResponse());
+      },
+    });
+
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: dependencies,
+    })).toBe(0);
+    expect(deadlineMs).toBe(5_000);
+    expect(requestedAuthority).toEqual(stopDaemonIdentity);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: true,
+      data: {
+        stopping: false,
+        running: false,
+        daemon: stopDaemonIdentity,
+        released: true,
+      },
+    });
+    expect(captured.read().stdout).not.toContain('"reconciled"');
+    expect(captured.read().stderr).toBe("");
+  });
+
+  test("reconciles an indeterminate stop response only against its captured pre-stop authority", async () => {
+    const captured = capture();
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        requestStop: () => Promise.reject(new LocalDaemonIndeterminateError("response lost")),
+      }),
+    })).toBe(0);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: true,
+      data: {
+        stopping: false,
+        running: false,
+        daemon: stopDaemonIdentity,
+        released: true,
+        reconciled: true,
+      },
+    });
+    expect(captured.read().stderr).toBe("");
+  });
+
+  test("treats a malformed successful stop response as indeterminate and reconciles exact authority", async () => {
+    const malformed: CommandResponse = {
+      data: { daemon: { pid: "invalid" }, running: true, stopping: true },
+      ok: true,
+      requestId: crypto.randomUUID(),
+      version: 1,
+    };
+    const released = capture();
+    expect(await main(["daemon", "stop", "--json"], released.output, {
+      daemonStopDependencies: exactStopDependencies({
+        requestStop: () => Promise.resolve(malformed),
+      }),
+    })).toBe(0);
+    expect(JSON.parse(released.read().stdout)).toMatchObject({
+      data: {
+        daemon: stopDaemonIdentity,
+        reconciled: true,
+        released: true,
+        running: false,
+        stopping: false,
+      },
+      ok: true,
+    });
+
+    const held = capture();
+    expect(await main(["daemon", "stop", "--json"], held.output, {
+      daemonStopDependencies: exactStopDependencies({
+        requestStop: () => Promise.resolve(malformed),
+        waitForRelease: () => Promise.resolve({
+          finalReceipt: daemonAuthorityReceipt("ready"),
+          replacement: null,
+        }),
+      }),
+    })).toBe(7);
+    expect(JSON.parse(held.read().stdout)).toMatchObject({
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra daemon status --json" },
+      },
+      ok: false,
+    });
+    expect(held.read().stdout).not.toContain('"released":true');
+  });
+
+  test("reconciles one generic release-observation error through the exact terminal publication window", async () => {
+    const captured = capture();
+    const receipts = [
+      daemonAuthorityReceipt("ready"),
+      daemonAuthorityReceipt("stopped"),
+      daemonAuthorityReceipt("stopped"),
+    ];
+    const sleeps: number[] = [];
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        observeReceipt: () => Promise.resolve(receipts.shift() ?? null),
+        waitForRelease: () => Promise.reject(new Error("transient release observation")),
+        authorityHeld: () => Promise.resolve(false),
+        sleep: (milliseconds) => {
+          sleeps.push(milliseconds);
+          return Promise.resolve();
+        },
+      }),
+    })).toBe(0);
+    expect(sleeps).toEqual([25]);
+    expect(receipts).toHaveLength(0);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: true,
+      data: {
+        running: false,
+        released: true,
+        reconciled: true,
+      },
+    });
+  });
+
+  test("does not reconcile a generic observation error while the exact stopped authority remains held", async () => {
+    const captured = capture();
+    const receipts = [
+      daemonAuthorityReceipt("ready"),
+      daemonAuthorityReceipt("stopped"),
+      daemonAuthorityReceipt("stopped"),
+    ];
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        observeReceipt: () => Promise.resolve(receipts.shift() ?? null),
+        waitForRelease: () => Promise.reject(new Error("transient release observation")),
+        authorityHeld: () => Promise.resolve(true),
+      }),
+    })).toBe(7);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra daemon status --json" },
+      },
+    });
+    expect(captured.read().stdout).not.toContain('"released":true');
+  });
+
+  test("turns daemon-authority safety errors into an actionable closed recovery", async () => {
+    const safety = new DaemonAuthoritySafetyError("unsafe authority fixture");
+    let observations = 0;
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-stop-safety") });
+    await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
+      observeReceipt: () => {
+        observations += 1;
+        return Promise.reject(safety);
+      },
+    }))).resolves.toMatchObject({
+      kind: "failure",
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra doctor --offline" },
+      },
+    });
+    expect(observations).toBe(1);
+  });
+
+  test("turns an invalid daemon-authority database into an actionable closed recovery", async () => {
+    const invalid = new Error("The daemon authority database is invalid and requires manual recovery.");
+    let observations = 0;
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-stop-invalid") });
+    await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
+      observeReceipt: () => {
+        observations += 1;
+        return Promise.reject(invalid);
+      },
+    }))).resolves.toMatchObject({
+      kind: "failure",
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra doctor --offline" },
+      },
+    });
+    expect(observations).toBe(1);
+  });
+
+  test("rejects a replacement before registering any daemon stop callback", () => {
+    let callbacks = 0;
+    const replacement = {
+      ...stopDaemonIdentity,
+      pid: 456,
+      nonce: "018bcfe5-6800-7000-8000-000000000799",
+      generation: 2,
+      bootId: `boot_${"f".repeat(32)}`,
+    };
+    expect(() => admitExactDaemonStop({
+      command: { kind: "daemon.stop", expected: stopDaemonIdentity },
+      receipt: daemonAuthorityReceipt("ready", replacement),
+      afterResponse: () => { callbacks += 1; },
+      requestStop: () => { callbacks += 100; },
+    })).toThrow("No daemon was stopped");
+    expect(callbacks).toBe(0);
+  });
+
+  test("treats a released maintenance receipt with no runtime generation as already stopped", async () => {
+    const maintenanceReceipt: DaemonAuthorityReceipt = {
+      version: 2,
+      protocol: DAEMON_PROTOCOL,
+      pid: 123,
+      nonce: "018bcfe5-6800-7000-8000-000000000798",
+      state: "stopped",
+      acquiredAt: 1,
+      updatedAt: 2,
+    };
+    let requests = 0;
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-maintenance-stop") });
+    await expect(stopDaemonWithExactAuthority(paths, exactStopDependencies({
+      observeReceipt: () => Promise.resolve(maintenanceReceipt),
+      inspectAuthority: () => Promise.resolve({
+        state: "released",
+        database: { authority: "released", custody: "safe" },
+        receipt: { custody: "safe", state: "stopped" },
+      }),
+      authorityHeld: () => Promise.resolve(false),
+      requestStop: () => {
+        requests += 1;
+        return Promise.resolve(acknowledgedDaemonStopResponse());
+      },
+    }))).resolves.toEqual({
+      kind: "success",
+      data: { stopping: false, running: false, released: false },
+    });
+    expect(requests).toBe(0);
+  });
+
+  test("requires database-backed release proof before calling a terminal or malformed receipt stopped", async () => {
+    const paths = resolveStatePaths({ rootDirectory: join(tmpdir(), "hra-unused-terminal-stop-proof") });
+    const absentDatabaseWithStoppedReceipt = exactStopDependencies({
+      observeReceipt: () => Promise.resolve(daemonAuthorityReceipt("stopped")),
+      inspectAuthority: () => Promise.resolve({
+        state: "indeterminate",
+        database: { custody: "absent" },
+        receipt: { custody: "safe", state: "stopped" },
+      }),
+    });
+    await expect(stopDaemonWithExactAuthority(
+      paths,
+      absentDatabaseWithStoppedReceipt,
+    )).resolves.toMatchObject({
+      error: { code: "RECOVERY_REQUIRED" },
+      kind: "failure",
+    });
+
+    const absentDatabaseWithMalformedReceipt = exactStopDependencies({
+      observeReceipt: () => Promise.resolve(null),
+      inspectAuthority: () => Promise.resolve({
+        state: "indeterminate",
+        database: { custody: "absent" },
+        receipt: { custody: "invalid" },
+      }),
+    });
+    await expect(stopDaemonWithExactAuthority(
+      paths,
+      absentDatabaseWithMalformedReceipt,
+    )).resolves.toMatchObject({
+      error: { code: "RECOVERY_REQUIRED" },
+      kind: "failure",
+    });
+
+    let requests = 0;
+    const safeReleasedTerminal = exactStopDependencies({
+      observeReceipt: () => Promise.resolve(daemonAuthorityReceipt("stopped")),
+      inspectAuthority: () => Promise.resolve({
+        state: "released",
+        database: { authority: "released", custody: "safe" },
+        receipt: { custody: "safe", state: "stopped" },
+      }),
+      requestStop: () => {
+        requests += 1;
+        return Promise.resolve(acknowledgedDaemonStopResponse());
+      },
+    });
+    await expect(stopDaemonWithExactAuthority(paths, safeReleasedTerminal)).resolves.toEqual({
+      data: { released: false, running: false, stopping: false },
+      kind: "success",
+    });
+    expect(requests).toBe(0);
+  });
+
+  test("treats safely released stale receipt evidence as already stopped without hiding it from doctor", async () => {
+    for (const receiptKind of ["live", "malformed"] as const) {
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-stop-stale-${receiptKind}-`)));
+      const statePaths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+      try {
+        await initializeStatePaths(statePaths);
+        const authority = await DaemonLock.acquire(statePaths, { state: "maintenance" });
+        await authority.publish({
+          bootId: `boot_${"7".repeat(32)}`,
+          generation: 1,
+          state: "ready",
+        });
+        await authority.release();
+        const terminal = await readDaemonAuthorityReceipt(statePaths);
+        if (terminal === null) throw new Error("Expected a terminal daemon receipt fixture.");
+        await writeFile(
+          statePaths.daemonLock,
+          receiptKind === "live"
+            ? `${JSON.stringify({ ...terminal, failure: undefined, state: "ready" })}\n`
+            : "malformed receipt\n",
+          { encoding: "utf8", mode: 0o600 },
+        );
+
+        const stopped = capture();
+        expect(await main(["daemon", "stop", "--json"], stopped.output, { statePaths })).toBe(0);
+        expect(JSON.parse(stopped.read().stdout)).toMatchObject({
+          data: { released: false, running: false, stopping: false },
+          ok: true,
+        });
+        expect(stopped.read().stdout).not.toContain("reconciled");
+
+        const doctor = capture();
+        expect(await main(["doctor", "--offline", "--json"], doctor.output, { statePaths })).toBe(0);
+        expect(JSON.parse(doctor.read().stdout)).toMatchObject({
+          data: {
+            healthy: true,
+            state: { daemonAuthority: { state: "stale_recoverable" } },
+          },
+          ok: true,
+        });
+      } finally {
+        await rm(temporary, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("fails closed when the stop response acknowledges a replacement of the pre-observed live authority", async () => {
+    const captured = capture();
+    let releaseWaits = 0;
+    const replacement = {
+      ...stopDaemonIdentity,
+      pid: 456,
+      nonce: "018bcfe5-6800-7000-8000-000000000701",
+      generation: 2,
+      bootId: `boot_${"b".repeat(32)}`,
+    };
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        requestStop: () => Promise.resolve({
+          ...acknowledgedDaemonStopResponse(),
+          data: { stopping: true, running: true, daemon: replacement },
+        }),
+        waitForRelease: () => {
+          releaseWaits += 1;
+          return Promise.resolve({ replacement: null, finalReceipt: daemonAuthorityReceipt("stopped") });
+        },
+      }),
+    })).toBe(7);
+    expect(releaseWaits).toBe(0);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: { code: "RECOVERY_REQUIRED" },
+    });
+    expect(captured.read().stdout).not.toContain('"released":true');
+  });
+
+  test("fails closed when a replacement authority appears during release observation", async () => {
+    const captured = capture();
+    const replacement = {
+      ...stopDaemonIdentity,
+      pid: 456,
+      nonce: "018bcfe5-6800-7000-8000-000000000702",
+      generation: 2,
+      bootId: `boot_${"c".repeat(32)}`,
+    };
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        waitForRelease: () => Promise.resolve({
+          replacement,
+          finalReceipt: daemonAuthorityReceipt("ready", replacement),
+        }),
+      }),
+    })).toBe(7);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: { code: "RECOVERY_REQUIRED" },
+    });
+    expect(captured.read().stdout).not.toContain('"released":true');
+  });
+
+  test("fails closed when the exact daemon releases a failed receipt", async () => {
+    const captured = capture();
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        waitForRelease: () => Promise.resolve({
+          replacement: null,
+          finalReceipt: daemonAuthorityReceipt("failed"),
+        }),
+      }),
+    })).toBe(7);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra doctor --offline" },
+      },
+    });
+    expect(captured.read().stdout).not.toContain("bounded shutdown failure");
+    expect(captured.read().stdout).not.toContain('"released":true');
+  });
+
+  test("reports a failed terminal publication only after its exact authority is released", async () => {
+    const captured = capture();
+    const receipts = [
+      daemonAuthorityReceipt("ready"),
+      daemonAuthorityReceipt("failed"),
+      daemonAuthorityReceipt("failed"),
+    ];
+    const sleeps: number[] = [];
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        observeReceipt: () => Promise.resolve(receipts.shift() ?? null),
+        waitForRelease: () => Promise.reject(new Error("transient failed-release observation")),
+        authorityHeld: () => Promise.resolve(false),
+        sleep: (milliseconds) => {
+          sleeps.push(milliseconds);
+          return Promise.resolve();
+        },
+      }),
+    })).toBe(7);
+    expect(sleeps).toEqual([25]);
+    expect(receipts).toHaveLength(0);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: false,
+      error: {
+        code: "RECOVERY_REQUIRED",
+        details: { nextCommand: "hra doctor --offline" },
+      },
+    });
+  });
+
+  test("accepts pre-dispatch unavailability only after the captured authority is exactly released", async () => {
+    const captured = capture();
+    expect(await main(["daemon", "stop", "--json"], captured.output, {
+      daemonStopDependencies: exactStopDependencies({
+        requestStop: () => Promise.reject(new LocalDaemonUnavailableError("endpoint disappeared")),
+      }),
+    })).toBe(0);
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: true,
+      data: {
+        daemon: stopDaemonIdentity,
+        running: false,
+        released: true,
+        reconciled: true,
+      },
+    });
+  });
+
   test("init without explicit acceptance reports the next command without creating state", async () => {
     const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-confirm-")));
     const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
@@ -2651,6 +3575,265 @@ describe("CLI entry point", () => {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("init creates a missing default Documents directory before committing local state", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-empty-home-")));
+    const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    const documents = join(temporary, "Documents");
+    try {
+      const captured = capture();
+      expect(await initialize(true, true, captured.output, { paths, documentsDirectory: documents })).toBe(0);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          defaultProjectCreated: true,
+          initialized: true,
+        },
+      });
+      const documentsMetadata = await lstat(documents);
+      expect(documentsMetadata.isDirectory()).toBe(true);
+      expect(documentsMetadata.isSymbolicLink()).toBe(false);
+      const store = new StateStore(paths, { readonly: true });
+      try {
+        expect(store.listProjects()).toHaveLength(1);
+        expect(store.listProjects()[0]?.rootPath).toBe(documents);
+      } finally {
+        store.close();
+      }
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("init escapes terminal-format scalars in its JSON state-root value", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-json-control-")));
+    const paths = resolveStatePaths({ rootDirectory: join(temporary, "state-\u202e-private") });
+    const documents = join(temporary, "Documents");
+    try {
+      const captured = capture();
+      expect(await initialize(true, true, captured.output, { paths, documentsDirectory: documents })).toBe(0);
+      expect(captured.read().stdout).toContain("\\u202e");
+      expect(captured.read().stdout).not.toContain("\u202e");
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        data: { stateRoot: paths.root },
+        ok: true,
+      });
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("project add rejects missing or unusable paths locally with actionable output", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-project-add-path-")));
+    const missing = join(temporary, "missing-private-project");
+    const regularFile = join(temporary, "not-a-directory-private-project");
+    await writeFile(regularFile, "not a project directory", { mode: 0o600 });
+    let daemonCalls = 0;
+    const callDaemon = (): Promise<never> => {
+      daemonCalls += 1;
+      return Promise.reject(new Error("Project validation must not call the daemon."));
+    };
+    try {
+      const json = capture();
+      expect(await main([
+        "project",
+        "add",
+        missing,
+        "--name",
+        "Missing",
+        "--json",
+      ], json.output, { callDaemon })).toBe(2);
+      expect(JSON.parse(json.read().stdout)).toMatchObject({
+        error: {
+          code: "INVALID_INPUT",
+          message: "The project directory does not exist or is not readable, writable, traversable, and canonical. Restore access or choose another directory, then retry.",
+        },
+        ok: false,
+      });
+      expect(json.read().stderr).toBe("");
+
+      const human = capture();
+      expect(await main([
+        "project",
+        "add",
+        regularFile,
+        "--name",
+        "Invalid",
+      ], human.output, { callDaemon })).toBe(2);
+      expect(human.read().stdout).toBe("");
+      expect(human.read().stderr).toContain("Restore access or choose another directory, then retry.");
+      expect(daemonCalls).toBe(0);
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("init rejects an unsafe default Documents path before creating the database", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-unsafe-documents-")));
+    const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    const documents = join(temporary, "Documents");
+    await writeFile(documents, "not a directory", { encoding: "utf8", mode: 0o600 });
+    try {
+      const captured = capture();
+      expect(await initialize(true, true, captured.output, { paths, documentsDirectory: documents })).toBe(5);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: false,
+        error: {
+          code: "UNAVAILABLE",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+        },
+      });
+      await expect(lstat(paths.database)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("init rejects a non-traversable default directory before creating the database", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-nontraversable-")));
+    const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    const documents = join(temporary, "Documents");
+    await mkdir(documents, { mode: 0o600 });
+    try {
+      const captured = capture();
+      expect(await initialize(true, true, captured.output, { paths, documentsDirectory: documents })).toBe(5);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: false,
+        error: {
+          code: "UNAVAILABLE",
+          message: "The default Documents project is not a readable, writable, and traversable canonical directory. Repair it, then run `hra init --yes` again.",
+        },
+      });
+      await expect(lstat(paths.database)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await chmod(documents, 0o700);
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("repeated init leaves unrelated default paths untouched after initialization", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-init-idempotent-")));
+    const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    const documents = join(temporary, "Documents");
+    const absent = join(temporary, "Absent Documents");
+    const unsafe = join(temporary, "Unsafe Documents");
+    try {
+      expect(await initialize(true, true, capture().output, { paths, documentsDirectory: documents })).toBe(0);
+
+      const absentCapture = capture();
+      expect(await initialize(true, true, absentCapture.output, { paths, documentsDirectory: absent })).toBe(0);
+      expect(JSON.parse(absentCapture.read().stdout)).toMatchObject({
+        ok: true,
+        data: { defaultProjectCreated: false, initialized: true },
+      });
+      await expect(lstat(absent)).rejects.toMatchObject({ code: "ENOENT" });
+
+      await writeFile(unsafe, "not a directory", { encoding: "utf8", mode: 0o600 });
+      const unsafeCapture = capture();
+      expect(await initialize(true, true, unsafeCapture.output, { paths, documentsDirectory: unsafe })).toBe(0);
+      expect(JSON.parse(unsafeCapture.read().stdout)).toMatchObject({
+        ok: true,
+        data: { defaultProjectCreated: false, initialized: true },
+      });
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor reports a projectless database as incomplete initialization", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-doctor-projectless-")));
+    const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+    try {
+      await initializeStatePaths(paths);
+      const store = new StateStore(paths);
+      store.close();
+      const captured = capture();
+      expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        data: {
+          healthy: false,
+          problems: ["No project directory is configured. Run `hra init --yes` or add a project."],
+          state: {
+            database: "ready",
+            initialized: false,
+            projectCount: 0,
+          },
+        },
+      });
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("offline doctor separates unusable project roots from a healthy database", async () => {
+    const problem = "A configured project directory is missing or unsafe. Run `hra project list`, then restore or repair every listed directory so it is readable, writable, traversable, and canonical.";
+    for (const scenario of ["missing", "symlink", "non_traversable"] as const) {
+      const temporary = await realpath(await mkdtemp(join(tmpdir(), `hra-doctor-project-${scenario}-`)));
+      const paths = resolveStatePaths({ homeDirectory: temporary, platform: process.platform });
+      const documents = join(temporary, "Documents");
+      try {
+        expect(await initialize(true, true, capture().output, { paths, documentsDirectory: documents })).toBe(0);
+        if (scenario === "missing") {
+          await rename(documents, join(temporary, "Documents moved"));
+        } else if (scenario === "symlink") {
+          const target = join(temporary, "Documents target");
+          await rename(documents, target);
+          await symlink(target, documents);
+        } else {
+          await chmod(documents, 0o600);
+        }
+
+        const captured = capture();
+        expect(await main(["doctor", "--offline", "--json"], captured.output, { statePaths: paths })).toBe(1);
+        expect(JSON.parse(captured.read().stdout)).toMatchObject({
+          ok: true,
+          data: {
+            healthy: false,
+            problems: [problem],
+            state: {
+              database: "ready",
+              initialized: true,
+              projectCount: 1,
+            },
+          },
+        });
+      } finally {
+        if (scenario === "non_traversable") await chmod(documents, 0o700).catch(() => undefined);
+        await rm(temporary, { force: true, recursive: true });
+      }
+    }
+  });
+
+  test("online doctor preserves one success envelope while its exit code follows validated health", async () => {
+    for (const entry of [
+      { data: { healthy: true, problems: [] }, exitCode: 0 },
+      { data: { healthy: false, problems: ["Cloud projection recovery is unsettled."] }, exitCode: 1 },
+      { data: { healthy: "yes", problems: [] }, exitCode: 1 },
+      { data: { healthy: true, problems: ["Cloud status is inconsistent."] }, exitCode: 1 },
+      { data: { healthy: true, problems: "none" }, exitCode: 1 },
+      { data: { healthy: true, problems: [1] }, exitCode: 1 },
+    ] as const) {
+      const captured = capture();
+      expect(await main(["doctor", "--json"], captured.output, {
+        callDaemon: (command) => {
+          expect(command).toEqual({ kind: "doctor", offline: false });
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: entry.data,
+          });
+        },
+      })).toBe(entry.exitCode);
+      expect(JSON.parse(captured.read().stdout)).toMatchObject({
+        ok: true,
+        command: "doctor",
+        data: entry.data,
+      });
+      expect(captured.read().stderr).toBe("");
     }
   });
 

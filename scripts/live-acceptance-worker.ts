@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import { isatty } from "node:tty";
 
 import { callLocalDaemon } from "../src/daemon/local-transport";
-import { waitForDaemonReady } from "../src/daemon/daemon-startup";
+import { waitForDaemonReady, type DaemonIdentity } from "../src/daemon/daemon-startup";
 import { main as cliMain, runDaemon } from "../src/cli";
 import type { Output } from "../src/cli/render";
 import type { CommandResponse } from "../src/domain/contracts";
@@ -196,6 +196,7 @@ type GenerationStopReason = "parent_closed" | "restart" | "stop" | "suspend";
 
 type DaemonGeneration = {
   expectedStop: GenerationStopReason | null;
+  identity?: DaemonIdentity;
   promise: Promise<number>;
 };
 
@@ -235,7 +236,7 @@ class DaemonSupervisor {
       () => this.#fail(new WorkerFailure("daemon_failed")),
     );
     try {
-      await Promise.race([
+      generation.identity = await Promise.race([
         waitForDaemonReady({
           deadlineMs: 30_000,
           paths: this.#installation.paths,
@@ -342,8 +343,9 @@ class DaemonSupervisor {
     }
     generation.expectedStop = reason;
     if (throughDaemonCommand) {
+      if (generation.identity === undefined) throw new WorkerFailure("daemon_failed");
       const response = await callLocalDaemon({
-        command: { kind: "daemon.stop" },
+        command: { kind: "daemon.stop", expected: generation.identity },
         deadlineMs: 5_000,
         paths: this.#installation.paths,
         signal,

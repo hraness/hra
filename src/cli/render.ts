@@ -1,4 +1,7 @@
-import type { LocalCommand } from "../domain/contracts";
+import {
+  signedOutSessionListMetadataSchema,
+  type LocalCommand,
+} from "../domain/contracts";
 import {
   type ProtectedInteractionDetailDocument,
   publicInteractionSchema,
@@ -610,9 +613,23 @@ const renderSessionList = (
   const sessions = Array.isArray(root?.sessions)
     ? root.sessions.filter((value): value is Record<string, unknown> => object(value) !== null)
     : [];
-  const listing = table(sessions, ["title", "state", "preset", "fastEnabled", "id"]);
-  const nextCursor = opaqueCursor(root?.nextCursor);
   const accountId = profileIdSchema.safeParse(root?.accountId);
+  const metadata = signedOutSessionListMetadataSchema.safeParse(root?.listing);
+  const localHeader = metadata.success
+    && accountId.success
+    && metadata.data.accountSelector === accountId.data
+    ? [
+        `Scope: local-only cache for ${accountId.data}`,
+        "Freshness: stale; provider not contacted",
+        `Completeness: ${metadata.data.localCompleteness === "complete" ? "complete local cache" : "partial local cache; more pages available"}; provider completeness unknown`,
+        `Sign in to refresh: ${metadata.data.nextCommand}`,
+      ]
+    : [];
+  const tableListing = table(sessions, ["title", "state", "preset", "fastEnabled", "id"]);
+  const listing = localHeader.length === 0
+    ? tableListing
+    : `${localHeader.join("\n")}\n\n${tableListing}`;
+  const nextCursor = opaqueCursor(root?.nextCursor);
   if (nextCursor === undefined || !accountId.success) return listing;
   return `${listing}\n\nContinue: hra session list --account ${accountId.data} --limit ${String(command.limit)} --cursor ${nextCursor}`;
 };
@@ -971,6 +988,363 @@ const renderAccountUsage = (data: unknown): string => {
   return [usage, "", "Refresh outcomes", ...outcomes.map((outcome) => `  ${outcome}`)].join("\n");
 };
 
+const humanState = (value: unknown): string => {
+  if (typeof value !== "string" || value.length === 0) return "unknown";
+  return terminalSafe(value).replaceAll("_", " ");
+};
+
+const renderAccountHeader = (account: Record<string, unknown>): string[] => {
+  const rows = [
+    `Account: ${humanState(account.state)}`,
+    `Label: ${line(account.label)}`,
+    `ID: ${line(account.id)}`,
+  ];
+  if (typeof account.providerEmail === "string") rows.push(`Email: ${line(account.providerEmail)}`);
+  if (typeof account.providerPlan === "string") rows.push(`Plan: ${line(account.providerPlan)}`);
+  if (typeof account.processGeneration === "number") {
+    rows.push(`Provider generation: ${line(account.processGeneration)}`);
+  }
+  if (typeof account.updatedAt === "number") rows.push(`Updated: ${instant(account.updatedAt)}`);
+  return rows;
+};
+
+const exactAccountCommand = (
+  account: Record<string, unknown>,
+  action: "login" | "login-cancel",
+): string | null => {
+  const parsed = profileIdSchema.safeParse(account.id);
+  return parsed.success ? `hra account ${action} ${parsed.data}` : null;
+};
+
+const renderAccountAdd = (data: unknown): string => {
+  const root = object(data);
+  const account = object(root?.account);
+  if (account === null) return "Account data is unavailable.";
+  const rows = renderAccountHeader(account);
+  const next = exactAccountCommand(account, "login");
+  if (next !== null && root?.next === next) rows.push(`Next: ${next}`);
+  return rows.join("\n");
+};
+
+const renderAccountShow = (data: unknown): string => {
+  const root = object(data);
+  const account = object(root?.account);
+  if (account === null) return "Account data is unavailable.";
+  const rows = renderAccountHeader(account);
+  const provider = object(root?.providerProjection);
+  if (typeof provider?.signedIn === "boolean") {
+    rows.push(`Provider: ${provider.signedIn ? "signed in" : "signed out"}`);
+  }
+  const recovery = object(root?.recovery);
+  if (recovery?.required === true) {
+    rows.push("Recovery: required");
+    if (typeof recovery.diagnostic === "string") {
+      rows.push(`  ${safeDiagnostic(recovery.diagnostic)}`);
+    }
+  } else if (recovery?.cleared === true) {
+    rows.push(`Recovery: cleared${typeof recovery.resolution === "string" ? ` (${humanState(recovery.resolution)})` : ""}`);
+  }
+  const login = object(root?.login);
+  if (login?.status === "pending") {
+    rows.push("Login: pending");
+    if (login.recoveryRequired === true) {
+      rows.push("Login recovery: required");
+      if (typeof login.diagnostic === "string") rows.push(`  ${safeDiagnostic(login.diagnostic)}`);
+    } else {
+      const cancel = exactAccountCommand(account, "login-cancel");
+      if (cancel !== null && login.next === cancel) rows.push(`Next: ${cancel}`);
+    }
+  } else if (account.state === "signed_out" && recovery?.required !== true) {
+    const next = exactAccountCommand(account, "login");
+    if (next !== null) rows.push(`Next: ${next}`);
+  }
+  return rows.join("\n");
+};
+
+const renderLastSync = (value: unknown): string => {
+  if (value === null) return "Last sync: never";
+  const lastSync = object(value);
+  if (lastSync === null) return "Last sync: unavailable";
+  const counts = [
+    typeof lastSync.accountCount === "number" ? `${line(lastSync.accountCount)} accounts` : null,
+    typeof lastSync.sessionCount === "number" ? `${line(lastSync.sessionCount)} sessions` : null,
+    typeof lastSync.usageSnapshotCount === "number"
+      ? `${line(lastSync.usageSnapshotCount)} usage snapshots`
+      : null,
+  ].filter((entry): entry is string => entry !== null);
+  return `Last sync: ${instant(lastSync.at)}${counts.length === 0 ? "" : ` (${counts.join(", ")})`}`;
+};
+
+const exactDevicePublicId = (value: unknown): string | null =>
+  typeof value === "string" && /^device_[A-Za-z0-9_-]{24}$/u.test(value)
+    ? value
+    : null;
+
+const renderCloudDevice = (root: Record<string, unknown>): string[] => {
+  if (root.automaticRegistrationPending === true) return ["Device: registration pending"];
+  const device = object(root.device);
+  if (device === null) return root.device === null ? ["Device: none"] : [];
+  const deviceId = exactDevicePublicId(device.publicId) ?? undefined;
+  return [
+    `Device: ${typeof device.status === "string" ? humanState(device.status) : "known locally"}${deviceId === undefined ? "" : ` (${line(deviceId)})`}`,
+  ];
+};
+
+const renderCloudNextAction = (root: Record<string, unknown>): string | null => {
+  if (root.configured !== true) {
+    return typeof root.diagnostic === "string" && root.unavailability !== "disabled"
+      ? "hra doctor"
+      : null;
+  }
+  if (object(root.deletion) !== null) return null;
+  if (root.signedIn !== true) return "hra auth login --input-stdin";
+  if (root.automaticRegistrationPending === true) return "hra device pair";
+  const device = object(root.device);
+  if (device?.status === "pending") {
+    const deviceId = exactDevicePublicId(device.publicId);
+    return deviceId === null
+      ? "hra device list"
+      : `on an active device, run hra device approve ${deviceId}`;
+  }
+  if (device?.status === "revoked" || root.pairingRequired === true) return "hra device pair";
+  return null;
+};
+
+const renderDeletion = (deletion: Record<string, unknown>): string[] => {
+  const rows = [`Hosted deletion: ${humanState(deletion.state)}`];
+  if (typeof deletion.category === "string") rows.push(`Deletion stage: ${humanState(deletion.category)}`);
+  if (typeof deletion.updatedAt === "number") rows.push(`Deletion updated: ${instant(deletion.updatedAt)}`);
+  if (deletion.statusFresh === false) rows.push("Deletion status: last known state; refresh unavailable");
+  return rows;
+};
+
+const renderAuthStatus = (data: unknown): string => {
+  const root = object(data);
+  if (root === null) return "Cloud account data is unavailable.";
+  const deletion = object(root.deletion);
+  const state = root.configured !== true
+    ? "unavailable"
+    : deletion !== null
+      ? `deletion ${humanState(deletion.state)}`
+      : root.signedIn === true
+        ? "signed in"
+        : "signed out";
+  const rows = [`Cloud account: ${state}`];
+  if (typeof root.email === "string") rows.push(`Email: ${line(root.email)}`);
+  rows.push(...renderCloudDevice(root));
+  if (root.signedIn === true && root.pairingRequired === true) rows.push("Account key: pairing required");
+  if (deletion !== null) rows.push(...renderDeletion(deletion));
+  if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
+  if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
+  const next = renderCloudNextAction(root);
+  if (next !== null) rows.push(`Next: ${next}`);
+  return rows.join("\n");
+};
+
+const renderProjectionStatus = (root: Record<string, unknown>): string[] => {
+  const cache = object(root.projectionCache);
+  const rows: string[] = [];
+  if (cache !== null) {
+    rows.push(`Projection cache: ${humanState(cache.state)}${typeof cache.code === "string" ? ` (${line(cache.code)})` : ""}`);
+    if (typeof cache.sessions === "number") rows.push(`Projection sessions needing recovery: ${line(cache.sessions)}`);
+    const affectedSessions = Array.isArray(cache.affectedSessions)
+      ? cache.affectedSessions
+        .map((value) => sessionIdSchema.safeParse(value))
+        .filter((result): result is { success: true; data: string } => result.success)
+        .map((result) => result.data)
+        .slice(0, 20)
+      : [];
+    for (const sessionId of affectedSessions) rows.push(`  Recover: ${sessionId}`);
+    if (cache.affectedSessionsTruncated === true) {
+      rows.push("  Additional recovery sessions are omitted from this bounded view.");
+    }
+    if (typeof cache.diagnostic === "string") rows.push(`Projection detail: ${safeDiagnostic(cache.diagnostic)}`);
+  }
+  const recovery = object(root.projectionRecovery);
+  const recoveries = Array.isArray(recovery?.recoveries)
+    ? recovery.recoveries.map(object).filter((entry): entry is Record<string, unknown> => entry !== null)
+    : [];
+  if (recoveries.length > 0) {
+    const phases = new Map<string, number>();
+    for (const entry of recoveries) {
+      const phase = humanState(entry.phase);
+      phases.set(phase, (phases.get(phase) ?? 0) + 1);
+    }
+    const totalRecoveries = typeof recovery?.totalRecoveries === "number"
+      && Number.isSafeInteger(recovery.totalRecoveries)
+      && recovery.totalRecoveries >= recoveries.length
+      ? recovery.totalRecoveries
+      : recoveries.length;
+    const count = recovery?.recoveriesTruncated === true && totalRecoveries > recoveries.length
+      ? `${String(recoveries.length)} of ${String(totalRecoveries)} shown`
+      : String(recoveries.length);
+    rows.push(`Projection recoveries: ${count} (${[...phases].map(([phase, phaseCount]) => `${phase} ${String(phaseCount)}`).join(", ")})`);
+  }
+  return rows;
+};
+
+const projectionRecoveryIsUnsettled = (root: Record<string, unknown>): boolean => {
+  const recovery = object(root.projectionRecovery);
+  if (!Array.isArray(recovery?.recoveries)) return false;
+  return recovery.recoveries.some((value) => {
+    const entry = object(value);
+    return entry?.phase === "prepared"
+      || entry?.phase === "effect_started"
+      || (entry?.phase === "applied" && entry.cacheActivated !== true);
+  });
+};
+
+const firstProjectionRecoverySession = (root: Record<string, unknown>): string | null => {
+  const cache = object(root.projectionCache);
+  if (!Array.isArray(cache?.affectedSessions)) return null;
+  for (const value of cache.affectedSessions.slice(0, 20)) {
+    const parsed = sessionIdSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+  }
+  return null;
+};
+
+const canonicalUuidV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+const unsettledProjectionRecoveryCommand = (root: Record<string, unknown>): string | null => {
+  const recovery = object(root.projectionRecovery);
+  if (!Array.isArray(recovery?.recoveries)) return null;
+  for (const value of recovery.recoveries.slice(0, 128)) {
+    const entry = object(value);
+    if (entry === null) continue;
+    const unsettled = entry.phase === "prepared"
+      || entry.phase === "effect_started"
+      || (entry.phase === "applied" && entry.cacheActivated !== true);
+    if (!unsettled) continue;
+    const session = sessionIdSchema.safeParse(entry.sessionPublicId);
+    if (!session.success || typeof entry.idempotencyKey !== "string" || !canonicalUuidV7.test(entry.idempotencyKey)) {
+      continue;
+    }
+    return `hra sync projection recover ${session.data} --acknowledge-gap --idempotency-key ${entry.idempotencyKey}`;
+  }
+  return null;
+};
+
+const disabledCloudRestartAction = (root: Record<string, unknown>): string | null => {
+  if (root.unavailability !== "disabled") return null;
+  const reenable = object(root.reenable);
+  if (reenable?.kind === "use_hosted_default") {
+    return "unset HRA_CONVEX_URL and restart the daemon";
+  }
+  if (
+    reenable?.kind === "restore_bound_deployment"
+    && typeof reenable.deploymentUrl === "string"
+  ) {
+    try {
+      const url = new URL(reenable.deploymentUrl);
+      const localHttp = url.protocol === "http:"
+        && (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "[::1]");
+      if (
+        (url.protocol === "https:" || localHttp)
+        && url.username === ""
+        && url.password === ""
+        && url.pathname === "/"
+        && url.search === ""
+        && url.hash === ""
+        && url.origin === reenable.deploymentUrl
+      ) return `set HRA_CONVEX_URL to ${safeDiagnostic(reenable.deploymentUrl)} and restart the daemon`;
+    } catch {
+      // Keep the static recovery instruction for malformed daemon output.
+    }
+  }
+  return "restore this state root's bound cloud deployment selection and restart the daemon";
+};
+
+const renderDoctor = (data: unknown): string => {
+  const root = object(data);
+  if (root === null) return "HRA checks returned an invalid local result.";
+  const problemsShapeValid = Array.isArray(root.problems)
+    && root.problems.every((value) => typeof value === "string");
+  const problems = problemsShapeValid
+    ? (root.problems as string[]).slice(0, 64)
+    : [];
+  if (!problemsShapeValid || typeof root.healthy !== "boolean") {
+    return "HRA checks returned an invalid local result.";
+  }
+  const cloud = object(root.cloud);
+  const cloudRestart = cloud === null ? null : disabledCloudRestartAction(cloud);
+  const disabledCloudBlock = cloudRestart === null
+    ? null
+    : `Cloud sync: disabled (optional)\nNext: ${cloudRestart}`;
+  if (root.healthy && problems.length === 0) {
+    return disabledCloudBlock === null
+      ? "HRA checks passed."
+      : `HRA checks passed.\n${disabledCloudBlock}`;
+  }
+  const summary = problems.length === 0
+    ? "HRA checks did not pass, but no safe diagnostic was available."
+    : `HRA checks found ${String(problems.length)} problem${problems.length === 1 ? "" : "s"}:\n${problems.map((problem) => `- ${line(problem)}`).join("\n")}`;
+  return disabledCloudBlock === null
+    ? summary
+    : `${summary}\n\n${disabledCloudBlock}`;
+};
+
+const renderSyncStatus = (data: unknown): string => {
+  const root = object(data);
+  if (root === null) return "Cloud sync data is unavailable.";
+  const deletion = object(root.deletion);
+  const device = object(root.device);
+  const projectionCache = object(root.projectionCache);
+  const projectionRecoveryUnsettled = projectionRecoveryIsUnsettled(root);
+  const projectionRecoverySession = firstProjectionRecoverySession(root);
+  const projectionRecoveryCommand = unsettledProjectionRecoveryCommand(root);
+  const state = root.configured !== true
+    ? projectionRecoveryUnsettled
+      ? "unavailable (projection recovery pending)"
+      : "unavailable"
+    : deletion !== null
+      ? `blocked by account deletion (${humanState(deletion.state)})`
+      : root.signedIn !== true
+        ? "unavailable (signed out)"
+        : root.automaticRegistrationPending === true
+          ? "waiting for device registration"
+          : device?.status === "pending"
+            ? "waiting for device approval"
+            : device?.status === "revoked"
+              ? "unavailable (device revoked)"
+              : root.pairingRequired === true
+                ? "pairing required"
+                : projectionCache?.state === "unavailable"
+                  ? "unavailable (projection cache)"
+                  : projectionCache?.state === "degraded"
+                    ? "degraded (projection cache)"
+                    : projectionRecoveryUnsettled
+                      ? "recovery required (projection)"
+                      : "ready";
+  const rows = [`Cloud sync: ${state}`, ...renderCloudDevice(root)];
+  if (deletion !== null) rows.push(...renderDeletion(deletion));
+  if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
+  rows.push(...renderProjectionStatus(root));
+  if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
+  const projectionNext = projectionRecoveryUnsettled
+    ? projectionRecoveryCommand ?? "hra doctor"
+    : projectionCache?.state === "unavailable"
+      ? "hra doctor"
+      : projectionCache?.state === "degraded" && projectionRecoverySession !== null
+        ? `hra sync projection recover ${projectionRecoverySession} --acknowledge-gap`
+        : projectionCache?.state === "degraded"
+          ? "hra sync status --json"
+          : null;
+  const disabledRestart = disabledCloudRestartAction(root);
+  if (disabledRestart !== null && projectionNext !== null) {
+    rows.push(`Recovery prerequisite: ${disabledRestart}.`);
+    rows.push(`Next after restart: ${projectionNext}`);
+  } else if (disabledRestart !== null) {
+    rows.push(`Next: ${disabledRestart}`);
+  } else {
+    const next = renderCloudNextAction(root)
+      ?? projectionNext
+      ?? (state === "ready" && root.lastSync === null ? "hra sync now" : null);
+    if (next !== null) rows.push(`Next: ${next}`);
+  }
+  return rows.join("\n");
+};
+
 export function renderSuccess(command: LocalCommand, data: unknown, json: boolean, output: Output): void {
   if (json) {
     output.writeStdout(`${safeJson({
@@ -983,7 +1357,9 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   }
   const publicData = command.kind === "account.login" ? publicAccountLoginData(data) : data;
   const value = publicData as Record<string, unknown>;
-  if (command.kind === "account.login") {
+  if (command.kind === "doctor") {
+    output.writeStdout(`${renderDoctor(data)}\n`);
+  } else if (command.kind === "account.login") {
     const login = object(value.login);
     const handoff = object(login?.handoff);
     if (login?.status === "signed_in") {
@@ -1001,6 +1377,10 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     }
   } else if (command.kind === "account.list" && Array.isArray(value.accounts)) {
     output.writeStdout(`${table(value.accounts as Record<string, unknown>[], ["label", "state", "providerPlan", "id"])}\n`);
+  } else if (command.kind === "account.add") {
+    output.writeStdout(`${renderAccountAdd(data)}\n`);
+  } else if (command.kind === "account.show") {
+    output.writeStdout(`${renderAccountShow(data)}\n`);
   } else if (command.kind === "project.list" && Array.isArray(value.projects)) {
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
   } else if (command.kind === "session.list" && Array.isArray(value.sessions)) {
@@ -1030,6 +1410,8 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {
     output.writeStdout(value.running === true ? `HRA daemon is running (pid ${line(value.pid)}).\n` : "HRA daemon is stopped.\n");
+  } else if (command.kind === "daemon.stop") {
+    output.writeStdout(value.released === true ? "HRA daemon stopped.\n" : "HRA daemon is already stopped.\n");
   } else if (command.kind === "account.login-cancel") {
     if (value.status === "signed_in") {
       output.writeStdout("The account completed sign-in before cancellation.\n");
@@ -1058,10 +1440,41 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${renderPluginList(data)}\n`);
   } else if (command.kind === "plugin.show") {
     output.writeStdout(`${renderPlugin(data)}\n`);
+  } else if (command.kind === "auth.status") {
+    output.writeStdout(`${renderAuthStatus(data)}\n`);
+  } else if (command.kind === "sync.status") {
+    output.writeStdout(`${renderSyncStatus(data)}\n`);
   } else {
     output.writeStdout(`${safeJson(data, 2)}\n`);
   }
 }
+
+const failureNextCommand = (details: unknown): string | null => {
+  const value = object(details);
+  if (
+    Object.keys(value ?? {}).length === 1
+    && (value?.nextCommand === "hra daemon status --json"
+      || value?.nextCommand === "hra doctor --offline"
+      || value?.nextCommand === "hra sync status --json")
+  ) {
+    return value.nextCommand;
+  }
+  if (
+    value?.nextCommand === "hra doctor"
+    && value.repair === "repair_or_select_project"
+    && Object.keys(value).length === 2
+  ) {
+    return "hra doctor";
+  }
+  if (value?.accountState !== "signed_out" || typeof value.nextCommand !== "string") {
+    return null;
+  }
+  const prefix = "hra account login ";
+  if (!value.nextCommand.startsWith(prefix)) return null;
+  const parsed = profileIdSchema.safeParse(value.nextCommand.slice(prefix.length));
+  if (!parsed.success || value.nextCommand !== `${prefix}${parsed.data}`) return null;
+  return value.accountSelector === parsed.data ? value.nextCommand : null;
+};
 
 export function renderFailure(error: { code: string; message: string; details?: unknown; trustedLocalPaths?: boolean }, json: boolean, output: Output): number {
   const safeError = {
@@ -1077,7 +1490,12 @@ export function renderFailure(error: { code: string; message: string; details?: 
     output.writeStdout(`${safeJson({ ok: false, version: 1, error: safeError })}\n`);
   } else {
     output.writeStderr(`hra: ${safeError.message}\n`);
-    if (safeError.details !== undefined) output.writeStderr(`${safeJson(safeError.details, 2)}\n`);
+    if (safeError.details !== undefined) {
+      const nextCommand = failureNextCommand(error.details);
+      output.writeStderr(nextCommand === null
+        ? `${safeJson(safeError.details, 2)}\n`
+        : `Next: ${nextCommand}\n`);
+    }
   }
   return error.code === "INVALID_INPUT" ? 2 : error.code === "NOT_FOUND" ? 4 : error.code === "INTERACTION_REQUIRED" ? 6 : error.code === "RECOVERY_REQUIRED" ? 7 : error.code === "UNAVAILABLE" ? 5 : 1;
 }

@@ -121,6 +121,26 @@ export const sessionListCursorPayloadSchema = z.object({
 
 export type SessionListCursorPayload = z.infer<typeof sessionListCursorPayloadSchema>;
 
+export const localSessionListCursorFilterSchema = z.object({
+  accountId: profileIdSchema,
+  accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(100),
+}).strict();
+
+export type LocalSessionListCursorFilter = z.infer<typeof localSessionListCursorFilterSchema>;
+
+export const localSessionListCursorPayloadSchema = z.object({
+  version: z.literal(1),
+  type: z.literal("session_list_local"),
+  accountId: profileIdSchema,
+  accountGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  limit: z.number().int().min(1).max(100),
+  afterCreatedAt: unixMillisecondsSchema.max(Number.MAX_SAFE_INTEGER),
+  afterSessionId: sessionIdSchema,
+}).strict();
+
+export type LocalSessionListCursorPayload = z.infer<typeof localSessionListCursorPayloadSchema>;
+
 const canonicalPayload = (payload: SessionEventCursorPayload): string => JSON.stringify({
   version: payload.version,
   sessionId: payload.sessionId,
@@ -155,6 +175,18 @@ const canonicalSessionListPayload = (payload: SessionListCursorPayload): string 
   pageCount: payload.pageCount,
 });
 
+const canonicalLocalSessionListPayload = (
+  payload: LocalSessionListCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  accountId: payload.accountId,
+  accountGeneration: payload.accountGeneration,
+  limit: payload.limit,
+  afterCreatedAt: payload.afterCreatedAt,
+  afterSessionId: payload.afterSessionId,
+});
+
 const sameInteractionFilter = (
   actual: InteractionCursorFilter,
   expected: InteractionCursorFilter,
@@ -168,6 +200,13 @@ const sameSessionListFilter = (
   expected: SessionListCursorFilter,
 ): boolean => actual.accountId === expected.accountId
   && actual.providerGeneration === expected.providerGeneration
+  && actual.limit === expected.limit;
+
+const sameLocalSessionListFilter = (
+  actual: LocalSessionListCursorFilter,
+  expected: LocalSessionListCursorFilter,
+): boolean => actual.accountId === expected.accountId
+  && actual.accountGeneration === expected.accountGeneration
   && actual.limit === expected.limit;
 
 const sessionListProviderCursorDigest = (providerCursor: string): string =>
@@ -271,6 +310,63 @@ export class SessionEventCursorCodec {
     if (!sameInteractionFilter(parsed.data, expected)) {
       throw new SessionEventCursorError(
         "Interaction cursor filters do not match the requested interaction list.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodeLocalSessionList(
+    input: LocalSessionListCursorFilter & Readonly<{
+      afterCreatedAt: number;
+      afterSessionId: string;
+    }>,
+  ): string {
+    const payload = localSessionListCursorPayloadSchema.parse({
+      version: 1,
+      type: "session_list_local",
+      accountId: input.accountId,
+      accountGeneration: input.accountGeneration,
+      limit: input.limit,
+      afterCreatedAt: input.afterCreatedAt,
+      afterSessionId: input.afterSessionId,
+    });
+    return this.#encodeCanonical(
+      canonicalLocalSessionListPayload(payload),
+      "Local session-list cursor",
+    );
+  }
+
+  decodeLocalSessionList(
+    cursor: string,
+    expectedFilter: LocalSessionListCursorFilter,
+  ): LocalSessionListCursorPayload {
+    const expected = localSessionListCursorFilterSchema.parse(expectedFilter);
+    const envelope = this.#decodeEnvelope(cursor, "Local session-list cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "session_list_local"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a local session-list cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = localSessionListCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalLocalSessionListPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Local session-list cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (!sameLocalSessionListFilter(parsed.data, expected)) {
+      throw new SessionEventCursorError(
+        "Local session-list cursor filters do not match the requested account listing.",
         "filter_mismatch",
       );
     }
