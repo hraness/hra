@@ -126,9 +126,11 @@ The operator strips inherited Vercel-token variables and uses the authenticated 
 1. For an archive plan, points `hra-weld.vercel.app` at Q and proves its exact alias tuple and generation-0 marker before touching `hra.sh`.
 2. Points `hra.sh` at the target's bare automatic hostname.
 3. Probes the exact alias tuple and commit-bearing marker for at most 60 seconds.
-4. Restores the exact previously proven source deployment if the command fails, readback is wrong, or public convergence times out. Archive compensation restores both fixed old-HRA aliases to P.
+4. Restores and proves every exact previously accepted traffic alias if the command fails, readback is wrong, or public convergence times out. Domain compensation proves the canonical alias, Q fallback, and N staging alias before it attempts an ownership reversal or reports ambiguous ownership. Archive compensation restores both fixed old-HRA aliases to P.
 5. For domain plans only, moves ownership in one API request after traffic is proven.
-6. Reads both project domain lists and re-proves the canonical, old fallback, and new staging alias tuples and markers before reporting `committed`.
+6. Reads both project domain lists with explicit 20-record pages. Every page must carry a matching item count and a valid next cursor. The operator follows unseen cursors until it receives an explicit terminal `next: null`, and refuses missing pagination, repeated cursors, empty nonterminal pages, or more than 64 pages. It then re-proves the canonical, old fallback, and new staging alias tuples and markers before reporting `committed`.
+
+The same exact plan is safe to replay after interruption or a lost result. The operator classifies the complete provider state only after re-reading both projects and both deployments. An exact target state succeeds without another mutation only after the canonical target, its commit-bearing marker, the fixed Q fallback, the fixed N staging alias, and domain ownership all pass again. Archive source, target, replay, and compensation states require `hra.sh` to remain owned exactly once by the fixed HRA v0 project and never by the new project. Its receipt reports `changed: false` and `replayed: true`. A normal source-to-target transition reports `changed: true` and `replayed: false`. A partial archive or domain state is never accepted as a replay: the operator restores the full exact source state, including both fixed staging aliases, and returns `cutover_reverted`, so a later invocation can begin from the proved source. Missing, duplicate, or unknown ownership remains an escalation condition.
 
 Every failed or uncertain traffic change enters automatic restoration. If source restoration itself cannot be proven within 60 seconds, the operator reports `compensation_failed`; stop all release work and escalate. Never continue to a repository rename, tag, release, or invitation after a refused result.
 
@@ -159,11 +161,11 @@ Q is now the only rollback source used by forward, reverse, and incident plans. 
 Run the `forward` plan Q → N. Independently read both domain lists:
 
 ```sh
-vercel api /v9/projects/prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr/domains --scope hraness --raw | jq -c '{domains:[.domains[]|{name}]}'
-vercel api /v9/projects/prj_8ciIt9t9foE3utG45frRN7cxckjS/domains --scope hraness --raw | jq -c '{domains:[.domains[]|{name}]}'
+vercel api '/v9/projects/prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr/domains?limit=20' --scope hraness --paginate --raw | jq -c '{domains:map({name})}'
+vercel api '/v9/projects/prj_8ciIt9t9foE3utG45frRN7cxckjS/domains?limit=20' --scope hraness --paginate --raw | jq -c '{domains:map({name})}'
 ```
 
-Require `hra.sh` exactly once under new HRA and zero times under HRA v0. Repeat the exact alias query, generation-1 marker, full public acceptance, and `https://www.hra.sh` redirect check.
+The pinned CLI's `--paginate` mode follows the provider cursor to its terminal page and emits the combined domain array. Require `hra.sh` exactly once under new HRA and zero times under HRA v0. A non-paginated first page is not ownership evidence. Repeat the exact alias query, generation-1 marker, full public acceptance, and `https://www.hra.sh` redirect check.
 
 ## Reverse rehearsal
 

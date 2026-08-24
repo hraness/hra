@@ -5,6 +5,7 @@ import { HRA_VERSION } from "../version.ts";
 import type {
   InteractionKind,
   InteractionResolution,
+  LiveInteractionApprovalAuthority,
   ProviderInteractionAuthority,
 } from "../domain/interactions.ts";
 import {
@@ -101,6 +102,7 @@ type ServerRequestState = "pending" | "writing" | "responded" | "resolved" | "re
 
 interface PendingServerRequest {
   readonly admission: ParsedBrokeredCodexServerRequest;
+  readonly deadlineAt: number;
   admitted: boolean;
   admissionTask?: Promise<void>;
   state: ServerRequestState;
@@ -109,6 +111,13 @@ interface PendingServerRequest {
     { id: number | string; result: unknown }
     | { id: number | string; error: Readonly<{ code: number; message: string }> }
   >;
+}
+
+class CodexFrameRejectedBeforeWriteError extends Error {
+  constructor(readonly rejection: CodexError) {
+    super(rejection.message, { cause: rejection });
+    this.name = "CodexFrameRejectedBeforeWriteError";
+  }
 }
 
 export interface CodexAppServerClientOptions {
@@ -641,13 +650,56 @@ export class CodexAppServerClient {
     return { responseDigest };
   }
 
+  async inspectInteractionAuthority(input: {
+    readonly provider: ProviderInteractionAuthority;
+    readonly kind: InteractionKind;
+  }): Promise<LiveInteractionApprovalAuthority> {
+    const pending = await this.#requirePendingServerRequest(input.provider);
+    const authority = pending.admission.privateApprovalAuthority;
+    if (
+      pending.state !== "pending"
+      || pending.admission.kind !== input.kind
+      || authority === null
+      || authority.kind !== input.kind
+    ) {
+      throw new CodexError(
+        "UNSUPPORTED_CAPABILITY",
+        "This provider request has no complete live approval authority to inspect.",
+      );
+    }
+    return authority;
+  }
+
   async resolveInteraction(input: {
     readonly provider: ProviderInteractionAuthority;
     readonly kind: InteractionKind;
     readonly resolution: InteractionResolution;
+    readonly deadlineAt: number;
   }): Promise<{ readonly responseWritten: true }> {
     const { pending, responseDigest, result } = await this.#compileInteractionResolution(input);
+    if (
+      !Number.isSafeInteger(input.deadlineAt)
+      || input.deadlineAt < 0
+      || input.deadlineAt !== pending.deadlineAt
+    ) {
+      throw new CodexError(
+        "AUTHORITY_STALE",
+        "the interaction deadline does not match the admitted provider request",
+      );
+    }
     if (pending.state === "responded") return { responseWritten: true };
+    if (pending.state === "writing" || pending.state === "resolution_unknown") {
+      throw new CodexError(
+        "INDETERMINATE_EFFECT",
+        "the provider response may already have been written; wait for reconciliation",
+      );
+    }
+    if (pending.state !== "pending") {
+      throw new CodexError(
+        "AUTHORITY_STALE",
+        "the provider request was resolved before the response could be reserved",
+      );
+    }
     const responseFrame = {
       id: rawProviderRequestId(input.provider.requestId),
       result,
@@ -656,10 +708,40 @@ export class CodexAppServerClient {
     pending.responseFrame = responseFrame;
     pending.state = "writing";
     try {
-      await this.#writeFrame(responseFrame);
+      await this.#writeFrame(responseFrame, {
+        beforeWrite: () => {
+          const exactPending = this.#serverRequests.get(
+            providerRequestIdKey(input.provider.requestId),
+          );
+          if (
+            this.#state !== "ready"
+            || exactPending !== pending
+            || pending.state !== "writing"
+            || pending.responseFrame !== responseFrame
+            || pending.responseDigest !== responseDigest
+          ) {
+            throw new CodexError(
+              "AUTHORITY_STALE",
+              "the provider request was resolved before the response write began",
+            );
+          }
+          if (this.#now() >= pending.deadlineAt) {
+            throw new CodexError(
+              "DEADLINE_EXPIRED",
+              "the interaction deadline elapsed before the response write began",
+            );
+          }
+        },
+      });
       pending.state = "responded";
       return { responseWritten: true };
     } catch (error) {
+      if (error instanceof CodexFrameRejectedBeforeWriteError) {
+        if (pending.state === "writing") pending.state = "pending";
+        delete pending.responseDigest;
+        delete pending.responseFrame;
+        throw error.rejection;
+      }
       pending.state = "resolution_unknown";
       this.#quarantineConnection("Codex interaction response write became indeterminate");
       throw new CodexError(
@@ -682,6 +764,18 @@ export class CodexAppServerClient {
   }): Promise<{ readonly responseWritten: true }> {
     const { pending, responseDigest } = await this.#compileInteractionTimeout(input.provider);
     if (pending.state === "responded") return { responseWritten: true };
+    if (pending.state === "writing" || pending.state === "resolution_unknown") {
+      throw new CodexError(
+        "INDETERMINATE_EFFECT",
+        "the provider response may already have been written; wait for reconciliation",
+      );
+    }
+    if (pending.state !== "pending") {
+      throw new CodexError(
+        "AUTHORITY_STALE",
+        "the provider request was resolved before the timeout could be reserved",
+      );
+    }
     const responseFrame = {
       id: rawProviderRequestId(input.provider.requestId),
       error: INTERACTION_DEADLINE_ERROR,
@@ -690,10 +784,34 @@ export class CodexAppServerClient {
     pending.responseFrame = responseFrame;
     pending.state = "writing";
     try {
-      await this.#writeFrame(responseFrame);
+      await this.#writeFrame(responseFrame, {
+        beforeWrite: () => {
+          const exactPending = this.#serverRequests.get(
+            providerRequestIdKey(input.provider.requestId),
+          );
+          if (
+            this.#state !== "ready"
+            || exactPending !== pending
+            || pending.state !== "writing"
+            || pending.responseFrame !== responseFrame
+            || pending.responseDigest !== responseDigest
+          ) {
+            throw new CodexError(
+              "AUTHORITY_STALE",
+              "the provider request was resolved before the timeout write began",
+            );
+          }
+        },
+      });
       pending.state = "responded";
       return { responseWritten: true };
     } catch (error) {
+      if (error instanceof CodexFrameRejectedBeforeWriteError) {
+        if (pending.state === "writing") pending.state = "pending";
+        delete pending.responseDigest;
+        delete pending.responseFrame;
+        throw error.rejection;
+      }
       pending.state = "resolution_unknown";
       this.#quarantineConnection("Codex interaction deadline response write became indeterminate");
       throw new CodexError(
@@ -1092,7 +1210,16 @@ export class CodexAppServerClient {
       this.#quarantineConnection("Codex exceeded the bounded server-request ledger");
       return;
     }
-    const pending: PendingServerRequest = { admission, admitted: false, state: "pending" };
+    const deadlineAt = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      requestedAt + admission.timeoutMs,
+    );
+    const pending: PendingServerRequest = {
+      admission,
+      deadlineAt,
+      admitted: false,
+      state: "pending",
+    };
     this.#serverRequests.set(key, pending);
     const task = this.#enqueueFact({
       type: "interactionRequested",
@@ -1102,7 +1229,7 @@ export class CodexAppServerClient {
       display: admission.display,
       timeoutMs: admission.timeoutMs,
       requestedAt,
-      deadlineAt: Math.min(Number.MAX_SAFE_INTEGER, requestedAt + admission.timeoutMs),
+      deadlineAt,
       connectionId: this.#connectionId,
     });
     pending.admissionTask = task;
@@ -1182,13 +1309,28 @@ export class CodexAppServerClient {
     this.#process.terminate();
   }
 
-  async #writeFrame(value: unknown): Promise<void> {
+  async #writeFrame(
+    value: unknown,
+    options: { readonly beforeWrite?: () => void } = {},
+  ): Promise<void> {
     const serialized = JSON.stringify(value);
     if (serialized.length > 4 * 1024 * 1024) {
       throw new CodexError("PROTOCOL_LIMIT", "outbound Codex frame exceeded its byte limit");
     }
     const bytes = this.#encoder.encode(`${serialized}\n`);
-    const write = this.#writeTail.then(async () => this.#process.write(bytes));
+    const write = this.#writeTail.then(async () => {
+      if (options.beforeWrite !== undefined) {
+        try {
+          options.beforeWrite();
+        } catch (error: unknown) {
+          if (error instanceof CodexError) {
+            throw new CodexFrameRejectedBeforeWriteError(error);
+          }
+          throw error;
+        }
+      }
+      await this.#process.write(bytes);
+    });
     this.#writeTail = write.catch(() => undefined);
     await write;
   }

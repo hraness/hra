@@ -65,6 +65,7 @@ class FakeProcess implements CodexProcess {
   readonly writes: unknown[] = [];
   readonly signals: ("SIGTERM" | "SIGKILL")[] = [];
   writeError: Error | undefined;
+  writeSettlementGate: Promise<void> | undefined;
   readonly exited: Promise<number>;
   #resolveExit!: (code: number) => void;
 
@@ -80,16 +81,18 @@ class FakeProcess implements CodexProcess {
     });
   }
 
-  write(bytes: Uint8Array): Promise<void> {
+  async write(bytes: Uint8Array): Promise<void> {
     const parsed = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
     this.writes.push(parsed);
     if (this.writeError !== undefined) {
       const error = this.writeError;
       this.writeError = undefined;
-      return Promise.reject(error);
+      throw error;
     }
     this.onWrite(parsed as Record<string, unknown>, this);
-    return Promise.resolve();
+    const gate = this.writeSettlementGate;
+    this.writeSettlementGate = undefined;
+    if (gate !== undefined) await gate;
   }
 
   respond(value: unknown): void {
@@ -428,6 +431,46 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("rejects file approvals whose pinned callback omits exact changed paths", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const diagnostics: string[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+      onSafeDiagnostic: (message) => { diagnostics.push(message); },
+    });
+    await client.initialize();
+    const sentinel = "/private/FILE-APPROVAL-REASON-SENTINEL";
+    process.respond({
+      id: 902,
+      method: "item/fileChange/requestApproval",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "item-file",
+        reason: sentinel,
+        grantRoot: "/workspace",
+      },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "protocolNotice"));
+    expect(process.writes.at(-1)).toEqual({
+      id: 902,
+      error: {
+        code: -32_601,
+        message: "HRA cannot broker this server request capability",
+        data: { code: "UNSUPPORTED_CAPABILITY" },
+      },
+    });
+    expect(facts.some((fact) => fact.type === "interactionRequested")).toBe(false);
+    expect(JSON.stringify({ writes: process.writes, facts, diagnostics })).not.toContain(sentinel);
+    await client.close();
+  });
+
   test("classifies MCP URL elicitation as unsupported without admitting or echoing its URL", async () => {
     const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
     const facts: CodexFact[] = [];
@@ -515,6 +558,18 @@ describe("CodexAppServerClient", () => {
         },
         requestedSchema: { type: "object", properties: {} },
       },
+      {
+        mode: "form",
+        _meta: {
+          codex_approval_kind: "mcp_tool_call",
+          codex_request_type: "approval_request",
+          connector_name: sentinel,
+          tool_name: "delete_records",
+          tool_params: { target: sentinel },
+          persist: "always",
+        },
+        requestedSchema: { type: "object", properties: {} },
+      },
     ] as const;
     for (const [index, request] of requests.entries()) {
       process.respond({
@@ -542,6 +597,7 @@ describe("CodexAppServerClient", () => {
     }
     expect(facts.some((fact) => fact.type === "interactionRequested")).toBe(false);
     expect(diagnostics).toEqual([
+      "Codex requested an unsupported capability for mcpServer/elicitation/request",
       "Codex requested an unsupported capability for mcpServer/elicitation/request",
       "Codex requested an unsupported capability for mcpServer/elicitation/request",
       "Codex requested an unsupported capability for mcpServer/elicitation/request",
@@ -628,6 +684,7 @@ describe("CodexAppServerClient", () => {
     await client.resolveInteraction({
       provider: requested.provider,
       kind: requested.kind,
+      deadlineAt: requested.deadlineAt ?? Number.NaN,
       resolution: {
         kind: "mcp_submission",
         action: "accept",
@@ -677,19 +734,45 @@ describe("CodexAppServerClient", () => {
     expect(requested.display).toMatchObject({
       kind: "command_approval",
       commandClass: "git push",
-      allowsSessionApproval: true,
+      availableDecisions: ["once" as const, "session" as const, "decline" as const, "cancel" as const],
     });
+    await expect(client.inspectInteractionAuthority({
+      provider: requested.provider,
+      kind: requested.kind,
+    })).resolves.toEqual({
+      kind: "command_approval",
+      command: "git push origin main",
+      reason: "Need network access",
+      availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+      workingDirectory: "/workspace/project",
+      environmentId: null,
+      commandActions: [],
+      networkApprovalContext: null,
+      additionalPermissions: null,
+      proposedExecpolicyAmendment: null,
+      proposedNetworkPolicyAmendments: null,
+    });
+    await expect(client.inspectInteractionAuthority({
+      provider: { ...requested.provider, connectionId: crypto.randomUUID() },
+      kind: requested.kind,
+    })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await expect(client.resolveInteraction({
       provider: { ...requested.provider, requestDigest: "b".repeat(64) },
       kind: requested.kind,
+      deadlineAt: requested.deadlineAt ?? Number.NaN,
       resolution: { kind: "approval_decision", decision: "once" },
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await client.resolveInteraction({
       provider: requested.provider,
       kind: requested.kind,
+      deadlineAt: requested.deadlineAt ?? Number.NaN,
       resolution: { kind: "approval_decision", decision: "session" },
     });
     expect(process.writes.at(-1)).toEqual({ id: 41, result: { decision: "acceptForSession" } });
+    await expect(client.inspectInteractionAuthority({
+      provider: requested.provider,
+      kind: requested.kind,
+    })).rejects.toMatchObject({ code: "UNSUPPORTED_CAPABILITY" });
 
     process.respond({
       method: "serverRequest/resolved",
@@ -750,6 +833,268 @@ describe("CodexAppServerClient", () => {
       params: { threadId: "thread-1", requestId: "deadline-request" },
     });
     await waitFor(() => facts.some((fact) => fact.type === "interactionResolved"));
+    await client.close();
+  });
+
+  test("rejects a manual response inside the serialized write boundary at its deadline", async () => {
+    let now = 10_000;
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      now: () => now,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({
+      id: 72,
+      method: "item/commandExecution/requestApproval",
+      params: { ...commandApprovalParams(), autoResolutionMs: 1_000 },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested" || requested.deadlineAt === undefined) {
+      throw new Error("Missing deadline interaction.");
+    }
+
+    let releaseWrite!: () => void;
+    process.writeSettlementGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const blockingRead = client.accountRead();
+    await waitFor(() => process.writes.some((value) =>
+      (value as { method?: string }).method === "account/read"));
+    now = 10_999;
+    const manualResponse = client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt,
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    await Bun.sleep(1);
+    now = 11_000;
+    releaseWrite();
+    await blockingRead;
+
+    await expect(manualResponse).rejects.toMatchObject({ code: "DEADLINE_EXPIRED" });
+    expect(process.writes.filter((value) =>
+      (value as { id?: unknown; result?: unknown }).id === 72
+      && "result" in (value as object))).toHaveLength(0);
+    await expect(client.timeoutInteraction({ provider: requested.provider }))
+      .resolves.toEqual({ responseWritten: true });
+    expect(process.writes.at(-1)).toEqual({
+      id: 72,
+      error: { code: -32_008, message: "HRA interaction deadline expired" },
+    });
+    await client.close();
+  });
+
+  test("admits the exact manual response one millisecond before its deadline", async () => {
+    let now = 30_000;
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      now: () => now,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({
+      id: 74,
+      method: "item/commandExecution/requestApproval",
+      params: { ...commandApprovalParams(), autoResolutionMs: 1_000 },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested" || requested.deadlineAt === undefined) {
+      throw new Error("Missing provider interaction.");
+    }
+    now = requested.deadlineAt - 1;
+    await expect(client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt,
+      resolution: { kind: "approval_decision", decision: "once" },
+    })).resolves.toEqual({ responseWritten: true });
+    expect(process.writes.at(-1)).toEqual({ id: 74, result: { decision: "accept" } });
+    await client.close();
+  });
+
+  test("does not write a queued response after the provider resolves the request", async () => {
+    let now = 20_000;
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      now: () => now,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({
+      id: 73,
+      method: "item/commandExecution/requestApproval",
+      params: { ...commandApprovalParams(), autoResolutionMs: 1_000 },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested" || requested.deadlineAt === undefined) {
+      throw new Error("Missing provider interaction.");
+    }
+
+    let releaseWrite!: () => void;
+    process.writeSettlementGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const blockingRead = client.accountRead();
+    await waitFor(() => process.writes.some((value) =>
+      (value as { method?: string }).method === "account/read"));
+    const manualResponse = client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt,
+      resolution: { kind: "approval_decision", decision: "once" },
+    });
+    await Bun.sleep(1);
+    process.respond({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: 73 },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionResolved"));
+    now = 20_001;
+    releaseWrite();
+    await blockingRead;
+
+    await expect(manualResponse).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(process.writes.filter((value) =>
+      (value as { id?: unknown; result?: unknown }).id === 73
+      && "result" in (value as object))).toHaveLength(0);
+    await client.close();
+  });
+
+  test("does not write a queued timeout after the provider resolves the request", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({ id: 75, method: "item/commandExecution/requestApproval", params: commandApprovalParams() });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested") throw new Error("Missing provider interaction.");
+
+    let releaseWrite!: () => void;
+    process.writeSettlementGate = new Promise<void>((resolve) => { releaseWrite = resolve; });
+    const blockingRead = client.accountRead();
+    await waitFor(() => process.writes.some((value) =>
+      (value as { method?: string }).method === "account/read"));
+    const timeout = client.timeoutInteraction({ provider: requested.provider });
+    await Bun.sleep(1);
+    process.respond({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: 75 },
+    });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionResolved"));
+    releaseWrite();
+    await blockingRead;
+    await expect(timeout).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(process.writes.filter((value) =>
+      (value as { id?: unknown; error?: unknown }).id === 75
+      && "error" in (value as object))).toHaveLength(0);
+    await client.close();
+  });
+
+  test("reserves one response frame across concurrent manual and timeout attempts", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    let race = false;
+    let arrivals = 0;
+    let releaseRace!: () => void;
+    const raceGate = new Promise<void>((resolve) => { releaseRace = resolve; });
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: async () => {
+        if (!race) return true;
+        arrivals += 1;
+        if (arrivals === 2) releaseRace();
+        await raceGate;
+        return true;
+      },
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({ id: 76, method: "item/commandExecution/requestApproval", params: commandApprovalParams() });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested" || requested.deadlineAt === undefined) {
+      throw new Error("Missing provider interaction.");
+    }
+    race = true;
+    const outcomes = await Promise.allSettled([
+      client.resolveInteraction({
+        provider: requested.provider,
+        kind: requested.kind,
+        deadlineAt: requested.deadlineAt,
+        resolution: { kind: "approval_decision", decision: "once" },
+      }),
+      client.timeoutInteraction({ provider: requested.provider }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+    expect(process.writes.filter((value) => (value as { id?: unknown }).id === 76)).toHaveLength(1);
+    await client.close();
+  });
+
+  test("keeps an admitted manual write rejection unknown without dispatching a timeout", async () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    const facts: CodexFact[] = [];
+    const client = new CodexAppServerClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      connectionId: CONNECTION_ID,
+      onFact: ({ value }) => { facts.push(value); },
+    });
+    await client.initialize();
+    process.respond({ id: 77, method: "item/commandExecution/requestApproval", params: commandApprovalParams() });
+    await waitFor(() => facts.some((fact) => fact.type === "interactionRequested"));
+    const requested = facts.find((fact) => fact.type === "interactionRequested");
+    if (requested?.type !== "interactionRequested" || requested.deadlineAt === undefined) {
+      throw new Error("Missing provider interaction.");
+    }
+    process.writeError = new Error("uncertain manual response write");
+    await expect(client.resolveInteraction({
+      provider: requested.provider,
+      kind: requested.kind,
+      deadlineAt: requested.deadlineAt,
+      resolution: { kind: "approval_decision", decision: "once" },
+    })).rejects.toMatchObject({ code: "INDETERMINATE_EFFECT" });
+    await expect(client.timeoutInteraction({ provider: requested.provider }))
+      .rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(process.writes.filter((value) =>
+      (value as { id?: unknown; error?: unknown }).id === 77
+      && "error" in (value as object))).toHaveLength(0);
     await client.close();
   });
 

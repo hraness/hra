@@ -1,14 +1,20 @@
 import { createHash } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 import { presetRequirements } from "../domain/presets.ts";
 import {
   INTERACTION_MAX_PENDING_MS,
+  PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
+  encodeProtectedInteractionDetailDocument,
+  type InteractionDecision,
   type InteractionDisplay,
   type InteractionKind,
   type InteractionResolution,
+  type LiveInteractionApprovalAuthority,
   type McpFormField,
   type ProviderInteractionAuthority,
   type ProviderRequestId,
+  type ProtectedInteractionJson,
 } from "../domain/interactions.ts";
 import { CodexError } from "./errors.ts";
 import {
@@ -28,6 +34,26 @@ import {
 } from "./parse.ts";
 
 export const PINNED_CODEX_VERSION = "0.149.0";
+
+const liveAcceptanceCommandPattern = /^\/bin\/echo hra-live-tool-progress \| \/usr\/bin\/tee \.\/(\.hra-live-command-proof-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.txt)$/u;
+const liveAcceptanceCommandDigestDomain = "hra:live-acceptance-command:v1\0";
+
+/**
+ * Projects a digest only for HRA's exact, deliberately non-secret live-gate
+ * command grammar. Arbitrary provider commands must never become public
+ * equality oracles.
+ */
+export const safeLiveAcceptanceCommandDigest = (command: string): string | undefined => {
+  const match = liveAcceptanceCommandPattern.exec(command);
+  const fileName = match?.[1];
+  if (fileName === undefined) return undefined;
+  const canonical = `/bin/echo hra-live-tool-progress | /usr/bin/tee ./${fileName}`;
+  if (command !== canonical) return undefined;
+  return createHash("sha256")
+    .update(liveAcceptanceCommandDigestDomain, "utf8")
+    .update(canonical, "utf8")
+    .digest("hex");
+};
 
 export type CodexServerRequestDisposition =
   | "brokered_interaction"
@@ -654,6 +680,7 @@ type CodexFactBody =
       readonly turnId: string;
       readonly itemId: string;
       readonly itemKind: string;
+      readonly liveAcceptanceCommandDigest?: string;
       readonly status?: string;
       readonly server?: string;
       readonly tool?: string;
@@ -764,6 +791,8 @@ export interface ParsedBrokeredCodexServerRequest {
   readonly timeoutMs: number;
   /** Kept only in process memory for exact response validation. */
   readonly privateParams: Readonly<Record<string, unknown>>;
+  /** Complete approval authority kept only in process memory for protected inspection. */
+  readonly privateApprovalAuthority: LiveInteractionApprovalAuthority | null;
 }
 
 export function parseInitialize(value: unknown): InitializeResult {
@@ -1575,18 +1604,117 @@ const classifyApprovalCommand = (value: unknown): string => {
   return action === undefined ? name : `${name} ${safeDisplayText(action, "command action", 64)}`;
 };
 
-const availableDecision = (value: unknown, decision: string): boolean => {
-  if (value === undefined || value === null) return false;
-  return array(value, "available decisions", (item) => item, 20)
-    .some((candidate) => candidate === decision);
-};
-
 const safeInteractionJson = (value: unknown): unknown => {
   const serialized = canonicalJson(value);
   if (canonicalTextEncoder.encode(serialized).byteLength > 64 * 1024) {
     throw new CodexError("PROTOCOL_LIMIT", "interaction display data exceeded its byte limit");
   }
   return JSON.parse(serialized) as unknown;
+};
+
+const exactApprovalJson = (value: unknown): ProtectedInteractionJson => {
+  const serialized = canonicalJson(value);
+  if (canonicalTextEncoder.encode(serialized).byteLength > PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES - 64 * 1024) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "The complete approval authority exceeds HRA's protected-output limit.",
+    );
+  }
+  return JSON.parse(serialized) as ProtectedInteractionJson;
+};
+
+const optionalExactApprovalJson = (
+  params: Readonly<Record<string, unknown>>,
+  key: string,
+): ProtectedInteractionJson | null => params[key] === undefined || params[key] === null
+  ? null
+  : exactApprovalJson(params[key]);
+
+const exactOptionalPrivateString = (
+  value: unknown,
+  label: string,
+  maximum: number,
+): string | null => value === undefined || value === null
+  ? null
+  : string(value, label, { max: maximum });
+
+const assertProtectedApprovalAuthorityFits = (
+  authority: LiveInteractionApprovalAuthority,
+): void => {
+  const encoded = encodeProtectedInteractionDetailDocument({
+    type: "hra_protected_interaction_detail",
+    version: 1,
+    binding: {
+      interactionId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+      revision: Number.MAX_SAFE_INTEGER,
+      kind: authority.kind,
+      sessionId: `sess_${"f".repeat(32)}`,
+      profileId: `acct_${"f".repeat(32)}`,
+      processGeneration: Number.MAX_SAFE_INTEGER,
+      connectionId: "ffffffff-ffff-4fff-bfff-ffffffffffff",
+    },
+    authority,
+  });
+  const fits = encoded.byteLength <= PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES;
+  encoded.fill(0);
+  if (!fits) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "The complete approval authority exceeds HRA's protected-output limit.",
+    );
+  }
+};
+
+const commandApprovalAuthority = (
+  params: Readonly<Record<string, unknown>>,
+): LiveInteractionApprovalAuthority => {
+  const command = string(params.command, "approval command", { min: 1, max: 1_000_000 });
+  if (command.trim().length === 0) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "A command approval without an exact command cannot support informed consent.",
+    );
+  }
+  const authority: LiveInteractionApprovalAuthority = {
+    kind: "command_approval",
+    command,
+    reason: exactOptionalPrivateString(params.reason, "command approval reason", 4_096),
+    availableDecisions: exactApprovalJson(params.availableDecisions),
+    workingDirectory: exactOptionalPrivateString(params.cwd, "command cwd", 16_384),
+    environmentId: exactOptionalPrivateString(params.environmentId, "command environment id", 512),
+    commandActions: optionalExactApprovalJson(params, "commandActions"),
+    networkApprovalContext: optionalExactApprovalJson(params, "networkApprovalContext"),
+    additionalPermissions: optionalExactApprovalJson(params, "additionalPermissions"),
+    proposedExecpolicyAmendment: optionalExactApprovalJson(params, "proposedExecpolicyAmendment"),
+    proposedNetworkPolicyAmendments: optionalExactApprovalJson(params, "proposedNetworkPolicyAmendments"),
+  };
+  assertProtectedApprovalAuthorityFits(authority);
+  return authority;
+};
+
+const permissionApprovalAuthority = (
+  params: Readonly<Record<string, unknown>>,
+): LiveInteractionApprovalAuthority => {
+  const requested = requestedPermissionAuthority(params.permissions);
+  if (requested.length === 0) {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "A permission approval without exact requested values cannot support informed consent.",
+    );
+  }
+  const workingDirectory = string(params.cwd, "permission cwd", { min: 1, max: 16_384 });
+  if (!isAbsolute(workingDirectory)) {
+    throw protocol("permission approval cwd must be an absolute path");
+  }
+  const authority: LiveInteractionApprovalAuthority = {
+    kind: "permission_approval",
+    permissions: exactApprovalJson(params.permissions),
+    reason: exactOptionalPrivateString(params.reason, "permission approval reason", 4_096),
+    workingDirectory,
+    environmentId: exactOptionalPrivateString(params.environmentId, "permission environment id", 512),
+  };
+  assertProtectedApprovalAuthorityFits(authority);
+  return authority;
 };
 
 type RequestedPermissionAuthority = Readonly<{
@@ -1931,15 +2059,26 @@ export function parseMcpFormFields(value: unknown): readonly McpFormField[] {
   });
 }
 
-const assertMcpFormMetadataDoesNotRequestPluginLifecycle = (value: unknown): void => {
+const assertMcpFormMetadataIsNonApproval = (value: unknown): void => {
   if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) return;
   const metadata = value as Readonly<Record<string, unknown>>;
+  if (!Object.hasOwn(metadata, "codex_approval_kind")) return;
   if (metadata.codex_approval_kind === "tool_suggestion") {
     throw new CodexError(
       "UNSUPPORTED_CAPABILITY",
       "HRA does not expose Codex's compound plugin and connector lifecycle effect.",
     );
   }
+  if (metadata.codex_approval_kind === "mcp_tool_call") {
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "HRA does not expose MCP tool side-effect approval through a generic form.",
+    );
+  }
+  throw new CodexError(
+    "UNSUPPORTED_CAPABILITY",
+    "HRA does not expose an unrecognized MCP approval contract through a generic form.",
+  );
 };
 
 const plainJsonObject = (value: unknown): value is Readonly<Record<string, unknown>> =>
@@ -1948,6 +2087,56 @@ const plainJsonObject = (value: unknown): value is Readonly<Record<string, unkno
   && !Array.isArray(value)
   && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
   && Object.getOwnPropertySymbols(value).length === 0;
+
+const commandApprovalDecisionContractUnsupported = (): CodexError => new CodexError(
+  "UNSUPPORTED_CAPABILITY",
+  "The command approval uses a decision contract HRA cannot safely represent.",
+);
+
+const isKnownCommandApprovalAmendment = (value: unknown): boolean => {
+  if (!plainJsonObject(value)) return false;
+  const entries = Object.entries(value);
+  if (entries.length !== 1) return false;
+  const entry = entries[0];
+  if (entry === undefined) return false;
+  const [kind, payload] = entry;
+  if (!plainJsonObject(payload)) return false;
+  const payloadKey = kind === "acceptWithExecpolicyAmendment"
+    ? "execpolicy_amendment"
+    : kind === "applyNetworkPolicyAmendment"
+      ? "network_policy_amendment"
+      : null;
+  return payloadKey !== null && Object.hasOwn(payload, payloadKey);
+};
+
+const commandApprovalDecisions = (value: unknown): readonly InteractionDecision[] => {
+  if (value === undefined || value === null) throw commandApprovalDecisionContractUnsupported();
+  const decisions: InteractionDecision[] = [];
+  const seen = new Set<InteractionDecision>();
+  const add = (decision: InteractionDecision): void => {
+    if (seen.has(decision)) return;
+    seen.add(decision);
+    decisions.push(decision);
+  };
+  for (const candidate of array(value, "available decisions", (item) => item, 20)) {
+    if (candidate === "accept") {
+      add("once");
+      continue;
+    }
+    if (candidate === "acceptForSession") {
+      add("session");
+      continue;
+    }
+    if (candidate === "decline" || candidate === "cancel") {
+      add(candidate);
+      continue;
+    }
+    if (isKnownCommandApprovalAmendment(candidate)) continue;
+    throw commandApprovalDecisionContractUnsupported();
+  }
+  if (decisions.length === 0) throw commandApprovalDecisionContractUnsupported();
+  return decisions;
+};
 
 export function validateMcpFormSubmission(
   fields: readonly McpFormField[],
@@ -2043,6 +2232,8 @@ export function parseBrokeredCodexServerRequest(input: {
 
   if (input.method === "item/commandExecution/requestApproval") {
     if (turnId === null || itemId === null) throw protocol("command approval omitted turn or item context");
+    const availableDecisions = commandApprovalDecisions(privateParams.availableDecisions);
+    const privateApprovalAuthority = commandApprovalAuthority(privateParams);
     const commandClass = classifyApprovalCommand(privateParams.command);
     const reason = nullableSafeDisplayText(privateParams.reason, "command approval reason", 4_096);
     return {
@@ -2056,32 +2247,26 @@ export function parseBrokeredCodexServerRequest(input: {
         reason,
         commandClass,
         workingDirectory: nullableSafeDisplayText(privateParams.cwd, "command cwd", 1_024),
-        allowsSessionApproval: availableDecision(privateParams.availableDecisions, "acceptForSession"),
+        availableDecisions: [...availableDecisions],
       },
       privateParams,
+      privateApprovalAuthority,
     };
   }
   if (input.method === "item/fileChange/requestApproval") {
     if (turnId === null || itemId === null) throw protocol("file approval omitted turn or item context");
-    const reason = nullableSafeDisplayText(privateParams.reason, "file approval reason", 4_096);
-    return {
-      provider,
-      kind: "file_change_approval",
-      blocking: true,
-      timeoutMs,
-      display: {
-        kind: "file_change_approval",
-        summary: "Allow the requested file changes",
-        reason,
-        grantRoot: nullableSafeDisplayText(privateParams.grantRoot, "file grant root", 1_024),
-        allowsSessionApproval: true,
-      },
-      privateParams,
-    };
+    throw new CodexError(
+      "UNSUPPORTED_CAPABILITY",
+      "The pinned file-change callback omits affected paths and change detail, so HRA cannot offer informed approval.",
+    );
   }
   if (input.method === "item/permissions/requestApproval") {
     if (turnId === null || itemId === null) throw protocol("permission approval omitted turn or item context");
-    const requested = requestedPermissionAuthority(privateParams.permissions)
+    const privateApprovalAuthority = permissionApprovalAuthority(privateParams);
+    if (privateApprovalAuthority.kind !== "permission_approval") {
+      throw protocol("permission approval authority kind changed during parsing");
+    }
+    const requested = requestedPermissionAuthority(privateApprovalAuthority.permissions)
       .map((permission) => ({ name: permission.displayName }));
     const reason = nullableSafeDisplayText(privateParams.reason, "permission approval reason", 4_096);
     return {
@@ -2097,6 +2282,7 @@ export function parseBrokeredCodexServerRequest(input: {
         allowsSessionScope: true,
       },
       privateParams,
+      privateApprovalAuthority,
     };
   }
   if (input.method === "item/tool/requestUserInput") {
@@ -2107,21 +2293,35 @@ export function parseBrokeredCodexServerRequest(input: {
         ? null
         : array(question.options, "user input options", (option, optionIndex) => {
             const parsed = record(option, `user input option ${String(optionIndex)}`);
+            const label = safeDisplayText(parsed.label, "user input option label", 512);
+            if (label.length === 0) throw protocol("user input option label is empty after safe rendering");
             return {
-              label: safeDisplayText(parsed.label, "user input option label", 512),
+              label,
               description: safeDisplayText(parsed.description, "user input option description", 2_048),
             };
           }, 20);
+      if (
+        options !== null
+        && new Set(options.map((option) => option.label)).size !== options.length
+      ) throw protocol("user input option labels must be unique");
+      const header = safeDisplayText(question.header, "user input header", 256);
+      const prompt = safeDisplayText(question.question, "user input question", 4_096);
+      if (header.length === 0 || prompt.length === 0) {
+        throw protocol("user input question text is empty after safe rendering");
+      }
       return {
         id: identifier(question.id, "user input question id"),
-        header: safeDisplayText(question.header, "user input header", 256),
-        question: safeDisplayText(question.question, "user input question", 4_096),
+        header,
+        question: prompt,
         options: options === null ? null : [...options],
         allowsOther: boolean(question.isOther, "user input allows other"),
         secret: boolean(question.isSecret, "user input secret flag"),
       };
     }, 3);
     if (questions.length < 1) throw protocol("user input request omitted questions");
+    if (new Set(questions.map((question) => question.id)).size !== questions.length) {
+      throw protocol("user input question ids must be unique");
+    }
     const blocking = boolean(privateParams.isBlocking, "user input blocking flag");
     return {
       provider,
@@ -2135,6 +2335,7 @@ export function parseBrokeredCodexServerRequest(input: {
         questions: [...questions],
       },
       privateParams,
+      privateApprovalAuthority: null,
     };
   }
 
@@ -2149,7 +2350,7 @@ export function parseBrokeredCodexServerRequest(input: {
     );
   }
   if (mode === "openai/form") throw unsupportedMcpForm();
-  assertMcpFormMetadataDoesNotRequestPluginLifecycle(privateParams._meta);
+  assertMcpFormMetadataIsNonApproval(privateParams._meta);
   const fields = parseMcpFormFields(privateParams.requestedSchema);
   const message = safeDisplayText(privateParams.message, "MCP elicitation message", 4_096);
   const serverName = identifier(privateParams.serverName, "MCP server name");
@@ -2168,6 +2369,7 @@ export function parseBrokeredCodexServerRequest(input: {
       fields: [...fields],
     },
     privateParams,
+    privateApprovalAuthority: null,
   };
 }
 
@@ -2185,18 +2387,17 @@ export function compileCodexInteractionResponse(input: {
     if (kind !== expectedKind || resolution.kind !== "approval_decision") {
       throw new CodexError("INVALID_INPUT", "interaction resolution kind does not match the provider request");
     }
+    if (
+      method === "item/commandExecution/requestApproval"
+      && !commandApprovalDecisions(privateParams.availableDecisions).includes(resolution.decision)
+    ) {
+      throw new CodexError("INVALID_INPUT", "the command approval does not offer that decision");
+    }
     const decision = resolution.decision === "once"
       ? "accept"
       : resolution.decision === "session"
         ? "acceptForSession"
         : resolution.decision;
-    if (
-      resolution.decision === "session"
-      && method === "item/commandExecution/requestApproval"
-      && !availableDecision(privateParams.availableDecisions, "acceptForSession")
-    ) {
-      throw new CodexError("INVALID_INPUT", "the command approval does not allow session scope");
-    }
     return { decision };
   }
   if (method === "item/permissions/requestApproval") {
@@ -2204,8 +2405,11 @@ export function compileCodexInteractionResponse(input: {
       throw new CodexError("INVALID_INPUT", "interaction resolution kind does not match the permission request");
     }
     if (resolution.kind === "approval_decision") {
-      if (resolution.decision === "once" || resolution.decision === "session") {
-        throw new CodexError("INVALID_INPUT", "permission approval requires an exact requested subset");
+      if (resolution.decision !== "decline") {
+        throw new CodexError(
+          "INVALID_INPUT",
+          "permission approval supports an exact requested subset or decline",
+        );
       }
       return { permissions: {}, scope: "turn" };
     }
@@ -2336,12 +2540,16 @@ export function parseFact(method: string, params: unknown): CodexFact {
     const tool = itemKind === "mcpToolCall" || itemKind === "dynamicToolCall"
       ? identifier(item.tool, "tool name")
       : undefined;
+    const liveAcceptanceCommandDigest = itemKind === "commandExecution"
+      ? safeLiveAcceptanceCommandDigest(string(item.command, "command", { max: 1_000_000 }))
+      : undefined;
     return {
       type: method === "item/started" ? "itemStarted" : "itemCompleted",
       threadId: identifier(root.threadId, "thread id"),
       turnId: identifier(root.turnId, "turn id"),
       itemId: identifier(item.id, "thread item id"),
       itemKind,
+      ...(liveAcceptanceCommandDigest === undefined ? {} : { liveAcceptanceCommandDigest }),
       ...(status === undefined ? {} : { status }),
       ...(server === undefined ? {} : { server }),
       ...(tool === undefined ? {} : { tool }),

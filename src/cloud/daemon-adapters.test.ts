@@ -75,7 +75,7 @@ class FakeCodex implements CodexRuntimePort {
   logout(): Promise<void> { return Promise.reject(new Error("unused")); }
   readAccount(): Promise<CodexAccountProjection> { return Promise.reject(new Error("unused")); }
   listPlugins(): Promise<never> { return Promise.reject(new Error("unused")); }
-  listSessions(): Promise<readonly CodexSessionProjection[]> { return Promise.reject(new Error("unused")); }
+  listSessions(): ReturnType<CodexRuntimePort["listSessions"]> { return Promise.reject(new Error("unused")); }
   reviewSessionStart(): Promise<never> { return Promise.reject(new Error("unused")); }
   startSession(): Promise<never> { return Promise.reject(new Error("unused")); }
   reviewTurnStart(): Promise<never> { return Promise.reject(new Error("unused")); }
@@ -84,6 +84,7 @@ class FakeCodex implements CodexRuntimePort {
   interrupt(): Promise<void> { return Promise.reject(new Error("unused")); }
   rename(): Promise<void> { return Promise.reject(new Error("unused")); }
   inspectTurn(): Promise<unknown> { return Promise.reject(new Error("unused")); }
+  inspectInteractionAuthority(): ReturnType<CodexRuntimePort["inspectInteractionAuthority"]> { return Promise.reject(new Error("unused")); }
   validateInteractionResolution(): Promise<{ responseDigest: string }> { return Promise.reject(new Error("unused")); }
   resolveInteraction(): Promise<{ responseWritten: true }> { return Promise.reject(new Error("unused")); }
   validateInteractionTimeout(): Promise<{ responseDigest: string }> { return Promise.reject(new Error("unused")); }
@@ -244,7 +245,7 @@ describe("state-backed cloud daemon adapter", () => {
     });
     try {
       const signal = new AbortController().signal;
-      const sessions = await adapter.listSessions({ limit: 25, signal });
+      const { sessions } = await adapter.listSessions({ limit: 25, signal });
       expect(sessions).toHaveLength(1);
       expect(sessions[0]).toMatchObject({
         publicId: value.sessionId,
@@ -307,6 +308,53 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       });
       expect(replay.events).toEqual(first.events);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("projects stable bounded local pages beyond the newest session window", async () => {
+    const value = await fixture();
+    const profileId = value.store.requireSession(value.sessionId).profileId;
+    for (let index = 0; index < 30; index += 1) {
+      const created = value.store.createSession({
+        fastEnabled: false,
+        preset: "high",
+        profileId,
+        title: `Paged ${index}`,
+      });
+      value.store.bindSession({
+        expectedRevision: created.revision,
+        providerThreadId: `thread_page_${index.toString().padStart(4, "0")}`,
+        providerUpdatedAt: 2_000 + index,
+        sessionId: created.id,
+        state: "idle",
+      });
+    }
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const observed: string[] = [];
+      let afterPublicId: string | null = null;
+      for (let pageNumber = 0; pageNumber < 5; pageNumber += 1) {
+        const page = await adapter.listSessions({
+          afterPublicId,
+          limit: 10,
+          signal: new AbortController().signal,
+        });
+        observed.push(...page.sessions.map((session) => session.publicId));
+        afterPublicId = page.continueAfterPublicId;
+        if (page.isDone) break;
+      }
+      expect(observed).toHaveLength(31);
+      expect(observed).toEqual([...observed].sort());
+      expect(new Set(observed).size).toBe(31);
+      expect(afterPublicId).toBeNull();
     } finally {
       adapter.close();
       value.store.close();
@@ -1585,7 +1633,10 @@ describe("state-backed cloud daemon adapter", () => {
       });
       try {
         expect(adapter.projectionCacheStatus()).toMatchObject({ state: "unavailable" });
-        expect(await adapter.listSessions({ limit: 25, signal: new AbortController().signal })).toHaveLength(1);
+        expect((await adapter.listSessions({
+          limit: 25,
+          signal: new AbortController().signal,
+        })).sessions).toHaveLength(1);
         expect(await adapter.listUsage({ limit: 100, signal: new AbortController().signal })).toHaveLength(1);
         const authority = await adapter.resolveCommandAuthority({ sessionPublicId: value.sessionId, signal: new AbortController().signal });
         expect(authority).not.toBeNull();
@@ -1672,6 +1723,7 @@ describe("state-backed cloud daemon adapter", () => {
 describe("bridged cloud control", () => {
   test("manual sync runs the daemon bridge before the ordinary control pull", async () => {
     const calls: string[] = [];
+    const deviceSignals: AbortSignal[] = [];
     const cycle: CloudDaemonCycleResult = {
       commandsApplied: 0,
       commandsUnsettled: 0,
@@ -1710,8 +1762,18 @@ describe("bridged cloud control", () => {
       },
       listDevices: unused,
       pairDevice: unused,
-      approveDevice: unused,
-      revokeDevice: unused,
+      approveDevice: (device, idempotencyKey, signal) => {
+        expect(signal.aborted).toBe(false);
+        deviceSignals.push(signal);
+        calls.push(`approve:${device}:${idempotencyKey}`);
+        return Promise.resolve({ approved: true });
+      },
+      revokeDevice: (device, idempotencyKey, signal) => {
+        expect(signal.aborted).toBe(false);
+        deviceSignals.push(signal);
+        calls.push(`revoke:${device}:${idempotencyKey}`);
+        return Promise.resolve({ revoked: true });
+      },
       listRemoteSessionHeads: unused,
       resolveRemoteSession: unused,
       pullRemoteSession: unused,
@@ -1771,5 +1833,19 @@ describe("bridged cloud control", () => {
       deletion: { effectsDisabled: true, state: "pending" },
     });
     expect(calls).toEqual(["close", "delete:true"]);
+
+    calls.length = 0;
+    const deviceSignal = new AbortController().signal;
+    const approvalKey = "018bcfe5-6800-7000-8000-000000000031";
+    const revocationKey = "018bcfe5-6800-7000-8000-000000000032";
+    expect(await combined.approveDevice("device_pending", approvalKey, deviceSignal))
+      .toEqual({ approved: true });
+    expect(await combined.revokeDevice("device_active", revocationKey, deviceSignal))
+      .toEqual({ revoked: true });
+    expect(calls).toEqual([
+      `approve:device_pending:${approvalKey}`,
+      `revoke:device_active:${revocationKey}`,
+    ]);
+    expect(deviceSignals).toEqual([deviceSignal, deviceSignal]);
   });
 });

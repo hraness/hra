@@ -27,9 +27,9 @@ const accountActions = new Set([
   "add",
   "list",
   "show",
-  "login",
   "logout",
   "usage",
+  "usage-history",
   "switch",
   "switch-recover",
 ]);
@@ -177,6 +177,11 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
   if (name === "account") {
     if (rest.length === 0) return { argv: ["account", "list"], kind: "dispatch" };
     const first = rest[0];
+    if (first === "login") {
+      throw new ShellUsageError(
+        "Account login is a dedicated one-shot command. Exit the shell, then run `hra account login <profile> [--device-code]`.",
+      );
+    }
     if (first !== undefined && accountActions.has(first)) {
       return { argv: ["account", ...rest], kind: "dispatch" };
     }
@@ -242,6 +247,9 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
       kind: "dispatch",
     };
   }
+  if (name === "inspect") {
+    return { argv: ["interaction", "inspect", ...rest], kind: "dispatch" };
+  }
   if (name === "decline") {
     return { argv: ["interaction", "decide", ...rest, "--decision", "decline"], kind: "dispatch" };
   }
@@ -265,6 +273,9 @@ export const compileShellLine = (line: string, selection: ShellSelection = {}): 
       kind: "dispatch",
     };
   }
+  if (name === "init") {
+    throw new ShellUsageError("Initialization is a one-shot maintenance command. Exit the shell, then run `hra init --yes`.");
+  }
   return { argv: [name, ...rest], kind: "dispatch" };
 };
 
@@ -285,12 +296,15 @@ export const formatShellPrompt = (selection: ShellSelection = {}): string => {
 export const shellHelp = `Shell commands
 
   /account [selector]       List or select an account
+  /account usage-history ACCOUNT [--limit N]
+                            Page the retained source-ordered usage ledger
   /session [selector]       List or select a session
   /plugin                   List plugins for the selected account
   /plugin show PLUGIN       Inspect one exact or unambiguous plugin
   /events                   Read the selected session's next event page
   /watch                    Follow the selected session as JSONL
   /interactions             List pending interactions for the selected session
+  /inspect ID --revision N  Show exact live approval authority in the protected terminal
   /approve ID --revision N  Approve once unless --decision is supplied
   /decline ID --revision N  Decline an interaction
   /answer ID --revision N   Read protected answers without terminal echo

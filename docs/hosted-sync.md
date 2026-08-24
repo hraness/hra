@@ -1,5 +1,9 @@
 # Hosted sync deployment
 
+Do not perform any provider write in this runbook until the user supplies the exact authorization phrase `approve both`. That phrase authorizes the paired hosted setup only: Resend GitHub OAuth and creation of the sending-only Resend key, followed by the checked hosted secret and bootstrap writes described here.
+
+`approve both` does not authorize DNS. Do not add, change, or remove any DNS record, domain assignment, or production alias until the user separately confirms the exact record-level change. Keep `hra.sh`, the HRA v0 project, and every rollback route unchanged meanwhile.
+
 Use this sequence only for a new HRA Convex project and production deployment. The setup helper refuses an existing HRA environment by default. It does not support overwrite.
 
 Never copy HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the new project. Keep the old project and deployment unchanged for rollback.
@@ -119,7 +123,7 @@ If no populated capability file exists and every pre-bootstrap authority remains
 
 Read the capability file only into HRA's protected authentication JSON input. Never print it, substitute it into argv, copy it into an environment variable, or route it through a log. Complete the verified-email code flow and confirm the identity and first device are active. Consuming this specific bound invitation atomically records a durable bootstrap-accepted timestamp in service control. Later friend invitation issuance depends on that durable fact, so maintenance may remove the terminal invitation receipt without relocking the service. Then remove the one-time capability file.
 
-Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled and do not move `hra.sh` until every live acceptance and rollback gate in the release plan passes.
+Continue launch acceptance with a second pending device approved by the active device, encrypted projection sync in both directions, usage upload cadence, session streaming, command custody, interaction resolution, revocation, and account deletion. Keep hosted invitations disabled. After exact-source live acceptance and Q rollback readiness pass, the checked domain operator may move `hra.sh` for the required forward and reverse rehearsal. The production forward move remains prohibited until that rehearsal and every other rollback gate in the release plan pass.
 
 ## Operate friend-beta invitations
 

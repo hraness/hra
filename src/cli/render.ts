@@ -1,5 +1,6 @@
 import type { LocalCommand } from "../domain/contracts";
 import {
+  type ProtectedInteractionDetailDocument,
   publicInteractionSchema,
   type PublicInteraction,
 } from "../domain/interactions";
@@ -8,27 +9,77 @@ import {
   type SessionEvent,
   type SessionEventPage,
 } from "../domain/session-events";
+import { accountUsageHistoryPageSchema } from "../domain/usage-metrics";
+import { profileIdSchema, sessionIdSchema } from "../domain/values";
+import { isSensitiveDiagnosticKey, redactCompleteSensitiveText } from "./sensitive-text";
 
 export type Output = {
   writeStdout(value: string): void;
   writeStderr(value: string): void;
+  /** Dedicated sink whose caller proves it is the visible local terminal. */
+  writeProtectedStderr?(value: string): void;
   writeStdoutAsync?(value: string, signal: AbortSignal): Promise<void>;
 };
 
 const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const safeJoinControl = /[\u200c\u200d]/u;
 
 export const terminalSafe = (value: string, preserveLineFeeds = false): string => {
   let output = "";
   for (const scalar of value) {
     if (scalar === "\n" && preserveLineFeeds) {
       output += scalar;
-    } else if (unsafeTerminalScalar.test(scalar)) {
+    } else if (unsafeTerminalScalar.test(scalar) && !safeJoinControl.test(scalar)) {
       output += `\\u{${scalar.codePointAt(0)?.toString(16).padStart(4, "0") ?? "fffd"}}`;
     } else {
       output += scalar;
     }
   }
   return output;
+};
+
+const protectedJsonLines = (label: string, value: unknown): readonly string[] =>
+  value === null ? [] : [`${label}:`, safeJson(value, 2)];
+
+export const renderProtectedInteractionDetail = (
+  document: ProtectedInteractionDetailDocument,
+): string => {
+  const binding = document.binding;
+  const lines = [
+    "Protected live approval authority",
+    `Interaction: ${terminalSafe(binding.interactionId)}`,
+    `Revision: ${String(binding.revision)}`,
+    `Kind: ${binding.kind}`,
+    `Session: ${binding.sessionId === null ? "none" : terminalSafe(binding.sessionId)}`,
+    `Profile: ${terminalSafe(binding.profileId)}`,
+    `Provider generation: ${String(binding.processGeneration)}`,
+    `Provider connection: ${terminalSafe(binding.connectionId)}`,
+  ];
+  if (document.authority.kind === "command_approval") {
+    lines.push(
+      "Exact command:",
+      terminalSafe(document.authority.command, true),
+      `Exact reason: ${document.authority.reason === null ? "none" : terminalSafe(document.authority.reason, true)}`,
+      `Working directory: ${document.authority.workingDirectory === null ? "none" : terminalSafe(document.authority.workingDirectory)}`,
+      `Environment: ${document.authority.environmentId === null ? "none" : terminalSafe(document.authority.environmentId)}`,
+      ...protectedJsonLines("Exact available decisions", document.authority.availableDecisions),
+      ...protectedJsonLines("Command actions", document.authority.commandActions),
+      ...protectedJsonLines("Network approval context", document.authority.networkApprovalContext),
+      ...protectedJsonLines("Additional permissions", document.authority.additionalPermissions),
+      ...protectedJsonLines("Proposed exec-policy amendment", document.authority.proposedExecpolicyAmendment),
+      ...protectedJsonLines("Proposed network-policy amendments", document.authority.proposedNetworkPolicyAmendments),
+    );
+  } else {
+    lines.push(
+      `Working directory: ${terminalSafe(document.authority.workingDirectory)}`,
+      `Environment: ${document.authority.environmentId === null ? "none" : terminalSafe(document.authority.environmentId)}`,
+      `Exact reason: ${document.authority.reason === null ? "none" : terminalSafe(document.authority.reason, true)}`,
+      "Exact requested permissions:",
+      safeJson(document.authority.permissions, 2),
+    );
+  }
+  lines.push("");
+  return lines.join("\n");
 };
 
 const jsonEscapeScalar = (scalar: string): string => {
@@ -48,7 +99,7 @@ export const safeJson = (value: unknown, space?: number): string => {
   for (const scalar of serialized) {
     output += scalar === "\n"
       ? scalar
-      : unsafeTerminalScalar.test(scalar)
+      : unsafeTerminalScalar.test(scalar) && !safeJoinControl.test(scalar)
         ? jsonEscapeScalar(scalar)
         : scalar;
   }
@@ -59,9 +110,6 @@ const diagnosticMaximumBytes = 2_048;
 const diagnosticMaximumDepth = 4;
 const diagnosticMaximumEntries = 64;
 const privateKeyDiagnostic = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/iu;
-const bearerDiagnostic = /\bBearer\s+[^\s,;]+/giu;
-const assignedSecretDiagnostic = /\b(token|secret|password|invite|otp|authorization|cookie|api[-_ ]?key)(\s*[:=]\s*)[^\s,;]+/giu;
-const jwtDiagnostic = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu;
 const unixAbsolutePathDiagnostic = /(^|[\s(=[{])\/(?:[^/\s)'"`]+\/)+[^/\s)'"`]*/gu;
 const windowsAbsolutePathDiagnostic = /\b[A-Za-z]:\\(?:[^\\\s)'"`]+\\)*[^\\\s)'"`]*/gu;
 
@@ -71,30 +119,38 @@ const boundedDiagnostic = (value: string): string => {
   return `${new TextDecoder().decode(encoded.subarray(0, diagnosticMaximumBytes))}[truncated]`;
 };
 
-export const safeDiagnostic = (value: string): string => {
+export const safeDiagnostic = (value: string, preserveAbsolutePaths = false): string => {
   if (privateKeyDiagnostic.test(value)) return "[redacted private key diagnostic]";
-  const bounded = boundedDiagnostic(value)
-    .replace(bearerDiagnostic, "Bearer [redacted]")
-    .replace(assignedSecretDiagnostic, (_match, label: string, separator: string) =>
-      `${label}${separator}[redacted]`)
-    .replace(jwtDiagnostic, "[redacted-token]")
-    .replace(unixAbsolutePathDiagnostic, (_match, prefix: string) => `${prefix}[local-path]`)
-    .replace(windowsAbsolutePathDiagnostic, "[local-path]");
-  return terminalSafe(bounded);
+  const bounded = boundedDiagnostic(redactCompleteSensitiveText(value));
+  const paths = preserveAbsolutePaths
+    ? bounded
+    : bounded
+      .replace(unixAbsolutePathDiagnostic, (_match, prefix: string) => `${prefix}[local-path]`)
+      .replace(windowsAbsolutePathDiagnostic, "[local-path]");
+  return terminalSafe(paths);
 };
 
-const safeDiagnosticDetails = (value: unknown, depth = 0): unknown => {
+const safeDiagnosticDetails = (value: unknown, depth = 0, trustedLocalPaths = false): unknown => {
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
   if (typeof value === "string") return safeDiagnostic(value);
   if (depth >= diagnosticMaximumDepth) return "[detail omitted]";
   if (Array.isArray(value)) {
-    return value.slice(0, diagnosticMaximumEntries).map((entry) => safeDiagnosticDetails(entry, depth + 1));
+    return value.slice(0, diagnosticMaximumEntries).map((entry) => safeDiagnosticDetails(entry, depth + 1, trustedLocalPaths));
   }
   if (typeof value !== "object") return "[detail omitted]";
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
       .slice(0, diagnosticMaximumEntries)
-      .map(([key, entry]) => [safeDiagnostic(key), safeDiagnosticDetails(entry, depth + 1)]),
+      .map(([key, entry]) => [
+        safeDiagnostic(key),
+        isSensitiveDiagnosticKey(key)
+          ? "[redacted]"
+          : trustedLocalPaths
+          && (key === "path" || key === "nextCommand" || key === "sameKeyReplayCommand")
+          && typeof entry === "string"
+          ? safeDiagnostic(entry, true)
+          : safeDiagnosticDetails(entry, depth + 1, trustedLocalPaths),
+      ]),
   );
 };
 
@@ -377,10 +433,124 @@ const interactionRecord = (data: unknown): PublicInteraction | null => {
   return recorded.success ? recorded.data : null;
 };
 
+const boundedString = (value: unknown, maximum: number): string | undefined =>
+  typeof value === "string" && value.length > 0 && value.length <= maximum
+    ? value
+    : undefined;
+
+const opaqueCursor = (value: unknown): string | undefined =>
+  typeof value === "string"
+    && value.length <= 2_048
+    && /^hra1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(value)
+    ? value
+    : undefined;
+
+const usageHistoryCursor = (value: unknown): string | undefined =>
+  typeof value === "string"
+    && value.length <= 2_048
+    && /^hrau1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(value)
+    ? value
+    : undefined;
+
+export const publicAccountLoginData = (data: unknown): unknown => {
+  const root = object(data);
+  const account = object(root?.account);
+  const login = object(root?.login);
+  if (root === null || account === null || login === null) {
+    return { login: { status: "unavailable" } };
+  }
+  const publicAccount = {
+    ...(boundedString(account.id, 200) === undefined ? {} : { id: boundedString(account.id, 200) }),
+    ...(boundedString(account.label, 200) === undefined ? {} : { label: boundedString(account.label, 200) }),
+    ...(boundedString(account.state, 64) === undefined ? {} : { state: boundedString(account.state, 64) }),
+    ...(typeof account.processGeneration !== "number" ? {} : { processGeneration: account.processGeneration }),
+    ...(boundedString(account.providerEmail, 320) === undefined ? {} : { providerEmail: boundedString(account.providerEmail, 320) }),
+    ...(boundedString(account.providerPlan, 200) === undefined ? {} : { providerPlan: boundedString(account.providerPlan, 200) }),
+    ...(typeof account.updatedAt !== "number" ? {} : { updatedAt: account.updatedAt }),
+  };
+  const handoff = object(login.handoff);
+  const status = login.status === "pending"
+    || login.status === "signed_in"
+    || login.status === "settled"
+    ? login.status
+    : "unavailable";
+  const publicHandoff = handoff === null
+    ? undefined
+    : handoff.status === "written"
+      && boundedString(handoff.path, 4_096) !== undefined
+      && handoff.documentVersion === 1
+      && handoff.disposition === "preserved_caller_removes_after_login"
+      ? {
+          disposition: "preserved_caller_removes_after_login" as const,
+          documentVersion: 1 as const,
+          path: boundedString(handoff.path, 4_096),
+          status: "written" as const,
+        }
+      : handoff.status === "shown_in_protected_terminal"
+        ? { status: "shown_in_protected_terminal" as const }
+        : handoff.status === "unavailable_on_replay"
+          ? { status: "unavailable_on_replay" as const }
+          : undefined;
+  return {
+    account: publicAccount,
+    ...(boundedString(root.idempotencyKey, 64) === undefined
+      ? {}
+      : { idempotencyKey: boundedString(root.idempotencyKey, 64) }),
+    login: {
+      status,
+      ...(publicHandoff === undefined ? {} : { handoff: publicHandoff }),
+    },
+  };
+};
+
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (command.kind === "account.login") return publicAccountLoginData(data);
+  if (command.kind === "account.usage-history") {
+    const parsed = accountUsageHistoryPageSchema.safeParse(data);
+    return parsed.success
+      ? parsed.data
+      : { account: null, range: null, entries: [], nextCursor: null };
+  }
+  if (command.kind === "session.list") {
+    const root = object(data);
+    if (root === null) {
+      return { accountId: null, sessions: [], nextCursor: null };
+    }
+    const accountId = profileIdSchema.safeParse(root.accountId);
+    const nextCursor = opaqueCursor(root.nextCursor);
+    return {
+      ...root,
+      accountId: accountId.success ? accountId.data : null,
+      sessions: Array.isArray(root.sessions) ? root.sessions : [],
+      nextCursor: root.nextCursor === null ? null : nextCursor ?? null,
+    };
+  }
   if (command.kind === "interaction.show") {
     const record = interactionRecord(data);
     return { interaction: record };
+  }
+  if (command.kind === "interaction.inspect") {
+    const root = object(data);
+    const binding = object(root?.binding);
+    const protectedOutput = object(root?.protectedOutput);
+    const status = protectedOutput?.status === "written"
+      && boundedString(protectedOutput.path, 4_096) !== undefined
+      && protectedOutput.documentVersion === 1
+      && protectedOutput.disposition === "preserved_caller_removes_after_decision"
+      ? {
+          disposition: "preserved_caller_removes_after_decision" as const,
+          documentVersion: 1 as const,
+          path: boundedString(protectedOutput.path, 4_096),
+          status: "written" as const,
+        }
+      : protectedOutput?.status === "shown_in_protected_terminal"
+        ? { status: "shown_in_protected_terminal" as const }
+        : { status: "unavailable" as const };
+    return {
+      interactionId: boundedString(binding?.interactionId, 64) ?? command.interaction,
+      revision: Number.isSafeInteger(binding?.revision) ? binding?.revision : command.expectedRevision,
+      protectedOutput: status,
+    };
   }
   if (command.kind === "interaction.resolve") {
     const root = object(data);
@@ -390,7 +560,14 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
     };
   }
   if (command.kind === "interaction.list" || command.kind === "session.interactions") {
-    return { interactions: interactionRecords(data) };
+    const root = object(data);
+    const sessionId = sessionIdSchema.safeParse(root?.sessionId);
+    const nextCursor = opaqueCursor(root?.nextCursor);
+    return {
+      sessionId: sessionId.success ? sessionId.data : null,
+      interactions: interactionRecords(data),
+      nextCursor: root?.nextCursor === null ? null : nextCursor ?? null,
+    };
   }
   if (command.kind === "session.status") {
     const root = object(data);
@@ -398,13 +575,16 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
     return {
       ...root,
       pendingInteractions: interactionRecords(root.pendingInteractions),
+      pendingInteractionsNextCursor: root.pendingInteractionsNextCursor === null
+        ? null
+        : opaqueCursor(root.pendingInteractionsNextCursor) ?? null,
     };
   }
   if (command.kind === "session.events") return sessionEventPage(data);
   return data;
 };
 
-const renderInteractionList = (data: unknown): string => {
+const renderInteractionTable = (data: unknown): string => {
   const records = interactionRecords(data);
   return table(records.map((record) => ({
     state: record.state,
@@ -414,6 +594,47 @@ const renderInteractionList = (data: unknown): string => {
     revision: record.revision,
     id: record.id,
   })), ["state", "kind", "summary", "deadline", "revision", "id"]);
+};
+
+const renderSessionList = (
+  command: Extract<LocalCommand, { kind: "session.list" }>,
+  data: unknown,
+): string => {
+  const root = object(data);
+  const sessions = Array.isArray(root?.sessions)
+    ? root.sessions.filter((value): value is Record<string, unknown> => object(value) !== null)
+    : [];
+  const listing = table(sessions, ["title", "state", "preset", "fastEnabled", "id"]);
+  const nextCursor = opaqueCursor(root?.nextCursor);
+  const accountId = profileIdSchema.safeParse(root?.accountId);
+  if (nextCursor === undefined || !accountId.success) return listing;
+  return `${listing}\n\nContinue: hra session list --account ${accountId.data} --limit ${String(command.limit)} --cursor ${nextCursor}`;
+};
+
+const renderInteractionList = (
+  command: Extract<LocalCommand, { kind: "interaction.list" | "session.interactions" }>,
+  data: unknown,
+): string => {
+  const listing = renderInteractionTable(data);
+  const root = object(data);
+  const nextCursor = opaqueCursor(root?.nextCursor);
+  if (nextCursor === undefined) return listing;
+  const resolvedSession = sessionIdSchema.safeParse(root?.sessionId);
+  if (command.kind === "session.interactions" && !resolvedSession.success) return listing;
+  if (command.kind === "interaction.list" && command.session !== undefined && !resolvedSession.success) {
+    return listing;
+  }
+  const invocation = command.kind === "session.interactions"
+    ? ["hra", "session", "interactions", resolvedSession.data]
+    : [
+        "hra",
+        "interaction",
+        "list",
+        ...(resolvedSession.success ? [resolvedSession.data] : []),
+      ];
+  if (command.pending) invocation.push("--pending");
+  invocation.push("--limit", String(command.limit), "--cursor", nextCursor);
+  return `${listing}\n\nContinue: ${invocation.join(" ")}`;
 };
 
 const renderInteraction = (record: PublicInteraction): string => {
@@ -441,20 +662,31 @@ const renderInteraction = (record: PublicInteraction): string => {
       rows.push(`Command class: ${line(display.commandClass)}`);
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       if (display.workingDirectory !== null) rows.push(`Directory: ${line(display.workingDirectory)}`);
+      rows.push(`Available decisions: ${display.availableDecisions.join(", ")}`);
+      if (record.state === "pending") {
+        rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
+      }
       break;
     case "file_change_approval":
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       if (display.grantRoot !== null) rows.push(`Grant root: ${line(display.grantRoot)}`);
+      rows.push(
+        "Approval disabled: the pinned provider callback did not expose exact affected paths or change detail.",
+        `Safe decisions: ${display.availableDecisions.filter((decision) => decision === "decline" || decision === "cancel").join(", ") || "wait for expiry"}`,
+      );
       break;
     case "permission_approval":
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       rows.push(`Permissions: ${display.requested.length === 0 ? "none" : display.requested.map((permission) => line(permission.name)).join(", ")}`);
       if (display.requested.length === 0) {
-        rows.push("No permission category can be granted. Decline or cancel this interaction.");
+        rows.push("No permission category can be granted. Decline this interaction.");
       } else {
         rows.push(`Protected grant document: ${line(JSON.stringify({
           permissions: display.requested.map((permission) => permission.name),
         }))}`);
+      }
+      if (record.state === "pending") {
+        rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
       }
       break;
     case "user_input":
@@ -523,7 +755,15 @@ const renderSessionStatus = (data: unknown): string => {
   }
   const pendingInteractions = interactionRecords(root?.pendingInteractions);
   if (pendingInteractions.length > 0) {
-    rows.push("", "Pending interactions", renderInteractionList(pendingInteractions));
+    rows.push("", "Pending interactions", renderInteractionTable(pendingInteractions));
+  }
+  const pendingCursor = opaqueCursor(root?.pendingInteractionsNextCursor);
+  const resolvedSession = sessionIdSchema.safeParse(session.id);
+  if (pendingCursor !== undefined && resolvedSession.success) {
+    rows.push(
+      "",
+      `Continue pending interactions: hra session interactions ${resolvedSession.data} --pending --limit 100 --cursor ${pendingCursor}`,
+    );
   }
   return rows.join("\n");
 };
@@ -623,6 +863,50 @@ const usagePercent = (payload: unknown): number | null => {
   return typeof primary?.usedPercent === "number" ? primary.usedPercent : null;
 };
 
+const renderAccountUsageHistory = (
+  command: Extract<LocalCommand, { kind: "account.usage-history" }>,
+  data: unknown,
+): string => {
+  const parsed = accountUsageHistoryPageSchema.safeParse(data);
+  if (!parsed.success) return "Account usage history data is unavailable.";
+  const page = parsed.data;
+  const rows = page.entries.map((entry): Record<string, unknown> => entry.state === "observed"
+    ? {
+        revision: entry.sourceRevision,
+        observed: instant(entry.observedAt),
+        state: entry.state,
+        lifetimeTokens: entry.lifetimeTokens === null
+          ? "unavailable"
+          : entry.lifetimeTokens.toLocaleString("en-US"),
+        gap: entry.gapBefore === null ? "unknown" : entry.gapBefore ? "yes" : "no",
+      }
+    : {
+        revision: entry.sourceRevision,
+        observed: instant(entry.observedAt),
+        state: entry.state,
+        lifetimeTokens: "unavailable",
+        gap: entry.reasonCode,
+      });
+  const body = rows.length === 0
+    ? "No usage observations in this range."
+    : table(rows, ["revision", "observed", "state", "lifetimeTokens", "gap"]);
+  const output = [
+    `Usage history for ${line(page.account.label)} (${line(page.account.id)})`,
+    `Range: ${instant(page.range.fromObservedAt)} through ${instant(page.range.throughObservedAt)}`,
+    "Ordered by durable source revision; provider observation times may be nonmonotonic.",
+    "",
+    body,
+  ];
+  const cursor = usageHistoryCursor(page.nextCursor);
+  if (cursor !== undefined) {
+    output.push(
+      "",
+      `Continue: hra account usage-history ${line(page.account.id)} --from ${instant(page.range.fromObservedAt)} --through ${instant(page.range.throughObservedAt)} --limit ${String(command.limit)} --cursor ${cursor}`,
+    );
+  }
+  return output.join("\n");
+};
+
 const renderAccountUsage = (data: unknown): string => {
   const root = object(data);
   const usage = !Array.isArray(root?.usage) || root.usage.length === 0
@@ -681,13 +965,30 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     })}\n`);
     return;
   }
-  const value = data as Record<string, unknown>;
-  if (command.kind === "account.list" && Array.isArray(value.accounts)) {
+  const publicData = command.kind === "account.login" ? publicAccountLoginData(data) : data;
+  const value = publicData as Record<string, unknown>;
+  if (command.kind === "account.login") {
+    const login = object(value.login);
+    const handoff = object(login?.handoff);
+    if (login?.status === "signed_in") {
+      output.writeStdout("The account is signed in.\n");
+    } else if (login?.status === "settled") {
+      output.writeStdout("This login is settled and the account is signed out. Start a fresh login if access is still needed.\n");
+    } else if (handoff?.status === "written") {
+      output.writeStdout(`Login instructions were written to ${line(handoff.path)}. The caller must remove the file after login.\n`);
+    } else if (handoff?.status === "shown_in_protected_terminal") {
+      output.writeStdout("Login instructions were shown in the protected foreground terminal.\n");
+    } else if (handoff?.status === "unavailable_on_replay") {
+      output.writeStdout("Login is pending, but one-time instructions are unavailable on same-key replay. Cancel this login before starting a fresh one.\n");
+    } else {
+      output.writeStdout("Login state is unavailable.\n");
+    }
+  } else if (command.kind === "account.list" && Array.isArray(value.accounts)) {
     output.writeStdout(`${table(value.accounts as Record<string, unknown>[], ["label", "state", "providerPlan", "id"])}\n`);
   } else if (command.kind === "project.list" && Array.isArray(value.projects)) {
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
   } else if (command.kind === "session.list" && Array.isArray(value.sessions)) {
-    output.writeStdout(`${table(value.sessions as Record<string, unknown>[], ["title", "state", "preset", "fastEnabled", "id"])}\n`);
+    output.writeStdout(`${renderSessionList(command, data)}\n`);
   } else if (command.kind === "session.show") {
     output.writeStdout(`${renderSession(data)}\n`);
   } else if (command.kind === "session.status") {
@@ -696,10 +997,19 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     const page = sessionEventPage(data);
     output.writeStdout(`${page === null ? "Event page data is unavailable." : renderSessionEventPageHuman(page)}\n`);
   } else if (command.kind === "session.interactions" || command.kind === "interaction.list") {
-    output.writeStdout(`${renderInteractionList(data)}\n`);
+    output.writeStdout(`${renderInteractionList(command, data)}\n`);
   } else if (command.kind === "interaction.show" || command.kind === "interaction.resolve") {
     const interaction = interactionRecord(data);
     output.writeStdout(`${interaction === null ? "Interaction data is unavailable." : renderInteraction(interaction)}\n`);
+  } else if (command.kind === "interaction.inspect") {
+    const projected = publicInteractionData(command, data) as {
+      protectedOutput?: { path?: unknown; status?: unknown };
+    };
+    output.writeStdout(projected.protectedOutput?.status === "written"
+      ? `Protected approval detail was written to ${line(projected.protectedOutput.path)}. The caller must remove the file after deciding.\n`
+      : projected.protectedOutput?.status === "shown_in_protected_terminal"
+        ? "Protected approval detail was shown in the foreground terminal.\n"
+        : "Protected approval detail is unavailable.\n");
   } else if (command.kind === "session.note.get") {
     output.writeStdout(`${line(value.note)}\n`);
   } else if (command.kind === "daemon.status") {
@@ -724,6 +1034,8 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     } else {
       output.writeStdout(`Desktop switch ${line(value.switchGeneration)} still requires recovery: ${line(value.diagnostic)}.\n`);
     }
+  } else if (command.kind === "account.usage-history") {
+    output.writeStdout(`${renderAccountUsageHistory(command, data)}\n`);
   } else if (command.kind === "account.usage") {
     output.writeStdout(`${renderAccountUsage(data)}\n`);
   } else if (command.kind === "plugin.list") {
@@ -735,7 +1047,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   }
 }
 
-export function renderFailure(error: { code: string; message: string; details?: unknown }, json: boolean, output: Output): number {
+export function renderFailure(error: { code: string; message: string; details?: unknown; trustedLocalPaths?: boolean }, json: boolean, output: Output): number {
   const safeError = {
     code: error.code,
     message: error.code === "INTERNAL"
@@ -743,7 +1055,7 @@ export function renderFailure(error: { code: string; message: string; details?: 
       : safeDiagnostic(error.message),
     ...(error.code === "INTERNAL" || error.details === undefined
       ? {}
-      : { details: safeDiagnosticDetails(error.details) }),
+      : { details: safeDiagnosticDetails(error.details, 0, error.trustedLocalPaths === true) }),
   };
   if (json) {
     output.writeStdout(`${safeJson({ ok: false, version: 1, error: safeError })}\n`);

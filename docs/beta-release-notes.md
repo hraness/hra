@@ -10,7 +10,7 @@ Install the immutable beta tag with Bun 1.3.14:
 bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
 hra --version
 hra doctor --offline
-hra init
+hra init --yes
 ```
 
 Cloud enrollment is invitation-only during the friend beta. Keep the invite and email verification code out of shell arguments and history; `hra auth login --input-stdin` or `--input-fd` accepts one protected JSON document.

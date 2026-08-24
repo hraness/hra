@@ -1,18 +1,20 @@
 #!/usr/bin/env bun
 
+import { dlopen } from "bun:ffi";
 import { randomUUID } from "node:crypto";
 import { access, lstat, mkdir, mkdtemp, readFile, realpath, rmdir, unlink, writeFile } from "node:fs/promises";
 import { constants, readSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
 import { isatty } from "node:tty";
 
 import {
   CliUsageError,
+  accountLoginCancelCommand,
+  accountLoginReplayCommand,
   completeProtectedAuthLogin,
   completeProtectedInteraction,
+  deviceMutationReplayCommand,
   parseCli,
   projectionRecoveryReplayCommand,
   requestsJsonOutput,
@@ -22,9 +24,19 @@ import {
   type ProtectedInputSource,
   type RemoteCliCommand,
 } from "./cli/parser";
-import { renderFailure, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
+import {
+  parseAccountLoginAuthorityList,
+  parseAccountLoginResponse,
+  parseProtectedInteractionDetailResponse,
+  ProtectedOutputError,
+  ProtectedOutputFile,
+  type DeviceLoginDocument,
+} from "./cli/protected-output";
+import { renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
+import { redactCompleteSensitiveText } from "./cli/sensitive-text";
 import { compileShellLine, formatShellPrompt, shellHelp, type ShellSelection } from "./cli/shell";
 import { ShellLiveObserver } from "./cli/shell-live";
+import { discardReadableUntilEnd, ShellTerminalCoordinator } from "./cli/shell-terminal";
 import { followSessionEvents } from "./cli/watch";
 import {
   BridgedCloudControl,
@@ -56,7 +68,10 @@ import {
 } from "./cloud/index";
 import { resolvePinnedCodexRuntime } from "./codex/index";
 import type { CommandResponse, LocalCommand } from "./domain/contracts";
-import { profileIdSchema, sessionIdSchema } from "./domain/values";
+import {
+  PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
+} from "./domain/interactions";
+import { profileIdSchema, selectByIdOrLabel, sessionIdSchema } from "./domain/values";
 import {
   LocalDaemonServer,
   LocalDaemonIndeterminateError,
@@ -77,6 +92,7 @@ import { UnavailableCloudControl, type CloudControlPort, type CodexRuntimePort, 
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { HraService } from "./daemon/service";
 import { AccountUsagePoller } from "./daemon/usage-poller";
+import { UsageHistoryCursorCodec } from "./daemon/usage-history-cursor";
 import { ExactChatGptBundlePort, LocalDesktopSwitchPort, PidBoundDesktopAccountRuntime } from "./desktop/index";
 import {
   assertInstallationHome,
@@ -117,10 +133,75 @@ const processOutput: Output = {
   writeStdout: (value) => process.stdout.write(value),
   writeStdoutAsync: writeProcessStdoutAsync,
   writeStderr: (value) => process.stderr.write(value),
+  writeProtectedStderr: (value) => process.stderr.write(value),
 };
 
 const protectedInputMaximumBytes = 64 * 1024;
 const sessionCursorCustodySlot = "session-cursor-key";
+
+export const protectedTerminalInputQueueForPlatform = (
+  platform: NodeJS.Platform,
+): 0 | 1 | null => platform === "darwin" ? 1 : platform === "linux" ? 0 : null;
+
+const terminalInputQueue = protectedTerminalInputQueueForPlatform(process.platform);
+
+export const protectedTerminalControlLibrariesForPlatform = (
+  platform: NodeJS.Platform,
+  architecture: NodeJS.Architecture,
+): readonly string[] => {
+  if (platform === "darwin") return ["/usr/lib/libSystem.B.dylib"];
+  if (platform !== "linux") return [];
+  const muslArchitecture = architecture === "x64"
+    ? "x86_64"
+    : architecture === "arm64"
+      ? "aarch64"
+      : null;
+  if (muslArchitecture === null) return ["libc.so.6"];
+  const muslLibrary = `libc.musl-${muslArchitecture}.so.1`;
+  return [
+    "libc.so.6",
+    muslLibrary,
+    `/lib/${muslLibrary}`,
+    `/usr/lib/${muslLibrary}`,
+  ];
+};
+
+type NativeTerminalControlLibrary = Readonly<{
+  symbols: Readonly<{
+    tcflush: (fd: number, queue: number) => number;
+  }>;
+}>;
+
+let nativeTerminalControlLibrary: NativeTerminalControlLibrary | null | undefined;
+
+const loadNativeTerminalControlLibrary = (): NativeTerminalControlLibrary | null => {
+  if (nativeTerminalControlLibrary !== undefined) return nativeTerminalControlLibrary;
+  nativeTerminalControlLibrary = null;
+  for (const library of protectedTerminalControlLibrariesForPlatform(process.platform, process.arch)) {
+    try {
+      nativeTerminalControlLibrary = dlopen(library, {
+        tcflush: { args: ["i32", "i32"], returns: "i32" },
+      });
+      break;
+    } catch {
+      // Try the next platform libc name. Protected input fails closed if none load.
+    }
+  }
+  return nativeTerminalControlLibrary;
+};
+
+const flushProtectedTerminalInput = (fd: number): void => {
+  const library = loadNativeTerminalControlLibrary();
+  if (library === null || terminalInputQueue === null) {
+    throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
+  }
+  try {
+    if (library.symbols.tcflush(fd, terminalInputQueue) === 0) return;
+  } catch {
+    // Preserve the same fail-closed, non-native diagnostic below.
+  }
+  throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
+};
 
 const decodeProtectedJson = (bytes: Buffer): unknown => {
   if (bytes.byteLength === 0) throw new CliUsageError("Protected input is empty.");
@@ -160,40 +241,658 @@ const readBoundedDescriptor = (fd: number): Buffer => {
   }
 };
 
-const readHiddenProtectedLine = async (output: Output): Promise<Buffer> => {
-  const sink = new Writable({
-    write(_chunk, _encoding, callback) { callback(); },
-  });
-  const terminal = createInterface({
-    input: process.stdin,
-    output: sink,
-    terminal: true,
-    historySize: 0,
-  });
-  const controller = new AbortController();
-  terminal.once("SIGINT", () => controller.abort(new Error("Protected input was cancelled.")));
-  output.writeStderr("Protected JSON input (hidden): ");
+type RawTerminalLineResult =
+  | Readonly<{ bytes: Buffer; kind: "line" }>
+  | Readonly<{ kind: "cancelled" | "ended" | "overflow" | "quit" | "suspended" }>;
+
+class ProtectedTerminalRawSignalRequest extends Error {
+  readonly signal: "SIGQUIT" | "SIGTSTP";
+
+  constructor(signal: "SIGQUIT" | "SIGTSTP") {
+    super(signal === "SIGTSTP"
+      ? "Protected terminal input was suspended."
+      : "Protected terminal input was interrupted by SIGQUIT.");
+    this.name = "ProtectedTerminalRawSignalRequest";
+    this.signal = signal;
+  }
+}
+
+const bestEffortStderr = (output: Output, value: string): boolean => {
   try {
-    const value = await terminal.question("", { signal: controller.signal });
-    const bytes = Buffer.from(value, "utf8");
-    if (bytes.byteLength > protectedInputMaximumBytes) {
-      bytes.fill(0);
-      throw new CliUsageError(`Protected input exceeds ${String(protectedInputMaximumBytes)} UTF-8 bytes.`);
-    }
-    return bytes;
-  } catch (error: unknown) {
-    if (controller.signal.aborted) throw new CliUsageError("Protected interaction input was cancelled.");
-    throw error;
-  } finally {
-    terminal.close();
-    sink.destroy();
-    output.writeStderr("\n");
+    output.writeStderr(value);
+    return true;
+  } catch {
+    // Protected-input custody must not depend on display availability.
+    return false;
   }
 };
+
+const abortRequested = (signal?: AbortSignal): boolean => signal?.aborted ?? false;
+const rawSignalTailQuietMilliseconds = 50;
+const rawSignalTailMaximumMilliseconds = 500;
+
+const discardReadableNow = (input: NodeJS.ReadableStream): number => {
+  const readable = input as unknown as {
+    read(size?: number): Buffer | string | null;
+  };
+  let discarded = 0;
+  for (;;) {
+    const value = readable.read();
+    if (value === null) return discarded;
+    discarded += 1;
+    if (Buffer.isBuffer(value)) value.fill(0);
+  }
+};
+
+const readBoundedRawTerminalLine = (
+  input: NodeJS.ReadableStream,
+  maximumBytes: number,
+  signal?: AbortSignal,
+): Promise<RawTerminalLineResult> => new Promise((resolve) => {
+  const storage = Buffer.alloc(maximumBytes + 1);
+  let length = 0;
+  let settled = false;
+  const finish = (result: RawTerminalLineResult): void => {
+    if (settled) {
+      if (result.kind === "line") result.bytes.fill(0);
+      return;
+    }
+    settled = true;
+    input.off("data", onData);
+    input.off("end", onEnded);
+    input.off("error", onEnded);
+    input.off("close", onEnded);
+    signal?.removeEventListener("abort", onAbort);
+    input.pause();
+    storage.fill(0);
+    resolve(result);
+  };
+  const onEnded = (): void => finish({ kind: "ended" });
+  const onAbort = (): void => finish({ kind: "cancelled" });
+  const onData = (value: unknown): void => {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
+    let result: RawTerminalLineResult | null = null;
+    for (const byte of chunk) {
+      if (byte === 0x03) {
+        result = { kind: "cancelled" };
+        break;
+      }
+      if (byte === 0x04) {
+        result = { kind: "ended" };
+        break;
+      }
+      if (byte === 0x1a) {
+        result = { kind: "suspended" };
+        break;
+      }
+      if (byte === 0x1c) {
+        result = { kind: "quit" };
+        break;
+      }
+      if (byte === 0x0a || byte === 0x0d) {
+        result = { bytes: Buffer.from(storage.subarray(0, length)), kind: "line" };
+        break;
+      }
+      if (byte === 0x08 || byte === 0x7f) {
+        if (length > 0) {
+          let removeFrom = length - 1;
+          while (removeFrom > 0 && ((storage[removeFrom] ?? 0) & 0xc0) === 0x80) removeFrom -= 1;
+          storage.fill(0, removeFrom, length);
+          length = removeFrom;
+        }
+        continue;
+      }
+      if (length >= maximumBytes) {
+        result = { kind: "overflow" };
+        break;
+      }
+      storage[length] = byte;
+      length += 1;
+    }
+    chunk.fill(0);
+    if (result !== null) finish(result);
+  };
+  input.on("data", onData);
+  input.once("end", onEnded);
+  input.once("error", onEnded);
+  input.once("close", onEnded);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
+  if (signal?.aborted === true) {
+    finish({ kind: "cancelled" });
+    return;
+  }
+  if (state.destroyed === true || state.readableEnded === true) {
+    finish({ kind: "ended" });
+    return;
+  }
+  input.resume();
+});
+
+const drainRawTerminalUntilQuiet = (
+  input: NodeJS.ReadableStream,
+  quietMilliseconds = 20,
+  maximumMilliseconds = 500,
+  signal?: AbortSignal,
+): Promise<"cancelled" | "continuous" | "ended" | "quiet" | "quit" | "suspended"> => new Promise((resolve) => {
+  let settled = false;
+  let quietTimer: ReturnType<typeof setTimeout> | null = null;
+  const maximumTimer = setTimeout(() => finish("continuous"), maximumMilliseconds);
+  const armQuietTimer = (): void => {
+    if (quietTimer !== null) clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => finish("quiet"), quietMilliseconds);
+  };
+  const finish = (result: "cancelled" | "continuous" | "ended" | "quiet" | "quit" | "suspended"): void => {
+    if (settled) return;
+    settled = true;
+    if (quietTimer !== null) clearTimeout(quietTimer);
+    clearTimeout(maximumTimer);
+    input.off("data", onData);
+    input.off("end", onEnded);
+    input.off("error", onEnded);
+    input.off("close", onEnded);
+    signal?.removeEventListener("abort", onAbort);
+    input.pause();
+    resolve(result);
+  };
+  const onEnded = (): void => finish("ended");
+  const onAbort = (): void => finish("cancelled");
+  const onData = (value: unknown): void => {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
+    const cancelled = chunk.includes(0x03);
+    const ended = chunk.includes(0x04);
+    const suspended = chunk.includes(0x1a);
+    const quit = chunk.includes(0x1c);
+    chunk.fill(0);
+    if (cancelled) {
+      finish("cancelled");
+      return;
+    }
+    if (suspended) {
+      finish("suspended");
+      return;
+    }
+    if (quit) {
+      finish("quit");
+      return;
+    }
+    if (ended) {
+      finish("ended");
+      return;
+    }
+    armQuietTimer();
+  };
+  input.on("data", onData);
+  input.once("end", onEnded);
+  input.once("error", onEnded);
+  input.once("close", onEnded);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
+  if (signal?.aborted === true) {
+    finish("cancelled");
+    return;
+  }
+  if (state.destroyed === true || state.readableEnded === true) {
+    finish("ended");
+    return;
+  }
+  armQuietTimer();
+  input.resume();
+});
+
+const discardRawSignalTailUntilQuiet = (
+  input: NodeJS.ReadableStream,
+  quietMilliseconds = 20,
+  maximumMilliseconds = 500,
+  signal?: AbortSignal,
+): Promise<"cancelled" | "continuous" | "ended" | "quiet"> => new Promise((resolve) => {
+  let settled = false;
+  let quietTimer: ReturnType<typeof setTimeout> | null = null;
+  const maximumTimer = setTimeout(() => finish("continuous"), maximumMilliseconds);
+  const armQuietTimer = (): void => {
+    if (quietTimer !== null) clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => finish("quiet"), quietMilliseconds);
+  };
+  const finish = (result: "cancelled" | "continuous" | "ended" | "quiet"): void => {
+    if (settled) return;
+    settled = true;
+    if (quietTimer !== null) clearTimeout(quietTimer);
+    clearTimeout(maximumTimer);
+    input.off("data", onData);
+    input.off("end", onEnded);
+    input.off("error", onEnded);
+    input.off("close", onEnded);
+    signal?.removeEventListener("abort", onAbort);
+    input.pause();
+    resolve(result);
+  };
+  const onEnded = (): void => finish("ended");
+  const onAbort = (): void => finish("cancelled");
+  const onData = (value: unknown): void => {
+    if (Buffer.isBuffer(value)) value.fill(0);
+    armQuietTimer();
+  };
+  input.on("data", onData);
+  input.once("end", onEnded);
+  input.once("error", onEnded);
+  input.once("close", onEnded);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
+  if (signal?.aborted === true) {
+    finish("cancelled");
+    return;
+  }
+  if (state.destroyed === true || state.readableEnded === true) {
+    finish("ended");
+    return;
+  }
+  armQuietTimer();
+  input.resume();
+});
+
+const discardRawTerminalUntilExit = (
+  input: NodeJS.ReadableStream,
+  signal?: AbortSignal,
+): Promise<"continuous" | "exited" | "quit" | "suspended"> =>
+  new Promise((resolve) => {
+    let settled = false;
+    let requestedSignal: "quit" | "suspended" | null = null;
+    let quietTimer: ReturnType<typeof setTimeout> | null = null;
+    let maximumTimer: ReturnType<typeof setTimeout> | null = null;
+    const armSignalQuietTimer = (): void => {
+      if (quietTimer !== null) clearTimeout(quietTimer);
+      quietTimer = setTimeout(
+        () => finish(requestedSignal ?? "continuous"),
+        rawSignalTailQuietMilliseconds,
+      );
+      maximumTimer ??= setTimeout(() => finish("continuous"), rawSignalTailMaximumMilliseconds);
+    };
+    const finish = (
+      result: "continuous" | "exited" | "quit" | "suspended" = "exited",
+    ): void => {
+      if (settled) return;
+      settled = true;
+      if (quietTimer !== null) clearTimeout(quietTimer);
+      if (maximumTimer !== null) clearTimeout(maximumTimer);
+      input.off("data", onData);
+      input.off("end", onEnded);
+      input.off("error", onEnded);
+      input.off("close", onEnded);
+      signal?.removeEventListener("abort", onEnded);
+      input.pause();
+      resolve(result);
+    };
+    const onEnded = (): void => finish();
+    const onData = (value: unknown): void => {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(String(value), "utf8");
+      const suspended = chunk.includes(0x1a);
+      const quit = chunk.includes(0x1c);
+      const exitRequested = chunk.includes(0x03) || chunk.includes(0x04);
+      chunk.fill(0);
+      if (requestedSignal !== null) {
+        armSignalQuietTimer();
+      } else if (suspended || quit) {
+        requestedSignal = suspended ? "suspended" : "quit";
+        armSignalQuietTimer();
+      } else if (exitRequested) {
+        finish();
+      }
+    };
+    input.on("data", onData);
+    input.once("end", onEnded);
+    input.once("error", onEnded);
+    input.once("close", onEnded);
+    signal?.addEventListener("abort", onEnded, { once: true });
+    const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
+    if (signal?.aborted === true || state.destroyed === true || state.readableEnded === true) {
+      finish();
+      return;
+    }
+    input.resume();
+  });
+
+export const readHiddenProtectedLineFromTerminal = async (
+  input: NodeJS.ReadableStream,
+  output: Output,
+  flushInput: () => void,
+  signal?: AbortSignal,
+): Promise<Buffer> => {
+  if (signal?.aborted === true) {
+    throw new CliUsageError("Protected terminal input is unavailable because the shell terminal closed.");
+  }
+  try {
+    discardReadableNow(input);
+    flushInput();
+    discardReadableNow(input);
+  } catch {
+    const noticeVisible = bestEffortStderr(output,
+      "Protected input cannot prove an empty terminal queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n",
+    );
+    if (!noticeVisible || await discardReadableUntilEnd(input, signal) === "aborted") {
+      input.pause();
+      discardReadableNow(input);
+      (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+    }
+    throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
+  }
+  const tty = input as NodeJS.ReadableStream & {
+    isRaw?: boolean;
+    setRawMode?: (mode: boolean) => unknown;
+  };
+  if (typeof tty.setRawMode !== "function") {
+    throw new CliUsageError("Protected terminal input cannot establish raw no-echo mode.");
+  }
+  const wasRaw = tty.isRaw === true;
+  let rawModeActive = false;
+  let promptWritten = false;
+  const displayState = { requiredAvailable: true };
+  let pendingAnswer: Buffer | null = null;
+  let releaseAnswer = false;
+  const writeRequiredPrompt = (value: string): void => {
+    try {
+      output.writeStderr(value);
+    } catch {
+      displayState.requiredAvailable = false;
+      throw new CliUsageError("Protected terminal input closed because its prompt became unavailable.");
+    }
+  };
+  const restoreRawMode = (): void => {
+    if (!rawModeActive) return;
+    let lastFailure: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        tty.setRawMode?.(wasRaw);
+        if (tty.isRaw === wasRaw) {
+          rawModeActive = false;
+          return;
+        }
+      } catch (error: unknown) {
+        lastFailure = error;
+        if (tty.isRaw === wasRaw) {
+          rawModeActive = false;
+          return;
+        }
+      }
+    }
+    input.pause();
+    discardReadableNow(input);
+    (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+    rawModeActive = false;
+    throw new CliUsageError(
+      lastFailure === null
+        ? "Protected terminal input was closed because raw mode could not be restored."
+        : "Protected terminal input was closed because raw mode restoration failed.",
+    );
+  };
+  let rawActivationProved = false;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      tty.setRawMode(true);
+      if (tty.isRaw === true) {
+        rawActivationProved = true;
+        break;
+      }
+    } catch {
+      if (tty.isRaw === true) {
+        rawActivationProved = true;
+        break;
+      }
+    }
+  }
+  if (!rawActivationProved) {
+    discardReadableNow(input);
+    try {
+      flushInput();
+      discardReadableNow(input);
+    } catch {
+      // Fencing the stream below does not depend on a successful final flush.
+    }
+    bestEffortStderr(output,
+      "Protected terminal input could not disable echo. HRA closed this shell input before reading protected bytes.\n");
+    input.pause();
+    (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+    throw new CliUsageError("Protected terminal input could not establish raw no-echo mode.");
+  }
+  rawModeActive = true;
+  try {
+    const beginPhrase = `BEGIN-${randomUUID().slice(0, 6).toUpperCase()}`;
+    const beginPhraseBytes = Buffer.from(beginPhrase, "utf8");
+    writeRequiredPrompt(
+      `Protected input is hidden. Type ${beginPhrase} and press Enter to begin (input remains hidden): `,
+    );
+    promptWritten = true;
+    let readinessAttempts = 0;
+    let readinessBytes = 0;
+    for (;;) {
+      const readiness = await readBoundedRawTerminalLine(input, 4 * 1_024, signal);
+      if (readiness.kind === "line") {
+        readinessAttempts += 1;
+        readinessBytes += readiness.bytes.byteLength;
+        const accepted = readiness.bytes.equals(beginPhraseBytes);
+        readiness.bytes.fill(0);
+        if (accepted) break;
+        if (readinessAttempts >= 8 || readinessBytes > 8 * 1_024) {
+          beginPhraseBytes.fill(0);
+          bestEffortStderr(output,
+            "\nhra: Protected-input readiness could not prove a human handoff. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+          throw new CliUsageError("Protected terminal input could not establish a bounded readiness handoff.");
+        }
+        writeRequiredPrompt(`\nhra: Queued input was discarded. Type ${beginPhrase} and press Enter: `);
+        continue;
+      }
+      if (readiness.kind === "suspended") throw new ProtectedTerminalRawSignalRequest("SIGTSTP");
+      if (readiness.kind === "quit") throw new ProtectedTerminalRawSignalRequest("SIGQUIT");
+      if (readiness.kind === "cancelled") {
+        throw new CliUsageError("Protected interaction input was cancelled.");
+      }
+      if (readiness.kind === "ended") {
+        throw new CliUsageError("Protected terminal input ended before a document was received.");
+      }
+      bestEffortStderr(output,
+        "\nhra: Protected-input readiness exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+      throw new CliUsageError("Protected-input readiness exceeded its bounded line size.");
+    }
+    beginPhraseBytes.fill(0);
+    const quiet = await drainRawTerminalUntilQuiet(input, 20, 500, signal);
+    if (quiet === "suspended") throw new ProtectedTerminalRawSignalRequest("SIGTSTP");
+    if (quiet === "quit") throw new ProtectedTerminalRawSignalRequest("SIGQUIT");
+    if (quiet === "cancelled") throw new CliUsageError("Protected interaction input was cancelled.");
+    if (quiet === "ended") {
+      throw new CliUsageError("Protected terminal input ended before a document was received.");
+    }
+    if (quiet === "continuous") {
+      bestEffortStderr(output,
+        "\nhra: Protected input did not become quiet. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+      throw new CliUsageError("Protected terminal input could not establish a quiet input boundary.");
+    }
+    discardReadableNow(input);
+    try {
+      flushInput();
+      discardReadableNow(input);
+    } catch {
+      bestEffortStderr(output,
+        "\nhra: Protected input cannot prove an empty terminal queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+      throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
+    }
+    writeRequiredPrompt("\nProtected JSON input (hidden): ");
+    const answer = await readBoundedRawTerminalLine(input, protectedInputMaximumBytes, signal);
+    if (answer.kind === "line") {
+      pendingAnswer = answer.bytes;
+      const resumePhrase = `RESUME-${randomUUID().slice(0, 6).toUpperCase()}`;
+      const resumePhraseBytes = Buffer.from(resumePhrase, "utf8");
+      writeRequiredPrompt(
+        `\nProtected input captured. Type ${resumePhrase} and press Enter to return to HRA (input remains hidden): `,
+      );
+      let handoffAttempts = 0;
+      let handoffBytes = 0;
+      for (;;) {
+        const handoff = await readBoundedRawTerminalLine(input, 128, signal);
+        if (handoff.kind === "line") {
+          handoffAttempts += 1;
+          handoffBytes += handoff.bytes.byteLength;
+          const accepted = handoff.bytes.equals(resumePhraseBytes);
+          handoff.bytes.fill(0);
+          if (accepted) break;
+          if (handoffAttempts >= 8 || handoffBytes > 1_024) {
+            resumePhraseBytes.fill(0);
+            answer.bytes.fill(0);
+            bestEffortStderr(output,
+              "\nhra: Protected-input return could not prove a human handoff. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+            throw new CliUsageError("Protected terminal input could not establish a bounded return handoff.");
+          }
+          writeRequiredPrompt(`\nhra: Trailing input was discarded. Type ${resumePhrase} and press Enter: `);
+          continue;
+        }
+        answer.bytes.fill(0);
+        if (handoff.kind === "suspended") throw new ProtectedTerminalRawSignalRequest("SIGTSTP");
+        if (handoff.kind === "quit") throw new ProtectedTerminalRawSignalRequest("SIGQUIT");
+        if (handoff.kind === "cancelled") {
+          throw new CliUsageError("Protected interaction input was cancelled.");
+        }
+        if (handoff.kind === "ended") {
+          throw new CliUsageError("Protected terminal input ended before custody was returned.");
+        }
+        bestEffortStderr(output,
+          "\nhra: Protected-input handoff exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        throw new CliUsageError("Protected terminal input could not establish a bounded handoff.");
+      }
+      resumePhraseBytes.fill(0);
+      const trailing = await drainRawTerminalUntilQuiet(input, 20, 500, signal);
+      if (trailing === "suspended") {
+        answer.bytes.fill(0);
+        throw new ProtectedTerminalRawSignalRequest("SIGTSTP");
+      }
+      if (trailing === "quit") {
+        answer.bytes.fill(0);
+        throw new ProtectedTerminalRawSignalRequest("SIGQUIT");
+      }
+      if (trailing === "ended") {
+        releaseAnswer = true;
+        return answer.bytes;
+      }
+      if (trailing === "cancelled") {
+        answer.bytes.fill(0);
+        throw new CliUsageError("Protected interaction input was cancelled.");
+      }
+      if (trailing === "continuous") {
+        answer.bytes.fill(0);
+        bestEffortStderr(output,
+          "\nhra: Protected input retained a continuing tail. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        throw new CliUsageError("Protected terminal input could not establish a quiet trailing boundary.");
+      }
+      discardReadableNow(input);
+      try {
+        flushInput();
+        discardReadableNow(input);
+      } catch {
+        answer.bytes.fill(0);
+        bestEffortStderr(output,
+          "\nhra: Protected input cannot prove an empty trailing queue. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+        throw new CliUsageError("Protected terminal input could not establish an empty trailing queue.");
+      }
+      releaseAnswer = true;
+      return answer.bytes;
+    }
+    if (answer.kind === "suspended") throw new ProtectedTerminalRawSignalRequest("SIGTSTP");
+    if (answer.kind === "quit") throw new ProtectedTerminalRawSignalRequest("SIGQUIT");
+    if (answer.kind === "cancelled") {
+      throw new CliUsageError("Protected interaction input was cancelled.");
+    }
+    if (answer.kind === "ended") {
+      throw new CliUsageError("Protected terminal input ended before a document was received.");
+    }
+    bestEffortStderr(output,
+      "\nhra: Protected input exceeded its bound. HRA will discard input until EOF; press Ctrl-D to return safely.\n");
+    throw new CliUsageError(`Protected input exceeds ${String(protectedInputMaximumBytes)} UTF-8 bytes.`);
+  } catch (error: unknown) {
+    const state = input as NodeJS.ReadableStream & { destroyed?: unknown; readableEnded?: unknown };
+    let failure = error;
+    if (error instanceof ProtectedTerminalRawSignalRequest) {
+      const tail = state.destroyed === true || state.readableEnded === true
+        ? "ended"
+        : await discardRawSignalTailUntilQuiet(
+            input,
+            rawSignalTailQuietMilliseconds,
+            rawSignalTailMaximumMilliseconds,
+            signal,
+          );
+      let boundaryProved = tail === "ended" || tail === "quiet";
+      discardReadableNow(input);
+      if (boundaryProved) {
+        try {
+          flushInput();
+          discardReadableNow(input);
+        } catch {
+          boundaryProved = false;
+        }
+      }
+      if (!boundaryProved) {
+        bestEffortStderr(output,
+          "\nhra: Protected input could not prove a quiet signal boundary. HRA closed this shell input without re-signalling.\n");
+        failure = new CliUsageError(
+          "Protected terminal input could not establish a quiet signal boundary.",
+        );
+      }
+      restoreRawMode();
+      if (state.destroyed !== true) {
+        (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+      }
+    } else if (state.destroyed !== true && state.readableEnded !== true) {
+      const immediateFence = !displayState.requiredAvailable || abortRequested(signal);
+      if (!immediateFence) {
+        bestEffortStderr(output,
+          "\nhra: Protected input remains hidden while HRA discards its tail. Press Ctrl-D or Ctrl-C; HRA will then close this shell input safely.\n");
+        const exit = await discardRawTerminalUntilExit(input, signal);
+        if (exit === "suspended") {
+          failure = new ProtectedTerminalRawSignalRequest("SIGTSTP");
+        } else if (exit === "quit") {
+          failure = new ProtectedTerminalRawSignalRequest("SIGQUIT");
+        } else if (exit === "continuous") {
+          failure = new CliUsageError(
+            "Protected terminal input could not establish a quiet signal boundary.",
+          );
+        }
+      }
+      discardReadableNow(input);
+      try {
+        flushInput();
+        discardReadableNow(input);
+      } catch {
+        if (failure instanceof ProtectedTerminalRawSignalRequest) {
+          failure = new CliUsageError(
+            "Protected terminal input could not establish an empty signal boundary.",
+          );
+        }
+      }
+      restoreRawMode();
+      (input as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+    }
+    throw failure;
+  } finally {
+    let rawRestored = false;
+    try {
+      restoreRawMode();
+      rawRestored = true;
+    } finally {
+      if (!rawRestored || !releaseAnswer) pendingAnswer?.fill(0);
+      input.pause();
+      if (promptWritten) bestEffortStderr(output, "\n");
+    }
+  }
+};
+
+const readHiddenProtectedLine = async (output: Output, signal?: AbortSignal): Promise<Buffer> =>
+  await readHiddenProtectedLineFromTerminal(
+    process.stdin,
+    output,
+    () => flushProtectedTerminalInput(0),
+    signal,
+  );
 
 const readProtectedDocument = async (
   source: ProtectedInputSource,
   output: Output,
+  signal?: AbortSignal,
 ): Promise<unknown> => {
   const fd = source.kind === "stdin" ? 0 : source.fd;
   let bytes: Buffer;
@@ -202,7 +901,7 @@ const readProtectedDocument = async (
       if (fd !== 0) {
         throw new CliUsageError("Protected input from a terminal is supported only through stdin.");
       }
-      bytes = await readHiddenProtectedLine(output);
+      bytes = await readHiddenProtectedLine(output, signal);
     } else {
       bytes = readBoundedDescriptor(fd);
     }
@@ -213,9 +912,84 @@ const readProtectedDocument = async (
   return decodeProtectedJson(bytes);
 };
 
-export async function resolveSessionEventCursorCodec(
+export type ProtectedTerminalLifecycleHooks = Readonly<{
+  onOutputFailure: (listener: () => void) => () => void;
+  onSignal: (signal: NodeJS.Signals, listener: () => void) => () => void;
+  resignal: (signal: NodeJS.Signals) => void;
+}>;
+
+const processProtectedTerminalLifecycleHooks: ProtectedTerminalLifecycleHooks = {
+  onOutputFailure: (listener) => {
+    process.stderr.once("error", listener);
+    process.stderr.once("close", listener);
+    const state = process.stderr as NodeJS.WritableStream & { destroyed?: unknown };
+    if (state.destroyed === true) listener();
+    return () => {
+      process.stderr.off("error", listener);
+      process.stderr.off("close", listener);
+    };
+  },
+  onSignal: (signal, listener) => {
+    process.once(signal, listener);
+    return () => process.off(signal, listener);
+  },
+  resignal: (signal) => process.kill(process.pid, signal),
+};
+
+const protectedTerminalLifecycleSignals: readonly NodeJS.Signals[] = process.platform === "win32"
+  ? ["SIGINT", "SIGTERM"]
+  : ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT", "SIGTSTP"];
+
+export const withProtectedTerminalLifecycle = async <T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal,
+  hooks: ProtectedTerminalLifecycleHooks = processProtectedTerminalLifecycleHooks,
+): Promise<T> => {
+  const controller = new AbortController();
+  const removers: (() => void)[] = [];
+  const lifecycleState: { receivedSignal: NodeJS.Signals | null } = { receivedSignal: null };
+  const abortForOutput = (): void => controller.abort(
+    new CliUsageError("Protected terminal input closed because its prompt output became unavailable."),
+  );
+  const abortForParent = (): void => controller.abort(
+    parentSignal?.reason ?? new CliUsageError("Protected terminal input lifecycle ended."),
+  );
+  try {
+    removers.push(hooks.onOutputFailure(abortForOutput));
+    for (const signal of protectedTerminalLifecycleSignals) {
+      removers.push(hooks.onSignal(signal, () => {
+        if (lifecycleState.receivedSignal === null) lifecycleState.receivedSignal = signal;
+        controller.abort(new CliUsageError(`Protected terminal input interrupted by ${signal}.`));
+      }));
+    }
+    if (parentSignal !== undefined) {
+      parentSignal.addEventListener("abort", abortForParent, { once: true });
+      removers.push(() => parentSignal.removeEventListener("abort", abortForParent));
+      if (parentSignal.aborted) abortForParent();
+    }
+    try {
+      return await operation(controller.signal);
+    } catch (error: unknown) {
+      if (error instanceof ProtectedTerminalRawSignalRequest && lifecycleState.receivedSignal === null) {
+        lifecycleState.receivedSignal = error.signal;
+      }
+      throw error;
+    }
+  } finally {
+    for (const remove of removers.reverse()) remove();
+    if (lifecycleState.receivedSignal !== null) {
+      try {
+        hooks.resignal(lifecycleState.receivedSignal);
+      } catch {
+        // Raw mode has already been restored or fenced; signal delivery is best effort.
+      }
+    }
+  }
+};
+
+async function resolveCursorAuthorityKey(
   custody: GenerationalSecretCustody,
-): Promise<SessionEventCursorCodec> {
+): Promise<string> {
   let observation = await custody.read(sessionCursorCustodySlot);
   if (observation === null) {
     observation = await custody.compareAndSwap(
@@ -226,16 +1000,24 @@ export async function resolveSessionEventCursorCodec(
     if (observation === null) observation = await custody.read(sessionCursorCustodySlot);
   }
   if (observation === null) throw new Error("Session event cursor authority could not be initialized.");
-  return new SessionEventCursorCodec(observation.value);
+  return observation.value;
+}
+
+export async function resolveSessionEventCursorCodec(
+  custody: GenerationalSecretCustody,
+): Promise<SessionEventCursorCodec> {
+  return new SessionEventCursorCodec(await resolveCursorAuthorityKey(custody));
+}
+
+export async function resolveUsageHistoryCursorCodec(
+  custody: GenerationalSecretCustody,
+): Promise<UsageHistoryCursorCodec> {
+  return new UsageHistoryCursorCodec(await resolveCursorAuthorityKey(custody));
 }
 
 const syncDiagnosticLimit = 16;
 const syncDiagnosticMaximumBytes = 768;
 const syncDiagnosticTruncationMarker = " [truncated]";
-const bearerSecretPattern = /(^|[^A-Za-z0-9])Bearer[ \t]+[A-Za-z0-9._~+/=-]+/giu;
-const prefixedSecretPattern = /(^|[^A-Za-z0-9])(?:sk|re)_[A-Za-z0-9_-]{8,}/gu;
-const assignedSecretPattern = /(^|[^A-Za-z0-9])(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|authorization)[ \t]*[:=][ \t]*(?:Bearer[ \t]+)?[A-Za-z0-9._~+/=-]{4,}/giu;
-const jwtSecretPattern = /(^|[^A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/gu;
 const privateKeyHeaderPattern = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/iu;
 const secretLabelPattern = /(?:\bBearer\b|\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|authorization)\b|\b(?:sk|re)_|\beyJ)/iu;
 const unsafeTerminalScalarPattern = /[\p{Cc}\p{Cf}\p{Cs}]/u;
@@ -322,8 +1104,18 @@ class DiagnosedUnavailableCloudControl extends UnavailableCloudControl {
   override deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
   override pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  override approveDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  override revokeDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  override approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+    void device;
+    void idempotencyKey;
+    void signal;
+    return Promise.reject(this.#unavailable());
+  }
+  override revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+    void device;
+    void idempotencyKey;
+    void signal;
+    return Promise.reject(this.#unavailable());
+  }
 }
 
 function cloudBindingDiagnostic(error: unknown): string {
@@ -531,11 +1323,7 @@ function redactSyncSecrets(value: string): string {
   if (unsafeTerminalScalarPattern.test(value) && secretLabelPattern.test(value)) {
     return "[redacted token-like diagnostic containing terminal controls]";
   }
-  return value
-    .replace(bearerSecretPattern, (_match, prefix: string) => `${prefix}Bearer [redacted]`)
-    .replace(prefixedSecretPattern, (_match, prefix: string) => `${prefix}[redacted-token]`)
-    .replace(jwtSecretPattern, (_match, prefix: string) => `${prefix}[redacted-token]`)
-    .replace(assignedSecretPattern, (_match, prefix: string) => `${prefix}[redacted-token]`);
+  return redactCompleteSensitiveText(value, "[redacted-token]");
 }
 
 function redactSyncPaths(value: string): string {
@@ -546,9 +1334,9 @@ function redactSyncPaths(value: string): string {
 }
 
 function sanitizeSyncDiagnostic(value: string): string {
-  const bounded = boundedUtf8Text(value, syncDiagnosticMaximumBytes);
-  const redacted = redactSyncSecrets(redactSyncPaths(bounded));
-  const terminalSanitized = terminalSafe(redacted);
+  const redacted = redactSyncPaths(redactSyncSecrets(value));
+  const bounded = boundedUtf8Text(redacted, syncDiagnosticMaximumBytes);
+  const terminalSanitized = terminalSafe(bounded);
   const sanitized = redactSyncSecrets(redactSyncPaths(terminalSanitized));
   const pathSafe = containsAbsolutePath(sanitized)
     ? "[sync diagnostic omitted because it contained a local path]"
@@ -798,6 +1586,12 @@ export async function initialize(
   input: { paths?: StatePaths; documentsDirectory?: string } = {},
 ): Promise<number> {
   const paths = input.paths ?? resolveStatePaths();
+  if (!yes) {
+    return renderFailure({
+      code: "INTERACTION_REQUIRED",
+      message: "Confirm the default Documents project with `hra init --yes`.",
+    }, json, output);
+  }
   await initializeStatePaths(paths);
   const authority = await DaemonLock.acquire(paths, { state: "maintenance" });
   let store: StateStore | undefined;
@@ -806,13 +1600,6 @@ export async function initialize(
     let projectCreated = false;
     const documents = input.documentsDirectory ?? join(homedir(), "Documents");
     if (store.listProjects().length === 0) {
-      let approved = yes;
-      if (!approved && !json && process.stdin.isTTY) {
-        approved = confirm(`Use ${documents} as the default HRA project?`);
-      }
-      if (!approved) {
-        return renderFailure({ code: "INTERACTION_REQUIRED", message: "Confirm the default Documents project with `hra init --yes`." }, json, output);
-      }
       await access(documents, constants.R_OK | constants.W_OK);
       await store.createProject("Documents", documents, true);
       projectCreated = true;
@@ -1352,6 +2139,7 @@ export async function runDaemon(
     const cloudIdentityNamespace = cloudStartup.identityNamespace;
     let cloudStartupDiagnostic = cloudStartup.diagnostic;
     const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
+    const usageHistoryCursors = await resolveUsageHistoryCursorCodec(secretCustody);
     const cloudJournal = cloudStartup.journal;
     const projectionRecoveryBlocker = cloudStartup.projectionRecoveryBlocker;
     cloudRequestController = new AbortController();
@@ -1474,6 +2262,7 @@ export async function runDaemon(
       daemonAuthority: activeDaemonAuthority,
       daemonGeneration: generation,
       eventCursors,
+      usageHistoryCursors,
       ...(desktop === undefined ? {} : { desktop }),
       requestStop,
     });
@@ -1669,6 +2458,24 @@ const isClosedStdout = (error: unknown): boolean => {
   return code === "EPIPE" || code === "ERR_STREAM_DESTROYED" || code === "ERR_STREAM_WRITE_AFTER_END";
 };
 
+const readInvocationProtectedDocument = async (
+  source: ProtectedInputSource,
+  output: Output,
+  input: CliMainInput,
+): Promise<unknown> => {
+  if (input.readProtectedDocument !== undefined) return await input.readProtectedDocument(source);
+  const fd = protectedInputDescriptor(source);
+  const terminal = (input.isTerminalDescriptor ?? isatty)(fd);
+  if (!terminal) return await readProtectedDocument(source, output);
+  if (!input.interactive || !process.stderr.isTTY) {
+    throw new CliUsageError(
+      "Terminal protected input requires an interactive stdin and a visible terminal on stderr. Redirect one protected JSON document from a non-terminal stdin or file descriptor instead.",
+    );
+  }
+  return await withProtectedTerminalLifecycle(async (signal) =>
+    await readProtectedDocument(source, output, signal));
+};
+
 async function executeProtectedInteraction(
   invocation: Extract<CliInvocation, { kind: "interaction.resolve-protected" }>,
   output: Output,
@@ -1676,8 +2483,7 @@ async function executeProtectedInteraction(
 ): Promise<number> {
   const terminalRefusal = rejectJsonTerminalProtectedInput(invocation, output, input);
   if (terminalRefusal !== null) return terminalRefusal;
-  const document = await (input.readProtectedDocument ?? ((source) =>
-    readProtectedDocument(source, output)))(invocation.input);
+  const document = await readInvocationProtectedDocument(invocation.input, output, input);
   const command = completeProtectedInteraction(invocation, document);
   const response = await commandCaller(input)(command);
   if (!response.ok) return renderFailure(response.error, invocation.json, output);
@@ -1692,13 +2498,332 @@ async function executeProtectedAuthLogin(
 ): Promise<number> {
   const terminalRefusal = rejectJsonTerminalProtectedInput(invocation, output, input);
   if (terminalRefusal !== null) return terminalRefusal;
-  const document = await (input.readProtectedDocument ?? ((source) =>
-    readProtectedDocument(source, output)))(invocation.input);
+  const document = await readInvocationProtectedDocument(invocation.input, output, input);
   const command = completeProtectedAuthLogin(invocation, document);
   const response = await commandCaller(input)(command);
   if (!response.ok) return renderFailure(response.error, invocation.json, output);
   renderSuccess(command, response.data, invocation.json, output);
   return 0;
+}
+
+const accountLoginPublicData = (
+  result: ReturnType<typeof parseAccountLoginResponse>,
+  handoff:
+    | Readonly<{
+        disposition: "preserved_caller_removes_after_login";
+        documentVersion: 1;
+        path: string;
+        status: "written";
+      }>
+    | Readonly<{ status: "shown_in_protected_terminal" | "unavailable_on_replay" }>
+    | undefined,
+): unknown => ({
+  account: result.account,
+  idempotencyKey: result.idempotencyKey,
+  login: {
+    status: result.kind === "signed_in"
+      ? "signed_in"
+      : result.kind === "settled"
+        ? "settled"
+        : "pending",
+    ...(handoff === undefined ? {} : { handoff }),
+  },
+});
+
+const renderProtectedForegroundLogin = (
+  document: DeviceLoginDocument,
+  output: Output,
+): void => {
+  output.writeStderr([
+    `Complete Codex ${document.method === "device_code" ? "device-code " : ""}login for ${terminalSafe(document.accountLabel)}.`,
+    `URL: ${terminalSafe(document.verificationUrl)}`,
+    ...(document.userCode === undefined ? [] : [`Code: ${terminalSafe(document.userCode)}`]),
+    `If needed, cancel with: ${terminalSafe(document.cancelCommand)}`,
+    "",
+  ].join("\n"));
+};
+
+const protectedInteractionInspectCommand = (
+  invocation: Extract<CliInvocation, { kind: "interaction.inspect-protected" }>,
+): string => `hra interaction inspect ${invocation.command.interaction} --revision ${String(invocation.command.expectedRevision)} --handoff-file /absolute/path/to/empty-protected-approval.json${invocation.json ? " --json" : ""}`;
+
+async function executeProtectedInteractionInspect(
+  invocation: Extract<CliInvocation, { kind: "interaction.inspect-protected" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const interactive = input.interactive === true;
+  const protectedTerminalWriter = output.writeProtectedStderr?.bind(output);
+  const protectedTerminal = interactive
+    && (input.isTerminalDescriptor ?? isatty)(2)
+    && protectedTerminalWriter !== undefined;
+  if (invocation.handoffFile === undefined && (invocation.json || !protectedTerminal)) {
+    return renderFailure({
+      code: "INTERACTION_REQUIRED",
+      details: {
+        nextCommand: protectedInteractionInspectCommand(invocation),
+        protectedOutput: "absolute_canonical_owned_mode_0600_empty_file",
+      },
+      message: "Protected approval inspection requires a foreground terminal or a caller-owned protected output file.",
+      trustedLocalPaths: true,
+    }, invocation.json, output);
+  }
+
+  let protectedOutput: ProtectedOutputFile | undefined;
+  const closeProtectedOutput = (): boolean => {
+    const current = protectedOutput;
+    protectedOutput = undefined;
+    return current?.close() ?? true;
+  };
+  try {
+    if (invocation.handoffFile !== undefined) {
+      try {
+        // Prove and hold the caller-owned empty file before asking for private authority.
+        protectedOutput = new ProtectedOutputFile(invocation.handoffFile);
+      } catch (error: unknown) {
+        if (!(error instanceof ProtectedOutputError)) throw error;
+        return renderFailure({
+          code: "INVALID_INPUT",
+          details: {
+            requirement: "absolute_canonical_current_user_owned_mode_0700_parent_empty_single_link_mode_0600_regular_file",
+          },
+          message: "The approval-detail handoff file does not satisfy the protected output contract.",
+        }, invocation.json, output);
+      }
+    }
+
+    const response = await commandCaller(input)(invocation.command);
+    if (!response.ok) return renderFailure(response.error, invocation.json, output);
+    let document: ReturnType<typeof parseProtectedInteractionDetailResponse>;
+    try {
+      document = parseProtectedInteractionDetailResponse(response.data, {
+        interactionId: invocation.command.interaction,
+        revision: invocation.command.expectedRevision,
+      });
+    } catch (error: unknown) {
+      if (!(error instanceof ProtectedOutputError)) throw error;
+      return renderFailure({
+        code: "INTERNAL",
+        message: "The daemon returned an invalid protected approval-detail document.",
+      }, invocation.json, output);
+    }
+
+    let terminalDocument: string | undefined;
+    if (protectedOutput === undefined) {
+      terminalDocument = renderProtectedInteractionDetail(document);
+      const terminalBytes = new TextEncoder().encode(terminalDocument);
+      const terminalSafeSize = terminalBytes.byteLength <= PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES;
+      terminalBytes.fill(0);
+      if (!terminalSafeSize) {
+        return renderFailure({
+          code: "INTERACTION_REQUIRED",
+          details: {
+            nextCommand: protectedInteractionInspectCommand(invocation),
+            protectedOutput: "absolute_canonical_owned_mode_0600_empty_file",
+          },
+          message: "The complete approval authority is too large for safe terminal display. Use a caller-owned protected output file.",
+          trustedLocalPaths: true,
+        }, invocation.json, output);
+      }
+    }
+
+    if (protectedOutput !== undefined) {
+      try {
+        const handoffPath = protectedOutput.path;
+        protectedOutput.write(document);
+        if (!closeProtectedOutput()) throw new ProtectedOutputError("write_unproven");
+        renderSuccess(invocation.command, {
+          binding: document.binding,
+          protectedOutput: {
+            disposition: "preserved_caller_removes_after_decision",
+            documentVersion: document.version,
+            path: handoffPath,
+            status: "written",
+          },
+        }, invocation.json, output);
+        return 0;
+      } catch (error: unknown) {
+        if (!(error instanceof ProtectedOutputError)) throw error;
+        return renderFailure({
+          code: "RECOVERY_REQUIRED",
+          message: "Protected approval detail may have reached the caller-owned file, but HRA could not prove the completed write. Treat the file as private material and remove it before retrying.",
+        }, invocation.json, output);
+      }
+    }
+
+    if (protectedTerminalWriter === undefined || terminalDocument === undefined) {
+      throw new Error("Protected terminal authority changed during interaction inspection.");
+    }
+    protectedTerminalWriter(terminalDocument);
+    renderSuccess(invocation.command, {
+      binding: document.binding,
+      protectedOutput: { status: "shown_in_protected_terminal" },
+    }, false, output);
+    return 0;
+  } finally {
+    closeProtectedOutput();
+  }
+}
+
+async function executeAccountLogin(
+  invocation: Extract<CliInvocation, { kind: "account.login-handoff" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const interactive = input.interactive === true;
+  if (invocation.handoffFile === undefined && (invocation.json || !interactive)) {
+    return renderFailure({
+      code: "INTERACTION_REQUIRED",
+      details: {
+        idempotencyKey: invocation.command.idempotencyKey,
+        nextCommand: invocation.replayCommand,
+        protectedOutput: "absolute_canonical_owned_mode_0600_empty_file",
+      },
+      message: "Account login requires a protected handoff file outside a foreground terminal. Create the file under a current-user-owned mode 0700 directory, set the empty file to mode 0600, then run the exact same-key command.",
+      trustedLocalPaths: true,
+    }, invocation.json, output);
+  }
+
+  let protectedOutput: ProtectedOutputFile | undefined;
+  const closeProtectedOutput = (): boolean => {
+    const current = protectedOutput;
+    protectedOutput = undefined;
+    return current?.close() ?? true;
+  };
+  try {
+    if (invocation.handoffFile !== undefined) {
+      try {
+        protectedOutput = new ProtectedOutputFile(invocation.handoffFile);
+      } catch (error: unknown) {
+        if (!(error instanceof ProtectedOutputError)) throw error;
+        return renderFailure({
+          code: "INVALID_INPUT",
+          details: {
+            requirement: "absolute_canonical_current_user_owned_mode_0700_parent_empty_single_link_mode_0600_regular_file",
+          },
+          message: "The login handoff file does not satisfy the protected output contract.",
+        }, invocation.json, output);
+      }
+    }
+
+    const callDaemon = commandCaller(input);
+    let listed: CommandResponse;
+    try {
+      listed = await callDaemon({ kind: "account.list" });
+    } catch (error: unknown) {
+      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+      return renderFailure({
+        code: "UNAVAILABLE",
+        details: {
+          idempotencyKey: invocation.command.idempotencyKey,
+          nextCommand: invocation.replayCommand,
+          providerEffectDispatched: false,
+        },
+        message: "HRA could not resolve the exact account authority. No provider login was dispatched; retry the same command.",
+        trustedLocalPaths: true,
+      }, invocation.json, output);
+    }
+    if (!listed.ok) return renderFailure(listed.error, invocation.json, output);
+    let authorities: ReturnType<typeof parseAccountLoginAuthorityList>;
+    try {
+      authorities = parseAccountLoginAuthorityList(listed.data);
+    } catch (error: unknown) {
+      if (!(error instanceof ProtectedOutputError)) throw error;
+      return renderFailure({
+        code: "INTERNAL",
+        message: "The daemon returned an invalid account authority list.",
+      }, invocation.json, output);
+    }
+    const selected = selectByIdOrLabel(authorities, invocation.command.account);
+    if (selected.kind === "missing") {
+      return renderFailure({
+        code: "NOT_FOUND",
+        message: "No account matches the requested login authority.",
+      }, invocation.json, output);
+    }
+    if (selected.kind === "ambiguous") {
+      return renderFailure({
+        code: "AMBIGUOUS",
+        details: {
+          candidates: selected.values.map(({ id, label }) => ({ id, label })),
+        },
+        message: "The account selector is ambiguous. Use the exact account ID.",
+      }, invocation.json, output);
+    }
+    const command = { ...invocation.command, account: selected.value.id };
+    const replayCommand = accountLoginReplayCommand(
+      command,
+      invocation.handoffFile ?? "/absolute/path/to/empty-protected-login.json",
+      invocation.json,
+    );
+    let response: CommandResponse;
+    try {
+      response = await callDaemon(command);
+    } catch (error: unknown) {
+      if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+      return renderFailure({
+        code: "RECOVERY_REQUIRED",
+        details: {
+          cancelCommand: accountLoginCancelCommand(selected.value.id),
+          idempotencyKey: command.idempotencyKey,
+          sameKeyReplayCommand: replayCommand,
+        },
+        message: "The account login response is uncertain. Reuse only the exact same-key command to inspect the durable result; cancel the pending login before starting a fresh one.",
+        trustedLocalPaths: true,
+      }, invocation.json, output);
+    }
+    if (!response.ok) return renderFailure(response.error, invocation.json, output);
+
+    let result: ReturnType<typeof parseAccountLoginResponse>;
+    try {
+      result = parseAccountLoginResponse(response.data, {
+        accountId: selected.value.id,
+        deviceCode: command.deviceCode,
+        idempotencyKey: command.idempotencyKey,
+      });
+      if (result.kind === "handoff") {
+        if (protectedOutput !== undefined) {
+          const handoffPath = protectedOutput.path;
+          protectedOutput.write(result.document);
+          if (!closeProtectedOutput()) throw new ProtectedOutputError("write_unproven");
+          renderSuccess(command, accountLoginPublicData(result, {
+            disposition: "preserved_caller_removes_after_login",
+            documentVersion: 1,
+            path: handoffPath,
+            status: "written",
+          }), invocation.json, output);
+        } else {
+          renderProtectedForegroundLogin(result.document, output);
+          renderSuccess(command, accountLoginPublicData(result, {
+            status: "shown_in_protected_terminal",
+          }), false, output);
+        }
+        return 0;
+      }
+      if (!closeProtectedOutput()) throw new ProtectedOutputError("write_unproven");
+      renderSuccess(command, accountLoginPublicData(
+        result,
+        result.kind === "pending_replay"
+          ? { status: "unavailable_on_replay" }
+          : undefined,
+      ), invocation.json, output);
+      return 0;
+    } catch (error: unknown) {
+      if (!(error instanceof ProtectedOutputError)) throw error;
+      return renderFailure({
+        code: "RECOVERY_REQUIRED",
+        details: {
+          cancelCommand: accountLoginCancelCommand(selected.value.id),
+          idempotencyKey: command.idempotencyKey,
+          sameKeyReplayCommand: replayCommand,
+        },
+        message: "The provider login effect may be pending, but HRA could not prove the protected handoff. Cancel the pending login before starting a fresh login; a same-key replay cannot recover one-time instructions.",
+        trustedLocalPaths: true,
+      }, invocation.json, output);
+    }
+  } finally {
+    closeProtectedOutput();
+  }
 }
 
 async function executeSessionEventFollow(
@@ -1781,23 +2906,6 @@ async function executeSessionEventFollow(
   }
 }
 
-const defaultReadShellLine = async (prompt: string): Promise<string | null> => {
-  const terminal = createInterface({
-    input: process.stdin,
-    output: process.stderr,
-    terminal: true,
-    historySize: 0,
-  });
-  try {
-    return await terminal.question(prompt);
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ERR_USE_AFTER_CLOSE") return null;
-    throw error;
-  } finally {
-    terminal.close();
-  }
-};
-
 const selectedId = (
   data: unknown,
   field: "account" | "session",
@@ -1806,27 +2914,72 @@ const selectedId = (
   const value = (data as Record<string, unknown>)[field];
   if (value === null || typeof value !== "object") return null;
   const id = (value as Record<string, unknown>).id;
-  return typeof id === "string" ? id : null;
+  const parsed = (field === "account" ? profileIdSchema : sessionIdSchema).safeParse(id);
+  return parsed.success ? parsed.data : null;
 };
 
 export async function runPersistentShell(
   output: Output = processOutput,
   input: CliMainInput = {},
 ): Promise<number> {
-  const readLine = input.readShellLine ?? defaultReadShellLine;
+  const terminal = input.readShellLine === undefined
+    ? new ShellTerminalCoordinator({
+        flushInput: () => flushProtectedTerminalInput(0),
+        input: process.stdin,
+        lifecycleHooks: {
+          onSignal: (signal, listener) => {
+            process.once(signal, listener);
+            return () => process.off(signal, listener);
+          },
+          resignal: (signal) => process.kill(process.pid, signal),
+        },
+        output: process.stderr,
+        terminal: true,
+      })
+    : null;
+  const readLine = input.readShellLine ?? (async (prompt: string) =>
+    terminal === null ? null : await terminal.question(prompt));
+  const commandInput: CliMainInput = terminal === null || input.readProtectedDocument !== undefined
+    ? input
+    : {
+        ...input,
+        readProtectedDocument: async (source) => {
+          if (source.kind === "stdin") {
+            const discarded = await terminal.establishProtectedInputBoundary();
+            if (discarded > 0) {
+              throw new CliUsageError(
+                "Protected input cannot consume pretyped shell lines. HRA discarded the buffered lines; retry and enter the protected document only after its hidden prompt appears.",
+              );
+            }
+          }
+          return await terminal.withSignalHandlingSuspended(
+            async () => await withProtectedTerminalLifecycle(
+              async (signal) => await readProtectedDocument(source, output, signal),
+              terminal.lifecycleSignal,
+            ),
+          );
+        },
+      };
   const callDaemon = commandCaller(input);
-  const status = await callDaemon({ kind: "daemon.status" });
-  if (!status.ok) return renderFailure(status.error, false, output);
-  daemonStatusIdentity(status);
-  const live = new ShellLiveObserver({
-    callDaemon,
-    write: (value) => output.writeStderr(value),
-  });
-  let selection: ShellSelection = {};
-  output.writeStderr("HRA shell. /help lists commands; /exit leaves the daemon running.\n");
+  let live: ShellLiveObserver | null = null;
   try {
+    const status = await callDaemon({ kind: "daemon.status" });
+    if (!status.ok) return renderFailure(status.error, false, output);
+    daemonStatusIdentity(status);
+    live = new ShellLiveObserver({
+      callDaemon,
+      write: (value) => terminal?.writeLive(value) ?? output.writeStderr(value),
+    });
+    let selection: ShellSelection = {};
+    output.writeStderr("HRA shell. /help lists commands; /exit leaves the daemon running.\n");
     for (;;) {
-      const line = await readLine(formatShellPrompt(selection));
+      let line: string | null;
+      try {
+        line = await readLine(formatShellPrompt(selection));
+      } catch {
+        output.writeStderr("hra: Shell input is unavailable.\n");
+        return 1;
+      }
       if (line === null) return 0;
       try {
         const intent = compileShellLine(line, selection);
@@ -1845,6 +2998,7 @@ export async function runPersistentShell(
           const account = selectedId(response.data, "account");
           if (account === null) throw new Error("Selected account response is invalid.");
           await live.stop();
+          terminal?.discardHeldLiveOutput();
           selection = { account };
           output.writeStderr(`Selected account ${terminalSafe(account)}.\n`);
           continue;
@@ -1858,22 +3012,32 @@ export async function runPersistentShell(
           const session = selectedId(response.data, "session");
           if (session === null) throw new Error("Selected session response is invalid.");
           const data = response.data as { session?: { profileId?: unknown } };
-          const account = typeof data.session?.profileId === "string"
-            ? data.session.profileId
-            : selection.account;
-          selection = { ...(account === undefined ? {} : { account }), session };
+          const parsedProfileId = profileIdSchema.safeParse(data.session?.profileId);
+          if (!parsedProfileId.success) {
+            throw new Error("Selected session account response is invalid.");
+          }
+          const account = parsedProfileId.data;
+          await live.stop();
+          terminal?.discardHeldLiveOutput();
+          selection = { account, session };
           output.writeStderr(`Selected session ${terminalSafe(session)}.\n`);
           await live.select({ session, statusData: response.data });
           continue;
         }
-        await main(intent.argv, output, input);
+        const execute = async (): Promise<number> => await main(intent.argv, output, commandInput);
+        if (terminal === null) await execute();
+        else await terminal.withLiveOutputHeld(execute);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Shell command failed.";
         output.writeStderr(`hra: ${safeDiagnostic(message)}\n`);
       }
     }
+  } catch {
+    bestEffortStderr(output, "hra: HRA could not start or continue the shell safely.\n");
+    return 1;
   } finally {
-    await live.stop();
+    await live?.stop().catch(() => undefined);
+    terminal?.close();
   }
 }
 
@@ -2093,11 +3257,17 @@ async function executeInvocation(
   if (invocation.kind === "remote") {
     return await executeRemoteInvocation(invocation, output, { ...input, installation });
   }
+  if (invocation.kind === "account.login-handoff") {
+    return await executeAccountLogin(invocation, output, input);
+  }
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);
   }
   if (invocation.kind === "interaction.resolve-protected") {
     return await executeProtectedInteraction(invocation, output, input);
+  }
+  if (invocation.kind === "interaction.inspect-protected") {
+    return await executeProtectedInteractionInspect(invocation, output, input);
   }
   if (invocation.kind === "session.events.follow") {
     return await executeSessionEventFollow(invocation, output, input);
@@ -2209,11 +3379,32 @@ export async function main(
   let invocation: CliInvocation | undefined;
   try {
     invocation = parseCli(argv);
-    return await executeInvocation(invocation, output, resolvedInput);
+    return await executeInvocation(invocation, output, { ...resolvedInput, interactive });
   } catch (error: unknown) {
     const syncNow = invocation?.kind === "command" && invocation.command.kind === "sync.now";
     const projectionRecovery = invocation?.kind === "sync.projection-recover"
       ? invocation
+      : undefined;
+    const deviceMutation = invocation?.kind === "command"
+      && (
+        invocation.command.kind === "device.approve"
+        || invocation.command.kind === "device.revoke"
+      )
+      ? invocation.command
+      : undefined;
+    const replayableLocalMutation = invocation?.kind === "command"
+      && (
+        invocation.command.kind === "account.logout"
+        || invocation.command.kind === "account.switch"
+        || invocation.command.kind === "session.start"
+        || invocation.command.kind === "session.send"
+        || invocation.command.kind === "session.queue"
+        || invocation.command.kind === "session.steer"
+        || invocation.command.kind === "session.stop"
+        || invocation.command.kind === "session.rename"
+      )
+      && typeof invocation.command.idempotencyKey === "string"
+      ? invocation.command
       : undefined;
     const sanitizeDaemonDiagnostic = (message: string): string =>
       syncNow || projectionRecovery !== undefined
@@ -2234,6 +3425,32 @@ export async function main(
             sameKeyReplay: true,
           },
           message: `${sanitizeSyncDiagnostic(error.message)} The response is uncertain. Reuse the exact same-key command; HRA did not create a different recovery authority.`,
+        }, json, output);
+      }
+      if (deviceMutation !== undefined) {
+        return renderFailure({
+          code: "RECOVERY_REQUIRED",
+          details: {
+            idempotencyKey: deviceMutation.idempotencyKey,
+            nextCommand: deviceMutationReplayCommand(deviceMutation, json),
+            sameKeyReplay: true,
+          },
+          message: "The device mutation response is uncertain. Reuse the exact same-key command; HRA did not create a second device-mutation authority.",
+        }, json, output);
+      }
+      if (replayableLocalMutation !== undefined) {
+        return renderFailure({
+          code: "RECOVERY_REQUIRED",
+          details: {
+            idempotencyKey: replayableLocalMutation.idempotencyKey,
+            replayArguments: [
+              "--idempotency-key",
+              replayableLocalMutation.idempotencyKey,
+            ],
+            replayPlacement: "before_double_dash",
+            sameKeyReplay: true,
+          },
+          message: "The mutation response is uncertain. Re-run the original command unchanged with the supplied same-key replay arguments before any double-dash delimiter. HRA did not create a second mutation authority.",
         }, json, output);
       }
       return renderFailure({

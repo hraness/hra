@@ -59,6 +59,10 @@ describe("HRA line shell", () => {
       argv: ["account", "usage", "work", "--refresh"],
       kind: "dispatch",
     });
+    expect(compileShellLine("/account usage-history work --limit 20")).toEqual({
+      argv: ["account", "usage-history", "work", "--limit", "20"],
+      kind: "dispatch",
+    });
     expect(compileShellLine("/session", { account: "work" })).toEqual({
       argv: ["session", "list", "--account", "work"],
       kind: "dispatch",
@@ -122,6 +126,16 @@ describe("HRA line shell", () => {
       argv: ["interaction", "decide", interaction, "--revision", "4", "--decision", "once"],
       kind: "dispatch",
     });
+    const inspect = compileShellLine(`/inspect ${interaction} --revision 4`);
+    expect(inspect).toEqual({
+      argv: ["interaction", "inspect", interaction, "--revision", "4"],
+      kind: "dispatch",
+    });
+    if (inspect.kind !== "dispatch") throw new Error("Expected an inspect dispatch.");
+    expect(parseCli(inspect.argv)).toMatchObject({
+      command: { interaction, expectedRevision: 4, kind: "interaction.inspect" },
+      kind: "interaction.inspect-protected",
+    });
     expect(compileShellLine(`/decline ${interaction} --revision 5`)).toEqual({
       argv: ["interaction", "decide", interaction, "--revision", "5", "--decision", "decline"],
       kind: "dispatch",
@@ -162,6 +176,25 @@ describe("HRA line shell", () => {
       json: false,
       kind: "command",
     });
+  });
+
+  test("keeps initialization outside the daemon-owned persistent shell", () => {
+    for (const line of ["/init", "/init --json", "/init --yes"]) {
+      expect(() => compileShellLine(line)).toThrow("Exit the shell, then run `hra init --yes`.");
+    }
+  });
+
+  test("keeps provider account login in a dedicated one-shot terminal", () => {
+    for (const line of [
+      "/account login",
+      "/account login personal",
+      "/account login personal --device-code",
+      "/account login personal --handoff-file /private/login.json --json",
+    ]) {
+      expect(() => compileShellLine(line)).toThrow(
+        "Exit the shell, then run `hra account login <profile> [--device-code]`.",
+      );
+    }
   });
 
   test("renders a bounded terminal-safe prompt and closed shell controls", () => {

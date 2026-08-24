@@ -17,7 +17,7 @@ describe("public content contract", () => {
   test("publishes the exact HRA release identity", () => {
     expect(publicContent).toMatchObject({
       doctorCommand: "hra doctor --offline",
-      initCommand: "hra init",
+      initCommand: "hra init --yes",
       installCommand: "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
       links: {
         github: "https://github.com/hraness/hra",
@@ -94,7 +94,9 @@ describe("public content contract", () => {
       expect(surface).not.toContain("auth login --email");
       expect(surface).not.toContain("auth login --code");
     }
-    expect(markdown).toContain("hra device approve <pending-device-id-or-prefix>");
+    expect(markdown).toContain(
+      "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
+    );
     expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
     for (const surface of [markdown, html]) {
       expect(surface).toContain("An unset");
@@ -125,7 +127,10 @@ describe("public content contract", () => {
       expect(surface).toContain("hra account show personal");
       expect(surface).toContain("hra account login-cancel");
       expect(surface).toContain("exact current-generation provider login");
-      expect(surface).toContain("Verification URLs, device codes, and provider credentials are never retained");
+      expect(surface).toContain("Verification URLs and device codes never enter HRA state, logs, or ordinary output");
+      expect(surface).toContain("--handoff-file /absolute/private/login.json --json");
+      expect(surface).toContain("A same-key replay never claims or rewrites a handoff");
+      expect(surface).toContain("after completion or cancellation it reports the terminal account state");
     }
   });
 
@@ -151,6 +156,51 @@ describe("public content contract", () => {
           .replaceAll(">", "&gt;")
           .replaceAll("'", "&#39;"),
       );
+    }
+  });
+
+  test("publishes informed protected approval inspection", () => {
+    const claims = [
+      "hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
+      "intentionally returns only a durable safe summary",
+      "complete authority still held by the live provider callback",
+      "ordinary stdout receives only safe binding and cleanup metadata",
+      "neither the directory nor file may have an extended ACL",
+      "Detail larger than 64 KiB also requires this file path.",
+      "rejects file-change approval callbacks before durable admission",
+      "does not provide the exact affected paths or change detail needed for informed approval",
+    ];
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(
+        claim
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll("'", "&#39;"),
+      );
+    }
+  });
+
+  test("publishes the persistent shell input and live-redaction boundaries", () => {
+    const claims = [
+      "An overflow or interrupted line flushes the current native terminal queue, retains input custody while discarding through EOF, and exits without executing the tail.",
+      "Protected terminal documents require a visible stderr TTY plus unpredictable begin and return phrases while raw no-echo mode is active.",
+      "then closes shell input instead of returning ambiguous bytes to an ordinary prompt.",
+      "Display loss, termination, and job-control signals restore or fence raw mode before propagation.",
+      "updates from an old session generation are discarded before a new selection is announced.",
+      "Slow-terminal backpressure drops additional updates behind one explicit omission notice",
+      "It renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary",
+      "A mid-item join omits ambiguous delta suffixes until the next item starts.",
+      "discard undecided tails with an explicit notice",
+    ];
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(claim.replaceAll("'", "&#39;"));
     }
   });
 

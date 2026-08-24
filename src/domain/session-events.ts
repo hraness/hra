@@ -79,12 +79,14 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
     turnId: providerIdentifierSchema,
     itemId: providerIdentifierSchema,
     itemKind: boundedText(128),
+    liveAcceptanceCommandDigest: digestSchema.optional(),
   }).strict(),
   z.object({
     type: z.literal("item_completed"),
     turnId: providerIdentifierSchema,
     itemId: providerIdentifierSchema,
     itemKind: boundedText(128),
+    liveAcceptanceCommandDigest: digestSchema.optional(),
     status: boundedText(128).optional(),
   }).strict(),
   z.object({

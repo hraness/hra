@@ -13,6 +13,7 @@ import {
   type CloudDaemonIdentityPort,
   type CloudDaemonLocalSourcePort,
   type CloudLocalSessionHead,
+  type CloudLocalSessionPage,
   type CloudLocalUsageSnapshot,
   createLocalCloudDaemonBridgeFromEnvironment,
   CustodyCloudDaemonIdentity,
@@ -22,6 +23,7 @@ import {
 import {
   CloudDaemonJournalRecoveryBlocker,
   MemoryCloudDaemonJournal,
+  MemoryCloudSessionSyncCursor,
   parseCloudDaemonJournal,
   type CloudCommandJournalEntry,
   type CloudDaemonJournalState,
@@ -29,6 +31,7 @@ import {
   type CloudDaemonJournalObservation,
   type CloudDaemonJournalPort,
   type CloudProjectionRecoveryBaselineInteraction,
+  type CloudSessionSyncCursorPort,
 } from "./daemon-journal";
 import {
   cloudDeploymentAuthorityFromEnvironment,
@@ -44,6 +47,12 @@ import { encryptRemoteCommand, type RemoteCommandPayload } from "./payloads";
 import { encryptCompactEvents, type CompactSessionEvent } from "./projection";
 
 const fixedNow = 1_900_000_000_000;
+
+function doneLocalSessionPage(
+  sessions: readonly CloudLocalSessionHead[],
+): CloudLocalSessionPage {
+  return { continueAfterPublicId: null, isDone: true, sessions };
+}
 const usageServerAdmissionMinIntervalMs = 24 * 60 * 60 * 1_000;
 const userPublicId = "user_12345678";
 const key = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
@@ -648,7 +657,31 @@ class FakeCloud {
         }
         if (name === "sessions:listHeads") {
           this.sessionHeadListCalls += 1;
-          return [...this.heads.values()].slice(0, args.limit as number);
+          return [...this.heads.values()]
+            .sort((left, right) =>
+              right.updatedAt - left.updatedAt
+              || left.publicId.localeCompare(right.publicId))
+            .slice(0, args.limit as number);
+        }
+        if (name === "sessions:listHeadsPage") {
+          this.sessionHeadListCalls += 1;
+          const pagination = args.paginationOpts as Readonly<{
+            cursor: string | null;
+            numItems: number;
+          }>;
+          const start = pagination.cursor === null
+            ? 0
+            : Number.parseInt(pagination.cursor, 10);
+          const heads = [...this.heads.values()].sort((left, right) =>
+            right.updatedAt - left.updatedAt
+            || left.publicId.localeCompare(right.publicId));
+          const page = heads.slice(start, start + pagination.numItems);
+          const next = start + page.length;
+          return {
+            continueCursor: String(next),
+            isDone: next >= heads.length,
+            page,
+          };
         }
         if (name === "sessions:getHead") {
           const publicId = args.publicId as string;
@@ -782,13 +815,13 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
   }
 
   async listSessions() {
-    return [{
+    return doneLocalSessionPage([{
       createdAt: fixedNow,
       metadata: { name: "Release", note: "Ship after the checks pass." },
       publicId: this.sessionPublicId,
       state: this.state,
       updatedAt: fixedNow,
-    }];
+    }]);
   }
 
   async readCompactEvents(input: { afterSequence: number; limit: number }) {
@@ -827,7 +860,12 @@ class FakeLocal implements CloudDaemonLocalSourcePort {
 
 class EmptyLocal implements CloudDaemonLocalSourcePort {
   constructor(readonly sessionPublicId?: string) {}
-  async listSessions(): Promise<readonly CloudLocalSessionHead[]> { return []; }
+  async listSessions(
+    _input: Parameters<CloudDaemonLocalSourcePort["listSessions"]>[0],
+  ): Promise<CloudLocalSessionPage> {
+    void _input;
+    return doneLocalSessionPage([]);
+  }
   async readCompactEvents(_input: Parameters<
     CloudDaemonLocalSourcePort["readCompactEvents"]
   >[0]): Promise<Readonly<{
@@ -852,6 +890,53 @@ class EmptyLocal implements CloudDaemonLocalSourcePort {
       profileId: "account_12345678",
       providerThreadId: "thread_12345678",
     };
+  }
+}
+
+class FairPagedLocal extends EmptyLocal {
+  #sessions: CloudLocalSessionHead[];
+  readonly observedAfterPublicIds: Array<string | null> = [];
+
+  constructor(count: number) {
+    super();
+    this.#sessions = Array.from({ length: count }, (_, index) => ({
+      createdAt: fixedNow + index,
+      metadata: { name: `Session ${index}`, note: null },
+      publicId: `session_${index.toString().padStart(8, "0")}`,
+      state: "idle" as const,
+      updatedAt: fixedNow + index,
+    }));
+  }
+
+  override async listSessions(input: {
+    afterPublicId: string | null;
+    limit: number;
+  }): Promise<CloudLocalSessionPage> {
+    this.observedAfterPublicIds.push(input.afterPublicId);
+    const sorted = [...this.#sessions].sort((left, right) =>
+      left.publicId.localeCompare(right.publicId));
+    const remaining = input.afterPublicId === null
+      ? sorted
+      : sorted.filter((session) => session.publicId > input.afterPublicId!);
+    const sessions = remaining.slice(0, input.limit);
+    const isDone = remaining.length <= input.limit;
+    return {
+      continueAfterPublicId: isDone ? null : sessions.at(-1)?.publicId ?? null,
+      isDone,
+      sessions,
+    };
+  }
+
+  touchNewest(count: number, updatedAt: number): void {
+    const newest = new Set(
+      [...this.#sessions]
+        .sort((left, right) => right.createdAt - left.createdAt)
+        .slice(0, count)
+        .map((session) => session.publicId),
+    );
+    this.#sessions = this.#sessions.map((session) => newest.has(session.publicId)
+      ? { ...session, updatedAt }
+      : session);
   }
 }
 
@@ -908,8 +993,8 @@ class UsageBacklogLocal extends EmptyLocal {
 class StalledProjectionLocal implements CloudDaemonLocalSourcePort {
   constructor(readonly sessionPublicId: string) {}
 
-  async listSessions(input: { signal: AbortSignal }): Promise<readonly never[]> {
-    return await new Promise<readonly never[]>((resolve, reject) => {
+  async listSessions(input: { signal: AbortSignal }): Promise<never> {
+    return await new Promise<never>((resolve, reject) => {
       const aborted = () => reject(input.signal.reason);
       if (input.signal.aborted) aborted();
       else input.signal.addEventListener("abort", aborted, { once: true });
@@ -937,22 +1022,22 @@ class StalledProjectionLocal implements CloudDaemonLocalSourcePort {
 class IgnoreAbortProjectionLocal extends StalledProjectionLocal {
   listSessionCalls = 0;
 
-  override async listSessions(): Promise<readonly never[]> {
+  override async listSessions(): Promise<never> {
     this.listSessionCalls += 1;
-    return await new Promise<readonly never[]>(() => undefined);
+    return await new Promise<never>(() => undefined);
   }
 }
 
 class DeferredIgnoreAbortProjectionLocal implements CloudDaemonLocalSourcePort {
   listSessionCalls = 0;
-  readonly #pending: Promise<readonly CloudLocalSessionHead[]>;
-  #release!: (sessions: readonly CloudLocalSessionHead[]) => void;
+  readonly #pending: Promise<CloudLocalSessionPage>;
+  #release!: (sessions: CloudLocalSessionPage) => void;
 
   constructor(readonly sessionPublicId: string) {
     this.#pending = new Promise((resolve) => { this.#release = resolve; });
   }
 
-  async listSessions(): Promise<readonly CloudLocalSessionHead[]> {
+  async listSessions(): Promise<CloudLocalSessionPage> {
     this.listSessionCalls += 1;
     return await this.#pending;
   }
@@ -964,7 +1049,7 @@ class DeferredIgnoreAbortProjectionLocal implements CloudDaemonLocalSourcePort {
   async resolveCommandAuthority() { return null; }
 
   release(sessions: readonly CloudLocalSessionHead[]): void {
-    this.#release(sessions);
+    this.#release(doneLocalSessionPage(sessions));
   }
 }
 
@@ -1052,13 +1137,13 @@ class RecoveryUploadingLocal extends RecoveryLocal {
   cacheId = "cache_recovery_pending";
 
   override async listSessions() {
-    return [{
+    return doneLocalSessionPage([{
       createdAt: fixedNow,
       metadata: { name: "Recovered", note: null },
       publicId: this.sessionPublicId as string,
       state: "idle" as const,
       updatedAt: fixedNow,
-    }];
+    }]);
   }
 
   override async stageCompactProjectionRecovery(input: RecoveryStageInput) {
@@ -1276,6 +1361,7 @@ function bridge(input: {
   now?: () => number;
   optionalSyncBudgetMs?: number;
   randomConnectionUuid?: () => string;
+  sessionSyncCursor?: CloudSessionSyncCursorPort;
   transport?: CloudTransport;
 }) {
   let uuidSequence = 100;
@@ -1303,6 +1389,7 @@ function bridge(input: {
     randomConnectionUuid: input.randomConnectionUuid
       ?? (() => connectionUuid(connectionUuidSequence += 1)),
     randomUuid: () => uuidV7(uuidSequence++, input.cloud.now),
+    sessionSyncCursor: input.sessionSyncCursor ?? new MemoryCloudSessionSyncCursor(),
     transport: input.transport ?? input.cloud.connect(input.device),
   });
 }
@@ -2019,6 +2106,162 @@ describe("cloud daemon bridge", () => {
     expect(malformed.online).toBe(false);
     expect(malformed.errors).toEqual(["Cloud presence response is invalid."]);
     expect(malformedCloud.sessionHeadListCalls).toBe(0);
+  });
+
+  test("uploads every stable local session page across hot updates and a daemon restart", async () => {
+    const cloud = new FakeCloud();
+    const local = new FairPagedLocal(60);
+    const sessionSyncCursor = new MemoryCloudSessionSyncCursor();
+    let daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local,
+      sessionSyncCursor,
+    });
+
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    await daemon.close();
+    local.touchNewest(25, fixedNow + 10_000);
+    daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local,
+      sessionSyncCursor,
+    });
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+    local.touchNewest(25, fixedNow + 20_000);
+    expect((await daemon.cycle(new AbortController().signal)).errors).toEqual([]);
+
+    expect(local.observedAfterPublicIds).toEqual([
+      null,
+      "session_00000024",
+      "session_00000049",
+    ]);
+    expect(new Set(cloud.sessionCreateCalls).size).toBe(60);
+    expect(cloud.sessionCreateCalls).toContain("session_00000000");
+    expect((await sessionSyncCursor.read()).state.localAfterPublicId).toBeNull();
+  });
+
+  test("pulls every remote session page while the newest page stays hot across restart", async () => {
+    const cloud = new FakeCloud();
+    const hottest = new Set<string>();
+    for (let index = 0; index < 60; index += 1) {
+      const publicId = `session_${index.toString().padStart(8, "0")}`;
+      if (index >= 35) hottest.add(publicId);
+      cloud.heads.set(publicId, {
+        compactHeadSequence: 0,
+        createdAt: fixedNow + index,
+        detailHeadSequence: 0,
+        executionDevicePublicId: "device_22222222",
+        metadataRevision: 0,
+        projectionRevision: 0,
+        publicId,
+        state: "idle",
+        updatedAt: fixedNow + index,
+      });
+    }
+    const sessionSyncCursor = new MemoryCloudSessionSyncCursor();
+    let daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new EmptyLocal(),
+      sessionSyncCursor,
+    });
+    const observed = new Set<string>();
+    for (let cycleNumber = 0; cycleNumber < 3; cycleNumber += 1) {
+      for (const publicId of hottest) {
+        const head = cloud.heads.get(publicId);
+        if (head !== undefined) head.updatedAt = fixedNow + 10_000 + cycleNumber;
+      }
+      const result = await daemon.cycle(new AbortController().signal);
+      expect(result.errors).toEqual([]);
+      for (const session of result.remoteSessions) observed.add(session.publicId);
+      if (cycleNumber === 0) {
+        expect((await sessionSyncCursor.read()).state.remoteContinueCursor).toBe("25");
+        await daemon.close();
+        daemon = bridge({
+          cloud,
+          device: "device_11111111",
+          local: new EmptyLocal(),
+          sessionSyncCursor,
+        });
+      }
+    }
+
+    expect(observed.size).toBe(60);
+    expect(observed).toContain("session_00000000");
+    expect((await sessionSyncCursor.read()).state.remoteContinueCursor).toBeNull();
+  });
+
+  test("rejects a nonadvancing remote page without changing durable cursor authority", async () => {
+    const cloud = new FakeCloud();
+    const sessionSyncCursor = new MemoryCloudSessionSyncCursor();
+    const underlying = cloud.connect("device_11111111");
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new EmptyLocal(),
+      sessionSyncCursor,
+      transport: {
+        action: (name, args) => underlying.action(name, args),
+        mutation: (name, args) => underlying.mutation(name, args),
+        async query(name, args) {
+          if (name === "sessions:listHeadsPage") {
+            return { continueCursor: "", isDone: false, page: [] };
+          }
+          return await underlying.query(name, args);
+        },
+      },
+    });
+
+    await expect(daemon.pullRemoteSessions(new AbortController().signal)).rejects.toThrow(
+      "Cloud session page is invalid.",
+    );
+    expect((await sessionSyncCursor.read()).state).toEqual({
+      localAfterPublicId: null,
+      remoteContinueCursor: null,
+      remoteCycle: null,
+      version: 2,
+    });
+  });
+
+  test("rejects a durable remote cursor cycle across separate pull cycles", async () => {
+    const cloud = new FakeCloud();
+    const sessionSyncCursor = new MemoryCloudSessionSyncCursor();
+    const underlying = cloud.connect("device_11111111");
+    const continuations = ["cursor-a", "cursor-b", "cursor-a", "cursor-b"];
+    let request = 0;
+    const daemon = bridge({
+      cloud,
+      device: "device_11111111",
+      local: new EmptyLocal(),
+      sessionSyncCursor,
+      transport: {
+        action: (name, args) => underlying.action(name, args),
+        mutation: (name, args) => underlying.mutation(name, args),
+        async query(name, args) {
+          if (name === "sessions:listHeadsPage") {
+            const continueCursor = continuations[request];
+            request += 1;
+            if (continueCursor === undefined) throw new Error("Unexpected cursor request.");
+            return { continueCursor, isDone: false, page: [] };
+          }
+          return await underlying.query(name, args);
+        },
+      },
+    });
+
+    for (let page = 0; page < 3; page += 1) {
+      expect(await daemon.pullRemoteSessions(new AbortController().signal)).toEqual([]);
+    }
+    await expect(daemon.pullRemoteSessions(new AbortController().signal)).rejects.toThrow(
+      "deterministic cursor cycle",
+    );
+    expect((await sessionSyncCursor.read()).state).toMatchObject({
+      remoteContinueCursor: "cursor-a",
+      remoteCycle: { pageCount: 3 },
+      version: 2,
+    });
   });
 
   test("begins one compact epoch, activates its cache, and replays the same key exactly", async () => {

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import type { LocalCommand } from "../domain/contracts";
 import { localCommandSchema } from "../domain/contracts";
+import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { isUuidV7 } from "../cloud/contracts";
 import { parseAuthCredentials } from "../cloud/authCredentials";
 import { createCloudUuidV7 } from "../cloud/local-control";
@@ -44,6 +45,13 @@ export type ProtectedInteractionCliInvocation = Readonly<{
     | Readonly<{ action: "accept"; kind: "mcp_submission" }>;
 }>;
 
+export type ProtectedInteractionInspectCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "interaction.inspect" }>;
+  handoffFile?: string;
+  json: boolean;
+  kind: "interaction.inspect-protected";
+}>;
+
 export type ProtectedAuthLoginCliInvocation = Readonly<{
   input: ProtectedInputSource;
   json: boolean;
@@ -54,6 +62,16 @@ export type SessionEventFollowCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
   jsonl: true;
   kind: "session.events.follow";
+}>;
+
+export type AccountLoginCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "account.login" }> & Readonly<{
+    idempotencyKey: string;
+  }>;
+  handoffFile?: string;
+  json: boolean;
+  kind: "account.login-handoff";
+  replayCommand: string;
 }>;
 
 export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interaction.resolve" }>;
@@ -67,6 +85,8 @@ export type CliInvocation =
   | { kind: "remote"; command: RemoteCliCommand; idempotencyKey?: string; json: boolean }
   | ProtectedAuthLoginCliInvocation
   | ProtectedInteractionCliInvocation
+  | ProtectedInteractionInspectCliInvocation
+  | AccountLoginCliInvocation
   | SessionEventFollowCliInvocation
   | InteractionRequiredInvocation
   | ProjectionRecoveryCliInvocation
@@ -94,15 +114,15 @@ Usage:
   hra init [--yes] [--json]
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
-  hra account add|list|show|login|login-cancel|logout|usage|switch|switch-recover
+  hra account add|list|show|login|login-cancel|logout|usage|usage-history|switch|switch-recover
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
   hra session list|show|status|start|send|queue|steer|stop
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow]
-  hra session interactions <session> [--pending] [--limit <1..100>]
+  hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|note|preset|fast|project
-  hra interaction list|show|decide|grant|answer|submit
+  hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|preset|fast
   hra turn inspect
   hra auth login --input-stdin|--input-fd <fd>
@@ -153,20 +173,22 @@ Examples:
 
 Usage:
   hra account add <label>
-  hra account login <profile> [--device-code]
+  hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
   hra account login-cancel <profile>
   hra account logout <profile>
   hra account list
   hra account show <profile>
   hra account usage [profile] [--refresh]
+  hra account usage-history <profile> [--from <UTC-RFC3339>] [--through <UTC-RFC3339>] [--limit <1..100>] [--cursor <cursor>]
   hra account switch <profile>
   hra account switch-recover
 
 Examples:
   hra account add personal
-  hra account login personal --device-code
+  hra account login personal --device-code --handoff-file /private/path/login.json
   hra account login-cancel personal
-  hra account usage personal --refresh`,
+  hra account usage personal --refresh
+  hra account usage-history personal --from 2026-08-23T12:00:00Z --json`,
   plugin: `HRA plugin
 
 Usage:
@@ -191,11 +213,11 @@ Examples:
   session: `HRA session
 
 Usage:
-  hra session list [--account <profile>] [--limit <1..100>]
+  hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session>
   hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow]
-  hra session interactions <session> [--pending] [--limit <1..100>]
+  hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
   hra session send|queue|steer <session> <message>
   hra session stop|recover|abandon <session>
@@ -213,13 +235,17 @@ Examples:
   interaction: `HRA interaction
 
 Usage:
-  hra interaction list [session] [--pending] [--limit <1..100>]
+  hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra interaction show <interaction-id>
+  hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
   hra interaction decide <interaction-id> --revision <n> --decision <once|session|decline|cancel>
   hra interaction grant|answer <interaction-id> --revision <n> --input-stdin|--input-fd <fd>
   hra interaction submit <interaction-id> --revision <n> --action <accept|decline|cancel> [--input-stdin|--input-fd <fd>]
 
 Protected values are accepted only through stdin or an explicit file descriptor.
+Use \`interaction inspect\` to read complete live command or permission authority through a protected terminal or caller-owned file.
+File-change callbacks without exact affected paths or change detail are rejected before admission.
+Permission approvals accept an exact grant or decline; their provider callback does not represent cancel.
 Permission grant document: {"permissions":["<requested-name>"]}
 Question answer document: {"answers":{"<question-id>":{"answers":["<answer>"]}}}
 
@@ -263,7 +289,7 @@ Examples:
 Usage:
   hra device list
   hra device pair
-  hra device approve|revoke <device-id-or-prefix>
+  hra device approve|revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 
 Examples:
   hra device pair
@@ -295,8 +321,8 @@ export function requestsJsonOutput(argv: readonly string[]): boolean {
 
 type Cursor = { values: string[] };
 const literalPrefix = "\u0000";
-const projectionRecoveryKeyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
-const projectionRecoveryKeyFutureSkewMs = 5 * 60 * 1_000;
+const uuidV7KeyLifetimeMs = 7 * 24 * 60 * 60 * 1_000;
+const uuidV7KeyFutureSkewMs = 5 * 60 * 1_000;
 const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "account.login",
   "account.logout",
@@ -307,17 +333,19 @@ const idempotentCommandKinds = new Set<LocalCommand["kind"]>([
   "session.steer",
   "session.stop",
   "session.rename",
+  "device.approve",
+  "device.revoke",
 ]);
 const literal = (value: string): string => `${literalPrefix}${value}`;
 const decode = (value: string): string => value.startsWith(literalPrefix) ? value.slice(literalPrefix.length) : value;
 const isOption = (value: string): boolean => !value.startsWith(literalPrefix) && value.startsWith("--");
 
-const isCurrentProjectionRecoveryKey = (value: string, now = Date.now()): boolean => {
+const isCurrentUuidV7 = (value: string, now = Date.now()): boolean => {
   if (!isUuidV7(value) || !Number.isSafeInteger(now) || now < 0) return false;
   const timestamp = Number.parseInt(`${value.slice(0, 8)}${value.slice(9, 13)}`, 16);
   return Number.isSafeInteger(timestamp)
-    && timestamp >= now - projectionRecoveryKeyLifetimeMs
-    && timestamp <= now + projectionRecoveryKeyFutureSkewMs;
+    && timestamp >= now - uuidV7KeyLifetimeMs
+    && timestamp <= now + uuidV7KeyFutureSkewMs;
 };
 
 const take = (cursor: Cursor, label: string): string => {
@@ -370,6 +398,25 @@ const boundedDecimal = (
   return parsed;
 };
 
+const utcRfc3339Milliseconds = (value: string | undefined, label: string): number | undefined => {
+  if (value === undefined) return undefined;
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?Z$/u.exec(value);
+  if (match === null) {
+    throw new CliUsageError(`${label} must be a UTC RFC3339 timestamp such as 2026-08-23T12:00:00Z.`);
+  }
+  const milliseconds = Date.parse(value);
+  const fraction = (match[2] ?? "0").padEnd(3, "0");
+  const canonical = `${match[1]}.${fraction}Z`;
+  if (
+    !Number.isSafeInteger(milliseconds)
+    || milliseconds < 0
+    || new Date(milliseconds).toISOString() !== canonical
+  ) {
+    throw new CliUsageError(`${label} must be a valid nonnegative UTC RFC3339 timestamp.`);
+  }
+  return milliseconds;
+};
+
 const protectedInput = (cursor: Cursor, required: boolean): ProtectedInputSource | undefined => {
   const stdin = flag(cursor, "--input-stdin");
   const descriptor = option(cursor, "--input-fd");
@@ -415,6 +462,36 @@ export const projectionRecoveryReplayCommand = (
   "--acknowledge-gap",
   "--idempotency-key",
   idempotencyKey,
+  ...(json ? ["--json"] : []),
+].join(" ");
+
+export const accountLoginReplayCommand = (
+  command: Extract<LocalCommand, { kind: "account.login" }> & Readonly<{
+    idempotencyKey: string;
+  }>,
+  handoffFile: string | undefined,
+  json: boolean,
+): string => [
+  "hra account login",
+  shellArgument(command.account),
+  ...(command.deviceCode ? ["--device-code"] : []),
+  "--idempotency-key",
+  command.idempotencyKey,
+  ...(handoffFile === undefined ? [] : ["--handoff-file", shellArgument(handoffFile)]),
+  ...(json ? ["--json"] : []),
+].join(" ");
+
+export const accountLoginCancelCommand = (account: string): string =>
+  `hra account login-cancel ${shellArgument(account)}`;
+
+export const deviceMutationReplayCommand = (
+  command: Extract<LocalCommand, { kind: "device.approve" | "device.revoke" }>,
+  json: boolean,
+): string => [
+  `hra device ${command.kind === "device.approve" ? "approve" : "revoke"}`,
+  shellArgument(command.device),
+  "--idempotency-key",
+  command.idempotencyKey,
   ...(json ? ["--json"] : []),
 ].join(" ");
 
@@ -489,16 +566,71 @@ export const completeProtectedAuthLogin = (
   return parsed;
 };
 
-const parseAccount = (cursor: Cursor): LocalCommand => {
+const parseAccount = (
+  cursor: Cursor,
+  idempotencyKey: string | undefined,
+  json: boolean,
+): LocalCommand | AccountLoginCliInvocation => {
   const action = take(cursor, "account action");
   switch (action) {
     case "list": finish(cursor); return { kind: "account.list" };
     case "add": { const label = remainder(cursor, "account label"); return command({ kind: "account.add", label }); }
     case "show": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.show", account }; }
-    case "login": { const deviceCode = flag(cursor, "--device-code"); const account = take(cursor, "account"); finish(cursor); return { kind: "account.login", account, deviceCode }; }
+    case "login": {
+      const deviceCode = flag(cursor, "--device-code");
+      const handoffFile = option(cursor, "--handoff-file");
+      const account = take(cursor, "account");
+      finish(cursor);
+      if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
+        throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
+      }
+      const parsed = command({
+        kind: "account.login",
+        account,
+        deviceCode,
+        idempotencyKey: idempotencyKey ?? randomUUID(),
+      });
+      if (parsed.kind !== "account.login" || parsed.idempotencyKey === undefined) {
+        throw new CliUsageError("Account login command is invalid.");
+      }
+      const exact = { ...parsed, idempotencyKey: parsed.idempotencyKey };
+      return {
+        command: exact,
+        ...(handoffFile === undefined ? {} : { handoffFile }),
+        json,
+        kind: "account.login-handoff",
+        replayCommand: accountLoginReplayCommand(
+          exact,
+          handoffFile ?? "/absolute/path/to/empty-protected-login.json",
+          json,
+        ),
+      };
+    }
     case "login-cancel": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.login-cancel", account }; }
     case "logout": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.logout", account }; }
     case "usage": { const refresh = flag(cursor, "--refresh"); const account = takeOptional(cursor); finish(cursor); return command({ kind: "account.usage", account, refresh }); }
+    case "usage-history": {
+      const fromObservedAt = utcRfc3339Milliseconds(option(cursor, "--from"), "Usage history --from");
+      const throughObservedAt = utcRfc3339Milliseconds(option(cursor, "--through"), "Usage history --through");
+      const limit = boundedDecimal(
+        option(cursor, "--limit"),
+        "usage history limit",
+        1,
+        ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
+        50,
+      );
+      const historyCursor = option(cursor, "--cursor");
+      const account = take(cursor, "account");
+      finish(cursor);
+      return command({
+        kind: "account.usage-history",
+        account,
+        limit,
+        ...(fromObservedAt === undefined ? {} : { fromObservedAt }),
+        ...(throughObservedAt === undefined ? {} : { throughObservedAt }),
+        ...(historyCursor === undefined ? {} : { cursor: historyCursor }),
+      });
+    }
     case "switch": { const account = take(cursor, "account"); finish(cursor); return { kind: "account.switch", account, idempotencyKey: randomUUID() }; }
     case "switch-recover": finish(cursor); return { kind: "account.switch-recover" };
     default: throw new CliUsageError("Unknown account action. Run `hra account --help` for supported actions.");
@@ -553,7 +685,13 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
 const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvocation => {
   const action = take(cursor, "session action");
   switch (action) {
-    case "list": { const account = option(cursor, "--account"); const limit = Number(option(cursor, "--limit") ?? "50"); finish(cursor); return command({ kind: "session.list", account, limit }); }
+    case "list": {
+      const account = option(cursor, "--account");
+      const limit = boundedDecimal(option(cursor, "--limit"), "session limit", 1, 100, 50);
+      const sessionCursor = option(cursor, "--cursor");
+      finish(cursor);
+      return command({ kind: "session.list", account, limit, cursor: sessionCursor });
+    }
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
     case "events": {
@@ -587,9 +725,10 @@ const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvoc
     case "interactions": {
       const pending = flag(cursor, "--pending");
       const limit = boundedDecimal(option(cursor, "--limit"), "interaction limit", 1, 100, 100);
+      const interactionCursor = option(cursor, "--cursor");
       const session = take(cursor, "session");
       finish(cursor);
-      return command({ kind: "session.interactions", session, pending, limit });
+      return command({ kind: "session.interactions", session, pending, limit, cursor: interactionCursor });
     }
     case "start": { const project = option(cursor, "--project"); const preset = option(cursor, "--preset") ?? "high"; const fast = flag(cursor, "--fast"); const account = take(cursor, "account"); finish(cursor); return command({ kind: "session.start", account, project, preset, fast }); }
     case "send": { const session = take(cursor, "session"); return command({ kind: "session.send", session, message: remainder(cursor, "message") }); }
@@ -609,7 +748,8 @@ const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvoc
 
 type ParsedInteraction =
   | Readonly<{ command: LocalCommand; kind: "command" }>
-  | ProtectedInteractionCliInvocation;
+  | ProtectedInteractionCliInvocation
+  | ProtectedInteractionInspectCliInvocation;
 
 const exactInteractionId = (value: string): string => {
   const parsed = command({ kind: "interaction.show", interaction: value });
@@ -622,14 +762,44 @@ const parseInteraction = (cursor: Cursor, json: boolean): ParsedInteraction => {
   if (action === "list") {
     const pending = flag(cursor, "--pending");
     const limit = boundedDecimal(option(cursor, "--limit"), "interaction limit", 1, 100, 100);
+    const interactionCursor = option(cursor, "--cursor");
     const session = takeOptional(cursor);
     finish(cursor);
-    return { command: command({ kind: "interaction.list", session, pending, limit }), kind: "command" };
+    return { command: command({ kind: "interaction.list", session, pending, limit, cursor: interactionCursor }), kind: "command" };
   }
   if (action === "show") {
     const interaction = take(cursor, "interaction ID");
     finish(cursor);
     return { command: command({ kind: "interaction.show", interaction }), kind: "command" };
+  }
+
+  if (action === "inspect") {
+    const expectedRevision = boundedDecimal(
+      option(cursor, "--revision"),
+      "interaction revision",
+      1,
+      Number.MAX_SAFE_INTEGER,
+    );
+    const handoffFile = option(cursor, "--handoff-file");
+    const interaction = take(cursor, "interaction ID");
+    finish(cursor);
+    if (handoffFile !== undefined && (!isAbsolute(handoffFile) || resolve(handoffFile) !== handoffFile)) {
+      throw new CliUsageError("--handoff-file must be an absolute normalized path to an existing protected file.");
+    }
+    const parsed = command({
+      kind: "interaction.inspect",
+      interaction,
+      expectedRevision,
+    });
+    if (parsed.kind !== "interaction.inspect") {
+      throw new CliUsageError("Protected interaction inspection is invalid.");
+    }
+    return {
+      command: parsed,
+      ...(handoffFile === undefined ? {} : { handoffFile }),
+      json,
+      kind: "interaction.inspect-protected",
+    };
   }
 
   const expectedRevision = boundedDecimal(
@@ -825,7 +995,11 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     };
   }
   let parsed: LocalCommand;
-  if (group === "account") parsed = parseAccount(cursor);
+  if (group === "account") {
+    const account = parseAccount(cursor, idempotencyKey, json);
+    if (account.kind === "account.login-handoff") return account;
+    parsed = account;
+  }
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "session") {
@@ -844,6 +1018,12 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError("Unknown turn action. Run `hra turn --help` for supported actions."); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
   else if (group === "interaction") {
     const interaction = parseInteraction(cursor, json);
+    if (interaction.kind === "interaction.inspect-protected") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by interaction.inspect.");
+      }
+      return interaction;
+    }
     if (interaction.kind === "interaction.resolve-protected") {
       if (idempotencyKey !== undefined) {
         throw new CliUsageError("--idempotency-key is not supported by interaction.resolve.");
@@ -880,7 +1060,23 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       throw new CliUsageError("Unknown auth action. Run `hra auth --help` for supported actions.");
     }
   }
-  else if (group === "device") { const action = take(cursor, "device action"); if (action === "list" || action === "pair") { finish(cursor); parsed = { kind: `device.${action}` }; } else if (action === "approve" || action === "revoke") { const device = take(cursor, "device"); finish(cursor); parsed = { kind: `device.${action}`, device }; } else throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions."); }
+  else if (group === "device") {
+    const action = take(cursor, "device action");
+    if (action === "list" || action === "pair") {
+      finish(cursor);
+      parsed = { kind: `device.${action}` };
+    } else if (action === "approve" || action === "revoke") {
+      const device = take(cursor, "device");
+      finish(cursor);
+      const deviceMutationKey = idempotencyKey ?? createCloudUuidV7();
+      if (!isCurrentUuidV7(deviceMutationKey)) {
+        throw new CliUsageError("Device mutation --idempotency-key must be a current UUIDv7.");
+      }
+      parsed = { device, idempotencyKey: deviceMutationKey, kind: `device.${action}` };
+    } else {
+      throw new CliUsageError("Unknown device action. Run `hra device --help` for supported actions.");
+    }
+  }
   else if (group === "sync") {
     const action = take(cursor, "sync action");
     if (action === "status" || action === "now") {
@@ -895,7 +1091,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       const session = take(cursor, "local session");
       finish(cursor);
       const recoveryKey = idempotencyKey ?? createCloudUuidV7();
-      if (!isCurrentProjectionRecoveryKey(recoveryKey)) {
+      if (!isCurrentUuidV7(recoveryKey)) {
         throw new CliUsageError("Projection recovery --idempotency-key must be a current UUIDv7.");
       }
       const recoveryCommand = command({

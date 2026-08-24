@@ -13,6 +13,9 @@ const skToken = ["sk", "secretvalue123456789"].join("_");
 const reToken = ["re", "secretvalue987654321"].join("_");
 const jwt = ["eyJheader123456", "payload123456789", "signature123456"].join(".");
 const obscuredBearerToken = "obscured-secret-value-123456789";
+const githubToken = ["github", "pat", "ABCDEFGH123456"].join("_");
+const clientSecret = ["client", "secret=topsecret123"].join("_");
+const shortBasic = ["Basic", "dTpw"].join(" ");
 
 function capture(): Readonly<{
   output: Output;
@@ -42,7 +45,7 @@ function attackedSyncProjection(): unknown {
       errors: [
         `Could not read ${localPath}`,
         `Authorization failed: ${bearer}`,
-        `token=another-secret-token-value`,
+        `token=another-secret-token-value ${githubToken} ${clientSecret} ${shortBasic}`,
         terminalAttack,
         `${privateKeyHeader}\n${privateKeyBodyStart}`,
         `Bearer${terminalAttack} ${obscuredBearerToken}`,
@@ -103,7 +106,6 @@ describe("terminal-safe CLI boundaries", () => {
       usageUploaded: 4,
     });
     expect(parsed.data.errors.join("\n")).toContain("[local-path]");
-    expect(parsed.data.errors.join("\n")).toContain("Bearer [redacted]");
     expect(parsed.data.errors.join("\n")).toContain("[redacted-token]");
     expect(parsed.data.errors.join("\n")).toContain("[redacted private key material]");
     expect(parsed.data.errors.join("\n")).toContain("[redacted token-like diagnostic containing terminal controls]");
@@ -117,6 +119,9 @@ describe("terminal-safe CLI boundaries", () => {
     expect(captured.read().stdout).not.toContain(reToken);
     expect(captured.read().stdout).not.toContain(jwt);
     expect(captured.read().stdout).not.toContain(obscuredBearerToken);
+    expect(captured.read().stdout).not.toContain(githubToken);
+    expect(captured.read().stdout).not.toContain("topsecret123");
+    expect(captured.read().stdout).not.toContain("dTpw");
     expect(captured.read().stdout).not.toContain("\u001b");
     expect(captured.read().stdout).not.toContain("\u0007");
     expect(captured.read().stdout).not.toContain("\u0085");

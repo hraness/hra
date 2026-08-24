@@ -142,6 +142,7 @@ export async function launchPinnedCodexAppServer(
     ...(options.shutdownSettlementMs === undefined
       ? {}
       : { shutdownSettlementMs: options.shutdownSettlementMs }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   await client.initialize();
   return client;

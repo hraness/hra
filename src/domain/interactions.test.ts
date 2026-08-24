@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   interactionRecordSchema,
+  protectedInteractionDetailDocumentSchema,
   mcpFormFieldSchema,
   providerInteractionAuthoritySchema,
   providerRequestIdSchema,
@@ -10,6 +11,42 @@ import {
 import { createProfileId, createSessionId } from "./values";
 
 describe("provider interactions", () => {
+  test("binds complete protected authority to one live public revision and kind", () => {
+    const document = {
+      type: "hra_protected_interaction_detail" as const,
+      version: 1 as const,
+      binding: {
+        interactionId: crypto.randomUUID(),
+        revision: 2,
+        kind: "permission_approval" as const,
+        sessionId: createSessionId(),
+        profileId: createProfileId(),
+        processGeneration: 3,
+        connectionId: crypto.randomUUID(),
+      },
+      authority: {
+        kind: "permission_approval" as const,
+        permissions: { fileSystem: { read: ["/private/exact"] } },
+        reason: "Read the exact path",
+        workingDirectory: "/workspace",
+        environmentId: "environment-1",
+      },
+    };
+    expect(protectedInteractionDetailDocumentSchema.parse(document)).toEqual(document);
+    expect(() => protectedInteractionDetailDocumentSchema.parse({
+      ...document,
+      authority: { ...document.authority, workingDirectory: null },
+    })).toThrow();
+    expect(() => protectedInteractionDetailDocumentSchema.parse({
+      ...document,
+      binding: { ...document.binding, kind: "command_approval" },
+    })).toThrow();
+    expect(() => protectedInteractionDetailDocumentSchema.parse({
+      ...document,
+      authority: { ...document.authority, permissions: { value: undefined } },
+    })).toThrow();
+  });
+
   test("preserves numeric and string JSON-RPC request IDs as different authority", () => {
     expect(providerRequestIdSchema.parse({ type: "number", value: 1 })).not.toEqual(
       providerRequestIdSchema.parse({ type: "string", value: "1" }),
@@ -85,7 +122,7 @@ describe("provider interactions", () => {
         reason: null,
         commandClass: "test",
         workingDirectory: null,
-        allowsSessionApproval: false,
+        availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
       },
       responseRecorded: true,
       context: { turnId: "turn-1", itemId: "item-1" },
@@ -103,6 +140,13 @@ describe("provider interactions", () => {
       ...value,
       requestDigest: "a".repeat(64),
     })).toThrow();
+    expect(() => publicInteractionSchema.parse({
+      ...value,
+      display: {
+        ...value.display,
+        availableDecisions: ["once", "once"],
+      },
+    })).toThrow("unique");
     expect(() => publicInteractionSchema.parse({
       ...value,
       responseDigest: "b".repeat(64),

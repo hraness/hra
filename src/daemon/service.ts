@@ -13,6 +13,9 @@ import {
 } from "../codex/index";
 import type { LocalCommand } from "../domain/contracts";
 import {
+  PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
+  encodeProtectedInteractionDetailDocument,
+  protectedInteractionDetailDocumentSchema,
   publicInteractionSchema,
   type InteractionRecord,
   type InteractionIntendedTerminalState,
@@ -22,6 +25,8 @@ import {
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
 import {
+  accountUsageHistoryEntrySchema,
+  accountUsageHistoryPageSchema,
   accountUsageCounterSamples,
   createStoredAccountUsageSnapshot,
   observedAccountTokenVelocity,
@@ -33,6 +38,8 @@ import { profileIdSchema, sessionIdSchema } from "../domain/values";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import {
   SelectionError,
+  StateSecurityScrubRequiredError,
+  USAGE_LOCAL_RETAIN_AGE_MS,
   type MutationAttemptRecord,
   type MutationEffectEvidence,
   type ProfileRecord,
@@ -42,8 +49,21 @@ import {
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
 import { commandFailureBrand } from "./local-transport";
 import type { CloudControlPort, CodexAccountProjection, CodexLoginOutcome, CodexRuntimePort, CodexSessionProjection, DesktopSwitchPort, ProfileAuthority, RuntimeStartReview } from "./ports";
-import { SessionEventCursorCodec, SessionEventCursorError } from "./session-event-cursor";
+import {
+  SessionEventCursorCodec,
+  SessionEventCursorError,
+  type InteractionCursorScope,
+} from "./session-event-cursor";
 import { SessionEventWaiterLimitError, SessionEventWaiters } from "./session-event-waiters";
+import {
+  UsageHistoryCursorCodec,
+  UsageHistoryCursorError,
+} from "./usage-history-cursor";
+import {
+  sanitizeInteractionDisplay,
+  SessionEventStreamRedactor,
+  type SessionEventWrite,
+} from "./streaming-redaction";
 
 export class CommandFailure extends Error {
   readonly [commandFailureBrand] = true as const;
@@ -135,7 +155,9 @@ export class HraService {
   readonly #daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
   readonly #requestStop: () => void;
   readonly #eventCursors: SessionEventCursorCodec;
+  readonly #usageHistoryCursors: UsageHistoryCursorCodec;
   readonly #eventWaiters: SessionEventWaiters;
+  readonly #eventRedactor = new SessionEventStreamRedactor();
   readonly #daemonGeneration: number;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
@@ -160,6 +182,7 @@ export class HraService {
     daemonAuthority: Pick<DaemonAuthorityFence, "assertCurrent" | "close">;
     desktop?: DesktopSwitchPort;
     eventCursors?: SessionEventCursorCodec;
+    usageHistoryCursors?: UsageHistoryCursorCodec;
     eventWaiters?: SessionEventWaiters;
     daemonGeneration?: number;
     now?: () => number;
@@ -172,6 +195,8 @@ export class HraService {
     this.#daemonAuthority = input.daemonAuthority;
     this.#eventCursors = input.eventCursors
       ?? new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
+    this.#usageHistoryCursors = input.usageHistoryCursors
+      ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
@@ -187,6 +212,18 @@ export class HraService {
       const result = await this.#executeAdmitted(command, context);
       await this.#daemonAuthority.assertCurrent();
       return result;
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) {
+        (context.afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop);
+        throw new CommandFailure(
+          "UNAVAILABLE",
+          error.operationCommitted
+            ? "The local transition committed, but its security scrub could not finish. HRA is stopping and will complete the scrub before the next startup."
+            : "A required local security scrub could not finish. HRA is stopping and will retry it before the next startup.",
+          { operationCommitted: error.operationCommitted },
+        );
+      }
+      throw error;
     } finally {
       finish();
     }
@@ -208,6 +245,10 @@ export class HraService {
           if (command.account === undefined) return await this.#usage(undefined, command.refresh, context.signal);
           const profile = this.#store.requireProfile(command.account);
           return await this.#serialize(`account:${profile.id}`, async () => this.#usage(profile.id, command.refresh, context.signal));
+        }
+        case "account.usage-history": {
+          const profile = this.#store.requireProfile(command.account);
+          return this.#usageHistory({ ...command, account: profile.id });
         }
         case "account.switch": { const profile = this.#store.requireProfile(command.account); return await this.#serialize("desktop-switch", async () => this.#switchAccount(profile.id, command.idempotencyKey, context.signal)); }
         case "account.switch-recover": return await this.#serialize("desktop-switch", async () => this.#recoverDesktopSwitch(context.signal));
@@ -231,22 +272,33 @@ export class HraService {
         case "project.add": return { project: await this.#store.createProject(command.label, command.path, this.#store.listProjects().length === 0) };
         case "project.use": return { project: this.#store.setDefaultProject(this.#store.requireProject(command.project).id) };
         case "session.list": {
-          if (command.account === undefined) return await this.#listSessions(undefined, command.limit, context.signal);
+          if (command.account === undefined) {
+            return await this.#listSessions(
+              undefined,
+              command.limit,
+              command.cursor,
+              context.signal,
+            );
+          }
           const profile = this.#store.requireProfile(command.account);
-          return await this.#serialize(`account:${profile.id}`, async () => this.#listSessions(profile.id, command.limit, context.signal));
+          return await this.#serialize(`account:${profile.id}`, async () => this.#listSessions(
+            profile.id,
+            command.limit,
+            command.cursor,
+            context.signal,
+          ));
         }
         case "session.show": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#showSession(session.id, command.detail, context.signal), { allowDuringProjectionRecovery: true }); }
         case "session.status": return this.#sessionStatus(command.session);
         case "session.events": return await this.#sessionEvents(command, context.signal);
         case "session.interactions": {
           const session = this.#store.requireSession(command.session);
-          return {
-            interactions: this.#store.listInteractions({
-              sessionId: session.id,
-              pendingOnly: command.pending,
-              limit: command.limit,
-            }).map((interaction) => this.#publicInteraction(interaction)),
-          };
+          return this.#interactionPage({
+            sessionId: session.id,
+            pending: command.pending,
+            limit: command.limit,
+            ...(command.cursor === undefined ? {} : { cursor: command.cursor }),
+          });
         }
         case "session.start": { const profile = this.#store.requireProfile(command.account); return await this.#serialize(`account:${profile.id}`, async () => this.#startSession({ ...command, account: profile.id }, context.signal)); }
         case "session.send": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#send(session.id, command.message, command.idempotencyKey, context.signal)); }
@@ -274,17 +326,17 @@ export class HraService {
           const sessionId = command.session === undefined
             ? undefined
             : this.#store.requireSession(command.session).id;
-          return {
-            interactions: this.#store.listInteractions({
-              ...(sessionId === undefined ? {} : { sessionId }),
-              pendingOnly: command.pending,
-              limit: command.limit,
-            }).map((interaction) => this.#publicInteraction(interaction)),
-          };
+          return this.#interactionPage({
+            ...(sessionId === undefined ? {} : { sessionId }),
+            pending: command.pending,
+            limit: command.limit,
+            ...(command.cursor === undefined ? {} : { cursor: command.cursor }),
+          });
         }
         case "interaction.show": return {
           interaction: this.#publicInteraction(this.#store.requireInteraction(command.interaction)),
         };
+        case "interaction.inspect": return await this.#inspectInteraction(command, context.signal);
         case "interaction.resolve": return await this.#resolveInteraction(command, context.signal);
         case "auth.login": {
           const result = await this.#fencedEffect(async () => await this.#cloud.auth({
@@ -322,8 +374,8 @@ export class HraService {
         }
         case "device.list": return await this.#fencedEffect(async () => await this.#cloud.listDevices(context.signal));
         case "device.pair": return await this.#fencedEffect(async () => await this.#cloud.pairDevice(context.signal));
-        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, context.signal));
-        case "device.revoke": return await this.#fencedEffect(async () => await this.#cloud.revokeDevice(command.device, context.signal));
+        case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, context.signal));
+        case "device.revoke": return await this.#fencedEffect(async () => await this.#cloud.revokeDevice(command.device, command.idempotencyKey, context.signal));
         case "sync.status": return await this.#fencedEffect(async () => await this.#cloud.status(context.signal));
         case "sync.now": return await this.#fencedEffect(async () => await this.#cloud.sync(context.signal));
         case "sync.projection-recover": {
@@ -351,11 +403,24 @@ export class HraService {
       if (error instanceof SessionEventCursorError) {
         throw new CommandFailure("INVALID_INPUT", error.message);
       }
+      if (error instanceof UsageHistoryCursorError) {
+        throw new CommandFailure(
+          error.reason === "expired" ? "CONFLICT" : "INVALID_INPUT",
+          error.message,
+          { reason: error.reason },
+        );
+      }
       if (error instanceof SessionEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
       }
       if (error instanceof SelectionError) throw new CommandFailure(error.code, error.message, { candidates: error.candidates });
-      if (error instanceof Error && error.message === "IDEMPOTENCY_CONFLICT") throw new CommandFailure("CONFLICT", error.message);
+      if (
+        error instanceof Error
+        && (
+          error.message === "IDEMPOTENCY_CONFLICT"
+          || error.message === "Cloud device mutation idempotency key was reused for a different request."
+        )
+      ) throw new CommandFailure("CONFLICT", error.message);
       if (error instanceof Error && error.message === "UNSETTLED_MUTATION_AUTHORITY") throw new CommandFailure("RECOVERY_REQUIRED", "This mutation authority has an unsettled earlier effect and rejects new idempotency keys.");
       if (error instanceof Error && error.message === "SESSION_EVENT_CURSOR_AHEAD") {
         throw new CommandFailure("CONFLICT", "The session event cursor is ahead of the current stream.");
@@ -378,6 +443,16 @@ export class HraService {
       const result = await this.#executeRemoteAdmitted(command, expectedAuthority, context);
       await this.#daemonAuthority.assertCurrent();
       return result;
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) {
+        this.#requestStop();
+        throw new CommandFailure(
+          "UNAVAILABLE",
+          "The local security scrub could not finish. HRA is stopping and will retry it before the next startup.",
+          { operationCommitted: error.operationCommitted },
+        );
+      }
+      throw error;
     } finally {
       finish();
     }
@@ -653,6 +728,9 @@ export class HraService {
     if (finish === null) return;
     try {
       await this.#observeCodexFactAdmitted(authority, fact);
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      throw error;
     } finally {
       finish();
     }
@@ -703,6 +781,9 @@ export class HraService {
       };
       if (this.#mutationTails.has(`account:${profile.id}`)) await apply();
       else await this.#serialize(`account:${profile.id}`, apply);
+    } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+      throw error;
     } finally {
       finish();
     }
@@ -748,7 +829,7 @@ export class HraService {
         authority: fact.provider,
         kind: fact.kind,
         blocking: fact.blocking,
-        display: fact.display,
+        display: sanitizeInteractionDisplay(fact.display),
         ...(fact.timeoutMs === undefined ? {} : { timeoutMs: fact.timeoutMs }),
         ...(fact.requestedAt === undefined ? {} : { requestedAt: fact.requestedAt }),
         ...(fact.deadlineAt === undefined ? {} : { deadlineAt: fact.deadlineAt }),
@@ -854,6 +935,12 @@ export class HraService {
   ): Promise<void> {
     const current = this.#store.findSessionByProviderThread(authority.id, fact.threadId);
     if (current === null || current.id !== expected.id) return;
+    this.#persistSessionEventWrites(this.#eventRedactor.interruptSession({
+      sessionId: current.id,
+      accountId: authority.id,
+      providerGeneration: authority.generation,
+      providerConnectionId: fact.connectionId ?? null,
+    }));
     this.#sessionFactEpochs.set(current.id, (this.#sessionFactEpochs.get(current.id) ?? 0) + 1);
     const terminal = this.#store.terminalizeSessionFromProviderDeletion({
       accountId: authority.id,
@@ -877,14 +964,20 @@ export class HraService {
     const parsedConnection = connectionId === null || connectionId === undefined
       ? null
       : z.string().uuid().parse(connectionId);
-    this.#store.appendSessionEvent({
+    this.#persistSessionEventWrites(this.#eventRedactor.accept({
       sessionId,
       accountId: authority.id,
       providerGeneration: authority.generation,
       providerConnectionId: parsedConnection,
       body,
-    });
-    this.#eventWaiters.notify(sessionId);
+    }));
+  }
+
+  #persistSessionEventWrites(writes: readonly SessionEventWrite[]): void {
+    for (const write of writes) {
+      this.#store.appendSessionEvent(write);
+      this.#eventWaiters.notify(write.sessionId);
+    }
   }
 
   #ensureSessionProviderConnection(
@@ -970,12 +1063,18 @@ export class HraService {
         turnId: fact.turnId,
         itemId: fact.itemId,
         itemKind: fact.itemKind,
+        ...(fact.liveAcceptanceCommandDigest === undefined
+          ? {}
+          : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
       };
       case "itemCompleted": return {
         type: "item_completed",
         turnId: fact.turnId,
         itemId: fact.itemId,
         itemKind: fact.itemKind,
+        ...(fact.liveAcceptanceCommandDigest === undefined
+          ? {}
+          : { liveAcceptanceCommandDigest: fact.liveAcceptanceCommandDigest }),
         ...(fact.status === undefined ? {} : { status: fact.status }),
       };
       case "assistantDelta": return {
@@ -1100,9 +1199,93 @@ export class HraService {
       runtimeError = error;
     }
     await this.#drainOwnedWork();
+    this.#persistSessionEventWrites(this.#eventRedactor.interruptAll());
+    let retirementError: unknown;
+    try {
+      this.#retireClosedRuntimeAuthorities();
+    } catch (error: unknown) {
+      retirementError = error;
+    }
     this.#state = "closed";
+    if (runtimeError !== undefined && retirementError !== undefined) {
+      throw new AggregateError(
+        [runtimeError, retirementError],
+        "The Codex runtime and its durable authority retirement both failed during shutdown.",
+      );
+    }
     if (runtimeError !== undefined) {
       throw runtimeError instanceof Error ? runtimeError : new Error("The Codex runtime closed with a non-Error failure.");
+    }
+    if (retirementError !== undefined) {
+      throw retirementError instanceof Error
+        ? retirementError
+        : new Error("The Codex runtime authority retirement failed with a non-Error failure.");
+    }
+  }
+
+  #retireClosedRuntimeAuthorities(): void {
+    const projectionErrors: unknown[] = [];
+    for (const profile of this.#store.listProfiles()) {
+      if (profile.processGeneration === 0) continue;
+      let terminal: readonly InteractionRecord[];
+      try {
+        terminal = this.#store.expireGenerationInteractions({
+          profileId: profile.id,
+          processGeneration: profile.processGeneration,
+        });
+      } catch (error: unknown) {
+        projectionErrors.push(error);
+        continue;
+      }
+      for (const interaction of terminal) {
+        try {
+          this.#appendInteractionState(interaction);
+        } catch (error: unknown) {
+          projectionErrors.push(error);
+        }
+      }
+      const authority = authorityFor(this.#paths, profile);
+      for (const [sessionId, connectionId] of [...this.#sessionProviderConnections]) {
+        let session: SessionRecord;
+        try {
+          session = this.#store.requireSession(sessionId);
+        } catch (error: unknown) {
+          projectionErrors.push(error);
+          this.#sessionProviderConnections.delete(sessionId);
+          continue;
+        }
+        if (session.profileId !== profile.id) continue;
+        try {
+          this.#appendSessionEvent(authority, session.id, connectionId, {
+            type: "connection",
+            state: "disconnected",
+            reason: "closed",
+          });
+          const position = this.#store.eventStreamPosition(session.id);
+          this.#appendSessionEvent(authority, session.id, connectionId, {
+            type: "gap",
+            reason: "provider_disconnect",
+            fromSequence: position.observedThroughSequence + 1,
+            throughSequence: position.observedThroughSequence + 1,
+          });
+        } catch (error: unknown) {
+          projectionErrors.push(error);
+        } finally {
+          this.#sessionProviderConnections.delete(sessionId);
+        }
+      }
+      try {
+        this.#store.advanceProfileGeneration(profile.id, profile.processGeneration);
+      } catch (error: unknown) {
+        projectionErrors.push(error);
+      }
+    }
+    this.#sessionProviderConnections.clear();
+    if (projectionErrors.length > 0) {
+      throw new AggregateError(
+        projectionErrors,
+        "The closed Codex runtime could not retire every durable provider authority.",
+      );
     }
   }
 
@@ -1431,14 +1614,28 @@ export class HraService {
           });
         },
       });
+      const observed = this.#store.requireProfile(current.id);
+      const replayedPendingReceipt = prior?.state === "applied" && result.status === "pending";
+      const login = replayedPendingReceipt && observed.state === "signed_in"
+        ? {
+            status: "signed_in" as const,
+            account: {
+              signedIn: true as const,
+              ...(observed.providerEmail === undefined ? {} : { email: observed.providerEmail }),
+              ...(observed.providerPlan === undefined ? {} : { plan: observed.providerPlan }),
+            },
+          }
+        : replayedPendingReceipt && observed.state === "signed_out"
+          ? { status: "settled" as const, outcome: "signed_out" as const }
+          : result.status === "pending"
+            ? {
+                ...result,
+                next: `hra account login-cancel ${current.id}`,
+              }
+            : result;
       return {
-        account: this.#publicProfile(this.#store.requireProfile(current.id)),
-        login: result.status === "pending"
-          ? {
-              ...result,
-              next: `hra account login-cancel ${current.id}`,
-            }
-          : result,
+        account: this.#publicProfile(observed),
+        login,
         idempotencyKey: key,
       };
     } catch (error: unknown) {
@@ -1650,6 +1847,100 @@ export class HraService {
     return { usage };
   }
 
+  #usageHistory(
+    command: Extract<LocalCommand, { kind: "account.usage-history" }>,
+  ): unknown {
+    const profile = this.#store.requireProfile(command.account);
+    const now = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(this.#now());
+    let fromObservedAt: number;
+    let throughObservedAt: number;
+    let afterSourceRevision = 0;
+    let issuedAt = now;
+    if (command.cursor !== undefined) {
+      const decoded = this.#usageHistoryCursors.decode(command.cursor, {
+        accountId: profile.id,
+        now,
+        ...(command.fromObservedAt === undefined
+          ? {}
+          : { fromObservedAt: command.fromObservedAt }),
+        ...(command.throughObservedAt === undefined
+          ? {}
+          : { throughObservedAt: command.throughObservedAt }),
+      });
+      fromObservedAt = decoded.fromObservedAt;
+      throughObservedAt = decoded.throughObservedAt;
+      afterSourceRevision = decoded.afterSourceRevision;
+      issuedAt = decoded.issuedAt;
+    } else {
+      const retentionFloor = Math.max(0, now - USAGE_LOCAL_RETAIN_AGE_MS);
+      fromObservedAt = command.fromObservedAt ?? retentionFloor;
+      throughObservedAt = command.throughObservedAt ?? now;
+      if (fromObservedAt > throughObservedAt) {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "Usage history --from must not be later than --through.",
+        );
+      }
+      if (throughObservedAt > now) {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "Usage history --through must not be in the future.",
+        );
+      }
+      if (fromObservedAt < retentionFloor || throughObservedAt < retentionFloor) {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "Usage history ranges must stay within the retained 24-hour window.",
+          { retentionFloorObservedAt: retentionFloor, throughObservedAt: now },
+        );
+      }
+    }
+
+    const listed = this.#store.usageHistoryPage({
+      profileId: profile.id,
+      fromObservedAt,
+      throughObservedAt,
+      afterSourceRevision,
+      limit: command.limit,
+    });
+    const entries = listed.entries.map((entry) => {
+      if (entry.state === "failed") {
+        return accountUsageHistoryEntrySchema.parse(entry);
+      }
+      const parsed = storedAccountUsageSnapshotSchema.safeParse(entry.payload);
+      const observation = parsed.success
+        && parsed.data.observation.sourceSequence === entry.sourceRevision
+        && parsed.data.observation.observedAt === entry.observedAt
+        ? parsed.data.observation
+        : null;
+      return accountUsageHistoryEntrySchema.parse({
+        state: "observed",
+        sourceRevision: entry.sourceRevision,
+        observedAt: entry.observedAt,
+        receivedAt: observation?.receivedAt ?? null,
+        lifetimeTokens: observation?.lifetimeTokens ?? null,
+        gapBefore: observation?.gapBefore ?? null,
+      });
+    });
+    const nextCursor = listed.nextSourceRevision === null
+      ? null
+      : this.#usageHistoryCursors.encode({
+          version: 1,
+          type: "account_usage_history",
+          accountId: profile.id,
+          fromObservedAt,
+          throughObservedAt,
+          afterSourceRevision: listed.nextSourceRevision,
+          issuedAt,
+        });
+    return accountUsageHistoryPageSchema.parse({
+      account: { id: profile.id, label: profile.label },
+      range: { fromObservedAt, throughObservedAt },
+      entries,
+      nextCursor,
+    });
+  }
+
   async #switchAccount(selector: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
     if (this.#desktop === undefined) throw new CommandFailure("UNAVAILABLE", "Desktop account switching is available only on a supported macOS ChatGPT build.");
     const desktop = this.#desktop;
@@ -1730,9 +2021,9 @@ export class HraService {
   #sessionStatus(selector: string): unknown {
     const session = this.#store.requireSession(selector);
     const snapshot = this.#store.readSessionSnapshotWithEventPosition(session.id);
-    const pending = this.#store.listInteractions({
+    const pending = this.#interactionPage({
       sessionId: session.id,
-      pendingOnly: true,
+      pending: true,
       limit: 100,
     });
     return {
@@ -1753,7 +2044,62 @@ export class HraService {
         floorSequence: snapshot.floorSequence,
         observedThroughSequence: snapshot.observedThroughSequence,
       },
-      pendingInteractions: pending.map((interaction) => this.#publicInteraction(interaction)),
+      pendingInteractions: pending.interactions,
+      pendingInteractionsNextCursor: pending.nextCursor,
+    };
+  }
+
+  #interactionPage(input: Readonly<{
+    cursor?: string;
+    limit: number;
+    pending: boolean;
+    sessionId?: SessionRecord["id"];
+  }>): Readonly<{
+    interactions: readonly PublicInteraction[];
+    nextCursor: string | null;
+    sessionId: SessionRecord["id"] | null;
+  }> {
+    const scope: InteractionCursorScope = input.sessionId === undefined
+      ? { type: "global" }
+      : { type: "session", sessionId: input.sessionId };
+    let after: Readonly<{ publicId: string; requestedAt: number }> | undefined;
+    if (input.cursor !== undefined) {
+      try {
+        const decoded = this.#eventCursors.decodeInteraction(input.cursor, {
+          scope,
+          pending: input.pending,
+        });
+        after = { requestedAt: decoded.requestedAt, publicId: decoded.publicId };
+      } catch (error: unknown) {
+        if (error instanceof SessionEventCursorError) {
+          throw new CommandFailure(
+            "INVALID_INPUT",
+            "The interaction cursor is invalid for this exact interaction listing.",
+          );
+        }
+        throw error;
+      }
+    }
+    const page = this.#store.listInteractionPage({
+      ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+      pendingOnly: input.pending,
+      limit: input.limit,
+      ...(after === undefined ? {} : { after }),
+    });
+    const nextCursor = page.nextPosition === null
+      ? null
+      : this.#eventCursors.encodeInteraction({
+          version: 1,
+          type: "interaction",
+          scope,
+          pending: input.pending,
+          requestedAt: page.nextPosition.requestedAt,
+          publicId: page.nextPosition.publicId,
+        });
+    return {
+      sessionId: input.sessionId ?? null,
+      interactions: page.interactions.map((interaction) => this.#publicInteraction(interaction)),
+      nextCursor,
     };
   }
 
@@ -1763,6 +2109,8 @@ export class HraService {
   ): Promise<SessionEventPage> {
     const session = this.#store.requireSession(command.session);
     let requestedSequence: number | null = null;
+    let restoredRequestedSequence: number | null = null;
+    let streamRestored = false;
     if (command.cursor !== undefined) {
       const cursor = this.#eventCursors.decode(command.cursor);
       const current = this.#store.eventStreamPosition(session.id);
@@ -1770,15 +2118,11 @@ export class HraService {
         throw new CommandFailure("INVALID_INPUT", "The session event cursor belongs to another session.");
       }
       if (cursor.streamEpoch !== current.streamEpoch) {
-        throw new CommandFailure("CONFLICT", "The session event cursor belongs to an earlier stream epoch.", {
-          currentRetentionFloorCursor: this.#encodeEventCursor({
-            sessionId: session.id,
-            streamEpoch: current.streamEpoch,
-            sequence: Math.max(0, current.floorSequence - 1),
-          }),
-        });
+        streamRestored = true;
+        restoredRequestedSequence = cursor.sequence;
+      } else {
+        requestedSequence = cursor.sequence;
       }
-      requestedSequence = cursor.sequence;
     }
 
     let listed = this.#store.listSessionEvents({
@@ -1786,7 +2130,7 @@ export class HraService {
       afterSequence: requestedSequence,
       limit: command.limit,
     });
-    if (listed.events.length === 0 && command.waitMs > 0) {
+    if (!streamRestored && listed.events.length === 0 && command.waitMs > 0) {
       await this.#eventWaiters.wait({
         sessionId: session.id,
         expectedObservedThrough: listed.observedThroughSequence,
@@ -1823,13 +2167,19 @@ export class HraService {
         streamEpoch: listed.streamEpoch,
         sequence: nextSequence,
       }),
-      gap: listed.gapReason === null
-        ? null
-        : {
-            reason: listed.gapReason,
-            requestedSequence,
+      gap: streamRestored
+        ? {
+            reason: "stream_restored" as const,
+            requestedSequence: restoredRequestedSequence,
             retainedFromSequence: listed.floorSequence,
-          },
+          }
+        : listed.gapReason === null
+          ? null
+          : {
+              reason: listed.gapReason,
+              requestedSequence,
+              retainedFromSequence: listed.floorSequence,
+            },
       events: [...listed.events],
     };
     return sessionEventPageSchema.parse(page);
@@ -1878,6 +2228,16 @@ export class HraService {
     interaction: InteractionRecord,
     resolution: InteractionResolution,
   ): void {
+    if (
+      interaction.kind === "file_change_approval"
+      && resolution.kind === "approval_decision"
+      && (resolution.decision === "once" || resolution.decision === "session")
+    ) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "File-change approval is disabled because the pinned provider callback does not expose exact affected paths or change detail.",
+      );
+    }
     const expected = interaction.kind === "user_input"
         ? "user_answers"
         : interaction.kind === "mcp_elicitation"
@@ -1885,14 +2245,14 @@ export class HraService {
           : "approval_decision";
     const permissionDecision = interaction.kind === "permission_approval"
       && resolution.kind === "approval_decision"
-      && (resolution.decision === "decline" || resolution.decision === "cancel");
+      && resolution.decision === "decline";
     const permissionGrant = interaction.kind === "permission_approval"
       && resolution.kind === "permission_grant";
     if (!permissionDecision && !permissionGrant && resolution.kind !== expected) {
       throw new CommandFailure(
         "INVALID_INPUT",
         interaction.kind === "permission_approval"
-          ? "A permission approval requires an exact permission grant, decline, or cancel resolution."
+          ? "A permission approval requires an exact permission grant or decline resolution."
           : `A ${interaction.kind} interaction requires a ${expected} resolution.`,
       );
     }
@@ -1903,17 +2263,16 @@ export class HraService {
     ) {
       throw new CommandFailure(
         "INVALID_INPUT",
-        "Permission approvals can be declined or canceled, but broad once or session approval is not allowed.",
+        "Permission approvals can be declined, but cancel, once, and session decisions are not represented by this provider callback.",
       );
     }
     if (
       resolution.kind === "approval_decision"
-      && resolution.decision === "session"
       && (interaction.display.kind === "command_approval"
         || interaction.display.kind === "file_change_approval")
-      && !interaction.display.allowsSessionApproval
+      && !interaction.display.availableDecisions.includes(resolution.decision)
     ) {
-      throw new CommandFailure("INVALID_INPUT", "This provider request does not allow session approval.");
+      throw new CommandFailure("INVALID_INPUT", "This provider request does not offer that decision.");
     }
     if (
       resolution.kind === "permission_grant"
@@ -1970,6 +2329,94 @@ export class HraService {
     return "resolved";
   }
 
+  async #inspectInteraction(
+    command: Extract<LocalCommand, { kind: "interaction.inspect" }>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return await this.#serialize(`interaction:${command.interaction}`, async () => {
+      const current = this.#store.requireInteraction(command.interaction);
+      if (
+        current.revision !== command.expectedRevision
+        || current.state !== "pending"
+        || this.#now() >= current.deadlineAt
+      ) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "The interaction revision, state, or deadline changed before protected inspection.",
+        );
+      }
+      if (current.kind !== "command_approval" && current.kind !== "permission_approval") {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "This interaction has no complete approval authority available for protected inspection.",
+        );
+      }
+      const profile = this.#store.requireProfileById(current.authority.profileId);
+      let authority: Awaited<ReturnType<CodexRuntimePort["inspectInteractionAuthority"]>>;
+      try {
+        await this.#daemonAuthority.assertCurrent();
+        authority = await this.#codex.inspectInteractionAuthority({
+          authority: authorityFor(this.#paths, profile),
+          provider: current.authority,
+          kind: current.kind,
+          signal,
+        });
+        await this.#daemonAuthority.assertCurrent();
+      } catch (error: unknown) {
+        if (error instanceof CodexError && error.code === "UNSUPPORTED_CAPABILITY") {
+          throw new CommandFailure("INVALID_INPUT", error.message);
+        }
+        throw new CommandFailure(
+          "CONFLICT",
+          "The interaction's exact live provider authority is no longer available.",
+        );
+      }
+      const observed = this.#store.requireInteraction(current.publicId);
+      if (
+        observed.revision !== current.revision
+        || observed.state !== "pending"
+        || observed.kind !== current.kind
+        || observed.sessionId !== current.sessionId
+        || observed.authority.profileId !== current.authority.profileId
+        || observed.authority.processGeneration !== current.authority.processGeneration
+        || observed.authority.connectionId !== current.authority.connectionId
+        || observed.authority.requestDigest !== current.authority.requestDigest
+        || observed.authority.requestId.type !== current.authority.requestId.type
+        || observed.authority.requestId.value !== current.authority.requestId.value
+        || this.#now() >= observed.deadlineAt
+      ) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "The interaction authority changed during protected inspection.",
+        );
+      }
+      const document = protectedInteractionDetailDocumentSchema.parse({
+        type: "hra_protected_interaction_detail",
+        version: 1,
+        binding: {
+          interactionId: observed.publicId,
+          revision: observed.revision,
+          kind: observed.kind,
+          sessionId: observed.sessionId,
+          profileId: observed.authority.profileId,
+          processGeneration: observed.authority.processGeneration,
+          connectionId: observed.authority.connectionId,
+        },
+        authority,
+      });
+      const encoded = encodeProtectedInteractionDetailDocument(document);
+      const fits = encoded.byteLength <= PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES;
+      encoded.fill(0);
+      if (!fits) {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "The complete approval authority exceeds HRA's protected-output limit.",
+        );
+      }
+      return document;
+    });
+  }
+
   async #resolveInteraction(
     command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
     signal: AbortSignal,
@@ -1982,6 +2429,9 @@ export class HraService {
           "The interaction revision or state changed before resolution.",
           { interaction: this.#publicInteraction(current) },
         );
+      }
+      if (this.#now() >= current.deadlineAt) {
+        await this.#rejectManualResolutionAtDeadline(current);
       }
       this.#assertResolutionMatches(current, command.resolution);
       const profile = this.#store.requireProfileById(current.authority.profileId);
@@ -1997,6 +2447,9 @@ export class HraService {
         });
         responseDigest = validated.responseDigest;
       } catch (error: unknown) {
+        if (this.#now() >= current.deadlineAt) {
+          await this.#rejectManualResolutionAtDeadline(current);
+        }
         if (error instanceof CodexError && error.code === "INVALID_INPUT") {
           throw new CommandFailure("INVALID_INPUT", error.message);
         }
@@ -2023,6 +2476,9 @@ export class HraService {
           { interaction: this.#publicInteraction(terminal) },
         );
       }
+      if (this.#now() >= current.deadlineAt) {
+        await this.#rejectManualResolutionAtDeadline(current);
+      }
       const prepared = this.#store.prepareInteractionResponse({
         id: current.publicId,
         expectedRevision: current.revision,
@@ -2030,16 +2486,27 @@ export class HraService {
         intendedTerminalState: this.#intendedInteractionTerminalState(command.resolution),
       });
       this.#appendInteractionState(prepared);
+      if (this.#now() >= prepared.deadlineAt) {
+        await this.#rejectPreparedManualResolutionAtDeadline(prepared);
+      }
       try {
         await this.#daemonAuthority.assertCurrent();
+        if (this.#now() >= prepared.deadlineAt) {
+          await this.#rejectPreparedManualResolutionAtDeadline(prepared);
+        }
         await this.#codex.resolveInteraction({
           authority: authorityFor(this.#paths, profile),
           provider: prepared.authority,
           kind: prepared.kind,
           resolution: command.resolution,
+          deadlineAt: prepared.deadlineAt,
           signal,
         });
       } catch (error: unknown) {
+        if (error instanceof CommandFailure) throw error;
+        if (error instanceof CodexError && error.code === "DEADLINE_EXPIRED") {
+          await this.#rejectPreparedManualResolutionAtDeadline(prepared);
+        }
         const terminal = error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
           ? this.#store.markInteractionResolutionUnknown({
               id: prepared.publicId,
@@ -2077,23 +2544,197 @@ export class HraService {
     });
   }
 
-  async #listSessions(account: string | undefined, limit: number, signal: AbortSignal): Promise<unknown> {
-    if (account === undefined) return { sessions: this.#store.listSessions(limit) };
+  async #rejectManualResolutionAtDeadline(current: InteractionRecord): Promise<never> {
+    await this.#expireInteractionAtDeadline(
+      current,
+      this.#interactionDeadlineAbort.signal,
+    );
+    const terminal = this.#store.requireInteraction(current.publicId);
+    throw new CommandFailure(
+      "CONFLICT",
+      "The interaction deadline elapsed before the manual resolution could be dispatched.",
+      { interaction: this.#publicInteraction(terminal) },
+    );
+  }
+
+  async #rejectPreparedManualResolutionAtDeadline(
+    prepared: InteractionRecord,
+  ): Promise<never> {
+    if (
+      prepared.state !== "response_prepared"
+      || prepared.responseDigest === null
+      || prepared.intendedTerminalState === null
+      || prepared.intendedTerminalState === "expired"
+    ) throw new Error("INTERACTION_MANUAL_RESPONSE_NOT_PREPARED");
+    const profile = this.#store.requireProfileById(prepared.authority.profileId);
+    const signal = this.#interactionDeadlineAbort.signal;
+    let timeoutResponseDigest: string;
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      const validated = await this.#codex.validateInteractionTimeout({
+        authority: authorityFor(this.#paths, profile),
+        provider: prepared.authority,
+        signal,
+      });
+      timeoutResponseDigest = validated.responseDigest;
+    } catch (error: unknown) {
+      const latest = this.#store.requireInteraction(prepared.publicId);
+      const terminal = latest.state === "response_prepared"
+        && latest.revision === prepared.revision
+        && latest.responseDigest === prepared.responseDigest
+        ? this.#store.markInteractionResolutionUnknown({
+            id: latest.publicId,
+            expectedRevision: latest.revision,
+            responseDigest: prepared.responseDigest,
+          })
+        : latest;
+      if (terminal !== latest) this.#appendInteractionState(terminal);
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+          ? "The interaction response may already have reached Codex; its resolution is unknown."
+          : "The expired interaction could not be closed on its exact provider connection.",
+        { interaction: this.#publicInteraction(terminal) },
+      );
+    }
+
+    const timeoutPrepared = this.#store.supersedePreparedInteractionResponseWithTimeout({
+      id: prepared.publicId,
+      expectedRevision: prepared.revision,
+      manualResponseDigest: prepared.responseDigest,
+      timeoutResponseDigest,
+    });
+    this.#appendInteractionState(timeoutPrepared);
+    try {
+      await this.#daemonAuthority.assertCurrent();
+      await this.#codex.timeoutInteraction({
+        authority: authorityFor(this.#paths, profile),
+        provider: timeoutPrepared.authority,
+        signal,
+      });
+    } catch (error: unknown) {
+      const latest = this.#store.requireInteraction(timeoutPrepared.publicId);
+      const terminal = latest.state === "response_prepared"
+        && latest.revision === timeoutPrepared.revision
+        && latest.responseDigest === timeoutResponseDigest
+        ? error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+          ? this.#store.markInteractionResolutionUnknown({
+              id: latest.publicId,
+              expectedRevision: latest.revision,
+              responseDigest: timeoutResponseDigest,
+            })
+          : this.#store.expireInteraction({
+              id: latest.publicId,
+              expectedRevision: latest.revision,
+            })
+        : latest;
+      if (terminal !== latest) this.#appendInteractionState(terminal);
+      throw new CommandFailure(
+        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+          ? "RECOVERY_REQUIRED"
+          : "CONFLICT",
+        error instanceof CodexError && error.code === "INDETERMINATE_EFFECT"
+          ? "The provider timeout response may have reached Codex; its resolution is unknown."
+          : "The expired interaction could not be closed on its exact provider connection.",
+        { interaction: this.#publicInteraction(terminal) },
+      );
+    }
+    const written = this.#store.markInteractionResponseWritten({
+      id: timeoutPrepared.publicId,
+      expectedRevision: timeoutPrepared.revision,
+      responseDigest: timeoutResponseDigest,
+    });
+    if (written.state === "response_written") this.#appendInteractionState(written);
+    const terminal = written.state === "response_written"
+      ? this.#store.settleInteraction({
+          id: written.publicId,
+          expectedRevision: written.revision,
+          state: "expired",
+          authority: written.authority,
+          responseDigest: timeoutResponseDigest,
+        })
+      : written;
+    if (terminal !== written) this.#appendInteractionState(terminal);
+    throw new CommandFailure(
+      "CONFLICT",
+      "The interaction deadline elapsed before the manual resolution could be dispatched.",
+      { interaction: this.#publicInteraction(terminal) },
+    );
+  }
+
+  async #listSessions(
+    account: string | undefined,
+    limit: number,
+    cursor: string | undefined,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (account === undefined) {
+      if (cursor !== undefined) {
+        throw new CommandFailure(
+          "INVALID_INPUT",
+          "A session-list cursor requires the same --account filter that created it.",
+        );
+      }
+      return {
+        accountId: null,
+        sessions: this.#store.listSessions(limit),
+        nextCursor: null,
+      };
+    }
     const profile = this.#store.requireProfile(account);
     this.#assertSignedIn(profile);
+    const cursorFilter = {
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      limit,
+    } as const;
+    const decodedCursor = cursor === undefined
+      ? undefined
+      : this.#eventCursors.decodeSessionList(cursor, cursorFilter);
     if (await this.#cloud.isCompactProjectionRecoveryUnsettledForProfile(profile.id)) {
       await this.#daemonAuthority.assertCurrent();
+      if (decodedCursor !== undefined) {
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "Provider session-list continuation is paused while compact-projection recovery preserves exact local authority.",
+        );
+      }
       return {
+        accountId: profile.id,
         sessions: this.#store.listSessions(limit, profile.id),
+        nextCursor: null,
         recovery: {
           diagnostic: "Provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
           required: true,
         },
       };
     }
-    const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({ authority: authorityFor(this.#paths, profile), limit, signal }));
+    const remote = await this.#fencedEffect(async () => await this.#codex.listSessions({
+      authority: authorityFor(this.#paths, profile),
+      limit,
+      ...(decodedCursor === undefined ? {} : { cursor: decodedCursor.providerCursor }),
+      signal,
+    }));
+    let nextCursor: string | null = null;
+    if (remote.nextCursor !== null) {
+      try {
+        nextCursor = this.#eventCursors.advanceSessionList({
+          ...cursorFilter,
+          providerCursor: remote.nextCursor,
+          ...(decodedCursor === undefined ? {} : { prior: decodedCursor }),
+        });
+      } catch (error: unknown) {
+        if (error instanceof SessionEventCursorError) {
+          throw new CommandFailure(
+            "UNAVAILABLE",
+            "Codex returned an unsafe or nonadvancing session-list continuation.",
+          );
+        }
+        throw error;
+      }
+    }
     const projects = this.#store.listProjects();
-    const sessions = remote.map((projection) => {
+    const sessions = remote.sessions.map((projection) => {
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
       return this.#store.upsertProviderSession({
         profileId: profile.id,
@@ -2105,7 +2746,7 @@ export class HraService {
         ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
       });
     });
-    return { sessions };
+    return { accountId: profile.id, sessions, nextCursor };
   }
 
   async #showSession(selector: string, detail: boolean, signal: AbortSignal): Promise<unknown> {
@@ -2837,6 +3478,10 @@ export class HraService {
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
     } catch (error: unknown) {
+      if (error instanceof StateSecurityScrubRequiredError) {
+        this.#requestStop();
+        throw error;
+      }
       await this.#daemonAuthority.assertCurrent();
       if (evidence === undefined) {
         if (this.#isRetryableQueuePreEffectError(error)) this.#scheduleQueuePreEffectRetry(session, queued.id);
@@ -2847,7 +3492,14 @@ export class HraService {
         this.#store.markQueueEffectAmbiguous(queued.id, evidence.digest);
         return;
       }
-      if (!this.#store.failQueueEffect(queued.id)) return;
+      try {
+        if (!this.#store.failQueueEffect(queued.id)) return;
+      } catch (settlementError: unknown) {
+        if (settlementError instanceof StateSecurityScrubRequiredError) {
+          this.#requestStop();
+        }
+        throw settlementError;
+      }
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
     }

@@ -57,8 +57,49 @@ const makeThread = (turns: readonly CodexTurn[]): CodexThread => ({
 });
 
 describe("PinnedCodexRuntimeManager", () => {
+  test("forwards Codex thread-list cursors and preserves the provider continuation", async () => {
+    let requested: Parameters<CodexAppServerClient["listThreads"]>[0] | undefined;
+    const providerAuthority = {
+      profileId: authority.id,
+      processGeneration: authority.generation,
+    };
+    const fake = {
+      state: "ready",
+      listThreads: async (options: Parameters<CodexAppServerClient["listThreads"]>[0]) => {
+        requested = options;
+        return {
+          authority: providerAuthority,
+          value: {
+            data: [makeThread([])],
+            nextCursor: "provider-page-3",
+            backwardsCursor: null,
+          },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = new PinnedCodexRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    await expect(manager.listSessions({
+      authority,
+      cursor: "provider-page-2",
+      limit: 17,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      nextCursor: "provider-page-3",
+      sessions: [{ providerThreadId: "thread-1", title: "Projection test" }],
+    });
+    expect(requested).toEqual({ cursor: "provider-page-2", limit: 17 });
+    await manager.close();
+  });
+
   test("prepares each isolated Codex home and threads its bounded launch policy", async () => {
     const steps: string[] = [];
+    const now = () => 12_345;
     let launched: LaunchPinnedCodexOptions | undefined;
     const fake = {
       state: "ready",
@@ -85,6 +126,7 @@ describe("PinnedCodexRuntimeManager", () => {
         return fake;
       },
       observer: { account: () => undefined, fact: () => undefined },
+      now,
       prepareCodexHome: async (codexHome) => {
         steps.push(`prepare:${codexHome}`);
       },
@@ -107,6 +149,7 @@ describe("PinnedCodexRuntimeManager", () => {
         TMPDIR: `${authority.codexHome}/tmp`,
       },
       expectedCodexHome: authority.codexHome,
+      now,
     });
     await manager.close();
   });
@@ -229,8 +272,15 @@ describe("PinnedCodexRuntimeManager", () => {
     const connectionId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b";
     const calls: unknown[] = [];
     const validations: unknown[] = [];
+    const inspections: unknown[] = [];
+    let clientState: "failed" | "ready" = "ready";
+    let delayInspection = false;
+    let releaseInspection!: () => void;
+    let markInspectionStarted!: () => void;
+    const inspectionGate = new Promise<void>((resolve) => { releaseInspection = resolve; });
+    const startedInspection = new Promise<void>((resolve) => { markInspectionStarted = resolve; });
     const fake = {
-      state: "ready",
+      get state() { return clientState; },
       connectionId,
       accountRead: async () => ({
         authority: { profileId: authority.id, processGeneration: authority.generation },
@@ -243,6 +293,26 @@ describe("PinnedCodexRuntimeManager", () => {
       validateInteractionResolution: async (input: unknown) => {
         validations.push(input);
         return { responseDigest: "a".repeat(64) };
+      },
+      inspectInteractionAuthority: async (input: unknown) => {
+        inspections.push(input);
+        if (delayInspection) {
+          markInspectionStarted();
+          await inspectionGate;
+        }
+        return {
+          kind: "command_approval" as const,
+          command: "git reset --hard HEAD",
+          reason: "Apply exact reset",
+          availableDecisions: ["accept", "decline", "cancel"],
+          workingDirectory: "/workspace",
+          environmentId: null,
+          commandActions: [],
+          networkApprovalContext: null,
+          additionalPermissions: null,
+          proposedExecpolicyAmendment: null,
+          proposedNetworkPolicyAmendments: null,
+        };
       },
       validateInteractionTimeout: async (input: unknown) => {
         validations.push(input);
@@ -272,6 +342,17 @@ describe("PinnedCodexRuntimeManager", () => {
       itemId: "item-1",
       approvalId: null,
     };
+    const commandProvider = {
+      ...provider,
+      method: "item/commandExecution/requestApproval",
+    } as const;
+    await expect(manager.inspectInteractionAuthority({
+      authority,
+      provider: commandProvider,
+      kind: "command_approval",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ command: "git reset --hard HEAD" });
+    expect(inspections).toEqual([{ provider: commandProvider, kind: "command_approval" }]);
     await expect(manager.validateInteractionResolution({
       authority,
       provider,
@@ -285,9 +366,11 @@ describe("PinnedCodexRuntimeManager", () => {
       provider,
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).resolves.toEqual({ responseWritten: true });
     expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ deadlineAt: Number.MAX_SAFE_INTEGER });
     await expect(manager.validateInteractionTimeout({
       authority,
       provider,
@@ -298,6 +381,15 @@ describe("PinnedCodexRuntimeManager", () => {
       provider,
       signal: new AbortController().signal,
     })).resolves.toEqual({ responseWritten: true });
+    expect(calls).toHaveLength(2);
+    await expect(manager.resolveInteraction({
+      authority,
+      provider,
+      kind: "file_change_approval",
+      resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: 0,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: "DEADLINE_EXPIRED" });
     expect(calls).toHaveLength(2);
     await expect(manager.validateInteractionResolution({
       authority,
@@ -311,6 +403,7 @@ describe("PinnedCodexRuntimeManager", () => {
       provider: { ...provider, connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3c" },
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     await expect(manager.resolveInteraction({
@@ -318,9 +411,22 @@ describe("PinnedCodexRuntimeManager", () => {
       provider: { ...provider, processGeneration: authority.generation + 1 },
       kind: "file_change_approval",
       resolution: { kind: "approval_decision", decision: "once" },
+      deadlineAt: Number.MAX_SAFE_INTEGER,
       signal: new AbortController().signal,
     })).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
     expect(calls).toHaveLength(2);
+    delayInspection = true;
+    const staleInspection = manager.inspectInteractionAuthority({
+      authority,
+      provider: commandProvider,
+      kind: "command_approval",
+      signal: new AbortController().signal,
+    });
+    await startedInspection;
+    clientState = "failed";
+    releaseInspection();
+    await expect(staleInspection).rejects.toMatchObject({ code: "AUTHORITY_STALE" });
+    expect(inspections).toHaveLength(2);
     await manager.close();
   });
 
@@ -564,6 +670,44 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(detail?.items[1]).toMatchObject({ text: safe });
     expect(detail?.items[2]).toMatchObject({ summary: [{ text: safe }] });
     expect(detail?.items[3]).toMatchObject({ paths: [`src/${safe}.ts`] });
+  });
+
+  test("redacts complete transcript secrets and local paths before compact cloud projection", () => {
+    const privatePath = ["", "Users", "alice", "private", "token.txt"].join("/");
+    const thread = makeThread([makeTurn("turn-private", [
+      {
+        type: "userMessage",
+        id: "user-private",
+        clientId: "client-private",
+        text: [
+          "Before Authorization: Bearer USER-PROJECTION-SECRET-11",
+          `Read ${privatePath}`,
+        ],
+      },
+      {
+        type: "reasoning",
+        id: "reason-private",
+        summary: ["device_code=REASONING-PROJECTION-SECRET-22 while checking"],
+      },
+      {
+        type: "agentMessage",
+        id: "agent-private",
+        text: "Result api_key=ASSISTANT-PROJECTION-SECRET-33 complete",
+      },
+    ])]);
+    const projection = projectBoundedThread(thread, true);
+    const serialized = JSON.stringify(projection);
+    expect(serialized).not.toContain("PROJECTION-SECRET");
+    expect(serialized).not.toContain(privatePath);
+    expect(serialized).toContain("[protected]");
+    expect(serialized).toContain("[local-path]");
+    expect(projection.messages?.map((message) => message.text)).toEqual([
+      "Before [protected]",
+      "Result [protected] complete",
+    ]);
+    const detail = (projection.turns as { items: Record<string, unknown>[] }[])[0];
+    expect(JSON.stringify(detail?.items)).not.toContain("PROJECTION-SECRET");
+    expect(JSON.stringify(detail?.items)).not.toContain(privatePath);
   });
 
   test("UTF-8 truncation is a scalar-safe prefix with exact byte accounting", () => {

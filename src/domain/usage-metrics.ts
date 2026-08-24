@@ -2,6 +2,45 @@ import { createHash, randomUUID } from "node:crypto";
 
 import { z } from "zod";
 
+import { labelSchema, profileIdSchema, unixMillisecondsSchema } from "./values";
+
+export const ACCOUNT_USAGE_HISTORY_PAGE_LIMIT = 100;
+
+const accountUsageHistoryBaseSchema = z.object({
+  sourceRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  observedAt: unixMillisecondsSchema,
+});
+
+export const accountUsageHistoryEntrySchema = z.discriminatedUnion("state", [
+  accountUsageHistoryBaseSchema.extend({
+    state: z.literal("observed"),
+    receivedAt: unixMillisecondsSchema.nullable(),
+    lifetimeTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+    gapBefore: z.boolean().nullable(),
+  }).strict(),
+  accountUsageHistoryBaseSchema.extend({
+    state: z.literal("failed"),
+    reasonCode: z.literal("account_usage_read_failed"),
+  }).strict(),
+]);
+
+export type AccountUsageHistoryEntry = z.infer<typeof accountUsageHistoryEntrySchema>;
+
+export const accountUsageHistoryPageSchema = z.object({
+  account: z.object({
+    id: profileIdSchema,
+    label: labelSchema,
+  }).strict(),
+  range: z.object({
+    fromObservedAt: unixMillisecondsSchema,
+    throughObservedAt: unixMillisecondsSchema,
+  }).strict(),
+  entries: z.array(accountUsageHistoryEntrySchema).max(ACCOUNT_USAGE_HISTORY_PAGE_LIMIT),
+  nextCursor: z.string().min(1).max(2_048).nullable(),
+}).strict();
+
+export type AccountUsageHistoryPage = z.infer<typeof accountUsageHistoryPageSchema>;
+
 export const usageVelocityWindowSchema = z.enum(["1m", "5m", "15m"]);
 export type UsageVelocityWindow = z.infer<typeof usageVelocityWindowSchema>;
 

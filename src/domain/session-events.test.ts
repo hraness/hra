@@ -20,6 +20,20 @@ describe("session events", () => {
       text: "safe",
       rawReasoning: "hidden",
     })).toThrow();
+    expect(sessionEventBodySchema.parse({
+      type: "item_started",
+      turnId: "turn-1",
+      itemId: "item-2",
+      itemKind: "commandExecution",
+      liveAcceptanceCommandDigest: "a".repeat(64),
+    })).toMatchObject({ liveAcceptanceCommandDigest: "a".repeat(64) });
+    expect(() => sessionEventBodySchema.parse({
+      type: "item_started",
+      turnId: "turn-1",
+      itemId: "item-2",
+      itemKind: "commandExecution",
+      liveAcceptanceCommandDigest: "not-a-digest",
+    })).toThrow();
     expect(() => sessionEventBodySchema.parse({
       type: "tool_progress",
       turnId: "turn-1",

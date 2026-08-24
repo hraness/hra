@@ -15,10 +15,13 @@ import {
   type ResolvedPreset,
   type ThreadStartResult,
 } from "../codex/index";
+import { redactAbsolutePaths } from "../cloud/contracts";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import { redactCompleteSensitiveText } from "../sensitive-text";
 import type {
   InteractionKind,
   InteractionResolution,
+  LiveInteractionApprovalAuthority,
   ProviderInteractionAuthority,
 } from "../domain/interactions";
 import type {
@@ -26,6 +29,7 @@ import type {
   CodexLoginOutcome,
   CodexProjectedMessage,
   CodexRuntimePort,
+  CodexSessionPage,
   CodexSessionProjection,
   CodexTurnSummary,
   ProfileAuthority,
@@ -97,10 +101,20 @@ const activeTurn = (thread: CodexThread): string | undefined =>
 
 const textEncoder = new TextEncoder();
 const unsafeTerminalScalar = /[\p{Cc}\p{Cf}\p{Cs}]/u;
+const sensitiveProviderTextHint = /(?:auth|cookie|token|key|pass|secret|otp|invite|code|Bearer|Basic|sk[_-]|re[_-]|gh[pousr]|github_pat|xox|AKIA|eyJ|PRIVATE KEY|[\p{Cc}\p{Cf}\p{Cs}\p{M}])/iu;
+const uncPathHint = /\\\\[^\\/\s]/u;
 
 const sanitizeProviderText = (input: string, preserveLineFeeds: boolean): string => {
+  const pathReduced = input.includes("/")
+    || input.includes(":\\")
+    || uncPathHint.test(input)
+    ? redactAbsolutePaths(input)
+    : input;
+  const protectedInput = sensitiveProviderTextHint.test(pathReduced)
+    ? redactCompleteSensitiveText(pathReduced, "[protected]")
+    : pathReduced;
   let output = "";
-  for (const scalar of input) {
+  for (const scalar of protectedInput) {
     output += scalar === "\n" && preserveLineFeeds
       ? scalar
       : unsafeTerminalScalar.test(scalar)
@@ -768,11 +782,22 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async listSessions(input: { authority: ProfileAuthority; limit: number; signal: AbortSignal }): Promise<readonly CodexSessionProjection[]> {
+  async listSessions(input: {
+    authority: ProfileAuthority;
+    limit: number;
+    cursor?: string;
+    signal: AbortSignal;
+  }): Promise<CodexSessionPage> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
-      const page = await (await this.#client(input.authority)).listThreads({ limit: input.limit });
-      return page.value.data.map((thread) => projectBoundedThread(thread, false));
+      const page = await (await this.#client(input.authority)).listThreads({
+        limit: input.limit,
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      });
+      return {
+        sessions: page.value.data.map((thread) => projectBoundedThread(thread, false)),
+        nextCursor: page.value.nextCursor,
+      };
     });
   }
 
@@ -950,10 +975,20 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     provider: ProviderInteractionAuthority;
     kind: InteractionKind;
     resolution: InteractionResolution;
+    deadlineAt: number;
     signal: AbortSignal;
   }): Promise<{ responseWritten: true }> {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
+      if (!Number.isSafeInteger(input.deadlineAt) || input.deadlineAt < 0) {
+        throw new CodexError("INVALID_INPUT", "The interaction deadline is invalid.");
+      }
+      if (this.#now() >= input.deadlineAt) {
+        throw new CodexError(
+          "DEADLINE_EXPIRED",
+          "The interaction deadline elapsed before runtime dispatch.",
+        );
+      }
       if (
         input.provider.profileId !== input.authority.id
         || input.provider.processGeneration !== input.authority.generation
@@ -980,6 +1015,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         provider: input.provider,
         kind: input.kind,
         resolution: input.resolution,
+        deadlineAt: input.deadlineAt,
       });
     });
   }
@@ -1021,6 +1057,72 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         resolution: input.resolution,
       });
     });
+  }
+
+  async inspectInteractionAuthority(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    signal: AbortSignal;
+  }): Promise<LiveInteractionApprovalAuthority> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      if (
+        input.provider.profileId !== input.authority.id
+        || input.provider.processGeneration !== input.authority.generation
+        || !this.#isCurrent(input.authority)
+      ) {
+        throw new CodexError(
+          "AUTHORITY_STALE",
+          "The interaction belongs to another account process generation.",
+        );
+      }
+      const running = this.#clients.get(input.authority.id);
+      if (
+        running === undefined
+        || !this.#interactionInspectionIsCurrent(
+          input.authority,
+          input.provider,
+          input.signal,
+          running,
+        )
+      ) {
+        throw new CodexError(
+          "AUTHORITY_STALE",
+          "The interaction's exact provider connection is no longer live.",
+        );
+      }
+      const approvalAuthority = await running.client.inspectInteractionAuthority({
+        provider: input.provider,
+        kind: input.kind,
+      });
+      if (!this.#interactionInspectionIsCurrent(
+        input.authority,
+        input.provider,
+        input.signal,
+        running,
+      )) {
+        throw new CodexError(
+          "AUTHORITY_STALE",
+          "The interaction's exact provider connection changed during inspection.",
+        );
+      }
+      return approvalAuthority;
+    });
+  }
+
+  #interactionInspectionIsCurrent(
+    authority: ProfileAuthority,
+    provider: ProviderInteractionAuthority,
+    signal: AbortSignal,
+    running: RunningClient,
+  ): boolean {
+    return !signal.aborted
+      && this.#isCurrent(authority)
+      && this.#clients.get(authority.id) === running
+      && running.authority.generation === authority.generation
+      && running.client.state === "ready"
+      && running.client.connectionId === provider.connectionId;
   }
 
   async validateInteractionTimeout(input: {
@@ -1539,6 +1641,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           : { credentialStorePreflight: this.#credentialStorePreflight }),
         experimentalApi: true,
         isAuthorityCurrent: () => this.#isCurrent(authority),
+        now: this.#now,
         onFact: async (value: FencedCodexValue<CodexFact>) => {
           if (value.value.type === "providerDisconnected") {
             this.#endedGenerationByProfile.set(

@@ -1,15 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
 import type { SessionEvent } from "../src/domain/session-events";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
+import { safeLiveAcceptanceCommandDigest } from "../src/codex/protocol";
 import {
   LIVE_ACCEPTANCE_CONTROL_FD,
   type LiveAcceptanceCliResult,
@@ -18,6 +31,7 @@ import {
 } from "./live-acceptance";
 import {
   liveAcceptanceScenarioConfigurationSchema,
+  liveAcceptanceScenarioTesting,
   runLiveAcceptanceScenario,
   type LiveAcceptanceOperatorRequest,
   type LiveAcceptanceScenarioOperator,
@@ -71,7 +85,10 @@ const interaction = (kind: "permission_approval" | "user_input"): PublicInteract
           allowsOther: false,
           header: "Acceptance",
           id: "acceptance_choice",
-          options: [{ description: "Continue the test", label: "Continue" }],
+          options: [
+            { description: "Continue the test", label: "Continue" },
+            { description: "Stop the test", label: "Stop" },
+          ],
           question: "Continue?",
           secret: false,
         }],
@@ -114,79 +131,202 @@ const event = (
   version: 1,
 });
 
+type EvidenceOrderViolation =
+  | "requested_prepared"
+  | "prepared_written"
+  | "written_command"
+  | "command_progress"
+  | "progress_completion"
+  | "completion_terminal";
+
+type EventPageHostility = Readonly<{
+  commandDigestMissing: boolean;
+  commandDigestMismatch: boolean;
+  duplicateCommandCompletion: boolean;
+  lateCommandProgress: boolean;
+  orderViolation?: EvidenceOrderViolation;
+  sequenceGap: boolean;
+  unrelatedProgressSameItem: boolean;
+  unrelatedSideEffectReuseCommandId: boolean;
+  unrelatedSideEffectItemKind?: "dynamicToolCall" | "fileChange" | "mcpToolCall";
+}>;
+
 const eventPage = (
   sessionId: string,
   complete: boolean,
   marker: string,
   requestedCursor: string | null,
-  sequenceGap = false,
+  commandDigest: string,
+  hostility: EventPageHostility,
 ): unknown => {
   const interactionId = sessionId === sessionA ? userInteractionId : permissionInteractionId;
   const interactionKind = sessionId === sessionA ? "user_input" : "permission_approval";
-  const events = (complete
-    ? [
-      event(sessionId, 5, {
-        interactionId,
-        revision: 2,
-        state: "response_prepared",
-        type: "interaction_state",
-      }),
-      event(sessionId, 6, {
-        interactionId,
-        revision: 3,
-        state: "response_written",
-        type: "interaction_state",
-      }),
-      event(sessionId, 7, {
-        itemId: "tool-1",
-        outputBytesObserved: 23,
-        status: "running",
-        toolKind: "command",
-        turnId: "turn-1",
-        type: "tool_progress",
-      }),
-      event(sessionId, 8, {
-        itemId: "tool-1",
-        itemKind: "commandExecution",
-        status: "completed",
-        turnId: "turn-1",
-        type: "item_completed",
-      }),
-      event(sessionId, 9, {
-        itemId: "assistant-1",
-        text: marker,
-        turnId: "turn-1",
-        type: "assistant_delta",
-      }),
-      event(sessionId, 10, {
-        status: "completed",
-        turnId: "turn-1",
-        type: "turn_completed",
-      }),
-    ]
-    : [
-      event(sessionId, 1, { turnId: "turn-1", type: "turn_started" }),
-      event(sessionId, 2, {
+  const projectedCommandDigest = hostility.commandDigestMissing
+    ? undefined
+    : hostility.commandDigestMismatch
+      ? "f".repeat(64)
+      : commandDigest;
+  const ordered: Array<Readonly<{ key: string; body: SessionEvent["body"] }>> = [
+    { key: "turn", body: { turnId: "turn-1", type: "turn_started" } },
+    {
+      key: "requested",
+      body: {
         blocking: true,
         interactionId,
         interactionKind,
         revision: 1,
         summary: "Acceptance interaction",
         type: "interaction_requested",
-      }),
-      event(sessionId, 3, {
+      },
+    },
+    {
+      key: "reasoning",
+      body: {
         itemId: "reasoning-1",
         text: "safe summary",
         turnId: "turn-1",
         type: "reasoning_summary_delta",
-      }),
-      event(sessionId, 4, {
+      },
+    },
+    {
+      key: "prepared",
+      body: {
+        interactionId,
+        revision: 2,
+        state: "response_prepared",
+        type: "interaction_state",
+      },
+    },
+    {
+      key: "written",
+      body: {
+        interactionId,
+        revision: 3,
+        state: "response_written",
+        type: "interaction_state",
+      },
+    },
+    {
+      key: "command",
+      body: {
         itemId: "tool-1",
         itemKind: "commandExecution",
+        ...(projectedCommandDigest === undefined
+          ? {}
+          : { liveAcceptanceCommandDigest: projectedCommandDigest }),
         turnId: "turn-1",
         type: "item_started",
-      }),
-    ]).map((entry) => sequenceGap && entry.sequence >= 3
+      },
+    },
+    ...(hostility.unrelatedSideEffectItemKind === undefined
+      ? []
+      : [{
+          key: "unrelated",
+          body: {
+            itemId: hostility.unrelatedSideEffectReuseCommandId ? "tool-1" : "unrelated-tool",
+            itemKind: hostility.unrelatedSideEffectItemKind,
+            turnId: "turn-1",
+            type: "item_started",
+          } satisfies SessionEvent["body"],
+        }]),
+    {
+      key: "progress",
+      body: {
+        itemId: "tool-1",
+        outputBytesObserved: 23,
+        status: "running",
+        toolKind: "command",
+        turnId: "turn-1",
+        type: "tool_progress",
+      },
+    },
+    {
+      key: "completion",
+      body: {
+        itemId: "tool-1",
+        itemKind: "commandExecution",
+        ...(projectedCommandDigest === undefined
+          ? {}
+          : { liveAcceptanceCommandDigest: projectedCommandDigest }),
+        status: "completed",
+        turnId: "turn-1",
+        type: "item_completed",
+      },
+    },
+    ...(hostility.duplicateCommandCompletion
+      ? [{
+          key: "duplicate-completion",
+          body: {
+            itemId: "tool-1",
+            itemKind: "commandExecution",
+            liveAcceptanceCommandDigest: projectedCommandDigest ?? "e".repeat(64),
+            status: "completed",
+            turnId: "turn-1",
+            type: "item_completed",
+          } satisfies SessionEvent["body"],
+        }]
+      : []),
+    ...(hostility.lateCommandProgress
+      ? [{
+          key: "late-progress",
+          body: {
+            itemId: "tool-1",
+            outputBytesObserved: 0,
+            status: "running",
+            toolKind: "command",
+            turnId: "turn-1",
+            type: "tool_progress",
+          } satisfies SessionEvent["body"],
+        }]
+      : []),
+    ...(hostility.unrelatedProgressSameItem
+      ? [{
+          key: "unrelated-progress",
+          body: {
+            itemId: "tool-1",
+            outputBytesObserved: 1,
+            status: "running",
+            toolKind: "file_change",
+            turnId: "turn-1",
+            type: "tool_progress",
+          } satisfies SessionEvent["body"],
+        }]
+      : []),
+    {
+      key: "assistant",
+      body: {
+        itemId: "assistant-1",
+        text: marker,
+        turnId: "turn-1",
+        type: "assistant_delta",
+      },
+    },
+    {
+      key: "terminal",
+      body: {
+        status: "completed",
+        turnId: "turn-1",
+        type: "turn_completed",
+      },
+    },
+  ];
+  const reversedPairs: Readonly<Record<EvidenceOrderViolation, readonly [string, string]>> = {
+    requested_prepared: ["requested", "prepared"],
+    prepared_written: ["prepared", "written"],
+    written_command: ["written", "command"],
+    command_progress: ["command", "progress"],
+    progress_completion: ["progress", "completion"],
+    completion_terminal: ["completion", "terminal"],
+  };
+  if (hostility.orderViolation !== undefined) {
+    const [leftKey, rightKey] = reversedPairs[hostility.orderViolation];
+    const left = ordered.findIndex((entry) => entry.key === leftKey);
+    const right = ordered.findIndex((entry) => entry.key === rightKey);
+    [ordered[left], ordered[right]] = [ordered[right]!, ordered[left]!];
+  }
+  const allEvents = ordered.map((entry, index) => event(sessionId, index + 1, entry.body));
+  const events = (complete ? allEvents.slice(3) : allEvents.slice(0, 3))
+    .map((entry) => hostility.sequenceGap && entry.sequence >= 3
       ? { ...entry, sequence: entry.sequence + 1 }
       : entry) as SessionEvent[];
   return {
@@ -203,16 +343,28 @@ const eventPage = (
 
 class FakeWorld {
   accountLoginPending = false;
+  autonomousPollerDisabled = false;
+  autonomousUsageAdvanceAfterA = 1;
+  autonomousUsageAdvanceAfterB = 1;
   approved = false;
   boundPeer: string | undefined;
   cleanupComplete = false;
   deviceBOnline = true;
   deviceBRevoked = false;
   readonly eventPolls = new Map<string, number>();
+  readonly resolvedSessions = new Set<string>();
+  readonly usagePolls = new Map<string, number>();
   readonly messages = new Map<string, string>();
   emptyUsage = false;
   eventSequenceGap = false;
+  commandDigestMissing = false;
+  commandDigestMismatch = false;
+  duplicateCommandCompletion = false;
+  lateCommandProgress = false;
+  evidenceOrderViolation: EvidenceOrderViolation | undefined;
   invalidInteractionResolution = false;
+  multipleQuestions = false;
+  allowsOtherQuestion = false;
   omitAssistantEvidence = false;
   remoteCommandPolls = 0;
   remoteApplied = false;
@@ -221,8 +373,19 @@ class FakeWorld {
   remoteProjectionPolls = 0;
   remoteProjectionWrongAuthority = false;
   remoteTurnNeverCompletes = false;
+  requestedBroadPermission = false;
   skipRemoteClaim = false;
+  terminalImmediatelyAfterResolve = false;
   unsafeDeviceCode = false;
+  providerPlan = "plus";
+  secretQuestion = false;
+  wrongQuestionId = false;
+  wrongToolSideEffect = false;
+  unrelatedSideEffectItemKind: EventPageHostility["unrelatedSideEffectItemKind"];
+  unrelatedProgressSameItem = false;
+  unrelatedSideEffectReuseCommandId = false;
+  cleanupClockAdvanceMs = 0;
+  cleanupObservedAt: number | undefined;
   wrongInteractionTurn = false;
   sessionStarts = 0;
   accountAdds = 0;
@@ -302,12 +465,32 @@ class FakeDevice implements LiveAcceptanceDevice {
       });
     }
     if (command === "account.login") {
+      const handoffIndex = argv.indexOf("--handoff-file");
+      const handoffPath = argv[handoffIndex + 1];
+      if (handoffIndex < 0 || handoffPath === undefined) {
+        throw new Error("Account login did not request protected output.");
+      }
+      const accountLabel = argv[2] === accountA ? "Acceptance Primary" : "Acceptance Secondary";
+      liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(handoffPath, {
+        accountId: argv[2],
+        accountLabel,
+        cancelCommand: `hra account login-cancel ${argv[2] ?? "unknown"}`,
+        method: "device_code",
+        type: "codex_device_login",
+        userCode: this.#world.unsafeDeviceCode ? "ABCD\u001b[2J" : "ABCD-EFGH",
+        verificationUrl: "https://example.test/device",
+        version: 1,
+      });
       return success(command, {
         account: { id: argv[2], state: "login_pending" },
         login: {
+          handoff: {
+            disposition: "preserved_caller_removes_after_login",
+            documentVersion: 1,
+            path: handoffPath,
+            status: "written",
+          },
           status: "pending",
-          userCode: this.#world.unsafeDeviceCode ? "ABCD\u001b[2J" : "ABCD-EFGH",
-          verificationUrl: "https://example.test/device",
         },
       });
     }
@@ -317,7 +500,7 @@ class FakeDevice implements LiveAcceptanceDevice {
         account: {
           id: argv[2],
           providerEmail: primary ? "primary@example.test" : "secondary@example.test",
-          providerPlan: "plus",
+          providerPlan: this.#world.providerPlan,
           state: this.#world.accountLoginPending ? "login_pending" : "signed_in",
         },
       });
@@ -325,11 +508,24 @@ class FakeDevice implements LiveAcceptanceDevice {
     if (command === "account.usage") {
       if (this.#world.emptyUsage) return success(command, { usage: [] });
       const accountId = argv[2]!;
+      const refreshing = argv.includes("--refresh");
+      const pollCount = refreshing
+        ? 0
+        : (this.#world.usagePolls.get(accountId) ?? 0) + 1;
+      if (!refreshing) this.#world.usagePolls.set(accountId, pollCount);
+      const advanceAfter = accountId === accountA
+        ? this.#world.autonomousUsageAdvanceAfterA
+        : this.#world.autonomousUsageAdvanceAfterB;
+      const sourceRevision = !refreshing
+        && !this.#world.autonomousPollerDisabled
+        && pollCount >= advanceAfter
+        ? 2
+        : 1;
       return success(command, {
         usage: [{
           account: { id: accountId },
-          poll: { observedAt: 10_000, sourceRevision: 1, state: "observed" },
-          snapshot: { observedAt: 10_000, sourceRevision: 1 },
+          poll: { observedAt: 10_000, sourceRevision, state: "observed" },
+          snapshot: { observedAt: 10_000, sourceRevision },
         }],
       });
     }
@@ -363,9 +559,31 @@ class FakeDevice implements LiveAcceptanceDevice {
     }
     if (command === "interaction.list") {
       const found = interaction(argv[2] === sessionA ? "user_input" : "permission_approval");
+      const hostileDisplay = found.display.kind === "user_input"
+        ? {
+            ...found.display,
+            questions: [
+              {
+                ...found.display.questions[0]!,
+                ...(this.#world.wrongQuestionId ? { id: "different_choice" } : {}),
+                ...(this.#world.secretQuestion ? { secret: true } : {}),
+                ...(this.#world.allowsOtherQuestion ? { allowsOther: true } : {}),
+              },
+              ...(this.#world.multipleQuestions
+                ? [{ ...found.display.questions[0]!, id: "second_choice" }]
+                : []),
+            ],
+          }
+        : {
+            ...found.display,
+            ...(this.#world.requestedBroadPermission
+              ? { requested: [{ name: "network" }, { name: "filesystem" }] }
+              : {}),
+          };
       return success(command, {
         interactions: [{
           ...found,
+          display: hostileDisplay,
           ...(this.#world.wrongInteractionTurn
             ? { context: { ...found.context, turnId: "turn-other" } }
             : {}),
@@ -379,7 +597,17 @@ class FakeDevice implements LiveAcceptanceDevice {
       if (this.#world.invalidInteractionResolution) {
         return success("interaction.resolve", { interaction: null, responseWritten: true });
       }
+      if (command === "interaction.answer") {
+        expect(options.protectedDocument).toEqual({
+          answers: { acceptance_choice: { answers: ["Continue"] } },
+        });
+      } else {
+        expect(argv.slice(argv.indexOf("--scope"), argv.indexOf("--scope") + 2))
+          .toEqual(["--scope", "turn"]);
+        expect(options.protectedDocument).toEqual({ permissions: ["network"] });
+      }
       const kind = command === "interaction.answer" ? "user_input" : "permission_approval";
+      this.#world.resolvedSessions.add(kind === "user_input" ? sessionA : sessionB);
       return success("interaction.resolve", {
         interaction: {
           ...interaction(kind),
@@ -400,12 +628,34 @@ class FakeDevice implements LiveAcceptanceDevice {
       const marker = this.#world.messages.get(sessionId)?.match(
         /hra-live-(?:user-input|permission)-[0-9a-f-]+/u,
       )?.[0] ?? "";
+      const expectedCommand = this.#world.messages.get(sessionId)?.match(
+        /\/bin\/echo hra-live-tool-progress \| \/usr\/bin\/tee \.\/\.hra-live-command-proof-[0-9a-f-]+\.txt/u,
+      )?.[0] ?? "";
+      const commandDigest = safeLiveAcceptanceCommandDigest(expectedCommand);
+      if (commandDigest === undefined) throw new Error("Fake prompt omitted the exact live command.");
       return success(command, eventPage(
         sessionId,
-        polls > 1,
+        this.#world.terminalImmediatelyAfterResolve
+          ? this.#world.resolvedSessions.has(sessionId)
+          : polls > 1,
         this.#world.omitAssistantEvidence ? "" : marker,
         requestedCursor,
-        this.#world.eventSequenceGap,
+        commandDigest,
+        {
+          commandDigestMissing: this.#world.commandDigestMissing,
+          commandDigestMismatch: this.#world.commandDigestMismatch,
+          duplicateCommandCompletion: this.#world.duplicateCommandCompletion,
+          lateCommandProgress: this.#world.lateCommandProgress,
+          ...(this.#world.evidenceOrderViolation === undefined
+            ? {}
+            : { orderViolation: this.#world.evidenceOrderViolation }),
+          sequenceGap: this.#world.eventSequenceGap,
+          unrelatedProgressSameItem: this.#world.unrelatedProgressSameItem,
+          unrelatedSideEffectReuseCommandId: this.#world.unrelatedSideEffectReuseCommandId,
+          ...(this.#world.unrelatedSideEffectItemKind === undefined
+            ? {}
+            : { unrelatedSideEffectItemKind: this.#world.unrelatedSideEffectItemKind }),
+        },
       ));
     }
     if (command === "session.show") {
@@ -533,10 +783,44 @@ class FakeOperator implements LiveAcceptanceScenarioOperator {
   deviceLogins = 0;
   readonly requests: LiveAcceptanceOperatorRequest[] = [];
 
-  async acknowledgeDeviceLogin(input: unknown, signal: AbortSignal): Promise<void> {
-    void input;
+  async acknowledgeDeviceLogin(input: Readonly<{
+    accountId: string;
+    accountLabel: string;
+    documentPath: string;
+  }>, signal: AbortSignal): Promise<void> {
     void signal;
+    const document = liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+      input.documentPath,
+    ) as {
+      accountId?: unknown;
+      accountLabel?: unknown;
+      cancelCommand?: unknown;
+      userCode?: unknown;
+      verificationUrl?: unknown;
+    };
+    if (
+      document.accountId !== input.accountId
+      || document.accountLabel !== input.accountLabel
+      || document.cancelCommand !== `hra account login-cancel ${input.accountId}`
+      || typeof document.userCode !== "string"
+      || !/^[A-Z0-9]{4,12}(?:-[A-Z0-9]{4,12}){0,2}$/u.test(document.userCode)
+      || typeof document.verificationUrl !== "string"
+      || !document.verificationUrl.startsWith("https://")
+    ) throw new Error("device_user_code_invalid");
     this.deviceLogins += 1;
+  }
+
+  async prepareDeviceLoginHandoff(input: Readonly<{
+    accountId: string;
+    accountLabel: string;
+    projectDirectory: string;
+  }>): Promise<string> {
+    void input;
+    const root = await mkdtemp(join(await realpath(tmpdir()), "hra-fake-login-"));
+    await chmod(root, 0o700);
+    const path = join(root, "handoff.json");
+    await writeFile(path, "", { flag: "wx", mode: 0o600 });
+    return path;
   }
 
   async progress(): Promise<void> {}
@@ -578,21 +862,39 @@ const startFakeScenario = (
     b: new FakeDevice("b", world),
   } as const;
   let clock = 1_000;
+  let commandProofSequence = 0;
   const promise = runLiveAcceptanceScenario({
     bindExpectedRevokedPeer: async (publicId) => { world.boundPeer = publicId; },
     cleanup: async () => {
       if (world.boundPeer !== deviceBId || !world.deviceBRevoked) {
         throw new Error("Cleanup was not bound to the exact revoked peer.");
       }
+      clock += world.cleanupClockAdvanceMs;
+      world.cleanupObservedAt = clock;
       world.cleanupComplete = true;
     },
     device: (name) => devices[name],
     runId: "50000000-0000-4000-8000-000000000001",
   }, operator, attestation, {
     accountLoginDeadlineMs: 1_000,
+    autonomousUsageProofDeadlineMs: 5,
     now: () => clock,
     pollIntervalMs: 1,
     presenceObservationMarginMs: 0,
+    prepareCommandProof: () => {
+      commandProofSequence += 1;
+      const proofId = `00000000-0000-4000-8000-${String(commandProofSequence).padStart(12, "0")}`;
+      const command = `/bin/echo hra-live-tool-progress | /usr/bin/tee ./.hra-live-command-proof-${proofId}.txt`;
+      const commandDigest = safeLiveAcceptanceCommandDigest(command);
+      if (commandDigest === undefined) throw new Error("Invalid fake command proof grammar.");
+      return {
+        command,
+        commandDigest,
+        verify: () => {
+          if (world.wrongToolSideEffect) throw new Error("command_proof_content_invalid");
+        },
+      };
+    },
     remoteCommandDeadlineMs: options.remoteCommandDeadlineMs ?? 1_000,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     sleep: options.sleep ?? (async (milliseconds) => { clock += milliseconds; }),
@@ -601,34 +903,87 @@ const startFakeScenario = (
   return { devices, promise };
 };
 
+type FifoProbeResult = Readonly<{
+  message: string;
+  rejected: boolean;
+}>;
+
+const runPromptFailureProbe = async (source: string): Promise<FifoProbeResult> => {
+  const child = spawn(process.execPath, ["-e", source], {
+    cwd: join(import.meta.dir, ".."),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const completion = new Promise<Readonly<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>>((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise);
+    child.once("close", (code, signal) => resolvePromise({ code, signal }));
+  });
+  const blocked = Symbol("blocked");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result = await Promise.race([
+    completion,
+    new Promise<typeof blocked>((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise(blocked), 3_000);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (result === blocked) {
+    child.kill("SIGKILL");
+    await completion;
+    throw new Error("FIFO substitution blocked instead of failing promptly.");
+  }
+  if (result.code !== 0 || result.signal !== null) {
+    throw new Error(`FIFO probe failed: ${stderr || stdout}`);
+  }
+  const parsed = JSON.parse(stdout) as Partial<FifoProbeResult>;
+  if (typeof parsed.message !== "string" || typeof parsed.rejected !== "boolean") {
+    throw new Error("FIFO probe returned an invalid result.");
+  }
+  return { message: parsed.message, rejected: parsed.rejected };
+};
+
+const probeDeviceLoginBinding = (
+  documentPath: string,
+  expectedAccountId: string,
+): ReturnType<typeof spawnSync> => {
+  const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+  return spawnSync(process.execPath, [
+    "-e",
+    [
+      `import { JsonlLiveAcceptanceOperator } from ${JSON.stringify(moduleUrl)};`,
+      "const operator = new JsonlLiveAcceptanceOperator();",
+      "try {",
+      `  await operator.acknowledgeDeviceLogin({ accountId: ${JSON.stringify(expectedAccountId)}, accountLabel: 'primary', documentPath: ${JSON.stringify(documentPath)} }, new AbortController().signal);`,
+      "  process.stderr.write('accepted');",
+      "  process.exitCode = 2;",
+      "} catch (error) {",
+      "  process.stderr.write(error instanceof Error ? error.message : String(error));",
+      "} finally {",
+      "  operator.close();",
+      "}",
+    ].join("\n"),
+  ], {
+    cwd: join(import.meta.dir, ".."),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+};
+
 describe("live acceptance release scenario", () => {
   test("executes the complete two-device CLI scenario and emits only bounded evidence", async () => {
     const world = new FakeWorld();
-    const devices = {
-      a: new FakeDevice("a", world),
-      b: new FakeDevice("b", world),
-    };
     const operator = new FakeOperator();
-    let clock = 1_000;
-    const evidence = await runLiveAcceptanceScenario({
-      bindExpectedRevokedPeer: async (publicId) => { world.boundPeer = publicId; },
-      cleanup: async () => {
-        if (world.boundPeer !== deviceBId || !world.deviceBRevoked) {
-          throw new Error("Cleanup was not bound to the exact revoked peer.");
-        }
-        world.cleanupComplete = true;
-      },
-      device: (name) => devices[name],
-      runId: "50000000-0000-4000-8000-000000000001",
-    }, operator, attestation, {
-      accountLoginDeadlineMs: 1_000,
-      now: () => clock,
-      pollIntervalMs: 1,
-      presenceObservationMarginMs: 0,
-      remoteCommandDeadlineMs: 1_000,
-      sleep: async (milliseconds) => { clock += milliseconds; },
-      turnDeadlineMs: 1_000,
-    });
+    const started = startFakeScenario(world, operator);
+    const evidence = await started.promise;
+    const devices = started.devices;
 
     expect(world.cleanupComplete).toBe(true);
     expect(world.boundPeer).toBe(deviceBId);
@@ -641,6 +996,13 @@ describe("live acceptance release scenario", () => {
       "user_answers",
       "permission_grant",
     ]);
+    expect(operator.requests.find((request) => request.kind === "permission_grant")?.context)
+      .toEqual({
+        reason: "Acceptance permission proof",
+        requested: ["network"],
+        scope: "turn",
+        summary: "Acceptance permission",
+      });
     expect(evidence).toMatchObject({
       accountIds: [accountA, accountB],
       cloudTargetDigest: "a".repeat(64),
@@ -656,6 +1018,7 @@ describe("live acceptance release scenario", () => {
       status: "passed",
       version: 1,
     });
+    expect(evidence.completedAt - evidence.startedAt).toBeGreaterThan(70_000);
     const serialized = JSON.stringify(evidence);
     expect(serialized).not.toContain("primary@example.test");
     expect(serialized).not.toContain("secondary@example.test");
@@ -671,6 +1034,9 @@ describe("live acceptance release scenario", () => {
     expect(devices.a.calls.some((argv) =>
       argv.includes("--input-fd") && argv.includes(String(LIVE_ACCEPTANCE_CONTROL_FD))))
       .toBe(true);
+    expect(devices.a.calls.filter((argv) =>
+      argv[0] === "account" && argv[1] === "usage" && !argv.includes("--refresh")))
+      .toHaveLength(2);
     for (const action of ["auth", "disable", "enable", "install"]) {
       expect(devices.a.calls.some((argv) => argv[0] === "plugin" && argv[1] === action))
         .toBe(true);
@@ -724,6 +1090,542 @@ describe("live acceptance release scenario", () => {
     const noOpResolution = new FakeWorld();
     noOpResolution.invalidInteractionResolution = true;
     await expect(startFakeScenario(noOpResolution, new FakeOperator()).promise).rejects.toThrow();
+  });
+
+  test("rejects wrong, secret, or multiple acceptance questions and broad permissions", async () => {
+    for (const field of [
+      "wrongQuestionId",
+      "secretQuestion",
+      "multipleQuestions",
+      "allowsOtherQuestion",
+    ] as const) {
+      const world = new FakeWorld();
+      world[field] = true;
+      await expect(startFakeScenario(world, new FakeOperator()).promise)
+        .rejects.toThrow("user_input_contract_invalid");
+    }
+    const broad = new FakeWorld();
+    broad.requestedBroadPermission = true;
+    await expect(startFakeScenario(broad, new FakeOperator()).promise)
+      .rejects.toThrow("permission_interaction_invalid");
+
+    class BroadGrantOperator extends FakeOperator {
+      override async protectedDocument(
+        request: LiveAcceptanceOperatorRequest,
+        signal: AbortSignal,
+      ): Promise<unknown> {
+        if (request.kind === "permission_grant") {
+          return { permissions: ["network", "filesystem"] };
+        }
+        return await super.protectedDocument(request, signal);
+      }
+    }
+    await expect(startFakeScenario(new FakeWorld(), new BroadGrantOperator()).promise)
+      .rejects.toThrow("permission_response_invalid");
+  });
+
+  test("requires the exact interaction-to-command-to-terminal event order", async () => {
+    for (const evidenceOrderViolation of [
+      "requested_prepared",
+      "prepared_written",
+      "written_command",
+      "command_progress",
+      "progress_completion",
+      "completion_terminal",
+    ] as const) {
+      const world = new FakeWorld();
+      world.evidenceOrderViolation = evidenceOrderViolation;
+      await expect(startFakeScenario(world, new FakeOperator()).promise).rejects.toThrow();
+    }
+  });
+
+  test("observes each pending interaction before resolving and retains that cursor through immediate terminal completion", async () => {
+    const world = new FakeWorld();
+    world.terminalImmediatelyAfterResolve = true;
+    const started = startFakeScenario(world, new FakeOperator());
+    await expect(started.promise).resolves.toMatchObject({ status: "passed" });
+    for (const sessionId of [sessionA, sessionB]) {
+      const calls = started.devices.a.calls;
+      const eventCalls = calls.filter((argv) =>
+        argv[0] === "session" && argv[1] === "events" && argv[2] === sessionId);
+      const firstEvent = calls.findIndex((argv) =>
+        argv[0] === "session" && argv[1] === "events" && argv[2] === sessionId);
+      const resolution = calls.findIndex((argv) =>
+        argv[0] === "interaction"
+        && (argv[1] === "answer" || argv[1] === "grant")
+        && argv[2] === (sessionId === sessionA ? userInteractionId : permissionInteractionId));
+      expect(firstEvent).toBeGreaterThanOrEqual(0);
+      expect(resolution).toBeGreaterThan(firstEvent);
+      expect(eventCalls).toHaveLength(2);
+      expect(eventCalls[0]).not.toContain("--cursor");
+      const continued = eventCalls[1];
+      if (continued === undefined) throw new Error("Missing continued event observation.");
+      expect(continued.slice(continued.indexOf("--cursor"), -1))
+        .toEqual(["--cursor", "cursor-first"]);
+      expect(world.eventPolls.get(sessionId)).toBe(2);
+    }
+  });
+
+  test("requires the exact safe command digest and rejects unrelated side-effect tools", async () => {
+    for (const field of ["commandDigestMissing", "commandDigestMismatch"] as const) {
+      const world = new FakeWorld();
+      world[field] = true;
+      await expect(startFakeScenario(world, new FakeOperator()).promise)
+        .rejects.toThrow("session_stream_evidence_incomplete");
+    }
+    for (const itemKind of ["dynamicToolCall", "fileChange", "mcpToolCall"] as const) {
+      const world = new FakeWorld();
+      world.unrelatedSideEffectItemKind = itemKind;
+      await expect(startFakeScenario(world, new FakeOperator()).promise)
+        .rejects.toThrow("session_stream_evidence_incomplete");
+    }
+    const reusedCommandId = new FakeWorld();
+    reusedCommandId.unrelatedSideEffectItemKind = "fileChange";
+    reusedCommandId.unrelatedSideEffectReuseCommandId = true;
+    await expect(startFakeScenario(reusedCommandId, new FakeOperator()).promise)
+      .rejects.toThrow("session_stream_evidence_incomplete");
+
+    const unrelatedProgress = new FakeWorld();
+    unrelatedProgress.unrelatedProgressSameItem = true;
+    await expect(startFakeScenario(unrelatedProgress, new FakeOperator()).promise)
+      .rejects.toThrow("session_stream_evidence_incomplete");
+
+    const duplicateCompletion = new FakeWorld();
+    duplicateCompletion.duplicateCommandCompletion = true;
+    await expect(startFakeScenario(duplicateCompletion, new FakeOperator()).promise)
+      .rejects.toThrow("session_stream_evidence_incomplete");
+
+    const lateProgress = new FakeWorld();
+    lateProgress.lateCommandProgress = true;
+    await expect(startFakeScenario(lateProgress, new FakeOperator()).promise)
+      .rejects.toThrow("session_stream_evidence_incomplete");
+  });
+
+  test("requires the command side effect and autonomous revisions for both accounts", async () => {
+    const wrongSideEffect = new FakeWorld();
+    wrongSideEffect.wrongToolSideEffect = true;
+    await expect(startFakeScenario(wrongSideEffect, new FakeOperator()).promise)
+      .rejects.toThrow("command_proof_content_invalid");
+
+    const disabledPoller = new FakeWorld();
+    disabledPoller.autonomousPollerDisabled = true;
+    const started = startFakeScenario(disabledPoller, new FakeOperator());
+    await expect(started.promise).rejects.toThrow("autonomous_account_polling_unproven");
+    expect(started.devices.a.calls.filter((argv) =>
+      argv[0] === "account" && argv[1] === "usage" && !argv.includes("--refresh")))
+      .toHaveLength(10);
+
+    const delayedSecondAccount = new FakeWorld();
+    delayedSecondAccount.autonomousUsageAdvanceAfterB = 4;
+    const delayed = startFakeScenario(delayedSecondAccount, new FakeOperator());
+    await expect(delayed.promise).resolves.toMatchObject({ status: "passed" });
+    expect(delayedSecondAccount.usagePolls.get(accountA)).toBe(1);
+    expect(delayedSecondAccount.usagePolls.get(accountB)).toBe(4);
+    expect(delayed.devices.a.calls.filter((argv) =>
+      argv[0] === "account"
+      && argv[1] === "usage"
+      && argv[2] === accountB
+      && !argv.includes("--refresh")))
+      .toHaveLength(4);
+  });
+
+  test("accepts the exact pinned paid plans and rejects non-paid or unknown variants", async () => {
+    for (const providerPlan of [
+      "business",
+      "edu",
+      "edu_plus",
+      "edu_pro",
+      "education",
+      "ent26",
+      "enterprise",
+      "enterprise_cbp_automation",
+      "enterprise_cbp_usage_based",
+      "go",
+      "k12",
+      "plus",
+      "pro",
+      "prolite",
+      "quorum",
+      "self_serve_business_prolite",
+      "self_serve_business_usage_based",
+      "team",
+    ]) {
+      const world = new FakeWorld();
+      world.providerPlan = providerPlan;
+      await expect(startFakeScenario(world, new FakeOperator()).promise)
+        .resolves.toMatchObject({ status: "passed" });
+    }
+    for (const providerPlan of ["guest", "free", "free_workspace", "unknown", "future_unreviewed_plan"]) {
+      const world = new FakeWorld();
+      world.providerPlan = providerPlan;
+      await expect(startFakeScenario(world, new FakeOperator()).promise)
+        .rejects.toThrow("provider_subscription_plan_unreviewed");
+    }
+  });
+
+  test("timestamps passing evidence only after cleanup succeeds", async () => {
+    const world = new FakeWorld();
+    world.cleanupClockAdvanceMs = 12_345;
+    const evidence = await startFakeScenario(world, new FakeOperator()).promise;
+    expect(world.cleanupComplete).toBe(true);
+    const cleanupObservedAt = world.cleanupObservedAt;
+    if (cleanupObservedAt === undefined) throw new Error("Cleanup timestamp was not observed.");
+    expect(evidence.completedAt).toBe(cleanupObservedAt);
+  });
+
+  test("loads the protected-open authority lazily across reviewed glibc and musl names", async () => {
+    expect(liveAcceptanceScenarioTesting.protectedOutputOpenAtLibrariesForPlatform(
+      "linux",
+      "x64",
+    )).toEqual([
+      "libc.so.6",
+      "libc.musl-x86_64.so.1",
+      "/lib/libc.musl-x86_64.so.1",
+      "/usr/lib/libc.musl-x86_64.so.1",
+    ]);
+    expect(liveAcceptanceScenarioTesting.protectedOutputOpenAtLibrariesForPlatform(
+      "linux",
+      "arm64",
+    )).toEqual([
+      "libc.so.6",
+      "libc.musl-aarch64.so.1",
+      "/lib/libc.musl-aarch64.so.1",
+      "/usr/lib/libc.musl-aarch64.so.1",
+    ]);
+    const attempts: string[] = [];
+    expect(liveAcceptanceScenarioTesting.loadProtectedOutputNativeOpenAtLibrary(
+      "linux",
+      "x64",
+      (library) => {
+        attempts.push(library);
+        throw new Error("not installed");
+      },
+    )).toBeNull();
+    expect(attempts).toEqual([
+      ...liveAcceptanceScenarioTesting.protectedOutputOpenAtLibrariesForPlatform(
+        "linux",
+        "x64",
+      ),
+    ]);
+
+    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-loader-"));
+    await chmod(createdRoot, 0o700);
+    const root = await realpath(createdRoot);
+    const documentPath = join(root, "document.json");
+    await writeFile(documentPath, "{\"answer\":42}", { mode: 0o600 });
+    let protectedOpenRequests = 0;
+    try {
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        documentPath,
+        {
+          loadNativeOpenAtLibrary: () => {
+            protectedOpenRequests += 1;
+            return null;
+          },
+        },
+      )).toThrow("protected_document_unsupported");
+      expect(protectedOpenRequests).toBe(1);
+      expect(JSON.parse(await readFile(documentPath, "utf8"))).toEqual({ answer: 42 });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("accepts only stable owned single-link protected JSON documents and preserves them", async () => {
+    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-hostile-"));
+    await chmod(createdRoot, 0o700);
+    const root = await realpath(createdRoot);
+    const makeCase = async (name: string, content = "{\"answer\":42}") => {
+      const directory = join(root, name);
+      await mkdir(directory, { mode: 0o700 });
+      const path = join(directory, "document.json");
+      await writeFile(path, content, { mode: 0o600 });
+      return { directory, path };
+    };
+    try {
+      const valid = await makeCase("valid");
+      expect(liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(valid.path))
+        .toEqual({ answer: 42 });
+      expect((await stat(valid.path)).isFile()).toBe(true);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument("document.json"))
+        .toThrow("protected_document_path_invalid");
+
+      const symbolic = await makeCase("symlink");
+      const symbolicPath = join(symbolic.directory, "symbolic.json");
+      await symlink(symbolic.path, symbolicPath);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(symbolicPath))
+        .toThrow();
+
+      const symbolicParentTarget = await makeCase("parent-target");
+      const symbolicParent = join(root, "parent-symbolic");
+      await symlink(symbolicParentTarget.directory, symbolicParent);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        join(symbolicParent, "document.json"),
+      )).toThrow();
+
+      const permissive = await makeCase("mode");
+      await chmod(permissive.path, 0o644);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(permissive.path))
+        .toThrow();
+
+      const permissiveParent = await makeCase("parent-mode");
+      await chmod(permissiveParent.directory, 0o755);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        permissiveParent.path,
+      )).toThrow("protected_document_parent_invalid");
+
+      const wrongOwner = await makeCase("owner");
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        wrongOwner.path,
+        { expectedOwnerUid: (process.getuid?.() ?? 0) + 1 },
+      )).toThrow();
+
+      const linked = await makeCase("link");
+      await link(linked.path, join(linked.directory, "second-link.json"));
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(linked.path))
+        .toThrow();
+
+      const raced = await makeCase("race");
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(raced.path, {
+        beforePostflight: () => chmodSync(raced.path, 0o644),
+      })).toThrow();
+
+      const contentRaced = await makeCase("content-race");
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        contentRaced.path,
+        { beforePostflight: () => writeFileSync(contentRaced.path, "{\"answer\":43}") },
+      )).toThrow("protected_document_changed");
+
+      const substituted = await makeCase("substitution");
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        substituted.path,
+        {
+          beforePostflight: () => {
+            renameSync(substituted.path, `${substituted.path}.original`);
+            writeFileSync(substituted.path, "{\"answer\":99}", { mode: 0o600 });
+          },
+        },
+      )).toThrow();
+
+      const parentSwapped = await makeCase("parent-swap");
+      const originalParent = `${parentSwapped.directory}.original`;
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        parentSwapped.path,
+        {
+          beforeChildOpen: () => {
+            renameSync(parentSwapped.directory, originalParent);
+            mkdirSync(parentSwapped.directory, { mode: 0o700 });
+            writeFileSync(parentSwapped.path, "{\"answer\":99}", { mode: 0o600 });
+          },
+        },
+      )).toThrow();
+      expect(JSON.parse(await readFile(parentSwapped.path, "utf8"))).toEqual({ answer: 99 });
+
+      const exactBoundary = await makeCase("exact-boundary", `"${"x".repeat(64 * 1024 - 2)}"`);
+      expect((liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        exactBoundary.path,
+      ) as string).length).toBe(64 * 1024 - 2);
+
+      const emptyHandoffDirectory = join(root, "empty-handoff");
+      await mkdir(emptyHandoffDirectory, { mode: 0o700 });
+      const emptyHandoffPath = join(emptyHandoffDirectory, "handoff.json");
+      await writeFile(emptyHandoffPath, "", { mode: 0o600 });
+      liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(
+        emptyHandoffPath,
+        { answer: 42 },
+      );
+      expect(liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(emptyHandoffPath))
+        .toEqual({ answer: 42 });
+      const nonemptyHandoff = await makeCase("nonempty-handoff");
+      expect(() => liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(
+        nonemptyHandoff.path,
+        { answer: 99 },
+      )).toThrow("protected_document_not_empty");
+
+      const oversized = await makeCase("oversize", `"${"x".repeat(64 * 1024)}"`);
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(oversized.path))
+        .toThrow("protected_document_oversize");
+
+      const multipleValues = await makeCase("multiple-values", "{} {}");
+      expect(() => liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(
+        multipleValues.path,
+      )).toThrow();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("rejects FIFO child substitutions promptly across every protected open", async () => {
+    const createdRoot = await mkdtemp(join(tmpdir(), "hra-protected-fifo-"));
+    await chmod(createdRoot, 0o700);
+    const root = await realpath(createdRoot);
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const makeDirectory = async (name: string): Promise<string> => {
+      const directory = join(root, name);
+      await mkdir(directory, { mode: 0o700 });
+      return directory;
+    };
+    const makeFifo = (path: string): void => {
+      const result = spawnSync("/usr/bin/mkfifo", [path], { encoding: "utf8" });
+      if (result.status !== 0) {
+        throw new Error(`mkfifo failed: ${result.stderr}`);
+      }
+      chmodSync(path, 0o600);
+    };
+    const probeSource = (operation: string): string => [
+      'import { renameSync } from "node:fs";',
+      'import { join } from "node:path";',
+      `import { liveAcceptanceScenarioTesting } from ${JSON.stringify(moduleUrl)};`,
+      "let rejected = false;",
+      'let message = "";',
+      "try {",
+      operation,
+      "} catch (error) {",
+      "  rejected = true;",
+      "  message = error instanceof Error ? error.message : String(error);",
+      "}",
+      'process.stdout.write(`${JSON.stringify({ message, rejected })}\\n`);',
+      "if (!rejected) process.exitCode = 2;",
+    ].join("\n");
+    try {
+      const readDirectory = await makeDirectory("read");
+      const readPath = join(readDirectory, "document.json");
+      makeFifo(readPath);
+
+      const writeDirectory = await makeDirectory("write");
+      const writePath = join(writeDirectory, "document.json");
+      makeFifo(writePath);
+
+      const rebindDirectory = await makeDirectory("rebind");
+      const rebindPath = join(rebindDirectory, "document.json");
+      const rebindReplacement = join(rebindDirectory, "replacement.fifo");
+      await writeFile(rebindPath, "{\"answer\":42}", { mode: 0o600 });
+      makeFifo(rebindReplacement);
+
+      const proofDirectory = await makeDirectory("proof");
+      const proofReplacement = join(proofDirectory, "replacement.fifo");
+      makeFifo(proofReplacement);
+
+      const settled = await Promise.allSettled([
+        runPromptFailureProbe(probeSource(
+          `  liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(${JSON.stringify(readPath)});`,
+        )),
+        runPromptFailureProbe(probeSource(
+          `  liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(${JSON.stringify(writePath)}, { answer: 42 });`,
+        )),
+        runPromptFailureProbe(probeSource([
+          `  const documentPath = ${JSON.stringify(rebindPath)};`,
+          "  liveAcceptanceScenarioTesting.readOwnedProtectedJsonDocument(documentPath, {",
+          "    beforePostflight: () => {",
+          '      renameSync(documentPath, `${documentPath}.original`);',
+          `      renameSync(${JSON.stringify(rebindReplacement)}, documentPath);`,
+          "    },",
+          "  });",
+        ].join("\n"))),
+        runPromptFailureProbe(probeSource([
+          '  let proofPath = "";',
+          "  const proof = liveAcceptanceScenarioTesting.createCommandProof(",
+          `    ${JSON.stringify(proofDirectory)},`,
+          "    {",
+          "      beforeVerifyOpen: () => {",
+          '        renameSync(proofPath, `${proofPath}.original`);',
+          `        renameSync(${JSON.stringify(proofReplacement)}, proofPath);`,
+          "      },",
+          "    },",
+          "  );",
+          '  const fileName = proof.command.match(/\\.\\/(\\.hra-live-command-proof-[0-9a-f-]+\\.txt)$/u)?.[1];',
+          '  if (fileName === undefined) throw new Error("Missing command proof file name.");',
+          `  proofPath = join(${JSON.stringify(proofDirectory)}, fileName);`,
+          "  proof.verify();",
+        ].join("\n"))),
+      ]);
+      const results = settled.map((result) => {
+        if (result.status === "rejected") throw result.reason;
+        return result.value;
+      });
+      expect(results).toEqual(Array.from({ length: 4 }, () => ({
+        message: "protected_document_file_invalid",
+        rejected: true,
+      })));
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  test("creates an isolated exact echo command proof and rejects a wrong side effect", async () => {
+    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-command-proof-"));
+    await chmod(createdDirectory, 0o700);
+    const directory = await realpath(createdDirectory);
+    try {
+      const proof = liveAcceptanceScenarioTesting.createCommandProof(directory);
+      expect(proof.command).toMatch(
+        /^\/bin\/echo hra-live-tool-progress \| \/usr\/bin\/tee \.\/\.hra-live-command-proof-[0-9a-f-]+\.txt$/u,
+      );
+      expect(safeLiveAcceptanceCommandDigest(proof.command)).toBe(proof.commandDigest);
+      const child = spawn("/bin/sh", ["-c", proof.command], {
+        cwd: directory,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const close = await new Promise<number | null>((resolvePromise) => {
+        child.once("close", resolvePromise);
+      });
+      expect(close).toBe(0);
+      proof.verify();
+
+      const fileName = proof.command.match(/\.\/(\.hra-live-command-proof-[0-9a-f-]+\.txt)$/u)?.[1];
+      if (fileName === undefined) throw new Error("Missing command proof file name.");
+      await writeFile(join(directory, fileName), "wrong\n");
+      expect(() => proof.verify()).toThrow("command_proof_content_invalid");
+
+      const unexecuted = liveAcceptanceScenarioTesting.createCommandProof(directory);
+      expect(() => unexecuted.verify()).toThrow("command_proof_content_invalid");
+
+      const symbolicDirectory = join(dirname(directory), `${basename(directory)}-symbolic`);
+      await symlink(directory, symbolicDirectory);
+      expect(() => liveAcceptanceScenarioTesting.createCommandProof(symbolicDirectory))
+        .toThrow("command_proof_directory_invalid");
+      await rm(symbolicDirectory);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("binds command proof children through held directory descriptors across parent swaps", async () => {
+    const createdRoot = await mkdtemp(join(tmpdir(), "hra-command-proof-swap-"));
+    await chmod(createdRoot, 0o700);
+    const root = await realpath(createdRoot);
+    const createDirectory = join(root, "create");
+    const verifyDirectory = join(root, "verify");
+    await mkdir(createDirectory, { mode: 0o700 });
+    await mkdir(verifyDirectory, { mode: 0o700 });
+    try {
+      expect(() => liveAcceptanceScenarioTesting.createCommandProof(createDirectory, {
+        beforeCreate: () => {
+          renameSync(createDirectory, `${createDirectory}.original`);
+          mkdirSync(createDirectory, { mode: 0o700 });
+        },
+      })).toThrow();
+
+      let swapped = false;
+      const proof = liveAcceptanceScenarioTesting.createCommandProof(verifyDirectory, {
+        beforeVerifyOpen: () => {
+          if (swapped) return;
+          swapped = true;
+          renameSync(verifyDirectory, `${verifyDirectory}.original`);
+          mkdirSync(verifyDirectory, { mode: 0o700 });
+        },
+      });
+      const child = spawn("/bin/sh", ["-c", proof.command], {
+        cwd: verifyDirectory,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      expect(await new Promise<number | null>((resolvePromise) => {
+        child.once("close", resolvePromise);
+      })).toBe(0);
+      expect(() => proof.verify()).toThrow();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   test("JSONL operator abort closes the standard-input read and lets the process exit", async () => {
@@ -820,8 +1722,221 @@ describe("live acceptance release scenario", () => {
     }
   }, 10_000);
 
+  test("JSONL routes Codex login secrets through a caller-owned protected handoff file", async () => {
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-handoff-"));
+    await chmod(createdDirectory, 0o700);
+    const directory = await realpath(createdDirectory);
+    const handoffPath = join(directory, "codex-login.json");
+    await writeFile(handoffPath, "", { mode: 0o600 });
+    const userCode = "ABCD-EFGH";
+    const verificationUrl = "https://example.test/device";
+    const child = spawn(process.execPath, [
+      "-e",
+      [
+        `import { JsonlLiveAcceptanceOperator, liveAcceptanceScenarioTesting } from ${JSON.stringify(moduleUrl)};`,
+        "const operator = new JsonlLiveAcceptanceOperator();",
+        "const signal = new AbortController().signal;",
+        `const accountId = 'acct_${"1".repeat(32)}';`,
+        "const documentPath = await operator.prepareDeviceLoginHandoff({ accountId, accountLabel: 'primary', projectDirectory: '/unused' }, signal);",
+        `liveAcceptanceScenarioTesting.writeOwnedProtectedJsonDocument(documentPath, { accountId: 'acct_${"1".repeat(32)}', accountLabel: 'primary', cancelCommand: 'hra account login-cancel acct_${"1".repeat(32)}', method: 'device_code', type: 'codex_device_login', userCode: ${JSON.stringify(userCode)}, verificationUrl: ${JSON.stringify(verificationUrl)}, version: 1 });`,
+        "await operator.acknowledgeDeviceLogin({ accountId, accountLabel: 'primary', documentPath }, signal);",
+        "await operator.flush();",
+        "operator.close();",
+      ].join("\n"),
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const lines = createInterface({ input: child.stdout });
+    const iterator = lines[Symbol.asyncIterator]();
+    const frames: string[] = [];
+    const closePromise = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+      (resolvePromise) => child.once("close", (code, signal) => resolvePromise({ code, signal })),
+    );
+    try {
+      const handoffLine = await iterator.next();
+      if (handoffLine.done) throw new Error("Missing login handoff request.");
+      frames.push(handoffLine.value);
+      const handoffRequest = JSON.parse(handoffLine.value) as { requestId: string };
+      expect(handoffRequest).toMatchObject({
+        accountId: `acct_${"1".repeat(32)}`,
+        accountLabel: "primary",
+        responseMode: "absolute_canonical_owned_mode_0600_empty_file",
+        type: "device_login_handoff_file_required",
+        version: 1,
+      });
+      child.stdin.write(`${JSON.stringify({
+        documentPath: handoffPath,
+        requestId: handoffRequest.requestId,
+        type: "device_login_handoff_file",
+        version: 1,
+      })}\n`);
+
+      const acknowledgementLine = await iterator.next();
+      if (acknowledgementLine.done) throw new Error("Missing login acknowledgement request.");
+      frames.push(acknowledgementLine.value);
+      const acknowledgementRequest = JSON.parse(acknowledgementLine.value) as { requestId: string };
+      expect(acknowledgementRequest).toMatchObject({
+        accountId: `acct_${"1".repeat(32)}`,
+        accountLabel: "primary",
+        handoffDocumentPath: handoffPath,
+        responseMode: "fixed_nonsecret_acknowledgement",
+        type: "device_login_required",
+        version: 1,
+      });
+      expect(frames.join("\n")).not.toContain(userCode);
+      expect(frames.join("\n")).not.toContain(verificationUrl);
+      expect(JSON.parse(await readFile(handoffPath, "utf8"))).toEqual({
+        accountId: `acct_${"1".repeat(32)}`,
+        accountLabel: "primary",
+        cancelCommand: `hra account login-cancel acct_${"1".repeat(32)}`,
+        method: "device_code",
+        type: "codex_device_login",
+        userCode,
+        verificationUrl,
+        version: 1,
+      });
+      child.stdin.write(`${JSON.stringify({
+        acknowledged: true,
+        requestId: acknowledgementRequest.requestId,
+        type: "device_login",
+        version: 1,
+      })}\n`);
+      expect(await closePromise).toEqual({ code: 0, signal: null });
+      expect((await stat(handoffPath)).isFile()).toBe(true);
+    } finally {
+      lines.close();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closePromise;
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 10_000);
+
+  test("JSONL rejects a protected device-login document bound to a different account ID", async () => {
+    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-account-binding-"));
+    await chmod(createdDirectory, 0o700);
+    const directory = await realpath(createdDirectory);
+    const handoffPath = join(directory, "codex-login.json");
+    const expectedAccountId = `acct_${"1".repeat(32)}`;
+    const userCode = "ABCD-EFGH";
+    const verificationUrl = "https://example.test/device";
+    try {
+      await writeFile(handoffPath, JSON.stringify({
+        accountId: `acct_${"9".repeat(32)}`,
+        accountLabel: "primary",
+        cancelCommand: `hra account login-cancel ${expectedAccountId}`,
+        method: "device_code",
+        type: "codex_device_login",
+        userCode,
+        verificationUrl,
+        version: 1,
+      }), { flag: "wx", mode: 0o600 });
+      const result = probeDeviceLoginBinding(handoffPath, expectedAccountId);
+      expect({ signal: result.signal, status: result.status }).toEqual({ signal: null, status: 0 });
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("device_login_account_changed");
+      expect(`${result.stdout}${result.stderr}`).not.toContain(userCode);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(verificationUrl);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("JSONL rejects a protected device-login document with a noncanonical cancel command", async () => {
+    const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-cancel-binding-"));
+    await chmod(createdDirectory, 0o700);
+    const directory = await realpath(createdDirectory);
+    const handoffPath = join(directory, "codex-login.json");
+    const expectedAccountId = `acct_${"1".repeat(32)}`;
+    const userCode = "ABCD-EFGH";
+    const verificationUrl = "https://example.test/device";
+    try {
+      await writeFile(handoffPath, JSON.stringify({
+        accountId: expectedAccountId,
+        accountLabel: "primary",
+        cancelCommand: `hra account login-cancel acct_${"9".repeat(32)}`,
+        method: "device_code",
+        type: "codex_device_login",
+        userCode,
+        verificationUrl,
+        version: 1,
+      }), { flag: "wx", mode: 0o600 });
+      const result = probeDeviceLoginBinding(handoffPath, expectedAccountId);
+      expect({ signal: result.signal, status: result.status }).toEqual({ signal: null, status: 0 });
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toBe("device_login_cancel_command_changed");
+      expect(`${result.stdout}${result.stderr}`).not.toContain(userCode);
+      expect(`${result.stdout}${result.stderr}`).not.toContain(verificationUrl);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("JSONL operator refuses inline authentication documents", async () => {
+    const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const child = spawn(process.execPath, [
+      "-e",
+      [
+        `import { JsonlLiveAcceptanceOperator } from ${JSON.stringify(moduleUrl)};`,
+        "const operator = new JsonlLiveAcceptanceOperator();",
+        "try {",
+        "  await operator.protectedDocument({ kind: 'device_a_auth_invite', prompt: 'probe' }, new AbortController().signal);",
+        "  process.exitCode = 2;",
+        "} catch {",
+        "  process.stdout.write(JSON.stringify({ status: 'inline_rejected', version: 1 }) + '\\n');",
+        "}",
+      ].join("\n"),
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const lines = createInterface({ input: child.stdout });
+    const iterator = lines[Symbol.asyncIterator]();
+    const closePromise = new Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>>(
+      (resolvePromise) => child.once("close", (code, signal) => resolvePromise({ code, signal })),
+    );
+    try {
+      const requestLine = await iterator.next();
+      if (requestLine.done) throw new Error("Missing authentication request.");
+      const request = JSON.parse(requestLine.value) as { requestId: string };
+      expect(request).toMatchObject({
+        responseMode: "absolute_canonical_owned_mode_0600_json_file",
+        type: "protected_input_required",
+      });
+      child.stdin.write(`${JSON.stringify({
+        document: { email: "must-not-be-accepted@example.test", invite: "secret" },
+        requestId: request.requestId,
+        type: "protected_input",
+        version: 1,
+      })}\n`);
+      const resultLine = await iterator.next();
+      if (resultLine.done) throw new Error("Missing inline-refusal result.");
+      expect(JSON.parse(resultLine.value) as unknown).toEqual({
+        status: "inline_rejected",
+        version: 1,
+      });
+      expect(await closePromise).toEqual({ code: 0, signal: null });
+    } finally {
+      lines.close();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closePromise;
+    }
+  }, 10_000);
+
   test("JSONL operator reads configuration and matching responses from one stdin stream", async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
+    const createdProtectedDirectory = await mkdtemp(join(tmpdir(), "hra-protected-input-"));
+    await chmod(createdProtectedDirectory, 0o700);
+    const protectedDirectory = await realpath(createdProtectedDirectory);
+    const protectedPath = join(protectedDirectory, "document.json");
+    await writeFile(protectedPath, JSON.stringify({ answer: 42 }), { mode: 0o600 });
     const child = spawn(process.execPath, [
       "-e",
       [
@@ -875,16 +1990,18 @@ describe("live acceptance release scenario", () => {
       const requestId = request.requestId;
       expect(typeof requestId).toBe("string");
       expect(request).toMatchObject({
+        documentFileDisposition: "hra_preserves_caller_removes_after_final_result",
         kind: "device_a_auth_invite",
         prompt: "probe",
         requestId,
+        responseMode: "absolute_canonical_owned_mode_0600_json_file",
         type: "protected_input_required",
         version: 1,
       });
       await write({
-        document: { answer: 42 },
+        documentPath: protectedPath,
         requestId,
-        type: "protected_input",
+        type: "protected_input_file",
         version: 1,
       });
       const progressLine = await outputIterator.next();
@@ -897,6 +2014,7 @@ describe("live acceptance release scenario", () => {
       expect(await closePromise).toEqual({ code: 0, signal: null });
       expect(await outputIterator.next()).toMatchObject({ done: true });
       expect(childStderr).toBe("");
+      expect((await stat(protectedPath)).isFile()).toBe(true);
     } finally {
       outputLines.close();
       child.stdin.destroy();
@@ -904,6 +2022,7 @@ describe("live acceptance release scenario", () => {
       child.stderr.destroy();
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
       await closePromise;
+      await rm(protectedDirectory, { force: true, recursive: true });
     }
   }, 10_000);
 

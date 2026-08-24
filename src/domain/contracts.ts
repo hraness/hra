@@ -8,11 +8,22 @@ import {
   SESSION_EVENT_PAGE_LIMIT,
   SESSION_EVENT_WAIT_MAX_MS,
 } from "./session-events";
-import { labelSchema, messageSchema, noteSchema, titleSchema } from "./values";
+import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
+import {
+  labelSchema,
+  messageSchema,
+  noteSchema,
+  titleSchema,
+  unixMillisecondsSchema,
+} from "./values";
 
 const selectorSchema = z.string().trim().min(1).max(200);
 const idempotencyKeySchema = z.string().uuid().optional();
 const requiredIdempotencyKeySchema = z.string().uuid();
+const requiredUuidV7IdempotencyKeySchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+  "Idempotency key must be a UUIDv7.",
+);
 const projectPathSchema = z.string().min(1).max(4096).refine(
   (value) => isAbsolute(value) && normalize(value) === value,
   "Project path must be absolute and normalized.",
@@ -29,6 +40,14 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("account.login-cancel"), account: selectorSchema }).strict(),
   z.object({ kind: z.literal("account.logout"), account: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.usage"), account: selectorSchema.optional(), refresh: z.boolean() }).strict(),
+  z.object({
+    kind: z.literal("account.usage-history"),
+    account: selectorSchema,
+    fromObservedAt: unixMillisecondsSchema.optional(),
+    throughObservedAt: unixMillisecondsSchema.optional(),
+    limit: z.number().int().min(1).max(ACCOUNT_USAGE_HISTORY_PAGE_LIMIT),
+    cursor: z.string().min(1).max(2_048).optional(),
+  }).strict(),
   z.object({ kind: z.literal("account.switch"), account: selectorSchema, idempotencyKey: requiredIdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("account.switch-recover") }).strict(),
   z.object({
@@ -47,7 +66,12 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("project.list") }).strict(),
   z.object({ kind: z.literal("project.add"), label: labelSchema, path: projectPathSchema }).strict(),
   z.object({ kind: z.literal("project.use"), project: selectorSchema }).strict(),
-  z.object({ kind: z.literal("session.list"), account: selectorSchema.optional(), limit: z.number().int().min(1).max(100) }).strict(),
+  z.object({
+    kind: z.literal("session.list"),
+    account: selectorSchema.optional(),
+    limit: z.number().int().min(1).max(100),
+    cursor: z.string().min(1).max(2_048).optional(),
+  }).strict(),
   z.object({ kind: z.literal("session.show"), session: selectorSchema, detail: z.boolean() }).strict(),
   z.object({ kind: z.literal("session.status"), session: selectorSchema }).strict(),
   z.object({
@@ -62,6 +86,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     session: selectorSchema,
     pending: z.boolean(),
     limit: z.number().int().min(1).max(100),
+    cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   z.object({ kind: z.literal("session.start"), account: selectorSchema, project: selectorSchema.optional(), preset: presetSchema, fast: z.boolean(), idempotencyKey: idempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("session.send"), session: selectorSchema, message: messageSchema, idempotencyKey: idempotencyKeySchema }).strict(),
@@ -84,8 +109,14 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
     session: selectorSchema.optional(),
     pending: z.boolean(),
     limit: z.number().int().min(1).max(100),
+    cursor: z.string().min(1).max(2_048).optional(),
   }).strict(),
   z.object({ kind: z.literal("interaction.show"), interaction: z.string().uuid() }).strict(),
+  z.object({
+    kind: z.literal("interaction.inspect"),
+    interaction: z.string().uuid(),
+    expectedRevision: z.number().int().positive(),
+  }).strict(),
   z.object({
     kind: z.literal("interaction.resolve"),
     interaction: z.string().uuid(),
@@ -103,8 +134,8 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("auth.delete"), acknowledgeErasure: z.literal(true) }).strict(),
   z.object({ kind: z.literal("device.list") }).strict(),
   z.object({ kind: z.literal("device.pair") }).strict(),
-  z.object({ kind: z.literal("device.approve"), device: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
-  z.object({ kind: z.literal("device.revoke"), device: selectorSchema, idempotencyKey: idempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("device.approve"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
+  z.object({ kind: z.literal("device.revoke"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("sync.status") }).strict(),
   z.object({ kind: z.literal("sync.now") }).strict(),
   z.object({ kind: z.literal("sync.projection-recover"), session: selectorSchema, idempotencyKey: requiredIdempotencyKeySchema, acknowledgeGap: z.literal(true) }).strict(),

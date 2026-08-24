@@ -5,6 +5,7 @@ import type { CodexPluginCatalog } from "../codex/protocol";
 import type {
   InteractionKind,
   InteractionResolution,
+  LiveInteractionApprovalAuthority,
   ProviderInteractionAuthority,
 } from "../domain/interactions";
 import type { ProfileId, ProjectId, SessionId } from "../domain/values";
@@ -91,6 +92,11 @@ export type CodexSessionProjection = {
   turns?: readonly unknown[];
 };
 
+export type CodexSessionPage = {
+  readonly sessions: readonly CodexSessionProjection[];
+  readonly nextCursor: string | null;
+};
+
 export interface CodexRuntimePort {
   login(input: { authority: ProfileAuthority; method: "browser" | "device_code"; signal: AbortSignal }): Promise<CodexLoginOutcome>;
   cancelLogin(input: { authority: ProfileAuthority; loginId: string; signal: AbortSignal }): Promise<{ status: "canceled" | "not_found" }>;
@@ -98,7 +104,12 @@ export interface CodexRuntimePort {
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   readUsage(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<{ revision: number; observedAt: number; payload: unknown }>;
   listPlugins(input: { authority: ProfileAuthority; projectRoot?: string; forceRefetch: boolean; signal: AbortSignal }): Promise<CodexPluginCatalog>;
-  listSessions(input: { authority: ProfileAuthority; limit: number; signal: AbortSignal }): Promise<readonly CodexSessionProjection[]>;
+  listSessions(input: {
+    authority: ProfileAuthority;
+    limit: number;
+    cursor?: string;
+    signal: AbortSignal;
+  }): Promise<CodexSessionPage>;
   reviewSessionStart(input: { authority: ProfileAuthority; projectRoot?: string; preset: Preset; fast: boolean; signal: AbortSignal }): Promise<RuntimeStartReview>;
   startSession(input: { authority: ProfileAuthority; projectRoot?: string; review: RuntimeStartReview; signal: AbortSignal }): Promise<CodexSessionProjection & { effectiveRuntimeProfile: EffectiveRuntimeProfile }>;
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection>;
@@ -108,6 +119,12 @@ export interface CodexRuntimePort {
   interrupt(input: { authority: ProfileAuthority; providerThreadId: string; activeTurnId: string; signal: AbortSignal }): Promise<void>;
   rename(input: { authority: ProfileAuthority; providerThreadId: string; name: string; signal: AbortSignal }): Promise<void>;
   inspectTurn(input: { authority: ProfileAuthority; providerThreadId: string; turnId: string; signal: AbortSignal }): Promise<unknown>;
+  inspectInteractionAuthority(input: {
+    authority: ProfileAuthority;
+    provider: ProviderInteractionAuthority;
+    kind: InteractionKind;
+    signal: AbortSignal;
+  }): Promise<LiveInteractionApprovalAuthority>;
   validateInteractionResolution(input: {
     authority: ProfileAuthority;
     provider: ProviderInteractionAuthority;
@@ -120,6 +137,7 @@ export interface CodexRuntimePort {
     provider: ProviderInteractionAuthority;
     kind: InteractionKind;
     resolution: InteractionResolution;
+    deadlineAt: number;
     signal: AbortSignal;
   }): Promise<{ responseWritten: true }>;
   validateInteractionTimeout(input: {
@@ -154,8 +172,8 @@ export interface CloudControlPort {
   deleteAccount(input: { acknowledgeErasure: boolean; signal: AbortSignal }): Promise<unknown>;
   listDevices(signal: AbortSignal): Promise<unknown>;
   pairDevice(signal: AbortSignal): Promise<unknown>;
-  approveDevice(device: string, signal: AbortSignal): Promise<unknown>;
-  revokeDevice(device: string, signal: AbortSignal): Promise<unknown>;
+  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
+  revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
 }
 
 export type CompactProjectionRecoveryBlocker = Pick<
@@ -184,6 +202,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   interrupt(): Promise<never> { return Promise.reject(this.#unavailable()); }
   rename(): Promise<never> { return Promise.reject(this.#unavailable()); }
   inspectTurn(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  inspectInteractionAuthority(): Promise<never> { return Promise.reject(this.#unavailable()); }
   validateInteractionResolution(): Promise<never> { return Promise.reject(this.#unavailable()); }
   resolveInteraction(): Promise<never> { return Promise.reject(this.#unavailable()); }
   validateInteractionTimeout(): Promise<never> { return Promise.reject(this.#unavailable()); }
@@ -222,8 +241,18 @@ export class UnavailableCloudControl implements CloudControlPort {
   deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
   pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  approveDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
-  revokeDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+    void device;
+    void idempotencyKey;
+    void signal;
+    return Promise.reject(this.#unavailable());
+  }
+  revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
+    void device;
+    void idempotencyKey;
+    void signal;
+    return Promise.reject(this.#unavailable());
+  }
 }
 
 export type SessionProjectUpdate = { sessionId: SessionId; projectId: ProjectId | null };

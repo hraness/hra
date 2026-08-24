@@ -225,6 +225,12 @@ export class LocalDaemonServer {
     let requestId: string = randomUUID();
     let response: CommandResponse;
     const afterResponse: Array<() => void> = [];
+    let afterResponseFinished = false;
+    const finishAfterResponse = (): void => {
+      if (afterResponseFinished) return;
+      afterResponseFinished = true;
+      for (const callback of afterResponse) callback();
+    };
     try {
       const parsedJson = JSON.parse(frame.toString("utf8")) as unknown;
       if (typeof parsedJson === "object" && parsedJson !== null && "requestId" in parsedJson && typeof parsedJson.requestId === "string") {
@@ -246,8 +252,16 @@ export class LocalDaemonServer {
     if (bytes.byteLength > maximumResponseBytes) {
       response = safeResponse(requestId, new Error("Local response exceeds the byte limit."));
     }
-    if (!socket.destroyed) socket.end(`${JSON.stringify(response)}\n`, () => {
-      for (const callback of afterResponse) callback();
+    if (socket.destroyed) {
+      // The response can no longer be delivered, so no response boundary remains
+      // to defer. Security and shutdown callbacks must still run exactly once.
+      finishAfterResponse();
+      return;
+    }
+    socket.once("close", finishAfterResponse);
+    socket.end(`${JSON.stringify(response)}\n`, () => {
+      socket.off("close", finishAfterResponse);
+      finishAfterResponse();
     });
   }
 

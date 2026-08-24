@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import fc from "fast-check";
 
-import { localCommandSchema } from "./contracts";
+import { commandEnvelopeSchema, localCommandSchema } from "./contracts";
 import { presetRequirements } from "./presets";
 import { canTransitionMutation, mutationStateSchema } from "./transitions";
 import { selectByIdOrLabel, utf8Bytes } from "./values";
@@ -23,6 +23,33 @@ describe("domain laws", () => {
       }),
       { numRuns: 1_000 },
     );
+  });
+
+  test("requires one UUIDv7 caller key for device mutations in commands and envelopes", () => {
+    const capability = "a".repeat(43);
+    const requestId = "00000000-0000-4000-8000-000000000001";
+    const idempotencyKey = "018bcfe5-6800-7000-8000-000000000001";
+    const command = { device: "device_target", idempotencyKey, kind: "device.approve" };
+
+    expect(localCommandSchema.safeParse(command).success).toBe(true);
+    expect(commandEnvelopeSchema.safeParse({ capability, command, requestId, version: 1 }).success)
+      .toBe(true);
+    for (const invalidCommand of [
+      { device: "device_target", kind: "device.approve" },
+      {
+        device: "device_target",
+        idempotencyKey: "00000000-0000-4000-8000-000000000001",
+        kind: "device.revoke",
+      },
+    ]) {
+      expect(localCommandSchema.safeParse(invalidCommand).success).toBe(false);
+      expect(commandEnvelopeSchema.safeParse({
+        capability,
+        command: invalidCommand,
+        requestId,
+        version: 1,
+      }).success).toBe(false);
+    }
   });
 
   test("terminal mutation states are absorbing", () => {

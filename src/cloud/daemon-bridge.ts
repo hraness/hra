@@ -41,15 +41,19 @@ import {
   type CloudProjectionRecoveryBaselineInteraction,
   type CloudProjectionRecoveryJournalEntry,
   type CloudProjectionRecoveryTerminalReceipt,
+  type CloudSessionSyncCursorObservation,
+  type CloudSessionSyncCursorPort,
   type CloudUsageAccountCursor,
   type PendingCloudUsageAccount,
   addCloudCommandJournalEntry,
   addCloudProjectionRecovery,
+  advanceCloudSessionRemoteCursor,
   assertCloudDaemonJournalFutureCapacity,
   cloudProjectionRecoveryReceiptResult,
   completePendingCloudUsageAccount,
   createCloudProjectionRecoveryTerminalReceipt,
   CustodyCloudDaemonJournal,
+  CustodyCloudSessionSyncCursor,
   hasUnsettledCompactProjectionRecovery,
   hasUnsettledCompactProjectionRecoveryForProfile,
   matchesCloudProjectionRecoveryIdentity,
@@ -156,6 +160,12 @@ export type CloudLocalSessionHead = Readonly<{
   updatedAt: number;
 }>;
 
+export type CloudLocalSessionPage = Readonly<{
+  continueAfterPublicId: string | null;
+  isDone: boolean;
+  sessions: readonly CloudLocalSessionHead[];
+}>;
+
 export type CloudLocalUsageSnapshot = Readonly<{
   localReference: string;
   matchReference: string;
@@ -199,9 +209,10 @@ export interface CloudDaemonLocalSourcePort {
   }>): Promise<void>;
   isSessionTerminal?(sessionPublicId: string): boolean | Promise<boolean>;
   listSessions(input: Readonly<{
+    afterPublicId: string | null;
     limit: number;
     signal: AbortSignal;
-  }>): Promise<readonly CloudLocalSessionHead[]>;
+  }>): Promise<CloudLocalSessionPage>;
   planCompactProjectionRecovery?(input: Readonly<{
     idempotencyKey: string;
     observedInteractionIds: readonly string[];
@@ -429,6 +440,7 @@ export type LocalCloudDaemonBridgeOptions = Readonly<{
   optionalSyncBudgetMs?: number;
   randomConnectionUuid?: () => string;
   randomUuid?: () => string;
+  sessionSyncCursor: CloudSessionSyncCursorPort;
   transport: CloudTransport;
 }>;
 
@@ -447,6 +459,7 @@ export type LocalCloudDaemonBridgeEnvironmentOptions = Readonly<{
   randomConnectionUuid?: () => string;
   randomUuid?: () => string;
   registration?: CloudDeviceRegistrationPort;
+  sessionSyncCursor?: CloudSessionSyncCursorPort;
   secretCustody: CloudSecretCustodyPort;
   transport?: CloudTransport;
 }>;
@@ -463,6 +476,12 @@ type CloudSessionHead = Readonly<{
   publicId: string;
   state: "active" | "idle" | "terminal" | "orphaned";
   updatedAt: number;
+}>;
+
+type CloudSessionHeadPage = Readonly<{
+  continueCursor: string;
+  isDone: boolean;
+  page: readonly CloudSessionHead[];
 }>;
 
 type CloudSessionChunk = Readonly<{
@@ -874,6 +893,77 @@ function parseSessionHeads(value: unknown): readonly CloudSessionHead[] {
     throw new Error("Cloud session response is invalid.");
   }
   return heads;
+}
+
+function parseSessionHeadPage(value: unknown): CloudSessionHeadPage {
+  if (!isRecord(value)) throw new Error("Cloud session page is invalid.");
+  const optional = ["pageStatus", "splitCursor"].filter((key) =>
+    Object.hasOwn(value, key));
+  if (
+    !hasExactKeys(value, ["continueCursor", "isDone", "page", ...optional])
+    || typeof value.continueCursor !== "string"
+    || value.continueCursor.length > 16_384
+    || (value.isDone === false && value.continueCursor.length < 1)
+    || typeof value.isDone !== "boolean"
+    || (value.pageStatus !== undefined
+      && value.pageStatus !== null
+      && value.pageStatus !== "SplitRecommended"
+      && value.pageStatus !== "SplitRequired")
+    || (value.splitCursor !== undefined
+      && value.splitCursor !== null
+      && (typeof value.splitCursor !== "string" || value.splitCursor.length > 16_384))
+  ) throw new Error("Cloud session page is invalid.");
+  const page = parseSessionHeads(value.page);
+  if (page.length > maximumRemoteSessions) {
+    throw new Error("Cloud session page is invalid.");
+  }
+  return {
+    continueCursor: value.continueCursor,
+    isDone: value.isDone,
+    page,
+  };
+}
+
+function validateLocalSessionPage(
+  value: CloudLocalSessionPage,
+  afterPublicId: string | null,
+): CloudLocalSessionPage {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["continueAfterPublicId", "isDone", "sessions"])
+    || typeof value.isDone !== "boolean"
+    || !Array.isArray(value.sessions)
+    || value.sessions.length > maximumLocalSessions
+    || (value.continueAfterPublicId !== null
+      && !isOpaqueIdentifier(value.continueAfterPublicId))
+    || (value.isDone !== (value.continueAfterPublicId === null))
+  ) throw new Error("Local cloud session page is invalid.");
+  const sessions = value.sessions.map((session) =>
+    validateLocalSession(session as CloudLocalSessionHead));
+  if (new Set(sessions.map((session) => session.publicId)).size !== sessions.length) {
+    throw new Error("Local cloud session projection contains duplicate identifiers.");
+  }
+  for (let index = 0; index < sessions.length; index += 1) {
+    const current = sessions[index];
+    const previous = sessions[index - 1];
+    if (
+      current === undefined
+      || (afterPublicId !== null && current.publicId <= afterPublicId)
+      || (previous !== undefined && current.publicId <= previous.publicId)
+      || (value.continueAfterPublicId !== null
+        && current.publicId > value.continueAfterPublicId)
+    ) throw new Error("Local cloud session page is invalid.");
+  }
+  if (
+    value.continueAfterPublicId !== null
+    && afterPublicId !== null
+    && value.continueAfterPublicId <= afterPublicId
+  ) throw new Error("Local cloud session page is invalid.");
+  return {
+    continueAfterPublicId: value.continueAfterPublicId,
+    isDone: value.isDone,
+    sessions,
+  };
 }
 
 function parseCompactProjectionRecoveryResponse(
@@ -1555,6 +1645,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
   readonly #optionalSyncBudgetMs: number;
   readonly #randomConnectionUuid: () => string;
   readonly #randomUuid: () => string;
+  readonly #sessionSyncCursor: CloudSessionSyncCursorPort;
   readonly #transport: CloudTransport;
   #closed = false;
   #optionalTask: OptionalCloudSyncTask | null = null;
@@ -1591,6 +1682,7 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     this.#optionalSyncBudgetMs = optionalSyncBudgetMs;
     this.#randomConnectionUuid = options.randomConnectionUuid ?? (() => crypto.randomUUID());
     this.#randomUuid = options.randomUuid ?? (() => uuidV7(this.#now()));
+    this.#sessionSyncCursor = options.sessionSyncCursor;
     this.#transport = deploymentFencedCloudTransport(
       options.transport,
       this.#deploymentAuthority,
@@ -1635,9 +1727,10 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
         if (registeredIdentity.status === "pending") return result;
         const identity = registeredIdentity.activeIdentity;
         await this.#assertDaemonCurrent(signal);
-        const heads = parseSessionHeads(await this.#transport.query("sessions:listHeads", {
-          limit: maximumRemoteSessions,
-        }));
+        const heads = parseSessionHeadPage(await this.#transport.query(
+          "sessions:listHeadsPage",
+          { paginationOpts: { cursor: null, numItems: maximumRemoteSessions } },
+        )).page;
         const headById = new Map(heads.map((head) => [head.publicId, head]));
         const leases = new Map<string, CloudLease>();
         const recoveryJournal = await this.#journal.read();
@@ -1688,14 +1781,14 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             lease: CloudLease;
             session: CloudLocalSessionHead;
           }>> = [];
-          const localSessions = (await this.#local.listSessions({
+          const localCursor = await this.#sessionSyncCursor.read();
+          const localPage = validateLocalSessionPage(await this.#local.listSessions({
+            afterPublicId: localCursor.state.localAfterPublicId,
             limit: maximumLocalSessions,
             signal: optionalController.signal,
-          })).map(validateLocalSession);
+          }), localCursor.state.localAfterPublicId);
+          const localSessions = localPage.sessions;
           abortBeforeEffect(optionalController.signal);
-          if (new Set(localSessions.map((session) => session.publicId)).size !== localSessions.length) {
-            throw new Error("Local cloud session projection contains duplicate identifiers.");
-          }
           for (const session of localSessions) {
             abortBeforeEffect(optionalController.signal);
             try {
@@ -1758,6 +1851,10 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
               optionalResult.errors.push(`${session.publicId}: ${normalizeError(error)}`);
             }
           }
+          await this.#advanceLocalSessionCursor(
+            localCursor,
+            localPage.continueAfterPublicId,
+          );
           optionalResult.usageUploaded = await this.#uploadUsage(
             identity,
             optionalController.signal,
@@ -1777,15 +1874,30 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
             });
           }
           abortBeforeEffect(optionalController.signal);
-          const refreshedHeads = parseSessionHeads(await this.#transport.query("sessions:listHeads", {
-            limit: maximumRemoteSessions,
-          }));
+          const remoteCursor = await this.#sessionSyncCursor.read();
+          const refreshedPage = parseSessionHeadPage(await this.#transport.query(
+            "sessions:listHeadsPage",
+            {
+              paginationOpts: {
+                cursor: remoteCursor.state.remoteContinueCursor,
+                numItems: maximumRemoteSessions,
+              },
+            },
+          ));
+          if (
+            !refreshedPage.isDone
+            && refreshedPage.continueCursor === remoteCursor.state.remoteContinueCursor
+          ) throw new Error("Cloud session pagination made no progress.");
           abortBeforeEffect(optionalController.signal);
           optionalResult.remoteSessions = [...await this.#pullHeads(
             identity,
-            refreshedHeads,
+            refreshedPage.page,
             optionalController.signal,
           )];
+          await this.#advanceRemoteSessionCursor(
+            remoteCursor,
+            refreshedPage.isDone ? null : refreshedPage.continueCursor,
+          );
         })();
         const optionalState = { outcome: null as OptionalCloudSyncOutcome | null };
         const trackedOptional: Promise<OptionalCloudSyncOutcome> = optionalTask.then(
@@ -2180,10 +2292,25 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return await this.#exclusive(async () => {
       await this.#assertDaemonCurrent(signal);
       const identity = await this.#identity.requireActive(signal);
-      const heads = parseSessionHeads(await this.#transport.query("sessions:listHeads", {
-        limit: maximumRemoteSessions,
-      }));
-      return await this.#pullHeads(identity, heads, signal);
+      const cursor = await this.#sessionSyncCursor.read();
+      const page = parseSessionHeadPage(await this.#transport.query(
+        "sessions:listHeadsPage",
+        {
+          paginationOpts: {
+            cursor: cursor.state.remoteContinueCursor,
+            numItems: maximumRemoteSessions,
+          },
+        },
+      ));
+      if (!page.isDone && page.continueCursor === cursor.state.remoteContinueCursor) {
+        throw new Error("Cloud session pagination made no progress.");
+      }
+      const sessions = await this.#pullHeads(identity, page.page, signal);
+      await this.#advanceRemoteSessionCursor(
+        cursor,
+        page.isDone ? null : page.continueCursor,
+      );
+      return sessions;
     });
   }
 
@@ -3699,6 +3826,51 @@ export class LocalCloudDaemonBridge implements CloudDaemonBridge {
     return sessions;
   }
 
+  async #advanceLocalSessionCursor(
+    expected: CloudSessionSyncCursorObservation,
+    next: string | null,
+  ): Promise<void> {
+    let observed = expected;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (observed.state.localAfterPublicId === next) return;
+      if (
+        observed.state.localAfterPublicId
+        !== expected.state.localAfterPublicId
+      ) throw new Error("Local cloud session cursor changed concurrently.");
+      const committed = await this.#sessionSyncCursor.compareAndSwap(
+        observed.generation,
+        { ...observed.state, localAfterPublicId: next },
+      );
+      if (committed !== null) return;
+      observed = await this.#sessionSyncCursor.read();
+    }
+    throw new Error("Local cloud session cursor changed concurrently.");
+  }
+
+  async #advanceRemoteSessionCursor(
+    expected: CloudSessionSyncCursorObservation,
+    next: string | null,
+  ): Promise<void> {
+    let observed = expected;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (observed.state.remoteContinueCursor === null && next === null) return;
+      if (
+        observed.state.remoteContinueCursor
+        !== expected.state.remoteContinueCursor
+        || JSON.stringify(observed.state.remoteCycle)
+          !== JSON.stringify(expected.state.remoteCycle)
+      ) throw new Error("Remote cloud session cursor changed concurrently.");
+      const advanced = advanceCloudSessionRemoteCursor(observed.state, next);
+      const committed = await this.#sessionSyncCursor.compareAndSwap(
+        observed.generation,
+        advanced,
+      );
+      if (committed !== null) return;
+      observed = await this.#sessionSyncCursor.read();
+    }
+    throw new Error("Remote cloud session cursor changed concurrently.");
+  }
+
   async #mutateJournal(
     transform: (state: CloudDaemonJournalState) => CloudDaemonJournalState,
   ): Promise<Readonly<{ generation: number | null; state: CloudDaemonJournalState }>> {
@@ -3967,6 +4139,8 @@ export async function createLocalCloudDaemonBridgeFromEnvironment(
       ? {}
       : { randomConnectionUuid: options.randomConnectionUuid }),
     ...(options.randomUuid === undefined ? {} : { randomUuid: options.randomUuid }),
+    sessionSyncCursor: options.sessionSyncCursor
+      ?? new CustodyCloudSessionSyncCursor(fencedCustody),
     transport,
   });
 }
