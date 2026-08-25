@@ -207,11 +207,15 @@ const TargetResult = extern struct {
 
 pub fn main(init: std.process.Init.Minimal) void {
     const launch_parent_pid = linux.getppid();
+    const args = init.args.vector;
     // In recovery mode the old target can still be alive while this helper is
-    // starting. Hide the nonce and eventual pidfd before it can inspect this
-    // helper through host /proc. Launch mode repeats this after user-namespace
-    // mapping because Linux may reset dumpability on credential changes.
-    setUndumpable() catch linux.exit(1);
+    // starting. Classify only the fixed action position and hide the nonce
+    // before full parsing or opening a pidfd. Launch must remain dumpable until
+    // it writes its unprivileged uid/gid maps; runLaunch hardens it immediately
+    // after that credential transition and before READY or target creation.
+    if (args.len > 5 and std.mem.eql(u8, std.mem.span(args[5]), "--terminate")) {
+        setUndumpable() catch linux.exit(1);
+    }
     const config = parseConfig(init) catch {
         linux.exit(64);
     };

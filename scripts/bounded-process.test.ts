@@ -106,6 +106,32 @@ describe("bounded detached process groups", () => {
     expect(source).not.toContain('"libc.musl-aarch64.so.1"');
   });
 
+  test("authenticates a pre-GO refusal and leaves its one cleanup to the outer recovery path", async () => {
+    const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
+    const validatorStart = source.indexOf("const assertAuthorityFailFrame = (");
+    const validatorEnd = source.indexOf(
+      "const assertAuthorityRecoveryReadyFrame = (",
+      validatorStart,
+    );
+    const validator = source.slice(validatorStart, validatorEnd);
+    const branchStart = source.indexOf('if (readyFrame.kind === "FAIL") {');
+    const branchEnd = source.indexOf("let authorityDeadlineMonotonicMs", branchStart);
+    const branch = source.slice(branchStart, branchEnd);
+
+    expect(validatorStart).toBeGreaterThanOrEqual(0);
+    expect(validatorEnd).toBeGreaterThan(validatorStart);
+    expect(validator).toContain('requireAuthorityFrame(frame, "FAIL", ["code", "nonce"])');
+    expect(validator).toContain("fields.nonce !== nonce");
+    expect(branchStart).toBeGreaterThanOrEqual(0);
+    expect(branchEnd).toBeGreaterThan(branchStart);
+    expect(branch).toContain("assertAuthorityFailFrame(readyFrame, nonce)");
+    expect(branch).toContain(
+      'throw new BoundedProcessContainmentUnavailableError("authority_backend_unavailable")',
+    );
+    expect(branch).not.toContain("recoverCurrent()");
+    expect(source).not.toContain("openAuthorityArtifact?:");
+  });
+
   test("publishes recovery journals only after an exact temporary write", async () => {
     const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
     const authorityReplacementStart = source.indexOf(

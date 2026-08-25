@@ -174,6 +174,35 @@ test("READY journals an exact namespace-init identity before GO", async () => {
   expect(init.indexOf("const init_identity = InitReadyRecord")).toBeLessThan(init.indexOf("waitForStartOrParentDeath"));
 });
 
+test("launch maps its caller identity before becoming nondumpable", async () => {
+  const source = await supervisorSource();
+  const mainStart = source.indexOf("pub fn main(");
+  const mainEnd = source.indexOf("fn parseConfig(", mainStart);
+  const main = source.slice(mainStart, mainEnd);
+  const launchStart = source.indexOf("fn runLaunch(");
+  const launchEnd = source.indexOf("fn runPrepared(", launchStart);
+  const launch = source.slice(launchStart, launchEnd);
+  const earlyRecoveryClassification =
+    'if (args.len > 5 and std.mem.eql(u8, std.mem.span(args[5]), "--terminate"))';
+  const earlyRecoveryHardening = "setUndumpable() catch linux.exit(1)";
+
+  expect(mainStart).toBeGreaterThanOrEqual(0);
+  expect(mainEnd).toBeGreaterThan(mainStart);
+  expect(launchStart).toBeGreaterThanOrEqual(0);
+  expect(launchEnd).toBeGreaterThan(launchStart);
+  expect(main).toContain("const args = init.args.vector");
+  expect(main).toContain(earlyRecoveryClassification);
+  expect(main.indexOf(earlyRecoveryClassification)).toBeLessThan(main.indexOf(earlyRecoveryHardening));
+  expect(main.indexOf(earlyRecoveryHardening)).toBeLessThan(main.indexOf("const config = parseConfig(init)"));
+  expect(main.match(/setUndumpable\(\)/g)).toHaveLength(1);
+  expect(launch.indexOf("try unshareAndMapCurrentIdentity(host_uid, host_gid)")).toBeLessThan(
+    launch.indexOf("try setUndumpable()"),
+  );
+  expect(launch.indexOf("try setUndumpable()")).toBeLessThan(
+    launch.indexOf("const identity = LaunchIdentity"),
+  );
+});
+
 test("recovery validates both pidfd-bound identities before signaling the outer helper", async () => {
   const source = await supervisorSource();
   const start = source.indexOf("fn runRecovery(");

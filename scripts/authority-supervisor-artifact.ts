@@ -61,21 +61,21 @@ const freezeAuthoritySupervisorArtifactManifest = (
 export const authoritySupervisorArtifactManifest = freezeAuthoritySupervisorArtifactManifest({
   artifacts: {
     arm64: {
-      byteLength: 237_776,
+      byteLength: 237_848,
       elfMachine: 183,
       maximumByteLength: 8 * 1024 * 1024,
       mode: 0o755,
       relativePath: artifactRelativePaths.arm64,
-      sha256: "35ba341d6105d881d504d5bca406f68f9e876a63cdb06cadf61c6136623b3040",
+      sha256: "c50e710b0c3fa207afd28f7c336f2c153e18f1b635caf583b6b81090ad4589a4",
       target: "aarch64-linux-musl",
     },
     x64: {
-      byteLength: 328_248,
+      byteLength: 328_360,
       elfMachine: 62,
       maximumByteLength: 8 * 1024 * 1024,
       mode: 0o755,
       relativePath: artifactRelativePaths.x64,
-      sha256: "c6a79d5f5c9f277ee03e854c60578cdf48fb30b93932bb9a0d2a1c341ba76ee0",
+      sha256: "51bb5ec0f565173627c0df0fb5d1e2a787814d21c53dd2d14bd47a105eb183a2",
       target: "x86_64-linux-musl",
     },
   },
@@ -85,11 +85,11 @@ export const authoritySupervisorArtifactManifest = freezeAuthoritySupervisorArti
   },
   schemaVersion: 1,
   source: {
-    byteLength: 73_312,
+    byteLength: 73_522,
     maximumByteLength: 2 * 1024 * 1024,
     mode: 0o644,
     relativePath: sourceRelativePath,
-    sha256: "5af19be5ce85d545fd3551fa37682388ac3667f6c1b302a24d75ccb1450156c2",
+    sha256: "28875a270246f21d82740e320b50835e55d21f92f4f76f58a29a15865eff2b54",
   },
 } as const satisfies AuthoritySupervisorArtifactManifest);
 

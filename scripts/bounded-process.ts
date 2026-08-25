@@ -2715,6 +2715,18 @@ const assertAuthorityCleanFrame = (
   return parseFrameExitCode(fields.exit);
 };
 
+const assertAuthorityFailFrame = (
+  frame: AuthorityControlFrame,
+  nonce: string,
+): void => {
+  const fields = requireAuthorityFrame(frame, "FAIL", ["code", "nonce"]);
+  if (
+    fields.nonce !== nonce
+    || fields.code === undefined
+    || !/^[a-z][a-z0-9_]{0,63}$/u.test(fields.code)
+  ) throw new AuthorityControlProtocolError("fail_frame_invalid");
+};
+
 const assertAuthorityRecoveryReadyFrame = (
   frame: AuthorityControlFrame,
   nonce: string,
@@ -4022,12 +4034,10 @@ const runAuthorityBoundedProcess = async (
         };
       }
       if (readyFrame.kind === "FAIL") {
-        const recovered = await recoverCurrent();
-        if (!recovered) return authorityUnprovenResult(
-          unresolvedAuthorityJournal(),
-          intent.path,
-          output(),
-        );
+        assertAuthorityFailFrame(readyFrame, nonce);
+        // The outer catch owns the one pre-GO cleanup. Cleaning here as well
+        // would remove the intent twice and misclassify a typed refusal as a
+        // recovery-journal identity change.
         throw new BoundedProcessContainmentUnavailableError("authority_backend_unavailable");
       }
       let authorityDeadlineMonotonicMs: bigint;
