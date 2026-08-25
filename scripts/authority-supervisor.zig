@@ -709,7 +709,6 @@ fn initMain(config: LaunchConfig, fds: PreparedFileDescriptors) noreturn {
     // retains them so the target can inherit its ordinary raw stdio surface.
 
     armParentDeath() catch initExit(fds.result_write, ResultKind.internal, 1);
-    establishNamespaceSession() catch initExit(fds.result_write, ResultKind.internal, 2);
     setUndumpable() catch initExit(fds.result_write, ResultKind.internal, 2);
     // PR_SET_PDEATHSIG covers parent death after this point. The lifeline pipe
     // closes the small fork-to-prctl race before READY can be emitted.
@@ -1091,18 +1090,6 @@ fn setUndumpable() SupervisorError!void {
     if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) != .SUCCESS) {
         return error.SupervisorHardeningFailed;
     }
-}
-
-fn establishNamespaceSession() SupervisorError!void {
-    // PID namespace children can inherit a process-group/session leader that
-    // is not visible in their namespace. Make namespace PID 1 the visible
-    // session and process-group leader before READY so ordinary descendants
-    // can reliably create detached sessions of their own.
-    const result = linux.setsid();
-    if (
-        linux.errno(result) != .SUCCESS
-        or @as(linux.pid_t, @intCast(result)) != linux.getpid()
-    ) return error.SupervisorHardeningFailed;
 }
 
 fn hardenTargetCredentials() SupervisorError!void {

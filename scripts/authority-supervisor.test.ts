@@ -38,8 +38,6 @@ test("authority supervisor establishes a private, fail-closed Linux custody boun
   expect(source).toContain("linux.PR.SET_PDEATHSIG");
   expect(source).toContain("try assertParentStill(launch_parent_pid)");
   expect(source).toContain("assertLifelineStillOpen(fds.lifeline_read)");
-  expect(source).toContain("fn establishNamespaceSession()");
-  expect(source).toContain("const result = linux.setsid()");
   expect(source).toContain("linux.PR.SET_DUMPABLE");
   expect(source).toContain("linux.PR.SET_NO_NEW_PRIVS");
   expect(source).toContain("linux.PR.CAPBSET_DROP");
@@ -72,9 +70,6 @@ test("authority supervisor conceals durable custody before READY without a cwd e
     init.indexOf("concealRecoveryDirectory(config.recovery_directory)"),
   );
   expect(init.indexOf("concealRecoveryDirectory(config.recovery_directory)")).toBeLessThan(
-    init.indexOf("const init_identity = InitReadyRecord"),
-  );
-  expect(init.indexOf("establishNamespaceSession()")).toBeLessThan(
     init.indexOf("const init_identity = InitReadyRecord"),
   );
   expect(target.indexOf("hardenTargetCredentials()")).toBeLessThan(

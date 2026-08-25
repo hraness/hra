@@ -3416,6 +3416,14 @@ const runAuthorityRecoveryHelperLocked = async (
       child.stdin.end();
       child.stdout.resume();
       child.stderr.resume();
+      const ready = await endpoint.nextFrame(authorityRecoveryReadyTimeoutMs);
+      if (ready.kind === "FAIL") {
+        failureCode = assertAuthorityFailFrame(ready, nonce);
+        throw new AuthorityControlProtocolError("recovery_helper_failed");
+      }
+      // A validated FAIL does not need a live child identity. RECOVERY_READY
+      // does: the helper remains behind RECOVERY_GO while HRA binds its exact
+      // direct child PID and start time to the authenticated frame.
       const recoveryPid = child.pid;
       const recoveryStartTime = recoveryPid === undefined
         ? undefined
@@ -3424,11 +3432,6 @@ const runAuthorityRecoveryHelperLocked = async (
         throw new AuthorityControlProtocolError("recovery_child_identity_unavailable");
       }
       const recoveryIdentity = { pid: recoveryPid, startTime: recoveryStartTime } as const;
-      const ready = await endpoint.nextFrame(authorityRecoveryReadyTimeoutMs);
-      if (ready.kind === "FAIL") {
-        failureCode = assertAuthorityFailFrame(ready, nonce);
-        throw new AuthorityControlProtocolError("recovery_helper_failed");
-      }
       assertAuthorityRecoveryReadyFrame(ready, nonce, identity, recoveryIdentity);
       await endpoint.write(`${authorityProtocolPrefix}RECOVERY_GO nonce=${nonce}\n`);
       const clean = await endpoint.nextFrame(authorityRecoveryCleanTimeoutMs);
