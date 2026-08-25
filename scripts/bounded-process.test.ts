@@ -84,7 +84,9 @@ describe("bounded detached process groups", () => {
 
   test("authority proof consumes CLEAN before treating the direct helper exit as terminal", async () => {
     const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
-    const proofStart = source.indexOf("const cleanFrame = endpoint.nextFrame(remaining())");
+    const proofStart = source.indexOf(
+      "const cleanFrame = endpoint.nextFrame(remaining() + authorityLaunchProofSettlementMs)",
+    );
     const proofEnd = source.indexOf("const cleanExit = assertAuthorityCleanFrame", proofStart);
     const proof = source.slice(proofStart, proofEnd);
     const socketEndStart = source.indexOf('socket.once("end"');
@@ -143,6 +145,22 @@ describe("bounded detached process groups", () => {
     expect(write).toContain("error === undefined || error === null");
     expect(write).toContain("resolvePromise()");
     expect(write).toContain("rejectPromise(error)");
+  });
+
+  test("keeps cleanup-proof settlement outside the immutable native execution deadline", async () => {
+    const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
+    const runStart = source.indexOf("const runAuthorityBoundedProcess = async (");
+    const runEnd = source.indexOf("export const runBoundedProcess = async (", runStart);
+    const run = source.slice(runStart, runEnd);
+
+    expect(source).toContain("const authorityLaunchProofSettlementMs = 1_000");
+    expect(runStart).toBeGreaterThanOrEqual(0);
+    expect(runEnd).toBeGreaterThan(runStart);
+    expect(run).toContain(
+      "endpoint.nextFrame(remaining() + authorityLaunchProofSettlementMs)",
+    );
+    expect(run).toContain("endpoint.waitForEnd(authorityLaunchProofSettlementMs)");
+    expect(run).not.toContain("endpoint.waitForEnd(Math.min(1_000, remaining()))");
   });
 
   test("binds native recovery to its authenticated direct-child identity without reading sealed proc state", async () => {

@@ -3345,6 +3345,7 @@ const authorityHelperCleanupProven = (
 const authorityRecoveryReadyTimeoutMs = 2_000;
 const authorityRecoveryCleanTimeoutMs = 6_000;
 const authorityRecoveryExitMarginMs = 2_000;
+const authorityLaunchProofSettlementMs = 1_000;
 const authorityRecoveryChildCloseTimeoutMs = authorityRecoveryReadyTimeoutMs
   + authorityRecoveryCleanTimeoutMs
   + authorityRecoveryExitMarginMs;
@@ -4152,7 +4153,10 @@ const runAuthorityBoundedProcess = async (
       );
       child.stdin.end(request.stdin ?? "", "utf8");
 
-      const cleanFrame = endpoint.nextFrame(remaining());
+      // The native deadline ends target authority. Reaping PID 1, emitting
+      // CLEAN, closing the direct child, and control EOF necessarily settle
+      // just after that boundary, so proof gets a fixed non-authority margin.
+      const cleanFrame = endpoint.nextFrame(remaining() + authorityLaunchProofSettlementMs);
       const raced = await Promise.race([
         cleanFrame.then((frame) => ({ kind: "frame" as const, frame })),
         abortPromise.then((result) => ({ ...result, kind: "abort" as const })),
@@ -4164,7 +4168,7 @@ const runAuthorityBoundedProcess = async (
       }
       const cleanExit = assertAuthorityCleanFrame(raced.frame, nonce);
       const directExit = await childClose;
-      await endpoint.waitForEnd(Math.min(1_000, remaining()));
+      await endpoint.waitForEnd(authorityLaunchProofSettlementMs);
       endpoint.assertComplete();
       if (
         directExit.code !== cleanExit
