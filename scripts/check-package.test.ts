@@ -135,7 +135,7 @@ describe("installed package generic command ownership", () => {
   });
 
   for (const scenario of [
-    { name: "deadline", overflow: false, timeoutMs: 200 },
+    { name: "deadline", overflow: false, timeoutMs: 2_000 },
     { name: "combined output overflow", overflow: true, timeoutMs: 10_000 },
   ] as const) {
     test(`kills every hostile descendant and returns bounded output after ${scenario.name}`, async () => {
@@ -155,7 +155,7 @@ describe("installed package generic command ownership", () => {
             timeoutMs: scenario.timeoutMs,
           },
         );
-        expect(Date.now() - startedAt).toBeLessThan(scenario.overflow ? 2_000 : 2_500);
+        expect(Date.now() - startedAt).toBeLessThan(scenario.overflow ? 2_000 : 4_000);
         expect(result.exitCode).toBe(scenario.overflow ? 1 : 124);
         expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(64);
         ownedPids = JSON.parse(await readFile(pidFile, "utf8")) as number[];

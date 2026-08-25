@@ -51,6 +51,7 @@ import {
   canonicalDigest,
   parseDeployEvidenceFile,
   liveAcceptanceEvidenceDocumentSchema,
+  PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM,
   runtimeReleaseAttestationSchema,
   withSelfDigest,
   writeProtectedJsonNoReplace,
@@ -2483,7 +2484,11 @@ export const parseLiveAcceptanceEvidenceOutput = (
       } else {
         if (!/^[0-9]+$/u.test(value)) throw new LiveAcceptanceError("input_invalid");
         const descriptor = Number(value);
-        if (!Number.isSafeInteger(descriptor) || descriptor < 3 || descriptor > 255) {
+        if (
+          !Number.isSafeInteger(descriptor)
+          || descriptor < 3
+          || descriptor > PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM
+        ) {
           throw new LiveAcceptanceError("input_invalid");
         }
         evidenceOutput = { descriptor, kind: "descriptor" };

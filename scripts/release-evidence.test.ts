@@ -186,8 +186,16 @@ describe("protected release evidence custody", () => {
   test("writes a preopened empty protected descriptor and refuses a nonempty replay", async () => {
     const root = await makeRoot();
     const path = join(root, "descriptor.json");
-    const descriptor = openSync(path, "wx+", 0o600);
+    const heldDescriptors: number[] = [];
+    let descriptor = -1;
     try {
+      if (process.platform === "linux") {
+        do {
+          heldDescriptors.push(openSync("/dev/null", "r"));
+        } while (heldDescriptors.at(-1)! < 255);
+      }
+      descriptor = openSync(path, "wx+", 0o600);
+      if (process.platform === "linux") expect(descriptor).toBeGreaterThan(255);
       writeProtectedJsonToFd(descriptor, liveEvidence(), liveAcceptanceEvidenceDocumentSchema);
       expect(() => writeProtectedJsonToFd(
         descriptor,
@@ -195,7 +203,8 @@ describe("protected release evidence custody", () => {
         liveAcceptanceEvidenceDocumentSchema,
       )).toThrow("evidence_descriptor_not_empty");
     } finally {
-      closeSync(descriptor);
+      if (descriptor >= 0) closeSync(descriptor);
+      for (const heldDescriptor of heldDescriptors) closeSync(heldDescriptor);
     }
     expect(readProtectedJson(path, liveAcceptanceEvidenceDocumentSchema)).toEqual(liveEvidence());
   });

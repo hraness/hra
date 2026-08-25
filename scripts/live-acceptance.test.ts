@@ -478,12 +478,12 @@ describe("source-only live acceptance isolation", () => {
     });
     expect(parseLiveAcceptanceEvidenceOutput([
       "--evidence-fd",
-      "4",
+      "256",
       "--deploy-evidence",
       "/private/operator/candidate-deploy.json",
       "--scenario-stdin",
     ])).toEqual({
-      evidenceOutput: { descriptor: 4, kind: "descriptor" },
+      evidenceOutput: { descriptor: 256, kind: "descriptor" },
       deployEvidencePath: "/private/operator/candidate-deploy.json",
       scenarioArguments: ["--scenario-stdin"],
     });
@@ -491,6 +491,13 @@ describe("source-only live acceptance isolation", () => {
       "--scenario-stdin",
       "--evidence-fd",
       "2",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toThrow();
+    expect(() => parseLiveAcceptanceEvidenceOutput([
+      "--scenario-stdin",
+      "--evidence-fd",
+      "2147483648",
       "--deploy-evidence",
       "/private/operator/candidate-deploy.json",
     ])).toThrow();

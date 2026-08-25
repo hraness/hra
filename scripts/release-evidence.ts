@@ -33,6 +33,7 @@ export const HRA_VERCEL_PROJECT_ID = "prj_8ciIt9t9foE3utG45frRN7cxckjS" as const
 export const HRA_V0_VERCEL_PROJECT_ID = "prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr" as const;
 
 const maximumEvidenceBytes = 256 * 1024;
+export const PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM = 0x7fff_ffff;
 const commitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 const positiveIntegerSchema = z.number().int().positive().safe();
@@ -785,7 +786,11 @@ export const writeProtectedJsonToFd = <T>(
   value: T,
   schema: z.ZodType<T>,
 ): void => {
-  if (!Number.isSafeInteger(descriptor) || descriptor < 3 || descriptor > 255) {
+  if (
+    !Number.isSafeInteger(descriptor)
+    || descriptor < 3
+    || descriptor > PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM
+  ) {
     throw new ReleaseEvidenceError("evidence_descriptor_invalid");
   }
   const parsed = schema.safeParse(value);
