@@ -261,7 +261,7 @@ test("recovery validates both pidfd-bound identities before signaling the outer 
   );
 });
 
-test("recovery fails closed if either durable init identity is unavailable or mismatched", async () => {
+test("recovery binds the sealed init namespace while revalidating both process identities", async () => {
   const source = await supervisorSource();
   const identityStart = source.indexOf("fn verifyRecoveryIdentity(");
   const identityEnd = source.indexOf("fn verifyProcStartTime(", identityStart);
@@ -279,13 +279,14 @@ test("recovery fails closed if either durable init identity is unavailable or mi
   expect(source).toContain("RecoveryInitPidfdUnavailable");
   expect(source).toContain("RecoveryInitProcUnavailable");
   expect(source).toContain("RecoveryInitStartTimeMismatch");
-  expect(source).toContain("RecoveryInitNamespaceMismatch");
   expect(source).toContain("RecoveryInitNotLive");
   expect(source).toContain("RecoverySelfIdentityUnavailable");
   expect(identity).toContain("readProcStartTime(recovery.init_host_pid, error.RecoveryInitProcUnavailable)");
   expect(identity).toContain("init_start_time != recovery.init_start_time");
-  expect(identity).toContain("readPidNamespaceInode(recovery.init_host_pid, error.RecoveryInitProcUnavailable)");
-  expect(identity).toContain("init_namespace_inode != recovery.init_pid_namespace_inode");
+  expect(identity).not.toContain("readPidNamespaceInode(");
+  expect(source).not.toContain("RecoveryInitNamespaceMismatch");
+  expect(source).toContain("PID-namespace membership cannot change during a task's lifetime");
+  expect(source).toContain(".pid_namespace_inode = readPidNamespaceInode(linux.getpid(), error.InitNotReady)");
   expect(source).toContain("recovery_exit_timeout_ms: u64 = 5_000");
   expect(source).toContain("RECOVERY_CLEAN");
   expect(source).toContain("RECOVERY_READY nonce={s} recovery_pid={d} recovery_start_time={d} outer_pid={d} outer_start_time={d} init_host_pid={d} init_start_time={d} init_pid_namespace_inode={d}");

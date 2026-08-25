@@ -52,10 +52,13 @@
 //! exit is indeterminate and must block later authority work.
 //!
 //! Recovery never claims remote provider-effect rollback. It validates the
-//! recorded boot ID and start-time while holding a pidfd, signals only through
-//! that pidfd, and polls at most five seconds for both the local outer process
-//! and its exact namespace init to exit. A failed validation sends no signal.
-//! A post-signal timeout or wait failure remains indeterminate for the caller.
+//! recorded boot ID and both start times while holding both pidfds, signals
+//! only the exact outer pidfd, and polls at most five seconds for both local
+//! processes to exit. The sealed namespace init self-observes its immutable
+//! PID-namespace inode before READY; recovery carries that durable binding but
+//! deliberately does not attempt the cross-process proc readlink that Linux
+//! denies for a nondumpable init. A failed validation sends no signal. A
+//! post-signal timeout or wait failure remains indeterminate for the caller.
 //! Before RECOVERY_GO, HRA must verify recovery_pid and recovery_start_time
 //! against the freshly spawned direct recovery-helper child it owns.
 
@@ -129,7 +132,6 @@ const SupervisorError = error{
     RecoveryInitPidfdUnavailable,
     RecoveryInitProcUnavailable,
     RecoveryInitStartTimeMismatch,
-    RecoveryInitNamespaceMismatch,
     RecoveryInitNotLive,
     RecoverySignalFailed,
     RecoveryExitTimeout,
@@ -613,8 +615,10 @@ fn verifyRecoveryIdentity(recovery: RecoveryConfig) SupervisorError!void {
     try verifyProcStartTime(recovery.outer_pid, recovery.outer_start_time);
     const init_start_time = try readProcStartTime(recovery.init_host_pid, error.RecoveryInitProcUnavailable);
     if (init_start_time != recovery.init_start_time) return error.RecoveryInitStartTimeMismatch;
-    const init_namespace_inode = try readPidNamespaceInode(recovery.init_host_pid, error.RecoveryInitProcUnavailable);
-    if (init_namespace_inode != recovery.init_pid_namespace_inode) return error.RecoveryInitNamespaceMismatch;
+    // PID-namespace membership cannot change during a task's lifetime. The
+    // exact sealed init self-reported this inode before READY, and both pidfd +
+    // start-time checks above bind recovery to that same task. Do not weaken
+    // the init's nondumpable boundary just to repeat its proc readlink here.
 }
 
 fn verifyProcStartTime(expected_pid: linux.pid_t, expected_start_time: u64) SupervisorError!void {
@@ -1776,7 +1780,6 @@ fn errorCode(err: SupervisorError) []const u8 {
         error.RecoveryInitPidfdUnavailable => "recovery_init_pidfd_unavailable",
         error.RecoveryInitProcUnavailable => "recovery_init_proc_unavailable",
         error.RecoveryInitStartTimeMismatch => "recovery_init_start_time_mismatch",
-        error.RecoveryInitNamespaceMismatch => "recovery_init_namespace_mismatch",
         error.RecoveryInitNotLive => "recovery_init_not_live",
         error.RecoverySignalFailed => "recovery_signal_failed",
         error.RecoveryExitTimeout => "recovery_exit_timeout",

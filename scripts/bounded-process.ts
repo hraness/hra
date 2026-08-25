@@ -3074,22 +3074,16 @@ export const linuxProcessIdentityProvenGoneForTesting = (
   readStat: LinuxProcStatReader,
 ): boolean => linuxProcessIdentityProvenGone(pid, expectedStartTime, readStat);
 
-const readLinuxPidNamespaceInode = (pid: number): string | undefined => {
-  if (!safeLinuxPid(pid)) return undefined;
-  try {
-    const target = readlinkSync(`/proc/${String(pid)}/ns/pid`, "utf8");
-    const match = /^pid:\[([1-9][0-9]{0,19})\]$/u.exec(target);
-    const inode = match?.[1];
-    return inode !== undefined && safeUnsignedDecimal(inode) ? inode : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
 const verifyAuthorityLaunchIdentity = (
   identity: Extract<BoundedProcessRecoveryIdentity, { containment: "authority" }>,
   childPid: number | undefined,
 ): void => {
+  // The sealed namespace init self-observes its immutable PID-namespace inode
+  // from the fresh proc mount before READY. Both helpers are intentionally
+  // nondumpable, so Linux denies an external /proc/<pid>/ns/pid readlink. Bind
+  // that trusted assertion to the exact direct child, boot, PIDs, and start
+  // times here; native execution separately proves the target sees the same
+  // inode after GO.
   if (
     childPid === undefined
     || childPid !== identity.outer.pid
@@ -3097,8 +3091,6 @@ const verifyAuthorityLaunchIdentity = (
     || readLinuxBootId() !== identity.bootId
     || readLinuxProcessStartTime(identity.outer.pid) !== identity.outer.startTime
     || readLinuxProcessStartTime(identity.namespaceInit.pid) !== identity.namespaceInit.startTime
-    || readLinuxPidNamespaceInode(identity.namespaceInit.pid)
-      !== identity.namespaceInit.pidNamespaceInode
   ) throw new AuthorityControlProtocolError("launch_identity_invalid");
 };
 
@@ -3126,6 +3118,9 @@ const preparedAuthorityJournal = (
 ): AuthorityPreparedRecoveryJournal => {
   if (identity.bootId !== intent.custodyBootId) {
     throw new AuthorityControlProtocolError("ready_boot_identity_invalid");
+  }
+  if (identity.namespaceInit.pidNamespaceInode === intent.custodyPidNamespaceInode) {
+    throw new AuthorityControlProtocolError("ready_pid_namespace_identity_invalid");
   }
   return {
     architecture: intent.architecture,

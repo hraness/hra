@@ -132,6 +132,25 @@ describe("bounded detached process groups", () => {
     expect(source).not.toContain("openAuthorityArtifact?:");
   });
 
+  test("binds the sealed init namespace without a forbidden cross-process proc readlink", async () => {
+    const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
+    const verifyStart = source.indexOf("const verifyAuthorityLaunchIdentity = (");
+    const verifyEnd = source.indexOf("const authorityJournalIdentity = (", verifyStart);
+    const verify = source.slice(verifyStart, verifyEnd);
+
+    expect(verifyStart).toBeGreaterThanOrEqual(0);
+    expect(verifyEnd).toBeGreaterThan(verifyStart);
+    expect(verify).toContain("childPid !== identity.outer.pid");
+    expect(verify).toContain("readLinuxBootId() !== identity.bootId");
+    expect(verify).toContain("readLinuxProcessStartTime(identity.outer.pid)");
+    expect(verify).toContain("readLinuxProcessStartTime(identity.namespaceInit.pid)");
+    expect(verify).not.toContain("readlinkSync(");
+    expect(source).not.toContain("const readLinuxPidNamespaceInode =");
+    expect(source).toContain(
+      "identity.namespaceInit.pidNamespaceInode === intent.custodyPidNamespaceInode",
+    );
+  });
+
   test("publishes recovery journals only after an exact temporary write", async () => {
     const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
     const authorityReplacementStart = source.indexOf(

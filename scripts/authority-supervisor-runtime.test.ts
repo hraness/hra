@@ -386,6 +386,7 @@ test("authority supervisor holds a target behind GO", async () => {
   if (!isSupportedLinux()) return;
   const root = await makeRoot();
   const marker = join(root, "target-ran");
+  const parentPidNamespace = await readlink("/proc/self/ns/pid");
   const controlRoot = join(root, "process-recovery");
   await mkdir(controlRoot, { mode: 0o700 });
   const control = await ControlServer.start(controlRoot);
@@ -401,7 +402,7 @@ test("authority supervisor holds a target behind GO", async () => {
       "--",
       process.execPath,
       "-e",
-      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`,
+      `const fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(marker)}, fs.readlinkSync('/proc/self/ns/pid'))`,
     ], {
       cwd: root,
       env: process.env,
@@ -417,7 +418,9 @@ test("authority supervisor holds a target behind GO", async () => {
     const ready = await control.nextLine();
     expect(ready).toMatch(new RegExp(`^HRA_AUTHORITY_SUPERVISOR/1 READY nonce=${nonce} `));
     const monotonicMatch = ready.match(/ monotonic_ms=([1-9][0-9]*)$/u);
+    const namespaceMatch = ready.match(/ init_pid_namespace_inode=([1-9][0-9]*) /u);
     expect(monotonicMatch).not.toBeNull();
+    expect(namespaceMatch).not.toBeNull();
     await Bun.sleep(175);
     expect(await Bun.file(marker).exists()).toBeFalse();
     control.write(
@@ -427,7 +430,9 @@ test("authority supervisor holds a target behind GO", async () => {
     const clean = await control.nextLine();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
     await expect(closed).resolves.toEqual({ code: 0, signal: null });
-    expect(await Bun.file(marker).exists()).toBeTrue();
+    const targetPidNamespace = await readFile(marker, "utf8");
+    expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
+    expect(targetPidNamespace).not.toBe(parentPidNamespace);
   } finally {
     child?.kill("SIGKILL");
     await opened.close().catch(() => undefined);
@@ -548,7 +553,7 @@ test("authority runner kills detached descendants after normal completion", asyn
   const escapedMarker = join(root, "normal-escape-marker");
   const escaped = [
     "const { writeFileSync } = require('node:fs');",
-    `setTimeout(() => writeFileSync(${JSON.stringify(escapedMarker)}, 'escaped'), 750);`,
+    `setTimeout(() => writeFileSync(${JSON.stringify(escapedMarker)}, 'escaped'), 4_000);`,
     "setInterval(() => undefined, 1_000);",
   ].join(" ");
   const target = [
@@ -572,9 +577,42 @@ test("authority runner kills detached descendants after normal completion", asyn
     timeoutMs: 5_000,
   }, { recoveryDirectory });
   expect(result).toMatchObject({ cleanup: "proven", exitCode: 0, stdout: Buffer.from("received:hello\n") });
-  await Bun.sleep(1_000);
+  await Bun.sleep(4_250);
   expect(await Bun.file(escapedMarker).exists()).toBeFalse();
-});
+}, 15_000);
+
+test("authority recovery kills post-GO custody after output overflow", async () => {
+  if (!isSupportedLinux()) return;
+  const root = await makeRoot();
+  const recoveryDirectory = join(root, "process-recovery");
+  const escapedMarker = join(root, "overflow-escape-marker");
+  const escaped = [
+    "const { writeFileSync } = require('node:fs');",
+    `setTimeout(() => writeFileSync(${JSON.stringify(escapedMarker)}, 'escaped'), 4_000);`,
+    "setInterval(() => undefined, 1_000);",
+  ].join(" ");
+  const target = [
+    "const { spawn } = require('node:child_process');",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(escaped)}], { detached: true, stdio: 'ignore' });`,
+    "child.unref();",
+    "process.stdout.write('x'.repeat(8_192));",
+    "setInterval(() => undefined, 1_000);",
+  ].join(" ");
+  const result = await runBoundedProcess({
+    arguments: ["-e", target],
+    containment: "authority",
+    cwd: root,
+    environment: process.env,
+    executable: process.execPath,
+    outputMaximumBytes: 64,
+    phase: "authority-overflow-custody",
+    terminationGraceMs: 50,
+    timeoutMs: 5_000,
+  }, { recoveryDirectory });
+  expect(result).toMatchObject({ cleanup: "proven", exitCode: 1 });
+  await Bun.sleep(4_250);
+  expect(await Bun.file(escapedMarker).exists()).toBeFalse();
+}, 15_000);
 
 test("authority target cannot replace the journal lock or erase custody", async () => {
   if (!isSupportedLinux()) return;
@@ -683,4 +721,4 @@ test("authority runner recovers a timed-out detached descendant", async () => {
   expect(result).toMatchObject({ cleanup: "proven", exitCode: 124 });
   await Bun.sleep(4_250);
   expect(await Bun.file(escapedMarker).exists()).toBeFalse();
-});
+}, 10_000);
