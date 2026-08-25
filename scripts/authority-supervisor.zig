@@ -59,8 +59,10 @@
 //! deliberately does not attempt the cross-process proc readlink that Linux
 //! denies for a nondumpable init. A failed validation sends no signal. A
 //! post-signal timeout or wait failure remains indeterminate for the caller.
-//! Before RECOVERY_GO, HRA must verify recovery_pid and recovery_start_time
-//! against the freshly spawned direct recovery-helper child it owns.
+//! Before RECOVERY_GO, HRA must bind recovery_pid to the freshly spawned direct
+//! child it owns. The sealed, nonce-authenticated, nondumpable helper reports
+//! its own positive recovery_start_time; HRA binds RECOVERY_CLEAN to that exact
+//! pair, the child's zero exit, and complete control-channel EOF.
 
 const builtin = @import("builtin");
 const std = @import("std");

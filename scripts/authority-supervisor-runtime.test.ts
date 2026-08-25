@@ -21,6 +21,16 @@ const makeRoot = async (): Promise<string> => {
   return root;
 };
 
+const observeMarkers = async (
+  markers: Readonly<Record<string, string>>,
+): Promise<Record<string, string>> => {
+  const observed: Record<string, string> = {};
+  await Promise.all(Object.entries(markers).map(async ([name, path]) => {
+    observed[name] = await Bun.file(path).exists() ? await readFile(path, "utf8") : "missing";
+  }));
+  return observed;
+};
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async (root) => {
     await rm(root, { force: true, recursive: true });
@@ -546,11 +556,105 @@ test("authority supervisor rejects an inherited bind alias of its recovery direc
   }
 }, 12_000);
 
+test("authority runner preserves direct Bun stdin and stdout", async () => {
+  if (!isSupportedLinux()) return;
+  const root = await makeRoot();
+  const recoveryDirectory = join(root, "process-recovery");
+  const target = [
+    "let input = ''; process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => { input += chunk; });",
+    "process.stdin.on('end', () => process.stdout.write(`received:${input}`));",
+  ].join(" ");
+  const result = await runBoundedProcess({
+    arguments: ["-e", target],
+    containment: "authority",
+    cwd: root,
+    environment: process.env,
+    executable: process.execPath,
+    outputMaximumBytes: 4_096,
+    phase: "authority-direct-stdio",
+    stdin: "hello\n",
+    terminationGraceMs: 50,
+    timeoutMs: 5_000,
+  }, { recoveryDirectory });
+  expect(result).toMatchObject({
+    cleanup: "proven",
+    exitCode: 0,
+    stderr: Buffer.alloc(0),
+    stdout: Buffer.from("received:hello\n"),
+  });
+}, 10_000);
+
+test("authority runner supports a non-detached nested Bun spawn", async () => {
+  if (!isSupportedLinux()) return;
+  const root = await makeRoot();
+  const recoveryDirectory = join(root, "process-recovery");
+  const markers = {
+    before: join(root, "nested-before-marker"),
+    child: join(root, "nested-child-marker"),
+    close: join(root, "nested-close-marker"),
+    error: join(root, "nested-error-marker"),
+    returned: join(root, "nested-returned-marker"),
+    spawn: join(root, "nested-spawn-marker"),
+  } as const;
+  const nested = [
+    "const { writeFileSync } = require('node:fs');",
+    `writeFileSync(${JSON.stringify(markers.child)}, 'child');`,
+  ].join(" ");
+  const target = [
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    `writeFileSync(${JSON.stringify(markers.before)}, 'before');`,
+    "try {",
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(nested)}], { detached: false, stdio: 'ignore' });`,
+    `writeFileSync(${JSON.stringify(markers.returned)}, 'returned:' + String(child.pid));`,
+    `child.once('spawn', () => writeFileSync(${JSON.stringify(markers.spawn)}, 'spawn:' + String(child.pid)));`,
+    `child.once('error', (error) => { writeFileSync(${JSON.stringify(markers.error)}, 'error:' + String(error && error.code)); process.exitCode = 1; });`,
+    `child.once('close', (code, signal) => { writeFileSync(${JSON.stringify(markers.close)}, 'close:' + String(code) + ':' + String(signal)); process.stdout.write('nested:' + String(code) + ':' + String(signal)); });`,
+    `} catch (error) { writeFileSync(${JSON.stringify(markers.error)}, 'throw:' + String(error && error.code)); process.exitCode = 1; }`,
+  ].join(" ");
+  const result = await runBoundedProcess({
+    arguments: ["-e", target],
+    containment: "authority",
+    cwd: root,
+    environment: process.env,
+    executable: process.execPath,
+    outputMaximumBytes: 4_096,
+    phase: "authority-nested-spawn",
+    terminationGraceMs: 50,
+    timeoutMs: 5_000,
+  }, { recoveryDirectory });
+  await Bun.sleep(50);
+  const observedMarkers = await observeMarkers(markers);
+  expect({ markers: observedMarkers, result }).toMatchObject({
+    markers: {
+      before: "before",
+      child: "child",
+      close: "close:0:null",
+      error: "missing",
+      returned: expect.stringMatching(/^returned:[1-9][0-9]*$/u),
+      spawn: expect.stringMatching(/^spawn:[1-9][0-9]*$/u),
+    },
+    result: {
+      cleanup: "proven",
+      exitCode: 0,
+      stderr: Buffer.alloc(0),
+      stdout: Buffer.from("nested:0:null"),
+    },
+  });
+}, 10_000);
+
 test("authority runner kills detached descendants after normal completion", async () => {
   if (!isSupportedLinux()) return;
   const root = await makeRoot();
   const recoveryDirectory = join(root, "process-recovery");
   const escapedMarker = join(root, "normal-escape-marker");
+  const markers = {
+    before: join(root, "detached-before-marker"),
+    error: join(root, "detached-error-marker"),
+    returned: join(root, "detached-returned-marker"),
+    spawn: join(root, "detached-spawn-marker"),
+  } as const;
   const escaped = [
     "const { writeFileSync } = require('node:fs');",
     `setTimeout(() => writeFileSync(${JSON.stringify(escapedMarker)}, 'escaped'), 4_000);`,
@@ -558,7 +662,12 @@ test("authority runner kills detached descendants after normal completion", asyn
   ].join(" ");
   const target = [
     "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    `writeFileSync(${JSON.stringify(markers.before)}, 'before');`,
     `const child = spawn(process.execPath, ['-e', ${JSON.stringify(escaped)}], { detached: true, stdio: 'ignore' });`,
+    `writeFileSync(${JSON.stringify(markers.returned)}, 'returned:' + String(child.pid));`,
+    `child.once('spawn', () => writeFileSync(${JSON.stringify(markers.spawn)}, 'spawn:' + String(child.pid)));`,
+    `child.once('error', (error) => writeFileSync(${JSON.stringify(markers.error)}, 'error:' + String(error && error.code)));`,
     "child.unref();",
     "let input = ''; process.stdin.setEncoding('utf8');",
     "process.stdin.on('data', (chunk) => { input += chunk; });",
@@ -576,7 +685,20 @@ test("authority runner kills detached descendants after normal completion", asyn
     terminationGraceMs: 50,
     timeoutMs: 5_000,
   }, { recoveryDirectory });
-  expect(result).toMatchObject({ cleanup: "proven", exitCode: 0, stdout: Buffer.from("received:hello\n") });
+  await Bun.sleep(50);
+  const observedMarkers = await observeMarkers(markers);
+  expect({ markers: observedMarkers, result }).toMatchObject({
+    markers: {
+      before: "before",
+      error: "missing",
+      returned: expect.stringMatching(/^returned:[1-9][0-9]*$/u),
+    },
+    result: {
+      cleanup: "proven",
+      exitCode: 0,
+      stdout: Buffer.from("received:hello\n"),
+    },
+  });
   await Bun.sleep(4_250);
   expect(await Bun.file(escapedMarker).exists()).toBeFalse();
 }, 15_000);

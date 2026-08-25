@@ -110,7 +110,7 @@ describe("bounded detached process groups", () => {
     const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
     const validatorStart = source.indexOf("const assertAuthorityFailFrame = (");
     const validatorEnd = source.indexOf(
-      "const assertAuthorityRecoveryReadyFrame = (",
+      "const authorityRecoveryReadyIdentity = (",
       validatorStart,
     );
     const validator = source.slice(validatorStart, validatorEnd);
@@ -130,6 +130,36 @@ describe("bounded detached process groups", () => {
     );
     expect(branch).not.toContain("recoverCurrent()");
     expect(source).not.toContain("openAuthorityArtifact?:");
+  });
+
+  test("binds native recovery to its authenticated direct-child identity without reading sealed proc state", async () => {
+    const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
+    const validatorStart = source.indexOf("const authorityRecoveryReadyIdentity = (");
+    const validatorEnd = source.indexOf(
+      "const assertAuthorityRecoveryCleanFrame = (",
+      validatorStart,
+    );
+    const validator = source.slice(validatorStart, validatorEnd);
+    const recoveryStart = source.indexOf("const runAuthorityRecoveryHelperLocked = async (");
+    const recoveryEnd = source.indexOf(
+      "const assertAuthorityTransitionTemporaryFile = (",
+      recoveryStart,
+    );
+    const recovery = source.slice(recoveryStart, recoveryEnd);
+
+    expect(validatorStart).toBeGreaterThanOrEqual(0);
+    expect(validatorEnd).toBeGreaterThan(validatorStart);
+    expect(validator).toContain("const recoveryPid = parseFramePid(fields.recovery_pid)");
+    expect(validator).toContain(
+      "const recoveryStartTime = parseFrameUnsignedDecimal(fields.recovery_start_time)",
+    );
+    expect(validator).toContain("recoveryPid !== childPid");
+    expect(validator).toContain("return { pid: recoveryPid, startTime: recoveryStartTime }");
+    expect(recoveryStart).toBeGreaterThanOrEqual(0);
+    expect(recoveryEnd).toBeGreaterThan(recoveryStart);
+    expect(recovery).toContain("const recoveryPid = child.pid");
+    expect(recovery).toContain("authorityRecoveryReadyIdentity(");
+    expect(recovery).not.toContain("readLinuxProcessStartTime(recoveryPid)");
   });
 
   test("binds the sealed init namespace without a forbidden cross-process proc readlink", async () => {

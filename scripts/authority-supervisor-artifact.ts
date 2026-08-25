@@ -85,11 +85,11 @@ export const authoritySupervisorArtifactManifest = freezeAuthoritySupervisorArti
   },
   schemaVersion: 1,
   source: {
-    byteLength: 73_709,
+    byteLength: 73_870,
     maximumByteLength: 2 * 1024 * 1024,
     mode: 0o644,
     relativePath: sourceRelativePath,
-    sha256: "c60ce0ee5ee825caaff06da44eb3563cd35fa6732a10108c41a9a79a0e075b5a",
+    sha256: "a8911c16f3327230e5cd9dea0fa07cfa1fd760896ec43233b2423e01e71de680",
   },
 } as const satisfies AuthoritySupervisorArtifactManifest);
 

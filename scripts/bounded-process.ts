@@ -2728,12 +2728,12 @@ const assertAuthorityFailFrame = (
   return fields.code;
 };
 
-const assertAuthorityRecoveryReadyFrame = (
+const authorityRecoveryReadyIdentity = (
   frame: AuthorityControlFrame,
   nonce: string,
   identity: Extract<BoundedProcessRecoveryIdentity, { containment: "authority" }>,
-  recovery: Readonly<{ pid: number; startTime: string }>,
-): void => {
+  childPid: number,
+): Readonly<{ pid: number; startTime: string }> => {
   const fields = requireAuthorityFrame(frame, "RECOVERY_READY", [
     "init_host_pid",
     "init_pid_namespace_inode",
@@ -2744,10 +2744,11 @@ const assertAuthorityRecoveryReadyFrame = (
     "recovery_pid",
     "recovery_start_time",
   ]);
+  const recoveryPid = parseFramePid(fields.recovery_pid);
+  const recoveryStartTime = parseFrameUnsignedDecimal(fields.recovery_start_time);
   if (
     fields.nonce !== nonce
-    || parseFramePid(fields.recovery_pid) !== recovery.pid
-    || parseFrameUnsignedDecimal(fields.recovery_start_time) !== recovery.startTime
+    || recoveryPid !== childPid
     || parseFramePid(fields.outer_pid) !== identity.outer.pid
     || parseFrameUnsignedDecimal(fields.outer_start_time) !== identity.outer.startTime
     || parseFramePid(fields.init_host_pid) !== identity.namespaceInit.pid
@@ -2755,6 +2756,7 @@ const assertAuthorityRecoveryReadyFrame = (
     || parseFrameUnsignedDecimal(fields.init_pid_namespace_inode)
       !== identity.namespaceInit.pidNamespaceInode
   ) throw new AuthorityControlProtocolError("recovery_ready_identity_invalid");
+  return { pid: recoveryPid, startTime: recoveryStartTime };
 };
 
 const assertAuthorityRecoveryCleanFrame = (
@@ -3421,18 +3423,20 @@ const runAuthorityRecoveryHelperLocked = async (
         failureCode = assertAuthorityFailFrame(ready, nonce);
         throw new AuthorityControlProtocolError("recovery_helper_failed");
       }
-      // A validated FAIL does not need a live child identity. RECOVERY_READY
-      // does: the helper remains behind RECOVERY_GO while HRA binds its exact
-      // direct child PID and start time to the authenticated frame.
+      // The trusted helper reads its own immutable start time after becoming
+      // nondumpable and binds it to this authenticated channel. HRA can still
+      // prove the announced PID is its exact direct child without a forbidden
+      // cross-process /proc read, then binds RECOVERY_CLEAN to both values.
       const recoveryPid = child.pid;
-      const recoveryStartTime = recoveryPid === undefined
-        ? undefined
-        : readLinuxProcessStartTime(recoveryPid);
-      if (recoveryPid === undefined || recoveryStartTime === undefined) {
+      if (recoveryPid === undefined) {
         throw new AuthorityControlProtocolError("recovery_child_identity_unavailable");
       }
-      const recoveryIdentity = { pid: recoveryPid, startTime: recoveryStartTime } as const;
-      assertAuthorityRecoveryReadyFrame(ready, nonce, identity, recoveryIdentity);
+      const recoveryIdentity = authorityRecoveryReadyIdentity(
+        ready,
+        nonce,
+        identity,
+        recoveryPid,
+      );
       await endpoint.write(`${authorityProtocolPrefix}RECOVERY_GO nonce=${nonce}\n`);
       const clean = await endpoint.nextFrame(authorityRecoveryCleanTimeoutMs);
       if (clean.kind === "FAIL") {
