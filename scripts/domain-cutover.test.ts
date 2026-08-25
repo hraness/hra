@@ -40,11 +40,11 @@ const newStagingAlias = "try-hra.vercel.app";
 const oldEndpoint: CutoverEndpoint = {
   deploymentId: "dpl_ArchiveAccepted1234567890",
   deploymentUrl: "hra-v0-accepted-hraness.vercel.app",
-  generation: 0,
+  generation: 1,
   projectId: oldProjectId,
   repositoryId: oldRepositoryId,
-  sourceCommit: "1111111111111111111111111111111111111111",
-  version: "0.1.14",
+  sourceCommit: "443448b79e9016e00d52501f047fce3a408de092",
+  version: "0.1.15",
 };
 
 const newEndpoint: CutoverEndpoint = {
@@ -131,17 +131,17 @@ const markerFor = (endpoint: CutoverEndpoint): unknown => {
     schemaVersion: 2,
     source: { commit: endpoint.sourceCommit },
   };
-  return endpoint.generation === 0
+  return endpoint.projectId === oldProjectId
     ? {
         ...shared,
         publication: {
-          build: 15,
-          dmgSha256: "7ff49500de3d1fc768c17454ef7642c51f6662dfa5bf0e2ba183a85bb67fcd03",
-          publicationCommit: "6221f79b745f154882080936b961ff431569f33e",
-          releaseId: 374_980_441,
-          sourceCommit: "7b39c459827b2acf45aa2d911c94fdb5d4f37860",
-          tag: "v0.1.14",
-          tagObject: "37ed37afb39cacfd6a51044cf7f3c1b873571aa3",
+          build: 16,
+          dmgSha256: "120b600d7cc11df260836198601cba91db33efc7b600dd2b601bde686c9ea028",
+          publicationCommit: "d96173c3556799cb203a4d659f29856180838029",
+          releaseId: 376_100_700,
+          sourceCommit: "0c7764da0dea0a71bbccca817539a02d8e4284d0",
+          tag: `v${endpoint.version}`,
+          tagObject: "e5bcf5c919e8a7ffcdccc337b8940b60a70f0489",
           version: endpoint.version,
         },
       }
@@ -426,6 +426,9 @@ describe("domain cutover runbook", () => {
     expect(runbook).toContain("vercel curl / --deployment <deployment-id>");
     expect(runbook).toContain("publication.version");
     expect(runbook).toContain("top-level `version`");
+    expect(runbook).toContain("443448b79e9016e00d52501f047fce3a408de092");
+    expect(runbook).toContain("version `0.1.15`");
+    expect(runbook).toContain("rather than generation alone");
     expect(runbook).not.toContain("vercel curl / --deployment <deployment-id> --scope");
     expect(runbook).toContain("/v4/aliases/hra-weld.vercel.app");
     expect(runbook).toContain("/v4/aliases/try-hra.vercel.app");
@@ -1703,11 +1706,11 @@ describe("domain cutover operator", () => {
     );
   });
 
-  test("refuses generation-zero markers with a wrong schema or top-level-only version", async () => {
+  test("refuses HRA v0 markers with a wrong schema or top-level-only version", async () => {
     for (const value of [
       { ...markerFor(oldEndpoint) as object, schemaVersion: 1 },
       {
-        generation: 0,
+        generation: 1,
         product: "HRA",
         repository: {
           id: oldEndpoint.repositoryId,
@@ -1716,6 +1719,14 @@ describe("domain cutover operator", () => {
         schemaVersion: 2,
         source: { commit: oldEndpoint.sourceCommit },
         version: oldEndpoint.version,
+      },
+      {
+        ...markerFor(oldEndpoint) as object,
+        repository: { id: newRepositoryId, path: "hraness/hra" },
+      },
+      {
+        ...markerFor(oldEndpoint) as object,
+        repository: { id: oldRepositoryId, path: "hraness/hra" },
       },
     ]) {
       const provider = new FakeCutoverProvider(archivePlan);

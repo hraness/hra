@@ -76,11 +76,14 @@ const endpointSchema = z.object({
   const expectedRepository = endpoint.projectId === oldProjectId
     ? oldRepositoryId
     : newRepositoryId;
-  const expectedGeneration = endpoint.projectId === oldProjectId ? 0 : 1;
   if (endpoint.repositoryId !== expectedRepository) {
     context.addIssue({ code: "custom", message: "repository_project_mismatch" });
   }
-  if (endpoint.generation !== null && endpoint.generation !== expectedGeneration) {
+  if (
+    endpoint.generation !== null
+    && endpoint.projectId === newProjectId
+    && endpoint.generation !== 1
+  ) {
     context.addIssue({ code: "custom", message: "generation_project_mismatch" });
   }
 });
@@ -166,24 +169,26 @@ const domainsReadbackSchema = z.object({
   }
 });
 
-const markerRepositorySchema = z.object({
-  id: z.number().int().positive(),
-  path: z.string().min(1).max(200),
-}).strict();
 const markerSourceSchema = z.object({ commit: commitSchema }).strict();
-const markerSchema = z.discriminatedUnion("generation", [
+const markerSchema = z.union([
   z.object({
-    generation: z.literal(0),
+    generation: z.union([z.literal(0), z.literal(1)]),
     product: z.literal("HRA"),
     publication: z.object({ version: versionSchema }).passthrough(),
-    repository: markerRepositorySchema,
+    repository: z.object({
+      id: z.literal(oldRepositoryId),
+      path: z.literal("hraness/hra-v0"),
+    }).strict(),
     schemaVersion: z.literal(2),
     source: markerSourceSchema,
   }).strict(),
   z.object({
     generation: z.literal(1),
     product: z.literal("HRA"),
-    repository: markerRepositorySchema,
+    repository: z.object({
+      id: z.literal(newRepositoryId),
+      path: z.literal("hraness/hra"),
+    }).strict(),
     schemaVersion: z.literal(2),
     source: markerSourceSchema,
     version: versionSchema,
@@ -330,7 +335,7 @@ const markerMatches = (value: unknown, endpoint: CutoverEndpoint): boolean => {
   const parsed = markerSchema.safeParse(value);
   const expectedPath = endpoint.projectId === oldProjectId ? "hraness/hra-v0" : "hraness/hra";
   const markerVersion = parsed.success
-    ? parsed.data.generation === 0
+    ? "publication" in parsed.data
       ? parsed.data.publication.version
       : parsed.data.version
     : null;
