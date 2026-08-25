@@ -183,7 +183,7 @@ class ControlServer {
 
 const deadlineDriverSource = (artifactModuleUrl: string): string => `
 const { spawn } = require("node:child_process");
-const { chmodSync, mkdirSync, writeFileSync } = require("node:fs");
+const { chmodSync, existsSync, mkdirSync, writeFileSync } = require("node:fs");
 const { createServer } = require("node:net");
 const { join } = require("node:path");
 
@@ -251,14 +251,19 @@ void (async () => {
       if (error) { reject(error); return; }
       writeFileSync(goMarker, String(outerPid));
       if (mode === "parent") process.kill(process.pid, "SIGSTOP");
-      else if (mode === "outer") {
-        process.kill(outerPid, "SIGSTOP");
-        setTimeout(() => process.kill(outerPid, "SIGCONT"), 3000);
-      } else throw new Error("driver_stop_mode_invalid");
+      else if (mode !== "outer") throw new Error("driver_stop_mode_invalid");
       resolve();
     },
   ));
   helper.stdin.end();
+  if (mode === "outer") {
+    for (let attempt = 0; attempt < 250 && !existsSync(startedMarker); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!existsSync(startedMarker)) throw new Error("driver_target_start_timeout");
+    process.kill(outerPid, "SIGSTOP");
+    setTimeout(() => process.kill(outerPid, "SIGCONT"), 3000);
+  }
   const clean = await nextLine();
   const closed = await helperClosed;
   writeFileSync(resultMarker, JSON.stringify({ clean, closed }));
