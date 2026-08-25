@@ -65,6 +65,24 @@ describe("authority supervisor build verifier", () => {
       expect(workflow).toMatch(/verify-authority-supervisor-build\.ts\s+--zig/u);
       expect(workflow).toContain("authority-supervisor-runtime.test.ts --isolate --max-concurrency=1");
       expect(workflow).not.toContain("setup-zig");
+      const enable = workflow.indexOf(
+        "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
+      );
+      const probe = workflow.indexOf(
+        "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
+      );
+      const runtime = workflow.indexOf(
+        "authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
+      );
+      const repositoryGate = workflow.indexOf("run: bun run check");
+      const restore = workflow.indexOf(
+        "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
+      );
+      expect(enable).toBeGreaterThan(-1);
+      expect(enable).toBeLessThan(probe);
+      expect(probe).toBeLessThan(runtime);
+      expect(runtime).toBeLessThan(repositoryGate);
+      expect(repositoryGate).toBeLessThan(restore);
     }
   });
 });

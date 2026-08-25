@@ -65,6 +65,13 @@ jobs:
           bun ./scripts/verify-authority-supervisor-build.ts
           --zig "$RUNNER_TEMP/hra-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"
 
+      - name: Enable isolated user namespaces for native custody checks
+        run: |
+          test "$(/usr/sbin/sysctl --values kernel.unprivileged_userns_clone)" = "1"
+          sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "0"
+          /usr/bin/unshare --user --map-root-user --fork /usr/bin/true
+
       - name: Run Linux authority-supervisor custody test
         run: bun test scripts/authority-supervisor-runtime.test.ts --isolate --max-concurrency=1
 
@@ -129,6 +136,12 @@ jobs:
 
       - name: Run the repository gate
         run: bun run check
+
+      - name: Restore Ubuntu user-namespace restriction
+        if: ${{ always() }}
+        run: |
+          sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1
+          test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "1"
 
       - name: Pack the source artifact
         run: |
