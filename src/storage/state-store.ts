@@ -109,6 +109,14 @@ export type InteractionListPage = Readonly<{
   nextPosition: InteractionListPosition | null;
 }>;
 
+export type InteractionPersistenceBoundaryEffect = "known_unsent" | "possibly_sent";
+
+export type InteractionPersistenceBoundaryQuarantine = Readonly<{
+  focalInteraction: InteractionRecord;
+  profile: ProfileRecord;
+  terminalInteractions: readonly InteractionRecord[];
+}>;
+
 const profileRowSchema = z.object({
   id: profileIdSchema,
   label: labelSchema,
@@ -5935,6 +5943,82 @@ export class StateStore {
     return this.#readonly ? read() : read.immediate();
   }
 
+  #appendSessionEventInTransaction(input: Readonly<{
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    body: SessionEventBody;
+    recordedAt: number;
+  }>): SessionEvent {
+    const authority = z.object({
+      profile_id: profileIdSchema,
+      process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(this.#database.query(
+      `SELECT s.profile_id,p.process_generation
+       FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`,
+    ).get(input.sessionId));
+    if (
+      authority.profile_id !== input.accountId
+      || authority.process_generation !== input.providerGeneration
+    ) throw new Error("SESSION_EVENT_AUTHORITY_CHANGED");
+    this.#ensureSessionEventStream(input.sessionId);
+    const stream = z.object({
+      stream_epoch: z.string().uuid(),
+      next_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(this.#database.query(
+      "SELECT stream_epoch,next_sequence FROM session_event_streams WHERE session_id=?",
+    ).get(input.sessionId));
+    if (stream.next_sequence >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("SESSION_EVENT_SEQUENCE_EXHAUSTED");
+    }
+    const event = sessionEventSchema.parse({
+      version: 1,
+      sessionId: input.sessionId,
+      streamEpoch: stream.stream_epoch,
+      sequence: stream.next_sequence,
+      recordedAt: input.recordedAt,
+      accountId: input.accountId,
+      providerGeneration: input.providerGeneration,
+      providerConnectionId: input.providerConnectionId,
+      body: input.body,
+    });
+    const eventJson = JSON.stringify(event);
+    const eventBytes = new TextEncoder().encode(eventJson).byteLength;
+    if (eventBytes > SESSION_EVENT_MAX_BYTES) throw new Error("SESSION_EVENT_EXCEEDS_BOUND");
+    this.#database.query(
+      `INSERT INTO session_events(
+         session_id,stream_epoch,sequence,recorded_at,account_id,provider_generation,
+         provider_connection_id,event_json,event_bytes
+       ) VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      input.sessionId,
+      stream.stream_epoch,
+      stream.next_sequence,
+      input.recordedAt,
+      input.accountId,
+      input.providerGeneration,
+      input.providerConnectionId,
+      eventJson,
+      eventBytes,
+    );
+    const advanced = this.#database.query(
+      `UPDATE session_event_streams
+       SET next_sequence=?,observed_through_sequence=?,updated_at=MAX(updated_at,?)
+       WHERE session_id=? AND stream_epoch=? AND next_sequence=?`,
+    ).run(
+      stream.next_sequence + 1,
+      stream.next_sequence,
+      input.recordedAt,
+      input.sessionId,
+      stream.stream_epoch,
+      stream.next_sequence,
+    );
+    if (advanced.changes !== 1) throw new Error("SESSION_EVENT_SEQUENCE_AUTHORITY_CHANGED");
+    this.#applySessionEventRetention(input.sessionId, input.recordedAt);
+    return event;
+  }
+
   appendSessionEvent(input: {
     sessionId: SessionId;
     accountId: ProfileId;
@@ -5942,80 +6026,67 @@ export class StateStore {
     providerConnectionId: string | null;
     body: SessionEventBody;
   }): SessionEvent {
-    const sessionId = sessionIdSchema.parse(input.sessionId);
-    const accountId = profileIdSchema.parse(input.accountId);
-    const providerGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(input.providerGeneration);
-    const providerConnectionId = z.string().uuid().nullable().parse(input.providerConnectionId);
-    const body = sessionEventBodySchema.parse(input.body);
-    const recordedAt = unixMillisecondsSchema.parse(this.#now());
-    let event: SessionEvent | undefined;
-    const append = this.#database.transaction(() => {
-      const authority = z.object({
-        profile_id: profileIdSchema,
-        process_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-      }).strict().parse(this.#database.query(
-        `SELECT s.profile_id,p.process_generation
-         FROM sessions s JOIN profiles p ON p.id=s.profile_id WHERE s.id=?`,
-      ).get(sessionId));
-      if (authority.profile_id !== accountId || authority.process_generation !== providerGeneration) {
-        throw new Error("SESSION_EVENT_AUTHORITY_CHANGED");
-      }
-      this.#ensureSessionEventStream(sessionId);
-      const stream = z.object({
-        stream_epoch: z.string().uuid(),
-        next_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-      }).strict().parse(this.#database.query(
-        "SELECT stream_epoch,next_sequence FROM session_event_streams WHERE session_id=?",
-      ).get(sessionId));
-      if (stream.next_sequence >= Number.MAX_SAFE_INTEGER) throw new Error("SESSION_EVENT_SEQUENCE_EXHAUSTED");
-      event = sessionEventSchema.parse({
-        version: 1,
-        sessionId,
-        streamEpoch: stream.stream_epoch,
-        sequence: stream.next_sequence,
-        recordedAt,
-        accountId,
-        providerGeneration,
-        providerConnectionId,
-        body,
-      });
-      const eventJson = JSON.stringify(event);
-      const eventBytes = new TextEncoder().encode(eventJson).byteLength;
-      if (eventBytes > SESSION_EVENT_MAX_BYTES) throw new Error("SESSION_EVENT_EXCEEDS_BOUND");
-      this.#database.query(
-        `INSERT INTO session_events(
-           session_id,stream_epoch,sequence,recorded_at,account_id,provider_generation,
-           provider_connection_id,event_json,event_bytes
-         ) VALUES (?,?,?,?,?,?,?,?,?)`,
-      ).run(
-        sessionId,
-        stream.stream_epoch,
-        stream.next_sequence,
-        recordedAt,
-        accountId,
-        providerGeneration,
-        providerConnectionId,
-        eventJson,
-        eventBytes,
-      );
-      const advanced = this.#database.query(
-        `UPDATE session_event_streams
-         SET next_sequence=?,observed_through_sequence=?,updated_at=MAX(updated_at,?)
-         WHERE session_id=? AND stream_epoch=? AND next_sequence=?`,
-      ).run(
-        stream.next_sequence + 1,
-        stream.next_sequence,
-        recordedAt,
-        sessionId,
-        stream.stream_epoch,
-        stream.next_sequence,
-      );
-      if (advanced.changes !== 1) throw new Error("SESSION_EVENT_SEQUENCE_AUTHORITY_CHANGED");
-      this.#applySessionEventRetention(sessionId, recordedAt);
+    const parsed = {
+      sessionId: sessionIdSchema.parse(input.sessionId),
+      accountId: profileIdSchema.parse(input.accountId),
+      providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.providerGeneration),
+      providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
+      body: sessionEventBodySchema.parse(input.body),
+      recordedAt: unixMillisecondsSchema.parse(this.#now()),
+    };
+    const append = this.#database.transaction(
+      () => this.#appendSessionEventInTransaction(parsed),
+    );
+    return append.immediate();
+  }
+
+  #ensureInteractionStateEventInTransaction(
+    interaction: InteractionRecord,
+    recordedAt: number,
+  ): void {
+    if (interaction.sessionId === null) return;
+    const matching = this.#database.query(
+      `SELECT event_json FROM session_events
+       WHERE session_id=?
+         AND json_extract(event_json,'$.body.type')='interaction_state'
+         AND json_extract(event_json,'$.body.interactionId')=?
+         AND json_extract(event_json,'$.body.revision')=?
+       ORDER BY sequence LIMIT 2`,
+    ).all(interaction.sessionId, interaction.publicId, interaction.revision).map((value) =>
+      z.object({ event_json: z.string() }).strict().parse(value)
+    );
+    if (matching.length > 1) {
+      throw new Error("INTERACTION_STATE_EVENT_DUPLICATED");
+    }
+    const existing = matching[0];
+    if (existing !== undefined) {
+      const event = sessionEventSchema.parse(JSON.parse(existing.event_json) as unknown);
+      if (
+        event.sessionId !== interaction.sessionId
+        || event.accountId !== interaction.authority.profileId
+        || event.providerGeneration !== interaction.authority.processGeneration
+        || event.providerConnectionId !== interaction.authority.connectionId
+        || event.body.type !== "interaction_state"
+        || event.body.interactionId !== interaction.publicId
+        || event.body.state !== interaction.state
+        || event.body.revision !== interaction.revision
+      ) throw new Error("INTERACTION_STATE_EVENT_CONFLICT");
+      return;
+    }
+    this.#appendSessionEventInTransaction({
+      sessionId: interaction.sessionId,
+      accountId: interaction.authority.profileId,
+      providerGeneration: interaction.authority.processGeneration,
+      providerConnectionId: interaction.authority.connectionId,
+      body: {
+        type: "interaction_state",
+        interactionId: interaction.publicId,
+        state: interaction.state,
+        revision: interaction.revision,
+      },
+      recordedAt,
     });
-    append.immediate();
-    if (event === undefined) throw new Error("Session event append lost its durable result.");
-    return event;
   }
 
   maintainSessionEventRetention(sessionId: SessionId, now = this.#now()): SessionEventStreamPosition {
@@ -6525,6 +6596,114 @@ export class StateStore {
     responseDigest?: string;
   }): InteractionRecord {
     return this.#terminalizeInteraction({ ...input, state: "resolution_unknown" });
+  }
+
+  /**
+   * Atomically retires a provider generation after an interaction write crosses
+   * an uncertain local persistence boundary. The profile-wide settlement is
+   * intentional: advancing the generation leaves no publicly pending callback
+   * carrying the now-stale authority.
+   */
+  quarantineInteractionPersistenceBoundary(input: {
+    profileId: ProfileId;
+    processGeneration: number;
+    connectionId: string;
+    focalInteractionId: string;
+    effect: InteractionPersistenceBoundaryEffect;
+    responseDigest?: string;
+  }): InteractionPersistenceBoundaryQuarantine {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER - 1).parse(input.processGeneration);
+    const connectionId = z.string().uuid().parse(input.connectionId);
+    const focalInteractionId = z.string().uuid().parse(input.focalInteractionId);
+    const effect = z.enum(["known_unsent", "possibly_sent"]).parse(input.effect);
+    const responseDigest = input.responseDigest === undefined
+      ? undefined
+      : sha256Schema.parse(input.responseDigest);
+    const now = unixMillisecondsSchema.parse(this.#now());
+    const quarantine = this.#database.transaction((): InteractionPersistenceBoundaryQuarantine => {
+      const currentProfile = mapProfile(this.#database.query(
+        "SELECT * FROM profiles WHERE id=? AND state!='removed'",
+      ).get(profileId));
+      if (currentProfile.processGeneration !== processGeneration) {
+        throw new Error("INTERACTION_QUARANTINE_PROFILE_AUTHORITY_CHANGED");
+      }
+
+      const focal = this.#requireInteractionRow(focalInteractionId);
+      if (
+        focal.profile_id !== profileId
+        || focal.process_generation !== processGeneration
+        || focal.connection_id !== connectionId
+      ) throw new Error("INTERACTION_QUARANTINE_FOCAL_AUTHORITY_MISMATCH");
+      if (responseDigest !== undefined && focal.response_digest !== responseDigest) {
+        throw new Error("INTERACTION_QUARANTINE_RESPONSE_CONFLICT");
+      }
+      if (
+        effect === "known_unsent"
+        && focal.state === "response_written"
+      ) throw new Error("INTERACTION_QUARANTINE_EFFECT_MISMATCH");
+      const openRows = this.#database.query(
+        `SELECT * FROM provider_interactions
+         WHERE profile_id=? AND process_generation=?
+           AND state IN ('pending','response_prepared','response_written')
+         ORDER BY CASE WHEN public_id=? THEN 0 ELSE 1 END,requested_at,public_id`,
+      ).all(profileId, processGeneration, focalInteractionId);
+      const terminalInteractions: InteractionRecord[] = [];
+      for (const value of openRows) {
+        const current = interactionRowSchema.parse(value);
+        const terminalState = current.public_id === focalInteractionId
+          ? effect === "known_unsent" ? "expired" : "resolution_unknown"
+          : current.state === "pending" ? "expired" : "resolution_unknown";
+        const changed = this.#database.query(
+          `UPDATE provider_interactions
+           SET state=?,revision=revision+1,updated_at=MAX(updated_at,?),terminal_at=MAX(requested_at,?)
+           WHERE public_id=? AND revision=? AND state=?`,
+        ).run(
+          terminalState,
+          now,
+          now,
+          current.public_id,
+          current.revision,
+          current.state,
+        );
+        if (changed.changes !== 1) throw new Error("INTERACTION_QUARANTINE_TRANSITION_CONFLICT");
+        const terminal = this.#requireInteractionRow(current.public_id);
+        this.#recordInteractionTransition(terminal, now);
+        const interaction = mapInteraction(terminal);
+        this.#ensureInteractionStateEventInTransaction(interaction, now);
+        terminalInteractions.push(interaction);
+      }
+
+      const focalInteraction = terminalInteractions.find(
+        (interaction) => interaction.publicId === focalInteractionId,
+      ) ?? mapInteraction(focal);
+      if (focalInteraction.terminalAt === null) {
+        throw new Error("INTERACTION_QUARANTINE_FOCAL_NOT_TERMINAL");
+      }
+      this.#ensureInteractionStateEventInTransaction(focalInteraction, now);
+
+      const advanced = this.#database.query(
+        `UPDATE profiles SET process_generation=process_generation+1,updated_at=MAX(updated_at,?)
+         WHERE id=? AND process_generation=? AND state!='removed'`,
+      ).run(now, profileId, processGeneration);
+      if (advanced.changes !== 1) {
+        throw new Error("INTERACTION_QUARANTINE_PROFILE_AUTHORITY_CHANGED");
+      }
+      const profile = mapProfile(this.#database.query(
+        "SELECT * FROM profiles WHERE id=? AND state!='removed'",
+      ).get(profileId));
+      return {
+        focalInteraction,
+        profile,
+        terminalInteractions: terminalInteractions.some(
+          (interaction) => interaction.publicId === focalInteractionId,
+        )
+          ? terminalInteractions
+          : [focalInteraction, ...terminalInteractions],
+      };
+    });
+    return quarantine.immediate();
   }
 
   #terminalizeInteraction(input: {

@@ -7,6 +7,11 @@ import {
   parseAdmissionArguments,
 } from "./manage-hosted-admission";
 import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
+import {
   HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
@@ -94,6 +99,7 @@ describe("hosted auth admission operator", () => {
       mutationId,
       state: "frozen",
     }));
+    expect(requests.every((request) => request.containment === "authority")).toBe(true);
     expect(requests.every((request) => request.stdin === "")).toBe(true);
     expect(JSON.stringify(requests)).not.toContain("secret");
   });
@@ -207,5 +213,93 @@ describe("hosted auth admission operator", () => {
     expect(stdout).toEqual([]);
     expect(stderr.join("")).not.toContain("provider-secret");
     expect(stderr.join("")).toContain("provider_result_invalid");
+  });
+
+  test("surfaces cleanup uncertainty without invoking target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedAdmission({
+      arguments: ["status", ...targetArguments],
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessCleanupUnprovenError(
+          43_220,
+          "hosted-admission-read-before",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(75);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toMatchObject({
+      code: "process_cleanup_unproven",
+      phase: "hosted-admission-read-before",
+      status: "recovery_required",
+    });
+  });
+
+  test("preserves a blocked recovery journal without target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let verifications = 0;
+    const recoveryPath = "/private/operator/process-recovery/authority-admission.json";
+    expect(await executeHostedAdmission({
+      arguments: ["status", ...targetArguments],
+      runner: async () => {
+        throw new BoundedProcessRecoveryJournalError(
+          [recoveryPath],
+          "authority_recovery_required",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => {
+        verifications += 1;
+        if (verifications === 2) throw new Error("postflight target identity changed");
+      },
+    })).toBe(75);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_recovery_journal_blocked",
+      reason: "authority_recovery_required",
+      recoveryPaths: [recoveryPath],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
+  test("refuses an unavailable authority backend without invoking target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedAdmission({
+      arguments: ["status", ...targetArguments],
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessContainmentUnavailableError(
+          "authority_backend_unavailable",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(1);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "authority_containment_unavailable",
+      reason: "authority_backend_unavailable",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
   });
 });

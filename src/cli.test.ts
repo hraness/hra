@@ -705,6 +705,10 @@ describe("CLI entry point", () => {
     const captured = capture();
     expect(await main(["--help"], captured.output)).toBe(0);
     expect(captured.read().stdout).toContain("hra session");
+    expect(captured.read().stdout).toContain("Usage:\n  hra\n");
+    expect(captured.read().stdout).toContain("--json                    Emit one versioned JSON result");
+    expect(captured.read().stdout).toContain("hra device list|pair|approve|revoke|key-loss");
+    expect(captured.read().stdout).toContain("Run bare `hra` in a TTY to start the persistent agent-and-human shell.");
     expect(captured.read().stderr).toBe("");
 
     const group = capture();
@@ -1269,6 +1273,60 @@ describe("CLI entry point", () => {
     expect(captured.read().stderr).toBe("");
   });
 
+  test("jsonl and follow intent keep malformed invocations machine-readable on stderr", async () => {
+    for (const argv of [
+      ["session", "events", "release", "--jsonl", "--wait-ms", "0"],
+      ["account", "list", "--follow"],
+    ]) {
+      const captured = capture();
+      expect(await main(argv, captured.output)).toBe(2);
+      expect(captured.read().stdout).toBe("");
+      expect(captured.read().stderr.trim().split("\n")).toHaveLength(1);
+      expect(JSON.parse(captured.read().stderr)).toMatchObject({
+        error: { code: "INVALID_INPUT" },
+        ok: false,
+        version: 1,
+      });
+      expect(captured.read().stderr).not.toContain("Usage:");
+    }
+  });
+
+  test("rejects malformed command-specific success data as INVALID_RESPONSE", async () => {
+    const secret = "PRIVATE-MALFORMED-DEVICE-RESPONSE";
+    const json = capture();
+    expect(await main(["device", "list", "--json"], json.output, {
+      callDaemon: () => Promise.resolve({
+        data: { devices: [{ encryptedLabel: secret }] },
+        ok: true,
+        requestId: "018bcfe5-6800-7000-8000-000000000799",
+        version: 1,
+      }),
+    })).toBe(1);
+    expect(json.read().stderr).toBe("");
+    expect(JSON.parse(json.read().stdout)).toMatchObject({
+      error: {
+        code: "INVALID_RESPONSE",
+        message: "The HRA daemon returned an invalid response for this command.",
+      },
+      ok: false,
+      version: 1,
+    });
+    expect(json.read().stdout).not.toContain(secret);
+
+    const human = capture();
+    expect(await main(["device", "list"], human.output, {
+      callDaemon: () => Promise.resolve({
+        data: { devices: [{ encryptedLabel: secret }] },
+        ok: true,
+        requestId: "018bcfe5-6800-7000-8000-000000000799",
+        version: 1,
+      }),
+    })).toBe(1);
+    expect(human.read().stdout).toBe("");
+    expect(human.read().stderr).toBe("hra: The HRA daemon returned an invalid response for this command.\n");
+    expect(human.read().stderr).not.toContain(secret);
+  });
+
   test("version is sourced from package metadata", async () => {
     const captured = capture();
     expect(await main(["--version"], captured.output)).toBe(0);
@@ -1295,7 +1353,37 @@ describe("CLI entry point", () => {
           ok: true,
           version: 1,
           requestId: "018bcfe5-6800-7000-8000-000000000778",
-          data: { accepted: true },
+          data: {
+            interaction: {
+              version: 1,
+              id: interaction,
+              sessionId: null,
+              kind: "user_input",
+              state: "response_written",
+              revision: 6,
+              blocking: true,
+              display: {
+                kind: "user_input",
+                summary: "Answer recorded",
+                blocking: true,
+                questions: [{
+                  id: "question_1",
+                  header: "Question",
+                  question: "Provide an answer.",
+                  options: null,
+                  allowsOther: true,
+                  secret: true,
+                }],
+              },
+              responseRecorded: true,
+              context: { turnId: null, itemId: null },
+              requestedAt: 1_000,
+              deadlineAt: 61_000,
+              updatedAt: 2_000,
+              terminalAt: null,
+            },
+            responseWritten: true,
+          },
         });
       },
       isTerminalDescriptor: () => false,
@@ -3095,6 +3183,61 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("pre-initialization commands require init without creating daemon state", async () => {
+    const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4c";
+    const runRoot = await realpath(
+      await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)),
+    );
+    const installation = createAcceptanceInstallation({
+      device: "a",
+      documentsDirectory: join(runRoot, "project-a-first-run"),
+      expectedHomeDirectory: process.env.HOME ?? "/missing-home",
+      rootDirectory: join(runRoot, "device-a-first-run"),
+      runId,
+      type: "hra-live-acceptance-device",
+      version: 1,
+    });
+    let daemonStarts = 0;
+    const input = {
+      installation,
+      startDaemon: async () => { daemonStarts += 1; },
+    };
+    try {
+      for (const argv of [
+        ["account", "add", "Personal", "--json"],
+        ["doctor", "--json"],
+        ["project", "list", "--json"],
+        ["daemon", "start", "--json"],
+      ] as const) {
+        const captured = capture();
+        expect(await main(argv, captured.output, input)).toBe(6);
+        expect(JSON.parse(captured.read().stdout)).toEqual({
+          error: {
+            code: "INTERACTION_REQUIRED",
+            details: { nextCommand: "hra init --yes" },
+            message: "Initialize HRA before starting its daemon.",
+          },
+          ok: false,
+          version: 1,
+        });
+        expect(captured.read().stderr).toBe("");
+        expect(daemonStarts).toBe(0);
+        await expect(lstat(installation.paths.database)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+
+      const initialized = capture();
+      expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
+      expect(JSON.parse(initialized.read().stdout)).toMatchObject({
+        data: { defaultProjectCreated: true, initialized: true },
+        ok: true,
+        version: 1,
+      });
+      expect((await lstat(installation.paths.database)).isFile()).toBe(true);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
   test("stops only after the acknowledged authority is exactly released and gives the request a bounded five-second response window", async () => {
     const captured = capture();
     let deadlineMs = 0;
@@ -3755,7 +3898,7 @@ describe("CLI entry point", () => {
         ok: true,
         data: {
           healthy: false,
-          problems: ["No project directory is configured. Run `hra init --yes` or add a project."],
+          problems: ["No project directory is configured. Run `hra init --yes`."],
           state: {
             database: "ready",
             initialized: false,

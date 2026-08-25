@@ -74,7 +74,8 @@ export default defineSchema({
   })
     .index("by_email", ["emailDigest"])
     .index("by_expires_at", ["expiresAt"])
-    .index("by_user", ["userId"]),
+    .index("by_user", ["userId"])
+    .index("by_user_and_expires_at", ["userId", "expiresAt"]),
   authInvites: defineTable({
     admissionExpiresAt: v.optional(v.number()),
     boundAt: v.optional(v.number()),

@@ -314,7 +314,46 @@ describe("persistent shell live observation", () => {
     expect(rendered).toContain(`Interaction required: user input ${interactionId}`);
     expect(rendered).toContain("revision 3, blocking");
     expect(rendered).toContain("Choose a release channel");
+    expect(rendered).toContain(`Show: /interaction show ${interactionId}`);
+    expect(rendered).toContain(`Resolve: /answer ${interactionId} --revision 3`);
     expect(rendered).not.toContain("protected-answer-must-not-render");
+  });
+
+  test("renders exact kind-specific show, inspection, and resolution commands", async () => {
+    let rendered = "";
+    const never = new Promise<CommandResponse>(() => undefined);
+    const observer = new ShellLiveObserver({
+      callDaemon: () => never,
+      write: (value) => { rendered += value; },
+    });
+    const interactions = [
+      ["70000000-0000-4000-8000-000000000011", "command_approval"],
+      ["70000000-0000-4000-8000-000000000012", "file_change_approval"],
+      ["70000000-0000-4000-8000-000000000013", "permission_approval"],
+      ["70000000-0000-4000-8000-000000000014", "mcp_elicitation"],
+    ] as const;
+    await observer.select({
+      session: sessionOne,
+      statusData: status(sessionOne, "c0", interactions.map(([id, kind], index) => ({
+        id,
+        kind,
+        state: "pending",
+        revision: index + 4,
+        blocking: true,
+        display: { summary: `Resolve ${kind}` },
+      }))),
+    });
+    await observer.stop();
+
+    for (const [id] of interactions) {
+      expect(rendered).toContain(`Show: /interaction show ${id}`);
+    }
+    expect(rendered).toContain(`/inspect ${interactions[0][0]} --revision 4`);
+    expect(rendered).toContain(`/approve ${interactions[0][0]} --revision 4`);
+    expect(rendered).toContain(`Resolve safely: /decline ${interactions[1][0]} --revision 5`);
+    expect(rendered).toContain(`/inspect ${interactions[2][0]} --revision 6`);
+    expect(rendered).toContain(`/grant ${interactions[2][0]} --revision 6`);
+    expect(rendered).toContain(`/submit ${interactions[3][0]} --revision 7 --action accept`);
   });
 
   test("drains every pending interaction page before following from the status event cursor", async () => {

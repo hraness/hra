@@ -17,6 +17,11 @@ import {
 } from "../src/cloud/inviteAuthority";
 
 import type { CapabilitySink } from "./bootstrap-hosted-sync";
+import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
 import {
   ConvexTargetError,
@@ -246,6 +251,7 @@ describe("hosted friend-beta invitation operator", () => {
       target.deploymentName,
     ]);
     expect(requests[0]).toMatchObject({
+      containment: "authority",
       outputMaximumBytes: 65_536,
       stdin: "",
       timeoutMs: 60_000,
@@ -663,5 +669,125 @@ describe("hosted friend-beta invitation operator", () => {
       "Hosted invite operator refused (invite_revoke_result_invalid).\n",
     ]);
     expect(stderr.join("")).not.toContain(capability);
+  });
+
+  test("surfaces cleanup uncertainty without invoking target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedInviteOperator({
+      arguments: ["status", ...targetArguments, "--public-id", publicId],
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessCleanupUnprovenError(
+          43_221,
+          "hosted-invite-status-read",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(75);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toMatchObject({
+      code: "process_cleanup_unproven",
+      phase: "hosted-invite-status-read",
+      status: "recovery_required",
+    });
+  });
+
+  test("surfaces blocked recovery journals without provider postflight or downgrade", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let verifications = 0;
+    expect(await executeHostedInviteOperator({
+      arguments: ["status", ...targetArguments, "--public-id", publicId],
+      runner: async () => {
+        throw new BoundedProcessRecoveryJournalError(
+          ["/private/operator/process-recovery/authority-fixture.json"],
+          "authority_recovery_required",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => {
+        verifications += 1;
+        if (verifications === 2) throw new Error("postflight target identity changed");
+      },
+    })).toBe(75);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_recovery_journal_blocked",
+      reason: "authority_recovery_required",
+      recoveryPaths: ["/private/operator/process-recovery/authority-fixture.json"],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
+  test("retains a committed invite capability when its provider journal blocks", async () => {
+    const sink = makeFakeSink();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let verifications = 0;
+    const inviteOutput = "/protected/operator/friend.invite";
+    const recoveryPath = "/private/operator/process-recovery/authority-invite.json";
+    expect(await executeHostedInviteOperator({
+      arguments: ["issue", ...targetArguments, "--invite-output", inviteOutput],
+      authorityFactory: async () => authority,
+      reserve: async () => sink.sink,
+      runner: async () => {
+        throw new BoundedProcessRecoveryJournalError(
+          [recoveryPath],
+          "authority_recovery_required",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(75);
+    expect(verifications).toBe(1);
+    expect(sink.commits()).toEqual([capability]);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_recovery_journal_blocked",
+      reason: "authority_recovery_required",
+      recoveryPaths: [recoveryPath, inviteOutput],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
+  test("refuses an unavailable authority backend without invoking target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedInviteOperator({
+      arguments: ["status", ...targetArguments, "--public-id", publicId],
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessContainmentUnavailableError(
+          "authority_unsupported_platform",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(1);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "authority_containment_unavailable",
+      reason: "authority_unsupported_platform",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
   });
 });

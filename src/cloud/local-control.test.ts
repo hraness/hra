@@ -3,6 +3,8 @@ import { describe, expect, test } from "bun:test";
 import type { CloudTransport } from "./client";
 import {
   isRecord,
+  parseAccountKeyStatus,
+  parseCloudDeviceList,
   parseEncryptedEnvelope,
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
@@ -13,6 +15,7 @@ import {
   IdentityScopedCloudSecretCustody,
 } from "./identity-custody";
 import {
+  AccountKeyLossPreconditionError,
   createLocalCloudControlFromEnvironment,
   createCloudUuidV7,
   deploymentFencedCloudTransport,
@@ -80,6 +83,7 @@ class MemoryCustody implements CloudSecretCustodyPort {
 
 type FakeDevice = {
   activatedAt?: number;
+  credentialGeneration?: number;
   encryptedLabel: EncryptedEnvelope;
   keyVersion: number;
   publicId: string;
@@ -278,6 +282,7 @@ class FakeCloud {
           }
           const device: FakeDevice = {
             ...(status === "active" ? { activatedAt: fixedNow } : {}),
+            credentialGeneration: 1,
             encryptedLabel: args.encryptedLabel as EncryptedEnvelope,
             keyVersion: 1,
             publicId: args.publicId,
@@ -448,6 +453,7 @@ class FakeCloud {
             device: device === undefined
               ? null
               : {
+                credentialGeneration: device.credentialGeneration ?? 1,
                 keyVersion: device.keyVersion,
                 publicId: device.publicId,
                 revision: device.revision,
@@ -464,10 +470,11 @@ class FakeCloud {
             encryptedLabel: device.encryptedLabel,
             keyVersion: device.keyVersion,
             lastSeenAt: fixedNow,
-            online: true,
+            online: device.status !== "revoked",
             publicId: device.publicId,
             revision: device.revision,
             status: device.status,
+            userPublicId: this.userPublicId,
             wrappingPublicKey: device.wrappingPublicKey,
           }));
           if (name === "devices:get") {
@@ -487,6 +494,7 @@ class FakeCloud {
             continueCursor: String(next),
             isDone: next >= records.length,
             page,
+            userPublicId: this.userPublicId,
           };
         }
         if (name === "devices:listKeyEnvelopes") {
@@ -564,14 +572,70 @@ function control(
   cloud: FakeCloud,
   custody: MemoryCustody,
   now: () => number = () => fixedNow,
+  deviceLabel?: string,
 ): LocalCloudControl {
   return new LocalCloudControl({
     deploymentAuthority: testDeploymentAuthority,
     deploymentUrl: testDeploymentUrl,
+    ...(deviceLabel === undefined ? {} : { deviceLabel }),
     now,
     secretCustody: custody,
     transport: cloud.connect(),
   });
+}
+
+type QueryInterceptor = Readonly<{
+  afterQuery: (
+    name: Parameters<CloudTransport["query"]>[0],
+    args: Parameters<CloudTransport["query"]>[1],
+    value: unknown,
+  ) => Promise<unknown>;
+}>;
+
+function interceptQueries(
+  transport: CloudTransport,
+  current: { value: QueryInterceptor | null },
+): CloudTransport {
+  return {
+    action: async (name, args) => await transport.action(name, args),
+    mutation: async (name, args) => await transport.mutation(name, args),
+    query: async (name, args) => {
+      const value = await transport.query(name, args);
+      return current.value === null
+        ? value
+        : await current.value.afterQuery(name, args, value);
+    },
+  };
+}
+
+async function registeredIdentityControl(
+  cloud: FakeCloud,
+  raw: MemoryCustody,
+): Promise<Readonly<{
+  control: LocalCloudControl;
+  interceptor: { value: QueryInterceptor | null };
+  scoped: IdentityScopedCloudSecretCustody;
+}>> {
+  const unbound = await IdentityScopedCloudSecretCustody.open(raw);
+  const authenticating = new LocalCloudControl({
+    deploymentAuthority: testDeploymentAuthority,
+    deploymentUrl: testDeploymentUrl,
+    now: () => fixedNow,
+    secretCustody: unbound,
+    transport: cloud.connect(),
+  });
+  await authenticate(authenticating);
+  const scoped = await IdentityScopedCloudSecretCustody.open(raw);
+  const interceptor: { value: QueryInterceptor | null } = { value: null };
+  const active = new LocalCloudControl({
+    deploymentAuthority: testDeploymentAuthority,
+    deploymentUrl: testDeploymentUrl,
+    now: () => fixedNow,
+    secretCustody: scoped,
+    transport: interceptQueries(cloud.connect(), interceptor),
+  });
+  await active.ensureDeviceRegistered(signal);
+  return { control: active, interceptor, scoped };
 }
 
 async function authenticate(adapter: LocalCloudControl): Promise<void> {
@@ -639,7 +703,354 @@ function expectSignedOutCustody(custody: MemoryCustody): void {
   });
 }
 
+function expectStablePublicDevice(
+  response: unknown,
+  expected: Readonly<{
+    keyVersion: number;
+    publicId: string;
+    revision: number;
+    status: "pending" | "active" | "revoked";
+  }>,
+): void {
+  if (!isRecord(response)) throw new Error("missing public device response fixture");
+  expect(response.device).toEqual(expected);
+  expect(JSON.stringify(response)).not.toContain("credentialGeneration");
+}
+
 describe("local cloud control", () => {
+  test("parses the exact closed public account-key status union", () => {
+    const statuses = [
+      { keyVersion: 3, status: "ready" },
+      {
+        ifNoHolder: "unrecoverable",
+        recovery: "existing_key_holder_required",
+        status: "pairing_required",
+      },
+      {
+        evidence: "operator_confirmed_no_key_holders",
+        status: "unrecoverable",
+      },
+    ] as const;
+    for (const status of statuses) expect(parseAccountKeyStatus(status)).toEqual(status);
+    for (const status of [
+      { keyVersion: 0, status: "ready" },
+      { keyVersion: 1, status: "ready", unexpected: true },
+      { recovery: "existing_key_holder_required", status: "pairing_required" },
+      { evidence: "inferred_from_missing_key", status: "unrecoverable" },
+      { status: "regenerated" },
+    ]) expect(parseAccountKeyStatus(status)).toBeNull();
+  });
+
+  test("accepts current credential authority while keeping every public device DTO stable", async () => {
+    const cloud = new FakeCloud();
+    const adapter = control(cloud, new MemoryCustody());
+    await authenticate(adapter);
+
+    const registration = await adapter.ensureDeviceRegistered(signal);
+    if (!isRecord(registration) || !isRecord(registration.device)) {
+      throw new Error("missing first-device registration fixture");
+    }
+    const publicId = registration.device.publicId;
+    if (typeof publicId !== "string") throw new Error("invalid first-device public ID fixture");
+    const expected = {
+      keyVersion: 1,
+      publicId,
+      revision: 1,
+      status: "active" as const,
+    };
+    expectStablePublicDevice(registration, expected);
+
+    const stored = cloud.devices.get(publicId);
+    if (stored === undefined) throw new Error("missing current credential-generation fixture");
+    stored.credentialGeneration = 7;
+
+    expectStablePublicDevice(await adapter.ensureDeviceRegistered(signal), expected);
+    expectStablePublicDevice(await adapter.pairDevice(signal), expected);
+    expectStablePublicDevice(await adapter.status(signal), expected);
+    expect(await adapter.auth({ email: "reader@example.com", signal })).toEqual({
+      codeRequestedOrRejected: true,
+      signedIn: false,
+    });
+    expectStablePublicDevice(await adapter.auth({
+      code: "12345678",
+      email: "reader@example.com",
+      signal,
+    }), expected);
+  });
+
+  test("normalizes an omitted legacy credential generation through first registration reconciliation", async () => {
+    const cloud = new FakeCloud();
+    let activeAccountResponses = 0;
+    const interceptor: { value: QueryInterceptor | null } = {
+      value: {
+        afterQuery: async (name, _args, value) => {
+          if (
+            name !== "account:current"
+            || !isRecord(value)
+            || !isRecord(value.device)
+          ) return value;
+          activeAccountResponses += 1;
+          if (activeAccountResponses % 2 === 0) return value;
+          const legacyDevice = { ...value.device };
+          delete legacyDevice.credentialGeneration;
+          return { ...value, device: legacyDevice };
+        },
+      },
+    };
+    const adapter = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: new MemoryCustody(),
+      transport: interceptQueries(cloud.connect(), interceptor),
+    });
+    await authenticate(adapter);
+
+    const registration = await adapter.ensureDeviceRegistered(signal);
+    if (!isRecord(registration) || !isRecord(registration.device)) {
+      throw new Error("missing legacy registration fixture");
+    }
+    const publicId = registration.device.publicId;
+    if (typeof publicId !== "string") throw new Error("invalid legacy public ID fixture");
+    const expected = {
+      keyVersion: 1,
+      publicId,
+      revision: 1,
+      status: "active" as const,
+    };
+    expectStablePublicDevice(registration, expected);
+    expectStablePublicDevice(await adapter.status(signal), expected);
+    expect(activeAccountResponses).toBeGreaterThanOrEqual(3);
+  });
+
+  test("rejects malformed credential generations from the account producer", async () => {
+    const fixture = await registeredIdentityControl(new FakeCloud(), new MemoryCustody());
+    for (const malformed of [undefined, null, 0, -1, 1.5, "1", true]) {
+      fixture.interceptor.value = {
+        afterQuery: async (name, _args, value) => {
+          if (
+            name !== "account:current"
+            || !isRecord(value)
+            || !isRecord(value.device)
+          ) return value;
+          return {
+            ...value,
+            device: { ...value.device, credentialGeneration: malformed },
+          };
+        },
+      };
+      await expect(fixture.control.status(signal))
+        .rejects.toThrow("Cloud account response is invalid.");
+    }
+  });
+
+  test("rejects credential-generation drift under otherwise identical account authority", async () => {
+    const cloud = new FakeCloud();
+    const fixture = await registeredIdentityControl(cloud, new MemoryCustody());
+    let accountReads = 0;
+    fixture.interceptor.value = {
+      afterQuery: async (name, _args, value) => {
+        if (
+          name !== "account:current"
+          || !isRecord(value)
+          || !isRecord(value.device)
+        ) return value;
+        accountReads += 1;
+        if (accountReads === 1) {
+          const stored = [...cloud.devices.values()][0];
+          if (stored === undefined) throw new Error("missing authority-drift fixture");
+          stored.credentialGeneration = (stored.credentialGeneration ?? 1) + 1;
+        }
+        return value;
+      },
+    };
+
+    await expect(fixture.control.status(signal))
+      .rejects.toThrow("Cloud account operation authority changed.");
+    expect(accountReads).toBeGreaterThanOrEqual(2);
+  });
+
+  test("uses a stable privacy-safe automatic device label and returns no ciphertext", async () => {
+    const cloud = new FakeCloud();
+    const adapter = control(cloud, new MemoryCustody());
+    await authenticate(adapter);
+    const paired = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const listed = await adapter.listDevices(signal);
+    const parsed = parseCloudDeviceList(listed);
+    expect(parsed).not.toBeNull();
+    expect(parsed).toEqual({
+      currentDevicePublicId: paired.device.publicId,
+      devices: [{
+        activatedAt: fixedNow,
+        current: true,
+        keyVersion: 1,
+        label: `HRA device ${paired.device.publicId.slice(-8)}`,
+        labelSource: "encrypted",
+        lastSeenAt: fixedNow,
+        online: true,
+        publicId: paired.device.publicId,
+        revision: 1,
+        status: "active",
+      }],
+    });
+    expect(JSON.stringify(listed)).not.toContain("encryptedLabel");
+    expect(JSON.stringify(listed)).not.toContain("ciphertext");
+  });
+
+  test("decrypts only labels under the current account key and uses explicit state fallbacks", async () => {
+    const cloud = new FakeCloud();
+    const first = control(cloud, new MemoryCustody(), () => fixedNow, "Studio Mac");
+    const second = control(cloud, new MemoryCustody(), () => fixedNow, "Travel Mac");
+    await authenticate(first);
+    const firstPair = await first.pairDevice(signal) as { device: { publicId: string } };
+    await authenticate(second);
+    const secondPair = await second.pairDevice(signal) as { device: { publicId: string } };
+
+    const pending = parseCloudDeviceList(await first.listDevices(signal));
+    expect(pending).not.toBeNull();
+    expect(pending?.devices.find((device) => device.publicId === firstPair.device.publicId))
+      .toMatchObject({ label: "Studio Mac", labelSource: "encrypted" });
+    expect(pending?.devices.find((device) => device.publicId === secondPair.device.publicId))
+      .toMatchObject({
+        label: `Pending device ${secondPair.device.publicId.slice(-8)}`,
+        labelSource: "fallback",
+      });
+
+    await first.approveDevice(secondPair.device.publicId, deviceMutationKey(), signal);
+    await second.pairDevice(signal);
+    const active = parseCloudDeviceList(await second.listDevices(signal));
+    expect(active?.devices.find((device) => device.publicId === firstPair.device.publicId))
+      .toMatchObject({ label: "Studio Mac", labelSource: "encrypted" });
+    expect(active?.devices.find((device) => device.publicId === secondPair.device.publicId))
+      .toMatchObject({
+        label: `This device ${secondPair.device.publicId.slice(-8)}`,
+        labelSource: "fallback",
+      });
+  });
+
+  test("contains authenticated-label corruption as a deterministic fallback", async () => {
+    const cloud = new FakeCloud();
+    const adapter = control(cloud, new MemoryCustody(), () => fixedNow, "Trusted label");
+    await authenticate(adapter);
+    const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
+    const stored = cloud.devices.get(pair.device.publicId);
+    if (stored === undefined) throw new Error("missing device fixture");
+    const ciphertext = stored.encryptedLabel.ciphertext;
+    cloud.devices.set(stored.publicId, {
+      ...stored,
+      encryptedLabel: {
+        ...stored.encryptedLabel,
+        ciphertext: `${ciphertext.slice(0, -1)}${ciphertext.endsWith("A") ? "B" : "A"}`,
+      },
+    });
+    expect(await adapter.listDevices(signal)).toMatchObject({
+      devices: [{
+        current: true,
+        label: `This device ${pair.device.publicId.slice(-8)}`,
+        labelSource: "fallback",
+      }],
+    });
+  });
+
+  test("rejects a status read when identity authority changes from A to B in flight", async () => {
+    const raw = new MemoryCustody();
+    const cloud = new FakeCloud("user_identity_a");
+    const fixture = await registeredIdentityControl(cloud, raw);
+    let switched = false;
+    fixture.interceptor.value = {
+      afterQuery: async (name, _args, value) => {
+        if (name === "account:current" && !switched) {
+          switched = true;
+          await fixture.scoped.activateIdentity("user_identity_b");
+        }
+        return value;
+      },
+    };
+
+    await expect(fixture.control.status(signal))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    expect(switched).toBe(true);
+  });
+
+  test("rejects a device list after an A to B to A identity-selector cycle", async () => {
+    const raw = new MemoryCustody();
+    const cloud = new FakeCloud("user_identity_a");
+    const fixture = await registeredIdentityControl(cloud, raw);
+    let cycled = false;
+    fixture.interceptor.value = {
+      afterQuery: async (name, _args, value) => {
+        if (name === "devices:listPage" && !cycled) {
+          cycled = true;
+          await fixture.scoped.activateIdentity("user_identity_b");
+          const identityB = await IdentityScopedCloudSecretCustody.open(raw);
+          await identityB.activateIdentity("user_identity_a");
+        }
+        return value;
+      },
+    };
+
+    await expect(fixture.control.listDevices(signal))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    expect(cycled).toBe(true);
+    expect((await IdentityScopedCloudSecretCustody.open(raw)).activeUserPublicId)
+      .toBe("user_identity_a");
+  });
+
+  test("rejects a foreign-authority second device page before projection", async () => {
+    const raw = new MemoryCustody();
+    const cloud = new FakeCloud("user_identity_a");
+    const fixture = await registeredIdentityControl(cloud, raw);
+    const template = [...cloud.devices.values()][0];
+    if (template === undefined) throw new Error("missing registered device fixture");
+    for (let index = 0; index < 100; index += 1) {
+      const publicId = `device_${String(index).padStart(24, "0")}`;
+      cloud.devices.set(publicId, { ...template, publicId });
+    }
+    let pageCalls = 0;
+    fixture.interceptor.value = {
+      afterQuery: async (name, _args, value) => {
+        if (name !== "devices:listPage") return value;
+        pageCalls += 1;
+        if (pageCalls !== 2 || !isRecord(value) || !Array.isArray(value.page)) return value;
+        const page = value.page as unknown[];
+        return {
+          ...value,
+          page: page.map((entry) => isRecord(entry)
+            ? { ...entry, userPublicId: "user_identity_b" }
+            : entry),
+          userPublicId: "user_identity_b",
+        };
+      },
+    };
+
+    await expect(fixture.control.listDevices(signal))
+      .rejects.toThrow("Cloud device page changed account authority.");
+    expect(pageCalls).toBe(2);
+  });
+
+  test("rejects a same-value auth rewrite during a device page", async () => {
+    const raw = new MemoryCustody();
+    const cloud = new FakeCloud("user_identity_a");
+    const fixture = await registeredIdentityControl(cloud, raw);
+    let rewritten = false;
+    fixture.interceptor.value = {
+      afterQuery: async (name, _args, value) => {
+        if (name === "devices:listPage" && !rewritten) {
+          const auth = raw.values.get("cloud-auth");
+          if (auth === undefined) throw new Error("missing auth fixture");
+          const committed = await raw.compareAndSwap("cloud-auth", auth.generation, auth.value);
+          if (committed === null) throw new Error("failed to rewrite auth fixture");
+          rewritten = true;
+        }
+        return value;
+      },
+    };
+
+    await expect(fixture.control.listDevices(signal))
+      .rejects.toThrow("Cloud auth changed during account identity binding.");
+    expect(rewritten).toBe(true);
+  });
+
   test("rejects a non-UUIDv7 caller key before a device mutation can reach cloud state", async () => {
     const cloud = new FakeCloud();
     const adapter = control(cloud, new MemoryCustody());
@@ -824,6 +1235,7 @@ describe("local cloud control", () => {
       email: "reader@example.com",
       signal,
     })).toEqual({
+      accountKey: null,
       automaticRegistrationPending: true,
       daemonRestartRequired: true,
       device: null,
@@ -1227,12 +1639,347 @@ describe("local cloud control", () => {
     });
     expect(accountKeyIsProvisional(pendingCustody)).toBe(true);
     expect(await pending.status(signal)).toMatchObject({
+      accountKey: {
+        ifNoHolder: "unrecoverable",
+        recovery: "existing_key_holder_required",
+        status: "pairing_required",
+      },
       automaticRegistrationPending: false,
       pairingRequired: true,
     });
     expect(await pending.pairDevice(signal)).toMatchObject({ paired: true });
     expect(accountKey(pendingCustody)).toEqual(accountKey(firstCustody));
-    expect(await pending.status(signal)).toMatchObject({ pairingRequired: false });
+    expect(await pending.status(signal)).toMatchObject({
+      accountKey: { keyVersion: 1, status: "ready" },
+      pairingRequired: false,
+    });
+  });
+
+  test("acknowledges key loss locally, isolates A to B to A custody, and yields to a recovered real key", async () => {
+    const cloudA = new FakeCloud("user_identity_a");
+    const holderA = control(cloudA, new MemoryCustody());
+    await authenticate(holderA);
+    await holderA.ensureDeviceRegistered(signal);
+
+    const cloudB = new FakeCloud("user_identity_b");
+    const holderB = control(cloudB, new MemoryCustody());
+    await authenticate(holderB);
+    await holderB.ensureDeviceRegistered(signal);
+
+    const raw = new MemoryCustody();
+    const unboundA = await IdentityScopedCloudSecretCustody.open(raw);
+    const authenticatingA = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: unboundA,
+      transport: cloudA.connect(),
+    });
+    await authenticate(authenticatingA);
+    const scopedA = await IdentityScopedCloudSecretCustody.open(raw);
+    const installationATransport = cloudA.connect();
+    const installationA = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: scopedA,
+      transport: installationATransport,
+    });
+    const registrationA = await installationA.ensureDeviceRegistered(signal) as {
+      device: { publicId: string };
+    };
+    await holderA.approveDevice(registrationA.device.publicId, deviceMutationKey(), signal);
+    await installationA.ensureDeviceRegistered(signal);
+
+    let transportCalls = 0;
+    const zeroTransport: CloudTransport = {
+      action: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected account-key acknowledgement transport action");
+      },
+      mutation: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected account-key acknowledgement transport mutation");
+      },
+      query: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected account-key acknowledgement transport query");
+      },
+    };
+    const localOnlyA = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: scopedA,
+      transport: zeroTransport,
+    });
+    await expect(localOnlyA.acknowledgeNoAccountKeyHolders(signal))
+      .rejects.toMatchObject({
+        code: "observation_missing",
+        name: "AccountKeyLossPreconditionError",
+      });
+    expect(transportCalls).toBe(0);
+
+    expect(await installationA.status(signal)).toMatchObject({
+      accountKey: { status: "pairing_required" },
+      pairingRequired: true,
+    });
+
+    let failBAccountQuery = true;
+    cloudB.beforeAccountCurrentReturn = async () => {
+      if (!failBAccountQuery) return;
+      failBAccountQuery = false;
+      throw new Error("lost B account response after token commit");
+    };
+    const failedHandoffToB = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: scopedA,
+      transport: cloudB.connect(),
+    });
+    await expect(failedHandoffToB.auth({ email: "reader@example.com", signal }))
+      .resolves.toEqual({ codeRequestedOrRejected: true, signedIn: false });
+    await expect(failedHandoffToB.auth({
+      code: "12345678",
+      email: "reader@example.com",
+      signal,
+    })).rejects.toThrow("lost B account response after token commit");
+    expect((await IdentityScopedCloudSecretCustody.open(raw)).activeUserPublicId)
+      .toBe("user_identity_a");
+    await expect(localOnlyA.acknowledgeNoAccountKeyHolders(signal))
+      .rejects.toMatchObject({
+        code: "auth_identity_unbound",
+        name: "AccountKeyLossPreconditionError",
+      });
+    expect(transportCalls).toBe(0);
+
+    await expect(installationA.auth({ email: "reader@example.com", signal }))
+      .resolves.toEqual({ codeRequestedOrRejected: true, signedIn: false });
+    await expect(installationA.auth({
+      code: "12345678",
+      email: "reader@example.com",
+      signal,
+    })).resolves.toMatchObject({
+      accountKey: { status: "pairing_required" },
+      signedIn: true,
+    });
+    expect(await localOnlyA.acknowledgeNoAccountKeyHolders(signal)).toEqual({
+      acknowledgedNoKeyHolders: true,
+      accountKey: {
+        evidence: "operator_confirmed_no_key_holders",
+        status: "unrecoverable",
+      },
+      localOnly: true,
+      replay: false,
+    });
+    expect(transportCalls).toBe(0);
+    expect(await localOnlyA.acknowledgeNoAccountKeyHolders(signal)).toMatchObject({
+      accountKey: { status: "unrecoverable" },
+      replay: true,
+    });
+    expect(transportCalls).toBe(0);
+    expect(await installationA.status(signal)).toMatchObject({
+      accountKey: {
+        evidence: "operator_confirmed_no_key_holders",
+        status: "unrecoverable",
+      },
+      pairingRequired: true,
+    });
+
+    await scopedA.activateIdentity("user_identity_b");
+    const scopedB = await IdentityScopedCloudSecretCustody.open(raw);
+    const installationB = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: scopedB,
+      transport: cloudB.connect(),
+    });
+    await authenticate(installationB);
+    const registrationB = await installationB.ensureDeviceRegistered(signal) as {
+      device: { publicId: string };
+    };
+    await holderB.approveDevice(registrationB.device.publicId, deviceMutationKey(), signal);
+    await installationB.ensureDeviceRegistered(signal);
+    expect(await installationB.status(signal)).toMatchObject({
+      accountKey: { status: "pairing_required" },
+    });
+
+    await scopedB.activateIdentity("user_identity_a");
+    const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
+    const reopenedA = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      now: () => fixedNow,
+      secretCustody: returnedA,
+      transport: installationATransport,
+    });
+    expect(await reopenedA.auth({ email: "reader@example.com", signal }))
+      .toEqual({ codeRequestedOrRejected: true, signedIn: false });
+    expect(await reopenedA.auth({
+      code: "12345678",
+      email: "reader@example.com",
+      signal,
+    })).toMatchObject({
+      accountKey: { status: "unrecoverable" },
+      signedIn: true,
+    });
+    expect(await reopenedA.status(signal)).toMatchObject({
+      accountKey: { status: "unrecoverable" },
+    });
+
+    await reopenedA.pairDevice(signal);
+    expect(await reopenedA.status(signal)).toMatchObject({
+      accountKey: { keyVersion: 1, status: "ready" },
+      pairingRequired: false,
+    });
+  });
+
+  test("does not treat a usable stale v1 key as readiness for a v2 recovery authority", async () => {
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const adapter = control(cloud, custody);
+    await authenticate(adapter);
+    const registered = await adapter.ensureDeviceRegistered(signal) as {
+      device: { publicId: string };
+    };
+    const device = cloud.devices.get(registered.device.publicId);
+    if (device === undefined) throw new Error("missing registered device fixture");
+    device.keyVersion = 2;
+
+    expect(await adapter.status(signal)).toMatchObject({
+      accountKey: { status: "pairing_required" },
+      pairingRequired: true,
+    });
+    const staleKey = JSON.parse(
+      custody.values.get("cloud-account-key")?.value ?? "null",
+    ) as { keyVersion?: unknown };
+    expect(staleKey.keyVersion).toBe(1);
+
+    expect(await adapter.acknowledgeNoAccountKeyHolders(signal)).toMatchObject({
+      acknowledgedNoKeyHolders: true,
+      accountKey: { status: "unrecoverable" },
+      replay: false,
+    });
+    const state = JSON.parse(custody.values.get("cloud-state")?.value ?? "null") as {
+      accountKeyRecovery?: { keyVersion?: unknown; status?: unknown };
+    };
+    expect(state.accountKeyRecovery).toMatchObject({
+      keyVersion: 2,
+      status: "unrecoverable",
+    });
+  });
+
+  test("validates recovery authority before reading corrupt account-key custody", async () => {
+    const missingCloud = new FakeCloud();
+    const missingCustody = new MemoryCustody();
+    const missing = control(missingCloud, missingCustody);
+    await authenticate(missing);
+    await missing.ensureDeviceRegistered(signal);
+    const missingKey = missingCustody.values.get("cloud-account-key");
+    if (missingKey === undefined) throw new Error("missing account-key fixture");
+    missingCustody.values.set("cloud-account-key", {
+      generation: missingKey.generation + 1,
+      value: "{corrupt",
+    });
+    await expect(missing.acknowledgeNoAccountKeyHolders(signal))
+      .rejects.toMatchObject({
+        code: "observation_missing",
+        name: "AccountKeyLossPreconditionError",
+      });
+
+    const observedCloud = new FakeCloud();
+    const observedCustody = new MemoryCustody();
+    const observed = control(observedCloud, observedCustody);
+    await authenticate(observed);
+    const registered = await observed.ensureDeviceRegistered(signal) as {
+      device: { publicId: string };
+    };
+    const device = observedCloud.devices.get(registered.device.publicId);
+    if (device === undefined) throw new Error("missing registered device fixture");
+    device.keyVersion = 2;
+    await observed.status(signal);
+    const recoveryBefore = observedCustody.values.get("cloud-state");
+    const observedKey = observedCustody.values.get("cloud-account-key");
+    if (recoveryBefore === undefined || observedKey === undefined) {
+      throw new Error("missing recovery fixture");
+    }
+    observedCustody.values.set("cloud-account-key", {
+      generation: observedKey.generation + 1,
+      value: "{corrupt",
+    });
+    await expect(observed.acknowledgeNoAccountKeyHolders(signal))
+      .rejects.toThrow("Cloud account-key custody is corrupt.");
+    expect(observedCustody.values.get("cloud-state")).toEqual(recoveryBefore);
+  });
+
+  test("closes signed-out, unregistered, and already-ready key-loss preconditions without transport", async () => {
+    let transportCalls = 0;
+    const zeroTransport: CloudTransport = {
+      action: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected key-loss transport action");
+      },
+      mutation: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected key-loss transport mutation");
+      },
+      query: async () => {
+        transportCalls += 1;
+        throw new Error("unexpected key-loss transport query");
+      },
+    };
+    const signedOut = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      secretCustody: new MemoryCustody(),
+      transport: zeroTransport,
+    });
+    const signedOutFailure = await signedOut.acknowledgeNoAccountKeyHolders(signal)
+      .catch((error: unknown) => error);
+    expect(signedOutFailure).toBeInstanceOf(AccountKeyLossPreconditionError);
+    expect(signedOutFailure).toMatchObject({ code: "signed_out" });
+
+    const cloud = new FakeCloud();
+    const custody = new MemoryCustody();
+    const online = control(cloud, custody);
+    await authenticate(online);
+    const localOnly = new LocalCloudControl({
+      deploymentAuthority: testDeploymentAuthority,
+      deploymentUrl: testDeploymentUrl,
+      secretCustody: custody,
+      transport: zeroTransport,
+    });
+    const unregisteredFailure = await localOnly.acknowledgeNoAccountKeyHolders(signal)
+      .catch((error: unknown) => error);
+    expect(unregisteredFailure).toBeInstanceOf(AccountKeyLossPreconditionError);
+    expect(unregisteredFailure).toMatchObject({ code: "device_unregistered" });
+
+    const registered = await online.ensureDeviceRegistered(signal) as {
+      device: { publicId: string };
+    };
+    const currentState = custody.values.get("cloud-state");
+    custody.values.set("cloud-state", {
+      generation: (currentState?.generation ?? -1) + 1,
+      value: JSON.stringify({
+        accountKeyRecovery: {
+          authEpoch: 1,
+          devicePublicId: registered.device.publicId,
+          keyVersion: 1,
+          observedAt: fixedNow,
+          status: "pairing_required",
+          userPublicId,
+        },
+        lastSync: null,
+        version: 2,
+      }),
+    });
+    const readyFailure = await localOnly.acknowledgeNoAccountKeyHolders(signal)
+      .catch((error: unknown) => error);
+    expect(readyFailure).toBeInstanceOf(AccountKeyLossPreconditionError);
+    expect(readyFailure).toMatchObject({ code: "already_ready" });
+    expect(transportCalls).toBe(0);
   });
 
   test("automatically resolves simultaneous first registration without duplicate authority", async () => {

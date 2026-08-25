@@ -49,6 +49,41 @@ export type CommandState =
 
 export type SyncStream = "compact" | "detail";
 
+export type AccountKeyStatus =
+  | Readonly<{
+      keyVersion: number;
+      status: "ready";
+    }>
+  | Readonly<{
+      ifNoHolder: "unrecoverable";
+      recovery: "existing_key_holder_required";
+      status: "pairing_required";
+    }>
+  | Readonly<{
+      evidence: "operator_confirmed_no_key_holders";
+      status: "unrecoverable";
+    }>;
+
+export type CloudDeviceListLabelSource = "encrypted" | "fallback";
+
+export type CloudDeviceListEntry = Readonly<{
+  activatedAt?: number;
+  current: boolean;
+  keyVersion: number;
+  label: string;
+  labelSource: CloudDeviceListLabelSource;
+  lastSeenAt: number | null;
+  online: boolean;
+  publicId: string;
+  revision: number;
+  status: "pending" | "active" | "revoked";
+}>;
+
+export type CloudDeviceList = Readonly<{
+  currentDevicePublicId: string;
+  devices: readonly CloudDeviceListEntry[];
+}>;
+
 export type CloudProjectionRecoveryAdmissionFailure =
   | "identity_or_session_conflict"
   | "idempotency_authority_invalid"
@@ -112,6 +147,78 @@ export function isDigest(value: unknown): value is string {
 
 export function isOpaqueIdentifier(value: unknown): value is string {
   return typeof value === "string" && opaqueIdentifierPattern.test(value);
+}
+
+export function parseCloudDeviceList(value: unknown): CloudDeviceList | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, ["currentDevicePublicId", "devices"])
+    || !isOpaqueIdentifier(value.currentDevicePublicId)
+    || !Array.isArray(value.devices)
+    || value.devices.length < 1
+    || value.devices.length > 5_000
+  ) return null;
+  const devices: CloudDeviceListEntry[] = [];
+  const publicIds = new Set<string>();
+  let currentCount = 0;
+  for (const candidate of value.devices) {
+    if (!isRecord(candidate)) return null;
+    const required = [
+      "current",
+      "keyVersion",
+      "label",
+      "labelSource",
+      "lastSeenAt",
+      "online",
+      "publicId",
+      "revision",
+      "status",
+    ];
+    const keys = candidate.activatedAt === undefined ? required : [...required, "activatedAt"];
+    if (
+      !hasExactKeys(candidate, keys)
+      || typeof candidate.current !== "boolean"
+      || !isSafePositiveInteger(candidate.keyVersion)
+      || typeof candidate.label !== "string"
+      || candidate.label.length < 1
+      || candidate.label.length > 160
+      || candidate.label !== candidate.label.trim()
+      || new TextEncoder().encode(candidate.label).byteLength > 640
+      || containsAbsolutePath(candidate.label)
+      || (candidate.labelSource !== "encrypted" && candidate.labelSource !== "fallback")
+      || (candidate.lastSeenAt !== null && !isFiniteTimestamp(candidate.lastSeenAt))
+      || typeof candidate.online !== "boolean"
+      || (candidate.online && candidate.lastSeenAt === null)
+      || !isOpaqueIdentifier(candidate.publicId)
+      || !isSafePositiveInteger(candidate.revision)
+      || (candidate.status !== "pending"
+        && candidate.status !== "active"
+        && candidate.status !== "revoked")
+      || (candidate.status === "revoked" && candidate.online)
+      || (candidate.activatedAt !== undefined && !isFiniteTimestamp(candidate.activatedAt))
+      || candidate.current !== (candidate.publicId === value.currentDevicePublicId)
+      || (candidate.current && candidate.status !== "active")
+      || publicIds.has(candidate.publicId)
+    ) return null;
+    publicIds.add(candidate.publicId);
+    if (candidate.current) currentCount += 1;
+    devices.push({
+      ...(typeof candidate.activatedAt === "number"
+        ? { activatedAt: candidate.activatedAt }
+        : {}),
+      current: candidate.current,
+      keyVersion: candidate.keyVersion,
+      label: candidate.label,
+      labelSource: candidate.labelSource,
+      lastSeenAt: candidate.lastSeenAt,
+      online: candidate.online,
+      publicId: candidate.publicId,
+      revision: candidate.revision,
+      status: candidate.status,
+    });
+  }
+  if (currentCount !== 1) return null;
+  return { currentDevicePublicId: value.currentDevicePublicId, devices };
 }
 
 export function isUuidV7(value: unknown): value is string {
@@ -203,6 +310,34 @@ export function parseWrappedKeyEnvelope(value: unknown): WrappedKeyEnvelope | nu
     keyVersion: value.keyVersion,
     nonce: value.nonce,
   };
+}
+
+export function parseAccountKeyStatus(value: unknown): AccountKeyStatus | null {
+  if (!isRecord(value) || typeof value.status !== "string") return null;
+  switch (value.status) {
+    case "ready":
+      return hasExactKeys(value, ["keyVersion", "status"])
+        && isSafePositiveInteger(value.keyVersion)
+        ? { keyVersion: value.keyVersion, status: value.status }
+        : null;
+    case "pairing_required":
+      return hasExactKeys(value, ["ifNoHolder", "recovery", "status"])
+        && value.recovery === "existing_key_holder_required"
+        && value.ifNoHolder === "unrecoverable"
+        ? {
+            ifNoHolder: value.ifNoHolder,
+            recovery: value.recovery,
+            status: value.status,
+          }
+        : null;
+    case "unrecoverable":
+      return hasExactKeys(value, ["evidence", "status"])
+        && value.evidence === "operator_confirmed_no_key_holders"
+        ? { evidence: value.evidence, status: value.status }
+        : null;
+    default:
+      return null;
+  }
 }
 
 export function parseAuthorityTuple(value: unknown): AuthorityTuple | null {

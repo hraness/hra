@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 
 import { isSafePositiveInteger } from "../src/cloud/contracts";
+import { maximumLiveOtpChallenges } from "./authPolicy";
 import { commandTerminalRetentionMs } from "./commands";
 import { CLOUD_USAGE_SNAPSHOT_RETENTION_MS } from "./lifecyclePolicy";
 import {
@@ -143,6 +144,25 @@ async function cleanAbandonedIdentity(ctx: MutationCtx, now: number, limit: numb
       updatedAt: now,
       verifiedAt: user.emailVerificationTime,
     };
+    await adjustQuotaForPatch(ctx, user._id, "identity", subject, subjectPatch);
+    await ctx.db.patch(subject._id, subjectPatch);
+    return 1;
+  }
+  const liveChallenges = await ctx.db.query("authOtpChallenges")
+    .withIndex("by_user_and_expires_at", (builder) => builder
+      .eq("userId", user._id)
+      .gt("expiresAt", now))
+    .take(maximumLiveOtpChallenges + 1);
+  if (liveChallenges.length > maximumLiveOtpChallenges) {
+    throw new Error("Maintenance authority is corrupt.");
+  }
+  if (liveChallenges.length > 0) {
+    if (liveChallenges.some((challenge) =>
+      challenge.authEpoch !== subject.authEpoch
+      || challenge.emailDigest !== subject.emailDigest)) {
+      throw new Error("Maintenance authority is corrupt.");
+    }
+    const subjectPatch = { updatedAt: now };
     await adjustQuotaForPatch(ctx, user._id, "identity", subject, subjectPatch);
     await ctx.db.patch(subject._id, subjectPatch);
     return 1;

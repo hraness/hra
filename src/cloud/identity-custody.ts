@@ -375,27 +375,59 @@ function namespaceFor(userPublicId: string): string {
 }
 
 export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort {
-  readonly #activeUserPublicId: string | null;
+  readonly #activeIdentity: Readonly<{
+    generation: number;
+    serialized: string;
+    userPublicId: string;
+  }> | null;
   readonly #custody: CloudSecretCustodyPort;
 
-  private constructor(custody: CloudSecretCustodyPort, activeUserPublicId: string | null) {
-    this.#activeUserPublicId = activeUserPublicId;
+  private constructor(
+    custody: CloudSecretCustodyPort,
+    activeIdentity: Readonly<{ generation: number; value: string }> | null,
+  ) {
+    this.#activeIdentity = activeIdentity === null
+      ? null
+      : {
+          generation: activeIdentity.generation,
+          serialized: activeIdentity.value,
+          userPublicId: parseActiveIdentity(activeIdentity.value).userPublicId,
+        };
     this.#custody = custody;
   }
 
   static async open(custody: CloudSecretCustodyPort): Promise<IdentityScopedCloudSecretCustody> {
     const observation = await custody.read(activeIdentitySlot);
-    const active = observation === null ? null : parseActiveIdentity(observation.value);
-    return new IdentityScopedCloudSecretCustody(custody, active?.userPublicId ?? null);
+    return new IdentityScopedCloudSecretCustody(custody, observation);
   }
 
   get activeUserPublicId(): string | null {
-    return this.#activeUserPublicId;
+    return this.#activeIdentity?.userPublicId ?? null;
+  }
+
+  async assertCurrentIdentity(expectedUserPublicId: string | null): Promise<void> {
+    if (expectedUserPublicId === null) {
+      if (this.#activeIdentity !== null || await this.#custody.read(activeIdentitySlot) !== null) {
+        throw new Error("Cloud identity selection changed; restart HRA.");
+      }
+      return;
+    }
+    if (
+      !isOpaqueIdentifier(expectedUserPublicId)
+      || this.#activeIdentity?.userPublicId !== expectedUserPublicId
+    ) throw new Error("Cloud identity selection changed; restart HRA.");
+    const current = await this.#custody.read(activeIdentitySlot);
+    if (
+      current === null
+      || current.generation !== this.#activeIdentity.generation
+      || current.value !== this.#activeIdentity.serialized
+      || parseActiveIdentity(current.value).userPublicId !== expectedUserPublicId
+    ) throw new Error("Cloud identity selection changed; restart HRA.");
   }
 
   get cacheNamespace(): string | null {
-    if (this.#activeUserPublicId === null) return null;
-    const identityNamespace = namespaceFor(this.#activeUserPublicId);
+    if (this.activeUserPublicId === null) return null;
+    const identityNamespace = namespaceFor(this.activeUserPublicId);
     const deploymentNamespace = this.#custody instanceof DeploymentScopedCloudSecretCustody
       ? this.#custody.cacheNamespace
       : null;
@@ -419,7 +451,7 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
         const selected = parseActiveIdentity(current.value);
         if (selected.userPublicId === userPublicId) {
           return {
-            restartRequired: this.#activeUserPublicId !== userPublicId,
+            restartRequired: this.activeUserPublicId !== userPublicId,
             userPublicId,
           };
         }
@@ -431,7 +463,7 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
       );
       if (committed !== null) {
         return {
-          restartRequired: this.#activeUserPublicId !== userPublicId,
+          restartRequired: this.activeUserPublicId !== userPublicId,
           userPublicId,
         };
       }
@@ -465,8 +497,8 @@ export class IdentityScopedCloudSecretCustody implements CloudSecretCustodyPort 
 
   #physicalSlot(slot: string): string | null {
     if (!scopedSlots.has(slot)) return slot;
-    if (this.#activeUserPublicId === null) return null;
-    return `i-${namespaceFor(this.#activeUserPublicId)}-${slot}`;
+    if (this.activeUserPublicId === null) return null;
+    return `i-${namespaceFor(this.activeUserPublicId)}-${slot}`;
   }
 }
 

@@ -107,6 +107,12 @@ Require the tuple to identify new project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS` 
 }
 ```
 
+Local plan preparation can use the operating-system account's fixed `~/.local/state/hra/process-recovery/` directory. Mutable `HOME` and XDG values cannot redirect this custody root. A private lock serializes recovery with launch, protected ancestry and macOS ACL authority are checked, and an active process-group journal is removed only after the operating system proves that recorded group absent. `process_cleanup_unproven` or `process_recovery_journal_blocked` is terminal for that local work and exits `75`. Once an execution reservation exists, both results include the final evidence path and its `.reservation` path in sorted `recoveryPaths`, including when startup recovery stops the command before another provider call. Preserve every reported path, never edit the journal, and rerun the checked local operation only after process absence is proved.
+
+The process-group boundary is intentionally narrow. A descendant can leave a group by starting a new session or double-forking, so it is not a sandbox and cannot authorize a Vercel subprocess. Every Vercel invocation is `authority` work and requires the supported Linux native authority backend for descendant-lifetime custody. That backend verifies the pinned helper, copies it into a sealed in-memory executable, journals exact Linux identities before `GO`, and keeps a private PID-namespace reaper until the target's descendants are gone. Any setup, protocol, or exact-recovery failure refuses before target execution or returns retained recovery evidence; HRA never falls back to local process-group custody. macOS and other unsupported platforms refuse before the Vercel target starts. The commands below remain provider-authority-gated: this runbook does not authorize a live preflight, cutover, compensation, or reconciliation by itself.
+
+Authority custody, once accepted, will still not prove that a remote domain or deployment effect did not occur. It is not a sandbox. The protected plan and evidence receipts, provider idempotency, and exact remote reconciliation remain mandatory after every ambiguous Vercel result.
+
 Plans add `schemaVersion`, `direction`, `mode`, `source`, and `target`. Only these identity mappings are valid:
 
 | Direction | Mode | Source | Target |
@@ -170,7 +176,17 @@ Q is now the only rollback source used by forward, reverse, and incident plans. 
 
 ## Forward rehearsal
 
-Run the `forward` plan Q → N. Independently read both domain lists:
+Run the `forward` plan Q → N with sequence 1 and a new protected evidence path:
+
+```sh
+bun run hosted:domain-cutover --execute \
+  --vercel-cli /absolute/path/to/vercel \
+  --sequence 1 \
+  --evidence-path /protected/release/forward.json \
+  < forward-plan.json
+```
+
+The operator writes `/protected/release/forward.json.reservation` before the first provider mutation. It binds the exact canonical plan digest, `N_COMMIT`, sequence, direction, and null predecessor. After the move, a fresh exact-target preflight supplies the final authority digest before the final evidence document is published. Independently read both domain lists:
 
 ```sh
 vercel api '/v9/projects/prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr/domains?limit=20' --scope hraness --paginate --raw | jq -c '{domains:map({name})}'
@@ -181,9 +197,31 @@ The pinned CLI's `--paginate` mode follows the provider cursor to its terminal p
 
 ## Reverse rehearsal
 
-Run the `reverse` plan N → Q. Require `hra.sh` exactly once under HRA v0, the exact Q alias tuple, generation-0 marker, old root, compatibility page, release downloads, privacy, security policy, and fallback. Require `hra-weld.vercel.app` to remain exact Q and `try-hra.vercel.app` to remain exact N with their own generation markers. Recheck P, Q, and N by deployment ID with authenticated `vercel curl --deployment`; do not use unauthenticated automatic-hostname responses as evidence.
+Run the `reverse` plan N → Q as sequence 2 and require the exact forward receipt as its predecessor:
 
-The rehearsal passes only after archive, forward, and reverse plans all commit and their independent readbacks pass. Repeat the forward plan and acceptance checks for production. Publish no immutable new-HRA tag until the final forward move is exact.
+```sh
+bun run hosted:domain-cutover --execute \
+  --vercel-cli /absolute/path/to/vercel \
+  --sequence 2 \
+  --previous-evidence /protected/release/forward.json \
+  --evidence-path /protected/release/reverse.json \
+  < reverse-plan.json
+```
+
+Require `hra.sh` exactly once under HRA v0, the exact Q alias tuple, generation-0 marker, old root, compatibility page, release downloads, privacy, security policy, and fallback. Require `hra-weld.vercel.app` to remain exact Q and `try-hra.vercel.app` to remain exact N with their own generation markers. Recheck P, Q, and N by deployment ID with authenticated `vercel curl --deployment`; do not use unauthenticated automatic-hostname responses as evidence.
+
+The rehearsal passes only after archive, forward, and reverse plans all commit and their independent readbacks pass. Repeat the exact Q → N forward plan as sequence 3:
+
+```sh
+bun run hosted:domain-cutover --execute \
+  --vercel-cli /absolute/path/to/vercel \
+  --sequence 3 \
+  --previous-evidence /protected/release/reverse.json \
+  --evidence-path /protected/release/final-forward.json \
+  < forward-plan.json
+```
+
+Sequence 1 and 3 must have the same exact forward plan digest; sequence 2 must have the exact reverse plan digest. Every receipt names the previous receipt digest, records whether the operation changed authority or was a checked replay, and binds the exact postflight authority digest. A retry with an existing final document performs only a fresh exact-authority preflight and returns a checked replay. It never repeats the move speculatively. A missing sequence, skipped predecessor, changed plan, changed `N_COMMIT`, partial state, or different final authority is a refusal. Publish no immutable new-HRA tag until the final forward receipt and independent production acceptance are exact.
 
 ## Ambiguous move decisions
 

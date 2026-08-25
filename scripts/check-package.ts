@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
-import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
@@ -20,12 +20,23 @@ import {
 } from "../src/daemon/daemon-startup";
 import type { StatePaths } from "../src/storage/paths";
 import { resolveStatePaths } from "../src/storage/paths";
+import { assertHraInstallManifest } from "../src/install-normalizer";
+import { HRA_INSTALL_PREFLIGHT_SUCCESS } from "../src/install-preflight";
+import {
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+} from "./bounded-process";
 import {
   assertPublicSensitiveText,
   assertPublicText,
   assertPublicTree,
 } from "./public-text-policy";
 import { assertProductionPackageOnly } from "./package-policy";
+import {
+  assertPseudoTerminalSuccess,
+  PTY_BEGIN_MARKER,
+  runInPseudoTerminal,
+} from "./pty-acceptance";
 
 const packageSchema = z.object({
   bin: z.object({ hra: z.literal("./src/cli.ts") }).strict(),
@@ -39,6 +50,7 @@ const packageSchema = z.object({
     type: z.literal("git"),
     url: z.literal("git+https://github.com/hraness/hra.git"),
   }).strict(),
+  scripts: z.record(z.string(), z.string()),
   version: z.literal("0.1.0"),
 }).passthrough();
 
@@ -76,62 +88,54 @@ const daemonRunningSchema = z.object({
   version: z.literal(1),
 }).passthrough();
 
-const run = async (
+const packageCommandTimeoutMaximumMs = 60_000;
+const packageCommandOutputMaximumBytes = 32 * 1024 * 1024;
+const packageCommandTerminationGraceMs = 250;
+const packageCommandKillSettlementMs = 1_000;
+
+export const runPackageCommand = async (
   executable: string,
   arguments_: readonly string[],
-  options: { cwd: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
-): Promise<ProcessResult> =>
-  await new Promise<ProcessResult>((resolvePromise, reject) => {
-    const child = spawn(executable, arguments_, {
-      cwd: options.cwd,
-      env: options.env ?? process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let timedOut = false;
-    let forceTimer: ReturnType<typeof setTimeout> | undefined;
-    let settlementTimer: ReturnType<typeof setTimeout> | undefined;
-    const timeout = options.timeoutMs === undefined
-      ? undefined
-      : setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGTERM");
-          forceTimer = setTimeout(() => {
-            child.kill("SIGKILL");
-            settlementTimer = setTimeout(() => {
-              reject(new Error(
-                `${executable} ${arguments_.join(" ")} did not settle after bounded forced termination.`,
-              ));
-            }, 1_000);
-          }, 1_000);
-        }, options.timeoutMs);
-    const clearTimers = () => {
-      if (timeout !== undefined) clearTimeout(timeout);
-      if (forceTimer !== undefined) clearTimeout(forceTimer);
-      if (settlementTimer !== undefined) clearTimeout(settlementTimer);
-    };
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-    child.once("error", (error) => {
-      clearTimers();
-      reject(error);
-    });
-    child.once("close", (exitCode) => {
-      clearTimers();
-      if (timedOut) {
-        reject(new Error(
-          `${executable} ${arguments_.join(" ")} exceeded ${String(options.timeoutMs)}ms:\n${Buffer.concat(stderr).toString("utf8")}${Buffer.concat(stdout).toString("utf8")}`,
-        ));
-        return;
-      }
-      resolvePromise({
-        exitCode: exitCode ?? 1,
-        stderr: Buffer.concat(stderr).toString("utf8"),
-        stdout: Buffer.concat(stdout).toString("utf8"),
-      });
-    });
-  });
+  options: {
+    cwd: string;
+    env?: NodeJS.ProcessEnv;
+    outputMaximumBytes?: number;
+    phase?: string;
+    timeoutMs?: number;
+  },
+): Promise<ProcessResult> => {
+  const requestedTimeout = options.timeoutMs;
+  const timeoutMs = requestedTimeout === undefined
+    || !Number.isSafeInteger(requestedTimeout)
+    || requestedTimeout < 1
+    ? packageCommandTimeoutMaximumMs
+    : Math.min(requestedTimeout, packageCommandTimeoutMaximumMs);
+  const requestedOutputMaximum = options.outputMaximumBytes;
+  const outputMaximumBytes = requestedOutputMaximum === undefined
+    || !Number.isSafeInteger(requestedOutputMaximum)
+    || requestedOutputMaximum < 1
+    ? packageCommandOutputMaximumBytes
+    : Math.min(requestedOutputMaximum, packageCommandOutputMaximumBytes);
+  const result = requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: arguments_,
+    containment: "local",
+    cwd: options.cwd,
+    environment: options.env ?? process.env,
+    executable,
+    killSettlementMs: packageCommandKillSettlementMs,
+    outputMaximumBytes,
+    phase: options.phase ?? "package-acceptance-command",
+    terminationGraceMs: packageCommandTerminationGraceMs,
+    timeoutMs,
+  }));
+  return {
+    exitCode: result.exitCode,
+    stderr: result.stderr.toString("utf8"),
+    stdout: result.stdout.toString("utf8"),
+  };
+};
+
+const run = runPackageCommand;
 
 const requireSuccess = (label: string, result: ProcessResult): ProcessResult => {
   if (result.exitCode !== 0) {
@@ -321,6 +325,7 @@ const repositoryRoot = resolve(import.meta.dir, "..");
 const packageJson = packageSchema.parse(
   JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as unknown,
 );
+assertHraInstallManifest(packageJson);
 if (!packageJson.files.includes("src")) throw new Error("The package must include src.");
 if (!packageJson.files.includes("!src/cloud/inviteAuthority.ts")) {
   throw new Error("The package must exclude operator-only invite authority.");
@@ -333,13 +338,13 @@ await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"
 await assertPublicTree(repositoryRoot);
 const completeHistory = requireSuccess(
   "Git history sensitive-text check",
-  await run("git", ["log", "--all", "--format=", "--patch", "--no-ext-diff", "--no-textconv"], { cwd: repositoryRoot }),
+  await run("/usr/bin/git", ["log", "--all", "--format=", "--patch", "--no-ext-diff", "--no-textconv"], { cwd: repositoryRoot }),
 );
 assertPublicSensitiveText(completeHistory.stdout, "Git history");
 const authoredHistory = requireSuccess(
   "Git history public-text check",
   await run(
-    "git",
+    "/usr/bin/git",
     [
       "log",
       "--all",
@@ -370,25 +375,38 @@ try {
   const consumerHome = join(temporaryRoot, "home");
   const consumerTemporaryDirectory = join(temporaryRoot, "tmp");
   const globalInstallRoot = join(temporaryRoot, "bun-global");
+  const runtimeBin = join(temporaryRoot, "runtime-bin");
+  const xdgCache = join(consumerHome, ".cache");
+  const xdgConfig = join(consumerHome, ".config");
+  const xdgData = join(consumerHome, ".local", "share");
+  const xdgState = join(consumerHome, ".local", "state");
   await mkdir(packageDirectory, { recursive: true, mode: 0o700 });
   await mkdir(consumerDirectory, { recursive: true, mode: 0o700 });
   await mkdir(consumerHome, { recursive: true, mode: 0o700 });
   await mkdir(consumerTemporaryDirectory, { recursive: true, mode: 0o700 });
   await mkdir(globalInstallRoot, { recursive: true, mode: 0o700 });
+  await mkdir(runtimeBin, { recursive: true, mode: 0o700 });
+  for (const directory of [xdgCache, xdgConfig, xdgData, xdgState]) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+  }
+  await symlink(process.execPath, join(runtimeBin, "bun"));
 
   requireSuccess(
     "package archive creation",
-    await run(process.execPath, ["pm", "pack", "--destination", packageDirectory], { cwd: repositoryRoot }),
+    await run(process.execPath, ["pm", "pack", "--ignore-scripts", "--destination", packageDirectory], { cwd: repositoryRoot }),
   );
   const archive = join(packageDirectory, `${packageJson.name}-${packageJson.version}.tgz`);
   const inspectionDirectory = join(temporaryRoot, "inspection");
   await mkdir(inspectionDirectory, { recursive: true, mode: 0o700 });
   requireSuccess(
     "package archive extraction",
-    await run("tar", ["-xzf", archive, "-C", inspectionDirectory], { cwd: repositoryRoot }),
+    await run("tar", ["-xzpf", archive, "-C", inspectionDirectory], { cwd: repositoryRoot }),
   );
   await assertPublicTree(inspectionDirectory);
   await assertProductionPackageOnly(inspectionDirectory);
+  assertHraInstallManifest(
+    JSON.parse(await readFile(join(inspectionDirectory, "package", "package.json"), "utf8")) as unknown,
+  );
   try {
     await access(
       join(inspectionDirectory, "package", "src", "storage", "legacy-secret-migration.ts"),
@@ -406,15 +424,52 @@ try {
   const isolatedEnvironment: NodeJS.ProcessEnv = {
     ...process.env,
     BUN_INSTALL: globalInstallRoot,
+    BUN_INSTALL_BIN: join(globalInstallRoot, "bin"),
+    BUN_INSTALL_GLOBAL_DIR: join(globalInstallRoot, "install", "global"),
     HOME: consumerHome,
     TMPDIR: consumerTemporaryDirectory,
   };
+  const installGlobalTransaction = async (label: string): Promise<void> => {
+    const preflight = requireSuccess(
+      label,
+      await run(process.execPath, [join(repositoryRoot, "src", "install-preflight.ts"), archive], {
+        cwd: consumerDirectory,
+        env: isolatedEnvironment,
+        phase: "package-transactional-global-install",
+      }),
+    );
+    if (preflight.stderr !== "" || preflight.stdout !== `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`) {
+      throw new Error(`${label} did not return its one exact success token.`);
+    }
+  };
   requireSuccess(
-    "clean consumer install",
-    await run(process.execPath, ["add", "--ignore-scripts", archive], {
+    "clean lifecycle-disabled consumer install",
+    await run(process.execPath, ["add", "--backend=copyfile", "--ignore-scripts", archive], {
       cwd: consumerDirectory,
       env: isolatedEnvironment,
     }),
+  );
+  const localPackageRoot = join(consumerDirectory, "node_modules", "hra");
+  const executable = join(consumerDirectory, "node_modules", ".bin", "hra");
+  assertHraInstallManifest(
+    JSON.parse(await readFile(join(localPackageRoot, "package.json"), "utf8")) as unknown,
+  );
+  if (((await lstat(join(localPackageRoot, "src", "cli.ts"))).mode & 0o777) !== 0o777) {
+    throw new Error("Bun's lifecycle-disabled local install no longer exhibits the reviewed mode-0777 bin-target behavior.");
+  }
+  requireSuccess(
+    "explicit local install normalization",
+    await run(process.execPath, [join(localPackageRoot, "src", "install-normalizer.ts")], {
+      cwd: consumerDirectory,
+      env: isolatedEnvironment,
+    }),
+  );
+  await assertProductionPackageOnly(localPackageRoot, "installed");
+  z.object({
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "hra")),
+    trustedDependencies: z.undefined().optional(),
+  }).passthrough().parse(
+    JSON.parse(await readFile(join(consumerDirectory, "package.json"), "utf8")) as unknown,
   );
   requireSuccess(
     "side-effect-free package import",
@@ -424,7 +479,6 @@ try {
     }),
   );
 
-  const executable = join(consumerDirectory, "node_modules", ".bin", "hra");
   const help = requireSuccess(
     "installed CLI help",
     await run(executable, ["--help"], { cwd: consumerDirectory, env: isolatedEnvironment }),
@@ -454,14 +508,44 @@ try {
   if (doctor.stderr !== "") throw new Error("JSON doctor wrote diagnostics to stderr.");
   if (doctor.exitCode !== 0) throw new Error("Offline doctor failed in the clean consumer.");
 
-  requireSuccess(
-    "clean global consumer install",
-    await run(process.execPath, ["add", "--global", "--ignore-scripts", archive], {
-      cwd: consumerDirectory,
-      env: isolatedEnvironment,
-    }),
-  );
+  await installGlobalTransaction("transactional lifecycle-disabled global consumer install");
   const globalExecutable = join(globalInstallRoot, "bin", "hra");
+  const activeGlobalCommand = await lstat(globalExecutable);
+  const uid = process.getuid?.();
+  if (
+    uid === undefined
+    || !activeGlobalCommand.isSymbolicLink()
+    || activeGlobalCommand.nlink !== 1
+    || activeGlobalCommand.uid !== uid
+  ) {
+    throw new Error("The active global HRA command is not one exact current-user symlink.");
+  }
+  const globalCli = await realpath(globalExecutable);
+  const globalPackageRoot = dirname(dirname(globalCli));
+  const globalVersionRoot = resolve(globalPackageRoot, "..", "..", "..", "..");
+  if (!globalVersionRoot.startsWith(`${join(globalInstallRoot, "install", "hra", "versions")}${sep}`)) {
+    throw new Error("The active global HRA command is outside its protected complete-version root.");
+  }
+  assertHraInstallManifest(
+    JSON.parse(await readFile(join(globalPackageRoot, "package.json"), "utf8")) as unknown,
+  );
+  if (((await lstat(globalCli)).mode & 0o777) !== 0o755) {
+    throw new Error("The transactional global install did not publish its reviewed mode-0755 CLI.");
+  }
+  const globalNormalizer = join(globalPackageRoot, "src", "install-normalizer.ts");
+  await access(globalNormalizer, constants.R_OK);
+  await assertProductionPackageOnly(globalPackageRoot, "installed");
+  z.object({
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "hra")),
+    trustedDependencies: z.undefined().optional(),
+  }).passthrough().parse(
+    JSON.parse(
+      await readFile(join(globalVersionRoot, "install", "global", "package.json"), "utf8"),
+    ) as unknown,
+  );
+  if (await Bun.file(join(globalInstallRoot, "install", "global", "node_modules", "hra")).exists()) {
+    throw new Error("The transactional global install exposed HRA in Bun's final global package path.");
+  }
   const globalHelp = requireSuccess(
     "global CLI help",
     await run(globalExecutable, ["--help"], { cwd: consumerDirectory, env: isolatedEnvironment }),
@@ -480,7 +564,15 @@ try {
 
   const daemonEnvironment: NodeJS.ProcessEnv = {
     ...isolatedEnvironment,
+    CODEX_ELECTRON_USER_DATA_PATH: undefined,
+    CODEX_HOME: undefined,
     HRA_CONVEX_URL: "",
+    NODE_PATH: undefined,
+    PATH: runtimeBin,
+    XDG_CACHE_HOME: xdgCache,
+    XDG_CONFIG_HOME: xdgConfig,
+    XDG_DATA_HOME: xdgData,
+    XDG_STATE_HOME: xdgState,
   };
   const daemonPaths = resolveStatePaths({
     homeDirectory: consumerHome,
@@ -491,22 +583,19 @@ try {
   let ownedDaemon: OwnedInstalledDaemon | undefined;
   let lifecycleError: Error | undefined;
   try {
-    const initialized = requireSuccess(
-      "globally installed CLI initialization",
-      await run(globalExecutable, ["init", "--yes", "--json"], {
-        cwd: consumerDirectory,
-        env: daemonEnvironment,
-        timeoutMs: lifecycleTimeoutMs,
-      }),
-    );
-    z.object({
-      data: z.object({ initialized: z.literal(true) }).passthrough(),
-      ok: z.literal(true),
-      version: z.literal(1),
-    }).passthrough().parse(assertExactlyOneJsonValue(initialized.stdout));
-    if (initialized.stderr !== "") {
-      throw new Error("Globally installed CLI initialization wrote diagnostics.");
-    }
+    const initialized = await runInPseudoTerminal({
+      command: [globalExecutable, "init", "--yes"],
+      cwd: consumerDirectory,
+      environment: daemonEnvironment,
+      steps: [
+        { expect: PTY_BEGIN_MARKER },
+        { expect: "HRA is ready." },
+        { expect: "Next: hra account add Personal" },
+      ],
+      temporaryDirectory: temporaryRoot,
+      timeoutMs: lifecycleTimeoutMs,
+    });
+    assertPseudoTerminalSuccess(initialized);
     const initializedDocuments = await lstat(join(consumerHome, "Documents"));
     if (!initializedDocuments.isDirectory() || initializedDocuments.isSymbolicLink()) {
       throw new Error("Globally installed CLI initialization did not create a safe default Documents directory in an empty home.");
@@ -635,6 +724,50 @@ try {
       if (listing.stderr !== "") throw new Error(`${label} wrote diagnostics.`);
     }
 
+    const shell = await runInPseudoTerminal({
+      command: [globalExecutable],
+      cwd: consumerDirectory,
+      environment: daemonEnvironment,
+      steps: [
+        { expect: PTY_BEGIN_MARKER },
+        { expect: "HRA shell. /help lists commands; /exit leaves the daemon running." },
+        { expect: "hra> ", write: `/account ${addedAccountValue.data.account.id}\n` },
+        { expect: `Selected account ${addedAccountValue.data.account.id}.` },
+        { expect: "hra[", write: "/session\n" },
+        { expect: "No results." },
+        { expect: "hra[", write: "//slash-command\n" },
+        {
+          expect: "hra: Select a session with /session <selector> before sending or following it.",
+        },
+        { expect: "hra[", write: "/send /slash-command\n" },
+        {
+          expect: "hra: Select a session with /session <selector> before sending or following it.",
+        },
+        { expect: "hra[", write: "/exit\n" },
+      ],
+      temporaryDirectory: temporaryRoot,
+      timeoutMs: lifecycleTimeoutMs,
+    });
+    assertPseudoTerminalSuccess(shell);
+
+    const postShellStatus = requireSuccess(
+      "globally installed post-shell daemon status",
+      await run(globalExecutable, ["daemon", "status", "--json"], {
+        cwd: consumerDirectory,
+        env: daemonEnvironment,
+        timeoutMs: lifecycleTimeoutMs,
+      }),
+    );
+    const postShellIdentity = daemonRunningSchema.parse(
+      assertExactlyOneJsonValue(postShellStatus.stdout),
+    ).data.daemon;
+    if (!sameDaemonIdentity(readyIdentity, postShellIdentity)) {
+      throw new Error("The installed attached shell did not leave its exact daemon authority running.");
+    }
+    if (postShellStatus.stderr !== "") {
+      throw new Error("Globally installed post-shell daemon status wrote diagnostics.");
+    }
+
     const stopped = requireSuccess(
       "globally installed daemon stop",
       await run(globalExecutable, ["daemon", "stop", "--json"], {
@@ -713,7 +846,7 @@ try {
   }
   if (lifecycleError !== undefined) throw lifecycleError;
 
-  process.stdout.write(`Verified ${basename(archive)} in isolated local and global consumers, including the global daemon lifecycle.\n`);
+  process.stdout.write(`Verified ${basename(archive)} in isolated local and global consumers, including a restored PTY shell and the global daemon lifecycle.\n`);
 } finally {
   if (removeTemporaryRoot) {
     await rm(temporaryRoot, { force: true, recursive: true });

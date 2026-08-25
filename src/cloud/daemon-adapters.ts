@@ -2122,6 +2122,9 @@ export class BridgedCloudControl implements CloudControlPort, CloudRemoteControl
   }
   listDevices(signal: AbortSignal): Promise<unknown> { return this.#control.listDevices(signal); }
   pairDevice(signal: AbortSignal): Promise<unknown> { return this.#control.pairDevice(signal); }
+  acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown> {
+    return this.#control.acknowledgeNoAccountKeyHolders(signal);
+  }
   approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
     return this.#control.approveDevice(device, idempotencyKey, signal);
   }

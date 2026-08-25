@@ -1,0 +1,1334 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+
+import {
+  buildHraGlobalInstallCommand,
+  HRA_INSTALL_ARCHIVE_URL,
+  HRA_INSTALL_PREFLIGHT_LOADER,
+  HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
+  HRA_INSTALL_PREFLIGHT_SOURCE_URL,
+  HRA_INSTALL_PREFLIGHT_SUCCESS,
+} from "./install-preflight";
+import {
+  assertSafeDarwinInstallAcl as assertSafeDarwinNormalizerAcl,
+} from "./install-normalizer";
+import {
+  HRA_INSTALL_ARCHIVE_NAME,
+  HRA_INSTALL_RELEASE_API_URL,
+  HRA_INSTALL_REPOSITORY_API_URL,
+  HRA_INSTALL_REPOSITORY_ID,
+  assertSafeDarwinInstallAcl,
+  HRA_INSTALL_NORMALIZER_SHA256,
+  parseOfficialHraReleaseRecord,
+  parseOfficialHraRepositoryRecord,
+  resolveOfficialHraArchiveIdentity,
+} from "./install-preflight-runtime";
+
+const repositoryRoot = resolve(import.meta.dir, "..");
+const temporaryRoots: string[] = [];
+let archivePath: string;
+let archiveSha256: string;
+
+type FetchObservation = Readonly<{
+  accept: string | null;
+  acceptEncoding: string | null;
+  cache: RequestCache | null;
+  credentials: RequestCredentials | null;
+  redirect: RequestRedirect | null;
+  url: string;
+}>;
+
+type OfficialInstallScenario =
+  | "disallowed-redirect"
+  | "overrun"
+  | "success"
+  | "truncated"
+  | "wrong-hash";
+
+const makeRoot = async (prefix = "hra-install-preflight-"): Promise<string> => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), prefix)));
+  await chmod(root, 0o700);
+  temporaryRoots.push(root);
+  return root;
+};
+
+const run = async (
+  command: readonly [string, ...string[]],
+  input: Readonly<{ cwd: string; environment?: NodeJS.ProcessEnv }>,
+): Promise<Readonly<{ exitCode: number; stderr: string; stdout: string }>> => {
+  const child = Bun.spawn([...command], {
+    cwd: input.cwd,
+    env: input.environment ?? process.env,
+    stderr: "pipe",
+    stdin: "ignore",
+    stdout: "pipe",
+  });
+  const [exitCode, stderr, stdout] = await Promise.all([
+    child.exited,
+    new Response(child.stderr).text(),
+    new Response(child.stdout).text(),
+  ]);
+  return { exitCode, stderr, stdout };
+};
+
+const installEnvironment = (root: string): NodeJS.ProcessEnv => ({
+  ...process.env,
+  BUN_INSTALL: join(root, "bun root"),
+  HOME: join(root, "home"),
+});
+
+const officialArchiveAsset = (
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> => ({
+  browser_download_url: HRA_INSTALL_ARCHIVE_URL,
+  digest: `sha256:${archiveSha256}`,
+  id: 8_675_309,
+  name: HRA_INSTALL_ARCHIVE_NAME,
+  size: 123,
+  state: "uploaded",
+  ...overrides,
+});
+
+const officialReleaseRecord = (
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> => ({
+  assets: [officialArchiveAsset()],
+  draft: false,
+  id: 9_715_113,
+  immutable: true,
+  tag_name: "v0.1.0",
+  ...overrides,
+});
+
+const officialRepositoryRecord = (
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> => ({
+  archived: false,
+  disabled: false,
+  full_name: "hraness/hra",
+  id: HRA_INSTALL_REPOSITORY_ID,
+  private: false,
+  ...overrides,
+});
+
+const jsonResponse = (
+  value: unknown,
+  input: Readonly<{ headers?: HeadersInit; status?: number }> = {},
+): Response => {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const headers = new Headers(input.headers);
+  if (!headers.has("content-length")) headers.set("content-length", String(bytes.byteLength));
+  return new Response(bytes, { headers, status: input.status ?? 200 });
+};
+
+const readJsonRecord = async (path: string): Promise<Record<string, unknown>> => {
+  const value: unknown = JSON.parse(await readFile(path, "utf8"));
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Expected one JSON object fixture at ${path}.`);
+  }
+  return value as Record<string, unknown>;
+};
+
+const processIdentityExists = (pid: number, group = false): boolean => {
+  try {
+    process.kill(group ? -pid : pid, 0);
+    return true;
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+    throw error;
+  }
+};
+
+const waitForProcessIdentityToDisappear = async (
+  pid: number,
+  group = false,
+  maximumWaitMilliseconds = 5_000,
+): Promise<void> => {
+  const deadline = Date.now() + maximumWaitMilliseconds;
+  while (processIdentityExists(pid, group) && Date.now() < deadline) await Bun.sleep(10);
+  expect(processIdentityExists(pid, group)).toBeFalse();
+};
+
+const runInstaller = async (root: string): Promise<Readonly<{
+  exitCode: number;
+  stderr: string;
+  stdout: string;
+}>> => {
+  await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
+  await chmod(join(root, "home"), 0o700);
+  return await run([
+    "/bin/sh",
+    "-c",
+    'umask 077; exec "$1" "$2" "$3"',
+    "hra-install-test",
+    process.execPath,
+    resolve(import.meta.dir, "install-preflight.ts"),
+    archivePath,
+  ], { cwd: root, environment: installEnvironment(root) });
+};
+
+const runTrustedLoader = async (
+  root: string,
+  sourceSha256 = HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
+): Promise<Readonly<{
+  exitCode: number;
+  stderr: string;
+  stdout: string;
+}>> => {
+  await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
+  await chmod(join(root, "home"), 0o700);
+  const child = Bun.spawn([
+    process.execPath,
+    "-e",
+    HRA_INSTALL_PREFLIGHT_LOADER,
+    "--",
+    archivePath,
+    sourceSha256,
+  ], {
+    cwd: root,
+    env: installEnvironment(root),
+    stderr: "pipe",
+    stdin: Bun.file(resolve(import.meta.dir, "install-preflight-runtime.ts")),
+    stdout: "pipe",
+  });
+  const [exitCode, stderr, stdout] = await Promise.all([
+    child.exited,
+    new Response(child.stderr).text(),
+    new Response(child.stdout).text(),
+  ]);
+  return { exitCode, stderr, stdout };
+};
+
+const runOfficialInstaller = async (
+  root: string,
+  scenario: OfficialInstallScenario,
+  mutatePrivateArchiveBeforeReadback = false,
+): Promise<Readonly<{
+  exitCode: number;
+  observations: readonly FetchObservation[];
+  stderr: string;
+  stdout: string;
+}>> => {
+  await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
+  await chmod(join(root, "home"), 0o700);
+  const observationsPath = join(root, "official-fetch-observations.json");
+  const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+  const authorityRoot = join(root, "bun root", "install", "hra");
+  const allowedAssetUrl = "https://release-assets.githubusercontent.com/hra-test/archive.tgz";
+  const program = [
+    'const crypto = await import("node:crypto");',
+    'const fs = await import("node:fs/promises");',
+    'const path = await import("node:path");',
+    `const module = await import(${JSON.stringify(runtimePath)});`,
+    `const archiveBytes = Buffer.from(await fs.readFile(${JSON.stringify(archivePath)}));`,
+    'const actualDigest = crypto.createHash("sha256").update(archiveBytes).digest("hex");',
+    `const scenario = ${JSON.stringify(scenario)};`,
+    "const advertisedDigest = scenario === \"wrong-hash\" ? \"0\".repeat(64) : actualDigest;",
+    "const repository = { archived: false, disabled: false, full_name: \"hraness/hra\", id: module.HRA_INSTALL_REPOSITORY_ID, private: false };",
+    "const release = { assets: [{ browser_download_url: module.HRA_INSTALL_ARCHIVE_URL, digest: `sha256:${advertisedDigest}`, id: 8675309, name: module.HRA_INSTALL_ARCHIVE_NAME, size: archiveBytes.byteLength, state: \"uploaded\" }], draft: false, id: 9715113, immutable: true, tag_name: module.HRA_INSTALL_RELEASE_TAG };",
+    "const jsonResponse = (value) => { const bytes = new TextEncoder().encode(JSON.stringify(value)); return new Response(bytes, { headers: { \"Content-Encoding\": \"identity\", \"Content-Length\": String(bytes.byteLength) }, status: 200 }); };",
+    "const chunkedResponse = (payload, includeLength) => {",
+    "  const first = Math.max(1, Math.floor(payload.byteLength / 3));",
+    "  const second = Math.max(first + 1, Math.floor(payload.byteLength * 2 / 3));",
+    "  const body = new ReadableStream({ start(controller) {",
+    "    for (const chunk of [payload.subarray(0, first), payload.subarray(first, second), payload.subarray(second)]) if (chunk.byteLength > 0) controller.enqueue(chunk);",
+    "    controller.close();",
+    "  } });",
+    "  const headers = new Headers({ \"Content-Encoding\": \"identity\" });",
+    "  if (includeLength) headers.set(\"Content-Length\", String(payload.byteLength));",
+    "  return new Response(body, { headers, status: 200 });",
+    "};",
+    "const observations = [];",
+    "const fetcher = async (input, init) => {",
+    "  const headers = new Headers(init.headers);",
+    "  observations.push({ accept: headers.get(\"accept\"), acceptEncoding: headers.get(\"accept-encoding\"), cache: init.cache ?? null, credentials: init.credentials ?? null, redirect: init.redirect ?? null, url: input });",
+    "  if (input === module.HRA_INSTALL_REPOSITORY_API_URL) return jsonResponse(repository);",
+    "  if (input === module.HRA_INSTALL_RELEASE_API_URL) return jsonResponse(release);",
+    "  if (input === module.HRA_INSTALL_ARCHIVE_URL) {",
+    "    const location = scenario === \"disallowed-redirect\" ? \"https://evil.example/hra.tgz\" : " + JSON.stringify(allowedAssetUrl) + ";",
+    "    return new Response(null, { headers: { Location: location }, status: 302 });",
+    "  }",
+    "  if (input === " + JSON.stringify(allowedAssetUrl) + ") {",
+    "    const payload = scenario === \"truncated\"",
+    "      ? archiveBytes.subarray(0, archiveBytes.byteLength - 1)",
+    "      : scenario === \"overrun\"",
+    "        ? Buffer.concat([archiveBytes, Buffer.from([0])])",
+    "        : archiveBytes;",
+    "    return chunkedResponse(payload, scenario !== \"truncated\" && scenario !== \"overrun\");",
+    "  }",
+    "  throw new Error(`Unexpected installer fetch: ${input}`);",
+    "};",
+    "const beforePrivateArchiveReadback = " + (mutatePrivateArchiveBeforeReadback
+      ? "async () => { const stage = (await fs.readdir(" + JSON.stringify(authorityRoot) + ")).find((entry) => entry.startsWith(\".staging-\")); if (!stage) throw new Error(\"The private archive stage is missing.\"); const privatePath = path.join(" + JSON.stringify(authorityRoot) + ", stage, \".hra-release-archive.tgz\"); const bytes = Buffer.from(await fs.readFile(privatePath)); bytes[0] = (bytes[0] ?? 0) ^ 1; await fs.writeFile(privatePath, bytes, { mode: 0o600 }); }"
+      : "undefined") + ";",
+    "try {",
+    "  await module.installHraRelease(module.HRA_INSTALL_ARCHIVE_URL, { beforePrivateArchiveReadback, fetcher });",
+    "  process.stdout.write(`${module.HRA_INSTALL_SUCCESS}\\n`);",
+    "} finally {",
+    `  await fs.writeFile(${JSON.stringify(observationsPath)}, JSON.stringify(observations), { mode: 0o600 });`,
+    "}",
+  ].join("\n");
+  const result = await run([process.execPath, "-e", program], {
+    cwd: root,
+    environment: installEnvironment(root),
+  });
+  const observations = await Bun.file(observationsPath).exists()
+    ? JSON.parse(await readFile(observationsPath, "utf8")) as readonly FetchObservation[]
+    : [];
+  return { ...result, observations };
+};
+
+const runStalledStage = async (
+  root: string,
+  mode: "stall-after-ready" | "stall-before-ready",
+): Promise<Readonly<{
+  bunPid: number;
+  result: Readonly<{ exitCode: number; stderr: string; stdout: string }>;
+  workerPid: number;
+}>> => {
+  await mkdir(join(root, "home"), { recursive: true, mode: 0o700 });
+  await chmod(join(root, "home"), 0o700);
+  const sentinel = join(root, `${mode}-pids`);
+  const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+  const program = [
+    `const module = await import(${JSON.stringify(runtimePath)});`,
+    `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+    "  stageDeadlineMilliseconds: 400,",
+    `  stageWorkerTestMode: ${JSON.stringify(mode)},`,
+    `  afterStageWorkerStarted: async (bunPid, workerPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(workerPid) + "\\n"); },`,
+    "});",
+  ].join("\n");
+  const result = await run([process.execPath, "-e", program], {
+    cwd: root,
+    environment: installEnvironment(root),
+  });
+  const [bunPidText, workerPidText] = (await readFile(sentinel, "utf8")).trim().split(" ");
+  const bunPid = Number.parseInt(bunPidText ?? "", 10);
+  const workerPid = Number.parseInt(workerPidText ?? "", 10);
+  if (!Number.isSafeInteger(bunPid) || !Number.isSafeInteger(workerPid)) {
+    throw new Error("The stalled-stage fixture did not capture its exact process identities.");
+  }
+  return { bunPid, result, workerPid };
+};
+
+const assertStalledStageRecovers = async (
+  mode: "stall-after-ready" | "stall-before-ready",
+): Promise<void> => {
+  const root = await makeRoot(`hra-install-${mode}-`);
+  const { bunPid, result, workerPid } = await runStalledStage(root, mode);
+  expect(result.exitCode).not.toBe(0);
+  expect(result.stdout).toBe("");
+  if (mode === "stall-before-ready") {
+    expect(result.stderr).toContain("ended before publishing complete lock readiness");
+  } else {
+    expect(result.stderr).toContain("hard detached-authority deadline");
+  }
+  await waitForProcessIdentityToDisappear(workerPid);
+  await waitForProcessIdentityToDisappear(bunPid, true);
+  const bunRoot = join(root, "bun root");
+  const authorityRoot = join(bunRoot, "install", "hra");
+  expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+  expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeTrue();
+
+  const recovered = await runInstaller(root);
+  expect(recovered.exitCode).toBe(0);
+  expect(recovered.stderr).toBe("");
+  expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
+  expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
+  expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
+  expect(await Bun.file(join(authorityRoot, "install-intent.json")).exists()).toBeFalse();
+};
+
+beforeAll(async () => {
+  const root = await makeRoot("hra-install-archive-");
+  const packed = await run([
+    process.execPath,
+    "pm",
+    "pack",
+    "--destination",
+    root,
+  ], { cwd: repositoryRoot });
+  if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
+  archivePath = join(root, "hra-0.1.0.tgz");
+  await chmod(archivePath, 0o600);
+  archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
+});
+
+afterAll(async () => {
+  if (process.platform === "darwin") {
+    await Promise.all(temporaryRoots.map(async (root) => {
+      await run(["/bin/chmod", "-RN", root], { cwd: tmpdir() });
+    }));
+  }
+  await Promise.all(temporaryRoots.splice(0).map(async (root) => {
+    await rm(root, { force: true, recursive: true });
+  }));
+}, 60_000);
+
+describe("transactional HRA installer", () => {
+  test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
+    expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
+      "https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts",
+    );
+    expect(HRA_INSTALL_ARCHIVE_URL).toBe(
+      "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+    );
+    const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
+    expect(createHash("sha256").update(runtimeBytes).digest("hex")).toBe(
+      HRA_INSTALL_PREFLIGHT_SOURCE_SHA256,
+    );
+    const runtimeSource = runtimeBytes.toString("utf8");
+    expect(runtimeSource).not.toContain('"libc.so.6"');
+    expect(runtimeSource).not.toContain('"libc.musl-x86_64.so.1"');
+    expect(runtimeSource).not.toContain('"libc.musl-aarch64.so.1"');
+    const normalizerBytes = await readFile(resolve(import.meta.dir, "install-normalizer.ts"));
+    expect(createHash("sha256").update(normalizerBytes).digest("hex")).toBe(
+      HRA_INSTALL_NORMALIZER_SHA256,
+    );
+    const command = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
+    expect(command).toBe(
+      `test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 ${HRA_INSTALL_PREFLIGHT_SOURCE_URL} | bun -e '${HRA_INSTALL_PREFLIGHT_LOADER}' -- ${HRA_INSTALL_ARCHIVE_URL} ${HRA_INSTALL_PREFLIGHT_SOURCE_SHA256})" = ${HRA_INSTALL_PREFLIGHT_SUCCESS}`,
+    );
+    expect(command).toContain("--connect-timeout 10");
+    expect(command).toContain("--max-time 60");
+    expect(command).toContain("--retry 3");
+    expect(command).toContain("--retry-max-time 60");
+    expect(command).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_SHA256);
+    expect(() => buildHraGlobalInstallCommand("https://example.com/hra.tgz")).toThrow(
+      "exact immutable release archive URL",
+    );
+    expect(command).not.toContain("| bun - ");
+    expect(command).not.toContain("bun add --global");
+    expect(command).not.toContain("install-normalizer.ts");
+
+    const refusedRoot = await makeRoot("hra-install-source-refusal-");
+    const refused = await runTrustedLoader(refusedRoot, "0".repeat(64));
+    expect(refused.exitCode).not.toBe(0);
+    expect(refused.stderr).toContain("tagged HRA preflight digest is invalid");
+    expect(refused.stdout).toBe("");
+    expect(await Bun.file(join(refusedRoot, "bun root")).exists()).toBeFalse();
+  });
+
+  test("accepts only one immutable GitHub release asset under the exact repository identity", () => {
+    const acceptedRelease = officialReleaseRecord({
+      future_release_field: { ignored: true },
+      assets: [officialArchiveAsset({ future_asset_field: ["ignored"] })],
+    });
+    expect(parseOfficialHraReleaseRecord(acceptedRelease)).toEqual({
+      archiveAssetId: 8_675_309,
+      archiveBytes: 123,
+      archiveReleaseId: 9_715_113,
+      archiveReleaseTag: "v0.1.0",
+      archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
+      archiveSha256,
+      archiveSource: "official",
+    });
+    expect(() => parseOfficialHraRepositoryRecord(officialRepositoryRecord({
+      future_repository_field: "ignored",
+    }))).not.toThrow();
+
+    const releaseFailures: readonly Readonly<{
+      label: string;
+      record: Readonly<Record<string, unknown>>;
+      message: string;
+    }>[] = [
+      {
+        label: "wrong tag",
+        message: "not an immutable published release",
+        record: officialReleaseRecord({ tag_name: "v0.1.1" }),
+      },
+      {
+        label: "draft release",
+        message: "not an immutable published release",
+        record: officialReleaseRecord({ draft: true }),
+      },
+      {
+        label: "mutable release",
+        message: "not an immutable published release",
+        record: officialReleaseRecord({ immutable: false }),
+      },
+      {
+        label: "duplicate exact assets",
+        message: "one exact archive asset",
+        record: officialReleaseRecord({
+          assets: [officialArchiveAsset(), officialArchiveAsset({ id: 8_675_310 })],
+        }),
+      },
+      {
+        label: "missing exact asset",
+        message: "one exact archive asset",
+        record: officialReleaseRecord({
+          assets: [officialArchiveAsset({
+            browser_download_url: "https://example.com/hra-v0.1.0.tgz",
+            name: "other.tgz",
+          })],
+        }),
+      },
+      {
+        label: "missing digest",
+        message: "archive asset is invalid",
+        record: officialReleaseRecord({ assets: [officialArchiveAsset({ digest: undefined })] }),
+      },
+      {
+        label: "invalid digest",
+        message: "no exact SHA-256 digest",
+        record: officialReleaseRecord({
+          assets: [officialArchiveAsset({ digest: `sha256:${"A".repeat(64)}` })],
+        }),
+      },
+    ];
+    for (const failure of releaseFailures) {
+      expect(() => parseOfficialHraReleaseRecord(failure.record)).toThrow(failure.message);
+    }
+
+    for (const record of [
+      officialRepositoryRecord({ id: HRA_INSTALL_REPOSITORY_ID + 1 }),
+      officialRepositoryRecord({ full_name: "attacker/hra" }),
+      officialRepositoryRecord({ private: true }),
+      officialRepositoryRecord({ archived: true }),
+      officialRepositoryRecord({ disabled: true }),
+    ] as const) {
+      expect(() => parseOfficialHraRepositoryRecord(record)).toThrow(
+        "GitHub repository identity is invalid",
+      );
+    }
+  });
+
+  test("fetches bounded release authority records without redirects, credentials, or encodings", async () => {
+    const calls: Array<Readonly<{ init: RequestInit; url: string }>> = [];
+    const identity = await resolveOfficialHraArchiveIdentity(async (url, init) => {
+      calls.push({ init, url });
+      if (url === HRA_INSTALL_REPOSITORY_API_URL) return jsonResponse(officialRepositoryRecord());
+      if (url === HRA_INSTALL_RELEASE_API_URL) return jsonResponse(officialReleaseRecord());
+      throw new Error(`Unexpected release-authority URL: ${url}`);
+    });
+    expect(identity.archiveRepositoryId).toBe(HRA_INSTALL_REPOSITORY_ID);
+    expect(identity.archiveSha256).toBe(archiveSha256);
+    expect(new Set(calls.map((call) => call.url))).toEqual(new Set([
+      HRA_INSTALL_REPOSITORY_API_URL,
+      HRA_INSTALL_RELEASE_API_URL,
+    ]));
+    for (const call of calls) {
+      const headers = new Headers(call.init.headers);
+      expect(call.init.cache).toBe("no-store");
+      expect(call.init.credentials).toBe("omit");
+      expect(call.init.redirect).toBe("error");
+      expect(call.init.signal).toBeInstanceOf(AbortSignal);
+      expect(headers.get("accept")).toBe("application/vnd.github+json");
+      expect(headers.get("accept-encoding")).toBe("identity");
+      expect(headers.get("user-agent")).toBe("hra-installer/0.1.0");
+      expect(headers.get("x-github-api-version")).toBe("2022-11-28");
+      expect(headers.get("authorization")).toBeNull();
+    }
+  });
+
+  test("rejects redirected, encoded, malformed, empty, and length-confused release records", async () => {
+    const failures: readonly Readonly<{
+      label: string;
+      message: string;
+      response: () => Response;
+    }>[] = [
+      {
+        label: "redirect",
+        message: "release record is unavailable",
+        response: () => new Response(null, { headers: { Location: "https://example.com" }, status: 302 }),
+      },
+      {
+        label: "encoded body",
+        message: "unrequested content encoding",
+        response: () => jsonResponse(officialReleaseRecord(), { headers: { "Content-Encoding": "gzip" } }),
+      },
+      {
+        label: "zero content length",
+        message: "invalid byte length",
+        response: () => new Response("{}", { headers: { "Content-Length": "0" }, status: 200 }),
+      },
+      {
+        label: "oversize declared content length",
+        message: "exceeds its byte bound",
+        response: () => new Response("{}", { headers: { "Content-Length": "262145" }, status: 200 }),
+      },
+      {
+        label: "truncated declared body",
+        message: "ended outside its declared byte length",
+        response: () => new Response("{}", { headers: { "Content-Length": "3" }, status: 200 }),
+      },
+      {
+        label: "malformed JSON",
+        message: "invalid JSON",
+        response: () => new Response("{", { headers: { "Content-Length": "1" }, status: 200 }),
+      },
+      {
+        label: "invalid UTF-8 JSON",
+        message: "invalid JSON",
+        response: () => new Response(Uint8Array.of(0xff), {
+          headers: { "Content-Length": "1" },
+          status: 200,
+        }),
+      },
+      {
+        label: "missing body",
+        message: "no bounded body",
+        response: () => new Response(null, { status: 200 }),
+      },
+    ];
+    for (const failure of failures) {
+      const operation = resolveOfficialHraArchiveIdentity(async (url) =>
+        url === HRA_INSTALL_REPOSITORY_API_URL
+          ? jsonResponse(officialRepositoryRecord())
+          : failure.response());
+      await expect(operation).rejects.toThrow(failure.message);
+    }
+  });
+
+  test("keeps Bun's post-link tree private, verifies the complete version, and atomically activates only its CLI", async () => {
+    const root = await makeRoot("hra install transactional ");
+    const first = await runTrustedLoader(root);
+    expect(first).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    const bunRoot = join(root, "bun root");
+    const activePath = join(bunRoot, "bin", "hra");
+    const activeMetadata = await lstat(activePath);
+    expect(activeMetadata.isSymbolicLink()).toBeTrue();
+    const activeTarget = await realpath(activePath);
+    expect(activeTarget).toContain(`${join(bunRoot, "install", "hra", "versions")}/`);
+    expect(activeTarget).toEndWith("/install/global/node_modules/hra/src/cli.ts");
+    expect((await lstat(activeTarget)).mode & 0o777).toBe(0o755);
+    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
+    const versions = await readdir(join(bunRoot, "install", "hra", "versions"));
+    expect(versions).toHaveLength(1);
+    expect(await Bun.file(join(
+      bunRoot,
+      "install",
+      "hra",
+      "versions",
+      versions[0] as string,
+      ".hra-install-complete.json",
+    )).exists()).toBeTrue();
+    expect(await readJsonRecord(join(
+      bunRoot,
+      "install",
+      "hra",
+      "versions",
+      versions[0] as string,
+      "install",
+      "global",
+      "package.json",
+    ))).toEqual({ dependencies: { hra: "0.1.0" } });
+
+    const second = await runInstaller(root);
+    expect(second).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    expect(await realpath(activePath)).toBe(activeTarget);
+    expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
+  }, 60_000);
+
+  test("keeps identical local and official archives in distinct namespaces and fetches the official asset", async () => {
+    const root = await makeRoot("hra-install-source-classes-");
+    const local = await runInstaller(root);
+    expect(local).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    const bunRoot = join(root, "bun root");
+    const versionsRoot = join(bunRoot, "install", "hra", "versions");
+    const localVersions = await readdir(versionsRoot);
+    expect(localVersions).toHaveLength(1);
+    expect(localVersions[0]).toContain("-local-");
+
+    const official = await runOfficialInstaller(root, "success");
+    expect({
+      exitCode: official.exitCode,
+      stderr: official.stderr,
+      stdout: official.stdout,
+    }).toEqual({
+      exitCode: 0,
+      stderr: "",
+      stdout: `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`,
+    });
+    const versions = (await readdir(versionsRoot)).sort();
+    expect(versions).toHaveLength(2);
+    const localVersion = versions.find((entry) => entry.includes("-local-"));
+    const officialVersion = versions.find((entry) => entry.includes("-official-"));
+    expect(localVersion).toBeDefined();
+    expect(officialVersion).toBeDefined();
+    expect(localVersion).not.toBe(officialVersion);
+
+    const localReceipt = await readJsonRecord(join(
+      versionsRoot,
+      localVersion as string,
+      ".hra-install-complete.json",
+    ));
+    const officialReceipt = await readJsonRecord(join(
+      versionsRoot,
+      officialVersion as string,
+      ".hra-install-complete.json",
+    ));
+    expect(localReceipt.archiveSource).toBe("local");
+    expect(localReceipt.archiveSha256).toBe(archiveSha256);
+    expect(localReceipt.archiveRepositoryId).toBeNull();
+    expect(localReceipt.archiveReleaseId).toBeNull();
+    expect(localReceipt.archiveAssetId).toBeNull();
+    expect(officialReceipt.archiveSource).toBe("official");
+    expect(officialReceipt.archiveSha256).toBe(archiveSha256);
+    expect(officialReceipt.archiveRepositoryId).toBe(HRA_INSTALL_REPOSITORY_ID);
+    expect(officialReceipt.archiveReleaseId).toBe(9_715_113);
+    expect(officialReceipt.archiveAssetId).toBe(8_675_309);
+    expect(await realpath(join(bunRoot, "bin", "hra"))).toContain(`/${officialVersion as string}/`);
+
+    const observedUrls = new Set(official.observations.map((observation) => observation.url));
+    for (const expectedUrl of [
+      HRA_INSTALL_REPOSITORY_API_URL,
+      HRA_INSTALL_RELEASE_API_URL,
+      HRA_INSTALL_ARCHIVE_URL,
+      "https://release-assets.githubusercontent.com/hra-test/archive.tgz",
+    ]) expect(observedUrls.has(expectedUrl)).toBeTrue();
+    const archiveRequests = official.observations.filter((observation) =>
+      observation.url === HRA_INSTALL_ARCHIVE_URL
+      || observation.url === "https://release-assets.githubusercontent.com/hra-test/archive.tgz");
+    expect(archiveRequests).toHaveLength(2);
+    for (const request of archiveRequests) {
+      expect(request.accept).toBe("application/octet-stream");
+      expect(request.acceptEncoding).toBe("identity");
+      expect(request.cache).toBe("no-store");
+      expect(request.credentials).toBe("omit");
+      expect(request.redirect).toBe("manual");
+    }
+  }, 60_000);
+
+  test("rejects disallowed redirects, truncation, overrun, and a wrong official archive hash", async () => {
+    const failures: readonly Readonly<{
+      message: string;
+      scenario: Exclude<OfficialInstallScenario, "success">;
+    }>[] = [
+      {
+        message: "left its GitHub download authority",
+        scenario: "disallowed-redirect",
+      },
+      {
+        message: "does not match its immutable SHA-256 identity",
+        scenario: "truncated",
+      },
+      {
+        message: "exceeds its immutable byte length",
+        scenario: "overrun",
+      },
+      {
+        message: "does not match its immutable SHA-256 identity",
+        scenario: "wrong-hash",
+      },
+    ];
+    for (const failure of failures) {
+      const root = await makeRoot(`hra-install-official-${failure.scenario}-`);
+      const result = await runOfficialInstaller(root, failure.scenario);
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain(failure.message);
+      expect(result.stdout).toBe("");
+      expect(result.observations.some((observation) => observation.url === HRA_INSTALL_ARCHIVE_URL)).toBeTrue();
+      expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+    }
+  }, 60_000);
+
+  test("rejects a same-size local archive mutation after recording its identity", async () => {
+    const root = await makeRoot("hra-install-local-mutation-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const localArchive = join(root, "mutable-hra.tgz");
+    const original = await readFile(archivePath);
+    await writeFile(localArchive, original, { mode: 0o600 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `const archive = ${JSON.stringify(localArchive)};`,
+      "await module.installHraRelease(archive, {",
+      "  afterArchiveIdentityResolved: async () => {",
+      "    const bytes = Buffer.from(await fs.readFile(archive));",
+      "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
+      "    await fs.writeFile(archive, bytes, { mode: 0o600 });",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect((await lstat(localArchive)).size).toBe(original.byteLength);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("changed after its identity was recorded");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  });
+
+  test("reopens and rejects a same-size mutation of the private official archive copy", async () => {
+    const root = await makeRoot("hra-install-private-archive-mutation-");
+    const result = await runOfficialInstaller(root, "success", true);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("private HRA archive copy changed");
+    expect(result.stdout).toBe("");
+    expect(result.observations.some((observation) =>
+      observation.url === "https://release-assets.githubusercontent.com/hra-test/archive.tgz")).toBeTrue();
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  });
+
+  test("refuses a private archive changed after parent verification but before worker custody", async () => {
+    const root = await makeRoot("hra-install-worker-archive-mutation-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  beforeStageWorkerSpawn: async (privateArchivePath) => {",
+      "    const bytes = Buffer.from(await fs.readFile(privateArchivePath));",
+      "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
+      "    await fs.writeFile(privateArchivePath, bytes, { mode: 0o600 });",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("ended before publishing complete lock readiness");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  });
+
+  test("refuses a private archive changed after the worker snapshots it without re-signaling the settled Bun group", async () => {
+    const root = await makeRoot("hra-install-worker-post-snapshot-mutation-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterStageWorkerStarted: async () => {",
+      `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
+      "    if (!stage) throw new Error(\"The private archive stage is missing.\");",
+      `    const privateArchivePath = path.join(${JSON.stringify(authorityRoot)}, stage, ".hra-release-archive.tgz");`,
+      "    const bytes = Buffer.from(await fs.readFile(privateArchivePath));",
+      "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
+      "    await fs.writeFile(privateArchivePath, bytes, { mode: 0o600 });",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("Bun could not stage the exact HRA archive (exit 1)");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("refuses an extracted package mutation before an official receipt is issued", async () => {
+    const root = await makeRoot("hra-install-extracted-package-mutation-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterStageCleanupCustody: async () => {",
+      `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
+      "    if (!stage) throw new Error(\"The extracted package stage is missing.\");",
+      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/hra/src/domain/values.ts");`,
+      "    const bytes = Buffer.from(await fs.readFile(packageFile));",
+      "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
+      "    await fs.writeFile(packageFile, bytes);",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("does not match its authenticated release archive");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("does not traverse a replaced Bun global directory during post-stage cleanup", async () => {
+    const root = await makeRoot("hra-install-global-cleanup-symlink-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const outside = join(root, "outside-global");
+    await mkdir(join(outside, "node_modules"), { recursive: true, mode: 0o700 });
+    await writeFile(join(outside, "bun.lock"), "outside lock\n", { mode: 0o600 });
+    await writeFile(join(outside, "package.json"), "outside manifest\n", { mode: 0o600 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterStageCleanupCustody: async () => {",
+      `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
+      "    if (!stage) throw new Error(\"The cleanup stage is missing.\");",
+      `    const stageRoot = path.join(${JSON.stringify(authorityRoot)}, stage);`,
+      '    const globalRoot = path.join(stageRoot, "install", "global");',
+      '    await fs.rename(globalRoot, path.join(stageRoot, "held-global"));',
+      `    await fs.symlink(${JSON.stringify(outside)}, globalRoot, "dir");`,
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("unsafe directory component");
+    expect(await readFile(join(outside, "bun.lock"), "utf8")).toBe("outside lock\n");
+    expect(await readFile(join(outside, "package.json"), "utf8")).toBe("outside manifest\n");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("quarantines Bun cache cleanup without following nested outside symlinks", async () => {
+    const root = await makeRoot("hra-install-cache-quarantine-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const outside = join(root, "outside-cache");
+    await mkdir(outside, { mode: 0o700 });
+    await writeFile(join(outside, "sentinel"), "outside cache sentinel\n", { mode: 0o600 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterStageWorkerExit: async () => {",
+      `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
+      "    if (!stage) throw new Error(\"The cache stage is missing.\");",
+      `    const cacheRoot = path.join(${JSON.stringify(authorityRoot)}, stage, "install/cache");`,
+      `    await fs.symlink(${JSON.stringify(outside)}, path.join(cacheRoot, "outside-bounce"), "dir");`,
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toBe("");
+    expect(await readFile(join(outside, "sentinel"), "utf8")).toBe("outside cache sentinel\n");
+    expect((await lstat(join(root, "bun root", "bin", "hra"))).isSymbolicLink()).toBeTrue();
+  }, 60_000);
+
+  test("quarantines only the exact Bun cache inode already held by staging custody", async () => {
+    const root = await makeRoot("hra-install-cache-held-identity-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const replacement = join(root, "replacement-cache");
+    await mkdir(replacement, { mode: 0o700 });
+    await writeFile(join(replacement, "sentinel"), "replacement cache sentinel\n", { mode: 0o600 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  beforeCacheQuarantine: async () => {",
+      `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
+      "    if (!stage) throw new Error(\"The held cache stage is missing.\");",
+      `    const stageRoot = path.join(${JSON.stringify(authorityRoot)}, stage);`,
+      '    const cacheRoot = path.join(stageRoot, "install", "cache");',
+      '    await fs.rename(cacheRoot, path.join(stageRoot, "held-cache"));',
+      `    await fs.rename(${JSON.stringify(replacement)}, cacheRoot);`,
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("no longer names its held directory descriptor");
+    const stage = (await readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));
+    expect(stage).toBeDefined();
+    expect(await readFile(join(authorityRoot, stage as string, "install", "cache", "sentinel"), "utf8"))
+      .toBe("replacement cache sentinel\n");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("retains staging-root descriptor custody through the version rename", async () => {
+    const root = await makeRoot("hra-install-version-root-swap-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterVersionRename: async () => {",
+      `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
+      "    const version = (await fs.readdir(versionsRoot)).find((entry) => !entry.endsWith(\"-authentic\"));",
+      "    if (!version) throw new Error(\"The renamed version is missing.\");",
+      "    const versionRoot = path.join(versionsRoot, version);",
+      '    await fs.rename(versionRoot, `${versionRoot}-authentic`);',
+      "    await fs.mkdir(versionRoot, { mode: 0o700 });",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("does not name its held staging directory after rename");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("retains version-root descriptor custody through the normalized intent write", async () => {
+    const root = await makeRoot("hra-install-version-root-rebind-swap-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const program = [
+      'const fs = await import("node:fs/promises");',
+      'const path = await import("node:path");',
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterVersionRebind: async () => {",
+      `    const versionsRoot = ${JSON.stringify(versionsRoot)};`,
+      "    const version = (await fs.readdir(versionsRoot)).find((entry) => !entry.endsWith(\"-authentic\"));",
+      "    if (!version) throw new Error(\"The rebound version is missing.\");",
+      "    const versionRoot = path.join(versionsRoot, version);",
+      '    await fs.rename(versionRoot, `${versionRoot}-authentic`);',
+      "    await fs.mkdir(versionRoot, { mode: 0o700 });",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("no longer names its held custody descriptor");
+    expect(result.stdout).toBe("");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("rejects a complete receipt whose archive identity no longer matches its namespace", async () => {
+    const root = await makeRoot("hra-install-receipt-identity-");
+    const installed = await runInstaller(root);
+    expect(installed.exitCode).toBe(0);
+    const bunRoot = join(root, "bun root");
+    const versionsRoot = join(bunRoot, "install", "hra", "versions");
+    const [versionName] = await readdir(versionsRoot);
+    expect(versionName).toBeDefined();
+    const receiptPath = join(versionsRoot, versionName as string, ".hra-install-complete.json");
+    const receipt = await readJsonRecord(receiptPath);
+    receipt.archiveSha256 = "0".repeat(64);
+    await writeFile(receiptPath, `${JSON.stringify(receipt)}\n`, { mode: 0o600 });
+    const activeBefore = await realpath(join(bunRoot, "bin", "hra"));
+
+    const rejected = await runInstaller(root);
+    expect(rejected.exitCode).not.toBe(0);
+    expect(rejected.stderr).toContain("namespace does not match its archive identity");
+    expect(rejected.stdout).toBe("");
+    expect(await realpath(join(bunRoot, "bin", "hra"))).toBe(activeBefore);
+  }, 60_000);
+
+  test("refuses an unverified pre-existing PATH entry without replacing it or starting a staged install", async () => {
+    const root = await makeRoot();
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const bunRoot = join(root, "bun root");
+    await mkdir(join(bunRoot, "bin"), { recursive: true, mode: 0o700 });
+    const activePath = join(bunRoot, "bin", "hra");
+    await writeFile(activePath, "unverified\n", { mode: 0o700 });
+    const result = await run([
+      process.execPath,
+      resolve(import.meta.dir, "install-preflight.ts"),
+      archivePath,
+    ], { cwd: root, environment: installEnvironment(root) });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe("");
+    expect(await readFile(activePath, "utf8")).toBe("unverified\n");
+    expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
+    const authorityEntries = await readdir(join(bunRoot, "install", "hra"));
+    expect(authorityEntries.some((entry) => entry.startsWith(".staging-"))).toBeFalse();
+  });
+
+  test("a pre-READY staging stall expires inside detached authority, leaves no process group, and recovers", async () => {
+    await assertStalledStageRecovers("stall-before-ready");
+  }, 60_000);
+
+  test("a post-READY staging stall expires inside detached authority, leaves no process group, and recovers", async () => {
+    await assertStalledStageRecovers("stall-after-ready");
+  }, 60_000);
+
+  test("a stalled Bun stage whose caller dies after READY retains custody until its detached deadline and recovers", async () => {
+    const root = await makeRoot("hra-install-kill-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const sentinel = join(root, "bun-link-observed");
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const program = [
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  stageDeadlineMilliseconds: 6000,",
+      '  stageWorkerTestMode: "stall-after-ready",',
+      `  afterStageWorkerReady: async (bunPid, lockPid) => { await Bun.write(${JSON.stringify(sentinel)}, String(bunPid) + " " + String(lockPid) + "\\n"); await new Promise(() => {}); },`,
+      "});",
+    ].join("\n");
+    const child = Bun.spawn([process.execPath, "-e", program], {
+      cwd: root,
+      detached: true,
+      env: installEnvironment(root),
+      stderr: "ignore",
+      stdin: "ignore",
+      stdout: "ignore",
+    });
+    const deadline = Date.now() + 10_000;
+    while (!await Bun.file(sentinel).exists() && Date.now() < deadline) await Bun.sleep(25);
+    if (!await Bun.file(sentinel).exists()) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      await child.exited;
+      throw new Error("The stalled Bun staging process did not reach its READY boundary.");
+    }
+    const [bunPidText, lockPidText] = (await Bun.file(sentinel).text()).trim().split(" ");
+    const bunPid = Number.parseInt(bunPidText ?? "", 10);
+    const lockPid = Number.parseInt(lockPidText ?? "", 10);
+    expect(Number.isSafeInteger(bunPid)).toBeTrue();
+    expect(Number.isSafeInteger(lockPid)).toBeTrue();
+    expect(bunPid).not.toBe(child.pid);
+    expect(lockPid).not.toBe(child.pid);
+    const bunRoot = join(root, "bun root");
+    const authorityRoot = join(bunRoot, "install", "hra");
+    const stageName = (await readdir(authorityRoot)).find((entry) => entry.startsWith(".staging-"));
+    expect(stageName).toBeDefined();
+    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+    process.kill(child.pid, "SIGKILL");
+    await child.exited;
+    expect(() => process.kill(lockPid, 0)).not.toThrow();
+    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+
+    const busy = await runInstaller(root);
+    expect(busy.exitCode).not.toBe(0);
+    expect(busy.stderr).toContain("prior HRA Bun staging process is still running");
+    expect(await Bun.file(join(bunRoot, "bin", "hra")).exists()).toBeFalse();
+
+    await waitForProcessIdentityToDisappear(lockPid, false, 10_000);
+    await waitForProcessIdentityToDisappear(bunPid, true, 5_000);
+
+    const recoveryDeadline = Date.now() + 5_000;
+    let recovered = await runInstaller(root);
+    while (
+      recovered.exitCode !== 0
+      && recovered.stderr.includes("prior HRA Bun staging process is still running")
+      && Date.now() < recoveryDeadline
+    ) {
+      await Bun.sleep(10);
+      recovered = await runInstaller(root);
+    }
+    expect(recovered.exitCode).toBe(0);
+    expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
+    expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
+    expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
+    expect(await Bun.file(join(authorityRoot, "install-intent.json")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("every post-link publication boundary leaves either no command or the complete verified command", async () => {
+    const root = await makeRoot("hra-install-boundaries-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const activePath = join(root, "bun root", "bin", "hra");
+    const runWithHook = async (hook: "afterNormalized" | "afterPublishRename" | "beforePublish") => await run([
+      process.execPath,
+      "-e",
+      [
+        `const module = await import(${JSON.stringify(runtimePath)});`,
+        `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+        `  ${hook}: () => { throw new Error(${JSON.stringify(`test interruption at ${hook}`)}); },`,
+        "});",
+      ].join("\n"),
+    ], { cwd: root, environment: installEnvironment(root) });
+
+    const normalizedInterruption = await runWithHook("afterNormalized");
+    expect(normalizedInterruption.exitCode).not.toBe(0);
+    expect(await Bun.file(activePath).exists()).toBeFalse();
+
+    const prepublishInterruption = await runWithHook("beforePublish");
+    expect(prepublishInterruption.exitCode).not.toBe(0);
+    expect(await Bun.file(activePath).exists()).toBeFalse();
+
+    const renamedInterruption = await runWithHook("afterPublishRename");
+    expect(renamedInterruption.exitCode).not.toBe(0);
+    expect((await lstat(activePath)).isSymbolicLink()).toBeTrue();
+    const publishedTarget = await realpath(activePath);
+    expect((await lstat(publishedTarget)).mode & 0o777).toBe(0o755);
+
+    const recovered = await runInstaller(root);
+    expect(recovered.exitCode).toBe(0);
+    expect(await realpath(activePath)).toBe(publishedTarget);
+    expect(await Bun.file(join(root, "bun root", "install", "hra", "install-intent.json")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("detects same-size dependency mutation after normalization before PATH publication", async () => {
+    const root = await makeRoot("hra-install-tree-digest-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const versionsRoot = join(root, "bun root", "install", "hra", "versions");
+    const program = [
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterNormalized: async () => {",
+      `    const versions = await (await import("node:fs/promises")).readdir(${JSON.stringify(versionsRoot)});`,
+      `    const path = ${JSON.stringify(versionsRoot)} + "/" + versions[0] + "/install/global/node_modules/zod/package.json";`,
+      "    const bytes = Buffer.from(await Bun.file(path).arrayBuffer());",
+      "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
+      "    await Bun.write(path, bytes);",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("durable tree receipt");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("rejects an outside bounce symlink even while its final target points back into the staged tree", async () => {
+    const root = await makeRoot("hra-install-symlink-bounce-");
+    await mkdir(join(root, "home"), { mode: 0o700 });
+    const outside = join(root, "outside");
+    await mkdir(outside, { mode: 0o700 });
+    const authorityRoot = join(root, "bun root", "install", "hra");
+    const runtimePath = resolve(import.meta.dir, "install-preflight-runtime.ts");
+    const program = [
+      `const module = await import(${JSON.stringify(runtimePath)});`,
+      `await module.installHraRelease(${JSON.stringify(archivePath)}, {`,
+      "  afterStageWorkerExit: async () => {",
+      '    const fs = await import("node:fs/promises");',
+      '    const path = await import("node:path");',
+      `    const authorityRoot = ${JSON.stringify(authorityRoot)};`,
+      "    const stageName = (await fs.readdir(authorityRoot)).find((entry) => entry.startsWith(\".staging-\"));",
+      '    if (!stageName) throw new Error("staging root is missing");',
+      "    const stageRoot = path.join(authorityRoot, stageName);",
+      "    const stagedLink = path.join(stageRoot, \"bin\", \"hra\");",
+      '    if (!(await fs.lstat(stagedLink)).isSymbolicLink()) throw new Error("staged hra link is missing");',
+      "    const inside = path.join(stageRoot, \"inside-target\");",
+      `    const bounce = ${JSON.stringify(join(outside, "bounce"))};`,
+      "    const candidate = path.join(stageRoot, \"outside-bounce\");",
+      '    await fs.writeFile(inside, "inside\\n", { mode: 0o600 });',
+      "    await fs.symlink(inside, bounce);",
+      "    await fs.symlink(path.relative(path.dirname(candidate), bounce), candidate);",
+      "  },",
+      "});",
+    ].join("\n");
+    const result = await run([process.execPath, "-e", program], {
+      cwd: root,
+      environment: installEnvironment(root),
+    });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("lexically escaping symbolic link");
+    expect(await Bun.file(join(root, "bun root", "bin", "hra")).exists()).toBeFalse();
+  }, 60_000);
+
+  test("accepts non-mutating Darwin ACLs and rejects a later inherited non-owner delete ALLOW", async () => {
+    if (process.platform !== "darwin") return;
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("Darwin ACL proof requires a current-user identity.");
+    const root = await makeRoot("hra-install-acl-");
+    const aclFree = join(root, "acl-free");
+    const denyOnly = join(root, "deny-only");
+    const readOnly = join(root, "read-only");
+    const dangerousAllow = join(root, "dangerous-allow");
+    await writeFile(aclFree, "private\n", { mode: 0o600 });
+    await mkdir(denyOnly, { mode: 0o700 });
+    await mkdir(readOnly, { mode: 0o700 });
+    await mkdir(dangerousAllow, { mode: 0o700 });
+    const aclFreeHandle = await open(aclFree, "r");
+    try {
+      expect(() => assertSafeDarwinInstallAcl(aclFreeHandle.fd, uid, aclFree)).not.toThrow();
+      expect(() => assertSafeDarwinNormalizerAcl(aclFreeHandle.fd, uid, aclFree)).not.toThrow();
+    } finally {
+      await aclFreeHandle.close();
+    }
+    const deny = await run(["/bin/chmod", "+a", "everyone deny delete", denyOnly], { cwd: root });
+    expect(deny.exitCode).toBe(0);
+    const denyHandle = await open(denyOnly, "r");
+    try {
+      expect(() => assertSafeDarwinInstallAcl(denyHandle.fd, uid, denyOnly)).not.toThrow();
+      expect(() => assertSafeDarwinNormalizerAcl(denyHandle.fd, uid, denyOnly)).not.toThrow();
+    } finally {
+      await denyHandle.close();
+    }
+    const read = await run([
+      "/bin/chmod",
+      "+a",
+      "everyone allow list,search,readattr,readextattr,readsecurity",
+      readOnly,
+    ], { cwd: root });
+    expect(read.exitCode).toBe(0);
+    const readHandle = await open(readOnly, "r");
+    try {
+      expect(() => assertSafeDarwinInstallAcl(readHandle.fd, uid, readOnly)).not.toThrow();
+      expect(() => assertSafeDarwinNormalizerAcl(readHandle.fd, uid, readOnly)).not.toThrow();
+    } finally {
+      await readHandle.close();
+    }
+    const leadingDeny = await run([
+      "/bin/chmod",
+      "+a",
+      "everyone deny write,append,delete_child,writeattr,writeextattr,writesecurity,chown",
+      dangerousAllow,
+    ], { cwd: root });
+    expect(leadingDeny.exitCode).toBe(0);
+    const allow = await run([
+      "/bin/chmod",
+      "+a",
+      "everyone allow delete,file_inherit,directory_inherit",
+      dangerousAllow,
+    ], { cwd: root });
+    expect(allow.exitCode).toBe(0);
+    const allowHandle = await open(dangerousAllow, "r");
+    try {
+      expect(() => assertSafeDarwinInstallAcl(allowHandle.fd, uid, dangerousAllow)).toThrow(
+        "dangerous non-owner Darwin ALLOW ACL",
+      );
+      expect(() => assertSafeDarwinNormalizerAcl(allowHandle.fd, uid, dangerousAllow)).toThrow(
+        "dangerous non-owner Darwin ALLOW ACL",
+      );
+    } finally {
+      await allowHandle.close();
+    }
+  });
+});

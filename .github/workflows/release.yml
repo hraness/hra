@@ -7,6 +7,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      candidate_digest:
+        description: Sealed release-candidate SHA-256 from the protected receipt
+        required: true
+        type: string
       publication_lease:
         description: Unique local publication lease holder
         required: true
@@ -42,6 +46,28 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile --ignore-scripts
 
+      - name: Download pinned Zig 0.16.0 for authority supervisor
+        run: |
+          HRA_ZIG_DIRECTORY="$RUNNER_TEMP/hra-zig-0.16.0"
+          HRA_ZIG_ARCHIVE="$HRA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0.tar.xz"
+          HRA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          mkdir -p "$HRA_ZIG_DIRECTORY"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --connect-timeout 10 --max-time 180 --retry 2 --retry-all-errors --retry-delay 1 \
+            --output "$HRA_ZIG_ARCHIVE" \
+            "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+          printf '%s  %s\n' "$HRA_ZIG_SHA256" "$HRA_ZIG_ARCHIVE" | sha256sum --check --status
+          tar -xJf "$HRA_ZIG_ARCHIVE" -C "$HRA_ZIG_DIRECTORY"
+          test -x "$HRA_ZIG_DIRECTORY/zig-x86_64-linux-0.16.0/zig"
+
+      - name: Rebuild and verify authority-supervisor artifacts
+        run: >-
+          bun ./scripts/verify-authority-supervisor-build.ts
+          --zig "$RUNNER_TEMP/hra-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"
+
+      - name: Run Linux authority-supervisor custody test
+        run: bun test scripts/authority-supervisor-runtime.test.ts --isolate --max-concurrency=1
+
       - name: Match the tag to package.json
         run: >-
           bun -e 'const packageJson: unknown = await Bun.file("package.json").json();
@@ -64,6 +90,15 @@ jobs:
           checked_out_commit="$(git rev-parse 'HEAD^{commit}')"
           main_commit="$(git rev-parse 'origin/main^{commit}')"
           remote_tagged_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
+          tag_object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq 'select(.object.type == "tag") | .object.sha')"
+          test -n "$tag_object_sha"
+          tag_record="$(gh api "repos/$GH_REPO/git/tags/$tag_object_sha")"
+          printf '%s' "$tag_record" | jq -e --arg tag "$GITHUB_REF_NAME" --arg commit "$tagged_commit" \
+            '.tag == $tag and .object.type == "commit" and .object.sha == $commit and (.message | test("^HRA v0\\.1\\.0 sealed candidate\\n\\nhra-release-candidate-sha256:[0-9a-f]{64}\\n?$"))' \
+            > /dev/null
+          candidate_digest="$(printf '%s' "$tag_record" | jq -r '.message' | sed -n 's/^hra-release-candidate-sha256:\([0-9a-f]\{64\}\)$/\1/p')"
+          printf '%s' "$candidate_digest" | grep -Eq '^[0-9a-f]{64}$'
+          printf 'HRA_RELEASE_CANDIDATE_SHA256=%s\n' "$candidate_digest" >> "$GITHUB_ENV"
           test "$tagged_commit" = "$checked_out_commit"
           test "$tagged_commit" = "$GITHUB_SHA"
           test "$remote_tagged_commit" = "$tagged_commit"
@@ -102,13 +137,29 @@ jobs:
           mv "release/hra-${GITHUB_REF_NAME#v}.tgz" "release/hra-${GITHUB_REF_NAME}.tgz"
 
       - name: Accept the exact packed installation
+        id: accept_packed_install
         env:
           BUN_INSTALL: ${{ runner.temp }}/hra-global
         run: |
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
-          bun add --global --ignore-scripts "./release/hra-${GITHUB_REF_NAME}.tgz"
-          bun ./scripts/check-installed-package.ts "$BUN_INSTALL/install/global/node_modules/hra"
+          umask 077
+          test "$(bun ./src/install-preflight.ts "./release/hra-${GITHUB_REF_NAME}.tgz")" = hra-install-safe
+          test -L "$BUN_INSTALL/bin/hra"
+          HRA_ACTIVE_CLI="$(realpath "$BUN_INSTALL/bin/hra")"
+          case "$HRA_ACTIVE_CLI" in
+            "$BUN_INSTALL"/install/hra/versions/*/install/global/node_modules/hra/src/cli.ts) ;;
+            *) exit 1 ;;
+          esac
+          HRA_PACKAGE_ROOT="$(dirname "$(dirname "$HRA_ACTIVE_CLI")")"
+          HRA_RUNTIME_NODE_MODULES="$(dirname "$HRA_PACKAGE_ROOT")"
+          HRA_GLOBAL_MANIFEST="$(dirname "$HRA_RUNTIME_NODE_MODULES")/package.json"
+          HRA_GLOBAL_MANIFEST="$HRA_GLOBAL_MANIFEST" HRA_RUNTIME_NODE_MODULES="$HRA_RUNTIME_NODE_MODULES" bun -e 'import { readdir } from "node:fs/promises"; import { join } from "node:path";
+          const root = process.env.HRA_GLOBAL_MANIFEST; const modules = process.env.HRA_RUNTIME_NODE_MODULES; if (!root || !modules) throw new Error("transactional install paths are missing");
+          const consumer = await Bun.file(root).json(); if (consumer.trustedDependencies !== undefined) throw new Error("lifecycle-disabled install changed consumer trust");
+          const visit = async (directory) => { for (const entry of await readdir(directory, { withFileTypes: true })) { if (!entry.isDirectory() || entry.name === ".bin") continue; const child = join(directory, entry.name); if (entry.name.startsWith("@")) { await visit(child); continue; } const manifest = await Bun.file(join(child, "package.json")).json(); if (manifest.trustedDependencies !== undefined) throw new Error(`installed package ${manifest.name ?? entry.name} broadens lifecycle trust`); const nested = join(child, "node_modules"); if (await Bun.file(nested).exists()) await visit(nested); } }; await visit(modules);'
+          bun ./scripts/check-installed-package.ts "$HRA_PACKAGE_ROOT"
+          printf 'runtime_node_modules=%s\n' "$HRA_RUNTIME_NODE_MODULES" >> "$GITHUB_OUTPUT"
           test "$("$BUN_INSTALL/bin/hra" --version)" = "hra ${GITHUB_REF_NAME#v}"
           "$BUN_INSTALL/bin/hra" doctor --offline --json | bun -e 'const value = JSON.parse(await Bun.stdin.text()); if (value?.ok !== true || value?.data?.offline !== true) throw new Error("offline doctor failed");'
 
@@ -146,7 +197,7 @@ jobs:
           config: .github/syft-runtime.yaml
           format: spdx-json
           output-file: release/hra-${{ github.ref_name }}.ubuntu-24.04-x64.runtime.spdx.json
-          path: ${{ runner.temp }}/hra-global/install/global/node_modules
+          path: ${{ steps.accept_packed_install.outputs.runtime_node_modules }}
           syft-version: v1.51.0
           upload-artifact: false
           upload-release-assets: false
@@ -158,6 +209,12 @@ jobs:
           const required = [["hra", process.env.HRA_RELEASE_VERSION], ["@openai/codex", "0.149.0"], ["convex", "1.45.0"], ["zod", "4.4.3"]];
           for (const [name, version] of required) if (!value.packages.some((entry) => entry && typeof entry === "object" && entry.name === name && entry.versionInfo === version)) throw new Error(`runtime SPDX is missing ${name}@${version}`);'
 
+      - name: Preserve the reviewed release metadata
+        run: |
+          bun -e 'const notes = await Bun.file("docs/beta-release-notes.md").text(); if (notes.trim().length === 0) throw new Error("release notes are empty"); await Bun.write("release/RELEASE_NOTES.md", notes.trimEnd());'
+          git rev-parse 'HEAD^{commit}' > release/RELEASE_COMMIT
+          printf '%s\n' "$HRA_RELEASE_CANDIDATE_SHA256" > release/RELEASE_CANDIDATE_SHA256
+
       - name: Write checksums
         working-directory: release
         run: >-
@@ -165,12 +222,8 @@ jobs:
           "hra-${GITHUB_REF_NAME}.tgz"
           "hra-${GITHUB_REF_NAME}.artifact.spdx.json"
           "hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json"
+          RELEASE_NOTES.md
           > SHA256SUMS
-
-      - name: Preserve the reviewed release metadata
-        run: |
-          bun -e 'const notes = await Bun.file("docs/beta-release-notes.md").text(); if (notes.trim().length === 0) throw new Error("release notes are empty"); await Bun.write("release/RELEASE_NOTES.md", notes.trimEnd());'
-          git rev-parse 'HEAD^{commit}' > release/RELEASE_COMMIT
 
       - name: Preserve verified release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -183,6 +236,7 @@ jobs:
             release/SHA256SUMS
             release/RELEASE_NOTES.md
             release/RELEASE_COMMIT
+            release/RELEASE_CANDIDATE_SHA256
           if-no-files-found: error
           retention-days: 1
 
@@ -209,7 +263,15 @@ jobs:
           test "$(wc -l < release/RELEASE_COMMIT | tr -d ' ')" = 1
           grep -Eq '^[0-9a-f]{40}$' release/RELEASE_COMMIT
           accepted_commit="$(tr -d '\n' < release/RELEASE_COMMIT)"
+          test "$(wc -l < release/RELEASE_CANDIDATE_SHA256 | tr -d ' ')" = 1
+          accepted_candidate_digest="$(tr -d '\n' < release/RELEASE_CANDIDATE_SHA256)"
+          printf '%s' "$accepted_candidate_digest" | grep -Eq '^[0-9a-f]{64}$'
           tag_commit="$(gh api "repos/$GH_REPO/commits/refs/tags/$GITHUB_REF_NAME" --jq '.sha')"
+          tag_object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq 'select(.object.type == "tag") | .object.sha')"
+          test -n "$tag_object_sha"
+          tag_record="$(gh api "repos/$GH_REPO/git/tags/$tag_object_sha")"
+          tag_candidate_digest="$(printf '%s' "$tag_record" | jq -r '.message' | sed -n 's/^hra-release-candidate-sha256:\([0-9a-f]\{64\}\)$/\1/p')"
+          test "$tag_candidate_digest" = "$accepted_candidate_digest"
           test "$accepted_commit" = "$GITHUB_SHA"
           test "$tag_commit" = "$accepted_commit"
           comparison="$(gh api "repos/$GH_REPO/compare/$accepted_commit...main")"
@@ -252,6 +314,7 @@ jobs:
             "release/hra-${GITHUB_REF_NAME}.tgz" \
             "release/hra-${GITHUB_REF_NAME}.artifact.spdx.json" \
             "release/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json" \
+            release/RELEASE_NOTES.md \
             release/SHA256SUMS \
             --clobber
 
@@ -265,10 +328,10 @@ jobs:
           release_id="$release_ids"
           mkdir published-draft
           assets="$(gh api --paginate "repos/$GH_REPO/releases/$release_id/assets?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
-          test "$(printf '%s\n' "$assets" | sed '/^$/d' | wc -l | tr -d ' ')" = 4
+          test "$(printf '%s\n' "$assets" | sed '/^$/d' | wc -l | tr -d ' ')" = 5
           while IFS=$'\t' read -r asset_id asset_name; do
             case "$asset_name" in
-              "hra-${GITHUB_REF_NAME}.tgz"|"hra-${GITHUB_REF_NAME}.artifact.spdx.json"|"hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json"|SHA256SUMS) ;;
+              "hra-${GITHUB_REF_NAME}.tgz"|"hra-${GITHUB_REF_NAME}.artifact.spdx.json"|"hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json"|RELEASE_NOTES.md|SHA256SUMS) ;;
               *) exit 1 ;;
             esac
             gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$asset_id" > "published-draft/$asset_name"
@@ -276,6 +339,7 @@ jobs:
           cmp release/hra-${GITHUB_REF_NAME}.tgz published-draft/hra-${GITHUB_REF_NAME}.tgz
           cmp release/hra-${GITHUB_REF_NAME}.artifact.spdx.json published-draft/hra-${GITHUB_REF_NAME}.artifact.spdx.json
           cmp release/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json published-draft/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json
+          cmp release/RELEASE_NOTES.md published-draft/RELEASE_NOTES.md
           cmp release/SHA256SUMS published-draft/SHA256SUMS
           test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.tag_name')" = "$GITHUB_REF_NAME"
           test "$(gh api "repos/$GH_REPO/releases/$release_id" --jq '.name')" = "HRA $GITHUB_REF_NAME"
@@ -319,6 +383,7 @@ jobs:
     steps:
       - name: Hold the exact release mutation lease until publication
         env:
+          CANDIDATE_DIGEST: ${{ inputs.candidate_digest }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           PUBLICATION_LEASE: ${{ inputs.publication_lease }}
@@ -327,6 +392,14 @@ jobs:
           test "$GITHUB_REF_NAME" = v0.1.0
           test "$GITHUB_SHA" != ""
           printf '%s' "$PUBLICATION_LEASE" | grep -Eq '^[0-9a-f]{32}$'
+          printf '%s' "$CANDIDATE_DIGEST" | grep -Eq '^[0-9a-f]{64}$'
+          tag_object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq 'select(.object.type == "tag") | .object.sha')"
+          test -n "$tag_object_sha"
+          tag_record="$(gh api "repos/$GH_REPO/git/tags/$tag_object_sha")"
+          tag_commit="$(printf '%s' "$tag_record" | jq -r 'select(.tag == "v0.1.0" and .object.type == "commit") | .object.sha')"
+          tag_candidate_digest="$(printf '%s' "$tag_record" | jq -r '.message' | sed -n 's/^hra-release-candidate-sha256:\([0-9a-f]\{64\}\)$/\1/p')"
+          test "$tag_commit" = "$GITHUB_SHA"
+          test "$tag_candidate_digest" = "$CANDIDATE_DIGEST"
           while true; do
             if ! release_rows="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
               --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.id, .draft, .immutable] | @tsv")"; then
@@ -369,16 +442,32 @@ jobs:
           XDG_DATA_HOME: ${{ runner.temp }}/hra-public-xdg/data
           XDG_STATE_HOME: ${{ runner.temp }}/hra-public-xdg/state
         run: |
+          umask 077
           mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
-          bun add --global --ignore-scripts "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.tgz"
-          bun ./scripts/check-installed-package.ts "$BUN_INSTALL/install/global/node_modules/hra"
+          HRA_PUBLIC_INSTALL_COMMAND="$(bun -e 'import { buildHraGlobalInstallCommand, HRA_INSTALL_ARCHIVE_URL } from "./src/install-preflight.ts"; process.stdout.write(buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL));')"
+          test -n "$HRA_PUBLIC_INSTALL_COMMAND"
+          /bin/sh -c "$HRA_PUBLIC_INSTALL_COMMAND"
+          test -L "$BUN_INSTALL/bin/hra"
+          HRA_ACTIVE_CLI="$(realpath "$BUN_INSTALL/bin/hra")"
+          case "$HRA_ACTIVE_CLI" in
+            "$BUN_INSTALL"/install/hra/versions/*/install/global/node_modules/hra/src/cli.ts) ;;
+            *) exit 1 ;;
+          esac
+          HRA_PACKAGE_ROOT="$(dirname "$(dirname "$HRA_ACTIVE_CLI")")"
+          HRA_RUNTIME_NODE_MODULES="$(dirname "$HRA_PACKAGE_ROOT")"
+          HRA_GLOBAL_MANIFEST="$(dirname "$HRA_RUNTIME_NODE_MODULES")/package.json"
+          HRA_GLOBAL_MANIFEST="$HRA_GLOBAL_MANIFEST" HRA_RUNTIME_NODE_MODULES="$HRA_RUNTIME_NODE_MODULES" bun -e 'import { readdir } from "node:fs/promises"; import { join } from "node:path";
+          const root = process.env.HRA_GLOBAL_MANIFEST; const modules = process.env.HRA_RUNTIME_NODE_MODULES; if (!root || !modules) throw new Error("transactional install paths are missing");
+          const consumer = await Bun.file(root).json(); if (consumer.trustedDependencies !== undefined) throw new Error("lifecycle-disabled install changed consumer trust");
+          const visit = async (directory) => { for (const entry of await readdir(directory, { withFileTypes: true })) { if (!entry.isDirectory() || entry.name === ".bin") continue; const child = join(directory, entry.name); if (entry.name.startsWith("@")) { await visit(child); continue; } const manifest = await Bun.file(join(child, "package.json")).json(); if (manifest.trustedDependencies !== undefined) throw new Error(`installed package ${manifest.name ?? entry.name} broadens lifecycle trust`); const nested = join(child, "node_modules"); if (await Bun.file(nested).exists()) await visit(nested); } }; await visit(modules);'
+          bun ./scripts/check-installed-package.ts "$HRA_PACKAGE_ROOT"
           test "$("$BUN_INSTALL/bin/hra" --version)" = "hra ${GITHUB_REF_NAME#v}"
           "$BUN_INSTALL/bin/hra" doctor --offline --json | bun -e 'const value = JSON.parse(await Bun.stdin.text()); if (value?.ok !== true || value?.data?.offline !== true) throw new Error("offline doctor failed");'
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             --connect-timeout 10 --max-time 60 --retry 2 --retry-all-errors --retry-delay 1 \
             "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.ubuntu-24.04-x64.runtime.spdx.json" \
             --output "${RUNNER_TEMP}/public-runtime.spdx.json"
-          PUBLIC_NODE_MODULES="$BUN_INSTALL/install/global/node_modules" \
+          PUBLIC_NODE_MODULES="$HRA_RUNTIME_NODE_MODULES" \
             PUBLIC_RUNTIME_SBOM="${RUNNER_TEMP}/public-runtime.spdx.json" \
             bun -e 'import { readdir } from "node:fs/promises"; import { join } from "node:path";
             const root = process.env.PUBLIC_NODE_MODULES; const sbomPath = process.env.PUBLIC_RUNTIME_SBOM;

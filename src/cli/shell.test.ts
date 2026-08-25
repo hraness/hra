@@ -8,6 +8,7 @@ import {
   ShellUsageError,
   compileShellLine,
   formatShellPrompt,
+  shellHelp,
   tokenizeShellCommand,
 } from "./shell";
 
@@ -212,6 +213,15 @@ describe("HRA line shell", () => {
     expect(compileShellLine("/help")).toEqual({ kind: "help" });
     expect(compileShellLine("   ")).toEqual({ kind: "noop" });
     expect(() => compileShellLine("/exit now")).toThrow(ShellUsageError);
+  });
+
+  test("makes detailed interaction inspection discoverable in shell help", () => {
+    expect(shellHelp).toContain("/interaction show ID");
+    expect(shellHelp).toContain("questions, choices, or form fields");
+    expect(compileShellLine("/interaction show 70000000-0000-4000-8000-000000000001")).toEqual({
+      argv: ["interaction", "show", "70000000-0000-4000-8000-000000000001"],
+      kind: "dispatch",
+    });
   });
 
   test("bounds lines and remains total for arbitrary short input", () => {

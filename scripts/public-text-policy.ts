@@ -1,6 +1,11 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative } from "node:path";
 
+import {
+  assertAuthoritySupervisorArtifactPublicFile,
+  isAuthoritySupervisorArtifactRelativePath,
+} from "./authority-supervisor-artifact";
+
 const allowedPublicScopes = new Set([
   "auth",
   "convex-dev",
@@ -65,7 +70,7 @@ export function assertPublicSensitiveText(value: string, label: string): void {
 }
 
 const excludedDirectories = new Set([".git", "dist", "node_modules"]);
-const textFile = /(?:^|\/)(?:LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yml|yaml)$/u;
+const textFile = /(?:^|\/)(?:LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yaml|yml|zig)$/u;
 
 export async function assertPublicTree(root: string): Promise<void> {
   const visit = async (path: string): Promise<void> => {
@@ -76,6 +81,8 @@ export async function assertPublicTree(root: string): Promise<void> {
         continue;
       } else if (entry.isDirectory()) {
         if (!excludedDirectories.has(entry.name)) await visit(child);
+      } else if (entry.isFile() && isAuthoritySupervisorArtifactRelativePath(label)) {
+        await assertAuthoritySupervisorArtifactPublicFile(root, label);
       } else if (entry.isFile() && textFile.test(child)) {
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);

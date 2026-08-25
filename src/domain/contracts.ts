@@ -165,6 +165,10 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("auth.delete"), acknowledgeErasure: z.literal(true) }).strict(),
   z.object({ kind: z.literal("device.list") }).strict(),
   z.object({ kind: z.literal("device.pair") }).strict(),
+  z.object({
+    acknowledgeNoKeyHolders: z.literal(true),
+    kind: z.literal("device.key-loss"),
+  }).strict(),
   z.object({ kind: z.literal("device.approve"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("device.revoke"), device: selectorSchema, idempotencyKey: requiredUuidV7IdempotencyKeySchema }).strict(),
   z.object({ kind: z.literal("sync.status") }).strict(),
@@ -183,6 +187,8 @@ export const commandEnvelopeSchema = z
   })
   .strict();
 
+// This validates only the transport envelope. Successful data stays unknown
+// until the caller validates it against the command that produced it.
 export const commandResponseSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(true), version: z.literal(1), requestId: z.string().uuid(), data: z.unknown() }).strict(),
   z.object({ ok: z.literal(false), version: z.literal(1), requestId: z.string().uuid(), error: z.object({ code: z.enum(["INVALID_INPUT", "NOT_FOUND", "AMBIGUOUS", "CONFLICT", "INTERACTION_REQUIRED", "UNAVAILABLE", "RECOVERY_REQUIRED", "INTERNAL"]), message: z.string().min(1).max(1000), details: z.unknown().optional() }).strict() }).strict(),

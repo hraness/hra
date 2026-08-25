@@ -111,6 +111,7 @@ export class CliUsageError extends Error {
 export const usage = `HRA
 
 Usage:
+  hra
   hra init [--yes] [--json]
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
@@ -119,7 +120,7 @@ Usage:
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
   hra session list|show|status|start|send|queue|steer|stop
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow]
+  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow|--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|note|preset|fast|project
   hra interaction list|show|inspect|decide|grant|answer|submit
@@ -128,9 +129,16 @@ Usage:
   hra auth login --input-stdin|--input-fd <fd>
   hra auth status|logout
   hra auth delete --acknowledge-erasure
-  hra device list|pair|approve|revoke
+  hra device list|pair|approve|revoke|key-loss
   hra sync status|now
   hra sync projection recover <local-session> --acknowledge-gap
+
+Output:
+  --json                    Emit one versioned JSON result for supported commands.
+  --jsonl, --follow         Follow session events as versioned JSON Lines.
+
+Interactive:
+  Run bare \`hra\` in a TTY to start the persistent agent-and-human shell.
 
 Mutation safety:
   --idempotency-key <uuid>  Reuse after a lost response; changed reuse fails closed.
@@ -216,7 +224,7 @@ Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
   hra session status <session>
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow]
+  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow|--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
   hra session send|queue|steer <session> <message>
@@ -230,7 +238,7 @@ Usage:
 
 Examples:
   hra session start personal --project jungle --preset high
-  hra session events my-session --wait-ms 30000 --follow
+  hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"`,
   interaction: `HRA interaction
 
@@ -289,10 +297,12 @@ Examples:
 Usage:
   hra device list
   hra device pair
+  hra device key-loss --acknowledge-no-key-holders
   hra device approve|revoke <device-id-or-prefix> [--idempotency-key <uuidv7>] [--json]
 
 Examples:
   hra device pair
+  hra device key-loss --acknowledge-no-key-holders
   hra device approve <pending-device-prefix>`,
   sync: `HRA sync
 
@@ -317,6 +327,12 @@ export function requestsJsonOutput(argv: readonly string[]): boolean {
   const delimiter = argv.indexOf("--");
   const options = delimiter < 0 ? argv : argv.slice(0, delimiter);
   return options.includes("--json");
+}
+
+export function requestsJsonlOutput(argv: readonly string[]): boolean {
+  const delimiter = argv.indexOf("--");
+  const options = delimiter < 0 ? argv : argv.slice(0, delimiter);
+  return options.includes("--jsonl") || options.includes("--follow");
 }
 
 type Cursor = { values: string[] };
@@ -688,7 +704,10 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
   }
 };
 
-const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvocation => {
+const parseSession = (
+  cursor: Cursor,
+  jsonl: boolean,
+): LocalCommand | SessionEventFollowCliInvocation => {
   const action = take(cursor, "session action");
   switch (action) {
     case "list": {
@@ -701,7 +720,8 @@ const parseSession = (cursor: Cursor): LocalCommand | SessionEventFollowCliInvoc
     case "show": { const detail = flag(cursor, "--detail"); const session = take(cursor, "session"); finish(cursor); return { kind: "session.show", session, detail }; }
     case "status": { const session = take(cursor, "session"); finish(cursor); return { kind: "session.status", session }; }
     case "events": {
-      const follow = flag(cursor, "--follow");
+      const followFlag = flag(cursor, "--follow");
+      const follow = followFlag || jsonl;
       const eventCursor = option(cursor, "--cursor");
       const limit = boundedDecimal(option(cursor, "--limit"), "event limit", 1, 200, 200);
       const waitMs = boundedDecimal(
@@ -961,6 +981,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   const literalTail = delimiter < 0 ? [] : argv.slice(delimiter + 1).map(literal);
   const cursor: Cursor = { values: regular };
   const json = flag(cursor, "--json");
+  const jsonl = flag(cursor, "--jsonl");
+  if (json && jsonl) {
+    throw new CliUsageError("--json and --jsonl are mutually exclusive output modes.");
+  }
   const idempotencyKey = option(cursor, "--idempotency-key");
   if (flag(cursor, "--help") || flag(cursor, "-h") || (cursor.values.length === 0 && literalTail.length === 0)) {
     const group = cursor.values[0];
@@ -969,6 +993,9 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
+  if (jsonl && group !== "session") {
+    throw new CliUsageError("--jsonl is supported only by `hra session events`.");
+  }
   if (group === "init") { const yes = flag(cursor, "--yes"); finish(cursor); return { kind: "init", yes, json }; }
   if (group === "doctor") { const offline = flag(cursor, "--offline"); finish(cursor); return { kind: "command", command: { kind: "doctor", offline }, json }; }
   if (group === "daemon") {
@@ -1009,7 +1036,7 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   else if (group === "plugin") parsed = parsePlugin(cursor);
   else if (group === "project") parsed = parseProject(cursor, cwd);
   else if (group === "session") {
-    const sessionCommand = parseSession(cursor);
+    const sessionCommand = parseSession(cursor, jsonl);
     if (sessionCommand.kind === "session.events.follow") {
       if (json) {
         throw new CliUsageError("Event following is already JSON Lines and cannot be combined with --json.");
@@ -1018,6 +1045,9 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
         throw new CliUsageError("--idempotency-key is not supported by session.events.");
       }
       return sessionCommand;
+    }
+    if (jsonl) {
+      throw new CliUsageError("--jsonl is supported only by `hra session events`.");
     }
     parsed = sessionCommand;
   }
@@ -1071,6 +1101,19 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
     if (action === "list" || action === "pair") {
       finish(cursor);
       parsed = { kind: `device.${action}` };
+    } else if (action === "key-loss") {
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by device key-loss.");
+      }
+      const acknowledgeNoKeyHolders = flag(cursor, "--acknowledge-no-key-holders");
+      finish(cursor);
+      if (!acknowledgeNoKeyHolders) {
+        throw new CliUsageError("Account-key loss acknowledgement requires --acknowledge-no-key-holders.");
+      }
+      parsed = {
+        acknowledgeNoKeyHolders: true,
+        kind: "device.key-loss",
+      };
     } else if (action === "approve" || action === "revoke") {
       const device = take(cursor, "device");
       finish(cursor);

@@ -1,14 +1,33 @@
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
+  chmod,
   lstat,
+  mkdir,
   mkdtemp,
   open,
+  readFile,
   rm,
+  writeFile,
   type FileHandle,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
+import { ConvexHttpClient } from "convex/browser";
+import { makeFunctionReference } from "convex/server";
+
+import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import {
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  retainBoundedProcessRecoveryPath,
+} from "./bounded-process";
+import {
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
 import {
   buildConvexChildEnvironment,
   runCommand,
@@ -28,15 +47,31 @@ import {
   type ConvexTarget,
   type ConvexTargetVerifier,
 } from "./convex-target";
+import {
+  canonicalDigest,
+  deployEvidenceSchema,
+  deployIntentSchema,
+  parseDeployEvidenceFile,
+  readProtectedJson,
+  runtimeReleaseAttestationSchema,
+  unboundRuntimeReleaseAttestationSchema,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
+  type DeployEvidence,
+  type DeployIntent,
+  type RuntimeReleaseAttestation,
+} from "./release-evidence";
 
 const convexDeployOutputMaximumBytes = 512 * 1024;
 const convexDeployTimeoutMs = 10 * 60 * 1_000;
+const convexAuthorityTimeoutMs = 30_000;
 const gitOutputMaximumBytes = 64 * 1024;
 const sourceCommitPattern = /^[0-9a-f]{40}$/u;
 
 type HostedDeployFailureCode =
   | "convex_deploy_failed"
   | "convex_target_refused"
+  | "process_cleanup_unproven"
   | "source_changed"
   | "target_file_refused"
   | "usage_invalid";
@@ -51,7 +86,19 @@ class HostedDeployError extends Error {
   }
 }
 
+const retainHostedDeployRecoveryPaths = (
+  error: unknown,
+  paths: readonly string[],
+): unknown => {
+  let retained = error;
+  for (const path of paths) retained = retainBoundedProcessRecoveryPath(retained, path);
+  return retained;
+};
+
 type DeployArguments = Readonly<{
+  evidencePath?: string;
+  phase?: "bootstrap" | "candidate";
+  previousDeployEvidencePath?: string;
   sourceCommit: string;
   target: ConvexTarget;
 }>;
@@ -64,6 +111,9 @@ export function parseDeployArguments(arguments_: readonly string[]): DeployArgum
     throw new HostedDeployError("usage_invalid");
   }
   let sourceCommit: string | undefined;
+  let evidencePath: string | undefined;
+  let phase: "bootstrap" | "candidate" | undefined;
+  let previousDeployEvidencePath: string | undefined;
   for (let index = 0; index < parsedTarget.otherArguments.length; index += 1) {
     const argument = parsedTarget.otherArguments[index];
     if (argument === "--source-commit" && sourceCommit === undefined) {
@@ -75,10 +125,55 @@ export function parseDeployArguments(arguments_: readonly string[]): DeployArgum
       index += 1;
       continue;
     }
+    if (argument === "--evidence-path" && evidencePath === undefined) {
+      const value = parsedTarget.otherArguments[index + 1];
+      if (value === undefined || !value.startsWith("/") || value.length > 4_096) {
+        throw new HostedDeployError("usage_invalid");
+      }
+      evidencePath = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--phase" && phase === undefined) {
+      const value = parsedTarget.otherArguments[index + 1];
+      if (value !== "bootstrap" && value !== "candidate") {
+        throw new HostedDeployError("usage_invalid");
+      }
+      phase = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--previous-deploy-evidence" && previousDeployEvidencePath === undefined) {
+      const value = parsedTarget.otherArguments[index + 1];
+      if (value === undefined || !value.startsWith("/") || value.length > 4_096) {
+        throw new HostedDeployError("usage_invalid");
+      }
+      previousDeployEvidencePath = value;
+      index += 1;
+      continue;
+    }
     throw new HostedDeployError("usage_invalid");
   }
   if (sourceCommit === undefined) throw new HostedDeployError("usage_invalid");
-  return { sourceCommit, target: parsedTarget.target };
+  const evidenceConfigured = evidencePath !== undefined
+    || phase !== undefined
+    || previousDeployEvidencePath !== undefined;
+  if (
+    evidenceConfigured
+    && (
+      evidencePath === undefined
+      || phase === undefined
+      || (phase === "bootstrap" && previousDeployEvidencePath !== undefined)
+      || (phase === "candidate" && previousDeployEvidencePath === undefined)
+    )
+  ) throw new HostedDeployError("usage_invalid");
+  return {
+    ...(evidencePath === undefined ? {} : { evidencePath }),
+    ...(phase === undefined ? {} : { phase }),
+    ...(previousDeployEvidencePath === undefined ? {} : { previousDeployEvidencePath }),
+    sourceCommit,
+    target: parsedTarget.target,
+  };
 }
 
 const convexCli = resolve(import.meta.dir, "..", "node_modules", "convex", "bin", "main.js");
@@ -87,6 +182,9 @@ const resolvedTargetAssertion = resolve(
   "assert-convex-deploy-target.ts",
 );
 const defaultRepositoryRoot = resolve(import.meta.dir, "..");
+const releaseAttestationFunction = makeFunctionReference<"query", Record<string, never>, unknown>(
+  "releaseAttestation:read",
+);
 
 const shellQuote = (value: string): string =>
   `'${value.replaceAll("'", `'"'"'`)}'`;
@@ -103,10 +201,12 @@ const invokeGit = async (
   arguments_: readonly string[],
 ): Promise<CommandResult> => await runner({
   arguments: arguments_,
+  containment: "local",
   cwd: repositoryRoot,
   environment,
-  executable: "git",
+  executable: "/usr/bin/git",
   outputMaximumBytes: gitOutputMaximumBytes,
+  phase: "git-source-read",
   stdin: "",
   timeoutMs: 60_000,
 });
@@ -141,6 +241,7 @@ const requireExactSource = async (
 type DeploymentBinding = Readonly<{
   cleanup: () => Promise<void>;
   path: string;
+  recoveryPath: string;
 }>;
 
 const closeQuietly = async (handle: FileHandle): Promise<void> => {
@@ -205,12 +306,237 @@ async function createDeploymentBinding(
       }
     },
     path,
+    recoveryPath: directory,
   };
 }
 
+export type ReleaseAttestationReader = (
+  target: ConvexTarget,
+) => Promise<RuntimeReleaseAttestation | null>;
+
+const runtimeReleaseAttestationReader = (
+  fetcher: typeof fetch,
+  timeoutMs: number,
+): ReleaseAttestationReader => async (target) => {
+  const client = new ConvexHttpClient(target.deploymentUrl, {
+    fetch: createBoundedAuthorityFetch(fetcher, timeoutMs, "convex_authority_timeout"),
+    logger: false,
+  });
+  let value: unknown;
+  try {
+    value = await client.query(releaseAttestationFunction, {});
+  } catch {
+    throw new HostedDeployError("convex_deploy_failed");
+  }
+  const bound = runtimeReleaseAttestationSchema.safeParse(value);
+  if (bound.success) return bound.data;
+  if (unboundRuntimeReleaseAttestationSchema.safeParse(value).success) return null;
+  throw new HostedDeployError("convex_deploy_failed");
+};
+
+const releaseAttestationOverlay = (
+  attestation: RuntimeReleaseAttestation,
+): string => [
+  'import { query } from "./server";',
+  "",
+  `export const RELEASE_ATTESTATION = Object.freeze(${JSON.stringify(attestation)} as const);`,
+  "",
+  "export const read = query({",
+  "  args: {},",
+  "  handler: () => RELEASE_ATTESTATION,",
+  "});",
+  "",
+].join("\n");
+
+const sameAttestation = (
+  left: RuntimeReleaseAttestation | null,
+  right: RuntimeReleaseAttestation | null,
+): boolean => canonicalDigest(left) === canonicalDigest(right);
+
+const createDeployIntent = (
+  options: Readonly<{
+    before: RuntimeReleaseAttestation | null;
+    now: () => number;
+    phase: "bootstrap" | "candidate";
+    previousDeployDigest: string | null;
+    revision: () => string;
+    sourceCommit: string;
+    target: ConvexTarget;
+  }>,
+): DeployIntent => {
+  const deployedAtMs = Math.max(options.now(), (options.before?.deployedAtMs ?? -1) + 1);
+  const after = runtimeReleaseAttestationSchema.parse({
+    bound: true,
+    deployedAtMs,
+    previousDeployDigest: options.previousDeployDigest,
+    runtimeRevision: options.revision(),
+    runtimeSourceCommit: options.sourceCommit,
+    schemaIdentity: "hra-release-attestation-v1",
+    schemaVersion: 1,
+  });
+  const overlay = releaseAttestationOverlay(after);
+  return deployIntentSchema.parse(withSelfDigest({
+    after,
+    before: options.before,
+    kind: "convex-deploy-intent" as const,
+    overlaySha256: createHash("sha256").update(overlay, "utf8").digest("hex"),
+    phase: options.phase,
+    previousDeployDigest: options.previousDeployDigest,
+    schemaVersion: 1 as const,
+    sourceCommit: options.sourceCommit,
+    target: options.target,
+    targetDigest: canonicalDigest(options.target),
+  }));
+};
+
+const evidenceFromIntent = (intent: DeployIntent): DeployEvidence =>
+  deployEvidenceSchema.parse(withSelfDigest({
+    after: intent.after,
+    before: intent.before,
+    kind: "convex-deploy" as const,
+    overlaySha256: intent.overlaySha256,
+    phase: intent.phase,
+    previousDeployDigest: intent.previousDeployDigest,
+    schemaVersion: 1 as const,
+    sourceCommit: intent.sourceCommit,
+    target: intent.target,
+    targetDigest: intent.targetDigest,
+  }));
+
+const readDeployIntent = (options: Readonly<{
+  before: RuntimeReleaseAttestation | null;
+  evidencePath: string;
+  phase: "bootstrap" | "candidate";
+  previousDeployDigest: string | null;
+  sourceCommit: string;
+  target: ConvexTarget;
+}>): DeployIntent | undefined => {
+  const path = `${options.evidencePath}.intent`;
+  let existing: DeployIntent | undefined;
+  try {
+    existing = readProtectedJson(path, deployIntentSchema, {
+      recoverInterruptedPublication: true,
+    });
+  } catch (error: unknown) {
+    if (!(error instanceof Error) || error.message !== "evidence_not_found") throw error;
+  }
+  if (existing !== undefined) {
+    const invariant = {
+      before: options.before,
+      phase: options.phase,
+      previousDeployDigest: options.previousDeployDigest,
+      sourceCommit: options.sourceCommit,
+      target: options.target,
+      targetDigest: canonicalDigest(options.target),
+    };
+    const recorded = {
+      before: existing.before,
+      phase: existing.phase,
+      previousDeployDigest: existing.previousDeployDigest,
+      sourceCommit: existing.sourceCommit,
+      target: existing.target,
+      targetDigest: existing.targetDigest,
+    };
+    if (canonicalDigest(invariant) !== canonicalDigest(recorded)) {
+      throw new HostedDeployError("source_changed");
+    }
+    return existing;
+  }
+  return undefined;
+};
+
+const createAndPersistDeployIntent = (options: Readonly<{
+  before: RuntimeReleaseAttestation | null;
+  evidencePath: string;
+  now: () => number;
+  phase: "bootstrap" | "candidate";
+  previousDeployDigest: string | null;
+  revision: () => string;
+  sourceCommit: string;
+  target: ConvexTarget;
+}>): DeployIntent => {
+  const intent = createDeployIntent(options);
+  writeProtectedJsonNoReplace(
+    `${options.evidencePath}.intent`,
+    intent,
+    deployIntentSchema,
+  );
+  return intent;
+};
+
+const prepareArchivedSource = async (
+  runner: CommandRunner,
+  repositoryRoot: string,
+  environment: Readonly<Record<string, string>>,
+  sourceCommit: string,
+  overlay: string,
+  temporaryRoot: string,
+): Promise<DeploymentBinding> => {
+  const directory = await mkdtemp(join(temporaryRoot, "hra-hosted-source-"));
+  try {
+    await chmod(directory, 0o700);
+    const archive = join(directory, "source.tar");
+    const source = join(directory, "source");
+    await mkdir(source, { mode: 0o700 });
+    const archived = await invokeGit(
+      runner,
+      repositoryRoot,
+      environment,
+      ["archive", "--format=tar", `--output=${archive}`, sourceCommit],
+    );
+    if (archived.exitCode !== 0 || archived.stdout !== "") {
+      throw new HostedDeployError("source_changed");
+    }
+    const extracted = await runner({
+      arguments: ["-xf", archive, "-C", source],
+      containment: "local",
+      cwd: repositoryRoot,
+      environment,
+      executable: "/usr/bin/tar",
+      outputMaximumBytes: gitOutputMaximumBytes,
+      phase: "source-archive-extract",
+      stdin: "",
+      timeoutMs: 60_000,
+    });
+    if (extracted.exitCode !== 0 || extracted.stdout !== "") {
+      throw new HostedDeployError("source_changed");
+    }
+    const attestationPath = join(source, "convex", "releaseAttestation.ts");
+    if (dirname(attestationPath) !== join(source, "convex")) {
+      throw new HostedDeployError("source_changed");
+    }
+    await writeFile(attestationPath, overlay, { encoding: "utf8", flag: "w", mode: 0o600 });
+    if (await readFile(attestationPath, "utf8") !== overlay) {
+      throw new HostedDeployError("source_changed");
+    }
+    return {
+      async cleanup() {
+        await rm(directory, { force: false, recursive: true });
+      },
+      path: source,
+      recoveryPath: directory,
+    };
+  } catch (error: unknown) {
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      error.retainRecoveryPath(directory);
+    } else {
+      await rm(directory, { force: true, recursive: true }).catch(() => undefined);
+    }
+    throw error;
+  }
+};
+
 type HostedDeployOptions = Readonly<{
+  authorityFetch?: typeof fetch;
+  authorityTimeoutMs?: number;
+  evidencePath?: string;
   environment?: Readonly<NodeJS.ProcessEnv>;
+  now?: () => number;
+  phase?: "bootstrap" | "candidate";
+  previousDeployEvidencePath?: string;
+  readAttestation?: ReleaseAttestationReader;
   repositoryRoot?: string;
+  revision?: () => string;
   runner?: CommandRunner;
   sourceCommit: string;
   target: ConvexTarget;
@@ -218,7 +544,9 @@ type HostedDeployOptions = Readonly<{
   verifyTarget?: ConvexTargetVerifier;
 }>;
 
-export async function deployHostedSync(options: HostedDeployOptions): Promise<void> {
+export async function deployHostedSync(
+  options: HostedDeployOptions,
+): Promise<DeployEvidence | undefined> {
   if (!sourceCommitPattern.test(options.sourceCommit)) {
     throw new HostedDeployError("usage_invalid");
   }
@@ -230,6 +558,24 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
     [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
   };
   const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
+  const authorityTimeout = options.authorityTimeoutMs ?? convexAuthorityTimeoutMs;
+  if (!Number.isSafeInteger(authorityTimeout) || authorityTimeout < 1 || authorityTimeout > 120_000) {
+    throw new HostedDeployError("usage_invalid");
+  }
+  const readAttestation = options.readAttestation
+    ?? runtimeReleaseAttestationReader(options.authorityFetch ?? fetch, authorityTimeout);
+  const evidenceConfigured = options.evidencePath !== undefined
+    || options.phase !== undefined
+    || options.previousDeployEvidencePath !== undefined;
+  if (
+    evidenceConfigured
+    && (
+      options.evidencePath === undefined
+      || options.phase === undefined
+      || (options.phase === "bootstrap" && options.previousDeployEvidencePath !== undefined)
+      || (options.phase === "candidate" && options.previousDeployEvidencePath === undefined)
+    )
+  ) throw new HostedDeployError("usage_invalid");
 
   await requireExactSource(
     runner,
@@ -238,12 +584,104 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
     options.sourceCommit,
   );
   await verifyTarget(target);
-  const binding = await createDeploymentBinding(
-    target.deploymentName,
-    options.temporaryRoot,
-  );
+  let intent: DeployIntent | undefined;
+  let sourceBinding: DeploymentBinding | undefined;
+  if (options.evidencePath !== undefined && options.phase !== undefined) {
+    const existingEvidence = (() => {
+      try {
+        return parseDeployEvidenceFile(options.evidencePath, {
+          recoverInterruptedPublication: true,
+        });
+      } catch (error: unknown) {
+        if (error instanceof Error && error.message === "evidence_not_found") return undefined;
+        throw error;
+      }
+    })();
+    if (existingEvidence !== undefined) {
+      const expectedPrevious = options.previousDeployEvidencePath === undefined
+        ? null
+        : parseDeployEvidenceFile(options.previousDeployEvidencePath).selfDigest;
+      if (
+        existingEvidence.sourceCommit !== options.sourceCommit
+        || existingEvidence.phase !== options.phase
+        || existingEvidence.previousDeployDigest !== expectedPrevious
+        || canonicalDigest(existingEvidence.target) !== canonicalDigest(target)
+        || !sameAttestation(await readAttestation(target), existingEvidence.after)
+      ) throw new HostedDeployError("source_changed");
+      await verifyTarget(target);
+      await requireExactSource(runner, repositoryRoot, environment, options.sourceCommit);
+      return existingEvidence;
+    }
+    const previous = options.phase === "candidate"
+      ? parseDeployEvidenceFile(options.previousDeployEvidencePath ?? "")
+      : undefined;
+    const before = previous?.after ?? null;
+    const previousDeployDigest = previous?.selfDigest ?? null;
+    intent = readDeployIntent({
+      before,
+      evidencePath: options.evidencePath,
+      phase: options.phase,
+      previousDeployDigest,
+      sourceCommit: options.sourceCommit,
+      target,
+    });
+    const current = await readAttestation(target);
+    if (intent !== undefined && sameAttestation(current, intent.after)) {
+      const reconciled = evidenceFromIntent(intent);
+      writeProtectedJsonNoReplace(
+        options.evidencePath,
+        reconciled,
+        deployEvidenceSchema,
+        { allowExactReplay: true },
+      );
+      await verifyTarget(target);
+      await requireExactSource(runner, repositoryRoot, environment, options.sourceCommit);
+      return reconciled;
+    }
+    if (!sameAttestation(current, intent?.before ?? before)) {
+      throw new HostedDeployError("source_changed");
+    }
+    intent ??= createAndPersistDeployIntent({
+      before,
+      evidencePath: options.evidencePath,
+      now: options.now ?? Date.now,
+      phase: options.phase,
+      previousDeployDigest,
+      revision: options.revision ?? randomUUID,
+      sourceCommit: options.sourceCommit,
+      target,
+    });
+    const overlay = releaseAttestationOverlay(intent.after);
+    if (createHash("sha256").update(overlay, "utf8").digest("hex") !== intent.overlaySha256) {
+      throw new HostedDeployError("source_changed");
+    }
+    try {
+      sourceBinding = await prepareArchivedSource(
+        runner,
+        repositoryRoot,
+        environment,
+        options.sourceCommit,
+        overlay,
+        options.temporaryRoot ?? tmpdir(),
+      );
+    } catch (error: unknown) {
+      throw retainHostedDeployRecoveryPaths(
+        error,
+        [options.evidencePath, `${options.evidencePath}.intent`],
+      );
+    }
+  }
+  let binding: DeploymentBinding | undefined;
   let failure: Error | undefined;
   try {
+    binding = await createDeploymentBinding(
+      target.deploymentName,
+      options.temporaryRoot,
+    );
+    if (
+      intent !== undefined
+      && !sameAttestation(await readAttestation(target), intent.before)
+    ) throw new HostedDeployError("source_changed");
     let result: CommandResult | undefined;
     try {
       result = await runner({
@@ -265,18 +703,30 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
           "--message",
           `HRA source ${options.sourceCommit}`,
         ],
-        cwd: repositoryRoot,
+        containment: "authority",
+        cwd: sourceBinding?.path ?? repositoryRoot,
         environment,
         executable: process.execPath,
         outputMaximumBytes: convexDeployOutputMaximumBytes,
+        phase: "convex-deploy",
         stdin: "",
         timeoutMs: convexDeployTimeoutMs,
       });
-    } catch {
+    } catch (error: unknown) {
+      if (isBoundedProcessCleanupUnprovenError(error)) throw error;
+      if (isBoundedProcessRecoveryJournalError(error)) throw error;
+      rethrowAuthorityContainmentUnavailable(error);
       result = undefined;
     }
     await verifyTarget(target);
-    if (result === undefined || result.exitCode !== 0) {
+    const runtimeAfter = intent === undefined ? undefined : await readAttestation(target);
+    if (
+      (result === undefined || result.exitCode !== 0)
+      && (intent === undefined || !sameAttestation(runtimeAfter ?? null, intent.after))
+    ) {
+      throw new HostedDeployError("convex_deploy_failed");
+    }
+    if (intent !== undefined && !sameAttestation(runtimeAfter ?? null, intent.after)) {
       throw new HostedDeployError("convex_deploy_failed");
     }
     await requireExactSource(
@@ -286,20 +736,54 @@ export async function deployHostedSync(options: HostedDeployOptions): Promise<vo
       options.sourceCommit,
     );
   } catch (error: unknown) {
-    failure = error instanceof Error
-      ? error
+    const retained = retainHostedDeployRecoveryPaths(
+      error,
+      intent === undefined || options.evidencePath === undefined
+        ? []
+        : [options.evidencePath, `${options.evidencePath}.intent`],
+    );
+    failure = retained instanceof Error
+      ? retained
       : new HostedDeployError("convex_deploy_failed");
   }
-  try {
-    await binding.cleanup();
-  } catch (error: unknown) {
-    if (failure === undefined) {
-      failure = error instanceof Error
-        ? error
-        : new HostedDeployError("target_file_refused");
+  const cleanupFailure = isBoundedProcessCleanupUnprovenError(failure) ? failure : undefined;
+  if (cleanupFailure !== undefined) {
+    if (binding !== undefined) cleanupFailure.retainRecoveryPath(binding.recoveryPath);
+    if (sourceBinding !== undefined) cleanupFailure.retainRecoveryPath(sourceBinding.recoveryPath);
+  }
+  const cleanupUnproven = cleanupFailure !== undefined;
+  if (!cleanupUnproven) {
+    try {
+      await binding?.cleanup();
+    } catch (error: unknown) {
+      if (failure === undefined) {
+        failure = error instanceof Error
+          ? error
+          : new HostedDeployError("target_file_refused");
+      }
+    }
+    try {
+      await sourceBinding?.cleanup();
+    } catch (error: unknown) {
+      if (failure === undefined) {
+        failure = error instanceof Error
+          ? error
+          : new HostedDeployError("target_file_refused");
+      }
     }
   }
   if (failure !== undefined) throw failure;
+  if (intent !== undefined && options.evidencePath !== undefined) {
+    const evidence = evidenceFromIntent(intent);
+    writeProtectedJsonNoReplace(
+      options.evidencePath,
+      evidence,
+      deployEvidenceSchema,
+      { allowExactReplay: true },
+    );
+    return evidence;
+  }
+  return undefined;
 }
 
 type ExecuteOptions = Readonly<{
@@ -316,8 +800,13 @@ type ExecuteOptions = Readonly<{
 export async function executeHostedDeploy(options: ExecuteOptions): Promise<number> {
   try {
     const parsed = parseDeployArguments(options.arguments);
-    await deployHostedSync({
+    const evidence = await deployHostedSync({
+      ...(parsed.evidencePath === undefined ? {} : { evidencePath: parsed.evidencePath }),
       ...(options.environment === undefined ? {} : { environment: options.environment }),
+      ...(parsed.phase === undefined ? {} : { phase: parsed.phase }),
+      ...(parsed.previousDeployEvidencePath === undefined
+        ? {}
+        : { previousDeployEvidencePath: parsed.previousDeployEvidencePath }),
       ...(options.repositoryRoot === undefined ? {} : { repositoryRoot: options.repositoryRoot }),
       ...(options.runner === undefined ? {} : { runner: options.runner }),
       sourceCommit: parsed.sourceCommit,
@@ -325,9 +814,45 @@ export async function executeHostedDeploy(options: ExecuteOptions): Promise<numb
       ...(options.temporaryRoot === undefined ? {} : { temporaryRoot: options.temporaryRoot }),
       ...(options.verifyTarget === undefined ? {} : { verifyTarget: options.verifyTarget }),
     });
-    options.stdout.write(`Deployed exact source ${parsed.sourceCommit} to the verified target.\n`);
+    options.stdout.write(evidence === undefined
+      ? `Deployed exact source ${parsed.sourceCommit} to the verified target.\n`
+      : `${JSON.stringify({
+          evidenceDigest: evidence.selfDigest,
+          evidencePath: parsed.evidencePath,
+          phase: evidence.phase,
+          schemaVersion: 1,
+          sourceCommit: evidence.sourceCommit,
+          status: "attested",
+        })}\n`);
     return 0;
   } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const code = error instanceof HostedDeployError
       ? error.code
       : error instanceof ConvexTargetError
@@ -339,11 +864,57 @@ export async function executeHostedDeploy(options: ExecuteOptions): Promise<numb
 }
 
 if (import.meta.main) {
-  const exitCode = await executeHostedDeploy({
-    arguments: process.argv.slice(2),
-    stderr: process.stderr,
-    stdout: process.stdout,
-  });
+  let exitCode = 75;
+  try {
+    const rawArguments = process.argv.slice(2);
+    let operatorRecoveryPaths: readonly string[] = [];
+    try {
+      const parsed = parseDeployArguments(rawArguments);
+      if (parsed.evidencePath !== undefined) {
+        operatorRecoveryPaths = [parsed.evidencePath, `${parsed.evidencePath}.intent`];
+      }
+    } catch {
+      // The process journal remains authoritative when this invocation's
+      // arguments are invalid. Only validated absolute paths are retained.
+    }
+    try {
+      await recoverBoundedProcessJournal();
+    } catch (error: unknown) {
+      throw retainHostedDeployRecoveryPaths(error, operatorRecoveryPaths);
+    }
+    exitCode = await executeHostedDeploy({
+      arguments: rawArguments,
+      stderr: process.stderr,
+      stdout: process.stdout,
+    });
+  } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else {
+      process.stderr.write("Hosted deploy refused (convex_deploy_failed).\n");
+      exitCode = 1;
+    }
+  }
   process.exitCode = exitCode;
 }
 

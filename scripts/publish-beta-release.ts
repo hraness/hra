@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -7,7 +6,6 @@ import {
   fstatSync,
   fsyncSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readSync,
   realpathSync,
@@ -25,11 +23,33 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { z } from "zod";
 
+import {
+  assertHraInstallManifest,
+  assertSafeDarwinInstallAcl,
+} from "../src/install-normalizer";
+import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import {
+  BoundedProcessInvocationGuard,
+  type BoundedProcessContainment,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  openOwnedPrivateStateDirectory,
+  recoverBoundedProcessJournal,
+  retainBoundedProcessRecoveryPath,
+  rethrowBoundedProcessCleanupUnproven as rethrowLocalProcessCleanupUnproven,
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+  settleConcurrentOperations,
+} from "./bounded-process";
+import {
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
 import { assertProductionPackageOnly } from "./package-policy";
 import { assertPublicTree } from "./public-text-policy";
 import {
@@ -39,6 +59,12 @@ import {
   type ManagedAlias,
   type ProjectReadback,
 } from "./domain-cutover";
+import {
+  SystemReleaseCandidateProvider,
+  verifyReleaseCandidateReceipt,
+  type ReleaseCandidateProvider,
+} from "./release-candidate";
+import { parseReleaseCandidateReceiptFile } from "./release-evidence";
 
 const repository = "hraness/hra";
 const repositoryId = 1_343_008_607;
@@ -93,6 +119,7 @@ export type PublicationRecoveryArguments = Readonly<{
 
 export type PublicationArguments = Readonly<{
   action: PublicationAction;
+  candidateReceipt: string;
   deploymentId: string;
   deploymentUrl: string;
   expectedCommit: string;
@@ -111,7 +138,26 @@ export type PublicationPhase =
   | "publication_unknown"
   | "published_acceptance_failed";
 
+const rethrowBoundedProcessCleanupUnproven = (error: unknown): void => {
+  rethrowAuthorityContainmentUnavailable(error);
+  rethrowLocalProcessCleanupUnproven(error);
+};
+
+const rethrowPublicationProcessCleanup = (
+  error: unknown,
+  phase: PublicationPhase,
+): void => {
+  rethrowAuthorityContainmentUnavailable(error);
+  if (isBoundedProcessRecoveryJournalError(error)) throw error;
+  if (isBoundedProcessCleanupUnprovenError(error)) {
+    error.annotateDiagnostic("publicationPhase", phase);
+    throw error;
+  }
+};
+
 export type PublicationLease = Readonly<{
+  candidateDigest: string;
+  candidateReceipt: string;
   expectedCommit: string;
   holder: string;
   runAttempt: number;
@@ -126,6 +172,8 @@ export type ReviewedSourceAuthority = Readonly<{
 }>;
 
 export type PublicationLeaseRecoveryReceipt = Readonly<{
+  candidateDigest: string;
+  candidateReceipt: string;
   expectedCommit: string;
   holder: string;
   repository: typeof repository;
@@ -210,6 +258,7 @@ export function parsePublicationArguments(arguments_: readonly string[]): Public
     throw new ReleasePublicationError("usage_invalid");
   }
   const tag = takeOption(values, "--tag");
+  const candidateReceipt = takeOption(values, "--candidate-receipt");
   const expectedCommit = takeOption(values, "--expected-commit");
   const deploymentId = takeOption(values, "--deployment-id");
   const deploymentUrl = takeOption(values, "--deployment-url");
@@ -226,6 +275,8 @@ export function parsePublicationArguments(arguments_: readonly string[]): Public
   if (
     values.length !== 0
     || tag !== releaseTag
+    || !isAbsolute(candidateReceipt)
+    || candidateReceipt.length > 4_096
     || !commitSchema.safeParse(expectedCommit).success
     || !deploymentIdSchema.safeParse(deploymentId).success
     || !deploymentUrlSchema.safeParse(deploymentUrl).success
@@ -246,6 +297,7 @@ export function parsePublicationArguments(arguments_: readonly string[]): Public
   ) throw new ReleasePublicationError("usage_invalid");
   return {
     action,
+    candidateReceipt,
     deploymentId,
     deploymentUrl,
     expectedCommit,
@@ -300,7 +352,11 @@ export const releaseArtifactName = (runId: number, runAttempt: number): string =
 };
 
 export interface ReleasePublicationProvider {
-  acquirePublicationLease(expectedCommit: string): Promise<PublicationLease>;
+  acquirePublicationLease(
+    expectedCommit: string,
+    candidateDigest: string,
+    candidateReceipt: string,
+  ): Promise<PublicationLease>;
   acceptPackedInstall(archive: string, temporaryRoot: string): Promise<void>;
   acceptPublicInstall(url: string, temporaryRoot: string, expectedDigest: string): Promise<void>;
   assertPublicationLease(lease: PublicationLease, expectedCommit: string): Promise<void>;
@@ -327,6 +383,10 @@ export interface ReleasePublicationProvider {
   readTagProtection(): Promise<unknown>;
   readWorkflow(): Promise<unknown>;
   verifyLocalSource(expectedCommit: string): Promise<void>;
+  verifyCandidateReceipt(
+    candidateReceipt: string,
+    expectedCommit: string,
+  ): Promise<string>;
   verifyVercelVersion(): Promise<void>;
 }
 
@@ -382,6 +442,8 @@ const publicationLeaseDispatchResponseSchema = z.object({
 }).passthrough();
 
 const publicationLeaseRecoveryReceiptSchema = z.object({
+  candidateDigest: z.string().regex(/^[0-9a-f]{64}$/u),
+  candidateReceipt: z.string().min(1).max(4_096).refine(isAbsolute),
   expectedCommit: commitSchema,
   holder: z.string().regex(/^[0-9a-f]{32}$/u),
   repository: z.literal(repository),
@@ -515,6 +577,7 @@ const hostedProjectReadbackSchema = z.object({
 }).passthrough();
 
 const expectedReleaseAssetNames = [
+  "RELEASE_NOTES.md",
   "SHA256SUMS",
   `hra-${releaseTag}.artifact.spdx.json`,
   `hra-${releaseTag}.tgz`,
@@ -526,12 +589,13 @@ const expectedChecksumNames = [
   `hra-${releaseTag}.tgz`,
   `hra-${releaseTag}.artifact.spdx.json`,
   `hra-${releaseTag}.ubuntu-24.04-x64.runtime.spdx.json`,
+  "RELEASE_NOTES.md",
 ] as const;
 
 const expectedAcceptedNames = [
   ...expectedReleaseAssetNames,
+  "RELEASE_CANDIDATE_SHA256",
   "RELEASE_COMMIT",
-  "RELEASE_NOTES.md",
 ].sort();
 
 const readBounded = async (file: string, maximumBytes: number): Promise<Buffer> => {
@@ -580,6 +644,7 @@ const readResponseBounded = async (
 
 type AcceptedBundle = Readonly<{
   archive: string;
+  candidateDigest: string;
   commit: string;
   notes: string;
   releaseAssets: ReadonlyMap<string, Buffer>;
@@ -657,6 +722,13 @@ export async function verifyAcceptedBundle(
   if (commit !== expectedCommit || !commitSchema.safeParse(commit).success) {
     throw new ReleasePublicationError("accepted_artifact_invalid");
   }
+  const candidateDigest = (await readBounded(
+    join(directory, "RELEASE_CANDIDATE_SHA256"),
+    128,
+  )).toString("utf8").trimEnd();
+  if (!/^[0-9a-f]{64}$/u.test(candidateDigest)) {
+    throw new ReleasePublicationError("accepted_artifact_invalid");
+  }
   const notesBuffer = await readBounded(join(directory, "RELEASE_NOTES.md"), 256 * 1024);
   const notes = notesBuffer.toString("utf8");
   if (notes.trim().length === 0 || notes !== notes.trimEnd()) {
@@ -704,7 +776,7 @@ export async function verifyAcceptedBundle(
         ?? Buffer.alloc(0),
     ),
   );
-  return { archive, commit, notes, releaseAssets };
+  return { archive, candidateDigest, commit, notes, releaseAssets };
 }
 
 const exactRelease = (value: unknown): z.infer<typeof releaseSchema> => {
@@ -794,6 +866,7 @@ const recoverAcceptedBundleFromPublishedRelease = async (
   provider: ReleasePublicationProvider,
   release: z.infer<typeof releaseSchema>,
   expectedCommit: string,
+  candidateDigest: string,
   directory: string,
 ): Promise<AcceptedBundle> => {
   if (
@@ -809,22 +882,23 @@ const recoverAcceptedBundleFromPublishedRelease = async (
     "published_acceptance_failed",
   );
   await mkdir(directory, { mode: 0o700 });
-  await Promise.all(expectedReleaseAssetNames.map(async (name) => {
+  await settleConcurrentOperations(expectedReleaseAssetNames.map(async (name) => {
     await provider.downloadPublicReleaseAsset(name, join(directory, name));
-  }));
-  await Promise.all([
-    writeFile(join(directory, "RELEASE_COMMIT"), `${expectedCommit}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    }),
-    writeFile(join(directory, "RELEASE_NOTES.md"), release.body, {
-      flag: "wx",
-      mode: 0o600,
-    }),
-  ]);
+  }) as unknown as readonly Promise<void>[]);
+  await writeFile(join(directory, "RELEASE_COMMIT"), `${expectedCommit}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  await writeFile(join(directory, "RELEASE_CANDIDATE_SHA256"), `${candidateDigest}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
   try {
-    return await verifyAcceptedBundle(directory, expectedCommit);
-  } catch {
+    const accepted = await verifyAcceptedBundle(directory, expectedCommit);
+    verifyReleaseMetadata(release, accepted, false);
+    return accepted;
+  } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
     throw new ReleasePublicationError(
       "published_release_invalid",
       "published_acceptance_failed",
@@ -836,6 +910,7 @@ const recoverAcceptedBundleFromDraftRelease = async (
   provider: ReleasePublicationProvider,
   release: z.infer<typeof releaseSchema>,
   expectedCommit: string,
+  candidateDigest: string,
   directory: string,
 ): Promise<Readonly<{ accepted: AcceptedBundle; assetIdentity: string }>> => {
   if (
@@ -852,16 +927,14 @@ const recoverAcceptedBundleFromDraftRelease = async (
   for (const asset of assets) {
     await provider.downloadReleaseAsset(asset.id, join(directory, asset.name));
   }
-  await Promise.all([
-    writeFile(join(directory, "RELEASE_COMMIT"), `${expectedCommit}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    }),
-    writeFile(join(directory, "RELEASE_NOTES.md"), release.body, {
-      flag: "wx",
-      mode: 0o600,
-    }),
-  ]);
+  await writeFile(join(directory, "RELEASE_COMMIT"), `${expectedCommit}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  await writeFile(join(directory, "RELEASE_CANDIDATE_SHA256"), `${candidateDigest}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
   const accepted = await verifyAcceptedBundle(directory, expectedCommit);
   verifyReleaseMetadata(release, accepted, true);
   return {
@@ -883,7 +956,8 @@ const verifyReviewedSourceAuthority = async (
   let reviewed: ReviewedSourceAuthority;
   try {
     reviewed = await provider.readReviewedSourceAuthority(temporaryRoot);
-  } catch {
+  } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, phase);
     throw new ReleasePublicationError(
       phase === "before_publication" ? "accepted_artifact_invalid" : "published_release_invalid",
       phase,
@@ -969,7 +1043,7 @@ const verifyFinalPublicationAuthority = async (
   provider: ReleasePublicationProvider,
   arguments_: Pick<PublicationArguments, "expectedCommit" | "tag">,
 ): Promise<void> => {
-  const [tagCommit, mainComparisonValue, tagProtectionValue, immutableSetting] = await Promise.all([
+  const [tagCommit, mainComparisonValue, tagProtectionValue, immutableSetting] = await settleConcurrentOperations([
     provider.readTagCommit(arguments_.tag),
     provider.readMainComparison(arguments_.expectedCommit),
     provider.readTagProtection(),
@@ -1041,7 +1115,7 @@ const verifyHostedPublicationAuthority = async (
       canonicalMarker,
       fallbackMarker,
       stagingMarker,
-    ] = await Promise.all([
+    ] = await settleConcurrentOperations([
       provider.readHostedProject(oldProjectId),
       provider.readHostedProject(newProjectId),
       provider.readHostedDeployment(arguments_.deploymentId),
@@ -1117,6 +1191,7 @@ const verifyHostedPublicationAuthority = async (
       || fallbackMarkerValue.data.publication.version !== arguments_.fallbackVersion
     ) throw new ReleasePublicationError("hosted_authority_invalid");
   } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     if (error instanceof ReleasePublicationError) throw error;
     throw new ReleasePublicationError("hosted_authority_invalid");
   }
@@ -1144,6 +1219,7 @@ const verifyPublished = async (
       sha256(archive),
     );
   } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
     const code = error instanceof ReleasePublicationError
       ? error.code
       : "published_release_invalid";
@@ -1160,7 +1236,8 @@ const verifyHostedAfterPublication = async (
 ): Promise<void> => {
   try {
     await verifyHostedPublicationAuthority(provider, arguments_);
-  } catch {
+  } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
     throw new ReleasePublicationError(
       "hosted_authority_invalid",
       "published_acceptance_failed",
@@ -1176,10 +1253,12 @@ const cancelLeaseAfterRefusal = async (
   releaseId: number,
   expectedAssetIdentity: string,
 ): Promise<never> => {
+  rethrowPublicationProcessCleanup(error, "before_publication");
   let outcome: PublicationLeaseCancellation;
   try {
     outcome = await provider.cancelPublicationLease(lease);
-  } catch {
+  } catch (cancellationError: unknown) {
+    rethrowPublicationProcessCleanup(cancellationError, "before_publication");
     throw new ReleasePublicationError(
       "publication_lease_cleanup_failed",
       "before_publication",
@@ -1194,7 +1273,8 @@ const cancelLeaseAfterRefusal = async (
         releaseId,
         expectedAssetIdentity,
       );
-    } catch {
+    } catch (verificationError: unknown) {
+      rethrowPublicationProcessCleanup(verificationError, "publication_unknown");
       throw new ReleasePublicationError(
         "publication_unknown",
         "publication_unknown",
@@ -1213,11 +1293,18 @@ const cancelLeaseAfterRefusal = async (
 const acceptPublicInstallationInLease = async (
   provider: ReleasePublicationProvider,
   expectedCommit: string,
+  candidateDigest: string,
+  candidateReceipt: string,
 ): Promise<void> => {
   let lease: PublicationLease;
   try {
-    lease = await provider.acquirePublicationLease(expectedCommit);
+    lease = await provider.acquirePublicationLease(
+      expectedCommit,
+      candidateDigest,
+      candidateReceipt,
+    );
   } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
     if (
       error instanceof ReleasePublicationError
       && error.code === "publication_lease_completed"
@@ -1235,6 +1322,7 @@ const acceptPublicInstallationInLease = async (
   try {
     await provider.completePublicationLease(lease);
   } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
     if (
       error instanceof ReleasePublicationError
       && error.code === "publication_lease_lost"
@@ -1257,6 +1345,10 @@ export async function executeReleasePublication(options: Readonly<{
   temporaryRoot: string;
 }>): Promise<Readonly<{ commit: string; status: "accepted" | "published"; tag: string }>> {
   const { arguments: arguments_, provider, temporaryRoot } = options;
+  const candidateDigest = await provider.verifyCandidateReceipt(
+    arguments_.candidateReceipt,
+    arguments_.expectedCommit,
+  );
   await provider.verifyLocalSource(arguments_.expectedCommit);
   await verifyRunIdentity(provider, arguments_);
   const acceptedDirectory = join(temporaryRoot, "accepted");
@@ -1267,6 +1359,7 @@ export async function executeReleasePublication(options: Readonly<{
       provider,
       publishedRelease,
       arguments_.expectedCommit,
+      candidateDigest,
       acceptedDirectory,
     );
   } else {
@@ -1279,6 +1372,9 @@ export async function executeReleasePublication(options: Readonly<{
     );
     accepted = await verifyAcceptedBundle(acceptedDirectory, arguments_.expectedCommit);
   }
+  if (accepted.candidateDigest !== candidateDigest) {
+    throw new ReleasePublicationError("release_authority_changed");
+  }
   await verifyReviewedSourceAuthority(
     provider,
     accepted,
@@ -1287,7 +1383,11 @@ export async function executeReleasePublication(options: Readonly<{
   );
   try {
     await provider.acceptPackedInstall(accepted.archive, join(temporaryRoot, "packed-install"));
-  } catch {
+  } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(
+      error,
+      arguments_.action === "publish" ? "before_publication" : "published_acceptance_failed",
+    );
     if (arguments_.action === "accept") {
       throw new ReleasePublicationError(
         "published_release_invalid",
@@ -1309,6 +1409,7 @@ export async function executeReleasePublication(options: Readonly<{
         accepted,
       );
     } catch (error: unknown) {
+      rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
       const code = error instanceof ReleasePublicationError
         ? error.code
         : "published_release_invalid";
@@ -1317,6 +1418,7 @@ export async function executeReleasePublication(options: Readonly<{
     try {
       await verifyFinalPublicationAuthority(provider, arguments_);
     } catch (error: unknown) {
+      rethrowPublicationProcessCleanup(error, "published_acceptance_failed");
       const code = error instanceof ReleasePublicationError
         ? error.code
         : "published_release_invalid";
@@ -1324,7 +1426,19 @@ export async function executeReleasePublication(options: Readonly<{
     }
     await verifyHostedAfterPublication(provider, arguments_);
     await verifyPublished(provider, accepted, temporaryRoot, acceptedReleaseId);
-    await acceptPublicInstallationInLease(provider, arguments_.expectedCommit);
+    const finalCandidateDigest = await provider.verifyCandidateReceipt(
+      arguments_.candidateReceipt,
+      arguments_.expectedCommit,
+    );
+    if (finalCandidateDigest !== candidateDigest) {
+      throw new ReleasePublicationError("release_authority_changed");
+    }
+    await acceptPublicInstallationInLease(
+      provider,
+      arguments_.expectedCommit,
+      candidateDigest,
+      arguments_.candidateReceipt,
+    );
     await verifyHostedAfterPublication(provider, arguments_);
     return { commit: accepted.commit, status: "accepted", tag: releaseTag };
   }
@@ -1340,10 +1454,22 @@ export async function executeReleasePublication(options: Readonly<{
 
   await verifyFinalPublicationAuthority(provider, arguments_);
   await verifyHostedPublicationAuthority(provider, arguments_);
+  const preLeaseCandidateDigest = await provider.verifyCandidateReceipt(
+    arguments_.candidateReceipt,
+    arguments_.expectedCommit,
+  );
+  if (preLeaseCandidateDigest !== candidateDigest) {
+    throw new ReleasePublicationError("release_authority_changed");
+  }
   let lease: PublicationLease;
   try {
-    lease = await provider.acquirePublicationLease(arguments_.expectedCommit);
+    lease = await provider.acquirePublicationLease(
+      arguments_.expectedCommit,
+      candidateDigest,
+      arguments_.candidateReceipt,
+    );
   } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(error, "before_publication");
     if (
       error instanceof ReleasePublicationError
       && error.code === "publication_lease_completed"
@@ -1356,7 +1482,8 @@ export async function executeReleasePublication(options: Readonly<{
           release.id,
           stagedAssetIdentity,
         );
-      } catch {
+      } catch (verificationError: unknown) {
+        rethrowPublicationProcessCleanup(verificationError, "publication_unknown");
         throw new ReleasePublicationError(
           "publication_unknown",
           "publication_unknown",
@@ -1371,6 +1498,7 @@ export async function executeReleasePublication(options: Readonly<{
     }
     throw error;
   }
+  let publicationConfirmed = false;
   try {
     await verifyFinalPublicationAuthority(provider, arguments_);
     await verifyHostedPublicationAuthority(provider, arguments_);
@@ -1385,6 +1513,14 @@ export async function executeReleasePublication(options: Readonly<{
     }
     await provider.assertPublicationLease(lease, arguments_.expectedCommit);
     await verifyDraftIdentity(provider, accepted, release.id, stagedAssetIdentity);
+    await provider.assertPublicationLease(lease, arguments_.expectedCommit);
+    const prePatchCandidateDigest = await provider.verifyCandidateReceipt(
+      arguments_.candidateReceipt,
+      arguments_.expectedCommit,
+    );
+    if (prePatchCandidateDigest !== candidateDigest) {
+      throw new ReleasePublicationError("release_authority_changed");
+    }
     await provider.assertPublicationLease(lease, arguments_.expectedCommit);
     try {
       const response = await provider.publishDraft(release.id, accepted.notes);
@@ -1403,6 +1539,7 @@ export async function executeReleasePublication(options: Readonly<{
         throw new ReleasePublicationError("published_release_invalid");
       }
     } catch (error: unknown) {
+      rethrowPublicationProcessCleanup(error, "publication_unknown");
       if (
         error instanceof ReleasePublicationError
         && error.phase === "published_acceptance_failed"
@@ -1414,7 +1551,8 @@ export async function executeReleasePublication(options: Readonly<{
           release.id,
           stagedAssetIdentity,
         );
-      } catch {
+      } catch (verificationError: unknown) {
+        rethrowPublicationProcessCleanup(verificationError, "publication_unknown");
         // A lost PATCH response cannot be distinguished from a request that never
         // reached GitHub. Keep the exact workflow lease alive for manual readback.
         throw new ReleasePublicationError(
@@ -1424,7 +1562,12 @@ export async function executeReleasePublication(options: Readonly<{
         );
       }
     }
+    publicationConfirmed = true;
   } catch (error: unknown) {
+    rethrowPublicationProcessCleanup(
+      error,
+      publicationConfirmed ? "published_acceptance_failed" : "before_publication",
+    );
     if (
       error instanceof ReleasePublicationError
       && error.phase === "publication_unknown"
@@ -1436,6 +1579,7 @@ export async function executeReleasePublication(options: Readonly<{
       try {
         await provider.completePublicationLease(lease);
       } catch (completionError: unknown) {
+        rethrowPublicationProcessCleanup(completionError, "published_acceptance_failed");
         if (
           completionError instanceof ReleasePublicationError
           && completionError.code === "publication_lease_lost"
@@ -1464,6 +1608,7 @@ export async function executeReleasePublication(options: Readonly<{
   try {
     await provider.completePublicationLease(lease);
   } catch (completionError: unknown) {
+    rethrowPublicationProcessCleanup(completionError, "published_acceptance_failed");
     if (
       completionError instanceof ReleasePublicationError
       && completionError.code === "publication_lease_lost"
@@ -1492,61 +1637,30 @@ type ProcessResult = Readonly<{
 
 type ProcessRequest = Readonly<{
   arguments: readonly string[];
+  containment: BoundedProcessContainment;
   cwd?: string;
   environment?: Readonly<NodeJS.ProcessEnv>;
   executable: string;
   outputMaximumBytes?: number;
+  phase: string;
   timeoutMs?: number;
 }>;
 
-const runProcess = async (request: ProcessRequest): Promise<ProcessResult> =>
-  await new Promise<ProcessResult>((resolvePromise) => {
-    const child = spawn(request.executable, [...request.arguments], {
-      cwd: request.cwd ?? repositoryRoot,
-      env: request.environment ?? process.env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let finished = false;
-    const maximum = request.outputMaximumBytes ?? commandOutputMaximumBytes;
-    const finish = (exitCode: number): void => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolvePromise({
-        exitCode,
-        stderr: Buffer.concat(stderr),
-        stdout: Buffer.concat(stdout),
-      });
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(124);
-    }, request.timeoutMs ?? 120_000);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.byteLength;
-      if (stdoutBytes <= maximum) stdout.push(chunk);
-      else {
-        child.kill("SIGKILL");
-        finish(1);
-      }
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.byteLength;
-      if (stderrBytes <= maximum) stderr.push(chunk);
-      else {
-        child.kill("SIGKILL");
-        finish(1);
-      }
-    });
-    child.once("error", () => finish(1));
-    child.once("close", (exitCode) => finish(exitCode ?? 1));
-  });
+const runProcess = async (
+  request: ProcessRequest,
+  recoveryDirectory?: string,
+): Promise<ProcessResult> =>
+  requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: request.arguments,
+    containment: request.containment,
+    cwd: request.cwd ?? repositoryRoot,
+    environment: request.environment ?? process.env,
+    executable: request.executable,
+    outputMaximumBytes: request.outputMaximumBytes ?? commandOutputMaximumBytes,
+    phase: request.phase,
+    terminationGraceMs: 1_000,
+    timeoutMs: request.timeoutMs ?? 120_000,
+  }, recoveryDirectory === undefined ? {} : { recoveryDirectory }));
 
 const requireSuccess = (result: ProcessResult): ProcessResult => {
   if (result.exitCode !== 0) throw new ReleasePublicationError("command_failed");
@@ -1768,6 +1882,8 @@ export const publicationLeaseCancellationOutcome = (
 };
 
 export class GitHubReleasePublicationProvider implements ReleasePublicationProvider {
+  private readonly guard: BoundedProcessInvocationGuard;
+  private readonly publicFetcher: typeof fetch;
   private readonly vercelProvider: VercelCutoverProvider;
 
   constructor(
@@ -1775,6 +1891,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       environment?: Readonly<NodeJS.ProcessEnv>;
       fetcher?: typeof fetch;
       ghCli: string;
+      guard?: BoundedProcessInvocationGuard;
       githubCommand?: (
         arguments_: readonly string[],
         maximum: number,
@@ -1789,16 +1906,31 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       ) => void;
       leaseReceiptDirectory?: string;
       now?: () => number;
+      publicTimeoutMs?: number;
       randomHolder?: () => string;
+      recoveryDirectory?: string;
       root?: string;
       sleep?: (milliseconds: number) => Promise<void>;
       vercelCli: string;
       writeStderr?: (value: string) => void;
     }>,
   ) {
+    const publicTimeoutMs = options.publicTimeoutMs ?? 60_000;
+    if (
+      !Number.isSafeInteger(publicTimeoutMs)
+      || publicTimeoutMs < 1
+      || publicTimeoutMs > 120_000
+    ) throw new ReleasePublicationError("provider_result_invalid");
+    this.guard = options.guard ?? new BoundedProcessInvocationGuard();
+    this.publicFetcher = createBoundedAuthorityFetch(
+      options.fetcher ?? fetch,
+      publicTimeoutMs,
+      "public_authority_timeout",
+    );
     this.vercelProvider = new VercelCutoverProvider({
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+      guard: this.guard,
       vercelCli: options.vercelCli,
     });
   }
@@ -1830,19 +1962,28 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       }
       return this.options.leaseReceiptDirectory;
     }
-    const xdgState = this.environment.XDG_STATE_HOME;
-    if (xdgState !== undefined && isAbsolute(xdgState)) {
-      return join(xdgState, "hra", "release-publication");
-    }
-    const home = this.environment.HOME;
-    if (home === undefined || !isAbsolute(home)) {
+    const owner = process.getuid?.();
+    let account: Readonly<{ homedir: string; uid: number }>;
+    try {
+      const systemAccount = userInfo({ encoding: "utf8" });
+      account = { homedir: systemAccount.homedir, uid: systemAccount.uid };
+    } catch {
       throw new ReleasePublicationError("local_source_invalid");
     }
-    return join(home, ".local", "state", "hra", "release-publication");
+    if (
+      owner === undefined
+      || account.uid !== owner
+      || !isAbsolute(account.homedir)
+    ) {
+      throw new ReleasePublicationError("local_source_invalid");
+    }
+    return join(account.homedir, ".local", "state", "hra", "release-publication");
   }
 
   private async persistPublicationLeaseRecoveryReceipt(
     lease: Readonly<{
+      candidateDigest: string;
+      candidateReceipt: string;
       expectedCommit: string;
       holder: string;
       runAttempt?: number;
@@ -1851,6 +1992,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     state: PublicationLeaseRecoveryReceipt["state"],
   ): Promise<string> {
     const receipt: PublicationLeaseRecoveryReceipt = {
+      candidateDigest: lease.candidateDigest,
+      candidateReceipt: lease.candidateReceipt,
       expectedCommit: lease.expectedCommit,
       holder: lease.holder,
       repository,
@@ -1874,21 +2017,21 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || encoded.byteLength > publicationLeaseRecoveryReceiptMaximumBytes
       ) throw new Error("publication_lease_receipt_oversize");
       const directory = this.leaseReceiptDirectory;
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
       const owner = process.getuid?.();
+      const canonicalDirectory = resolve(directory);
+      if (canonicalDirectory !== directory) {
+        throw new Error("publication_lease_receipt_directory_invalid");
+      }
+      directoryDescriptor = openOwnedPrivateStateDirectory(canonicalDirectory);
       const pathStats = lstatSync(directory);
-      const canonicalDirectory = realpathSync(directory);
       if (
         owner === undefined
+        || realpathSync(directory) !== canonicalDirectory
         || !pathStats.isDirectory()
         || pathStats.isSymbolicLink()
         || pathStats.uid !== owner
         || (pathStats.mode & 0o777) !== 0o700
       ) throw new Error("publication_lease_receipt_directory_invalid");
-      directoryDescriptor = openSync(
-        canonicalDirectory,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-      );
       const directoryStats = fstatSync(directoryDescriptor);
       if (
         !directoryStats.isDirectory()
@@ -1897,6 +2040,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || directoryStats.uid !== owner
         || (directoryStats.mode & 0o777) !== 0o700
       ) throw new Error("publication_lease_receipt_directory_changed");
+      assertSafeDarwinInstallAcl(directoryDescriptor, owner, canonicalDirectory);
       const destination = join(canonicalDirectory, `${releaseTag}-${lease.holder}.json`);
       temporary = join(
         canonicalDirectory,
@@ -1920,6 +2064,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || (temporaryIdentity.mode & 0o777) !== 0o600
         || temporaryIdentity.size !== 0
       ) throw new Error("publication_lease_receipt_temporary_invalid");
+      assertSafeDarwinInstallAcl(temporaryDescriptor, owner, temporary);
       this.options.leaseReceiptBoundary?.("temporary_opened", state, temporary);
       let written = 0;
       while (written < encoded.byteLength) {
@@ -1982,6 +2127,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || (postDirectoryStats.mode & 0o777) !== 0o700
         || realpathSync(directory) !== canonicalDirectory
       ) throw new Error("publication_lease_receipt_directory_changed");
+      assertSafeDarwinInstallAcl(directoryDescriptor, owner, canonicalDirectory);
+      assertSafeDarwinInstallAcl(temporaryDescriptor, owner, temporary);
       renameSync(temporary, destination);
       renamed = true;
       const destinationStats = lstatSync(destination);
@@ -2012,6 +2159,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || (finalDirectoryStats.mode & 0o777) !== 0o700
         || realpathSync(directory) !== canonicalDirectory
       ) throw new Error("publication_lease_receipt_directory_changed");
+      assertSafeDarwinInstallAcl(directoryDescriptor, owner, canonicalDirectory);
+      assertSafeDarwinInstallAcl(temporaryDescriptor, owner, destination);
       this.options.leaseReceiptBoundary?.("directory_synced", state, temporary);
       return destination;
     } catch {
@@ -2056,16 +2205,34 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
   }
 
   private async gh(arguments_: readonly string[], maximum = providerJsonMaximumBytes): Promise<ProcessResult> {
-    if (this.options.githubCommand !== undefined) {
-      return await this.options.githubCommand(arguments_, maximum);
-    }
-    return await runProcess({
-      arguments: [...arguments_],
-      cwd: this.root,
-      environment: this.ghEnvironment,
-      executable: this.options.ghCli,
-      outputMaximumBytes: maximum,
+    const phase = arguments_.includes("PATCH")
+      ? "github-release-publish"
+      : arguments_.some((argument) => argument.endsWith("/dispatches"))
+        ? "github-lease-dispatch"
+        : arguments_.some((argument) => argument.endsWith("/cancel"))
+          ? "github-lease-cancel"
+          : arguments_[0] === "run" ? "github-artifact-download" : "github-authority-read";
+    return await this.guard.observe(async () => {
+      if (this.options.githubCommand !== undefined) {
+        return await this.options.githubCommand(arguments_, maximum);
+      }
+      return await runProcess({
+        arguments: [...arguments_],
+        containment: "authority",
+        cwd: this.root,
+        environment: this.ghEnvironment,
+        executable: this.options.ghCli,
+        outputMaximumBytes: maximum,
+        phase,
+      });
     });
+  }
+
+  private async process(request: ProcessRequest & Readonly<{ phase: string }>): Promise<ProcessResult> {
+    return await this.guard.observe(async () => await runProcess(
+      request,
+      this.options.recoveryDirectory,
+    ));
   }
 
   private async ghJson(arguments_: readonly string[]): Promise<unknown> {
@@ -2135,9 +2302,9 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || directoryPathStats.uid !== owner
         || (directoryPathStats.mode & 0o777) !== 0o700
       ) throw new Error("receipt_directory_invalid");
-      directoryDescriptor = openSync(
+      directoryDescriptor = openOwnedPrivateStateDirectory(
         canonicalReceiptDirectory,
-        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        false,
       );
       const directoryIdentity = fstatSync(directoryDescriptor);
       if (
@@ -2147,6 +2314,11 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || directoryIdentity.uid !== owner
         || (directoryIdentity.mode & 0o777) !== 0o700
       ) throw new Error("receipt_directory_changed");
+      assertSafeDarwinInstallAcl(
+        directoryDescriptor,
+        owner,
+        canonicalReceiptDirectory,
+      );
       descriptor = openSync(receiptPath, constants.O_RDONLY | constants.O_NOFOLLOW);
       const identity = fstatSync(descriptor);
       if (
@@ -2157,6 +2329,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || identity.size <= 0
         || identity.size > publicationLeaseRecoveryReceiptMaximumBytes
       ) throw new Error("receipt_file_invalid");
+      assertSafeDarwinInstallAcl(descriptor, owner, receiptPath);
       let bytesRead = 0;
       while (bytesRead < observed.byteLength) {
         const count = readSync(
@@ -2191,6 +2364,12 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         || finalDirectoryIdentity.ino !== directoryIdentity.ino
         || realpathSync(receiptDirectory) !== canonicalReceiptDirectory
       ) throw new Error("receipt_identity_changed");
+      assertSafeDarwinInstallAcl(
+        directoryDescriptor,
+        owner,
+        canonicalReceiptDirectory,
+      );
+      assertSafeDarwinInstallAcl(descriptor, owner, receiptPath);
       const encoded = observed.subarray(0, bytesRead).toString("utf8");
       if (!encoded.endsWith("\n") || encoded.slice(0, -1).includes("\n")) {
         throw new Error("receipt_encoding_invalid");
@@ -2202,6 +2381,11 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         receipt.expectedCommit !== expectedCommit
         || basename(receiptPath) !== `${releaseTag}-${receipt.holder}.json`
       ) throw new Error("receipt_binding_invalid");
+      const candidate = parseReleaseCandidateReceiptFile(receipt.candidateReceipt);
+      if (
+        candidate.sourceCommit !== receipt.expectedCommit
+        || candidate.selfDigest !== receipt.candidateDigest
+      ) throw new Error("candidate_receipt_binding_invalid");
       return receipt;
     } catch {
       throw new ReleasePublicationError(
@@ -2251,15 +2435,23 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     throw new ReleasePublicationError("publication_lease_cleanup_failed");
   }
 
-  async acquirePublicationLease(expectedCommit: string): Promise<PublicationLease> {
+  async acquirePublicationLease(
+    expectedCommit: string,
+    candidateDigest: string,
+    candidateReceipt: string,
+  ): Promise<PublicationLease> {
+    if (!/^[0-9a-f]{64}$/u.test(candidateDigest) || !isAbsolute(candidateReceipt)) {
+      throw new ReleasePublicationError("release_authority_changed");
+    }
     const holder = (this.options.randomHolder ?? (() => randomBytes(16).toString("hex")))();
     if (!/^[0-9a-f]{32}$/u.test(holder)) {
       throw new ReleasePublicationError("provider_result_invalid");
     }
     const recoveryReceiptPath = await this.persistPublicationLeaseRecoveryReceipt(
-      { expectedCommit, holder },
+      { candidateDigest, candidateReceipt, expectedCommit, holder },
       "dispatching",
     );
+    this.guard.retainRecoveryPath(recoveryReceiptPath);
     this.emitPublicationLeaseRecoveryReceipt(recoveryReceiptPath, holder);
     const dispatch = await this.gh([
       "api",
@@ -2269,6 +2461,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       `ref=${releaseTag}`,
       "-f",
       `inputs[publication_lease]=${holder}`,
+      "-f",
+      `inputs[candidate_digest]=${candidateDigest}`,
       "-F",
       "return_run_details=true",
       `repos/${repository}/actions/workflows/${workflowFile}/dispatches`,
@@ -2290,6 +2484,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     let discoveredLease = returnedRunId === undefined
       ? undefined
       : {
+          candidateDigest,
+          candidateReceipt,
           expectedCommit,
           holder,
           runAttempt: 1,
@@ -2315,6 +2511,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         if (identity.runAttempt === null) partialLeaseRunIds.add(identity.runId);
         else {
           rememberLease({
+            candidateDigest,
+            candidateReceipt,
             expectedCommit,
             holder,
             runAttempt: identity.runAttempt,
@@ -2355,6 +2553,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
                 )
               : listedCandidate;
             const candidateLease: PublicationLease = {
+              candidateDigest,
+              candidateReceipt,
               expectedCommit,
               holder,
               runAttempt: identity.runAttempt ?? candidateRun.run_attempt,
@@ -2418,6 +2618,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
           }
         }
       } catch (error: unknown) {
+        rethrowBoundedProcessCleanupUnproven(error);
         if (
           error instanceof ReleasePublicationError
           && [
@@ -2431,10 +2632,13 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       }
       await this.sleep(publicationLeasePollIntervalMs);
     }
-    const terminalScan = await this.scanPublicationLeaseHolderPages(
-      expectedCommit,
-      holder,
-    ).catch(() => undefined);
+    let terminalScan: PublicationLeaseCandidateScan | undefined;
+    try {
+      terminalScan = await this.scanPublicationLeaseHolderPages(expectedCommit, holder);
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
+      terminalScan = undefined;
+    }
     if (terminalScan !== undefined) {
       rememberScan(terminalScan);
     } else {
@@ -2450,6 +2654,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
           await this.readPublicationLeaseRun(runId),
         );
         const cleanupLease: PublicationLease = {
+          candidateDigest,
+          candidateReceipt,
           expectedCommit,
           holder,
           runAttempt: run.run_attempt,
@@ -2457,7 +2663,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         };
         assertPublicationLeaseRun(run, cleanupLease, expectedCommit, "any");
         rememberLease(cleanupLease);
-      } catch {
+      } catch (error: unknown) {
+        rethrowBoundedProcessCleanupUnproven(error);
         cleanupFailed = true;
         firstLeaseRunId ??= runId;
       }
@@ -2467,7 +2674,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       try {
         const outcome = await this.cancelPublicationLease(cleanupLease);
         if (outcome === "published") publishedLeaseRunId ??= cleanupLease.runId;
-      } catch {
+      } catch (error: unknown) {
+        rethrowBoundedProcessCleanupUnproven(error);
         cleanupFailed = true;
       }
     }
@@ -2528,6 +2736,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         try {
           return await this.readExactPublicationLeaseRun(lease);
         } catch (error: unknown) {
+          rethrowBoundedProcessCleanupUnproven(error);
           if (
             error instanceof ReleasePublicationError
             && error.code === "publication_lease_lost"
@@ -2592,6 +2801,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
           break;
         }
       } catch (error: unknown) {
+        rethrowBoundedProcessCleanupUnproven(error);
         if (error instanceof ReleasePublicationError) {
           if (error.code === "publication_lease_lost") throw error;
           if (!["command_failed", "provider_result_invalid"].includes(error.code)) {
@@ -2613,13 +2823,14 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     temporaryRoot: string,
   ): Promise<PublicationLeaseRecoveryResult> {
     const receiptPath = arguments_.receipt;
+    this.guard.retainRecoveryPath(receiptPath);
     try {
       const receipt = this.readPublicationLeaseRecoveryReceipt(
         receiptPath,
         arguments_.expectedCommit,
       );
       await this.verifyLocalSource(arguments_.expectedCommit);
-      const [repositoryValue, workflowValue] = await Promise.all([
+      const [repositoryValue, workflowValue] = await settleConcurrentOperations([
         this.readRepository(),
         this.readWorkflow(),
       ]);
@@ -2644,6 +2855,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         const leases = new Map<string, PublicationLease>();
         for (const candidate of scan.candidates) {
           const lease: PublicationLease = {
+            candidateDigest: receipt.candidateDigest,
+            candidateReceipt: receipt.candidateReceipt,
             expectedCommit: receipt.expectedCommit,
             holder: receipt.holder,
             runAttempt: candidate.run_attempt,
@@ -2658,6 +2871,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         }
         if (receipt.runId !== null && receipt.runAttempt !== null) {
           const receiptLease: PublicationLease = {
+            candidateDigest: receipt.candidateDigest,
+            candidateReceipt: receipt.candidateReceipt,
             expectedCommit: receipt.expectedCommit,
             holder: receipt.holder,
             runAttempt: receipt.runAttempt,
@@ -2677,6 +2892,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
           this,
           release,
           receipt.expectedCommit,
+          receipt.candidateDigest,
           join(temporaryRoot, "public-release"),
         );
         await verifyReviewedSourceAuthority(
@@ -2698,6 +2914,8 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         }
         if (receipt.runId !== null && receipt.runAttempt !== null) {
           await this.persistPublicationLeaseRecoveryReceipt({
+            candidateDigest: receipt.candidateDigest,
+            candidateReceipt: receipt.candidateReceipt,
             expectedCommit: receipt.expectedCommit,
             holder: receipt.holder,
             runAttempt: receipt.runAttempt,
@@ -2724,6 +2942,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         this,
         release,
         receipt.expectedCommit,
+        receipt.candidateDigest,
         join(temporaryRoot, "draft-release"),
       );
       await verifyReviewedSourceAuthority(
@@ -2809,6 +3028,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       }
       throw new ReleasePublicationError("publication_lease_cleanup_failed");
     } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       if (error instanceof ReleasePublicationError) {
         throw new ReleasePublicationError(
           error.code,
@@ -2828,21 +3048,25 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
 
   async verifyLocalSource(expectedCommit: string): Promise<void> {
     assertLocalOperatorEnvironment(this.environment);
-    requireSuccess(await runProcess({
+    requireSuccess(await this.process({
       arguments: ["fetch", "origin", "main", "--tags"],
+      containment: "authority",
       cwd: this.root,
       environment: this.environment,
-      executable: "git",
+      executable: "/usr/bin/git",
+      phase: "git-source-fetch",
     }));
     const query = async (arguments_: readonly string[]): Promise<string> =>
-      requireSuccess(await runProcess({
+      requireSuccess(await this.process({
         arguments: [...arguments_],
+        containment: "local",
         cwd: this.root,
         environment: this.environment,
-        executable: "git",
+        executable: "/usr/bin/git",
         outputMaximumBytes: 64 * 1024,
+        phase: "git-source-read",
       })).stdout.toString("utf8").trimEnd();
-    const [status, head, tagCommit, remote] = await Promise.all([
+    const [status, head, tagCommit, remote] = await settleConcurrentOperations([
       query(["status", "--porcelain=v1", "--untracked-files=all"]),
       query(["rev-parse", "HEAD^{commit}"]),
       query(["rev-parse", `refs/tags/${releaseTag}^{commit}`]),
@@ -2858,10 +3082,40 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     ) throw new ReleasePublicationError("local_source_invalid");
   }
 
+  async verifyCandidateReceipt(
+    candidateReceipt: string,
+    expectedCommit: string,
+  ): Promise<string> {
+    const provider: ReleaseCandidateProvider = new SystemReleaseCandidateProvider({
+      ...(this.options.environment === undefined
+        ? {}
+        : { environment: this.options.environment }),
+      ghCli: this.options.ghCli,
+      guard: this.guard,
+      repositoryRoot: this.root,
+      vercelCli: this.options.vercelCli,
+    });
+    try {
+      const receipt = await verifyReleaseCandidateReceipt({
+        expectedReleaseState: "draft-or-published",
+        expectedTag: "exact",
+        path: candidateReceipt,
+        provider,
+      });
+      if (receipt.sourceCommit !== expectedCommit) {
+        throw new Error("release_authority_changed");
+      }
+      return receipt.selfDigest;
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
+      throw new ReleasePublicationError("release_authority_changed");
+    }
+  }
+
   async readReviewedSourceAuthority(temporaryRoot: string): Promise<ReviewedSourceAuthority> {
     await mkdir(temporaryRoot, { mode: 0o700 });
     const environment = await buildCandidateInspectionEnvironment(temporaryRoot);
-    requireSuccess(await runProcess({
+    requireSuccess(await this.process({
       arguments: [
         "pm",
         "pack",
@@ -2870,10 +3124,12 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         temporaryRoot,
         "--quiet",
       ],
+      containment: "local",
       cwd: this.root,
       environment,
       executable: process.execPath,
       outputMaximumBytes: 64 * 1024,
+      phase: "bun-pack",
     }));
     const archiveName = `hra-${releaseVersion}.tgz`;
     if (JSON.stringify((await readdir(temporaryRoot)).sort()) !== JSON.stringify([
@@ -2965,15 +3221,14 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
         "published_acceptance_failed",
       );
     }
-    const fetcher = this.options.fetcher ?? fetch;
+    this.guard.assertMayProceed();
     let response: Response;
     try {
-      response = await fetcher(
+      response = await this.publicFetcher(
         `https://github.com/${repository}/releases/download/${releaseTag}/${encodeURIComponent(name)}`,
         {
           cache: "no-store",
           redirect: "follow",
-          signal: AbortSignal.timeout(60_000),
         },
       );
     } catch {
@@ -3080,19 +3335,23 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
   async acceptPackedInstall(archive: string, temporaryRoot: string): Promise<void> {
     await mkdir(temporaryRoot, { mode: 0o700 });
     const environment = await buildCandidateInspectionEnvironment(temporaryRoot);
-    const listing = requireSuccess(await runProcess({
+    const listing = requireSuccess(await this.process({
       arguments: ["-tzf", archive],
+      containment: "local",
       cwd: this.root,
       environment,
       executable: "/usr/bin/tar",
       outputMaximumBytes: 4 * 1024 * 1024,
+      phase: "tar-list",
     })).stdout.toString("utf8");
-    const verboseListing = requireSuccess(await runProcess({
+    const verboseListing = requireSuccess(await this.process({
       arguments: ["-tvzf", archive],
+      containment: "local",
       cwd: this.root,
       environment,
       executable: "/usr/bin/tar",
       outputMaximumBytes: 8 * 1024 * 1024,
+      phase: "tar-verbose-list",
     })).stdout.toString("utf8").trimEnd().split("\n");
     const entries = listing.trimEnd().split("\n");
     if (
@@ -3110,14 +3369,23 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     ) throw new ReleasePublicationError("accepted_artifact_invalid");
     const extracted = join(temporaryRoot, "extracted");
     await mkdir(extracted, { mode: 0o700 });
-    requireSuccess(await runProcess({
+    requireSuccess(await this.process({
       arguments: ["-xzf", archive, "-C", extracted],
+      containment: "local",
       cwd: this.root,
       environment,
       executable: "/usr/bin/tar",
+      phase: "tar-extract",
     }));
-    await assertPublicTree(extracted);
-    await assertProductionPackageOnly(extracted);
+    try {
+      await assertPublicTree(extracted);
+      await assertProductionPackageOnly(extracted);
+      assertHraInstallManifest(
+        JSON.parse(await readFile(join(extracted, "package", "package.json"), "utf8")) as unknown,
+      );
+    } catch {
+      throw new ReleasePublicationError("accepted_artifact_invalid");
+    }
   }
 
   async acceptPublicInstall(
@@ -3125,13 +3393,12 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
     _temporaryRoot: string,
     expectedDigest: string,
   ): Promise<void> {
-    const fetcher = this.options.fetcher ?? fetch;
+    this.guard.assertMayProceed();
     let response: Response;
     try {
-      response = await fetcher(url, {
+      response = await this.publicFetcher(url, {
         cache: "no-store",
         redirect: "follow",
-        signal: AbortSignal.timeout(60_000),
       });
     } catch {
       throw new ReleasePublicationError("public_acceptance_failed", "published_acceptance_failed");
@@ -3158,14 +3425,34 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
 export async function withBestEffortReleaseCleanup<T>(
   operation: () => Promise<T>,
   cleanup: () => Promise<void>,
+  recovery?: Readonly<{
+    path?: string;
+    publicationPhase?: PublicationPhase;
+  }>,
 ): Promise<T> {
+  let custodyUnproven = false;
   try {
     return await operation();
+  } catch (error: unknown) {
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      custodyUnproven = true;
+      if (recovery?.path !== undefined) error.retainRecoveryPath(recovery.path);
+      if (recovery?.publicationPhase !== undefined) {
+        error.annotateDiagnostic("publicationPhase", recovery.publicationPhase);
+      }
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      custodyUnproven = true;
+      throw recovery?.path === undefined
+        ? error
+        : error.withRecoveryPaths([recovery.path]);
+    }
+    throw error;
   } finally {
     // Cleanup removes temporary public bytes and static-inspection state. This is
     // hygiene, not filesystem, network, or keychain containment, and it must
     // never replace the authoritative pre- or post-publication outcome.
-    await cleanup().catch(() => undefined);
+    if (!custodyUnproven) await cleanup().catch(() => undefined);
   }
 }
 
@@ -3183,6 +3470,12 @@ export async function runReleasePublication(options: Readonly<{
       temporaryRoot,
     }),
     async () => await rm(temporaryRoot, { force: true, recursive: true }),
+    {
+      path: temporaryRoot,
+      publicationPhase: options.arguments.action === "publish"
+        ? "before_publication"
+        : "published_acceptance_failed",
+    },
   );
 }
 
@@ -3199,6 +3492,7 @@ export async function runPublicationLeaseRecovery(options: Readonly<{
       temporaryRoot,
     ),
     async () => await rm(temporaryRoot, { force: true, recursive: true }),
+    { path: temporaryRoot, publicationPhase: "before_publication" },
   );
 }
 
@@ -3210,10 +3504,18 @@ if (import.meta.main) {
     const result = recovery
       ? await (async (): Promise<PublicationLeaseRecoveryResult> => {
           const arguments_ = parsePublicationRecoveryArguments(rawArguments);
+          try {
+            await recoverBoundedProcessJournal();
+          } catch (error: unknown) {
+            throw retainBoundedProcessRecoveryPath(error, arguments_.receipt);
+          }
+          const guard = new BoundedProcessInvocationGuard();
+          guard.retainRecoveryPath(arguments_.receipt);
           return await runPublicationLeaseRecovery({
             arguments: arguments_,
             provider: new GitHubReleasePublicationProvider({
               ghCli: arguments_.ghCli,
+              guard,
               vercelCli: "/usr/bin/false",
             }),
           });
@@ -3224,10 +3526,18 @@ if (import.meta.main) {
           tag: string;
         }>> => {
           const arguments_ = parsePublicationArguments(rawArguments);
+          try {
+            await recoverBoundedProcessJournal();
+          } catch (error: unknown) {
+            throw retainBoundedProcessRecoveryPath(error, arguments_.candidateReceipt);
+          }
+          const guard = new BoundedProcessInvocationGuard();
+          guard.retainRecoveryPath(arguments_.candidateReceipt);
           return await runReleasePublication({
             arguments: arguments_,
             provider: new GitHubReleasePublicationProvider({
               ghCli: arguments_.ghCli,
+              guard,
               vercelCli: arguments_.vercelCli,
             }),
           });
@@ -3235,17 +3545,57 @@ if (import.meta.main) {
     process.stdout.write(`${JSON.stringify({ schemaVersion: 1, ...result })}\n`);
     exitCode = 0;
   } catch (error: unknown) {
-    const failure = error instanceof ReleasePublicationError
-      ? error
-      : new ReleasePublicationError("provider_result_invalid");
-    process.stderr.write(`${JSON.stringify({
-      code: failure.code,
-      ...(failure.leaseRunId === undefined ? {} : { leaseRunId: failure.leaseRunId }),
-      phase: failure.phase,
-      ...(failure.receiptPath === undefined ? {} : { receiptPath: failure.receiptPath }),
-      schemaVersion: 1,
-      status: "refused",
-    })}\n`);
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      const receiptPath = error.recoveryPaths.find((path) => (
+        basename(path).startsWith(`${releaseTag}-`) && path.endsWith(".json")
+      ));
+      const temporaryPath = error.recoveryPaths.find((path) => (
+        basename(path).startsWith("hra-release-")
+      ));
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        ...(error.diagnostics.publicationPhase === undefined
+          ? { publicationPhase: "publication_unknown" }
+          : { publicationPhase: error.diagnostics.publicationPhase }),
+        processGroupId: error.processGroupId,
+        processPhase: error.phase,
+        processes: error.processes,
+        ...(receiptPath === undefined ? {} : { receiptPath }),
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+        ...(temporaryPath === undefined ? {} : { temporaryPath }),
+      })}\n`);
+      exitCode = 75;
+      process.exitCode = exitCode;
+      // The durable receipt and every child-reachable temporary path remain in
+      // place. No provider readback, cancellation, retry, or local deletion is
+      // safe until the recorded process groups are proven absent.
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      exitCode = 75;
+    } else {
+      const failure = error instanceof ReleasePublicationError
+        ? error
+        : new ReleasePublicationError("provider_result_invalid");
+      process.stderr.write(`${JSON.stringify({
+        code: failure.code,
+        ...(failure.leaseRunId === undefined ? {} : { leaseRunId: failure.leaseRunId }),
+        phase: failure.phase,
+        ...(failure.receiptPath === undefined ? {} : { receiptPath: failure.receiptPath }),
+        schemaVersion: 1,
+        status: "refused",
+      })}\n`);
+    }
   }
   process.exitCode = exitCode;
 }

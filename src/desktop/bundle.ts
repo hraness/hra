@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -14,15 +15,23 @@ export interface SupportedChatGptBuild {
   readonly shortVersion: string;
   readonly bundleVersion: string;
   readonly cdHash: string;
+  readonly asarBytes: number;
+  readonly asarSha256: string;
 }
 
 export const SUPPORTED_CHATGPT_BUILDS: readonly SupportedChatGptBuild[] = [
   {
-    shortVersion: "26.818.22352",
-    bundleVersion: "6872",
-    cdHash: "bec4975bcdb74af55b948acc9ef7e25305743907",
+    shortVersion: "26.818.41509",
+    bundleVersion: "6962",
+    cdHash: "59729f374e9041c73fae77d3fb33ce323d514ba4",
+    asarBytes: 284_124_509,
+    asarSha256: "8eb91bd9efbf9a4dd04b9b0afdbfcb4e0bab5da18c1919ad74ca327c00c7e791",
   },
 ] as const;
+
+export interface ChatGptArchiveInspector {
+  inspect(asarPath: string, build: SupportedChatGptBuild): Promise<void>;
+}
 
 export interface BoundedCommandResult {
   readonly exitCode: number;
@@ -59,6 +68,8 @@ export interface ChatGptBundleCapability {
   readonly shortVersion: string;
   readonly bundleVersion: string;
   readonly cdHash: string;
+  readonly asarBytes?: number;
+  readonly asarSha256?: string;
   readonly hooks: {
     readonly codexHome: true;
     readonly isolatedDesktopUserData: true;
@@ -70,6 +81,7 @@ export interface ChatGptBundleCapability {
 export async function inspectChatGptBundle(
   bundlePath: string,
   runner: BoundedCommandRunner = new BunBoundedCommandRunner(),
+  archiveInspector: ChatGptArchiveInspector = defaultChatGptArchiveInspector,
 ): Promise<ChatGptBundleCapability> {
   const inputStat = await lstat(bundlePath).catch((error: unknown) => {
     throw new DesktopSwitchError("BUNDLE_UNSUPPORTED", "ChatGPT bundle is unavailable", {
@@ -148,7 +160,7 @@ export async function inspectChatGptBundle(
     );
   }
 
-  await assertProfileHooks(asarPath);
+  await archiveInspector.inspect(asarPath, supported);
   return {
     status: "supported-experimental",
     bundlePath: canonicalBundle,
@@ -161,6 +173,8 @@ export async function inspectChatGptBundle(
     shortVersion,
     bundleVersion,
     cdHash,
+    asarBytes: supported.asarBytes,
+    asarSha256: supported.asarSha256,
     hooks: {
       codexHome: true,
       isolatedDesktopUserData: true,
@@ -254,27 +268,156 @@ async function plistValue(
   return value;
 }
 
-async function assertProfileHooks(asarPath: string): Promise<void> {
-  const file = Bun.file(asarPath);
-  if (file.size < 1 || file.size > 256 * 1024 * 1024) {
-    throw new DesktopSwitchError("CAPABILITY_MISSING", "ChatGPT app archive size is unsupported");
+const maximumReviewedAsarBytes = 384 * 1024 * 1024;
+const semanticScanTailCharacters = 128 * 1024;
+const codexHomeRestorationWindowCharacters = 4_096;
+const identifierSource = "[A-Za-z_$][A-Za-z0-9_$]*";
+const codexHomeCapturePattern = new RegExp(
+  `(${identifierSource})=process\\.env\\.${CODEX_ELECTRON_USER_DATA_PATH}\\?\\.trim\\(\\)\\?process\\.env\\.${CODEX_HOME}:void 0`,
+  "gu",
+);
+const codexHomeRestorePattern = new RegExp(
+  `(${identifierSource})!=null&&\\(process\\.env\\.${CODEX_HOME}=\\1\\)`,
+  "gu",
+);
+const userDataResolverPattern = new RegExp(
+  `function (${identifierSource})\\(\\{appDataPath:(${identifierSource}),buildFlavor:(${identifierSource}),env:(${identifierSource})\\}\\)\\{let (${identifierSource})=\\4\\.${CODEX_ELECTRON_USER_DATA_PATH}\\?\\.trim\\(\\);if\\(\\5\\)return\\(0,(${identifierSource})\\.resolve\\)\\(\\5\\);`,
+  "gu",
+);
+const userDataSetPathPattern = new RegExp(
+  `\\.app\\.setPath\\(\\x60userData\\x60,(${identifierSource})\\(\\{appDataPath:${identifierSource}\\.app\\.getPath\\(\\x60appData\\x60\\),buildFlavor:${identifierSource},env:process\\.env\\}\\)\\)`,
+  "gu",
+);
+const explicitPathFencePattern = new RegExp(
+  `var (${identifierSource})=${identifierSource}\\.${identifierSource}\\(\\{isMacOS:${identifierSource},isPackaged:${identifierSource}\\.app\\.isPackaged,hasExplicitUserDataPath:!!process\\.env\\.${CODEX_ELECTRON_USER_DATA_PATH}\\?\\.trim\\(\\)\\}\\);if\\(!\\(!\\1\\|\\|${identifierSource}\\.app\\.requestSingleInstanceLock\\(\\)\\)\\)`,
+  "gu",
+);
+
+type PositionedIdentifier = Readonly<{ identifier: string; offset: number; end: number }>;
+
+class ProfileHookScanner {
+  readonly #captures = new Map<number, PositionedIdentifier>();
+  readonly #restores = new Map<number, PositionedIdentifier>();
+  readonly #resolverDefinitions = new Map<number, PositionedIdentifier>();
+  readonly #resolverCalls = new Map<number, PositionedIdentifier>();
+  readonly #fences = new Set<number>();
+  #tail = "";
+  #characters = 0;
+
+  push(value: string): void {
+    if (value.length === 0) return;
+    const source = this.#tail + value;
+    const sourceOffset = this.#characters - this.#tail.length;
+    this.#collectIdentifiers(source, sourceOffset, codexHomeCapturePattern, this.#captures);
+    this.#collectIdentifiers(source, sourceOffset, codexHomeRestorePattern, this.#restores);
+    this.#collectIdentifiers(source, sourceOffset, userDataResolverPattern, this.#resolverDefinitions);
+    this.#collectIdentifiers(source, sourceOffset, userDataSetPathPattern, this.#resolverCalls);
+    this.#collectOffsets(source, sourceOffset, explicitPathFencePattern, this.#fences);
+    this.#characters += value.length;
+    this.#tail = source.slice(-semanticScanTailCharacters);
   }
-  const source = await file.text();
-  const required = [
-    CODEX_ELECTRON_USER_DATA_PATH,
-    CODEX_HOME,
-    "setPath(`userData`",
-    "hasExplicitUserDataPath",
-    "process.env.CODEX_HOME=ZS",
-  ] as const;
-  for (const needle of required) {
-    if (!source.includes(needle)) {
-      throw new DesktopSwitchError(
-        "CAPABILITY_MISSING",
-        "ChatGPT does not expose the reviewed isolated-profile launch hook",
-      );
+
+  assertComplete(): void {
+    const captures = [...this.#captures.values()];
+    if (captures.length !== 1) throwMissingProfileHook();
+    const capture = captures[0] as PositionedIdentifier;
+    const matchingRestores = [...this.#restores.values()].filter((restore) =>
+      restore.identifier === capture.identifier
+      && restore.offset >= capture.end
+      && restore.offset - capture.end <= codexHomeRestorationWindowCharacters);
+    if (matchingRestores.length !== 1 || this.#restores.size !== 1) throwMissingProfileHook();
+
+    const resolverDefinitions = new Set(
+      [...this.#resolverDefinitions.values()].map((entry) => entry.identifier),
+    );
+    const matchingResolverCalls = [...this.#resolverCalls.values()].filter((entry) =>
+      resolverDefinitions.has(entry.identifier));
+    if (
+      this.#resolverDefinitions.size !== 1
+      || this.#resolverCalls.size !== 1
+      || matchingResolverCalls.length !== 1
+      || this.#fences.size !== 1
+    ) throwMissingProfileHook();
+  }
+
+  #collectIdentifiers(
+    source: string,
+    sourceOffset: number,
+    pattern: RegExp,
+    target: Map<number, PositionedIdentifier>,
+  ): void {
+    pattern.lastIndex = 0;
+    for (const match of source.matchAll(pattern)) {
+      const identifier = match[1];
+      if (identifier === undefined) continue;
+      const index = match.index;
+      const offset = sourceOffset + index;
+      target.set(offset, { identifier, offset, end: offset + match[0].length });
     }
   }
+
+  #collectOffsets(
+    source: string,
+    sourceOffset: number,
+    pattern: RegExp,
+    target: Set<number>,
+  ): void {
+    pattern.lastIndex = 0;
+    for (const match of source.matchAll(pattern)) {
+      target.add(sourceOffset + match.index);
+    }
+  }
+}
+
+export async function inspectChatGptArchiveStream(
+  stream: ReadableStream<Uint8Array>,
+  expected: Pick<SupportedChatGptBuild, "asarBytes" | "asarSha256">,
+): Promise<void> {
+  if (
+    !Number.isSafeInteger(expected.asarBytes)
+    || expected.asarBytes < 1
+    || expected.asarBytes > maximumReviewedAsarBytes
+    || !/^[0-9a-f]{64}$/u.test(expected.asarSha256)
+  ) throwMissingProfileHook();
+  const digest = createHash("sha256");
+  const decoder = new TextDecoder("utf-8");
+  const scanner = new ProfileHookScanner();
+  const reader = stream.getReader();
+  let bytes = 0;
+  try {
+    let read = await reader.read();
+    while (!read.done) {
+      bytes += read.value.byteLength;
+      if (bytes > expected.asarBytes || bytes > maximumReviewedAsarBytes) {
+        throwMissingProfileHook();
+      }
+      digest.update(read.value);
+      scanner.push(decoder.decode(read.value, { stream: true }));
+      read = await reader.read();
+    }
+    scanner.push(decoder.decode());
+  } finally {
+    reader.releaseLock();
+  }
+  if (bytes !== expected.asarBytes || digest.digest("hex") !== expected.asarSha256) {
+    throwMissingProfileHook();
+  }
+  scanner.assertComplete();
+}
+
+const defaultChatGptArchiveInspector: ChatGptArchiveInspector = {
+  async inspect(asarPath, build): Promise<void> {
+    const file = Bun.file(asarPath);
+    if (file.size !== build.asarBytes) throwMissingProfileHook();
+    await inspectChatGptArchiveStream(file.stream(), build);
+  },
+};
+
+function throwMissingProfileHook(): never {
+  throw new DesktopSwitchError(
+    "CAPABILITY_MISSING",
+    "ChatGPT does not expose the reviewed isolated-profile launch hook",
+  );
 }
 
 async function assertRegularFile(path: string, label: string): Promise<void> {

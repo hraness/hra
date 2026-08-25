@@ -17,7 +17,7 @@ Every child is a canonical mode-`0700` directory owned by the invoking user. The
 
 Each worker receives one strict installation document as the first bounded JSONL frame on standard input. The document is limited to 8 KiB and contains the run ID, device name, state root, project directory, exact expected `HOME`, and optional cloud deployment URL. These values never appear in worker arguments or environment variables. The worker arguments contain only the fixed source-worker path.
 
-The same standard-input stream then carries bounded CLI invocations, paired protected input documents, and internal cleanup commands. Closing it owns the worker lifetime. Every scenario operation enters the exported HRA `main()` function, passes through the production parser and renderer, and reaches the daemon through the ordinary local transport. A protected command must select `--input-fd 0`; the worker proves that standard input is nonterminal, consumes exactly one paired document from the control frame, and rejects `--input-stdin`, another descriptor, an unused document, `--follow`, and daemon lifecycle commands. Parent death aborts an in-flight local request immediately, closes the queue, and requests bounded daemon shutdown. Standard output carries only bounded typed results and lifecycle acknowledgements. Worker stderr is discarded, so provider output, credentials, paths, and diagnostics cannot escape through process output.
+The same standard-input stream then carries bounded CLI invocations, paired protected input documents, and internal cleanup commands. Closing it owns the worker lifetime. Every scenario operation enters the exported HRA `main()` function, passes through the production parser and renderer, and reaches the daemon through the ordinary local transport. A protected command must select `--input-fd 0`; the worker proves that standard input is nonterminal, consumes exactly one paired document from the control frame, and rejects `--input-stdin`, another descriptor, an unused document, `--follow`, `--jsonl`, and daemon lifecycle commands. Parent death aborts an in-flight local request immediately, closes the queue, and requests bounded daemon shutdown. Standard output carries only bounded typed results and lifecycle acknowledgements. Worker stderr is discarded, so provider output, credentials, paths, and diagnostics cannot escape through process output.
 
 Each worker supervises sequential full daemon generations. A successful auth completion or account-deletion response that declares `daemonRestartRequired` is delivered first, then the worker waits for complete authority release and starts a new generation before accepting another operation. An unexpected daemon completion after readiness is terminal. Device suspend and resume stop and start a full generation while preserving the worker control process, which allows the scenario to cross the hosted presence boundary without a second state authority.
 
@@ -36,19 +36,33 @@ Before the daemon starts, each worker changes its process working directory to i
 
 The executable is the release gate. It requires the explicit canonical origin to equal the candidate authority compiled into this checkout. Loopback, a different HTTPS deployment, an omitted value, and a noncanonical spelling all fail before either worker starts. Put this non-secret configuration in a mode-`0600` file:
 
+Local live-gate preparation can use the release recovery boundary below the operating-system account's fixed `~/.local/state/hra/process-recovery/` directory. It holds the local child behind a private gate until an active process-group record is durably promoted. Mutable `HOME` and XDG values cannot redirect the directory. Startup recovery is serialized with launch and removes an active record only after the operating system proves that recorded group absent. `process_cleanup_unproven` or `process_recovery_journal_blocked` is terminal for that local work: preserve all reported paths, do not retry the associated local operation while the group may be live, and never delete the journal.
+
+Local process-group custody is deliberately limited. A descendant can escape with a new session or a double fork. It is not a sandbox and cannot authorize provider or source-attestation subprocesses. Those calls are `authority` work and require the supported Linux native authority backend for descendant-lifetime custody. It verifies the pinned helper, executes only a sealed in-memory copy, records exact pre-`GO` identities, and retains its PID-namespace reaper until descendants are gone. Any unavailable or unproven backend refuses before target execution or retains recovery evidence; HRA never falls back to local custody. A live gate that needs such a target therefore refuses on macOS and other unsupported platforms.
+
+Even after authority custody is accepted, it will not prove that a remote effect did not occur. Keep the deploy and live evidence receipts, use provider idempotency, and perform exact source-attestation reconciliation after every ambiguous provider outcome.
+
 ```json
 {"cloudDeploymentUrl":"https://qualified-hummingbird-537.convex.cloud","operator":{"kind":"terminal"},"version":1}
 ```
 
-Run the complete scenario with that document on a nonterminal descriptor:
+For a release run, write the durable summary to a new path in a canonical invoking-user-owned mode-`0700` directory and bind it to the exact deploy evidence. Run the complete scenario with the configuration on a nonterminal descriptor:
 
 ```sh
-bun run acceptance:live --scenario-fd 3 3< /protected/path/to/live-acceptance.json
+bun run acceptance:live \
+  --deploy-evidence /protected/release/candidate-deploy.json \
+  --evidence-path /protected/release/candidate-live.json \
+  --scenario-fd 3 \
+  3< /protected/path/to/live-acceptance.json
 ```
 
 Terminal mode hides every invite, OTP, auth document, interaction answer, and permission grant. Before rendering provider-controlled login handoff values, it requires an HTTPS URL without credentials or terminal-control scalars and a short uppercase alphanumeric device code. It then waits for the human to acknowledge provider completion. The process prints safe progress to stderr and exactly one final JSON value to stdout. Exit `0` means the full scenario and cleanup passed. It does not mean that two daemons merely became ready.
 
-The gate also requires a clean Git worktree and resolves the exact `HEAD` commit before starting workers. Passing evidence binds the SHA-256 digest of the configured cloud origin, the package version, and the 40-character source revision. This makes a result from a local fake, a different deployment, a dirty checkout, or a different source revision distinguishable from the intended release candidate.
+The gate also requires a clean Git worktree and resolves the exact `HEAD` commit before starting workers. The protected release summary binds the deploy evidence digest, fixed Convex target digest, bound runtime revision, package version, start and completion times, and 40-character source revision. Its start must be later than the bound deployment time. This makes a result from a local fake, a different deployment, a dirty checkout, a prior runtime, or a different source revision distinguishable from the intended release candidate.
+
+The release form reads the public `releaseAttestation:read` authority before worker startup and again after successful cleanup, immediately before it writes evidence. Both reads must equal the exact deploy attestation, including its source commit, deployment time, predecessor digest, and runtime revision. Run this interval under one exclusive release operator with every other Convex deploy path stopped. Two endpoint reads cannot detect a deployment that another operator performs and fully restores between them, so concurrent deployment authority invalidates the run even if both reads match. Candidate sealing later revalidates the current runtime and fixed deployment authority; it does not waive this exclusive-operator requirement.
+
+HRA writes the summary only after cleanup succeeds and before it emits the terminal stdout frame. The output is canonical self-digested JSON in an exclusive no-follow, single-link, mode-`0600` file with bounded readback and durable directory sync. An agent may instead supply an already-open empty mode-`0600` descriptor with `--evidence-fd <fd>`; `--deploy-evidence` remains mandatory. The summary contains no credential, email, invitation, OTP, device code, local project path, raw provider output, raw reasoning, or arbitrary tool output. Preserve the full live recovery semantics on failure; no passing summary is emitted before cleanup.
 
 Agent runners start the gate with standard-stream mode:
 

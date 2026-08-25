@@ -17,6 +17,28 @@ export const usagePollInterval = (accountId: string): number =>
 export const usagePollInitialStagger = (accountId: string): number =>
   stableOffset(`initial:${accountId}`, USAGE_POLL_INITIAL_STAGGER_MAX_MS + 1);
 
+export const sleepForUsagePolling = async (
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> => {
+  if (signal.aborted) throw signal.reason;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => finish(() => reject(signal.reason));
+    const timer = setTimeout(() => finish(resolve), milliseconds);
+    timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+};
+
 type PollState = {
   failures: number;
   nextAt: number;
@@ -43,18 +65,7 @@ export class AccountUsagePoller {
     this.#poll = input.poll;
     this.#onFailure = input.onFailure ?? (() => undefined);
     this.#now = input.now ?? Date.now;
-    this.#sleep = input.sleep ?? (async (milliseconds, signal) => {
-      if (signal.aborted) throw signal.reason;
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, milliseconds);
-        timer.unref();
-        const onAbort = () => {
-          clearTimeout(timer);
-          reject(signal.reason);
-        };
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-    });
+    this.#sleep = input.sleep ?? sleepForUsagePolling;
   }
 
   start(): void {

@@ -1,7 +1,7 @@
 # HRA
 
 ```sh
-bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 8f64f735eddcf1b364dc3964305249a0544a7c64aaac268b3af8c46621ec0311)" = hra-install-safe
 ```
 
 ```sh
@@ -18,35 +18,46 @@ HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives 
 
 [GitHub](https://github.com/hraness/hra) · [Documentation](https://github.com/hraness/hra#command-reference) · [Security](https://github.com/hraness/hra/blob/main/SECURITY.md) · [Privacy](https://github.com/hraness/hra/blob/main/PRIVACY.md)
 
-## Install, update, and remove
+## Install and update
 
-HRA requires Bun 1.3.14. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:
+HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:
 
 ```text
 bun --version
-bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 8f64f735eddcf1b364dc3964305249a0544a7c64aaac268b3af8c46621ec0311)" = hra-install-safe
 hra --version
 hra doctor --offline
 ```
 
-Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace both v0.1.0 occurrences in the URL with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:
+The single install command streams the exact v0.1.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.1.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged.
+
+Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:
 
 ```text
 hra daemon stop
 hra daemon status --json
-bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 8f64f735eddcf1b364dc3964305249a0544a7c64aaac268b3af8c46621ec0311)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra daemon start
 ```
 
-Removing the package does not remove HRA's local profiles, session history, recovery evidence, or cloud account. Log out each Codex profile and complete any intended cloud-account deletion before uninstalling. Then stop the daemon, confirm that it is stopped, and remove the installed command:
+### Optional full local-data removal
+
+Full local-data removal is a separate destructive operation. While HRA remains installed, complete `hra auth delete --acknowledge-erasure` if `hra auth status` says you are signed in, then wait for `hra auth status` to report terminal deletion. Run `hra account list`, then run `hra account logout <profile>` for every Codex profile. Stop the daemon, require a successful `hra daemon status --json` result whose `data.running` is `false` before touching local data.
 
 ```text
+hra auth delete --acknowledge-erasure
+hra auth status
+hra account list
+hra account logout <profile>
 hra daemon stop
 hra daemon status --json
-bun remove --global hra
 ```
+
+> **Permanent local-data loss.** HRA deliberately has no recursive local-delete command. The exact state directory is `$HOME/Library/Application Support/HRA Control Plane v1` on macOS and `$HOME/.local/state/hra-control-plane-v1` on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local profiles, Codex credential stores, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Do not move or remove its parent. Inspect the trashed directory before emptying Trash.
+
+An agent must resolve the canonical exact state-directory path, present that path and the permanent-loss consequences to the user, and obtain explicit destructive approval before moving or removing it. An install, update, or daemon-stop request does not authorize local-data removal.
 
 ## First account
 
@@ -73,6 +84,36 @@ If the first pending-login handoff is lost or the daemon restarts before complet
 
 HRA cloud identity is separate from every Codex account. Use the email-code flow below only after a hosted or self-managed Convex deployment has been configured.
 
+## First session
+
+Complete initialization and the first account login before this walkthrough. Account login remains a dedicated one-shot command. The session-start command returns the new session ID.
+
+### Human terminal
+
+Create an idle session, open the persistent shell, select the account and exact returned session ID, then type a request as an ordinary line. HRA sends that line to the selected session and shows safe live updates. `/exit` leaves the daemon running.
+
+```text
+hra session start personal --preset high
+hra
+/account personal
+/session <session-id>
+Review this project and summarize its current state.
+```
+
+### Agent caller
+
+Read `data.session.id` from the start response. Before sending, read `data.eventStream.cursor` from status so the follower begins at one atomic observation boundary. Keep the follower as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation.
+
+```text
+hra session start personal --preset high --json
+hra session status <session-id> --json
+hra session send <session-id> -- "Review this project and summarize its current state."
+hra session events <session-id> --cursor <status-cursor> --wait-ms 30000 --jsonl
+hra session interactions <session-id> --pending --json
+```
+
+If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below.
+
 ## Cloud sign-in and device pairing
 
 The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
@@ -81,6 +122,7 @@ The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA'
 hra auth login --input-stdin
 hra auth login --input-fd <fd>
 hra device pair
+hra device key-loss --acknowledge-no-key-holders
 hra sync status
 ```
 
@@ -99,11 +141,17 @@ hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uui
 
 After approval, run `hra device pair` on the new machine to retrieve and unwrap its encryption-key envelope. Use `hra device revoke <device-id-or-prefix>` from a different active machine to revoke a device.
 
+`hra auth status` and `hra sync status` expose the account key as a closed status. `ready` includes the usable key version. `pairing_required` says recovery requires an existing account-key holder and that no remaining holder makes the encrypted content unrecoverable.
+
+Only after this authenticated, registered, active installation reports `pairing_required` and the operator has confirmed that no account-key holder remains, run `hra device key-loss --acknowledge-no-key-holders`. The command records that explicit observation in the current HRA cloud identity's isolated local custody, but only when the current auth token generation, identity, auth epoch, registered device, and pairing observation agree exactly. It performs no network, provider, or cloud mutation and does not mint, replace, or delete a key or ciphertext. Signed-out, unregistered, stale-identity, missing-observation, and already-ready states fail with a bounded next command. Pairing the real account key later supersedes the observation.
+
+> **Unrecoverable encrypted cloud content.** After that acknowledgement, account-key status is unrecoverable on this installation. Local Codex accounts, sessions, credentials, and execution are unaffected, but existing encrypted cloud content cannot be decrypted without the real account key. Search again for an existing holder and run hra device pair if one is rediscovered; the real key restores ready status and supersedes the acknowledgement. Only after that renewed holder search is exhausted may the operator explicitly choose erasing and reinitializing the HRA cloud account as a fallback. Reinitialization creates a new account boundary; it does not regenerate the lost account key or recover old ciphertext.
+
 Approve and revoke create one current UUIDv7 before daemon transport. If the response is lost after dispatch, HRA prints the exact same-key replay command. Reusing that command recovers the original operation; changing the device or operation under the same key is rejected.
 
 Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked.
 
-Cloud-account erasure is explicit and irreversible. Run `hra auth delete --acknowledge-erasure` to disable every cloud effect before bounded server-side removal begins. `hra auth status` recovers capability-only progress after authentication records disappear. Erasure does not delete local Codex accounts, local sessions, or local encryption custody.
+Cloud-account erasure is an explicit and irreversible fallback, not the default response to a key-loss acknowledgement. After a renewed holder search is exhausted, run `hra auth delete --acknowledge-erasure` to disable every cloud effect before bounded server-side removal begins. `hra auth status` recovers capability-only progress after authentication records disappear. Erasure does not delete local Codex accounts, local sessions, or local encryption custody.
 
 ## Features
 
@@ -124,12 +172,26 @@ Selected-session monitoring starts at the atomic status cursor. The shell drains
 hra
 hra session status <session> --json
 hra session events <session> --cursor <cursor> --limit <1-200> --wait-ms <0-30000> --json
-hra session events <session> --cursor <cursor> --wait-ms 30000 --follow
+hra session events <session> --cursor <cursor> --wait-ms 30000 --jsonl
 hra session interactions <session> --pending --json
 hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
 ```
 
-JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved.
+JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following with `--jsonl` writes JSON Lines as the turn progresses; `--follow` is an equivalent compatibility spelling. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved.
+
+### Exit status and JSONL
+
+Every one-shot caller must check the process exit status. HRA uses this exact mapping:
+
+- `0`: success. A normally stopped event follower, including a user SIGINT, may also return 0.
+- `1`: CONFLICT, AMBIGUOUS, INTERNAL, any other closed failure code, or an unhealthy doctor result.
+- `2`: INVALID_INPUT.
+- `4`: NOT_FOUND.
+- `5`: UNAVAILABLE.
+- `6`: INTERACTION_REQUIRED.
+- `7`: RECOVERY_REQUIRED.
+
+For non-streaming `--json` commands, stdout contains exactly one versioned success or failure envelope. For `--jsonl` or its equivalent `--follow`, stdout contains only JSONL gap, event, and checkpoint frames. If the follower ends on a command error, HRA leaves all completed frames on stdout and writes exactly one newline-terminated version-1 failure envelope to stderr shaped as `{"ok":false,"version":1,"error":{"code":"<code>","message":"<safe-message>"}}`; the error may also include bounded details. Callers must consume stdout and stderr independently, must not merge the terminal error into the JSONL stream, and must check the process exit status. A normal user stop or SIGINT may exit 0 without a terminal failure envelope.
 
 `interaction show` intentionally returns only a durable safe summary. Before approving a command or permission request, run `hra interaction inspect <interaction-id> --revision <n>` to read the complete authority still held by the live provider callback. A foreground human receives bounded detail on the protected stderr terminal. An agent or other noninteractive caller must first create an empty mode-0600 regular file under a current-user-owned mode-0700 directory and pass its absolute canonical path with `--handoff-file`; ordinary stdout receives only safe binding and cleanup metadata. On macOS, neither the directory nor file may have an extended ACL, and HRA rechecks both held descriptors before and after writing. Detail larger than 64 KiB also requires this file path. Read it within that protected boundary and remove it after deciding. HRA rejects file-change approval callbacks before durable admission because pinned Codex 0.149.0 does not provide the exact affected paths or change detail needed for informed approval.
 
@@ -243,6 +305,7 @@ hra auth login --input-stdin|--input-fd <fd>
 hra auth status|logout
 hra auth delete --acknowledge-erasure
 hra device list|pair
+hra device key-loss --acknowledge-no-key-holders
 hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]
 hra account add <label>
 hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]
@@ -262,7 +325,7 @@ hra project use <project>
 hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]
 hra session show <session> [--detail]
 hra session status <session>
-hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--follow]
+hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1-100>] [--cursor <cursor>]
 hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
 hra session send|queue|steer <session> <message>

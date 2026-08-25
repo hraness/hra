@@ -10,6 +10,28 @@
   "bin": {
     "hra": "./src/cli.ts"
   },
+  "scripts": {
+    "build": "bun run build:cli && bun run build:site",
+    "build:cli": "bun build ./src/cli.ts --target=bun --outdir=dist/cli",
+    "build:site": "bun ./scripts/build-site.ts",
+    "check": "bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build && bun run check:package",
+    "check:package": "bun run test:package-policy && bun ./scripts/check-package.ts",
+    "acceptance:live": "bun ./scripts/live-acceptance.ts",
+    "hosted:bootstrap": "bun ./scripts/bootstrap-hosted-sync.ts",
+    "hosted:admission": "bun ./scripts/manage-hosted-admission.ts",
+    "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",
+    "hosted:deploy": "bun ./scripts/deploy-hosted-sync.ts",
+    "hosted:domain-cutover": "bun ./scripts/domain-cutover.ts",
+    "hosted:invites": "bun ./scripts/manage-hosted-invites.ts",
+    "operator:migrate-legacy-secrets": "bun ./scripts/migrate-legacy-secrets.ts",
+    "release:candidate": "bun ./scripts/release-candidate.ts",
+    "release:publish": "bun ./scripts/publish-beta-release.ts",
+    "lint": "eslint .",
+    "start": "bun ./src/cli.ts",
+    "test": "bun test --isolate --max-concurrency=1",
+    "test:package-policy": "sh -c 'umask 077; exec bun test ./scripts/package-policy.test.ts --isolate --max-concurrency=1'",
+    "typecheck": "tsc --noEmit"
+  },
   "files": [
     "src",
     "!src/**/*.test.ts",
@@ -39,26 +61,6 @@
     "codex",
     "multi-account"
   ],
-  "scripts": {
-    "build": "bun run build:cli && bun run build:site",
-    "build:cli": "bun build ./src/cli.ts --target=bun --outdir=dist/cli",
-    "build:site": "bun ./scripts/build-site.ts",
-    "check": "bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build && bun run check:package",
-    "check:package": "bun ./scripts/check-package.ts",
-    "acceptance:live": "bun ./scripts/live-acceptance.ts",
-    "hosted:bootstrap": "bun ./scripts/bootstrap-hosted-sync.ts",
-    "hosted:admission": "bun ./scripts/manage-hosted-admission.ts",
-    "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",
-    "hosted:deploy": "bun ./scripts/deploy-hosted-sync.ts",
-    "hosted:domain-cutover": "bun ./scripts/domain-cutover.ts",
-    "hosted:invites": "bun ./scripts/manage-hosted-invites.ts",
-    "operator:migrate-legacy-secrets": "bun ./scripts/migrate-legacy-secrets.ts",
-    "release:publish": "bun ./scripts/publish-beta-release.ts",
-    "lint": "eslint .",
-    "start": "bun ./src/cli.ts",
-    "test": "bun test --isolate --max-concurrency=1",
-    "typecheck": "tsc --noEmit"
-  },
   "dependencies": {
     "@openai/codex": "0.149.0",
     "convex": "1.45.0",

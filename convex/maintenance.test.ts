@@ -15,6 +15,7 @@ import {
   reserveQuotaForStoredIdentity,
   reserveServiceQuotaForInsert,
   reserveSessionHeadQuotaForInsert,
+  requireHardQuotaAuthority,
   USER_TOTAL_QUOTA,
 } from "./quota";
 import schema from "./schema";
@@ -41,6 +42,9 @@ const cleanupExpired = makeFunctionReference<"mutation", Args, Readonly<{
 }>>("maintenance:cleanupExpired");
 const genesisQuota = makeFunctionReference<"mutation", Record<string, never>, unknown>(
   "quota:genesisHardAuthority",
+);
+const consumeOtpChallenge = makeFunctionReference<"mutation", Args, unknown>(
+  "authDelivery:consumeOtpChallenge",
 );
 
 describe("bounded cloud retention", () => {
@@ -284,6 +288,132 @@ describe("bounded cloud retention", () => {
     expect(second.processed).toBe(2);
     expect(second.authAttempts).toBe(1);
     expect(second.otpChallenges).toBe(1);
+  });
+
+  test("preserves valid verification and exact quota authority while abandoned cleanup races", async () => {
+    for (const first of ["cleanup", "verification"] as const) {
+      const runtime = convexTest(schema, modules);
+      await runtime.mutation(genesisQuota, {});
+      const now = Date.now();
+      const emailDigest = first === "cleanup" ? "d".repeat(64) : "e".repeat(64);
+      const codeDigest = first === "cleanup" ? "f".repeat(64) : "a".repeat(64);
+      const fixture = await runtime.run(async (ctx) => {
+        const userId = await ctx.db.insert("users", { email: `${first}@example.com` });
+        await initializeUserQuotaAuthority(ctx, userId);
+        const user = await ctx.db.get(userId);
+        if (user === null) throw new Error("missing verification race user");
+        await reserveQuotaForStoredIdentity(ctx, userId, user);
+        const account = {
+          provider: "hra-control-plane-otp-v1",
+          providerAccountId: `${first}@example.com`,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", account);
+        const accountId = await ctx.db.insert("authAccounts", account);
+        const invite = {
+          admissionExpiresAt: now + 60_000,
+          boundAt: now - 2 * 24 * 60 * 60 * 1_000,
+          boundEmailDigest: emailDigest,
+          capabilityDigest: (first === "cleanup" ? "b" : "c").repeat(64),
+          createdAt: now - 2 * 24 * 60 * 60 * 1_000,
+          expiresAt: now + 60_000,
+          publicId: `invite_verification_cleanup_${first}`,
+          purpose: "identity" as const,
+          state: "bound_to_email" as const,
+          updatedAt: now - 2 * 24 * 60 * 60 * 1_000,
+        };
+        await reserveServiceQuotaForInsert(ctx, invite);
+        const inviteId = await ctx.db.insert("authInvites", invite);
+        const subject = {
+          admissionInviteId: inviteId,
+          authEpoch: 1,
+          createdAt: now - 2 * 24 * 60 * 60 * 1_000,
+          emailDigest,
+          status: "active" as const,
+          updatedAt: now - 2 * 24 * 60 * 60 * 1_000,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", subject);
+        const subjectId = await ctx.db.insert("authSubjects", subject);
+        const challenge = {
+          accountId,
+          authEpoch: 1,
+          codeDigest,
+          createdAt: now,
+          deliveryState: "accepted" as const,
+          emailDigest,
+          expiresAt: now + 60_000,
+          updatedAt: now,
+          userId,
+        };
+        await reserveQuotaForInsert(ctx, userId, "identity", challenge);
+        const challengeId = await ctx.db.insert("authOtpChallenges", challenge);
+        return { accountId, challengeId, inviteId, subjectId, userId };
+      });
+
+      const verify = async () => await runtime.mutation(consumeOtpChallenge, {
+        authEpoch: 1,
+        codeDigest,
+        emailDigest,
+      });
+      const cleanup = async () => await runtime.mutation(cleanupExpired, { limit: 200 });
+      const results = first === "cleanup"
+        ? await Promise.all([cleanup(), verify()])
+        : await Promise.all([verify(), cleanup()]);
+      expect(results).toHaveLength(2);
+
+      const observed = await runtime.run(async (ctx) => {
+        await requireHardQuotaAuthority(ctx);
+        const [account, challenge, invite, subject, user] = await Promise.all([
+          ctx.db.get(fixture.accountId),
+          ctx.db.get(fixture.challengeId),
+          ctx.db.get(fixture.inviteId),
+          ctx.db.get(fixture.subjectId),
+          ctx.db.get(fixture.userId),
+        ]);
+        const identity = await ctx.db.query("storageUsageByUser")
+          .withIndex("by_user_and_category", (query) =>
+            query.eq("userId", fixture.userId).eq("category", "identity"))
+          .unique();
+        const service = await ctx.db.query("storageUsageService")
+          .withIndex("by_key", (query) => query.eq("key", "global"))
+          .unique();
+        const chargedDocument = (value: Readonly<Record<string, unknown>>) => {
+          const document = Object.fromEntries(Object.entries(value).filter(
+            ([key]) => key !== "_creationTime" && key !== "_id",
+          ));
+          return logicalDocumentBytes(document as Readonly<Record<string, Value>>);
+        };
+        const expectedIdentityBytes = account === null || subject === null || user === null
+          ? -1
+          : chargedDocument(account) + chargedDocument(subject) + chargedDocument(user);
+        return {
+          account,
+          challenge,
+          expectedIdentityBytes,
+          identity,
+          invite,
+          service,
+          subject,
+          user,
+        };
+      });
+      expect(observed.challenge).toBeNull();
+      expect(observed.account).toMatchObject({ emailVerified: `${first}@example.com` });
+      expect(observed.invite).toMatchObject({ state: "consumed" });
+      expect(observed.subject).toMatchObject({ status: "active", userId: fixture.userId });
+      expect(observed.subject?.verifiedAt).toBeNumber();
+      expect(observed.user?.emailVerificationTime).toBe(observed.subject?.verifiedAt);
+      expect(observed.identity).toMatchObject({
+        logicalBytes: observed.expectedIdentityBytes,
+        records: 3,
+      });
+      expect(observed.service).toMatchObject({
+        identities: 1,
+        serviceRecords: 1,
+        userRecords: 3,
+      });
+    }
   });
 
   test("expires no-effect pending commands and deletes only old terminal evidence", async () => {

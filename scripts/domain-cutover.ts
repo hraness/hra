@@ -1,9 +1,41 @@
-import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { isAbsolute } from "node:path";
 import { isatty } from "node:tty";
 
 import { z } from "zod";
+
+import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import {
+  BoundedProcessInvocationGuard,
+  type BoundedProcessContainment,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  retainBoundedProcessRecoveryPath,
+  rethrowBoundedProcessCleanupUnproven as rethrowLocalProcessCleanupUnproven,
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+} from "./bounded-process";
+import {
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
+
+import {
+  canonicalDigest,
+  cutoverEvidenceSchema,
+  cutoverReservationSchema,
+  parseCutoverEvidenceFile,
+  readProtectedJson,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
+  type CutoverEvidence,
+} from "./release-evidence";
+
+const rethrowBoundedProcessCleanupUnproven = (error: unknown): void => {
+  rethrowAuthorityContainmentUnavailable(error);
+  rethrowLocalProcessCleanupUnproven(error);
+};
 
 const oldProjectId = "prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr";
 const newProjectId = "prj_8ciIt9t9foE3utG45frRN7cxckjS";
@@ -16,6 +48,7 @@ const fallbackAlias = "hra-weld.vercel.app";
 const newStagingAlias = "try-hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
 const commandTimeoutMs = 30_000;
+const commandTerminationGraceMs = 1_000;
 const convergenceTimeoutMs = 60_000;
 const domainPageLimit = 20;
 const maximumDomainPages = 64;
@@ -255,6 +288,24 @@ const defaultClock: CutoverClock = {
   },
 };
 
+const settleProviderOperations = async <const Values extends readonly unknown[]>(
+  operations: { readonly [Index in keyof Values]: Promise<Values[Index]> },
+): Promise<Values> => {
+  const results = await Promise.allSettled(operations);
+  const cleanupFailure = results.find((result): result is PromiseRejectedResult =>
+    result.status === "rejected"
+    && isBoundedProcessCleanupUnprovenError(result.reason));
+  if (cleanupFailure !== undefined) throw cleanupFailure.reason;
+  const journalFailure = results.find((result): result is PromiseRejectedResult =>
+    result.status === "rejected"
+    && isBoundedProcessRecoveryJournalError(result.reason));
+  if (journalFailure !== undefined) throw journalFailure.reason;
+  const failure = results.find((result): result is PromiseRejectedResult =>
+    result.status === "rejected");
+  if (failure !== undefined) throw failure.reason;
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as unknown as Values;
+};
+
 const aliasMatches = (
   value: AliasReadback,
   endpoint: CutoverEndpoint,
@@ -296,7 +347,7 @@ const readOwner = async (
   sourceProjectId: string,
   targetProjectId: string,
 ): Promise<DomainOwner> => {
-  const [sourceNames, targetNames] = await Promise.all([
+  const [sourceNames, targetNames] = await settleProviderOperations([
     provider.readDomainNames(sourceProjectId),
     provider.readDomainNames(targetProjectId),
   ]);
@@ -314,7 +365,8 @@ const readOwnerSafely = async (
 ): Promise<DomainOwner> => {
   try {
     return await readOwner(provider, sourceProjectId, targetProjectId);
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     return "ambiguous";
   }
 };
@@ -365,7 +417,7 @@ const readTrafficState = async (
   plan: CutoverPlan,
 ): Promise<TrafficState> => {
   if (plan.direction !== "archive") {
-    const [canonical, fallback, staging] = await Promise.all([
+    const [canonical, fallback, staging] = await settleProviderOperations([
       provider.readAlias(canonicalAlias),
       provider.readAlias(fallbackAlias),
       provider.readAlias(newStagingAlias),
@@ -387,7 +439,7 @@ const readTrafficState = async (
       || aliasMatches(staging, plan.target, newStagingAlias);
     return fallbackKnown && stagingKnown ? "partial" : "ambiguous";
   }
-  const [canonical, fallback] = await Promise.all([
+  const [canonical, fallback] = await settleProviderOperations([
     provider.readAlias(canonicalAlias),
     provider.readAlias(fallbackAlias),
   ]);
@@ -412,7 +464,7 @@ const readStateClassification = async (
 ): Promise<StateClassification> => {
   const ownerExpectation = stateExpectation(plan, "source").owner;
   const read = async (): Promise<StateClassification> => {
-    const [traffic, owner] = await Promise.all([
+    const [traffic, owner] = await settleProviderOperations([
       readTrafficState(provider, plan),
       failureMode === "refuse"
         ? readOwner(
@@ -442,7 +494,8 @@ const readStateClassification = async (
   if (failureMode === "refuse") return await read();
   try {
     return await read();
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     return { owner: "ambiguous", state: "ambiguous", traffic: "ambiguous" };
   }
 };
@@ -473,9 +526,9 @@ const readExactTraffic = async (
   provider: CutoverProvider,
   expectation: ExactStateExpectation,
 ): Promise<boolean> => {
-  const aliases = await Promise.all(
+  const aliases = await settleProviderOperations(
     expectation.aliases.map(async ({ aliasName, endpoint }) => {
-      const [aliasValue, markerValue] = await Promise.all([
+      const [aliasValue, markerValue] = await settleProviderOperations([
         provider.readAlias(aliasName),
         endpoint.generation === null
           ? Promise.resolve(null)
@@ -492,7 +545,7 @@ const readExactState = async (
   provider: CutoverProvider,
   expectation: ExactStateExpectation,
 ): Promise<boolean> => {
-  const [traffic, owner] = await Promise.all([
+  const [traffic, owner] = await settleProviderOperations([
     readExactTraffic(provider, expectation),
     readOwner(
       provider,
@@ -513,7 +566,8 @@ const probeExactTraffic = async (
   do {
     try {
       if (await readExactTraffic(provider, expectation)) return true;
-    } catch {
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       // A provider or public read can be transient inside the bounded window.
     }
     if (clock.now() >= deadline) break;
@@ -536,7 +590,8 @@ const probeExactState = async (
     } else {
       try {
         if (await readExactState(provider, expectation)) return true;
-      } catch {
+      } catch (error: unknown) {
+        rethrowBoundedProcessCleanupUnproven(error);
         // A provider or public read can be transient inside the bounded window.
       }
     }
@@ -556,7 +611,7 @@ const probeEndpoint = async (
   const deadline = clock.now() + timeoutMs;
   do {
     try {
-      const [aliasValue, markerValue] = await Promise.all([
+      const [aliasValue, markerValue] = await settleProviderOperations([
         provider.readAlias(aliasName),
         endpoint.generation === null ? Promise.resolve(null) : provider.readMarker(aliasName),
       ]);
@@ -566,7 +621,8 @@ const probeEndpoint = async (
       ) {
         return true;
       }
-    } catch {
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       // A provider or public read can be transient inside the bounded window.
     }
     if (clock.now() >= deadline) break;
@@ -584,7 +640,8 @@ const restoreTraffic = async (
 ): Promise<void> => {
   try {
     await provider.setAlias(source.deploymentUrl, aliasName);
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     // Alias mutation failures are ambiguous, so the exact readback still decides.
   }
   if (!await probeEndpoint(provider, source, aliasName, clock, timeoutMs)) {
@@ -602,6 +659,14 @@ const restoreExactTraffic = async (
     expectation.aliases.map(async ({ aliasName, endpoint }) =>
       await restoreTraffic(provider, endpoint, aliasName, clock, timeoutMs)),
   );
+  const cleanupFailure = results.find((result): result is PromiseRejectedResult =>
+    result.status === "rejected"
+    && isBoundedProcessCleanupUnprovenError(result.reason));
+  if (cleanupFailure !== undefined) throw cleanupFailure.reason;
+  const journalFailure = results.find((result): result is PromiseRejectedResult =>
+    result.status === "rejected"
+    && isBoundedProcessRecoveryJournalError(result.reason));
+  if (journalFailure !== undefined) throw journalFailure.reason;
   if (results.some((result) => result.status === "rejected")) {
     throw new DomainCutoverError("compensation_failed");
   }
@@ -623,7 +688,8 @@ const reconcileExactSource = async (
       const remainingMs = Math.max(0, deadline - clock.now());
       await restoreExactTraffic(provider, expectation, clock, remainingMs);
       if (await readProof() && await readProof()) return true;
-    } catch {
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       // Reconcile again while the single bounded window remains.
     }
     if (clock.now() >= deadline) break;
@@ -669,7 +735,8 @@ const reverseMetadataIfExact = async (
   if (owner !== "target") return "ambiguous";
   try {
     await provider.moveDomain(plan.target.projectId, plan.source.projectId);
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     // Readback below determines whether the reverse request committed.
   }
   const postMoveDeadline = clock.now() + timeoutMs;
@@ -720,10 +787,11 @@ const verifyCutoverIdentityAuthority = async (
   plan: CutoverPlan,
   provider: CutoverProvider,
 ): Promise<void> => {
-  const projects = await Promise.all([
+  const projects = await settleProviderOperations([
     provider.readProject(oldProjectId),
     provider.readProject(newProjectId),
-  ]).catch(() => {
+  ]).catch((error: unknown) => {
+    rethrowBoundedProcessCleanupUnproven(error);
     throw new DomainCutoverError("automatic_domain_assignment_unsafe");
   });
   const expectedProjects = [oldProjectId, newProjectId] as const;
@@ -734,10 +802,11 @@ const verifyCutoverIdentityAuthority = async (
       || parsed.data.autoAssignCustomDomains;
   })) throw new DomainCutoverError("automatic_domain_assignment_unsafe");
 
-  const [sourceDeployment, targetDeployment] = await Promise.all([
+  const [sourceDeployment, targetDeployment] = await settleProviderOperations([
     provider.readDeployment(plan.source.deploymentId),
     provider.readDeployment(plan.target.deploymentId),
-  ]).catch(() => {
+  ]).catch((error: unknown) => {
+    rethrowBoundedProcessCleanupUnproven(error);
     throw new DomainCutoverError("deployment_readback_invalid");
   });
   if (
@@ -747,6 +816,7 @@ const verifyCutoverIdentityAuthority = async (
 };
 
 const refuseProviderRead = (error: unknown, fallback: CutoverFailureCode): never => {
+  rethrowBoundedProcessCleanupUnproven(error);
   if (error instanceof DomainCutoverError) throw error;
   throw new DomainCutoverError(fallback);
 };
@@ -911,7 +981,8 @@ export async function executeCutoverPlan(
   if (plan.direction === "archive") {
     try {
       await provider.setAlias(plan.target.deploymentUrl, fallbackAlias);
-    } catch {
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
     if (!await probeEndpoint(provider, plan.target, fallbackAlias, clock, timeoutMs)) {
@@ -924,7 +995,8 @@ export async function executeCutoverPlan(
 
   try {
     await provider.setAlias(plan.target.deploymentUrl, canonicalAlias);
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     if (plan.direction === "archive") {
       return await restoreArchiveTraffic(provider, plan, clock, timeoutMs);
     }
@@ -945,7 +1017,8 @@ export async function executeCutoverPlan(
 
   try {
     await provider.moveDomain(plan.source.projectId, plan.target.projectId);
-  } catch {
+  } catch (error: unknown) {
+    rethrowBoundedProcessCleanupUnproven(error);
     // Exact alias and ownership readback below resolve an ambiguous API result.
   }
 
@@ -969,8 +1042,10 @@ export function parseCutoverPlan(document: string): CutoverPlan {
 
 export type VercelCommandRequest = Readonly<{
   arguments: readonly string[];
+  containment: BoundedProcessContainment;
   environment: Readonly<Record<string, string>>;
   executable: string;
+  phase: string;
 }>;
 
 export type VercelCommandResult = Readonly<{
@@ -983,54 +1058,24 @@ export type VercelCommandRunner = (
   request: VercelCommandRequest,
 ) => Promise<VercelCommandResult>;
 
-const appendBounded = (
-  chunks: Buffer[],
-  chunk: Buffer,
-  state: { bytes: number; overflow: boolean },
-): void => {
-  state.bytes += chunk.byteLength;
-  if (state.bytes <= outputMaximumBytes) chunks.push(chunk);
-  else state.overflow = true;
+export const runVercelCommand: VercelCommandRunner = async (request) => {
+  const result = requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: request.arguments,
+    containment: request.containment,
+    cwd: process.cwd(),
+    environment: request.environment,
+    executable: request.executable,
+    outputMaximumBytes,
+    phase: request.phase,
+    terminationGraceMs: commandTerminationGraceMs,
+    timeoutMs: commandTimeoutMs,
+  }));
+  return {
+    exitCode: result.exitCode,
+    stderr: result.stderr.toString("utf8"),
+    stdout: result.stdout.toString("utf8"),
+  };
 };
-
-export const runVercelCommand: VercelCommandRunner = async (request) =>
-  await new Promise<VercelCommandResult>((resolvePromise) => {
-    const child = spawn(request.executable, [...request.arguments], {
-      env: request.environment,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    const stdoutState = { bytes: 0, overflow: false };
-    const stderrState = { bytes: 0, overflow: false };
-    let finished = false;
-    const finish = (exitCode: number): void => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolvePromise({
-        exitCode: stdoutState.overflow || stderrState.overflow ? 1 : exitCode,
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-      });
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(124);
-    }, commandTimeoutMs);
-    child.stdout.on("data", (chunk: Buffer) => {
-      appendBounded(stdoutChunks, chunk, stdoutState);
-      if (stdoutState.overflow) child.kill("SIGKILL");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      appendBounded(stderrChunks, chunk, stderrState);
-      if (stderrState.overflow) child.kill("SIGKILL");
-    });
-    child.once("error", () => finish(1));
-    child.once("close", (code) => finish(code ?? 1));
-  });
 
 const childEnvironmentNames = [
   "APPDATA",
@@ -1069,6 +1114,8 @@ const parseProviderJson = (document: string): unknown => {
 type VercelProviderOptions = Readonly<{
   environment?: Readonly<NodeJS.ProcessEnv>;
   fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  guard?: BoundedProcessInvocationGuard;
+  markerTimeoutMs?: number;
   runner?: VercelCommandRunner;
   vercelCli: string;
 }>;
@@ -1076,29 +1123,41 @@ type VercelProviderOptions = Readonly<{
 export class VercelCutoverProvider implements CutoverProvider {
   readonly #environment: Readonly<Record<string, string>>;
   readonly #fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  readonly #guard: BoundedProcessInvocationGuard;
   readonly #runner: VercelCommandRunner;
   readonly #vercelCli: string;
 
   constructor(options: VercelProviderOptions) {
     if (!isAbsolute(options.vercelCli)) throw new DomainCutoverError("usage_invalid");
+    const markerTimeoutMs = options.markerTimeoutMs ?? 5_000;
+    if (!Number.isSafeInteger(markerTimeoutMs) || markerTimeoutMs < 1 || markerTimeoutMs > 5_000) {
+      throw new DomainCutoverError("usage_invalid");
+    }
     this.#environment = buildVercelEnvironment(options.environment ?? process.env);
-    this.#fetcher = options.fetcher ?? fetch;
+    this.#guard = options.guard ?? new BoundedProcessInvocationGuard();
+    this.#fetcher = createBoundedAuthorityFetch(
+      options.fetcher ?? fetch,
+      markerTimeoutMs,
+      "vercel_marker_timeout",
+    );
     this.#runner = options.runner ?? runVercelCommand;
     this.#vercelCli = options.vercelCli;
   }
 
-  async #invoke(arguments_: readonly string[]): Promise<string> {
-    const result = await this.#runner({
+  async #invoke(arguments_: readonly string[], phase: string): Promise<string> {
+    const result = await this.#guard.observe(async () => await this.#runner({
       arguments: arguments_,
+      containment: "authority",
       environment: this.#environment,
       executable: this.#vercelCli,
-    });
+      phase,
+    }));
     if (result.exitCode !== 0) throw new DomainCutoverError("command_failed");
     return result.stdout;
   }
 
   async verifyVersion(): Promise<void> {
-    const version = (await this.#invoke(["--version"])).trim();
+    const version = (await this.#invoke(["--version"], "vercel-version-read")).trim();
     if (version !== supportedVercelVersion) {
       throw new DomainCutoverError("vercel_version_unsupported");
     }
@@ -1115,10 +1174,11 @@ export class VercelCutoverProvider implements CutoverProvider {
         "--scope",
         team,
         "--raw",
-      ])));
+      ], "vercel-alias-read")));
       if (parsed.alias !== aliasName) throw new DomainCutoverError("alias_readback_invalid");
       return parsed;
     } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       if (error instanceof DomainCutoverError && error.code === "command_failed") throw error;
       throw new DomainCutoverError("alias_readback_invalid");
     }
@@ -1135,8 +1195,9 @@ export class VercelCutoverProvider implements CutoverProvider {
         "--scope",
         team,
         "--raw",
-      ])));
+      ], "vercel-deployment-read")));
     } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       if (error instanceof DomainCutoverError && error.code === "command_failed") throw error;
       throw new DomainCutoverError("deployment_readback_invalid");
     }
@@ -1157,7 +1218,7 @@ export class VercelCutoverProvider implements CutoverProvider {
         "--scope",
         team,
         "--raw",
-      ])));
+      ], "vercel-domain-list-read")));
       if (!parsed.success) throw new DomainCutoverError("command_output_invalid");
       names.push(...parsed.data.domains.map((domain) => domain.name));
       const next = parsed.data.pagination.next;
@@ -1170,52 +1231,46 @@ export class VercelCutoverProvider implements CutoverProvider {
   }
 
   async readMarker(aliasName: ManagedAlias): Promise<unknown> {
+    this.#guard.assertMayProceed();
     if (!managedAliasSchema.safeParse(aliasName).success) {
       throw new DomainCutoverError("command_output_invalid");
     }
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5_000);
+    const response = await this.#fetcher(
+      `https://${aliasName}/.well-known/hra.json?cutover=${crypto.randomUUID()}`,
+      {
+        cache: "no-store",
+        headers: { "cache-control": "no-cache" },
+        redirect: "error",
+      },
+    );
+    const length = response.headers.get("content-length");
+    if (
+      response.status !== 200
+      || response.body === null
+      || (length !== null && (!/^[0-9]+$/u.test(length) || Number(length) > inputMaximumBytes))
+    ) throw new DomainCutoverError("command_output_invalid");
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
     try {
-      const response = await this.#fetcher(
-        `https://${aliasName}/.well-known/hra.json?cutover=${crypto.randomUUID()}`,
-        {
-          cache: "no-store",
-          headers: { "cache-control": "no-cache" },
-          redirect: "error",
-          signal: controller.signal,
-        },
-      );
-      const length = response.headers.get("content-length");
-      if (
-        response.status !== 200
-        || response.body === null
-        || (length !== null && (!/^[0-9]+$/u.test(length) || Number(length) > inputMaximumBytes))
-      ) throw new DomainCutoverError("command_output_invalid");
-      const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let bytes = 0;
-      try {
-        let result = await reader.read();
-        while (!result.done) {
-          bytes += result.value.byteLength;
-          if (bytes > inputMaximumBytes) {
-            controller.abort();
-            throw new DomainCutoverError("command_output_invalid");
-          }
-          chunks.push(result.value);
-          result = await reader.read();
+      let result = await reader.read();
+      while (!result.done) {
+        bytes += result.value.byteLength;
+        if (bytes > inputMaximumBytes) {
+          await reader.cancel().catch(() => undefined);
+          throw new DomainCutoverError("command_output_invalid");
         }
-      } catch (error: unknown) {
-        await reader.cancel().catch(() => undefined);
-        if (error instanceof DomainCutoverError) throw error;
-        throw new DomainCutoverError("command_output_invalid");
+        chunks.push(result.value);
+        result = await reader.read();
       }
-      const document = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))
-        .toString("utf8");
-      return parseProviderJson(document);
-    } finally {
-      clearTimeout(timeout);
+    } catch (error: unknown) {
+      await reader.cancel().catch(() => undefined);
+      if (error instanceof DomainCutoverError) throw error;
+      throw new DomainCutoverError("command_output_invalid");
     }
+    const document = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))
+      .toString("utf8");
+    return parseProviderJson(document);
   }
 
   async readProject(projectId: string): Promise<ProjectReadback> {
@@ -1229,12 +1284,13 @@ export class VercelCutoverProvider implements CutoverProvider {
         "--scope",
         team,
         "--raw",
-      ])));
+      ], "vercel-project-read")));
       if (parsed.id !== projectId) {
         throw new DomainCutoverError("automatic_domain_assignment_unsafe");
       }
       return parsed;
-    } catch {
+    } catch (error: unknown) {
+      rethrowBoundedProcessCleanupUnproven(error);
       throw new DomainCutoverError("automatic_domain_assignment_unsafe");
     }
   }
@@ -1246,7 +1302,10 @@ export class VercelCutoverProvider implements CutoverProvider {
     ) {
       throw new DomainCutoverError("usage_invalid");
     }
-    await this.#invoke(["alias", "set", deploymentUrl, aliasName, "--scope", team]);
+    await this.#invoke(
+      ["alias", "set", deploymentUrl, aliasName, "--scope", team],
+      "vercel-alias-set",
+    );
   }
 
   async moveDomain(sourceProjectId: string, targetProjectId: string): Promise<void> {
@@ -1265,19 +1324,25 @@ export class VercelCutoverProvider implements CutoverProvider {
       "-F",
       `projectId=${targetProjectId}`,
       "--silent",
-    ]);
+    ], "vercel-domain-move");
   }
 }
 
 type ParsedArguments = Readonly<{
+  evidencePath?: string;
   operation: "execute" | "preflight";
   planFd: number;
+  previousEvidencePath?: string;
+  sequence?: 1 | 2 | 3;
   vercelCli: string;
 }>;
 
 export function parseArguments(arguments_: readonly string[]): ParsedArguments {
   let operation: ParsedArguments["operation"] | undefined;
+  let evidencePath: string | undefined;
   let planFd = 0;
+  let previousEvidencePath: string | undefined;
+  let sequence: 1 | 2 | 3 | undefined;
   let vercelCli: string | undefined;
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -1310,12 +1375,55 @@ export function parseArguments(arguments_: readonly string[]): ParsedArguments {
       index += 1;
       continue;
     }
+    if (argument === "--evidence-path" && evidencePath === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !isAbsolute(value) || value.length > 4_096) {
+        throw new DomainCutoverError("usage_invalid");
+      }
+      evidencePath = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--previous-evidence" && previousEvidencePath === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !isAbsolute(value) || value.length > 4_096) {
+        throw new DomainCutoverError("usage_invalid");
+      }
+      previousEvidencePath = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--sequence" && sequence === undefined) {
+      const value = arguments_[index + 1];
+      if (value !== "1" && value !== "2" && value !== "3") {
+        throw new DomainCutoverError("usage_invalid");
+      }
+      sequence = Number(value) as 1 | 2 | 3;
+      index += 1;
+      continue;
+    }
     throw new DomainCutoverError("usage_invalid");
   }
   if (operation === undefined || vercelCli === undefined) {
     throw new DomainCutoverError("usage_invalid");
   }
-  return { operation, planFd, vercelCli };
+  const evidenceConfigured = evidencePath !== undefined
+    || previousEvidencePath !== undefined
+    || sequence !== undefined;
+  if (
+    operation === "preflight" && evidenceConfigured
+    || evidenceConfigured && (evidencePath === undefined || sequence === undefined)
+    || sequence === 1 && previousEvidencePath !== undefined
+    || (sequence === 2 || sequence === 3) && previousEvidencePath === undefined
+  ) throw new DomainCutoverError("usage_invalid");
+  return {
+    ...(evidencePath === undefined ? {} : { evidencePath }),
+    operation,
+    planFd,
+    ...(previousEvidencePath === undefined ? {} : { previousEvidencePath }),
+    ...(sequence === undefined ? {} : { sequence }),
+    vercelCli,
+  };
 }
 
 export async function readPlanInput(fd: number, timeoutMs = 15_000): Promise<string> {
@@ -1348,6 +1456,146 @@ export async function readPlanInput(fd: number, timeoutMs = 15_000): Promise<str
   });
 }
 
+const newEndpointForPlan = (plan: CutoverPlan): CutoverEndpoint =>
+  plan.direction === "forward" ? plan.target : plan.source;
+
+const validateCutoverEvidenceChain = (
+  plan: CutoverPlan,
+  sequence: 1 | 2 | 3,
+  previousPath: string | undefined,
+): Readonly<{ previous: CutoverEvidence | null; sourceCommit: string }> => {
+  if (plan.direction === "archive") throw new DomainCutoverError("usage_invalid");
+  const expectedDirection = sequence === 2 ? "reverse" : "forward";
+  if (plan.direction !== expectedDirection) throw new DomainCutoverError("usage_invalid");
+  const previous = previousPath === undefined ? null : parseCutoverEvidenceFile(previousPath);
+  if (
+    (sequence === 1 && previous !== null)
+    || (sequence > 1 && (previous === null || previous.sequence !== sequence - 1))
+  ) throw new DomainCutoverError("input_invalid");
+  const sourceCommit = newEndpointForPlan(plan).sourceCommit;
+  if (previous !== null && previous.sourceCommit !== sourceCommit) {
+    throw new DomainCutoverError("input_invalid");
+  }
+  return { previous, sourceCommit };
+};
+
+const reserveCutoverEvidence = (
+  plan: CutoverPlan,
+  arguments_: ParsedArguments,
+): Readonly<{
+  evidencePath: string;
+  planDigest: string;
+  previous: CutoverEvidence | null;
+  sequence: 1 | 2 | 3;
+  sourceCommit: string;
+}> | null => {
+  if (arguments_.evidencePath === undefined || arguments_.sequence === undefined) return null;
+  const chain = validateCutoverEvidenceChain(
+    plan,
+    arguments_.sequence,
+    arguments_.previousEvidencePath,
+  );
+  const planDigest = canonicalDigest(plan);
+  const reservation = cutoverReservationSchema.parse(withSelfDigest({
+    direction: plan.direction as "forward" | "reverse",
+    kind: "domain-cutover-reservation" as const,
+    planDigest,
+    previousDigest: chain.previous?.selfDigest ?? null,
+    schemaVersion: 1 as const,
+    sequence: arguments_.sequence,
+    sourceCommit: chain.sourceCommit,
+  }));
+  const reservationPath = `${arguments_.evidencePath}.reservation`;
+  try {
+    const existing = readProtectedJson(reservationPath, cutoverReservationSchema, {
+      recoverInterruptedPublication: true,
+    });
+    if (canonicalDigest(existing) !== canonicalDigest(reservation)) {
+      throw new DomainCutoverError("input_invalid");
+    }
+  } catch (error: unknown) {
+    if (error instanceof DomainCutoverError) throw error;
+    if (error instanceof Error && error.message !== "evidence_not_found") throw error;
+    writeProtectedJsonNoReplace(reservationPath, reservation, cutoverReservationSchema);
+  }
+  return {
+    evidencePath: arguments_.evidencePath,
+    planDigest,
+    previous: chain.previous,
+    sequence: arguments_.sequence,
+    sourceCommit: chain.sourceCommit,
+  };
+};
+
+const existingCutoverEvidence = (
+  reservation: NonNullable<ReturnType<typeof reserveCutoverEvidence>>,
+  plan: CutoverPlan,
+): CutoverEvidence | null => {
+  try {
+    const evidence = parseCutoverEvidenceFile(reservation.evidencePath, {
+      recoverInterruptedPublication: true,
+    });
+    if (
+      evidence.direction !== plan.direction
+      || evidence.planDigest !== reservation.planDigest
+      || evidence.previousDigest !== (reservation.previous?.selfDigest ?? null)
+      || evidence.sequence !== reservation.sequence
+      || evidence.sourceCommit !== reservation.sourceCommit
+    ) throw new DomainCutoverError("input_invalid");
+    return evidence;
+  } catch (error: unknown) {
+    if (error instanceof DomainCutoverError) throw error;
+    if (error instanceof Error && error.message === "evidence_not_found") return null;
+    throw error;
+  }
+};
+
+const cutoverAuthorityDigest = (
+  plan: CutoverPlan,
+  authority: CutoverPreflightOutcome,
+): string => {
+  if (
+    authority.status !== "already_committed"
+    || authority.nextAction !== "replay_plan_for_receipt"
+    || authority.reason !== "exact_target"
+  ) throw new DomainCutoverError("cutover_ambiguous");
+  return canonicalDigest({
+    authority,
+    canonicalAlias,
+    fallbackAlias,
+    stagingAlias: newStagingAlias,
+    target: plan.target,
+  });
+};
+
+const finalizeCutoverEvidence = (
+  reservation: NonNullable<ReturnType<typeof reserveCutoverEvidence>>,
+  plan: CutoverPlan,
+  outcome: CutoverOutcome,
+  authority: CutoverPreflightOutcome,
+): CutoverEvidence => {
+  const finalAuthorityDigest = cutoverAuthorityDigest(plan, authority);
+  const evidence = cutoverEvidenceSchema.parse(withSelfDigest({
+    changed: outcome.changed,
+    direction: plan.direction as "forward" | "reverse",
+    finalAuthorityDigest,
+    kind: "domain-cutover" as const,
+    planDigest: reservation.planDigest,
+    previousDigest: reservation.previous?.selfDigest ?? null,
+    replayed: outcome.replayed,
+    schemaVersion: 1 as const,
+    sequence: reservation.sequence,
+    sourceCommit: reservation.sourceCommit,
+  }));
+  writeProtectedJsonNoReplace(
+    reservation.evidencePath,
+    evidence,
+    cutoverEvidenceSchema,
+    { allowExactReplay: true },
+  );
+  return evidence;
+};
+
 type ExecuteOptions = Readonly<{
   arguments: readonly string[];
   environment?: Readonly<NodeJS.ProcessEnv>;
@@ -1359,12 +1607,15 @@ type ExecuteOptions = Readonly<{
 }>;
 
 export async function executeDomainCutover(options: ExecuteOptions): Promise<number> {
+  let evidenceRecoveryPaths: readonly string[] = [];
   try {
     const arguments_ = parseArguments(options.arguments);
     const plan = parseCutoverPlan(options.inputDocument);
+    const guard = new BoundedProcessInvocationGuard();
     const provider = new VercelCutoverProvider({
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+      guard,
       ...(options.runner === undefined ? {} : { runner: options.runner }),
       vercelCli: arguments_.vercelCli,
     });
@@ -1388,10 +1639,49 @@ export async function executeDomainCutover(options: ExecuteOptions): Promise<num
       })}\n`);
       return outcome.status === "blocked" ? 1 : 0;
     }
+    const reservation = reserveCutoverEvidence(plan, arguments_);
+    if (reservation !== null) {
+      evidenceRecoveryPaths = [
+        reservation.evidencePath,
+        `${reservation.evidencePath}.reservation`,
+      ];
+      for (const path of evidenceRecoveryPaths) guard.retainRecoveryPath(path);
+      const existing = existingCutoverEvidence(reservation, plan);
+      if (existing !== null) {
+        const authority = await preflightCutoverPlan(plan, provider);
+        if (cutoverAuthorityDigest(plan, authority) !== existing.finalAuthorityDigest) {
+          throw new DomainCutoverError("cutover_ambiguous");
+        }
+        options.stdout.write(`${JSON.stringify({
+          changed: existing.changed,
+          direction: plan.direction,
+          evidenceDigest: existing.selfDigest,
+          evidencePath: reservation.evidencePath,
+          replayed: true,
+          schemaVersion: 1,
+          status: "committed",
+          targetDeploymentId: plan.target.deploymentId,
+          targetProjectId: plan.target.projectId,
+        })}\n`);
+        return 0;
+      }
+    }
     const outcome = await executeCutoverPlan(plan, provider);
+    const evidence = reservation === null
+      ? undefined
+      : finalizeCutoverEvidence(
+          reservation,
+          plan,
+          outcome,
+          await preflightCutoverPlan(plan, provider),
+        );
     options.stdout.write(`${JSON.stringify({
       changed: outcome.changed,
       direction: plan.direction,
+      ...(evidence === undefined ? {} : {
+        evidenceDigest: evidence.selfDigest,
+        evidencePath: reservation?.evidencePath,
+      }),
       replayed: outcome.replayed,
       schemaVersion: 1,
       status: "committed",
@@ -1399,17 +1689,65 @@ export async function executeDomainCutover(options: ExecuteOptions): Promise<num
       targetProjectId: plan.target.projectId,
     })}\n`);
     return 0;
-  } catch (error: unknown) {
-    const code = error instanceof DomainCutoverError ? error.code : "input_invalid";
-    options.stderr.write(`${JSON.stringify({ code, schemaVersion: 1, status: "refused" })}\n`);
-    return 1;
+  } catch (caught: unknown) {
+    let error = caught;
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      for (const path of evidenceRecoveryPaths) error.retainRecoveryPath(path);
+    } else if (isBoundedProcessRecoveryJournalError(error) && evidenceRecoveryPaths.length > 0) {
+      for (const path of evidenceRecoveryPaths) {
+        error = retainBoundedProcessRecoveryPath(error, path);
+      }
+    }
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    const cleanup = isBoundedProcessCleanupUnprovenError(error) ? error : undefined;
+    const journal = isBoundedProcessRecoveryJournalError(error) ? error : undefined;
+    const code = error instanceof DomainCutoverError
+      ? error.code
+      : cleanup === undefined && journal === undefined
+        ? "input_invalid"
+        : cleanup !== undefined
+          ? "process_cleanup_unproven"
+          : "process_recovery_journal_blocked";
+    options.stderr.write(`${JSON.stringify({
+      code,
+      ...(cleanup === undefined ? {} : {
+        phase: cleanup.phase,
+        processGroupId: cleanup.processGroupId,
+        processes: cleanup.processes,
+        recoveryPaths: cleanup.recoveryPaths,
+      }),
+      ...(journal === undefined ? {} : {
+        reason: journal.reason,
+        recoveryPaths: journal.recoveryPaths,
+      }),
+      schemaVersion: 1,
+      status: cleanup === undefined && journal === undefined ? "refused" : "recovery_required",
+    })}\n`);
+    return cleanup === undefined && journal === undefined ? 1 : 75;
   }
 }
 
 if (import.meta.main) {
-  let exitCode = 1;
+  let exitCode = 75;
   try {
     const arguments_ = parseArguments(process.argv.slice(2));
+    try {
+      await recoverBoundedProcessJournal();
+    } catch (error: unknown) {
+      let retained = error;
+      if (arguments_.evidencePath !== undefined) {
+        retained = retainBoundedProcessRecoveryPath(retained, arguments_.evidencePath);
+        retained = retainBoundedProcessRecoveryPath(
+          retained,
+          `${arguments_.evidencePath}.reservation`,
+        );
+      }
+      throw retained;
+    }
     const inputDocument = await readPlanInput(arguments_.planFd);
     exitCode = await executeDomainCutover({
       arguments: process.argv.slice(2),
@@ -1418,8 +1756,37 @@ if (import.meta.main) {
       stdout: process.stdout,
     });
   } catch (error: unknown) {
-    const code = error instanceof DomainCutoverError ? error.code : "input_invalid";
-    process.stderr.write(`${JSON.stringify({ code, schemaVersion: 1, status: "refused" })}\n`);
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else {
+      const cleanup = isBoundedProcessCleanupUnprovenError(error) ? error : undefined;
+      const journal = isBoundedProcessRecoveryJournalError(error) ? error : undefined;
+      const code = error instanceof DomainCutoverError
+        ? error.code
+        : cleanup === undefined && journal === undefined
+          ? "input_invalid"
+          : cleanup !== undefined
+            ? "process_cleanup_unproven"
+            : "process_recovery_journal_blocked";
+      process.stderr.write(`${JSON.stringify({
+        code,
+        ...(cleanup === undefined ? {} : {
+          phase: cleanup.phase,
+          processGroupId: cleanup.processGroupId,
+          processes: cleanup.processes,
+          recoveryPaths: cleanup.recoveryPaths,
+        }),
+        ...(journal === undefined ? {} : {
+          reason: journal.reason,
+          recoveryPaths: journal.recoveryPaths,
+        }),
+        schemaVersion: 1,
+        status: cleanup === undefined && journal === undefined ? "refused" : "recovery_required",
+      })}\n`);
+      if (cleanup === undefined && journal === undefined) exitCode = 1;
+    }
   }
   process.exitCode = exitCode;
 }

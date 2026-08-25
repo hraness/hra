@@ -26,6 +26,18 @@ import {
   type CommandRunner,
 } from "./configure-hosted-sync";
 import {
+  BoundedProcessInvocationGuard,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  retainBoundedProcessRecoveryPath,
+} from "./bounded-process";
+import {
+  isAuthorityContainmentUnavailable,
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
+import {
   ConvexTargetError,
   parseConvexTarget,
   parseConvexTargetArguments,
@@ -628,8 +640,9 @@ const authorityRowsSchema = z.object({
 }).strict();
 
 type BootstrapInvoker = Readonly<{
-  invoke: (arguments_: readonly string[]) => Promise<CommandResult>;
-  invokeMutation: (arguments_: readonly string[]) => Promise<CommandResult>;
+  invoke: (arguments_: readonly string[], phase: string) => Promise<CommandResult>;
+  invokeMutation: (arguments_: readonly string[], phase: string) => Promise<CommandResult>;
+  retainRecoveryPath: (path: string) => void;
   target: ConvexTarget;
   verifyTarget: () => Promise<void>;
 }>;
@@ -649,30 +662,46 @@ const createBootstrapInvoker = async (
     forbiddenEnvironmentValues,
   );
   const runner = options.runner ?? runCommand;
-  const invoke = async (arguments_: readonly string[]): Promise<CommandResult> =>
-    await runner({
+  const guard = new BoundedProcessInvocationGuard();
+  const invoke = async (
+    arguments_: readonly string[],
+    phase: string,
+  ): Promise<CommandResult> => await guard.observe(async () => await runner({
       arguments: [convexCli, ...arguments_],
+      containment: "authority",
       cwd: repositoryRoot,
       environment,
       executable: process.execPath,
       outputMaximumBytes: convexOutputMaximumBytes,
+      phase,
       stdin: "",
       timeoutMs: convexTimeoutMs,
-    });
+    }));
   const invokeMutation = async (
     arguments_: readonly string[],
+    phase: string,
   ): Promise<CommandResult> => {
+    let authorityUnavailable = false;
+    let custodyFailure = false;
     try {
-      return await invoke(arguments_);
+      return await invoke(arguments_, phase);
+    } catch (error: unknown) {
+      authorityUnavailable = isAuthorityContainmentUnavailable(error);
+      custodyFailure = isBoundedProcessCleanupUnprovenError(error)
+        || isBoundedProcessRecoveryJournalError(error);
+      throw error;
     } finally {
-      await verifyTarget(target);
+      if (!authorityUnavailable && !custodyFailure) {
+        await guard.observe(async () => await verifyTarget(target));
+      }
     }
   };
   return {
     invoke,
     invokeMutation,
+    retainRecoveryPath: (path) => guard.retainRecoveryPath(path),
     target,
-    verifyTarget: async () => await verifyTarget(target),
+    verifyTarget: async () => await guard.observe(async () => await verifyTarget(target)),
   };
 };
 
@@ -685,6 +714,7 @@ const runHostedGenesis = async (
   try {
     const genesis = await invoker.invokeMutation(
       genesisArguments(invoker.target.deploymentName, authority),
+      "hosted-bootstrap-genesis",
     );
     if (genesis.exitCode !== 0) {
       mutationFailure = new BootstrapError("genesis_failed");
@@ -706,12 +736,18 @@ const runHostedGenesis = async (
     }
   } catch (error: unknown) {
     if (error instanceof ConvexTargetError) throw error;
+    if (isBoundedProcessCleanupUnprovenError(error)) throw error;
+    if (isBoundedProcessRecoveryJournalError(error)) throw error;
+    rethrowAuthorityContainmentUnavailable(error);
     mutationFailure = error instanceof Error
       ? error
       : new BootstrapError("genesis_failed");
   }
 
-  const after = await invoker.invoke(authorityArguments(invoker.target.deploymentName));
+  const after = await invoker.invoke(
+    authorityArguments(invoker.target.deploymentName),
+    "hosted-bootstrap-authority-read",
+  );
   if (after.exitCode !== 0) throw new BootstrapError("authority_readback_invalid");
   const afterValue = parseJson(after.stdout);
   let invite: z.infer<typeof bootstrapInviteRowSchema>;
@@ -745,7 +781,10 @@ export async function bootstrapHostedSync(
 ): Promise<HostedBootstrapResult> {
   const invoker = await createBootstrapInvoker(options);
 
-  const before = await invoker.invoke(preGenesisArguments(invoker.target.deploymentName));
+  const before = await invoker.invoke(
+    preGenesisArguments(invoker.target.deploymentName),
+    "hosted-bootstrap-preflight-read",
+  );
   if (before.exitCode !== 0) throw new BootstrapError("authority_readback_invalid");
   let beforeValue: z.infer<typeof emptyAuthoritySchema>;
   try {
@@ -779,6 +818,7 @@ export async function bootstrapHostedSync(
     await sink.abort();
     throw new BootstrapError("invite_output_refused");
   }
+  invoker.retainRecoveryPath(options.inviteOutput);
   return {
     invite: await runHostedGenesis(invoker, authority),
     operation: "bootstrap",
@@ -803,6 +843,7 @@ export async function recoverHostedBootstrap(
     capabilityDigest,
     publicId: invitePublicIdFromCapabilityDigest(capabilityDigest),
   });
+  invoker.retainRecoveryPath(options.inviteFile);
   return {
     invite: await runHostedGenesis(invoker, authority),
     operation: "recover",
@@ -849,6 +890,33 @@ export async function executeHostedBootstrap(options: ExecuteOptions): Promise<n
     options.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const code = error instanceof BootstrapError
       ? error.code
       : error instanceof ConvexTargetError
@@ -860,11 +928,59 @@ export async function executeHostedBootstrap(options: ExecuteOptions): Promise<n
 }
 
 if (import.meta.main) {
-  const exitCode = await executeHostedBootstrap({
-    arguments: process.argv.slice(2),
-    stderr: process.stderr,
-    stdout: process.stdout,
-  });
+  let exitCode = 75;
+  try {
+    const rawArguments = process.argv.slice(2);
+    let operatorRecoveryPath: string | undefined;
+    try {
+      const parsed = parseBootstrapArguments(rawArguments);
+      operatorRecoveryPath = parsed.operation.kind === "initialize"
+        ? parsed.operation.inviteOutput
+        : parsed.operation.inviteFile;
+    } catch {
+      // Recovery remains authoritative even when a later argument parse would
+      // refuse this invocation. Only validated absolute paths are retained.
+    }
+    try {
+      await recoverBoundedProcessJournal();
+    } catch (error: unknown) {
+      throw operatorRecoveryPath === undefined
+        ? error
+        : retainBoundedProcessRecoveryPath(error, operatorRecoveryPath);
+    }
+    exitCode = await executeHostedBootstrap({
+      arguments: rawArguments,
+      stderr: process.stderr,
+      stdout: process.stdout,
+    });
+  } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else {
+      process.stderr.write("Hosted bootstrap refused (authority_readback_invalid).\n");
+      exitCode = 1;
+    }
+  }
   process.exitCode = exitCode;
 }
 

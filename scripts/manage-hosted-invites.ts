@@ -21,6 +21,18 @@ import {
   type CommandRunner,
 } from "./configure-hosted-sync";
 import {
+  BoundedProcessInvocationGuard,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  retainBoundedProcessRecoveryPath,
+} from "./bounded-process";
+import {
+  isAuthorityContainmentUnavailable,
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
+import {
   ConvexTargetError,
   parseConvexTarget,
   parseConvexTargetArguments,
@@ -309,7 +321,8 @@ export async function manageHostedInvite(
 ): Promise<HostedInviteOperatorResult> {
   const target = parseConvexTarget(options.target);
   const verifyTarget = options.verifyTarget ?? verifyConvexDefaultTarget;
-  await verifyTarget(target);
+  const guard = new BoundedProcessInvocationGuard();
+  await guard.observe(async () => await verifyTarget(target));
   const sourceEnvironment = options.environment ?? process.env;
   const forbiddenEnvironmentValues = Object.values(sourceEnvironment)
     .filter((value): value is string =>
@@ -322,19 +335,25 @@ export async function manageHostedInvite(
   const invoke = async (
     arguments_: readonly string[],
     failureCode: InviteOperatorFailureCode,
+    phase: string,
   ): Promise<CommandResult> => {
     let result: CommandResult;
     try {
-      result = await runner({
+      result = await guard.observe(async () => await runner({
         arguments: [convexCli, ...arguments_],
+        containment: "authority",
         cwd: repositoryRoot,
         environment,
         executable: process.execPath,
         outputMaximumBytes: convexOutputMaximumBytes,
+        phase,
         stdin: "",
         timeoutMs: convexTimeoutMs,
-      });
-    } catch {
+      }));
+    } catch (error: unknown) {
+      if (isBoundedProcessCleanupUnprovenError(error)) throw error;
+      if (isBoundedProcessRecoveryJournalError(error)) throw error;
+      rethrowAuthorityContainmentUnavailable(error);
       throw new InviteOperatorError(failureCode);
     }
     if (result.exitCode !== 0) throw new InviteOperatorError(failureCode);
@@ -343,11 +362,21 @@ export async function manageHostedInvite(
   const invokeWithPostflight = async (
     arguments_: readonly string[],
     failureCode: InviteOperatorFailureCode,
+    phase: string,
   ): Promise<CommandResult> => {
+    let authorityUnavailable = false;
+    let custodyFailure = false;
     try {
-      return await invoke(arguments_, failureCode);
+      return await invoke(arguments_, failureCode, phase);
+    } catch (error: unknown) {
+      authorityUnavailable = isAuthorityContainmentUnavailable(error);
+      custodyFailure = isBoundedProcessCleanupUnprovenError(error)
+        || isBoundedProcessRecoveryJournalError(error);
+      throw error;
     } finally {
-      await verifyTarget(target);
+      if (!authorityUnavailable && !custodyFailure) {
+        await guard.observe(async () => await verifyTarget(target));
+      }
     }
   };
 
@@ -372,9 +401,11 @@ export async function manageHostedInvite(
       } catch {
         throw new InviteOperatorError("invite_output_refused");
       }
+      guard.retainRecoveryPath(options.operation.inviteOutput);
       const result = await invokeWithPostflight(
         issueArguments(target.deploymentName, authority),
         "invite_issue_failed",
+        "hosted-invite-issue",
       );
       const parsed = issueResultSchema.safeParse(
         parseJson(result.stdout, "invite_result_invalid"),
@@ -408,9 +439,11 @@ export async function manageHostedInvite(
     } catch {
       throw new InviteOperatorError("invite_input_refused");
     }
+    guard.retainRecoveryPath(options.operation.inviteFile);
     const before = await invokeWithPostflight(
       statusArguments(target.deploymentName, authority.publicId),
       "invite_status_failed",
+      "hosted-invite-recovery-read-before",
     );
     const existing = parseStatus(before.stdout, authority.publicId);
     if (existing !== null) return { invite: existing, operation: "recover" };
@@ -420,6 +453,7 @@ export async function manageHostedInvite(
       const result = await invokeWithPostflight(
         issueArguments(target.deploymentName, authority),
         "invite_issue_failed",
+        "hosted-invite-recovery-issue",
       );
       const parsed = issueResultSchema.safeParse(
         parseJson(result.stdout, "invite_result_invalid"),
@@ -430,6 +464,9 @@ export async function manageHostedInvite(
       ) throw new InviteOperatorError("invite_result_invalid");
     } catch (error: unknown) {
       if (error instanceof ConvexTargetError) throw error;
+      if (isBoundedProcessCleanupUnprovenError(error)) throw error;
+      if (isBoundedProcessRecoveryJournalError(error)) throw error;
+      rethrowAuthorityContainmentUnavailable(error);
       issueFailure = error instanceof Error
         ? error
         : new InviteOperatorError("invite_issue_failed");
@@ -438,6 +475,7 @@ export async function manageHostedInvite(
     const after = await invokeWithPostflight(
       statusArguments(target.deploymentName, authority.publicId),
       "invite_status_failed",
+      "hosted-invite-recovery-read-after",
     );
     const recovered = parseStatus(after.stdout, authority.publicId);
     if (recovered === null) {
@@ -450,6 +488,9 @@ export async function manageHostedInvite(
   const before = await invokeWithPostflight(
     statusArguments(target.deploymentName, options.operation.publicId),
     "invite_status_failed",
+    options.operation.kind === "status"
+      ? "hosted-invite-status-read"
+      : "hosted-invite-revoke-read-before",
   );
   const status = parseStatus(before.stdout, options.operation.publicId);
   if (options.operation.kind === "status") {
@@ -459,6 +500,7 @@ export async function manageHostedInvite(
   const revoked = await invokeWithPostflight(
     revokeArguments(target.deploymentName, options.operation.publicId),
     "invite_revoke_failed",
+    "hosted-invite-revoke",
   );
   const revoke = parseRevoke(revoked.stdout, options.operation.publicId);
   if ((status === null) !== (revoke === null)) {
@@ -501,6 +543,33 @@ export async function executeHostedInviteOperator(
     options.stdout.write(`${JSON.stringify(result)}\n`);
     return 0;
   } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const code = error instanceof InviteOperatorError
       ? error.code
       : error instanceof ConvexTargetError
@@ -512,10 +581,60 @@ export async function executeHostedInviteOperator(
 }
 
 if (import.meta.main) {
-  const exitCode = await executeHostedInviteOperator({
-    arguments: process.argv.slice(2),
-    stderr: process.stderr,
-    stdout: process.stdout,
-  });
+  let exitCode = 75;
+  try {
+    const rawArguments = process.argv.slice(2);
+    let operatorRecoveryPath: string | undefined;
+    try {
+      const parsed = parseHostedInviteArguments(rawArguments);
+      operatorRecoveryPath = parsed.operation.kind === "issue"
+        ? parsed.operation.inviteOutput
+        : parsed.operation.kind === "recover"
+          ? parsed.operation.inviteFile
+          : undefined;
+    } catch {
+      // Recovery remains authoritative even when a later argument parse would
+      // refuse this invocation. Only validated absolute paths are retained.
+    }
+    try {
+      await recoverBoundedProcessJournal();
+    } catch (error: unknown) {
+      throw operatorRecoveryPath === undefined
+        ? error
+        : retainBoundedProcessRecoveryPath(error, operatorRecoveryPath);
+    }
+    exitCode = await executeHostedInviteOperator({
+      arguments: rawArguments,
+      stderr: process.stderr,
+      stdout: process.stdout,
+    });
+  } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else {
+      process.stderr.write("Hosted invite operator refused (invite_result_invalid).\n");
+      exitCode = 1;
+    }
+  }
   process.exitCode = exitCode;
 }

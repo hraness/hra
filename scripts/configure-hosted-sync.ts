@@ -1,10 +1,22 @@
-import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { isatty } from "node:tty";
 
 import { z } from "zod";
+
+import {
+  type BoundedProcessContainment,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+} from "./bounded-process";
+import {
+  isAuthorityContainmentUnavailable,
+  renderAuthorityContainmentUnavailable,
+} from "./authority-containment";
 
 import {
   ConvexTargetError,
@@ -31,6 +43,7 @@ const convexOutputMaximumBytes = 64 * 1024;
 const convexTimeoutMs = 60_000;
 const commandOutputHardMaximumBytes = 1024 * 1024;
 const commandTimeoutHardMaximumMs = 15 * 60 * 1_000;
+const commandTerminationGraceMs = 1_000;
 
 const hasControlCharacter = (value: string): boolean => {
   for (let index = 0; index < value.length; index += 1) {
@@ -62,10 +75,12 @@ export type GeneratedHostedSecrets = Readonly<{
 
 export type CommandRequest = Readonly<{
   arguments: readonly string[];
+  containment: BoundedProcessContainment;
   cwd: string;
   environment: Readonly<Record<string, string>>;
   executable: string;
   outputMaximumBytes?: number;
+  phase: string;
   stdin: string;
   timeoutMs?: number;
 }>;
@@ -86,6 +101,7 @@ type HostedSetupFailureCode =
   | "convex_target_refused"
   | "input_invalid"
   | "input_not_protected"
+  | "process_cleanup_unproven"
   | "input_timed_out"
   | "input_too_large"
   | "target_already_configured"
@@ -323,19 +339,29 @@ export async function configureHostedSync(options: ConfigureOptions): Promise<vo
   const invoke = async (arguments_: readonly string[], stdin: string): Promise<CommandResult> =>
     await runner({
       arguments: [convexCli, ...arguments_],
+      containment: "authority",
       cwd: repositoryRoot,
       environment,
       executable,
+      phase: arguments_.includes("set") ? "convex-env-set" : "convex-env-read",
       stdin,
     });
   const invokeMutation = async (
     arguments_: readonly string[],
     stdin: string,
   ): Promise<CommandResult> => {
+    let cleanupUnproven = false;
+    let authorityUnavailable = false;
+    let custodyFailure = false;
     try {
       return await invoke(arguments_, stdin);
+    } catch (error: unknown) {
+      cleanupUnproven = isBoundedProcessCleanupUnprovenError(error);
+      authorityUnavailable = isAuthorityContainmentUnavailable(error);
+      custodyFailure = cleanupUnproven || isBoundedProcessRecoveryJournalError(error);
+      throw error;
     } finally {
-      await verifyTarget(target);
+      if (!authorityUnavailable && !custodyFailure) await verifyTarget(target);
     }
   };
 
@@ -367,66 +393,35 @@ export async function configureHostedSync(options: ConfigureOptions): Promise<vo
   await verifyTarget(target);
 }
 
-export const runCommand: CommandRunner = async (request) =>
-  await new Promise<CommandResult>((resolvePromise) => {
-    const requestedOutputMaximum = request.outputMaximumBytes === undefined
-      || !Number.isSafeInteger(request.outputMaximumBytes)
-      || request.outputMaximumBytes <= 0
-      ? convexOutputMaximumBytes
-      : request.outputMaximumBytes;
-    const outputMaximumBytes = Math.min(
-      requestedOutputMaximum,
-      commandOutputHardMaximumBytes,
-    );
-    const requestedTimeout = request.timeoutMs === undefined
-      || !Number.isSafeInteger(request.timeoutMs)
-      || request.timeoutMs <= 0
-      ? convexTimeoutMs
-      : request.timeoutMs;
-    const timeoutMs = Math.min(requestedTimeout, commandTimeoutHardMaximumMs);
-    const child = spawn(request.executable, [...request.arguments], {
-      cwd: request.cwd,
-      env: request.environment,
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    const stdoutState = { bytes: 0, overflow: false };
-    const stderrState = { bytes: 0, overflow: false };
-    let finished = false;
-    const finish = (exitCode: number): void => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      resolvePromise({
-        exitCode: stdoutState.overflow || stderrState.overflow ? 1 : exitCode,
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-      });
-    };
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(124);
-    }, timeoutMs);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutState.bytes += chunk.byteLength;
-      if (stdoutState.bytes <= outputMaximumBytes) stdoutChunks.push(chunk);
-      else stdoutState.overflow = true;
-      if (stdoutState.overflow) child.kill("SIGKILL");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrState.bytes += chunk.byteLength;
-      if (stderrState.bytes <= outputMaximumBytes) stderrChunks.push(chunk);
-      else stderrState.overflow = true;
-      if (stderrState.overflow) child.kill("SIGKILL");
-    });
-    child.once("error", () => finish(1));
-    child.once("close", (code) => finish(code ?? 1));
-    child.stdin.once("error", () => undefined);
-    child.stdin.end(request.stdin, "utf8");
-  });
+export const runCommand: CommandRunner = async (request) => {
+  const requestedOutputMaximum = request.outputMaximumBytes === undefined
+    || !Number.isSafeInteger(request.outputMaximumBytes)
+    || request.outputMaximumBytes <= 0
+    ? convexOutputMaximumBytes
+    : request.outputMaximumBytes;
+  const requestedTimeout = request.timeoutMs === undefined
+    || !Number.isSafeInteger(request.timeoutMs)
+    || request.timeoutMs <= 0
+    ? convexTimeoutMs
+    : request.timeoutMs;
+  const result = requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: request.arguments,
+    containment: request.containment,
+    cwd: request.cwd,
+    environment: request.environment,
+    executable: request.executable,
+    outputMaximumBytes: Math.min(requestedOutputMaximum, commandOutputHardMaximumBytes),
+    phase: request.phase,
+    stdin: request.stdin,
+    terminationGraceMs: commandTerminationGraceMs,
+    timeoutMs: Math.min(requestedTimeout, commandTimeoutHardMaximumMs),
+  }));
+  return {
+    exitCode: result.exitCode,
+    stderr: result.stderr.toString("utf8"),
+    stdout: result.stdout.toString("utf8"),
+  };
+};
 
 export async function readProtectedInput(
   fd: number,
@@ -496,6 +491,33 @@ export async function executeHostedSetup(options: ExecuteOptions): Promise<numbe
     );
     return 0;
   } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const code = error instanceof HostedSetupError
       ? error.code
       : error instanceof ConvexTargetError
@@ -507,9 +529,10 @@ export async function executeHostedSetup(options: ExecuteOptions): Promise<numbe
 }
 
 if (import.meta.main) {
-  let exitCode = 1;
+  let exitCode = 75;
   try {
     const parsedArguments = parseHostedArguments(process.argv.slice(2));
+    await recoverBoundedProcessJournal();
     const inputDocument = await readProtectedInput(parsedArguments.inputFd);
     exitCode = await executeHostedSetup({
       arguments: process.argv.slice(2),
@@ -518,12 +541,37 @@ if (import.meta.main) {
       stdout: process.stdout,
     });
   } catch (error: unknown) {
-    const code = error instanceof HostedSetupError
-      ? error.code
-      : error instanceof ConvexTargetError
-        ? "convex_target_refused"
-        : "input_invalid";
-    process.stderr.write(`Hosted setup refused (${code}).\n`);
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else {
+      const code = error instanceof HostedSetupError
+        ? error.code
+        : error instanceof ConvexTargetError
+          ? "convex_target_refused"
+          : "input_invalid";
+      process.stderr.write(`Hosted setup refused (${code}).\n`);
+      exitCode = 1;
+    }
   }
   process.exitCode = exitCode;
 }
