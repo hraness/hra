@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -968,8 +969,9 @@ describe("verified hosted deployment", () => {
             const path = substitutedPath === "assertion"
               ? join(archivedSource, "scripts", "assert-convex-deploy-target.ts")
               : join(archivedSource, "node_modules", "convex", "bin", "main.js");
-            await rm(path, { force: false });
-            await writeFile(path, `// substituted ${substitutedPath}\n`, "utf8");
+            const replacementPath = `${path}.replacement`;
+            await writeFile(replacementPath, `// substituted ${substitutedPath}\n`, "utf8");
+            await rename(replacementPath, path);
           }
           return null;
         },
