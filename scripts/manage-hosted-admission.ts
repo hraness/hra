@@ -10,6 +10,16 @@ import {
   type CommandRunner,
 } from "./configure-hosted-sync";
 import {
+  BoundedProcessInvocationGuard,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+} from "./bounded-process";
+import {
+  isAuthorityContainmentUnavailable,
+  renderAuthorityContainmentUnavailable,
+} from "./authority-containment";
+import {
   ConvexTargetError,
   parseConvexTarget,
   parseConvexTargetArguments,
@@ -164,27 +174,46 @@ export async function manageHostedAdmission(options: AdmissionOptions): Promise<
   const verify = options.verifyTarget ?? verifyConvexDefaultTarget;
   const runner = options.runner ?? runCommand;
   const environment = buildConvexChildEnvironment(options.environment ?? process.env, []);
-  const invoke = async (arguments_: readonly string[]): Promise<CommandResult> => await runner({
+  const guard = new BoundedProcessInvocationGuard();
+  const invoke = async (
+    arguments_: readonly string[],
+    phase: string,
+  ): Promise<CommandResult> => await guard.observe(async () => await runner({
     arguments: [convexCli, ...arguments_],
+    containment: "authority",
     cwd: repositoryRoot,
     environment,
     executable: process.execPath,
     outputMaximumBytes: providerOutputMaximumBytes,
+    phase,
     stdin: "",
     timeoutMs: 60_000,
-  });
+  }));
   const invokeWithPostflight = async (
     arguments_: readonly string[],
+    phase: string,
   ): Promise<CommandResult> => {
+    let authorityUnavailable = false;
+    let custodyFailure = false;
     try {
-      return await invoke(arguments_);
+      return await invoke(arguments_, phase);
+    } catch (error: unknown) {
+      authorityUnavailable = isAuthorityContainmentUnavailable(error);
+      custodyFailure = isBoundedProcessCleanupUnprovenError(error)
+        || isBoundedProcessRecoveryJournalError(error);
+      throw error;
     } finally {
-      await verify(target);
+      if (!authorityUnavailable && !custodyFailure) {
+        await guard.observe(async () => await verify(target));
+      }
     }
   };
 
-  await verify(target);
-  const beforeResult = await invokeWithPostflight(statusArguments(target.deploymentName));
+  await guard.observe(async () => await verify(target));
+  const beforeResult = await invokeWithPostflight(
+    statusArguments(target.deploymentName),
+    "hosted-admission-read-before",
+  );
   if (beforeResult.exitCode !== 0) {
     throw new AdmissionOperatorError("provider_result_invalid");
   }
@@ -206,6 +235,7 @@ export async function manageHostedAdmission(options: AdmissionOptions): Promise<
 
   const changedResult = await invokeWithPostflight(
     transitionArguments(target.deploymentName, options.action),
+    "hosted-admission-transition",
   );
   if (changedResult.exitCode !== 0) {
     throw new AdmissionOperatorError("transition_refused");
@@ -218,7 +248,10 @@ export async function manageHostedAdmission(options: AdmissionOptions): Promise<
     || (possibleLostResponse && !changed.replay)
   ) throw new AdmissionOperatorError("transition_refused");
 
-  const afterResult = await invokeWithPostflight(statusArguments(target.deploymentName));
+  const afterResult = await invokeWithPostflight(
+    statusArguments(target.deploymentName),
+    "hosted-admission-read-after",
+  );
   if (afterResult.exitCode !== 0) {
     throw new AdmissionOperatorError("provider_result_invalid");
   }
@@ -255,6 +288,33 @@ export async function executeHostedAdmission(options: ExecuteAdmissionOptions): 
     })}\n`);
     return 0;
   } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      options.stderr.write(authorityUnavailable);
+      return 1;
+    }
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      options.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const code = error instanceof AdmissionOperatorError
       ? error.code
       : error instanceof ConvexTargetError
@@ -266,9 +326,41 @@ export async function executeHostedAdmission(options: ExecuteAdmissionOptions): 
 }
 
 if (import.meta.main) {
-  process.exitCode = await executeHostedAdmission({
-    arguments: process.argv.slice(2),
-    stderr: process.stderr,
-    stdout: process.stdout,
-  });
+  let exitCode = 75;
+  try {
+    await recoverBoundedProcessJournal();
+    exitCode = await executeHostedAdmission({
+      arguments: process.argv.slice(2),
+      stderr: process.stderr,
+      stdout: process.stdout,
+    });
+  } catch (error: unknown) {
+    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+    if (authorityUnavailable !== undefined) {
+      process.stderr.write(authorityUnavailable);
+      exitCode = 1;
+    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_cleanup_unproven",
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else if (isBoundedProcessRecoveryJournalError(error)) {
+      process.stderr.write(`${JSON.stringify({
+        code: "process_recovery_journal_blocked",
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+    } else {
+      process.stderr.write("Hosted auth admission operation refused (provider_result_invalid).\n");
+      exitCode = 1;
+    }
+  }
+  process.exitCode = exitCode;
 }

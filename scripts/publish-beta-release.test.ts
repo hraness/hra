@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -34,6 +35,19 @@ import type {
   ManagedAlias,
   ProjectReadback,
 } from "./domain-cutover";
+import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
+import {
+  canonicalDigest,
+  HRA_CONVEX_PROJECT_ID,
+  HRA_CONVEX_TEAM_ID,
+  HRA_REPOSITORY_ID,
+  releaseCandidateReceiptSchema,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
+} from "./release-evidence";
 
 const commit = "a".repeat(40);
 const tag = "v0.1.0";
@@ -50,6 +64,8 @@ const oldRepositoryId = 1_334_876_494;
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
 const fallbackCommit = "b".repeat(40);
 const notes = "# HRA v0.1.0 friend beta\n\nAccepted notes.";
+const candidateDigest = "d".repeat(64);
+const candidateReceipt = "/opt/hra-test/state/release-candidate.json";
 const temporaryRoots: string[] = [];
 type HostedFault =
   | "canonical-alias"
@@ -79,6 +95,7 @@ const commandResult = (
 });
 
 const assetNames = [
+  "RELEASE_NOTES.md",
   "SHA256SUMS",
   `hra-${tag}.artifact.spdx.json`,
   `hra-${tag}.tgz`,
@@ -106,9 +123,11 @@ const makeAssets = (): ReadonlyMap<string, Buffer> => {
     `${digest(archive)}  hra-${tag}.tgz`,
     `${digest(artifactSbom)}  hra-${tag}.artifact.spdx.json`,
     `${digest(runtimeSbom)}  hra-${tag}.ubuntu-24.04-x64.runtime.spdx.json`,
+    `${digest(Buffer.from(notes))}  RELEASE_NOTES.md`,
     "",
   ].join("\n"));
   return new Map([
+    ["RELEASE_NOTES.md", Buffer.from(notes)],
     ["SHA256SUMS", checksums],
     [`hra-${tag}.artifact.spdx.json`, artifactSbom],
     [`hra-${tag}.tgz`, archive],
@@ -128,7 +147,7 @@ const writeAccepted = async (
     flag: "wx",
     mode: 0o600,
   });
-  await writeFile(join(directory, "RELEASE_NOTES.md"), notes, {
+  await writeFile(join(directory, "RELEASE_CANDIDATE_SHA256"), `${candidateDigest}\n`, {
     flag: "wx",
     mode: 0o600,
   });
@@ -140,6 +159,8 @@ class FakeProvider implements ReleasePublicationProvider {
   artifactExpired = false;
   artifactAttempts: number[] = [1, runAttempt];
   assetIdentityChangesBeforePublish = false;
+  candidateDigests: string[] = [];
+  candidateReceiptReads = 0;
   draftImmutable = false;
   hostedFault: HostedFault | undefined;
   hostedFailsAfterPublish = false;
@@ -147,6 +168,7 @@ class FakeProvider implements ReleasePublicationProvider {
   leaseCleanupFails = false;
   leaseCancellationOutcome: PublicationLeaseCancellation = "cancelled";
   leaseLost = false;
+  loseLeaseOnCandidateRead: number | undefined;
   leaseRunId = 7_654_321;
   leaseUnavailable = false;
   mainContainsCommit = true;
@@ -154,19 +176,27 @@ class FakeProvider implements ReleasePublicationProvider {
   publicInstallFails = false;
   publishFailsAfterCommit = false;
   publishFailsBeforeCommit = false;
+  publishCleanupFailure: BoundedProcessCleanupUnprovenError | undefined;
   publishedReleaseId: number | undefined;
   publicReleaseImmutable = true;
   reviewedSourceMismatch = false;
+  releaseBody = notes;
   releaseAssetsReads = 0;
   tagProtected = true;
   tagCommit = commit;
 
-  async acquirePublicationLease(expectedCommit: string): Promise<PublicationLease> {
+  async acquirePublicationLease(
+    expectedCommit: string,
+    exactCandidateDigest: string,
+    exactCandidateReceipt: string,
+  ): Promise<PublicationLease> {
     this.calls.push("lease:acquire");
     if (this.leaseUnavailable) {
       throw new ReleasePublicationError("publication_lease_unavailable");
     }
     return {
+      candidateDigest: exactCandidateDigest,
+      candidateReceipt: exactCandidateReceipt,
       expectedCommit,
       holder: "0123456789abcdef0123456789abcdef",
       runAttempt: 1,
@@ -199,6 +229,13 @@ class FakeProvider implements ReleasePublicationProvider {
 
   async verifyLocalSource(expectedCommit: string): Promise<void> {
     this.calls.push(`local:${expectedCommit}`);
+  }
+
+  async verifyCandidateReceipt(path: string, expectedCommit: string): Promise<string> {
+    this.calls.push(`candidate:${path}:${expectedCommit}`);
+    this.candidateReceiptReads += 1;
+    if (this.candidateReceiptReads === this.loseLeaseOnCandidateRead) this.leaseLost = true;
+    return this.candidateDigests.shift() ?? candidateDigest;
   }
 
   async readRepository(): Promise<unknown> {
@@ -253,7 +290,7 @@ class FakeProvider implements ReleasePublicationProvider {
 
   private release(): unknown {
     return {
-      body: notes,
+      body: this.releaseBody,
       draft: !this.published,
       id: releaseId,
       immutable: this.published ? this.publicReleaseImmutable : this.draftImmutable,
@@ -437,6 +474,7 @@ class FakeProvider implements ReleasePublicationProvider {
     this.calls.push("publish");
     this.publishedReleaseId = id;
     if (publishedNotes !== notes) throw new Error("wrong notes");
+    if (this.publishCleanupFailure !== undefined) throw this.publishCleanupFailure;
     if (this.publishFailsBeforeCommit) throw new Error("lost before commit");
     this.published = true;
     if (this.publishFailsAfterCommit) throw new Error("lost after commit");
@@ -451,6 +489,7 @@ class FakeProvider implements ReleasePublicationProvider {
 
 const publicationArguments = (action: "accept" | "publish"): PublicationArguments => ({
   action,
+  candidateReceipt,
   deploymentId,
   deploymentUrl,
   expectedCommit: commit,
@@ -484,8 +523,110 @@ const writeRecoveryReceipt = async (
 ): Promise<string> => {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const holder = "0123456789abcdef0123456789abcdef";
+  const protectedCandidateReceipt = join(directory, "release-candidate.json");
+  const convexTarget = {
+    deploymentId: 5_089_017,
+    deploymentName: "qualified-hummingbird-537",
+    deploymentUrl: "https://qualified-hummingbird-537.convex.cloud",
+    projectId: HRA_CONVEX_PROJECT_ID,
+    teamId: HRA_CONVEX_TEAM_ID,
+  } as const;
+  const bootstrapRuntimeAttestation = {
+    bound: true as const,
+    deployedAtMs: 100,
+    previousDeployDigest: null,
+    runtimeRevision: "00000000-0000-4000-8000-000000000001",
+    runtimeSourceCommit: commit,
+    schemaIdentity: "hra-release-attestation-v1" as const,
+    schemaVersion: 1 as const,
+  };
+  const candidateRuntimeAttestation = {
+    ...bootstrapRuntimeAttestation,
+    deployedAtMs: 200,
+    previousDeployDigest: "2".repeat(64),
+    runtimeRevision: "00000000-0000-4000-8000-000000000002",
+  };
+  const candidate = releaseCandidateReceiptSchema.parse(withSelfDigest({
+    ci: ["Check (macos-15)", "Check (ubuntu-24.04)", "Required"].map((name) => ({
+      completedAt: "2026-08-24T12:00:00.000Z",
+      conclusion: "success" as const,
+      headCommit: commit,
+      name,
+      runAttempt: 1,
+      runId: 123,
+      workflow: "CI" as const,
+    })),
+    convex: {
+      bootstrapDeployDigest: "2".repeat(64),
+      bootstrapLive: {
+        completedAt: 200,
+        deployEvidenceDigest: "2".repeat(64),
+        digest: "3".repeat(64),
+        packageVersion: "0.1.0" as const,
+        runtimeRevision: bootstrapRuntimeAttestation.runtimeRevision,
+        sourceCommit: commit,
+        startedAt: 150,
+        targetDigest: canonicalDigest(convexTarget),
+      },
+      bootstrapRuntime: bootstrapRuntimeAttestation,
+      candidateDeployDigest: "4".repeat(64),
+      candidateLive: {
+        completedAt: 300,
+        deployEvidenceDigest: "4".repeat(64),
+        digest: "5".repeat(64),
+        packageVersion: "0.1.0" as const,
+        runtimeRevision: candidateRuntimeAttestation.runtimeRevision,
+        sourceCommit: commit,
+        startedAt: 250,
+        targetDigest: canonicalDigest(convexTarget),
+      },
+      candidateRuntime: candidateRuntimeAttestation,
+      target: convexTarget,
+      targetDigest: canonicalDigest(convexTarget),
+    },
+    cutover: {
+      finalForwardDigest: "6".repeat(64),
+      forwardDigest: "7".repeat(64),
+      reverseDigest: "8".repeat(64),
+    },
+    kind: "release-candidate" as const,
+    releaseVersion: "0.1.0" as const,
+    repository: { id: HRA_REPOSITORY_ID, name: "hraness/hra" as const },
+    schemaVersion: 1 as const,
+    sealedAt: Date.parse("2026-08-24T13:00:00.000Z"),
+    sourceCommit: commit,
+    surfaceDigest: "9".repeat(64),
+    tag: "v0.1.0" as const,
+    vercel: {
+      authorityDigest: "a".repeat(64),
+      candidate: {
+        deploymentId,
+        deploymentUrl,
+        projectId: newProjectId,
+        repositoryId: HRA_REPOSITORY_ID,
+        sourceCommit: commit,
+        version: "0.1.0",
+      },
+      fallback: {
+        deploymentId: fallbackDeploymentId,
+        deploymentUrl: fallbackDeploymentUrl,
+        projectId: oldProjectId,
+        repositoryId: oldRepositoryId,
+        sourceCommit: fallbackCommit,
+        version: "0.1.14",
+      },
+      teamId,
+    },
+  }));
+  writeProtectedJsonNoReplace(
+    protectedCandidateReceipt,
+    candidate,
+    releaseCandidateReceiptSchema,
+  );
   const receipt = join(directory, `${tag}-${holder}.json`);
   await writeFile(receipt, `${JSON.stringify({
+    candidateDigest: candidate.selfDigest,
+    candidateReceipt: protectedCandidateReceipt,
     expectedCommit: commit,
     holder,
     repository: "hraness/hra",
@@ -542,6 +683,7 @@ describe("release publication arguments", () => {
   test("requires an exact run, source commit, CLI, tag, and explicit publish acknowledgement", () => {
     const common = [
       "--tag", tag,
+      "--candidate-receipt", candidateReceipt,
       "--run-id", String(runId),
       "--run-attempt", String(runAttempt),
       "--expected-commit", commit,
@@ -649,6 +791,11 @@ describe("release publication arguments", () => {
       .toThrow("local_source_invalid");
   });
 
+  test("uses an absolute Git executable for the authority-classified source fetch", async () => {
+    const source = await Bun.file(join(import.meta.dir, "publish-beta-release.ts")).text();
+    expect(source).toMatch(/arguments: \["fetch", "origin", "main", "--tags"\],\s+containment: "authority",\s+cwd: this\.root,\s+environment: this\.environment,\s+executable: "\/usr\/bin\/git"/u);
+  });
+
   test("inspects a hostile candidate without importing it or running lifecycle scripts", async () => {
     const root = await makeRoot();
     const packageRoot = join(root, "payload", "package");
@@ -660,14 +807,16 @@ describe("release publication arguments", () => {
       "export {};",
       "",
     ].join("\n"));
-    await writeFile(join(packageRoot, "postinstall.ts"), [
+    await chmod(join(packageRoot, "src", "cli.ts"), 0o755);
+    await writeFile(join(packageRoot, "src", "install-normalizer.ts"), [
       `await Bun.write(${JSON.stringify(lifecycleSentinel)}, "ran");`,
       "",
     ].join("\n"));
+    await chmod(join(packageRoot, "src", "install-normalizer.ts"), 0o644);
     await writeFile(join(packageRoot, "package.json"), JSON.stringify({
-      bin: { hra: "src/cli.ts" },
+      bin: { hra: "./src/cli.ts" },
       name: "hra",
-      scripts: { postinstall: "bun ./postinstall.ts" },
+      scripts: { postinstall: "bun ./src/install-normalizer.ts" },
       type: "module",
       version: "0.1.0",
     }));
@@ -688,9 +837,11 @@ describe("release publication arguments", () => {
 
     const provider = new GitHubReleasePublicationProvider({
       ghCli: "/not-used/gh",
+      recoveryDirectory: join(root, "process-recovery"),
       vercelCli: "/not-used/vercel",
     });
-    await provider.acceptPackedInstall(archive, join(root, "inspection"));
+    await expect(provider.acceptPackedInstall(archive, join(root, "inspection")))
+      .rejects.toThrow("accepted_artifact_invalid");
     expect(await Bun.file(importSentinel).exists()).toBeFalse();
     expect(await Bun.file(lifecycleSentinel).exists()).toBeFalse();
 
@@ -702,7 +853,19 @@ describe("release publication arguments", () => {
     expect(publisherSource).not.toContain('arguments: ["add", "--global"');
     expect(publisherSource).toContain('"pack",\n        "--ignore-scripts"');
     expect(workflowSource).toContain("bun pm pack --ignore-scripts --destination release");
-    expect(workflowSource).toContain("bun add --global --ignore-scripts");
+    expect(workflowSource).toContain("src/install-preflight.ts");
+    expect(workflowSource).toContain("hra-install-safe");
+    expect(workflowSource.indexOf("hra-install-safe")).toBeLessThan(
+      workflowSource.indexOf('test -L "$BUN_INSTALL/bin/hra"'),
+    );
+    expect(workflowSource).toContain(
+      'test "$(bun ./src/install-preflight.ts "./release/hra-${GITHUB_REF_NAME}.tgz")" = hra-install-safe',
+    );
+    expect(workflowSource).toContain("HRA_PUBLIC_INSTALL_COMMAND");
+    expect(workflowSource).toContain("buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL)");
+    expect(workflowSource).not.toContain("bun add --global --backend=copyfile --ignore-scripts");
+    expect(workflowSource).toContain("lifecycle-disabled install changed consumer trust");
+    expect(workflowSource).not.toContain("bun add --global --backend=copyfile --trust");
     const publicRuntimeProof = "public runtime SPDX does not match the installed package inventory";
     expect(workflowSource.split(publicRuntimeProof)).toHaveLength(2);
     expect(workflowSource.indexOf(publicRuntimeProof)).toBeGreaterThan(
@@ -730,10 +893,100 @@ describe("release publication cleanup", () => {
     }
     expect(observed).toBe(primary);
   });
+
+  test("preserves child-reachable temporary state after cleanup becomes indeterminate", async () => {
+    const root = await makeRoot();
+    const cleanup = new BoundedProcessCleanupUnprovenError(42_420, "tar-extract");
+    let removed = false;
+    await expect(withBestEffortReleaseCleanup(
+      async () => { throw cleanup; },
+      async () => { removed = true; },
+      { path: root, publicationPhase: "before_publication" },
+    )).rejects.toBe(cleanup);
+    expect(removed).toBeFalse();
+    expect(cleanup.recoveryPaths).toContain(root);
+    expect(cleanup.diagnostics).toEqual({ publicationPhase: "before_publication" });
+  });
+
+  test("preserves child-reachable temporary state when the recovery journal blocks", async () => {
+    const root = await makeRoot();
+    const journal = new BoundedProcessRecoveryJournalError(
+      ["/private/operator/process-recovery/authority-publication.json"],
+      "authority_recovery_required",
+    );
+    let removed = false;
+    let observed: unknown;
+    try {
+      await withBestEffortReleaseCleanup(
+        async () => { throw journal; },
+        async () => { removed = true; },
+        { path: root, publicationPhase: "before_publication" },
+      );
+    } catch (error: unknown) {
+      observed = error;
+    }
+    expect(observed).toBeInstanceOf(BoundedProcessRecoveryJournalError);
+    expect((observed as BoundedProcessRecoveryJournalError).recoveryPaths).toEqual([
+      "/private/operator/process-recovery/authority-publication.json",
+      root,
+    ].sort());
+    expect(journal.recoveryPaths).toEqual([
+      "/private/operator/process-recovery/authority-publication.json",
+    ]);
+    expect(removed).toBeFalse();
+  });
+
+  test("bounds hostile public bodies and preserves the final URL authority", async () => {
+    let cancelled = false;
+    const stalled = new Response(new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
+      pull() {
+        return new Promise(() => undefined);
+      },
+    }), { status: 200 });
+    Object.defineProperty(stalled, "url", { value: "https://downloads.example.test/hra.tgz" });
+    const stalledProvider = new GitHubReleasePublicationProvider({
+      fetcher: Object.assign(() => Promise.resolve(stalled), {
+        preconnect: () => undefined,
+      }) as typeof fetch,
+      ghCli: "/not-used/gh",
+      publicTimeoutMs: 10,
+      vercelCli: "/not-used/vercel",
+    });
+    const startedAt = performance.now();
+    await expect(stalledProvider.acceptPublicInstall(
+      "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      "/not-used",
+      "0".repeat(64),
+    )).rejects.toThrow("public_acceptance_failed");
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(cancelled).toBeTrue();
+
+    const bytes = new TextEncoder().encode("exact public archive");
+    const insecure = new Response(bytes, { status: 200 });
+    Object.defineProperty(insecure, "url", { value: "http://downloads.example.test/hra.tgz" });
+    const insecureProvider = new GitHubReleasePublicationProvider({
+      fetcher: Object.assign(() => Promise.resolve(insecure), {
+        preconnect: () => undefined,
+      }) as typeof fetch,
+      ghCli: "/not-used/gh",
+      publicTimeoutMs: 100,
+      vercelCli: "/not-used/vercel",
+    });
+    await expect(insecureProvider.acceptPublicInstall(
+      "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      "/not-used",
+      digest(bytes),
+    )).rejects.toThrow("public_acceptance_failed");
+  });
 });
 
 describe("release publication lease identity", () => {
   const lease: PublicationLease = {
+    candidateDigest,
+    candidateReceipt,
     expectedCommit: commit,
     holder: "0123456789abcdef0123456789abcdef",
     runAttempt: 1,
@@ -904,7 +1157,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: (value) => { stderr.push(value); },
     });
-    await expect(provider.acquirePublicationLease(commit)).resolves.toEqual(lease);
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .resolves.toEqual(lease);
     expect(commands[0]).toContain("return_run_details=true");
     expect(receiptObservedBeforeDispatch).toBeTrue();
     expect(commands[1]).toContain(`repos/hraness/hra/actions/runs/${String(lease.runId)}`);
@@ -956,7 +1210,8 @@ describe("release publication lease identity", () => {
         vercelCli: "/not-used/vercel",
         writeStderr: () => undefined,
       });
-      await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+      await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+        .rejects.toMatchObject({
         code: "local_source_invalid",
         phase: "before_publication",
       });
@@ -980,9 +1235,38 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "local_source_invalid",
     });
+    expect(remoteCommands).toBe(0);
+  });
+
+  test("rejects a mode-private receipt directory with a dangerous Darwin ACL", async () => {
+    if (process.platform !== "darwin") return;
+    const root = await makeRoot();
+    const receiptDirectory = join(root, "receipts");
+    await mkdir(receiptDirectory, { mode: 0o700 });
+    const acl = spawnSync("/bin/chmod", [
+      "+a",
+      "everyone allow list,search,add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
+      receiptDirectory,
+    ], { encoding: "utf8" });
+    expect(acl.status).toBe(0);
+    let remoteCommands = 0;
+    const provider = new GitHubReleasePublicationProvider({
+      ghCli: "/not-used/gh",
+      githubCommand: async () => {
+        remoteCommands += 1;
+        return commandResult(undefined);
+      },
+      leaseReceiptDirectory: receiptDirectory,
+      randomHolder: () => lease.holder,
+      vercelCli: "/not-used/vercel",
+      writeStderr: () => undefined,
+    });
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({ code: "local_source_invalid" });
     expect(remoteCommands).toBe(0);
   });
 
@@ -1005,7 +1289,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "local_source_invalid",
     });
     expect(remoteCommands).toBe(0);
@@ -1041,7 +1326,8 @@ describe("release publication lease identity", () => {
         vercelCli: "/not-used/vercel",
         writeStderr: () => undefined,
       });
-      await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+      await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+        .rejects.toMatchObject({
         code: "publication_lease_cleanup_failed",
         leaseRunId: lease.runId,
         phase: "before_publication",
@@ -1130,7 +1416,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).resolves.toEqual(lease);
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .resolves.toEqual(lease);
     expect(commands.some((arguments_) => arguments_.some((argument) =>
       argument.includes("event=workflow_dispatch&head_sha=")))).toBeTrue();
     expect(commands.at(-1)).toContain(
@@ -1162,7 +1449,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).resolves.toEqual(lease);
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .resolves.toEqual(lease);
     expect(commands.some((arguments_) => arguments_.at(-1)?.endsWith("&page=2")))
       .toBeTrue();
   });
@@ -1191,7 +1479,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "publication_lease_cleanup_failed",
       receiptPath,
     });
@@ -1222,7 +1511,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "publication_lease_unavailable",
       receiptPath,
     });
@@ -1248,7 +1538,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "publication_lease_cleanup_failed",
     });
     const scans = commands.filter((arguments_) => arguments_.at(-1)?.includes("&page="));
@@ -1300,7 +1591,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "publication_lease_unavailable",
       leaseRunId: lease.runId,
     });
@@ -1344,7 +1636,8 @@ describe("release publication lease identity", () => {
       vercelCli: "/not-used/vercel",
       writeStderr: () => undefined,
     });
-    await expect(provider.acquirePublicationLease(commit)).rejects.toMatchObject({
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toMatchObject({
       code: "publication_lease_cleanup_failed",
       phase: "before_publication",
     });
@@ -1448,6 +1741,52 @@ describe("release publication lease identity", () => {
       leaseRunId: lease.runId,
     });
     expect(sleeps).toBe(0);
+  });
+
+  test("never retries or cancels after GitHub cleanup becomes indeterminate", async () => {
+    const root = await makeRoot();
+    const cleanup = new BoundedProcessCleanupUnprovenError(42_421, "github-lease-read");
+    const commands: string[][] = [];
+    let sleeps = 0;
+    const provider = new GitHubReleasePublicationProvider({
+      ghCli: "/not-used/gh",
+      githubCommand: async (arguments_) => {
+        commands.push([...arguments_]);
+        throw cleanup;
+      },
+      leaseCleanupTimeoutMs: 10_000,
+      leaseReceiptDirectory: join(root, "receipts"),
+      sleep: async () => { sleeps += 1; },
+      vercelCli: "/not-used/vercel",
+      writeStderr: () => undefined,
+    });
+    await expect(provider.cancelPublicationLease(lease)).rejects.toBe(cleanup);
+    await expect(provider.readRepository()).rejects.toBe(cleanup);
+    expect(commands).toHaveLength(1);
+    expect(sleeps).toBe(0);
+  });
+
+  test("retains the holder-first receipt and stops after an indeterminate dispatch", async () => {
+    const root = await makeRoot();
+    const cleanup = new BoundedProcessCleanupUnprovenError(42_422, "github-lease-dispatch");
+    const commands: string[][] = [];
+    const receiptPath = join(root, "receipts", `${tag}-${lease.holder}.json`);
+    const provider = new GitHubReleasePublicationProvider({
+      ghCli: "/not-used/gh",
+      githubCommand: async (arguments_) => {
+        commands.push([...arguments_]);
+        throw cleanup;
+      },
+      leaseReceiptDirectory: join(root, "receipts"),
+      randomHolder: () => lease.holder,
+      vercelCli: "/not-used/vercel",
+      writeStderr: () => undefined,
+    });
+    await expect(provider.acquirePublicationLease(commit, candidateDigest, candidateReceipt))
+      .rejects.toBe(cleanup);
+    expect(commands).toHaveLength(1);
+    expect(await Bun.file(receiptPath).exists()).toBeTrue();
+    expect(cleanup.recoveryPaths).toContain(receiptPath);
   });
 
   test("consumes an exact private receipt and permits retry only after draft reconciliation", async () => {
@@ -1649,6 +1988,7 @@ describe("accepted release bundle", () => {
     const root = await makeRoot();
     const provider = new GitHubReleasePublicationProvider({
       ghCli: "/not-used/gh",
+      recoveryDirectory: join(root, "process-recovery"),
       vercelCli: "/not-used/vercel",
     });
     const first = await provider.readReviewedSourceAuthority(join(root, "first"));
@@ -1672,6 +2012,15 @@ describe("accepted release bundle", () => {
     const root = await makeRoot();
     await writeAccepted(root);
     await writeFile(join(root, `hra-${tag}.tgz`), "changed");
+    await expect(verifyAcceptedBundle(root, commit)).rejects.toMatchObject({
+      code: "accepted_artifact_invalid",
+    });
+  });
+
+  test("rejects changed release notes before publication", async () => {
+    const root = await makeRoot();
+    await writeAccepted(root);
+    await writeFile(join(root, "RELEASE_NOTES.md"), `${notes}\nchanged`);
     await expect(verifyAcceptedBundle(root, commit)).rejects.toMatchObject({
       code: "accepted_artifact_invalid",
     });
@@ -1735,6 +2084,24 @@ describe("release publication authority", () => {
     expect(provider.calls).not.toContain("publish");
   });
 
+  test("rejects an edited public body that no longer presents the immutable notes asset", async () => {
+    const root = await makeRoot();
+    const provider = new FakeProvider();
+    provider.artifactExpired = true;
+    provider.published = true;
+    provider.releaseBody = `${notes}\n\nEdited after publication.`;
+    await expect(executeReleasePublication({
+      arguments: publicationArguments("accept"),
+      provider,
+      temporaryRoot: root,
+    })).rejects.toMatchObject({
+      code: "published_release_invalid",
+      phase: "published_acceptance_failed",
+    });
+    expect(provider.calls).toContain("download-public-asset:RELEASE_NOTES.md");
+    expect(provider.calls).not.toContain("publish");
+  });
+
   test("never treats an immutable release as its own provenance authority", async () => {
     const root = await makeRoot();
     const provider = new FakeProvider();
@@ -1781,12 +2148,17 @@ describe("release publication authority", () => {
       publishIndex,
     );
     const finalLeaseRead = provider.calls.lastIndexOf("lease:assert", publishIndex);
+    const finalCandidateRead = provider.calls.lastIndexOf(
+      `candidate:${candidateReceipt}:${commit}`,
+      publishIndex,
+    );
     expect(finalTagRead).toBeLessThan(finalHostedVersion);
     expect(finalMainRead).toBeLessThan(finalHostedVersion);
     expect(finalProtectionRead).toBeLessThan(finalHostedVersion);
     expect(finalHostedMarker).toBeLessThan(finalLeaseRead);
     expect(finalReleaseRead).toBeLessThan(finalAssetRead);
     expect(finalAssetRead).toBeLessThan(finalLeaseRead);
+    expect(finalCandidateRead).toBeLessThan(finalLeaseRead);
     expect(finalLeaseRead + 1).toBe(publishIndex);
     expect(provider.calls.indexOf("lease:acquire")).toBeLessThan(finalTagRead);
     expect(provider.calls.indexOf("lease:complete")).toBeGreaterThan(publishIndex);
@@ -1796,6 +2168,24 @@ describe("release publication authority", () => {
     expect(provider.calls).toContain(
       `public-install:https://github.com/hraness/hra/releases/download/${tag}/hra-${tag}.tgz`,
     );
+  });
+
+  test("performs no readback, cancellation, completion, or success after indeterminate PATCH cleanup", async () => {
+    const root = await makeRoot();
+    const provider = new FakeProvider();
+    const cleanup = new BoundedProcessCleanupUnprovenError(42_423, "github-release-publish");
+    provider.publishCleanupFailure = cleanup;
+    await expect(executeReleasePublication({
+      arguments: publicationArguments("publish"),
+      provider,
+      temporaryRoot: root,
+    })).rejects.toBe(cleanup);
+    const publishIndex = provider.calls.indexOf("publish");
+    expect(publishIndex).toBeGreaterThan(0);
+    expect(provider.calls.slice(publishIndex + 1)).toEqual([]);
+    expect(provider.calls).not.toContain("lease:cancel");
+    expect(provider.calls).not.toContain("lease:complete");
+    expect(cleanup.diagnostics).toEqual({ publicationPhase: "publication_unknown" });
   });
 
   test("fails closed on tag, ancestry, draft, asset, or hosted-authority races", async () => {
@@ -1818,6 +2208,31 @@ describe("release publication authority", () => {
     }
   });
 
+  test("revalidates the sealed receipt immediately before lease dispatch and PATCH", async () => {
+    const beforeLeaseRoot = await makeRoot();
+    const beforeLease = new FakeProvider();
+    beforeLease.candidateDigests = [candidateDigest, "e".repeat(64)];
+    await expect(executeReleasePublication({
+      arguments: publicationArguments("publish"),
+      provider: beforeLease,
+      temporaryRoot: beforeLeaseRoot,
+    })).rejects.toThrow("release_authority_changed");
+    expect(beforeLease.calls).not.toContain("lease:acquire");
+    expect(beforeLease.calls).not.toContain("publish");
+
+    const beforePatchRoot = await makeRoot();
+    const beforePatch = new FakeProvider();
+    beforePatch.candidateDigests = [candidateDigest, candidateDigest, "e".repeat(64)];
+    await expect(executeReleasePublication({
+      arguments: publicationArguments("publish"),
+      provider: beforePatch,
+      temporaryRoot: beforePatchRoot,
+    })).rejects.toThrow("release_authority_changed");
+    expect(beforePatch.calls).toContain("lease:acquire");
+    expect(beforePatch.calls).toContain("lease:cancel");
+    expect(beforePatch.calls).not.toContain("publish");
+  });
+
   test("requires the exact in-progress lease and cancels it on a prepublication refusal", async () => {
     const root = await makeRoot();
     const provider = new FakeProvider();
@@ -1829,6 +2244,26 @@ describe("release publication authority", () => {
     })).rejects.toMatchObject({ phase: "before_publication" });
     expect(provider.calls).toContain("lease:acquire");
     expect(provider.calls).toContain("lease:assert");
+    expect(provider.calls).toContain("lease:cancel");
+    expect(provider.calls).not.toContain("publish");
+  });
+
+  test("refuses when the lease is lost during final candidate verification", async () => {
+    const root = await makeRoot();
+    const provider = new FakeProvider();
+    provider.loseLeaseOnCandidateRead = 3;
+    await expect(executeReleasePublication({
+      arguments: publicationArguments("publish"),
+      provider,
+      temporaryRoot: root,
+    })).rejects.toMatchObject({
+      code: "publication_lease_lost",
+      phase: "before_publication",
+    });
+    const finalCandidateRead = provider.calls.lastIndexOf(
+      `candidate:${candidateReceipt}:${commit}`,
+    );
+    expect(provider.calls[finalCandidateRead + 1]).toBe("lease:assert");
     expect(provider.calls).toContain("lease:cancel");
     expect(provider.calls).not.toContain("publish");
   });
@@ -2016,7 +2451,7 @@ describe("release publication authority", () => {
     expect(provider.calls).not.toContain("publish");
     expect(provider.calls).toContain("lease:acquire");
     expect(provider.calls).toContain("lease:complete");
-    expect(provider.calls[0]).toBe(`local:${commit}`);
+    expect(provider.calls[0]).toBe(`candidate:${candidateReceipt}:${commit}`);
     expect(provider.calls).toContain("hosted-marker:hra.sh");
   });
 

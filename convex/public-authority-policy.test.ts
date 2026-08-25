@@ -33,6 +33,7 @@ describe("hosted public authority policy", () => {
     expect(Object.values(HOSTED_PUBLIC_FUNCTION_AUTHORITY).every((policy) => [
       "active_device",
       "convex_auth",
+      "public_release_attestation",
       "registered_device",
       "status_capability",
       "verified_identity",

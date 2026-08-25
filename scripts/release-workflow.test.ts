@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  buildHraGlobalInstallCommand,
+  HRA_INSTALL_ARCHIVE_URL,
+} from "../src/install-preflight";
 
 const reviewedActions = {
   checkout: "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
@@ -19,6 +23,22 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 }
 
 describe("release workflow", () => {
+  test("publishes the exact transactional installer in the immutable release notes", async () => {
+    const [releaseNotes, readme] = await Promise.all([
+      readFile(join(import.meta.dir, "..", "docs", "beta-release-notes.md"), "utf8"),
+      readFile(join(import.meta.dir, "..", "README.md"), "utf8"),
+    ]);
+    const installCommand = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
+
+    expect(releaseNotes).toContain(installCommand);
+    expect(readme).toContain(installCommand);
+    expect(releaseNotes).not.toContain("src/install-preflight.ts | bun -");
+    expect(releaseNotes).not.toContain("bun add --global");
+    expect(releaseNotes).not.toContain(
+      'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
+    );
+  });
+
   test("binds the artifact-only draft job to the exact repository", async () => {
     const workflow = await readFile(
       join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
@@ -80,6 +100,7 @@ describe("release workflow", () => {
     expect(releaseStep.run).toContain("--notes-file release/RELEASE_NOTES.md");
     expect(releaseStep.run).toContain("--jq '.immutable')\" = false");
     expect(releaseStep.run).toContain('gh release upload "$GITHUB_REF_NAME"');
+    expect(releaseStep.run).toContain("release/RELEASE_NOTES.md");
     expect(releaseStep.run).toContain("--clobber");
     expect(releaseStep.run).not.toContain("--generate-notes");
     expect(releaseStep.run).not.toContain("release/*");
@@ -87,9 +108,13 @@ describe("release workflow", () => {
     const stagedDraft = stageSteps.find((step) =>
       step.name === "Read back the staged draft assets");
     expect(stagedDraft?.run).toContain("shasum -a 256 -c SHA256SUMS");
-    expect(stagedDraft?.run).toContain("= 4");
+    expect(stagedDraft?.run).toContain("= 5");
     expect(stagedDraft?.run).toContain(".artifact.spdx.json");
     expect(stagedDraft?.run).toContain(".ubuntu-24.04-x64.runtime.spdx.json");
+    expect(stagedDraft?.run).toContain("RELEASE_NOTES.md");
+    expect(stagedDraft?.run).toContain(
+      "cmp release/RELEASE_NOTES.md published-draft/RELEASE_NOTES.md",
+    );
     expect(stagedDraft?.run).toContain('test "$tag_commit" = "$accepted_commit"');
     expect(stagedDraft?.run).toContain('commits/refs/tags/$GITHUB_REF_NAME');
     expect(stagedDraft?.run).toContain('repos/$GH_REPO/compare/$accepted_commit...main');
@@ -114,6 +139,11 @@ describe("release workflow", () => {
     const holdLease = parsedLeaseSteps
       .find((step) => step.name === "Hold the exact release mutation lease until publication");
     expect(holdLease?.run).toContain("^[0-9a-f]{32}$");
+    expect(holdLease?.run).toContain("^[0-9a-f]{64}$");
+    expect(holdLease?.run).toContain('test "$tag_candidate_digest" = "$CANDIDATE_DIGEST"');
+    expect(asRecord(holdLease, "publication lease hold step").env).toMatchObject({
+      CANDIDATE_DIGEST: "${{ inputs.candidate_digest }}",
+    });
     expect(holdLease?.run).toContain("true:false) sleep 5");
     expect(holdLease?.run).toContain("false:true) break");
     expect(holdLease?.run).toContain("*) sleep 5");
@@ -125,6 +155,10 @@ describe("release workflow", () => {
       step.name === "Install Bun for public acceptance");
     const publicAcceptance = parsedLeaseSteps.find((step) =>
       step.name === "Accept the exact immutable public URL");
+    const publicAcceptanceRun = publicAcceptance?.run;
+    if (typeof publicAcceptanceRun !== "string") {
+      throw new TypeError("public acceptance run must be a string");
+    }
     expect(parsedLeaseSteps
       .map((step) => step.uses)
       .filter((value): value is string => typeof value === "string"))
@@ -136,9 +170,23 @@ describe("release workflow", () => {
     expect(asRecord(leaseSetupBun, "publication lease Bun setup step").with).toEqual({
       "bun-version-file": ".bun-version",
     });
+    expect(publicAcceptance?.run).toContain("HRA_PUBLIC_INSTALL_COMMAND");
     expect(publicAcceptance?.run).toContain(
-      'bun add --global --ignore-scripts "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/hra-${GITHUB_REF_NAME}.tgz"',
+      "buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL)",
     );
+    expect(publicAcceptance?.run).toContain('/bin/sh -c "$HRA_PUBLIC_INSTALL_COMMAND"');
+    expect(publicAcceptance?.run).not.toContain("bun add --global");
+    expect(publicAcceptanceRun.indexOf("HRA_PUBLIC_INSTALL_COMMAND")).toBeLessThan(
+      publicAcceptanceRun.indexOf('test -L "$BUN_INSTALL/bin/hra"'),
+    );
+    expect(publicAcceptance?.run).toContain('"$BUN_INSTALL"/install/hra/versions/*/install/global/node_modules/hra/src/cli.ts');
+    expect(publicAcceptance?.run).toContain("transactional install paths are missing");
+    expect(publicAcceptance?.run).toContain("lifecycle-disabled install changed consumer trust");
+    expect(publicAcceptance?.run).not.toContain("normalization changed consumer trust");
+    expect(publicAcceptance?.run).not.toContain(
+      'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
+    );
+    expect(publicAcceptance?.run).toContain("broadens lifecycle trust");
     expect(publicAcceptance?.run).toContain("check-installed-package.ts");
     expect(publicAcceptance?.run).toContain('hra" --version');
     expect(publicAcceptance?.run).toContain("doctor --offline --json");
@@ -178,6 +226,10 @@ describe("release workflow", () => {
       step.name === "Verify public release availability");
     const packedInstall = verifySteps.find((step) =>
       step.name === "Accept the exact packed installation");
+    const packedInstallRun = packedInstall?.run;
+    if (typeof packedInstallRun !== "string") {
+      throw new TypeError("packed install run must be a string");
+    }
     const artifactSbom = verifySteps.find((step) =>
       step.name === "Generate the artifact identity SPDX SBOM");
     const artifactSbomVerification = verifySteps.find((step) =>
@@ -188,6 +240,7 @@ describe("release workflow", () => {
       step.name === "Verify the Ubuntu 24.04 x64 runtime SPDX SBOM");
     const releaseMetadata = verifySteps.find((step) =>
       step.name === "Preserve the reviewed release metadata");
+    const checksums = verifySteps.find((step) => step.name === "Write checksums");
     expect(asRecord(checkout, "release checkout step").with).toEqual({
       "fetch-depth": 0,
       "persist-credentials": false,
@@ -195,6 +248,9 @@ describe("release workflow", () => {
     expect(exactHead?.run).toContain("tagged_commit=\"$(git rev-parse \"refs/tags/$GITHUB_REF_NAME^{commit}\")\"");
     expect(workflow).not.toContain('commits/$GITHUB_REF_NAME');
     expect(exactHead?.run).toContain('test "$remote_tagged_commit" = "$tagged_commit"');
+    expect(exactHead?.run).toContain('select(.object.type == "tag")');
+    expect(exactHead?.run).toContain("hra-release-candidate-sha256:[0-9a-f]{64}");
+    expect(exactHead?.run).toContain("HRA_RELEASE_CANDIDATE_SHA256");
     expect(exactHead?.run).toContain('git merge-base --is-ancestor "$tagged_commit" "$main_commit"');
     expect(exactHead?.run).toContain('repos/$GH_REPO/compare/$tagged_commit...main');
     expect(exactHead?.run).toContain('repos/$GH_REPO/rulesets/21213369');
@@ -233,7 +289,21 @@ describe("release workflow", () => {
     expect(availability?.run).toContain('publicReleaseState !== "release-ready"');
     expect(availability?.run).toContain('endpoints.hostedSync !== "live"');
     expect(packedInstall?.run).toContain("./release/hra-${GITHUB_REF_NAME}.tgz");
-    expect(packedInstall?.run).toContain("bun add --global --ignore-scripts");
+    expect(packedInstall?.run).toContain(
+      'test "$(bun ./src/install-preflight.ts "./release/hra-${GITHUB_REF_NAME}.tgz")" = hra-install-safe',
+    );
+    expect(packedInstallRun.indexOf("hra-install-safe")).toBeLessThan(
+      packedInstallRun.indexOf('test -L "$BUN_INSTALL/bin/hra"'),
+    );
+    expect(packedInstall?.run).not.toContain("bun add --global");
+    expect(packedInstall?.run).toContain('"$BUN_INSTALL"/install/hra/versions/*/install/global/node_modules/hra/src/cli.ts');
+    expect(packedInstall?.run).toContain("transactional install paths are missing");
+    expect(packedInstall?.run).toContain("lifecycle-disabled install changed consumer trust");
+    expect(packedInstall?.run).not.toContain("normalization changed consumer trust");
+    expect(packedInstall?.run).not.toContain(
+      'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
+    );
+    expect(packedInstall?.run).toContain("broadens lifecycle trust");
     expect(packedInstall?.run).toContain("check-installed-package.ts");
     expect(packedInstall?.run).not.toContain("github:${GITHUB_REPOSITORY}");
     const artifactSbomStep = asRecord(artifactSbom, "artifact identity SBOM step");
@@ -249,7 +319,7 @@ describe("release workflow", () => {
     expect(artifactSbomVerification?.run).toContain("artifact SPDX checksum does not bind the tarball");
     const runtimeSbomStep = asRecord(runtimeSbom, "runtime SBOM step");
     const runtimeSbomWith = asRecord(runtimeSbomStep.with, "runtime SBOM inputs");
-    expect(runtimeSbomWith.path).toBe("${{ runner.temp }}/hra-global/install/global/node_modules");
+    expect(runtimeSbomWith.path).toBe("${{ steps.accept_packed_install.outputs.runtime_node_modules }}");
     expect(runtimeSbomWith.config).toBe(".github/syft-runtime.yaml");
     expect(runtimeSbomWith.file).toBeUndefined();
     expect(runtimeSbomWith["output-file"]).toContain(".ubuntu-24.04-x64.runtime.spdx.json");
@@ -258,6 +328,25 @@ describe("release workflow", () => {
     expect(runtimeSbomVerification?.run).toContain('["zod", "4.4.3"]');
     expect(releaseMetadata?.run).toContain('Bun.file("docs/beta-release-notes.md")');
     expect(releaseMetadata?.run).toContain("git rev-parse 'HEAD^{commit}' > release/RELEASE_COMMIT");
+    expect(releaseMetadata?.run).toContain("release/RELEASE_CANDIDATE_SHA256");
+    expect(checksums?.run).toContain("RELEASE_NOTES.md");
+    expect(verifySteps.indexOf(asRecord(releaseMetadata, "release metadata step")))
+      .toBeLessThan(verifySteps.indexOf(asRecord(checksums, "release checksum step")));
+    const uploadInputs = asRecord(
+      asRecord(upload, "release artifact upload step").with,
+      "release artifact upload inputs",
+    );
+    expect(uploadInputs.path).toBeString();
+    expect(uploadInputs.path).toContain("release/RELEASE_NOTES.md");
+    expect(uploadInputs.path).toContain("release/RELEASE_CANDIDATE_SHA256");
+
+    const trigger = asRecord(document.on, "release workflow trigger");
+    const dispatch = asRecord(trigger.workflow_dispatch, "release workflow dispatch");
+    const inputs = asRecord(dispatch.inputs, "release workflow dispatch inputs");
+    expect(asRecord(inputs.candidate_digest, "candidate digest input")).toMatchObject({
+      required: true,
+      type: "string",
+    });
 
     const syftConfig = await readFile(join(import.meta.dir, "..", ".github", "syft-runtime.yaml"), "utf8");
     expect(Bun.YAML.parse(syftConfig)).toEqual({

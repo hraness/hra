@@ -12,6 +12,7 @@ export const modules = {
   "./maintenance.ts": async () => await import("./maintenance"),
   "./presence.ts": async () => await import("./presence"),
   "./quota.ts": async () => await import("./quota"),
+  "./releaseAttestation.ts": async () => await import("./releaseAttestation"),
   "./sessions.ts": async () => await import("./sessions"),
   "./usage.ts": async () => await import("./usage"),
 };

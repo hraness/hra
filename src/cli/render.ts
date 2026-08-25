@@ -3,6 +3,11 @@ import {
   type LocalCommand,
 } from "../domain/contracts";
 import {
+  parseAccountKeyStatus,
+  parseCloudDeviceList,
+  type AccountKeyStatus,
+} from "../cloud/contracts";
+import {
   type ProtectedInteractionDetailDocument,
   publicInteractionSchema,
   type PublicInteraction,
@@ -512,8 +517,115 @@ export const publicAccountLoginData = (data: unknown): unknown => {
   };
 };
 
+export class InvalidCommandResponseError extends Error {
+  readonly command: LocalCommand["kind"];
+
+  constructor(command: LocalCommand["kind"]) {
+    super(`The HRA daemon returned an invalid response for ${command}.`);
+    this.name = "InvalidCommandResponseError";
+    this.command = command;
+  }
+}
+
+const invalidCommandResponse = (command: LocalCommand): never => {
+  throw new InvalidCommandResponseError(command.kind);
+};
+
+const isRecordArray = (value: unknown): value is readonly Record<string, unknown>[] =>
+  Array.isArray(value) && value.every((entry) => object(entry) !== null);
+
+const hasOnlyValidInteractions = (value: unknown): boolean =>
+  Array.isArray(value)
+  && value.every((entry) => publicInteractionSchema.safeParse(entry).success);
+
+const hasOpaqueCursorOrNull = (value: unknown): boolean =>
+  value === null || opaqueCursor(value) !== undefined;
+
+const assertCommandSuccessData = (command: LocalCommand, data: unknown): void => {
+  if (command.kind === "device.list") {
+    if (parseCloudDeviceList(data) === null) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "account.usage-history") {
+    const parsed = accountUsageHistoryPageSchema.safeParse(data);
+    if (!parsed.success || (parsed.data.nextCursor !== null && usageHistoryCursor(parsed.data.nextCursor) === undefined)) {
+      invalidCommandResponse(command);
+    }
+    return;
+  }
+  if (command.kind === "session.list") {
+    const root = object(data);
+    const accountId = profileIdSchema.safeParse(root?.accountId);
+    const validAccount = command.account === undefined
+      ? root?.accountId === null
+      : accountId.success;
+    if (
+      root === null
+      || !validAccount
+      || !isRecordArray(root.sessions)
+      || !hasOpaqueCursorOrNull(root.nextCursor)
+      || (command.account === undefined && root.nextCursor !== null)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "session.status") {
+    const root = object(data);
+    const session = object(root?.session);
+    const eventStream = object(root?.eventStream);
+    const sessionId = sessionIdSchema.safeParse(session?.id);
+    const streamEpoch = boundedString(eventStream?.streamEpoch, 64);
+    const validStreamEpoch = streamEpoch !== undefined
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(streamEpoch);
+    if (
+      root?.version !== 1
+      || !sessionId.success
+      || eventStream === null
+      || opaqueCursor(eventStream.cursor) === undefined
+      || opaqueCursor(eventStream.retentionFloorCursor) === undefined
+      || !validStreamEpoch
+      || !Number.isSafeInteger(eventStream.floorSequence)
+      || Number(eventStream.floorSequence) < 0
+      || !Number.isSafeInteger(eventStream.observedThroughSequence)
+      || Number(eventStream.observedThroughSequence) < 0
+      || !hasOnlyValidInteractions(root.pendingInteractions)
+      || !hasOpaqueCursorOrNull(root.pendingInteractionsNextCursor)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "session.events") {
+    if (sessionEventPage(data) === null) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "interaction.show") {
+    if (interactionRecord(data) === null) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "interaction.resolve") {
+    const root = object(data);
+    if (interactionRecord(data) === null || typeof root?.responseWritten !== "boolean") {
+      invalidCommandResponse(command);
+    }
+    return;
+  }
+  if (command.kind === "interaction.list" || command.kind === "session.interactions") {
+    const root = object(data);
+    const sessionId = sessionIdSchema.safeParse(root?.sessionId);
+    const scoped = command.kind === "session.interactions" || command.session !== undefined;
+    if (
+      root === null
+      || (scoped ? !sessionId.success : root.sessionId !== null)
+      || !hasOnlyValidInteractions(root.interactions)
+      || !hasOpaqueCursorOrNull(root.nextCursor)
+    ) invalidCommandResponse(command);
+  }
+};
+
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
   if (command.kind === "account.login") return publicAccountLoginData(data);
+  if (command.kind === "device.list") {
+    const parsed = parseCloudDeviceList(data);
+    return parsed ?? { currentDevicePublicId: null, devices: [] };
+  }
   if (command.kind === "account.usage-history") {
     const parsed = accountUsageHistoryPageSchema.safeParse(data);
     return parsed.success
@@ -872,6 +984,75 @@ const instant = (value: unknown): string => {
   }
 };
 
+const maximumHumanDeviceRows = 100;
+
+const deviceLabelBaseScalar = /[\p{L}\p{N}\p{P}\p{S}]/u;
+const deviceLabelMarkScalar = /\p{M}/u;
+
+const escapeTerminalScalar = (scalar: string): string =>
+  `\\u{${scalar.codePointAt(0)?.toString(16).padStart(4, "0") ?? "fffd"}}`;
+
+const terminalSafeDeviceLabel = (value: string): string => {
+  const scalars = Array.from(value);
+  let hasVisibleBase = false;
+  let output = "";
+  for (const [index, scalar] of scalars.entries()) {
+    if (safeJoinControl.test(scalar)) {
+      const hasFollowingBase = scalars
+        .slice(index + 1)
+        .some((candidate) => deviceLabelBaseScalar.test(candidate));
+      output += hasVisibleBase && hasFollowingBase ? scalar : escapeTerminalScalar(scalar);
+      continue;
+    }
+    if (unsafeTerminalScalar.test(scalar)) {
+      output += escapeTerminalScalar(scalar);
+      continue;
+    }
+    if (deviceLabelMarkScalar.test(scalar)) {
+      output += hasVisibleBase ? scalar : escapeTerminalScalar(scalar);
+      continue;
+    }
+    output += scalar;
+    if (deviceLabelBaseScalar.test(scalar)) hasVisibleBase = true;
+  }
+  return output;
+};
+
+const renderDeviceList = (data: unknown): string => {
+  const parsed = parseCloudDeviceList(data);
+  if (parsed === null) return "Device list data is unavailable.";
+  const visible = parsed.devices.slice(0, maximumHumanDeviceRows);
+  const hasFallback = visible.some((device) => device.labelSource === "fallback");
+  const blocks = visible.map((device, index) => [
+    `Device ${String(index + 1)}${device.current ? " (current)" : ""}`,
+    `  Label: ${terminalSafeDeviceLabel(device.label)}${device.labelSource === "fallback" ? " [fallback]" : ""}`,
+    `  ID: ${device.publicId}`,
+    `  Status: ${device.status}`,
+    `  Presence: ${device.online
+      ? "online"
+      : device.lastSeenAt === null
+        ? "not seen"
+        : `last seen ${instant(device.lastSeenAt)}`}`,
+  ].join("\n"));
+  const output = [
+    `Devices: ${String(visible.length)}${parsed.devices.length > visible.length
+      ? ` of ${String(parsed.devices.length)}`
+      : ""}`,
+    blocks.join("\n\n"),
+  ];
+  if (parsed.devices.length > visible.length) {
+    output.push(
+      `${String(parsed.devices.length - visible.length)} additional devices omitted from this bounded view; use --json for the complete list.`,
+    );
+  }
+  if (hasFallback) {
+    output.push(
+      "Fallback labels use device state and opaque ID because the encrypted label was not authentic under this account key.",
+    );
+  }
+  return output.join("\n\n");
+};
+
 const usageVelocity = (value: unknown): string => {
   const velocity = object(value);
   if (velocity?.available === true && typeof velocity.tokensPerMinute === "number") {
@@ -1090,6 +1271,37 @@ const renderCloudDevice = (root: Record<string, unknown>): string[] => {
   ];
 };
 
+const authoritativeAccountKeyStatus = (
+  root: Record<string, unknown>,
+): AccountKeyStatus | null => parseAccountKeyStatus(root.accountKey);
+
+const renderAccountKeyStatus = (root: Record<string, unknown>): string[] => {
+  const accountKey = authoritativeAccountKeyStatus(root);
+  if (accountKey === null) {
+    return Object.hasOwn(root, "accountKey") && root.accountKey !== null
+      ? ["Account key: invalid status"]
+      : [];
+  }
+  if (accountKey.status === "ready") {
+    return [`Account key: ready (version ${line(accountKey.keyVersion)})`];
+  }
+  if (accountKey.status === "pairing_required") {
+    return [
+      "Account key: pairing required",
+      "Recovery: an existing account-key holder must pair this device.",
+      "Local Codex data: unaffected.",
+      "No existing key holder: hra device key-loss --acknowledge-no-key-holders",
+    ];
+  }
+  return [
+    "Account key: unrecoverable (operator confirmed no key holders)",
+    "Local Codex data: unaffected.",
+    "Existing encrypted cloud content: cannot be decrypted.",
+    "Recovery: search again for an existing account-key holder, then pair the real key.",
+    "Fallback: erase and reinitialize the HRA cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
+  ];
+};
+
 const renderCloudNextAction = (root: Record<string, unknown>): string | null => {
   if (root.configured !== true) {
     return typeof root.diagnostic === "string" && root.unavailability !== "disabled"
@@ -1106,7 +1318,16 @@ const renderCloudNextAction = (root: Record<string, unknown>): string | null => 
       ? "hra device list"
       : `on an active device, run hra device approve ${deviceId}`;
   }
-  if (device?.status === "revoked" || root.pairingRequired === true) return "hra device pair";
+  const accountKey = authoritativeAccountKeyStatus(root);
+  if (accountKey?.status === "unrecoverable") return "hra device pair";
+  if (accountKey?.status === "pairing_required") return "hra device pair";
+  if (Object.hasOwn(root, "accountKey") && root.accountKey !== null && accountKey === null) {
+    return "hra doctor";
+  }
+  if (
+    device?.status === "revoked"
+    || (!Object.hasOwn(root, "accountKey") && root.pairingRequired === true)
+  ) return "hra device pair";
   return null;
 };
 
@@ -1132,13 +1353,34 @@ const renderAuthStatus = (data: unknown): string => {
   const rows = [`Cloud account: ${state}`];
   if (typeof root.email === "string") rows.push(`Email: ${line(root.email)}`);
   rows.push(...renderCloudDevice(root));
-  if (root.signedIn === true && root.pairingRequired === true) rows.push("Account key: pairing required");
+  if (root.signedIn === true) rows.push(...renderAccountKeyStatus(root));
   if (deletion !== null) rows.push(...renderDeletion(deletion));
   if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
   if (typeof root.diagnostic === "string") rows.push(`Detail: ${safeDiagnostic(root.diagnostic)}`);
   const next = renderCloudNextAction(root);
   if (next !== null) rows.push(`Next: ${next}`);
   return rows.join("\n");
+};
+
+const renderAccountKeyLossAcknowledgement = (data: unknown): string => {
+  const root = object(data);
+  if (root === null) return "Account-key loss acknowledgement data is unavailable.";
+  const accountKey = authoritativeAccountKeyStatus(root);
+  if (accountKey?.status === "ready") {
+    return [
+      "Account-key loss acknowledgement: superseded by the real account key.",
+      ...renderAccountKeyStatus(root),
+    ].join("\n");
+  }
+  if (accountKey?.status !== "unrecoverable") {
+    return "Account-key loss acknowledgement data is invalid.";
+  }
+  return [
+    `Account-key loss acknowledgement: ${root.replay === true ? "already recorded locally" : "recorded locally"}.`,
+    ...renderAccountKeyStatus(root),
+    "No account key, device key, or ciphertext was minted, replaced, or deleted.",
+    "Next: hra device pair",
+  ].join("\n");
 };
 
 const renderProjectionStatus = (root: Record<string, unknown>): string[] => {
@@ -1293,6 +1535,7 @@ const renderSyncStatus = (data: unknown): string => {
   const projectionRecoveryUnsettled = projectionRecoveryIsUnsettled(root);
   const projectionRecoverySession = firstProjectionRecoverySession(root);
   const projectionRecoveryCommand = unsettledProjectionRecoveryCommand(root);
+  const accountKey = authoritativeAccountKeyStatus(root);
   const state = root.configured !== true
     ? projectionRecoveryUnsettled
       ? "unavailable (projection recovery pending)"
@@ -1307,8 +1550,12 @@ const renderSyncStatus = (data: unknown): string => {
             ? "waiting for device approval"
             : device?.status === "revoked"
               ? "unavailable (device revoked)"
-              : root.pairingRequired === true
+              : accountKey?.status === "unrecoverable"
+                ? "unrecoverable (account key)"
+                : accountKey?.status === "pairing_required"
                 ? "pairing required"
+                : !Object.hasOwn(root, "accountKey") && root.pairingRequired === true
+                  ? "pairing required"
                 : projectionCache?.state === "unavailable"
                   ? "unavailable (projection cache)"
                   : projectionCache?.state === "degraded"
@@ -1316,7 +1563,11 @@ const renderSyncStatus = (data: unknown): string => {
                     : projectionRecoveryUnsettled
                       ? "recovery required (projection)"
                       : "ready";
-  const rows = [`Cloud sync: ${state}`, ...renderCloudDevice(root)];
+  const rows = [
+    `Cloud sync: ${state}`,
+    ...renderCloudDevice(root),
+    ...(root.signedIn === true ? renderAccountKeyStatus(root) : []),
+  ];
   if (deletion !== null) rows.push(...renderDeletion(deletion));
   if (Object.hasOwn(root, "lastSync")) rows.push(renderLastSync(root.lastSync));
   rows.push(...renderProjectionStatus(root));
@@ -1346,6 +1597,7 @@ const renderSyncStatus = (data: unknown): string => {
 };
 
 export function renderSuccess(command: LocalCommand, data: unknown, json: boolean, output: Output): void {
+  assertCommandSuccessData(command, data);
   if (json) {
     output.writeStdout(`${safeJson({
       ok: true,
@@ -1440,6 +1692,10 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     output.writeStdout(`${renderPluginList(data)}\n`);
   } else if (command.kind === "plugin.show") {
     output.writeStdout(`${renderPlugin(data)}\n`);
+  } else if (command.kind === "device.list") {
+    output.writeStdout(`${renderDeviceList(data)}\n`);
+  } else if (command.kind === "device.key-loss") {
+    output.writeStdout(`${renderAccountKeyLossAcknowledgement(data)}\n`);
   } else if (command.kind === "auth.status") {
     output.writeStdout(`${renderAuthStatus(data)}\n`);
   } else if (command.kind === "sync.status") {
@@ -1455,6 +1711,10 @@ const failureNextCommand = (details: unknown): string | null => {
     Object.keys(value ?? {}).length === 1
     && (value?.nextCommand === "hra daemon status --json"
       || value?.nextCommand === "hra doctor --offline"
+      || value?.nextCommand === "hra init --yes"
+      || value?.nextCommand === "hra auth login --input-stdin"
+      || value?.nextCommand === "hra auth status"
+      || value?.nextCommand === "hra device pair"
       || value?.nextCommand === "hra sync status --json")
   ) {
     return value.nextCommand;

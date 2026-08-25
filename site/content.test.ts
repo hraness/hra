@@ -1,24 +1,31 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  buildHraGlobalInstallCommand,
+  HRA_INSTALL_PREFLIGHT_SOURCE_URL,
+} from "../src/install-preflight";
+import {
   publicContent,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
 } from "./content.ts";
 import { renderPrivacyHtml, renderSiteHtml } from "./template.ts";
 
-const firstSubstantiveReadmeLine = (markdown: string): string => {
-  const lines = markdown.split("\n");
-  const titleIndex = lines.findIndex((line) => line === `# ${publicContent.productName}`);
-  return lines.slice(titleIndex + 1).find((line) => line.trim().length > 0 && line !== "```sh") ?? "";
-};
+const htmlText = (value: string): string => value
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;")
+  .replaceAll("'", "&#39;");
 
 describe("public content contract", () => {
   test("publishes the exact HRA release identity", () => {
     expect(publicContent).toMatchObject({
       doctorCommand: "hra doctor --offline",
       initCommand: "hra init --yes",
-      installCommand: "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      installCommand: buildHraGlobalInstallCommand(
+        "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      ),
       links: {
         github: "https://github.com/hraness/hra",
       },
@@ -30,12 +37,15 @@ describe("public content contract", () => {
   test("leads both public surfaces with the eventual beta install command", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
+    const encodedInstallCommand = htmlText(publicContent.installCommand);
 
-    expect(firstSubstantiveReadmeLine(markdown)).toBe(publicContent.installCommand);
-    expect(html.indexOf(`<h1>${publicContent.productName}</h1>`)).toBeLessThan(
-      html.indexOf(publicContent.installCommand),
+    expect(markdown).toStartWith(
+      `# ${publicContent.productName}\n\n\`\`\`sh\n${publicContent.installCommand}\n\`\`\``,
     );
-    expect(html.indexOf(publicContent.installCommand)).toBeLessThan(
+    expect(html.indexOf(`<h1>${publicContent.productName}</h1>`)).toBeLessThan(
+      html.indexOf(encodedInstallCommand),
+    );
+    expect(html.indexOf(encodedInstallCommand)).toBeLessThan(
       html.indexOf(publicContent.doctorCommand),
     );
     expect(html.indexOf(publicContent.doctorCommand)).toBeLessThan(
@@ -98,6 +108,30 @@ describe("public content contract", () => {
       "hra device approve <pending-device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
     );
     expect(html).toContain("hra device approve &lt;pending-device-id-or-prefix&gt;");
+    for (const claim of [
+      "hra device key-loss --acknowledge-no-key-holders",
+      "the account key as a closed status",
+      "recovery requires an existing account-key holder",
+      "no remaining holder makes the encrypted content unrecoverable",
+      "authenticated, registered, active installation",
+      "current HRA cloud identity's isolated local custody",
+      "current auth token generation, identity, auth epoch, registered device, and pairing observation agree exactly",
+      "no network, provider, or cloud mutation",
+      "does not mint, replace, or delete a key or ciphertext",
+      "fail with a bounded next command",
+      "Pairing the real account key later supersedes the observation",
+      "Local Codex accounts, sessions, credentials, and execution are unaffected",
+      "existing encrypted cloud content cannot be decrypted",
+      "Search again for an existing holder",
+      "the real key restores ready status and supersedes the acknowledgement",
+      "Only after that renewed holder search is exhausted",
+      "erasing and reinitializing the HRA cloud account",
+      "does not regenerate the lost account key",
+      "not the default response to a key-loss acknowledgement",
+    ]) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(htmlText(claim));
+    }
     for (const surface of [markdown, html]) {
       expect(surface).toContain("An unset");
       expect(surface).toContain("hosted deployment");
@@ -317,30 +351,139 @@ describe("public content contract", () => {
 
   test("publishes exact beta prerequisites and package lifecycle limits", () => {
     const markdown = renderReadmeMarkdown();
-    const surfaces = [markdown, renderSiteHtml()];
+    const html = renderSiteHtml();
+    const surfaces = [markdown, html];
+    expect(publicContent.installCommand).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+    expect(publicContent.installCommand).toContain("| bun -e '");
+    expect(publicContent.installCommand).toContain(
+      "-- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+    );
+    expect(publicContent.installCommand).toContain("hra-install-safe");
+    expect(publicContent.installCommand).not.toContain("bun add --global");
+    expect(publicContent.installCommand).not.toContain("install-normalizer.ts");
+    expect(markdown).toContain(publicContent.installCommand);
+    expect(html).toContain(htmlText(publicContent.installCommand));
     for (const surface of surfaces) {
       expect(surface).toContain("HRA requires Bun 1.3.14");
+      expect(surface).toContain("curl with HTTPS and TLS 1.2 support");
       expect(surface).toContain("support macOS and Linux");
-      expect(surface).toContain("bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz");
-      expect(surface).toContain("bun remove --global hra");
+      expect(surface).toContain(HRA_INSTALL_PREFLIGHT_SOURCE_URL);
+      expect(surface).toContain("hra-install-safe");
+      expect(surface).toContain("fresh random private staging root");
+      expect(surface).toContain("GitHub repository ID 1343008607");
+      expect(surface).toContain("published immutable v0.1.0 release");
+      expect(surface).toContain("immutable release metadata");
+      expect(surface).toContain("verified in-memory snapshot");
+      expect(surface).toContain("bounded package-file manifest");
+      expect(surface).toContain("every extracted HRA package path and SHA-256");
+      expect(surface).toContain("separate full-digest version namespaces");
+      expect(surface).toContain("lifecycle scripts disabled");
+      expect(surface).toContain("complete staged tree");
+      expect(surface).toContain("configured package registry trust boundary");
+      expect(surface).toContain("does not claim to contain that dependency closure");
+      expect(surface).toContain("prior verified command remains active throughout staging");
+      expect(surface).toContain("atomically replaces only the $BUN_INSTALL/bin/hra symlink");
+      expect(surface).toContain("next invocation recovers or removes only the proven private stage");
+      expect(surface).toContain("Existing trustedDependencies remain unchanged");
       expect(surface).toContain("hra daemon stop");
       expect(surface).toContain("hra daemon status --json");
       expect(surface).toContain("hra daemon start");
-      expect(surface).toContain("Removing the package does not remove");
-      expect(surface).toContain("local profiles, session history, recovery evidence, or cloud account");
       expect(surface).toContain("Do not install a moving branch");
       expect(surface).toContain("verified repair installation of v0.1.0");
-      expect(surface).toContain("replace both v0.1.0 occurrences");
+      expect(surface).toContain("replace the tagged preflight and release archive references together");
+      expect(surface).not.toContain("bun remove --global hra");
+      expect(surface).not.toContain("uninstall the package");
     }
-    const updateStart = markdown.indexOf("Before updating");
+    const updateStart = markdown.indexOf("Before replacing the installed binary");
     const updateDoctor = markdown.indexOf("hra doctor --offline", updateStart);
     const updateRestart = markdown.indexOf("hra daemon start", updateStart);
     expect(updateDoctor).toBeGreaterThan(updateStart);
     expect(updateRestart).toBeGreaterThan(updateDoctor);
-    const removalWarning = markdown.indexOf("Removing the package does not remove");
-    const removalCommand = markdown.indexOf("bun remove --global hra");
-    expect(removalWarning).toBeGreaterThan(-1);
-    expect(removalCommand).toBeGreaterThan(removalWarning);
+  });
+
+  test("publishes first-session walkthroughs for humans and agents", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    const claims = [
+      "Human terminal",
+      "hra session start personal --preset high",
+      "/account personal",
+      "/session <session-id>",
+      "Agent caller",
+      "data.session.id",
+      "data.eventStream.cursor",
+      "hra session start personal --preset high --json",
+      "hra session status <session-id> --json",
+      "hra session events <session-id> --cursor <status-cursor> --wait-ms 30000 --jsonl",
+      "--follow",
+      "equivalent compatibility spelling",
+      "hra session interactions <session-id> --pending --json",
+      "Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form.",
+    ];
+
+    expect(markdown).toContain("## First session");
+    expect(html).toContain('id="first-session"');
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(htmlText(claim));
+    }
+  });
+
+  test("documents safe optional full local-data removal without a recursive command", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    const claims = [
+      "Optional full local-data removal",
+      "hra auth delete --acknowledge-erasure",
+      "hra account logout <profile>",
+      "data.running",
+      "$HOME/Library/Application Support/HRA Control Plane v1",
+      "$HOME/.local/state/hra-control-plane-v1",
+      "explicitly accepts permanent loss",
+      "move only the exact platform directory to Trash",
+      "Do not move or remove its parent.",
+      "obtain explicit destructive approval",
+      "An install, update, or daemon-stop request does not authorize local-data removal.",
+    ];
+
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(htmlText(claim));
+    }
+    expect(markdown).not.toContain("rm -r");
+    expect(html).not.toContain("rm -r");
+  });
+
+  test("publishes the exact exit-code and JSONL terminal-error contract", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    const statuses = [
+      ["0", "success. A normally stopped event follower, including a user SIGINT, may also return 0."],
+      ["1", "CONFLICT, AMBIGUOUS, INTERNAL, any other closed failure code, or an unhealthy doctor result."],
+      ["2", "INVALID_INPUT."],
+      ["4", "NOT_FOUND."],
+      ["5", "UNAVAILABLE."],
+      ["6", "INTERACTION_REQUIRED."],
+      ["7", "RECOVERY_REQUIRED."],
+    ] as const;
+    const claims = [
+      "Exit status and JSONL",
+      "stdout contains only JSONL gap, event, and checkpoint frames",
+      "exactly one newline-terminated version-1 failure envelope to stderr",
+      '{"ok":false,"version":1,"error":{"code":"<code>","message":"<safe-message>"}}',
+      "must not merge the terminal error into the JSONL stream",
+      "must check the process exit status",
+      "may exit 0 without a terminal failure envelope",
+    ];
+
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(htmlText(claim));
+    }
+    for (const [status, meaning] of statuses) {
+      expect(markdown).toContain(`- \`${status}\`: ${meaning}`);
+      expect(html).toContain(`<code>${status}</code>: ${htmlText(meaning)}`);
+    }
   });
 
   test("publishes the local interaction deadline boundary", () => {

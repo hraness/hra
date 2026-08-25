@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
 import {
   buildVercelEnvironment,
   DomainCutoverError,
@@ -445,6 +451,228 @@ describe("domain cutover runbook", () => {
 });
 
 describe("domain cutover operator", () => {
+  test("refuses an unavailable authority backend without turning it into a provider read failure", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const requests: VercelCommandRequest[] = [];
+    expect(await executeDomainCutover({
+      arguments: ["preflight", "--vercel-cli", "/safe/vercel"],
+      inputDocument: JSON.stringify(forwardPlan),
+      runner: async (request) => {
+        requests.push(request);
+        if (request.arguments[0] === "--version") {
+          return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+        }
+        throw new BoundedProcessContainmentUnavailableError(
+          "authority_backend_unavailable",
+        );
+      },
+      stderr: {
+        write(chunk: string | Uint8Array): boolean {
+          stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+          return true;
+        },
+      },
+      stdout: {
+        write(chunk: string | Uint8Array): boolean {
+          stdout.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+          return true;
+        },
+      },
+    })).toBe(1);
+    expect(requests[0]?.arguments).toEqual(["--version"]);
+    expect(requests.some((request) => request.arguments[0] !== "--version")).toBe(true);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "authority_containment_unavailable",
+      reason: "authority_backend_unavailable",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
+  });
+
+  test("terminalizes cleanup and journal custody before later provider calls", async () => {
+    const cleanupPath = "/private/operator/process-recovery/local-cutover.json";
+    const journalPath = "/private/operator/process-recovery/authority-cutover.json";
+    const cases = [
+      {
+        error: new BoundedProcessCleanupUnprovenError(
+          42_435,
+          "vercel-project-read",
+        ).retainRecoveryPath(cleanupPath),
+        expected: {
+          code: "process_cleanup_unproven",
+          phase: "vercel-project-read",
+          processGroupId: 42_435,
+          processes: [{
+            phase: "vercel-project-read",
+            recoveryIdentity: { containment: "local", processGroupId: 42_435 },
+          }],
+          recoveryPaths: [cleanupPath],
+          schemaVersion: 1,
+          status: "recovery_required",
+        },
+      },
+      {
+        error: new BoundedProcessRecoveryJournalError(
+          [journalPath],
+          "authority_recovery_required",
+        ),
+        expected: {
+          code: "process_recovery_journal_blocked",
+          reason: "authority_recovery_required",
+          recoveryPaths: [journalPath],
+          schemaVersion: 1,
+          status: "recovery_required",
+        },
+      },
+    ] as const;
+    for (const scenario of cases) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      const requests: VercelCommandRequest[] = [];
+      let fetchCalls = 0;
+      expect(await executeDomainCutover({
+        arguments: ["preflight", "--vercel-cli", "/safe/vercel"],
+        fetcher: async () => {
+          fetchCalls += 1;
+          throw new Error("unexpected marker read");
+        },
+        inputDocument: JSON.stringify(forwardPlan),
+        runner: async (request) => {
+          requests.push(request);
+          if (request.arguments[0] === "--version") {
+            return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+          }
+          throw scenario.error;
+        },
+        stderr: {
+          write(chunk: string | Uint8Array): boolean {
+            stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+            return true;
+          },
+        },
+        stdout: {
+          write(chunk: string | Uint8Array): boolean {
+            stdout.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+            return true;
+          },
+        },
+      })).toBe(75);
+      expect(requests.map((request) => request.phase)).toEqual([
+        "vercel-version-read",
+        "vercel-project-read",
+      ]);
+      expect(fetchCalls).toBe(0);
+      expect(stdout).toEqual([]);
+      expect(JSON.parse(stderr.join(""))).toEqual(scenario.expected);
+    }
+  });
+
+  test("surfaces a durable cutover reservation on terminal provider custody", async () => {
+    const cleanupPath = "/private/operator/process-recovery/local-cutover-reserved.json";
+    const journalPath = "/private/operator/process-recovery/authority-cutover-reserved.json";
+    const cases = [
+      {
+        error: new BoundedProcessCleanupUnprovenError(
+          42_454,
+          "vercel-project-read",
+        ).retainRecoveryPath(cleanupPath),
+        terminalPath: cleanupPath,
+        type: "cleanup" as const,
+      },
+      {
+        error: new BoundedProcessRecoveryJournalError(
+          [journalPath],
+          "authority_recovery_required",
+        ),
+        terminalPath: journalPath,
+        type: "journal" as const,
+      },
+    ];
+    for (const scenario of cases) {
+      const evidenceDirectory = await realpath(
+        await mkdtemp(join(tmpdir(), "hra-domain-terminal-evidence-")),
+      );
+      try {
+        await chmod(evidenceDirectory, 0o700);
+        const evidencePath = join(evidenceDirectory, "forward.json");
+        const reservationPath = `${evidencePath}.reservation`;
+        const stdout: string[] = [];
+        const stderr: string[] = [];
+        const requests: VercelCommandRequest[] = [];
+        let fetchCalls = 0;
+
+        expect(await executeDomainCutover({
+          arguments: [
+            "--execute",
+            "--vercel-cli",
+            "/safe/vercel",
+            "--sequence",
+            "1",
+            "--evidence-path",
+            evidencePath,
+          ],
+          fetcher: async () => {
+            fetchCalls += 1;
+            throw new Error("unexpected marker read");
+          },
+          inputDocument: JSON.stringify(forwardPlan),
+          runner: async (request) => {
+            requests.push(request);
+            if (request.arguments[0] === "--version") {
+              return { exitCode: 0, stderr: "", stdout: "54.18.0\n" };
+            }
+            throw scenario.error;
+          },
+          stderr: {
+            write(chunk: string | Uint8Array): boolean {
+              stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+              return true;
+            },
+          },
+          stdout: {
+            write(chunk: string | Uint8Array): boolean {
+              stdout.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+              return true;
+            },
+          },
+        })).toBe(75);
+
+        expect(requests.map((request) => request.phase)).toEqual([
+          "vercel-version-read",
+          "vercel-project-read",
+        ]);
+        expect(fetchCalls).toBe(0);
+        expect(stdout).toEqual([]);
+        expect(JSON.parse(stderr.join(""))).toEqual(scenario.type === "cleanup"
+          ? {
+              code: "process_cleanup_unproven",
+              phase: "vercel-project-read",
+              processGroupId: 42_454,
+              processes: [{
+                phase: "vercel-project-read",
+                recoveryIdentity: { containment: "local", processGroupId: 42_454 },
+              }],
+              recoveryPaths: [evidencePath, reservationPath, scenario.terminalPath].sort(),
+              schemaVersion: 1,
+              status: "recovery_required",
+            }
+          : {
+              code: "process_recovery_journal_blocked",
+              reason: "authority_recovery_required",
+              recoveryPaths: [evidencePath, reservationPath, scenario.terminalPath].sort(),
+              schemaVersion: 1,
+              status: "recovery_required",
+            });
+        expect(await readFile(reservationPath, "utf8")).toEndWith("\n");
+      } finally {
+        await rm(evidenceDirectory, { force: true, recursive: true });
+      }
+    }
+  });
+
   test("requires both fixed projects to disable automatic domains before switching traffic", async () => {
     const provider = new FakeCutoverProvider(forwardPlan);
     const outcome = await executeCutoverPlan(forwardPlan, provider, {
@@ -725,6 +953,7 @@ describe("domain cutover operator", () => {
         })}\n`,
       ]);
       expect(mutationCalls).toBe(0);
+      expect(requests.every((request) => request.containment === "authority")).toBe(true);
       expect(requests.some((request) => request.arguments[0] === "alias")).toBe(false);
       expect(requests.some((request) => request.arguments[1]?.endsWith(
         `/domains/${canonicalAlias}/move`,
@@ -1575,12 +1804,114 @@ describe("domain cutover operator", () => {
       "--plan-fd",
       "3",
     ])).toEqual({ operation: "preflight", planFd: 3, vercelCli: "/safe/vercel" });
+    expect(parseArguments([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--sequence",
+      "1",
+      "--evidence-path",
+      "/safe/forward.json",
+    ])).toEqual({
+      evidencePath: "/safe/forward.json",
+      operation: "execute",
+      planFd: 0,
+      sequence: 1,
+      vercelCli: "/safe/vercel",
+    });
+    expect(parseArguments([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--sequence",
+      "2",
+      "--evidence-path",
+      "/safe/reverse.json",
+      "--previous-evidence",
+      "/safe/forward.json",
+    ])).toEqual({
+      evidencePath: "/safe/reverse.json",
+      operation: "execute",
+      planFd: 0,
+      previousEvidencePath: "/safe/forward.json",
+      sequence: 2,
+      vercelCli: "/safe/vercel",
+    });
+    expect(() => parseArguments([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--sequence",
+      "2",
+      "--evidence-path",
+      "/safe/reverse.json",
+    ])).toThrow("usage_invalid");
+    expect(() => parseArguments([
+      "--execute",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--sequence",
+      "1",
+      "--evidence-path",
+      "/safe/forward.json",
+      "--previous-evidence",
+      "/safe/older.json",
+    ])).toThrow("usage_invalid");
+    expect(() => parseArguments([
+      "preflight",
+      "--vercel-cli",
+      "/safe/vercel",
+      "--sequence",
+      "1",
+      "--evidence-path",
+      "/safe/forward.json",
+    ])).toThrow("usage_invalid");
     expect(() => parseArguments([
       "preflight",
       "--execute",
       "--vercel-cli",
       "/safe/vercel",
     ])).toThrow("usage_invalid");
+  });
+
+  test("refuses an invalid reserved evidence destination before provider authority reads", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "hra-domain-evidence-test-")));
+    await chmod(root, 0o700);
+    try {
+      const evidencePath = join(root, "forward.json");
+      await writeFile(evidencePath, "{}\n", { mode: 0o644 });
+      await chmod(evidencePath, 0o644);
+      const requests: VercelCommandRequest[] = [];
+      const runner: VercelCommandRunner = async (request) => {
+        requests.push(request);
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: request.arguments[0] === "--version" ? "54.18.0\n" : "",
+        };
+      };
+      const output = (): Pick<NodeJS.WriteStream, "write"> => ({
+        write: (() => true) as NodeJS.WriteStream["write"],
+      });
+      expect(await executeDomainCutover({
+        arguments: [
+          "--execute",
+          "--vercel-cli",
+          "/safe/vercel",
+          "--sequence",
+          "1",
+          "--evidence-path",
+          evidencePath,
+        ],
+        inputDocument: JSON.stringify(forwardPlan),
+        runner,
+        stderr: output(),
+        stdout: output(),
+      })).toBe(1);
+      expect(requests.map((request) => request.arguments)).toEqual([["--version"]]);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   test("emits changed and replayed outcomes for a fresh archive and its exact retry", async () => {
@@ -2013,6 +2344,59 @@ describe("domain cutover operator", () => {
     await expect(provider.readMarker(canonicalAlias)).rejects.toMatchObject({
       code: "command_output_invalid",
     });
+  });
+
+  test("treats provider cleanup uncertainty as terminal across later operations", async () => {
+    const cleanup = new BoundedProcessCleanupUnprovenError(43_223, "vercel-alias-read");
+    let calls = 0;
+    const provider = new VercelCutoverProvider({
+      runner: async () => {
+        calls += 1;
+        throw cleanup;
+      },
+      vercelCli: "/safe/vercel",
+    });
+
+    await expect(provider.readAlias(canonicalAlias)).rejects.toBe(cleanup);
+    await expect(provider.readProject(oldProjectId)).rejects.toBe(cleanup);
+    expect(calls).toBe(1);
+  });
+
+  test("gives a recovery journal precedence over an ordinary concurrent read failure", async () => {
+    const provider = new FakeCutoverProvider(forwardPlan);
+    const journal = new BoundedProcessRecoveryJournalError(
+      ["/private/operator/process-recovery/authority-cutover.json"],
+      "authority_recovery_required",
+    );
+    provider.readProject = async (projectId) => {
+      if (projectId === oldProjectId) throw new Error("ordinary_failure");
+      throw journal;
+    };
+    await expect(preflightCutoverPlan(forwardPlan, provider)).rejects.toBe(journal);
+  });
+
+  test("bounds and cancels a marker body that stalls after its response headers", async () => {
+    let cancelled = false;
+    const provider = new VercelCutoverProvider({
+      fetcher: async () => new Response(new ReadableStream<Uint8Array>({
+        cancel() {
+          cancelled = true;
+        },
+        pull(): Promise<void> {
+          return new Promise(() => undefined);
+        },
+      }), { status: 200 }),
+      markerTimeoutMs: 10,
+      runner: async () => ({ exitCode: 0, stderr: "", stdout: "54.18.0\n" }),
+      vercelCli: "/safe/vercel",
+    });
+    const startedAt = performance.now();
+
+    await expect(provider.readMarker(canonicalAlias)).rejects.toMatchObject({
+      code: "command_output_invalid",
+    });
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(cancelled).toBe(true);
   });
 
   test("surfaces stable refusal codes", () => {

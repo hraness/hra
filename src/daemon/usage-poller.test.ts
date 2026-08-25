@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import {
   AccountUsagePoller,
+  sleepForUsagePolling,
   USAGE_POLL_BACKOFF_MAX_MS,
   usagePollInitialStagger,
   usagePollInterval,
@@ -62,5 +63,20 @@ describe("AccountUsagePoller", () => {
     ids = [];
     expect(await poller.tick()).toBe(1_000);
     expect(polled).toEqual([]);
+  });
+
+  test("removes its abort listener after a normal sleep", async () => {
+    const controller = new AbortController();
+    const add = spyOn(controller.signal, "addEventListener");
+    const remove = spyOn(controller.signal, "removeEventListener");
+    try {
+      await sleepForUsagePolling(1, controller.signal);
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+    } finally {
+      add.mockRestore();
+      remove.mockRestore();
+    }
   });
 });

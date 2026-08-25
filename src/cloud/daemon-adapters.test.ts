@@ -1765,6 +1765,11 @@ describe("bridged cloud control", () => {
       },
       listDevices: unused,
       pairDevice: unused,
+      acknowledgeNoAccountKeyHolders: (signal) => {
+        expect(signal.aborted).toBe(false);
+        calls.push("key-loss");
+        return Promise.resolve({ localOnly: true });
+      },
       approveDevice: (device, idempotencyKey, signal) => {
         expect(signal.aborted).toBe(false);
         deviceSignals.push(signal);
@@ -1841,11 +1846,14 @@ describe("bridged cloud control", () => {
     const deviceSignal = new AbortController().signal;
     const approvalKey = "018bcfe5-6800-7000-8000-000000000031";
     const revocationKey = "018bcfe5-6800-7000-8000-000000000032";
+    expect(await combined.acknowledgeNoAccountKeyHolders(deviceSignal))
+      .toEqual({ localOnly: true });
     expect(await combined.approveDevice("device_pending", approvalKey, deviceSignal))
       .toEqual({ approved: true });
     expect(await combined.revokeDevice("device_active", revocationKey, deviceSignal))
       .toEqual({ revoked: true });
     expect(calls).toEqual([
+      "key-loss",
       `approve:device_pending:${approvalKey}`,
       `revoke:device_active:${revocationKey}`,
     ]);

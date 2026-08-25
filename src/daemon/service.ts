@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { z } from "zod";
 
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
+import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
   CodexError,
   IndeterminateCodexEffectError,
@@ -268,6 +269,17 @@ class IndeterminateLocalCommitError extends Error {
   }
 }
 
+class InteractionPersistenceBoundaryError extends Error {
+  constructor(
+    readonly focalInteraction: InteractionRecord,
+    readonly quarantineFailed: boolean,
+    cause: unknown,
+  ) {
+    super("The interaction persistence boundary could not complete safely.", { cause });
+    this.name = "InteractionPersistenceBoundaryError";
+  }
+}
+
 const authorityFor = (paths: StatePaths, profile: ProfileRecord): ProfileAuthority => {
   const owned = profilePaths(paths, profile.id);
   return { id: profile.id, generation: profile.processGeneration, codexHome: owned.codexHome, desktopUserData: owned.desktopUserData };
@@ -383,6 +395,7 @@ export class HraService {
   readonly #interactionDeadlineAbort = new AbortController();
   #interactionDeadlineTask: Promise<void> | undefined;
   #interactionDeadlineWake: (() => void) | undefined;
+  #stopScheduled = false;
   #state: "open" | "closing" | "closed" = "open";
   #closeTask: Promise<void> | undefined;
 
@@ -425,6 +438,19 @@ export class HraService {
       await this.#daemonAuthority.assertCurrent();
       return result;
     } catch (error: unknown) {
+      if (error instanceof InteractionPersistenceBoundaryError) {
+        this.#scheduleStop(context.afterResponse);
+        throw new CommandFailure(
+          "RECOVERY_REQUIRED",
+          error.quarantineFailed
+            ? "The interaction response crossed an uncertain local persistence boundary. HRA stopped accepting work because the durable quarantine could not be confirmed; restart before another response can be sent."
+            : "The interaction response crossed an uncertain local persistence boundary. HRA fenced the provider authority and must restart before another response can be sent.",
+          {
+            interaction: this.#publicInteraction(error.focalInteraction),
+            daemonRestartRequired: true,
+          },
+        );
+      }
       if (error instanceof StateSecurityScrubRequiredError) {
         (context.afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop);
         throw new CommandFailure(
@@ -565,7 +591,7 @@ export class HraService {
           interaction: this.#publicInteraction(this.#store.requireInteraction(command.interaction)),
         };
         case "interaction.inspect": return await this.#inspectInteraction(command, context.signal);
-        case "interaction.resolve": return await this.#resolveInteraction(command, context.signal);
+        case "interaction.resolve": return await this.#resolveInteraction(command, context);
         case "auth.login": {
           const result = await this.#fencedEffect(async () => await this.#cloud.auth({
             email: command.email,
@@ -602,6 +628,8 @@ export class HraService {
         }
         case "device.list": return await this.#fencedEffect(async () => await this.#cloud.listDevices(context.signal));
         case "device.pair": return await this.#fencedEffect(async () => await this.#cloud.pairDevice(context.signal));
+        case "device.key-loss": return await this.#fencedEffect(async () =>
+          await this.#cloud.acknowledgeNoAccountKeyHolders(context.signal));
         case "device.approve": return await this.#fencedEffect(async () => await this.#cloud.approveDevice(command.device, command.idempotencyKey, context.signal));
         case "device.revoke": return await this.#fencedEffect(async () => await this.#cloud.revokeDevice(command.device, command.idempotencyKey, context.signal));
         case "sync.status": return await this.#fencedEffect(async () => await this.#cloud.status(context.signal));
@@ -657,6 +685,41 @@ export class HraService {
       }
       if (error instanceof SessionEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
+      }
+      if (error instanceof AccountKeyLossPreconditionError) {
+        switch (error.code) {
+          case "signed_out":
+            throw new CommandFailure(
+              "INTERACTION_REQUIRED",
+              "Sign in to the HRA cloud account before acknowledging account-key loss.",
+              { nextCommand: "hra auth login --input-stdin" },
+            );
+          case "device_unregistered":
+            throw new CommandFailure(
+              "INTERACTION_REQUIRED",
+              "Register and activate this installation before acknowledging account-key loss.",
+              { nextCommand: "hra device pair" },
+            );
+          case "observation_missing":
+            throw new CommandFailure(
+              "INTERACTION_REQUIRED",
+              "Inspect the current account-key status before acknowledging account-key loss.",
+              { nextCommand: "hra auth status" },
+            );
+          case "already_ready":
+            throw new CommandFailure(
+              "CONFLICT",
+              "The real account key is already available on this device.",
+              { nextCommand: "hra auth status" },
+            );
+          case "auth_identity_unbound":
+          case "authority_changed":
+            throw new CommandFailure(
+              "RECOVERY_REQUIRED",
+              "The local auth, device, and account-key recovery authority do not identify one exact cloud account.",
+              { nextCommand: "hra auth status" },
+            );
+        }
       }
       if (error instanceof CloudProjectionRecoveryAdmissionError) {
         switch (error.code) {
@@ -782,6 +845,12 @@ export class HraService {
     });
   }
 
+  #scheduleStop(afterResponse?: (callback: () => void) => void): void {
+    if (this.#stopScheduled) return;
+    this.#stopScheduled = true;
+    (afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop);
+  }
+
   close(): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask;
     this.#state = "closing";
@@ -871,7 +940,10 @@ export class HraService {
           current,
           this.#interactionDeadlineAbort.signal,
         );
-      }).catch(() => { failed += 1; });
+      }).catch((error: unknown) => {
+        if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
+        failed += 1;
+      });
     }
     return { examined: due.length, failed };
   }
@@ -965,13 +1037,22 @@ export class HraService {
       this.#appendInteractionState(terminal);
       return;
     }
-    const prepared = this.#store.prepareInteractionResponse({
-      id: current.publicId,
-      expectedRevision: current.revision,
-      responseDigest,
-      intendedTerminalState: "expired",
-    });
-    this.#appendInteractionState(prepared);
+    let prepared: InteractionRecord;
+    try {
+      prepared = this.#store.prepareInteractionResponse({
+        id: current.publicId,
+        expectedRevision: current.revision,
+        responseDigest,
+        intendedTerminalState: "expired",
+      });
+      this.#appendInteractionState(prepared);
+    } catch (error: unknown) {
+      throw this.#interactionPersistenceBoundaryError({
+        cause: error,
+        effect: "known_unsent",
+        focalInteraction: current,
+      });
+    }
     try {
       await this.#daemonAuthority.assertCurrent();
       await this.#codex.timeoutInteraction({
@@ -996,21 +1077,30 @@ export class HraService {
       this.#appendInteractionState(terminal);
       return;
     }
-    const written = this.#store.markInteractionResponseWritten({
-      id: prepared.publicId,
-      expectedRevision: prepared.revision,
-      responseDigest,
-    });
-    if (written.state === "response_written") this.#appendInteractionState(written);
-    if (written.state !== "response_written") return;
-    const terminal = this.#store.settleInteraction({
-      id: written.publicId,
-      expectedRevision: written.revision,
-      state: "expired",
-      authority: written.authority,
-      responseDigest,
-    });
-    this.#appendInteractionState(terminal);
+    try {
+      const written = this.#store.markInteractionResponseWritten({
+        id: prepared.publicId,
+        expectedRevision: prepared.revision,
+        responseDigest,
+      });
+      if (written.state === "response_written") this.#appendInteractionState(written);
+      if (written.state !== "response_written") return;
+      const terminal = this.#store.settleInteraction({
+        id: written.publicId,
+        expectedRevision: written.revision,
+        state: "expired",
+        authority: written.authority,
+        responseDigest,
+      });
+      this.#appendInteractionState(terminal);
+    } catch (error: unknown) {
+      throw this.#interactionPersistenceBoundaryError({
+        cause: error,
+        effect: "possibly_sent",
+        focalInteraction: prepared,
+        responseDigest,
+      });
+    }
   }
 
   async observeCodexFact(authority: ProfileAuthority, fact: CodexFact): Promise<void> {
@@ -1019,6 +1109,7 @@ export class HraService {
     try {
       await this.#observeCodexFactAdmitted(authority, fact);
     } catch (error: unknown) {
+      if (error instanceof InteractionPersistenceBoundaryError) this.#scheduleStop();
       if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
       throw error;
     } finally {
@@ -1150,14 +1241,25 @@ export class HraService {
           || current.state === "expired"
           || current.state === "resolution_unknown"
         ) return;
-        const settled = this.#store.settleInteraction({
-          id: current.publicId,
-          expectedRevision: current.revision,
-          state: current.intendedTerminalState ?? "resolved",
-          authority: fact.provider,
-          ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
-        });
-        this.#appendInteractionState(settled);
+        try {
+          const settled = this.#store.settleInteraction({
+            id: current.publicId,
+            expectedRevision: current.revision,
+            state: current.intendedTerminalState ?? "resolved",
+            authority: fact.provider,
+            ...(current.responseDigest === null ? {} : { responseDigest: current.responseDigest }),
+          });
+          this.#appendInteractionState(settled);
+        } catch (error: unknown) {
+          throw this.#interactionPersistenceBoundaryError({
+            cause: error,
+            effect: "possibly_sent",
+            focalInteraction: current,
+            ...(current.responseDigest === null
+              ? {}
+              : { responseDigest: current.responseDigest }),
+          });
+        }
       });
       return;
     }
@@ -1694,7 +1796,9 @@ export class HraService {
     }
     const projects = this.#store.listProjects();
     const projectReady = projects.length > 0;
-    if (!projectReady) problems.push("No project directory is configured. Run `hra init --yes` or add a project.");
+    if (!projectReady) {
+      problems.push("No project directory is configured. Stop the daemon with `hra daemon stop`, then run `hra init --yes`.");
+    }
     if (projectReady) {
       const usable = await Promise.all(projects.map(async (project) =>
         await resolveUsableCanonicalProjectDirectory(project.rootPath)));
@@ -2898,6 +3002,54 @@ export class HraService {
     this.#eventWaiters.notify(interaction.sessionId);
   }
 
+  #interactionPersistenceBoundaryError(input: Readonly<{
+    cause: unknown;
+    effect: "known_unsent" | "possibly_sent";
+    focalInteraction: InteractionRecord;
+    responseDigest?: string;
+  }>): InteractionPersistenceBoundaryError {
+    const failures: unknown[] = [input.cause];
+    let focalInteraction = input.focalInteraction;
+    let quarantineFailed = false;
+    try {
+      const quarantined = this.#store.quarantineInteractionPersistenceBoundary({
+        profileId: input.focalInteraction.authority.profileId,
+        processGeneration: input.focalInteraction.authority.processGeneration,
+        connectionId: input.focalInteraction.authority.connectionId,
+        focalInteractionId: input.focalInteraction.publicId,
+        effect: input.effect,
+        ...(input.responseDigest === undefined
+          ? {}
+          : { responseDigest: input.responseDigest }),
+      });
+      focalInteraction = quarantined.focalInteraction;
+      for (const interaction of quarantined.terminalInteractions) {
+        if (interaction.sessionId !== null) this.#eventWaiters.notify(interaction.sessionId);
+      }
+    } catch (error: unknown) {
+      quarantineFailed = true;
+      failures.push(error);
+      this.#state = "closing";
+      this.#interactionDeadlineAbort.abort(
+        new Error("The interaction persistence quarantine failed."),
+      );
+      this.#interactionDeadlineWake?.();
+      this.#interactionDeadlineWake = undefined;
+      try {
+        focalInteraction = this.#store.requireInteraction(
+          input.focalInteraction.publicId,
+        );
+      } catch (readError: unknown) {
+        failures.push(readError);
+      }
+    }
+    return new InteractionPersistenceBoundaryError(
+      focalInteraction,
+      quarantineFailed,
+      new AggregateError(failures, "Interaction persistence quarantine evidence."),
+    );
+  }
+
   #assertResolutionMatches(
     interaction: InteractionRecord,
     resolution: InteractionResolution,
@@ -3093,8 +3245,9 @@ export class HraService {
 
   async #resolveInteraction(
     command: Extract<LocalCommand, { kind: "interaction.resolve" }>,
-    signal: AbortSignal,
+    context: { signal: AbortSignal; afterResponse?: (callback: () => void) => void },
   ): Promise<unknown> {
+    const signal = context.signal;
     return await this.#serialize(`interaction:${command.interaction}`, async () => {
       const current = this.#store.requireInteraction(command.interaction);
       if (current.revision !== command.expectedRevision || current.state !== "pending") {
@@ -3153,13 +3306,22 @@ export class HraService {
       if (this.#now() >= current.deadlineAt) {
         await this.#rejectManualResolutionAtDeadline(current);
       }
-      const prepared = this.#store.prepareInteractionResponse({
-        id: current.publicId,
-        expectedRevision: current.revision,
-        responseDigest,
-        intendedTerminalState: this.#intendedInteractionTerminalState(command.resolution),
-      });
-      this.#appendInteractionState(prepared);
+      let prepared: InteractionRecord;
+      try {
+        prepared = this.#store.prepareInteractionResponse({
+          id: current.publicId,
+          expectedRevision: current.revision,
+          responseDigest,
+          intendedTerminalState: this.#intendedInteractionTerminalState(command.resolution),
+        });
+        this.#appendInteractionState(prepared);
+      } catch (error: unknown) {
+        throw this.#interactionPersistenceBoundaryError({
+          cause: error,
+          effect: "known_unsent",
+          focalInteraction: current,
+        });
+      }
       if (this.#now() >= prepared.deadlineAt) {
         await this.#rejectPreparedManualResolutionAtDeadline(prepared);
       }
@@ -3208,12 +3370,22 @@ export class HraService {
           { interaction: this.#publicInteraction(terminal) },
         );
       }
-      const written = this.#store.markInteractionResponseWritten({
-        id: prepared.publicId,
-        expectedRevision: prepared.revision,
-        responseDigest,
-      });
-      if (written.state === "response_written") this.#appendInteractionState(written);
+      let written: InteractionRecord;
+      try {
+        written = this.#store.markInteractionResponseWritten({
+          id: prepared.publicId,
+          expectedRevision: prepared.revision,
+          responseDigest,
+        });
+        if (written.state === "response_written") this.#appendInteractionState(written);
+      } catch (error: unknown) {
+        throw this.#interactionPersistenceBoundaryError({
+          cause: error,
+          effect: "possibly_sent",
+          focalInteraction: prepared,
+          responseDigest,
+        });
+      }
       return { interaction: this.#publicInteraction(written), responseWritten: true };
     });
   }
@@ -3272,13 +3444,22 @@ export class HraService {
       );
     }
 
-    const timeoutPrepared = this.#store.supersedePreparedInteractionResponseWithTimeout({
-      id: prepared.publicId,
-      expectedRevision: prepared.revision,
-      manualResponseDigest: prepared.responseDigest,
-      timeoutResponseDigest,
-    });
-    this.#appendInteractionState(timeoutPrepared);
+    let timeoutPrepared: InteractionRecord;
+    try {
+      timeoutPrepared = this.#store.supersedePreparedInteractionResponseWithTimeout({
+        id: prepared.publicId,
+        expectedRevision: prepared.revision,
+        manualResponseDigest: prepared.responseDigest,
+        timeoutResponseDigest,
+      });
+      this.#appendInteractionState(timeoutPrepared);
+    } catch (error: unknown) {
+      throw this.#interactionPersistenceBoundaryError({
+        cause: error,
+        effect: "known_unsent",
+        focalInteraction: prepared,
+      });
+    }
     try {
       await this.#daemonAuthority.assertCurrent();
       await this.#codex.timeoutInteraction({
@@ -3313,22 +3494,32 @@ export class HraService {
         { interaction: this.#publicInteraction(terminal) },
       );
     }
-    const written = this.#store.markInteractionResponseWritten({
-      id: timeoutPrepared.publicId,
-      expectedRevision: timeoutPrepared.revision,
-      responseDigest: timeoutResponseDigest,
-    });
-    if (written.state === "response_written") this.#appendInteractionState(written);
-    const terminal = written.state === "response_written"
-      ? this.#store.settleInteraction({
-          id: written.publicId,
-          expectedRevision: written.revision,
-          state: "expired",
-          authority: written.authority,
-          responseDigest: timeoutResponseDigest,
-        })
-      : written;
-    if (terminal !== written) this.#appendInteractionState(terminal);
+    let terminal: InteractionRecord;
+    try {
+      const written = this.#store.markInteractionResponseWritten({
+        id: timeoutPrepared.publicId,
+        expectedRevision: timeoutPrepared.revision,
+        responseDigest: timeoutResponseDigest,
+      });
+      if (written.state === "response_written") this.#appendInteractionState(written);
+      terminal = written.state === "response_written"
+        ? this.#store.settleInteraction({
+            id: written.publicId,
+            expectedRevision: written.revision,
+            state: "expired",
+            authority: written.authority,
+            responseDigest: timeoutResponseDigest,
+          })
+        : written;
+      if (terminal !== written) this.#appendInteractionState(terminal);
+    } catch (error: unknown) {
+      throw this.#interactionPersistenceBoundaryError({
+        cause: error,
+        effect: "possibly_sent",
+        focalInteraction: timeoutPrepared,
+        responseDigest: timeoutResponseDigest,
+      });
+    }
     throw new CommandFailure(
       "CONFLICT",
       "The interaction deadline elapsed before the manual resolution could be dispatched.",

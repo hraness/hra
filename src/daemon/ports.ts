@@ -203,6 +203,7 @@ export interface CloudControlPort {
   deleteAccount(input: { acknowledgeErasure: boolean; signal: AbortSignal }): Promise<unknown>;
   listDevices(signal: AbortSignal): Promise<unknown>;
   pairDevice(signal: AbortSignal): Promise<unknown>;
+  acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown>;
   approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
   revokeDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown>;
 }
@@ -279,6 +280,9 @@ export class UnavailableCloudControl implements CloudControlPort {
   deleteAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listDevices(): Promise<never> { return Promise.reject(this.#unavailable()); }
   pairDevice(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  acknowledgeNoAccountKeyHolders(): Promise<never> {
+    return Promise.reject(this.#unavailable());
+  }
   approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<never> {
     void device;
     void idempotencyKey;

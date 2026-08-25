@@ -14,6 +14,7 @@ import {
 } from "../codex";
 import { parseFact } from "../codex/protocol";
 import { CloudProjectionRecoveryAdmissionError } from "../cloud/contracts";
+import { AccountKeyLossPreconditionError } from "../cloud/local-control";
 import {
   CloudDaemonJournalRecoveryBlocker,
   createCloudProjectionRecoveryTerminalReceipt,
@@ -28,6 +29,7 @@ import {
   encodeProtectedInteractionDetailDocument,
   protectedInteractionDetailDocumentSchema,
   publicInteractionSchema,
+  type InteractionRecord,
   type InteractionResolution,
   type PublicInteraction,
 } from "../domain/interactions";
@@ -389,6 +391,8 @@ class FakeCloud implements CloudControlPort {
     deletion: { effectsDisabled: true, state: "pending", statusFresh: true },
   };
   deleteAccountCalls = 0;
+  keyLossCalls = 0;
+  keyLossError?: AccountKeyLossPreconditionError;
   readonly deviceMutations: Array<Readonly<{
     device: string;
     idempotencyKey: string;
@@ -468,6 +472,11 @@ class FakeCloud implements CloudControlPort {
   }
   async listDevices(): Promise<unknown> { return { devices: [] }; }
   async pairDevice(): Promise<unknown> { return { pending: true }; }
+  async acknowledgeNoAccountKeyHolders(): Promise<unknown> {
+    this.keyLossCalls += 1;
+    if (this.keyLossError !== undefined) throw this.keyLossError;
+    return { acknowledgedNoKeyHolders: true, localOnly: true };
+  }
   async approveDevice(device: string, idempotencyKey: string, signal: AbortSignal): Promise<unknown> {
     return await this.#mutateDevice("approve", device, idempotencyKey, signal);
   }
@@ -628,6 +637,61 @@ function seedUnsettledInteractionStates(
   return { pending, prepared, written, profile, session };
 }
 
+async function seedResolvableInteraction(
+  value: Awaited<ReturnType<typeof fixture>>,
+  sessionId: `sess_${string}`,
+  requestId: string,
+  timing?: Readonly<{ requestedAt: number; deadlineAt: number }>,
+): Promise<Readonly<{
+  authority: ProfileAuthority;
+  interaction: InteractionRecord;
+}>> {
+  const session = value.store.requireSession(sessionId);
+  const profile = value.store.requireProfileById(session.profileId);
+  if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+  const connectionId = crypto.randomUUID();
+  const authority: ProfileAuthority = {
+    id: profile.id,
+    generation: profile.processGeneration,
+    codexHome: "unused",
+    desktopUserData: "unused",
+  };
+  await value.service.observeCodexFact(authority, {
+    type: "interactionRequested",
+    connectionId,
+    provider: {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      connectionId,
+      requestId: { type: "string", value: requestId },
+      method: "item/commandExecution/requestApproval",
+      requestDigest: createHash("sha256").update(requestId).digest("hex"),
+      threadId: session.providerThreadId,
+      turnId: `turn-${requestId}`,
+      itemId: `item-${requestId}`,
+      approvalId: null,
+    },
+    kind: "command_approval",
+    blocking: true,
+    display: {
+      kind: "command_approval",
+      summary: "Exercise the persistence boundary",
+      reason: null,
+      commandClass: "test",
+      workingDirectory: null,
+      availableDecisions: ["once", "decline", "cancel"],
+    },
+    ...(timing === undefined ? {} : timing),
+  });
+  const interaction = value.store.listInteractions({
+    sessionId,
+    pendingOnly: true,
+    limit: 10,
+  }).find((candidate) => candidate.authority.requestId.value === requestId);
+  if (interaction === undefined) throw new Error("Expected a resolvable interaction.");
+  return { authority, interaction };
+}
+
 const providerMutationCalls = (codex: FakeCodex): readonly string[] => codex.calls.filter(
   (call) => call.startsWith("login:") || call.startsWith("start:") || call === "logout" || call === "send" || call === "steer" || call === "stop" || call === "rename",
 );
@@ -701,6 +765,55 @@ describe("HraService", () => {
       idempotencyKey,
       kind: "device.revoke",
     }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  test("maps every expected account-key loss precondition to a closed actionable failure", async () => {
+    const cases = [
+      {
+        failure: "signed_out",
+        code: "INTERACTION_REQUIRED",
+        nextCommand: "hra auth login --input-stdin",
+      },
+      {
+        failure: "device_unregistered",
+        code: "INTERACTION_REQUIRED",
+        nextCommand: "hra device pair",
+      },
+      {
+        failure: "observation_missing",
+        code: "INTERACTION_REQUIRED",
+        nextCommand: "hra auth status",
+      },
+      {
+        failure: "already_ready",
+        code: "CONFLICT",
+        nextCommand: "hra auth status",
+      },
+      {
+        failure: "auth_identity_unbound",
+        code: "RECOVERY_REQUIRED",
+        nextCommand: "hra auth status",
+      },
+      {
+        failure: "authority_changed",
+        code: "RECOVERY_REQUIRED",
+        nextCommand: "hra auth status",
+      },
+    ] as const;
+    const cloud = new FakeCloud();
+    const { service } = await fixture(undefined, cloud);
+    for (const expected of cases) {
+      cloud.keyLossError = new AccountKeyLossPreconditionError(expected.failure);
+      await expect(service.execute({
+        acknowledgeNoKeyHolders: true,
+        kind: "device.key-loss",
+      }, { signal })).rejects.toMatchObject({
+        code: expected.code,
+        details: { nextCommand: expected.nextCommand },
+        name: "CommandFailure",
+      });
+    }
+    expect(cloud.keyLossCalls).toBe(cases.length);
   });
 
   test("defers identity-switch and account-erasure shutdown until after the response boundary", async () => {
@@ -4698,6 +4811,257 @@ describe("HraService", () => {
     }))).not.toContain("EXACT-KEY-SECRET-11");
   });
 
+  for (const fault of [
+    { boundary: "prepare", timing: "before", providerCalls: 0, state: "expired" },
+    { boundary: "prepare", timing: "after", providerCalls: 0, state: "expired" },
+    { boundary: "prepared_event", timing: "before", providerCalls: 0, state: "expired" },
+    { boundary: "prepared_event", timing: "after", providerCalls: 0, state: "expired" },
+    { boundary: "mark", timing: "before", providerCalls: 1, state: "resolution_unknown" },
+    { boundary: "mark", timing: "after", providerCalls: 1, state: "resolution_unknown" },
+    { boundary: "written_event", timing: "before", providerCalls: 1, state: "resolution_unknown" },
+    { boundary: "written_event", timing: "after", providerCalls: 1, state: "resolution_unknown" },
+  ] as const) {
+    test(`quarantines an interaction persistence fault ${fault.timing} ${fault.boundary}`, async () => {
+      let stopCalls = 0;
+      const value = await fixture(
+        undefined,
+        new FakeCloud(),
+        () => { stopCalls += 1; },
+      );
+      const { sessionId } = await createIdleSession(
+        value,
+        `Persistence ${fault.boundary} ${fault.timing}`,
+      );
+      const seeded = await seedResolvableInteraction(
+        value,
+        sessionId,
+        `persistence-${fault.boundary}-${fault.timing}`,
+      );
+      const originalGeneration = seeded.authority.generation;
+      let injected = false;
+      if (fault.boundary === "prepare") {
+        const original = value.store.prepareInteractionResponse.bind(value.store);
+        (value.store as unknown as {
+          prepareInteractionResponse: StateStore["prepareInteractionResponse"];
+        }).prepareInteractionResponse = (input) => {
+          if (injected) return original(input);
+          injected = true;
+          if (fault.timing === "after") original(input);
+          throw new Error(`injected ${fault.timing} prepare fault`);
+        };
+      } else if (fault.boundary === "mark") {
+        const original = value.store.markInteractionResponseWritten.bind(value.store);
+        (value.store as unknown as {
+          markInteractionResponseWritten: StateStore["markInteractionResponseWritten"];
+        }).markInteractionResponseWritten = (input) => {
+          if (injected) return original(input);
+          injected = true;
+          if (fault.timing === "after") original(input);
+          throw new Error(`injected ${fault.timing} mark fault`);
+        };
+      } else {
+        const targetState = fault.boundary === "prepared_event"
+          ? "response_prepared"
+          : "response_written";
+        const original = value.store.appendSessionEvent.bind(value.store);
+        (value.store as unknown as {
+          appendSessionEvent: StateStore["appendSessionEvent"];
+        }).appendSessionEvent = (input) => {
+          if (
+            !injected
+            && input.body.type === "interaction_state"
+            && input.body.state === targetState
+          ) {
+            injected = true;
+            if (fault.timing === "after") original(input);
+            throw new Error(`injected ${fault.timing} ${fault.boundary} fault`);
+          }
+          return original(input);
+        };
+      }
+
+      const command = {
+        kind: "interaction.resolve" as const,
+        interaction: seeded.interaction.publicId,
+        expectedRevision: seeded.interaction.revision,
+        resolution: { kind: "approval_decision" as const, decision: "once" as const },
+      };
+      const beforeQuarantine = await value.service.execute({
+        kind: "session.status",
+        session: sessionId,
+      }, { signal }) as { eventStream: { cursor: string } };
+      const afterResponse: Array<() => void> = [];
+      const error = await value.service.execute(command, {
+        signal,
+        afterResponse: (callback) => { afterResponse.push(callback); },
+      }).catch((caught: unknown) => caught);
+
+      expect(injected).toBe(true);
+      expect(error).toMatchObject({
+        code: "RECOVERY_REQUIRED",
+        details: {
+          daemonRestartRequired: true,
+          interaction: {
+            id: seeded.interaction.publicId,
+            state: fault.state,
+          },
+        },
+      });
+      expect(value.codex.resolvedInteractions).toHaveLength(fault.providerCalls);
+      expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+        state: fault.state,
+      });
+      expect(value.store.requireProfileById(seeded.authority.id).processGeneration)
+        .toBe(originalGeneration + 1);
+      expect(afterResponse).toHaveLength(1);
+      expect(stopCalls).toBe(0);
+
+      const publicEvents = await value.service.execute({
+        kind: "session.events",
+        session: sessionId,
+        cursor: beforeQuarantine.eventStream.cursor,
+        limit: 200,
+        waitMs: 0,
+      }, { signal }) as {
+        events: Array<{
+          body: {
+            interactionId?: string;
+            revision?: number;
+            state?: string;
+            type: string;
+          };
+        }>;
+      };
+      expect(publicEvents.events.at(-1)?.body).toEqual({
+        type: "interaction_state",
+        interactionId: seeded.interaction.publicId,
+        state: fault.state,
+        revision: expect.any(Number),
+      });
+
+      const restartVisible = new StateStore(value.paths, { readonly: true });
+      try {
+        expect(restartVisible.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+          state: fault.state,
+        });
+        expect(restartVisible.requireProfileById(seeded.authority.id).processGeneration)
+          .toBe(originalGeneration + 1);
+        expect(restartVisible.listSessionEvents({
+          sessionId,
+          afterSequence: 0,
+        }).events.at(-1)?.body).toEqual({
+          type: "interaction_state",
+          interactionId: seeded.interaction.publicId,
+          state: fault.state,
+          revision: expect.any(Number),
+        });
+      } finally {
+        restartVisible.close();
+      }
+
+      await expect(value.service.execute(command, {
+        signal,
+        afterResponse: (callback) => { afterResponse.push(callback); },
+      })).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(value.codex.resolvedInteractions).toHaveLength(fault.providerCalls);
+      expect(afterResponse).toHaveLength(1);
+
+      const eventsBeforeStaleFact = value.store.listSessionEvents({
+        sessionId,
+        afterSequence: 0,
+      }).events;
+      await value.service.observeCodexFact(seeded.authority, {
+        type: "assistantDelta",
+        connectionId: seeded.interaction.authority.connectionId,
+        threadId: seeded.interaction.authority.threadId as string,
+        turnId: "turn-stale-persistence-boundary",
+        itemId: "item-stale-persistence-boundary",
+        text: "must remain fenced",
+      });
+      expect(value.store.listSessionEvents({ sessionId, afterSequence: 0 }).events)
+        .toEqual(eventsBeforeStaleFact);
+
+      afterResponse[0]?.();
+      expect(stopCalls).toBe(1);
+      await value.service.close();
+    });
+  }
+
+  test("stops admitting work immediately when the atomic interaction quarantine itself fails", async () => {
+    let stopCalls = 0;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => { stopCalls += 1; },
+    );
+    const { sessionId } = await createIdleSession(value, "Failed persistence quarantine");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "failed-persistence-quarantine",
+    );
+    const originalPrepare = value.store.prepareInteractionResponse.bind(value.store);
+    const originalQuarantine = value.store.quarantineInteractionPersistenceBoundary
+      .bind(value.store);
+    (value.store as unknown as {
+      prepareInteractionResponse: StateStore["prepareInteractionResponse"];
+      quarantineInteractionPersistenceBoundary:
+        StateStore["quarantineInteractionPersistenceBoundary"];
+    }).prepareInteractionResponse = () => {
+      throw new Error("injected prepare failure before commit");
+    };
+    (value.store as unknown as {
+      quarantineInteractionPersistenceBoundary:
+        StateStore["quarantineInteractionPersistenceBoundary"];
+    }).quarantineInteractionPersistenceBoundary = () => {
+      throw new Error("injected atomic quarantine failure");
+    };
+    const afterResponse: Array<() => void> = [];
+
+    const error = await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, {
+      signal,
+      afterResponse: (callback) => { afterResponse.push(callback); },
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        daemonRestartRequired: true,
+        interaction: { id: seeded.interaction.publicId, state: "pending" },
+      },
+    });
+    expect((error as Error).message).toContain("could not be confirmed");
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "pending",
+      revision: 1,
+    });
+    expect(value.store.requireProfileById(seeded.authority.id).processGeneration)
+      .toBe(seeded.authority.generation);
+    expect(afterResponse).toHaveLength(1);
+    await expect(value.service.execute({ kind: "account.list" }, { signal }))
+      .rejects.toMatchObject({ code: "UNAVAILABLE" });
+    expect(value.codex.resolvedInteractions).toHaveLength(0);
+    expect(stopCalls).toBe(0);
+    afterResponse[0]?.();
+    expect(stopCalls).toBe(1);
+
+    (value.store as unknown as {
+      prepareInteractionResponse: StateStore["prepareInteractionResponse"];
+      quarantineInteractionPersistenceBoundary:
+        StateStore["quarantineInteractionPersistenceBoundary"];
+    }).prepareInteractionResponse = originalPrepare;
+    (value.store as unknown as {
+      quarantineInteractionPersistenceBoundary:
+        StateStore["quarantineInteractionPersistenceBoundary"];
+    }).quarantineInteractionPersistenceBoundary = originalQuarantine;
+    await value.service.close();
+  });
+
   test("durably admits, privately routes, and settles an exact provider interaction", async () => {
     const value = await fixture();
     const { sessionId } = await createIdleSession(value, "Interaction broker");
@@ -5055,6 +5419,108 @@ describe("HraService", () => {
     expect(JSON.stringify(value.store.listInteractions({ limit: 100 })))
       .not.toContain("SECRET_SENTINEL");
   });
+
+  for (const timing of ["before", "after"] as const) {
+    test(`quarantines a committed provider-resolution event boundary ${timing} event insertion`, async () => {
+    let stopCalls = 0;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => { stopCalls += 1; },
+    );
+    const { sessionId } = await createIdleSession(value, "Provider resolution persistence");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "provider-resolution-persistence",
+    );
+    await value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, { signal });
+    const peer = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "provider-resolution-peer",
+    );
+    const originalAppend = value.store.appendSessionEvent.bind(value.store);
+    let injected = false;
+    (value.store as unknown as {
+      appendSessionEvent: StateStore["appendSessionEvent"];
+    }).appendSessionEvent = (input) => {
+      if (
+        !injected
+        && input.body.type === "interaction_state"
+        && input.body.interactionId === seeded.interaction.publicId
+        && input.body.state === "resolved"
+      ) {
+        injected = true;
+        if (timing === "after") originalAppend(input);
+        throw new Error(`injected ${timing} provider-resolution event fault`);
+      }
+      return originalAppend(input);
+    };
+
+    await expect(value.service.observeCodexFact(seeded.authority, {
+      type: "interactionResolved",
+      connectionId: seeded.interaction.authority.connectionId,
+      provider: seeded.interaction.authority,
+      kind: "command_approval",
+    })).rejects.toMatchObject({ name: "InteractionPersistenceBoundaryError" });
+
+    expect(injected).toBe(true);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "resolved",
+      revision: 4,
+    });
+    expect(value.store.requireInteraction(peer.interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: 2,
+    });
+    expect(value.store.requireProfileById(seeded.authority.id).processGeneration)
+      .toBe(seeded.authority.generation + 1);
+    const focalTerminalEvents = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events.filter((event) =>
+      event.body.type === "interaction_state"
+      && event.body.interactionId === seeded.interaction.publicId
+      && event.body.revision === 4
+    );
+    expect(focalTerminalEvents).toHaveLength(1);
+    expect(focalTerminalEvents[0]?.body).toEqual({
+      type: "interaction_state",
+      interactionId: seeded.interaction.publicId,
+      state: "resolved",
+      revision: 4,
+    });
+    await Bun.sleep(10);
+    expect(stopCalls).toBe(1);
+
+    const restartVisible = new StateStore(value.paths, { readonly: true });
+    try {
+      expect(restartVisible.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+        state: "resolved",
+      });
+      expect(restartVisible.requireInteraction(peer.interaction.publicId)).toMatchObject({
+        state: "expired",
+      });
+      expect(restartVisible.listSessionEvents({
+        sessionId,
+        afterSequence: 0,
+      }).events.filter((event) =>
+        event.body.type === "interaction_state"
+        && event.body.interactionId === seeded.interaction.publicId
+        && event.body.revision === 4
+      )).toHaveLength(1);
+    } finally {
+      restartVisible.close();
+    }
+    await value.service.close();
+    });
+  }
 
   test("pages signed interaction listings beyond the first hundred and binds cursors to the exact filter", async () => {
     const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 200_000);
@@ -5774,6 +6240,236 @@ describe("HraService", () => {
       revision: 4,
     });
     expect(value.codex.timedOutInteractions).toHaveLength(2);
+    await value.service.close();
+  });
+
+  test("quarantines automatic timeout persistence after the provider accepts the timeout", async () => {
+    const now = 120_000;
+    let stopCalls = 0;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => { stopCalls += 1; },
+      () => now,
+    );
+    const { sessionId } = await createIdleSession(value, "Automatic timeout persistence");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const interaction = value.store.admitInteraction({
+      publicId: crypto.randomUUID(),
+      sessionId,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId: "46100000-0000-4000-8000-000000000001",
+        requestId: { type: "string", value: "automatic-timeout-persistence" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "a".repeat(64),
+        threadId: session.providerThreadId,
+        turnId: "turn-automatic-timeout-persistence",
+        itemId: "item-automatic-timeout-persistence",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Expire at the automatic timeout boundary",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+      requestedAt: now,
+      deadlineAt: now,
+    }).record;
+    const originalMark = value.store.markInteractionResponseWritten.bind(value.store);
+    let injected = false;
+    (value.store as unknown as {
+      markInteractionResponseWritten: StateStore["markInteractionResponseWritten"];
+    }).markInteractionResponseWritten = (input) => {
+      if (injected) return originalMark(input);
+      injected = true;
+      throw new Error("injected automatic timeout mark failure");
+    };
+
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({
+      examined: 1,
+      failed: 1,
+    });
+    expect(injected).toBe(true);
+    expect(value.codex.timedOutInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "resolution_unknown",
+      intendedTerminalState: "expired",
+      revision: 3,
+    });
+    expect(value.store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    await Bun.sleep(10);
+    expect(stopCalls).toBe(1);
+    await value.service.close();
+  });
+
+  test("repairs a final automatic-timeout event failure before retiring the provider generation", async () => {
+    const now = 125_000;
+    let stopCalls = 0;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => { stopCalls += 1; },
+      () => now,
+    );
+    const { sessionId } = await createIdleSession(value, "Automatic timeout terminal event");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const interaction = value.store.admitInteraction({
+      publicId: crypto.randomUUID(),
+      sessionId,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId: "46150000-0000-4000-8000-000000000001",
+        requestId: { type: "string", value: "automatic-timeout-terminal-event" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "b".repeat(64),
+        threadId: session.providerThreadId,
+        turnId: "turn-automatic-timeout-terminal-event",
+        itemId: "item-automatic-timeout-terminal-event",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Expire with one durable terminal event",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+      requestedAt: now,
+      deadlineAt: now,
+    }).record;
+    const originalAppend = value.store.appendSessionEvent.bind(value.store);
+    let injected = false;
+    (value.store as unknown as {
+      appendSessionEvent: StateStore["appendSessionEvent"];
+    }).appendSessionEvent = (input) => {
+      if (
+        !injected
+        && input.body.type === "interaction_state"
+        && input.body.interactionId === interaction.publicId
+        && input.body.state === "expired"
+      ) {
+        injected = true;
+        throw new Error("injected pre-insert automatic timeout terminal event fault");
+      }
+      return originalAppend(input);
+    };
+
+    expect(await value.service.maintainInteractionDeadlines()).toEqual({
+      examined: 1,
+      failed: 1,
+    });
+    expect(injected).toBe(true);
+    expect(value.codex.timedOutInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(interaction.publicId)).toMatchObject({
+      state: "expired",
+      revision: 4,
+    });
+    expect(value.store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    const terminalEvents = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events.filter((event) =>
+      event.body.type === "interaction_state"
+      && event.body.interactionId === interaction.publicId
+      && event.body.revision === 4
+    );
+    expect(terminalEvents).toHaveLength(1);
+    expect(terminalEvents[0]?.body).toEqual({
+      type: "interaction_state",
+      interactionId: interaction.publicId,
+      state: "expired",
+      revision: 4,
+    });
+    await Bun.sleep(10);
+    expect(stopCalls).toBe(1);
+    await value.service.close();
+  });
+
+  test("quarantines deadline-supersede persistence after the provider accepts the neutral timeout", async () => {
+    let now = 130_000;
+    let stopCalls = 0;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => { stopCalls += 1; },
+      () => now,
+    );
+    const { sessionId } = await createIdleSession(value, "Deadline supersede persistence");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "deadline-supersede-persistence",
+      { requestedAt: 130_000, deadlineAt: 131_000 },
+    );
+    now = 130_999;
+    value.codex.beforeResolveInteractionReturn = async () => { now = 131_000; };
+    value.codex.resolveInteractionError = new CodexError(
+      "DEADLINE_EXPIRED",
+      "the provider rejected the final manual write at its deadline",
+    );
+    const originalMark = value.store.markInteractionResponseWritten.bind(value.store);
+    let injected = false;
+    (value.store as unknown as {
+      markInteractionResponseWritten: StateStore["markInteractionResponseWritten"];
+    }).markInteractionResponseWritten = (input) => {
+      if (injected) return originalMark(input);
+      injected = true;
+      throw new Error("injected deadline supersede mark failure");
+    };
+    const afterResponse: Array<() => void> = [];
+
+    await expect(value.service.execute({
+      kind: "interaction.resolve",
+      interaction: seeded.interaction.publicId,
+      expectedRevision: seeded.interaction.revision,
+      resolution: { kind: "approval_decision", decision: "once" },
+    }, {
+      signal,
+      afterResponse: (callback) => { afterResponse.push(callback); },
+    })).rejects.toMatchObject({
+      code: "RECOVERY_REQUIRED",
+      details: {
+        daemonRestartRequired: true,
+        interaction: {
+          id: seeded.interaction.publicId,
+          state: "resolution_unknown",
+        },
+      },
+    });
+    expect(injected).toBe(true);
+    expect(value.codex.resolvedInteractions).toHaveLength(1);
+    expect(value.codex.timedOutInteractions).toHaveLength(1);
+    expect(value.store.requireInteraction(seeded.interaction.publicId)).toMatchObject({
+      state: "resolution_unknown",
+      intendedTerminalState: "expired",
+      revision: 4,
+    });
+    expect(value.store.requireProfileById(profile.id).processGeneration)
+      .toBe(profile.processGeneration + 1);
+    expect(afterResponse).toHaveLength(1);
+    expect(stopCalls).toBe(0);
+    afterResponse[0]?.();
+    expect(stopCalls).toBe(1);
     await value.service.close();
   });
 

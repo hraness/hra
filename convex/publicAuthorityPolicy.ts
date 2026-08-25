@@ -36,6 +36,7 @@ export const HOSTED_PUBLIC_FUNCTION_AUTHORITY = Object.freeze({
   "presence:current": "registered_device",
   "presence:disconnect": "registered_device",
   "presence:heartbeat": "registered_device",
+  "releaseAttestation:read": "public_release_attestation",
   "sessions:appendChunk": "active_device",
   "sessions:beginCompactEpoch": "active_device",
   "sessions:create": "active_device",

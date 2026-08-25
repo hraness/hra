@@ -28,6 +28,11 @@ import {
   reserveCapabilityFile,
   type CapabilitySink,
 } from "./bootstrap-hosted-sync";
+import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
 import type { CommandRequest, CommandRunner } from "./configure-hosted-sync";
 import {
   HRA_CONVEX_PROJECT_ID,
@@ -262,6 +267,7 @@ describe("fresh hosted bootstrap", () => {
       ],
     ]);
     expect(requests.every((request) => request.stdin === "")).toBe(true);
+    expect(requests.every((request) => request.containment === "authority")).toBe(true);
     expect(requests.every((request) => request.outputMaximumBytes === 64 * 1_024))
       .toBe(true);
     expect(requests.every((request) => request.timeoutMs === 60_000)).toBe(true);
@@ -548,6 +554,112 @@ describe("bootstrap capability custody", () => {
     })).rejects.toThrow("genesis_failed");
     expect(committed.aborts()).toBe(0);
     expect(committed.commits()).toEqual([capability]);
+  });
+
+  test("surfaces genesis cleanup uncertainty without reconciliation or postflight", async () => {
+    const sink = makeFakeSink();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedBootstrap({
+      arguments: [...targetArguments, "--invite-output", "/protected/new-invite"],
+      authorityFactory: async () => authority,
+      reserve: async () => sink.sink,
+      runner: async () => {
+        runnerCalls += 1;
+        if (runnerCalls === 1) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(emptyAuthority) };
+        }
+        throw new BoundedProcessCleanupUnprovenError(
+          43_222,
+          "hosted-bootstrap-genesis",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(75);
+    expect(runnerCalls).toBe(2);
+    expect(verifications).toBe(1);
+    expect(sink.commits()).toEqual([capability]);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toMatchObject({
+      code: "process_cleanup_unproven",
+      phase: "hosted-bootstrap-genesis",
+      recoveryPaths: ["/protected/new-invite"],
+      status: "recovery_required",
+    });
+  });
+
+  test("preserves a genesis recovery journal without target postflight or reconciliation", async () => {
+    const sink = makeFakeSink();
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    const recoveryPath = "/private/operator/process-recovery/authority-bootstrap.json";
+    expect(await executeHostedBootstrap({
+      arguments: [...targetArguments, "--invite-output", "/protected/new-invite"],
+      authorityFactory: async () => authority,
+      reserve: async () => sink.sink,
+      runner: async () => {
+        runnerCalls += 1;
+        if (runnerCalls === 1) {
+          return { exitCode: 0, stderr: "", stdout: JSON.stringify(emptyAuthority) };
+        }
+        throw new BoundedProcessRecoveryJournalError(
+          [recoveryPath],
+          "authority_recovery_required",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => {
+        verifications += 1;
+        if (verifications === 2) throw new Error("postflight target identity changed");
+      },
+    })).toBe(75);
+    expect(runnerCalls).toBe(2);
+    expect(verifications).toBe(1);
+    expect(sink.commits()).toEqual([capability]);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_recovery_journal_blocked",
+      reason: "authority_recovery_required",
+      recoveryPaths: [recoveryPath, "/protected/new-invite"],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
+  test("refuses an unavailable authority backend without issuing a reconciliation read", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedBootstrap({
+      arguments: [...targetArguments, "--invite-output", "/protected/new-invite"],
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessContainmentUnavailableError(
+          "authority_backend_unavailable",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(1);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "authority_containment_unavailable",
+      reason: "authority_backend_unavailable",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
   });
 });
 

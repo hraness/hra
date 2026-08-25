@@ -14,6 +14,7 @@ import {
   CloudDeploymentAuthorityError,
   DeploymentScopedCloudSecretCustody,
   IdentityScopedCloudSecretCustody,
+  isIdentityScopedCloudCustody,
   type CloudDeploymentAuthority,
 } from "./identity-custody";
 import {
@@ -29,14 +30,19 @@ import {
   isSafePositiveInteger,
   isUuidV7,
   parseAuthorityTuple,
+  parseCloudDeviceList,
   parseEncryptedEnvelope,
   parseWrappedKeyEnvelope,
+  type AccountKeyStatus,
+  type CloudDeviceList,
+  type CloudDeviceListEntry,
   type CommandState,
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
 } from "./contracts";
 import {
   decodeBase64Url,
+  decryptBytes,
   encodeBase64Url,
   encryptBytes,
   exportDevicePrivateKey,
@@ -66,6 +72,7 @@ import {
 } from "./projection";
 
 const authSlot = "cloud-auth";
+const authIdentitySlot = "cloud-auth-identity";
 const authLogoutSlot = "cloud-auth-logout";
 const accountDeletionSlot = "cloud-account-deletion";
 const deviceSlot = "cloud-device";
@@ -90,6 +97,21 @@ class AccountDeletionStatusUnavailableError extends Error {
   constructor() {
     super("Cloud account-erasure status is temporarily unavailable.");
     this.name = "AccountDeletionStatusUnavailableError";
+  }
+}
+
+export type AccountKeyLossPreconditionFailure =
+  | "already_ready"
+  | "auth_identity_unbound"
+  | "authority_changed"
+  | "device_unregistered"
+  | "observation_missing"
+  | "signed_out";
+
+export class AccountKeyLossPreconditionError extends Error {
+  constructor(readonly code: AccountKeyLossPreconditionFailure) {
+    super(`Account-key loss acknowledgement precondition failed: ${code}.`);
+    this.name = "AccountKeyLossPreconditionError";
   }
 }
 
@@ -306,6 +328,14 @@ type AuthCustody =
   | Readonly<{ claim: AuthLogoutClaim; kind: "logout_claim" }>
   | Readonly<{ kind: "signed_out"; signedOut: AuthSignedOut }>;
 
+type AuthIdentityBinding = Readonly<{
+  authDigest: string;
+  authEpoch: number;
+  authGeneration: number;
+  userPublicId: string;
+  version: 1;
+}>;
+
 type PendingAuthLogout =
   | Readonly<{
       authDigest: string;
@@ -404,14 +434,56 @@ type AccountKeySecret = Readonly<{
   version: 1;
 }>;
 
+type AccountKeyRecoveryAuthority = Readonly<{
+  authEpoch: number;
+  devicePublicId: string;
+  keyVersion: number;
+  userPublicId: string;
+}>;
+
+type AccountKeyPairingObservation = AccountKeyRecoveryAuthority & Readonly<{
+  observedAt: number;
+  status: "pairing_required";
+}>;
+
+type AccountKeyUnrecoverableObservation = AccountKeyRecoveryAuthority & Readonly<{
+  acknowledgedAt: number;
+  evidence: "operator_confirmed_no_key_holders";
+  observedAt: number;
+  status: "unrecoverable";
+}>;
+
+type AccountKeySupersededObservation = AccountKeyRecoveryAuthority & Readonly<{
+  prior:
+    | Readonly<{
+        observedAt: number;
+        status: "pairing_required";
+      }>
+    | Readonly<{
+        acknowledgedAt: number;
+        evidence: "operator_confirmed_no_key_holders";
+        observedAt: number;
+        status: "unrecoverable";
+      }>;
+  reason: "account_key_obtained";
+  status: "superseded";
+  supersededAt: number;
+}>;
+
+type AccountKeyRecoveryObservation =
+  | AccountKeyPairingObservation
+  | AccountKeyUnrecoverableObservation
+  | AccountKeySupersededObservation;
+
 type LocalCloudState = Readonly<{
+  accountKeyRecovery: AccountKeyRecoveryObservation | null;
   lastSync: null | Readonly<{
     accountCount: number;
     at: number;
     sessionCount: number;
     usageSnapshotCount: number;
   }>;
-  version: 1;
+  version: 2;
 }>;
 
 type PendingDeviceMutation =
@@ -501,6 +573,7 @@ type SecretObservation<T> = Readonly<{
 type AccountContext = Readonly<{
   authEpoch: number;
   device: null | Readonly<{
+    credentialGeneration: number;
     keyVersion: number;
     publicId: string;
     revision: number;
@@ -508,6 +581,12 @@ type AccountContext = Readonly<{
   }>;
   hasActiveDevices: boolean;
   userPublicId: string;
+}>;
+
+type AccountOperationAuthority = Readonly<{
+  account: AccountContext;
+  auth: SecretObservation<Extract<AuthCustody, Readonly<{ kind: "authenticated" }>>>;
+  authIdentity: SecretObservation<AuthIdentityBinding>;
 }>;
 
 type DeviceRecord = Readonly<{
@@ -519,6 +598,7 @@ type DeviceRecord = Readonly<{
   publicId: string;
   revision: number;
   status: DeviceStatus;
+  userPublicId: string;
   wrappingPublicKey: string;
 }>;
 
@@ -526,6 +606,7 @@ type DevicePage = Readonly<{
   continueCursor: string;
   isDone: boolean;
   page: readonly DeviceRecord[];
+  userPublicId: string;
 }>;
 
 type SessionHead = Readonly<{
@@ -656,6 +737,37 @@ function parseAuthCustody(value: string): AuthCustody {
     };
   }
   return { auth: parseAuthSecretValue(decoded), kind: "authenticated" };
+}
+
+function parseAuthIdentityBinding(value: string): AuthIdentityBinding {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value) as unknown;
+  } catch {
+    throw new Error("Cloud auth-identity binding is corrupt.");
+  }
+  if (
+    !isRecord(decoded)
+    || !hasExactKeys(decoded, [
+      "authDigest",
+      "authEpoch",
+      "authGeneration",
+      "userPublicId",
+      "version",
+    ])
+    || decoded.version !== 1
+    || !isDigest(decoded.authDigest)
+    || !isSafePositiveInteger(decoded.authEpoch)
+    || !isSafeNonNegativeInteger(decoded.authGeneration)
+    || !isOpaqueIdentifier(decoded.userPublicId)
+  ) throw new Error("Cloud auth-identity binding is corrupt.");
+  return {
+    authDigest: decoded.authDigest,
+    authEpoch: decoded.authEpoch,
+    authGeneration: decoded.authGeneration,
+    userPublicId: decoded.userPublicId,
+    version: 1,
+  };
 }
 
 function parsePendingAuthLogout(value: string): PendingAuthLogout {
@@ -949,6 +1061,116 @@ function parseAccountKeySecret(value: string): AccountKeySecret {
   return decoded as AccountKeySecret;
 }
 
+function parseAccountKeyRecoveryObservation(
+  value: unknown,
+): AccountKeyRecoveryObservation | null {
+  if (value === null) return null;
+  if (
+    !isRecord(value)
+    || !isSafeNonNegativeInteger(value.authEpoch)
+    || !isOpaqueIdentifier(value.devicePublicId)
+    || !isSafePositiveInteger(value.keyVersion)
+    || !isOpaqueIdentifier(value.userPublicId)
+    || typeof value.status !== "string"
+  ) throw new Error("Cloud account-key recovery evidence is corrupt.");
+  const authority = {
+    authEpoch: value.authEpoch,
+    devicePublicId: value.devicePublicId,
+    keyVersion: value.keyVersion,
+    userPublicId: value.userPublicId,
+  };
+  if (value.status === "pairing_required") {
+    if (
+      !hasExactKeys(value, [
+        "authEpoch",
+        "devicePublicId",
+        "keyVersion",
+        "observedAt",
+        "status",
+        "userPublicId",
+      ])
+      || !isFiniteTimestamp(value.observedAt)
+    ) throw new Error("Cloud account-key recovery evidence is corrupt.");
+    return { ...authority, observedAt: value.observedAt, status: value.status };
+  }
+  if (value.status === "unrecoverable") {
+    if (
+      !hasExactKeys(value, [
+        "acknowledgedAt",
+        "authEpoch",
+        "devicePublicId",
+        "evidence",
+        "keyVersion",
+        "observedAt",
+        "status",
+        "userPublicId",
+      ])
+      || !isFiniteTimestamp(value.acknowledgedAt)
+      || value.evidence !== "operator_confirmed_no_key_holders"
+      || !isFiniteTimestamp(value.observedAt)
+    ) throw new Error("Cloud account-key recovery evidence is corrupt.");
+    return {
+      ...authority,
+      acknowledgedAt: value.acknowledgedAt,
+      evidence: value.evidence,
+      observedAt: value.observedAt,
+      status: value.status,
+    };
+  }
+  if (value.status === "superseded") {
+    if (
+      !hasExactKeys(value, [
+        "authEpoch",
+        "devicePublicId",
+        "keyVersion",
+        "prior",
+        "reason",
+        "status",
+        "supersededAt",
+        "userPublicId",
+      ])
+      || value.reason !== "account_key_obtained"
+      || !isFiniteTimestamp(value.supersededAt)
+      || !isRecord(value.prior)
+      || typeof value.prior.status !== "string"
+    ) throw new Error("Cloud account-key recovery evidence is corrupt.");
+    if (
+      value.prior.status === "pairing_required"
+      && hasExactKeys(value.prior, ["observedAt", "status"])
+      && isFiniteTimestamp(value.prior.observedAt)
+    ) {
+      return {
+        ...authority,
+        prior: { observedAt: value.prior.observedAt, status: value.prior.status },
+        reason: value.reason,
+        status: value.status,
+        supersededAt: value.supersededAt,
+      };
+    }
+    if (
+      value.prior.status === "unrecoverable"
+      && hasExactKeys(value.prior, ["acknowledgedAt", "evidence", "observedAt", "status"])
+      && isFiniteTimestamp(value.prior.acknowledgedAt)
+      && value.prior.evidence === "operator_confirmed_no_key_holders"
+      && isFiniteTimestamp(value.prior.observedAt)
+    ) {
+      return {
+        ...authority,
+        prior: {
+          acknowledgedAt: value.prior.acknowledgedAt,
+          evidence: value.prior.evidence,
+          observedAt: value.prior.observedAt,
+          status: value.prior.status,
+        },
+        reason: value.reason,
+        status: value.status,
+        supersededAt: value.supersededAt,
+      };
+    }
+  }
+  throw new Error("Cloud account-key recovery evidence is corrupt.");
+}
+
 function parseLocalState(value: string): LocalCloudState {
   let decoded: unknown;
   try {
@@ -958,31 +1180,43 @@ function parseLocalState(value: string): LocalCloudState {
   }
   if (
     !isRecord(decoded)
-    || !hasExactKeys(decoded, ["lastSync", "version"])
-    || decoded.version !== 1
+    || (
+      decoded.version === 1
+        ? !hasExactKeys(decoded, ["lastSync", "version"])
+        : decoded.version !== 2
+          || !hasExactKeys(decoded, ["accountKeyRecovery", "lastSync", "version"])
+    )
   ) throw new Error("Cloud local state is corrupt.");
-  if (decoded.lastSync === null) return { lastSync: null, version: 1 };
-  if (
-    !isRecord(decoded.lastSync)
-    || !hasExactKeys(decoded.lastSync, [
-      "accountCount",
-      "at",
-      "sessionCount",
-      "usageSnapshotCount",
-    ])
-    || !isSafeNonNegativeInteger(decoded.lastSync.accountCount)
-    || !isFiniteTimestamp(decoded.lastSync.at)
-    || !isSafeNonNegativeInteger(decoded.lastSync.sessionCount)
-    || !isSafeNonNegativeInteger(decoded.lastSync.usageSnapshotCount)
-  ) throw new Error("Cloud local state is corrupt.");
-  return {
-    lastSync: {
+  let lastSync: LocalCloudState["lastSync"];
+  if (decoded.lastSync === null) {
+    lastSync = null;
+  } else {
+    if (
+      !isRecord(decoded.lastSync)
+      || !hasExactKeys(decoded.lastSync, [
+        "accountCount",
+        "at",
+        "sessionCount",
+        "usageSnapshotCount",
+      ])
+      || !isSafeNonNegativeInteger(decoded.lastSync.accountCount)
+      || !isFiniteTimestamp(decoded.lastSync.at)
+      || !isSafeNonNegativeInteger(decoded.lastSync.sessionCount)
+      || !isSafeNonNegativeInteger(decoded.lastSync.usageSnapshotCount)
+    ) throw new Error("Cloud local state is corrupt.");
+    lastSync = {
       accountCount: decoded.lastSync.accountCount,
       at: decoded.lastSync.at,
       sessionCount: decoded.lastSync.sessionCount,
       usageSnapshotCount: decoded.lastSync.usageSnapshotCount,
-    },
-    version: 1,
+    };
+  }
+  return {
+    accountKeyRecovery: decoded.version === 1
+      ? null
+      : parseAccountKeyRecoveryObservation(decoded.accountKeyRecovery),
+    lastSync,
+    version: 2,
   };
 }
 
@@ -1318,7 +1552,14 @@ function parseAccountContext(value: unknown): AccountContext {
   }
   if (
     !isRecord(value.device)
-    || !hasExactKeys(value.device, ["keyVersion", "publicId", "revision", "status"])
+    || !hasExactKeys(
+      value.device,
+      Object.hasOwn(value.device, "credentialGeneration")
+        ? ["credentialGeneration", "keyVersion", "publicId", "revision", "status"]
+        : ["keyVersion", "publicId", "revision", "status"],
+    )
+    || (Object.hasOwn(value.device, "credentialGeneration")
+      && !isSafePositiveInteger(value.device.credentialGeneration))
     || !isSafePositiveInteger(value.device.keyVersion)
     || !isOpaqueIdentifier(value.device.publicId)
     || !isSafePositiveInteger(value.device.revision)
@@ -1329,6 +1570,10 @@ function parseAccountContext(value: unknown): AccountContext {
   return {
     authEpoch: value.authEpoch,
     device: {
+      credentialGeneration: Object.hasOwn(value.device, "credentialGeneration")
+        && typeof value.device.credentialGeneration === "number"
+          ? value.device.credentialGeneration
+          : 1,
       keyVersion: value.device.keyVersion,
       publicId: value.device.publicId,
       revision: value.device.revision,
@@ -1336,6 +1581,35 @@ function parseAccountContext(value: unknown): AccountContext {
     },
     hasActiveDevices: value.hasActiveDevices,
     userPublicId: value.userPublicId,
+  };
+}
+
+function sameAccountContext(left: AccountContext, right: AccountContext): boolean {
+  return left.authEpoch === right.authEpoch
+    && left.hasActiveDevices === right.hasActiveDevices
+    && left.userPublicId === right.userPublicId
+    && (left.device === null) === (right.device === null)
+    && (left.device === null || right.device === null || (
+      left.device.credentialGeneration === right.device.credentialGeneration
+      && left.device.keyVersion === right.device.keyVersion
+      && left.device.publicId === right.device.publicId
+      && left.device.revision === right.device.revision
+      && left.device.status === right.device.status
+    ));
+}
+
+function publicAccountDevice(device: AccountContext["device"]): null | Readonly<{
+  keyVersion: number;
+  publicId: string;
+  revision: number;
+  status: DeviceStatus;
+}> {
+  if (device === null) return null;
+  return {
+    keyVersion: device.keyVersion,
+    publicId: device.publicId,
+    revision: device.revision,
+    status: device.status,
   };
 }
 
@@ -1364,6 +1638,7 @@ function parseDeviceRecord(value: unknown): DeviceRecord {
     "publicId",
     "revision",
     "status",
+    "userPublicId",
     "wrappingPublicKey",
   ];
   const keys = value.activatedAt === undefined ? required : [...required, "activatedAt"];
@@ -1374,9 +1649,12 @@ function parseDeviceRecord(value: unknown): DeviceRecord {
     || !isSafePositiveInteger(value.keyVersion)
     || (value.lastSeenAt !== null && !isFiniteTimestamp(value.lastSeenAt))
     || typeof value.online !== "boolean"
+    || (value.online && value.lastSeenAt === null)
     || !isOpaqueIdentifier(value.publicId)
     || !isSafePositiveInteger(value.revision)
     || (value.status !== "pending" && value.status !== "active" && value.status !== "revoked")
+    || (value.status === "revoked" && value.online)
+    || !isOpaqueIdentifier(value.userPublicId)
     || typeof value.wrappingPublicKey !== "string"
     || parseDevicePublicKeyJson(value.wrappingPublicKey) === null
     || (value.activatedAt !== undefined && !isFiniteTimestamp(value.activatedAt))
@@ -1390,6 +1668,7 @@ function parseDeviceRecord(value: unknown): DeviceRecord {
     publicId: value.publicId,
     revision: value.revision,
     status: value.status,
+    userPublicId: value.userPublicId,
     wrappingPublicKey: value.wrappingPublicKey,
   };
 }
@@ -1408,13 +1687,20 @@ function parseDeviceRecords(value: unknown): readonly DeviceRecord[] {
 function parseDevicePage(value: unknown): DevicePage {
   if (!isRecord(value)) throw new Error("Cloud device page is invalid.");
   const optional = ["pageStatus", "splitCursor"].filter((key) => Object.hasOwn(value, key));
-  if (!hasExactKeys(value, ["continueCursor", "isDone", "page", ...optional])) {
+  if (!hasExactKeys(value, [
+    "continueCursor",
+    "isDone",
+    "page",
+    "userPublicId",
+    ...optional,
+  ])) {
     throw new Error("Cloud device page is invalid.");
   }
   if (
     typeof value.continueCursor !== "string"
     || value.continueCursor.length > 16_384
     || typeof value.isDone !== "boolean"
+    || !isOpaqueIdentifier(value.userPublicId)
     || (value.pageStatus !== undefined
       && value.pageStatus !== null
       && value.pageStatus !== "SplitRecommended"
@@ -1427,6 +1713,7 @@ function parseDevicePage(value: unknown): DevicePage {
     continueCursor: value.continueCursor,
     isDone: value.isDone,
     page: parseDeviceRecords(value.page),
+    userPublicId: value.userPublicId,
   };
 }
 
@@ -1756,6 +2043,7 @@ function parseLatestUsageSnapshot(value: unknown): UsageSnapshot | null {
 
 function serializeSecret(
   value: AuthSecret
+    | AuthIdentityBinding
     | AuthLogoutClaim
     | AuthSignedOut
     | PendingAuthLogout
@@ -1775,10 +2063,38 @@ function serializeSecret(
 
 function validateDeviceLabel(value: string): string {
   const label = value.trim();
-  if (label.length < 1 || label.length > 160 || containsAbsolutePath(label)) {
+  if (
+    label.length < 1
+    || label.length > 160
+    || new TextEncoder().encode(label).byteLength > 640
+    || containsAbsolutePath(label)
+  ) {
     throw new Error("Cloud device label is invalid.");
   }
   return label;
+}
+
+function shortDeviceId(publicId: string): string {
+  if (!isOpaqueIdentifier(publicId)) throw new Error("Cloud device identity is invalid.");
+  return publicId.slice(-8);
+}
+
+function automaticDeviceLabel(publicId: string): string {
+  return `HRA device ${shortDeviceId(publicId)}`;
+}
+
+function fallbackDeviceLabel(
+  device: Pick<DeviceRecord, "publicId" | "status">,
+  current: boolean,
+): string {
+  const qualifier = current
+    ? "This device"
+    : device.status === "pending"
+      ? "Pending device"
+      : device.status === "revoked"
+        ? "Revoked device"
+        : "Device";
+  return `${qualifier} ${shortDeviceId(device.publicId)}`;
 }
 
 function randomOpaqueId(prefix: "bind" | "device"): string {
@@ -1817,15 +2133,23 @@ function outboxIdempotencyExpired(idempotencyKey: string, now: number): boolean 
   return timestamp === null || timestamp <= now - maximumRemoteCommandLifetimeMs;
 }
 
-function deviceLabelAad(userPublicId: string, devicePublicId: string): Uint8Array {
-  if (!isOpaqueIdentifier(userPublicId) || !isOpaqueIdentifier(devicePublicId)) {
+function deviceLabelAad(
+  userPublicId: string,
+  devicePublicId: string,
+  deviceLabelKeyVersion: number,
+): Uint8Array {
+  if (
+    !isOpaqueIdentifier(userPublicId)
+    || !isOpaqueIdentifier(devicePublicId)
+    || !isSafePositiveInteger(deviceLabelKeyVersion)
+  ) {
     throw new Error("Invalid cloud device-label authority.");
   }
   return new TextEncoder().encode([
     "hra-control-plane-device-label:v1",
     userPublicId,
     devicePublicId,
-    String(keyVersion),
+    String(deviceLabelKeyVersion),
   ].join("\n"));
 }
 
@@ -1842,7 +2166,8 @@ export function deploymentUrlFromEnvironment(
 
 export class LocalCloudControl implements CloudControlPort {
   readonly #deploymentAuthority: CloudDeploymentAuthority;
-  readonly #deviceLabel: string;
+  readonly #deviceLabel: string | null;
+  readonly #identityCustody: IdentityScopedCloudSecretCustody | null;
   readonly #now: () => number;
   readonly #secrets: CloudSecretCustodyPort;
   readonly #transport: CloudTransport;
@@ -1857,7 +2182,12 @@ export class LocalCloudControl implements CloudControlPort {
       );
     }
     this.#deploymentAuthority = options.deploymentAuthority;
-    this.#deviceLabel = validateDeviceLabel(options.deviceLabel ?? "This device");
+    this.#deviceLabel = options.deviceLabel === undefined
+      ? null
+      : validateDeviceLabel(options.deviceLabel);
+    this.#identityCustody = isIdentityScopedCloudCustody(options.secretCustody)
+      ? options.secretCustody
+      : null;
     this.#now = options.now ?? Date.now;
     this.#secrets = deploymentFencedSecretCustody(
       options.secretCustody,
@@ -1945,6 +2275,7 @@ export class LocalCloudControl implements CloudControlPort {
         const selection = await this.#secrets.activateIdentity(account.userPublicId);
         if (selection.restartRequired) {
           return {
+            accountKey: null,
             automaticRegistrationPending: true,
             daemonRestartRequired: true,
             device: null,
@@ -1954,11 +2285,14 @@ export class LocalCloudControl implements CloudControlPort {
           };
         }
       }
+      const accountKey = await this.#accountKeyStatus(account);
       return {
+        accountKey,
         automaticRegistrationPending: account.device === null,
-        device: account.device,
+        device: publicAccountDevice(account.device),
         email: parsed.email,
-        pairingRequired: await this.#accountKeyPairingRequired(account),
+        pairingRequired: accountKey?.status === "pairing_required"
+          || accountKey?.status === "unrecoverable",
         signedIn: true,
       };
     }, true);
@@ -1988,12 +2322,30 @@ export class LocalCloudControl implements CloudControlPort {
           signedIn: false,
         };
       }
-      const [auth, state, localDevice] = await Promise.all([
-        this.#readAuth(),
-        this.#readState(),
-        this.#readDevice(),
-      ]);
-      if (auth === null) {
+      const authBefore = await this.#readAuthCustodyObservation();
+      if (authBefore?.value.kind !== "authenticated") {
+        if (this.#identityCustody !== null) {
+          await this.#identityCustody.assertCurrentIdentity(
+            this.#identityCustody.activeUserPublicId,
+          );
+        }
+        const [state, localDevice] = await Promise.all([
+          this.#readState(),
+          this.#readDevice(),
+        ]);
+        const authAfter = await this.#readAuthCustodyObservation();
+        if (
+          (authBefore === null) !== (authAfter === null)
+          || (authBefore !== null && authAfter !== null && (
+            authBefore.generation !== authAfter.generation
+            || authBefore.serialized !== authAfter.serialized
+          ))
+        ) throw new Error("Cloud account operation authority changed.");
+        if (this.#identityCustody !== null) {
+          await this.#identityCustody.assertCurrentIdentity(
+            this.#identityCustody.activeUserPublicId,
+          );
+        }
         return {
           configured: true,
           device: localDevice === null ? null : { publicId: localDevice.publicId },
@@ -2001,15 +2353,22 @@ export class LocalCloudControl implements CloudControlPort {
           signedIn: false,
         };
       }
-      const account = await this.#readAccount(true);
+      const authority = await this.#openAccountOperationAuthority(true);
+      await this.#assertLocalAccountOperationAuthority(authority);
+      const state = await this.#readState();
+      await this.#assertLocalAccountOperationAuthority(authority);
+      const accountKey = await this.#accountKeyStatus(authority.account, authority);
+      await this.#assertServerAccountOperationAuthority(authority);
       return {
-        automaticRegistrationPending: account.device === null,
-        authEpoch: account.authEpoch,
+        accountKey,
+        automaticRegistrationPending: authority.account.device === null,
+        authEpoch: authority.account.authEpoch,
         configured: true,
-        device: account.device,
-        email: auth.email,
+        device: publicAccountDevice(authority.account.device),
+        email: authority.auth.value.auth.email,
         lastSync: state.lastSync,
-        pairingRequired: await this.#accountKeyPairingRequired(account),
+        pairingRequired: accountKey?.status === "pairing_required"
+          || accountKey?.status === "unrecoverable",
         signedIn: true,
       };
     }, true);
@@ -2239,7 +2598,7 @@ export class LocalCloudControl implements CloudControlPort {
         ) throw new Error("The registered cloud device key is unavailable; recovery is required.");
         if (account.device.status === "revoked") {
           return {
-            device: account.device,
+            device: publicAccountDevice(account.device),
             registered: false,
             recoveryRequired: true,
           };
@@ -2270,7 +2629,7 @@ export class LocalCloudControl implements CloudControlPort {
           await this.#clearExactSecret(registrationSlot, pendingRegistration);
         }
         return {
-          device: account.device,
+          device: publicAccountDevice(account.device),
           registered: true,
         };
       }
@@ -2297,7 +2656,7 @@ export class LocalCloudControl implements CloudControlPort {
       if (deviceSecret !== null && deviceSecret.registered) {
         account = await this.#bindRegisteredDevice(account, deviceSecret);
         return {
-          device: account.device,
+          device: publicAccountDevice(account.device),
           rebound: true,
           registered: true,
         };
@@ -2340,7 +2699,7 @@ export class LocalCloudControl implements CloudControlPort {
             deviceSecret,
           );
           return {
-            device: account.device,
+            device: publicAccountDevice(account.device),
             paired: false,
             reauthenticationRequired: true,
             replacementPrepared: true,
@@ -2364,7 +2723,10 @@ export class LocalCloudControl implements CloudControlPort {
         if (account.device.status === "active") {
           await this.#hydrateAccountKey(account, deviceSecret);
         }
-        return { device: account.device, paired: account.device.status === "active" };
+        return {
+          device: publicAccountDevice(account.device),
+          paired: account.device.status === "active",
+        };
       }
 
       if (replacement !== null) {
@@ -2404,7 +2766,11 @@ export class LocalCloudControl implements CloudControlPort {
           throw new Error("Cloud device bind did not establish active authority.");
         }
         await this.#hydrateAccountKey(account, deviceSecret);
-        return { device: account.device, paired: true, rebound: true };
+        return {
+          device: publicAccountDevice(account.device),
+          paired: true,
+          rebound: true,
+        };
       }
 
       if (deviceSecret !== null && !deviceSecret.registered && replacement === null) {
@@ -2417,6 +2783,126 @@ export class LocalCloudControl implements CloudControlPort {
         deviceSecret,
         replacement,
       );
+    });
+  }
+
+  async acknowledgeNoAccountKeyHolders(signal: AbortSignal): Promise<unknown> {
+    return await this.#exclusive(async () => {
+      abortBeforeEffect(signal);
+      const [auth, authIdentity, device, state] = await Promise.all([
+        this.#readAuthCustodyObservation(),
+        this.#readAuthIdentityBinding(),
+        this.#readDevice(),
+        this.#readState(),
+      ]);
+      if (auth?.value.kind !== "authenticated") {
+        throw new AccountKeyLossPreconditionError("signed_out");
+      }
+      if (device === null || !device.registered) {
+        throw new AccountKeyLossPreconditionError("device_unregistered");
+      }
+      const authDigest = createHash("sha256").update(auth.serialized).digest("hex");
+      if (
+        authIdentity === null
+        || authIdentity.authDigest !== authDigest
+        || authIdentity.authGeneration !== auth.generation
+        || authIdentity.userPublicId !== device.userPublicId
+      ) {
+        throw new AccountKeyLossPreconditionError("auth_identity_unbound");
+      }
+      const recovery = state.accountKeyRecovery;
+      if (recovery === null) {
+        throw new AccountKeyLossPreconditionError("observation_missing");
+      }
+      if (
+        recovery.status === "superseded"
+        || recovery.authEpoch !== authIdentity.authEpoch
+        || recovery.userPublicId !== authIdentity.userPublicId
+        || recovery.userPublicId !== device.userPublicId
+        || recovery.devicePublicId !== device.publicId
+      ) {
+        throw new AccountKeyLossPreconditionError("authority_changed");
+      }
+      const key = await this.#readAccountKey();
+      if (this.#usableAccountKey(key, recovery)) {
+        await this.#supersedeAccountKeyRecovery(key);
+        throw new AccountKeyLossPreconditionError("already_ready");
+      }
+      if (recovery.status === "unrecoverable") {
+        return {
+          acknowledgedNoKeyHolders: true,
+          accountKey: {
+            evidence: recovery.evidence,
+            status: recovery.status,
+          } satisfies AccountKeyStatus,
+          localOnly: true,
+          replay: true,
+        };
+      }
+      const next = await this.#updateState((current) => {
+        const observed = current.accountKeyRecovery;
+        if (
+          observed === null
+          || observed.status === "superseded"
+          || observed.userPublicId !== recovery.userPublicId
+          || observed.devicePublicId !== recovery.devicePublicId
+          || observed.keyVersion !== recovery.keyVersion
+          || observed.authEpoch !== recovery.authEpoch
+        ) {
+          throw new AccountKeyLossPreconditionError("authority_changed");
+        }
+        if (observed.status === "unrecoverable") return current;
+        return {
+          ...current,
+          accountKeyRecovery: {
+            ...observed,
+            acknowledgedAt: this.#now(),
+            evidence: "operator_confirmed_no_key_holders",
+            status: "unrecoverable",
+          },
+        };
+      });
+      const afterKey = await this.#readAccountKey();
+      if (this.#usableAccountKey(afterKey, recovery)) {
+        await this.#supersedeAccountKeyRecovery(afterKey);
+        return {
+          acknowledgedNoKeyHolders: false,
+          accountKey: {
+            keyVersion: afterKey.keyVersion,
+            status: "ready",
+          } satisfies AccountKeyStatus,
+          localOnly: true,
+          replay: false,
+          superseded: true,
+        };
+      }
+      const committed = next.accountKeyRecovery;
+      if (committed?.status !== "unrecoverable") {
+        throw new AccountKeyLossPreconditionError("authority_changed");
+      }
+      const [afterAuth, afterAuthIdentity] = await Promise.all([
+        this.#readAuthCustodyObservation(),
+        this.#readAuthIdentityBinding(),
+      ]);
+      if (
+        afterAuth?.value.kind !== "authenticated"
+        || afterAuth.generation !== auth.generation
+        || afterAuth.serialized !== auth.serialized
+        || afterAuthIdentity === null
+        || afterAuthIdentity.authDigest !== authIdentity.authDigest
+        || afterAuthIdentity.authEpoch !== authIdentity.authEpoch
+        || afterAuthIdentity.authGeneration !== authIdentity.authGeneration
+        || afterAuthIdentity.userPublicId !== authIdentity.userPublicId
+      ) throw new AccountKeyLossPreconditionError("authority_changed");
+      return {
+        acknowledgedNoKeyHolders: true,
+        accountKey: {
+          evidence: committed.evidence,
+          status: committed.status,
+        } satisfies AccountKeyStatus,
+        localOnly: true,
+        replay: false,
+      };
     });
   }
 
@@ -2434,10 +2920,12 @@ export class LocalCloudControl implements CloudControlPort {
         version: 1,
       });
       const encryptedLabel = await encryptBytes(
-        new TextEncoder().encode(this.#deviceLabel),
+        new TextEncoder().encode(
+          this.#deviceLabel ?? automaticDeviceLabel(deviceSecret.publicId),
+        ),
         provisionalKey,
         keyVersion,
-        deviceLabelAad(account.userPublicId, deviceSecret.publicId),
+        deviceLabelAad(account.userPublicId, deviceSecret.publicId, keyVersion),
       );
       const bootstrapKeyEnvelope = account.hasActiveDevices
         ? undefined
@@ -2486,22 +2974,78 @@ export class LocalCloudControl implements CloudControlPort {
   async listDevices(signal: AbortSignal): Promise<unknown> {
     return await this.#exclusive(async () => {
       abortBeforeEffect(signal);
-      const account = await this.#requireActiveDevice();
-      const devices = await this.#listDeviceRecords();
-      return {
-        currentDevicePublicId: account.device.publicId,
-        devices: devices.map((device) => ({
+      const { account, authority } = await this.#requireActiveDeviceOperationAuthority();
+      const devices = await this.#listDeviceRecords(account.userPublicId, authority);
+      await this.#assertLocalAccountOperationAuthority(authority);
+      const accountKey = await this.#requireAccountKey(account.userPublicId);
+      await this.#assertServerAccountOperationAuthority(authority);
+      const currentRecord = devices.find((device) =>
+        device.publicId === account.device.publicId);
+      if (
+        currentRecord === undefined
+        || currentRecord.keyVersion !== account.device.keyVersion
+        || currentRecord.revision !== account.device.revision
+        || currentRecord.status !== "active"
+        || accountKey.keyVersion !== account.device.keyVersion
+      ) throw new Error("Cloud device listing changed authority.");
+      await this.#assertServerAccountOperationAuthority(authority);
+      const publicDevices: CloudDeviceListEntry[] = [];
+      for (const device of devices) {
+        const current = device.publicId === account.device.publicId;
+        const decryptedLabel = await this.#decryptDeviceLabel(
+          account.userPublicId,
+          device,
+          accountKey,
+        );
+        publicDevices.push({
           ...(device.activatedAt === undefined ? {} : { activatedAt: device.activatedAt }),
-          current: device.publicId === account.device.publicId,
+          current,
           keyVersion: device.keyVersion,
+          label: decryptedLabel ?? fallbackDeviceLabel(device, current),
+          labelSource: decryptedLabel === null ? "fallback" : "encrypted",
           lastSeenAt: device.lastSeenAt,
-          online: device.online,
+          online: device.status === "revoked" ? false : device.online,
           publicId: device.publicId,
           revision: device.revision,
           status: device.status,
-        })),
-      };
+        });
+      }
+      await this.#assertServerAccountOperationAuthority(authority);
+      const result = {
+        currentDevicePublicId: account.device.publicId,
+        devices: publicDevices,
+      } satisfies CloudDeviceList;
+      const parsed = parseCloudDeviceList(result);
+      if (parsed === null) throw new Error("Cloud device listing changed authority.");
+      await this.#assertLocalAccountOperationAuthority(authority);
+      return parsed;
     });
+  }
+
+  async #decryptDeviceLabel(
+    userPublicId: string,
+    device: DeviceRecord,
+    accountKey: Readonly<{ bytes: Uint8Array; keyVersion: number }>,
+  ): Promise<string | null> {
+    if (
+      device.keyVersion !== accountKey.keyVersion
+      || device.encryptedLabel.keyVersion !== accountKey.keyVersion
+    ) return null;
+    try {
+      const plaintext = await decryptBytes(
+        device.encryptedLabel,
+        accountKey.bytes,
+        deviceLabelAad(
+          userPublicId,
+          device.publicId,
+          device.encryptedLabel.keyVersion,
+        ),
+      );
+      if (plaintext.byteLength > 640) return null;
+      return validateDeviceLabel(new TextDecoder("utf-8", { fatal: true }).decode(plaintext));
+    } catch {
+      return null;
+    }
   }
 
   async approveDevice(
@@ -2535,7 +3079,7 @@ export class LocalCloudControl implements CloudControlPort {
     return await this.#exclusive(async () => {
       abortBeforeEffect(signal);
       const account = await this.#requireActiveDevice();
-      const target = await this.#resolveDevice(selector);
+      const target = await this.#resolveDevice(selector, account.userPublicId);
       if (target.publicId === account.device.publicId) {
         throw new Error(kind === "approve"
           ? "The current cloud device is already active."
@@ -3068,14 +3612,14 @@ export class LocalCloudControl implements CloudControlPort {
         }
       }
       const syncedAt = this.#now();
-      await this.#writeSecret(stateSlot, serializeSecret({
+      await this.#updateState((current) => ({
+        ...current,
         lastSync: {
           accountCount: accounts.length,
           at: syncedAt,
           sessionCount: heads.length,
           usageSnapshotCount,
         },
-        version: 1,
       }));
       return {
         accountCount: accounts.length,
@@ -3225,27 +3769,220 @@ export class LocalCloudControl implements CloudControlPort {
     };
   }
 
+  async #openAccountOperationAuthority(refresh: boolean): Promise<AccountOperationAuthority> {
+    if (refresh) await this.#ensureFreshAuth();
+    else if (await this.#readAuth() === null) throw new Error("Cloud auth is unavailable.");
+    let auth = await this.#requireAuthenticatedAuthObservation();
+    let account: AccountContext;
+    try {
+      await this.#assertExactAuthenticatedAuth(auth);
+      account = parseAccountContext(await this.#transport.query("account:current", {}));
+    } catch (error: unknown) {
+      if (!refresh) throw error;
+      await this.#ensureFreshAuth(true);
+      auth = await this.#requireAuthenticatedAuthObservation();
+      await this.#assertExactAuthenticatedAuth(auth);
+      account = parseAccountContext(await this.#transport.query("account:current", {}));
+    }
+    await this.#assertExactAuthenticatedAuth(auth);
+    if (this.#identityCustody !== null) {
+      await this.#identityCustody.assertCurrentIdentity(account.userPublicId);
+    }
+    await this.#bindAuthIdentity(auth, account);
+    const authIdentity = await this.#readAuthIdentityBindingObservation();
+    if (authIdentity === null) {
+      throw new Error("Cloud account operation authority is unavailable.");
+    }
+    const authority = { account, auth, authIdentity } satisfies AccountOperationAuthority;
+    await this.#assertLocalAccountOperationAuthority(authority);
+    return authority;
+  }
+
+  async #assertLocalAccountOperationAuthority(
+    authority: AccountOperationAuthority,
+  ): Promise<void> {
+    await this.#deploymentAuthority.assertCurrent();
+    await this.#assertExactAuthenticatedAuth(authority.auth);
+    if (this.#identityCustody !== null) {
+      await this.#identityCustody.assertCurrentIdentity(authority.account.userPublicId);
+    }
+    const currentBinding = await this.#secrets.read(authIdentitySlot);
+    const expectedDigest = createHash("sha256")
+      .update(authority.auth.serialized)
+      .digest("hex");
+    if (
+      currentBinding === null
+      || currentBinding.generation !== authority.authIdentity.generation
+      || currentBinding.value !== authority.authIdentity.serialized
+      || authority.authIdentity.value.authDigest !== expectedDigest
+      || authority.authIdentity.value.authEpoch !== authority.account.authEpoch
+      || authority.authIdentity.value.authGeneration !== authority.auth.generation
+      || authority.authIdentity.value.userPublicId !== authority.account.userPublicId
+    ) throw new Error("Cloud account operation authority changed.");
+    await this.#assertExactAuthenticatedAuth(authority.auth);
+    if (this.#identityCustody !== null) {
+      await this.#identityCustody.assertCurrentIdentity(authority.account.userPublicId);
+    }
+    await this.#deploymentAuthority.assertCurrent();
+  }
+
+  async #assertServerAccountOperationAuthority(
+    authority: AccountOperationAuthority,
+  ): Promise<void> {
+    await this.#assertLocalAccountOperationAuthority(authority);
+    const current = parseAccountContext(
+      await this.#transport.query("account:current", {}),
+    );
+    await this.#assertLocalAccountOperationAuthority(authority);
+    if (!sameAccountContext(current, authority.account)) {
+      throw new Error("Cloud account operation authority changed.");
+    }
+  }
+
   async #readAccount(refresh: boolean): Promise<AccountContext> {
     if (refresh) await this.#ensureFreshAuth();
     else if (await this.#readAuth() === null) throw new Error("Cloud auth is unavailable.");
+    let auth = await this.#requireAuthenticatedAuthObservation();
     let account: AccountContext;
     try {
       account = parseAccountContext(await this.#transport.query("account:current", {}));
     } catch (error: unknown) {
       if (!refresh) throw error;
       await this.#ensureFreshAuth(true);
+      auth = await this.#requireAuthenticatedAuthObservation();
       account = parseAccountContext(await this.#transport.query("account:current", {}));
     }
+    await this.#assertExactAuthenticatedAuth(auth);
+    await this.#bindAuthIdentity(auth, account);
     return account;
   }
 
-  async #accountKeyPairingRequired(account: AccountContext): Promise<boolean> {
-    if (account.device?.status !== "active") return false;
+  #accountKeyRecoveryAuthority(
+    account: AccountContext & { device: NonNullable<AccountContext["device"]> },
+  ): AccountKeyRecoveryAuthority {
+    return {
+      authEpoch: account.authEpoch,
+      devicePublicId: account.device.publicId,
+      keyVersion: account.device.keyVersion,
+      userPublicId: account.userPublicId,
+    };
+  }
+
+  #sameAccountKeyRecoveryAuthority(
+    observation: AccountKeyRecoveryObservation,
+    authority: AccountKeyRecoveryAuthority,
+  ): boolean {
+    return observation.authEpoch === authority.authEpoch
+      && observation.devicePublicId === authority.devicePublicId
+      && observation.keyVersion === authority.keyVersion
+      && observation.userPublicId === authority.userPublicId;
+  }
+
+  #usableAccountKey(
+    key: AccountKeySecret | null,
+    authority: Pick<AccountKeyRecoveryAuthority, "keyVersion" | "userPublicId">,
+  ): key is AccountKeySecret {
+    return key !== null
+      && key.userPublicId === authority.userPublicId
+      && key.keyVersion === authority.keyVersion
+      && !key.provisional;
+  }
+
+  async #accountKeyStatus(
+    account: AccountContext,
+    operationAuthority?: AccountOperationAuthority,
+  ): Promise<AccountKeyStatus | null> {
+    const assertAuthority = async (): Promise<void> => {
+      if (operationAuthority === undefined) return;
+      if (!sameAccountContext(account, operationAuthority.account)) {
+        throw new Error("Cloud account operation authority changed.");
+      }
+      await this.#assertLocalAccountOperationAuthority(operationAuthority);
+    };
+    await assertAuthority();
+    if (account.device?.status !== "active") return null;
+    const authority = this.#accountKeyRecoveryAuthority({ ...account, device: account.device });
+    await assertAuthority();
     const key = await this.#readAccountKey();
-    return key === null
-      || key.userPublicId !== account.userPublicId
-      || key.keyVersion !== account.device.keyVersion
-      || key.provisional;
+    await assertAuthority();
+    if (this.#usableAccountKey(key, authority)) {
+      await assertAuthority();
+      await this.#supersedeAccountKeyRecovery(key);
+      await assertAuthority();
+      return { keyVersion: key.keyVersion, status: "ready" };
+    }
+    await assertAuthority();
+    const state = await this.#readState();
+    await assertAuthority();
+    const observed = state.accountKeyRecovery;
+    if (
+      observed !== null
+      && this.#sameAccountKeyRecoveryAuthority(observed, authority)
+      && observed.status === "unrecoverable"
+    ) {
+      await assertAuthority();
+      return {
+        evidence: "operator_confirmed_no_key_holders",
+        status: "unrecoverable",
+      };
+    }
+    await assertAuthority();
+    await this.#updateState((current) => {
+      const recovery = current.accountKeyRecovery;
+      if (
+        recovery !== null
+        && this.#sameAccountKeyRecoveryAuthority(recovery, authority)
+        && (recovery.status === "pairing_required" || recovery.status === "unrecoverable")
+      ) return current;
+      return {
+        ...current,
+        accountKeyRecovery: {
+          ...authority,
+          observedAt: this.#now(),
+          status: "pairing_required",
+        },
+      };
+    });
+    await assertAuthority();
+    return {
+      ifNoHolder: "unrecoverable",
+      recovery: "existing_key_holder_required",
+      status: "pairing_required",
+    };
+  }
+
+  async #supersedeAccountKeyRecovery(key: AccountKeySecret): Promise<void> {
+    if (key.provisional) return;
+    await this.#updateState((current) => {
+      const recovery = current.accountKeyRecovery;
+      if (
+        recovery === null
+        || recovery.status === "superseded"
+        || recovery.userPublicId !== key.userPublicId
+        || recovery.keyVersion !== key.keyVersion
+      ) return current;
+      const prior = recovery.status === "unrecoverable"
+        ? {
+            acknowledgedAt: recovery.acknowledgedAt,
+            evidence: recovery.evidence,
+            observedAt: recovery.observedAt,
+            status: recovery.status,
+          } as const
+        : { observedAt: recovery.observedAt, status: recovery.status } as const;
+      return {
+        ...current,
+        accountKeyRecovery: {
+          authEpoch: recovery.authEpoch,
+          devicePublicId: recovery.devicePublicId,
+          keyVersion: recovery.keyVersion,
+          prior,
+          reason: "account_key_obtained",
+          status: "superseded",
+          supersededAt: this.#now(),
+          userPublicId: recovery.userPublicId,
+        },
+      };
+    });
   }
 
   async #requireActiveDevice(): Promise<AccountContext & {
@@ -3266,15 +4003,59 @@ export class LocalCloudControl implements CloudControlPort {
     return { ...account, device: account.device };
   }
 
-  async #listDeviceRecords(): Promise<readonly DeviceRecord[]> {
+  async #requireActiveDeviceOperationAuthority(): Promise<Readonly<{
+    account: AccountContext & { device: NonNullable<AccountContext["device"]> };
+    authority: AccountOperationAuthority;
+  }>> {
+    const authority = await this.#openAccountOperationAuthority(true);
+    const account = authority.account;
+    if (account.device === null) throw new Error("Pair this device before using cloud sync.");
+    if (account.device.status !== "active") {
+      throw new Error("This cloud device is awaiting approval.");
+    }
+    await this.#assertLocalAccountOperationAuthority(authority);
+    const localDevice = await this.#readDevice();
+    await this.#assertLocalAccountOperationAuthority(authority);
+    if (
+      localDevice === null
+      || !localDevice.registered
+      || localDevice.userPublicId !== account.userPublicId
+      || localDevice.publicId !== account.device.publicId
+    ) throw new Error("The active cloud device key is unavailable; recovery is required.");
+    await this.#hydrateAccountKey(account, localDevice, authority);
+    await this.#assertServerAccountOperationAuthority(authority);
+    return {
+      account: { ...account, device: account.device },
+      authority,
+    };
+  }
+
+  async #listDeviceRecords(
+    expectedUserPublicId: string,
+    operationAuthority?: AccountOperationAuthority,
+  ): Promise<readonly DeviceRecord[]> {
     const devices: DeviceRecord[] = [];
     const publicIds = new Set<string>();
     let cursor: string | null = null;
     let isDone = false;
     for (let pageNumber = 0; pageNumber < 50 && !isDone; pageNumber += 1) {
-      const result = parseDevicePage(await this.#transport.query("devices:listPage", {
+      if (operationAuthority !== undefined) {
+        await this.#assertServerAccountOperationAuthority(operationAuthority);
+      }
+      const response = await this.#transport.query("devices:listPage", {
         paginationOpts: { cursor, numItems: 100 },
-      }));
+      });
+      if (operationAuthority !== undefined) {
+        await this.#assertLocalAccountOperationAuthority(operationAuthority);
+      }
+      const result = parseDevicePage(response);
+      if (
+        result.userPublicId !== expectedUserPublicId
+        || result.page.some((device) => device.userPublicId !== expectedUserPublicId)
+      ) throw new Error("Cloud device page changed account authority.");
+      if (operationAuthority !== undefined) {
+        await this.#assertServerAccountOperationAuthority(operationAuthority);
+      }
       for (const device of result.page) {
         if (publicIds.has(device.publicId)) {
           throw new Error("Cloud device pagination repeated an identity.");
@@ -3291,16 +4072,22 @@ export class LocalCloudControl implements CloudControlPort {
     return devices;
   }
 
-  async #resolveDevice(selector: string): Promise<DeviceRecord> {
+  async #resolveDevice(selector: string, expectedUserPublicId: string): Promise<DeviceRecord> {
     const normalized = selector.trim();
     if (normalized.length < 1 || normalized.length > 200) {
       throw new Error("Cloud device selector is invalid.");
     }
     if (isOpaqueIdentifier(normalized)) {
       const exact = await this.#transport.query("devices:get", { publicId: normalized });
-      if (exact !== null) return parseDeviceRecord(exact);
+      if (exact !== null) {
+        const parsed = parseDeviceRecord(exact);
+        if (parsed.userPublicId !== expectedUserPublicId) {
+          throw new Error("Cloud device response changed account authority.");
+        }
+        return parsed;
+      }
     }
-    const devices = await this.#listDeviceRecords();
+    const devices = await this.#listDeviceRecords(expectedUserPublicId);
     const prefix = devices.filter((device) => device.publicId.startsWith(normalized));
     if (prefix.length === 1 && prefix[0] !== undefined) return prefix[0];
     if (prefix.length === 0) throw new Error("Cloud device was not found.");
@@ -3347,15 +4134,31 @@ export class LocalCloudControl implements CloudControlPort {
     return refreshed;
   }
 
-  async #hydrateAccountKey(account: AccountContext, device: DeviceSecret): Promise<void> {
+  async #hydrateAccountKey(
+    account: AccountContext,
+    device: DeviceSecret,
+    operationAuthority?: AccountOperationAuthority,
+  ): Promise<void> {
+    const assertAuthority = async (server: boolean): Promise<void> => {
+      if (operationAuthority === undefined) return;
+      if (!sameAccountContext(account, operationAuthority.account)) {
+        throw new Error("Cloud account operation authority changed.");
+      }
+      if (server) await this.#assertServerAccountOperationAuthority(operationAuthority);
+      else await this.#assertLocalAccountOperationAuthority(operationAuthority);
+    };
+    await assertAuthority(false);
     const current = await this.#readAccountKey();
+    await assertAuthority(false);
     if (
       current !== null
       && current.userPublicId === account.userPublicId
       && current.keyVersion === account.device?.keyVersion
       && !current.provisional
     ) return;
+    await assertAuthority(true);
     const value = await this.#transport.query("devices:listKeyEnvelopes", {});
+    await assertAuthority(false);
     if (!Array.isArray(value) || value.length > 16) {
       throw new Error("Cloud account-key response is invalid.");
     }
@@ -3383,6 +4186,7 @@ export class LocalCloudControl implements CloudControlPort {
       devicePublicId: device.publicId,
       userPublicId: account.userPublicId,
     });
+    await assertAuthority(true);
     await this.#writeAccountKey({
       key: encodeBase64Url(bytes),
       keyVersion: expectedVersion,
@@ -3390,6 +4194,7 @@ export class LocalCloudControl implements CloudControlPort {
       userPublicId: account.userPublicId,
       version: 1,
     });
+    await assertAuthority(true);
   }
 
   async #generateDeviceSecret(userPublicId: string): Promise<DeviceSecret> {
@@ -3606,6 +4411,73 @@ export class LocalCloudControl implements CloudControlPort {
   async #readAuth(): Promise<AuthSecret | null> {
     const observation = await this.#readAuthCustodyObservation();
     return observation?.value.kind === "authenticated" ? observation.value.auth : null;
+  }
+
+  async #readAuthIdentityBinding(): Promise<AuthIdentityBinding | null> {
+    return (await this.#readAuthIdentityBindingObservation())?.value ?? null;
+  }
+
+  async #readAuthIdentityBindingObservation(): Promise<SecretObservation<AuthIdentityBinding> | null> {
+    const observation = await this.#secrets.read(authIdentitySlot);
+    return observation === null ? null : {
+      generation: observation.generation,
+      serialized: observation.value,
+      value: parseAuthIdentityBinding(observation.value),
+    };
+  }
+
+  async #requireAuthenticatedAuthObservation(): Promise<SecretObservation<
+    Extract<AuthCustody, Readonly<{ kind: "authenticated" }>>
+  >> {
+    const observation = await this.#readAuthCustodyObservation();
+    if (observation?.value.kind !== "authenticated") {
+      throw new Error("Cloud auth is unavailable.");
+    }
+    return {
+      generation: observation.generation,
+      serialized: observation.serialized,
+      value: observation.value,
+    };
+  }
+
+  async #assertExactAuthenticatedAuth(
+    expected: Readonly<{ generation: number; serialized: string }>,
+  ): Promise<void> {
+    const current = await this.#readAuthCustodyObservation();
+    if (
+      current?.value.kind !== "authenticated"
+      || current.generation !== expected.generation
+      || current.serialized !== expected.serialized
+    ) throw new Error("Cloud auth changed during account identity binding.");
+  }
+
+  async #bindAuthIdentity(
+    auth: Readonly<{ generation: number; serialized: string }>,
+    account: AccountContext,
+  ): Promise<void> {
+    const binding: AuthIdentityBinding = {
+      authDigest: createHash("sha256").update(auth.serialized).digest("hex"),
+      authEpoch: account.authEpoch,
+      authGeneration: auth.generation,
+      userPublicId: account.userPublicId,
+      version: 1,
+    };
+    const serialized = serializeSecret(binding);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await this.#assertExactAuthenticatedAuth(auth);
+      const current = await this.#secrets.read(authIdentitySlot);
+      if (current?.value === serialized) return;
+      const committed = await this.#secrets.compareAndSwap(
+        authIdentitySlot,
+        current?.generation ?? null,
+        serialized,
+      );
+      if (committed !== null) {
+        await this.#assertExactAuthenticatedAuth(auth);
+        return;
+      }
+    }
+    throw new Error("Cloud auth-identity binding changed concurrently.");
   }
 
   async #readTransportAuth(): Promise<AuthSecret | null> {
@@ -3831,8 +4703,29 @@ export class LocalCloudControl implements CloudControlPort {
   async #readState(): Promise<LocalCloudState> {
     const observation = await this.#secrets.read(stateSlot);
     return observation === null
-      ? { lastSync: null, version: 1 }
+      ? { accountKeyRecovery: null, lastSync: null, version: 2 }
       : parseLocalState(observation.value);
+  }
+
+  async #updateState(
+    update: (current: LocalCloudState) => LocalCloudState,
+  ): Promise<LocalCloudState> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await this.#secrets.read(stateSlot);
+      const parsed = current === null
+        ? { accountKeyRecovery: null, lastSync: null, version: 2 } as const
+        : parseLocalState(current.value);
+      const next = update(parsed);
+      const serialized = serializeSecret(next);
+      if (current?.value === serialized) return next;
+      const committed = await this.#secrets.compareAndSwap(
+        stateSlot,
+        current?.generation ?? null,
+        serialized,
+      );
+      if (committed !== null) return next;
+    }
+    throw new Error("Cloud local state changed concurrently.");
   }
 
   async #readDeviceMutationCustody(
@@ -4109,7 +5002,7 @@ export class LocalCloudControl implements CloudControlPort {
     }
     await this.#clearExactSecret(registrationSlot, observation);
     return {
-      device: rebound.device,
+      device: publicAccountDevice(rebound.device),
       paired: rebound.device.status === "active",
       ...(replay ? { replay: true } : {}),
     };
@@ -4218,6 +5111,7 @@ export class LocalCloudControl implements CloudControlPort {
 
   async #writeAccountKey(value: AccountKeySecret): Promise<void> {
     await this.#writeSecret(accountKeySlot, serializeSecret(value));
+    await this.#supersedeAccountKeyRecovery(value);
   }
 
   async #writeSecret(slot: string, value: string): Promise<Readonly<{

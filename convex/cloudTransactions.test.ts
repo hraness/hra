@@ -162,6 +162,12 @@ describe("cloud transactions", () => {
   test("fences one encrypted command effect under an exact device and lease", async () => {
     const world = await authenticatedWorld();
     const now = Date.now();
+    expect(await world.runtime.query(accountCurrent, {})).toEqual({
+      authEpoch: 1,
+      device: null,
+      hasActiveDevices: false,
+      userPublicId: String(world.ids.userId),
+    });
     const registerKey = uuidV7(now, "1");
     const registered = await world.runtime.mutation(register, {
       bootstrapKeyEnvelope: wrappedKeyEnvelope,
@@ -203,9 +209,17 @@ describe("cloud transactions", () => {
       signingPublicKey: publicKey,
       wrappingPublicKey: publicKey,
     }), "Cloud authority is not current");
-    expect(await world.runtime.query(accountCurrent, {})).toMatchObject({
+    expect(await world.runtime.query(accountCurrent, {})).toEqual({
       authEpoch: 1,
-      device: { publicId: "device_12345678", status: "active" },
+      device: {
+        credentialGeneration: 1,
+        keyVersion: 1,
+        publicId: "device_12345678",
+        revision: 1,
+        status: "active",
+      },
+      hasActiveDevices: true,
+      userPublicId: String(world.ids.userId),
     });
 
     const secondAuthSessionId = await world.testRuntime.run(async (ctx) =>
@@ -228,8 +242,17 @@ describe("cloud transactions", () => {
       signingPublicKey: publicKey,
       wrappingPublicKey: publicKey,
     })).toEqual(registered);
-    expect(await secondAuthSession.query(accountCurrent, {})).toMatchObject({
-      device: { publicId: "device_12345678", status: "active" },
+    expect(await secondAuthSession.query(accountCurrent, {})).toEqual({
+      authEpoch: 1,
+      device: {
+        credentialGeneration: 1,
+        keyVersion: 1,
+        publicId: "device_12345678",
+        revision: 1,
+        status: "active",
+      },
+      hasActiveDevices: true,
+      userPublicId: String(world.ids.userId),
     });
     expect(await world.testRuntime.run(async (ctx) =>
       (await ctx.db.query("devices").collect()).length)).toBe(1);
@@ -237,7 +260,14 @@ describe("cloud transactions", () => {
       .toMatchObject({ publicId: "device_12345678", status: "active" });
     expect(await world.runtime.query(listDevicePage, {
       paginationOpts: { cursor: null, numItems: 100 },
-    })).toMatchObject({ isDone: true, page: [{ publicId: "device_12345678" }] });
+    })).toMatchObject({
+      isDone: true,
+      page: [{
+        publicId: "device_12345678",
+        userPublicId: String(world.ids.userId),
+      }],
+      userPublicId: String(world.ids.userId),
+    });
 
     await world.runtime.mutation(upsertUsageAccount, {
       encryptedLocalReference: encryptedEnvelope,

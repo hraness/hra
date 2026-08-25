@@ -18,6 +18,11 @@ import {
   type GeneratedHostedSecrets,
 } from "./configure-hosted-sync";
 import {
+  BoundedProcessCleanupUnprovenError,
+  BoundedProcessContainmentUnavailableError,
+  BoundedProcessRecoveryJournalError,
+} from "./bounded-process";
+import {
   HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
@@ -162,6 +167,7 @@ describe("fresh hosted configuration", () => {
 
     expect(result).toBe(0);
     expect(requests).toHaveLength(3);
+    expect(requests.every((request) => request.containment === "authority")).toBe(true);
     expect(requests.map((request) => request.arguments.slice(1))).toEqual([
       ["env", "list", "--names-only", "--deployment", target.deploymentName],
       ["env", "set", "--deployment", target.deploymentName],
@@ -257,6 +263,113 @@ describe("fresh hosted configuration", () => {
     }
   });
 
+  test("refuses before an authority command starts without reporting cleanup recovery", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    expect(await executeHostedSetup({
+      arguments: targetArguments,
+      generate: async () => generatedSentinels,
+      inputDocument: protectedDocument,
+      runner: async () => {
+        runnerCalls += 1;
+        throw new BoundedProcessContainmentUnavailableError(
+          "authority_unsupported_platform",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(1);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "authority_containment_unavailable",
+      reason: "authority_unsupported_platform",
+      schemaVersion: 1,
+      status: "refused",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
+  });
+
+  test("preserves a mutation recovery journal without target postflight", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    const recoveryPath = "/private/operator/process-recovery/authority-configure.json";
+    expect(await executeHostedSetup({
+      arguments: targetArguments,
+      generate: async () => generatedSentinels,
+      inputDocument: protectedDocument,
+      runner: async () => {
+        runnerCalls += 1;
+        if (runnerCalls === 1) return { exitCode: 0, stderr: "", stdout: "" };
+        throw new BoundedProcessRecoveryJournalError(
+          [recoveryPath],
+          "authority_recovery_required",
+        );
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => {
+        verifications += 1;
+        if (verifications === 2) throw new Error("postflight target identity changed");
+      },
+    })).toBe(75);
+    expect(runnerCalls).toBe(2);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_recovery_journal_blocked",
+      reason: "authority_recovery_required",
+      recoveryPaths: [recoveryPath],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
+  test("renders unproven cleanup as a recovery-required temporary failure", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+    let verifications = 0;
+    const recoveryPath = "/private/operator/process-recovery/local-configure.json";
+    const cleanup = new BoundedProcessCleanupUnprovenError(
+      42_432,
+      "convex-env-read",
+    ).retainRecoveryPath(recoveryPath);
+    expect(await executeHostedSetup({
+      arguments: targetArguments,
+      generate: async () => generatedSentinels,
+      inputDocument: protectedDocument,
+      runner: async () => {
+        runnerCalls += 1;
+        throw cleanup;
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      verifyTarget: async () => { verifications += 1; },
+    })).toBe(75);
+    expect(runnerCalls).toBe(1);
+    expect(verifications).toBe(1);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "process_cleanup_unproven",
+      phase: "convex-env-read",
+      processGroupId: 42_432,
+      processes: [{
+        phase: "convex-env-read",
+        recoveryIdentity: { containment: "local", processGroupId: 42_432 },
+      }],
+      recoveryPaths: [recoveryPath],
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+  });
+
   test("accepts one strict bounded document and a closed deployment selector", () => {
     expect(parseHostedArguments([
       ...targetArguments,
@@ -337,10 +450,12 @@ describe("protected operator process boundaries", () => {
     const environment = buildConvexChildEnvironment(process.env, []);
     const timeout = await runCommand({
       arguments: ["-e", "setInterval(() => undefined, 1000)"],
+      containment: "local",
       cwd: import.meta.dir,
       environment,
       executable: process.execPath,
       outputMaximumBytes: 1_024,
+      phase: "hosted-timeout-proof",
       stdin: "",
       timeoutMs: 25,
     });
@@ -348,10 +463,12 @@ describe("protected operator process boundaries", () => {
 
     const overflow = await runCommand({
       arguments: ["-e", "process.stdout.write('x'.repeat(4096))"],
+      containment: "local",
       cwd: import.meta.dir,
       environment,
       executable: process.execPath,
       outputMaximumBytes: 64,
+      phase: "hosted-overflow-proof",
       stdin: "",
       timeoutMs: 1_000,
     });

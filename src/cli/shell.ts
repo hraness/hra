@@ -304,6 +304,7 @@ export const shellHelp = `Shell commands
   /events                   Read the selected session's next event page
   /watch                    Follow the selected session as JSONL
   /interactions             List pending interactions for the selected session
+  /interaction show ID      Show one interaction's questions, choices, or form fields
   /inspect ID --revision N  Show exact live approval authority in the protected terminal
   /approve ID --revision N  Approve once unless --decision is supplied
   /decline ID --revision N  Decline an interaction

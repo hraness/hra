@@ -7,9 +7,17 @@ import {
   completeProtectedAuthLogin,
   completeProtectedInteraction,
   parseCli,
+  requestsJsonlOutput,
 } from "./parser";
 
 describe("CLI parser", () => {
+  test("detects machine streaming intent only before the literal delimiter", () => {
+    expect(requestsJsonlOutput(["session", "events", "release", "--jsonl"])).toBe(true);
+    expect(requestsJsonlOutput(["session", "events", "release", "--follow"])).toBe(true);
+    expect(requestsJsonlOutput(["session", "send", "release", "--", "please use --jsonl"])).toBe(false);
+    expect(requestsJsonlOutput(["session", "send", "release", "--", "--follow"])).toBe(false);
+  });
+
   test("keeps the protected login handoff path at the CLI boundary", () => {
     const idempotencyKey = "00000000-0000-4000-8000-000000000101";
     expect(parseCli([
@@ -424,6 +432,42 @@ describe("CLI parser", () => {
     ])).toThrow("current UUIDv7");
   });
 
+  test("parses only the exact local account-key loss acknowledgement", () => {
+    expect(parseCli([
+      "device",
+      "key-loss",
+      "--acknowledge-no-key-holders",
+      "--json",
+    ])).toEqual({
+      command: {
+        acknowledgeNoKeyHolders: true,
+        kind: "device.key-loss",
+      },
+      json: true,
+      kind: "command",
+    });
+    for (const argv of [
+      ["device", "key-loss"],
+      ["device", "key-loss", "--acknowledge"],
+      ["device", "key-loss", "--acknowledge-no-key-holders", "extra"],
+      [
+        "device",
+        "key-loss",
+        "--acknowledge-no-key-holders",
+        "--acknowledge-no-key-holders",
+      ],
+      [
+        "device",
+        "key-loss",
+        "--acknowledge-no-key-holders",
+        "--idempotency-key",
+        "018bcfe5-6800-7000-8000-000000000099",
+      ],
+    ] as const) {
+      expect(() => parseCli(argv)).toThrow(CliUsageError);
+    }
+  });
+
   test("admits append-only projection recovery only with an explicit gap acknowledgement", () => {
     const warning = parseCli([
       "sync",
@@ -596,8 +640,51 @@ describe("CLI parser", () => {
       jsonl: true,
       kind: "session.events.follow",
     });
+    expect(parseCli(["session", "events", "release", "--jsonl"])).toEqual({
+      command: {
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 30_000,
+      },
+      jsonl: true,
+      kind: "session.events.follow",
+    });
+    expect(parseCli(["session", "events", "release", "--follow", "--jsonl"])).toEqual({
+      command: {
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 30_000,
+      },
+      jsonl: true,
+      kind: "session.events.follow",
+    });
+    expect(parseCli([
+      "session",
+      "events",
+      "release",
+      "--jsonl",
+      "--wait-ms",
+      "2500",
+    ])).toEqual({
+      command: {
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 2_500,
+      },
+      jsonl: true,
+      kind: "session.events.follow",
+    });
     expect(() => parseCli(["session", "events", "release", "--follow", "--json"]))
       .toThrow("already JSON Lines");
+    expect(() => parseCli(["session", "events", "release", "--jsonl", "--json"]))
+      .toThrow("mutually exclusive");
+    expect(() => parseCli(["session", "status", "release", "--jsonl"]))
+      .toThrow("supported only by `hra session events`");
+    expect(() => parseCli(["account", "list", "--jsonl"]))
+      .toThrow("supported only by `hra session events`");
     expect(parseCli([
       "session",
       "interactions",

@@ -10,6 +10,14 @@ Never copy HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC 
 
 The provider identity guard pins the intended Convex team to numeric ID `513923` and provider slug `cclrte`. HRA v0 owns Convex project ID `2680173` and production deployment ID `4677913`; neither may be renamed into or selected by this runbook. The new source repository has GitHub repository ID `1343008607`, and the new web project has Vercel project ID `prj_8ciIt9t9foE3utG45frRN7cxckjS`. Project and deployment names may change during cutover. The team identity and numeric resource IDs do not.
 
+Local hosted preparation can use a process-group recovery journal in the operating-system account's fixed `~/.local/state/hra/process-recovery/` directory. Mutable `HOME` and XDG values cannot redirect it. A private lock serializes startup recovery with launch; a durable pending intent remains behind a private child gate until an active process-group journal has been atomically published, synced, and read back. Protected ancestry, exact ownership and modes, descriptor identity, and macOS ACL authority are rechecked. An active journal is cleared only after the operating system proves that the exact process group is absent. A pending journal proves the child never crossed its gate, while an incomplete promotion is a hard stop.
+
+This local custody covers only its recorded process group. A descendant can escape with a new session or a double fork. It is not a sandbox and it cannot authorize a Convex subprocess.
+
+Convex subprocesses are `authority` work. They require the supported Linux native authority backend for descendant-lifetime custody. It verifies the pinned helper, materializes a sealed in-memory executable, journals exact host, boot, PID-namespace, mount-namespace, outer-process, and namespace-init identity before `GO`, rejects inherited recovery-directory mount aliases, and relies on a private PID-namespace reaper rather than a process group. The outer supervisor and namespace PID 1 independently enforce the same authenticated monotonic deadline. Any unavailable or unproven backend refuses before it starts the Convex target or retains recovery evidence. macOS and other unsupported platforms refuse as unsupported. There is no local-process-group fallback. The commands below describe the guarded hosted procedure, not authorization to perform a provider action.
+
+For local work, `process_cleanup_unproven` and `process_recovery_journal_blocked` are terminal recovery states and exit `75`. Preserve every sorted `recoveryPaths` entry and do not retry the associated local operation while its recorded group may still be live. Hosted bootstrap and invitation results retain the protected invite file after capability commit; attested deploy results retain the final evidence path, its `.intent`, and every child-reachable source or binding root whose cleanup is unproven. Even after authority custody is accepted, it will not be a sandbox or prove that a remote effect did not occur. Durable intents and receipts, provider idempotency, and exact reconciliation remain mandatory for every ambiguous Convex result.
+
 ## Migrate staged prerelease secret pointers
 
 This compatibility operator is only for repository checkouts that ran an unpublished prerelease HRA v1 build on macOS when the default secret backend was Keychain. No HRA v1 beta containing that default was published. This command is therefore a repository-operator migration for staged prerelease state, not an installed-product feature, a daemon fallback, or a reason to make the daemon read Keychain.
@@ -53,6 +61,45 @@ The operation is safe to replay after a crash or refusal. Exact copies are accep
    The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, the exact project, deployment, production type, generated deployment name, URL, and two matching default-production facts: the deployment reports `isDefault: true` and the project names that deployment as `prodDeploymentName`. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the HRA v0 numeric IDs.
 
    The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. Convex uses that value as project context and deploys to the project's current default production deployment, so the matching default-production readbacks are part of the target guard rather than an informational check. After Convex resolves the actual deployment credentials and before it pushes, its mandatory `--cmd` exposes the resolved canonical cloud URL only to a silent local assertion. That assertion must match the exact expected deployment URL or the deploy stops before `runPush`; a later default change cannot redirect the already-resolved credentials. The helper disables Convex's optional pre-command WorkOS provisioning because HRA does not use Convex AuthKit and no provider mutation may precede this assertion. It otherwise invokes `convex deploy --env-file` with confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. Provider output is suppressed. A failure, changed default, resolved-target mismatch, or dirty postflight leaves the deployment quarantined for inspection; do not retry it.
+
+## Release deployment evidence
+
+The ordinary first deployment above installs the tracked `releaseAttestation:read` query in its explicit unbound state. The query exposes only schema identity and binding state. It contains no credential, provider response, deployment selector, or secret. A transport failure, missing function, malformed response, or timed-out query is ambiguous and never counts as an unbound runtime.
+
+Create release evidence only from a clean detached worktree at the exact source commit. The evidence directory must be canonical, invoking-user-owned, and mode `0700`; each output path must not name a symlink or unsafe existing file. Bind the first release deployment as the bootstrap phase:
+
+```sh
+bun run hosted:deploy -- \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --source-commit <BOOTSTRAP_COMMIT> \
+  --phase bootstrap \
+  --evidence-path /protected/release/bootstrap-deploy.json
+```
+
+The bootstrap pre-read must positively return the tracked unbound attestation. HRA records a protected intent before deployment. It creates a private temporary tree with `git archive` from the exact clean commit, overlays only `convex/releaseAttestation.ts` with the bound source commit, fresh runtime revision, deployment time, and null predecessor, and deploys from that tree. The operator checkout remains unchanged. The postflight query must return that exact attestation on the same fixed numeric target tuple before final evidence is published.
+
+Deploy the candidate from its exact clean detached commit and bind it to the bootstrap receipt:
+
+```sh
+bun run hosted:deploy -- \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --source-commit <N_COMMIT> \
+  --phase candidate \
+  --previous-deploy-evidence /protected/release/bootstrap-deploy.json \
+  --evidence-path /protected/release/candidate-deploy.json
+```
+
+The candidate intent requires its `before` attestation to equal the bootstrap `after` attestation, names the bootstrap evidence digest as its predecessor, advances deployment time and runtime revision, and binds `runtimeSourceCommit` to `N_COMMIT`. A bootstrap may be an earlier clean commit; the candidate must be the release commit. Losing CLI output never authorizes a speculative redeploy. A retry may finalize only when the durable intent, current runtime attestation, fixed target, and prior evidence still match exactly. Drift or an ambiguous provider read is a refusal. An exact completed evidence file replays through read-only attestation and target checks without deploying.
+
+Deployment intents and final documents use canonical SHA-256 JSON, bounded no-follow reads, exclusive mode-`0600` files, descriptor and path identity checks, file and directory sync, and atomic no-replace publication. Retain the `.intent` beside its final evidence until the release is complete.
 
 ## Configure secrets
 

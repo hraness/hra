@@ -18,6 +18,7 @@ import {
   parseCli,
   projectionRecoveryReplayCommand,
   requestsJsonOutput,
+  requestsJsonlOutput,
   usageForGroup,
   type CliInvocation,
   type ProjectionRecoveryCliInvocation,
@@ -32,7 +33,7 @@ import {
   ProtectedOutputFile,
   type DeviceLoginDocument,
 } from "./cli/protected-output";
-import { renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
+import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
 import { redactCompleteSensitiveText } from "./cli/sensitive-text";
 import { compileShellLine, formatShellPrompt, shellHelp, type ShellSelection } from "./cli/shell";
 import { ShellLiveObserver } from "./cli/shell-live";
@@ -1941,6 +1942,7 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
   }
   const cliPath = process.argv[1] ?? import.meta.path;
   const paths = installation.paths;
+  await requireInitializedDaemonState(paths);
   await initializeStatePaths(paths);
   const child = Bun.spawn([process.execPath, cliPath, "daemon", "run"], {
     detached: true,
@@ -1979,6 +1981,49 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
   }
 }
 
+const initializationRequired = (): CommandFailure => new CommandFailure(
+  "INTERACTION_REQUIRED",
+  "Initialize HRA before starting its daemon.",
+  { nextCommand: "hra init --yes" },
+);
+
+async function requireInitializedDaemonState(paths: StatePaths): Promise<void> {
+  try {
+    await lstat(paths.database);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw initializationRequired();
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "HRA could not prove that local state is initialized. Inspect it before starting the daemon.",
+      { nextCommand: "hra doctor --offline" },
+    );
+  }
+  let store: StateStore | undefined;
+  let inspectionFailure: CommandFailure | undefined;
+  try {
+    store = new StateStore(paths, { readonly: true });
+    if (store.listProjects().length === 0) throw initializationRequired();
+  } catch (error: unknown) {
+    inspectionFailure = error instanceof CommandFailure
+      ? error
+      : new CommandFailure(
+          "RECOVERY_REQUIRED",
+          "HRA could not prove that local state is initialized. Inspect it before starting the daemon.",
+          { nextCommand: "hra doctor --offline" },
+        );
+  }
+  try {
+    store?.close();
+  } catch {
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      "HRA could not close its initialization inspection safely. Inspect local state before starting the daemon.",
+      { nextCommand: "hra doctor --offline" },
+    );
+  }
+  if (inspectionFailure !== undefined) throw inspectionFailure;
+}
+
 async function callWithAutostart(
   installation: HraInstallation,
   command: LocalCommand,
@@ -1989,7 +2034,14 @@ async function callWithAutostart(
   const paths = installation.paths;
   return await callWithSafeAutostart(
     async () => await callLocalDaemon({ paths, command, ...(signal === undefined ? {} : { signal }) }),
-    async () => await (injectedStart ?? startDaemonProcess)(installation),
+    async () => {
+      if (injectedStart === undefined) {
+        await startDaemonProcess(installation);
+        return;
+      }
+      await requireInitializedDaemonState(paths);
+      await injectedStart(installation);
+    },
   );
 }
 
@@ -2167,7 +2219,11 @@ async function offlineDoctor(
   }
   if (database === "ready") {
     if (projectCount === 0) {
-      problems.push("No project directory is configured. Run `hra init --yes` or add a project.");
+      problems.push(
+        daemonAuthority.state === "held" || daemonAuthority.state === "releasing"
+          ? "No project directory is configured. Stop the daemon with `hra daemon stop`, then run `hra init --yes`."
+          : "No project directory is configured. Run `hra init --yes`.",
+      );
     }
     let unusableProjectRoots = 0;
     for (const projectRoot of projectRoots) {
@@ -2630,6 +2686,7 @@ export async function runDaemon(
 ): Promise<number> {
   assertInstallationHome(installation);
   const paths = installation.paths;
+  await requireInitializedDaemonState(paths);
   await initializeStatePaths(paths);
   await mkdir(paths.runtime, { recursive: true, mode: 0o700 });
   const daemonLock = await DaemonLock.acquire(paths);
@@ -3629,7 +3686,14 @@ export async function runPersistentShell(
         output.writeStderr(`hra: ${safeDiagnostic(message)}\n`);
       }
     }
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof CommandFailure) {
+      return renderFailure({
+        code: error.code,
+        message: error.message,
+        ...(error.details === undefined ? {} : { details: error.details }),
+      }, false, output);
+    }
     bestEffortStderr(output, "hra: HRA could not start or continue the shell safely.\n");
     return 1;
   } finally {
@@ -3890,6 +3954,7 @@ async function executeInvocation(
     } catch (error: unknown) {
       if (!isLocalDaemonUnavailable(error)) throw error;
     }
+    await requireInitializedDaemonState(installation.paths);
     await (input.startDaemon ?? startDaemonProcess)(installation);
     const response = await callLocalDaemon({ paths: installation.paths, command: { kind: "daemon.status" } });
     if (!response.ok) return renderFailure(response.error, invocation.json, output);
@@ -3985,6 +4050,7 @@ export async function main(
     ?? (process.stdin.isTTY && process.stderr.isTTY);
   if (argv.length === 0 && interactive) return await runPersistentShell(output, resolvedInput);
   const json = requestsJsonOutput(argv);
+  const jsonl = requestsJsonlOutput(argv);
   let invocation: CliInvocation | undefined;
   try {
     invocation = parseCli(argv);
@@ -4020,9 +4086,16 @@ export async function main(
         ? sanitizeSyncDiagnostic(message)
         : message;
     if (error instanceof CliUsageError) {
+      if (jsonl) return renderJsonlFailure({ code: "INVALID_INPUT", message: error.message }, output);
       if (json) return renderFailure({ code: "INVALID_INPUT", message: error.message }, true, output);
       output.writeStderr(`hra: ${safeDiagnostic(error.message)}\n\n${usageForGroup(undefined)}\n`);
       return 2;
+    }
+    if (error instanceof InvalidCommandResponseError) {
+      return renderFailure({
+        code: "INVALID_RESPONSE",
+        message: "The HRA daemon returned an invalid response for this command.",
+      }, json, output);
     }
     if (error instanceof LocalDaemonIndeterminateError) {
       if (projectionRecovery !== undefined) {
@@ -4071,6 +4144,13 @@ export async function main(
       return renderFailure({
         code: "UNAVAILABLE",
         message: sanitizeDaemonDiagnostic(error.message),
+      }, json, output);
+    }
+    if (error instanceof CommandFailure) {
+      return renderFailure({
+        code: error.code,
+        message: error.message,
+        ...(error.details === undefined ? {} : { details: error.details }),
       }, json, output);
     }
     if (json) {

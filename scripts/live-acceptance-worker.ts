@@ -602,6 +602,14 @@ async function workerMain(): Promise<number> {
     if (process.cwd() !== descriptor.documentsDirectory) {
       throw new WorkerFailure("layout_invalid");
     }
+    const installation = createAcceptanceInstallation(descriptor);
+    const initializationOutput = new CapturedCliOutput();
+    const initializationExitCode = await cliMain(
+      ["init", "--yes"],
+      initializationOutput,
+      { installation, interactive: false },
+    );
+    if (initializationExitCode !== 0) throw new WorkerFailure("daemon_failed");
     const supervisor = new DaemonSupervisor(descriptor);
     await supervisor.start();
     if (process.env.HOME !== descriptor.expectedHomeDirectory) {

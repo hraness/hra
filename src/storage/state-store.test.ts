@@ -2871,6 +2871,257 @@ describe("StateStore", () => {
     })).toThrow("INTERACTION_AUTHORITY_CHANGED");
   });
 
+  for (const effect of ["known_unsent", "possibly_sent"] as const) {
+    test(`atomically quarantines an interaction persistence boundary that is ${effect}`, async () => {
+      const { store } = await fixture();
+      const profile = signInProfile(
+        store,
+        `Persistence ${effect}`,
+        `persistence-${effect}@example.com`,
+      );
+      const session = store.createSession({
+        profileId: profile.id,
+        preset: "high",
+        fastEnabled: false,
+      });
+      const connectionId = effect === "known_unsent"
+        ? "30100000-0000-4000-8000-000000000001"
+        : "30200000-0000-4000-8000-000000000001";
+      let request = 0;
+      const admit = (connection = connectionId) => {
+        request += 1;
+        return store.admitInteraction({
+          publicId: crypto.randomUUID(),
+          sessionId: session.id,
+          authority: {
+            profileId: profile.id,
+            processGeneration: profile.processGeneration,
+            connectionId: connection,
+            requestId: { type: "number", value: request },
+            method: "item/commandExecution/requestApproval",
+            requestDigest: request.toString(16).padStart(64, "0"),
+            threadId: "thread-persistence-quarantine",
+            turnId: "turn-persistence-quarantine",
+            itemId: `item-${String(request)}`,
+            approvalId: null,
+          },
+          kind: "command_approval",
+          blocking: true,
+          display: {
+            kind: "command_approval",
+            summary: "Quarantine the persistence boundary",
+            reason: null,
+            commandClass: "test",
+            workingDirectory: null,
+            availableDecisions: ["once", "decline", "cancel"],
+          },
+        }).record;
+      };
+      const focalBase = admit();
+      const focalPrepared = store.prepareInteractionResponse({
+        id: focalBase.publicId,
+        expectedRevision: focalBase.revision,
+        responseDigest: "a".repeat(64),
+      });
+      const focal = effect === "known_unsent"
+        ? focalPrepared
+        : store.markInteractionResponseWritten({
+            id: focalPrepared.publicId,
+            expectedRevision: focalPrepared.revision,
+            responseDigest: "a".repeat(64),
+          });
+      const peerPending = admit();
+      const peerPrepared = store.prepareInteractionResponse({
+        id: admit().publicId,
+        expectedRevision: 1,
+        responseDigest: "b".repeat(64),
+      });
+      const peerPreparedForWrite = store.prepareInteractionResponse({
+        id: admit().publicId,
+        expectedRevision: 1,
+        responseDigest: "c".repeat(64),
+      });
+      const peerWritten = store.markInteractionResponseWritten({
+        id: peerPreparedForWrite.publicId,
+        expectedRevision: peerPreparedForWrite.revision,
+        responseDigest: "c".repeat(64),
+      });
+      const otherConnection = admit("30900000-0000-4000-8000-000000000001");
+
+      expect(() => store.quarantineInteractionPersistenceBoundary({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        focalInteractionId: focal.publicId,
+        effect,
+        responseDigest: "f".repeat(64),
+      })).toThrow("INTERACTION_QUARANTINE_RESPONSE_CONFLICT");
+      expect(store.requireProfileById(profile.id).processGeneration).toBe(
+        profile.processGeneration,
+      );
+      expect(store.requireInteraction(focal.publicId)).toEqual(focal);
+      expect(store.requireInteraction(peerPending.publicId)).toEqual(peerPending);
+      expect(store.requireInteraction(otherConnection.publicId)).toEqual(otherConnection);
+
+      const quarantined = store.quarantineInteractionPersistenceBoundary({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        focalInteractionId: focal.publicId,
+        effect,
+        responseDigest: "a".repeat(64),
+      });
+
+      expect(quarantined.profile.processGeneration).toBe(profile.processGeneration + 1);
+      expect(quarantined.focalInteraction).toMatchObject({
+        publicId: focal.publicId,
+        state: effect === "known_unsent" ? "expired" : "resolution_unknown",
+        revision: focal.revision + 1,
+      });
+      expect(quarantined.terminalInteractions).toEqual([
+        expect.objectContaining({ publicId: focal.publicId }),
+        expect.objectContaining({ publicId: peerPending.publicId, state: "expired" }),
+        expect.objectContaining({ publicId: peerPrepared.publicId, state: "resolution_unknown" }),
+        expect.objectContaining({ publicId: peerWritten.publicId, state: "resolution_unknown" }),
+        expect.objectContaining({ publicId: otherConnection.publicId, state: "expired" }),
+      ]);
+      const terminalEvents = store.listSessionEvents({
+        sessionId: session.id,
+        afterSequence: 0,
+      }).events;
+      expect(terminalEvents).toHaveLength(quarantined.terminalInteractions.length);
+      expect(terminalEvents.map((event) => ({
+        accountId: event.accountId,
+        body: event.body,
+        providerGeneration: event.providerGeneration,
+      }))).toEqual(quarantined.terminalInteractions.map((interaction) => ({
+        accountId: profile.id,
+        body: {
+          type: "interaction_state",
+          interactionId: interaction.publicId,
+          state: interaction.state,
+          revision: interaction.revision,
+        },
+        providerGeneration: profile.processGeneration,
+      })));
+      expect(store.requireInteraction(otherConnection.publicId)).toMatchObject({
+        state: "expired",
+        revision: 2,
+      });
+      expect(() => store.prepareInteractionResponse({
+        id: otherConnection.publicId,
+        expectedRevision: otherConnection.revision,
+        responseDigest: "d".repeat(64),
+      })).toThrow("INTERACTION_AUTHORITY_CHANGED");
+
+      const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+      try {
+        for (const terminal of quarantined.terminalInteractions) {
+          expect(inspector.query(
+            `SELECT revision,state FROM provider_interaction_transitions
+             WHERE public_id=? ORDER BY revision DESC LIMIT 1`,
+          ).get(terminal.publicId)).toEqual({
+            revision: terminal.revision,
+            state: terminal.state,
+          });
+        }
+        expect(inspector.query(
+          "SELECT COUNT(*) AS count FROM provider_interaction_transitions WHERE public_id=?",
+        ).get(otherConnection.publicId)).toEqual({ count: 2 });
+      } finally {
+        inspector.close(false);
+      }
+    });
+  }
+
+  test("rolls back every quarantine transition when its generation fence cannot commit", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Persistence rollback", "persistence-rollback@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const connectionId = "30300000-0000-4000-8000-000000000001";
+    const admit = (requestId: number) => store.admitInteraction({
+      publicId: crypto.randomUUID(),
+      sessionId: session.id,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "number", value: requestId },
+        method: "item/tool/requestUserInput",
+        requestDigest: requestId.toString(16).padStart(64, "0"),
+        threadId: "thread-persistence-rollback",
+        turnId: null,
+        itemId: null,
+        approvalId: null,
+      },
+      kind: "user_input",
+      blocking: true,
+      display: {
+        kind: "user_input",
+        summary: "Rollback the persistence quarantine",
+        blocking: true,
+        questions: [{
+          id: `rollback-${String(requestId)}`,
+          header: "Rollback",
+          question: "Continue?",
+          options: null,
+          allowsOther: true,
+          secret: true,
+        }],
+      },
+    }).record;
+    const focal = store.prepareInteractionResponse({
+      id: admit(1).publicId,
+      expectedRevision: 1,
+      responseDigest: "a".repeat(64),
+    });
+    const peer = admit(2);
+    const injector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      injector.exec(`
+        CREATE TRIGGER reject_interaction_quarantine_generation
+        BEFORE UPDATE OF process_generation ON profiles
+        WHEN OLD.id='${profile.id}'
+        BEGIN SELECT RAISE(ABORT, 'injected quarantine rollback'); END;
+      `);
+    } finally {
+      injector.close(false);
+    }
+
+    expect(() => store.quarantineInteractionPersistenceBoundary({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      connectionId,
+      focalInteractionId: focal.publicId,
+      effect: "known_unsent",
+      responseDigest: "a".repeat(64),
+    })).toThrow("injected quarantine rollback");
+    expect(store.requireProfileById(profile.id).processGeneration).toBe(
+      profile.processGeneration,
+    );
+    expect(store.requireInteraction(focal.publicId)).toEqual(focal);
+    expect(store.requireInteraction(peer.publicId)).toEqual(peer);
+    expect(store.listSessionEvents({ sessionId: session.id, afterSequence: 0 }).events).toEqual([]);
+    const inspector = new Database(store.paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(focal.publicId)).toEqual([
+        { revision: 1, state: "pending" },
+        { revision: 2, state: "response_prepared" },
+      ]);
+      expect(inspector.query(
+        "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
+      ).all(peer.publicId)).toEqual([{ revision: 1, state: "pending" }]);
+    } finally {
+      inspector.close(false);
+    }
+  });
+
   test("allocates usage revisions atomically and pages the historical ledger", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Usage ledger");

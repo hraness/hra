@@ -12,6 +12,7 @@ import {
   rename,
   rm,
   symlink,
+  writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,6 +20,7 @@ import { createInterface } from "node:readline";
 
 import type { CommandResponse, LocalCommand } from "../src/domain/contracts";
 import { readDaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
+import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
 import {
   acceptanceInstallationDescriptorSchema,
@@ -31,16 +33,67 @@ import {
   LIVE_ACCEPTANCE_CONTROL_FD,
   LIVE_ACCEPTANCE_WORKER_STDIO,
   liveAcceptanceRecoveryReceiptSchema,
+  liveAcceptanceSourceAttestation,
+  liveAcceptanceWorkerControlSchema,
   liveAcceptanceWorkerStatusSchema,
   liveAcceptanceWorkerLaunch,
   LiveAcceptanceStartError,
+  openLiveRuntimeAttestationBoundary,
+  parseLiveAcceptanceEvidenceOutput,
+  readLiveRuntimeAttestation,
   resumeLiveAcceptanceCleanup,
+  sourceGitOutput,
   startLiveAcceptanceRun,
   type LiveAcceptanceDeviceName,
   type LiveAcceptanceWorker,
 } from "./live-acceptance";
+import {
+  canonicalDigest,
+  deployEvidenceSchema,
+  withSelfDigest,
+  type DeployEvidence,
+  type RuntimeReleaseAttestation,
+} from "./release-evidence";
+import {
+  HRA_CONVEX_PROJECT_ID,
+  HRA_CONVEX_TEAM_ID,
+} from "./convex-target";
 
 const deadPidBase = 900_000;
+const releaseSourceCommit = "a".repeat(40);
+const releaseRuntimeAttestation: RuntimeReleaseAttestation = {
+  bound: true,
+  deployedAtMs: 1_000,
+  previousDeployDigest: null,
+  runtimeRevision: "00000000-0000-4000-8000-000000000010",
+  runtimeSourceCommit: releaseSourceCommit,
+  schemaIdentity: "hra-release-attestation-v1",
+  schemaVersion: 1,
+};
+const releaseDeployEvidence: DeployEvidence = deployEvidenceSchema.parse(withSelfDigest({
+  after: releaseRuntimeAttestation,
+  before: null,
+  kind: "convex-deploy" as const,
+  overlaySha256: "b".repeat(64),
+  phase: "bootstrap" as const,
+  previousDeployDigest: null,
+  schemaVersion: 1 as const,
+  sourceCommit: releaseSourceCommit,
+  target: {
+    deploymentId: 5_089_017,
+    deploymentName: "qualified-hummingbird-537",
+    deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+    projectId: HRA_CONVEX_PROJECT_ID,
+    teamId: HRA_CONVEX_TEAM_ID,
+  },
+  targetDigest: canonicalDigest({
+    deploymentId: 5_089_017,
+    deploymentName: "qualified-hummingbird-537",
+    deploymentUrl: DEFAULT_CLOUD_DEPLOYMENT_URL,
+    projectId: HRA_CONVEX_PROJECT_ID,
+    teamId: HRA_CONVEX_TEAM_ID,
+  }),
+}));
 
 async function privateTestBase(): Promise<string> {
   const root = await mkdtemp(join(await realpath(tmpdir()), "hra-live-acceptance-test-"));
@@ -261,6 +314,204 @@ const fakeShutdownVerifier = async (worker: LiveAcceptanceWorker): Promise<void>
 };
 
 describe("source-only live acceptance isolation", () => {
+  test("ignores a hostile PATH when reading release source authority", async () => {
+    const root = await privateTestBase();
+    const hostileGit = join(root, "git");
+    const sentinel = join(root, "ambient-git-ran");
+    await writeFile(
+      hostileGit,
+      `#!/bin/sh\nprintf hostile > ${JSON.stringify(sentinel)}\nprintf '%s\\n' ${JSON.stringify("c".repeat(40))}\n`,
+      { mode: 0o755 },
+    );
+    await chmod(hostileGit, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = root;
+    try {
+      expect(await sourceGitOutput(
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        "live-source-hostile-path",
+      )).toMatch(/^[0-9a-f]{40}\n$/u);
+      expect(await Bun.file(sentinel).exists()).toBeFalse();
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      await removeOwnedTestBase(root);
+    }
+  });
+
+  test("serializes source revision and status reads through local subprocess custody", async () => {
+    const calls: string[] = [];
+    let active = 0;
+    let peak = 0;
+    const sourceRevision = "b".repeat(40);
+    const attestation = await liveAcceptanceSourceAttestation(
+      DEFAULT_CLOUD_DEPLOYMENT_URL,
+      async (arguments_, phase) => {
+        calls.push(`${phase}:${arguments_.join(" ")}`);
+        active += 1;
+        peak = Math.max(peak, active);
+        try {
+          await Bun.sleep(5);
+          return arguments_[0] === "rev-parse" ? `${sourceRevision}\n` : "";
+        } finally {
+          active -= 1;
+        }
+      },
+    );
+
+    expect(peak).toBe(1);
+    expect(calls).toEqual([
+      "live-source-revision:rev-parse --verify HEAD^{commit}",
+      "live-source-status:status --porcelain=v1 --untracked-files=all",
+    ]);
+    expect(attestation.sourceRevision).toBe(sourceRevision);
+  });
+
+  test("rejects both unbounded event-stream aliases at the worker boundary", () => {
+    const control = {
+      argv: ["session", "events", "session-id"],
+      requestId: randomUUID(),
+      type: "cli" as const,
+      version: 1 as const,
+    };
+    expect(liveAcceptanceWorkerControlSchema.safeParse({
+      ...control,
+      argv: [...control.argv, "--follow"],
+    }).success).toBeFalse();
+    expect(liveAcceptanceWorkerControlSchema.safeParse({
+      ...control,
+      argv: [...control.argv, "--jsonl"],
+    }).success).toBeFalse();
+    expect(liveAcceptanceWorkerControlSchema.safeParse(control).success).toBeTrue();
+  });
+
+  test("pins exact runtime authority before and after acceptance", async () => {
+    const reads: string[] = [];
+    const boundary = await openLiveRuntimeAttestationBoundary(
+      releaseDeployEvidence,
+      async (deploymentUrl) => {
+        reads.push(deploymentUrl);
+        return releaseRuntimeAttestation;
+      },
+    );
+    expect(boundary.attestation).toEqual(releaseDeployEvidence.after);
+    expect(await boundary.close()).toEqual(releaseDeployEvidence.after);
+    expect(reads).toEqual([
+      DEFAULT_CLOUD_DEPLOYMENT_URL,
+      DEFAULT_CLOUD_DEPLOYMENT_URL,
+    ]);
+    await expect(boundary.close()).rejects.toThrow("input_invalid");
+  });
+
+  test("places both runtime probes around the live run and before durable evidence", async () => {
+    const source = await readFile(join(import.meta.dir, "live-acceptance.ts"), "utf8");
+    const main = source.slice(source.indexOf("export const liveAcceptanceMain"));
+    const open = main.indexOf("openLiveRuntimeAttestationBoundary(");
+    const start = main.indexOf("startLiveAcceptanceRun({");
+    const firstClose = main.indexOf("runtimeBoundary?.close()", start);
+    const firstPersist = main.indexOf("persistLiveAcceptanceEvidence(", firstClose);
+    const secondClose = main.indexOf("runtimeBoundary?.close()", firstClose + 1);
+    const secondPersist = main.indexOf("persistLiveAcceptanceEvidence(", secondClose);
+    expect(open).toBeGreaterThan(-1);
+    expect(open).toBeLessThan(start);
+    expect(firstClose).toBeGreaterThan(start);
+    expect(firstClose).toBeLessThan(firstPersist);
+    expect(secondClose).toBeGreaterThan(firstPersist);
+    expect(secondClose).toBeLessThan(secondPersist);
+    expect(source).toContain("runtimeRevision: runtimeAttestation.runtimeRevision");
+  });
+
+  test("refuses runtime replacement and a wrong-before then restored-after attack", async () => {
+    const replacement = {
+      ...releaseRuntimeAttestation,
+      runtimeRevision: "00000000-0000-4000-8000-000000000099",
+    } satisfies RuntimeReleaseAttestation;
+    const replacementReads = [releaseRuntimeAttestation, replacement];
+    const replacementBoundary = await openLiveRuntimeAttestationBoundary(
+      releaseDeployEvidence,
+      async () => replacementReads.shift() ?? replacement,
+    );
+    await expect(replacementBoundary.close()).rejects.toThrow("input_invalid");
+
+    let restoreReads = 0;
+    await expect(openLiveRuntimeAttestationBoundary(
+      releaseDeployEvidence,
+      async () => {
+        restoreReads += 1;
+        return restoreReads === 1 ? replacement : releaseRuntimeAttestation;
+      },
+    )).rejects.toThrow("input_invalid");
+    expect(restoreReads).toBe(1);
+  });
+
+  test("aborts a stalled runtime authority transport", async () => {
+    let authoritySignal: AbortSignal | undefined;
+    const authorityFetch = Object.assign((
+      _input: Parameters<typeof fetch>[0],
+      init?: Parameters<typeof fetch>[1],
+    ): Promise<Response> => {
+      authoritySignal = init?.signal ?? undefined;
+      return new Promise(() => undefined);
+    }, { preconnect: () => undefined }) as typeof fetch;
+
+    const startedAt = performance.now();
+    await expect(readLiveRuntimeAttestation(DEFAULT_CLOUD_DEPLOYMENT_URL, {
+      fetcher: authorityFetch,
+      timeoutMs: 10,
+    })).rejects.toThrow("input_invalid");
+    expect(performance.now() - startedAt).toBeLessThan(500);
+    expect(authoritySignal?.aborted).toBeTrue();
+  });
+
+  test("accepts one protected evidence path or descriptor without changing scenario arguments", () => {
+    expect(parseLiveAcceptanceEvidenceOutput([
+      "--scenario-fd",
+      "3",
+      "--evidence-path",
+      "/private/operator/candidate-live.json",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toEqual({
+      evidenceOutput: { kind: "path", path: "/private/operator/candidate-live.json" },
+      deployEvidencePath: "/private/operator/candidate-deploy.json",
+      scenarioArguments: ["--scenario-fd", "3"],
+    });
+    expect(parseLiveAcceptanceEvidenceOutput([
+      "--evidence-fd",
+      "256",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+      "--scenario-stdin",
+    ])).toEqual({
+      evidenceOutput: { descriptor: 256, kind: "descriptor" },
+      deployEvidencePath: "/private/operator/candidate-deploy.json",
+      scenarioArguments: ["--scenario-stdin"],
+    });
+    expect(() => parseLiveAcceptanceEvidenceOutput([
+      "--scenario-stdin",
+      "--evidence-fd",
+      "2",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toThrow();
+    expect(() => parseLiveAcceptanceEvidenceOutput([
+      "--scenario-stdin",
+      "--evidence-fd",
+      "2147483648",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toThrow();
+    expect(() => parseLiveAcceptanceEvidenceOutput([
+      "--scenario-stdin",
+      "--evidence-path",
+      "/one.json",
+      "--evidence-fd",
+      "4",
+      "--deploy-evidence",
+      "/private/operator/candidate-deploy.json",
+    ])).toThrow();
+  });
+
   test("creates two canonical private installations without changing HOME", async () => {
     const base = await privateTestBase();
     const originalHomeDirectory = process.env.HOME;
@@ -495,10 +746,16 @@ describe("source-only live acceptance isolation", () => {
       expect(listed).toMatchObject({ exitCode: 0, stderr: "" });
       expect(JSON.parse(listed.stdout)).toMatchObject({
         command: "project.list",
-        data: { projects: [] },
+        data: {
+          projects: [{
+            default: true,
+            label: "Documents",
+            rootPath: deviceA.projectDirectory,
+          }],
+        },
         ok: true,
       });
-      const added = await deviceA.execute([
+      const duplicate = await deviceA.execute([
         "project",
         "add",
         "--path",
@@ -507,10 +764,10 @@ describe("source-only live acceptance isolation", () => {
         "Acceptance",
         "--json",
       ]);
-      expect(added).toMatchObject({ exitCode: 0, stderr: "" });
-      expect(JSON.parse(added.stdout)).toMatchObject({
-        command: "project.add",
-        ok: true,
+      expect(duplicate).toMatchObject({ exitCode: 1, stderr: "" });
+      expect(JSON.parse(duplicate.stdout)).toMatchObject({
+        error: { code: "CONFLICT" },
+        ok: false,
       });
       const protectedRefusal = await deviceA.execute([
         "auth",

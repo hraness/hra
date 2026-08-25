@@ -120,6 +120,28 @@ describe("cloud identity-scoped custody", () => {
     expect((await returnedA.read("cloud-daemon-journal"))?.value).toBe("journal-a");
   });
 
+  test("fences one opened identity to its exact selector generation", async () => {
+    const raw = new MemoryCustody();
+    const unbound = await IdentityScopedCloudSecretCustody.open(raw);
+    await unbound.assertCurrentIdentity(null);
+    await unbound.activateIdentity("user_aaaaaaaa");
+    await expect(unbound.assertCurrentIdentity(null))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+
+    const identityA = await IdentityScopedCloudSecretCustody.open(raw);
+    await identityA.assertCurrentIdentity("user_aaaaaaaa");
+    await identityA.activateIdentity("user_bbbbbbbb");
+    await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+
+    const identityB = await IdentityScopedCloudSecretCustody.open(raw);
+    await identityB.activateIdentity("user_aaaaaaaa");
+    await expect(identityA.assertCurrentIdentity("user_aaaaaaaa"))
+      .rejects.toThrow("Cloud identity selection changed; restart HRA.");
+    const returnedA = await IdentityScopedCloudSecretCustody.open(raw);
+    await returnedA.assertCurrentIdentity("user_aaaaaaaa");
+  });
+
   test("fails closed on corrupt active identity custody", async () => {
     const raw = new MemoryCustody();
     await write(raw, "cloud-active-identity", JSON.stringify({

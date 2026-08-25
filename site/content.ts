@@ -1,3 +1,5 @@
+import { buildHraGlobalInstallCommand } from "../src/install-preflight";
+
 export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
 
 export interface PublicEndpoints {
@@ -120,11 +122,15 @@ const privacyBlocks: readonly ContentBlock[] = [
 
 export const publicReleaseState: "release-ready" | "staged" = "staged";
 
+const betaInstallCommand = buildHraGlobalInstallCommand(
+  "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+);
+
 export const publicContent: PublicContent = {
   productName: "HRA",
   description: "A persistent Bun CLI for isolated Codex accounts, live sessions, safe macOS account switching, and optional encrypted sync.",
   siteUrl: "https://hra.sh",
-  installCommand: "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+  installCommand: betaInstallCommand,
   initCommand: "hra init --yes",
   doctorCommand: "hra doctor --offline",
   endpoints: {
@@ -159,46 +165,83 @@ export const publicContent: PublicContent = {
   ],
   sections: [
     {
-      id: "install-update-and-remove",
-      heading: "Install, update, and remove",
+      id: "install-and-update",
+      heading: "Install and update",
       blocks: [
         paragraph(
-          text("HRA requires Bun 1.3.14. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
+          text("HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and local daemon support macOS and Linux; supported ChatGPT desktop account switching is macOS-only. Native protected-input control loads only when a terminal prompt needs it and supports the standard macOS, glibc, and x64 or arm64 musl library names. Install one reviewed immutable tag, then verify the binary before initialization:"),
         ),
         {
           kind: "commands",
           commands: [
             "bun --version",
-            "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+            betaInstallCommand,
             "hra --version",
             "hra doctor --offline",
           ],
         },
         paragraph(
-          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace both v0.1.0 occurrences in the URL with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
+          text("The single install command streams the exact v0.1.0 preflight from HRA's protected source tag and passes it the exact release archive URL. The preflight requires GitHub repository ID 1343008607, a published immutable v0.1.0 release, and one uploaded archive whose byte length and SHA-256 match GitHub's immutable release metadata. It creates a fresh random private staging root, downloads the archive into a private file there, and gives Bun only a verified in-memory snapshot of those exact bytes. The reviewed normalizer verifies the private archive again, derives its bounded package-file manifest, and compares every extracted HRA package path and SHA-256 while measuring the completion receipt. Local archives and official archives use separate full-digest version namespaces, so a local package cannot populate or replace the official cache entry. HRA then verifies the tagged preflight and normalizer, exact package identity, zero-lifecycle manifest, CLI SHA-256, and complete staged tree under protected descriptor and ACL custody. Bun 1.3.14 resolves the package's exact dependency versions from the configured package registry trust boundary with lifecycle scripts disabled; the release archive does not claim to contain that dependency closure. The prior verified command remains active throughout staging. Publication atomically replaces only the $BUN_INSTALL/bin/hra symlink after every check succeeds and fsyncs its directory. If installation is interrupted, the next invocation recovers or removes only the proven private stage. Existing trustedDependencies remain unchanged."),
+        ),
+        paragraph(
+          text("Before replacing the installed binary, stop the persistent daemon and confirm that its old process has released authority. The command below performs a verified repair installation of v0.1.0. For a future update, replace the tagged preflight and release archive references together with the exact reviewed release version, verify it, then restart explicitly. Do not install a moving branch for a release machine:"),
         ),
         {
           kind: "commands",
           commands: [
             "hra daemon stop",
             "hra daemon status --json",
-            "bun add --global https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+            betaInstallCommand,
             "hra --version",
             "hra doctor --offline",
             "hra daemon start",
           ],
         },
+        { kind: "subheading", text: "Optional full local-data removal" },
         paragraph(
-          text("Removing the package does not remove HRA's local profiles, session history, recovery evidence, or cloud account. Log out each Codex profile and complete any intended cloud-account deletion before uninstalling. Then stop the daemon, confirm that it is stopped, and remove the installed command:"),
+          text("Full local-data removal is a separate destructive operation. While HRA remains installed, complete "),
+          code("hra auth delete --acknowledge-erasure"),
+          text(" if "),
+          code("hra auth status"),
+          text(" says you are signed in, then wait for "),
+          code("hra auth status"),
+          text(" to report terminal deletion. Run "),
+          code("hra account list"),
+          text(", then run "),
+          code("hra account logout <profile>"),
+          text(" for every Codex profile. Stop the daemon, require a successful "),
+          code("hra daemon status --json"),
+          text(" result whose "),
+          code("data.running"),
+          text(" is "),
+          code("false"),
+          text(" before touching local data."),
         ),
         {
           kind: "commands",
           commands: [
+            "hra auth delete --acknowledge-erasure",
+            "hra auth status",
+            "hra account list",
+            "hra account logout <profile>",
             "hra daemon stop",
             "hra daemon status --json",
-            "bun remove --global hra",
           ],
         },
+        {
+          kind: "notice",
+          label: "Permanent local-data loss",
+          content: [
+            text("HRA deliberately has no recursive local-delete command. The exact state directory is "),
+            code("$HOME/Library/Application Support/HRA Control Plane v1"),
+            text(" on macOS and "),
+            code("$HOME/.local/state/hra-control-plane-v1"),
+            text(" on Linux. After every prerequisite above, a human who explicitly accepts permanent loss of all local profiles, Codex credential stores, sessions, ledgers, encryption keys, device credentials, and recovery evidence may move only the exact platform directory to Trash. Do not move or remove its parent. Inspect the trashed directory before emptying Trash."),
+          ],
+        },
+        paragraph(
+          text("An agent must resolve the canonical exact state-directory path, present that path and the permanent-loss consequences to the user, and obtain explicit destructive approval before moving or removing it. An install, update, or daemon-stop request does not authorize local-data removal."),
+        ),
       ],
     },
     {
@@ -258,6 +301,52 @@ export const publicContent: PublicContent = {
       ],
     },
     {
+      id: "first-session",
+      heading: "First session",
+      blocks: [
+        paragraph(
+          text("Complete initialization and the first account login before this walkthrough. Account login remains a dedicated one-shot command. The session-start command returns the new session ID."),
+        ),
+        { kind: "subheading", text: "Human terminal" },
+        paragraph(
+          text("Create an idle session, open the persistent shell, select the account and exact returned session ID, then type a request as an ordinary line. HRA sends that line to the selected session and shows safe live updates. "),
+          code("/exit"),
+          text(" leaves the daemon running."),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra session start personal --preset high",
+            "hra",
+            "/account personal",
+            "/session <session-id>",
+            "Review this project and summarize its current state.",
+          ],
+        },
+        { kind: "subheading", text: "Agent caller" },
+        paragraph(
+          text("Read "),
+          code("data.session.id"),
+          text(" from the start response. Before sending, read "),
+          code("data.eventStream.cursor"),
+          text(" from status so the follower begins at one atomic observation boundary. Keep the follower as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation."),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra session start personal --preset high --json",
+            "hra session status <session-id> --json",
+            "hra session send <session-id> -- \"Review this project and summarize its current state.\"",
+            "hra session events <session-id> --cursor <status-cursor> --wait-ms 30000 --jsonl",
+            "hra session interactions <session-id> --pending --json",
+          ],
+        },
+        paragraph(
+          text("If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below."),
+        ),
+      ],
+    },
+    {
       id: "cloud-sign-in-and-device-pairing",
       heading: "Cloud sign-in and device pairing",
       blocks: [
@@ -278,6 +367,7 @@ export const publicContent: PublicContent = {
             "hra auth login --input-stdin",
             "hra auth login --input-fd <fd>",
             "hra device pair",
+            "hra device key-loss --acknowledge-no-key-holders",
             "hra sync status",
           ],
         },
@@ -318,13 +408,37 @@ export const publicContent: PublicContent = {
           text(" from a different active machine to revoke a device."),
         ),
         paragraph(
+          code("hra auth status"),
+          text(" and "),
+          code("hra sync status"),
+          text(" expose the account key as a closed status. "),
+          code("ready"),
+          text(" includes the usable key version. "),
+          code("pairing_required"),
+          text(" says recovery requires an existing account-key holder and that no remaining holder makes the encrypted content unrecoverable."),
+        ),
+        paragraph(
+          text("Only after this authenticated, registered, active installation reports "),
+          code("pairing_required"),
+          text(" and the operator has confirmed that no account-key holder remains, run "),
+          code("hra device key-loss --acknowledge-no-key-holders"),
+          text(". The command records that explicit observation in the current HRA cloud identity's isolated local custody, but only when the current auth token generation, identity, auth epoch, registered device, and pairing observation agree exactly. It performs no network, provider, or cloud mutation and does not mint, replace, or delete a key or ciphertext. Signed-out, unregistered, stale-identity, missing-observation, and already-ready states fail with a bounded next command. Pairing the real account key later supersedes the observation."),
+        ),
+        {
+          kind: "notice",
+          label: "Unrecoverable encrypted cloud content",
+          content: [
+            text("After that acknowledgement, account-key status is unrecoverable on this installation. Local Codex accounts, sessions, credentials, and execution are unaffected, but existing encrypted cloud content cannot be decrypted without the real account key. Search again for an existing holder and run hra device pair if one is rediscovered; the real key restores ready status and supersedes the acknowledgement. Only after that renewed holder search is exhausted may the operator explicitly choose erasing and reinitializing the HRA cloud account as a fallback. Reinitialization creates a new account boundary; it does not regenerate the lost account key or recover old ciphertext."),
+          ],
+        },
+        paragraph(
           text("Approve and revoke create one current UUIDv7 before daemon transport. If the response is lost after dispatch, HRA prints the exact same-key replay command. Reusing that command recovers the original operation; changing the device or operation under the same key is rejected."),
         ),
         paragraph(
           text("Device credentials are bearer credentials, not hardware-bound proofs. Connection and generation fencing blocks a copied credential from creating a second concurrent connection or surviving revocation, but an uncontested, unrevoked copy can impersonate that device until it is detected and revoked."),
         ),
         paragraph(
-          text("Cloud-account erasure is explicit and irreversible. Run "),
+          text("Cloud-account erasure is an explicit and irreversible fallback, not the default response to a key-loss acknowledgement. After a renewed holder search is exhausted, run "),
           code("hra auth delete --acknowledge-erasure"),
           text(" to disable every cloud effect before bounded server-side removal begins. "),
           code("hra auth status"),
@@ -380,13 +494,41 @@ export const publicContent: PublicContent = {
             "hra",
             "hra session status <session> --json",
             "hra session events <session> --cursor <cursor> --limit <1-200> --wait-ms <0-30000> --json",
-            "hra session events <session> --cursor <cursor> --wait-ms 30000 --follow",
+            "hra session events <session> --cursor <cursor> --wait-ms 30000 --jsonl",
             "hra session interactions <session> --pending --json",
             "hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
           ],
         },
         paragraph(
-          text("JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following writes JSON Lines as the turn progresses. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved."),
+          text("JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following with "),
+          code("--jsonl"),
+          text(" writes JSON Lines as the turn progresses; "),
+          code("--follow"),
+          text(" is an equivalent compatibility spelling. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved."),
+        ),
+        { kind: "subheading", text: "Exit status and JSONL" },
+        paragraph(
+          text("Every one-shot caller must check the process exit status. HRA uses this exact mapping:"),
+        ),
+        list(
+          [code("0"), text(": success. A normally stopped event follower, including a user SIGINT, may also return 0.")],
+          [code("1"), text(": CONFLICT, AMBIGUOUS, INTERNAL, any other closed failure code, or an unhealthy doctor result.")],
+          [code("2"), text(": INVALID_INPUT.")],
+          [code("4"), text(": NOT_FOUND.")],
+          [code("5"), text(": UNAVAILABLE.")],
+          [code("6"), text(": INTERACTION_REQUIRED.")],
+          [code("7"), text(": RECOVERY_REQUIRED.")],
+        ),
+        paragraph(
+          text("For non-streaming "),
+          code("--json"),
+          text(" commands, stdout contains exactly one versioned success or failure envelope. For "),
+          code("--jsonl"),
+          text(" or its equivalent "),
+          code("--follow"),
+          text(", stdout contains only JSONL gap, event, and checkpoint frames. If the follower ends on a command error, HRA leaves all completed frames on stdout and writes exactly one newline-terminated version-1 failure envelope to stderr shaped as "),
+          code('{"ok":false,"version":1,"error":{"code":"<code>","message":"<safe-message>"}}'),
+          text("; the error may also include bounded details. Callers must consume stdout and stderr independently, must not merge the terminal error into the JSONL stream, and must check the process exit status. A normal user stop or SIGINT may exit 0 without a terminal failure envelope."),
         ),
         paragraph(
           code("interaction show"),
@@ -556,6 +698,7 @@ export const publicContent: PublicContent = {
             "hra auth status|logout",
             "hra auth delete --acknowledge-erasure",
             "hra device list|pair",
+            "hra device key-loss --acknowledge-no-key-holders",
             "hra device approve|revoke <device-id-or-prefix> [--idempotency-key <current-uuidv7>]",
             "hra account add <label>",
             "hra account login <profile> [--device-code] [--handoff-file <absolute-path>] [--idempotency-key <uuid>]",
@@ -575,7 +718,7 @@ export const publicContent: PublicContent = {
             "hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]",
             "hra session show <session> [--detail]",
             "hra session status <session>",
-            "hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--follow]",
+            "hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--jsonl|--follow]",
             "hra session interactions <session> [--pending] [--limit <1-100>] [--cursor <cursor>]",
             "hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]",
             "hra session send|queue|steer <session> <message>",

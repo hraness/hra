@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { createHash, randomUUID } from "node:crypto";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { constants, readSync, type Stats } from "node:fs";
 import {
   chmod,
@@ -21,6 +21,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 import type { Readable, Writable } from "node:stream";
 import { isatty } from "node:tty";
 
+import { ConvexHttpClient } from "convex/browser";
+import { makeFunctionReference } from "convex/server";
 import { z } from "zod";
 
 import {
@@ -37,6 +39,27 @@ import { DaemonLock, readDaemonAuthorityReceipt } from "../src/daemon/daemon-loc
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { resolveStatePaths } from "../src/storage/paths";
 import { HRA_VERSION } from "../src/version";
+import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import {
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+} from "./bounded-process";
+import {
+  canonicalDigest,
+  parseDeployEvidenceFile,
+  liveAcceptanceEvidenceDocumentSchema,
+  PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM,
+  runtimeReleaseAttestationSchema,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
+  writeProtectedJsonToFd,
+  type LiveAcceptanceEvidenceDocument,
+  type DeployEvidence,
+  type RuntimeReleaseAttestation,
+} from "./release-evidence";
 
 export const LIVE_ACCEPTANCE_CONTROL_FD = 0;
 export const LIVE_ACCEPTANCE_STATUS_FD = 1;
@@ -50,6 +73,7 @@ const workerCommandDeadlineMs = 90_000;
 const workerShutdownDeadlineMs = 30_000;
 const cloudDeletionDeadlineMs = 15 * 60 * 1_000;
 const cloudDeletionPollMs = 1_000;
+const liveAuthorityTimeoutMs = 30_000;
 
 const deviceSchema = z.enum(["a", "b"]);
 export type LiveAcceptanceDeviceName = z.infer<typeof deviceSchema>;
@@ -104,7 +128,7 @@ export const liveAcceptanceWorkerControlSchema = z.discriminatedUnion("type", [
   if (serializedBytes > 64 * 1024) {
     context.addIssue({ code: "custom", message: "CLI arguments are oversized." });
   }
-  if (value.argv.includes("--follow")) {
+  if (value.argv.includes("--follow") || value.argv.includes("--jsonl")) {
     context.addIssue({ code: "custom", message: "Unbounded CLI following is unavailable." });
   }
   if (value.argv.includes("--input-stdin")) {
@@ -2293,35 +2317,103 @@ export function readLiveAcceptanceRecoveryReceiptFromFd(fd: number): LiveAccepta
   }
 }
 
-const sourceGitOutput = async (arguments_: readonly string[]): Promise<string> => {
+export const sourceGitOutput = async (
+  arguments_: readonly string[],
+  phase: string,
+): Promise<string> => {
   const repositoryRoot = resolve(import.meta.dir, "..");
-  return await new Promise<string>((resolvePromise, rejectPromise) => {
-    execFile(
-      "git",
-      [...arguments_],
-      {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-        maxBuffer: 64 * 1024,
-        timeout: 5_000,
-      },
-      (error, stdout, stderr) => {
-        if (
-          error !== null
-          || stderr !== ""
-          || typeof stdout !== "string"
-        ) {
-          rejectPromise(new LiveAcceptanceError("input_invalid"));
-          return;
-        }
-        resolvePromise(stdout);
-      },
-    );
+  const result = requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: arguments_,
+    containment: "local",
+    cwd: repositoryRoot,
+    environment: {
+      ...(process.env.PATH === undefined ? {} : { PATH: process.env.PATH }),
+    },
+    executable: "/usr/bin/git",
+    outputMaximumBytes: 64 * 1024,
+    phase,
+    terminationGraceMs: 1_000,
+    timeoutMs: 5_000,
+  }));
+  if (result.exitCode !== 0 || result.stderr.byteLength !== 0) {
+    throw new LiveAcceptanceError("input_invalid");
+  }
+  return result.stdout.toString("utf8");
+};
+
+const liveReleaseAttestationFunction = makeFunctionReference<
+  "query",
+  Record<string, never>,
+  unknown
+>("releaseAttestation:read");
+
+export type LiveRuntimeAttestationReader = (
+  deploymentUrl: string,
+) => Promise<RuntimeReleaseAttestation>;
+
+export const readLiveRuntimeAttestation = async (
+  deploymentUrl: string,
+  options: Readonly<{
+    fetcher?: typeof fetch;
+    timeoutMs?: number;
+  }> = {},
+): Promise<RuntimeReleaseAttestation> => {
+  const timeoutMs = options.timeoutMs ?? liveAuthorityTimeoutMs;
+  if (
+    deploymentUrl !== DEFAULT_CLOUD_DEPLOYMENT_URL
+    || !Number.isSafeInteger(timeoutMs)
+    || timeoutMs < 1
+    || timeoutMs > 120_000
+  ) throw new LiveAcceptanceError("input_invalid");
+  const client = new ConvexHttpClient(deploymentUrl, {
+    fetch: createBoundedAuthorityFetch(
+      options.fetcher ?? fetch,
+      timeoutMs,
+      "live_authority_timeout",
+    ),
+    logger: false,
   });
+  try {
+    return runtimeReleaseAttestationSchema.parse(
+      await client.query(liveReleaseAttestationFunction, {}),
+    );
+  } catch {
+    throw new LiveAcceptanceError("input_invalid");
+  }
+};
+
+export type LiveRuntimeAttestationBoundary = Readonly<{
+  attestation: RuntimeReleaseAttestation;
+  close: () => Promise<RuntimeReleaseAttestation>;
+}>;
+
+export const openLiveRuntimeAttestationBoundary = async (
+  deployEvidence: DeployEvidence,
+  reader: LiveRuntimeAttestationReader = readLiveRuntimeAttestation,
+): Promise<LiveRuntimeAttestationBoundary> => {
+  const before = await reader(deployEvidence.target.deploymentUrl);
+  if (canonicalDigest(before) !== canonicalDigest(deployEvidence.after)) {
+    throw new LiveAcceptanceError("input_invalid");
+  }
+  let closed = false;
+  return {
+    attestation: before,
+    close: async () => {
+      if (closed) throw new LiveAcceptanceError("input_invalid");
+      closed = true;
+      const after = await reader(deployEvidence.target.deploymentUrl);
+      if (
+        canonicalDigest(after) !== canonicalDigest(before)
+        || canonicalDigest(after) !== canonicalDigest(deployEvidence.after)
+      ) throw new LiveAcceptanceError("input_invalid");
+      return after;
+    },
+  };
 };
 
 export const liveAcceptanceSourceAttestation = async (
   cloudDeploymentUrlInput: string,
+  sourceOutput: typeof sourceGitOutput = sourceGitOutput,
 ): Promise<Readonly<{
   cloudTargetDigest: string;
   packageVersion: string;
@@ -2330,10 +2422,17 @@ export const liveAcceptanceSourceAttestation = async (
   if (cloudDeploymentUrlInput !== DEFAULT_CLOUD_DEPLOYMENT_URL) {
     throw new LiveAcceptanceError("input_invalid");
   }
-  const [revisionOutput, statusOutput] = await Promise.all([
-    sourceGitOutput(["rev-parse", "--verify", "HEAD^{commit}"]),
-    sourceGitOutput(["status", "--porcelain=v1", "--untracked-files=all"]),
-  ]);
+  // Local subprocess custody is deliberately serialized by one recovery
+  // journal lock. Keep both reads inside that contract instead of making the
+  // status probe contend with the revision probe.
+  const revisionOutput = await sourceOutput(
+    ["rev-parse", "--verify", "HEAD^{commit}"],
+    "live-source-revision",
+  );
+  const statusOutput = await sourceOutput(
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    "live-source-status",
+  );
   const sourceRevision = revisionOutput.trim();
   if (!/^[a-f0-9]{40}$/u.test(sourceRevision) || statusOutput !== "") {
     throw new LiveAcceptanceError("input_invalid");
@@ -2357,11 +2456,172 @@ const writeStandardOutputFrame = async (value: unknown): Promise<void> => {
   });
 };
 
+type LiveAcceptanceEvidenceOutput =
+  | Readonly<{ descriptor: number; kind: "descriptor" }>
+  | Readonly<{ kind: "path"; path: string }>;
+
+export const parseLiveAcceptanceEvidenceOutput = (
+  arguments_: readonly string[],
+): Readonly<{
+  evidenceOutput?: LiveAcceptanceEvidenceOutput;
+  deployEvidencePath?: string;
+  scenarioArguments: readonly string[];
+}> => {
+  const scenarioArguments: string[] = [];
+  let evidenceOutput: LiveAcceptanceEvidenceOutput | undefined;
+  let deployEvidencePath: string | undefined;
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === "--evidence-path" || argument === "--evidence-fd") {
+      if (evidenceOutput !== undefined) throw new LiveAcceptanceError("input_invalid");
+      const value = arguments_[index + 1];
+      if (value === undefined) throw new LiveAcceptanceError("input_invalid");
+      if (argument === "--evidence-path") {
+        if (!isAbsolute(value) || value.length > 4_096) {
+          throw new LiveAcceptanceError("input_invalid");
+        }
+        evidenceOutput = { kind: "path", path: value };
+      } else {
+        if (!/^[0-9]+$/u.test(value)) throw new LiveAcceptanceError("input_invalid");
+        const descriptor = Number(value);
+        if (
+          !Number.isSafeInteger(descriptor)
+          || descriptor < 3
+          || descriptor > PROTECTED_EVIDENCE_DESCRIPTOR_MAXIMUM
+        ) {
+          throw new LiveAcceptanceError("input_invalid");
+        }
+        evidenceOutput = { descriptor, kind: "descriptor" };
+      }
+      index += 1;
+      continue;
+    }
+    if (argument === "--deploy-evidence" && deployEvidencePath === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !isAbsolute(value) || value.length > 4_096) {
+        throw new LiveAcceptanceError("input_invalid");
+      }
+      deployEvidencePath = value;
+      index += 1;
+      continue;
+    }
+    if (argument !== undefined) scenarioArguments.push(argument);
+  }
+  if ((evidenceOutput === undefined) !== (deployEvidencePath === undefined)) {
+    throw new LiveAcceptanceError("input_invalid");
+  }
+  return {
+    ...(evidenceOutput === undefined ? {} : { evidenceOutput }),
+    ...(deployEvidencePath === undefined ? {} : { deployEvidencePath }),
+    scenarioArguments,
+  };
+};
+
+const persistLiveAcceptanceEvidence = (
+  evidence: Readonly<{
+    cloudTargetDigest: string;
+    completedAt: number;
+    packageVersion: string;
+    runId: string;
+    sourceRevision: string;
+    startedAt: number;
+    status: "passed";
+    version: 1;
+  }>,
+  deployEvidence: DeployEvidence | undefined,
+  output: LiveAcceptanceEvidenceOutput | undefined,
+  runtimeAttestation: RuntimeReleaseAttestation | undefined,
+): LiveAcceptanceEvidenceDocument | undefined => {
+  if (output === undefined) return undefined;
+  if (
+    deployEvidence === undefined
+    || runtimeAttestation === undefined
+    || evidence.sourceRevision !== deployEvidence.sourceCommit
+    || evidence.startedAt <= deployEvidence.after.deployedAtMs
+    || canonicalDigest(runtimeAttestation) !== canonicalDigest(deployEvidence.after)
+  ) throw new LiveAcceptanceError("input_invalid");
+  const document = liveAcceptanceEvidenceDocumentSchema.parse(withSelfDigest({
+    completedAt: evidence.completedAt,
+    deployEvidenceDigest: deployEvidence.selfDigest,
+    evidenceDigest: canonicalDigest(evidence),
+    kind: "live-acceptance" as const,
+    packageVersion: evidence.packageVersion,
+    runId: evidence.runId,
+    runtimeRevision: runtimeAttestation.runtimeRevision,
+    schemaVersion: 1 as const,
+    sourceCommit: evidence.sourceRevision,
+    startedAt: evidence.startedAt,
+    status: evidence.status,
+    targetDigest: deployEvidence.targetDigest,
+  }));
+  if (output.kind === "path") {
+    writeProtectedJsonNoReplace(
+      output.path,
+      document,
+      liveAcceptanceEvidenceDocumentSchema,
+      { allowExactReplay: true },
+    );
+  } else {
+    writeProtectedJsonToFd(
+      output.descriptor,
+      document,
+      liveAcceptanceEvidenceDocumentSchema,
+    );
+  }
+  return document;
+};
+
 export const liveAcceptanceMain = async (
   arguments_: readonly string[] = Bun.argv.slice(2),
+  options: Readonly<{
+    readRuntimeAttestation?: LiveRuntimeAttestationReader;
+    sourceAttestation?: typeof liveAcceptanceSourceAttestation;
+  }> = {},
 ): Promise<number> => {
-  if (arguments_.length === 2 && arguments_[0] === "--resume-fd") {
-    const rawFd = arguments_[1];
+  let parsedOutput: ReturnType<typeof parseLiveAcceptanceEvidenceOutput>;
+  try {
+    parsedOutput = parseLiveAcceptanceEvidenceOutput(arguments_);
+  } catch {
+    process.stderr.write("hra live acceptance: invalid evidence output\n");
+    return 2;
+  }
+  try {
+    await recoverBoundedProcessJournal();
+  } catch (error: unknown) {
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      await writeStandardOutputFrame({
+        code: "process_cleanup_unproven",
+        ok: false,
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        recoveryPaths: error.recoveryPaths,
+        status: "recovery_required",
+        version: 1,
+      }).catch(() => undefined);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      await writeStandardOutputFrame({
+        code: "process_recovery_journal_blocked",
+        ok: false,
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        status: "recovery_required",
+        version: 1,
+      }).catch(() => undefined);
+      return 75;
+    }
+    process.stderr.write("hra live acceptance: process recovery journal unavailable\n");
+    return 1;
+  }
+  const scenarioArguments = parsedOutput.scenarioArguments;
+  if (scenarioArguments.length === 2 && scenarioArguments[0] === "--resume-fd") {
+    if (parsedOutput.evidenceOutput !== undefined) {
+      process.stderr.write("hra live acceptance: evidence output is unavailable during recovery\n");
+      return 2;
+    }
+    const rawFd = scenarioArguments[1];
     if (rawFd === undefined || !/^[0-9]+$/u.test(rawFd)) {
       process.stderr.write("hra live acceptance: invalid protected descriptor\n");
       return 2;
@@ -2385,19 +2645,26 @@ export const liveAcceptanceMain = async (
       process.off("SIGTERM", stopResume);
     }
   }
-  const standardStreamScenario = arguments_.length === 1
-    && arguments_[0] === "--scenario-stdin";
-  const descriptorScenario = arguments_.length === 2
-    && arguments_[0] === "--scenario-fd"
-    && arguments_[1] !== undefined
-    && /^[0-9]+$/u.test(arguments_[1]);
+  const standardStreamScenario = scenarioArguments.length === 1
+    && scenarioArguments[0] === "--scenario-stdin";
+  const descriptorScenario = scenarioArguments.length === 2
+    && scenarioArguments[0] === "--scenario-fd"
+    && scenarioArguments[1] !== undefined
+    && /^[0-9]+$/u.test(scenarioArguments[1]);
   if (!standardStreamScenario && !descriptorScenario) {
     process.stderr.write(
       "hra live acceptance: use --scenario-fd <nonterminal-fd> for a terminal run or --scenario-stdin for a JSONL agent run\n",
     );
     return 2;
   }
-  const scenarioFd = descriptorScenario ? Number(arguments_[1]) : undefined;
+  const scenarioFd = descriptorScenario ? Number(scenarioArguments[1]) : undefined;
+  if (
+    parsedOutput.evidenceOutput?.kind === "descriptor"
+    && parsedOutput.evidenceOutput.descriptor === scenarioFd
+  ) {
+    process.stderr.write("hra live acceptance: scenario and evidence descriptors must differ\n");
+    return 2;
+  }
   let run: LiveAcceptanceRun | undefined;
   let scenarioOperator: Readonly<{
     close?: () => void;
@@ -2436,7 +2703,25 @@ export const liveAcceptanceMain = async (
     const operator = standardScenario?.operator
       ?? scenarioModule.createLiveAcceptanceScenarioOperator(configuration);
     scenarioOperator = operator;
-    const attestation = await liveAcceptanceSourceAttestation(configuration.cloudDeploymentUrl);
+    const attestation = await (options.sourceAttestation ?? liveAcceptanceSourceAttestation)(
+      configuration.cloudDeploymentUrl,
+    );
+    const deployEvidence = parsedOutput.deployEvidencePath === undefined
+      ? undefined
+      : parseDeployEvidenceFile(parsedOutput.deployEvidencePath);
+    if (
+      deployEvidence !== undefined
+      && (
+        deployEvidence.sourceCommit !== attestation.sourceRevision
+        || deployEvidence.target.deploymentUrl !== configuration.cloudDeploymentUrl
+      )
+    ) throw new LiveAcceptanceError("input_invalid");
+    const runtimeBoundary = deployEvidence === undefined
+      ? undefined
+      : await openLiveRuntimeAttestationBoundary(
+          deployEvidence,
+          options.readRuntimeAttestation ?? readLiveRuntimeAttestation,
+        );
     if (scenarioAbort.signal.aborted) throw new LiveAcceptanceError("operator_interrupted");
     run = await startLiveAcceptanceRun({
       cloudDeploymentUrl: configuration.cloudDeploymentUrl,
@@ -2468,6 +2753,13 @@ export const liveAcceptanceMain = async (
       ).catch(() => ({ type: "failed" as const }));
       if (preservation === "cleanup_complete" && settlement.type === "complete") {
         await scenarioOperator.flush?.();
+        const runtimeAttestation = await runtimeBoundary?.close();
+        persistLiveAcceptanceEvidence(
+          settlement.evidence,
+          deployEvidence,
+          parsedOutput.evidenceOutput,
+          runtimeAttestation,
+        );
         await writeStandardOutputFrame({
           evidence: settlement.evidence,
           ok: true,
@@ -2499,6 +2791,13 @@ export const liveAcceptanceMain = async (
       return 75;
     }
     await scenarioOperator.flush?.();
+    const runtimeAttestation = await runtimeBoundary?.close();
+    persistLiveAcceptanceEvidence(
+      outcome.evidence,
+      deployEvidence,
+      parsedOutput.evidenceOutput,
+      runtimeAttestation,
+    );
     await writeStandardOutputFrame({
       evidence: outcome.evidence,
       ok: true,
@@ -2507,6 +2806,33 @@ export const liveAcceptanceMain = async (
     });
     return 0;
   } catch (error: unknown) {
+    if (isBoundedProcessCleanupUnprovenError(error)) {
+      if (!scenarioAbort.signal.aborted) scenarioAbort.abort(error);
+      run?.requestAbort();
+      await writeStandardOutputFrame({
+        ok: false,
+        phase: error.phase,
+        processGroupId: error.processGroupId,
+        processes: error.processes,
+        ...(error.recoveryPaths.length === 0 ? {} : { recoveryPaths: error.recoveryPaths }),
+        status: "recovery_required",
+        version: 1,
+      }).catch(() => undefined);
+      return 75;
+    }
+    if (isBoundedProcessRecoveryJournalError(error)) {
+      if (!scenarioAbort.signal.aborted) scenarioAbort.abort(error);
+      run?.requestAbort();
+      await writeStandardOutputFrame({
+        code: "process_recovery_journal_blocked",
+        ok: false,
+        reason: error.reason,
+        recoveryPaths: error.recoveryPaths,
+        status: "recovery_required",
+        version: 1,
+      }).catch(() => undefined);
+      return 75;
+    }
     const failedRun = run;
     const operatorInterrupted = scenarioAbort.signal.aborted
       && scenarioAbort.signal.reason instanceof LiveAcceptanceError

@@ -13,5 +13,5 @@ if (
   throw new Error("Expected one absolute installed-package root.");
 }
 const canonicalRoot = await realpath(packageRoot);
-await assertProductionPackageOnly(canonicalRoot);
+await assertProductionPackageOnly(canonicalRoot, "installed");
 process.stdout.write("Installed package contains production files only.\n");

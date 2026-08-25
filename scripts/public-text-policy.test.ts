@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
-import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,7 @@ import {
   assertPublicTree,
   PublicTextPolicyError,
 } from "./public-text-policy";
+import { authoritySupervisorArtifactManifest } from "./authority-supervisor-artifact";
 
 describe("public text policy", () => {
   test("rejects credential sentinels, private scopes, and machine user paths without echoing them", () => {
@@ -87,6 +88,47 @@ describe("public text policy", () => {
       await writeFile(join(root, ".git"), "gitdir: /private/tmp/repository/.git/worktrees/review\n", "utf8");
       await writeFile(join(root, "README.md"), "# Public package\n", "utf8");
       await expect(assertPublicTree(root)).resolves.toBeUndefined();
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("permits only the two verified authority-supervisor binary names", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-authority-artifacts-"));
+    const repositoryRoot = join(import.meta.dir, "..");
+    const sourceRelativePath = join("scripts", "authority-supervisor.zig");
+    const binaryDirectory = join("scripts", "authority-supervisor-bin");
+    const binaries = [
+      "authority-supervisor-linux-x64-musl",
+      "authority-supervisor-linux-arm64-musl",
+    ];
+    try {
+      await mkdir(join(root, binaryDirectory), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(root, sourceRelativePath),
+        await readFile(join(repositoryRoot, sourceRelativePath)),
+        { mode: 0o644 },
+      );
+      await chmod(join(root, sourceRelativePath), 0o644);
+      for (const binary of binaries) {
+        const destination = join(root, binaryDirectory, binary);
+        await writeFile(
+          destination,
+          await readFile(join(repositoryRoot, binaryDirectory, binary)),
+          { mode: 0o755 },
+        );
+        await chmod(destination, 0o755);
+      }
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+
+      await writeFile(join(root, binaryDirectory, "unreviewed"), Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+      await unlink(join(root, binaryDirectory, "unreviewed"));
+
+      const x64Path = join(root, binaryDirectory, binaries[0] ?? "");
+      await writeFile(x64Path, Buffer.alloc(authoritySupervisorArtifactManifest.artifacts.x64.byteLength, 0));
+      await chmod(x64Path, 0o755);
+      await expect(assertPublicTree(root)).rejects.toThrow("authority_supervisor_binary_hash_mismatch");
     } finally {
       await rm(root, { force: true, recursive: true });
     }

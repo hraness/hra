@@ -124,6 +124,7 @@ function publicDevice(device: Readonly<{
   revision: number;
   status: "pending" | "active" | "revoked";
   updatedAt: number;
+  userId: string;
   wrappingPublicKey: string;
 }>, presence: Awaited<ReturnType<typeof presenceForDevice>>, now: number) {
   return {
@@ -135,6 +136,7 @@ function publicDevice(device: Readonly<{
     publicId: device.publicId,
     revision: device.revision,
     status: device.status,
+    userPublicId: device.userId,
     wrappingPublicKey: device.wrappingPublicKey,
   };
 }
@@ -411,6 +413,7 @@ export const listPage = query({
       ...result,
       page: result.page.map((device, index) =>
         publicDevice(device, presence[index] ?? null, now)),
+      userPublicId: String(authority.userId),
     };
   },
 });

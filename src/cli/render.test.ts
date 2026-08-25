@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, type Output } from "./render";
+import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, type Output } from "./render";
 import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
 
@@ -173,6 +173,261 @@ describe("CLI rendering", () => {
       "Next: hra auth login --input-stdin",
       "",
     ].join("\n"));
+  });
+
+  test("renders devices as control-safe bounded blocks and preserves the exact JSON DTO", () => {
+    const currentDeviceId = `device_${"D".repeat(24)}`;
+    const pendingDeviceId = `device_${"P".repeat(24)}`;
+    const revokedDeviceId = `device_${"R".repeat(24)}`;
+    const unsafeLabel = "Desk\u001b[31m\nLine";
+    const data = {
+      currentDevicePublicId: currentDeviceId,
+      devices: [
+        {
+          activatedAt: 1_700_000_000_000,
+          current: true,
+          keyVersion: 1,
+          label: unsafeLabel,
+          labelSource: "encrypted",
+          lastSeenAt: 1_700_000_000_000,
+          online: true,
+          publicId: currentDeviceId,
+          revision: 3,
+          status: "active",
+        },
+        {
+          current: false,
+          keyVersion: 1,
+          label: "Pending device PPPPPPPP",
+          labelSource: "fallback",
+          lastSeenAt: null,
+          online: false,
+          publicId: pendingDeviceId,
+          revision: 1,
+          status: "pending",
+        },
+        {
+          activatedAt: 1_699_999_000_000,
+          current: false,
+          keyVersion: 1,
+          label: "Revoked device RRRRRRRR",
+          labelSource: "fallback",
+          lastSeenAt: 1_700_000_000_000,
+          online: false,
+          publicId: revokedDeviceId,
+          revision: 4,
+          status: "revoked",
+        },
+      ],
+    } as const;
+    const human = capture();
+    renderSuccess({ kind: "device.list" }, data, false, human.output);
+    const rendered = human.stdout.join("");
+    expect(rendered).toContain("Devices: 3");
+    expect(rendered).toContain("Device 1 (current)");
+    expect(rendered).toContain("  Label:");
+    expect(rendered).toContain("  Status:");
+    expect(rendered).toContain("  Presence:");
+    expect(rendered).toContain("  ID:");
+    expect(rendered).toContain("Desk\\u{001b}[31m\\u{000a}Line");
+    expect(rendered).not.toContain("\u001b");
+    expect(rendered).not.toContain(unsafeLabel);
+    expect(rendered).toContain("online");
+    expect(rendered).toContain("not seen");
+    expect(rendered).toContain("last seen 2023-11-14T22:13:20.000Z");
+    expect(rendered).toContain(currentDeviceId);
+    expect(rendered).toContain(pendingDeviceId);
+    expect(rendered).toContain(revokedDeviceId);
+    expect(rendered).toContain("[fallback]");
+    expect(rendered).toContain("the encrypted label was not authentic under this account key");
+
+    const json = capture();
+    renderSuccess({ kind: "device.list" }, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "device.list",
+      data,
+      ok: true,
+      version: 1,
+    });
+  });
+
+  test("rejects malformed device-list authority and never projects ciphertext", () => {
+    const currentDeviceId = `device_${"D".repeat(24)}`;
+    const validDevice = {
+      current: true,
+      keyVersion: 1,
+      label: "HRA device DDDDDDDD",
+      labelSource: "encrypted",
+      lastSeenAt: null,
+      online: false,
+      publicId: currentDeviceId,
+      revision: 1,
+      status: "active",
+    } as const;
+    const invalidValues: unknown[] = [
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, current: false }] },
+      { currentDevicePublicId: currentDeviceId, devices: [validDevice, validDevice] },
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, labelSource: "server" }] },
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, label: "/private/device" }] },
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, label: "   " }] },
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, label: " padded" }] },
+      { currentDevicePublicId: currentDeviceId, devices: [{ ...validDevice, status: "revoked", online: true }] },
+      {
+        currentDevicePublicId: currentDeviceId,
+        devices: [{
+          ...validDevice,
+          encryptedLabel: { ciphertext: "PRIVATE-CIPHERTEXT" },
+        }],
+      },
+    ];
+    for (const data of invalidValues) {
+      const human = capture();
+      expect(() => renderSuccess({ kind: "device.list" }, data, false, human.output))
+        .toThrow(InvalidCommandResponseError);
+      expect(human.stdout.join("")).toBe("");
+    }
+
+    const json = capture();
+    expect(() => renderSuccess({ kind: "device.list" }, invalidValues.at(-1), true, json.output))
+      .toThrow(InvalidCommandResponseError);
+    expect(json.stdout.join("")).toBe("");
+    expect(json.stdout.join("")).not.toContain("PRIVATE-CIPHERTEXT");
+  });
+
+  test("renders device-label Unicode without invisible-only or bidi terminal ambiguity", () => {
+    const publicId = `device_${"U".repeat(24)}`;
+    const renderLabel = (label: string): string => {
+      const target = capture();
+      renderSuccess({ kind: "device.list" }, {
+        currentDevicePublicId: publicId,
+        devices: [{
+          current: true,
+          keyVersion: 1,
+          label,
+          labelSource: "encrypted",
+          lastSeenAt: null,
+          online: false,
+          publicId,
+          revision: 1,
+          status: "active",
+        }],
+      }, false, target.output);
+      return target.stdout.join("");
+    };
+
+    const zwjOnly = renderLabel("\u200d");
+    expect(zwjOnly).toContain("Label: \\u{200d}");
+    expect(zwjOnly).not.toContain("\u200d");
+
+    const combiningOnly = renderLabel("\u0301");
+    expect(combiningOnly).toContain("Label: \\u{0301}");
+    expect(combiningOnly).not.toContain("\u0301");
+
+    expect(renderLabel("Cafe\u0301")).toContain("Label: Cafe\u0301");
+    expect(renderLabel("東京")).toContain("Label: 東京");
+    const family = "👩‍👩‍👧‍👦";
+    expect(renderLabel(family)).toContain(`Label: ${family}`);
+    expect(renderLabel(family)).not.toContain("\\u{200d}");
+
+    const bidi = renderLabel("abc\u202edef");
+    expect(bidi).toContain("Label: abc\\u{202e}def");
+    expect(bidi).not.toContain("\u202e");
+  });
+
+  test("bounds the human device view while leaving complete JSON available", () => {
+    const devices = Array.from({ length: 101 }, (_, index) => {
+      const publicId = `device_${String(index).padStart(8, "0")}`;
+      return {
+        current: index === 0,
+        keyVersion: 1,
+        label: "\u200d".repeat(160),
+        labelSource: "fallback" as const,
+        lastSeenAt: null,
+        online: false,
+        publicId,
+        revision: 1,
+        status: "active" as const,
+      };
+    });
+    const data = { currentDevicePublicId: devices[0]?.publicId, devices };
+    const human = capture();
+    renderSuccess({ kind: "device.list" }, data, false, human.output);
+    expect(human.stdout.join("")).toContain(
+      "1 additional devices omitted from this bounded view; use --json for the complete list.",
+    );
+    expect(human.stdout.join("")).not.toContain("device_00000100");
+    expect(human.stdout.join("")).not.toContain("\u200d");
+    expect(new TextEncoder().encode(human.stdout.join("")).byteLength).toBeLessThan(160_000);
+
+    const json = capture();
+    renderSuccess({ kind: "device.list" }, data, true, json.output);
+    expect((JSON.parse(json.stdout.join("")) as { data: { devices: unknown[] } }).data.devices)
+      .toHaveLength(101);
+  });
+
+  test("renders authoritative pairing and acknowledged account-key loss without implying regeneration", () => {
+    const deviceId = `device_${"K".repeat(24)}`;
+    const pairing = capture();
+    renderSuccess({ kind: "auth.status" }, {
+      accountKey: {
+        ifNoHolder: "unrecoverable",
+        recovery: "existing_key_holder_required",
+        status: "pairing_required",
+      },
+      automaticRegistrationPending: false,
+      configured: true,
+      device: { publicId: deviceId, status: "active" },
+      pairingRequired: false,
+      signedIn: true,
+    }, false, pairing.output);
+    expect(pairing.stdout.join("")).toBe([
+      "Cloud account: signed in",
+      `Device: active (${deviceId})`,
+      "Account key: pairing required",
+      "Recovery: an existing account-key holder must pair this device.",
+      "Local Codex data: unaffected.",
+      "No existing key holder: hra device key-loss --acknowledge-no-key-holders",
+      "Next: hra device pair",
+      "",
+    ].join("\n"));
+
+    const data = {
+      acknowledgedNoKeyHolders: true,
+      accountKey: {
+        evidence: "operator_confirmed_no_key_holders",
+        status: "unrecoverable",
+      },
+      localOnly: true,
+      replay: false,
+    } as const;
+    const acknowledged = capture();
+    renderSuccess({
+      acknowledgeNoKeyHolders: true,
+      kind: "device.key-loss",
+    }, data, false, acknowledged.output);
+    expect(acknowledged.stdout.join("")).toBe([
+      "Account-key loss acknowledgement: recorded locally.",
+      "Account key: unrecoverable (operator confirmed no key holders)",
+      "Local Codex data: unaffected.",
+      "Existing encrypted cloud content: cannot be decrypted.",
+      "Recovery: search again for an existing account-key holder, then pair the real key.",
+      "Fallback: erase and reinitialize the HRA cloud account only after that renewed holder search is exhausted. The lost account key cannot be regenerated.",
+      "No account key, device key, or ciphertext was minted, replaced, or deleted.",
+      "Next: hra device pair",
+      "",
+    ].join("\n"));
+
+    const json = capture();
+    renderSuccess({
+      acknowledgeNoKeyHolders: true,
+      kind: "device.key-loss",
+    }, data, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toEqual({
+      command: "device.key-loss",
+      data,
+      ok: true,
+      version: 1,
+    });
   });
 
   test("renders sync status with last-sync and projection health while redacting diagnostics", () => {
@@ -546,7 +801,11 @@ describe("CLI rendering", () => {
     );
     expect(absent.stdout.join("")).toBe("HRA daemon is already stopped.\n");
 
-    for (const nextCommand of ["hra daemon status --json", "hra doctor --offline"] as const) {
+    for (const nextCommand of [
+      "hra daemon status --json",
+      "hra doctor --offline",
+      "hra init --yes",
+    ] as const) {
       const recovery = capture();
       renderFailure({
         code: "RECOVERY_REQUIRED",
@@ -570,6 +829,34 @@ describe("CLI rendering", () => {
     }, false, injected.output);
     expect(injected.stderr.join("")).not.toContain("\nNext:");
     expect(injected.stderr.join("")).not.toContain("touch /tmp/unsafe\nNext:");
+  });
+
+  test("renders only the closed key-loss precondition handoffs", () => {
+    for (const [code, nextCommand] of [
+      ["INTERACTION_REQUIRED", "hra auth login --input-stdin"],
+      ["INTERACTION_REQUIRED", "hra device pair"],
+      ["RECOVERY_REQUIRED", "hra auth status"],
+    ] as const) {
+      const target = capture();
+      renderFailure({
+        code,
+        details: { nextCommand },
+        message: "Account-key loss acknowledgement requires another local step.",
+      }, false, target.output);
+      expect(target.stderr.join("")).toBe([
+        "hra: Account-key loss acknowledgement requires another local step.",
+        `Next: ${nextCommand}`,
+        "",
+      ].join("\n"));
+    }
+
+    const injected = capture();
+    renderFailure({
+      code: "RECOVERY_REQUIRED",
+      details: { nextCommand: "hra auth status; touch /tmp/unsafe" },
+      message: "Account-key loss acknowledgement requires another local step.",
+    }, false, injected.output);
+    expect(injected.stderr.join("")).not.toContain("\nNext:");
   });
 
   test("renders pending-login cancellation as a fresh-start handoff", () => {
@@ -842,6 +1129,7 @@ describe("CLI rendering", () => {
     renderSuccess(
       { kind: "session.status", session: "release" },
       {
+        version: 1,
         session: {
           id: "sess_00000000000000000000000000000000",
           title: "Release",
@@ -856,8 +1144,11 @@ describe("CLI rendering", () => {
           state: "live",
         },
         eventStream: {
+          cursor: "hra1.head.signature",
           floorSequence: 2,
           observedThroughSequence: 9,
+          retentionFloorCursor: "hra1.floor.signature",
+          streamEpoch: "90000000-0000-4000-8000-000000000001",
         },
         pendingInteractions: [{
           version: 1,
@@ -882,6 +1173,7 @@ describe("CLI rendering", () => {
           updatedAt: 1_000,
           terminalAt: null,
         }],
+        pendingInteractionsNextCursor: null,
       },
       false,
       status.output,
@@ -978,7 +1270,7 @@ describe("CLI rendering", () => {
     const list = capture();
     renderSuccess(
       { kind: "interaction.list", pending: true, limit: 100 },
-      { interactions: [record] },
+      { sessionId: null, interactions: [record], nextCursor: null },
       false,
       list.output,
     );
@@ -1108,14 +1400,22 @@ describe("CLI rendering", () => {
     expect(human.stdout.join("")).not.toContain("mutable-label");
 
     const status = capture();
+    const statusData = {
+      version: 1,
+      session: { id: sessionId, state: "idle" },
+      eventStream: {
+        cursor: "hra1.head.signature",
+        floorSequence: 1,
+        observedThroughSequence: 1,
+        retentionFloorCursor: "hra1.floor.signature",
+        streamEpoch: "90000000-0000-4000-8000-000000000001",
+      },
+      pendingInteractions: [],
+      pendingInteractionsNextCursor: cursor,
+    };
     renderSuccess(
       { kind: "session.status", session: "mutable-label" },
-      {
-        session: { id: sessionId, state: "idle" },
-        eventStream: {},
-        pendingInteractions: [],
-        pendingInteractionsNextCursor: cursor,
-      },
+      statusData,
       false,
       status.output,
     );
@@ -1126,12 +1426,7 @@ describe("CLI rendering", () => {
     const statusJson = capture();
     renderSuccess(
       { kind: "session.status", session: "mutable-label" },
-      {
-        session: { id: sessionId, state: "idle" },
-        eventStream: {},
-        pendingInteractions: [],
-        pendingInteractionsNextCursor: cursor,
-      },
+      statusData,
       true,
       statusJson.output,
     );
@@ -1222,13 +1517,13 @@ describe("CLI rendering", () => {
     });
 
     const malformed = capture();
-    renderSuccess(
+    expect(() => renderSuccess(
       { kind: "session.list", account: "mutable-label", limit: 37 },
       { ...listing, nextCursor: "provider-cursor-must-not-render" },
       false,
       malformed.output,
-    );
-    expect(malformed.stdout.join("")).not.toContain("Continue:");
+    )).toThrow(InvalidCommandResponseError);
+    expect(malformed.stdout.join("")).toBe("");
     expect(malformed.stdout.join("")).not.toContain("provider-cursor-must-not-render");
 
     const unsafeMetadata = capture();
@@ -1529,14 +1824,12 @@ describe("CLI rendering", () => {
     });
 
     const attacked = capture();
-    renderSuccess(command, {
+    expect(() => renderSuccess(command, {
       ...data,
       providerPayload: { access_token: "PRIVATE-USAGE-SENTINEL" },
-    }, true, attacked.output);
+    }, true, attacked.output)).toThrow(InvalidCommandResponseError);
     expect(attacked.stdout.join("")).not.toContain("PRIVATE-USAGE-SENTINEL");
-    expect(JSON.parse(attacked.stdout.join(""))).toMatchObject({
-      data: { account: null, entries: [], nextCursor: null, range: null },
-    });
+    expect(attacked.stdout.join("")).toBe("");
   });
 
   test("renders historical usage health and velocity without dumping provider payloads", () => {
@@ -1593,35 +1886,33 @@ describe("CLI rendering", () => {
   test("fails closed instead of dumping malformed interaction or event payloads", () => {
     const sentinel = "SECRET_SENTINEL";
     const interaction = capture();
-    renderSuccess(
+    expect(() => renderSuccess(
       { kind: "interaction.show", interaction: "c0000000-0000-4000-8000-000000000001" },
       { interaction: { rawProviderRequest: sentinel } },
       false,
       interaction.output,
-    );
-    expect(interaction.stdout).toEqual(["Interaction data is unavailable.\n"]);
+    )).toThrow(InvalidCommandResponseError);
+    expect(interaction.stdout).toEqual([]);
     expect(interaction.stdout.join("")).not.toContain(sentinel);
 
     const interactionJson = capture();
-    renderSuccess(
+    expect(() => renderSuccess(
       { kind: "interaction.show", interaction: "c0000000-0000-4000-8000-000000000001" },
       { interaction: { rawProviderRequest: sentinel } },
       true,
       interactionJson.output,
-    );
-    expect(JSON.parse(interactionJson.stdout.join(""))).toMatchObject({
-      data: { interaction: null },
-    });
+    )).toThrow(InvalidCommandResponseError);
+    expect(interactionJson.stdout).toEqual([]);
     expect(interactionJson.stdout.join("")).not.toContain(sentinel);
 
     const events = capture();
-    renderSuccess(
+    expect(() => renderSuccess(
       { kind: "session.events", session: "release", limit: 200, waitMs: 0 },
       { rawProviderEvent: sentinel },
       false,
       events.output,
-    );
-    expect(events.stdout).toEqual(["Event page data is unavailable.\n"]);
+    )).toThrow(InvalidCommandResponseError);
+    expect(events.stdout).toEqual([]);
     expect(events.stdout.join("")).not.toContain(sentinel);
   });
 });

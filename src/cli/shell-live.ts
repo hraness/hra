@@ -178,6 +178,34 @@ const interactionLabel = (kind: PendingInteraction["kind"]): string => {
   }
 };
 
+const pendingInteractionCommands = (interaction: PendingInteraction): readonly string[] => {
+  const binding = `${interaction.id} --revision ${String(interaction.revision)}`;
+  const show = `  Show: /interaction show ${interaction.id}`;
+  switch (interaction.kind) {
+    case "command_approval":
+      return [
+        show,
+        `  Inspect authority: /inspect ${binding}`,
+        `  Resolve: /approve ${binding} (or /decline ${binding})`,
+      ];
+    case "file_change_approval":
+      return [show, `  Resolve safely: /decline ${binding}`];
+    case "permission_approval":
+      return [
+        show,
+        `  Inspect authority: /inspect ${binding}`,
+        `  Resolve: /grant ${binding} (or /decline ${binding})`,
+      ];
+    case "user_input":
+      return [show, `  Resolve: /answer ${binding}`];
+    case "mcp_elicitation":
+      return [
+        show,
+        `  Resolve: /submit ${binding} --action accept (or replace accept with decline or cancel)`,
+      ];
+  }
+};
+
 const renderPendingInteraction = (interaction: PendingInteraction): string => {
   const detail = [
     `  revision ${String(interaction.revision)}${interaction.blocking ? ", blocking" : ""}`,
@@ -187,7 +215,7 @@ const renderPendingInteraction = (interaction: PendingInteraction): string => {
     return [
       `Interaction required: ${interactionLabel(interaction.kind)} ${interaction.id}`,
       ...detail,
-      "  Use /interactions to inspect it.",
+      ...pendingInteractionCommands(interaction),
     ].join("\n");
   }
   return [
