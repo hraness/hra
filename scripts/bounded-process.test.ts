@@ -132,6 +132,19 @@ describe("bounded detached process groups", () => {
     expect(source).not.toContain("openAuthorityArtifact?:");
   });
 
+  test("accepts Bun's null successful socket-write callback before waiting for native proof", async () => {
+    const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
+    const writeStart = source.indexOf("async write(frame: string): Promise<void> {");
+    const writeEnd = source.indexOf("async waitForEnd(timeoutMs: number)", writeStart);
+    const write = source.slice(writeStart, writeEnd);
+
+    expect(writeStart).toBeGreaterThanOrEqual(0);
+    expect(writeEnd).toBeGreaterThan(writeStart);
+    expect(write).toContain("error === undefined || error === null");
+    expect(write).toContain("resolvePromise()");
+    expect(write).toContain("rejectPromise(error)");
+  });
+
   test("binds native recovery to its authenticated direct-child identity without reading sealed proc state", async () => {
     const source = await readFile(join(import.meta.dir, "bounded-process.ts"), "utf8");
     const validatorStart = source.indexOf("const authorityRecoveryReadyIdentity = (");

@@ -2957,7 +2957,11 @@ class AuthorityControlEndpoint {
       throw authorityControlError("socket_unavailable");
     }
     await new Promise<void>((resolvePromise, rejectPromise) => {
-      socket.write(frame, "utf8", (error) => error === undefined ? resolvePromise() : rejectPromise(error));
+      socket.write(frame, "utf8", (error) => (
+        error === undefined || error === null
+          ? resolvePromise()
+          : rejectPromise(error)
+      ));
     });
   }
 
