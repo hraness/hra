@@ -7,6 +7,7 @@ import {
   readdir,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -34,6 +35,7 @@ import {
   resolvedConvexDeployTargetMatches,
 } from "./assert-convex-deploy-target";
 import {
+  ConvexTargetError,
   HRA_CONVEX_PROJECT_ID,
   HRA_CONVEX_TEAM_ID,
   type ConvexTarget,
@@ -73,6 +75,39 @@ const makeTemporaryDirectory = async (label: string): Promise<string> => {
   const directory = await mkdtemp(join(tmpdir(), label));
   temporaryDirectories.push(directory);
   return directory;
+};
+
+const materializeArchivedSource = async (request: CommandRequest): Promise<void> => {
+  const destination = request.arguments[3];
+  if (destination === undefined) throw new Error("missing archive destination");
+  await Promise.all([
+    mkdir(join(destination, "convex"), { recursive: true, mode: 0o700 }),
+    mkdir(join(destination, "scripts"), { recursive: true, mode: 0o700 }),
+  ]);
+  await Promise.all([
+    writeFile(join(destination, "bun.lock"), "fixture-lock\n", "utf8"),
+    writeFile(join(destination, "package.json"), "{}\n", "utf8"),
+    writeFile(
+      join(destination, "convex", "releaseAttestation.ts"),
+      "// fixture release attestation\n",
+      "utf8",
+    ),
+    writeFile(
+      join(destination, "scripts", "assert-convex-deploy-target.ts"),
+      "// fixture assertion\n",
+      "utf8",
+    ),
+  ]);
+};
+
+const materializeArchivedDependencies = async (request: CommandRequest): Promise<void> => {
+  const convexPackage = join(request.cwd, "node_modules", "convex");
+  const convexBin = join(convexPackage, "bin");
+  await mkdir(convexBin, { recursive: true, mode: 0o700 });
+  await Promise.all([
+    writeFile(join(convexPackage, "package.json"), "{\"name\":\"convex\"}\n", "utf8"),
+    writeFile(join(convexBin, "main.js"), "// fixture Convex CLI\n", "utf8"),
+  ]);
 };
 
 const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({
@@ -344,8 +379,107 @@ describe("verified hosted deployment", () => {
     expect(await readdir(temporaryRoot)).toEqual([]);
   });
 
+  test("classifies later filesystem cleanup failures while preserving a blocked journal", async () => {
+    for (const failedCleanup of ["binding", "source", "both"] as const) {
+      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-journal-cleanup-source-");
+      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-journal-cleanup-temp-");
+      const evidenceDirectory = await realpath(
+        await makeTemporaryDirectory("hra-hosted-journal-cleanup-evidence-"),
+      );
+      await chmod(evidenceDirectory, 0o700);
+      const evidencePath = join(evidenceDirectory, `bootstrap-${failedCleanup}.json`);
+      const processRecoveryPath = `/private/operator/process-recovery/${failedCleanup}.json`;
+      let archivedRoot = "";
+      let bindingRoot = "";
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+
+      expect(await executeHostedDeploy({
+        ...(failedCleanup === "source" || failedCleanup === "both"
+          ? {
+              archivedSourceRemover: async (path: string) => {
+                archivedRoot = path;
+                throw new Error("fixture source cleanup refusal");
+              },
+            }
+          : {}),
+        arguments: [
+          ...targetArguments,
+          "--source-commit",
+          sourceCommit,
+          "--phase",
+          "bootstrap",
+          "--evidence-path",
+          evidencePath,
+        ],
+        ...(failedCleanup === "binding" || failedCleanup === "both"
+          ? {
+              deploymentBindingRemover: async (path: string) => {
+                bindingRoot = path;
+                throw new Error("fixture binding cleanup refusal");
+              },
+            }
+          : {}),
+        readAttestation: async () => null,
+        repositoryRoot,
+        runner: async (request) => {
+          if (request.executable === "/usr/bin/git") {
+            return request.arguments[0] === "rev-parse"
+              ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+              : { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.executable === "/usr/bin/tar") {
+            await materializeArchivedSource(request);
+            return { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.phase === "source-dependency-install") {
+            archivedRoot = join(request.cwd, "..");
+            await materializeArchivedDependencies(request);
+            return { exitCode: 0, stderr: "", stdout: "installed" };
+          }
+          if (request.containment === "authority") {
+            throw new BoundedProcessRecoveryJournalError(
+              [processRecoveryPath],
+              "authority_recovery_required",
+            );
+          }
+          return { exitCode: 0, stderr: "", stdout: "" };
+        },
+        stderr: outputWriter(stderr),
+        stdout: outputWriter(stdout),
+        temporaryRoot,
+        verifyTarget: async () => undefined,
+      })).toBe(75);
+
+      expect(JSON.parse(stderr.join(""))).toEqual({
+        code: failedCleanup === "binding"
+          ? "deployment_binding_cleanup_failed"
+          : "source_cleanup_failed",
+        primaryCode: "process_recovery_journal_blocked",
+        primaryReason: "authority_recovery_required",
+        recoveryPaths: [
+          evidencePath,
+          `${evidencePath}.intent`,
+          processRecoveryPath,
+          ...(failedCleanup === "binding" || failedCleanup === "both" ? [bindingRoot] : []),
+          ...(failedCleanup === "source" || failedCleanup === "both" ? [archivedRoot] : []),
+        ].sort(),
+        schemaVersion: 1,
+        status: "recovery_required",
+      });
+      expect(stdout).toEqual([]);
+      if (failedCleanup === "binding" || failedCleanup === "both") {
+        expect(bindingRoot).toStartWith(temporaryRoot);
+      }
+      if (failedCleanup === "source" || failedCleanup === "both") {
+        expect(archivedRoot).toStartWith(temporaryRoot);
+        expect(await readdir(archivedRoot)).toContain("source");
+      }
+    }
+  });
+
   test("surfaces a source archive root when local preparation cleanup is unproven", async () => {
-    for (const failedExecutable of ["/usr/bin/git", "/usr/bin/tar"] as const) {
+    for (const failedExecutable of ["/usr/bin/git", "/usr/bin/tar", process.execPath] as const) {
       const repositoryRoot = await makeTemporaryDirectory("hra-hosted-archive-terminal-source-");
       const temporaryRoot = await makeTemporaryDirectory("hra-hosted-archive-terminal-temp-");
       const evidenceDirectory = await realpath(
@@ -353,10 +487,15 @@ describe("verified hosted deployment", () => {
       );
       await chmod(evidenceDirectory, 0o700);
       const evidencePath = join(evidenceDirectory, "bootstrap.json");
-      const processRecoveryPath = `/private/operator/process-recovery/${failedExecutable.endsWith("git") ? "git" : "tar"}.json`;
+      const failedPhase = failedExecutable.endsWith("git")
+        ? "git-source-read"
+        : failedExecutable.endsWith("tar")
+          ? "source-archive-extract"
+          : "source-dependency-install";
+      const processRecoveryPath = `/private/operator/process-recovery/${failedExecutable.endsWith("git") ? "git" : failedExecutable.endsWith("tar") ? "tar" : "install"}.json`;
       const cleanup = new BoundedProcessCleanupUnprovenError(
-        failedExecutable.endsWith("git") ? 42_451 : 42_452,
-        failedExecutable.endsWith("git") ? "git-source-read" : "source-archive-extract",
+        failedExecutable.endsWith("git") ? 42_451 : failedExecutable.endsWith("tar") ? 42_452 : 42_454,
+        failedPhase,
       ).retainRecoveryPath(processRecoveryPath);
       const requests: CommandRequest[] = [];
       let verifications = 0;
@@ -371,8 +510,13 @@ describe("verified hosted deployment", () => {
           requests.push(request);
           if (
             request.executable === failedExecutable
-            && (failedExecutable === "/usr/bin/tar" || request.arguments[0] === "archive")
+            && (
+              failedExecutable === "/usr/bin/tar"
+              || failedExecutable === process.execPath
+              || request.arguments[0] === "archive"
+            )
           ) throw cleanup;
+          if (request.executable === "/usr/bin/tar") await materializeArchivedSource(request);
           return request.arguments[0] === "rev-parse"
             ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
             : { exitCode: 0, stderr: "", stdout: "" };
@@ -397,6 +541,568 @@ describe("verified hosted deployment", () => {
       expect(requests.at(-1)?.executable).toBe(failedExecutable);
       expect(requests.some((request) => request.containment === "authority")).toBe(false);
     }
+  });
+
+  test("refuses before provider execution when the archived frozen install fails", async () => {
+    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-install-source-");
+    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-install-temp-");
+    const evidenceDirectory = await realpath(
+      await makeTemporaryDirectory("hra-hosted-install-evidence-"),
+    );
+    await chmod(evidenceDirectory, 0o700);
+    const evidencePath = join(evidenceDirectory, "bootstrap.json");
+    const requests: CommandRequest[] = [];
+
+    await expect(deployHostedSync({
+      environment: {
+        CONVEX_DEPLOY_KEY: "hostile-key",
+        HOME: "/operator-home",
+        PATH: "/safe/bin",
+      },
+      evidencePath,
+      phase: "bootstrap",
+      readAttestation: async () => null,
+      repositoryRoot,
+      revision: () => "00000000-0000-4000-8000-000000000053",
+      runner: async (request) => {
+        requests.push(request);
+        if (request.executable === "/usr/bin/git") {
+          return request.arguments[0] === "rev-parse"
+            ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+            : { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (request.executable === "/usr/bin/tar") {
+          await materializeArchivedSource(request);
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (request.phase === "source-dependency-install") {
+          return {
+            exitCode: 1,
+            stderr: "hostile install failure",
+            stdout: "hostile install output",
+          };
+        }
+        throw new Error("provider execution was reachable after install failure");
+      },
+      sourceCommit,
+      target,
+      temporaryRoot,
+      verifyTarget: async () => undefined,
+    })).rejects.toThrow("source_dependency_install_failed");
+
+    const archiveIndex = requests.findIndex((request) => request.arguments[0] === "archive");
+    const extractIndex = requests.findIndex((request) => request.phase === "source-archive-extract");
+    const installIndex = requests.findIndex((request) => request.phase === "source-dependency-install");
+    expect(archiveIndex).toBeGreaterThanOrEqual(0);
+    expect(extractIndex).toBeGreaterThan(archiveIndex);
+    expect(installIndex).toBeGreaterThan(extractIndex);
+    expect(requests.some((request) => request.containment === "authority")).toBeFalse();
+    expect(requests[installIndex]).toMatchObject({
+      arguments: [
+        "install",
+        "--frozen-lockfile",
+        "--ignore-scripts",
+        "--backend=copyfile",
+      ],
+      containment: "local",
+      environment: {
+        HOME: "/operator-home",
+        [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+        NO_COLOR: "1",
+        PATH: "/safe/bin",
+        TERM: "dumb",
+      },
+      executable: process.execPath,
+      outputMaximumBytes: 524_288,
+      phase: "source-dependency-install",
+      stdin: "",
+      timeoutMs: 600_000,
+    });
+    expect(requests[installIndex]?.cwd).toContain("hra-hosted-source-");
+    expect(await readdir(temporaryRoot)).toEqual([]);
+    expect(await readdir(evidenceDirectory)).toEqual(["bootstrap.json.intent"]);
+  });
+
+  test("surfaces the archived root when preparation cleanup fails with a primary error", async () => {
+    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-preparation-cleanup-source-");
+    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-preparation-cleanup-temp-");
+    const evidenceDirectory = await realpath(
+      await makeTemporaryDirectory("hra-hosted-preparation-cleanup-evidence-"),
+    );
+    await chmod(evidenceDirectory, 0o700);
+    const evidencePath = join(evidenceDirectory, "bootstrap.json");
+    let archivedRoot = "";
+    let providerCalls = 0;
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+
+    expect(await executeHostedDeploy({
+      archivedSourceRemover: async (path) => {
+        archivedRoot = path;
+        throw new Error("fixture cleanup refusal");
+      },
+      arguments: [
+        ...targetArguments,
+        "--source-commit",
+        sourceCommit,
+        "--phase",
+        "bootstrap",
+        "--evidence-path",
+        evidencePath,
+      ],
+      readAttestation: async () => null,
+      repositoryRoot,
+      runner: async (request) => {
+        if (request.executable === "/usr/bin/git") {
+          return request.arguments[0] === "rev-parse"
+            ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+            : { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (request.executable === "/usr/bin/tar") {
+          await materializeArchivedSource(request);
+          return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (request.phase === "source-dependency-install") {
+          return { exitCode: 1, stderr: "install refused", stdout: "" };
+        }
+        providerCalls += 1;
+        return { exitCode: 0, stderr: "", stdout: "" };
+      },
+      stderr: outputWriter(stderr),
+      stdout: outputWriter(stdout),
+      temporaryRoot,
+      verifyTarget: async () => undefined,
+    })).toBe(75);
+    expect(providerCalls).toBe(0);
+    expect(archivedRoot).toStartWith(temporaryRoot);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "source_cleanup_failed",
+      primaryCode: "source_dependency_install_failed",
+      recoveryPaths: [evidencePath, `${evidencePath}.intent`, archivedRoot].sort(),
+      schemaVersion: 1,
+      status: "recovery_required",
+    });
+    expect(stderr.join("")).not.toContain("process_cleanup_unproven");
+    expect(stdout).toEqual([]);
+    expect(await readdir(archivedRoot)).toContain("source");
+  });
+
+  test("surfaces post-deploy archived cleanup failures with and without a primary error", async () => {
+    for (const providerFails of [false, true]) {
+      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-post-cleanup-source-");
+      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-post-cleanup-temp-");
+      const evidenceDirectory = await realpath(
+        await makeTemporaryDirectory("hra-hosted-post-cleanup-evidence-"),
+      );
+      await chmod(evidenceDirectory, 0o700);
+      const evidencePath = join(evidenceDirectory, "bootstrap.json");
+      let archivedRoot = "";
+      let runtime: RuntimeReleaseAttestation | null = null;
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+
+      expect(await executeHostedDeploy({
+        archivedSourceRemover: async (path) => {
+          archivedRoot = path;
+          throw new Error("fixture cleanup refusal");
+        },
+        arguments: [
+          ...targetArguments,
+          "--source-commit",
+          sourceCommit,
+          "--phase",
+          "bootstrap",
+          "--evidence-path",
+          evidencePath,
+        ],
+        readAttestation: async () => runtime,
+        repositoryRoot,
+        runner: async (request) => {
+          if (request.executable === "/usr/bin/git") {
+            return request.arguments[0] === "rev-parse"
+              ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+              : { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.executable === "/usr/bin/tar") {
+            await materializeArchivedSource(request);
+            return { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.phase === "source-dependency-install") {
+            await materializeArchivedDependencies(request);
+            return { exitCode: 0, stderr: "", stdout: "installed" };
+          }
+          if (providerFails) {
+            return { exitCode: 1, stderr: "stopped before push", stdout: "" };
+          }
+          const overlay = await readFile(
+            join(request.cwd, "convex", "releaseAttestation.ts"),
+            "utf8",
+          );
+          const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
+          if (match?.[1] === undefined) throw new Error("missing attestation overlay");
+          runtime = JSON.parse(match[1]) as RuntimeReleaseAttestation;
+          return { exitCode: 0, stderr: "", stdout: "deployed" };
+        },
+        stderr: outputWriter(stderr),
+        stdout: outputWriter(stdout),
+        temporaryRoot,
+        verifyTarget: async () => undefined,
+      })).toBe(75);
+      expect(archivedRoot).toStartWith(temporaryRoot);
+      expect(JSON.parse(stderr.join(""))).toEqual({
+        code: "source_cleanup_failed",
+        primaryCode: providerFails ? "convex_deploy_failed" : null,
+        recoveryPaths: [evidencePath, `${evidencePath}.intent`, archivedRoot].sort(),
+        schemaVersion: 1,
+        status: "recovery_required",
+      });
+      expect(stderr.join("")).not.toContain("process_cleanup_unproven");
+      expect(stdout).toEqual([]);
+      expect(await readdir(archivedRoot)).toContain("source");
+    }
+  });
+
+  test("composes binding and source cleanup roots without losing the primary failure", async () => {
+    for (const scenario of ["success", "ordinary", "authority", "target"] as const) {
+      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-cleanup-compose-source-");
+      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-cleanup-compose-temp-");
+      const evidenceDirectory = await realpath(
+        await makeTemporaryDirectory("hra-hosted-cleanup-compose-evidence-"),
+      );
+      await chmod(evidenceDirectory, 0o700);
+      const evidencePath = join(evidenceDirectory, `bootstrap-${scenario}.json`);
+      let runtime: RuntimeReleaseAttestation | null = null;
+      let archivedRoot = "";
+      let bindingRoot = "";
+      let verifications = 0;
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+
+      expect(await executeHostedDeploy({
+        ...(scenario === "ordinary"
+          ? {
+              archivedSourceRemover: async (path: string) => {
+                archivedRoot = path;
+                throw new Error("fixture source cleanup refusal");
+              },
+            }
+          : {}),
+        arguments: [
+          ...targetArguments,
+          "--source-commit",
+          sourceCommit,
+          "--phase",
+          "bootstrap",
+          "--evidence-path",
+          evidencePath,
+        ],
+        deploymentBindingRemover: async (path) => {
+          bindingRoot = path;
+          throw new Error("fixture binding cleanup refusal");
+        },
+        readAttestation: async () => runtime,
+        repositoryRoot,
+        runner: async (request) => {
+          if (request.executable === "/usr/bin/git") {
+            return request.arguments[0] === "rev-parse"
+              ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+              : { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.executable === "/usr/bin/tar") {
+            await materializeArchivedSource(request);
+            return { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.phase === "source-dependency-install") {
+            archivedRoot = join(request.cwd, "..");
+            await materializeArchivedDependencies(request);
+            return { exitCode: 0, stderr: "", stdout: "installed" };
+          }
+          if (scenario === "authority") {
+            throw new BoundedProcessContainmentUnavailableError(
+              "authority_backend_unavailable",
+            );
+          }
+          if (scenario === "ordinary") {
+            return { exitCode: 1, stderr: "stopped", stdout: "" };
+          }
+          const overlay = await readFile(
+            join(request.cwd, "convex", "releaseAttestation.ts"),
+            "utf8",
+          );
+          const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
+          if (match?.[1] === undefined) throw new Error("missing attestation overlay");
+          runtime = JSON.parse(match[1]) as RuntimeReleaseAttestation;
+          return { exitCode: 0, stderr: "", stdout: "deployed" };
+        },
+        stderr: outputWriter(stderr),
+        stdout: outputWriter(stdout),
+        temporaryRoot,
+        verifyTarget: async () => {
+          verifications += 1;
+          if (scenario === "target" && verifications === 2) {
+            throw new ConvexTargetError("target_mismatch");
+          }
+        },
+      })).toBe(75);
+
+      const expectedCode = scenario === "ordinary"
+        ? "source_cleanup_failed"
+        : "deployment_binding_cleanup_failed";
+      const expectedPrimary = scenario === "ordinary"
+        ? "convex_deploy_failed"
+        : scenario === "authority"
+          ? "authority_containment_unavailable"
+          : scenario === "target"
+            ? "convex_target_refused"
+            : null;
+      const expectedRecoveryPaths = [
+        evidencePath,
+        `${evidencePath}.intent`,
+        bindingRoot,
+        ...(scenario === "ordinary" ? [archivedRoot] : []),
+      ].sort();
+      expect(JSON.parse(stderr.join(""))).toEqual({
+        code: expectedCode,
+        primaryCode: expectedPrimary,
+        ...(scenario === "authority"
+          ? { primaryReason: "authority_backend_unavailable" }
+          : {}),
+        recoveryPaths: expectedRecoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      });
+      expect(bindingRoot).toStartWith(temporaryRoot);
+      expect(stderr.join("")).not.toContain("process_cleanup_unproven");
+      expect(stdout).toEqual([]);
+      if (scenario === "ordinary") {
+        expect(await readdir(archivedRoot)).toContain("source");
+      }
+    }
+  });
+
+  test("refuses symlink ancestors for the archived assertion and Convex CLI", async () => {
+    for (const hostileAncestor of ["scripts", "convex-package"] as const) {
+      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-symlink-source-");
+      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-symlink-temp-");
+      const evidenceDirectory = await realpath(
+        await makeTemporaryDirectory("hra-hosted-symlink-evidence-"),
+      );
+      const outside = await makeTemporaryDirectory("hra-hosted-symlink-outside-");
+      await chmod(evidenceDirectory, 0o700);
+      const evidencePath = join(evidenceDirectory, `bootstrap-${hostileAncestor}.json`);
+      let authorityCalls = 0;
+      const requests: CommandRequest[] = [];
+
+      await expect(deployHostedSync({
+        evidencePath,
+        phase: "bootstrap",
+        readAttestation: async () => null,
+        repositoryRoot,
+        runner: async (request) => {
+          requests.push(request);
+          if (request.executable === "/usr/bin/git") {
+            return request.arguments[0] === "rev-parse"
+              ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+              : { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.executable === "/usr/bin/tar") {
+            await materializeArchivedSource(request);
+            if (hostileAncestor === "scripts") {
+              const scriptsPath = join(request.arguments[3] ?? "", "scripts");
+              await rm(scriptsPath, { force: true, recursive: true });
+              await writeFile(
+                join(outside, "assert-convex-deploy-target.ts"),
+                "// outside assertion\n",
+                "utf8",
+              );
+              await symlink(outside, scriptsPath, "dir");
+            }
+            return { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.phase === "source-dependency-install") {
+            await materializeArchivedDependencies(request);
+            if (hostileAncestor === "convex-package") {
+              const convexPackagePath = join(request.cwd, "node_modules", "convex");
+              await rm(convexPackagePath, { force: true, recursive: true });
+              await mkdir(join(outside, "bin"), { recursive: true, mode: 0o700 });
+              await writeFile(join(outside, "bin", "main.js"), "// outside CLI\n", "utf8");
+              await symlink(outside, convexPackagePath, "dir");
+            }
+            return { exitCode: 0, stderr: "", stdout: "installed" };
+          }
+          authorityCalls += 1;
+          return { exitCode: 0, stderr: "", stdout: "" };
+        },
+        sourceCommit,
+        target,
+        temporaryRoot,
+        verifyTarget: async () => undefined,
+      })).rejects.toThrow(
+        hostileAncestor === "scripts" ? "source_changed" : "source_dependency_install_failed",
+      );
+      expect(authorityCalls).toBe(0);
+      expect(requests.some((request) => request.containment === "authority")).toBeFalse();
+      expect(await readdir(temporaryRoot)).toEqual([]);
+    }
+  });
+
+  test("rechecks archived assertion and CLI identities immediately before authority launch", async () => {
+    for (const substitutedPath of ["assertion", "cli"] as const) {
+      const repositoryRoot = await makeTemporaryDirectory("hra-hosted-substitution-source-");
+      const temporaryRoot = await makeTemporaryDirectory("hra-hosted-substitution-temp-");
+      const evidenceDirectory = await realpath(
+        await makeTemporaryDirectory("hra-hosted-substitution-evidence-"),
+      );
+      await chmod(evidenceDirectory, 0o700);
+      const evidencePath = join(evidenceDirectory, `bootstrap-${substitutedPath}.json`);
+      let archivedSource = "";
+      let authorityCalls = 0;
+      let attestationReads = 0;
+
+      await expect(deployHostedSync({
+        evidencePath,
+        phase: "bootstrap",
+        readAttestation: async () => {
+          attestationReads += 1;
+          if (attestationReads === 2) {
+            const path = substitutedPath === "assertion"
+              ? join(archivedSource, "scripts", "assert-convex-deploy-target.ts")
+              : join(archivedSource, "node_modules", "convex", "bin", "main.js");
+            await rm(path, { force: false });
+            await writeFile(path, `// substituted ${substitutedPath}\n`, "utf8");
+          }
+          return null;
+        },
+        repositoryRoot,
+        runner: async (request) => {
+          if (request.executable === "/usr/bin/git") {
+            return request.arguments[0] === "rev-parse"
+              ? { exitCode: 0, stderr: "", stdout: `${sourceCommit}\n` }
+              : { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.executable === "/usr/bin/tar") {
+            await materializeArchivedSource(request);
+            return { exitCode: 0, stderr: "", stdout: "" };
+          }
+          if (request.phase === "source-dependency-install") {
+            archivedSource = request.cwd;
+            await materializeArchivedDependencies(request);
+            return { exitCode: 0, stderr: "", stdout: "installed" };
+          }
+          authorityCalls += 1;
+          return { exitCode: 0, stderr: "", stdout: "" };
+        },
+        sourceCommit,
+        target,
+        temporaryRoot,
+        verifyTarget: async () => undefined,
+      })).rejects.toThrow("source_changed");
+      expect(attestationReads).toBe(2);
+      expect(authorityCalls).toBe(0);
+      expect(await readdir(temporaryRoot)).toEqual([]);
+    }
+  });
+
+  test("supersedes a proven pre-push stop only through a fresh source path", async () => {
+    const oldSourceCommit = "a".repeat(40);
+    const fixedSourceCommit = "b".repeat(40);
+    const repositoryRoot = await makeTemporaryDirectory("hra-hosted-supersession-source-");
+    const temporaryRoot = await makeTemporaryDirectory("hra-hosted-supersession-temp-");
+    const evidenceDirectory = await realpath(
+      await makeTemporaryDirectory("hra-hosted-supersession-evidence-"),
+    );
+    await chmod(evidenceDirectory, 0o700);
+    const oldEvidencePath = join(evidenceDirectory, `bootstrap-${oldSourceCommit}.json`);
+    const fixedEvidencePath = join(evidenceDirectory, `bootstrap-${fixedSourceCommit}.json`);
+    let reportedHead = oldSourceCommit;
+    let failBeforePush = true;
+    let runtime: RuntimeReleaseAttestation | null = null;
+    let providerCalls = 0;
+    const verifiedTargets: ConvexTarget[] = [];
+    const requests: CommandRequest[] = [];
+    const runner: CommandRunner = async (request) => {
+      requests.push(request);
+      if (request.executable === "/usr/bin/git") {
+        return request.arguments[0] === "rev-parse"
+          ? { exitCode: 0, stderr: "", stdout: `${reportedHead}\n` }
+          : { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (request.executable === "/usr/bin/tar") {
+        await materializeArchivedSource(request);
+        return { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (request.phase === "source-dependency-install") {
+        await materializeArchivedDependencies(request);
+        return { exitCode: 0, stderr: "", stdout: "installed" };
+      }
+      providerCalls += 1;
+      if (failBeforePush) {
+        return { exitCode: 1, stderr: "typecheck stopped before runPush", stdout: "" };
+      }
+      const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
+      const match = /Object\.freeze\((\{.*\}) as const\)/u.exec(overlay);
+      if (match?.[1] === undefined) throw new Error("missing attestation overlay");
+      runtime = JSON.parse(match[1]) as RuntimeReleaseAttestation;
+      return { exitCode: 0, stderr: "", stdout: "deployed" };
+    };
+    const readAttestation = async (): Promise<RuntimeReleaseAttestation | null> => runtime;
+
+    await expect(deployHostedSync({
+      evidencePath: oldEvidencePath,
+      phase: "bootstrap",
+      readAttestation,
+      repositoryRoot,
+      revision: () => "00000000-0000-4000-8000-000000000054",
+      runner,
+      sourceCommit: oldSourceCommit,
+      target,
+      temporaryRoot,
+      verifyTarget: async (value) => { verifiedTargets.push(value); },
+    })).rejects.toThrow("convex_deploy_failed");
+    expect(providerCalls).toBe(1);
+    expect(runtime).toBeNull();
+    expect(verifiedTargets).toEqual([target, target]);
+    const oldIntentDocument = await readFile(`${oldEvidencePath}.intent`, "utf8");
+
+    reportedHead = fixedSourceCommit;
+    failBeforePush = false;
+    const fixed = await deployHostedSync({
+      evidencePath: fixedEvidencePath,
+      phase: "bootstrap",
+      readAttestation,
+      repositoryRoot,
+      revision: () => "00000000-0000-4000-8000-000000000055",
+      runner,
+      sourceCommit: fixedSourceCommit,
+      target,
+      temporaryRoot,
+      verifyTarget: async (value) => { verifiedTargets.push(value); },
+    });
+    expect(fixed?.sourceCommit).toBe(fixedSourceCommit);
+    expect(providerCalls).toBe(2);
+    expect((await readAttestation())?.runtimeSourceCommit).toBe(fixedSourceCommit);
+    expect(await readFile(`${oldEvidencePath}.intent`, "utf8")).toBe(oldIntentDocument);
+    expect(await Bun.file(oldEvidencePath).exists()).toBeFalse();
+
+    reportedHead = oldSourceCommit;
+    const requestCount = requests.length;
+    await expect(deployHostedSync({
+      evidencePath: oldEvidencePath,
+      phase: "bootstrap",
+      readAttestation,
+      repositoryRoot,
+      runner,
+      sourceCommit: oldSourceCommit,
+      target,
+      temporaryRoot,
+      verifyTarget: async (value) => { verifiedTargets.push(value); },
+    })).rejects.toThrow("source_changed");
+    expect(providerCalls).toBe(2);
+    expect(requests.slice(requestCount).every(
+      (request) => request.executable === "/usr/bin/git",
+    )).toBeTrue();
+    expect(await readFile(`${oldEvidencePath}.intent`, "utf8")).toBe(oldIntentDocument);
+    expect(await readdir(temporaryRoot)).toEqual([]);
   });
 
   test("surfaces every preserved deploy root and durable intent without postflight", async () => {
@@ -425,10 +1131,12 @@ describe("verified hosted deployment", () => {
       runner: async (request) => {
         requests.push(request);
         if (request.executable === "/usr/bin/tar") {
-          const destination = request.arguments[3];
-          if (destination === undefined) throw new Error("missing archive destination");
-          await mkdir(join(destination, "convex"), { recursive: true, mode: 0o700 });
+          await materializeArchivedSource(request);
           return { exitCode: 0, stderr: "", stdout: "" };
+        }
+        if (request.phase === "source-dependency-install") {
+          await materializeArchivedDependencies(request);
+          return { exitCode: 0, stderr: "", stdout: "installed" };
         }
         if (request.containment === "authority") {
           authorityCalls += 1;
@@ -561,10 +1269,12 @@ describe("verified hosted deployment", () => {
         return { exitCode: 0, stderr: "", stdout: "" };
       }
       if (request.executable === "/usr/bin/tar") {
-        const destination = request.arguments[3];
-        if (destination === undefined) throw new Error("missing archive destination");
-        await mkdir(join(destination, "convex"), { recursive: true, mode: 0o700 });
+        await materializeArchivedSource(request);
         return { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (request.phase === "source-dependency-install") {
+        await materializeArchivedDependencies(request);
+        return { exitCode: 0, stderr: "", stdout: "installed" };
       }
       deploymentCalls += 1;
       const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");
@@ -606,8 +1316,42 @@ describe("verified hosted deployment", () => {
       environment: { PATH: "/hostile/git-bin" },
       executable: "/usr/bin/git",
     });
-    expect(requests.find((request) => request.executable !== "/usr/bin/git" && request.executable !== "/usr/bin/tar")?.cwd)
-      .toContain("hra-hosted-source-");
+    const installRequest = requests.find(
+      (request) => request.phase === "source-dependency-install",
+    );
+    const deployRequest = requests.find((request) => request.phase === "convex-deploy");
+    if (installRequest === undefined || deployRequest === undefined) {
+      throw new Error("missing archived install or deploy request");
+    }
+    expect(installRequest).toMatchObject({
+      arguments: [
+        "install",
+        "--frozen-lockfile",
+        "--ignore-scripts",
+        "--backend=copyfile",
+      ],
+      containment: "local",
+      environment: {
+        [HRA_EXPECTED_CONVEX_DEPLOY_URL]: target.deploymentUrl,
+        NO_COLOR: "1",
+        PATH: "/hostile/git-bin",
+        TERM: "dumb",
+      },
+      executable: process.execPath,
+      outputMaximumBytes: 524_288,
+      phase: "source-dependency-install",
+      stdin: "",
+      timeoutMs: 600_000,
+    });
+    expect(installRequest.cwd).toContain("hra-hosted-source-");
+    expect(deployRequest.cwd).toBe(installRequest.cwd);
+    expect(deployRequest.arguments[0]).toBe(
+      join(installRequest.cwd, "node_modules", "convex", "bin", "main.js"),
+    );
+    expect(deployRequest.arguments[10]).toContain(
+      join(installRequest.cwd, "scripts", "assert-convex-deploy-target.ts"),
+    );
+    expect(requests.indexOf(installRequest)).toBeLessThan(requests.indexOf(deployRequest));
 
     const requestCount = requests.length;
     const replay = await deployHostedSync({
@@ -648,10 +1392,12 @@ describe("verified hosted deployment", () => {
           : { exitCode: 0, stderr: "", stdout: "" };
       }
       if (request.executable === "/usr/bin/tar") {
-        const destination = request.arguments[3];
-        if (destination === undefined) throw new Error("missing archive destination");
-        await mkdir(join(destination, "convex"), { recursive: true, mode: 0o700 });
+        await materializeArchivedSource(request);
         return { exitCode: 0, stderr: "", stdout: "" };
+      }
+      if (request.phase === "source-dependency-install") {
+        await materializeArchivedDependencies(request);
+        return { exitCode: 0, stderr: "", stdout: "installed" };
       }
       deploymentCalls += 1;
       const overlay = await readFile(join(request.cwd, "convex", "releaseAttestation.ts"), "utf8");

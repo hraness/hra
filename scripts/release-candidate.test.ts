@@ -47,7 +47,7 @@ import {
 const roots: string[] = [];
 const candidateCommit = "a".repeat(40);
 const bootstrapCommit = "b".repeat(40);
-const fallbackCommit = "c".repeat(40);
+const fallbackCommit = "443448b79e9016e00d52501f047fce3a408de092";
 const target = {
   deploymentId: 5_089_017,
   deploymentName: "qualified-hummingbird-537",
@@ -118,7 +118,7 @@ const vercel: CandidateVercelAuthority = {
     projectId: HRA_V0_VERCEL_PROJECT_ID,
     repositoryId: 1_334_876_494,
     sourceCommit: fallbackCommit,
-    version: "0.1.14",
+    version: "0.1.15",
   },
 };
 
@@ -284,6 +284,27 @@ const writeEvidenceChain = async (
 };
 
 describe("sealed release candidate", () => {
+  test("binds both generation-one cutover endpoints to their distinct repositories", () => {
+    expect(candidateForwardPlan(vercel.candidate, vercel.fallback)).toMatchObject({
+      source: {
+        generation: 1,
+        repositoryId: 1_334_876_494,
+        sourceCommit: fallbackCommit,
+        version: "0.1.15",
+      },
+      target: {
+        generation: 1,
+        repositoryId: HRA_REPOSITORY_ID,
+        sourceCommit: candidateCommit,
+        version: "0.1.0",
+      },
+    });
+    expect(candidateReversePlan(vercel.candidate, vercel.fallback)).toMatchObject({
+      source: { generation: 1, repositoryId: HRA_REPOSITORY_ID },
+      target: { generation: 1, repositoryId: 1_334_876_494 },
+    });
+  });
+
   test("bounds subprocesses with TERM then KILL and refuses an aborted Convex authority read", async () => {
     const startedAt = performance.now();
     const processResult = await runReleaseCandidateProcess({

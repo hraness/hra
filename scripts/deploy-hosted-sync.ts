@@ -25,6 +25,7 @@ import {
   retainBoundedProcessRecoveryPath,
 } from "./bounded-process";
 import {
+  isAuthorityContainmentUnavailable,
   renderAuthorityContainmentUnavailable,
   rethrowAuthorityContainmentUnavailable,
 } from "./authority-containment";
@@ -65,6 +66,8 @@ import {
 const convexDeployOutputMaximumBytes = 512 * 1024;
 const convexDeployTimeoutMs = 10 * 60 * 1_000;
 const convexAuthorityTimeoutMs = 30_000;
+const archivedDependencyOutputMaximumBytes = 512 * 1024;
+const archivedDependencyTimeoutMs = 10 * 60 * 1_000;
 const gitOutputMaximumBytes = 64 * 1024;
 const sourceCommitPattern = /^[0-9a-f]{40}$/u;
 
@@ -72,6 +75,7 @@ type HostedDeployFailureCode =
   | "convex_deploy_failed"
   | "convex_target_refused"
   | "process_cleanup_unproven"
+  | "source_dependency_install_failed"
   | "source_changed"
   | "target_file_refused"
   | "usage_invalid";
@@ -86,12 +90,99 @@ class HostedDeployError extends Error {
   }
 }
 
+type HostedDeployFilesystemCleanupCode =
+  | "deployment_binding_cleanup_failed"
+  | "source_cleanup_failed";
+
+type HostedDeployPrimaryFailureCode =
+  | HostedDeployFailureCode
+  | "authority_containment_unavailable"
+  | "process_recovery_journal_blocked";
+
+class HostedDeployFilesystemCleanupError extends Error {
+  readonly code: HostedDeployFilesystemCleanupCode;
+  readonly primaryCode: HostedDeployPrimaryFailureCode | null;
+  readonly primaryReason?: string;
+  readonly recoveryPaths: readonly string[];
+
+  constructor(
+    code: HostedDeployFilesystemCleanupCode,
+    recoveryPaths: readonly string[],
+    primaryCode: HostedDeployPrimaryFailureCode | null,
+    primaryReason?: string,
+  ) {
+    super(code);
+    this.name = "HostedDeployFilesystemCleanupError";
+    this.code = code;
+    this.primaryCode = primaryCode;
+    if (primaryReason !== undefined) this.primaryReason = primaryReason;
+    this.recoveryPaths = [...new Set(recoveryPaths)].sort();
+  }
+
+  withRecoveryPaths(paths: readonly string[]): HostedDeployFilesystemCleanupError {
+    return new HostedDeployFilesystemCleanupError(
+      this.code,
+      [...this.recoveryPaths, ...paths],
+      this.primaryCode,
+      this.primaryReason,
+    );
+  }
+}
+
+const primaryFailure = (
+  primary: unknown,
+): Readonly<{
+  code: HostedDeployPrimaryFailureCode | null;
+  reason?: string;
+}> => {
+  if (primary instanceof HostedDeployFilesystemCleanupError) {
+    return {
+      code: primary.primaryCode,
+      ...(primary.primaryReason === undefined ? {} : { reason: primary.primaryReason }),
+    };
+  }
+  if (primary instanceof HostedDeployError) return { code: primary.code };
+  if (primary instanceof ConvexTargetError) return { code: "convex_target_refused" };
+  if (isBoundedProcessRecoveryJournalError(primary)) {
+    return { code: "process_recovery_journal_blocked", reason: primary.reason };
+  }
+  if (isAuthorityContainmentUnavailable(primary)) {
+    return { code: "authority_containment_unavailable", reason: primary.reason };
+  }
+  return { code: primary === undefined ? null : "convex_deploy_failed" };
+};
+
+const retainFailedFilesystemCleanup = (
+  kind: "binding" | "source",
+  primary: unknown,
+  recoveryPath: string,
+): Error => {
+  if (isBoundedProcessCleanupUnprovenError(primary)) {
+    return primary.retainRecoveryPath(recoveryPath);
+  }
+  const priorPaths = primary instanceof HostedDeployFilesystemCleanupError
+    ? primary.recoveryPaths
+    : isBoundedProcessRecoveryJournalError(primary)
+      ? primary.recoveryPaths
+      : [];
+  const prior = primaryFailure(primary);
+  return new HostedDeployFilesystemCleanupError(
+    kind === "source" ? "source_cleanup_failed" : "deployment_binding_cleanup_failed",
+    [...priorPaths, recoveryPath],
+    prior.code,
+    prior.reason,
+  );
+};
+
 const retainHostedDeployRecoveryPaths = (
   error: unknown,
   paths: readonly string[],
 ): unknown => {
   let retained = error;
   for (const path of paths) retained = retainBoundedProcessRecoveryPath(retained, path);
+  if (retained instanceof HostedDeployFilesystemCleanupError) {
+    return retained.withRecoveryPaths(paths);
+  }
   return retained;
 };
 
@@ -176,12 +267,9 @@ export function parseDeployArguments(arguments_: readonly string[]): DeployArgum
   };
 }
 
-const convexCli = resolve(import.meta.dir, "..", "node_modules", "convex", "bin", "main.js");
-const resolvedTargetAssertion = resolve(
-  import.meta.dir,
-  "assert-convex-deploy-target.ts",
-);
 const defaultRepositoryRoot = resolve(import.meta.dir, "..");
+const convexCli = resolve(defaultRepositoryRoot, "node_modules", "convex", "bin", "main.js");
+const resolvedTargetAssertion = resolve(import.meta.dir, "assert-convex-deploy-target.ts");
 const releaseAttestationFunction = makeFunctionReference<"query", Record<string, never>, unknown>(
   "releaseAttestation:read",
 );
@@ -192,6 +280,14 @@ const shellQuote = (value: string): string =>
 export const resolvedTargetAssertionCommand = [
   shellQuote(process.execPath),
   shellQuote(resolvedTargetAssertion),
+].join(" ");
+
+const archivedConvexCli = (sourceRoot: string): string =>
+  resolve(sourceRoot, "node_modules", "convex", "bin", "main.js");
+
+const archivedTargetAssertionCommand = (sourceRoot: string): string => [
+  shellQuote(process.execPath),
+  shellQuote(resolve(sourceRoot, "scripts", "assert-convex-deploy-target.ts")),
 ].join(" ");
 
 const invokeGit = async (
@@ -244,6 +340,81 @@ type DeploymentBinding = Readonly<{
   recoveryPath: string;
 }>;
 
+type TemporaryTreeRemover = (
+  path: string,
+  options: Readonly<{ force: boolean }>,
+) => Promise<void>;
+
+type ArchivedPathIdentity = Readonly<{
+  dev: number;
+  ino: number;
+  kind: "directory" | "file";
+  nlink: number;
+  path: string;
+}>;
+
+type ArchivedSourceBinding = DeploymentBinding & Readonly<{
+  revalidate: () => Promise<void>;
+}>;
+
+const removeTemporaryTree: TemporaryTreeRemover = async (path, options) => {
+  await rm(path, { force: options.force, recursive: true });
+};
+
+const captureArchivedPathIdentity = async (
+  path: string,
+  kind: ArchivedPathIdentity["kind"],
+  failureCode: "source_changed" | "source_dependency_install_failed",
+): Promise<ArchivedPathIdentity> => {
+  try {
+    const identity = await lstat(path);
+    if (
+      (kind === "directory" ? !identity.isDirectory() : !identity.isFile())
+      || !Number.isSafeInteger(identity.dev)
+      || !Number.isSafeInteger(identity.ino)
+      || !Number.isSafeInteger(identity.nlink)
+      || identity.nlink < 1
+      || (kind === "file" && identity.nlink !== 1)
+    ) throw new HostedDeployError(failureCode);
+    return {
+      dev: identity.dev,
+      ino: identity.ino,
+      kind,
+      nlink: identity.nlink,
+      path,
+    };
+  } catch (error: unknown) {
+    if (error instanceof HostedDeployError) throw error;
+    throw new HostedDeployError(failureCode);
+  }
+};
+
+const captureArchivedPathIdentities = async (
+  paths: readonly Readonly<{ kind: ArchivedPathIdentity["kind"]; path: string }>[],
+  failureCode: "source_changed" | "source_dependency_install_failed",
+): Promise<readonly ArchivedPathIdentity[]> => await Promise.all(
+  paths.map(async ({ kind, path }) => await captureArchivedPathIdentity(path, kind, failureCode)),
+);
+
+const revalidateArchivedPathIdentities = async (
+  expected: readonly ArchivedPathIdentity[],
+  allowedLinkCountChanges: ReadonlySet<string> = new Set(),
+): Promise<void> => {
+  const observed = await captureArchivedPathIdentities(expected, "source_changed");
+  if (observed.some((identity, index) => {
+    const prior = expected[index];
+    return prior === undefined
+      || identity.dev !== prior.dev
+      || identity.ino !== prior.ino
+      || identity.kind !== prior.kind
+      || (
+        identity.nlink !== prior.nlink
+        && !allowedLinkCountChanges.has(identity.path)
+      )
+      || identity.path !== prior.path;
+  })) throw new HostedDeployError("source_changed");
+};
+
 const closeQuietly = async (handle: FileHandle): Promise<void> => {
   await handle.close().catch(() => undefined);
 };
@@ -251,6 +422,7 @@ const closeQuietly = async (handle: FileHandle): Promise<void> => {
 async function createDeploymentBinding(
   deploymentName: string,
   temporaryRoot = tmpdir(),
+  removeBinding: TemporaryTreeRemover = removeTemporaryTree,
 ): Promise<DeploymentBinding> {
   let directory: string;
   try {
@@ -270,8 +442,13 @@ async function createDeploymentBinding(
       0o600,
     );
   } catch {
-    await rm(directory, { force: true, recursive: true }).catch(() => undefined);
-    throw new HostedDeployError("target_file_refused");
+    const primary = new HostedDeployError("target_file_refused");
+    try {
+      await removeBinding(directory, { force: true });
+    } catch {
+      throw retainFailedFilesystemCleanup("binding", primary, directory);
+    }
+    throw primary;
   }
   try {
     await handle.writeFile(`CONVEX_DEPLOYMENT=prod:${deploymentName}\n`, "utf8");
@@ -290,8 +467,13 @@ async function createDeploymentBinding(
     ) throw new HostedDeployError("target_file_refused");
   } catch {
     await closeQuietly(handle);
-    await rm(directory, { force: true, recursive: true }).catch(() => undefined);
-    throw new HostedDeployError("target_file_refused");
+    const primary = new HostedDeployError("target_file_refused");
+    try {
+      await removeBinding(directory, { force: true });
+    } catch {
+      throw retainFailedFilesystemCleanup("binding", primary, directory);
+    }
+    throw primary;
   }
   await closeQuietly(handle);
   let cleaned = false;
@@ -300,7 +482,7 @@ async function createDeploymentBinding(
       if (cleaned) return;
       cleaned = true;
       try {
-        await rm(directory, { force: false, recursive: true });
+        await removeBinding(directory, { force: false });
       } catch {
         throw new HostedDeployError("target_file_refused");
       }
@@ -471,7 +653,8 @@ const prepareArchivedSource = async (
   sourceCommit: string,
   overlay: string,
   temporaryRoot: string,
-): Promise<DeploymentBinding> => {
+  removeSource: TemporaryTreeRemover,
+): Promise<ArchivedSourceBinding> => {
   const directory = await mkdtemp(join(temporaryRoot, "hra-hosted-source-"));
   try {
     await chmod(directory, 0o700);
@@ -501,7 +684,87 @@ const prepareArchivedSource = async (
     if (extracted.exitCode !== 0 || extracted.stdout !== "") {
       throw new HostedDeployError("source_changed");
     }
-    const attestationPath = join(source, "convex", "releaseAttestation.ts");
+    const packagePath = join(source, "package.json");
+    const lockfilePath = join(source, "bun.lock");
+    const convexSourcePath = join(source, "convex");
+    const attestationPath = join(convexSourcePath, "releaseAttestation.ts");
+    const scriptsPath = join(source, "scripts");
+    const targetAssertionPath = join(scriptsPath, "assert-convex-deploy-target.ts");
+    const archiveIdentities = await captureArchivedPathIdentities([
+      { kind: "directory", path: directory },
+      { kind: "directory", path: source },
+      { kind: "file", path: packagePath },
+      { kind: "file", path: lockfilePath },
+      { kind: "directory", path: convexSourcePath },
+      { kind: "file", path: attestationPath },
+      { kind: "directory", path: scriptsPath },
+      { kind: "file", path: targetAssertionPath },
+    ], "source_changed");
+    const nodeModulesPath = join(source, "node_modules");
+    try {
+      await lstat(nodeModulesPath);
+      throw new HostedDeployError("source_changed");
+    } catch (error: unknown) {
+      if (error instanceof HostedDeployError) throw error;
+      if (
+        !(error instanceof Error)
+        || !("code" in error)
+        || error.code !== "ENOENT"
+      ) throw new HostedDeployError("source_changed");
+    }
+    let lockfileBefore: Buffer;
+    let packageBefore: Buffer;
+    try {
+      [lockfileBefore, packageBefore] = await Promise.all([
+        readFile(lockfilePath),
+        readFile(packagePath),
+      ]);
+    } catch (error: unknown) {
+      if (error instanceof HostedDeployError) throw error;
+      throw new HostedDeployError("source_changed");
+    }
+    const installed = await runner({
+      arguments: [
+        "install",
+        "--frozen-lockfile",
+        "--ignore-scripts",
+        "--backend=copyfile",
+      ],
+      containment: "local",
+      cwd: source,
+      environment,
+      executable: process.execPath,
+      outputMaximumBytes: archivedDependencyOutputMaximumBytes,
+      phase: "source-dependency-install",
+      stdin: "",
+      timeoutMs: archivedDependencyTimeoutMs,
+    });
+    if (installed.exitCode !== 0) {
+      throw new HostedDeployError("source_dependency_install_failed");
+    }
+    await revalidateArchivedPathIdentities(archiveIdentities, new Set([source]));
+    try {
+      const convexPackagePath = join(nodeModulesPath, "convex");
+      const convexPackageManifestPath = join(convexPackagePath, "package.json");
+      const convexBinPath = join(convexPackagePath, "bin");
+      const [lockfileAfter, packageAfter] = await Promise.all([
+        readFile(lockfilePath),
+        readFile(packagePath),
+      ]);
+      if (!lockfileAfter.equals(lockfileBefore) || !packageAfter.equals(packageBefore)) {
+        throw new HostedDeployError("source_dependency_install_failed");
+      }
+      await captureArchivedPathIdentities([
+        { kind: "directory", path: nodeModulesPath },
+        { kind: "directory", path: convexPackagePath },
+        { kind: "file", path: convexPackageManifestPath },
+        { kind: "directory", path: convexBinPath },
+        { kind: "file", path: archivedConvexCli(source) },
+      ], "source_dependency_install_failed");
+    } catch (error: unknown) {
+      if (error instanceof HostedDeployError) throw error;
+      throw new HostedDeployError("source_dependency_install_failed");
+    }
     if (dirname(attestationPath) !== join(source, "convex")) {
       throw new HostedDeployError("source_changed");
     }
@@ -509,24 +772,47 @@ const prepareArchivedSource = async (
     if (await readFile(attestationPath, "utf8") !== overlay) {
       throw new HostedDeployError("source_changed");
     }
+    const launchIdentities = await captureArchivedPathIdentities([
+      { kind: "directory", path: directory },
+      { kind: "directory", path: source },
+      { kind: "file", path: packagePath },
+      { kind: "file", path: lockfilePath },
+      { kind: "directory", path: convexSourcePath },
+      { kind: "file", path: attestationPath },
+      { kind: "directory", path: scriptsPath },
+      { kind: "file", path: targetAssertionPath },
+      { kind: "directory", path: nodeModulesPath },
+      { kind: "directory", path: join(nodeModulesPath, "convex") },
+      { kind: "file", path: join(nodeModulesPath, "convex", "package.json") },
+      { kind: "directory", path: join(nodeModulesPath, "convex", "bin") },
+      { kind: "file", path: archivedConvexCli(source) },
+    ], "source_dependency_install_failed");
     return {
       async cleanup() {
-        await rm(directory, { force: false, recursive: true });
+        await removeSource(directory, { force: false });
       },
       path: source,
+      async revalidate() {
+        await revalidateArchivedPathIdentities(launchIdentities);
+      },
       recoveryPath: directory,
     };
   } catch (error: unknown) {
     if (isBoundedProcessCleanupUnprovenError(error)) {
       error.retainRecoveryPath(directory);
     } else {
-      await rm(directory, { force: true, recursive: true }).catch(() => undefined);
+      try {
+        await removeSource(directory, { force: true });
+      } catch {
+        throw retainFailedFilesystemCleanup("source", error, directory);
+      }
     }
     throw error;
   }
 };
 
 type HostedDeployOptions = Readonly<{
+  archivedSourceRemover?: TemporaryTreeRemover;
   authorityFetch?: typeof fetch;
   authorityTimeoutMs?: number;
   evidencePath?: string;
@@ -541,6 +827,7 @@ type HostedDeployOptions = Readonly<{
   sourceCommit: string;
   target: ConvexTarget;
   temporaryRoot?: string;
+  deploymentBindingRemover?: TemporaryTreeRemover;
   verifyTarget?: ConvexTargetVerifier;
 }>;
 
@@ -585,7 +872,7 @@ export async function deployHostedSync(
   );
   await verifyTarget(target);
   let intent: DeployIntent | undefined;
-  let sourceBinding: DeploymentBinding | undefined;
+  let sourceBinding: ArchivedSourceBinding | undefined;
   if (options.evidencePath !== undefined && options.phase !== undefined) {
     const existingEvidence = (() => {
       try {
@@ -663,6 +950,7 @@ export async function deployHostedSync(
         options.sourceCommit,
         overlay,
         options.temporaryRoot ?? tmpdir(),
+        options.archivedSourceRemover ?? removeTemporaryTree,
       );
     } catch (error: unknown) {
       throw retainHostedDeployRecoveryPaths(
@@ -677,16 +965,21 @@ export async function deployHostedSync(
     binding = await createDeploymentBinding(
       target.deploymentName,
       options.temporaryRoot,
+      options.deploymentBindingRemover ?? removeTemporaryTree,
     );
     if (
       intent !== undefined
       && !sameAttestation(await readAttestation(target), intent.before)
     ) throw new HostedDeployError("source_changed");
+    const deploymentSourceRoot = sourceBinding?.path;
+    await sourceBinding?.revalidate();
     let result: CommandResult | undefined;
     try {
       result = await runner({
         arguments: [
-          convexCli,
+          deploymentSourceRoot === undefined
+            ? convexCli
+            : archivedConvexCli(deploymentSourceRoot),
           "deploy",
           "--env-file",
           binding.path,
@@ -696,7 +989,9 @@ export async function deployHostedSync(
           "--codegen",
           "disable",
           "--cmd",
-          resolvedTargetAssertionCommand,
+          deploymentSourceRoot === undefined
+            ? resolvedTargetAssertionCommand
+            : archivedTargetAssertionCommand(deploymentSourceRoot),
           "--cmd-url-env-var-name",
           HRA_RESOLVED_CONVEX_DEPLOY_URL,
           "--skip-workos-check",
@@ -747,6 +1042,9 @@ export async function deployHostedSync(
       : new HostedDeployError("convex_deploy_failed");
   }
   const cleanupFailure = isBoundedProcessCleanupUnprovenError(failure) ? failure : undefined;
+  const durableRecoveryPaths = intent === undefined || options.evidencePath === undefined
+    ? []
+    : [options.evidencePath, `${options.evidencePath}.intent`];
   if (cleanupFailure !== undefined) {
     if (binding !== undefined) cleanupFailure.retainRecoveryPath(binding.recoveryPath);
     if (sourceBinding !== undefined) cleanupFailure.retainRecoveryPath(sourceBinding.recoveryPath);
@@ -755,20 +1053,22 @@ export async function deployHostedSync(
   if (!cleanupUnproven) {
     try {
       await binding?.cleanup();
-    } catch (error: unknown) {
-      if (failure === undefined) {
-        failure = error instanceof Error
-          ? error
-          : new HostedDeployError("target_file_refused");
+    } catch {
+      if (binding !== undefined) {
+        failure = retainHostedDeployRecoveryPaths(
+          retainFailedFilesystemCleanup("binding", failure, binding.recoveryPath),
+          durableRecoveryPaths,
+        ) as Error;
       }
     }
     try {
       await sourceBinding?.cleanup();
-    } catch (error: unknown) {
-      if (failure === undefined) {
-        failure = error instanceof Error
-          ? error
-          : new HostedDeployError("target_file_refused");
+    } catch {
+      if (sourceBinding !== undefined) {
+        failure = retainHostedDeployRecoveryPaths(
+          retainFailedFilesystemCleanup("source", failure, sourceBinding.recoveryPath),
+          durableRecoveryPaths,
+        ) as Error;
       }
     }
   }
@@ -787,9 +1087,12 @@ export async function deployHostedSync(
 }
 
 type ExecuteOptions = Readonly<{
+  archivedSourceRemover?: TemporaryTreeRemover;
   arguments: readonly string[];
+  deploymentBindingRemover?: TemporaryTreeRemover;
   environment?: Readonly<NodeJS.ProcessEnv>;
   repositoryRoot?: string;
+  readAttestation?: ReleaseAttestationReader;
   runner?: CommandRunner;
   stderr: Pick<NodeJS.WriteStream, "write">;
   stdout: Pick<NodeJS.WriteStream, "write">;
@@ -801,6 +1104,9 @@ export async function executeHostedDeploy(options: ExecuteOptions): Promise<numb
   try {
     const parsed = parseDeployArguments(options.arguments);
     const evidence = await deployHostedSync({
+      ...(options.archivedSourceRemover === undefined
+        ? {}
+        : { archivedSourceRemover: options.archivedSourceRemover }),
       ...(parsed.evidencePath === undefined ? {} : { evidencePath: parsed.evidencePath }),
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(parsed.phase === undefined ? {} : { phase: parsed.phase }),
@@ -808,6 +1114,12 @@ export async function executeHostedDeploy(options: ExecuteOptions): Promise<numb
         ? {}
         : { previousDeployEvidencePath: parsed.previousDeployEvidencePath }),
       ...(options.repositoryRoot === undefined ? {} : { repositoryRoot: options.repositoryRoot }),
+      ...(options.readAttestation === undefined
+        ? {}
+        : { readAttestation: options.readAttestation }),
+      ...(options.deploymentBindingRemover === undefined
+        ? {}
+        : { deploymentBindingRemover: options.deploymentBindingRemover }),
       ...(options.runner === undefined ? {} : { runner: options.runner }),
       sourceCommit: parsed.sourceCommit,
       target: parsed.target,
@@ -826,6 +1138,17 @@ export async function executeHostedDeploy(options: ExecuteOptions): Promise<numb
         })}\n`);
     return 0;
   } catch (error: unknown) {
+    if (error instanceof HostedDeployFilesystemCleanupError) {
+      options.stderr.write(`${JSON.stringify({
+        code: error.code,
+        primaryCode: error.primaryCode,
+        ...(error.primaryReason === undefined ? {} : { primaryReason: error.primaryReason }),
+        recoveryPaths: error.recoveryPaths,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
     const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
     if (authorityUnavailable !== undefined) {
       options.stderr.write(authorityUnavailable);
@@ -888,31 +1211,42 @@ if (import.meta.main) {
       stdout: process.stdout,
     });
   } catch (error: unknown) {
-    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
-    if (authorityUnavailable !== undefined) {
-      process.stderr.write(authorityUnavailable);
-      exitCode = 1;
-    } else if (isBoundedProcessCleanupUnprovenError(error)) {
+    if (error instanceof HostedDeployFilesystemCleanupError) {
       process.stderr.write(`${JSON.stringify({
-        code: "process_cleanup_unproven",
-        phase: error.phase,
-        processGroupId: error.processGroupId,
-        processes: error.processes,
-        recoveryPaths: error.recoveryPaths,
-        schemaVersion: 1,
-        status: "recovery_required",
-      })}\n`);
-    } else if (isBoundedProcessRecoveryJournalError(error)) {
-      process.stderr.write(`${JSON.stringify({
-        code: "process_recovery_journal_blocked",
-        reason: error.reason,
+        code: error.code,
+        primaryCode: error.primaryCode,
+        ...(error.primaryReason === undefined ? {} : { primaryReason: error.primaryReason }),
         recoveryPaths: error.recoveryPaths,
         schemaVersion: 1,
         status: "recovery_required",
       })}\n`);
     } else {
-      process.stderr.write("Hosted deploy refused (convex_deploy_failed).\n");
-      exitCode = 1;
+      const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+      if (authorityUnavailable !== undefined) {
+        process.stderr.write(authorityUnavailable);
+        exitCode = 1;
+      } else if (isBoundedProcessCleanupUnprovenError(error)) {
+        process.stderr.write(`${JSON.stringify({
+          code: "process_cleanup_unproven",
+          phase: error.phase,
+          processGroupId: error.processGroupId,
+          processes: error.processes,
+          recoveryPaths: error.recoveryPaths,
+          schemaVersion: 1,
+          status: "recovery_required",
+        })}\n`);
+      } else if (isBoundedProcessRecoveryJournalError(error)) {
+        process.stderr.write(`${JSON.stringify({
+          code: "process_recovery_journal_blocked",
+          reason: error.reason,
+          recoveryPaths: error.recoveryPaths,
+          schemaVersion: 1,
+          status: "recovery_required",
+        })}\n`);
+      } else {
+        process.stderr.write("Hosted deploy refused (convex_deploy_failed).\n");
+        exitCode = 1;
+      }
     }
   }
   process.exitCode = exitCode;

@@ -21,7 +21,7 @@ The authenticated Vercel alias readback is the traffic authority. Its exact `(pr
 vercel api /v4/aliases/hra.sh --scope hraness --raw | jq -c '{alias,projectId,deploymentId,deployment:{id:.deployment.id,url:.deployment.url}}'
 ```
 
-`https://hra.sh/.well-known/hra.json` is independent product evidence. Generation 0 must identify repository ID `1334876494`, path `hraness/hra-v0`, the exact accepted archive source commit, and the archive version at `publication.version`. Generation 1 must identify repository ID `1343008607`, path `hraness/hra`, the exact accepted new-HRA source commit, and its top-level `version`. Both schema-version-2 markers carry `source.commit`; their generation-discriminated version locations are intentional. A marker does not replace the deployment-ID readback because two deployments can share source and version.
+`https://hra.sh/.well-known/hra.json` is independent product evidence. Marker generation is not repository identity. An HRA v0 marker must identify repository ID `1334876494`, path `hraness/hra-v0`, the exact accepted archive source commit, and the archive version at `publication.version`; its strict top level must not contain `version`. The accepted Q candidate is generation 1 at source commit `443448b79e9016e00d52501f047fce3a408de092`, version `0.1.15`. A new-HRA marker must be generation 1, identify repository ID `1343008607` and path `hraness/hra`, carry its version at the top-level `version`, and omit `publication`. Both schema-version-2 shapes carry `source.commit`. The operator distinguishes them by the fixed repository ID, repository path, and strict publication shape rather than generation alone. A marker does not replace the deployment-ID readback because two deployments can share source and version.
 
 Record only filtered provider fields. Full deployment and alias responses can contain operator identity data. Do not use `--debug`, `--verbose`, `--token`, `--force`, remove-then-add, or a token-bearing shell variable.
 
@@ -117,9 +117,9 @@ Plans add `schemaVersion`, `direction`, `mode`, `source`, and `target`. Only the
 
 | Direction | Mode | Source | Target |
 | --- | --- | --- | --- |
-| `archive` | `traffic-only` | P, old project, `generation: null` | Q, old project, generation 0 |
-| `forward` | `domain` | Q, old project, generation 0 | N, new project, generation 1 |
-| `reverse` | `domain` | N, new project, generation 1 | Q, old project, generation 0 |
+| `archive` | `traffic-only` | P, old project, `generation: null` | Q, old project, generation 1 with the HRA v0 publication shape |
+| `forward` | `domain` | Q, old project, generation 1 with the HRA v0 publication shape | N, new project, generation 1 with the new-HRA top-level version shape |
+| `reverse` | `domain` | N, new project, generation 1 with the new-HRA top-level version shape | Q, old project, generation 1 with the HRA v0 publication shape |
 
 Read the complete provider state without changing it before every rehearsal or cutover:
 
@@ -141,7 +141,7 @@ bun run hosted:domain-cutover --execute --vercel-cli /absolute/path/to/vercel < 
 
 The operator strips inherited Vercel-token variables and uses the authenticated local Vercel session. Before any mutation it verifies `autoAssignCustomDomains === false` on both fixed numeric projects, both deployments, the exact current alias tuple, the current public marker when one exists, and project-domain ownership. Domain plans additionally require `hra-weld.vercel.app` to identify exact Q and `try-hra.vercel.app` to identify exact N, including their public commit-bearing markers. It refuses before reading or changing traffic if either project setting or fixed staging alias is unsafe. It then:
 
-1. For an archive plan, points `hra-weld.vercel.app` at Q and proves its exact alias tuple and generation-0 marker before touching `hra.sh`.
+1. For an archive plan, points `hra-weld.vercel.app` at Q and proves its exact alias tuple and generation-1 HRA v0 publication marker before touching `hra.sh`.
 2. Points `hra.sh` at the target's bare automatic hostname.
 3. Probes the exact alias tuple and commit-bearing marker for at most 60 seconds.
 4. Restores and proves every exact previously accepted traffic alias if the command fails, readback is wrong, or public convergence times out. Domain compensation proves the canonical alias, Q fallback, and N staging alias before it attempts an ownership reversal or reports ambiguous ownership. Archive compensation restores both fixed old-HRA aliases to P.
@@ -168,9 +168,9 @@ vercel api /v4/aliases/hra-weld.vercel.app --scope hraness --raw | jq -c '{alias
 vercel api /v4/aliases/hra.sh --scope hraness --raw | jq -c '{alias,projectId,deploymentId,deployment:{id:.deployment.id,url:.deployment.url}}'
 ```
 
-The operator first moves only `hra-weld.vercel.app` from P to Q. It requires the fallback alias tuple to identify the old numeric project and exact Q deployment ID and URL, then fetches the fallback marker without cached evidence and requires generation 0, repository ID `1334876494`, path `hraness/hra-v0`, Q's `source.commit`, and Q's version. Only after that proof does it move `hra.sh` from P to Q. Any ambiguous command, tuple mismatch, marker failure, or timeout restores both aliases to exact P and returns a refusal.
+The operator first moves only `hra-weld.vercel.app` from P to Q. It requires the fallback alias tuple to identify the old numeric project and exact Q deployment ID and URL, then fetches the fallback marker without cached evidence and requires generation 1, repository ID `1334876494`, path `hraness/hra-v0`, Q's `source.commit`, and Q's version at `publication.version`. A top-level `version` or the new-HRA repository identity is a mismatch. Only after that proof does it move `hra.sh` from P to Q. Any ambiguous command, tuple mismatch, marker failure, or timeout restores both aliases to exact P and returns a refusal.
 
-After a committed result, independently repeat the exact readbacks for both aliases. Check the fallback's root, compatibility pages, release downloads, privacy, security policy, TLS, and headers, then repeat the generation-0 marker and canonical surface checks on `hra.sh`. This transition does not move project ownership.
+After a committed result, independently repeat the exact readbacks for both aliases. Check the fallback's root, compatibility pages, release downloads, privacy, security policy, TLS, and headers, then repeat the generation-1 HRA v0 publication marker and canonical surface checks on `hra.sh`. This transition does not move project ownership.
 
 Q is now the only rollback source used by forward, reverse, and incident plans. P remains unchanged and readable by deployment ID as historical evidence.
 
@@ -208,7 +208,7 @@ bun run hosted:domain-cutover --execute \
   < reverse-plan.json
 ```
 
-Require `hra.sh` exactly once under HRA v0, the exact Q alias tuple, generation-0 marker, old root, compatibility page, release downloads, privacy, security policy, and fallback. Require `hra-weld.vercel.app` to remain exact Q and `try-hra.vercel.app` to remain exact N with their own generation markers. Recheck P, Q, and N by deployment ID with authenticated `vercel curl --deployment`; do not use unauthenticated automatic-hostname responses as evidence.
+Require `hra.sh` exactly once under HRA v0, the exact Q alias tuple, generation-1 HRA v0 publication marker, old root, compatibility page, release downloads, privacy, security policy, and fallback. Require `hra-weld.vercel.app` to remain exact Q and `try-hra.vercel.app` to remain exact N with their own repository-bound marker shapes. Recheck P, Q, and N by deployment ID with authenticated `vercel curl --deployment`; do not use unauthenticated automatic-hostname responses as evidence.
 
 The rehearsal passes only after archive, forward, and reverse plans all commit and their independent readbacks pass. Repeat the exact Q → N forward plan as sequence 3:
 

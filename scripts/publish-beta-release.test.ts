@@ -62,7 +62,7 @@ const oldProjectId = "prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr";
 const newProjectId = "prj_8ciIt9t9foE3utG45frRN7cxckjS";
 const oldRepositoryId = 1_334_876_494;
 const teamId = "team_UAd1iD2XogJlbFg4h14mRaPM";
-const fallbackCommit = "b".repeat(40);
+const fallbackCommit = "443448b79e9016e00d52501f047fce3a408de092";
 const notes = "# HRA v0.1.0 friend beta\n\nAccepted notes.";
 const candidateDigest = "d".repeat(64);
 const candidateReceipt = "/opt/hra-test/state/release-candidate.json";
@@ -75,6 +75,8 @@ type HostedFault =
   | "deployment-state"
   | "fallback-alias"
   | "fallback-marker"
+  | "fallback-marker-repository"
+  | "fallback-marker-shape"
   | "owner"
   | "project"
   | "staging-alias"
@@ -443,13 +445,32 @@ class FakeProvider implements ReleasePublicationProvider {
   async readHostedMarker(alias: ManagedAlias): Promise<unknown> {
     this.calls.push(`hosted-marker:${alias}`);
     if (alias === "hra-weld.vercel.app") {
+      if (this.hostedFault === "fallback-marker-shape") {
+        return {
+          generation: 1,
+          product: "HRA",
+          repository: { id: oldRepositoryId, path: "hraness/hra-v0" },
+          schemaVersion: 2,
+          source: { commit: fallbackCommit },
+          version: "0.1.15",
+        };
+      }
       return {
-        generation: 0,
+        generation: 1,
         product: "HRA",
         publication: {
-          version: this.hostedFault === "fallback-marker" ? "0.1.13" : "0.1.14",
+          build: 16,
+          dmgSha256: "120b600d7cc11df260836198601cba91db33efc7b600dd2b601bde686c9ea028",
+          publicationCommit: "d96173c3556799cb203a4d659f29856180838029",
+          releaseId: 376_100_700,
+          sourceCommit: "0c7764da0dea0a71bbccca817539a02d8e4284d0",
+          tag: "v0.1.15",
+          tagObject: "e5bcf5c919e8a7ffcdccc337b8940b60a70f0489",
+          version: this.hostedFault === "fallback-marker" ? "0.1.14" : "0.1.15",
         },
-        repository: { id: oldRepositoryId, path: "hraness/hra-v0" },
+        repository: this.hostedFault === "fallback-marker-repository"
+          ? { id: 1_343_008_607, path: "hraness/hra" }
+          : { id: oldRepositoryId, path: "hraness/hra-v0" },
         schemaVersion: 2,
         source: { commit: fallbackCommit },
       };
@@ -495,7 +516,7 @@ const publicationArguments = (action: "accept" | "publish"): PublicationArgument
   expectedCommit: commit,
   fallbackDeploymentId,
   fallbackDeploymentUrl,
-  fallbackVersion: "0.1.14",
+  fallbackVersion: "0.1.15",
   ghCli: "/opt/homebrew/bin/gh",
   runAttempt,
   runId,
@@ -613,7 +634,7 @@ const writeRecoveryReceipt = async (
         projectId: oldProjectId,
         repositoryId: oldRepositoryId,
         sourceCommit: fallbackCommit,
-        version: "0.1.14",
+        version: "0.1.15",
       },
       teamId,
     },
@@ -691,7 +712,7 @@ describe("release publication arguments", () => {
       "--deployment-url", deploymentUrl,
       "--fallback-deployment-id", fallbackDeploymentId,
       "--fallback-deployment-url", fallbackDeploymentUrl,
-      "--fallback-version", "0.1.14",
+      "--fallback-version", "0.1.15",
       "--gh-cli", "/opt/homebrew/bin/gh",
       "--vercel-cli", "/opt/hra-test/bin/vercel",
     ];
@@ -2348,6 +2369,8 @@ describe("release publication authority", () => {
       "deployment-state",
       "fallback-alias",
       "fallback-marker",
+      "fallback-marker-repository",
+      "fallback-marker-shape",
       "owner",
       "project",
       "staging-alias",

@@ -186,7 +186,7 @@ const asCutoverEndpoint = (
   endpoint: ReleaseCandidateReceipt["vercel"]["candidate"],
 ): CutoverEndpoint => ({
   ...endpoint,
-  generation: endpoint.projectId === newProjectId ? 1 : 0,
+  generation: 1,
 });
 
 export const candidateForwardPlan = (

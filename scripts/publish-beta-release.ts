@@ -536,7 +536,7 @@ const hostedMarkerSchema = z.object({
 }).strict();
 
 const fallbackMarkerSchema = z.object({
-  generation: z.literal(0),
+  generation: z.literal(1),
   product: z.literal("HRA"),
   publication: z.object({ version: versionSchema }).passthrough(),
   repository: z.object({
