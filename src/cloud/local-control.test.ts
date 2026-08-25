@@ -9,7 +9,7 @@ import {
   type EncryptedEnvelope,
   type WrappedKeyEnvelope,
 } from "./contracts";
-import { decodeBase64Url } from "./crypto";
+import { decodeBase64Url, encodeBase64Url } from "./crypto";
 import {
   cloudDeploymentAuthorityFromEnvironment,
   IdentityScopedCloudSecretCustody,
@@ -935,12 +935,15 @@ describe("local cloud control", () => {
     const pair = await adapter.pairDevice(signal) as { device: { publicId: string } };
     const stored = cloud.devices.get(pair.device.publicId);
     if (stored === undefined) throw new Error("missing device fixture");
-    const ciphertext = stored.encryptedLabel.ciphertext;
+    const corruptedCiphertext = decodeBase64Url(stored.encryptedLabel.ciphertext);
+    const firstByte = corruptedCiphertext.at(0);
+    if (firstByte === undefined) throw new Error("empty encrypted-label fixture");
+    corruptedCiphertext[0] = firstByte ^ 1;
     cloud.devices.set(stored.publicId, {
       ...stored,
       encryptedLabel: {
         ...stored.encryptedLabel,
-        ciphertext: `${ciphertext.slice(0, -1)}${ciphertext.endsWith("A") ? "B" : "A"}`,
+        ciphertext: encodeBase64Url(corruptedCiphertext),
       },
     });
     expect(await adapter.listDevices(signal)).toMatchObject({
