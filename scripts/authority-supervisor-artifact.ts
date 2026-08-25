@@ -61,21 +61,21 @@ const freezeAuthoritySupervisorArtifactManifest = (
 export const authoritySupervisorArtifactManifest = freezeAuthoritySupervisorArtifactManifest({
   artifacts: {
     arm64: {
-      byteLength: 237_792,
+      byteLength: 237_776,
       elfMachine: 183,
       maximumByteLength: 8 * 1024 * 1024,
       mode: 0o755,
       relativePath: artifactRelativePaths.arm64,
-      sha256: "ee1868055b014ba5007b66f100d76beb0711cba4a16d9d8ff0d3b3f3d7fdf681",
+      sha256: "35ba341d6105d881d504d5bca406f68f9e876a63cdb06cadf61c6136623b3040",
       target: "aarch64-linux-musl",
     },
     x64: {
-      byteLength: 328_256,
+      byteLength: 328_248,
       elfMachine: 62,
       maximumByteLength: 8 * 1024 * 1024,
       mode: 0o755,
       relativePath: artifactRelativePaths.x64,
-      sha256: "81d909518947641e02fb70efcf1f2a9cf8678e771af8ca29acd80c33148fdee9",
+      sha256: "c6a79d5f5c9f277ee03e854c60578cdf48fb30b93932bb9a0d2a1c341ba76ee0",
       target: "x86_64-linux-musl",
     },
   },
