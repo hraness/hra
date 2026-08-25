@@ -694,6 +694,7 @@ test("authority runner recovers a timed-out detached descendant", async () => {
   const root = await makeRoot();
   const recoveryDirectory = join(root, "process-recovery");
   const escapedMarker = join(root, "timeout-escape-marker");
+  const recoveryFailures: string[] = [];
   const escaped = [
     "const { writeFileSync } = require('node:fs');",
     "process.on('SIGTERM', () => {});",
@@ -717,8 +718,14 @@ test("authority runner recovers a timed-out detached descendant", async () => {
     phase: "authority-timeout-custody",
     terminationGraceMs: 50,
     timeoutMs: 1_000,
-  }, { recoveryDirectory });
-  expect(result).toMatchObject({ cleanup: "proven", exitCode: 124 });
+  }, {
+    afterAuthorityRecoveryFailure: (code) => recoveryFailures.push(code),
+    recoveryDirectory,
+  });
+  expect({ recoveryFailures, result }).toMatchObject({
+    recoveryFailures: [],
+    result: { cleanup: "proven", exitCode: 124 },
+  });
   await Bun.sleep(4_250);
   expect(await Bun.file(escapedMarker).exists()).toBeFalse();
 }, 10_000);

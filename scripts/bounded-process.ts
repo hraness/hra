@@ -2718,13 +2718,14 @@ const assertAuthorityCleanFrame = (
 const assertAuthorityFailFrame = (
   frame: AuthorityControlFrame,
   nonce: string,
-): void => {
+): string => {
   const fields = requireAuthorityFrame(frame, "FAIL", ["code", "nonce"]);
   if (
     fields.nonce !== nonce
     || fields.code === undefined
     || !/^[a-z][a-z0-9_]{0,63}$/u.test(fields.code)
   ) throw new AuthorityControlProtocolError("fail_frame_invalid");
+  return fields.code;
 };
 
 const assertAuthorityRecoveryReadyFrame = (
@@ -3359,6 +3360,7 @@ const runAuthorityRecoveryHelperLocked = async (
   journal: AuthorityPreparedRecoveryJournal
     | AuthorityArmedRecoveryJournal
     | AuthorityGoAttemptedRecoveryJournal,
+  afterFailure?: (code: string) => void,
 ): Promise<boolean> => {
   if (boundedProcessCustodyRelationship(journal) !== "current") return false;
   let opened: OpenAuthoritySupervisorArtifact | undefined;
@@ -3372,6 +3374,7 @@ const runAuthorityRecoveryHelperLocked = async (
     const identity = authorityJournalIdentity(journal);
     let endpoint: AuthorityControlEndpoint | undefined;
     let child: ChildProcessWithoutNullStreams | undefined;
+    let failureCode: string | undefined;
     try {
       endpoint = await AuthorityControlEndpoint.create(directory);
       const nonce = randomBytes(16).toString("hex");
@@ -3422,9 +3425,17 @@ const runAuthorityRecoveryHelperLocked = async (
       }
       const recoveryIdentity = { pid: recoveryPid, startTime: recoveryStartTime } as const;
       const ready = await endpoint.nextFrame(authorityRecoveryReadyTimeoutMs);
+      if (ready.kind === "FAIL") {
+        failureCode = assertAuthorityFailFrame(ready, nonce);
+        throw new AuthorityControlProtocolError("recovery_helper_failed");
+      }
       assertAuthorityRecoveryReadyFrame(ready, nonce, identity, recoveryIdentity);
       await endpoint.write(`${authorityProtocolPrefix}RECOVERY_GO nonce=${nonce}\n`);
       const clean = await endpoint.nextFrame(authorityRecoveryCleanTimeoutMs);
+      if (clean.kind === "FAIL") {
+        failureCode = assertAuthorityFailFrame(clean, nonce);
+        throw new AuthorityControlProtocolError("recovery_helper_failed");
+      }
       assertAuthorityRecoveryCleanFrame(clean, nonce, identity, recoveryIdentity);
       const exit = await close;
       if (exit.code !== 0 || exit.signal !== null) return false;
@@ -3433,6 +3444,13 @@ const runAuthorityRecoveryHelperLocked = async (
       return true;
     } catch {
       if (child !== undefined) await stopDirectAuthorityHelperBeforeGo(child);
+      if (failureCode !== undefined && afterFailure !== undefined) {
+        try {
+          afterFailure(failureCode);
+        } catch {
+          // Test-only observation cannot weaken or replace cleanup handling.
+        }
+      }
       return false;
     } finally {
       await endpoint?.close().catch(() => undefined);
@@ -3854,6 +3872,8 @@ const invalidRequest = (request: BoundedProcessRequest): boolean =>
 type BoundedProcessDependencies = Readonly<{
   /** Test-only delay/failure point after durable GO intent but before release. */
   afterAuthorityGoJournal?: () => void;
+  /** Test-only observation of an authenticated native recovery refusal. */
+  afterAuthorityRecoveryFailure?: (code: string) => void;
   beforeJournalPromotion?: () => void;
   /** Test-only narrowing switch. It can only refuse authority execution. */
   forceAuthorityUnavailable?: boolean;
@@ -3961,7 +3981,11 @@ const runAuthorityBoundedProcess = async (
         clearIntent();
         return true;
       }
-      const recovered = await runAuthorityRecoveryHelperLocked(recoveryDirectory, current);
+      const recovered = await runAuthorityRecoveryHelperLocked(
+        recoveryDirectory,
+        current,
+        dependencies.afterAuthorityRecoveryFailure,
+      );
       if (!recovered && !authorityHelperCleanupProven(current)) return false;
       if (childClose !== undefined && !await closeOriginalAuthorityChildAfterRecovery(childClose)) {
         return false;
