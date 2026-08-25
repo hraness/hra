@@ -160,6 +160,8 @@ describe("bounded detached process groups", () => {
     expect(recovery).toContain("const recoveryPid = child.pid");
     expect(recovery).toContain("authorityRecoveryReadyIdentity(");
     expect(recovery).not.toContain("readLinuxProcessStartTime(recoveryPid)");
+    expect(recovery).toContain('"recovery_child_exit_invalid"');
+    expect(recovery).toContain("error instanceof AuthorityControlProtocolError");
   });
 
   test("binds the sealed init namespace without a forbidden cross-process proc readlink", async () => {

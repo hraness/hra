@@ -3445,13 +3445,18 @@ const runAuthorityRecoveryHelperLocked = async (
       }
       assertAuthorityRecoveryCleanFrame(clean, nonce, identity, recoveryIdentity);
       const exit = await close;
-      if (exit.code !== 0 || exit.signal !== null) return false;
+      if (exit.code !== 0 || exit.signal !== null) {
+        throw new AuthorityControlProtocolError("recovery_child_exit_invalid");
+      }
       await endpoint.waitForEnd(1_000);
       endpoint.assertComplete();
       return true;
-    } catch {
+    } catch (error: unknown) {
+      failureCode ??= error instanceof AuthorityControlProtocolError
+        ? error.code
+        : "recovery_internal_error";
       if (child !== undefined) await stopDirectAuthorityHelperBeforeGo(child);
-      if (failureCode !== undefined && afterFailure !== undefined) {
+      if (afterFailure !== undefined) {
         try {
           afterFailure(failureCode);
         } catch {

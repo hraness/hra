@@ -654,9 +654,11 @@ test("authority runner kills detached descendants after normal completion", asyn
     error: join(root, "detached-error-marker"),
     returned: join(root, "detached-returned-marker"),
     spawn: join(root, "detached-spawn-marker"),
+    started: join(root, "detached-started-marker"),
   } as const;
   const escaped = [
     "const { writeFileSync } = require('node:fs');",
+    "process.stdout.write('started');",
     `setTimeout(() => writeFileSync(${JSON.stringify(escapedMarker)}, 'escaped'), 4_000);`,
     "setInterval(() => undefined, 1_000);",
   ].join(" ");
@@ -664,14 +666,16 @@ test("authority runner kills detached descendants after normal completion", asyn
     "const { spawn } = require('node:child_process');",
     "const { writeFileSync } = require('node:fs');",
     `writeFileSync(${JSON.stringify(markers.before)}, 'before');`,
-    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(escaped)}], { detached: true, stdio: 'ignore' });`,
+    `const child = spawn(process.execPath, ['-e', ${JSON.stringify(escaped)}], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });`,
     `writeFileSync(${JSON.stringify(markers.returned)}, 'returned:' + String(child.pid));`,
     `child.once('spawn', () => writeFileSync(${JSON.stringify(markers.spawn)}, 'spawn:' + String(child.pid)));`,
     `child.once('error', (error) => writeFileSync(${JSON.stringify(markers.error)}, 'error:' + String(error && error.code)));`,
-    "child.unref();",
+    "let childStarted = false; let inputEnded = false;",
     "let input = ''; process.stdin.setEncoding('utf8');",
+    "const finish = () => { if (childStarted && inputEnded) process.stdout.write(`received:${input}`); };",
+    `child.stdout.once('data', () => { childStarted = true; writeFileSync(${JSON.stringify(markers.started)}, 'started'); child.stdout.destroy(); child.unref(); finish(); });`,
     "process.stdin.on('data', (chunk) => { input += chunk; });",
-    "process.stdin.on('end', () => process.stdout.write(`received:${input}`));",
+    "process.stdin.on('end', () => { inputEnded = true; finish(); });",
   ].join(" ");
   const result = await runBoundedProcess({
     arguments: ["-e", target],
@@ -692,6 +696,8 @@ test("authority runner kills detached descendants after normal completion", asyn
       before: "before",
       error: "missing",
       returned: expect.stringMatching(/^returned:[1-9][0-9]*$/u),
+      spawn: expect.stringMatching(/^spawn:[1-9][0-9]*$/u),
+      started: "started",
     },
     result: {
       cleanup: "proven",
