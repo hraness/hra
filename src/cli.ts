@@ -1102,9 +1102,15 @@ export type DaemonStopResult =
   | Readonly<{ kind: "success"; data: Readonly<Record<string, unknown>> }>
   | Readonly<{ kind: "failure"; error: DaemonStopResponseError }>;
 
+export type DaemonReadyStatus = Readonly<{
+  running: true;
+  pid: number;
+  daemon: DaemonIdentity;
+}>;
+
 export type CliMainInput = Readonly<{
   installation?: HraInstallation;
-  startDaemon?: (installation: HraInstallation) => Promise<void>;
+  startDaemon?: (installation: HraInstallation) => Promise<DaemonReadyStatus>;
   statePaths?: StatePaths;
   callDaemon?: (command: LocalCommand, signal?: AbortSignal) => Promise<CommandResponse>;
   daemonStopDependencies?: DaemonStopDependencies;
@@ -1935,7 +1941,27 @@ function renderProjectionRecoveryFailure(
   }, invocation.json, output);
 }
 
-async function startDaemonProcess(installation: HraInstallation): Promise<void> {
+export const daemonRunProcessArguments = (
+  bunExecutable: string,
+  cliPath: string,
+): string[] => [
+  bunExecutable,
+  "--no-env-file",
+  cliPath,
+  "daemon",
+  "run",
+];
+
+export const daemonRunProcessOptions = (cwd: string) => ({
+  cwd,
+  detached: true,
+  env: process.env,
+  stdin: "ignore" as const,
+  stdout: "ignore" as const,
+  stderr: "ignore" as const,
+});
+
+async function startDaemonProcess(installation: HraInstallation): Promise<DaemonReadyStatus> {
   assertInstallationHome(installation);
   if (installation.kind !== "production") {
     throw new Error("A live-acceptance daemon must be started by its source-only worker.");
@@ -1944,13 +1970,10 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
   const paths = installation.paths;
   await requireInitializedDaemonState(paths);
   await initializeStatePaths(paths);
-  const child = Bun.spawn([process.execPath, cliPath, "daemon", "run"], {
-    detached: true,
-    env: process.env,
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  const child = Bun.spawn(
+    daemonRunProcessArguments(process.execPath, cliPath),
+    daemonRunProcessOptions(paths.root),
+  );
   child.unref();
   let exited = false;
   let exitCode: number | undefined;
@@ -1959,7 +1982,7 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
     exited = true;
   });
   try {
-    await waitForDaemonReady({
+    const daemon = await waitForDaemonReady({
       paths,
       queryStatus: async () => await callLocalDaemon({ paths, command: { kind: "daemon.status" }, deadlineMs: 750 }),
       observeChild: () => ({
@@ -1968,6 +1991,7 @@ async function startDaemonProcess(installation: HraInstallation): Promise<void> 
         ...(exitCode === undefined ? {} : { exitCode }),
       }),
     });
+    return { running: true, pid: daemon.pid, daemon };
   } catch (error: unknown) {
     try {
       await terminateDaemonStartupChild(child);
@@ -2028,7 +2052,7 @@ async function callWithAutostart(
   installation: HraInstallation,
   command: LocalCommand,
   signal?: AbortSignal,
-  injectedStart?: (installation: HraInstallation) => Promise<void>,
+  injectedStart?: (installation: HraInstallation) => Promise<DaemonReadyStatus>,
 ): Promise<Awaited<ReturnType<typeof callLocalDaemon>>> {
   assertInstallationHome(installation);
   const paths = installation.paths;
@@ -3955,11 +3979,8 @@ async function executeInvocation(
       if (!isLocalDaemonUnavailable(error)) throw error;
     }
     await requireInitializedDaemonState(installation.paths);
-    await (input.startDaemon ?? startDaemonProcess)(installation);
-    const response = await callLocalDaemon({ paths: installation.paths, command: { kind: "daemon.status" } });
-    if (!response.ok) return renderFailure(response.error, invocation.json, output);
-    daemonStatusIdentity(response);
-    renderSuccess({ kind: "daemon.status" }, response.data, invocation.json, output);
+    const ready = await (input.startDaemon ?? startDaemonProcess)(installation);
+    renderSuccess({ kind: "daemon.status" }, ready, invocation.json, output);
     return 0;
   }
   if (invocation.command.kind === "doctor" && invocation.command.offline) {

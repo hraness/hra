@@ -28,8 +28,8 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
 export const HRA_INSTALL_PACKAGE_NAME = "hra";
 export const HRA_INSTALL_PACKAGE_VERSION = "0.1.0";
-export const HRA_INSTALL_CLI_SHA256 = "1d3a10faa38e84b4ac01a2d04a5ab26a54899e33f7e71a18f7c8e613c2a73e2a";
-export const HRA_INSTALL_NORMALIZER_SHA256 = "72280bf66770204a63ec5ca144f1107768e2cebd7281ea40c50ffd4a3cce48a8";
+export const HRA_INSTALL_CLI_SHA256 = "ccbc21dfa7ab8a710218cb500db2f91df16ded6f15044022c1fdbd6096c5e640";
+export const HRA_INSTALL_NORMALIZER_SHA256 = "04b3826aafd0d5ee7e080e1975c4ddf30ccc79519e8af609d643706ed4a56e7e";
 export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz";
 export const HRA_INSTALL_ARCHIVE_NAME = "hra-v0.1.0.tgz";
 export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.1.0";
