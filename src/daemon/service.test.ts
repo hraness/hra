@@ -8,6 +8,7 @@ import { Database } from "bun:sqlite";
 
 import {
   CodexError,
+  CodexRemoteError,
   IndeterminateCodexEffectError,
   type CodexFact,
   type CodexPluginCatalog,
@@ -2994,6 +2995,101 @@ describe("HraService", () => {
     }
   });
 
+  test("maps bounded Codex failures to phase-specific safe guidance before dispatch", async () => {
+    const failures = [
+      {
+        code: "HOME_MISMATCH",
+        reason: "codex_home_mismatch",
+        message: "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+      },
+      {
+        code: "PROCESS_EXITED",
+        reason: "codex_process_exited",
+        message: "The pinned Codex process exited before the operation finished. Inspect daemon status before starting a fresh attempt.",
+      },
+      {
+        code: "PROTOCOL_ERROR",
+        reason: "codex_protocol_error",
+        message: "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+      },
+      {
+        code: "PROTOCOL_LIMIT",
+        reason: "codex_protocol_limit",
+        message: "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+      },
+      {
+        code: "REMOTE_ERROR",
+        reason: "codex_remote_rejected",
+        message: "Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.",
+      },
+      {
+        code: "RUNTIME_MISMATCH",
+        reason: "codex_runtime_mismatch",
+        message: "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+      },
+      {
+        code: "TIMEOUT",
+        reason: "codex_timeout",
+        message: "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+      },
+      {
+        code: "UNSUPPORTED_CAPABILITY",
+        reason: "codex_capability_unsupported",
+        message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+      },
+    ] as const;
+    for (const [index, failure] of failures.entries()) {
+      const { service, codex, documents, store } = await fixture();
+      const added = await service.execute({ kind: "account.add", label: `Unavailable ${failure.code}` }, { signal }) as { account: { id: string } };
+      await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+      await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
+      const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+      const idempotencyKey = `00000000-0000-4000-8000-${String(730 + index).padStart(12, "0")}`;
+      codex.reviewTurnErrorOnce = new CodexError(failure.code, "private provider capability diagnostic");
+
+      await expect(service.execute({
+        kind: "session.send",
+        session: started.session.id,
+        message: "must not dispatch",
+        idempotencyKey,
+      }, { signal })).rejects.toMatchObject({
+        code: "UNAVAILABLE",
+        details: { reason: failure.reason },
+        message: failure.message,
+      });
+
+      expect(codex.calls.filter((call) => call === "send")).toHaveLength(0);
+      expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "prepared" });
+      expect(JSON.stringify(store.readMutation(idempotencyKey))).not.toContain("private provider capability diagnostic");
+    }
+  });
+
+  test("records a dispatched remote rejection as failed and never describes it as unsettled", async () => {
+    const { service, codex, documents, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Remote rejection" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Docs", path: documents }, { signal });
+    const started = await service.execute({ kind: "session.start", account: added.account.id, preset: "high", fast: false }, { signal }) as { session: { id: `sess_${string}` } };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000799";
+    codex.startTurnErrorOnce = new CodexRemoteError(-32_600, "private provider rejection diagnostic");
+
+    const command = {
+      kind: "session.send" as const,
+      session: started.session.id,
+      message: "settled rejection",
+      idempotencyKey,
+    };
+    await expect(service.execute(command, { signal })).rejects.toMatchObject({
+      code: "UNAVAILABLE",
+      details: { reason: "codex_remote_rejected", requestState: "settled" },
+      message: "Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.",
+    });
+    expect(store.readMutation(idempotencyKey)).toMatchObject({ state: "failed" });
+    expect(JSON.stringify(store.readMutation(idempotencyKey))).not.toContain("private provider rejection diagnostic");
+    await expect(service.execute(command, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
+  });
+
   test("bounds persistent pre-evidence retries and permits an explicit project trigger", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Bounded retry" }, { signal }) as { account: { id: string } };
@@ -3597,7 +3693,7 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
   });
 
-  test("causally reconciles a lost send by exact client id and newer provider revision without redispatch", async () => {
+  test("causally reconciles a lost send by exact client id within one provider timestamp tick", async () => {
     const { service, codex, documents, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Causal send" }, { signal }) as { account: { id: string } };
     await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
@@ -3610,9 +3706,10 @@ describe("HraService", () => {
     expect(codex.calls.filter((call) => call === "send")).toHaveLength(1);
 
     delete codex.startTurnError;
+    codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10 };
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       idempotencyKey: key,
-      session: { state: "active", activeTurnId: "turn-next", providerUpdatedAt: 11 },
+      session: { state: "active", activeTurnId: "turn-next", providerUpdatedAt: 10 },
       recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false },
     });
     expect(store.readMutation(key)).toMatchObject({ state: "reconciled", originalState: "ambiguous", result: { turnId: "turn-next" } });
@@ -3976,6 +4073,7 @@ describe("HraService", () => {
     expect(store.requireQueue(queued.queued.id)).toMatchObject({ state: "ambiguous" });
     expect(store.requireSession(started.session.id)).toMatchObject({ state: "recovery_required" });
     delete codex.startTurnError;
+    codex.readProjection = { ...codex.readProjection, providerUpdatedAt: 10 };
 
     expect(await service.execute({ kind: "session.recover", session: started.session.id }, { signal })).toMatchObject({
       queueId: queued.queued.id,

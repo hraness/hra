@@ -9,10 +9,12 @@ import { ensurePrivateDirectory, type StatePaths } from "../storage/paths";
 
 const maximumRequestBytes = 1_048_576;
 const maximumResponseBytes = 4_194_304;
-// The pinned Codex adapter may perform bounded capability discovery plus one
-// 30-second provider mutation. The local exchange must outlive that complete
-// descriptor so a client never times out while an effect is still settling.
-const defaultDeadlineMs = 180_000;
+// Cold session creation can spend 10 seconds initializing Codex, 10 seconds on
+// launch credential preflight, twice 10 + 40 seconds on credential review and
+// capability discovery, and 30 seconds on the provider mutation. The final 30
+// seconds lets the adapter settle cancellation and durable effect authority.
+export const DEFAULT_LOCAL_REQUEST_DEADLINE_MS =
+  10_000 + 10_000 + 2 * (10_000 + 40_000) + 30_000 + 30_000;
 
 type Handler = (command: LocalCommand, context: { requestId: string; signal: AbortSignal; afterResponse(callback: () => void): void }) => Promise<unknown>;
 
@@ -83,6 +85,75 @@ const publicFailureMessages = {
   INTERNAL: "The local request failed before a safe diagnostic was available.",
 } as const satisfies Readonly<Record<PublicFailureCode, string>>;
 
+const closedFailureReasonMessages = {
+  codex_authority_stale: {
+    code: "UNAVAILABLE",
+    message: "The exact Codex process authority changed before the operation finished. Inspect daemon status before starting a fresh attempt.",
+  },
+  codex_interaction_deadline_expired: {
+    code: "CONFLICT",
+    message: "The Codex interaction deadline expired before HRA could apply the response. Refresh pending interactions instead of replaying the expired response.",
+  },
+  codex_home_mismatch: {
+    code: "UNAVAILABLE",
+    message: "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+  },
+  codex_effect_indeterminate: {
+    code: "RECOVERY_REQUIRED",
+    message: "Codex may have applied the operation, but HRA could not prove its outcome. Reconcile the recorded attempt before retrying.",
+  },
+  codex_request_invalid: {
+    code: "INVALID_INPUT",
+    message: "Codex rejected HRA's bounded request as invalid. Inspect the command and run `hra doctor --json` before retrying.",
+  },
+  codex_process_exited: {
+    code: "UNAVAILABLE",
+    message: "The pinned Codex process exited before the operation finished. Inspect daemon status before starting a fresh attempt.",
+  },
+  codex_protocol_error: {
+    code: "UNAVAILABLE",
+    message: "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+  },
+  codex_protocol_limit: {
+    code: "UNAVAILABLE",
+    message: "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+  },
+  codex_remote_rejected: {
+    code: "UNAVAILABLE",
+    message: "Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.",
+  },
+  codex_runtime_mismatch: {
+    code: "UNAVAILABLE",
+    message: "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+  },
+  codex_timeout: {
+    code: "UNAVAILABLE",
+    message: "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+  },
+  codex_capability_unsupported: {
+    code: "UNAVAILABLE",
+    message: "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+  },
+} as const satisfies Readonly<Record<string, Readonly<{
+  code: PublicFailureCode;
+  message: string;
+}>>>;
+
+const closedFailureMessage = (
+  code: PublicFailureCode,
+  details: unknown,
+): string => {
+  if (typeof details !== "object" || details === null || Array.isArray(details)) {
+    return publicFailureMessages[code];
+  }
+  const reason = "reason" in details ? details.reason : undefined;
+  if (typeof reason !== "string" || !Object.hasOwn(closedFailureReasonMessages, reason)) {
+    return publicFailureMessages[code];
+  }
+  const closed = closedFailureReasonMessages[reason as keyof typeof closedFailureReasonMessages];
+  return closed.code === code ? closed.message : publicFailureMessages[code];
+};
+
 type DeclaredCommandFailure = Error & Readonly<{
   [commandFailureBrand]: true;
   code: PublicFailureCode;
@@ -107,7 +178,9 @@ const safeResponse = (requestId: string, error: unknown): CommandResponse => {
     requestId,
     error: {
       code,
-      message: publicFailureMessages[code],
+      message: publicFailure
+        ? closedFailureMessage(code, error.details)
+        : publicFailureMessages[code],
       ...(publicFailure
         && code !== "INTERNAL"
         && error.details !== undefined
@@ -143,7 +216,12 @@ export class LocalDaemonServer {
     await removeStaleEndpoint(input.paths);
     const capability = randomBytes(32).toString("base64url");
     await publishCapability(input.paths, capability);
-    const owned = new LocalDaemonServer(input.paths, capability, input.handler, input.deadlineMs ?? defaultDeadlineMs);
+    const owned = new LocalDaemonServer(
+      input.paths,
+      capability,
+      input.handler,
+      input.deadlineMs ?? DEFAULT_LOCAL_REQUEST_DEADLINE_MS,
+    );
     try {
       await new Promise<void>((resolve, reject) => {
         owned.#server.once("error", reject);
@@ -370,7 +448,7 @@ export async function callLocalDaemon(input: {
         ? new LocalDaemonIndeterminateError("The HRA daemon did not respond before the deadline.")
         : new LocalDaemonUnavailableError("The HRA daemon was unavailable before the request deadline.")));
       destroyImmediately();
-    }, input.deadlineMs ?? defaultDeadlineMs);
+    }, input.deadlineMs ?? DEFAULT_LOCAL_REQUEST_DEADLINE_MS);
     deadline.unref();
     const onAbort = () => {
       settle(() => rejectPromise(connected

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, spyOn, test } from "bun:test";
 
 import { HRA_VERSION } from "../version.ts";
 import { CodexAppServerClient, type CodexAppServerClientOptions } from "./client.ts";
@@ -39,6 +39,15 @@ const commandApprovalParams = (reason = "Need network access") => ({
   proposedExecpolicyAmendment: null,
   proposedNetworkPolicyAmendments: null,
   availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+});
+
+const appFixture = (id: string) => ({
+  id,
+  name: `App ${id}`,
+  description: null,
+  isAccessible: true,
+  isEnabled: true,
+  pluginDisplayNames: [],
 });
 
 class ByteQueue implements AsyncIterable<Uint8Array> {
@@ -208,6 +217,19 @@ describe("CodexAppServerClient", () => {
     expect(() => new CodexAppServerClient(options)).toThrow(
       "credential-store preflight is required",
     );
+    expect(process.writes).toEqual([]);
+    expect(process.signals).toEqual([]);
+  });
+
+  test("bounds the deterministic capability-discovery deadline override", () => {
+    const process = successfulFake("/tmp/hra-control-plane/profile-a/codex-home");
+    expect(() => createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: "/tmp/hra-control-plane/profile-a/codex-home",
+      isAuthorityCurrent: () => true,
+      capabilityDiscoveryDeadlineMs: 40_001,
+    })).toThrow("capability discovery deadline must be an integer between 1 and 40000 milliseconds");
     expect(process.writes).toEqual([]);
     expect(process.signals).toEqual([]);
   });
@@ -1728,6 +1750,719 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("applies one aggregate deadline to stalled capability discovery", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      capabilityDiscoveryDeadlineMs: 20,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    const startedAt = performance.now();
+    await expect(client.discoverCapabilities()).rejects.toMatchObject({
+      code: "TIMEOUT",
+      message: "capability discovery timed out",
+    });
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    expect(process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "model/list")).toHaveLength(1);
+    expect(client.state).toBe("ready");
+    await client.close();
+  });
+
+  test("observes discovery settlement when the caller signal is already aborted", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const reason = new Error("request boundary already closed");
+    controller.abort(reason);
+
+    await expect(client.discoverCapabilities({ signal: controller.signal })).rejects.toBe(reason);
+    await Bun.sleep(2);
+
+    expect(process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "model/list")).toBe(false);
+    expect(client.state).toBe("ready");
+    await client.close();
+  });
+
+  test("caller abort cancels the current page, prevents continuations, and tolerates its late response", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let modelPage = 0;
+    let stalledRequestId: unknown;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list") {
+        modelPage += 1;
+        if (modelPage === 1) {
+          target.respond({ id: message.id, result: { data: [], nextCursor: "models-page-2" } });
+        } else {
+          stalledRequestId = message.id;
+        }
+      } else if (message.method === "account/read") {
+        target.respond({
+          id: message.id,
+          result: {
+            account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+            requiresOpenaiAuth: true,
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const reason = new Error("request boundary closed");
+    const discovery = client.discoverCapabilities({ signal: controller.signal });
+    await waitFor(() => stalledRequestId !== undefined);
+
+    controller.abort(reason);
+    await expect(discovery).rejects.toBe(reason);
+    process.respond({
+      id: stalledRequestId,
+      result: { data: [], nextCursor: "models-page-3" },
+    });
+    await Bun.sleep(2);
+
+    expect(process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "model/list")).toHaveLength(2);
+    await expect(client.accountRead()).resolves.toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+    expect(client.state).toBe("ready");
+    await client.close();
+  });
+
+  test("aborted queued discovery never writes its first read frame", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const writeGate = deferred<undefined>();
+    process.writeSettlementGate = writeGate.promise;
+    const occupyingRead = client.accountRead();
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "account/read"));
+    const controller = new AbortController();
+    const reason = new Error("request boundary closed");
+    const discovery = client.discoverCapabilities({ signal: controller.signal });
+    const discoveryResult = discovery.catch((error: unknown) => error);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    controller.abort(reason);
+    writeGate.resolve(undefined);
+
+    await expect(occupyingRead).resolves.toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+    expect(await discoveryResult).toBe(reason);
+    expect(process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "model/list")).toBe(false);
+    await client.close();
+  });
+
+  test("caller abort settles a queued credential read while the prior write remains blocked", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const writeGate = deferred<undefined>();
+    process.writeSettlementGate = writeGate.promise;
+    const occupyingRead = client.accountRead();
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "account/read"));
+    const configReadsBefore = process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "config/read").length;
+    const controller = new AbortController();
+    const reason = new Error("request boundary closed while queued");
+    const credentialRead = client.assertCredentialStores(
+      "/tmp/hra-control-plane/project",
+      controller.signal,
+    ).then(
+      () => "resolved" as const,
+      (error: unknown) => error,
+    );
+
+    try {
+      controller.abort(reason);
+      const result = await Promise.race([
+        credentialRead,
+        Bun.sleep(200).then(() => "still-blocked" as const),
+      ]);
+      expect(result).toBe(reason);
+      expect(process.writes.filter((frame) =>
+        (frame as { method?: unknown }).method === "config/read")).toHaveLength(configReadsBefore);
+    } finally {
+      writeGate.resolve(undefined);
+    }
+
+    await expect(occupyingRead).resolves.toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+    await credentialRead;
+    await client.close();
+  });
+
+  test("does not dispatch a queued mutation after its deadline expires", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const writeGate = deferred<undefined>();
+    process.writeSettlementGate = writeGate.promise;
+    const occupyingRead = client.accountRead();
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { method?: unknown }).method === "account/read"));
+    await expect(occupyingRead).resolves.toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+
+    jest.useFakeTimers();
+    try {
+      const mutation = client.renameThread("thread-1", "renamed");
+      for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+      jest.advanceTimersByTime(15_000);
+
+      await expect(mutation).rejects.toMatchObject({
+        code: "TIMEOUT",
+        message: "thread/name/set timed out",
+      });
+      expect(process.writes.some((frame) =>
+        (frame as { method?: unknown }).method === "thread/name/set")).toBe(false);
+
+      writeGate.resolve(undefined);
+      for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+      expect(process.writes.some((frame) =>
+        (frame as { method?: unknown }).method === "thread/name/set")).toBe(false);
+    } finally {
+      writeGate.resolve(undefined);
+      jest.useRealTimers();
+    }
+
+    await client.close();
+  });
+
+  test("quarantines a response that arrives before its queued request is dispatched", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = successfulFake(codexHome);
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const writeGate = deferred<undefined>();
+    process.writeSettlementGate = writeGate.promise;
+    const occupyingRead = client.accountRead();
+    await waitFor(() => process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === 3));
+    await expect(occupyingRead).resolves.toMatchObject({
+      value: { account: { type: "chatgpt", planType: "pro" } },
+    });
+    const queuedRead = client.accountRead();
+    for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === 4)).toBe(false);
+
+    process.respond({
+      id: 4,
+      result: {
+        account: { type: "chatgpt", email: "person@example.com", planType: "pro" },
+        requiresOpenaiAuth: true,
+      },
+    });
+    await expect(queuedRead).rejects.toMatchObject({
+      code: "PROTOCOL_ERROR",
+      message: "Codex provider connection was quarantined",
+    });
+    expect(client.state).toBe("failed");
+    expect(process.signals).toEqual(["SIGTERM"]);
+
+    writeGate.resolve(undefined);
+    for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
+    expect(process.writes.some((frame) =>
+      (frame as { id?: unknown }).id === 4)).toBe(false);
+    await client.close();
+  });
+
+  test("keeps a dispatched mutation indeterminate when its response deadline expires", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const mutationWritten = deferred<undefined>();
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "thread/name/set") {
+        mutationWritten.resolve(undefined);
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    jest.useFakeTimers();
+    try {
+      const mutation = client.renameThread("thread-1", "renamed");
+      await mutationWritten.promise;
+      jest.advanceTimersByTime(15_000);
+
+      await expect(mutation).rejects.toMatchObject({
+        code: "INDETERMINATE_EFFECT",
+        operation: "thread/name/set",
+      });
+      expect(process.writes.filter((frame) =>
+        (frame as { method?: unknown }).method === "thread/name/set")).toHaveLength(1);
+    } finally {
+      jest.useRealTimers();
+    }
+
+    await client.close();
+  });
+
+  test("removes the caller abort listener after successful discovery", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      capabilityDiscoveryDeadlineMs: 20,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const add = spyOn(controller.signal, "addEventListener");
+    const remove = spyOn(controller.signal, "removeEventListener");
+    try {
+      await expect(client.discoverCapabilities({ signal: controller.signal })).resolves.toMatchObject({
+        value: { models: [], features: [] },
+      });
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+      await Bun.sleep(30);
+      expect(controller.signal.aborted).toBe(false);
+      expect(client.state).toBe("ready");
+    } finally {
+      add.mockRestore();
+      remove.mockRestore();
+      await client.close();
+    }
+  });
+
+  test("removes a read abort listener when the descriptor deadline wins", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let configRead = 0;
+    const stalled = deferred<undefined>();
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "config/read") {
+        configRead += 1;
+        if (configRead === 1) {
+          target.respond({
+            id: message.id,
+            result: {
+              config: {
+                cli_auth_credentials_store: "file",
+                mcp_oauth_credentials_store: "file",
+              },
+              origins: {},
+            },
+          });
+        } else {
+          stalled.resolve(undefined);
+        }
+      }
+    }, { autoCredentialStorePreflight: false });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+    const controller = new AbortController();
+    const add = spyOn(controller.signal, "addEventListener");
+    const remove = spyOn(controller.signal, "removeEventListener");
+    jest.useFakeTimers();
+    try {
+      const credentialRead = client.assertCredentialStores(
+        "/tmp/hra-control-plane/project",
+        controller.signal,
+      );
+      await stalled.promise;
+      jest.advanceTimersByTime(10_000);
+      await expect(credentialRead).rejects.toMatchObject({
+        code: "TIMEOUT",
+        message: "config/read timed out",
+      });
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+    } finally {
+      jest.useRealTimers();
+      add.mockRestore();
+      remove.mockRestore();
+      await client.close();
+    }
+  });
+
+  test("refreshes the app cache once and disables refetch for every continuation", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let appPage = 0;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      } else if (message.method === "app/list") {
+        appPage += 1;
+        const id = `app-${String(appPage)}`;
+        target.respond({
+          id: message.id,
+          result: {
+            data: [appFixture(id)],
+            nextCursor: appPage === 1
+              ? "apps-page-2"
+              : appPage === 2
+                ? "apps-page-3"
+                : null,
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    const capabilities = await client.discoverCapabilities({
+      threadId: "thread-1",
+      includeExperimental: true,
+    });
+
+    expect(capabilities.value.apps?.map((app) => app.id)).toEqual([
+      "app-1",
+      "app-2",
+      "app-3",
+    ]);
+    expect(process.writes.slice(5)).toEqual([
+      {
+        id: 5,
+        method: "permissionProfile/list",
+        params: { limit: 100, cursor: null },
+      },
+      {
+        id: 6,
+        method: "app/list",
+        params: {
+          limit: 100,
+          forceRefetch: true,
+          threadId: "thread-1",
+          cursor: null,
+        },
+      },
+      {
+        id: 7,
+        method: "app/list",
+        params: {
+          limit: 100,
+          forceRefetch: false,
+          threadId: "thread-1",
+          cursor: "apps-page-2",
+        },
+      },
+      {
+        id: 8,
+        method: "app/list",
+        params: {
+          limit: 100,
+          forceRefetch: false,
+          threadId: "thread-1",
+          cursor: "apps-page-3",
+        },
+      },
+    ]);
+    await client.close();
+  });
+
+  test("admits an exactly terminal 50th app page", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let appPage = 0;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      } else if (message.method === "app/list") {
+        appPage += 1;
+        target.respond({
+          id: message.id,
+          result: {
+            data: [appFixture(`app-${String(appPage)}`)],
+            nextCursor: appPage < 50 ? `apps-page-${String(appPage + 1)}` : null,
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    const capabilities = await client.discoverCapabilities({
+      threadId: "thread-1",
+      includeExperimental: true,
+    });
+
+    expect(capabilities.value.apps).toHaveLength(50);
+    const appRequests = process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "app/list");
+    expect(appRequests).toHaveLength(50);
+    expect(appRequests[0]).toEqual({
+      id: 6,
+      method: "app/list",
+      params: {
+        limit: 100,
+        forceRefetch: true,
+        threadId: "thread-1",
+        cursor: null,
+      },
+    });
+    expect(appRequests[49]).toEqual({
+      id: 55,
+      method: "app/list",
+      params: {
+        limit: 100,
+        forceRefetch: false,
+        threadId: "thread-1",
+        cursor: "apps-page-50",
+      },
+    });
+    await client.close();
+  });
+
+  test("rejects a nonterminal continuation at the 50-page app limit", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let appPage = 0;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      } else if (message.method === "app/list") {
+        appPage += 1;
+        target.respond({
+          id: message.id,
+          result: { data: [], nextCursor: `apps-page-${String(appPage + 1)}` },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.discoverCapabilities({ includeExperimental: true })).rejects.toMatchObject({
+      code: "PROTOCOL_LIMIT",
+      message: "app/list exceeded its page limit",
+    });
+    const appRequests = process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "app/list");
+    expect(appRequests).toHaveLength(50);
+    expect(appRequests[49]).toEqual({
+      id: 55,
+      method: "app/list",
+      params: { limit: 100, forceRefetch: false, cursor: "apps-page-50" },
+    });
+    await client.close();
+  });
+
+  test("fails closed when app pagination exceeds 5,000 aggregate items", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let appPage = 0;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      } else if (message.method === "app/list") {
+        appPage += 1;
+        target.respond({
+          id: message.id,
+          result: {
+            data: Array.from(
+              { length: 1_000 },
+              (_, index) => appFixture(`app-${String(appPage)}-${String(index)}`),
+            ),
+            nextCursor: `apps-page-${String(appPage + 1)}`,
+          },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.discoverCapabilities({ includeExperimental: true })).rejects.toMatchObject({
+      code: "PROTOCOL_LIMIT",
+      message: "app/list exceeded its item limit",
+    });
+    const appRequests = process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "app/list");
+    expect(appRequests).toHaveLength(6);
+    await client.close();
+  });
+
+  test("keeps non-app capability discovery at the 20-page limit", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    let modelPage = 0;
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list") {
+        modelPage += 1;
+        target.respond({
+          id: message.id,
+          result: { data: [], nextCursor: `models-page-${String(modelPage + 1)}` },
+        });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.discoverCapabilities()).rejects.toMatchObject({
+      code: "PROTOCOL_LIMIT",
+      message: "model/list exceeded its page limit",
+    });
+    const modelRequests = process.writes.filter((frame) =>
+      (frame as { method?: unknown }).method === "model/list");
+    expect(modelRequests).toHaveLength(20);
+    expect(modelRequests[19]).toEqual({
+      id: 22,
+      method: "model/list",
+      params: { includeHidden: true, limit: 100, cursor: "models-page-20" },
+    });
+    await client.close();
+  });
+
+  test("rejects a repeated app cursor after the one-shot refresh", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, target) => {
+      if (message.method === "initialize") {
+        target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
+      } else if (message.method === "model/list" || message.method === "experimentalFeature/list" || message.method === "permissionProfile/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: null } });
+      } else if (message.method === "app/list") {
+        target.respond({ id: message.id, result: { data: [], nextCursor: "repeated" } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      experimentalApi: true,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.discoverCapabilities({ includeExperimental: true })).rejects.toMatchObject({
+      code: "PROTOCOL_ERROR",
+      message: "app/list repeated a cursor",
+    });
+    expect(process.writes.slice(-2)).toEqual([
+      {
+        id: 6,
+        method: "app/list",
+        params: { limit: 100, forceRefetch: true, cursor: null },
+      },
+      {
+        id: 7,
+        method: "app/list",
+        params: { limit: 100, forceRefetch: false, cursor: "repeated" },
+      },
+    ]);
+    await client.close();
+  });
+
   test("discovers plugins through the read-only pinned method and never sends a lifecycle effect", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, target) => {
@@ -1849,6 +2584,7 @@ describe("CodexAppServerClient", () => {
       sessionId: "thread-1",
       preview: "",
       ephemeral: false,
+      historyMode: "paginated",
       modelProvider: "openai",
       createdAt: 1,
       updatedAt: 1,
@@ -1906,6 +2642,7 @@ describe("CodexAppServerClient", () => {
         approvalsReviewer: "auto_review",
         config: { model_reasoning_effort: "max" },
         ephemeral: false,
+        historyMode: "paginated",
       },
     });
     await client.close();
@@ -1918,7 +2655,7 @@ describe("CodexAppServerClient", () => {
         target.respond({ id: message.id, result: { userAgent: "codex-cli/0.149.0", codexHome, platformFamily: "unix", platformOs: "macos" } });
       } else if (message.method === "thread/start") {
         target.respond({ id: message.id, result: {
-          thread: { id: "thread-unsafe", sessionId: "thread-unsafe", preview: "", ephemeral: false, modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" }, cwd: "/workspace/project", name: null, turns: [] },
+          thread: { id: "thread-unsafe", sessionId: "thread-unsafe", preview: "", ephemeral: false, historyMode: "paginated", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" }, cwd: "/workspace/project", name: null, turns: [] },
           cwd: "/workspace/project",
           model: "gpt-5.6-sol",
           modelProvider: "openai",

@@ -3,6 +3,7 @@ import { isAbsolute, relative } from "node:path";
 
 import {
   CodexError,
+  CodexRemoteError,
   IndeterminateCodexEffectError,
   launchPinnedCodexAppServer,
   type CodexAppServerClient,
@@ -40,15 +41,30 @@ import {
 } from "./ports";
 import { compileEffectiveRuntimeProfile } from "./recommended-capabilities";
 
-type RunningClient = { authority: ProfileAuthority; client: CodexAppServerClient };
-type SessionObservationProof = {
-  readonly resumed: boolean;
+type RunningClient = {
+  authority: ProfileAuthority;
+  client: CodexAppServerClient;
+  threadItemsListSupport: Map<string, "supported" | "unsupported">;
+  sessionObservationFactSequence: number;
+  sessionObservationFactByThread: Map<string, number>;
 };
+type SessionObservationProof =
+  | {
+      readonly projection: CodexSessionProjection;
+      readonly resumed: false;
+    }
+  | {
+      readonly resumed: false;
+    }
+  | {
+      readonly resumed: true;
+    };
 type SessionObservationEntry = {
   readonly connectionId: string;
   readonly generation: number;
   readonly profileId: string;
   readonly providerThreadId: string;
+  readonly startProjection?: CodexSessionProjection;
   readonly task: Promise<SessionObservationProof>;
 };
 type PendingRuntimeReview = {
@@ -86,6 +102,7 @@ const assertReviewedThreadStart = (
     || !sandboxMatches
     || !rootsMatch
     || value.thread.ephemeral
+    || value.thread.historyMode !== "paginated"
   ) {
     throw new CodexError(
       "PROTOCOL_ERROR",
@@ -386,6 +403,14 @@ type TurnSummaryMetadata = Pick<
 type TurnCompactEssentials = Readonly<{
   firstUser?: CodexProjectedMessage;
   finalAssistant?: CodexProjectedMessage;
+}>;
+
+type RecentTurnsHydration = Readonly<{
+  turns: readonly CodexTurn[];
+  unreadItemTurnIds: ReadonlySet<string>;
+  incompleteTurnIds: ReadonlySet<string>;
+  summaryMetadataByTurn: ReadonlyMap<string, TurnSummaryMetadata>;
+  compactEssentialsByTurn: ReadonlyMap<string, TurnCompactEssentials>;
 }>;
 
 type TurnSummaryAccumulator = {
@@ -817,7 +842,15 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       if (input.projectRoot === undefined) throw new Error("A project directory is required before starting a session.");
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
-      const reviewed = await this.#reviewedPreset(running, input.preset, input.fast, input.projectRoot);
+      input.signal.throwIfAborted();
+      const reviewed = await this.#reviewedPreset(
+        running,
+        input.preset,
+        input.fast,
+        input.projectRoot,
+        undefined,
+        input.signal,
+      );
       return this.#rememberReview({ kind: "session_start", running, projectRoot: input.projectRoot, ...reviewed });
     });
   }
@@ -833,6 +866,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       });
       const running = reviewed.running;
       const preset = reviewed.preset;
+      const observationFactSequence = running.sessionObservationFactSequence;
       const started = (await running.client.startThread({ cwd: input.projectRoot, preset, policy: this.#policy(input.projectRoot) })).value;
       try {
         assertReviewedThreadStart(started, reviewed.review.effectiveRuntimeProfile, input.projectRoot);
@@ -842,6 +876,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           preset.fast,
           input.projectRoot,
           started.thread.id,
+          input.signal,
         );
         const normalizedContextualProfile: EffectiveRuntimeProfile = {
           ...contextual.profile,
@@ -857,7 +892,13 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
           );
         }
         const projection = projectBoundedThread(started.thread, false);
-        this.#rememberSessionObservation(running, projection, false);
+        this.#assertObservedClientCurrent(running);
+        if (
+          (running.sessionObservationFactByThread.get(projection.providerThreadId) ?? 0)
+          <= observationFactSequence
+        ) {
+          this.#rememberSessionObservation(running, projection, false);
+        }
         return { ...projection, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
       } catch (error: unknown) {
         throw new IndeterminateCodexEffectError("thread/start", 0, error);
@@ -881,25 +922,59 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     return await this.#admit(async () => {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
-      await this.#ensureSessionObserved(running, input.providerThreadId);
+      const proof = await this.#ensureSessionObserved(running, input.providerThreadId);
+      if (!proof.resumed && "projection" in proof) {
+        input.signal.throwIfAborted();
+        this.#assertObservedClientCurrent(running);
+        return input.detail
+          ? { ...proof.projection, turns: [] }
+          : proof.projection;
+      }
       const client = running.client;
-      const [metadata, turns] = await Promise.all([
-        client.readThread(input.providerThreadId, false),
-        client.listThreadTurns({
+      const metadata = await client.readThread(input.providerThreadId, false);
+      if (metadata.value.historyMode === "legacy") {
+        running.threadItemsListSupport.set(input.providerThreadId, "unsupported");
+      }
+      let turns: Awaited<ReturnType<CodexAppServerClient["listThreadTurns"]>>;
+      let hydrated: RecentTurnsHydration;
+      if (running.threadItemsListSupport.get(input.providerThreadId) === "unsupported") {
+        turns = await client.listThreadTurns({
+          threadId: input.providerThreadId,
+          limit: RECENT_TURN_LIMIT,
+          sortDirection: "desc",
+          itemsView: "summary",
+        });
+        input.signal.throwIfAborted();
+        hydrated = this.#projectLegacyRecentTurns(turns.value, metadata.value.cwd);
+      } else {
+        turns = await client.listThreadTurns({
           threadId: input.providerThreadId,
           limit: RECENT_TURN_LIMIT,
           sortDirection: "desc",
           itemsView: "notLoaded",
-        }),
-      ]);
-      const chronologicalTurns = [...turns.value.data].reverse();
-      const hydrated = await this.#hydrateRecentTurns(
-        client,
-        input.providerThreadId,
-        chronologicalTurns,
-        metadata.value.cwd,
-        input.signal,
-      );
+        });
+        try {
+          hydrated = await this.#hydrateRecentTurns(
+            client,
+            input.providerThreadId,
+            [...turns.value.data].reverse(),
+            metadata.value.cwd,
+            input.signal,
+          );
+          running.threadItemsListSupport.set(input.providerThreadId, "supported");
+        } catch (error: unknown) {
+          if (!(error instanceof CodexRemoteError) || error.remoteCode !== -32_601) throw error;
+          running.threadItemsListSupport.set(input.providerThreadId, "unsupported");
+          turns = await client.listThreadTurns({
+            threadId: input.providerThreadId,
+            limit: RECENT_TURN_LIMIT,
+            sortDirection: "desc",
+            itemsView: "summary",
+          });
+          input.signal.throwIfAborted();
+          hydrated = this.#projectLegacyRecentTurns(turns.value, metadata.value.cwd);
+        }
+      }
       const thread: CodexThread = {
         ...metadata.value,
         turns: hydrated.turns,
@@ -922,7 +997,15 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
       await this.#ensureSessionObserved(running, input.providerThreadId);
-      const reviewed = await this.#reviewedPreset(running, input.preset, input.fast, input.projectRoot, input.providerThreadId);
+      input.signal.throwIfAborted();
+      const reviewed = await this.#reviewedPreset(
+        running,
+        input.preset,
+        input.fast,
+        input.projectRoot,
+        input.providerThreadId,
+        input.signal,
+      );
       return this.#rememberReview({ kind: "turn_start", running, projectRoot: input.projectRoot, providerThreadId: input.providerThreadId, ...reviewed });
     });
   }
@@ -940,6 +1023,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const running = reviewed.running;
       await this.#ensureSessionObserved(running, input.providerThreadId);
       const preset = reviewed.preset;
+      this.#invalidateRememberedStartProjection(
+        running,
+        input.providerThreadId,
+      );
       const value = await running.client.startTurn({ threadId: input.providerThreadId, clientMessageId: input.clientMessageId, text: input.message, preset, cwd: input.projectRoot, policy: this.#policy(input.projectRoot) });
       return { turnId: value.value.turn.id, status: value.value.turn.status, effectiveRuntimeProfile: reviewed.review.effectiveRuntimeProfile };
     });
@@ -968,6 +1055,10 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       if (input.signal.aborted) throw input.signal.reason;
       const running = await this.#running(input.authority);
       await this.#ensureSessionObserved(running, input.providerThreadId);
+      this.#invalidateRememberedStartProjection(
+        running,
+        input.providerThreadId,
+      );
       await running.client.renameThread(input.providerThreadId, input.name);
     });
   }
@@ -978,30 +1069,60 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       const running = await this.#running(input.authority);
       await this.#ensureSessionObserved(running, input.providerThreadId);
       const client = running.client;
-      const [metadata, turn, itemPage] = await Promise.all([
+      const [metadata, found] = await Promise.all([
         client.readThread(input.providerThreadId, false),
         this.#findTurn(client, input.providerThreadId, input.turnId, input.signal),
-        client.listThreadItems({
-          threadId: input.providerThreadId,
-          turnId: input.turnId,
-          limit: INSPECT_ITEM_LIMIT,
-          sortDirection: "asc",
-        }),
       ]);
-      const items = itemPage.value.data.map((entry) => {
-        if (entry.turnId !== input.turnId) {
-          throw new CodexError(
-            "PROTOCOL_ERROR",
-            "thread/items/list returned an item for a different turn",
+      if (metadata.value.historyMode === "legacy") {
+        running.threadItemsListSupport.set(input.providerThreadId, "unsupported");
+      }
+      let turn = found.turn;
+      let hasMoreItems = false;
+      if (running.threadItemsListSupport.get(input.providerThreadId) === "unsupported") {
+        turn = await this.#readLegacyFullTurn(
+          client,
+          input.providerThreadId,
+          input.turnId,
+          found,
+          input.signal,
+        );
+      } else {
+        try {
+          const itemPage = await client.listThreadItems({
+            threadId: input.providerThreadId,
+            turnId: input.turnId,
+            limit: INSPECT_ITEM_LIMIT,
+            sortDirection: "asc",
+          });
+          running.threadItemsListSupport.set(input.providerThreadId, "supported");
+          const items = itemPage.value.data.map((entry) => {
+            if (entry.turnId !== input.turnId) {
+              throw new CodexError(
+                "PROTOCOL_ERROR",
+                "thread/items/list returned an item for a different turn",
+              );
+            }
+            return entry.item;
+          });
+          turn = { ...turn, items };
+          hasMoreItems = itemPage.value.nextCursor !== null;
+        } catch (error: unknown) {
+          if (!(error instanceof CodexRemoteError) || error.remoteCode !== -32_601) throw error;
+          running.threadItemsListSupport.set(input.providerThreadId, "unsupported");
+          turn = await this.#readLegacyFullTurn(
+            client,
+            input.providerThreadId,
+            input.turnId,
+            found,
+            input.signal,
           );
         }
-        return entry.item;
-      });
+      }
       return assertTransportSafeProjection(projectTurn(
-        { ...turn, items },
+        turn,
         metadata.value.cwd,
         INSPECT_ITEM_LIMIT,
-        itemPage.value.nextCursor !== null,
+        hasMoreItems,
         { remaining: INSPECT_ITEM_JSON_BYTE_BUDGET },
       ));
     });
@@ -1282,70 +1403,121 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     resumed: boolean,
   ): SessionObservationProof {
     this.#assertObservedClientCurrent(running);
-    const proof = { resumed } satisfies SessionObservationProof;
+    const proof: SessionObservationProof = resumed
+      ? { resumed: true }
+      : { projection, resumed: false };
     const task = Promise.resolve(proof);
     this.#sessionObservations.set(this.#observationKey(running, projection.providerThreadId), {
       connectionId: running.client.connectionId,
       generation: running.authority.generation,
       profileId: running.authority.id,
       providerThreadId: projection.providerThreadId,
+      ...(resumed ? {} : { startProjection: projection }),
       task,
     });
     return proof;
+  }
+
+  #invalidateRememberedStartProjection(
+    running: RunningClient,
+    providerThreadId: string,
+  ): void {
+    const key = this.#observationKey(running, providerThreadId);
+    const existing = this.#sessionObservations.get(key);
+    if (existing?.startProjection === undefined) return;
+    const replacement: SessionObservationEntry = {
+      connectionId: existing.connectionId,
+      generation: existing.generation,
+      profileId: existing.profileId,
+      providerThreadId: existing.providerThreadId,
+      task: Promise.resolve({ resumed: false }),
+    };
+    this.#sessionObservations.set(key, replacement);
+  }
+
+  #rotateSessionObservation(
+    running: RunningClient,
+    providerThreadId: string,
+  ): void {
+    const key = this.#observationKey(running, providerThreadId);
+    const existing = this.#sessionObservations.get(key);
+    if (existing === undefined) return;
+    this.#sessionObservations.set(key, {
+      connectionId: existing.connectionId,
+      generation: existing.generation,
+      profileId: existing.profileId,
+      providerThreadId: existing.providerThreadId,
+      task: Promise.resolve({ resumed: false }),
+    });
+  }
+
+  #clearSessionObservation(
+    running: RunningClient,
+    providerThreadId: string,
+  ): void {
+    this.#sessionObservations.delete(this.#observationKey(running, providerThreadId));
   }
 
   async #ensureSessionObserved(
     running: RunningClient,
     providerThreadId: string,
   ): Promise<SessionObservationProof> {
-    this.#assertObservedClientCurrent(running);
     const key = this.#observationKey(running, providerThreadId);
-    const existing = this.#sessionObservations.get(key);
-    if (existing !== undefined) {
-      const proof = await existing.task;
+    for (;;) {
       this.#assertObservedClientCurrent(running);
-      return proof;
-    }
-    const task = (async (): Promise<SessionObservationProof> => {
-      try {
-        const resumed = (await running.client.resumeThread(providerThreadId)).value;
-        if (resumed.id !== providerThreadId) {
-          throw new CodexSessionObservationError("thread_mismatch");
-        }
+      const existing = this.#sessionObservations.get(key);
+      if (existing !== undefined) {
+        const proof = await existing.task;
         this.#assertObservedClientCurrent(running);
-        return { resumed: true };
-      } catch (error: unknown) {
-        if (error instanceof CodexSessionObservationError) throw error;
-        if (error instanceof IndeterminateCodexEffectError) {
-          await this.#retireIndeterminateObservation(running);
-          throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+        if (this.#sessionObservations.get(key) !== existing) continue;
+        return proof;
+      }
+      const task = (async (): Promise<SessionObservationProof> => {
+        try {
+          const resumed = (await running.client.resumeThread(providerThreadId)).value;
+          if (resumed.id !== providerThreadId) {
+            throw new CodexSessionObservationError("thread_mismatch");
+          }
+          this.#assertObservedClientCurrent(running);
+          return { resumed: true };
+        } catch (error: unknown) {
+          if (error instanceof CodexSessionObservationError) throw error;
+          if (error instanceof IndeterminateCodexEffectError) {
+            await this.#retireIndeterminateObservation(running);
+            throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+          }
+          if (error instanceof CodexError) {
+            throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+          }
+          throw error;
         }
-        if (error instanceof CodexError) {
-          throw new CodexSessionObservationError("resume_unavailable", { cause: error });
+      })();
+      const entry: SessionObservationEntry = {
+        connectionId: running.client.connectionId,
+        generation: running.authority.generation,
+        profileId: running.authority.id,
+        providerThreadId,
+        task,
+      };
+      this.#sessionObservations.set(key, entry);
+      try {
+        const proof = await task;
+        this.#assertObservedClientCurrent(running);
+        if (this.#sessionObservations.get(key) !== entry) continue;
+        return proof;
+      } catch (error: unknown) {
+        if (this.#sessionObservations.get(key) !== entry) {
+          if (this.#clients.get(running.authority.id) !== running) throw error;
+          continue;
+        }
+        const deterministicUnavailable = error instanceof CodexSessionObservationError
+          && error.reason === "resume_unavailable"
+          && this.#clients.get(running.authority.id) === running;
+        if (!deterministicUnavailable) {
+          this.#sessionObservations.delete(key);
         }
         throw error;
       }
-    })();
-    const entry: SessionObservationEntry = {
-      connectionId: running.client.connectionId,
-      generation: running.authority.generation,
-      profileId: running.authority.id,
-      providerThreadId,
-      task,
-    };
-    this.#sessionObservations.set(key, entry);
-    try {
-      const proof = await task;
-      this.#assertObservedClientCurrent(running);
-      return proof;
-    } catch (error: unknown) {
-      const deterministicUnavailable = error instanceof CodexSessionObservationError
-        && error.reason === "resume_unavailable"
-        && this.#clients.get(running.authority.id) === running;
-      if (!deterministicUnavailable && this.#sessionObservations.get(key) === entry) {
-        this.#sessionObservations.delete(key);
-      }
-      throw error;
     }
   }
 
@@ -1354,6 +1526,17 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     providerThreadId: string,
     proof: SessionObservationProof,
   ): Promise<CodexSessionObservation> {
+    if (!proof.resumed && "projection" in proof) {
+      if (proof.projection.providerThreadId !== providerThreadId) {
+        throw new CodexSessionObservationError("thread_mismatch");
+      }
+      this.#assertObservedClientCurrent(running);
+      return {
+        connectionId: running.client.connectionId,
+        projection: proof.projection,
+        resumed: false,
+      };
+    }
     const metadata = (await running.client.readThread(providerThreadId, false)).value;
     if (metadata.id !== providerThreadId) {
       throw new CodexSessionObservationError("thread_mismatch");
@@ -1420,13 +1603,7 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     turns: readonly CodexTurn[],
     root: string,
     signal: AbortSignal,
-  ): Promise<Readonly<{
-    turns: readonly CodexTurn[];
-    unreadItemTurnIds: ReadonlySet<string>;
-    incompleteTurnIds: ReadonlySet<string>;
-    summaryMetadataByTurn: ReadonlyMap<string, TurnSummaryMetadata>;
-    compactEssentialsByTurn: ReadonlyMap<string, TurnCompactEssentials>;
-  }>> {
+  ): Promise<RecentTurnsHydration> {
     type HydrationState = {
       readonly turn: CodexTurn;
       readonly items: CodexThreadItem[];
@@ -1735,12 +1912,42 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     };
   }
 
+  #projectLegacyRecentTurns(
+    page: Awaited<ReturnType<CodexAppServerClient["listThreadTurns"]>>["value"],
+    root: string,
+  ): RecentTurnsHydration {
+    const turns = [...page.data].reverse();
+    const incompleteTurnIds = new Set(
+      turns
+        .filter((turn) => turn.status === "completed" && (
+          !turn.items.some((item) => item.type === "userMessage" && item.text.length > 0)
+          || !turn.items.some((item) => item.type === "agentMessage")
+        ))
+        .map((turn) => turn.id),
+    );
+    return {
+      turns,
+      unreadItemTurnIds: new Set(turns.map((turn) => turn.id)),
+      incompleteTurnIds,
+      summaryMetadataByTurn: new Map(
+        turns.map((turn) => [turn.id, summarizeTurnItems(turn.items, root)]),
+      ),
+      compactEssentialsByTurn: new Map(),
+    };
+  }
+
   async #findTurn(
     client: CodexAppServerClient,
     threadId: string,
     turnId: string,
     signal: AbortSignal,
-  ): Promise<CodexTurn> {
+  ): Promise<Readonly<{
+    turn: CodexTurn;
+    pageCursor: string | null;
+    pageBackwardsCursor: string | null;
+    pageIndex: number;
+    pageTurnIds: readonly string[];
+  }>> {
     let cursor: string | null = null;
     const seenCursors = new Set<string>();
     for (let pageIndex = 0; pageIndex < TURN_SEARCH_PAGE_LIMIT; pageIndex += 1) {
@@ -1752,8 +1959,17 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         sortDirection: "desc",
         itemsView: "notLoaded",
       });
-      const match = page.value.data.find((candidate) => candidate.id === turnId);
-      if (match !== undefined) return match;
+      const pageIndex = page.value.data.findIndex((candidate) => candidate.id === turnId);
+      const match = pageIndex < 0 ? undefined : page.value.data[pageIndex];
+      if (match !== undefined) {
+        return {
+          turn: match,
+          pageCursor: cursor,
+          pageBackwardsCursor: page.value.backwardsCursor,
+          pageIndex,
+          pageTurnIds: page.value.data.map((candidate) => candidate.id),
+        };
+      }
       cursor = page.value.nextCursor;
       if (cursor === null) throw new Error("Turn was not found.");
       if (seenCursors.has(cursor)) {
@@ -1765,6 +1981,72 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       "PROTOCOL_LIMIT",
       "Turn is outside the bounded inspection history window",
     );
+  }
+
+  async #readLegacyFullTurn(
+    client: CodexAppServerClient,
+    threadId: string,
+    turnId: string,
+    found: Readonly<{
+      pageCursor: string | null;
+      pageBackwardsCursor: string | null;
+      pageIndex: number;
+      pageTurnIds: readonly string[];
+    }>,
+    signal: AbortSignal,
+  ): Promise<CodexTurn> {
+    if (signal.aborted) throw signal.reason;
+    let targetCursor: string;
+    if (found.pageIndex === 0) {
+      if (found.pageBackwardsCursor === null) {
+        throw new CodexError(
+          "PROTOCOL_ERROR",
+          "thread/turns/list omitted the target turn compatibility cursor",
+        );
+      }
+      targetCursor = found.pageBackwardsCursor;
+    } else {
+      const prefix = (await client.listThreadTurns({
+        threadId,
+        cursor: found.pageCursor,
+        limit: found.pageIndex,
+        sortDirection: "desc",
+        itemsView: "notLoaded",
+      })).value;
+      signal.throwIfAborted();
+      const expectedPrefix = found.pageTurnIds.slice(0, found.pageIndex);
+      const actualPrefix = prefix.data.map((turn) => turn.id);
+      if (
+        JSON.stringify(actualPrefix) !== JSON.stringify(expectedPrefix)
+        || prefix.nextCursor === null
+      ) {
+        throw new CodexError(
+          "PROTOCOL_ERROR",
+          "thread/turns/list changed while selecting the pinned turn compatibility cursor",
+        );
+      }
+      targetCursor = prefix.nextCursor;
+    }
+    const page = (await client.listThreadTurns({
+      threadId,
+      cursor: targetCursor,
+      limit: 1,
+      sortDirection: "desc",
+      itemsView: "full",
+    })).value;
+    signal.throwIfAborted();
+    const actualIds = page.data.map((turn) => turn.id);
+    const turn = page.data[0];
+    if (
+      actualIds.length !== 1
+      || turn?.id !== turnId
+    ) {
+      throw new CodexError(
+        "PROTOCOL_ERROR",
+        "thread/turns/list changed while selecting the pinned turn compatibility view",
+      );
+    }
+    return turn;
   }
 
   async #running(authority: ProfileAuthority): Promise<RunningClient> {
@@ -1828,6 +2110,40 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
         isAuthorityCurrent: () => this.#isCurrent(authority),
         now: this.#now,
         onFact: async (value: FencedCodexValue<CodexFact>) => {
+          const factUnloadsThread = value.value.type === "threadDeleted"
+            || (
+              value.value.type === "threadStatusChanged"
+              && value.value.status.type === "notLoaded"
+            );
+          const factInvalidatesStartProjection = value.value.type === "turnStarted"
+            || value.value.type === "turnCompleted"
+            || value.value.type === "threadNameUpdated"
+            || (
+              value.value.type === "threadStatusChanged"
+              && value.value.status.type !== "idle"
+              && value.value.status.type !== "notLoaded"
+            );
+          if ((factUnloadsThread || factInvalidatesStartProjection) && "threadId" in value.value) {
+            const observed = this.#clients.get(authority.id);
+            if (
+              observed?.authority.generation === authority.generation
+              && observed.client.connectionId === value.value.connectionId
+            ) {
+              observed.sessionObservationFactSequence += 1;
+              observed.sessionObservationFactByThread.set(
+                value.value.threadId,
+                observed.sessionObservationFactSequence,
+              );
+              if (factUnloadsThread) {
+                this.#clearSessionObservation(observed, value.value.threadId);
+                if (value.value.type === "threadDeleted") {
+                  observed.threadItemsListSupport.delete(value.value.threadId);
+                }
+              } else {
+                this.#rotateSessionObservation(observed, value.value.threadId);
+              }
+            }
+          }
           if (value.value.type === "providerDisconnected") {
             const disconnected = this.#clients.get(authority.id);
             if (
@@ -1864,7 +2180,13 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
       await client.close();
       throw new Error("Codex account generation changed during launch.");
     }
-    const running: RunningClient = { authority, client };
+    const running: RunningClient = {
+      authority,
+      client,
+      threadItemsListSupport: new Map(),
+      sessionObservationFactSequence: 0,
+      sessionObservationFactByThread: new Map(),
+    };
     this.#clients.set(authority.id, running);
     return running;
   }
@@ -1899,12 +2221,27 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
-  async #reviewedPreset(running: RunningClient, alias: "low" | "high" | "ultra", fast: boolean, cwd: string, threadId?: string): Promise<{
+  async #reviewedPreset(
+    running: RunningClient,
+    alias: "low" | "high" | "ultra",
+    fast: boolean,
+    cwd: string,
+    threadId: string | undefined,
+    signal: AbortSignal,
+  ): Promise<{
     preset: ResolvedPreset;
     profile: EffectiveRuntimeProfile;
   }> {
-    await running.client.assertCredentialStores(cwd);
-    const capabilities = await running.client.discoverCapabilities({ cwd, ...(threadId === undefined ? {} : { threadId }), includeExperimental: true });
+    signal.throwIfAborted();
+    await running.client.assertCredentialStores(cwd, signal);
+    signal.throwIfAborted();
+    const capabilities = await running.client.discoverCapabilities({
+      cwd,
+      ...(threadId === undefined ? {} : { threadId }),
+      includeExperimental: true,
+      signal,
+    });
+    signal.throwIfAborted();
     const preset = running.client.resolvePreset(capabilities, alias, fast);
     const profile = compileEffectiveRuntimeProfile({
       authority: running.authority,

@@ -585,6 +585,7 @@ export interface CodexThread {
   readonly sessionId: string;
   readonly preview: string;
   readonly ephemeral: boolean;
+  readonly historyMode: "legacy" | "paginated";
   readonly modelProvider: string;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -1386,6 +1387,11 @@ function parseThread(value: unknown, index: number): CodexThread {
     sessionId: identifier(root.sessionId ?? root.id, "thread.sessionId"),
     preview: string(root.preview, "thread.preview", { max: 32_768 }),
     ephemeral: boolean(root.ephemeral, "thread.ephemeral"),
+    historyMode: oneOf(
+      root.historyMode ?? "legacy",
+      "thread.historyMode",
+      ["legacy", "paginated"] as const,
+    ),
     modelProvider: identifier(root.modelProvider, "thread.modelProvider"),
     createdAt: nonnegativeNumber(root.createdAt, "thread.createdAt"),
     updatedAt: nonnegativeNumber(root.updatedAt, "thread.updatedAt"),
