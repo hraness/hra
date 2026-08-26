@@ -1257,13 +1257,54 @@ export class HraService {
       return;
     }
     if (profile.processGeneration !== authority.generation || profile.state === "removed") return;
-    if (fact.type === "providerConnected") return;
     if (fact.type === "providerDisconnected") {
-      this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
-      this.#store.advanceProfileGeneration(authority.id, authority.generation);
+      await this.#applyOrderedAccountFact(profile.id, () => {
+        let current: ProfileRecord;
+        try {
+          current = this.#store.requireProfileById(authority.id);
+        } catch (error: unknown) {
+          if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
+          throw error;
+        }
+        if (current.processGeneration !== authority.generation) return;
+        this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
+        this.#store.advanceProfileGeneration(authority.id, authority.generation);
+      });
       return;
     }
+    if (fact.type === "providerConnected") return;
     if (fact.type === "notificationIgnored") return;
+    if (fact.type === "loginCompleted") {
+      if (fact.success || fact.loginId === null) return;
+      const loginId = fact.loginId;
+      const settleFailedLogin = (): void => {
+        let current: ProfileRecord;
+        try {
+          current = this.#store.requireProfileById(authority.id);
+        } catch (error: unknown) {
+          if (error instanceof SelectionError && error.code === "NOT_FOUND") return;
+          throw error;
+        }
+        if (
+          current.processGeneration !== authority.generation
+          || current.state !== "login_pending"
+        ) return;
+        const pending = this.#store.readPendingLoginAuthority(
+          current.id,
+          current.processGeneration,
+        );
+        if (pending?.loginId !== loginId) return;
+        this.#store.settlePendingLogin({
+          profileId: current.id,
+          processGeneration: current.processGeneration,
+          loginId,
+          providerStatus: "not_found",
+          provider: { signedIn: false },
+        });
+      };
+      await this.#applyOrderedAccountFact(profile.id, settleFailedLogin);
+      return;
+    }
     if (fact.type === "interactionRequested") {
       if (
         fact.provider.profileId !== authority.id
@@ -1527,6 +1568,55 @@ export class HraService {
       this.#sessionResubscriptionConnections.delete(session.id);
       this.#sessionsAwaitingResubscription.add(session.id);
     }
+  }
+
+  #prepareAccountLoginProviderRetirements(
+    profileId: ProfileRecord["id"],
+    processGeneration: number,
+  ): readonly Readonly<{
+    connectionId: string;
+    releasedEvents: readonly SessionEventWrite[];
+    sessionId: SessionRecord["id"];
+  }>[] {
+    const retirements: Array<Readonly<{
+      connectionId: string;
+      releasedEvents: readonly SessionEventWrite[];
+      sessionId: SessionRecord["id"];
+    }>> = [];
+    for (const [sessionId, connectionId] of this.#sessionProviderConnections) {
+      const session = this.#store.requireSession(sessionId);
+      if (session.profileId !== profileId) continue;
+      retirements.push({
+        connectionId,
+        releasedEvents: this.#eventRedactor.interruptSession({
+          accountId: profileId,
+          providerConnectionId: connectionId,
+          providerGeneration: processGeneration,
+          sessionId,
+        }),
+        sessionId,
+      });
+    }
+    return retirements;
+  }
+
+  #applyAccountLoginProviderRetirements(
+    retirements: readonly Readonly<{
+      connectionId: string;
+      sessionId: SessionRecord["id"];
+    }>[],
+    retiredSessionIds: readonly SessionRecord["id"][],
+  ): void {
+    for (const retirement of retirements) {
+      if (this.#sessionProviderConnections.get(retirement.sessionId) !== retirement.connectionId) {
+        throw new Error("ACCOUNT_LOGIN_RETIREMENT_CONNECTION_CHANGED");
+      }
+      this.#sessionProviderConnections.delete(retirement.sessionId);
+      this.#sessionObservationFailures.delete(retirement.sessionId);
+      this.#sessionResubscriptionConnections.delete(retirement.sessionId);
+      this.#sessionsAwaitingResubscription.add(retirement.sessionId);
+    }
+    for (const sessionId of retiredSessionIds) this.#eventWaiters.notify(sessionId);
   }
 
   #eventBodyForCodexFact(
@@ -2190,12 +2280,36 @@ export class HraService {
         request: { deviceCode },
         idempotencyKey: key,
         beginEffect: (attemptId) => {
-          this.#store.beginAccountMutationEffect({
-            attemptId,
-            profileId: current.id,
-            profileGeneration: targetGeneration,
-            evidence: { kind: "account.login", method: deviceCode ? "device_code" : "browser" },
-          });
+          try {
+            const retirements = this.#prepareAccountLoginProviderRetirements(
+              current.id,
+              current.processGeneration,
+            );
+            const begun = this.#store.beginAccountMutationEffect({
+              attemptId,
+              profileId: current.id,
+              profileGeneration: targetGeneration,
+              evidence: { kind: "account.login", method: deviceCode ? "device_code" : "browser" },
+              providerRetirements: retirements,
+            });
+            this.#applyAccountLoginProviderRetirements(
+              retirements,
+              begun.retiredSessionIds,
+            );
+          } catch (error: unknown) {
+            // Preparing the retirement drains bounded redactor custody. A
+            // failed atomic commit must stop this daemon so recovery exposes a
+            // provider gap instead of continuing from an incomplete stream.
+            this.#state = "closing";
+            this.#interactionDeadlineAbort.abort(
+              new Error("Account login provider retirement did not commit exactly."),
+            );
+            this.#interactionDeadlineWake?.();
+            this.#interactionDeadlineWake = undefined;
+            this.#daemonAuthority.close();
+            this.#scheduleStop();
+            throw error;
+          }
         },
         effect: async () => await this.#fencedEffect(async () => await this.#codex.login({ authority: authorityFor(this.#paths, authority), method: deviceCode ? "device_code" : "browser", signal })),
         receipt: (value) => loginReceiptSchema.parse(value.status === "pending"
@@ -4601,6 +4715,30 @@ export class HraService {
     } finally {
       if (this.#mutationTails.get(key) === current) this.#mutationTails.delete(key);
     }
+  }
+
+  async #applyOrderedAccountFact(
+    profileId: ProfileRecord["id"],
+    operation: () => Promise<void> | void,
+  ): Promise<void> {
+    const accountKey = `account:${profileId}`;
+    if (!this.#mutationTails.has(accountKey)) {
+      await this.#serialize(accountKey, operation);
+      return;
+    }
+    // Return the old client's fact callback before a queued fresh-generation
+    // login closes that client. Later account facts join the same FIFO tail, so a
+    // disconnect cannot overtake an already observed terminal login result.
+    const task = this.#serialize(accountKey, operation);
+    const tracked = task.then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+        else this.#scheduleStop();
+      },
+    );
+    this.#background.add(tracked);
+    void tracked.then(() => this.#background.delete(tracked));
   }
 
   async #serializeSessionAuthority<T>(

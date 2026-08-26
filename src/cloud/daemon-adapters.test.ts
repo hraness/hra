@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   copyFile,
@@ -48,6 +49,10 @@ import type { CloudRemoteControlPort } from "./local-control";
 const privateRootFixture = ["", "Users", "alice", "private"].join("/");
 const bearerFixture = ["Bearer", "secret-token-value"].join(" ");
 
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 class FakeCodex implements CodexRuntimePort {
   projection: CodexSessionProjection = {
     providerThreadId: "thread_0001",
@@ -68,6 +73,7 @@ class FakeCodex implements CodexRuntimePort {
       omittedActions: 0,
     }],
   };
+  readSessionCalls = 0;
   usageCalls = 0;
 
   login(): Promise<never> { return Promise.reject(new Error("unused")); }
@@ -93,6 +99,7 @@ class FakeCodex implements CodexRuntimePort {
   close(): Promise<void> { return Promise.resolve(); }
 
   readSession(input: { authority: ProfileAuthority; providerThreadId: string; detail: boolean; signal: AbortSignal }): Promise<CodexSessionProjection> {
+    this.readSessionCalls += 1;
     expect(input.providerThreadId).toBe("thread_0001");
     return Promise.resolve(this.projection);
   }
@@ -224,6 +231,41 @@ function beginTurnProfileBinding(value: Awaited<ReturnType<typeof fixture>>, inp
     sessionId: session.id,
   });
   return { attemptId: attempt.id as `attempt_${string}`, profile: runtime };
+}
+
+function admitCloudInteraction(
+  value: Awaited<ReturnType<typeof fixture>>,
+  publicId: string,
+  connectionId: string,
+): void {
+  const session = value.store.requireSession(value.sessionId);
+  const profile = value.store.requireProfileById(session.profileId);
+  value.store.admitInteraction({
+    authority: {
+      approvalId: null,
+      connectionId,
+      itemId: null,
+      method: "mcp/elicitation/create",
+      processGeneration: profile.processGeneration,
+      profileId: profile.id,
+      requestDigest: "d".repeat(64),
+      requestId: { type: "string", value: `request_${publicId}` },
+      threadId: session.providerThreadId ?? null,
+      turnId: null,
+    },
+    blocking: true,
+    display: {
+      kind: "mcp_elicitation",
+      mayContainSecrets: true,
+      mode: "form",
+      serverName: "fixture",
+      summary: "Review provider input",
+      url: null,
+    },
+    kind: "mcp_elicitation",
+    publicId,
+    sessionId: value.sessionId as `sess_${string}`,
+  });
 }
 
 afterEach(async () => {
@@ -475,6 +517,778 @@ describe("state-backed cloud daemon adapter", () => {
     }
   });
 
+  test("drains only an observed terminal interaction while its profile is signed out", async () => {
+    const value = await fixture();
+    const observedId = "70000000-0000-4000-8000-000000000201";
+    const unobservedId = "70000000-0000-4000-8000-000000000202";
+    admitCloudInteraction(
+      value,
+      observedId,
+      "80000000-0000-4000-8000-000000000201",
+    );
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      const initial = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(initial.events.at(-1)).toMatchObject({
+        interactionId: observedId,
+        revision: 1,
+        sequence: 4,
+        state: "pending",
+      });
+      const initialCheckpoint = {
+        cacheId: initial.cacheId,
+        digest: "a".repeat(64),
+        expectedHeadSequence: 0,
+        expectedStreamEpoch: 0,
+        headSequence: 4,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(initialCheckpoint);
+      await adapter.acknowledgeCompactUpload(initialCheckpoint);
+
+      admitCloudInteraction(
+        value,
+        unobservedId,
+        "80000000-0000-4000-8000-000000000202",
+      );
+      value.store.expireInteraction({ id: observedId, expectedRevision: 1 });
+      const profile = value.store.requireProfileById(
+        value.store.requireSession(value.sessionId).profileId,
+      );
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+
+      const readSessionCalls = value.codex.readSessionCalls;
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
+        (session) => session.publicId,
+      )).toEqual([value.sessionId]);
+      expect(value.codex.readSessionCalls).toBe(readSessionCalls);
+      const terminal = await adapter.readCompactEvents({
+        afterSequence: 4,
+        limit: 128,
+        remoteTailDigest: initialCheckpoint.digest,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(terminal.events).toEqual([{
+        blocking: true,
+        interactionId: observedId,
+        interactionKind: "mcp_elicitation",
+        kind: "interaction_state",
+        revision: 2,
+        sequence: 5,
+        state: "expired",
+        summary: "An MCP server requests protected form input",
+      }]);
+      expect(JSON.stringify(terminal.events)).not.toContain(unobservedId);
+
+      const terminalCheckpoint = {
+        cacheId: terminal.cacheId,
+        digest: "b".repeat(64),
+        expectedHeadSequence: 4,
+        expectedStreamEpoch: 0,
+        expectedTailDigest: initialCheckpoint.digest,
+        headSequence: 5,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(terminalCheckpoint);
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions).toHaveLength(1);
+      expect(value.codex.readSessionCalls).toBe(readSessionCalls);
+      await adapter.acknowledgeCompactUpload(terminalCheckpoint);
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
+      expect(value.codex.readSessionCalls).toBe(readSessionCalls);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("unions newest and fair observed pages without starving an older terminal revision", async () => {
+    const value = await fixture();
+    const oldestId = "7fffffff-ffff-4fff-8fff-ffffffffffff";
+    const interactionIds = [
+      oldestId,
+      ...Array.from({ length: 200 }, (_, index) =>
+        `70000000-0000-4000-8001-${String(index + 1).padStart(12, "0")}`),
+    ];
+    admitCloudInteraction(
+      value,
+      oldestId,
+      "8fffffff-ffff-4fff-8fff-ffffffffffff",
+    );
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      for (const [index, interactionId] of interactionIds.slice(1).entries()) {
+        admitCloudInteraction(
+          value,
+          interactionId,
+          `80000000-0000-4000-8001-${String(index + 1).padStart(12, "0")}`,
+        );
+      }
+      await adapter.listSessions({ limit: 25, signal });
+      const initial = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 512,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const initialHead = initial.events.at(-1)?.sequence ?? 0;
+      expect(initialHead).toBe(204);
+      const initialCheckpoint = {
+        cacheId: initial.cacheId,
+        digest: "c".repeat(64),
+        expectedHeadSequence: 0,
+        expectedStreamEpoch: 0,
+        headSequence: initialHead,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(initialCheckpoint);
+      await adapter.acknowledgeCompactUpload(initialCheckpoint);
+
+      for (const interactionId of interactionIds) {
+        value.store.expireInteraction({ id: interactionId, expectedRevision: 1 });
+      }
+      const profile = value.store.requireProfileById(
+        value.store.requireSession(value.sessionId).profileId,
+      );
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+
+      await adapter.listSessions({ limit: 25, signal });
+      const firstTerminalPage = await adapter.readCompactEvents({
+        afterSequence: initialHead,
+        limit: 512,
+        remoteTailDigest: initialCheckpoint.digest,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(firstTerminalPage.events).toHaveLength(201);
+      expect(firstTerminalPage.events.some((event) =>
+        event.kind === "interaction_state" && event.interactionId === oldestId)).toBe(true);
+      const firstTerminalHead = firstTerminalPage.events.at(-1)?.sequence ?? initialHead;
+      const firstTerminalCheckpoint = {
+        cacheId: firstTerminalPage.cacheId,
+        digest: "d".repeat(64),
+        expectedHeadSequence: initialHead,
+        expectedStreamEpoch: 0,
+        expectedTailDigest: initialCheckpoint.digest,
+        headSequence: firstTerminalHead,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(firstTerminalCheckpoint);
+      await adapter.acknowledgeCompactUpload(firstTerminalCheckpoint);
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("persists a fair interaction scan and reaches item 201 while the first 200 stay pending", async () => {
+    const value = await fixture();
+    const interactionIds = [
+      "7fffffff-ffff-4fff-8ffe-ffffffffffff",
+      ...Array.from({ length: 200 }, (_, index) =>
+        `70000000-0000-4000-8002-${String(index + 1).padStart(12, "0")}`),
+    ];
+    admitCloudInteraction(
+      value,
+      interactionIds[0] as string,
+      "80000000-0000-4000-8002-000000000001",
+    );
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      for (const [index, interactionId] of interactionIds.slice(1).entries()) {
+        admitCloudInteraction(
+          value,
+          interactionId,
+          `80000000-0000-4000-8002-${String(index + 2).padStart(12, "0")}`,
+        );
+      }
+      await adapter.listSessions({ limit: 25, signal });
+      const initial = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 512,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const pendingEvents = initial.events.filter((event) => event.kind === "interaction_state");
+      expect(pendingEvents).toHaveLength(201);
+      const terminalId = pendingEvents.at(-1)?.interactionId;
+      expect(terminalId).toBeDefined();
+      const initialHead = initial.events.at(-1)?.sequence ?? 0;
+      const initialCheckpoint = {
+        cacheId: initial.cacheId,
+        digest: "6".repeat(64),
+        expectedHeadSequence: 0,
+        expectedStreamEpoch: 0,
+        headSequence: initialHead,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(initialCheckpoint);
+      await adapter.acknowledgeCompactUpload(initialCheckpoint);
+
+      value.store.expireInteraction({ id: terminalId as string, expectedRevision: 1 });
+      const profile = value.store.requireProfileById(
+        value.store.requireSession(value.sessionId).profileId,
+      );
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
+        (session) => session.publicId,
+      )).toEqual([value.sessionId]);
+      adapter.close();
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
+        (session) => session.publicId,
+      )).toEqual([value.sessionId]);
+      const terminal = await adapter.readCompactEvents({
+        afterSequence: initialHead,
+        limit: 128,
+        remoteTailDigest: initialCheckpoint.digest,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(terminal.events).toEqual([expect.objectContaining({
+        interactionId: terminalId,
+        revision: 2,
+        state: "expired",
+      })]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("discovers the newest page while a persisted fair history cursor continues", async () => {
+    const value = await fixture();
+    const interactionIds = Array.from({ length: 201 }, (_, index) =>
+      `71000000-0000-4000-8005-${String(index + 1).padStart(12, "0")}`);
+    for (const [index, interactionId] of interactionIds.entries()) {
+      admitCloudInteraction(
+        value,
+        interactionId,
+        `81000000-0000-4000-8005-${String(index + 1).padStart(12, "0")}`,
+      );
+    }
+    const terminalId = interactionIds.at(-1) as string;
+    value.store.expireInteraction({ id: terminalId, expectedRevision: 1 });
+
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      const first = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 512,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(first.events.filter((event) => event.kind === "interaction_state"))
+        .toHaveLength(200);
+
+      adapter.close();
+      const newestTerminalId = "11000000-0000-4000-8005-000000000001";
+      admitCloudInteraction(
+        value,
+        newestTerminalId,
+        "21000000-0000-4000-8005-000000000001",
+      );
+      value.store.expireInteraction({ id: newestTerminalId, expectedRevision: 1 });
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      await adapter.listSessions({ limit: 25, signal });
+      const complete = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 512,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const interactions = complete.events.filter((event) => event.kind === "interaction_state");
+      expect(interactions).toHaveLength(202);
+      expect(interactions.find((event) => event.interactionId === terminalId)).toMatchObject({
+        revision: 2,
+        state: "expired",
+      });
+      expect(interactions.find((event) =>
+        event.interactionId === newestTerminalId)).toMatchObject({
+        revision: 2,
+        state: "expired",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("freezes the interaction scan ceiling so continuous new rows cannot prevent wraparound", async () => {
+    const value = await fixture();
+    const firstId = "7fffffff-ffff-4fff-8ffd-ffffffffffff";
+    const firstPageIds = Array.from({ length: 200 }, (_, index) =>
+      `70000000-0000-4000-8004-${String(index + 1).padStart(12, "0")}`);
+    const newerPageIds = Array.from({ length: 200 }, (_, index) =>
+      `60000000-0000-4000-8004-${String(index + 1).padStart(12, "0")}`);
+    admitCloudInteraction(
+      value,
+      firstId,
+      "8fffffff-ffff-4fff-8ffd-ffffffffffff",
+    );
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      for (const [index, interactionId] of firstPageIds.entries()) {
+        admitCloudInteraction(
+          value,
+          interactionId,
+          `80000000-0000-4000-8004-${String(index + 1).padStart(12, "0")}`,
+        );
+      }
+      await adapter.listSessions({ limit: 25, signal });
+      for (const [index, interactionId] of newerPageIds.entries()) {
+        admitCloudInteraction(
+          value,
+          interactionId,
+          `90000000-0000-4000-8004-${String(index + 1).padStart(12, "0")}`,
+        );
+      }
+      // Finish the frozen older discovery page, then wrap to the newer page.
+      await adapter.listSessions({ limit: 25, signal });
+      await adapter.listSessions({ limit: 25, signal });
+      const initial = await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 512,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const interactions = initial.events.filter((event) => event.kind === "interaction_state");
+      expect(interactions).toHaveLength(401);
+      const initialHead = initial.events.at(-1)?.sequence ?? 0;
+      const checkpoint = {
+        cacheId: initial.cacheId,
+        digest: "7".repeat(64),
+        expectedHeadSequence: 0,
+        expectedStreamEpoch: 0,
+        headSequence: initialHead,
+        sessionPublicId: value.sessionId,
+      };
+      await adapter.recordCompactUploadIntent(checkpoint);
+      await adapter.acknowledgeCompactUpload(checkpoint);
+
+      value.store.expireInteraction({ id: firstId, expectedRevision: 1 });
+      const profile = value.store.requireProfileById(
+        value.store.requireSession(value.sessionId).profileId,
+      );
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
+        (session) => session.publicId,
+      )).toEqual([value.sessionId]);
+
+      adapter.close();
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions.map(
+        (session) => session.publicId,
+      )).toEqual([value.sessionId]);
+      const terminal = await adapter.readCompactEvents({
+        afterSequence: initialHead,
+        limit: 128,
+        remoteTailDigest: checkpoint.digest,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      expect(terminal.events).toEqual([expect.objectContaining({
+        interactionId: firstId,
+        revision: 2,
+        state: "expired",
+      })]);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("withholds offline heads when the compact stream ledger is semantically incoherent", async () => {
+    for (const variant of [
+      "epoch",
+      "pending",
+      "recovered_zero",
+      "unsafe_sequence",
+      "scan_cursor",
+      "discovery_cursor",
+    ] as const) {
+      const value = await fixture();
+      const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+      let adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      try {
+        const signal = new AbortController().signal;
+        await adapter.listSessions({ limit: 25, signal });
+        const initial = await adapter.readCompactEvents({
+          afterSequence: 0,
+          limit: 128,
+          sessionPublicId: value.sessionId,
+          signal,
+        });
+        const checkpoint = {
+          cacheId: initial.cacheId,
+          digest: "a".repeat(64),
+          expectedHeadSequence: 0,
+          expectedStreamEpoch: 0,
+          headSequence: initial.events.at(-1)?.sequence ?? 0,
+          sessionPublicId: value.sessionId,
+        };
+        await adapter.recordCompactUploadIntent(checkpoint);
+        await adapter.acknowledgeCompactUpload(checkpoint);
+        adapter.close();
+
+        const database = new Database(cachePath, { strict: true });
+        if (variant === "epoch") {
+          database.query(
+            "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
+          ).run(value.sessionId);
+        } else if (variant === "pending") {
+          database.query(
+            `UPDATE projection_remote_checkpoints
+             SET pending_expected_head=head_sequence,
+                 pending_expected_tail=tail_digest,
+                 pending_head=head_sequence+100,
+                 pending_tail=?
+             WHERE session_id=?`,
+          ).run("b".repeat(64), value.sessionId);
+        } else if (variant === "recovered_zero") {
+          database.query(
+            "UPDATE projection_sessions SET stream_epoch=1 WHERE session_id=?",
+          ).run(value.sessionId);
+          database.query(
+            `UPDATE projection_remote_checkpoints
+             SET stream_epoch=1,head_sequence=0,tail_digest=NULL
+             WHERE session_id=?`,
+          ).run(value.sessionId);
+        } else if (variant === "unsafe_sequence") {
+          database.query(
+            `UPDATE projection_sessions SET next_sequence=9007199254740992
+             WHERE session_id=?`,
+          ).run(value.sessionId);
+        } else if (variant === "scan_cursor") {
+          database.query(
+            `UPDATE projection_sessions
+             SET interaction_scan_sequence=4,interaction_scan_ceiling_sequence=4
+             WHERE session_id=?`,
+          ).run(value.sessionId);
+        } else {
+          database.query(
+            `UPDATE projection_sessions SET interaction_discovery_cursor=?
+             WHERE session_id=?`,
+          ).run("x".repeat(50), value.sessionId);
+        }
+        database.close(false);
+        const profile = value.store.requireProfileById(
+          value.store.requireSession(value.sessionId).profileId,
+        );
+        expect(value.store.setProfileState(
+          profile.id,
+          profile.processGeneration,
+          "signed_out",
+        )).toBe(true);
+        adapter = new StateBackedCloudDaemonAdapter({
+          codex: value.codex,
+          executeRemote: () => Promise.resolve({}),
+          paths: value.paths,
+          store: value.store,
+        });
+
+        expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
+        expect(adapter.projectionCacheStatus()).toMatchObject({
+          affectedSessions: [value.sessionId],
+          code: "STREAM_RECOVERY_REQUIRED",
+          sessions: 1,
+          state: "degraded",
+        });
+        await expect(adapter.readCompactEvents({
+          afterSequence: checkpoint.headSequence,
+          limit: 128,
+          remoteTailDigest: checkpoint.digest,
+          sessionPublicId: value.sessionId,
+          signal,
+        })).rejects.toThrow("explicit, potentially history-discarding reseed");
+      } finally {
+        adapter.close();
+        value.store.close();
+      }
+    }
+  });
+
+  test("rejects compact rows whose body, count, sequence, or turn identity changed", async () => {
+    for (const variant of ["body", "count", "sequence", "turn_id"] as const) {
+      const value = await fixture();
+      const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+      let adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      try {
+        const signal = new AbortController().signal;
+        await adapter.listSessions({ limit: 25, signal });
+        adapter.close();
+        const database = new Database(cachePath, { strict: true });
+        if (variant === "body") {
+          database.query(
+            `UPDATE projection_turns
+             SET events_json=json_set(events_json,'$[0].text','safe changed body')
+             WHERE session_id=?`,
+          ).run(value.sessionId);
+        } else if (variant === "count") {
+          database.query(
+            "UPDATE projection_turns SET event_count=event_count+1 WHERE session_id=?",
+          ).run(value.sessionId);
+          database.query(
+            "UPDATE projection_sessions SET next_sequence=next_sequence+1 WHERE session_id=?",
+          ).run(value.sessionId);
+        } else if (variant === "sequence") {
+          database.query(
+            `UPDATE projection_turns
+             SET events_json=json_set(events_json,
+               '$[0].sequence',2,'$[1].sequence',3,'$[2].sequence',4)
+             WHERE session_id=?`,
+          ).run(value.sessionId);
+        } else {
+          database.query(
+            "UPDATE projection_turns SET turn_id='turn_tampered_0001' WHERE session_id=?",
+          ).run(value.sessionId);
+        }
+        database.close(false);
+        adapter = new StateBackedCloudDaemonAdapter({
+          codex: value.codex,
+          executeRemote: () => Promise.resolve({}),
+          paths: value.paths,
+          store: value.store,
+        });
+        await expect(adapter.readCompactEvents({
+          afterSequence: 0,
+          limit: 128,
+          sessionPublicId: value.sessionId,
+          signal,
+        })).rejects.toThrow("explicit, potentially history-discarding reseed");
+        expect(adapter.projectionCacheStatus()).toMatchObject({
+          affectedSessions: [value.sessionId],
+          code: "STREAM_RECOVERY_REQUIRED",
+          state: "degraded",
+        });
+      } finally {
+        adapter.close();
+        value.store.close();
+      }
+    }
+  });
+
+  test("invalidates incremental ledger trust after an external SQLite commit", async () => {
+    const value = await fixture();
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      await adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+
+      const tampered = new Database(cachePath, { strict: true });
+      tampered.query(
+        `UPDATE projection_turns
+         SET events_json=json_set(events_json,'$[0].text','externally changed')
+         WHERE session_id=?`,
+      ).run(value.sessionId);
+      tampered.close(false);
+
+      await expect(adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).rejects.toThrow("explicit, potentially history-discarding reseed");
+      expect(adapter.projectionCacheStatus()).toMatchObject({
+        code: "STREAM_RECOVERY_REQUIRED",
+        state: "degraded",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("rejects an interaction index that no longer matches the verified ledger", async () => {
+    const value = await fixture();
+    const interactionId = "73000000-0000-4000-8007-000000000001";
+    admitCloudInteraction(
+      value,
+      interactionId,
+      "83000000-0000-4000-8007-000000000001",
+    );
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      const tampered = new Database(cachePath, { strict: true });
+      tampered.query(
+        `DELETE FROM projection_interaction_index
+         WHERE session_id=? AND interaction_id=?`,
+      ).run(value.sessionId, interactionId);
+      tampered.close(false);
+
+      await expect(adapter.readCompactEvents({
+        afterSequence: 0,
+        limit: 128,
+        sessionPublicId: value.sessionId,
+        signal,
+      })).rejects.toThrow("explicit, potentially history-discarding reseed");
+      expect(adapter.projectionCacheStatus()).toMatchObject({
+        code: "STREAM_RECOVERY_REQUIRED",
+        state: "degraded",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("rejects a forged safe interaction identity before offline state lookup", async () => {
+    const value = await fixture();
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    const interactionId = "70000000-0000-4000-8003-000000000001";
+    admitCloudInteraction(
+      value,
+      interactionId,
+      "80000000-0000-4000-8003-000000000001",
+    );
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      adapter.close();
+      const database = new Database(cachePath, { strict: true });
+      database.query(
+        `UPDATE projection_turns
+         SET events_json=json_set(
+           events_json,'$[0].interactionId','70000000-0000-4000-8003-000000000002'
+         )
+         WHERE session_id=? AND json_extract(events_json,'$[0].kind')='interaction_state'`,
+      ).run(value.sessionId);
+      database.close(false);
+      const profile = value.store.requireProfileById(
+        value.store.requireSession(value.sessionId).profileId,
+      );
+      expect(value.store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_out",
+      )).toBe(true);
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      expect((await adapter.listSessions({ limit: 25, signal })).sessions).toEqual([]);
+      expect(adapter.projectionCacheStatus()).toMatchObject({
+        affectedSessions: [value.sessionId],
+        code: "STREAM_RECOVERY_REQUIRED",
+        state: "degraded",
+      });
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
   test("pages upload history by source revision with bounded redacted projections", async () => {
     const value = await fixture();
     const profile = value.store.listProfiles()[0];
@@ -672,18 +1486,18 @@ describe("state-backed cloud daemon adapter", () => {
       "INSERT INTO projection_turns(session_id,turn_id,start_sequence,event_count,digest,events_json) VALUES (?,?,?,?,?,?)",
     );
     for (let sequence = 1; sequence <= 40; sequence += 1) {
+      const body = {
+        kind: "assistant_message",
+        text: "x".repeat(60_000),
+        turnId: `turn_cache_${String(sequence).padStart(4, "0")}`,
+      } as const;
       insert.run(
         value.sessionId,
-        `turn_cache_${String(sequence).padStart(4, "0")}`,
+        body.turnId,
         sequence,
         1,
-        sequence.toString(16).padStart(64, "0"),
-        JSON.stringify([{
-          kind: "assistant_message",
-          sequence,
-          text: "x".repeat(60_000),
-          turnId: `turn_cache_${String(sequence).padStart(4, "0")}`,
-        }]),
+        sha256(JSON.stringify([body])),
+        JSON.stringify([{ ...body, sequence }]),
       );
     }
     database.close(false);
@@ -787,6 +1601,67 @@ describe("state-backed cloud daemon adapter", () => {
         sessionPublicId: value.sessionId,
         signal,
       })).rejects.toThrow("explicit, potentially history-discarding reseed");
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("reports cache unavailability when recovery activation fails after closing the source", async () => {
+    const value = await fixture();
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      await adapter.listSessions({ limit: 25, signal });
+      await expect(adapter.readCompactEvents({
+        afterSequence: 300,
+        limit: 128,
+        remoteTailDigest: "b".repeat(64),
+        sessionPublicId: value.sessionId,
+        signal,
+      })).rejects.toThrow("explicit, potentially history-discarding reseed");
+
+      const idempotencyKey = "00000000-0000-7000-8000-00000000071a";
+      const plan = await adapter.planCompactProjectionRecovery({
+        idempotencyKey,
+        sessionPublicId: value.sessionId,
+        signal,
+      });
+      const installation = {
+        ...plan,
+        boundaryHeadSequence: 300,
+        boundaryTailDigest: "b".repeat(64),
+        compactStreamEpoch: 1,
+        idempotencyKey,
+        signal,
+      } as const;
+      await adapter.stageCompactProjectionRecovery(installation);
+      await writeFile(
+        `${cachePath}.quarantine-${idempotencyKey}`,
+        "safe conflict",
+        { mode: 0o600 },
+      );
+
+      await expect(adapter.activateCompactProjectionRecovery(installation))
+        .rejects.toThrow("quarantine conflicts");
+      expect(adapter.projectionCacheStatus()).toMatchObject({
+        code: "CACHE_RECOVERY_IN_PROGRESS",
+        state: "unavailable",
+      });
+      await expect(adapter.readCompactEvents({
+        afterSequence: 300,
+        limit: 128,
+        remoteStreamEpoch: 1,
+        remoteTailDigest: "b".repeat(64),
+        sessionPublicId: value.sessionId,
+        signal,
+      })).rejects.toThrow("awaiting exact local cache activation");
     } finally {
       adapter.close();
       value.store.close();
@@ -1217,7 +2092,7 @@ describe("state-backed cloud daemon adapter", () => {
       await adapter.stageCompactProjectionRecovery(installation);
       await rm(cachePath);
       const replacement = new Database(cachePath, { create: true, strict: true });
-      replacement.exec("PRAGMA user_version=3");
+      replacement.exec("PRAGMA user_version=6");
       replacement.close(false);
       await chmod(cachePath, 0o600);
 
@@ -1225,7 +2100,7 @@ describe("state-backed cloud daemon adapter", () => {
         .rejects.toThrow("newer HRA version");
       const preserved = new Database(cachePath, { strict: true });
       expect((preserved.query("PRAGMA user_version").get() as { user_version: number })
-        .user_version).toBe(3);
+        .user_version).toBe(6);
       preserved.close(false);
       expect((await readdir(value.paths.root)).some((name) =>
         name.includes(`quarantine-${idempotencyKey}`))).toBe(false);
@@ -1415,7 +2290,7 @@ describe("state-backed cloud daemon adapter", () => {
         PRAGMA wal_autocheckpoint=0;
         CREATE TABLE future_sentinel(value TEXT NOT NULL) STRICT;
         INSERT INTO future_sentinel(value) VALUES ('preserve-me');
-        PRAGMA user_version=3;
+        PRAGMA user_version=6;
       \`);
       process.exit(0);
     `, cachePath]);
@@ -1476,7 +2351,7 @@ describe("state-backed cloud daemon adapter", () => {
         execFileSync("mkfifo", [cachePath]);
       } else {
         const database = new Database(cachePath, { create: true, strict: true });
-        database.exec("PRAGMA user_version=3");
+        database.exec("PRAGMA user_version=6");
         database.close(false);
         await chmod(cachePath, 0o600);
       }
@@ -1565,9 +2440,196 @@ describe("state-backed cloud daemon adapter", () => {
       adapter.close();
       const migrated = new Database(cachePath, { strict: true });
       expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
-        .user_version).toBe(2);
-      expect((migrated.query("PRAGMA table_info(projection_sessions)").all() as
-        Array<{ name: string }>).map((column) => column.name)).toContain("stream_epoch");
+        .user_version).toBe(5);
+      const migratedColumns = (migrated.query("PRAGMA table_info(projection_sessions)").all() as
+        Array<{ name: string }>).map((column) => column.name);
+      expect(migratedColumns).toContain("stream_epoch");
+      expect(migratedColumns).toContain("interaction_scan_sequence");
+      expect(migratedColumns).toContain("interaction_scan_ceiling_sequence");
+      expect(migratedColumns).toContain("interaction_discovery_cursor");
+      migrated.close(false);
+      value.store.close();
+    }
+  });
+
+  test("migrates a populated v2 cache with an inactive durable interaction scan", async () => {
+    const value = await fixture();
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    const database = new Database(cachePath, { create: true, strict: true });
+    database.exec(`
+      CREATE TABLE projection_sessions (
+        session_id TEXT PRIMARY KEY,
+        next_sequence INTEGER NOT NULL CHECK(next_sequence > 0),
+        stream_epoch INTEGER NOT NULL DEFAULT 0 CHECK(stream_epoch >= 0)
+      ) STRICT;
+      CREATE TABLE projection_turns (
+        session_id TEXT NOT NULL REFERENCES projection_sessions(session_id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        start_sequence INTEGER NOT NULL CHECK(start_sequence > 0),
+        event_count INTEGER NOT NULL CHECK(event_count > 0),
+        digest TEXT NOT NULL CHECK(length(digest) = 64),
+        events_json TEXT NOT NULL,
+        PRIMARY KEY(session_id, turn_id),
+        UNIQUE(session_id, start_sequence)
+      ) STRICT;
+      CREATE TABLE projection_baselines (
+        session_id TEXT NOT NULL REFERENCES projection_sessions(session_id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        digest TEXT NOT NULL CHECK(length(digest) = 64),
+        PRIMARY KEY(session_id, turn_id)
+      ) STRICT;
+      CREATE TABLE projection_ledger (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        cache_id TEXT NOT NULL CHECK(length(cache_id) BETWEEN 16 AND 128)
+      ) STRICT;
+      CREATE TABLE projection_remote_checkpoints (
+        session_id TEXT PRIMARY KEY,
+        head_sequence INTEGER NOT NULL CHECK(head_sequence >= 0),
+        stream_epoch INTEGER NOT NULL DEFAULT 0 CHECK(stream_epoch >= 0),
+        tail_digest TEXT,
+        pending_expected_head INTEGER,
+        pending_expected_tail TEXT,
+        pending_head INTEGER,
+        pending_tail TEXT
+      ) STRICT;
+      INSERT INTO projection_ledger(singleton,cache_id)
+        VALUES (1,'cache_v2_1234567890');
+      PRAGMA user_version=2;
+    `);
+    database.query(
+      "INSERT INTO projection_sessions(session_id,next_sequence,stream_epoch) VALUES (?,1,0)",
+    ).run(value.sessionId);
+    database.query(
+      `INSERT INTO projection_remote_checkpoints(
+         session_id,head_sequence,stream_epoch,tail_digest
+       ) VALUES (?,0,0,NULL)`,
+    ).run(value.sessionId);
+    database.close(false);
+    await chmod(cachePath, 0o600);
+
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
+    } finally {
+      adapter.close();
+      const migrated = new Database(cachePath, { readonly: true, strict: true });
+      expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version).toBe(5);
+      expect(migrated.query(
+        `SELECT interaction_scan_sequence,interaction_scan_ceiling_sequence,
+                interaction_discovery_cursor
+         FROM projection_sessions WHERE session_id=?`,
+      ).get(value.sessionId)).toEqual({
+        interaction_discovery_cursor: null,
+        interaction_scan_ceiling_sequence: 0,
+        interaction_scan_sequence: 0,
+      });
+      expect(migrated.query(
+        "SELECT cache_id FROM projection_ledger WHERE singleton=1",
+      ).get()).toEqual({ cache_id: "cache_v2_1234567890" });
+      expect(migrated.query(
+        "SELECT head_sequence,stream_epoch,tail_digest FROM projection_remote_checkpoints WHERE session_id=?",
+      ).get(value.sessionId)).toEqual({ head_sequence: 0, stream_epoch: 0, tail_digest: null });
+      migrated.close(false);
+      value.store.close();
+    }
+  });
+
+  test("migrates a populated v3 cache with an inactive interaction discovery cursor", async () => {
+    const value = await fixture();
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      await adapter.listSessions({
+        limit: 25,
+        signal: new AbortController().signal,
+      });
+      adapter.close();
+      const previous = new Database(cachePath, { strict: true });
+      previous.exec(`
+        DROP TABLE projection_interaction_index;
+        ALTER TABLE projection_sessions DROP COLUMN interaction_discovery_cursor;
+        PRAGMA user_version=3;
+      `);
+      previous.close(false);
+
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
+    } finally {
+      adapter.close();
+      const migrated = new Database(cachePath, { readonly: true, strict: true });
+      expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version).toBe(5);
+      expect(migrated.query(
+        "SELECT interaction_discovery_cursor FROM projection_sessions WHERE session_id=?",
+      ).get(value.sessionId)).toEqual({ interaction_discovery_cursor: null });
+      migrated.close(false);
+      value.store.close();
+    }
+  });
+
+  test("migrates v4 by rebuilding the bounded interaction index atomically", async () => {
+    const value = await fixture();
+    const interactionId = "72000000-0000-4000-8006-000000000001";
+    admitCloudInteraction(
+      value,
+      interactionId,
+      "82000000-0000-4000-8006-000000000001",
+    );
+    const cachePath = join(value.paths.root, "cloud-projection.sqlite");
+    let adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      await adapter.listSessions({
+        limit: 25,
+        signal: new AbortController().signal,
+      });
+      adapter.close();
+      const previous = new Database(cachePath, { strict: true });
+      previous.exec(`
+        DROP TABLE projection_interaction_index;
+        PRAGMA user_version=4;
+      `);
+      previous.close(false);
+
+      adapter = new StateBackedCloudDaemonAdapter({
+        codex: value.codex,
+        executeRemote: () => Promise.resolve({}),
+        paths: value.paths,
+        store: value.store,
+      });
+      expect(adapter.projectionCacheStatus()).toEqual({ state: "ready" });
+    } finally {
+      adapter.close();
+      const migrated = new Database(cachePath, { readonly: true, strict: true });
+      expect((migrated.query("PRAGMA user_version").get() as { user_version: number })
+        .user_version).toBe(5);
+      expect(migrated.query(
+        `SELECT interaction_id,start_sequence FROM projection_interaction_index
+         WHERE session_id=?`,
+      ).get(value.sessionId)).toEqual({
+        interaction_id: interactionId,
+        start_sequence: 4,
+      });
       migrated.close(false);
       value.store.close();
     }
@@ -1624,7 +2686,7 @@ describe("state-backed cloud daemon adapter", () => {
       else if (variant === "symlink") await symlink("/dev/null", cachePath);
       else {
         const database = new Database(cachePath, { create: true, strict: true });
-        database.exec("PRAGMA user_version=3");
+        database.exec("PRAGMA user_version=6");
         database.close(false);
       }
       const commands: LocalCommand[] = [];
