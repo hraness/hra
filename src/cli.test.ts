@@ -6,6 +6,8 @@ import { PassThrough } from "node:stream";
 
 import {
   admitExactDaemonStop,
+  daemonRunProcessArguments,
+  daemonRunProcessOptions,
   initialize,
   main,
   protectedTerminalControlLibrariesForPlatform,
@@ -147,6 +149,11 @@ const runningDaemonResponse = () => ({
     },
   },
 });
+
+const readyDaemonStatus = () => {
+  const daemon = runningDaemonResponse().data.daemon;
+  return { running: true as const, pid: daemon.pid, daemon };
+};
 
 const stopDaemonIdentity = runningDaemonResponse().data.daemon;
 
@@ -3183,6 +3190,65 @@ describe("CLI entry point", () => {
     }
   });
 
+  test("builds the exact detached daemon spawn descriptor inside the private state root", () => {
+    expect(daemonRunProcessArguments("/opt/hra/bun", "/opt/hra/src/cli.ts")).toEqual([
+      "/opt/hra/bun",
+      "--no-env-file",
+      "/opt/hra/src/cli.ts",
+      "daemon",
+      "run",
+    ]);
+    expect(daemonRunProcessOptions("/var/lib/hra-control-plane-v1")).toEqual({
+      cwd: "/var/lib/hra-control-plane-v1",
+      detached: true,
+      env: process.env,
+      stderr: "ignore",
+      stdin: "ignore",
+      stdout: "ignore",
+    });
+  });
+
+  test("daemon start renders the starter's verified identity without a second status request", async () => {
+    const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4d";
+    const runRoot = await realpath(
+      await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)),
+    );
+    const installation = createAcceptanceInstallation({
+      device: "a",
+      documentsDirectory: join(runRoot, "project-a-daemon-start"),
+      expectedHomeDirectory: process.env.HOME ?? "/missing-home",
+      rootDirectory: join(runRoot, "device-a-daemon-start"),
+      runId,
+      type: "hra-live-acceptance-device",
+      version: 1,
+    });
+    let daemonStarts = 0;
+    const input = {
+      installation,
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
+    };
+    try {
+      const initialized = capture();
+      expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);
+
+      const started = capture();
+      expect(await main(["daemon", "start", "--json"], started.output, input)).toBe(0);
+      expect(JSON.parse(started.read().stdout)).toEqual({
+        command: "daemon.status",
+        data: readyDaemonStatus(),
+        ok: true,
+        version: 1,
+      });
+      expect(started.read().stderr).toBe("");
+      expect(daemonStarts).toBe(1);
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
   test("pre-initialization commands require init without creating daemon state", async () => {
     const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4c";
     const runRoot = await realpath(
@@ -3200,7 +3266,10 @@ describe("CLI entry point", () => {
     let daemonStarts = 0;
     const input = {
       installation,
-      startDaemon: async () => { daemonStarts += 1; },
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
     };
     try {
       for (const argv of [
