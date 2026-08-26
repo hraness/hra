@@ -169,10 +169,13 @@ class FakeCodex implements CodexRuntimePort {
   readonly sessionListRequests: Array<Parameters<CodexRuntimePort["listSessions"]>[0]> = [];
   loginResult: CodexLoginOutcome = { status: "signed_in", account: { signedIn: true, email: "person@example.com", plan: "Plus" } };
   cancelLoginResult: { status: "canceled" | "not_found" } = { status: "canceled" };
-  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); return this.loginResult; }
-  async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); return this.cancelLoginResult; }
+  beforeLoginReturn?: (input: { authority: ProfileAuthority; method: "browser" | "device_code" }) => Promise<void>;
+  beforeCancelLoginReturn?: () => Promise<void>;
+  beforeReadAccountReturn?: () => Promise<void>;
+  async login(input: { authority: ProfileAuthority; method: "browser" | "device_code" }): Promise<CodexLoginOutcome> { this.calls.push(`login:${input.authority.id}:${input.authority.generation}:${input.method}`); await this.beforeLoginReturn?.(input); return this.loginResult; }
+  async cancelLogin(input: { authority: ProfileAuthority; loginId: string }): Promise<{ status: "canceled" | "not_found" }> { this.calls.push(`login-cancel:${input.authority.id}:${input.authority.generation}:${input.loginId}`); await this.beforeCancelLoginReturn?.(); return this.cancelLoginResult; }
   async logout(): Promise<void> { this.calls.push("logout"); await this.beforeLogoutReturn?.(); if (this.logoutError !== undefined) throw this.logoutError; }
-  async readAccount(): Promise<CodexAccountProjection> { this.calls.push("readAccount"); return this.accountProjection; }
+  async readAccount(): Promise<CodexAccountProjection> { this.calls.push("readAccount"); await this.beforeReadAccountReturn?.(); return this.accountProjection; }
   async listPlugins(input: Parameters<CodexRuntimePort["listPlugins"]>[0]): Promise<CodexPluginCatalog> {
     this.calls.push("plugins");
     this.pluginRequests.push(input);
@@ -379,6 +382,9 @@ class FakeCloud implements CloudControlPort {
   }> = [];
   beforeProjectionRecoveryReturn?: () => Promise<void>;
   beforeProjectionUnsettledSessionReturn?: (sessionPublicId: `sess_${string}`) => Promise<void>;
+  beforeProjectionUnsettledProfileReturn?: (
+    profileId: Parameters<CloudControlPort["isCompactProjectionRecoveryUnsettledForProfile"]>[0],
+  ) => Promise<void>;
   projectionRecoveryResult: unknown = { phase: "applied", compactStreamEpoch: 1 };
   projectionRecoveryBlocker?: CompactProjectionRecoveryBlocker;
   readonly unsettledProjectionProfiles = new Set<string>();
@@ -431,6 +437,7 @@ class FakeCloud implements CloudControlPort {
   async isCompactProjectionRecoveryUnsettledForProfile(
     profileId: Parameters<CloudControlPort["isCompactProjectionRecoveryUnsettledForProfile"]>[0],
   ): Promise<boolean> {
+    await this.beforeProjectionUnsettledProfileReturn?.(profileId);
     return this.projectionRecoveryBlocker === undefined
       ? this.unsettledProjectionProfiles.has(profileId)
       : await this.projectionRecoveryBlocker.isCompactProjectionRecoveryUnsettledForProfile(profileId);
@@ -3378,6 +3385,433 @@ describe("HraService", () => {
     expect(JSON.stringify(replay)).not.toContain("STOP-CODE");
     expect(JSON.stringify(replay)).not.toContain("secret=canceled");
     expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+  });
+
+  test("settles only the exact failed provider login completion and permits a fresh login", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Timed out login",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    const idempotencyKey = "00000000-0000-4000-8000-000000000122";
+    codex.loginResult = { status: "pending", loginId: "provider-login-timeout" };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+      idempotencyKey,
+    }, { signal });
+    const authority = {
+      id: added.account.id,
+      generation: 1,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    } as const;
+
+    await service.observeCodexFact(authority, {
+      type: "loginCompleted",
+      loginId: "provider-login-timeout",
+      success: true,
+    });
+    await service.observeCodexFact(authority, {
+      type: "loginCompleted",
+      loginId: null,
+      success: false,
+    });
+    await service.observeCodexFact(authority, {
+      type: "loginCompleted",
+      loginId: "another-provider-login",
+      success: false,
+    });
+    await service.observeCodexFact({ ...authority, generation: 0 }, {
+      type: "loginCompleted",
+      loginId: "provider-login-timeout",
+      success: false,
+    });
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 1,
+      state: "login_pending",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toMatchObject({
+      idempotencyKey,
+      loginId: "provider-login-timeout",
+    });
+
+    await service.observeCodexFact(authority, {
+      type: "loginCompleted",
+      loginId: "provider-login-timeout",
+      success: false,
+    });
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 1,
+      state: "signed_out",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    await expect(service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+      idempotencyKey,
+    }, { signal })).resolves.toMatchObject({
+      login: { outcome: "signed_out", status: "settled" },
+    });
+
+    codex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
+    };
+    await expect(service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal })).resolves.toMatchObject({
+      account: { processGeneration: 2, state: "signed_in" },
+      login: { status: "signed_in" },
+    });
+  });
+
+  test("returns an old failed-login fact before a queued fresh generation closes that client", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Cancellation race",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-race" };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    codex.accountProjection = { signedIn: false };
+    codex.cancelLoginResult = { status: "canceled" };
+    let releaseCancellation!: () => void;
+    let cancellationStarted!: () => void;
+    const cancellationGate = new Promise<void>((resolve) => {
+      releaseCancellation = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      cancellationStarted = resolve;
+    });
+    codex.beforeCancelLoginReturn = async () => {
+      cancellationStarted();
+      await cancellationGate;
+    };
+    let releaseOldFactObserver!: () => void;
+    const oldFactObserverReturned = new Promise<void>((resolve) => {
+      releaseOldFactObserver = resolve;
+    });
+    codex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
+    };
+    codex.beforeLoginReturn = async ({ authority }) => {
+      if (authority.generation === 2) await oldFactObserverReturned;
+    };
+
+    const cancellation = service.execute({
+      kind: "account.login-cancel",
+      account: added.account.id,
+    }, { signal });
+    await started;
+    const freshLogin = service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    await Bun.sleep(0);
+    const fact = service.observeCodexFact({
+      id: added.account.id,
+      generation: 1,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    }, {
+      type: "loginCompleted",
+      loginId: "provider-login-race",
+      success: false,
+    }).then(() => {
+      releaseOldFactObserver();
+    });
+    const factDelivery = await Promise.race([
+      fact.then(() => "returned" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+    ]);
+    expect(factDelivery).toBe("returned");
+
+    releaseCancellation();
+    await expect(cancellation).resolves.toMatchObject({
+      account: { state: "signed_out" },
+      providerStatus: "canceled",
+      status: "canceled",
+    });
+    await expect(freshLogin).resolves.toMatchObject({
+      account: { processGeneration: 2, state: "signed_in" },
+      login: { status: "signed_in" },
+    });
+    await service.settled();
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "signed_in",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(codex.calls.filter((call) => call.startsWith("login-cancel:"))).toHaveLength(1);
+  });
+
+  test("orders a failed login completion before a following provider disconnect", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Timeout then disconnect",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    codex.loginResult = { status: "pending", loginId: "provider-login-disconnect-race" };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    codex.accountProjection = { signedIn: false };
+    let releaseAccountRead!: () => void;
+    let accountReadStarted!: () => void;
+    const accountReadGate = new Promise<void>((resolve) => {
+      releaseAccountRead = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      accountReadStarted = resolve;
+    });
+    codex.beforeReadAccountReturn = async () => {
+      accountReadStarted();
+      await accountReadGate;
+    };
+    const authority = {
+      id: added.account.id,
+      generation: 1,
+      codexHome: "unused",
+      desktopUserData: "unused",
+    } as const;
+
+    const accountShow = service.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal });
+    await started;
+    await service.observeCodexFact(authority, {
+      type: "loginCompleted",
+      loginId: "provider-login-disconnect-race",
+      success: false,
+    });
+    await service.observeCodexFact(authority, {
+      type: "providerDisconnected",
+      connectionId: "018f1f55-3f10-7c1a-8f7b-c6dc608bcd3b",
+      reason: "process_exit",
+    });
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 1,
+      state: "login_pending",
+    });
+
+    releaseAccountRead();
+    await expect(accountShow).resolves.toMatchObject({
+      account: { processGeneration: 1, state: "login_pending" },
+    });
+    await service.settled();
+    expect(store.requireProfile(added.account.id)).toMatchObject({
+      processGeneration: 2,
+      state: "signed_out",
+    });
+    expect(store.readPendingLoginAuthority(added.account.id, 1)).toBeNull();
+    expect(store.readPendingLoginAuthority(added.account.id, 2)).toBeNull();
+  });
+
+  test("atomically retires an old connection while a fresh login advances the profile", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Disconnect retirement");
+    const seeded = await seedResolvableInteraction(
+      value,
+      sessionId,
+      "disconnect-retirement",
+    );
+    const session = value.store.requireSession(sessionId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    await value.service.observeCodexFact(seeded.authority, {
+      type: "itemStarted",
+      connectionId: seeded.interaction.authority.connectionId,
+      threadId: session.providerThreadId,
+      turnId: "turn-retirement-redaction",
+      itemId: "assistant-retirement-redaction",
+      itemKind: "agentMessage",
+    });
+    await value.service.observeCodexFact(seeded.authority, {
+      type: "assistantDelta",
+      connectionId: seeded.interaction.authority.connectionId,
+      threadId: session.providerThreadId,
+      turnId: "turn-retirement-redaction",
+      itemId: "assistant-retirement-redaction",
+      text: "unfinished api_",
+    });
+    value.codex.observeErrorOnce = new CodexSessionObservationError("resume_unavailable");
+    await expect(value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal })).resolves.toMatchObject({
+      providerObservation: {
+        code: "resume_unavailable",
+        state: "unavailable",
+      },
+    });
+    expect(JSON.stringify(value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+      limit: 100,
+    }))).not.toContain("unfinished api_");
+    await value.service.execute({
+      kind: "account.logout",
+      account: seeded.authority.id,
+    }, { signal });
+    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("pending");
+    let releaseFreshLogin!: () => void;
+    let freshLoginPreflightStarted!: () => void;
+    const freshLoginGate = new Promise<void>((resolve) => {
+      releaseFreshLogin = resolve;
+    });
+    const preflightStarted = new Promise<void>((resolve) => {
+      freshLoginPreflightStarted = resolve;
+    });
+    value.cloud.beforeProjectionUnsettledProfileReturn = async (profileId) => {
+      if (profileId !== seeded.authority.id) return;
+      freshLoginPreflightStarted();
+      await freshLoginGate;
+    };
+    value.codex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
+    };
+    value.codex.beforeLoginReturn = async ({ authority }) => {
+      if (authority.generation !== 2) return;
+      await value.service.observeCodexFact(seeded.authority, {
+        type: "providerDisconnected",
+        connectionId: seeded.interaction.authority.connectionId,
+        reason: "closed",
+      });
+    };
+
+    const freshLogin = value.service.execute({
+      kind: "account.login",
+      account: seeded.authority.id,
+      deviceCode: false,
+    }, { signal });
+    await preflightStarted;
+    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("pending");
+    expect(value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+      limit: 100,
+    }).events.map((event) => event.body)).not.toContainEqual(expect.objectContaining({
+      type: "connection",
+      state: "disconnected",
+    }));
+    releaseFreshLogin();
+    await expect(freshLogin).resolves.toMatchObject({
+      account: { processGeneration: 2, state: "signed_in" },
+      login: { status: "signed_in" },
+    });
+    await value.service.settled();
+
+    expect(value.store.requireProfileById(seeded.authority.id)).toMatchObject({
+      processGeneration: 2,
+      state: "signed_in",
+    });
+    expect(value.store.requireInteraction(seeded.interaction.publicId).state).toBe("expired");
+    const events = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(JSON.stringify(events)).not.toContain("unfinished api_");
+    expect(events.flatMap((event) =>
+      event.body.type === "assistant_delta" ? [event.body.text] : []))
+      .toEqual(["[protected]"]);
+    const retirementEvents = events.filter((event) =>
+      event.body.type === "assistant_delta"
+      || event.body.type === "warning"
+      || (event.body.type === "interaction_state" && event.body.interactionId === seeded.interaction.publicId)
+      || (event.body.type === "connection" && event.body.state === "disconnected")
+      || (event.body.type === "gap" && event.body.reason === "provider_disconnect"));
+    expect(retirementEvents.map((event) => event.providerGeneration))
+      .toEqual(retirementEvents.map(() => seeded.authority.generation));
+    expect(retirementEvents.map((event) => event.sequence))
+      .toEqual([...retirementEvents.map((event) => event.sequence)].sort((left, right) => left - right));
+    const bodies = events.map((event) => event.body);
+    expect(bodies.filter((event) => event.type === "connection" && event.state === "disconnected")).toEqual([{
+      type: "connection",
+      state: "disconnected",
+      reason: "closed",
+    }]);
+    expect(bodies.filter((event) => event.type === "gap" && event.reason === "provider_disconnect"))
+      .toHaveLength(1);
+    expect(events.filter((event) => event.body.type === "warning")).toMatchObject([{
+      providerConnectionId: null,
+      body: {
+        code: "provider_resume_unavailable",
+        type: "warning",
+      },
+    }]);
+  });
+
+  test("retires a mapped session that a provider list already made terminal", async () => {
+    const value = await fixture();
+    const { sessionId } = await createIdleSession(value, "Terminal login retirement");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    if (session.providerThreadId === undefined) throw new Error("Expected a bound session.");
+    await value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal });
+    value.codex.listedProjections = [{
+      ...value.codex.readProjection,
+      providerThreadId: session.providerThreadId,
+      status: "terminal",
+      providerUpdatedAt: (session.providerUpdatedAt ?? 0) + 1,
+    }];
+    await value.service.execute({
+      kind: "session.list",
+      account: profile.id,
+      limit: 100,
+    }, { signal });
+    expect(value.store.requireSession(sessionId).state).toBe("terminal");
+
+    await value.service.execute({
+      kind: "account.logout",
+      account: profile.id,
+    }, { signal });
+    value.codex.loginResult = {
+      status: "signed_in",
+      account: { signedIn: true, email: "fresh@example.com", plan: "Plus" },
+    };
+    await expect(value.service.execute({
+      kind: "account.login",
+      account: profile.id,
+      deviceCode: false,
+    }, { signal })).resolves.toMatchObject({
+      account: { processGeneration: profile.processGeneration + 1, state: "signed_in" },
+      login: { status: "signed_in" },
+    });
+
+    const events = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(events.filter((event) =>
+      event.body.type === "connection" && event.body.state === "disconnected")).toHaveLength(1);
+    expect(events.filter((event) =>
+      event.body.type === "gap" && event.body.reason === "provider_disconnect")).toHaveLength(1);
+    expect(events.filter((event) =>
+      event.body.type === "connection" || event.body.type === "gap").map(
+      (event) => event.providerGeneration,
+    )).toEqual(events.filter((event) =>
+      event.body.type === "connection" || event.body.type === "gap").map(
+      () => profile.processGeneration,
+    ));
   });
 
   test("recovers a lost pending-login response across daemon generation rollover by exact cancellation and fresh login", async () => {

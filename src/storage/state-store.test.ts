@@ -2325,6 +2325,264 @@ describe("StateStore", () => {
     }
   });
 
+  test("atomically retires one provider generation before an account login advances it", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Login retirement", "login-retirement@example.com");
+    const created = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const session = store.bindSession({
+      sessionId: created.id,
+      expectedRevision: created.revision,
+      providerThreadId: "thread-login-retirement",
+      state: "idle",
+    });
+    const connectionId = "11000000-0000-4000-8000-000000000001";
+    store.appendSessionEvent({
+      sessionId: session.id,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: connectionId,
+      body: { type: "connection", state: "connected" },
+    });
+    const interaction = store.admitInteraction({
+      publicId: "11000000-0000-4000-8000-000000000002",
+      sessionId: session.id,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "string", value: "login-retirement" },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "1".repeat(64),
+        threadId: "thread-login-retirement",
+        turnId: "turn-login-retirement",
+        itemId: "item-login-retirement",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Retire this prompt",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    }).record;
+    const attempt = store.prepareMutation({
+      kind: "account.login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration + 1,
+      request: { deviceCode: false },
+      idempotencyKey: "00000000-0000-4000-8000-000000000811",
+    });
+
+    const begun = store.beginAccountMutationEffect({
+      attemptId: attempt.id,
+      profileId: profile.id,
+      profileGeneration: profile.processGeneration + 1,
+      evidence: { kind: "account.login", method: "browser" },
+      providerRetirements: [{
+        sessionId: session.id,
+        connectionId,
+        releasedEvents: [{
+          accountId: profile.id,
+          sessionId: session.id,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: connectionId,
+          body: {
+            type: "assistant_delta",
+            turnId: "turn-login-retirement",
+            itemId: "item-login-retirement",
+            text: "[protected]",
+          },
+        }, {
+          accountId: profile.id,
+          sessionId: session.id,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: null,
+          body: {
+            type: "warning",
+            code: "provider_resume_unavailable",
+            message: "Provider observation is unavailable.",
+          },
+        }],
+      }],
+    });
+
+    expect(begun).toMatchObject({
+      profile: { processGeneration: profile.processGeneration + 1, state: "login_pending" },
+      retiredSessionIds: [session.id],
+    });
+    expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+      revision: interaction.revision + 1,
+      state: "expired",
+    });
+    expect(store.readMutation("00000000-0000-4000-8000-000000000811"))
+      .toMatchObject({ state: "effect_started" });
+    const events = store.listSessionEvents({
+      sessionId: session.id,
+      afterSequence: 0,
+      limit: 100,
+    }).events;
+    expect(events.map((event) => event.body)).toEqual([
+      { type: "connection", state: "connected" },
+      {
+        type: "assistant_delta",
+        turnId: "turn-login-retirement",
+        itemId: "item-login-retirement",
+        text: "[protected]",
+      },
+      {
+        type: "warning",
+        code: "provider_resume_unavailable",
+        message: "Provider observation is unavailable.",
+      },
+      {
+        type: "interaction_state",
+        interactionId: interaction.publicId,
+        state: "expired",
+        revision: interaction.revision + 1,
+      },
+      { type: "connection", state: "disconnected", reason: "closed" },
+      {
+        type: "gap",
+        reason: "provider_disconnect",
+        fromSequence: 6,
+        throughSequence: 6,
+      },
+    ]);
+    expect(events.map((event) => event.providerGeneration))
+      .toEqual(events.map(() => profile.processGeneration));
+    expect(events.map((event) => event.sequence)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  test("rolls an invalid account-login retirement back and permits an exact retry", async () => {
+    const { store } = await fixture();
+    const profile = signInProfile(store, "Rollback retirement", "rollback-retirement@example.com");
+    const other = signInProfile(store, "Other retirement", "other-retirement@example.com");
+    const session = store.createSession({
+      profileId: profile.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const otherSession = store.createSession({
+      profileId: other.id,
+      preset: "high",
+      fastEnabled: false,
+    });
+    const connectionId = "12000000-0000-4000-8000-000000000001";
+    const interaction = store.admitInteraction({
+      publicId: "12000000-0000-4000-8000-000000000002",
+      sessionId: session.id,
+      authority: {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        connectionId,
+        requestId: { type: "number", value: 1 },
+        method: "item/commandExecution/requestApproval",
+        requestDigest: "2".repeat(64),
+        threadId: "thread-rollback-retirement",
+        turnId: "turn-rollback-retirement",
+        itemId: "item-rollback-retirement",
+        approvalId: null,
+      },
+      kind: "command_approval",
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Keep pending after rollback",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+    }).record;
+    const key = "00000000-0000-4000-8000-000000000812";
+    const attempt = store.prepareMutation({
+      kind: "account.login",
+      authorityId: profile.id,
+      authorityGeneration: profile.processGeneration + 1,
+      request: { deviceCode: false },
+      idempotencyKey: key,
+    });
+    const begin = (providerRetirements: Parameters<StateStore["beginAccountMutationEffect"]>[0]["providerRetirements"]) =>
+      store.beginAccountMutationEffect({
+        attemptId: attempt.id,
+        profileId: profile.id,
+        profileGeneration: profile.processGeneration + 1,
+        evidence: { kind: "account.login", method: "browser" },
+        ...(providerRetirements === undefined ? {} : { providerRetirements }),
+      });
+    const assertUnchanged = (): void => {
+      expect(store.requireProfileById(profile.id)).toMatchObject({
+        processGeneration: profile.processGeneration,
+        state: "signed_in",
+      });
+      expect(store.requireInteraction(interaction.publicId)).toMatchObject({
+        revision: interaction.revision,
+        state: "pending",
+      });
+      expect(store.readMutation(key)).toMatchObject({ state: "prepared" });
+      expect(store.eventStreamPosition(session.id).observedThroughSequence).toBe(0);
+    };
+
+    expect(() => begin([{
+      sessionId: session.id,
+      connectionId,
+      releasedEvents: [{
+        accountId: profile.id,
+        sessionId: session.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: null,
+        body: {
+          type: "assistant_delta",
+          turnId: "turn-rollback-retirement",
+          itemId: "item-rollback-retirement",
+          text: "[protected]",
+        },
+      }],
+    }])).toThrow("ACCOUNT_LOGIN_RETIREMENT_EVENT_AUTHORITY_MISMATCH");
+    assertUnchanged();
+    expect(() => begin([{
+      sessionId: session.id,
+      connectionId,
+      releasedEvents: [{
+        accountId: profile.id,
+        sessionId: session.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: connectionId,
+        body: {
+          type: "gap",
+          reason: "provider_disconnect",
+          fromSequence: 1,
+          throughSequence: 1,
+        },
+      }],
+    }])).toThrow("ACCOUNT_LOGIN_RETIREMENT_EVENT_AUTHORITY_MISMATCH");
+    assertUnchanged();
+    expect(() => begin([{
+      sessionId: otherSession.id,
+      connectionId,
+      releasedEvents: [],
+    }])).toThrow("ACCOUNT_LOGIN_RETIREMENT_SESSION_AUTHORITY_MISMATCH");
+    assertUnchanged();
+
+    expect(begin([{
+      sessionId: session.id,
+      connectionId,
+      releasedEvents: [],
+    }])).toMatchObject({
+      profile: { processGeneration: profile.processGeneration + 1 },
+      retiredSessionIds: [session.id],
+    });
+    expect(store.requireInteraction(interaction.publicId).state).toBe("expired");
+  });
+
   test("evicts a deterministic contiguous event prefix by age and reports the exact floor gap", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-store-event-retention-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });

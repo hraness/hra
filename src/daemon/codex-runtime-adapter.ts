@@ -2093,6 +2093,13 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     if (existing !== undefined) {
       this.#clients.delete(authority.id);
       this.#clearSessionObservations(existing);
+      this.#endedGenerationByProfile.set(
+        existing.authority.id,
+        Math.max(
+          this.#endedGenerationByProfile.get(existing.authority.id) ?? 0,
+          existing.authority.generation,
+        ),
+      );
       await existing.client.close();
     }
     if (this.#prepareCodexHome !== undefined) {

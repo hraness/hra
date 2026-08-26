@@ -4609,11 +4609,67 @@ export class StateStore {
     profileId: ProfileId;
     profileGeneration: number;
     evidence: Extract<MutationEffectEvidence, { kind: "account.login" | "account.logout" }>;
-  }): ProfileRecord {
+    providerRetirements?: readonly Readonly<{
+      connectionId: string;
+      releasedEvents: readonly Readonly<Pick<
+        SessionEvent,
+        | "accountId"
+        | "body"
+        | "providerConnectionId"
+        | "providerGeneration"
+        | "sessionId"
+      >>[];
+      sessionId: SessionId;
+    }>[];
+  }): Readonly<{
+    profile: ProfileRecord;
+    retiredSessionIds: readonly SessionId[];
+  }> {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     const parsedProfileId = profileIdSchema.parse(input.profileId);
     const parsedGeneration = z.number().int().nonnegative().parse(input.profileGeneration);
     const evidence = mutationEffectEvidenceSchema.parse(input.evidence) as typeof input.evidence;
+    const expectedCurrentGeneration = evidence.kind === "account.login"
+      ? parsedGeneration - 1
+      : parsedGeneration;
+    const seenRetirementSessions = new Set<SessionId>();
+    const providerRetirements = (input.providerRetirements ?? []).map((retirement) => {
+      const sessionId = sessionIdSchema.parse(retirement.sessionId);
+      if (seenRetirementSessions.has(sessionId)) {
+        throw new Error("ACCOUNT_LOGIN_RETIREMENT_SESSION_DUPLICATED");
+      }
+      seenRetirementSessions.add(sessionId);
+      const connectionId = z.string().uuid().parse(retirement.connectionId);
+      const releasedEvents = retirement.releasedEvents.map((event) => {
+        const parsed = {
+          accountId: profileIdSchema.parse(event.accountId),
+          body: sessionEventBodySchema.parse(event.body),
+          providerConnectionId: z.string().uuid().nullable().parse(event.providerConnectionId),
+          providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+            .parse(event.providerGeneration),
+          sessionId: sessionIdSchema.parse(event.sessionId),
+        };
+        const connectionMatches = parsed.providerConnectionId === connectionId
+          || (
+            parsed.providerConnectionId === null
+            && (parsed.body.type === "warning" || parsed.body.type === "error")
+          );
+        if (
+          parsed.accountId !== parsedProfileId
+          || parsed.providerGeneration !== expectedCurrentGeneration
+          || !connectionMatches
+          || parsed.sessionId !== sessionId
+          || parsed.body.type === "connection"
+          || parsed.body.type === "gap"
+          || parsed.body.type === "interaction_state"
+        ) throw new Error("ACCOUNT_LOGIN_RETIREMENT_EVENT_AUTHORITY_MISMATCH");
+        return parsed;
+      });
+      return { connectionId, releasedEvents, sessionId };
+    });
+    if (evidence.kind !== "account.login" && providerRetirements.length > 0) {
+      throw new Error("ACCOUNT_LOGOUT_CANNOT_RETIRE_PROVIDER_GENERATION");
+    }
     const canonical = JSON.stringify(evidence);
     const digest = createHash("sha256").update(canonical).digest("hex");
     const now = this.#now();
@@ -4622,7 +4678,6 @@ export class StateStore {
         this.#database.query(`SELECT m.kind,m.authority_id,m.authority_generation,m.state,p.process_generation,p.state AS profile_state
                               FROM mutation_attempts m JOIN profiles p ON p.id=m.authority_id WHERE m.id=?`).get(parsedAttemptId),
       );
-      const expectedCurrentGeneration = evidence.kind === "account.login" ? parsedGeneration - 1 : parsedGeneration;
       if (
         row.kind !== evidence.kind
         || row.authority_id !== parsedProfileId
@@ -4631,16 +4686,82 @@ export class StateStore {
         || row.profile_state === "removed"
         || row.profile_state === "recovery_required"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      const retiredSessionIds = new Set<SessionId>();
       if (evidence.kind === "account.login") {
+        for (const retirement of providerRetirements) {
+          const session = z.object({
+            profile_id: profileIdSchema,
+          }).strict().parse(this.#database.query(
+            "SELECT profile_id FROM sessions WHERE id=?",
+          ).get(retirement.sessionId));
+          if (session.profile_id !== parsedProfileId) {
+            throw new Error("ACCOUNT_LOGIN_RETIREMENT_SESSION_AUTHORITY_MISMATCH");
+          }
+          for (const event of retirement.releasedEvents) {
+            this.#appendSessionEventInTransaction({ ...event, recordedAt: now });
+          }
+        }
+        const openInteractions = this.#database.query(
+          `SELECT * FROM provider_interactions
+           WHERE profile_id=? AND process_generation=?
+             AND state IN ('pending','response_prepared','response_written')
+           ORDER BY requested_at,public_id`,
+        ).all(parsedProfileId, expectedCurrentGeneration);
+        for (const value of openInteractions) {
+          const current = interactionRowSchema.parse(value);
+          const state = current.state === "pending" ? "expired" : "resolution_unknown";
+          const changed = this.#database.query(
+            `UPDATE provider_interactions
+             SET state=?,revision=revision+1,updated_at=MAX(updated_at,?),terminal_at=MAX(requested_at,?)
+             WHERE public_id=? AND revision=? AND state=?`,
+          ).run(state, now, now, current.public_id, current.revision, current.state);
+          if (changed.changes !== 1) {
+            throw new Error("ACCOUNT_LOGIN_INTERACTION_RETIREMENT_CONFLICT");
+          }
+          const terminal = this.#requireInteractionRow(current.public_id);
+          this.#recordInteractionTransition(terminal, now);
+          const interaction = mapInteraction(terminal);
+          this.#ensureInteractionStateEventInTransaction(interaction, now);
+          if (interaction.sessionId !== null) retiredSessionIds.add(interaction.sessionId);
+        }
+        for (const retirement of providerRetirements) {
+          this.#appendSessionEventInTransaction({
+            accountId: parsedProfileId,
+            body: { type: "connection", state: "disconnected", reason: "closed" },
+            providerConnectionId: retirement.connectionId,
+            providerGeneration: expectedCurrentGeneration,
+            recordedAt: now,
+            sessionId: retirement.sessionId,
+          });
+          const position = this.#readSessionEventStream(retirement.sessionId);
+          const missingSequence = position.observed_through_sequence + 1;
+          this.#appendSessionEventInTransaction({
+            accountId: parsedProfileId,
+            body: {
+              type: "gap",
+              reason: "provider_disconnect",
+              fromSequence: missingSequence,
+              throughSequence: missingSequence,
+            },
+            providerConnectionId: retirement.connectionId,
+            providerGeneration: expectedCurrentGeneration,
+            recordedAt: now,
+            sessionId: retirement.sessionId,
+          });
+          retiredSessionIds.add(retirement.sessionId);
+        }
         const advanced = this.#database.query("UPDATE profiles SET process_generation=?,state='login_pending',provider_email=NULL,provider_plan=NULL,updated_at=? WHERE id=? AND process_generation=?").run(parsedGeneration, now, parsedProfileId, expectedCurrentGeneration);
         if (advanced.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
       this.#database.query("INSERT INTO mutation_effect_evidence(attempt_id,kind,evidence_json,evidence_digest,recorded_at) VALUES (?,?,?,?,?)").run(parsedAttemptId, evidence.kind, canonical, digest, now);
       const changed = this.#database.query("UPDATE mutation_attempts SET state='effect_started',updated_at=? WHERE id=? AND state='prepared'").run(now, parsedAttemptId);
       if (changed.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
+      return {
+        profile: this.requireProfile(parsedProfileId),
+        retiredSessionIds: [...retiredSessionIds].sort(),
+      };
     });
-    begin.immediate();
-    return this.requireProfile(parsedProfileId);
+    return begin.immediate();
   }
 
   listUnsettledMutations(input: { authorityId?: string; sessionId?: SessionId } = {}): readonly MutationAttemptRecord[] {

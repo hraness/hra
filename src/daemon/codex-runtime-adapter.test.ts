@@ -20,7 +20,7 @@ import {
   projectBoundedThread,
   projectUtf8Text,
 } from "./codex-runtime-adapter";
-import type { CodexAccountProjection, CodexSessionObservationError } from "./ports";
+import type { CodexAccountProjection, CodexSessionObservationError, ProfileAuthority } from "./ports";
 
 const authority = {
   id: "acct_00000000000000000000000000000000",
@@ -2183,6 +2183,53 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(observed).toEqual([]);
   });
 
+  test("forwards failed login completion without scheduling an account refresh", async () => {
+    let onFact: LaunchPinnedCodexOptions["onFact"];
+    let refreshCalls = 0;
+    const observedFacts: CodexFact[] = [];
+    const fake = {
+      state: "ready",
+      accountRead: async (refreshToken = false) => {
+        if (refreshToken) refreshCalls += 1;
+        return {
+          authority: { profileId: authority.id, processGeneration: 1 },
+          value: { account: null, requiresOpenaiAuth: true },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: {
+        account: () => undefined,
+        fact: (_authority, fact) => {
+          observedFacts.push(fact);
+        },
+      },
+      launchClient: async (options) => {
+        onFact = options.onFact;
+        return fake;
+      },
+    });
+    await manager.readAccount({
+      authority,
+      signal: new AbortController().signal,
+    });
+    const failed = {
+      type: "loginCompleted",
+      loginId: "provider-login-timeout",
+      success: false,
+    } as const;
+    await onFact?.({
+      authority: { profileId: authority.id, processGeneration: 1 },
+      value: failed,
+    });
+    await manager.close();
+
+    expect(observedFacts).toEqual([failed]);
+    expect(refreshCalls).toBe(0);
+  });
+
   test("closes admission before draining in-flight work and discards late facts and account refreshes", async () => {
     let onFact: LaunchPinnedCodexOptions["onFact"];
     let releaseUsage!: () => void;
@@ -2336,6 +2383,48 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(usageA.payload).toEqual(usageB.payload);
     expect(launches).toBe(2);
     expect(closed).toContain(1);
+    await manager.close();
+  });
+
+  test("closes an established old-generation client before launching its replacement", async () => {
+    let currentGeneration = 1;
+    const closed: number[] = [];
+    const observedFacts: Array<Readonly<{
+      authority: ProfileAuthority;
+      fact: CodexFact;
+    }>> = [];
+    const makeClient = (generation: number) => ({
+      state: "ready",
+      connectionId: `connection-${generation}`,
+      accountUsage: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { summary: { lifetimeTokens: generation, peakDailyTokens: null, longestRunningTurnSec: null, currentStreakDays: null, longestStreakDays: null }, dailyUsageBuckets: null } }),
+      accountRateLimits: async () => ({ authority: { profileId: authority.id, processGeneration: generation }, value: { primary: { limitId: null, limitName: null, primary: null, secondary: null, planType: null, rateLimitReachedType: null }, byLimitId: null } }),
+      close: async () => { closed.push(generation); },
+    }) as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: (candidate) => candidate.generation === currentGeneration,
+      observer: {
+        account: () => undefined,
+        fact: (observedAuthority, fact) => {
+          observedFacts.push({ authority: observedAuthority, fact });
+        },
+      },
+      launchClient: async (options: LaunchPinnedCodexOptions) =>
+        makeClient(options.authority.processGeneration),
+    });
+
+    await manager.readUsage({ authority, signal: new AbortController().signal });
+    currentGeneration = 2;
+    const replacementAuthority = { ...authority, generation: 2 } as const;
+    const replacementUsage = await manager.readUsage({
+      authority: replacementAuthority,
+      signal: new AbortController().signal,
+    });
+
+    expect(replacementUsage.payload).toMatchObject({
+      usage: { summary: { lifetimeTokens: 2 } },
+    });
+    expect(closed).toEqual([1]);
+    expect(observedFacts).toEqual([]);
     await manager.close();
   });
 });

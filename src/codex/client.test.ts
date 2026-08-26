@@ -782,6 +782,9 @@ describe("CodexAppServerClient", () => {
 
   test("sends the exact pinned login cancellation authority", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const factGate = deferred<undefined>();
+    let factStarted = false;
+    let factSettled = false;
     const process = new FakeProcess((message, runtime) => {
       if (message.method === "initialize") {
         runtime.respond({
@@ -795,6 +798,10 @@ describe("CodexAppServerClient", () => {
         });
       } else if (message.method === "account/login/cancel") {
         expect(message.params).toEqual({ loginId: "provider-login-exact" });
+        runtime.respond({
+          method: "account/login/completed",
+          params: { loginId: "provider-login-exact", success: false },
+        });
         runtime.respond({ id: message.id, result: { status: "notFound" } });
       }
     });
@@ -803,17 +810,27 @@ describe("CodexAppServerClient", () => {
       authority: { profileId: "profile-a", processGeneration: 7 },
       expectedCodexHome: codexHome,
       isAuthorityCurrent: () => true,
+      onFact: async () => {
+        factStarted = true;
+        await factGate.promise;
+        factSettled = true;
+      },
     });
     await client.initialize();
-    await expect(client.cancelManagedLogin("provider-login-exact")).resolves.toEqual({
+    const cancellation = client.cancelManagedLogin("provider-login-exact");
+    await waitFor(() => factStarted);
+    await expect(cancellation).resolves.toEqual({
       authority: { profileId: "profile-a", processGeneration: 7 },
       value: { status: "notFound" },
     });
+    expect(factSettled).toBe(false);
     expect(process.writes).toContainEqual({
       id: 3,
       method: "account/login/cancel",
       params: { loginId: "provider-login-exact" },
     });
+    factGate.resolve(undefined);
+    await waitFor(() => factSettled);
     await client.close();
   });
 
