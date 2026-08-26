@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 
-import { CodexError, IndeterminateCodexEffectError } from "../codex/index";
+import { CodexError, CodexRemoteError, IndeterminateCodexEffectError } from "../codex/index";
 import type {
   CodexAppServerClient,
   CodexCapabilitySnapshot,
@@ -93,6 +93,7 @@ const makeThread = (turns: readonly CodexTurn[], id = "thread-1"): CodexThread =
   sessionId: id,
   preview: "Preview",
   ephemeral: false,
+  historyMode: "paginated",
   modelProvider: "openai",
   createdAt: 1,
   updatedAt: 2,
@@ -319,26 +320,40 @@ describe("PinnedCodexRuntimeManager", () => {
 
   test("caches a determinate resume rejection without retiring or retrying the client", async () => {
     let resumeCalls = 0;
+    let readCalls = 0;
     let closeCalls = 0;
+    let onFact: LaunchPinnedCodexOptions["onFact"];
+    const connectionId = "71000000-0000-4000-8000-000000000003";
+    const providerThreadId = "thread-resume";
     const fake = {
       state: "ready",
-      connectionId: "71000000-0000-4000-8000-000000000003",
+      connectionId,
       resumeThread: async () => {
         resumeCalls += 1;
         throw new CodexError("REMOTE_ERROR", "Codex rejected thread/resume.");
+      },
+      readThread: async () => {
+        readCalls += 1;
+        return {
+          authority: { profileId: authority.id, processGeneration: authority.generation },
+          value: makeThread([], providerThreadId),
+        };
       },
       close: async () => { closeCalls += 1; },
     } as unknown as CodexAppServerClient;
     const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
-      launchClient: async () => fake,
+      launchClient: async (options) => {
+        onFact = options.onFact;
+        return fake;
+      },
     });
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await expect(manager.observeSession({
         authority,
-        providerThreadId: "thread-resume",
+        providerThreadId,
         signal: new AbortController().signal,
       })).rejects.toMatchObject({
         name: "CodexSessionObservationError",
@@ -346,6 +361,22 @@ describe("PinnedCodexRuntimeManager", () => {
       });
     }
     expect(resumeCalls).toBe(1);
+    await onFact?.({
+      authority: { profileId: authority.id, processGeneration: authority.generation },
+      value: {
+        type: "threadNameUpdated",
+        threadId: providerThreadId,
+        name: "Provider evidence",
+        connectionId,
+      },
+    });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId,
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ connectionId, resumed: false });
+    expect(resumeCalls).toBe(1);
+    expect(readCalls).toBe(1);
     expect(closeCalls).toBe(0);
     await manager.close();
     expect(closeCalls).toBe(1);
@@ -837,10 +868,19 @@ describe("PinnedCodexRuntimeManager", () => {
     const events: string[] = [];
     let discovery = 0;
     const credentialStoreChecks: string[] = [];
+    const credentialStoreSignals: Array<AbortSignal | undefined> = [];
+    const discoverySignals: Array<AbortSignal | undefined> = [];
     let ephemeral = false;
     let resumeCalls = 0;
+    let readCalls = 0;
+    let turnListCalls = 0;
+    let startTurnFailure: Error | undefined;
+    let emitInvalidatingFactBeforeFailure = false;
+    let emitDeletionDuringContextualDiscovery = false;
+    let onFact: LaunchPinnedCodexOptions["onFact"];
     let sandboxWritableRoots = ["/workspace/project"];
     const providerAuthority = { profileId: authority.id, processGeneration: authority.generation };
+    const connectionId = "71000000-0000-4000-8000-000000000006";
     const capabilities = (suffix: string): CodexCapabilitySnapshot => ({
       models: [{
         id: "gpt-5.6-sol",
@@ -863,12 +903,26 @@ describe("PinnedCodexRuntimeManager", () => {
     });
     const fake = {
       state: "ready",
-      assertCredentialStores: async (cwd: string) => {
+      connectionId,
+      assertCredentialStores: async (cwd: string, signal?: AbortSignal) => {
         credentialStoreChecks.push(cwd);
+        credentialStoreSignals.push(signal);
       },
-      discoverCapabilities: async (options: unknown) => {
+      discoverCapabilities: async (options: { signal?: AbortSignal }) => {
         discovery += 1;
+        discoverySignals.push(options.signal);
         events.push(`discover:${String(discovery)}:${JSON.stringify(options)}`);
+        if (emitDeletionDuringContextualDiscovery) {
+          emitDeletionDuringContextualDiscovery = false;
+          await onFact?.({
+            authority: providerAuthority,
+            value: {
+              type: "threadDeleted",
+              threadId: "thread-1",
+              connectionId,
+            },
+          });
+        }
         return { authority: providerAuthority, value: capabilities(discovery <= 2 ? "1" : "2") };
       },
       resolvePreset: (_snapshot: unknown, alias: string, fast: boolean) => {
@@ -904,8 +958,35 @@ describe("PinnedCodexRuntimeManager", () => {
         resumeCalls += 1;
         return { authority: providerAuthority, value: makeThread([], threadId) };
       },
+      readThread: async (threadId: string, includeTurns: boolean) => {
+        readCalls += 1;
+        expect(includeTurns).toBe(false);
+        return { authority: providerAuthority, value: makeThread([], threadId) };
+      },
+      listThreadTurns: async () => {
+        turnListCalls += 1;
+        return {
+          authority: providerAuthority,
+          value: { data: [], nextCursor: null, backwardsCursor: null },
+        };
+      },
       startTurn: async (input: unknown) => {
         events.push(`turn:${JSON.stringify(input)}`);
+        const failure = startTurnFailure;
+        startTurnFailure = undefined;
+        if (failure !== undefined && emitInvalidatingFactBeforeFailure) {
+          emitInvalidatingFactBeforeFailure = false;
+          await onFact?.({
+            authority: providerAuthority,
+            value: {
+              type: "threadStatusChanged",
+              threadId: "thread-1",
+              status: { type: "active", activeFlags: [] },
+              connectionId,
+            },
+          });
+        }
+        if (failure !== undefined) throw failure;
         return { authority: providerAuthority, value: { turn: makeTurn("turn-1", [], "inProgress") } };
       },
       close: async () => undefined,
@@ -914,35 +995,174 @@ describe("PinnedCodexRuntimeManager", () => {
     const manager = createRuntimeManager({
       isCurrent: () => true,
       observer: { account: () => undefined, fact: () => undefined },
-      launchClient: async () => fake,
+      launchClient: async (options) => {
+        onFact = options.onFact;
+        return fake;
+      },
       now: () => now++,
     });
 
-    const sessionReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
-    const started = await manager.startSession({ authority, projectRoot: "/workspace/project", review: sessionReview, signal: new AbortController().signal });
-    const turnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: new AbortController().signal });
+    const sessionReviewSignal = new AbortController().signal;
+    const sessionStartSignal = new AbortController().signal;
+    const rejectedTurnReviewSignal = new AbortController().signal;
+    const invalidatedTurnReviewSignal = new AbortController().signal;
+    const turnReviewSignal = new AbortController().signal;
+    const sessionReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: sessionReviewSignal });
+    const started = await manager.startSession({ authority, projectRoot: "/workspace/project", review: sessionReview, signal: sessionStartSignal });
+    const pristineObservation = await manager.observeSession({
+      authority,
+      providerThreadId: "thread-1",
+      signal: new AbortController().signal,
+    });
+    const pristineDetail = await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: true,
+      signal: new AbortController().signal,
+    });
+    expect(pristineObservation).toMatchObject({
+      connectionId,
+      projection: { providerThreadId: "thread-1", status: "idle" },
+      resumed: false,
+    });
+    expect(pristineDetail).toMatchObject({
+      providerThreadId: "thread-1",
+      status: "idle",
+      turns: [],
+    });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 0,
+      resumeCalls: 0,
+      turnListCalls: 0,
+    });
+    const rejectedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: rejectedTurnReviewSignal });
+    startTurnFailure = new CodexRemoteError(-32_600, "request failed");
+    await expect(manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: rejectedTurnReview, message: "rejected", clientMessageId: "client-rejected", signal: new AbortController().signal })).rejects.toBeInstanceOf(CodexRemoteError);
+    await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: false,
+      signal: new AbortController().signal,
+    });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 1,
+      resumeCalls: 0,
+      turnListCalls: 1,
+    });
+    const invalidatedTurnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: invalidatedTurnReviewSignal });
+    startTurnFailure = new CodexRemoteError(-32_600, "request failed");
+    emitInvalidatingFactBeforeFailure = true;
+    await expect(manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: invalidatedTurnReview, message: "fact then reject", clientMessageId: "client-fact-rejected", signal: new AbortController().signal })).rejects.toBeInstanceOf(CodexRemoteError);
+    await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: false,
+      signal: new AbortController().signal,
+    });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 2,
+      resumeCalls: 0,
+      turnListCalls: 2,
+    });
+    const turnReview = await manager.reviewTurnStart({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", preset: "high", fast: false, signal: turnReviewSignal });
     const turned = await manager.startTurn({ authority, providerThreadId: "thread-1", projectRoot: "/workspace/project", review: turnReview, message: "continue", clientMessageId: "client-1", signal: new AbortController().signal });
+    const postTurnObservation = await manager.observeSession({
+      authority,
+      providerThreadId: "thread-1",
+      signal: new AbortController().signal,
+    });
+    await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: false,
+      signal: new AbortController().signal,
+    });
 
     expect(credentialStoreChecks).toEqual([
       "/workspace/project",
       "/workspace/project",
       "/workspace/project",
+      "/workspace/project",
+      "/workspace/project",
     ]);
-    expect(events.map((event) => event.split(":", 1)[0])).toEqual(["discover", "resolve", "thread", "discover", "resolve", "discover", "resolve", "turn"]);
-    expect(resumeCalls).toBe(0);
+    expect(credentialStoreSignals).toEqual([
+      sessionReviewSignal,
+      sessionStartSignal,
+      rejectedTurnReviewSignal,
+      invalidatedTurnReviewSignal,
+      turnReviewSignal,
+    ]);
+    expect(discoverySignals).toEqual(credentialStoreSignals);
+    expect(events.map((event) => event.split(":", 1)[0])).toEqual(["discover", "resolve", "thread", "discover", "resolve", "discover", "resolve", "turn", "discover", "resolve", "turn", "discover", "resolve", "turn"]);
+    expect(postTurnObservation.resumed).toBe(false);
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 4,
+      resumeCalls: 0,
+      turnListCalls: 3,
+    });
     expect(events[0]).toContain('"cwd":"/workspace/project"');
     expect(events[0]).not.toContain('"threadId"');
     expect(events[3]).toContain('"threadId":"thread-1"');
     expect(events[5]).toContain('"threadId":"thread-1"');
+    expect(events[8]).toContain('"threadId":"thread-1"');
+    expect(events[11]).toContain('"threadId":"thread-1"');
     expect(events[2]).toContain('"review":"auto_review"');
     expect(events[2]).toContain('"permissionProfile":":workspace"');
     expect(events[2]).toContain('"writableRoots":["/workspace/project"]');
-    expect(events[7]).toContain('"review":"auto_review"');
+    expect(events[13]).toContain('"review":"auto_review"');
     expect(started.effectiveRuntimeProfile).toMatchObject({ observedAt: 100, enabledApps: [{ id: "app-1", pluginDisplayNames: ["Plugin 1"] }] });
-    expect(turned.effectiveRuntimeProfile).toMatchObject({ observedAt: 103, enabledApps: [{ id: "app-2", pluginDisplayNames: ["Plugin 2"] }] });
+    expect(turned.effectiveRuntimeProfile).toMatchObject({ observedAt: 107, enabledApps: [{ id: "app-2", pluginDisplayNames: ["Plugin 2"] }] });
+    await onFact?.({
+      authority: providerAuthority,
+      value: {
+        type: "threadStatusChanged",
+        threadId: "thread-1",
+        status: { type: "notLoaded" },
+        connectionId,
+      },
+    });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-1",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ resumed: true });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 5,
+      resumeCalls: 1,
+      turnListCalls: 3,
+    });
+    await onFact?.({
+      authority: providerAuthority,
+      value: {
+        type: "threadDeleted",
+        threadId: "thread-1",
+        connectionId,
+      },
+    });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-1",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ resumed: true });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 6,
+      resumeCalls: 2,
+      turnListCalls: 3,
+    });
     sandboxWritableRoots = [];
     const legacySandboxReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
+    emitDeletionDuringContextualDiscovery = true;
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: legacySandboxReview, signal: new AbortController().signal })).resolves.toMatchObject({ providerThreadId: "thread-1" });
+    await expect(manager.observeSession({
+      authority,
+      providerThreadId: "thread-1",
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ resumed: true });
+    expect({ readCalls, resumeCalls, turnListCalls }).toEqual({
+      readCalls: 7,
+      resumeCalls: 3,
+      turnListCalls: 3,
+    });
     sandboxWritableRoots = ["/"];
     const broadRootReview = await manager.reviewSessionStart({ authority, projectRoot: "/workspace/project", preset: "high", fast: true, signal: new AbortController().signal });
     await expect(manager.startSession({ authority, projectRoot: "/workspace/project", review: broadRootReview, signal: new AbortController().signal })).rejects.toBeInstanceOf(IndeterminateCodexEffectError);
@@ -1285,6 +1505,125 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(projection.turnSummaries?.find((turn) => turn.id === "new")).toMatchObject({ files: ["src/index.ts"], actions: ["git status"] });
     expect(projection.omission?.hasMoreOlderTurns).toBe(true);
     expect(projection.omission?.incompleteTurnIds).toEqual(["new", "old"]);
+    await manager.close();
+  });
+
+  test("uses the bounded summary compatibility view for legacy thread history", async () => {
+    const calls: unknown[] = [];
+    const legacyMetadata = { ...makeThread([]), historyMode: "legacy" as const };
+    const recentDescending = [
+      makeTurn("new", [{ type: "agentMessage", id: "new-answer", text: "new answer" }]),
+      makeTurn("old", [{ type: "userMessage", id: "old-user", clientId: "old-client", text: ["old question"] }]),
+    ];
+    const fake = {
+      state: "ready",
+      readThread: async () => ({
+        authority: { profileId: authority.id, processGeneration: 1 },
+        value: legacyMetadata,
+      }),
+      listThreadTurns: async (options: { itemsView: "notLoaded" | "summary" | "full" }) => {
+        calls.push({ method: "turns", options });
+        if (options.itemsView === "full") throw new Error("legacy session reads must not request the full multi-turn view");
+        return {
+          authority: { profileId: authority.id, processGeneration: 1 },
+          value: {
+            data: options.itemsView === "summary"
+              ? recentDescending
+              : recentDescending.map((turn) => ({ ...turn, items: [] })),
+            nextCursor: null,
+            backwardsCursor: "newest",
+          },
+        };
+      },
+      listThreadItems: async () => {
+        calls.push({ method: "items" });
+        throw new Error("legacy history must not request thread/items/list");
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const compact = await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: false,
+      signal: new AbortController().signal,
+    });
+    const detailed = await manager.readSession({
+      authority,
+      providerThreadId: "thread-1",
+      detail: true,
+      signal: new AbortController().signal,
+    });
+
+    expect(calls).not.toContainEqual({ method: "items" });
+    expect(calls).not.toContainEqual(expect.objectContaining({
+      method: "turns",
+      options: expect.objectContaining({ itemsView: "full" }),
+    }));
+    expect(compact.messages?.map((message) => message.text)).toEqual(["old question", "new answer"]);
+    expect(compact.omission?.unreadItemTurnIds).toEqual(["new", "old"]);
+    expect(detailed.turns).toHaveLength(2);
+    expect(detailed.omission?.unreadItemTurnIds).toEqual(["new", "old"]);
+    await manager.close();
+  });
+
+  test("memoizes an exact unsupported item page per thread without downgrading another thread", async () => {
+    const itemCalls: string[] = [];
+    const fake = {
+      state: "ready",
+      readThread: async (threadId: string) => ({
+        authority: { profileId: authority.id, processGeneration: 1 },
+        value: makeThread([], threadId),
+      }),
+      listThreadTurns: async (options: { threadId: string; itemsView: "notLoaded" | "summary" }) => ({
+        authority: { profileId: authority.id, processGeneration: 1 },
+        value: {
+          data: [makeTurn(`${options.threadId}-turn`, options.itemsView === "summary"
+            ? [{ type: "agentMessage", id: `${options.threadId}-answer`, text: options.threadId }]
+            : [])],
+          nextCursor: null,
+          backwardsCursor: "anchor",
+        },
+      }),
+      listThreadItems: async (options: { threadId: string; turnId: string }) => {
+        itemCalls.push(options.threadId);
+        if (options.threadId === "thread-legacy") {
+          throw new CodexRemoteError(-32_601, "request failed");
+        }
+        return {
+          authority: { profileId: authority.id, processGeneration: 1 },
+          value: {
+            data: [{ turnId: options.turnId, item: { type: "agentMessage", id: "answer", text: "paginated" } }],
+            nextCursor: null,
+            backwardsCursor: null,
+          },
+        };
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const read = async (providerThreadId: string) => await manager.readSession({
+      authority,
+      providerThreadId,
+      detail: false,
+      signal: new AbortController().signal,
+    });
+    await read("thread-legacy");
+    await read("thread-legacy");
+    await expect(read("thread-paginated")).resolves.toMatchObject({
+      messages: [{ role: "assistant", text: "paginated" }],
+    });
+    expect(itemCalls).toEqual(["thread-legacy", "thread-paginated"]);
     await manager.close();
   });
 
@@ -1736,6 +2075,66 @@ describe("PinnedCodexRuntimeManager", () => {
     expect(projectedDetail.items[0]).toMatchObject({ type: "agentMessage", text: "done" });
     expect(projectedDetail.omission.omittedLoadedItems).toBeGreaterThan(0);
     expect(new TextEncoder().encode(JSON.stringify(detail)).byteLength).toBeLessThanOrEqual(3 * 1024 * 1024);
+    await manager.close();
+  });
+
+  test("inspects one legacy turn through an exact one-turn full compatibility page", async () => {
+    const calls: unknown[] = [];
+    const newer = makeTurn("newer", []);
+    const target = makeTurn("target", []);
+    const fullTarget = makeTurn("target", [
+      { type: "userMessage", id: "question", clientId: "client", text: ["question"] },
+      { type: "agentMessage", id: "answer", text: "answer" },
+    ]);
+    const fake = {
+      state: "ready",
+      readThread: async () => ({
+        authority: { profileId: authority.id, processGeneration: 1 },
+        value: { ...makeThread([]), historyMode: "legacy" as const },
+      }),
+      listThreadTurns: async (options: { cursor?: string | null; limit: number; itemsView: "notLoaded" | "full" }) => {
+        calls.push(options);
+        if (options.itemsView === "full") {
+          return {
+            authority: { profileId: authority.id, processGeneration: 1 },
+            value: { data: [fullTarget], nextCursor: null, backwardsCursor: "target-anchor" },
+          };
+        }
+        if (options.limit === 1) {
+          return {
+            authority: { profileId: authority.id, processGeneration: 1 },
+            value: { data: [newer], nextCursor: "before-target", backwardsCursor: "newer-anchor" },
+          };
+        }
+        return {
+          authority: { profileId: authority.id, processGeneration: 1 },
+          value: { data: [newer, target], nextCursor: null, backwardsCursor: "newer-anchor" },
+        };
+      },
+      listThreadItems: async () => {
+        throw new Error("legacy inspection must not request thread/items/list");
+      },
+      close: async () => undefined,
+    } as unknown as CodexAppServerClient;
+    const manager = createRuntimeManager({
+      isCurrent: () => true,
+      observer: { account: () => undefined, fact: () => undefined },
+      launchClient: async () => fake,
+    });
+
+    const detail = await manager.inspectTurn({
+      authority,
+      providerThreadId: "thread-1",
+      turnId: "target",
+      signal: new AbortController().signal,
+    }) as { id: string; items: Array<{ type: string; text?: string }> };
+    expect(calls).toEqual([
+      { threadId: "thread-1", cursor: null, limit: 128, sortDirection: "desc", itemsView: "notLoaded" },
+      { threadId: "thread-1", cursor: null, limit: 1, sortDirection: "desc", itemsView: "notLoaded" },
+      { threadId: "thread-1", cursor: "before-target", limit: 1, sortDirection: "desc", itemsView: "full" },
+    ]);
+    expect(detail.id).toBe("target");
+    expect(detail.items.map((item) => item.type)).toEqual(["userMessage", "agentMessage"]);
     await manager.close();
   });
 

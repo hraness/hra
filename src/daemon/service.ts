@@ -178,6 +178,83 @@ const cloudProjectionRecoveryAction = (
   ? `${cloudReenableAction(root)} first. After restart, ${action}`
   : `${action.slice(0, 1).toUpperCase()}${action.slice(1)}`;
 
+const codexCommandFailure = (error: CodexError): CommandFailure => {
+  switch (error.code) {
+    case "AUTHORITY_STALE":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The exact Codex process authority changed before the operation finished. Inspect daemon status before starting a fresh attempt.",
+        { reason: "codex_authority_stale", nextCommand: "hra daemon status --json" },
+      );
+    case "DEADLINE_EXPIRED":
+      return new CommandFailure(
+        "CONFLICT",
+        "The Codex interaction deadline expired before HRA could apply the response. Refresh pending interactions instead of replaying the expired response.",
+        { reason: "codex_interaction_deadline_expired", nextCommand: "hra interaction list --pending --json" },
+      );
+    case "HOME_MISMATCH":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The Codex home does not match this account's isolated runtime. Run `hra doctor --json` and repair the reported configuration before retrying.",
+        { reason: "codex_home_mismatch", nextCommand: "hra doctor --json" },
+      );
+    case "INDETERMINATE_EFFECT":
+      return new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "Codex may have applied the operation, but HRA could not prove its outcome. Reconcile the recorded attempt before retrying.",
+        { reason: "codex_effect_indeterminate" },
+      );
+    case "INVALID_INPUT":
+      return new CommandFailure(
+        "INVALID_INPUT",
+        "Codex rejected HRA's bounded request as invalid. Inspect the command and run `hra doctor --json` before retrying.",
+        { reason: "codex_request_invalid", nextCommand: "hra doctor --json" },
+      );
+    case "PROCESS_EXITED":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The pinned Codex process exited before the operation finished. Inspect daemon status before starting a fresh attempt.",
+        { reason: "codex_process_exited", nextCommand: "hra daemon status --json" },
+      );
+    case "PROTOCOL_ERROR":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "Codex returned data that violates HRA's pinned protocol. Run `hra doctor --json` and repair or update HRA before retrying.",
+        { reason: "codex_protocol_error", nextCommand: "hra doctor --json" },
+      );
+    case "PROTOCOL_LIMIT":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "Codex data exceeded HRA's bounded protocol limits. Narrow the request where possible or update HRA before trying again.",
+        { reason: "codex_protocol_limit" },
+      );
+    case "REMOTE_ERROR":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.",
+        { reason: "codex_remote_rejected", requestState: "settled" },
+      );
+    case "RUNTIME_MISMATCH":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "HRA's pinned Codex runtime is missing or incompatible. Run `hra doctor --json` and repair or reinstall HRA before retrying.",
+        { reason: "codex_runtime_mismatch", nextCommand: "hra doctor --json" },
+      );
+    case "TIMEOUT":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "Codex did not complete the operation within HRA's bounded deadline. Inspect current state before deciding whether to start a fresh attempt.",
+        { reason: "codex_timeout" },
+      );
+    case "UNSUPPORTED_CAPABILITY":
+      return new CommandFailure(
+        "UNAVAILABLE",
+        "The pinned Codex runtime does not support a capability required for this operation. Run `hra doctor --json` and update or reconfigure HRA before retrying.",
+        { reason: "codex_capability_unsupported", nextCommand: "hra doctor --json" },
+      );
+  }
+};
+
 const cloudDoctorProblems = (status: unknown): readonly string[] => {
   const root = doctorRecord(status);
   if (root === null) {
@@ -759,6 +836,7 @@ export class HraService {
       if (error instanceof Error && error.message === "SESSION_EVENT_CURSOR_AHEAD") {
         throw new CommandFailure("CONFLICT", "The session event cursor is ahead of the current stream.");
       }
+      if (error instanceof CodexError) throw codexCommandFailure(error);
       if (error instanceof Error && /unavailable|not configured/iu.test(error.message)) {
         throw new CommandFailure("UNAVAILABLE", "A required local or provider capability is unavailable.");
       }
@@ -4231,10 +4309,6 @@ export class HraService {
       return { receipt: { sessionId, sourceId: attempt.id }, evidence: { kind: evidence.kind, providerThreadId: projection.providerThreadId, exactBinding: true } };
     }
     if (!("providerThreadId" in evidence) || projection.providerThreadId !== evidence.providerThreadId) return null;
-    const strictlyNewer = evidence.baseline.providerUpdatedAt !== null
-      && projection.providerUpdatedAt !== undefined
-      && projection.providerUpdatedAt > evidence.baseline.providerUpdatedAt;
-    if (!strictlyNewer) return null;
     if (evidence.kind === "session.send" || evidence.kind === "session.steer") {
       const matchingTurns = new Set((projection.messages ?? [])
         .filter((message) => message.role === "user" && message.clientId === evidence.clientMessageId && message.turnId !== undefined)
@@ -4248,6 +4322,10 @@ export class HraService {
       if (evidence.activeTurnId === null || turnId !== evidence.activeTurnId) return null;
       return { receipt: { steered: true, activeTurnId: evidence.activeTurnId }, evidence: { kind: evidence.kind, clientMessageId: evidence.clientMessageId, turnId, providerUpdatedAt: projection.providerUpdatedAt } };
     }
+    const strictlyNewer = evidence.baseline.providerUpdatedAt !== null
+      && projection.providerUpdatedAt !== undefined
+      && projection.providerUpdatedAt > evidence.baseline.providerUpdatedAt;
+    if (!strictlyNewer) return null;
     if (evidence.kind === "session.stop") {
       if (evidence.activeTurnId === null || projection.activeTurnId === evidence.activeTurnId) return null;
       const observed = (projection.turnSummaries ?? []).find((turn) => turn.id === evidence.activeTurnId);
@@ -4290,15 +4368,11 @@ export class HraService {
       this.#scheduleIdleQueue(resolved);
       return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
-    const baseline = record.evidence.baseline;
-    const strictlyNewer = baseline.providerUpdatedAt !== null
-      && projection.providerUpdatedAt !== undefined
-      && projection.providerUpdatedAt > baseline.providerUpdatedAt;
     const matches = new Set((projection.messages ?? [])
       .filter((message) => message.role === "user" && message.clientId === record.evidence.clientMessageId && message.turnId !== undefined)
       .map((message) => message.turnId as string));
     const [turnId] = matches;
-    if (!strictlyNewer || matches.size !== 1 || turnId === undefined) {
+    if (matches.size !== 1 || turnId === undefined) {
       throw new CommandFailure("RECOVERY_REQUIRED", "The exact provider read does not contain causal proof for the uncertain queued message. No effect was replayed.");
     }
     const receipt = { turnId, sourceId: record.queueId };

@@ -98,6 +98,7 @@ const INTERACTION_DEADLINE_ERROR = Object.freeze({
 });
 const PRE_READY_FACT_LIMIT = 128;
 const PRE_READY_FACT_BYTES = 1 * 1024 * 1024;
+const CAPABILITY_DISCOVERY_MAX_DEADLINE_MS = 40_000;
 
 interface PendingRequest {
   readonly id: number;
@@ -105,6 +106,9 @@ interface PendingRequest {
   readonly parseAndResolve: (value: unknown, authority: CodexAuthority) => void;
   readonly reject: (reason: unknown) => void;
   readonly timeout: ReturnType<typeof setTimeout>;
+  readonly signal?: AbortSignal;
+  readonly onAbort?: () => void;
+  dispatched: boolean;
 }
 
 type ServerRequestState = "pending" | "writing" | "responded" | "resolved" | "resolution_unknown";
@@ -146,6 +150,8 @@ export interface CodexAppServerClientOptions {
   readonly shutdownTermGraceMs?: number;
   readonly shutdownSettlementMs?: number;
   readonly now?: () => number;
+  /** Deterministic tests only. Production uses the hard 40-second ceiling. */
+  readonly capabilityDiscoveryDeadlineMs?: number;
   /** Deterministic tests only. Production always accepts the generated UUID. */
   readonly connectionId?: string;
 }
@@ -154,6 +160,7 @@ export interface DiscoverCapabilitiesOptions {
   readonly cwd?: string;
   readonly threadId?: string;
   readonly includeExperimental?: boolean;
+  readonly signal?: AbortSignal;
 }
 
 export interface ThreadListOptions {
@@ -214,6 +221,7 @@ export class CodexAppServerClient {
   readonly #connectionId: string;
   readonly #shutdownTermGraceMs: number;
   readonly #shutdownSettlementMs: number;
+  readonly #capabilityDiscoveryDeadlineMs: number;
   readonly #now: () => number;
   readonly #encoder = new TextEncoder();
   readonly #pending = new Map<number, PendingRequest>();
@@ -267,6 +275,9 @@ export class CodexAppServerClient {
     this.#shutdownSettlementMs = boundedShutdownDuration(
       options.shutdownSettlementMs ?? 1_000,
       "Codex shutdown settlement",
+    );
+    this.#capabilityDiscoveryDeadlineMs = boundedCapabilityDiscoveryDeadline(
+      options.capabilityDiscoveryDeadlineMs ?? CAPABILITY_DISCOVERY_MAX_DEADLINE_MS,
     );
     this.#now = options.now ?? Date.now;
   }
@@ -367,13 +378,14 @@ export class CodexAppServerClient {
   }
 
   /** Rechecks project-layer effective custody before a project-scoped effect. */
-  async assertCredentialStores(cwd: string): Promise<void> {
-    await this.#assertCredentialStores(cwd, "ready");
+  async assertCredentialStores(cwd: string, signal?: AbortSignal): Promise<void> {
+    await this.#assertCredentialStores(cwd, "ready", signal);
   }
 
   async #assertCredentialStores(
     cwd: string,
     requestState: "preflighting" | "ready",
+    signal?: AbortSignal,
   ): Promise<void> {
     const stores = await this.#request(
       OPERATIONS["config/read"],
@@ -383,6 +395,7 @@ export class CodexAppServerClient {
       },
       parseCredentialStores,
       requestState,
+      signal,
     );
     if (
       stores.value.cliAuth !== this.#credentialStorePreflight.cliAuth
@@ -426,56 +439,82 @@ export class CodexAppServerClient {
   async discoverCapabilities(
     options: DiscoverCapabilitiesOptions = {},
   ): Promise<FencedCodexValue<CodexCapabilitySnapshot>> {
-    const models = await this.#allPages<CodexModel>("model/list", parseModelPage, {
-      includeHidden: true,
-      limit: 100,
-    });
-    const features = await this.#allPages<CodexFeature>(
-      "experimentalFeature/list",
-      parseFeaturePage,
-      {
+    const aggregate = new AbortController();
+    const abortForCaller = () => {
+      aggregate.abort(options.signal?.reason ?? new DOMException(
+        "Capability discovery was aborted",
+        "AbortError",
+      ));
+    };
+    options.signal?.addEventListener("abort", abortForCaller, { once: true });
+    if (options.signal?.aborted === true) abortForCaller();
+    const deadline = setTimeout(() => {
+      aggregate.abort(new CodexError("TIMEOUT", "capability discovery timed out"));
+    }, this.#capabilityDiscoveryDeadlineMs);
+    deadline.unref();
+
+    const discovery = (async () => {
+      const models = await this.#allPages<CodexModel>("model/list", parseModelPage, {
+        includeHidden: true,
         limit: 100,
-        ...(options.threadId === undefined
-          ? {}
-          : { threadId: boundedIdentifier(options.threadId, "thread id") }),
-      },
-    );
-    let permissionProfiles: readonly PermissionProfile[] | null = null;
-    let apps: readonly CodexApp[] | null = null;
-    if (options.includeExperimental === true) {
-      if (!this.#experimentalApi) {
-        throw new CodexError(
-          "UNSUPPORTED_CAPABILITY",
-          "experimental capability discovery was not enabled at initialization",
-        );
-      }
-      permissionProfiles = await this.#allPages<PermissionProfile>(
-        "permissionProfile/list",
-        parsePermissionProfilePage,
+      }, aggregate.signal);
+      const features = await this.#allPages<CodexFeature>(
+        "experimentalFeature/list",
+        parseFeaturePage,
         {
           limit: 100,
-          ...(options.cwd === undefined ? {} : { cwd: canonicalAbsolute(options.cwd, "cwd") }),
+          ...(options.threadId === undefined
+            ? {}
+            : { threadId: boundedIdentifier(options.threadId, "thread id") }),
         },
+        aggregate.signal,
       );
-      apps = await this.#allPages<CodexApp>("app/list", parseAppPage, {
-        limit: 100,
-        forceRefetch: true,
-        ...(options.threadId === undefined
-          ? {}
-          : { threadId: boundedIdentifier(options.threadId, "thread id") }),
-      });
+      let permissionProfiles: readonly PermissionProfile[] | null = null;
+      let apps: readonly CodexApp[] | null = null;
+      if (options.includeExperimental === true) {
+        if (!this.#experimentalApi) {
+          throw new CodexError(
+            "UNSUPPORTED_CAPABILITY",
+            "experimental capability discovery was not enabled at initialization",
+          );
+        }
+        permissionProfiles = await this.#allPages<PermissionProfile>(
+          "permissionProfile/list",
+          parsePermissionProfilePage,
+          {
+            limit: 100,
+            ...(options.cwd === undefined ? {} : { cwd: canonicalAbsolute(options.cwd, "cwd") }),
+          },
+          aggregate.signal,
+        );
+        apps = await this.#allPages<CodexApp>("app/list", parseAppPage, {
+          limit: 100,
+          forceRefetch: true,
+          ...(options.threadId === undefined
+            ? {}
+            : { threadId: boundedIdentifier(options.threadId, "thread id") }),
+        }, aggregate.signal);
+      }
+      await this.#assertAuthority();
+      throwIfAborted(aggregate.signal);
+      return {
+        authority: this.#authority,
+        value: {
+          models,
+          features,
+          permissionProfiles,
+          apps,
+          pluginLifecycle: "unsupported-under-development" as const,
+        },
+      };
+    })();
+
+    try {
+      return await raceWithAbort(discovery, aggregate.signal);
+    } finally {
+      clearTimeout(deadline);
+      options.signal?.removeEventListener("abort", abortForCaller);
     }
-    await this.#assertAuthority();
-    return {
-      authority: this.#authority,
-      value: {
-        models,
-        features,
-        permissionProfiles,
-        apps,
-        pluginLifecycle: "unsupported-under-development",
-      },
-    };
   }
 
   async listPlugins(options: { readonly cwd?: string; readonly forceRefetch?: boolean } = {}): Promise<
@@ -597,6 +636,7 @@ export class CodexAppServerClient {
         approvalsReviewer: input.policy.review,
         config: { model_reasoning_effort: input.preset.effort },
         ephemeral: false,
+        historyMode: "paginated",
       },
       (value) => validateThreadStartResult(parseThreadStart(value), input, policy.runtimeWorkspaceRoots, cwd),
     );
@@ -978,6 +1018,7 @@ export class CodexAppServerClient {
     method: Exclude<CodexMethod, "initialize">,
     params: unknown,
     parse: (value: unknown) => T,
+    signal?: AbortSignal,
   ): Promise<FencedCodexValue<T>> {
     if (this.#state !== "ready") {
       throw new CodexError("PROTOCOL_ERROR", "Codex app-server is not ready");
@@ -989,7 +1030,7 @@ export class CodexAppServerClient {
         `${method} requires the pinned experimental API capability`,
       );
     }
-    return this.#request(descriptor, params, parse, "ready");
+    return this.#request(descriptor, params, parse, "ready", signal);
   }
 
   async #request<T>(
@@ -997,6 +1038,7 @@ export class CodexAppServerClient {
     params: unknown,
     parse: (value: unknown) => T,
     requestState: "initializing" | "preflighting" | "ready",
+    signal?: AbortSignal,
   ): Promise<FencedCodexValue<T>> {
     if (this.#state !== requestState) {
       throw new CodexError(
@@ -1006,21 +1048,37 @@ export class CodexAppServerClient {
           : "Codex app-server initialization phase changed",
       );
     }
+    if (signal !== undefined && descriptor.effect !== "read") {
+      throw new CodexError(
+        "PROTOCOL_ERROR",
+        "only read-only Codex requests may be canceled after dispatch",
+      );
+    }
+    throwIfAborted(signal);
     await this.#assertAuthority();
+    throwIfAborted(signal);
     if (this.#state !== requestState) {
       throw new CodexError("PROCESS_EXITED", "Codex is shutting down");
     }
     const id = this.#allocateRequestId();
+    let exactPending: PendingRequest | undefined;
     const promise = new Promise<FencedCodexValue<T>>((resolvePromise, rejectPromise) => {
       const timeout = setTimeout(() => {
-        this.#pending.delete(id);
-        if (descriptor.lostResponse === "reconcile") {
+        const pending = this.#takePending(id);
+        if (pending === undefined) return;
+        if (descriptor.lostResponse === "reconcile" && pending.dispatched) {
           rejectPromise(new IndeterminateCodexEffectError(descriptor.method, id));
         } else {
           rejectPromise(new CodexError("TIMEOUT", `${descriptor.method} timed out`));
         }
       }, descriptor.deadlineMs);
-      this.#pending.set(id, {
+      const onAbort = signal === undefined
+        ? undefined
+        : () => {
+          const pending = this.#takePending(id);
+          if (pending !== undefined) pending.reject(abortReason(signal));
+        };
+      exactPending = {
         id,
         descriptor,
         parseAndResolve: (value, authority) => {
@@ -1028,18 +1086,36 @@ export class CodexAppServerClient {
         },
         reject: rejectPromise,
         timeout,
-      });
+        ...(signal === undefined ? {} : { signal }),
+        ...(onAbort === undefined ? {} : { onAbort }),
+        dispatched: false,
+      };
+      this.#pending.set(id, exactPending);
+      if (signal !== undefined && onAbort !== undefined) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }
     });
 
     try {
-      await this.#writeFrame({ id, method: descriptor.method, params });
+      const write = this.#writeFrame(
+        { id, method: descriptor.method, params },
+        {
+          beforeWrite: () => {
+            throwIfAborted(signal);
+            if (exactPending === undefined || this.#pending.get(id) !== exactPending) {
+              throw new CodexError("TIMEOUT", `${descriptor.method} expired before dispatch`);
+            }
+            exactPending.dispatched = true;
+          },
+        },
+      );
+      await Promise.race([write, promise]);
     } catch (error) {
-      const pending = this.#pending.get(id);
+      const pending = this.#takePending(id);
       if (pending !== undefined) {
-        clearTimeout(pending.timeout);
-        this.#pending.delete(id);
         pending.reject(
-          descriptor.lostResponse === "reconcile"
+          descriptor.lostResponse === "reconcile" && pending.dispatched
             ? new IndeterminateCodexEffectError(descriptor.method, id, error)
             : error,
         );
@@ -1052,15 +1128,21 @@ export class CodexAppServerClient {
     method: "model/list" | "experimentalFeature/list" | "permissionProfile/list" | "app/list",
     parse: (value: unknown) => Page<T>,
     baseParams: Readonly<Record<string, unknown>>,
+    signal: AbortSignal,
   ): Promise<readonly T[]> {
     const output: T[] = [];
     let nextCursor: string | null = null;
     const seen = new Set<string>();
-    for (let page = 0; page < 20; page += 1) {
+    const pageLimit = method === "app/list" ? 50 : 20;
+    for (let page = 0; page < pageLimit; page += 1) {
+      const pageParams = method === "app/list" && page > 0 && baseParams.forceRefetch === true
+        ? { ...baseParams, forceRefetch: false, cursor: nextCursor }
+        : { ...baseParams, cursor: nextCursor };
       const result: FencedCodexValue<Page<T>> = await this.#closedRequest<Page<T>>(
         method,
-        { ...baseParams, cursor: nextCursor },
+        pageParams,
         parse,
+        signal,
       );
       output.push(...result.value.data);
       if (output.length > 5_000) {
@@ -1234,8 +1316,11 @@ export class CodexAppServerClient {
       }
       return;
     }
-    this.#pending.delete(id);
-    clearTimeout(pending.timeout);
+    if (!pending.dispatched) {
+      this.#quarantineConnection("Codex emitted a response before HRA dispatched its request");
+      return;
+    }
+    this.#takePending(id);
     if (!(await this.#authorityIsCurrent())) {
       const stale = new CodexError("AUTHORITY_STALE", "Codex response belongs to a stale generation");
       pending.reject(pending.descriptor.lostResponse === "reconcile"
@@ -1476,6 +1561,17 @@ export class CodexAppServerClient {
     return id;
   }
 
+  #takePending(id: number): PendingRequest | undefined {
+    const pending = this.#pending.get(id);
+    if (pending === undefined) return undefined;
+    this.#pending.delete(id);
+    clearTimeout(pending.timeout);
+    if (pending.signal !== undefined && pending.onAbort !== undefined) {
+      pending.signal.removeEventListener("abort", pending.onAbort);
+    }
+    return pending;
+  }
+
   async #assertAuthority(): Promise<void> {
     if (!(await this.#authorityIsCurrent())) {
       throw new CodexError("AUTHORITY_STALE", "Codex process generation is stale");
@@ -1487,15 +1583,15 @@ export class CodexAppServerClient {
   }
 
   #failPending(cause: unknown): void {
-    for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timeout);
+    for (const id of [...this.#pending.keys()]) {
+      const pending = this.#takePending(id);
+      if (pending === undefined) continue;
       pending.reject(
-        pending.descriptor.lostResponse === "reconcile"
+        pending.descriptor.lostResponse === "reconcile" && pending.dispatched
           ? new IndeterminateCodexEffectError(pending.descriptor.method, pending.id, cause)
           : cause,
       );
     }
-    this.#pending.clear();
   }
 }
 
@@ -1514,6 +1610,53 @@ function canonicalAbsolute(value: string, label: string): string {
     throw new CodexError("INVALID_INPUT", `${label} must already be normalized`);
   }
   return canonical;
+}
+
+function boundedCapabilityDiscoveryDeadline(value: number): number {
+  if (
+    !Number.isSafeInteger(value)
+    || value < 1
+    || value > CAPABILITY_DISCOVERY_MAX_DEADLINE_MS
+  ) {
+    throw new CodexError(
+      "INVALID_INPUT",
+      `capability discovery deadline must be an integer between 1 and ${String(CAPABILITY_DISCOVERY_MAX_DEADLINE_MS)} milliseconds`,
+    );
+  }
+  return value;
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException("The Codex read was aborted", "AbortError");
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) throw abortReason(signal);
+}
+
+async function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return await new Promise<T>((resolvePromise, rejectPromise) => {
+    let settled = false;
+    const settle = (operation: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      operation();
+    };
+    const onAbort = () => {
+      settle(() => rejectPromise(abortReason(signal)));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void operation.then(
+      (value) => {
+        settle(() => resolvePromise(value));
+      },
+      (error: unknown) => {
+        settle(() => rejectPromise(error));
+      },
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 function compileThreadPolicy(policy: ThreadPolicy): {
@@ -1551,6 +1694,7 @@ function validateThreadStartResult(
     value.cwd !== cwd
     || value.thread.cwd !== cwd
     || value.thread.ephemeral
+    || value.thread.historyMode !== "paginated"
     || value.model !== input.preset.model
     || value.reasoningEffort !== input.preset.effort
     || !serviceTierMatches

@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
+import { renderFailure } from "../cli/render";
 import {
   callLocalDaemon,
   callWithSafeAutostart,
   commandFailureBrand,
+  DEFAULT_LOCAL_REQUEST_DEADLINE_MS,
   LocalDaemonIndeterminateError,
   LocalDaemonServer,
   LocalDaemonShutdownTimeoutError,
@@ -36,6 +38,12 @@ async function fixture(deadlineMs = 200): Promise<{ paths: ReturnType<typeof res
 }
 
 describe("local daemon transport", () => {
+  test("keeps the default deadline above the complete cold-session budget", () => {
+    expect(DEFAULT_LOCAL_REQUEST_DEADLINE_MS).toBe(
+      10_000 + 10_000 + 2 * (10_000 + 40_000) + 30_000 + 30_000,
+    );
+  });
+
   test("accepts one authenticated bounded command", async () => {
     const { paths } = await fixture();
     expect(await callLocalDaemon({ paths, command: { kind: "daemon.status" } })).toEqual({
@@ -109,6 +117,54 @@ describe("local daemon transport", () => {
       },
     });
     expect(JSON.stringify(response)).not.toContain(secret);
+  });
+
+  test("preserves closed settled-rejection guidance across the local transport", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    const secret = "REMOTE_REJECTION_SENTINEL_DO_NOT_RETURN";
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: () => {
+        throw Object.assign(new Error(`provider rejected ${secret}`), {
+          [commandFailureBrand]: true as const,
+          code: "UNAVAILABLE" as const,
+          details: {
+            reason: "codex_remote_rejected",
+            requestState: "settled",
+          },
+        });
+      },
+    });
+    servers.push(server);
+
+    const response = await callLocalDaemon({ paths, command: { kind: "daemon.status" } });
+    expect(response).toEqual({
+      ok: false,
+      version: 1,
+      requestId: expect.any(String),
+      error: {
+        code: "UNAVAILABLE",
+        message: "Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.",
+        details: {
+          reason: "codex_remote_rejected",
+          requestState: "settled",
+        },
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain(secret);
+    if (response.ok) throw new Error("Expected the closed settled-rejection failure.");
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    expect(renderFailure(response.error, false, {
+      writeStdout: (value) => { stdout.push(value); },
+      writeStderr: (value) => { stderr.push(value); },
+    })).toBe(5);
+    expect(stdout).toEqual([]);
+    expect(stderr.join("")).toContain(
+      "hra: Codex rejected the provider request. That request has settled; inspect current state before deciding whether a fresh attempt is appropriate.\n",
+    );
   });
 
   test("uses an absolute client deadline", async () => {
