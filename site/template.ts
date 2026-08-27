@@ -32,7 +32,12 @@ const renderInline = (content: readonly InlineContent[]): string =>
     })
     .join("");
 
-const renderBlock = (block: ContentBlock, sectionId: string, blockIndex: number): string => {
+const renderBlock = (
+  block: ContentBlock,
+  sectionId: string,
+  blockIndex: number,
+  subheadingLevel: "h2" | "h3" = "h3",
+): string => {
   switch (block.kind) {
     case "commands":
       return `<pre class="command-list" tabindex="0"><code>${escapeHtml(block.commands.join("\n"))}</code></pre>`;
@@ -44,15 +49,23 @@ const renderBlock = (block: ContentBlock, sectionId: string, blockIndex: number)
       return `<p>${renderInline(block.content)}</p>`;
     case "subheading": {
       const id = `${sectionId}-${blockIndex.toString()}-${block.text.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/(^-|-$)/g, "")}`;
-      return `<h3 id="${escapeHtml(id)}">${escapeHtml(block.text)}</h3>`;
+      return `<${subheadingLevel} id="${escapeHtml(id)}">${escapeHtml(block.text)}</${subheadingLevel}>`;
     }
   }
 };
 
-const renderSection = (section: ContentSection): string =>
+const renderSection = (
+  section: ContentSection,
+  headingLevel: "h1" | "h2" = "h2",
+): string =>
   `<section id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
-  <h2 id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</h2>
-  ${section.blocks.map((block, index) => renderBlock(block, section.id, index)).join("\n  ")}
+  <${headingLevel} id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
+  ${section.blocks.map((block, index) => renderBlock(
+    block,
+    section.id,
+    index,
+    headingLevel === "h1" ? "h2" : "h3",
+  )).join("\n  ")}
 </section>`;
 
 const renderHead = (
@@ -133,7 +146,7 @@ ${renderHead(content, {
     ${renderBlock(deepseekHarnessReading.homeLink, "introduction", content.introduction.length)}
   </header>
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
-  ${content.sections.map(renderSection).join("\n  ")}
+  ${content.sections.map((section) => renderSection(section)).join("\n  ")}
 </main>
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
@@ -206,7 +219,7 @@ ${renderHead(content, {
 <a class="skip-link" href="#content">Skip to content</a>
 <main id="content" class="narrow-page">
   <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
-  ${renderSection(page.section)}
+  ${renderSection(page.section, "h1")}
 </main>
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
