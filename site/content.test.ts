@@ -11,11 +11,18 @@ import {
   HRA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
 import {
+  deepseekHarnessReading,
   publicContent,
+  renderLlmsText,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
+  renderSitemapXml,
 } from "./content.ts";
-import { renderPrivacyHtml, renderSiteHtml } from "./template.ts";
+import {
+  renderDeepseekHarnessReadingHtml,
+  renderPrivacyHtml,
+  renderSiteHtml,
+} from "./template.ts";
 
 const htmlText = (value: string): string => value
   .replaceAll("&", "&amp;")
@@ -566,7 +573,11 @@ describe("public content contract", () => {
       ...hranessSocialLinks.map(({ href }) => href),
     ];
 
-    for (const document of [renderSiteHtml(), renderPrivacyHtml()]) {
+    for (const document of [
+      renderSiteHtml(),
+      renderPrivacyHtml(),
+      renderDeepseekHarnessReadingHtml(),
+    ]) {
       expect(document.match(/<footer\b/gu)).toHaveLength(1);
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
       expect(footer).toContain('data-slot="hraness-site-footer"');
@@ -590,5 +601,64 @@ describe("public content contract", () => {
     expect(html).toContain('aria-label="Documentation"');
     expect(html).not.toContain("<style>");
     expect(html).not.toContain(" style=");
+  });
+
+  test("ships one crawlable DeepSeek Harness reading page without orphaning it", () => {
+    const home = renderSiteHtml();
+    const reading = renderDeepseekHarnessReadingHtml();
+    const llms = renderLlmsText();
+    const sitemap = renderSitemapXml();
+    const markdown = renderReadmeMarkdown();
+    const requiredHrefs = [
+      "https://hra.sh/",
+      "https://hraness.com/writing/what-is-an-agent-harness",
+      "https://hraness.com/writing/direct-wrench-hra",
+      "https://github.com/deepseek-ai/deepseek-harness",
+      "https://hraness.com/reading/deepseek-harness",
+      "https://wrench.rip/provider-capabilities/",
+    ];
+    const absentHrefs = [
+      "/reading/headlong-always-on-loop",
+      "/reading/not-a-codex-tui",
+      "stripedex.com",
+      "spongeresearch.com",
+    ];
+
+    expect(home).toContain('href="/reading/deepseek-harness/"');
+    expect(home).toContain("A plugin catalog is not a Codex account loop");
+    expect(home).toContain('"@type":"SoftwareApplication"');
+    expect(home).not.toContain('"@type":"Article"');
+    expect(reading).toContain(
+      `<link rel="canonical" href="https://hra.sh${deepseekHarnessReading.canonicalPath}">`,
+    );
+    expect(reading).toContain('<meta property="og:type" content="article">');
+    expect(reading).toContain('"@type":"Article"');
+    expect(reading).not.toContain('"@type":"SoftwareApplication"');
+    expect(reading).toContain(`>${deepseekHarnessReading.heading}</h2>`);
+    expect(reading).toContain(deepseekHarnessReading.description);
+    expect(llms).toContain(
+      `[${deepseekHarnessReading.title}](${publicContent.siteUrl}${deepseekHarnessReading.canonicalPath})`,
+    );
+    expect(sitemap).toContain(`<loc>${publicContent.siteUrl}/</loc>`);
+    expect(sitemap).toContain(`<loc>${publicContent.siteUrl}/privacy/</loc>`);
+    expect(sitemap).toContain(
+      `<loc>${publicContent.siteUrl}${deepseekHarnessReading.canonicalPath}</loc>`,
+    );
+    expect(markdown).not.toContain("/reading/deepseek-harness/");
+    for (const href of requiredHrefs) {
+      expect(reading).toContain(`href="${href}"`);
+    }
+    for (const document of [home, reading, llms, sitemap, markdown]) {
+      for (const href of absentHrefs) {
+        expect(document).not.toContain(href);
+      }
+      expect(document).not.toMatch(/<script(?! type="application\/ld\+json")/);
+    }
+    expect(reading).not.toMatch(/<script[^>]+src=/);
+    expect(reading).not.toContain("onclick=");
+    expect(reading).not.toContain("graphql");
+    expect(reading).not.toContain("GraphQL");
+    expect(reading).not.toContain("OAuth");
+    expect(reading).not.toContain("MCP");
   });
 });

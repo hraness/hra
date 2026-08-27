@@ -39,6 +39,7 @@ describe("static-site build", () => {
       "PRIVACY.md",
       "dist/site/index.html",
       "dist/site/privacy/index.html",
+      "dist/site/reading/deepseek-harness/index.html",
       "dist/site/robots.txt",
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
@@ -101,6 +102,23 @@ describe("static-site build", () => {
     ) as { version?: unknown };
 
     expect(identity.version).toBe(packageJson.version);
+  });
+
+  test("lists the DeepSeek Harness reading page in the built sitemap and llms index", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
+    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
+    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
+    const reading = await readFile(
+      join(root, "dist/site/reading/deepseek-harness/index.html"),
+      "utf8",
+    );
+
+    expect(sitemap).toContain("<loc>https://hra.sh/reading/deepseek-harness/</loc>");
+    expect(llms).toContain("https://hra.sh/reading/deepseek-harness/");
+    expect(home).toContain('href="/reading/deepseek-harness/"');
+    expect(reading).toContain("A plugin catalog is not a Codex account loop");
   });
 
   test("passes check mode in a clean clone without ignored build output", async () => {
