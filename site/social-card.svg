@@ -1,8 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-labelledby="title description">
   <title id="title">HRA</title>
   <desc id="description">A terminal prompt showing the HRA install command.</desc>
+  <style>@font-face{font-display:swap;font-family:"Nebula Sans";font-style:normal;font-weight:700;src:url("/fonts/nebula-sans/NebulaSans-Bold.woff2") format("woff2")}</style>
   <rect width="1200" height="630" fill="#f4f1e9"/>
-  <text x="88" y="188" fill="#161512" font-family="ui-sans-serif, system-ui, sans-serif" font-size="96" font-weight="700">HRA</text>
+  <text x="88" y="188" fill="#161512" font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif" font-size="96" font-weight="700">HRA</text>
   <rect x="88" y="260" width="1024" height="150" rx="14" fill="#161512"/>
   <text x="128" y="326" fill="#f4f1e9" font-family="ui-monospace, monospace" font-size="27">bun add --global</text>
   <text x="128" y="370" fill="#f4f1e9" font-family="ui-monospace, monospace" font-size="22">https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz</text>

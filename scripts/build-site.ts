@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -99,6 +99,10 @@ const staticAssets = ["favicon.svg", "social-card.svg"] as const;
 const siteFooterStylesPath = fileURLToPath(
   import.meta.resolve("@hraness/site-footer/styles.css"),
 );
+const designKitFontsStylesPath = fileURLToPath(
+  import.meta.resolve("@hraness/design-kit/fonts.css"),
+);
+const designKitFontsDirectory = join(dirname(designKitFontsStylesPath), "fonts");
 
 const readExisting = async (path: string): Promise<string | undefined> => {
   try {
@@ -146,13 +150,18 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await copyFile(source, destination);
   }
 
-  const [productStyles, siteFooterStyles] = await Promise.all([
+  const [productStyles, designKitFontsStyles, siteFooterStyles] = await Promise.all([
     readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
+    readFile(designKitFontsStylesPath, "utf8"),
     readFile(siteFooterStylesPath, "utf8"),
   ]);
+  await cp(designKitFontsDirectory, join(options.repositoryRoot, "dist/site/fonts"), {
+    dereference: true,
+    recursive: true,
+  });
   await writeFile(
     join(options.repositoryRoot, "dist/site/styles.css"),
-    `${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
+    `${designKitFontsStyles.trim()}\n\n${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
     "utf8",
   );
 

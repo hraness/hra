@@ -4,6 +4,7 @@
   --code-background: #1a1916;
   --code-foreground: #f7f3e8;
   --foreground: #161512;
+  --font-sans: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --muted: #5d594f;
   --rule: #c9c2b3;
   --surface: #ebe5d8;
@@ -54,7 +55,7 @@ pre,
 }
 
 h1 {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
   font-size: clamp(3rem, 11vw, 7rem);
   letter-spacing: -0.065em;
   line-height: 0.92;
@@ -62,7 +63,7 @@ h1 {
 }
 
 h2 {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
   font-size: clamp(1.65rem, 4vw, 2.4rem);
   letter-spacing: -0.03em;
   line-height: 1.1;
@@ -140,6 +141,12 @@ pre code {
   gap: 0.55rem 1.25rem;
   margin-block: 4rem;
   padding-block: 1rem;
+}
+
+.section-nav,
+.project-resources nav,
+.preview-summary {
+  font-family: var(--font-sans);
 }
 
 section {
@@ -268,7 +275,6 @@ li + li {
 }
 
 .preview-summary {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: clamp(1.1rem, 2.7vw, 1.65rem);
   line-height: 1.35;
   max-width: 42rem;

@@ -49,6 +49,8 @@ describe("static-site build", () => {
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/styles.css",
+      "dist/site/fonts/nebula-sans/LICENSE.txt",
+      "dist/site/fonts/nebula-sans/PROVENANCE.md",
     ];
 
     for (const path of expectedPaths) {
@@ -57,7 +59,13 @@ describe("static-site build", () => {
 
     const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");
     expect(builtStyles).toContain("fixture:styles.css");
+    expect(builtStyles).toContain('font-family: "Nebula Sans";');
+    expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
     expect(builtStyles).toContain(".hraness-site-footer {");
+
+    expect((await readFile(
+      join(root, "dist/site/fonts/nebula-sans/NebulaSans-Bold.woff2"),
+    )).byteLength).toBeGreaterThan(60_000);
 
     expect(JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
@@ -165,13 +173,19 @@ describe("static-site build", () => {
     expect(html).not.toMatch(/<script[^>]+src=/);
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);
     expect(css).not.toMatch(/url\(["']?https?:\/\//);
+    expect(css).toContain('--font-sans: "Nebula Sans", ui-sans-serif, system-ui');
+    expect(css).toContain("font-family: var(--font-sans);");
+    expect(css).not.toMatch(/font-family:\s*ui-sans-serif/u);
+    expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
+    expect(await readFile(join(repositoryRoot, "site/social-card.svg"), "utf8"))
+      .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(vercel.headers).toEqual([
       {
         source: "/preview/",
         headers: [
           {
             key: "Content-Security-Policy",
-            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'none'; form-action 'none'; frame-ancestors https://hraness.com https://www.hraness.com; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
+            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-ancestors https://hraness.com https://www.hraness.com; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
           },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {
@@ -188,7 +202,7 @@ describe("static-site build", () => {
         headers: [
           {
             key: "Content-Security-Policy",
-            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'none'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
+            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
           },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {
