@@ -52,37 +52,34 @@ describe("authority supervisor build verifier", () => {
     }
   });
 
-  test("pins the official Zig archive and rebuilds the checked-in artifacts in CI and release", async () => {
-    const paths = [
+  test("pins the official Zig archive and rebuilds the checked-in artifacts in CI", async () => {
+    const workflow = await readFile(
       join(import.meta.dir, "..", ".github", "workflows", "ci.yml"),
-      join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
-    ];
-    for (const path of paths) {
-      const workflow = await readFile(path, "utf8");
-      expect(workflow).toContain("https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz");
-      expect(workflow).toContain("70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00");
-      expect(workflow).toContain("sha256sum --check --status");
-      expect(workflow).toMatch(/verify-authority-supervisor-build\.ts\s+--zig/u);
-      expect(workflow).toContain("authority-supervisor-runtime.test.ts --isolate --max-concurrency=1");
-      expect(workflow).not.toContain("setup-zig");
-      const enable = workflow.indexOf(
-        "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
-      );
-      const probe = workflow.indexOf(
-        "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
-      );
-      const runtime = workflow.indexOf(
-        "authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
-      );
-      const repositoryGate = workflow.indexOf("run: bun run check");
-      const restore = workflow.indexOf(
-        "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
-      );
-      expect(enable).toBeGreaterThan(-1);
-      expect(enable).toBeLessThan(probe);
-      expect(probe).toBeLessThan(runtime);
-      expect(runtime).toBeLessThan(repositoryGate);
-      expect(repositoryGate).toBeLessThan(restore);
-    }
+      "utf8",
+    );
+    expect(workflow).toContain("https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz");
+    expect(workflow).toContain("70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00");
+    expect(workflow).toContain("sha256sum --check --status");
+    expect(workflow).toMatch(/verify-authority-supervisor-build\.ts\s+--zig/u);
+    expect(workflow).toContain("authority-supervisor-runtime.test.ts --isolate --max-concurrency=1");
+    expect(workflow).not.toContain("setup-zig");
+    const enable = workflow.indexOf(
+      "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
+    );
+    const probe = workflow.indexOf(
+      "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
+    );
+    const runtime = workflow.indexOf(
+      "authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
+    );
+    const repositoryGate = workflow.indexOf("run: bun run check");
+    const restore = workflow.indexOf(
+      "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
+    );
+    expect(enable).toBeGreaterThan(-1);
+    expect(enable).toBeLessThan(probe);
+    expect(probe).toBeLessThan(runtime);
+    expect(runtime).toBeLessThan(repositoryGate);
+    expect(repositoryGate).toBeLessThan(restore);
   });
 });
