@@ -7,8 +7,13 @@ import {
   renderLlmsText,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
+  renderSitemapXml,
 } from "../site/content.ts";
-import { renderPrivacyHtml, renderSiteHtml } from "../site/template.ts";
+import {
+  renderDeepseekHarnessReadingHtml,
+  renderPrivacyHtml,
+  renderSiteHtml,
+} from "../site/template.ts";
 
 interface BuildOptions {
   readonly check: boolean;
@@ -48,12 +53,16 @@ const siteTextOutputs = (
     content: renderPrivacyHtml(),
   },
   {
+    path: join(repositoryRoot, "dist/site/reading/deepseek-harness/index.html"),
+    content: renderDeepseekHarnessReadingHtml(),
+  },
+  {
     path: join(repositoryRoot, "dist/site/robots.txt"),
     content: `User-agent: *\nAllow: /\nSitemap: ${publicContent.siteUrl}/sitemap.xml\n`,
   },
   {
     path: join(repositoryRoot, "dist/site/sitemap.xml"),
-    content: `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${publicContent.siteUrl}/</loc></url>\n  <url><loc>${publicContent.siteUrl}/privacy/</loc></url>\n</urlset>\n`,
+    content: renderSitemapXml(),
   },
   {
     path: join(repositoryRoot, "dist/site/llms.txt"),

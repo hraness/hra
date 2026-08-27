@@ -1,7 +1,7 @@
 # Contents
 
 - `content.ts` is the shared public content contract for README and website generation.
-- `template.ts` renders one accessible static page.
+- `template.ts` renders the homepage, privacy page, and standalone reading pages.
 - Tests enforce semantic and command parity.
 
 # Guidelines

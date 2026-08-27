@@ -47,6 +47,16 @@ export interface PublicContent {
   readonly siteUrl: string;
 }
 
+export interface ReadingPage {
+  readonly canonicalPath: string;
+  readonly datePublished: string;
+  readonly description: string;
+  readonly heading: string;
+  readonly homeLink: ContentBlock;
+  readonly section: ContentSection;
+  readonly title: string;
+}
+
 const text = (value: string): InlineContent => ({ kind: "text", value });
 const code = (value: string): InlineContent => ({ kind: "code", value });
 const link = (label: string, href: string): InlineContent => ({ kind: "link", label, href });
@@ -118,6 +128,75 @@ const privacyBlocks: readonly ContentBlock[] = [
       text("The hosted sync endpoint is beta-not-yet-live. Authenticated account deletion and capability-only progress recovery are implemented and pass deterministic hostile tests. Fresh-deployment and live completion acceptance remain launch gates."),
     ],
   },
+];
+
+export const deepseekHarnessReading: ReadingPage = {
+  canonicalPath: "/reading/deepseek-harness/",
+  datePublished: "2026-08-27",
+  description:
+    "DeepSeek Harness is an open-source plugin-first agent harness. HRA is a Bun CLI and local daemon for isolated Codex accounts, live sessions, and optional encrypted sync.",
+  heading: "A plugin catalog is not a Codex account loop",
+  title: "A plugin catalog is not a Codex account loop",
+  homeLink: paragraph(
+    text("A sourced reading take: "),
+    link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
+    text(" reads DeepSeek Harness as a plugin-first design reference, not as HRA's isolated Codex account job."),
+  ),
+  section: {
+    id: "reading-deepseek-harness",
+    heading: "A plugin catalog is not a Codex account loop",
+    blocks: [
+      paragraph(text("Published 27 August 2026.")),
+      paragraph(
+        text("DeepSeek Harness is an open-source agent harness whose public design is \"everything is a plugin.\" That catalog is a composition model. HRA is a Bun CLI plus a local daemon. It keeps isolated Codex accounts, live sessions, and optional encrypted sync. A plugin catalog is not multi-subscription Codex parallelism."),
+      ),
+      { kind: "subheading", text: "DeepSeek Harness as published" },
+      paragraph(
+        text("The "),
+        link("DeepSeek Harness repository", "https://github.com/deepseek-ai/deepseek-harness"),
+        text(" describes an open-source harness from DeepSeek AI. Features live in plugins instead of a growing privileged core. Cordis is the published composition layer. The first advertised run starts a local browser interface from npm without a repository checkout."),
+      ),
+      paragraph(
+        text("The maintainers mark the work as a developer preview and warn that compatibility-breaking changes will happen. That warning is the useful boundary. The "),
+        link("Reading digest", "https://hraness.com/reading/deepseek-harness"),
+        text(" records the same source as a gist. This page is the HRA take, not that digest."),
+      ),
+      { kind: "subheading", text: "A design reference, not a target" },
+      paragraph(
+        text("HRA does not wrap DeepSeek Harness, consume its plugin catalog, or treat the preview interface as a provider. The repository is worth reading because it keeps the core small and pushes features into plugins. It is not a stable integration target while that preview warning remains."),
+      ),
+      paragraph(
+        text("HRA already has a closed plugin surface of its own: read-only discovery against the selected isolated Codex profile. Codex app-server remains authoritative for plugins. HRA does not install, enable, or disable them. That boundary is about one pinned Codex profile. It is not a marketplace, and it is not an account loop."),
+      ),
+      { kind: "subheading", text: "What HRA keeps on this host" },
+      paragraph(
+        text("The live product page is "),
+        link("HRA on hra.sh", "https://hra.sh/"),
+        text(". HRA owns isolated profiles, process generations, durable commands, local projections, optional encrypted sync, and recovery. Codex app-server owns login, transcripts, turns, tools, and approvals. One machine remains the fenced execution custodian for a session. Other paired devices may read or submit durable commands. They do not become a second provider writer."),
+      ),
+      paragraph(
+        text("Several Codex accounts stay independent subscriptions. HRA does not pool quota or replay a failed turn under another account. That is the account loop this host publishes: named profiles, live sessions, and a local daemon. It is not a plugin catalog."),
+      ),
+      { kind: "subheading", text: "The harness noun stays on its own host" },
+      paragraph(
+        link("What is an agent harness?", "https://hraness.com/writing/what-is-an-agent-harness"),
+        text(" defines the noun and points at live surfaces. "),
+        link("Direct, Wrench, and Hra", "https://hraness.com/writing/direct-wrench-hra"),
+        text(" keeps the product split off this host: Direct owns application state, Wrench owns attested web operations, and Hra owns multi-subscription Codex parallelism. This generation-1 site publishes the Bun CLI and daemon that keep those isolated Codex accounts. It does not republish the comparison essay."),
+      ),
+      paragraph(
+        text("When those Codex sessions need an attested web operation rather than a plugin slot, the "),
+        link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
+        text(" table names the operations a session can call on purpose."),
+      ),
+    ],
+  },
+};
+
+export const siteDocumentPaths: readonly string[] = [
+  "/",
+  "/privacy/",
+  deepseekHarnessReading.canonicalPath,
 ];
 
 export const publicReleaseState: "release-ready" | "staged" = "staged";
@@ -940,6 +1019,19 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     ...content.sections.map(
       (section) => `- [${section.heading}](${content.siteUrl}/#${section.id})`,
     ),
+    "",
+    "## Reading",
+    "",
+    `- [${deepseekHarnessReading.title}](${content.siteUrl}${deepseekHarnessReading.canonicalPath})`,
+    "",
+  ].join("\n");
+
+export const renderSitemapXml = (content: PublicContent = publicContent): string =>
+  [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`,
+    ...siteDocumentPaths.map((path) => `  <url><loc>${content.siteUrl}${path}</loc></url>`),
+    "</urlset>",
     "",
   ].join("\n");
 
