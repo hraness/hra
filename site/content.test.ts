@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  HRANESS_HOME_URL,
+  HRANESS_NEWSLETTER_URL,
+  hranessSocialLinks,
+} from "@hraness/site-footer";
+
+import {
   buildHraGlobalInstallCommand,
   HRA_INSTALL_PREFLIGHT_SOURCE_URL,
 } from "../src/install-preflight";
@@ -504,6 +510,29 @@ describe("public content contract", () => {
     expect(html).toContain('<script type="application/ld+json">');
     expect(html).not.toMatch(/<script(?! type="application\/ld\+json")/);
     expect(html).not.toContain("onclick=");
+  });
+
+  test("renders the canonical Hraness network footer on every HTML page", () => {
+    const expectedHrefs = [
+      HRANESS_HOME_URL,
+      HRANESS_NEWSLETTER_URL,
+      ...hranessSocialLinks.map(({ href }) => href),
+    ];
+
+    for (const document of [renderSiteHtml(), renderPrivacyHtml()]) {
+      expect(document.match(/<footer\b/gu)).toHaveLength(1);
+      const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
+      expect(footer).toContain('data-slot="hraness-site-footer"');
+      expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
+      expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(10);
+      expect(
+        [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
+          .map((match) => match[1]),
+      ).toEqual(expectedHrefs);
+      expect(document.indexOf('class="project-resources"')).toBeLessThan(
+        document.indexOf('data-slot="hraness-site-footer"'),
+      );
+    }
   });
 
   test("provides keyboard and landmark structure without inline presentation", () => {

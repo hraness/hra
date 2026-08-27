@@ -8,6 +8,7 @@
   --rule: #c9c2b3;
   --surface: #ebe5d8;
   --link: #69401c;
+  --hraness-site-footer-measure: 74rem;
   font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
   font-synthesis: none;
   line-height: 1.55;
@@ -28,7 +29,7 @@ body {
 }
 
 main,
-footer {
+.project-resources {
   margin-inline: auto;
   max-width: 74rem;
   padding-inline: clamp(1rem, 4vw, 3rem);
@@ -182,7 +183,7 @@ li + li {
   margin-top: 3rem;
 }
 
-footer {
+.project-resources {
   border-top: 1px solid var(--rule);
   display: flex;
   flex-wrap: wrap;
@@ -191,11 +192,11 @@ footer {
   padding-block: 2rem 4rem;
 }
 
-footer p {
+.project-resources p {
   margin: 0;
 }
 
-footer nav {
+.project-resources nav {
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem 1.25rem;

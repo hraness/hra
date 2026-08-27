@@ -1,3 +1,5 @@
+import { renderHranessSiteFooter } from "@hraness/site-footer";
+
 import {
   findSection,
   publicContent,
@@ -88,7 +90,7 @@ const renderHead = (
 <script type="application/ld+json">${jsonLd}</script>`;
 };
 
-const renderFooter = (content: PublicContent): string => `<footer>
+const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="project-resources">
   <p>${escapeHtml(content.productName)} is MIT licensed.</p>
   <nav aria-label="Project links">
     <a href="${escapeHtml(content.links.github)}">GitHub</a>
@@ -96,7 +98,7 @@ const renderFooter = (content: PublicContent): string => `<footer>
     <a href="${escapeHtml(content.links.security)}">Security</a>
     <a href="/privacy/">Privacy</a>
   </nav>
-</footer>`;
+</aside>`;
 
 export const renderSiteHtml = (content: PublicContent = publicContent): string => {
   const navigation = content.sections
@@ -125,7 +127,8 @@ ${renderHead(content, {
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
   ${content.sections.map(renderSection).join("\n  ")}
 </main>
-${renderFooter(content)}
+${renderProjectResources(content)}
+${renderHranessSiteFooter()}
 </body>
 </html>
 `;
@@ -149,7 +152,8 @@ ${renderHead(content, {
   ${renderSection(privacy)}
   <p>Report a suspected boundary violation through <a href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
 </main>
-${renderFooter(content)}
+${renderProjectResources(content)}
+${renderHranessSiteFooter()}
 </body>
 </html>
 `;

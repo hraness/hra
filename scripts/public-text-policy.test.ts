@@ -61,6 +61,14 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("allows only the reviewed public Hraness package", () => {
+    expect(() => assertPublicText("@hraness/site-footer", "public dependency"))
+      .not.toThrow();
+    const privatePackage = `@${["hraness", "private-package"].join("/")}`;
+    expect(() => assertPublicText(privatePackage, "private dependency"))
+      .toThrow(PublicTextPolicyError);
+  });
+
   test("scans SVG text and rejects unreviewed file types", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-"));
     const svg = join(root, "image.svg");
