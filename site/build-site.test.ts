@@ -48,6 +48,8 @@ describe("static-site build", () => {
       "dist/site/favicon.svg",
       "dist/site/social-card.svg",
       "dist/site/styles.css",
+      "dist/site/fonts/nebula-sans/LICENSE.txt",
+      "dist/site/fonts/nebula-sans/PROVENANCE.md",
     ];
 
     for (const path of expectedPaths) {
@@ -56,7 +58,13 @@ describe("static-site build", () => {
 
     const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");
     expect(builtStyles).toContain("fixture:styles.css");
+    expect(builtStyles).toContain('font-family: "Nebula Sans";');
+    expect(builtStyles).toContain('./fonts/nebula-sans/NebulaSans-Book.woff2');
     expect(builtStyles).toContain(".hraness-site-footer {");
+
+    expect((await readFile(
+      join(root, "dist/site/fonts/nebula-sans/NebulaSans-Bold.woff2"),
+    )).byteLength).toBeGreaterThan(60_000);
 
     expect(JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
@@ -150,7 +158,13 @@ describe("static-site build", () => {
     expect(html).not.toMatch(/<script[^>]+src=/);
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);
     expect(css).not.toMatch(/url\(["']?https?:\/\//);
+    expect(css).toContain('font-family: "Nebula Sans", ui-sans-serif, system-ui');
+    expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
+    expect(await readFile(join(repositoryRoot, "site/social-card.svg"), "utf8"))
+      .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
     expect(vercel).toContain("default-src 'none'");
+    expect(vercel).toContain("font-src 'self'");
+    expect(vercel).not.toMatch(/font-src[^;]*(?:https?:|data:)/u);
     expect(vercel).toContain("script-src 'none'");
     expect(vercel).toContain('"X-Content-Type-Options"');
     expect(vercel).toContain('"Permissions-Policy"');

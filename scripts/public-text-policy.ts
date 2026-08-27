@@ -14,7 +14,10 @@ const allowedPublicScopes = new Set([
   "types",
   "typescript-eslint",
 ]);
-const allowedPublicScopedPackages = new Set(["@hraness/site-footer"]);
+const allowedPublicScopedPackages = new Set([
+  "@hraness/design-kit",
+  "@hraness/site-footer",
+]);
 
 const secretPatterns = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u,

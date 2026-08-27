@@ -61,7 +61,9 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
-  test("allows only the reviewed public Hraness package", () => {
+  test("allows only the reviewed public Hraness packages", () => {
+    expect(() => assertPublicText("@hraness/design-kit", "public dependency"))
+      .not.toThrow();
     expect(() => assertPublicText("@hraness/site-footer", "public dependency"))
       .not.toThrow();
     const privatePackage = `@${["hraness", "private-package"].join("/")}`;

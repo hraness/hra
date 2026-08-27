@@ -54,7 +54,7 @@ pre,
 }
 
 h1 {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: clamp(3rem, 11vw, 7rem);
   letter-spacing: -0.065em;
   line-height: 0.92;
@@ -62,7 +62,7 @@ h1 {
 }
 
 h2 {
-  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: "Nebula Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: clamp(1.65rem, 4vw, 2.4rem);
   letter-spacing: -0.03em;
   line-height: 1.1;
