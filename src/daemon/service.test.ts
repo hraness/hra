@@ -34,8 +34,13 @@ import {
   type InteractionResolution,
   type PublicInteraction,
 } from "../domain/interactions";
+import { sessionStatusSchema, type SessionStatus } from "../domain/observation";
 import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import {
+  SESSION_EVENT_RETAIN_AGE_MS,
+  sessionEventPageSchema,
+} from "../domain/session-events";
 import {
   createStoredAccountUsageSnapshot,
   storedAccountUsageSnapshotSchema,
@@ -3653,7 +3658,11 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).resolves.toMatchObject({
       providerObservation: {
+        basis: "provider_read",
         code: "resume_unavailable",
+        coverage: "unavailable",
+        freshness: "fresh",
+        source: "codex_app_server",
         state: "unavailable",
       },
     });
@@ -4720,15 +4729,56 @@ describe("HraService", () => {
       itemKind: "reasoning",
     });
 
-    const status = await value.service.execute({
+    const status = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
       session: sessionId,
-    }, { signal }) as { eventStream: { cursor: string; observedThroughSequence: number }; session: { id: string } };
+    }, { signal }));
     expect(status).toMatchObject({
-      version: 1,
-      session: { id: sessionId },
+      version: 2,
+      session: { id: sessionId, execution: "idle" },
+      advisory: {
+        attention: "none",
+        execution: "idle",
+        queueDepth: 0,
+      },
+      localObservation: {
+        coverage: "complete",
+        freshness: "fresh",
+        source: "sqlite",
+      },
+      providerObservation: {
+        basis: "provider_read",
+        connectionId,
+        coverage: "complete",
+        freshness: "fresh",
+        profileGeneration: authority.generation,
+        source: "codex_app_server",
+        state: "live",
+      },
       eventStream: { observedThroughSequence: 5 },
+      interactions: {
+        pending: [],
+        pendingCount: 0,
+        responseInFlightCount: 0,
+        truncated: false,
+      },
+      queue: {
+        ambiguousCount: 0,
+        depth: 0,
+        dispatchingCount: 0,
+        failedCount: 0,
+      },
     });
+    expect(Object.keys(status).sort()).toEqual([
+      "advisory",
+      "eventStream",
+      "interactions",
+      "localObservation",
+      "providerObservation",
+      "queue",
+      "session",
+      "version",
+    ]);
     const waiting = value.service.execute({
       kind: "session.events",
       session: sessionId,
@@ -4758,7 +4808,12 @@ describe("HraService", () => {
     await expect(waiting).resolves.toMatchObject({
       events: [
         { body: { type: "reasoning_summary_delta", text: "Checking the public contract" } },
-        { body: { type: "item_completed", itemId: "reasoning-live" } },
+        {
+          body: {
+            type: "item_completed",
+            itemId: value.eventCursors.projectPublicProviderIdentifier("reasoning-live"),
+          },
+        },
       ],
     });
     await expect(value.service.execute({
@@ -4768,6 +4823,80 @@ describe("HraService", () => {
       limit: 10,
       waitMs: 0,
     }, { signal })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+
+  test("maintains idle and terminal event streams on read without a new append", async () => {
+    for (const localState of ["idle_signed_out", "terminal"] as const) {
+      let currentTime = 1_000;
+      const value = await fixture(
+        undefined,
+        new FakeCloud(),
+        () => undefined,
+        () => currentTime,
+      );
+      const { sessionId } = await createIdleSession(value, `Read retention ${localState}`);
+      const session = value.store.requireSession(sessionId);
+      const profile = value.store.requireProfileById(session.profileId);
+      const event = value.store.appendSessionEvent({
+        sessionId,
+        accountId: profile.id,
+        providerGeneration: profile.processGeneration,
+        providerConnectionId: null,
+        body: {
+          type: "warning",
+          code: "RETENTION",
+          message: `age ${localState} without append`,
+        },
+      });
+      if (localState === "idle_signed_out") {
+        expect(value.store.setProfileState(
+          profile.id,
+          profile.processGeneration,
+          "signed_out",
+        )).toBe(true);
+      } else {
+        value.store.setSessionTurnState({
+          sessionId,
+          expectedRevision: session.revision,
+          state: "terminal",
+        });
+      }
+      const cursor = value.eventCursors.encode({
+        version: 1,
+        sessionId,
+        streamEpoch: event.streamEpoch,
+        sequence: 0,
+      });
+      const providerReadsBefore = value.codex.observedThreads.length;
+
+      currentTime += SESSION_EVENT_RETAIN_AGE_MS + 1;
+
+      const page = sessionEventPageSchema.parse(await value.service.execute({
+        kind: "session.events",
+        session: sessionId,
+        cursor,
+        limit: 10,
+        waitMs: 0,
+      }, { signal }));
+      expect(page.events).toEqual([]);
+      expect(page.gap).toEqual({
+        reason: "retention_age",
+        requestedSequence: 0,
+        retainedFromSequence: event.sequence + 1,
+      });
+      expect(value.eventCursors.decode(page.nextCursor)).toEqual({
+        version: 1,
+        sessionId,
+        streamEpoch: event.streamEpoch,
+        sequence: event.sequence,
+      });
+      expect(value.store.eventStreamPosition(sessionId)).toEqual({
+        streamEpoch: event.streamEpoch,
+        floorSequence: event.sequence + 1,
+        observedThroughSequence: event.sequence,
+      });
+      expect(value.codex.observedThreads).toHaveLength(providerReadsBefore);
+    }
   });
 
   test("fails an unavailable event follow closed after surfacing one durable warning", async () => {
@@ -4838,10 +4967,18 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).resolves.toMatchObject({
       providerObservation: {
+        basis: "provider_read",
         code: "thread_mismatch",
+        coverage: "partial",
+        freshness: "fresh",
+        source: "codex_app_server",
         state: "recovery_required",
       },
-      session: { state: "recovery_required" },
+      advisory: {
+        attention: "recovery_required",
+        execution: "recovery_required",
+      },
+      session: { execution: "recovery_required" },
     });
     const mismatch = value.store.listSessionEvents({
       sessionId,
@@ -4852,6 +4989,102 @@ describe("HraService", () => {
       terminal: true,
       type: "error",
     });
+  });
+
+  test("reports explicit provider provenance for unbound, signed-out, quarantined, and terminal sessions", async () => {
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 210_000);
+    const unboundProfile = value.store.createProfile("Unbound observation");
+    const unboundSession = value.store.createSession({
+      profileId: unboundProfile.id,
+      title: "Unbound observation",
+      preset: "high",
+      fastEnabled: false,
+    });
+    const unbound = sessionStatusSchema.parse(await value.service.execute({
+      kind: "session.status",
+      session: unboundSession.id,
+    }, { signal }));
+    expect(unbound.providerObservation).toEqual({
+      source: "codex_app_server",
+      basis: "local_state",
+      profileGeneration: 0,
+      observedAt: 210_000,
+      state: "not_applicable",
+      coverage: "not_attempted",
+      freshness: "unknown",
+      reason: "unbound",
+    });
+
+    const { sessionId } = await createIdleSession(value, "Provider variants");
+    const session = value.store.requireSession(sessionId);
+    const profile = value.store.requireProfileById(session.profileId);
+    const observeCallsBeforeNonLiveStatuses = value.codex.calls.filter(
+      (call) => call === "observe",
+    ).length;
+    expect(value.store.setProfileState(profile.id, profile.processGeneration, "signed_out")).toBe(true);
+    const signedOut = sessionStatusSchema.parse(await value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal }));
+    expect(signedOut.providerObservation).toEqual({
+      source: "codex_app_server",
+      basis: "local_state",
+      profileGeneration: profile.processGeneration,
+      observedAt: 210_000,
+      state: "unavailable",
+      coverage: "unavailable",
+      freshness: "fresh",
+      code: "account_signed_out",
+    });
+
+    value.store.setSessionTurnState({
+      sessionId,
+      expectedRevision: session.revision,
+      state: "recovery_required",
+    });
+    const quarantined = sessionStatusSchema.parse(await value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal }));
+    expect(quarantined.providerObservation).toEqual({
+      source: "codex_app_server",
+      basis: "local_state",
+      profileGeneration: profile.processGeneration,
+      observedAt: 210_000,
+      state: "recovery_required",
+      coverage: "partial",
+      freshness: "fresh",
+      code: "session_quarantined",
+    });
+    expect(quarantined.advisory.attention).toBe("recovery_required");
+
+    const terminalSession = value.store.upsertProviderSession({
+      profileId: profile.id,
+      providerThreadId: "provider-terminal-observation",
+      title: "Terminal provider observation",
+      state: "terminal",
+    });
+    const terminal = sessionStatusSchema.parse(await value.service.execute({
+      kind: "session.status",
+      session: terminalSession.id,
+    }, { signal }));
+    expect(terminal.providerObservation).toEqual({
+      source: "codex_app_server",
+      basis: "local_state",
+      profileGeneration: profile.processGeneration,
+      observedAt: 210_000,
+      state: "not_applicable",
+      coverage: "not_attempted",
+      freshness: "unknown",
+      reason: "terminal",
+    });
+    expect(terminal.advisory).toMatchObject({
+      attention: "none",
+      execution: "terminal",
+    });
+    expect(value.codex.calls.filter((call) => call === "observe")).toHaveLength(
+      observeCallsBeforeNonLiveStatuses,
+    );
   });
 
   test("does not append an old-generation warning when resume retirement advances authority", async () => {
@@ -4871,6 +5104,7 @@ describe("HraService", () => {
       session: sessionId,
     }, { signal })).resolves.toMatchObject({
       providerObservation: {
+        basis: "provider_read",
         code: "resume_unavailable",
         profileGeneration: profile.processGeneration + 1,
         state: "unavailable",
@@ -5606,6 +5840,8 @@ describe("HraService", () => {
       codexHome: "unused",
       desktopUserData: "unused",
     };
+    const privateTurnId = `${["", "Users", "person", "private"].join("/")}/api_key=INTERACTION-TURN-SECRET`;
+    const privateItemId = "token=INTERACTION-ITEM-SECRET";
     const provider = {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
@@ -5614,8 +5850,8 @@ describe("HraService", () => {
       method: "item/commandExecution/requestApproval",
       requestDigest: "a".repeat(64),
       threadId: session.providerThreadId,
-      turnId: "turn-approval",
-      itemId: "item-approval",
+      turnId: privateTurnId,
+      itemId: privateItemId,
       approvalId: "approval-1",
     };
     await value.service.observeCodexFact(authority, {
@@ -5646,9 +5882,21 @@ describe("HraService", () => {
     expect(listed.interactions).toHaveLength(1);
     expect(JSON.stringify(listed)).not.toContain("approval-request-1");
     expect(JSON.stringify(listed)).not.toContain(provider.requestDigest);
+    expect(JSON.stringify(listed)).not.toContain(privateTurnId);
+    expect(JSON.stringify(listed)).not.toContain(privateItemId);
     const interaction = listed.interactions[0];
     if (interaction === undefined) throw new Error("Expected an admitted interaction.");
     expect(publicInteractionSchema.parse(interaction)).toEqual(interaction);
+    expect(interaction.context.turnId).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    expect(interaction.context.itemId).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    if (interaction.context.turnId === null) {
+      throw new Error("Expected a public turn alias.");
+    }
+    const publicTurnId = interaction.context.turnId;
+    expect(value.store.requireInteraction(interaction.id).authority).toMatchObject({
+      turnId: privateTurnId,
+      itemId: privateItemId,
+    });
 
     const interactionListCommand = {
       kind: "interaction.list",
@@ -5661,8 +5909,50 @@ describe("HraService", () => {
       interaction: interaction.id,
     } satisfies LocalCommand;
     const interactionShow = await value.service.execute(interactionShowCommand, { signal });
+    const privateNote = "PRIVATE-SESSION-NOTE-MUST-NOT-LEAK";
+    const beforeNote = value.store.requireSession(sessionId);
+    value.store.updateSessionMetadata({
+      sessionId,
+      expectedRevision: beforeNote.revision,
+      note: privateNote,
+    });
+    const beforeActive = value.store.requireSession(sessionId);
+    value.store.setSessionTurnState({
+      sessionId,
+      expectedRevision: beforeActive.revision,
+      state: "active",
+      activeTurnId: privateTurnId,
+    });
+    value.store.appendSessionEvent({
+      sessionId,
+      accountId: profile.id,
+      providerGeneration: profile.processGeneration,
+      providerConnectionId: provider.connectionId,
+      body: { type: "turn_started", turnId: privateTurnId },
+    });
+    value.codex.readProjection = {
+      ...value.codex.readProjection,
+      providerThreadId: session.providerThreadId,
+      status: "active",
+      activeTurnId: privateTurnId,
+      providerUpdatedAt: (value.codex.readProjection.providerUpdatedAt ?? 10) + 1,
+    };
     const statusCommand = { kind: "session.status", session: sessionId } satisfies LocalCommand;
-    const status = await value.service.execute(statusCommand, { signal });
+    const status = sessionStatusSchema.parse(
+      await value.service.execute(statusCommand, { signal }),
+    );
+    expect(status.session.activeTurnId).toBe(publicTurnId);
+    const eventAliases = value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events.flatMap((event) =>
+      event.body.type === "turn_started" ? [event.body.turnId] : []);
+    expect(eventAliases).toContain(publicTurnId);
+    const serializedStatus = JSON.stringify(status);
+    expect(serializedStatus).not.toContain(privateNote);
+    expect(serializedStatus).not.toContain(session.providerThreadId);
+    expect(serializedStatus).not.toContain('"note"');
+    expect(serializedStatus).not.toContain('"providerThreadId"');
     for (const [command, result] of [
       [sessionInteractionsCommand, listed],
       [interactionListCommand, interactionList],
@@ -5676,6 +5966,8 @@ describe("HraService", () => {
       const json = renderJson(command, result);
       expect(json).not.toContain("approval-request-1");
       expect(json).not.toContain(provider.requestDigest);
+      expect(json).not.toContain("INTERACTION-TURN-SECRET");
+      expect(json).not.toContain("INTERACTION-ITEM-SECRET");
       expect(json).not.toContain("requestDigest");
       expect(json).not.toContain("responseDigest");
       expect(json).not.toContain("authority");
@@ -5825,7 +6117,7 @@ describe("HraService", () => {
       blocking: true,
       display: {
         kind: "mcp_elicitation",
-        summary: "Configure the MCP server",
+        summary: "credential=TOPSECRET-9415",
         serverName: "example",
         mode: "form",
         url: null,
@@ -5846,6 +6138,11 @@ describe("HraService", () => {
     const mcpForm = value.store.listInteractions({ sessionId, pendingOnly: true, limit: 10 })
       .find((record) => record.authority.requestId.value === "mcp-form-request-1");
     if (mcpForm === undefined) throw new Error("Expected a standard MCP form interaction.");
+    expect(mcpForm.display.summary).toBe("Codex requests MCP form input");
+    expect(JSON.stringify(value.store.listSessionEvents({
+      sessionId,
+      afterSequence: 0,
+    }).events)).not.toContain("TOPSECRET-9415");
     const submittedSentinel = "MCP_SERVICE_SUBMISSION_SECRET_SENTINEL";
     await expect(value.service.execute({
       kind: "interaction.resolve",
@@ -6054,7 +6351,7 @@ describe("HraService", () => {
     });
   }
 
-  test("pages signed interaction listings beyond the first hundred and binds cursors to the exact filter", async () => {
+  test("pages signed interaction listings and caps the separate status summary", async () => {
     const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 200_000);
     const { sessionId } = await createIdleSession(value, "Interaction pagination");
     const session = value.store.requireSession(sessionId);
@@ -6117,13 +6414,15 @@ describe("HraService", () => {
     const status = await value.service.execute({
       kind: "session.status",
       session: sessionId,
-    }, { signal }) as {
-      eventStream: { cursor: string };
-      pendingInteractions: readonly PublicInteraction[];
-      pendingInteractionsNextCursor: string | null;
-    };
-    expect(status.pendingInteractions).toHaveLength(100);
-    expect(status.pendingInteractionsNextCursor).toBe(first.nextCursor);
+    }, { signal }) as SessionStatus;
+    expect(status.interactions).toMatchObject({
+      pendingCount: 101,
+      responseInFlightCount: 0,
+      truncated: true,
+    });
+    expect(status.interactions.pending.map((interaction) => interaction.id)).toEqual(
+      publicIds.slice(0, 10),
+    );
     expect(status.eventStream.cursor).not.toBe(first.nextCursor);
 
     const second = await value.service.execute({
@@ -6201,28 +6500,71 @@ describe("HraService", () => {
     });
   });
 
-  test("session status keeps prepared and written interactions visible as unsettled", async () => {
+  test("session status separates pending summaries from responses in flight and reports queue axes", async () => {
     const value = await fixture(undefined, new FakeCloud(), () => undefined, () => 200_000);
     const { sessionId } = await createIdleSession(value, "Unsettled status");
-    seedUnsettledInteractionStates(
+    const seeded = seedUnsettledInteractionStates(
       value,
       sessionId,
       "75000000-0000-4000-8000-000000000001",
       "status-unsettled",
     );
-    const status = await value.service.execute({
+    const pendingQueue = value.store.enqueue(sessionId, "Pending queue status");
+    const dispatchingQueue = value.store.enqueue(sessionId, "Dispatching queue status");
+    const ambiguousQueue = value.store.enqueue(sessionId, "Ambiguous queue status");
+    const failedQueue = value.store.enqueue(sessionId, "Failed queue status");
+    expect(value.store.transitionQueue(dispatchingQueue.id, "pending", "dispatching")).toBe(true);
+    expect(value.store.transitionQueue(ambiguousQueue.id, "pending", "dispatching")).toBe(true);
+    expect(value.store.transitionQueue(ambiguousQueue.id, "dispatching", "ambiguous")).toBe(true);
+    expect(value.store.transitionQueue(failedQueue.id, "pending", "dispatching")).toBe(true);
+    expect(value.store.transitionQueue(failedQueue.id, "dispatching", "failed")).toBe(true);
+
+    const status = sessionStatusSchema.parse(await value.service.execute({
       kind: "session.status",
       session: sessionId,
-    }, { signal }) as {
-      pendingInteractions: readonly PublicInteraction[];
-      pendingInteractionsNextCursor: string | null;
-    };
-    expect(status.pendingInteractions.map((interaction) => interaction.state).sort()).toEqual([
-      "pending",
-      "response_prepared",
-      "response_written",
-    ]);
-    expect(status.pendingInteractionsNextCursor).toBeNull();
+    }, { signal }));
+    expect(status.interactions).toMatchObject({
+      pendingCount: 1,
+      responseInFlightCount: 2,
+      truncated: false,
+    });
+    expect(status.interactions.pending).toEqual([{
+      id: seeded.pending.publicId,
+      kind: seeded.pending.kind,
+      revision: seeded.pending.revision,
+      blocking: true,
+      summary: "Recover pending response state",
+      requestedAt: seeded.pending.requestedAt,
+      deadlineAt: seeded.pending.deadlineAt,
+    }]);
+    expect(status.advisory).toEqual({
+      attention: "human_action_required",
+      execution: "idle",
+      queueDepth: 1,
+    });
+    expect(status.queue).toEqual({
+      depth: 1,
+      dispatchingCount: 1,
+      ambiguousCount: 1,
+      failedCount: 1,
+    });
+    expect(value.store.requireQueue(pendingQueue.id).state).toBe("pending");
+
+    value.store.expireInteraction({
+      id: seeded.pending.publicId,
+      expectedRevision: seeded.pending.revision,
+    });
+    const responseInFlightOnly = sessionStatusSchema.parse(await value.service.execute({
+      kind: "session.status",
+      session: sessionId,
+    }, { signal }));
+    expect(responseInFlightOnly.interactions).toMatchObject({
+      pending: [],
+      pendingCount: 0,
+      responseInFlightCount: 2,
+      truncated: false,
+    });
+    expect(responseInFlightOnly.advisory.attention).toBe("response_in_flight");
   });
 
   test("expires all callback kinds exactly at their receipt-anchored deadline", async () => {
@@ -7515,6 +7857,7 @@ describe("HraService", () => {
     }, { signal }) as { eventStream: { cursor: string }; providerObservation: unknown };
     expect(restartStatus).toMatchObject({
       providerObservation: {
+        basis: "provider_read",
         connectionId: restartedCodex.observationConnectionId,
         mode: "resubscribed",
         state: "live",

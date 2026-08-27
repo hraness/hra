@@ -16,6 +16,7 @@ import {
   type ProviderRequestId,
   type ProtectedInteractionJson,
 } from "../domain/interactions.ts";
+import { PUBLIC_MCP_FORM_SUMMARY } from "../public-provider-identifier.ts";
 import { CodexError } from "./errors.ts";
 import {
   array,
@@ -2358,7 +2359,7 @@ export function parseBrokeredCodexServerRequest(input: {
   if (mode === "openai/form") throw unsupportedMcpForm();
   assertMcpFormMetadataIsNonApproval(privateParams._meta);
   const fields = parseMcpFormFields(privateParams.requestedSchema);
-  const message = safeDisplayText(privateParams.message, "MCP elicitation message", 4_096);
+  string(privateParams.message, "MCP elicitation message", { max: 4 * 1024 * 1024 });
   const serverName = identifier(privateParams.serverName, "MCP server name");
   return {
     provider,
@@ -2367,7 +2368,7 @@ export function parseBrokeredCodexServerRequest(input: {
     timeoutMs,
     display: {
       kind: "mcp_elicitation",
-      summary: message,
+      summary: PUBLIC_MCP_FORM_SUMMARY,
       serverName,
       mode: "form",
       url: null,

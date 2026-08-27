@@ -234,7 +234,7 @@ describe("public content contract", () => {
       "Display loss, termination, and job-control signals restore or fence raw mode before propagation.",
       "updates from an old session generation are discarded before a new selection is announced.",
       "Slow-terminal backpressure drops additional updates behind one explicit omission notice",
-      "It renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary",
+      "Human watch renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary",
       "A mid-item join omits ambiguous delta suffixes until the next item starts.",
       "discard undecided tails with an explicit notice",
     ];
@@ -420,7 +420,7 @@ describe("public content contract", () => {
       "data.eventStream.cursor",
       "hra session start personal --preset high --json",
       "hra session status <session-id> --json",
-      "hra session events <session-id> --cursor <status-cursor> --wait-ms 30000 --jsonl",
+      "hra session watch <session-id> --cursor <status-cursor> --jsonl",
       "--follow",
       "equivalent compatibility spelling",
       "hra session interactions <session-id> --pending --json",
@@ -433,6 +433,53 @@ describe("public content contract", () => {
       expect(markdown).toContain(claim);
       expect(html).toContain(htmlText(claim));
     }
+  });
+
+  test("publishes bounded status and cursor-safe observation contracts", () => {
+    const markdown = renderReadmeMarkdown();
+    const html = renderSiteHtml();
+    const claims = [
+      "Bounded local status",
+      "hra status [--json]",
+      "bounded, effect-free read of local SQLite state",
+      "does not start, stop, or contact the daemon",
+      "at most 50 ID-and-revision action records",
+      "complete JSON result, including its versioned command envelope, is at most 256 KiB",
+      "Provider and cloud coverage are explicitly",
+      "not_attempted",
+      "registered and online device counts are unknown rather than zero",
+      "Session observation",
+      "returns status version 2",
+      "one typed provider-observation result, attempting a Codex app-server read only when the current local state makes one applicable",
+      "Execution, attention, provider, and queue remain separate axes",
+      "Pending and response-in-flight counts are exact",
+      "at most 10 bounded safe summaries",
+      "excludes the session note and private provider thread binding",
+      "becomes a secret-keyed opaque public alias before status, event, or interaction output",
+      "renders a bounded human stream by default",
+      "Watch is a presentation alias over the existing session event stream",
+      "drains each output page before advancing its internal cursor",
+      "Resolution guidance appears only from a complete current interaction record and only for a supported decision",
+      "event-only interaction notice points to the exact show command without proposing a mutation",
+      "JSONL delivery is at least once across a pipe or process failure",
+      "(sessionId, streamEpoch, sequence)",
+      "persist each checkpoint only after durably applying all preceding lines",
+      "remains an equivalent compatibility spelling",
+      "is unavailable until every wait predicate has a transactional wake revision",
+      "Use status followed by watch from its cursor, or bounded repeated status polling",
+    ];
+
+    for (const claim of claims) {
+      expect(markdown).toContain(claim);
+      expect(html).toContain(htmlText(claim));
+    }
+
+    const documentedCommands = publicContent.sections.flatMap((section) =>
+      section.blocks.flatMap((block) => block.kind === "commands" ? block.commands : []),
+    );
+    expect(documentedCommands).toContain("hra status [--json]");
+    expect(documentedCommands).toContain("hra session watch <session> [--cursor <cursor>] [--jsonl]");
+    expect(documentedCommands.some((command) => command.startsWith("hra session wait"))).toBe(false);
   });
 
   test("documents safe optional full local-data removal without a recursive command", () => {

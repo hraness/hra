@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { createProfileId, createSessionId } from "../domain/values";
+import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import {
   sanitizeInteractionDisplay,
   SessionEventStreamRedactor,
@@ -11,6 +12,18 @@ const accountId = createProfileId();
 const sessionId = createSessionId();
 const connectionId = "65000000-0000-4000-8000-000000000001";
 const privatePathRoot = ["", "Users", "private"].join("/");
+const providerIdentifierKey = Buffer.alloc(32, 0x51);
+const publicProviderId = (value: string): string =>
+  projectPublicProviderIdentifier(value, providerIdentifierKey);
+type RedactorOptions = NonNullable<
+  ConstructorParameters<typeof SessionEventStreamRedactor>[0]
+>;
+const createRedactor = (
+  options: Omit<RedactorOptions, "projectPublicProviderIdentifier"> = {},
+): SessionEventStreamRedactor => new SessionEventStreamRedactor({
+  ...options,
+  projectPublicProviderIdentifier: publicProviderId,
+});
 
 const write = (
   body: SessionEventWrite["body"],
@@ -53,13 +66,78 @@ const complete = (itemId: string): SessionEventWrite => write({
 const texts = (writes: readonly SessionEventWrite[], itemId: string): string =>
   writes.flatMap((entry) =>
     (entry.body.type === "assistant_delta" || entry.body.type === "reasoning_summary_delta")
-    && entry.body.itemId === itemId
+    && entry.body.itemId === publicProviderId(itemId)
       ? [entry.body.text]
       : []).join("");
 
 describe("SessionEventStreamRedactor", () => {
+  test("keeps raw provider identifiers private while preserving lifecycle equality", () => {
+    const redactor = createRedactor();
+    const rawTurnId = `${privatePathRoot}/api_key=TURN-SECRET-1234`;
+    const rawItemId = "i".repeat(201);
+    const started = redactor.accept(start(rawItemId, {}, rawTurnId));
+    expect(redactor.accept(write({
+      type: "assistant_delta",
+      turnId: rawTurnId,
+      itemId: rawItemId,
+      text: "safe progress",
+    }))).toEqual([]);
+    const completed = redactor.accept(write({
+      type: "item_completed",
+      turnId: rawTurnId,
+      itemId: rawItemId,
+      itemKind: "agentMessage",
+      status: "completed",
+    }));
+    const output = [...started, ...completed];
+    const publicIds = output.flatMap((entry) => {
+      const body = entry.body;
+      return "turnId" in body && "itemId" in body
+        ? [[body.turnId, body.itemId] as const]
+        : [];
+    });
+
+    expect(publicIds).toHaveLength(3);
+    expect(new Set(publicIds.map(([turnId]) => turnId)).size).toBe(1);
+    expect(new Set(publicIds.map(([, itemId]) => itemId)).size).toBe(1);
+    expect(publicIds[0]?.[0]).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    expect(publicIds[0]?.[1]).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    expect(texts(output, rawItemId)).toBe("safe progress");
+    expect(JSON.stringify(output)).not.toContain("TURN-SECRET-1234");
+    expect(JSON.stringify(output)).not.toContain(rawItemId);
+  });
+
+  test("projects provider identifiers on every complete public event shape", () => {
+    const redactor = createRedactor();
+    const privateId = `${privatePathRoot}/api_key=EVENT-SECRET-1234`;
+    const bodies: SessionEventWrite["body"][] = [
+      { type: "session_status", status: "active", activeTurnId: privateId },
+      { type: "turn_started", turnId: privateId },
+      { type: "turn_completed", turnId: privateId, status: "completed" },
+      { type: "tool_progress", turnId: privateId, itemId: privateId, toolKind: "command" },
+      { type: "file_change", turnId: privateId, itemId: privateId, status: "completed", paths: [], omittedPaths: 0 },
+      { type: "plan_updated", turnId: privateId, steps: [] },
+      { type: "diff_updated", turnId: privateId, changedFiles: 0, patchBytesObserved: 0 },
+      {
+        type: "token_usage",
+        turnId: privateId,
+        inputTokens: null,
+        cachedInputTokens: null,
+        outputTokens: null,
+        reasoningOutputTokens: null,
+        totalTokens: null,
+        modelContextWindow: null,
+      },
+    ];
+    const output = bodies.flatMap((body) => redactor.accept(write(body)));
+    expect(output).toHaveLength(bodies.length);
+    expect(JSON.stringify(output)).not.toContain("EVENT-SECRET-1234");
+    expect(JSON.stringify(output).match(/opaque_v2_[a-f0-9]{64}/gu)?.length)
+      .toBeGreaterThanOrEqual(bodies.length);
+  });
+
   test("sanitizes and UTF-8 bounds tool lifecycle identity without dropping it", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const started = redactor.accept(write({
       type: "item_started",
       turnId: "turn-tool",
@@ -102,7 +180,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("redacts split authorization, device-code, token, and key assignments before release", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const output: SessionEventWrite[] = [];
 
     for (const [itemId, chunks] of [
@@ -127,7 +205,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("keeps interleaved items and reasoning parts isolated and ordered", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const output: SessionEventWrite[] = [];
     redactor.accept(start("safe-a"));
     redactor.accept(start("secret-b"));
@@ -163,7 +241,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("keeps hostile reasoning-summary interleaving isolated by summary part", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const output: SessionEventWrite[] = [];
     redactor.accept(start("reasoning-hostile"));
     for (const [summaryPart, text] of [
@@ -187,7 +265,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("requires an exact item-start boundary and recovers without poisoning later items", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const unstarted = redactor.accept(assistant("unstarted", "must not enter durable custody"));
     expect(texts(unstarted, "unstarted")).toBe("[protected]");
     expect(JSON.stringify(unstarted)).not.toContain("must not enter");
@@ -208,7 +286,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("binds lifecycle custody to the exact provider connection and generation", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const otherAuthority = {
       providerConnectionId: "65000000-0000-4000-8000-000000000099",
       providerGeneration: 4,
@@ -243,7 +321,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("releases staged interleaved deltas and non-deltas in provider source order", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const output: SessionEventWrite[] = [];
     redactor.accept(start("safe-a"));
     redactor.accept(start("secret-b"));
@@ -264,19 +342,19 @@ describe("SessionEventStreamRedactor", () => {
       if (body.type === "item_completed") return `completed:${body.itemId}`;
       return body.type;
     })).toEqual([
-      "safe-a:alpha ",
-      "secret-b:[protected]",
+      `${publicProviderId("safe-a")}:alpha `,
+      `${publicProviderId("secret-b")}:[protected]`,
       "plan_updated",
-      "safe-a:continues",
-      "completed:secret-b",
-      "completed:safe-a",
+      `${publicProviderId("safe-a")}:continues`,
+      `completed:${publicProviderId("secret-b")}`,
+      `completed:${publicProviderId("safe-a")}`,
     ]);
     expect(JSON.stringify(output)).not.toContain("ORDER-SECRET-11");
   });
 
   test("scopes overflow quarantine to one session and recovers at trustworthy boundaries", () => {
     const otherSessionId = createSessionId();
-    const global = new SessionEventStreamRedactor({
+    const global = createRedactor({
       maximumActiveStreams: 1,
       maximumActiveStreamsPerSession: 1,
     });
@@ -313,7 +391,7 @@ describe("SessionEventStreamRedactor", () => {
     }, { sessionId: otherSessionId }));
     expect(texts(recovered, "other-recovered")).toBe("other safe after recovery");
 
-    const perSession = new SessionEventStreamRedactor({
+    const perSession = createRedactor({
       maximumActiveStreams: 2,
       maximumActiveStreamsPerSession: 1,
     });
@@ -330,7 +408,7 @@ describe("SessionEventStreamRedactor", () => {
     expect(texts(perSession.accept(complete("recovered")), "recovered"))
       .toBe("safe after item start");
 
-    const staged = new SessionEventStreamRedactor({
+    const staged = createRedactor({
       maximumActiveStreams: 2,
       maximumActiveStreamsPerSession: 2,
       maximumStagedNodes: 1,
@@ -341,7 +419,7 @@ describe("SessionEventStreamRedactor", () => {
     expect(JSON.stringify(exhausted)).not.toContain("fragment");
     expect(JSON.stringify(exhausted).match(/\[protected\]/gu)?.length).toBe(2);
 
-    const invalidBacklog = new SessionEventStreamRedactor({
+    const invalidBacklog = createRedactor({
       maximumActiveStreams: 2,
       maximumActiveStreamsPerSession: 2,
       maximumStagedNodes: 2,
@@ -358,7 +436,7 @@ describe("SessionEventStreamRedactor", () => {
   });
 
   test("replaces unresolved tails on disconnect and restart boundaries", () => {
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     redactor.accept(start("disconnect"));
     expect(redactor.accept(assistant("disconnect", "visible then api_"))).toEqual([]);
 
@@ -424,7 +502,7 @@ describe("SessionEventStreamRedactor", () => {
     expect(JSON.stringify(display)).toContain("[protected]");
     expect(JSON.stringify(display)).toContain("[local-path]");
 
-    const redactor = new SessionEventStreamRedactor();
+    const redactor = createRedactor();
     const plan = redactor.accept(write({
       type: "plan_updated",
       turnId: "turn-1",

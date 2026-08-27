@@ -2,6 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import type { CommandResponse, LocalCommand } from "../domain/contracts";
 import type { SessionEvent, SessionEventPage } from "../domain/session-events";
+import {
+  projectPublicProviderIdentifier,
+  projectPublicSessionEventBody,
+} from "../public-provider-identifier";
 import { ShellLiveObserver } from "./shell-live";
 
 const sessionOne = `sess_${"1".repeat(32)}`;
@@ -10,6 +14,13 @@ const account = `acct_${"a".repeat(32)}`;
 const streamEpoch = "90000000-0000-4000-8000-000000000001";
 const privateUserPath = ["", "Users", "person", "private"].join("/");
 const privateFolderPath = ["", "Users", "person", "Folder"].join("/");
+const publicProviderIdentifierKey = new Uint8Array(32).fill(17);
+const publicProviderIdentifier = (value: string) =>
+  projectPublicProviderIdentifier(value, publicProviderIdentifierKey);
+const cursorWireSignature = "A".repeat(43);
+const cursorWire = (labelOrWire: string): string => labelOrWire.startsWith("hra1.")
+  ? labelOrWire
+  : `hra1.${Buffer.from(`fixture:${labelOrWire}`).toString("base64url")}.${cursorWireSignature}`;
 
 const ok = (data: unknown): CommandResponse => ({
   data,
@@ -31,7 +42,10 @@ const event = (
   accountId: account,
   providerGeneration: 1,
   providerConnectionId: null,
-  body,
+  body: projectPublicSessionEventBody(
+    body,
+    publicProviderIdentifier,
+  ) as SessionEvent["body"],
 });
 
 const page = (
@@ -42,10 +56,10 @@ const page = (
 ): SessionEventPage => ({
   version: 1,
   sessionId,
-  requestedCursor,
-  retentionFloorCursor: "floor",
-  observedThroughCursor: nextCursor,
-  nextCursor,
+  requestedCursor: cursorWire(requestedCursor),
+  retentionFloorCursor: cursorWire("floor"),
+  observedThroughCursor: cursorWire(nextCursor),
+  nextCursor: cursorWire(nextCursor),
   gap: null,
   events: [...events],
 });
@@ -64,13 +78,74 @@ const status = (
     profileGeneration: 2,
     state: "live",
   },
-  eventStream: { cursor },
+  eventStream: { cursor: cursorWire(cursor) },
   pendingInteractions,
   pendingInteractionsNextCursor,
 });
 
-const pendingInteraction = (id: string): unknown => ({
+const statusV2 = (
+  sessionId: string,
+  cursor: string,
+  responseInFlightCount = 0,
+): unknown => ({
+  version: 2,
+  session: {
+    id: sessionId,
+    accountId: account,
+    projectId: null,
+    title: "Observed session",
+    execution: "active",
+    activeTurnId: publicProviderIdentifier("turn-live"),
+    revision: 3,
+    createdAt: 1_700_000_000_000,
+    updatedAt: 1_700_000_000_001,
+  },
+  advisory: {
+    execution: "active",
+    attention: responseInFlightCount > 0 ? "response_in_flight" : "none",
+    queueDepth: 0,
+  },
+  localObservation: {
+    source: "sqlite",
+    coverage: "complete",
+    freshness: "fresh",
+    observedAt: 1_700_000_000_001,
+  },
+  providerObservation: {
+    source: "codex_app_server",
+    basis: "provider_read",
+    state: "live",
+    coverage: "complete",
+    freshness: "fresh",
+    profileGeneration: 2,
+    observedAt: 1_700_000_000_001,
+    connectionId: "90000000-0000-4000-8000-000000000099",
+    mode: "resubscribed",
+  },
+  eventStream: {
+    streamEpoch,
+    floorSequence: 1,
+    observedThroughSequence: 0,
+    cursor: cursorWire(cursor),
+    retentionFloorCursor: cursorWire("floor"),
+  },
+  interactions: {
+    pendingCount: 0,
+    responseInFlightCount,
+    pending: [],
+    truncated: false,
+  },
+  queue: {
+    depth: 0,
+    dispatchingCount: 0,
+    ambiguousCount: 0,
+    failedCount: 0,
+  },
+});
+
+const pendingInteraction = (id: string, sessionId = sessionOne): unknown => ({
   id,
+  sessionId,
   kind: "command_approval",
   state: "pending",
   revision: 1,
@@ -104,6 +179,43 @@ const deferred = <T>(): Deferred<T> => {
 };
 
 describe("persistent shell live observation", () => {
+  test("fails closed instead of downgrading malformed or unknown status versions", async () => {
+    let rendered = "";
+    let daemonCalls = 0;
+    const observer = new ShellLiveObserver({
+      callDaemon: () => {
+        daemonCalls += 1;
+        return new Promise<CommandResponse>(() => undefined);
+      },
+      write: (value) => { rendered += value; },
+    });
+    const legacyFields = {
+      session: { id: sessionOne },
+      providerObservation: {
+        connectionId: "90000000-0000-4000-8000-000000000099",
+        mode: "resubscribed",
+        profileGeneration: 2,
+        state: "live",
+      },
+      eventStream: { cursor: cursorWire("c0") },
+      pendingInteractions: [],
+      pendingInteractionsNextCursor: null,
+    };
+
+    await observer.select({
+      session: sessionOne,
+      statusData: { version: 2, ...legacyFields },
+    });
+    await observer.select({
+      session: sessionOne,
+      statusData: { version: 99, ...legacyFields },
+    });
+    await observer.stop();
+
+    expect(rendered.match(/matching resumable event cursor/gu)).toHaveLength(2);
+    expect(daemonCalls).toBe(0);
+  });
+
   test("surfaces distinct consecutive lifecycle events with identical presentation", async () => {
     let rendered = "";
     let request = 0;
@@ -224,7 +336,10 @@ describe("persistent shell live observation", () => {
     expect(rendered).not.toContain("/private/raw");
     expect(rendered).not.toContain("99999");
     expect(rendered).not.toContain("{\"version\"");
-    expect(requestedCursors.slice(0, 2)).toEqual(["c0", "c1"]);
+    expect(requestedCursors.slice(0, 2)).toEqual([
+      cursorWire("c0"),
+      cursorWire("c1"),
+    ]);
   });
 
   test("keeps hostile reasoning-summary interleaving isolated by summary part", async () => {
@@ -298,6 +413,7 @@ describe("persistent shell live observation", () => {
       session: sessionOne,
       statusData: status(sessionOne, "c0", [{
         id: interactionId,
+        sessionId: sessionOne,
         kind: "user_input",
         state: "pending",
         revision: 3,
@@ -315,7 +431,8 @@ describe("persistent shell live observation", () => {
     expect(rendered).toContain("revision 3, blocking");
     expect(rendered).toContain("Choose a release channel");
     expect(rendered).toContain(`Show: /interaction show ${interactionId}`);
-    expect(rendered).toContain(`Resolve: /answer ${interactionId} --revision 3`);
+    expect(rendered).toContain("does not carry complete decision authority");
+    expect(rendered).not.toContain(`/answer ${interactionId} --revision 3`);
     expect(rendered).not.toContain("protected-answer-must-not-render");
   });
 
@@ -327,33 +444,147 @@ describe("persistent shell live observation", () => {
       write: (value) => { rendered += value; },
     });
     const interactions = [
-      ["70000000-0000-4000-8000-000000000011", "command_approval"],
-      ["70000000-0000-4000-8000-000000000012", "file_change_approval"],
-      ["70000000-0000-4000-8000-000000000013", "permission_approval"],
-      ["70000000-0000-4000-8000-000000000014", "mcp_elicitation"],
+      {
+        id: "70000000-0000-4000-8000-000000000011",
+        kind: "command_approval",
+        display: {
+          kind: "command_approval",
+          summary: "Run verification",
+          reason: null,
+          commandClass: "test",
+          workingDirectory: null,
+          availableDecisions: ["once", "decline"],
+        },
+      },
+      {
+        id: "70000000-0000-4000-8000-000000000012",
+        kind: "file_change_approval",
+        display: {
+          kind: "file_change_approval",
+          summary: "Apply reviewed changes",
+          reason: null,
+          grantRoot: null,
+          availableDecisions: ["decline", "cancel"],
+        },
+      },
+      {
+        id: "70000000-0000-4000-8000-000000000013",
+        kind: "permission_approval",
+        display: {
+          kind: "permission_approval",
+          summary: "Grant network access",
+          reason: null,
+          requested: [{ name: "network" }],
+          allowsSessionScope: false,
+        },
+      },
+      {
+        id: "70000000-0000-4000-8000-000000000014",
+        kind: "mcp_elicitation",
+        display: {
+          kind: "mcp_elicitation",
+          summary: "Complete a provider form",
+          serverName: "provider",
+          mode: "form",
+          url: null,
+          mayContainSecrets: true,
+          fields: [],
+        },
+      },
     ] as const;
     await observer.select({
       session: sessionOne,
-      statusData: status(sessionOne, "c0", interactions.map(([id, kind], index) => ({
-        id,
-        kind,
+      statusData: status(sessionOne, "c0", interactions.map((interaction, index) => ({
+        ...interaction,
+        sessionId: sessionOne,
         state: "pending",
         revision: index + 4,
         blocking: true,
-        display: { summary: `Resolve ${kind}` },
       }))),
     });
     await observer.stop();
 
-    for (const [id] of interactions) {
+    for (const { id } of interactions) {
       expect(rendered).toContain(`Show: /interaction show ${id}`);
     }
-    expect(rendered).toContain(`/inspect ${interactions[0][0]} --revision 4`);
-    expect(rendered).toContain(`/approve ${interactions[0][0]} --revision 4`);
-    expect(rendered).toContain(`Resolve safely: /decline ${interactions[1][0]} --revision 5`);
-    expect(rendered).toContain(`/inspect ${interactions[2][0]} --revision 6`);
-    expect(rendered).toContain(`/grant ${interactions[2][0]} --revision 6`);
-    expect(rendered).toContain(`/submit ${interactions[3][0]} --revision 7 --action accept`);
+    expect(rendered).toContain(`/inspect ${interactions[0].id} --revision 4`);
+    expect(rendered).toContain(`/approve ${interactions[0].id} --revision 4`);
+    expect(rendered).toContain(`/decline ${interactions[1].id} --revision 5`);
+    expect(rendered).toContain(`/interaction decide ${interactions[1].id} --revision 5 --decision cancel`);
+    expect(rendered).toContain(`/inspect ${interactions[2].id} --revision 6`);
+    expect(rendered).toContain(`/grant ${interactions[2].id} --revision 6`);
+    expect(rendered).toContain(`/submit ${interactions[3].id} --revision 7 --action accept`);
+  });
+
+  test("offers only decisions carried by complete current interaction displays", async () => {
+    let rendered = "";
+    const observer = new ShellLiveObserver({
+      callDaemon: () => new Promise<CommandResponse>(() => undefined),
+      write: (value) => { rendered += value; },
+    });
+    const commandId = "70000000-0000-4000-8000-000000000021";
+    const fileId = "70000000-0000-4000-8000-000000000022";
+    const permissionId = "70000000-0000-4000-8000-000000000023";
+    await observer.select({
+      session: sessionOne,
+      statusData: status(sessionOne, "c0", [
+        {
+          id: commandId,
+          sessionId: sessionOne,
+          kind: "command_approval",
+          state: "pending",
+          revision: 1,
+          blocking: true,
+          display: {
+            kind: "command_approval",
+            summary: "Reject only",
+            reason: null,
+            commandClass: "test",
+            workingDirectory: null,
+            availableDecisions: ["decline"],
+          },
+        },
+        {
+          id: fileId,
+          sessionId: sessionOne,
+          kind: "file_change_approval",
+          state: "pending",
+          revision: 2,
+          blocking: true,
+          display: {
+            kind: "file_change_approval",
+            summary: "Unsafe approval choices plus cancel",
+            reason: null,
+            grantRoot: null,
+            availableDecisions: ["once", "session", "cancel"],
+          },
+        },
+        {
+          id: permissionId,
+          sessionId: sessionOne,
+          kind: "permission_approval",
+          state: "pending",
+          revision: 3,
+          blocking: true,
+          display: {
+            kind: "permission_approval",
+            summary: "No grantable permissions",
+            reason: null,
+            requested: [],
+            allowsSessionScope: false,
+          },
+        },
+      ]),
+    });
+    await observer.stop();
+
+    expect(rendered).toContain(`/decline ${commandId} --revision 1`);
+    expect(rendered).not.toContain(`/approve ${commandId}`);
+    expect(rendered).toContain(`/interaction decide ${fileId} --revision 2 --decision cancel`);
+    expect(rendered).not.toContain(`/decline ${fileId}`);
+    expect(rendered).not.toContain(`/approve ${fileId}`);
+    expect(rendered).toContain(`/decline ${permissionId} --revision 3`);
+    expect(rendered).not.toContain(`/grant ${permissionId}`);
   });
 
   test("drains every pending interaction page before following from the status event cursor", async () => {
@@ -407,18 +638,18 @@ describe("persistent shell live observation", () => {
     expect(calls[1]).toMatchObject({
       kind: "session.events",
       session: sessionOne,
-      cursor: "status-event-cursor",
+      cursor: cursorWire("status-event-cursor"),
     });
   });
 
-  test("does not replay an older required prompt after draining its prepared revision", async () => {
+  test("does not replay an older required prompt after a v2 status drains its prepared revision", async () => {
     let rendered = "";
     const preparedId = "71100000-0000-4000-8000-000000000001";
-    const initial = Array.from({ length: 100 }, (_, index) =>
-      pendingInteraction(`71100000-0000-4000-8001-${String(index).padStart(12, "0")}`));
+    const calls: LocalCommand[] = [];
     let eventReads = 0;
     const observer = new ShellLiveObserver({
       callDaemon: (command) => {
+        calls.push(command);
         if (command.kind === "session.interactions") {
           return Promise.resolve(ok({
             sessionId: sessionOne,
@@ -460,13 +691,202 @@ describe("persistent shell live observation", () => {
     });
     await observer.select({
       session: sessionOne,
-      statusData: status(sessionOne, "status-event-cursor", initial, "prepared-page"),
+      statusData: statusV2(sessionOne, "status-event-cursor", 1),
     });
     await waitUntil(() => rendered.includes("Turn completed."));
     await observer.stop();
 
     expect(rendered).toContain(`Interaction in progress: command approval ${preparedId}`);
     expect(rendered).not.toContain(`Interaction required: command approval ${preparedId}`);
+    expect(calls[0]).toEqual({
+      kind: "session.interactions",
+      session: sessionOne,
+      pending: true,
+      limit: 100,
+    });
+  });
+
+  test("continues on the new epoch after an empty restored-stream gap page", async () => {
+    let rendered = "";
+    let eventReads = 0;
+    const restoredEpoch = "90000000-0000-4000-8000-000000000099";
+    const observer = new ShellLiveObserver({
+      callDaemon: (command) => {
+        if (command.kind !== "session.events") {
+          throw new Error("Legacy fixture should proceed directly to event follow.");
+        }
+        eventReads += 1;
+        if (eventReads === 1) {
+          return Promise.resolve(ok(page(sessionOne, "old-0", "old-1", [
+            event(sessionOne, 1, { type: "warning", code: "OLD", message: "old epoch" }),
+          ])));
+        }
+        if (eventReads === 2) {
+          return Promise.resolve(ok({
+            ...page(sessionOne, "old-1", "restored-0", []),
+            gap: { reason: "stream_restored", requestedSequence: 1, retainedFromSequence: 1 },
+          }));
+        }
+        if (eventReads === 3) {
+          return Promise.resolve(ok(page(sessionOne, "restored-0", "restored-1", [{
+            ...event(sessionOne, 1, {
+              type: "warning",
+              code: "RESTORED",
+              message: "new epoch accepted",
+            }),
+            streamEpoch: restoredEpoch,
+          }])));
+        }
+        return new Promise<CommandResponse>(() => undefined);
+      },
+      coalesceMs: 0,
+      write: (value) => { rendered += value; },
+    });
+
+    await observer.select({
+      session: sessionOne,
+      statusData: status(sessionOne, "old-0"),
+    });
+    await waitUntil(() => rendered.includes("new epoch accepted"));
+    await observer.stop();
+
+    expect(rendered).not.toContain("invalid event page");
+    expect(eventReads).toBeGreaterThanOrEqual(3);
+  });
+
+  test("rejects cross-page sequence and account discontinuities", async () => {
+    const otherAccount = `acct_${"b".repeat(32)}`;
+    for (const secondEvent of [
+      event(sessionOne, 3, { type: "warning", code: "SKIP", message: "skipped sequence" }),
+      {
+        ...event(sessionOne, 2, { type: "warning", code: "ACCOUNT", message: "foreign account" }),
+        accountId: otherAccount,
+      },
+    ]) {
+      let rendered = "";
+      let eventReads = 0;
+      const observer = new ShellLiveObserver({
+        callDaemon: (command) => {
+          if (command.kind !== "session.events") throw new Error("Expected event follow.");
+          eventReads += 1;
+          if (eventReads === 1) {
+            return Promise.resolve(ok(page(sessionOne, "c0", "c1", [
+              event(sessionOne, 1, { type: "warning", code: "FIRST", message: "first event" }),
+            ])));
+          }
+          if (eventReads === 2) {
+            return Promise.resolve(ok(page(sessionOne, "c1", "c2", [secondEvent])));
+          }
+          return new Promise<CommandResponse>(() => undefined);
+        },
+        coalesceMs: 0,
+        write: (value) => { rendered += value; },
+      });
+
+      await observer.select({ session: sessionOne, statusData: status(sessionOne, "c0") });
+      await waitUntil(() => rendered.includes("invalid event page"));
+      await observer.stop();
+
+      expect(eventReads).toBe(2);
+      expect(rendered).not.toContain(secondEvent.body.type === "warning"
+        ? secondEvent.body.message
+        : "unreachable");
+    }
+  });
+
+  test("rejects the old epoch after an empty restored-stream gap page", async () => {
+    let rendered = "";
+    let eventReads = 0;
+    const observer = new ShellLiveObserver({
+      callDaemon: (command) => {
+        if (command.kind !== "session.events") throw new Error("Expected event follow.");
+        eventReads += 1;
+        if (eventReads === 1) {
+          return Promise.resolve(ok(page(sessionOne, "old-0", "old-1", [
+            event(sessionOne, 1, { type: "warning", code: "OLD", message: "old epoch" }),
+          ])));
+        }
+        if (eventReads === 2) {
+          return Promise.resolve(ok({
+            ...page(sessionOne, "old-1", "restored-0", []),
+            gap: { reason: "stream_restored", requestedSequence: 1, retainedFromSequence: 1 },
+          }));
+        }
+        if (eventReads === 3) {
+          return Promise.resolve(ok(page(sessionOne, "restored-0", "restored-1", [
+            event(sessionOne, 1, { type: "warning", code: "STALE", message: "stale epoch reused" }),
+          ])));
+        }
+        return new Promise<CommandResponse>(() => undefined);
+      },
+      coalesceMs: 0,
+      write: (value) => { rendered += value; },
+    });
+
+    await observer.select({ session: sessionOne, statusData: status(sessionOne, "old-0") });
+    await waitUntil(() => rendered.includes("invalid event page"));
+    await observer.stop();
+
+    expect(eventReads).toBe(3);
+    expect(rendered).not.toContain("stale epoch reused");
+  });
+
+  test("rejects an empty no-gap page that advances its checkpoint", async () => {
+    let rendered = "";
+    let eventReads = 0;
+    const observer = new ShellLiveObserver({
+      callDaemon: (command) => {
+        if (command.kind !== "session.events") throw new Error("Expected event follow.");
+        eventReads += 1;
+        return Promise.resolve(ok(page(sessionOne, "c0", "c1", [])));
+      },
+      write: (value) => { rendered += value; },
+    });
+
+    await observer.select({ session: sessionOne, statusData: status(sessionOne, "c0") });
+    await waitUntil(() => rendered.includes("invalid event page"));
+    await observer.stop();
+
+    expect(eventReads).toBe(1);
+  });
+
+  test("rejects a restored page containing more than one stream epoch", async () => {
+    let rendered = "";
+    let eventReads = 0;
+    const restoredEpoch = "90000000-0000-4000-8000-000000000098";
+    const foreignEpoch = "90000000-0000-4000-8000-000000000097";
+    const observer = new ShellLiveObserver({
+      callDaemon: (command) => {
+        if (command.kind !== "session.events") throw new Error("Expected event follow.");
+        eventReads += 1;
+        return Promise.resolve(ok({
+          ...page(sessionOne, command.cursor ?? "", "restored-1", [
+            {
+              ...event(sessionOne, 1, { type: "warning", code: "ONE", message: "first epoch" }),
+              streamEpoch: restoredEpoch,
+            },
+            {
+              ...event(sessionOne, 2, { type: "warning", code: "TWO", message: "foreign epoch" }),
+              streamEpoch: foreignEpoch,
+            },
+          ]),
+          gap: { reason: "stream_restored", requestedSequence: 1, retainedFromSequence: 1 },
+        }));
+      },
+      coalesceMs: 0,
+      write: (value) => { rendered += value; },
+    });
+
+    await observer.select({
+      session: sessionOne,
+      statusData: status(sessionOne, "old-0"),
+    });
+    await waitUntil(() => rendered.includes("invalid event page"));
+    await observer.stop();
+
+    expect(eventReads).toBe(1);
+    expect(rendered).not.toContain("first epoch");
+    expect(rendered).not.toContain("foreign epoch");
   });
 
   test("fails closed on duplicate or nonadvancing pending interaction pages", async () => {
@@ -624,8 +1044,14 @@ describe("persistent shell live observation", () => {
 
     expect(rendered).toContain("new selection update");
     expect(rendered).not.toContain("old selection must stay silent");
-    expect(requests[0]?.command).toMatchObject({ session: sessionOne, cursor: "one-0" });
-    expect(requests[1]?.command).toMatchObject({ session: sessionTwo, cursor: "two-0" });
+    expect(requests[0]?.command).toMatchObject({
+      session: sessionOne,
+      cursor: cursorWire("one-0"),
+    });
+    expect(requests[1]?.command).toMatchObject({
+      session: sessionTwo,
+      cursor: cursorWire("two-0"),
+    });
   });
 
   test("omits mid-item delta suffixes until an observed item-start boundary", async () => {

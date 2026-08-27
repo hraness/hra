@@ -8,6 +8,7 @@ import {
   admitExactDaemonStop,
   daemonRunProcessArguments,
   daemonRunProcessOptions,
+  HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES,
   initialize,
   main,
   protectedTerminalControlLibrariesForPlatform,
@@ -39,6 +40,7 @@ import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
   type ProtectedInteractionDetailDocument,
 } from "./domain/interactions";
+import type { RootStatus } from "./domain/observation";
 import { renderProtectedInteractionDetail } from "./cli/render";
 import {
   DAEMON_PROTOCOL,
@@ -65,6 +67,59 @@ const capture = () => {
     read: () => ({ stdout, stderr }),
   };
 };
+
+const cursorWireSignature = "A".repeat(43);
+const cursorWire = (label: string): string =>
+  `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
+
+const emptyRootStatus = (): RootStatus => ({
+  version: 1,
+  scope: "local_only",
+  localObservation: {
+    source: "sqlite",
+    coverage: "complete",
+    freshness: "fresh",
+    observedAt: 1,
+    tables: [
+      "profiles",
+      "sessions",
+      "provider_interactions",
+      "queue_entries",
+      "usage_snapshots",
+      "usage_poll_failures",
+    ],
+  },
+  providerObservation: {
+    source: "codex_app_server",
+    coverage: "not_attempted",
+    freshness: "unknown",
+    observedAt: null,
+  },
+  cloudObservation: {
+    source: "convex",
+    coverage: "not_attempted",
+    freshness: "unknown",
+    observedAt: null,
+    devices: { registered: null, online: null },
+  },
+  counts: {
+    accounts: { signedOut: 0, loginPending: 0, signedIn: 0, recoveryRequired: 0 },
+    sessions: { starting: 0, active: 0, idle: 0, terminal: 0, recoveryRequired: 0 },
+    interactions: {
+      pending: 0,
+      responsePrepared: 0,
+      responseWritten: 0,
+      resolved: 0,
+      declined: 0,
+      canceled: 0,
+      expired: 0,
+      resolutionUnknown: 0,
+    },
+    queue: { pending: 0, dispatching: 0, applied: 0, failed: 0, ambiguous: 0, cancelled: 0 },
+    usage: { observed: 0, failed: 0, missing: 0 },
+  },
+  attention: { records: [], total: 0, truncated: false },
+});
 
 const rawTerminalInput = (): PassThrough & {
   isRaw: boolean;
@@ -204,6 +259,558 @@ const exactStopDependencies = (
 });
 
 describe("CLI entry point", () => {
+  test("reads root status locally without daemon autostart or transport", async () => {
+    const captured = capture();
+    let daemonCalls = 0;
+    let daemonStarts = 0;
+    let localReads = 0;
+    expect(await main(["status", "--json"], captured.output, {
+      callDaemon: async () => {
+        daemonCalls += 1;
+        throw new Error("root status must not call the daemon");
+      },
+      startDaemon: async () => {
+        daemonStarts += 1;
+        return readyDaemonStatus();
+      },
+      readRootStatus: () => {
+        localReads += 1;
+        return emptyRootStatus();
+      },
+    })).toBe(0);
+    expect({ daemonCalls, daemonStarts, localReads }).toEqual({
+      daemonCalls: 0,
+      daemonStarts: 0,
+      localReads: 1,
+    });
+    expect(JSON.parse(captured.read().stdout)).toMatchObject({
+      ok: true,
+      version: 1,
+      command: "status",
+      data: {
+        scope: "local_only",
+        providerObservation: { coverage: "not_attempted" },
+        cloudObservation: { coverage: "not_attempted" },
+      },
+    });
+    expect(captured.read().stderr).toBe("");
+  });
+
+  test("diagnoses corrupt local status state without describing daemon startup", async () => {
+    const runId = "018f1f55-3f10-7c1a-8f7b-c6dc608bcd4d";
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), `hra-live-acceptance-${runId}-`)));
+    const installation = createAcceptanceInstallation({
+      device: "a",
+      documentsDirectory: join(runRoot, "project-a-corrupt"),
+      expectedHomeDirectory: process.env.HOME ?? "/missing-home",
+      rootDirectory: join(runRoot, "device-a-corrupt"),
+      runId,
+      type: "hra-live-acceptance-device",
+      version: 1,
+    });
+    try {
+      await initializeStatePaths(installation.paths);
+      await writeFile(installation.paths.database, "not a sqlite database", { mode: 0o600 });
+      const captured = capture();
+      expect(await main(["status", "--json"], captured.output, {
+        installation,
+        startDaemon: () => { throw new Error("Local status must not start the daemon."); },
+        callDaemon: () => { throw new Error("Local status must not call the daemon."); },
+      })).toBe(7);
+      const rendered = JSON.parse(captured.read().stdout) as {
+        error: { message: string };
+      };
+      expect(rendered.error.message).toContain("before reading local status");
+      expect(rendered.error.message).not.toContain("starting the daemon");
+      expect(captured.read().stderr).toBe("");
+    } finally {
+      await rm(runRoot, { force: true, recursive: true });
+    }
+  });
+
+  test("human watch seeds current interaction revisions and treats closed stdout as completion", async () => {
+    const sessionId = `sess_${"2".repeat(32)}`;
+    const accountId = `acct_${"1".repeat(32)}`;
+    const interactionId = "10300000-0000-4000-8000-000000000001";
+    const pendingInteractionId = "10300000-0000-4000-8000-000000000003";
+    const streamEpoch = "10300000-0000-4000-8000-000000000002";
+    const turnId = `opaque_v2_${"c".repeat(64)}`;
+    const itemId = `opaque_v2_${"d".repeat(64)}`;
+    const calls: LocalCommand[] = [];
+    let stdout = "";
+    let stderr = "";
+    let stdoutWrites = 0;
+    const exitCode = await main([
+      "session",
+      "watch",
+      "current",
+      "--cursor",
+      cursorWire("status-cursor"),
+    ], {
+      writeStdout: (value) => {
+        stdout += value;
+        stdoutWrites += 1;
+        if (stdoutWrites > 1) {
+          throw Object.assign(new Error("stdout closed"), { code: "EPIPE" });
+        }
+      },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        calls.push(command);
+        if (command.kind === "session.interactions") {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              sessionId,
+              interactions: [
+                {
+                  id: interactionId,
+                  sessionId,
+                  kind: "command_approval",
+                  state: "response_prepared",
+                  revision: 2,
+                  blocking: true,
+                  display: { summary: "Prepared response" },
+                },
+                {
+                  id: pendingInteractionId,
+                  sessionId,
+                  kind: "user_input",
+                  state: "pending",
+                  revision: 4,
+                  blocking: true,
+                  display: { summary: "Choose a release channel" },
+                },
+              ],
+              nextCursor: null,
+            },
+          });
+        }
+        if (command.kind !== "session.events") {
+          throw new Error(`Unexpected watch command: ${command.kind}`);
+        }
+        const base = {
+          version: 1 as const,
+          sessionId,
+          streamEpoch,
+          recordedAt: 1_700_000_000_000,
+          accountId,
+          providerGeneration: 1,
+          providerConnectionId: null,
+        };
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            version: 1,
+            sessionId,
+            requestedCursor: cursorWire("status-cursor"),
+            retentionFloorCursor: cursorWire("floor"),
+            observedThroughCursor: cursorWire("next-cursor"),
+            nextCursor: cursorWire("next-cursor"),
+            gap: null,
+            events: [
+              {
+                ...base,
+                sequence: 1,
+                body: {
+                  type: "interaction_requested" as const,
+                  interactionId,
+                  interactionKind: "command_approval" as const,
+                  revision: 1,
+                  blocking: true,
+                  summary: "Stale request",
+                },
+              },
+              {
+                ...base,
+                sequence: 2,
+                body: {
+                  type: "item_started" as const,
+                  turnId,
+                  itemId,
+                  itemKind: "assistant" as const,
+                },
+              },
+              {
+                ...base,
+                sequence: 3,
+                body: {
+                  type: "assistant_delta" as const,
+                  turnId,
+                  itemId,
+                  text: "partial output",
+                },
+              },
+            ],
+          },
+        });
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(calls.map((command) => command.kind)).toEqual([
+      "session.interactions",
+      "session.events",
+    ]);
+    expect(calls[1]).toMatchObject({
+      session: sessionId,
+      cursor: cursorWire("status-cursor"),
+    });
+    expect(stdout).toContain(`Interaction in progress: command approval ${interactionId}`);
+    expect(stdout).not.toContain(`Interaction required: command approval ${interactionId}`);
+    expect(stdout).toContain(`Show: hra interaction show ${pendingInteractionId}`);
+    expect(stdout).toContain("does not carry complete decision authority");
+    expect(stdout).not.toContain(
+      `hra interaction answer ${pendingInteractionId} --revision 4 --input-stdin`,
+    );
+    expect(stdout).not.toMatch(/\n\s*\//u);
+    expect(stdout).toContain("Trailing live delta text omitted");
+    expect(stderr).toBe("");
+  });
+
+  test("human watch removes signal listeners before a final output failure escapes", async () => {
+    const sessionId = `sess_${"4".repeat(32)}`;
+    const accountId = `acct_${"5".repeat(32)}`;
+    const interactionId = "10400000-0000-4000-8000-000000000001";
+    const streamEpoch = "10400000-0000-4000-8000-000000000002";
+    const turnId = `opaque_v2_${"e".repeat(64)}`;
+    const itemId = `opaque_v2_${"f".repeat(64)}`;
+    const listenerCounts = {
+      sigint: process.listenerCount("SIGINT"),
+      sigterm: process.listenerCount("SIGTERM"),
+    };
+    let eventReads = 0;
+    let stdoutWrites = 0;
+    let stderr = "";
+    const exitCode = await main([
+      "session",
+      "watch",
+      sessionId,
+      "--cursor",
+      cursorWire("status-cursor"),
+    ], {
+      writeStdout: () => { throw new Error("Human watch must use the async output boundary."); },
+      writeStdoutAsync: (value) => {
+        stdoutWrites += 1;
+        if (stdoutWrites <= 2 && (stdoutWrites > 1 || value.includes("Interaction in progress"))) {
+          return Promise.resolve();
+        }
+        return Promise.reject(new Error("final output failed"));
+      },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        if (command.kind === "session.interactions") {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              sessionId,
+              interactions: [{
+                id: interactionId,
+                sessionId,
+                kind: "command_approval",
+                state: "response_prepared",
+                revision: 2,
+                blocking: true,
+                display: { summary: "Prepared response" },
+              }],
+              nextCursor: null,
+            },
+          });
+        }
+        if (command.kind !== "session.events") throw new Error("Expected session events.");
+        eventReads += 1;
+        if (eventReads > 1) {
+          return Promise.resolve({
+            ok: false,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            error: { code: "INVALID_INPUT", message: "Stop the fixture." },
+          });
+        }
+        const base = {
+          version: 1 as const,
+          sessionId,
+          streamEpoch,
+          recordedAt: 1_700_000_000_000,
+          accountId,
+          providerGeneration: 1,
+          providerConnectionId: null,
+        };
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            version: 1,
+            sessionId,
+            requestedCursor: command.cursor ?? null,
+            retentionFloorCursor: cursorWire("floor"),
+            observedThroughCursor: cursorWire("next-cursor"),
+            nextCursor: cursorWire("next-cursor"),
+            gap: null,
+            events: [
+              {
+                ...base,
+                sequence: 1,
+                body: {
+                  type: "item_started" as const,
+                  turnId,
+                  itemId,
+                  itemKind: "assistant" as const,
+                },
+              },
+              {
+                ...base,
+                sequence: 2,
+                body: {
+                  type: "assistant_delta" as const,
+                  turnId,
+                  itemId,
+                  text: "api_key=",
+                },
+              },
+            ],
+          },
+        });
+      },
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(stdoutWrites).toBe(3);
+    expect(stderr).not.toBe("");
+    expect(process.listenerCount("SIGINT")).toBe(listenerCounts.sigint);
+    expect(process.listenerCount("SIGTERM")).toBe(listenerCounts.sigterm);
+  });
+
+  test("human watch withholds partial interaction guidance when bootstrap fails", async () => {
+    const sessionId = `sess_${"6".repeat(32)}`;
+    const interactionId = "10500000-0000-4000-8000-000000000001";
+    let stdout = "";
+    let stderr = "";
+    let interactionPages = 0;
+    let eventCalls = 0;
+    const exitCode = await main([
+      "session",
+      "watch",
+      sessionId,
+      "--cursor",
+      cursorWire("status-cursor"),
+    ], {
+      writeStdout: (value) => { stdout += value; },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        if (command.kind === "session.events") {
+          eventCalls += 1;
+          throw new Error("Event follow must not begin after an incomplete bootstrap.");
+        }
+        if (command.kind !== "session.interactions") {
+          throw new Error("Expected interaction bootstrap.");
+        }
+        interactionPages += 1;
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            sessionId,
+            interactions: [{
+              id: interactionId,
+              sessionId,
+              kind: "command_approval",
+              state: "pending",
+              revision: 1,
+              blocking: true,
+              display: { summary: "Must remain withheld" },
+            }],
+            nextCursor: interactionPages === 1 ? "page-2" : null,
+          },
+        });
+      },
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(interactionPages).toBe(2);
+    expect(eventCalls).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).not.toBe("");
+    expect(stderr).not.toContain(interactionId);
+    expect(stderr).not.toContain("Must remain withheld");
+  });
+
+  test("human watch bounds its atomic interaction bootstrap before writing stdout", async () => {
+    const sessionId = `sess_${"b".repeat(32)}`;
+    let bootstrapObserved = false;
+    let eventCalls = 0;
+    let interactionPages = 0;
+    let stdout = "";
+    let stderr = "";
+    const interactionsPerPage = 100;
+    const maximumFixturePages = 10;
+
+    const exitCode = await main([
+      "session",
+      "watch",
+      sessionId,
+      "--cursor",
+      cursorWire("bounded-bootstrap-status"),
+    ], {
+      writeStdout: (value) => { stdout += value; },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        if (command.kind === "session.events") {
+          eventCalls += 1;
+          throw new Error("Event follow must not begin after bootstrap output exceeds its bound.");
+        }
+        if (command.kind !== "session.interactions") {
+          throw new Error("Expected a bounded interaction bootstrap.");
+        }
+        const pageIndex = interactionPages;
+        interactionPages += 1;
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            sessionId,
+            interactions: Array.from({ length: interactionsPerPage }, (_, index) => ({
+              id: `10700000-0000-4000-8000-${String(
+                pageIndex * interactionsPerPage + index + 1,
+              ).padStart(12, "0")}`,
+              sessionId,
+              kind: "user_input",
+              state: "pending",
+              revision: 1,
+              blocking: true,
+              display: { summary: "x".repeat(2_048) },
+            })),
+            nextCursor: interactionPages < maximumFixturePages
+              ? `bootstrap-page-${String(interactionPages + 1)}`
+              : null,
+          },
+        });
+      },
+      onHumanSessionObserverBootstrap: () => { bootstrapObserved = true; },
+    });
+
+    expect(HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES).toBe(1_048_576);
+    expect(exitCode).not.toBe(0);
+    expect(interactionPages).toBeGreaterThan(1);
+    expect(interactionPages).toBeLessThan(maximumFixturePages);
+    expect(eventCalls).toBe(0);
+    expect(bootstrapObserved).toBe(false);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("Pending interaction guidance exceeds the bounded human watch bootstrap");
+    expect(stderr).not.toContain("10700000-0000-4000-8000-");
+  });
+
+  test("human watch rejects a foreign bootstrap page for an exact session ID", async () => {
+    const requestedSessionId = `sess_${"7".repeat(32)}`;
+    const foreignSessionId = `sess_${"8".repeat(32)}`;
+    let stdout = "";
+    let stderr = "";
+    let eventCalls = 0;
+    const exitCode = await main([
+      "session",
+      "watch",
+      requestedSessionId,
+      "--cursor",
+      cursorWire("status-cursor"),
+    ], {
+      writeStdout: (value) => { stdout += value; },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        if (command.kind === "session.events") {
+          eventCalls += 1;
+          throw new Error("Foreign bootstrap must prevent event follow.");
+        }
+        if (command.kind !== "session.interactions") {
+          throw new Error("Expected interaction bootstrap.");
+        }
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            sessionId: foreignSessionId,
+            interactions: [],
+            nextCursor: null,
+          },
+        });
+      },
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(eventCalls).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).not.toBe("");
+    expect(stderr).not.toContain(foreignSessionId);
+  });
+
+  test("human watch rejects a foreign interaction nested in a correctly scoped bootstrap page", async () => {
+    const requestedSessionId = `sess_${"9".repeat(32)}`;
+    const foreignSessionId = `sess_${"a".repeat(32)}`;
+    const foreignInteractionId = "10600000-0000-4000-8000-000000000001";
+    let stdout = "";
+    let stderr = "";
+    let eventCalls = 0;
+    const exitCode = await main([
+      "session",
+      "watch",
+      requestedSessionId,
+      "--cursor",
+      cursorWire("status-cursor"),
+    ], {
+      writeStdout: (value) => { stdout += value; },
+      writeStderr: (value) => { stderr += value; },
+    }, {
+      callDaemon: (command) => {
+        if (command.kind === "session.events") {
+          eventCalls += 1;
+          throw new Error("Foreign nested interaction must prevent event follow.");
+        }
+        if (command.kind !== "session.interactions") {
+          throw new Error("Expected interaction bootstrap.");
+        }
+        return Promise.resolve({
+          ok: true,
+          version: 1,
+          requestId: crypto.randomUUID(),
+          data: {
+            sessionId: requestedSessionId,
+            interactions: [{
+              id: foreignInteractionId,
+              sessionId: foreignSessionId,
+              kind: "command_approval",
+              state: "pending",
+              revision: 1,
+              blocking: true,
+              display: { summary: "Foreign interaction" },
+            }],
+            nextCursor: null,
+          },
+        });
+      },
+    });
+
+    expect(exitCode).not.toBe(0);
+    expect(eventCalls).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).not.toBe("");
+    expect(stderr).not.toContain(foreignSessionId);
+    expect(stderr).not.toContain(foreignInteractionId);
+  });
+
   test("uses each supported platform's native terminal input queue selector", () => {
     expect(protectedTerminalInputQueueForPlatform("darwin")).toBe(1);
     expect(protectedTerminalInputQueueForPlatform("linux")).toBe(0);
@@ -2424,6 +3031,7 @@ describe("CLI entry point", () => {
             version: 1,
             requestId: crypto.randomUUID(),
             data: {
+              version: 1,
               session: {
                 id: "sess_22222222222222222222222222222222",
                 profileId: "acct_11111111111111111111111111111111",
@@ -2474,9 +3082,10 @@ describe("CLI entry point", () => {
             version: 1,
             requestId: crypto.randomUUID(),
             data: {
+              version: 99,
               session: {
                 id: `sess_${"2".repeat(32)}`,
-                profileId: `acct_${"x".repeat(4_096)}`,
+                profileId: `acct_${"2".repeat(32)}`,
               },
             },
           });
@@ -2486,8 +3095,61 @@ describe("CLI entry point", () => {
     })).toBe(0);
     expect(prompts).toEqual(["hra> ", "hra> ", "hra> "]);
     expect(captured.read().stderr).toContain("Selected account response is invalid.");
-    expect(captured.read().stderr).toContain("Selected session account response is invalid.");
+    expect(captured.read().stderr).toContain("Selected session response is invalid.");
     expect(captured.read().stderr).not.toContain("x".repeat(128));
+  });
+
+  test("binds exact persistent-shell selectors to the exact returned identity", async () => {
+    const captured = capture();
+    const prompts: string[] = [];
+    const requestedAccount = `acct_${"1".repeat(32)}`;
+    const foreignAccount = `acct_${"2".repeat(32)}`;
+    const requestedSession = `sess_${"3".repeat(32)}`;
+    const foreignSession = `sess_${"4".repeat(32)}`;
+    const lines = [
+      `/account ${requestedAccount}`,
+      `/session ${requestedSession}`,
+      "/exit",
+    ];
+    expect(await main([], captured.output, {
+      interactive: true,
+      readShellLine: (prompt) => {
+        prompts.push(prompt);
+        return Promise.resolve(lines.shift() ?? null);
+      },
+      callDaemon: (command) => {
+        if (command.kind === "daemon.status") return Promise.resolve(runningDaemonResponse());
+        if (command.kind === "account.show") {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: { account: { id: foreignAccount } },
+          });
+        }
+        if (command.kind === "session.status") {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              version: 1,
+              session: { id: foreignSession, profileId: foreignAccount },
+            },
+          });
+        }
+        throw new Error(`Unexpected shell selection command: ${command.kind}`);
+      },
+    })).toBe(0);
+    expect(prompts).toEqual(["hra> ", "hra> ", "hra> "]);
+    expect(captured.read().stderr).toContain(
+      "Selected account response does not match the exact requested account.",
+    );
+    expect(captured.read().stderr).toContain(
+      "Selected session response does not match the exact requested session.",
+    );
+    expect(captured.read().stderr).not.toContain("Selected account acct_");
+    expect(captured.read().stderr).not.toContain("Selected session sess_");
   });
 
   test("rejects a selected session without its authoritative account identity", async () => {
@@ -2515,7 +3177,7 @@ describe("CLI entry point", () => {
             ok: true,
             version: 1,
             requestId: crypto.randomUUID(),
-            data: { session: { id: "sess_22222222222222222222222222222222" } },
+            data: { version: 1, session: { id: "sess_22222222222222222222222222222222" } },
           });
         }
         throw new Error(`Unexpected shell selection command: ${command.kind}`);
@@ -2569,6 +3231,8 @@ describe("CLI entry point", () => {
     const sessionId = `sess_${"2".repeat(32)}`;
     const accountId = `acct_${"1".repeat(32)}`;
     const streamEpoch = "90000000-0000-4000-8000-000000000011";
+    const turnId = `opaque_v2_${"1".repeat(64)}`;
+    const itemId = `opaque_v2_${"2".repeat(64)}`;
     let releaseExit: (line: string | null) => void = () => undefined;
     const exitLine = new Promise<string | null>((resolve) => { releaseExit = resolve; });
     let readCount = 0;
@@ -2589,24 +3253,87 @@ describe("CLI entry point", () => {
             version: 1,
             requestId: crypto.randomUUID(),
             data: {
-              version: 1,
-              session: { id: sessionId, profileId: accountId },
+              version: 2,
+              session: {
+                id: sessionId,
+                accountId,
+                projectId: null,
+                title: "Current session",
+                execution: "active",
+                activeTurnId: turnId,
+                revision: 4,
+                createdAt: 1_700_000_000_000,
+                updatedAt: 1_700_000_000_001,
+              },
+              advisory: {
+                execution: "active",
+                attention: "human_action_required",
+                queueDepth: 0,
+              },
+              localObservation: {
+                source: "sqlite",
+                coverage: "complete",
+                freshness: "fresh",
+                observedAt: 1_700_000_000_001,
+              },
               providerObservation: {
+                source: "codex_app_server",
+                basis: "provider_read",
+                coverage: "complete",
+                freshness: "fresh",
+                observedAt: 1_700_000_000_001,
                 connectionId: "90000000-0000-4000-8000-000000000099",
                 mode: "resubscribed",
                 profileGeneration: 1,
                 state: "live",
               },
-              eventStream: { cursor: "head-0" },
-              pendingInteractionsNextCursor: null,
-              pendingInteractions: [{
+              eventStream: {
+                streamEpoch,
+                floorSequence: 1,
+                observedThroughSequence: 0,
+                cursor: cursorWire("head-0"),
+                retentionFloorCursor: cursorWire("floor"),
+              },
+              interactions: {
+                pendingCount: 1,
+                responseInFlightCount: 0,
+                pending: [{
+                  id: "70000000-0000-4000-8000-000000000011",
+                  kind: "command_approval",
+                  revision: 2,
+                  blocking: true,
+                  summary: "Run the release verification",
+                  requestedAt: 1_700_000_000_000,
+                  deadlineAt: 1_700_000_030_000,
+                }],
+                truncated: false,
+              },
+              queue: {
+                depth: 0,
+                dispatchingCount: 0,
+                ambiguousCount: 0,
+                failedCount: 0,
+              },
+            },
+          });
+        }
+        if (command.kind === "session.interactions") {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              sessionId,
+              interactions: [{
                 id: "70000000-0000-4000-8000-000000000011",
+                sessionId,
                 kind: "command_approval",
                 state: "pending",
                 revision: 2,
                 blocking: true,
                 display: { summary: "Run the release verification" },
               }],
+              nextCursor: null,
             },
           });
         }
@@ -2629,16 +3356,16 @@ describe("CLI entry point", () => {
             data: {
               version: 1,
               sessionId,
-              requestedCursor: "head-0",
-              retentionFloorCursor: "floor",
-              observedThroughCursor: "head-4",
-              nextCursor: "head-4",
+              requestedCursor: cursorWire("head-0"),
+              retentionFloorCursor: cursorWire("floor"),
+              observedThroughCursor: cursorWire("head-4"),
+              nextCursor: cursorWire("head-4"),
               gap: null,
               events: [
-                { ...base, sequence: 1, body: { type: "item_started" as const, turnId: "turn-1", itemId: "assistant-1", itemKind: "assistant" } },
-                { ...base, sequence: 2, body: { type: "assistant_delta" as const, turnId: "turn-1", itemId: "assistant-1", text: "release " } },
-                { ...base, sequence: 3, body: { type: "assistant_delta" as const, turnId: "turn-1", itemId: "assistant-1", text: "is ready" } },
-                { ...base, sequence: 4, body: { type: "turn_completed" as const, turnId: "turn-1", status: "completed" as const } },
+                { ...base, sequence: 1, body: { type: "item_started" as const, turnId, itemId, itemKind: "assistant" } },
+                { ...base, sequence: 2, body: { type: "assistant_delta" as const, turnId, itemId, text: "release " } },
+                { ...base, sequence: 3, body: { type: "assistant_delta" as const, turnId, itemId, text: "is ready" } },
+                { ...base, sequence: 4, body: { type: "turn_completed" as const, turnId, status: "completed" as const } },
               ],
             },
           });
@@ -2662,6 +3389,302 @@ describe("CLI entry point", () => {
     expect(await Promise.race([shell.then(() => "exited" as const), timeout])).toBe("exited");
     expect(await shell).toBe(0);
     expect(commands.some((command) => command.kind === "daemon.stop")).toBe(false);
+  });
+
+  test("gives foreground watch exclusive observer output and resumes from a fresh status cut", async () => {
+    const captured = capture();
+    const sessionId = `sess_${"2".repeat(32)}`;
+    const accountId = `acct_${"1".repeat(32)}`;
+    const streamEpoch = "90000000-0000-4000-8000-000000000012";
+    const marker = "foreground ownership marker";
+    const postWatchInteractionMarker = "post-watch pending ownership marker";
+    const turnId = `opaque_v2_${"a".repeat(64)}`;
+    const itemId = `opaque_v2_${"b".repeat(64)}`;
+    let statusReads = 0;
+    let interactionReads = 0;
+    let backgroundEventReads = 0;
+    let foregroundEventReads = 0;
+    let resolveBackgroundBuffered: () => void = () => undefined;
+    const backgroundBuffered = new Promise<void>((resolve) => {
+      resolveBackgroundBuffered = resolve;
+    });
+    let resolveExit: (line: string) => void = () => undefined;
+    const exitLine = new Promise<string>((resolve) => { resolveExit = resolve; });
+    let lineRead = 0;
+    const statusData = (
+      cursor: string,
+      observedThroughSequence: number,
+      pendingCount = 0,
+    ): unknown => ({
+      version: 2,
+      session: {
+        id: sessionId,
+        accountId,
+        projectId: null,
+        title: "Observer ownership",
+        execution: "active",
+        activeTurnId: null,
+        revision: 1,
+        createdAt: 1_700_000_000_000,
+        updatedAt: 1_700_000_000_001,
+      },
+      advisory: {
+        execution: "active",
+        attention: pendingCount > 0 ? "human_action_required" : "none",
+        queueDepth: 0,
+      },
+      localObservation: {
+        source: "sqlite",
+        coverage: "complete",
+        freshness: "fresh",
+        observedAt: 1_700_000_000_001,
+      },
+      providerObservation: {
+        source: "codex_app_server",
+        basis: "provider_read",
+        state: "live",
+        coverage: "complete",
+        freshness: "fresh",
+        profileGeneration: 1,
+        observedAt: 1_700_000_000_001,
+        connectionId: "90000000-0000-4000-8000-000000000099",
+        mode: "resubscribed",
+      },
+      eventStream: {
+        streamEpoch,
+        floorSequence: 1,
+        observedThroughSequence,
+        cursor: cursorWire(cursor),
+        retentionFloorCursor: cursorWire("floor"),
+      },
+      interactions: {
+        pendingCount,
+        responseInFlightCount: 0,
+        pending: pendingCount === 0 ? [] : [{
+          id: "70000000-0000-4000-8000-000000000019",
+          kind: "user_input",
+          revision: 1,
+          blocking: true,
+          summary: "foreground pending ownership marker",
+          requestedAt: 1_700_000_000_000,
+          deadlineAt: 1_700_000_030_000,
+        }],
+        truncated: false,
+      },
+      queue: { depth: 0, dispatchingCount: 0, ambiguousCount: 0, failedCount: 0 },
+    });
+    const event = (sequence: number, body: Record<string, unknown>) => ({
+      version: 1 as const,
+      sessionId,
+      streamEpoch,
+      sequence,
+      recordedAt: 1_700_000_000_000 + sequence,
+      accountId,
+      providerGeneration: 1,
+      providerConnectionId: null,
+      body,
+    });
+    const page = (
+      requestedCursor: string | null,
+      nextCursor: string,
+      events: readonly unknown[],
+    ): unknown => ({
+      version: 1,
+      sessionId,
+      requestedCursor: requestedCursor === null
+        ? null
+        : cursorWire(requestedCursor),
+      retentionFloorCursor: cursorWire("floor"),
+      observedThroughCursor: cursorWire(nextCursor),
+      nextCursor: cursorWire(nextCursor),
+      gap: null,
+      events,
+    });
+    const waitUntilAbort = (signal: AbortSignal | undefined): Promise<CommandResponse> =>
+      new Promise<CommandResponse>((_resolve, reject) => {
+        if (signal === undefined) {
+          reject(new Error("Expected cancellable event observation."));
+          return;
+        }
+        const abort = () => reject(signal.reason ?? new Error("Observation stopped."));
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+
+    const shell = main([], captured.output, {
+      interactive: true,
+      sessionObserverSignalMode: "foreground_interrupt",
+      readShellLine: async () => {
+        lineRead += 1;
+        if (lineRead === 1) return "/session current";
+        if (lineRead === 2) {
+          await backgroundBuffered;
+          return "/watch";
+        }
+        if (lineRead === 3) return await exitLine;
+        return null;
+      },
+      callDaemon: (command, signal) => {
+        if (command.kind === "daemon.status") return Promise.resolve(runningDaemonResponse());
+        if (command.kind === "session.status") {
+          statusReads += 1;
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: statusReads === 1
+              ? statusData("background-0", 0)
+              : statusData("foreground-3", 3, 1),
+          });
+        }
+        if (command.kind === "session.interactions") {
+          interactionReads += 1;
+          const foregroundInteraction = {
+            id: "70000000-0000-4000-8000-000000000019",
+            sessionId,
+            kind: "user_input" as const,
+            state: "pending" as const,
+            revision: 1,
+            blocking: true,
+            display: { summary: "foreground pending ownership marker" },
+          };
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: {
+              sessionId,
+              interactions: interactionReads === 1
+                ? []
+                : interactionReads === 2
+                  ? [foregroundInteraction]
+                  : [
+                      foregroundInteraction,
+                      {
+                        ...foregroundInteraction,
+                        id: "70000000-0000-4000-8000-000000000020",
+                        display: { summary: postWatchInteractionMarker },
+                      },
+                    ],
+              nextCursor: null,
+            },
+          });
+        }
+        if (command.kind !== "session.events") {
+          throw new Error(`Unexpected observer ownership command: ${command.kind}`);
+        }
+        if (command.waitMs === 1_000) {
+          backgroundEventReads += 1;
+          if (backgroundEventReads === 1) {
+            return Promise.resolve({
+              ok: true,
+              version: 1,
+              requestId: crypto.randomUUID(),
+              data: page("background-0", "background-2", [
+                event(1, {
+                  type: "item_started",
+                  turnId,
+                  itemId,
+                  itemKind: "assistant",
+                }),
+                event(2, {
+                  type: "assistant_delta",
+                  turnId,
+                  itemId,
+                  text: marker,
+                }),
+              ]),
+            });
+          }
+          if (backgroundEventReads === 2) resolveBackgroundBuffered();
+          else resolveExit("/exit");
+          return waitUntilAbort(signal);
+        }
+        foregroundEventReads += 1;
+        if (foregroundEventReads === 1) {
+          return Promise.resolve({
+            ok: true,
+            version: 1,
+            requestId: crypto.randomUUID(),
+            data: page(null, "foreground-3", [
+              event(1, {
+                type: "item_started",
+                turnId,
+                itemId,
+                itemKind: "assistant",
+              }),
+              event(2, {
+                type: "assistant_delta",
+                turnId,
+                itemId,
+                text: marker,
+              }),
+              event(3, {
+                type: "turn_completed",
+                turnId,
+                status: "completed",
+              }),
+            ]),
+          });
+        }
+        queueMicrotask(() => { process.emit("SIGINT"); });
+        return waitUntilAbort(signal);
+      },
+    });
+
+    expect(await shell).toBe(0);
+    expect(statusReads).toBe(2);
+    expect(interactionReads).toBe(3);
+    expect(backgroundEventReads).toBe(3);
+    expect(foregroundEventReads).toBe(2);
+    expect(`${captured.read().stdout}${captured.read().stderr}`.match(
+      new RegExp(marker, "gu"),
+    )).toHaveLength(1);
+    expect(`${captured.read().stdout}${captured.read().stderr}`.match(
+      /foreground pending ownership marker/gu,
+    )).toHaveLength(1);
+    expect(`${captured.read().stdout}${captured.read().stderr}`.match(
+      new RegExp(postWatchInteractionMarker, "gu"),
+    )).toHaveLength(1);
+  });
+
+  test("cancels a persistent-shell event long poll with Ctrl-C and returns to the prompt", async () => {
+    const captured = capture();
+    const sessionId = `sess_${"3".repeat(32)}`;
+    const lines = [`/session events ${sessionId} --wait-ms 30000`, "/exit"];
+    const originalSigintListeners = process.listenerCount("SIGINT");
+    let observedSignal: AbortSignal | undefined;
+    let reads = 0;
+    expect(await main([], captured.output, {
+      interactive: true,
+      sessionObserverSignalMode: "foreground_interrupt",
+      readShellLine: () => {
+        reads += 1;
+        return Promise.resolve(lines.shift() ?? null);
+      },
+      callDaemon: (command, signal) => {
+        if (command.kind === "daemon.status") return Promise.resolve(runningDaemonResponse());
+        if (command.kind !== "session.events") {
+          throw new Error(`Unexpected event cancellation command: ${command.kind}`);
+        }
+        observedSignal = signal;
+        queueMicrotask(() => { process.emit("SIGINT"); });
+        return new Promise<CommandResponse>((_resolve, reject) => {
+          if (signal === undefined) {
+            reject(new Error("Event long poll did not receive cancellation authority."));
+            return;
+          }
+          const abort = () => reject(signal.reason ?? new Error("Event read canceled."));
+          signal.addEventListener("abort", abort, { once: true });
+          if (signal.aborted) abort();
+        });
+      },
+    })).toBe(0);
+    expect(reads).toBe(2);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(process.listenerCount("SIGINT")).toBe(originalSigintListeners);
+    expect(captured.read().stderr).toContain("HRA shell");
+    expect(captured.read().stderr).not.toContain("could not start or continue");
   });
 
   test("keeps event and interaction cursor signatures stable across daemon restarts", async () => {
@@ -2694,6 +3717,55 @@ describe("CLI entry point", () => {
         scope: { type: "session", sessionId: "sess_33333333333333333333333333333333" },
         pending: true,
       })).toMatchObject({ publicId: "76000000-0000-4000-8000-000000000001" });
+    } finally {
+      await rm(temporary, { force: true, recursive: true });
+    }
+  });
+
+  test("refuses to replace a lost cursor key after durable event authority exists", async () => {
+    const temporary = await realpath(await mkdtemp(join(tmpdir(), "hra-lost-cursor-key-")));
+    try {
+      const paths = resolveStatePaths({ homeDirectory: temporary, platform: "linux" });
+      await initializeStatePaths(paths);
+      const custody = new GenerationalSecretCustody(
+        paths,
+        new FileSecretBackend(join(paths.root, "test-secret-values")),
+      );
+      const store = new StateStore(paths, { now: () => 1_000 });
+      try {
+        expect(store.canInitializeDaemonCursorAuthority()).toBe(true);
+        const codec = await resolveSessionEventCursorCodec(custody);
+        store.configurePublicProviderIdentifierProjector(
+          (value) => codec.projectPublicProviderIdentifier(value),
+        );
+        const profile = store.createProfile("Lost cursor key");
+        const session = store.createSession({
+          profileId: profile.id,
+          title: "Lost cursor key",
+          preset: "high",
+          fastEnabled: false,
+        });
+        store.appendSessionEvent({
+          sessionId: session.id,
+          accountId: profile.id,
+          providerGeneration: profile.processGeneration,
+          providerConnectionId: null,
+          body: { type: "turn_started", turnId: "low-entropy-turn" },
+        });
+        expect(store.canInitializeDaemonCursorAuthority()).toBe(false);
+        const authority = await custody.read("session-cursor-key");
+        if (authority === null) throw new Error("Expected cursor authority.");
+        expect(await custody.clearIfGeneration(
+          "session-cursor-key",
+          authority.generation,
+        )).toBe(true);
+        await expect(resolveSessionEventCursorCodec(custody, {
+          allowInitialization: store.canInitializeDaemonCursorAuthority(),
+        })).rejects.toThrow("Restore the original local secret");
+        expect(await custody.read("session-cursor-key")).toBeNull();
+      } finally {
+        store.close();
+      }
     } finally {
       await rm(temporary, { force: true, recursive: true });
     }
@@ -3293,6 +4365,21 @@ describe("CLI entry point", () => {
         expect(daemonStarts).toBe(0);
         await expect(lstat(installation.paths.database)).rejects.toMatchObject({ code: "ENOENT" });
       }
+
+      const status = capture();
+      expect(await main(["status", "--json"], status.output, input)).toBe(6);
+      expect(JSON.parse(status.read().stdout)).toEqual({
+        error: {
+          code: "INTERACTION_REQUIRED",
+          details: { nextCommand: "hra init --yes" },
+          message: "Initialize HRA before reading local status.",
+        },
+        ok: false,
+        version: 1,
+      });
+      expect(status.read().stderr).toBe("");
+      expect(daemonStarts).toBe(0);
+      await expect(lstat(installation.paths.database)).rejects.toMatchObject({ code: "ENOENT" });
 
       const initialized = capture();
       expect(await main(["init", "--yes", "--json"], initialized.output, input)).toBe(0);

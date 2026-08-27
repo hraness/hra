@@ -2,11 +2,19 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 
 import { z } from "zod";
 
-import { sessionEventCursorPayloadSchema, type SessionEventCursorPayload } from "../domain/session-events";
+import {
+  SESSION_EVENT_CURSOR_MAX_BYTES,
+  sessionEventCursorPayloadSchema,
+  type SessionEventCursorPayload,
+} from "../domain/session-events";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
+import {
+  projectPublicProviderIdentifier,
+  type PublicProviderIdentifier,
+} from "../public-provider-identifier";
 
 const CURSOR_PREFIX = "hra1";
-export const HRA_CURSOR_MAX_BYTES = 2_048;
+export const HRA_CURSOR_MAX_BYTES = SESSION_EVENT_CURSOR_MAX_BYTES;
 
 export type SessionEventCursorErrorReason =
   | "filter_mismatch"
@@ -248,6 +256,10 @@ export class SessionEventCursorCodec {
 
   static generateKey(): string {
     return randomBytes(32).toString("base64url");
+  }
+
+  projectPublicProviderIdentifier(value: string): PublicProviderIdentifier {
+    return projectPublicProviderIdentifier(value, this.#key);
   }
 
   encode(input: SessionEventCursorPayload): string {

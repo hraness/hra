@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 
-import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, type Output } from "./render";
+import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, type Output } from "./render";
 import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
+import { projectPublicProviderIdentifier } from "../public-provider-identifier";
+
+const publicProviderId = (value: string) =>
+  projectPublicProviderIdentifier(value, Buffer.alloc(32, 0x52));
+const cursorWireSignature = "A".repeat(43);
+const cursorWire = (label: string): string =>
+  `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
 
 const capture = (): { output: Output; stdout: string[]; stderr: string[] } => {
   const stdout: string[] = [];
@@ -53,6 +61,89 @@ const data = {
 };
 
 describe("CLI rendering", () => {
+  test("renders bounded local root status with closed recovery commands", () => {
+    const status = {
+      version: 1 as const,
+      scope: "local_only" as const,
+      localObservation: {
+        source: "sqlite" as const,
+        coverage: "complete" as const,
+        freshness: "fresh" as const,
+        observedAt: 1_000,
+        tables: [
+          "profiles",
+          "sessions",
+          "provider_interactions",
+          "queue_entries",
+          "usage_snapshots",
+          "usage_poll_failures",
+        ] as const,
+      },
+      providerObservation: {
+        source: "codex_app_server" as const,
+        coverage: "not_attempted" as const,
+        freshness: "unknown" as const,
+        observedAt: null,
+      },
+      cloudObservation: {
+        source: "convex" as const,
+        coverage: "not_attempted" as const,
+        freshness: "unknown" as const,
+        observedAt: null,
+        devices: { registered: null, online: null },
+      },
+      counts: {
+        accounts: { signedOut: 1, loginPending: 0, signedIn: 1, recoveryRequired: 0 },
+        sessions: { starting: 0, active: 1, idle: 2, terminal: 3, recoveryRequired: 1 },
+        interactions: {
+          pending: 1,
+          responsePrepared: 0,
+          responseWritten: 0,
+          resolved: 2,
+          declined: 0,
+          canceled: 0,
+          expired: 0,
+          resolutionUnknown: 0,
+        },
+        queue: { pending: 1, dispatching: 0, applied: 2, failed: 0, ambiguous: 0, cancelled: 0 },
+        usage: { observed: 1, failed: 0, missing: 1 },
+      },
+      attention: {
+        total: 1,
+        truncated: false,
+        records: [{
+          kind: "session_recovery_required" as const,
+          accountId: "acct_00000000000000000000000000000000",
+          sessionId: "sess_00000000000000000000000000000000",
+          sessionRevision: 7,
+          observedAt: 1_000,
+          intent: {
+            kind: "inspect_session" as const,
+            sessionId: "sess_00000000000000000000000000000000",
+          },
+        }],
+      },
+    };
+    const human = capture();
+    renderRootStatus(status, false, human.output);
+    expect(human.stdout.join("")).toContain("Coverage: local complete; provider not_attempted; cloud not_attempted");
+    expect(human.stdout.join("")).toContain(
+      "Devices: registered unknown, online unknown (cloud not_attempted)",
+    );
+    expect(human.stdout.join("")).toContain(
+      "hra session status sess_00000000000000000000000000000000",
+    );
+
+    const json = capture();
+    renderRootStatus(status, true, json.output);
+    expect(JSON.parse(json.stdout.join(""))).toMatchObject({
+      ok: true,
+      version: 1,
+      command: "status",
+      data: { scope: "local_only", attention: { total: 1 } },
+    });
+  });
+
   test("renders account add and show as state-first summaries with bounded next actions", () => {
     const accountId = `acct_${"1".repeat(32)}`;
     const account = {
@@ -1129,69 +1220,72 @@ describe("CLI rendering", () => {
     renderSuccess(
       { kind: "session.status", session: "release" },
       {
-        version: 1,
+        version: 2,
         session: {
           id: "sess_00000000000000000000000000000000",
+          accountId: "acct_00000000000000000000000000000000",
+          projectId: null,
           title: "Release",
-          state: "active",
-          activeTurnId: "turn-1",
+          execution: "active",
+          activeTurnId: publicProviderId("turn-1"),
           revision: 4,
+          createdAt: 500,
+          updatedAt: 1_000,
+        },
+        advisory: {
+          execution: "active",
+          attention: "human_action_required",
+          queueDepth: 1,
+        },
+        localObservation: {
+          source: "sqlite",
+          coverage: "complete",
+          freshness: "fresh",
+          observedAt: 1_000,
         },
         providerObservation: {
+          source: "codex_app_server",
+          basis: "provider_read",
+          coverage: "complete",
+          freshness: "fresh",
+          observedAt: 1_000,
           connectionId: "90000000-0000-4000-8000-000000000099",
           mode: "resubscribed",
           profileGeneration: 2,
           state: "live",
         },
         eventStream: {
-          cursor: "hra1.head.signature",
+          cursor: cursorWire("head"),
           floorSequence: 2,
           observedThroughSequence: 9,
-          retentionFloorCursor: "hra1.floor.signature",
+          retentionFloorCursor: cursorWire("floor"),
           streamEpoch: "90000000-0000-4000-8000-000000000001",
         },
-        pendingInteractions: [{
-          version: 1,
+        interactions: {
+          pendingCount: 1,
+          responseInFlightCount: 0,
+          pending: [{
           id: "a0000000-0000-4000-8000-000000000009",
-          sessionId: "sess_00000000000000000000000000000000",
           kind: "command_approval",
-          state: "pending",
           revision: 2,
           blocking: true,
-          display: {
-            kind: "command_approval",
-            summary: "Run release verification",
-            reason: null,
-            commandClass: "test",
-            workingDirectory: null,
-            availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
-          },
-          responseRecorded: false,
-          context: { turnId: "turn-1", itemId: "item-1" },
+          summary: "Run release verification",
           requestedAt: 1_000,
           deadlineAt: 61_000,
-          updatedAt: 1_000,
-          terminalAt: null,
-        }],
-        pendingInteractionsNextCursor: null,
+          }],
+          truncated: false,
+        },
+        queue: { depth: 1, dispatchingCount: 0, ambiguousCount: 0, failedCount: 0 },
       },
       false,
       status.output,
     );
-    expect(status.stdout.join("")).toContain("Provider: live (resubscribed, generation 2");
-    expect(status.stdout.join("")).toBe([
-      "Release",
-      "State: active",
-      "Active turn: turn-1",
-      "Revision: 4",
-      "Provider: live (resubscribed, generation 2, connection 90000000-0000-4000-8000-000000000099)",
-      "Events: through 9, retained from 2",
-      "",
-      "Pending interactions",
-      "STATE    KIND              SUMMARY                   DEADLINE                  REVISION  ID",
-      "pending  command_approval  Run release verification  1970-01-01T00:01:01.000Z  2         a0000000-0000-4000-8000-000000000009",
-      "",
-    ].join("\n"));
+    const statusText = status.stdout.join("");
+    expect(statusText).toContain("Execution: active");
+    expect(statusText).toContain("Attention: human_action_required");
+    expect(statusText).toContain("Provider: live (resubscribed, connection 90000000-0000-4000-8000-000000000099, basis provider_read, coverage complete, freshness fresh, generation 2");
+    expect(statusText).toContain("Queue: 1 pending, 0 dispatching, 0 ambiguous, 0 failed");
+    expect(statusText).toContain("Run release verification");
 
     const sessionId = "sess_00000000000000000000000000000000" as const;
     const accountId = "acct_00000000000000000000000000000000" as const;
@@ -1208,23 +1302,23 @@ describe("CLI rendering", () => {
     const page: SessionEventPage = {
       version: 1,
       sessionId,
-      requestedCursor: "old",
-      retentionFloorCursor: "floor",
-      observedThroughCursor: "next",
-      nextCursor: "next",
+      requestedCursor: cursorWire("old"),
+      retentionFloorCursor: cursorWire("floor"),
+      observedThroughCursor: cursorWire("next"),
+      nextCursor: cursorWire("next"),
       gap: { reason: "retention_count", requestedSequence: 1, retainedFromSequence: 2 },
       events: [
-        { ...base, sequence: 2, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "done " } },
-        { ...base, sequence: 3, body: { type: "assistant_delta", turnId: "turn-1", itemId: "item-1", text: "and verified" } },
-        { ...base, sequence: 4, body: { type: "item_started", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue" } },
-        { ...base, sequence: 5, body: { type: "item_completed", turnId: "turn-1", itemId: "mcp-1", itemKind: "mcpToolCall", server: "github", tool: "create_issue", status: "completed" } },
-        { ...base, sequence: 6, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "started", outputBytesObserved: 0 } },
-        { ...base, sequence: 7, body: { type: "tool_progress", turnId: "turn-1", itemId: "tool-1", toolKind: "command", status: "completed", outputBytesObserved: 120 } },
+        { ...base, sequence: 2, body: { type: "assistant_delta", turnId: publicProviderId("turn-1"), itemId: publicProviderId("item-1"), text: "done " } },
+        { ...base, sequence: 3, body: { type: "assistant_delta", turnId: publicProviderId("turn-1"), itemId: publicProviderId("item-1"), text: "and verified" } },
+        { ...base, sequence: 4, body: { type: "item_started", turnId: publicProviderId("turn-1"), itemId: publicProviderId("mcp-1"), itemKind: "mcpToolCall", server: "github", tool: "create_issue" } },
+        { ...base, sequence: 5, body: { type: "item_completed", turnId: publicProviderId("turn-1"), itemId: publicProviderId("mcp-1"), itemKind: "mcpToolCall", server: "github", tool: "create_issue", status: "completed" } },
+        { ...base, sequence: 6, body: { type: "tool_progress", turnId: publicProviderId("turn-1"), itemId: publicProviderId("tool-1"), toolKind: "command", status: "started", outputBytesObserved: 0 } },
+        { ...base, sequence: 7, body: { type: "tool_progress", turnId: publicProviderId("turn-1"), itemId: publicProviderId("tool-1"), toolKind: "command", status: "completed", outputBytesObserved: 120 } },
       ],
     };
     const events = capture();
     renderSuccess(
-      { kind: "session.events", session: "release", limit: 200, waitMs: 0 },
+      { kind: "session.events", session: "release", cursor: cursorWire("old"), limit: 200, waitMs: 0 },
       page,
       false,
       events.output,
@@ -1232,8 +1326,8 @@ describe("CLI rendering", () => {
     expect(events.stdout.join("")).toContain("Event gap: retention_count");
     expect(events.stdout.join("")).toContain("Codex\n  done and verified");
     expect(events.stdout.join("").match(/Codex/gu)).toHaveLength(1);
-    expect(events.stdout.join("")).toContain("Item started: mcpToolCall github/create_issue mcp-1");
-    expect(events.stdout.join("")).toContain("Item completed: mcpToolCall github/create_issue mcp-1 (completed)");
+    expect(events.stdout.join("")).toContain(`Item started: mcpToolCall github/create_issue ${publicProviderId("mcp-1")}`);
+    expect(events.stdout.join("")).toContain(`Item completed: mcpToolCall github/create_issue ${publicProviderId("mcp-1")} (completed)`);
     expect(events.stdout.join("")).toContain("Tool: command, completed, 120 bytes observed");
     expect(events.stdout.join("")).not.toContain("Tool: command, started");
   });
@@ -1261,7 +1355,10 @@ describe("CLI rendering", () => {
         }],
       },
       responseRecorded: false,
-      context: { turnId: "turn-visible", itemId: "item-visible" },
+      context: {
+        turnId: publicProviderId("turn-visible"),
+        itemId: publicProviderId("item-visible"),
+      },
       requestedAt: 1_000,
       deadlineAt: Date.now() + 60_000,
       updatedAt: 1_001,
@@ -1338,6 +1435,122 @@ describe("CLI rendering", () => {
     );
   });
 
+  test("renders non-pending interactions without stale mutation guidance", () => {
+    const base = {
+      version: 1 as const,
+      sessionId: "sess_00000000000000000000000000000000" as const,
+      state: "response_prepared" as const,
+      revision: 2,
+      blocking: true,
+      responseRecorded: true,
+      context: { turnId: null, itemId: null },
+      requestedAt: 1_000,
+      deadlineAt: 2_000,
+      updatedAt: 1_100,
+      terminalAt: null,
+    };
+    const records: PublicInteraction[] = [
+      {
+        ...base,
+        id: "a0000000-0000-4000-8000-000000000011",
+        kind: "command_approval",
+        state: "response_written",
+        display: {
+          kind: "command_approval",
+          summary: "Run a command",
+          reason: null,
+          commandClass: "test",
+          workingDirectory: null,
+          availableDecisions: ["once", "decline", "cancel"],
+        },
+      },
+      {
+        ...base,
+        id: "a0000000-0000-4000-8000-000000000012",
+        kind: "file_change_approval",
+        display: {
+          kind: "file_change_approval",
+          summary: "Apply files",
+          reason: null,
+          grantRoot: null,
+          availableDecisions: ["decline", "cancel"],
+        },
+      },
+      {
+        ...base,
+        id: "a0000000-0000-4000-8000-000000000013",
+        kind: "permission_approval",
+        display: {
+          kind: "permission_approval",
+          summary: "Grant access",
+          reason: null,
+          requested: [{ name: "network" }],
+          allowsSessionScope: true,
+        },
+      },
+      {
+        ...base,
+        id: "a0000000-0000-4000-8000-000000000014",
+        kind: "user_input",
+        display: {
+          kind: "user_input",
+          summary: "Answer a question",
+          blocking: true,
+          questions: [{
+            id: "answer",
+            header: "Answer",
+            question: "What is the answer?",
+            options: null,
+            allowsOther: true,
+            secret: true,
+          }],
+        },
+      },
+      {
+        ...base,
+        id: "a0000000-0000-4000-8000-000000000015",
+        kind: "mcp_elicitation",
+        display: {
+          kind: "mcp_elicitation",
+          summary: "Complete a form",
+          serverName: "example",
+          mode: "form",
+          url: null,
+          mayContainSecrets: true,
+          fields: [{
+            name: "value",
+            type: "string",
+            required: true,
+            minLength: 1,
+            maxLength: 10,
+            format: null,
+          }],
+        },
+      },
+    ];
+    const actionGuidance = [
+      "Available decisions:",
+      "Safe decisions:",
+      "Protected authority:",
+      "Protected grant document:",
+      "Protected answer document:",
+      "Submit one protected JSON document",
+      "Decline this interaction",
+    ];
+    for (const record of records) {
+      const rendered = capture();
+      renderSuccess(
+        { kind: "interaction.show", interaction: record.id },
+        { interaction: record },
+        false,
+        rendered.output,
+      );
+      const text = rendered.stdout.join("");
+      expect(text).toContain("Do not resubmit it.");
+      for (const guidance of actionGuidance) expect(text).not.toContain(guidance);
+    }
+  });
+
   test("renders private approval authority only through the explicit protected renderer", () => {
     const privateCommand = "git reset --hard RENDER-PRIVATE-AUTHORITY";
     const document: ProtectedInteractionDetailDocument = {
@@ -1385,7 +1598,7 @@ describe("CLI rendering", () => {
 
   test("renders interaction continuations with the resolved immutable session ID and preserves cursors in JSON", () => {
     const sessionId = "sess_00000000000000000000000000000000";
-    const cursor = "hra1.eyJ0eXBlIjoiaW50ZXJhY3Rpb24ifQ.signature";
+    const cursor = cursorWire("interaction-list");
     const data = { sessionId, interactions: [], nextCursor: cursor };
     const human = capture();
     renderSuccess(
@@ -1399,19 +1612,83 @@ describe("CLI rendering", () => {
     );
     expect(human.stdout.join("")).not.toContain("mutable-label");
 
+    const foreignInteraction: PublicInteraction = {
+      version: 1,
+      id: "a0000000-0000-4000-8000-000000000099",
+      sessionId: "sess_11111111111111111111111111111111",
+      kind: "command_approval",
+      state: "pending",
+      revision: 1,
+      blocking: true,
+      display: {
+        kind: "command_approval",
+        summary: "Foreign interaction",
+        reason: null,
+        commandClass: "test",
+        workingDirectory: null,
+        availableDecisions: ["once", "decline", "cancel"],
+      },
+      responseRecorded: false,
+      context: { turnId: null, itemId: null },
+      requestedAt: 1,
+      deadlineAt: 2,
+      updatedAt: 1,
+      terminalAt: null,
+    };
+    const foreign = capture();
+    expect(() => renderSuccess(
+      { kind: "session.interactions", session: "mutable-label", pending: true, limit: 37 },
+      { sessionId, interactions: [foreignInteraction], nextCursor: null },
+      false,
+      foreign.output,
+    )).toThrow(InvalidCommandResponseError);
+    expect(foreign.stdout.join("")).toBe("");
+
     const status = capture();
     const statusData = {
-      version: 1,
-      session: { id: sessionId, state: "idle" },
+      version: 2,
+      session: {
+        id: sessionId,
+        accountId: "acct_00000000000000000000000000000000",
+        projectId: null,
+        title: "Release",
+        execution: "idle",
+        activeTurnId: null,
+        revision: 4,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      advisory: { execution: "idle", attention: "human_action_required", queueDepth: 0 },
+      localObservation: {
+        source: "sqlite",
+        coverage: "complete",
+        freshness: "fresh",
+        observedAt: 2,
+      },
+      providerObservation: {
+        source: "codex_app_server",
+        basis: "local_state",
+        state: "not_applicable",
+        coverage: "not_attempted",
+        freshness: "unknown",
+        observedAt: 2,
+        profileGeneration: 1,
+        reason: "unbound",
+      },
       eventStream: {
-        cursor: "hra1.head.signature",
+        cursor: cursorWire("head"),
         floorSequence: 1,
         observedThroughSequence: 1,
-        retentionFloorCursor: "hra1.floor.signature",
+        retentionFloorCursor: cursorWire("floor"),
         streamEpoch: "90000000-0000-4000-8000-000000000001",
       },
-      pendingInteractions: [],
-      pendingInteractionsNextCursor: cursor,
+      interactions: {
+        pendingCount: 1,
+        responseInFlightCount: 0,
+        pending: [],
+        truncated: true,
+      },
+      queue: { depth: 0, dispatchingCount: 0, ambiguousCount: 0, failedCount: 0 },
     };
     renderSuccess(
       { kind: "session.status", session: "mutable-label" },
@@ -1420,7 +1697,10 @@ describe("CLI rendering", () => {
       status.output,
     );
     expect(status.stdout.join("")).toContain(
-      `Continue pending interactions: hra session interactions ${sessionId} --pending --limit 100 --cursor ${cursor}\n`,
+      `More pending interactions: hra session interactions ${sessionId} --pending --limit 100\n`,
+    );
+    expect(status.stdout.join("")).toContain(
+      "Provider: not_applicable (unbound, basis local_state, coverage not_attempted, freshness unknown",
     );
     expect(status.stdout.join("")).not.toContain("mutable-label");
     const statusJson = capture();
@@ -1431,8 +1711,25 @@ describe("CLI rendering", () => {
       statusJson.output,
     );
     expect(JSON.parse(statusJson.stdout.join(""))).toMatchObject({
-      data: { pendingInteractionsNextCursor: cursor },
+      data: { interactions: { pendingCount: 1, truncated: true } },
     });
+    for (const json of [false, true]) {
+      const impossibleCut = capture();
+      expect(() => renderSuccess(
+        { kind: "session.status", session: "mutable-label" },
+        {
+          ...statusData,
+          eventStream: {
+            ...statusData.eventStream,
+            floorSequence: 3,
+            observedThroughSequence: 1,
+          },
+        },
+        json,
+        impossibleCut.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(impossibleCut.stdout).toEqual([]);
+    }
 
     const global = capture();
     renderSuccess(
@@ -1459,7 +1756,7 @@ describe("CLI rendering", () => {
 
   test("renders session-list continuations with the resolved account ID and preserves cursors in JSON", () => {
     const accountId = "acct_00000000000000000000000000000000";
-    const cursor = "hra1.eyJ0eXBlIjoic2Vzc2lvbl9saXN0In0.signature";
+    const cursor = cursorWire("session-list");
     const listing = {
       accountId,
       listing: {
@@ -1474,10 +1771,14 @@ describe("CLI rendering", () => {
       },
       sessions: [{
         id: "sess_00000000000000000000000000000000",
+        profileId: accountId,
         title: "Older imported thread",
         state: "idle",
         preset: "high",
         fastEnabled: false,
+        revision: 4,
+        createdAt: 1_700_000_000_000,
+        updatedAt: 1_700_000_000_001,
       }],
       nextCursor: cursor,
     };
@@ -1516,6 +1817,53 @@ describe("CLI rendering", () => {
       },
     });
 
+    const privateSentinel = "PRIVATE-PROVIDER-THREAD-SENTINEL";
+    const stripped = capture();
+    renderSuccess(
+      { kind: "session.list", account: accountId, limit: 37 },
+      {
+        ...listing,
+        sessions: listing.sessions.map((session) => ({
+          ...session,
+          providerThreadId: privateSentinel,
+          activeTurnId: privateSentinel,
+          note: privateSentinel,
+          unknownField: privateSentinel,
+        })),
+        unknownRoot: privateSentinel,
+      },
+      true,
+      stripped.output,
+    );
+    expect(stripped.stdout.join("")).not.toContain(privateSentinel);
+    const strippedEnvelope = z.object({
+      data: z.object({ sessions: z.array(z.unknown()) }).passthrough(),
+    }).passthrough().parse(JSON.parse(stripped.stdout.join("")) as unknown);
+    expect(strippedEnvelope.data.sessions[0]).toEqual(
+      listing.sessions[0],
+    );
+
+    const foreignAccountId = "acct_11111111111111111111111111111111";
+    for (const response of [
+      { ...listing, accountId: foreignAccountId },
+      {
+        ...listing,
+        sessions: listing.sessions.map((session) => ({
+          ...session,
+          profileId: foreignAccountId,
+        })),
+      },
+    ]) {
+      const mismatched = capture();
+      expect(() => renderSuccess(
+        { kind: "session.list", account: accountId, limit: 37 },
+        response,
+        true,
+        mismatched.output,
+      )).toThrow(InvalidCommandResponseError);
+      expect(mismatched.stdout).toEqual([]);
+    }
+
     const malformed = capture();
     expect(() => renderSuccess(
       { kind: "session.list", account: "mutable-label", limit: 37 },
@@ -1527,7 +1875,7 @@ describe("CLI rendering", () => {
     expect(malformed.stdout.join("")).not.toContain("provider-cursor-must-not-render");
 
     const unsafeMetadata = capture();
-    renderSuccess(
+    expect(() => renderSuccess(
       { kind: "session.list", account: "mutable-label", limit: 37 },
       {
         ...listing,
@@ -1538,8 +1886,7 @@ describe("CLI rendering", () => {
       },
       false,
       unsafeMetadata.output,
-    );
-    expect(unsafeMetadata.stdout.join("")).not.toContain("Sign in to refresh:");
+    )).toThrow(InvalidCommandResponseError);
     expect(unsafeMetadata.stdout.join("")).not.toContain("touch /tmp/unsafe");
   });
 
@@ -1618,6 +1965,23 @@ describe("CLI rendering", () => {
     });
     if (record.display.kind !== "mcp_elicitation") throw new Error("Expected MCP display.");
     expect(payload.data.interaction.display.fields).toEqual(record.display.fields);
+
+    const unsupported = capture();
+    renderSuccess(
+      { kind: "interaction.show", interaction: record.id },
+      {
+        ...record,
+        display: { ...record.display, fields: undefined },
+      },
+      false,
+      unsupported.output,
+    );
+    expect(unsupported.stdout.join("")).toContain(
+      "This MCP request cannot be resolved safely through HRA.",
+    );
+    expect(unsupported.stdout.join("")).not.toContain(
+      "Submit one protected JSON document",
+    );
   });
 
   test("serializes undefined output as JSON null instead of throwing", () => {

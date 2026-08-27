@@ -21,6 +21,10 @@ import { pathToFileURL } from "node:url";
 
 import type { PublicInteraction } from "../src/domain/interactions";
 import type { SessionEvent } from "../src/domain/session-events";
+import {
+  projectPublicProviderIdentifier,
+  projectPublicSessionEventBody,
+} from "../src/public-provider-identifier";
 import { DEFAULT_CLOUD_DEPLOYMENT_URL } from "../src/cloud/identity-custody";
 import { safeLiveAcceptanceCommandDigest } from "../src/codex/protocol";
 import {
@@ -48,6 +52,12 @@ const deviceBId = `device_${"8".repeat(32)}`;
 const commandId = "018bcfe5-6800-7000-8000-000000000001";
 const userInteractionId = "10000000-0000-4000-8000-000000000001";
 const permissionInteractionId = "20000000-0000-4000-8000-000000000001";
+const publicProviderIdentifierKey = Buffer.alloc(32, 0x4c);
+const publicProviderIdentifier = (value: string) =>
+  projectPublicProviderIdentifier(value, publicProviderIdentifierKey);
+const cursorWireSignature = "A".repeat(43);
+const cursorWire = (label: string): string =>
+  `hra1.${Buffer.from(`fixture:${label}`).toString("base64url")}.${cursorWireSignature}`;
 const attestation = {
   cloudTargetDigest: "a".repeat(64),
   packageVersion: "0.1.0",
@@ -75,7 +85,10 @@ const failure = (
 
 const interaction = (kind: "permission_approval" | "user_input"): PublicInteraction => ({
   blocking: true,
-  context: { itemId: "item-1", turnId: "turn-1" },
+  context: {
+    itemId: publicProviderIdentifier("item-1"),
+    turnId: publicProviderIdentifier("turn-1"),
+  },
   deadlineAt: 1_000_000,
   display: kind === "user_input"
     ? {
@@ -121,7 +134,10 @@ const event = (
   body: SessionEvent["body"],
 ): SessionEvent => ({
   accountId: sessionId === sessionA ? accountA : accountB,
-  body,
+  body: projectPublicSessionEventBody(
+    body,
+    publicProviderIdentifier,
+  ) as SessionEvent["body"],
   providerConnectionId: "30000000-0000-4000-8000-000000000001",
   providerGeneration: 1,
   recordedAt: sequence,
@@ -332,10 +348,10 @@ const eventPage = (
   return {
     events,
     gap: null,
-    nextCursor: complete ? "cursor-terminal" : "cursor-first",
-    observedThroughCursor: "cursor-observed",
+    nextCursor: cursorWire(complete ? "terminal" : "first"),
+    observedThroughCursor: cursorWire("observed"),
     requestedCursor,
-    retentionFloorCursor: "cursor-floor",
+    retentionFloorCursor: cursorWire("floor"),
     sessionId,
     version: 1,
   };
@@ -555,7 +571,10 @@ class FakeDevice implements LiveAcceptanceDevice {
     }
     if (command === "session.send") {
       this.#world.messages.set(argv[2]!, argv[3]!);
-      return success(command, { session: { id: argv[2] }, turnId: "turn-1" });
+      return success(command, {
+        session: { id: argv[2] },
+        turnId: publicProviderIdentifier("turn-1"),
+      });
     }
     if (command === "interaction.list") {
       const found = interaction(argv[2] === sessionA ? "user_input" : "permission_approval");
@@ -585,7 +604,12 @@ class FakeDevice implements LiveAcceptanceDevice {
           ...found,
           display: hostileDisplay,
           ...(this.#world.wrongInteractionTurn
-            ? { context: { ...found.context, turnId: "turn-other" } }
+            ? {
+                context: {
+                  ...found.context,
+                  turnId: publicProviderIdentifier("turn-other"),
+                },
+              }
             : {}),
         }],
       });
@@ -664,11 +688,15 @@ class FakeDevice implements LiveAcceptanceDevice {
       return success(command, {
         projection: {
           messages: [
-            { role: "user", text: prompt, turnId: "turn-1" },
+            {
+              role: "user",
+              text: prompt,
+              turnId: publicProviderIdentifier("turn-1"),
+            },
             {
               role: "assistant",
               text: this.#world.omitAssistantEvidence ? "" : marker,
-              turnId: "turn-1",
+              turnId: publicProviderIdentifier("turn-1"),
             },
           ],
         },
@@ -706,15 +734,25 @@ class FakeDevice implements LiveAcceptanceDevice {
         complete: true,
         executionDevicePublicId: deviceAId,
         events: [
-          { kind: "user_message", sequence: 1, text: prompt, turnId: "turn-1" },
-          { kind: "assistant_message", sequence: 2, text: localMarker, turnId: "turn-1" },
+          {
+            kind: "user_message",
+            sequence: 1,
+            text: prompt,
+            turnId: publicProviderIdentifier("turn-1"),
+          },
+          {
+            kind: "assistant_message",
+            sequence: 2,
+            text: localMarker,
+            turnId: publicProviderIdentifier("turn-1"),
+          },
           ...(this.#world.remoteApplied
             ? [
                 {
                   kind: "user_message",
                   sequence: 3,
                   text: this.#world.remotePrompt,
-                  turnId: "turn-remote",
+                  turnId: publicProviderIdentifier("turn-remote"),
                 },
                 ...(remoteTurnSettled
                   ? [
@@ -722,7 +760,7 @@ class FakeDevice implements LiveAcceptanceDevice {
                         kind: "assistant_message",
                         sequence: 4,
                         text: this.#world.remoteMarker,
-                        turnId: "turn-remote",
+                        turnId: publicProviderIdentifier("turn-remote"),
                       },
                       {
                         filesTouched: [],
@@ -730,7 +768,7 @@ class FakeDevice implements LiveAcceptanceDevice {
                         kind: "turn_summary",
                         runtimeMs: 1,
                         sequence: 5,
-                        turnId: "turn-remote",
+                        turnId: publicProviderIdentifier("turn-remote"),
                       },
                     ]
                   : []),
@@ -1078,7 +1116,7 @@ describe("live acceptance release scenario", () => {
     const localGap = new FakeWorld();
     localGap.eventSequenceGap = true;
     await expect(startFakeScenario(localGap, new FakeOperator()).promise)
-      .rejects.toThrow("session_events_unordered");
+      .rejects.toThrow("Event sequences must be exactly contiguous within a page.");
   });
 
   test("requires exact-turn pending interactions and an exact response-written receipt", async () => {
@@ -1161,7 +1199,7 @@ describe("live acceptance release scenario", () => {
       const continued = eventCalls[1];
       if (continued === undefined) throw new Error("Missing continued event observation.");
       expect(continued.slice(continued.indexOf("--cursor"), -1))
-        .toEqual(["--cursor", "cursor-first"]);
+        .toEqual(["--cursor", cursorWire("first")]);
       expect(world.eventPolls.get(sessionId)).toBe(2);
     }
   });

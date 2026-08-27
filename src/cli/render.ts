@@ -1,4 +1,5 @@
 import {
+  publicSessionListPageSchema,
   signedOutSessionListMetadataSchema,
   type LocalCommand,
 } from "../domain/contracts";
@@ -13,6 +14,15 @@ import {
   type PublicInteraction,
 } from "../domain/interactions";
 import {
+  assertRootStatusBound,
+  rootStatusSchema,
+  sessionStatusSchema,
+  type RecoveryIntent,
+  type RootStatus,
+  type RootStatusAttentionRecord,
+} from "../domain/observation";
+import {
+  sessionEventCursorWireSchema,
   sessionEventPageSchema,
   type SessionEvent,
   type SessionEventPage,
@@ -452,12 +462,10 @@ const boundedString = (value: unknown, maximum: number): string | undefined =>
     ? value
     : undefined;
 
-const opaqueCursor = (value: unknown): string | undefined =>
-  typeof value === "string"
-    && value.length <= 2_048
-    && /^hra1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u.test(value)
-    ? value
-    : undefined;
+const opaqueCursor = (value: unknown): string | undefined => {
+  const parsed = sessionEventCursorWireSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+};
 
 const usageHistoryCursor = (value: unknown): string | undefined =>
   typeof value === "string"
@@ -531,12 +539,16 @@ const invalidCommandResponse = (command: LocalCommand): never => {
   throw new InvalidCommandResponseError(command.kind);
 };
 
-const isRecordArray = (value: unknown): value is readonly Record<string, unknown>[] =>
-  Array.isArray(value) && value.every((entry) => object(entry) !== null);
-
 const hasOnlyValidInteractions = (value: unknown): boolean =>
   Array.isArray(value)
   && value.every((entry) => publicInteractionSchema.safeParse(entry).success);
+
+const hasOnlyInteractionsBoundToSession = (value: unknown, sessionId: string): boolean =>
+  Array.isArray(value)
+  && value.every((entry) => {
+    const parsed = publicInteractionSchema.safeParse(entry);
+    return parsed.success && parsed.data.sessionId === sessionId;
+  });
 
 const hasOpaqueCursorOrNull = (value: unknown): boolean =>
   value === null || opaqueCursor(value) !== undefined;
@@ -554,55 +566,55 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     return;
   }
   if (command.kind === "session.list") {
-    const root = object(data);
-    const accountId = profileIdSchema.safeParse(root?.accountId);
-    const validAccount = command.account === undefined
-      ? root?.accountId === null
-      : accountId.success;
+    const parsed = publicSessionListPageSchema.safeParse(data);
+    const exactRequestedAccount = profileIdSchema.safeParse(command.account);
     if (
-      root === null
-      || !validAccount
-      || !isRecordArray(root.sessions)
-      || !hasOpaqueCursorOrNull(root.nextCursor)
-      || (command.account === undefined && root.nextCursor !== null)
+      !parsed.success
+      || (command.account === undefined
+        ? parsed.data.accountId !== null
+        : parsed.data.accountId === null)
+      || (
+        exactRequestedAccount.success
+        && parsed.data.accountId !== exactRequestedAccount.data
+      )
+      || !hasOpaqueCursorOrNull(parsed.data.nextCursor)
     ) invalidCommandResponse(command);
     return;
   }
   if (command.kind === "session.status") {
-    const root = object(data);
-    const session = object(root?.session);
-    const eventStream = object(root?.eventStream);
-    const sessionId = sessionIdSchema.safeParse(session?.id);
-    const streamEpoch = boundedString(eventStream?.streamEpoch, 64);
-    const validStreamEpoch = streamEpoch !== undefined
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(streamEpoch);
+    const parsed = sessionStatusSchema.safeParse(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
     if (
-      root?.version !== 1
-      || !sessionId.success
-      || eventStream === null
-      || opaqueCursor(eventStream.cursor) === undefined
-      || opaqueCursor(eventStream.retentionFloorCursor) === undefined
-      || !validStreamEpoch
-      || !Number.isSafeInteger(eventStream.floorSequence)
-      || Number(eventStream.floorSequence) < 0
-      || !Number.isSafeInteger(eventStream.observedThroughSequence)
-      || Number(eventStream.observedThroughSequence) < 0
-      || !hasOnlyValidInteractions(root.pendingInteractions)
-      || !hasOpaqueCursorOrNull(root.pendingInteractionsNextCursor)
+      !parsed.success
+      || (exactSession.success && parsed.data.session.id !== exactSession.data)
     ) invalidCommandResponse(command);
     return;
   }
   if (command.kind === "session.events") {
-    if (sessionEventPage(data) === null) invalidCommandResponse(command);
+    const page = sessionEventPage(data);
+    const exactSession = sessionIdSchema.safeParse(command.session);
+    if (
+      page === null
+      || (exactSession.success && page.sessionId !== exactSession.data)
+      || page.requestedCursor !== (command.cursor ?? null)
+    ) invalidCommandResponse(command);
     return;
   }
   if (command.kind === "interaction.show") {
-    if (interactionRecord(data) === null) invalidCommandResponse(command);
+    const interaction = interactionRecord(data);
+    if (interaction === null || interaction.id !== command.interaction) {
+      invalidCommandResponse(command);
+    }
     return;
   }
   if (command.kind === "interaction.resolve") {
     const root = object(data);
-    if (interactionRecord(data) === null || typeof root?.responseWritten !== "boolean") {
+    const interaction = interactionRecord(data);
+    if (
+      interaction === null
+      || interaction.id !== command.interaction
+      || typeof root?.responseWritten !== "boolean"
+    ) {
       invalidCommandResponse(command);
     }
     return;
@@ -611,10 +623,26 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     const root = object(data);
     const sessionId = sessionIdSchema.safeParse(root?.sessionId);
     const scoped = command.kind === "session.interactions" || command.session !== undefined;
+    const requestedSession = command.kind === "session.interactions"
+      ? command.session
+      : command.session;
+    const exactRequestedSession = sessionIdSchema.safeParse(requestedSession);
     if (
       root === null
       || (scoped ? !sessionId.success : root.sessionId !== null)
       || !hasOnlyValidInteractions(root.interactions)
+      || (
+        scoped
+        && !hasOnlyInteractionsBoundToSession(
+          root.interactions,
+          sessionId.success ? sessionId.data : "",
+        )
+      )
+      || (
+        scoped
+        && exactRequestedSession.success
+        && (!sessionId.success || sessionId.data !== exactRequestedSession.data)
+      )
       || !hasOpaqueCursorOrNull(root.nextCursor)
     ) invalidCommandResponse(command);
   }
@@ -633,17 +661,14 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
       : { account: null, range: null, entries: [], nextCursor: null };
   }
   if (command.kind === "session.list") {
-    const root = object(data);
-    if (root === null) {
+    const parsed = publicSessionListPageSchema.safeParse(data);
+    if (!parsed.success) {
       return { accountId: null, sessions: [], nextCursor: null };
     }
-    const accountId = profileIdSchema.safeParse(root.accountId);
-    const nextCursor = opaqueCursor(root.nextCursor);
+    const nextCursor = opaqueCursor(parsed.data.nextCursor);
     return {
-      ...root,
-      accountId: accountId.success ? accountId.data : null,
-      sessions: Array.isArray(root.sessions) ? root.sessions : [],
-      nextCursor: root.nextCursor === null ? null : nextCursor ?? null,
+      ...parsed.data,
+      nextCursor: parsed.data.nextCursor === null ? null : nextCursor ?? null,
     };
   }
   if (command.kind === "interaction.show") {
@@ -691,15 +716,8 @@ const publicInteractionData = (command: LocalCommand, data: unknown): unknown =>
     };
   }
   if (command.kind === "session.status") {
-    const root = object(data);
-    if (root === null) return data;
-    return {
-      ...root,
-      pendingInteractions: interactionRecords(root.pendingInteractions),
-      pendingInteractionsNextCursor: root.pendingInteractionsNextCursor === null
-        ? null
-        : opaqueCursor(root.pendingInteractionsNextCursor) ?? null,
-    };
+    const parsed = sessionStatusSchema.safeParse(data);
+    return parsed.success ? parsed.data : data;
   }
   if (command.kind === "session.events") return sessionEventPage(data);
   return data;
@@ -789,7 +807,15 @@ const renderInteraction = (record: PublicInteraction): string => {
       remainingMs <= 0
         ? "Remaining: deadline reached; waiting for deterministic expiry"
         : `Remaining: ${duration(remainingMs)}`,
+      );
+  } else if (record.state === "response_prepared") {
+    rows.push("A response is prepared. Do not resubmit it.");
+  } else if (record.state === "response_written") {
+    rows.push(
+      "The response was sent and is awaiting provider acknowledgement. Do not resubmit it.",
     );
+  } else {
+    rows.push("This interaction is not pending. No response can be submitted.");
   }
   const display = record.display;
   switch (display.kind) {
@@ -797,30 +823,32 @@ const renderInteraction = (record: PublicInteraction): string => {
       rows.push(`Command class: ${line(display.commandClass)}`);
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       if (display.workingDirectory !== null) rows.push(`Directory: ${line(display.workingDirectory)}`);
-      rows.push(`Available decisions: ${display.availableDecisions.join(", ")}`);
       if (record.state === "pending") {
+        rows.push(`Available decisions: ${display.availableDecisions.join(", ")}`);
         rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
       }
       break;
     case "file_change_approval":
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       if (display.grantRoot !== null) rows.push(`Grant root: ${line(display.grantRoot)}`);
-      rows.push(
-        "Approval disabled: the pinned provider callback did not expose exact affected paths or change detail.",
-        `Safe decisions: ${display.availableDecisions.filter((decision) => decision === "decline" || decision === "cancel").join(", ") || "wait for expiry"}`,
-      );
+      if (record.state === "pending") {
+        rows.push(
+          "Approval disabled: the pinned provider callback did not expose exact affected paths or change detail.",
+          `Safe decisions: ${display.availableDecisions.filter((decision) => decision === "decline" || decision === "cancel").join(", ") || "wait for expiry"}`,
+        );
+      }
       break;
     case "permission_approval":
       if (display.reason !== null) rows.push(`Reason: ${line(display.reason)}`);
       rows.push(`Permissions: ${display.requested.length === 0 ? "none" : display.requested.map((permission) => line(permission.name)).join(", ")}`);
-      if (display.requested.length === 0) {
-        rows.push("No permission category can be granted. Decline this interaction.");
-      } else {
-        rows.push(`Protected grant document: ${line(JSON.stringify({
-          permissions: display.requested.map((permission) => permission.name),
-        }))}`);
-      }
       if (record.state === "pending") {
+        if (display.requested.length === 0) {
+          rows.push("No permission category can be granted. Decline this interaction.");
+        } else {
+          rows.push(`Protected grant document: ${line(JSON.stringify({
+            permissions: display.requested.map((permission) => permission.name),
+          }))}`);
+        }
         rows.push(`Protected authority: hra interaction inspect ${record.id} --revision ${String(record.revision)}`);
       }
       break;
@@ -836,18 +864,24 @@ const renderInteraction = (record: PublicInteraction): string => {
           rows.push(...question.options.map((option) => `  ${line(option.label)}: ${line(option.description)}`));
         }
       }
-      rows.push("", `Protected answer document: ${line(JSON.stringify({
-        answers: Object.fromEntries(display.questions.map((question) => [
-          question.id,
-          { answers: ["<answer>"] },
-        ])),
-      }))}`);
+      if (record.state === "pending") {
+        rows.push("", `Protected answer document: ${line(JSON.stringify({
+          answers: Object.fromEntries(display.questions.map((question) => [
+            question.id,
+            { answers: ["<answer>"] },
+          ])),
+        }))}`);
+      }
       break;
     case "mcp_elicitation":
       rows.push(`Server: ${line(display.serverName)}`, `Mode: ${line(display.mode)}`);
       rows.push("Input: protected");
       if (display.mode === "form") {
-        const fields = display.fields ?? [];
+        const fields = display.fields;
+        if (fields === undefined) {
+          rows.push("This MCP request cannot be resolved safely through HRA.");
+          break;
+        }
         rows.push(`Fields: ${fields.length === 0 ? "none" : String(fields.length)}`);
         for (const field of fields) {
           const requirement = field.required ? "required" : "optional";
@@ -867,7 +901,9 @@ const renderInteraction = (record: PublicInteraction): string => {
             rows.push(`  ${line(multiSelect.name)}: multi select, ${requirement}, ${String(multiSelect.minItems)}..${String(multiSelect.maxItems)} choices from ${multiSelect.choices.map(line).join(", ")}`);
           }
         }
-        rows.push("Submit one protected JSON document shaped as {\"content\":{...}}.");
+        if (record.state === "pending") {
+          rows.push("Submit one protected JSON document shaped as {\"content\":{...}}.");
+        }
       }
       break;
   }
@@ -875,43 +911,123 @@ const renderInteraction = (record: PublicInteraction): string => {
 };
 
 const renderSessionStatus = (data: unknown): string => {
-  const root = object(data);
-  const session = object(root?.session) ?? root;
-  if (session === null) return safeJson(data, 2);
+  const parsed = sessionStatusSchema.safeParse(data);
+  if (!parsed.success) return safeJson(data, 2);
+  const root = parsed.data;
+  const session = root.session;
   const rows = [
-    typeof session.title === "string" ? line(session.title) : `Session ${line(session.id)}`,
-    `State: ${line(session.state ?? session.status)}`,
+    line(session.title),
+    `Session: ${line(session.id)}`,
+    `Execution: ${line(root.advisory.execution)}`,
+    `Attention: ${line(root.advisory.attention)}`,
   ];
-  if (session.activeTurnId !== undefined) rows.push(`Active turn: ${line(session.activeTurnId)}`);
-  if (typeof session.revision === "number") rows.push(`Revision: ${String(session.revision)}`);
-  const providerObservation = object(root?.providerObservation);
-  if (providerObservation?.state === "live") {
-    rows.push(`Provider: live (${line(providerObservation.mode)}, generation ${line(providerObservation.profileGeneration)}, connection ${line(providerObservation.connectionId)})`);
-  } else if (providerObservation?.state === "unavailable") {
-    rows.push(`Provider: unavailable (${line(providerObservation.code)}, generation ${line(providerObservation.profileGeneration)})`);
-  } else if (providerObservation?.state === "recovery_required") {
-    rows.push(`Provider: recovery required (${line(providerObservation.code)}, generation ${line(providerObservation.profileGeneration)})`);
-  } else if (providerObservation?.state === "not_applicable") {
-    rows.push(`Provider: not applicable (${line(providerObservation.reason)}, generation ${line(providerObservation.profileGeneration)})`);
-  }
-  const eventStream = object(root?.eventStream) ?? root;
-  if (typeof eventStream?.observedThroughSequence === "number" && typeof eventStream.floorSequence === "number") {
-    rows.push(`Events: through ${String(eventStream.observedThroughSequence)}, retained from ${String(eventStream.floorSequence)}`);
-  }
-  const pendingInteractions = interactionRecords(root?.pendingInteractions);
-  if (pendingInteractions.length > 0) {
-    rows.push("", "Pending interactions", renderInteractionTable(pendingInteractions));
-  }
-  const pendingCursor = opaqueCursor(root?.pendingInteractionsNextCursor);
-  const resolvedSession = sessionIdSchema.safeParse(session.id);
-  if (pendingCursor !== undefined && resolvedSession.success) {
+  rows.push(
+    `Revision: ${String(session.revision)}`,
+    `Local: ${root.localObservation.coverage}, ${root.localObservation.freshness}, observed ${instant(root.localObservation.observedAt)}`,
+  );
+  if (session.activeTurnId !== null) rows.push(`Active turn: ${line(session.activeTurnId)}`);
+  const providerObservation = root.providerObservation;
+  const providerDetail = providerObservation.state === "live"
+    ? `${providerObservation.mode}, connection ${line(providerObservation.connectionId)}`
+    : providerObservation.state === "not_applicable"
+      ? providerObservation.reason
+      : providerObservation.code;
+  rows.push(
+    `Provider: ${line(providerObservation.state)} (${line(providerDetail)}, basis ${providerObservation.basis}, coverage ${providerObservation.coverage}, freshness ${providerObservation.freshness}, generation ${String(providerObservation.profileGeneration)}, observed ${instant(providerObservation.observedAt)})`,
+    `Queue: ${String(root.queue.depth)} pending, ${String(root.queue.dispatchingCount)} dispatching, ${String(root.queue.ambiguousCount)} ambiguous, ${String(root.queue.failedCount)} failed`,
+    `Interactions: ${String(root.interactions.pendingCount)} pending, ${String(root.interactions.responseInFlightCount)} response in flight`,
+    `Events: through ${String(root.eventStream.observedThroughSequence)}, retained from ${String(root.eventStream.floorSequence)}`,
+  );
+  if (root.interactions.pending.length > 0) {
     rows.push(
       "",
-      `Continue pending interactions: hra session interactions ${resolvedSession.data} --pending --limit 100 --cursor ${pendingCursor}`,
+      "Pending interactions",
+      table(root.interactions.pending.map((interaction) => ({
+        kind: interaction.kind,
+        summary: interaction.summary,
+        blocking: interaction.blocking,
+        deadline: instant(interaction.deadlineAt),
+        revision: interaction.revision,
+        id: interaction.id,
+      })), ["kind", "summary", "blocking", "deadline", "revision", "id"]),
+    );
+  }
+  if (root.interactions.truncated) {
+    rows.push(
+      "",
+      `More pending interactions: hra session interactions ${session.id} --pending --limit 100`,
     );
   }
   return rows.join("\n");
 };
+
+const recoveryCommand = (intent: RecoveryIntent): string => {
+  switch (intent.kind) {
+    case "inspect_account": return `hra account show ${intent.accountId}`;
+    case "inspect_session": return `hra session status ${intent.sessionId}`;
+    case "inspect_interaction": return `hra interaction inspect ${intent.interactionId} --revision ${String(intent.expectedRevision)}`;
+    case "show_interaction": return `hra interaction show ${intent.interactionId}`;
+  }
+};
+
+const rootAttentionIdentity = (record: RootStatusAttentionRecord): string => {
+  if ("interactionId" in record) return record.interactionId;
+  if ("sessionId" in record) return record.sessionId;
+  return record.accountId;
+};
+
+const rootAttentionState = (record: RootStatusAttentionRecord): string => {
+  if (record.kind === "interaction_pending" || record.kind === "interaction_response_in_flight") {
+    return record.interactionState;
+  }
+  return record.kind === "account_login_pending"
+    ? "login_pending"
+    : "recovery_required";
+};
+
+const renderRootStatusHuman = (status: RootStatus): string => {
+  const counts = status.counts;
+  const rows = [
+    "HRA local status",
+    `Observed: ${instant(status.localObservation.observedAt)}`,
+    `Coverage: local ${status.localObservation.coverage}; provider ${status.providerObservation.coverage}; cloud ${status.cloudObservation.coverage}`,
+    `Accounts: ${String(counts.accounts.signedIn)} signed in, ${String(counts.accounts.signedOut)} signed out, ${String(counts.accounts.loginPending)} login pending, ${String(counts.accounts.recoveryRequired)} recovery required`,
+    `Sessions: ${String(counts.sessions.active)} active, ${String(counts.sessions.idle)} idle, ${String(counts.sessions.starting)} starting, ${String(counts.sessions.terminal)} terminal, ${String(counts.sessions.recoveryRequired)} recovery required`,
+    `Interactions: ${String(counts.interactions.pending)} pending, ${String(counts.interactions.responsePrepared + counts.interactions.responseWritten)} response in flight, ${String(counts.interactions.resolutionUnknown)} resolution unknown`,
+    `Queue: ${String(counts.queue.pending)} pending, ${String(counts.queue.dispatching)} dispatching, ${String(counts.queue.ambiguous)} ambiguous, ${String(counts.queue.failed)} failed`,
+    `Usage: ${String(counts.usage.observed)} observed, ${String(counts.usage.failed)} latest failures, ${String(counts.usage.missing)} missing`,
+    `Devices: registered unknown, online unknown (cloud ${status.cloudObservation.coverage})`,
+  ];
+  if (status.attention.records.length > 0) {
+    rows.push(
+      "",
+      `Attention (${String(status.attention.total)}${status.attention.truncated ? ", showing first 50" : ""})`,
+      table(status.attention.records.map((record) => ({
+        kind: record.kind,
+        state: rootAttentionState(record),
+        id: rootAttentionIdentity(record),
+        next: recoveryCommand(record.intent),
+      })), ["kind", "state", "id", "next"]),
+    );
+  } else {
+    rows.push("Attention: none");
+  }
+  return rows.join("\n");
+};
+
+export function renderRootStatus(data: unknown, json: boolean, output: Output): void {
+  const status = assertRootStatusBound(rootStatusSchema.parse(data));
+  if (json) {
+    output.writeStdout(`${safeJson({
+      ok: true,
+      version: 1,
+      command: "status",
+      data: status,
+    })}\n`);
+    return;
+  }
+  output.writeStdout(`${renderRootStatusHuman(status)}\n`);
+}
 
 const pluginLifecycleNotice =
   "Lifecycle: discovery only. Pinned Codex 0.149.0 combines install, enablement, and browser-capable OAuth, so HRA blocks that compound effect.";
@@ -1607,7 +1723,9 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
     })}\n`);
     return;
   }
-  const publicData = command.kind === "account.login" ? publicAccountLoginData(data) : data;
+  const publicData = command.kind === "account.login" || command.kind === "session.list"
+    ? publicInteractionData(command, data)
+    : data;
   const value = publicData as Record<string, unknown>;
   if (command.kind === "doctor") {
     output.writeStdout(`${renderDoctor(data)}\n`);
@@ -1636,7 +1754,7 @@ export function renderSuccess(command: LocalCommand, data: unknown, json: boolea
   } else if (command.kind === "project.list" && Array.isArray(value.projects)) {
     output.writeStdout(`${table(value.projects as Record<string, unknown>[], ["label", "rootPath", "default", "id"])}\n`);
   } else if (command.kind === "session.list" && Array.isArray(value.sessions)) {
-    output.writeStdout(`${renderSessionList(command, data)}\n`);
+    output.writeStdout(`${renderSessionList(command, publicData)}\n`);
   } else if (command.kind === "session.show") {
     output.writeStdout(`${renderSession(data)}\n`);
   } else if (command.kind === "session.status") {

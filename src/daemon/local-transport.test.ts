@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, realpath, unlink, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -53,6 +53,67 @@ describe("local daemon transport", () => {
       data: { command: "daemon.status" },
     });
     expect((await readFile(paths.capability, "utf8")).trim()).toHaveLength(43);
+  });
+
+  test("rejects a mismatched request protocol before entering the command handler", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let handlerCalls = 0;
+    const server = await LocalDaemonServer.start({
+      paths,
+      handler: async () => {
+        handlerCalls += 1;
+        return { executed: true };
+      },
+    });
+    servers.push(server);
+    const capability = (await readFile(paths.capability, "utf8")).trim();
+    const requestId = randomUUID();
+    const response = await new Promise<unknown>((resolve, reject) => {
+      const socket = createConnection(paths.socket);
+      let received = Buffer.alloc(0);
+      let settled = false;
+      const finish = (operation: () => void): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        operation();
+      };
+      const deadline = setTimeout(() => {
+        finish(() => reject(new Error("Timed out waiting for the protocol-mismatch response.")));
+        socket.destroy();
+      }, 1_000);
+      socket.once("connect", () => {
+        socket.write(`${JSON.stringify({
+          version: 1,
+          capability,
+          requestId,
+          command: { kind: "daemon.status" },
+        })}\n`);
+      });
+      socket.on("data", (chunk) => {
+        received = Buffer.concat([
+          received,
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+        ]);
+        const newline = received.indexOf(0x0a);
+        if (newline < 0) return;
+        finish(() => resolve(JSON.parse(received.subarray(0, newline).toString("utf8")) as unknown));
+        socket.end();
+      });
+      socket.once("error", (error) => finish(() => reject(error)));
+      socket.once("close", () => finish(() => reject(
+        new Error("The daemon closed without a protocol-mismatch response."),
+      )));
+    });
+
+    expect(response).toMatchObject({
+      ok: false,
+      version: 1,
+      requestId,
+    });
+    expect(handlerCalls).toBe(0);
   });
 
   test("closes unexpected daemon failures without returning runtime diagnostics", async () => {

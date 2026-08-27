@@ -1,7 +1,7 @@
 # HRA
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 65e53a3f4ee53eca188b6bd789a6dab8e48b43366e644fcdb1668073efc98721)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
 ```
 
 ```sh
@@ -24,7 +24,7 @@ HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and lo
 
 ```text
 bun --version
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 65e53a3f4ee53eca188b6bd789a6dab8e48b43366e644fcdb1668073efc98721)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
 hra --version
 hra doctor --offline
 ```
@@ -36,7 +36,7 @@ Before replacing the installed binary, stop the persistent daemon and confirm th
 ```text
 hra daemon stop
 hra daemon status --json
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 65e53a3f4ee53eca188b6bd789a6dab8e48b43366e644fcdb1668073efc98721)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra daemon start
@@ -102,13 +102,13 @@ Review this project and summarize its current state.
 
 ### Agent caller
 
-Read `data.session.id` from the start response. Before sending, read `data.eventStream.cursor` from status so the follower begins at one atomic observation boundary. Keep the follower as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation.
+Read `data.session.id` from the start response. Before sending, call status and read `data.eventStream.cursor` from its version-2 result. Start watch from that exact cursor so the atomic local snapshot and subsequent event stream are contiguous. Keep watch as a long-running subprocess, consume its two output streams independently, and use the exact ID instead of a mutable title in automation.
 
 ```text
 hra session start personal --preset high --json
 hra session status <session-id> --json
 hra session send <session-id> -- "Review this project and summarize its current state."
-hra session events <session-id> --cursor <status-cursor> --wait-ms 30000 --jsonl
+hra session watch <session-id> --cursor <status-cursor> --jsonl
 hra session interactions <session-id> --pending --json
 ```
 
@@ -166,18 +166,35 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 
 Run `hra` in a TTY to open a persistent shell. Account and session selections stay in the prompt, live updates redraw wrapped partial input without moving its logical cursor, protected answers are read without terminal echo, and `/exit` leaves the daemon running. Pasted command lines use a bounded queue. An overflow or interrupted line flushes the current native terminal queue, retains input custody while discarding through EOF, and exits without executing the tail. Protected terminal documents require a visible stderr TTY plus unpredictable begin and return phrases while raw no-echo mode is active. A failed protected boundary keeps echo disabled while discarding the tail, then closes shell input instead of returning ambiguous bytes to an ordinary prompt. Display loss, termination, and job-control signals restore or fence raw mode before propagation. Live display is buffered while a foreground or protected prompt owns the terminal, and updates from an old session generation are discarded before a new selection is announced. Slow-terminal backpressure drops additional updates behind one explicit omission notice instead of growing memory without bound. One-shot commands provide the same control surface to scripts and agents.
 
-Selected-session monitoring starts at the atomic status cursor. The shell drains every signed pending-interaction continuation page before following newer events from that cursor. HRA always surfaces bounded lifecycle, tool, interaction, warning, error, and terminal updates. It renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary, then redacts credentials and absolute paths with state carried across chunks and interleaved events. A mid-item join omits ambiguous delta suffixes until the next item starts. Gaps, shutdown, malformed repeated starts, and exhausted redaction capacity discard undecided tails with an explicit notice rather than releasing text whose boundary cannot be proved.
+### Bounded local status
+
+`hra status [--json]` is a bounded, effect-free read of local SQLite state. It does not start, stop, or contact the daemon; use the network; attempt provider or cloud observation; open a browser; log in; refresh usage; or run recovery. It returns fixed count fields for account, session, interaction, queue, and latest usage states plus at most 50 ID-and-revision action records. Provider and cloud coverage are explicitly `not_attempted`, and registered and online device counts are unknown rather than zero. The complete JSON result, including its versioned command envelope, is at most 256 KiB.
+
+```text
+hra status
+hra status --json
+```
+
+### Session observation
+
+`hra session status <session> --json` returns status version 2. HRA produces one typed provider-observation result, attempting a Codex app-server read only when the current local state makes one applicable, then reads the session, event cut, interactions, and queue from one local SQLite transaction. Execution, attention, provider, and queue remain separate axes, so a headline state cannot hide a recovery condition, pending interaction, response in flight, or queued work. Pending and response-in-flight counts are exact. The result includes at most 10 bounded safe summaries for pending interactions and excludes the session note and private provider thread binding. Every provider turn and item identifier becomes a secret-keyed opaque public alias before status, event, or interaction output. Public observation schemas accept only that exact alias form. The same local installation key keeps aliases coherent across surfaces and daemon restarts without making low-entropy provider IDs guessable from public output. If an existing installation loses that key, HRA refuses to replace it and directs the operator to restore the original local secret.
+
+For snapshot-to-stream continuity, start selected-session monitoring at the atomic status cursor. `hra session watch <session> [--cursor <cursor>]` renders a bounded human stream by default; add `--jsonl` for a machine stream. Watch is a presentation alias over the existing session event stream, and it drains each output page before advancing its internal cursor. The shell drains every signed pending-interaction continuation page before following newer committed ledger events from the status cursor. Standalone human watch buffers that initial guidance until enumeration is complete, caps the atomic bootstrap at 1 MiB of UTF-8, and writes none of it if enumeration or the bound fails. Resolution guidance appears only from a complete current interaction record and only for a supported decision; an event-only interaction notice points to the exact show command without proposing a mutation. Those events cover bounded lifecycle, tool, interaction, warning, error, and terminal updates, but the ledger is not a complete wake source for every authority transition. Agents that need exact current authority must also repeat bounded session status or pending-interaction reads. Human watch renders assistant and provider-visible reasoning-summary text only after observing that item's start boundary, then redacts credentials and absolute paths with state carried across chunks and interleaved events. A mid-item join omits ambiguous delta suffixes until the next item starts. Gaps, shutdown, malformed repeated starts, and exhausted redaction capacity discard undecided tails with an explicit notice rather than releasing text whose boundary cannot be proved.
 
 ```text
 hra
 hra session status <session> --json
+hra session watch <session> --cursor <cursor>
+hra session watch <session> --cursor <cursor> --jsonl
 hra session events <session> --cursor <cursor> --limit <1-200> --wait-ms <0-30000> --json
 hra session events <session> --cursor <cursor> --wait-ms 30000 --jsonl
 hra session interactions <session> --pending --json
 hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
 ```
 
-JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following with `--jsonl` writes JSON Lines as the turn progresses; `--follow` is an equivalent compatibility spelling. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved.
+JSON mode writes one versioned document to stdout and diagnostics to stderr. Event following with `--jsonl` writes JSON Lines as the turn progresses; `--follow` remains an equivalent compatibility spelling for `session events`. JSONL delivery is at least once across a pipe or process failure: a crash after an event line but before its page checkpoint can replay that event. Durable consumers deduplicate by `(sessionId, streamEpoch, sequence)` and persist each checkpoint only after durably applying all preceding lines. Signed opaque cursors let an agent resume bounded session-list, event, and interaction pages, and durable interaction records keep approvals, questions, permission grants, and MCP form elicitation visible until they are explicitly resolved.
+
+Exact `hra session wait` is unavailable until every wait predicate has a transactional wake revision that changes in the same commit as the observed state. Use status followed by watch from its cursor, or bounded repeated status polling, when a caller needs to wait.
 
 ### Exit status and JSONL
 
@@ -300,6 +317,7 @@ Codex activity remains subject to OpenAI's own service and privacy terms.
 
 ```text
 hra init [--yes] [--json]
+hra status [--json]
 hra doctor [--offline] [--json]
 hra auth login --input-stdin|--input-fd <fd>
 hra auth status|logout
@@ -324,8 +342,9 @@ hra project list
 hra project use <project>
 hra session list [--account <profile>] [--limit <1-100>] [--cursor <cursor>]
 hra session show <session> [--detail]
-hra session status <session>
-hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--jsonl|--follow]
+hra session status <session> [--json]
+hra session watch <session> [--cursor <cursor>] [--jsonl]
+hra session events <session> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--json|--jsonl|--follow]
 hra session interactions <session> [--pending] [--limit <1-100>] [--cursor <cursor>]
 hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
 hra session send|queue|steer <session> <message>

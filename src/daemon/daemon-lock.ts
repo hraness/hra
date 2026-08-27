@@ -6,9 +6,10 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Database, type SQLiteError } from "bun:sqlite";
 import { z } from "zod";
 
+import { LOCAL_DAEMON_PROTOCOL } from "../domain/contracts";
 import { ensurePrivateDirectory, type StatePaths } from "../storage/paths";
 
-export const DAEMON_PROTOCOL = "hra-control-plane-local-v1" as const;
+export const DAEMON_PROTOCOL = LOCAL_DAEMON_PROTOCOL;
 
 const receiptStateSchema = z.enum(["booting", "ready", "stopping", "stopped", "failed", "maintenance"]);
 

@@ -4,7 +4,13 @@ import { chmod, lstat, open, rename, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join } from "node:path";
 
-import { commandEnvelopeSchema, commandResponseSchema, type CommandResponse, type LocalCommand } from "../domain/contracts";
+import {
+  commandEnvelopeSchema,
+  commandResponseSchema,
+  LOCAL_COMMAND_REQUEST_VERSION,
+  type CommandResponse,
+  type LocalCommand,
+} from "../domain/contracts";
 import { ensurePrivateDirectory, type StatePaths } from "../storage/paths";
 
 const maximumRequestBytes = 1_048_576;
@@ -426,7 +432,12 @@ export async function callLocalDaemon(input: {
   }
   throwIfClientAborted(input.signal);
   const requestId = randomUUID();
-  const request = `${JSON.stringify({ version: 1, capability, requestId, command: input.command })}\n`;
+  const request = `${JSON.stringify({
+    version: LOCAL_COMMAND_REQUEST_VERSION,
+    capability,
+    requestId,
+    command: input.command,
+  })}\n`;
   return await new Promise<CommandResponse>((resolvePromise, rejectPromise) => {
     let settled = false;
     let connected = false;

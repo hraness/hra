@@ -710,7 +710,7 @@ describe("pinned server requests and safe notifications", () => {
       serverName: "example",
       mode: "form",
       _meta: null,
-      message: "Configure Example",
+      message: "credential=TOPSECRET-9415",
       requestedSchema: {
         $schema: "https://json-schema.org/draft/2020-12/schema",
         type: "object",
@@ -763,7 +763,7 @@ describe("pinned server requests and safe notifications", () => {
     });
     expect(parsed.display).toEqual({
       kind: "mcp_elicitation",
-      summary: "Configure Example",
+      summary: "Codex requests MCP form input",
       serverName: "example",
       mode: "form",
       url: null,
@@ -780,6 +780,7 @@ describe("pinned server requests and safe notifications", () => {
         { name: "when", type: "string", required: false, minLength: 0, maxLength: 16_384, format: "date-time" },
       ],
     });
+    expect(JSON.stringify(parsed.display)).not.toContain("TOPSECRET-9415");
     expect(JSON.stringify(parsed.display)).not.toContain(schemaOnlySentinel);
     const content = {
       birthday: "2024-02-29",

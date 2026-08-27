@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
 
@@ -18,6 +19,7 @@ import {
   terminateDaemonStartupChild,
   type DaemonIdentity,
 } from "../src/daemon/daemon-startup";
+import { rootStatusSchema } from "../src/domain/observation";
 import type { StatePaths } from "../src/storage/paths";
 import { resolveStatePaths } from "../src/storage/paths";
 import { assertHraInstallManifest } from "../src/install-normalizer";
@@ -88,6 +90,20 @@ const daemonRunningSchema = z.object({
   version: z.literal(1),
 }).passthrough();
 
+const installedRootStatusEnvelopeSchema = z.object({
+  command: z.literal("status"),
+  data: rootStatusSchema,
+  ok: z.literal(true),
+  version: z.literal(1),
+}).strict();
+
+const installedMissingSessionErrorSchema = z.object({
+  error: z.object({ code: z.literal("NOT_FOUND") }).passthrough(),
+  ok: z.literal(false),
+  version: z.literal(1),
+}).passthrough();
+const installedNotFoundExitCode = 4;
+
 const packageCommandTimeoutMaximumMs = 60_000;
 const packageCommandOutputMaximumBytes = 32 * 1024 * 1024;
 const packageCommandTerminationGraceMs = 250;
@@ -142,6 +158,23 @@ const requireSuccess = (label: string, result: ProcessResult): ProcessResult => 
     throw new Error(`${label} failed with exit ${String(result.exitCode)}:\n${result.stderr}${result.stdout}`);
   }
   return result;
+};
+
+const assertSessionObservationHelp = (label: string, result: ProcessResult): void => {
+  requireSuccess(label, result);
+  if (result.stderr !== "") throw new Error(`${label} wrote diagnostics.`);
+  for (const command of [
+    "hra session status <session> [--json]",
+    "hra session watch <session> [--cursor <cursor>] [--jsonl]",
+    "hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]",
+  ]) {
+    if (!result.stdout.includes(command)) {
+      throw new Error(`${label} omitted ${command}.`);
+    }
+  }
+  if (/\bhra session wait\b/u.test(result.stdout)) {
+    throw new Error(`${label} exposed the withheld session wait command.`);
+  }
 };
 
 const assertExactlyOneJsonValue = (value: string): unknown => {
@@ -485,6 +518,13 @@ try {
   );
   if (!help.stdout.startsWith("HRA\n")) throw new Error("Installed CLI help has an unexpected header.");
   if (help.stderr !== "") throw new Error("Installed CLI help wrote diagnostics.");
+  assertSessionObservationHelp(
+    "installed session help",
+    await run(executable, ["session", "--help"], {
+      cwd: consumerDirectory,
+      env: isolatedEnvironment,
+    }),
+  );
 
   const version = requireSuccess(
     "installed CLI version",
@@ -553,6 +593,24 @@ try {
   if (!globalHelp.stdout.startsWith("HRA\n") || globalHelp.stderr !== "") {
     throw new Error("Globally installed CLI help is invalid.");
   }
+  assertSessionObservationHelp(
+    "globally installed session help",
+    await run(globalExecutable, ["session", "--help"], {
+      cwd: consumerDirectory,
+      env: isolatedEnvironment,
+    }),
+  );
+  const withheldWait = await run(globalExecutable, ["session", "wait", "withheld"], {
+    cwd: consumerDirectory,
+    env: isolatedEnvironment,
+  });
+  if (
+    withheldWait.exitCode !== 2
+    || withheldWait.stdout !== ""
+    || !withheldWait.stderr.includes("Unknown session action")
+  ) {
+    throw new Error("Globally installed CLI did not reject the withheld session wait command.");
+  }
   const globalDoctor = await run(globalExecutable, ["doctor", "--offline", "--json"], {
     cwd: consumerDirectory,
     env: isolatedEnvironment,
@@ -601,6 +659,34 @@ try {
       throw new Error("Globally installed CLI initialization did not create a safe default Documents directory in an empty home.");
     }
 
+    const rootStatusAuthorityBefore = await readDaemonAuthorityReceipt(daemonPaths);
+    if (await socketExists(daemonPaths)) {
+      throw new Error("Globally installed initialization unexpectedly created a daemon socket.");
+    }
+    const rootStatusResult = requireSuccess(
+      "globally installed root status",
+      await run(globalExecutable, ["status", "--json"], {
+        cwd: consumerDirectory,
+        env: daemonEnvironment,
+        timeoutMs: lifecycleTimeoutMs,
+      }),
+    );
+    if (rootStatusResult.stderr !== "") {
+      throw new Error("Globally installed root status wrote diagnostics.");
+    }
+    installedRootStatusEnvelopeSchema.parse(
+      assertExactlyOneJsonValue(rootStatusResult.stdout),
+    );
+    if (
+      !isDeepStrictEqual(
+        await readDaemonAuthorityReceipt(daemonPaths),
+        rootStatusAuthorityBefore,
+      )
+      || await socketExists(daemonPaths)
+    ) {
+      throw new Error("Globally installed root status changed daemon authority or created a daemon socket.");
+    }
+
     ownedDaemon = await launchOwnedInstalledDaemon({
       cwd: consumerDirectory,
       env: daemonEnvironment,
@@ -641,6 +727,41 @@ try {
     }
     if (status.stderr !== "") {
       throw new Error("Globally installed daemon status wrote diagnostics.");
+    }
+
+    const missingSessionId = `sess_${"f".repeat(32)}`;
+    for (const [label, arguments_] of [
+      [
+        "globally installed session status path",
+        ["session", "status", missingSessionId, "--json"],
+      ],
+      [
+        "globally installed session events path",
+        ["session", "events", missingSessionId, "--json"],
+      ],
+    ] as const) {
+      const missing = await run(globalExecutable, arguments_, {
+        cwd: consumerDirectory,
+        env: daemonEnvironment,
+        timeoutMs: lifecycleTimeoutMs,
+      });
+      installedMissingSessionErrorSchema.parse(assertExactlyOneJsonValue(missing.stdout));
+      if (missing.exitCode !== installedNotFoundExitCode || missing.stderr !== "") {
+        throw new Error(`${label} did not return one quiet typed error.`);
+      }
+    }
+    const missingWatch = await run(
+      globalExecutable,
+      ["session", "watch", missingSessionId, "--jsonl"],
+      {
+        cwd: consumerDirectory,
+        env: daemonEnvironment,
+        timeoutMs: lifecycleTimeoutMs,
+      },
+    );
+    installedMissingSessionErrorSchema.parse(assertExactlyOneJsonValue(missingWatch.stderr));
+    if (missingWatch.exitCode !== installedNotFoundExitCode || missingWatch.stdout !== "") {
+      throw new Error("Globally installed session watch path did not return one typed JSONL error.");
     }
 
     const accountSchema = z.object({

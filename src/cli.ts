@@ -33,10 +33,16 @@ import {
   ProtectedOutputFile,
   type DeviceLoginDocument,
 } from "./cli/protected-output";
-import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
+import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, safeJson, terminalSafe, type Output } from "./cli/render";
 import { redactCompleteSensitiveText } from "./cli/sensitive-text";
 import { compileShellLine, formatShellPrompt, shellHelp, type ShellSelection } from "./cli/shell";
-import { ShellLiveObserver } from "./cli/shell-live";
+import {
+  enumerateUnsettledSessionInteractions,
+  pendingInteractionStateKey,
+  ShellLiveObserver,
+  ShellLivePresenter,
+  type PendingInteraction,
+} from "./cli/shell-live";
 import { discardReadableUntilEnd, ShellTerminalCoordinator } from "./cli/shell-terminal";
 import { followSessionEvents } from "./cli/watch";
 import {
@@ -75,6 +81,7 @@ import type { CommandResponse, LocalCommand } from "./domain/contracts";
 import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
 } from "./domain/interactions";
+import { sessionStatusSchema } from "./domain/observation";
 import { profileIdSchema, selectByIdOrLabel, sessionIdSchema } from "./domain/values";
 import {
   LocalDaemonServer,
@@ -154,6 +161,8 @@ const processOutput: Output = {
 };
 
 const protectedInputMaximumBytes = 64 * 1024;
+export const HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES = 1 * 1024 * 1024;
+const humanSessionWatchUtf8Encoder = new TextEncoder();
 const sessionCursorCustodySlot = "session-cursor-key";
 
 export const protectedTerminalInputQueueForPlatform = (
@@ -1004,11 +1013,24 @@ export const withProtectedTerminalLifecycle = async <T>(
   }
 };
 
+class CursorAuthorityMissingError extends Error {
+  constructor() {
+    super(
+      "Session event cursor authority is missing for existing HRA state. Restore the original local secret before starting the daemon.",
+    );
+    this.name = "CursorAuthorityMissingError";
+  }
+}
+
 async function resolveCursorAuthorityKey(
   custody: GenerationalSecretCustody,
+  allowInitialization: boolean,
 ): Promise<string> {
   let observation = await custody.read(sessionCursorCustodySlot);
   if (observation === null) {
+    if (!allowInitialization) {
+      throw new CursorAuthorityMissingError();
+    }
     observation = await custody.compareAndSwap(
       sessionCursorCustodySlot,
       null,
@@ -1022,14 +1044,22 @@ async function resolveCursorAuthorityKey(
 
 export async function resolveSessionEventCursorCodec(
   custody: GenerationalSecretCustody,
+  options: Readonly<{ allowInitialization?: boolean }> = {},
 ): Promise<SessionEventCursorCodec> {
-  return new SessionEventCursorCodec(await resolveCursorAuthorityKey(custody));
+  return new SessionEventCursorCodec(await resolveCursorAuthorityKey(
+    custody,
+    options.allowInitialization ?? true,
+  ));
 }
 
 export async function resolveUsageHistoryCursorCodec(
   custody: GenerationalSecretCustody,
+  options: Readonly<{ allowInitialization?: boolean }> = {},
 ): Promise<UsageHistoryCursorCodec> {
-  return new UsageHistoryCursorCodec(await resolveCursorAuthorityKey(custody));
+  return new UsageHistoryCursorCodec(await resolveCursorAuthorityKey(
+    custody,
+    options.allowInitialization ?? true,
+  ));
 }
 
 const syncDiagnosticLimit = 16;
@@ -1119,7 +1149,17 @@ export type CliMainInput = Readonly<{
   isTerminalDescriptor?: (fd: number) => boolean;
   readProtectedDocument?: (source: ProtectedInputSource) => Promise<unknown>;
   readShellLine?: (prompt: string) => Promise<string | null>;
+  readRootStatus?: (paths: StatePaths) => unknown;
   offlineDoctorOwnerUid?: number;
+  sessionObserverSignalMode?: "process" | "foreground_interrupt";
+  onHumanSessionObserverBootstrap?: (bootstrap: Readonly<{
+    interactions: readonly Readonly<{
+      id: string;
+      revision: number;
+      state: PendingInteraction["state"];
+    }>[];
+    sessionId: string;
+  }>) => void;
 }>;
 
 const daemonStopRequestDeadlineMs = 5_000;
@@ -2005,20 +2045,31 @@ async function startDaemonProcess(installation: HraInstallation): Promise<Daemon
   }
 }
 
-const initializationRequired = (): CommandFailure => new CommandFailure(
+const initializationRequired = (
+  operation: "daemon" | "local_status" = "daemon",
+): CommandFailure => new CommandFailure(
   "INTERACTION_REQUIRED",
-  "Initialize HRA before starting its daemon.",
+  operation === "daemon"
+    ? "Initialize HRA before starting its daemon."
+    : "Initialize HRA before reading local status.",
   { nextCommand: "hra init --yes" },
 );
 
-async function requireInitializedDaemonState(paths: StatePaths): Promise<void> {
+async function requireInitializedDaemonState(
+  paths: StatePaths,
+  operation: "daemon" | "local_status" = "daemon",
+): Promise<void> {
   try {
     await lstat(paths.database);
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw initializationRequired();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw initializationRequired(operation);
+    }
     throw new CommandFailure(
       "RECOVERY_REQUIRED",
-      "HRA could not prove that local state is initialized. Inspect it before starting the daemon.",
+      operation === "daemon"
+        ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
+        : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
       { nextCommand: "hra doctor --offline" },
     );
   }
@@ -2026,13 +2077,15 @@ async function requireInitializedDaemonState(paths: StatePaths): Promise<void> {
   let inspectionFailure: CommandFailure | undefined;
   try {
     store = new StateStore(paths, { readonly: true });
-    if (store.listProjects().length === 0) throw initializationRequired();
+    if (store.listProjects().length === 0) throw initializationRequired(operation);
   } catch (error: unknown) {
     inspectionFailure = error instanceof CommandFailure
       ? error
       : new CommandFailure(
           "RECOVERY_REQUIRED",
-          "HRA could not prove that local state is initialized. Inspect it before starting the daemon.",
+          operation === "daemon"
+            ? "HRA could not prove that local state is initialized. Inspect it before starting the daemon."
+            : "HRA could not prove that local state is initialized. Inspect it before reading local status.",
           { nextCommand: "hra doctor --offline" },
         );
   }
@@ -2041,7 +2094,9 @@ async function requireInitializedDaemonState(paths: StatePaths): Promise<void> {
   } catch {
     throw new CommandFailure(
       "RECOVERY_REQUIRED",
-      "HRA could not close its initialization inspection safely. Inspect local state before starting the daemon.",
+      operation === "daemon"
+        ? "HRA could not close its initialization inspection safely. Inspect local state before starting the daemon."
+        : "HRA could not close its initialization inspection safely. Inspect local state before reading local status.",
       { nextCommand: "hra doctor --offline" },
     );
   }
@@ -2660,6 +2715,7 @@ class DaemonJoinDeadlineError extends Error {
 }
 
 function safeDaemonFailure(error: unknown): string {
+  if (error instanceof CursorAuthorityMissingError) return error.message;
   if (error instanceof DaemonJoinDeadlineError || error instanceof LocalDaemonShutdownTimeoutError) {
     return `Forced recovery boundary: ${error.message}`;
   }
@@ -2751,6 +2807,18 @@ export async function runDaemon(
     checkpointBoot();
     store = new StateStore(paths);
     const activeStore = store;
+    const secretCustody = installation.createSecretCustody();
+    const allowCursorAuthorityInitialization =
+      activeStore.canInitializeDaemonCursorAuthority();
+    const eventCursors = await resolveSessionEventCursorCodec(secretCustody, {
+      allowInitialization: allowCursorAuthorityInitialization,
+    });
+    const usageHistoryCursors = await resolveUsageHistoryCursorCodec(secretCustody, {
+      allowInitialization: allowCursorAuthorityInitialization,
+    });
+    activeStore.configurePublicProviderIdentifierProjector(
+      (value) => eventCursors.projectPublicProviderIdentifier(value),
+    );
     bootId = `boot_${randomUUID().replaceAll("-", "")}`;
     generation = activeStore.nextDaemonGeneration(bootId);
     await daemonLock.publish({ state: "booting", generation, bootId });
@@ -2781,7 +2849,6 @@ export async function runDaemon(
         fact: async (authority, fact) => { await serviceReference.current?.observeCodexFact(authority, fact); },
       },
     });
-    const secretCustody = installation.createSecretCustody();
     const cloudEnvironment = installation.cloudEnvironment;
     const cloudStartup = await resolveDaemonCloudStartup({
       environment: cloudEnvironment,
@@ -2798,8 +2865,6 @@ export async function runDaemon(
     const cloudIdentityNamespace = cloudStartup.identityNamespace;
     let cloudStartupDiagnostic = cloudStartup.diagnostic;
     let cloudStartupUnavailability = cloudStartup.unavailability;
-    const eventCursors = await resolveSessionEventCursorCodec(secretCustody);
-    const usageHistoryCursors = await resolveUsageHistoryCursorCodec(secretCustody);
     const cloudJournal = cloudStartup.journal;
     const projectionRecoveryBlocker = cloudStartup.projectionRecoveryBlocker;
     const unavailableProjectionRecoveryStatus = cloudJournal === null
@@ -3504,20 +3569,116 @@ async function executeAccountLogin(
   }
 }
 
-async function executeSessionEventFollow(
-  invocation: Extract<CliInvocation, { kind: "session.events.follow" }>,
+async function executeSessionEventObserver(
+  invocation: Extract<CliInvocation, {
+    kind: "session.events.follow" | "session.events.watch";
+  }>,
   output: Output,
   input: CliMainInput,
 ): Promise<number> {
   const controller = new AbortController();
-  const abort = () => controller.abort(new Error("Session event follow stopped."));
+  const abort = () => controller.abort(new Error("Session event observation stopped."));
+  const human = invocation.kind === "session.events.watch" && !invocation.jsonl;
+  let humanBootstrapComplete = !human;
+  let humanBootstrapBytes = 0;
+  const humanChunks: string[] = [];
+  const presenter = human
+    ? new ShellLivePresenter((value) => {
+        if (!humanBootstrapComplete) {
+          const nextBytes = humanSessionWatchUtf8Encoder.encode(value).byteLength;
+          if (
+            humanBootstrapBytes + nextBytes
+              > HUMAN_SESSION_WATCH_BOOTSTRAP_MAXIMUM_BYTES
+          ) {
+            throw new CommandFailure(
+              "UNAVAILABLE",
+              "Pending interaction guidance exceeds the bounded human watch bootstrap. Inspect pending interactions in bounded pages, then restart watch.",
+            );
+          }
+          humanBootstrapBytes += nextBytes;
+        }
+        humanChunks.push(value);
+      }, 35, "cli")
+    : null;
+  const bootstrappedInteractions: Array<Readonly<{
+    id: string;
+    revision: number;
+    state: PendingInteraction["state"];
+  }>> = [];
+  const callDaemon = commandCaller(input);
+  const drainHumanChunks = async (signal: AbortSignal): Promise<void> => {
+    if (humanChunks.length === 0) return;
+    const value = humanChunks.splice(0).join("");
+    if (output.writeStdoutAsync !== undefined) {
+      await output.writeStdoutAsync(value, signal);
+      return;
+    }
+    output.writeStdout(value);
+  };
+  const finalize = async (): Promise<void> => {
+    presenter?.close();
+    process.off("SIGINT", abort);
+    if (input.sessionObserverSignalMode !== "foreground_interrupt") {
+      process.off("SIGTERM", abort);
+    }
+    if (!humanBootstrapComplete) humanChunks.length = 0;
+    if (humanChunks.length === 0) return;
+    const finalOutputController = new AbortController();
+    const finalOutputDeadline = setTimeout(
+      () => finalOutputController.abort(new Error("Final human watch output exceeded its deadline.")),
+      1_000,
+    );
+    finalOutputDeadline.unref();
+    try {
+      await drainHumanChunks(finalOutputController.signal);
+    } catch (error: unknown) {
+      if (!isClosedStdout(error) && !finalOutputController.signal.aborted) throw error;
+    } finally {
+      clearTimeout(finalOutputDeadline);
+    }
+  };
   process.once("SIGINT", abort);
-  process.once("SIGTERM", abort);
+  if (input.sessionObserverSignalMode !== "foreground_interrupt") {
+    process.once("SIGTERM", abort);
+  }
   try {
+    let command = invocation.command;
+    if (presenter !== null) {
+      const exactRequestedSession = sessionIdSchema.safeParse(invocation.command.session);
+      const { sessionId } = await enumerateUnsettledSessionInteractions({
+        callDaemon,
+        ...(exactRequestedSession.success
+          ? { expectedSessionId: exactRequestedSession.data }
+          : {}),
+        onInteractions: (interactions) => {
+          bootstrappedInteractions.push(...interactions.map((interaction) => ({
+            id: interaction.id,
+            revision: interaction.revision,
+            state: interaction.state,
+          })));
+          presenter.showInitialInteractions(interactions);
+        },
+        session: invocation.command.session,
+        signal: controller.signal,
+      });
+      humanBootstrapComplete = true;
+      presenter.flush();
+      await drainHumanChunks(controller.signal);
+      input.onHumanSessionObserverBootstrap?.({
+        interactions: bootstrappedInteractions,
+        sessionId,
+      });
+      command = { ...command, session: sessionId };
+    }
     await followSessionEvents({
-      command: invocation.command,
+      command,
+      ...(human
+        ? { expectedSessionId: command.session }
+        : sessionIdSchema.safeParse(command.session).success
+          ? { expectedSessionId: command.session }
+          : {}),
       fetchPage: async (command, signal) => {
-        const response = await commandCaller(input)(command, signal);
+        const response = await callDaemon(command, signal);
         if (!response.ok) throw Object.assign(new Error(response.error.message), {
           commandError: response.error,
         });
@@ -3556,11 +3717,30 @@ async function executeSessionEventFollow(
         return !signal.aborted;
       },
       signal: controller.signal,
+      ...(presenter === null
+        ? {}
+        : {
+            writePage: async (page, _pageOutput, signal) => {
+              presenter.acceptPage(page);
+              presenter.flush();
+              await drainHumanChunks(signal);
+            },
+          }),
     });
     return 0;
   } catch (error: unknown) {
     if (controller.signal.aborted) return 0;
     if (isClosedStdout(error)) return 0;
+    if (error instanceof CommandFailure) {
+      const failure = {
+        code: error.code,
+        message: error.message,
+        ...(error.details === undefined ? {} : { details: error.details }),
+      };
+      return human
+        ? renderFailure(failure, false, output)
+        : renderJsonlFailure(failure, output);
+    }
     const commandError = error !== null && typeof error === "object" && "commandError" in error
       ? (error as { commandError?: unknown }).commandError
       : undefined;
@@ -3572,16 +3752,41 @@ async function executeSessionEventFollow(
       && "message" in commandError
       && typeof commandError.message === "string"
     ) {
-      return renderJsonlFailure(commandError as { code: string; message: string; details?: unknown }, output);
+      return human
+        ? renderFailure(commandError as { code: string; message: string; details?: unknown }, false, output)
+        : renderJsonlFailure(commandError as { code: string; message: string; details?: unknown }, output);
     }
-    return renderJsonlFailure({
+    const failure = {
       code: "INTERNAL",
-      message: error instanceof Error ? error.message : "Session event follow failed.",
-    }, output);
+      message: error instanceof Error ? error.message : "Session event observation failed.",
+    };
+    return human
+      ? renderFailure(failure, false, output)
+      : renderJsonlFailure(failure, output);
   } finally {
-    process.off("SIGINT", abort);
-    process.off("SIGTERM", abort);
+    await finalize();
   }
+}
+
+async function executeRootStatus(
+  invocation: Extract<CliInvocation, { kind: "status" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const installation = input.installation ?? createProductionInstallation();
+  const data = input.readRootStatus === undefined
+    ? await (async (): Promise<unknown> => {
+        await requireInitializedDaemonState(installation.paths, "local_status");
+        const store = new StateStore(installation.paths, { readonly: true });
+        try {
+          return store.readRootStatusSnapshot();
+        } finally {
+          store.close();
+        }
+      })()
+    : input.readRootStatus(installation.paths);
+  renderRootStatus(data, invocation.json, output);
+  return 0;
 }
 
 const selectedId = (
@@ -3595,6 +3800,42 @@ const selectedId = (
   const parsed = (field === "account" ? profileIdSchema : sessionIdSchema).safeParse(id);
   return parsed.success ? parsed.data : null;
 };
+
+const selectedShellSessionIdentity = (
+  data: unknown,
+):
+  | Readonly<{ account: string; kind: "valid"; session: string }>
+  | Readonly<{ kind: "invalid_account" | "invalid_session" }> => {
+  const current = sessionStatusSchema.safeParse(data);
+  if (current.success) {
+    return {
+      account: current.data.session.accountId,
+      kind: "valid",
+      session: current.data.session.id,
+    };
+  }
+  const legacy = isRecord(data) && data.version === 1 ? data : null;
+  if (legacy === null) return { kind: "invalid_session" };
+  const session = selectedId(legacy, "session");
+  if (session === null) return { kind: "invalid_session" };
+  const legacySession = legacy.session;
+  const account = profileIdSchema.safeParse(
+    isRecord(legacySession) ? legacySession.profileId : undefined,
+  );
+  return account.success
+    ? { account: account.data, kind: "valid", session }
+    : { kind: "invalid_account" };
+};
+
+type ForegroundSessionBootstrap = Parameters<
+  NonNullable<CliMainInput["onHumanSessionObserverBootstrap"]>
+>[0];
+
+const matchesSelectedSession = (
+  observed: ForegroundSessionBootstrap | null,
+  selected: string | undefined,
+): observed is ForegroundSessionBootstrap =>
+  observed !== null && observed.sessionId === selected;
 
 export async function runPersistentShell(
   output: Output = processOutput,
@@ -3638,17 +3879,81 @@ export async function runPersistentShell(
           );
         },
       };
+  let foregroundBootstrap: ForegroundSessionBootstrap | null = null;
+  const shellCommandInput: CliMainInput = {
+    ...commandInput,
+    ...(terminal === null ? {} : { sessionObserverSignalMode: "foreground_interrupt" as const }),
+    onHumanSessionObserverBootstrap: (bootstrap) => {
+      foregroundBootstrap = bootstrap;
+      commandInput.onHumanSessionObserverBootstrap?.(bootstrap);
+    },
+  };
   const callDaemon = commandCaller(input);
   let live: ShellLiveObserver | null = null;
+  let liveOutputEnabled = true;
   try {
     const status = await callDaemon({ kind: "daemon.status" });
     if (!status.ok) return renderFailure(status.error, false, output);
     daemonStatusIdentity(status);
     live = new ShellLiveObserver({
       callDaemon,
-      write: (value) => terminal?.writeLive(value) ?? output.writeStderr(value),
+      write: (value) => {
+        if (!liveOutputEnabled) return;
+        if (terminal === null) output.writeStderr(value);
+        else terminal.writeLive(value);
+      },
     });
     let selection: ShellSelection = {};
+    const stopSelectedSessionLive = async (): Promise<void> => {
+      liveOutputEnabled = false;
+      await live?.stop();
+      terminal?.discardHeldLiveOutput();
+    };
+    const restartSelectedSessionLive = async (
+      bootstrap: ForegroundSessionBootstrap | null,
+    ): Promise<void> => {
+      if (selection.session === undefined || selection.account === undefined) return;
+      try {
+        const response = await callDaemon({
+          kind: "session.status",
+          session: selection.session,
+        });
+        if (!response.ok) {
+          output.writeStderr(
+            "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+          );
+          return;
+        }
+        const identity = selectedShellSessionIdentity(response.data);
+        if (
+          identity.kind !== "valid"
+          || identity.session !== selection.session
+          || identity.account !== selection.account
+        ) {
+          output.writeStderr(
+            "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+          );
+          return;
+        }
+        liveOutputEnabled = true;
+        await live?.select({
+          session: identity.session,
+          statusData: response.data,
+          ...(bootstrap === null
+            ? {}
+            : {
+                suppressedInitialInteractionKeys: new Set(
+                  bootstrap.interactions.map(pendingInteractionStateKey),
+                ),
+              }),
+        });
+      } catch {
+        liveOutputEnabled = false;
+        output.writeStderr(
+          "hra: Live updates remain paused because HRA could not refresh the exact selected session. Reselect it to resume.\n",
+        );
+      }
+    };
     output.writeStderr("HRA shell. /help lists commands; /exit leaves the daemon running.\n");
     for (;;) {
       let line: string | null;
@@ -3675,8 +3980,11 @@ export async function runPersistentShell(
           }
           const account = selectedId(response.data, "account");
           if (account === null) throw new Error("Selected account response is invalid.");
-          await live.stop();
-          terminal?.discardHeldLiveOutput();
+          const exactAccount = profileIdSchema.safeParse(intent.selector);
+          if (exactAccount.success && account !== exactAccount.data) {
+            throw new Error("Selected account response does not match the exact requested account.");
+          }
+          await stopSelectedSessionLive();
           selection = { account };
           output.writeStderr(`Selected account ${terminalSafe(account)}.\n`);
           continue;
@@ -3687,24 +3995,65 @@ export async function runPersistentShell(
             renderFailure(response.error, false, output);
             continue;
           }
-          const session = selectedId(response.data, "session");
-          if (session === null) throw new Error("Selected session response is invalid.");
-          const data = response.data as { session?: { profileId?: unknown } };
-          const parsedProfileId = profileIdSchema.safeParse(data.session?.profileId);
-          if (!parsedProfileId.success) {
-            throw new Error("Selected session account response is invalid.");
+          const identity = selectedShellSessionIdentity(response.data);
+          if (identity.kind !== "valid") {
+            throw new Error(identity.kind === "invalid_account"
+              ? "Selected session account response is invalid."
+              : "Selected session response is invalid.");
           }
-          const account = parsedProfileId.data;
-          await live.stop();
-          terminal?.discardHeldLiveOutput();
+          const { account, session } = identity;
+          const exactSession = sessionIdSchema.safeParse(intent.selector);
+          if (exactSession.success && session !== exactSession.data) {
+            throw new Error("Selected session response does not match the exact requested session.");
+          }
+          await stopSelectedSessionLive();
           selection = { account, session };
           output.writeStderr(`Selected session ${terminalSafe(session)}.\n`);
+          liveOutputEnabled = true;
           await live.select({ session, statusData: response.data });
           continue;
         }
-        const execute = async (): Promise<number> => await main(intent.argv, output, commandInput);
-        if (terminal === null) await execute();
-        else await terminal.withLiveOutputHeld(execute);
+        const execute = async (): Promise<number> => await main(intent.argv, output, shellCommandInput);
+        let parsedForeground: CliInvocation | null = null;
+        try {
+          parsedForeground = parseCli(intent.argv);
+        } catch {
+          // main owns diagnostics for malformed shell commands.
+        }
+        const foregroundObserver = parsedForeground?.kind === "session.events.follow"
+          || parsedForeground?.kind === "session.events.watch";
+        const foregroundEventRead = foregroundObserver
+          || (
+            parsedForeground?.kind === "command"
+            && parsedForeground.command.kind === "session.events"
+          );
+        const ownsForegroundSignal = foregroundObserver
+          || (
+            parsedForeground?.kind === "command"
+            && parsedForeground.command.kind === "session.events"
+            && parsedForeground.command.waitMs > 0
+        );
+        const runForeground = async (): Promise<void> => {
+          if (foregroundEventRead) await stopSelectedSessionLive();
+          foregroundBootstrap = null;
+          try {
+            if (terminal !== null && ownsForegroundSignal) {
+              await terminal.withInterruptHandlingSuspended(execute);
+            } else {
+              await execute();
+            }
+          } finally {
+            if (foregroundEventRead) {
+              await restartSelectedSessionLive(
+                matchesSelectedSession(foregroundBootstrap, selection.session)
+                  ? foregroundBootstrap
+                  : null,
+              );
+            }
+          }
+        };
+        if (terminal === null) await runForeground();
+        else await terminal.withLiveOutputHeld(runForeground);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Shell command failed.";
         output.writeStderr(`hra: ${safeDiagnostic(message)}\n`);
@@ -3721,6 +4070,7 @@ export async function runPersistentShell(
     bestEffortStderr(output, "hra: HRA could not start or continue the shell safely.\n");
     return 1;
   } finally {
+    liveOutputEnabled = false;
     await live?.stop().catch(() => undefined);
     terminal?.close();
   }
@@ -3932,6 +4282,9 @@ async function executeInvocation(
   const callDaemon = commandCaller({ ...input, installation });
   if (invocation.kind === "help") { output.writeStdout(`${usageForGroup(invocation.group)}\n`); return 0; }
   if (invocation.kind === "version") { output.writeStdout(`hra ${HRA_VERSION}\n`); return 0; }
+  if (invocation.kind === "status") {
+    return await executeRootStatus(invocation, output, { ...input, installation });
+  }
   if (invocation.kind === "init") {
     return await initialize(invocation.yes, invocation.json, output, {
       documentsDirectory: installation.documentsDirectory,
@@ -3954,8 +4307,8 @@ async function executeInvocation(
   if (invocation.kind === "interaction.inspect-protected") {
     return await executeProtectedInteractionInspect(invocation, output, input);
   }
-  if (invocation.kind === "session.events.follow") {
-    return await executeSessionEventFollow(invocation, output, input);
+  if (invocation.kind === "session.events.follow" || invocation.kind === "session.events.watch") {
+    return await executeSessionEventObserver(invocation, output, input);
   }
   if (invocation.kind === "interaction-required") {
     return renderFailure(invocation.error, invocation.json, output);
@@ -4040,7 +4393,27 @@ async function executeInvocation(
     }
     command = { ...invocation.command, path: canonicalProjectRoot };
   }
-  const response = await callDaemon(command);
+  let response: CommandResponse;
+  if (
+    command.kind === "session.events"
+    && command.waitMs > 0
+    && input.sessionObserverSignalMode === "foreground_interrupt"
+  ) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(new Error("Session event read interrupted."));
+    process.once("SIGINT", abort);
+    try {
+      response = await callDaemon(command, controller.signal);
+      if (controller.signal.aborted) return 0;
+    } catch (error: unknown) {
+      if (controller.signal.aborted) return 0;
+      throw error;
+    } finally {
+      process.off("SIGINT", abort);
+    }
+  } else {
+    response = await callDaemon(command);
+  }
   if (!response.ok) {
     return command.kind === "sync.now"
       ? renderSyncNowFailure(response.error, invocation.json, output)

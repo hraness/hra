@@ -21,7 +21,7 @@ const identity = (pid: number): DaemonIdentity => ({
   generation: 1,
   nonce: "10000000-0000-4000-8000-000000000001",
   pid,
-  protocol: "hra-control-plane-local-v1",
+  protocol: "hra-control-plane-local-v2",
 });
 
 const receipt = (pid: number): DaemonAuthorityReceipt => ({
@@ -30,7 +30,7 @@ const receipt = (pid: number): DaemonAuthorityReceipt => ({
   generation: 1,
   nonce: "10000000-0000-4000-8000-000000000001",
   pid,
-  protocol: "hra-control-plane-local-v1",
+  protocol: "hra-control-plane-local-v2",
   state: "ready",
   updatedAt: 0,
   version: 2,
@@ -239,8 +239,11 @@ describe("installed package pseudo-terminal acceptance", () => {
           { expect: "Live updates unavailable:" },
           { expect: "hra[", write: "//slash-one\n" },
           { expect: "hra[", write: "/send /slash-two\n" },
+          { expect: "hra[", write: "/watch\n" },
+          { expect: "WATCH_STARTED", write: "\u0003" },
+          { expect: "hra[", write: "//after-watch\n" },
           { expect: "hra[", write: "/exit\n" },
-          { expect: "Deterministic PTY shell preserved // and /send payloads." },
+          { expect: "Deterministic PTY shell preserved // and /send payloads across watch cancellation." },
         ],
         temporaryDirectory,
         timeoutMs: 15_000,

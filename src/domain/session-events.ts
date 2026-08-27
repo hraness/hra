@@ -1,17 +1,21 @@
 import { z } from "zod";
 
+import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
 
 export const SESSION_EVENT_PAGE_LIMIT = 200;
 export const SESSION_EVENT_PAGE_BYTES = 512 * 1024;
 export const SESSION_EVENT_MAX_BYTES = 64 * 1024;
+export const SESSION_EVENT_CURSOR_MAX_BYTES = 2_048;
+// A legacy v1 row can contain two one-byte provider identifiers. Projecting
+// both to the 74-byte opaque form adds at most 146 bytes to its public envelope.
+export const SESSION_EVENT_PUBLIC_MAX_BYTES = SESSION_EVENT_MAX_BYTES + 146;
 export const SESSION_EVENT_WAIT_MAX_MS = 30_000;
 export const SESSION_EVENT_RETAIN_COUNT = 50_000;
 export const SESSION_EVENT_RETAIN_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
 export const SESSION_EVENT_RETAIN_BYTES = 64 * 1024 * 1024;
 
 const boundedText = (maximum: number) => z.string().max(maximum);
-const providerIdentifierSchema = z.string().min(1).max(512);
 const providerToolLabelMaximumUtf8Bytes = 256;
 const utf8Encoder = new TextEncoder();
 const providerToolLabelSchema = z.string()
@@ -21,15 +25,35 @@ const providerToolLabelSchema = z.string()
     (value) => utf8Encoder.encode(value).byteLength <= providerToolLabelMaximumUtf8Bytes,
     { message: `Must be at most ${providerToolLabelMaximumUtf8Bytes} UTF-8 bytes` },
   );
-const eventSequenceSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const cursorSequenceSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const eventSequenceSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const streamEpochSchema = z.string().uuid();
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+const canonicalBase64Url = (value: string): boolean => {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return false;
+  const remainder = value.length % 4;
+  if (remainder === 1) return false;
+  if (remainder === 2) return /[AQgw]$/u.test(value);
+  if (remainder === 3) return /[AEIMQUYcgkosw048]$/u.test(value);
+  return true;
+};
+
+export const sessionEventCursorWireSchema = z.string()
+  .max(SESSION_EVENT_CURSOR_MAX_BYTES)
+  .refine((value) => {
+    if (value.length > SESSION_EVENT_CURSOR_MAX_BYTES) return false;
+    const match = /^hra1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{43})$/u.exec(value);
+    return match !== null
+      && canonicalBase64Url(match[1] ?? "")
+      && canonicalBase64Url(match[2] ?? "");
+  }, "Must be one canonical HRA cursor envelope");
 
 export const sessionEventCursorPayloadSchema = z.object({
   version: z.literal(1),
   sessionId: sessionIdSchema,
   streamEpoch: streamEpochSchema,
-  sequence: eventSequenceSchema,
+  sequence: cursorSequenceSchema,
 }).strict();
 
 export type SessionEventCursorPayload = z.infer<typeof sessionEventCursorPayloadSchema>;
@@ -71,22 +95,22 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("session_status"),
     status: z.enum(["active", "idle", "terminal", "system_error", "not_loaded"]),
-    activeTurnId: providerIdentifierSchema.nullable(),
+    activeTurnId: publicProviderIdentifierSchema.nullable(),
   }).strict(),
   z.object({
     type: z.literal("turn_started"),
-    turnId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
   }).strict(),
   z.object({
     type: z.literal("turn_completed"),
-    turnId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
     status: z.enum(["completed", "interrupted", "failed"]),
     errorCode: boundedText(256).optional(),
   }).strict(),
   z.object({
     type: z.literal("item_started"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     itemKind: boundedText(128),
     server: providerToolLabelSchema.optional(),
     tool: providerToolLabelSchema.optional(),
@@ -94,8 +118,8 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
   }).strict(),
   z.object({
     type: z.literal("item_completed"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     itemKind: boundedText(128),
     server: providerToolLabelSchema.optional(),
     tool: providerToolLabelSchema.optional(),
@@ -104,21 +128,21 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
   }).strict(),
   z.object({
     type: z.literal("assistant_delta"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     text: boundedText(32_768),
   }).strict(),
   z.object({
     type: z.literal("reasoning_summary_delta"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     summaryPart: z.number().int().nonnegative().max(10_000).optional(),
     text: boundedText(32_768),
   }).strict(),
   z.object({
     type: z.literal("tool_progress"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     toolKind: boundedText(128),
     status: boundedText(128).optional(),
     outputBytesObserved: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
@@ -127,27 +151,27 @@ export const sessionEventBodySchema = z.discriminatedUnion("type", [
   }).strict(),
   z.object({
     type: z.literal("file_change"),
-    turnId: providerIdentifierSchema,
-    itemId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
+    itemId: publicProviderIdentifierSchema,
     status: boundedText(128),
     paths: z.array(safePathSummarySchema).max(100),
     omittedPaths: z.number().int().nonnegative().max(1_000_000),
   }).strict(),
   z.object({
     type: z.literal("plan_updated"),
-    turnId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
     steps: z.array(planStepSchema).max(100),
     explanation: boundedText(4_096).optional(),
   }).strict(),
   z.object({
     type: z.literal("diff_updated"),
-    turnId: providerIdentifierSchema,
+    turnId: publicProviderIdentifierSchema,
     changedFiles: z.number().int().nonnegative().max(1_000_000),
     patchBytesObserved: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   }).strict(),
   z.object({
     type: z.literal("token_usage"),
-    turnId: providerIdentifierSchema.nullable(),
+    turnId: publicProviderIdentifierSchema.nullable(),
     inputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
     cachedInputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
     outputTokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
@@ -214,23 +238,183 @@ export const sessionEventSchema = z.object({
   providerGeneration: z.number().int().nonnegative(),
   providerConnectionId: z.string().uuid().nullable(),
   body: sessionEventBodySchema,
-}).strict();
+}).strict().superRefine((event, context) => {
+  if (
+    utf8Encoder.encode(JSON.stringify(event)).byteLength
+      > SESSION_EVENT_PUBLIC_MAX_BYTES
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "A session event exceeds its serialized UTF-8 byte bound.",
+    });
+  }
+});
 
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
+
+export type SessionEventContinuity = Readonly<{
+  accountId: string | null;
+  expectedSequence: number | null;
+  lastEvent: Readonly<{
+    sequence: number;
+    streamEpoch: string;
+  }> | null;
+  requiredEpochChangeFrom: string | null;
+}>;
+
+export const initialSessionEventContinuity = (): SessionEventContinuity => ({
+  accountId: null,
+  expectedSequence: null,
+  lastEvent: null,
+  requiredEpochChangeFrom: null,
+});
 
 export const sessionEventPageSchema = z.object({
   version: z.literal(1),
   sessionId: sessionIdSchema,
-  requestedCursor: z.string().max(2_048).nullable(),
-  retentionFloorCursor: z.string().min(1).max(2_048),
-  observedThroughCursor: z.string().min(1).max(2_048),
-  nextCursor: z.string().min(1).max(2_048),
+  requestedCursor: sessionEventCursorWireSchema.nullable(),
+  retentionFloorCursor: sessionEventCursorWireSchema,
+  observedThroughCursor: sessionEventCursorWireSchema,
+  nextCursor: sessionEventCursorWireSchema,
   gap: z.object({
     reason: sessionEventGapReasonSchema,
-    requestedSequence: eventSequenceSchema.nullable(),
+    requestedSequence: cursorSequenceSchema.nullable(),
     retainedFromSequence: eventSequenceSchema,
   }).strict().nullable(),
   events: z.array(sessionEventSchema).max(SESSION_EVENT_PAGE_LIMIT),
-}).strict();
+}).strict().superRefine((page, context) => {
+  const eventBytes = page.events.reduce(
+    (total, event) => total + utf8Encoder.encode(JSON.stringify(event)).byteLength,
+    0,
+  );
+  if (eventBytes > SESSION_EVENT_PAGE_BYTES) {
+    context.addIssue({
+      code: "custom",
+      message: "A session event page exceeds its serialized event byte bound.",
+      path: ["events"],
+    });
+  }
+  let accountId: string | null = null;
+  let streamEpoch: string | null = null;
+  let priorSequence: number | null = null;
+  for (const [index, event] of page.events.entries()) {
+    if (event.sessionId !== page.sessionId) {
+      context.addIssue({
+        code: "custom",
+        message: "Every event must bind the page session.",
+        path: ["events", index, "sessionId"],
+      });
+    }
+    if (streamEpoch === null) streamEpoch = event.streamEpoch;
+    else if (event.streamEpoch !== streamEpoch) {
+      context.addIssue({
+        code: "custom",
+        message: "One event page cannot mix stream epochs.",
+        path: ["events", index, "streamEpoch"],
+      });
+    }
+    if (accountId === null) accountId = event.accountId;
+    else if (event.accountId !== accountId) {
+      context.addIssue({
+        code: "custom",
+        message: "One event page cannot mix account identities.",
+        path: ["events", index, "accountId"],
+      });
+    }
+    if (priorSequence !== null && event.sequence !== priorSequence + 1) {
+      context.addIssue({
+        code: "custom",
+        message: "Event sequences must be exactly contiguous within a page.",
+        path: ["events", index, "sequence"],
+      });
+    }
+    priorSequence = event.sequence;
+  }
+  if (
+    page.gap !== null
+    && page.events.length > 0
+    && page.events[0]?.sequence !== page.gap.retainedFromSequence
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "The first retained event must start at the gap retention floor.",
+      path: ["events", 0, "sequence"],
+    });
+  }
+  if (
+    (page.events.length > 0 || page.gap !== null)
+    && page.nextCursor === page.requestedCursor
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "A nonempty or gap page must advance its checkpoint.",
+      path: ["nextCursor"],
+    });
+  }
+  if (
+    page.events.length === 0
+    && page.gap === null
+    && page.requestedCursor !== null
+    && page.nextCursor !== page.requestedCursor
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "An empty page without a gap cannot advance its checkpoint.",
+      path: ["nextCursor"],
+    });
+  }
+});
 
 export type SessionEventPage = z.infer<typeof sessionEventPageSchema>;
+
+export const advanceSessionEventContinuity = (
+  prior: SessionEventContinuity,
+  page: SessionEventPage,
+): SessionEventContinuity => {
+  let accountId = prior.accountId;
+  let expectedSequence = prior.expectedSequence;
+  let lastEvent = prior.lastEvent;
+  let requiredEpochChangeFrom = prior.requiredEpochChangeFrom;
+
+  if (page.gap?.reason === "stream_restored") {
+    requiredEpochChangeFrom ??= lastEvent?.streamEpoch ?? null;
+    expectedSequence = page.gap.retainedFromSequence;
+  } else if (page.gap !== null) {
+    if (
+      expectedSequence !== null
+      && page.gap.retainedFromSequence < expectedSequence
+    ) {
+      throw new Error("SESSION_EVENT_CONTINUITY_GAP_MOVED_BACKWARD");
+    }
+    expectedSequence = page.gap.retainedFromSequence;
+  }
+
+  for (const event of page.events) {
+    if (accountId !== null && event.accountId !== accountId) {
+      throw new Error("SESSION_EVENT_CONTINUITY_ACCOUNT_CHANGED");
+    }
+    accountId ??= event.accountId;
+
+    if (requiredEpochChangeFrom !== null) {
+      if (event.streamEpoch === requiredEpochChangeFrom) {
+        throw new Error("SESSION_EVENT_CONTINUITY_RESTORED_EPOCH_DID_NOT_CHANGE");
+      }
+      requiredEpochChangeFrom = null;
+    } else if (lastEvent !== null && event.streamEpoch !== lastEvent.streamEpoch) {
+      throw new Error("SESSION_EVENT_CONTINUITY_STREAM_CHANGED_WITHOUT_RESTORE");
+    }
+
+    if (expectedSequence !== null && event.sequence !== expectedSequence) {
+      throw new Error("SESSION_EVENT_CONTINUITY_SEQUENCE_MISMATCH");
+    }
+    expectedSequence = event.sequence + 1;
+    lastEvent = { sequence: event.sequence, streamEpoch: event.streamEpoch };
+  }
+
+  return {
+    accountId,
+    expectedSequence,
+    lastEvent,
+    requiredEpochChangeFrom,
+  };
+};
