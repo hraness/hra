@@ -173,7 +173,9 @@ describe("static-site build", () => {
     expect(html).not.toMatch(/<script[^>]+src=/);
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);
     expect(css).not.toMatch(/url\(["']?https?:\/\//);
-    expect(css).toContain('font-family: "Nebula Sans", ui-sans-serif, system-ui');
+    expect(css).toContain('--font-sans: "Nebula Sans", ui-sans-serif, system-ui');
+    expect(css).toContain("font-family: var(--font-sans);");
+    expect(css).not.toMatch(/font-family:\s*ui-sans-serif/u);
     expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
     expect(await readFile(join(repositoryRoot, "site/social-card.svg"), "utf8"))
       .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
