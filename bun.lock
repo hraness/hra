@@ -13,7 +13,7 @@
         "@auth/core": "0.41.3",
         "@convex-dev/auth": "0.0.95",
         "@eslint/js": "9.34.0",
-        "@hraness/site-footer": "github:hraness/site-footer#v0.1.0",
+        "@hraness/site-footer": "github:hraness/site-footer#v0.2.1",
         "@types/bun": "1.3.14",
         "convex-test": "0.0.56",
         "eslint": "9.34.0",
@@ -99,7 +99,7 @@
 
     "@eslint/plugin-kit": ["@eslint/plugin-kit@0.3.5", "", { "dependencies": { "@eslint/core": "^0.15.2", "levn": "^0.4.1" } }, "sha512-Z5kJ+wU3oA7MMIqVR9tyZRtjYPr4OC004Q4Rw7pgOKUOKkJfZ3O24nz3WYfGRpMDNmcOi3TwQOmgm7B7Tpii0w=="],
 
-    "@hraness/site-footer": ["@hraness/site-footer@github:hraness/site-footer#f8502c7", { "peerDependencies": { "react": ">=18 <20" }, "optionalPeers": ["react"] }, "hraness-site-footer-f8502c7", "sha512-lKRVRBUxl2pp6pg6Iuw9mgNOTR9QVDS/011b8FsgVN/3rNzPB1g6ClHuNacJJ42964FUxWuPAbvggNED4Y7Cfg=="],
+    "@hraness/site-footer": ["@hraness/site-footer@github:hraness/site-footer#20030a9", { "peerDependencies": { "react": ">=18 <20" }, "optionalPeers": ["react"] }, "hraness-site-footer-20030a9", "sha512-x/6X02B/rAhtO3ULvm5yHIzZkn+h/aKEZMbAAvVamVmoRBied2/MfpHIMfqfLDUbE9Zhey+qljH16YT8BenT0A=="],
 
     "@humanfs/core": ["@humanfs/core@0.19.2", "", { "dependencies": { "@humanfs/types": "^0.15.0" } }, "sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA=="],
 
