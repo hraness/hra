@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSite } from "../scripts/build-site.ts";
-import { renderSiteHtml } from "./template.ts";
+import { renderPreviewHtml, renderSiteHtml } from "./template.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -38,6 +38,7 @@ describe("static-site build", () => {
       "README.md",
       "PRIVACY.md",
       "dist/site/index.html",
+      "dist/site/preview/index.html",
       "dist/site/privacy/index.html",
       "dist/site/reading/deepseek-harness/index.html",
       "dist/site/robots.txt",
@@ -129,6 +130,18 @@ describe("static-site build", () => {
     expect(reading).toContain("A plugin catalog is not a Codex account loop");
   });
 
+  test("generates the inert preview without publishing it as an indexable document", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const preview = await readFile(join(root, "dist/site/preview/index.html"), "utf8");
+    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
+
+    expect(preview).toBe(renderPreviewHtml());
+    expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
+    expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(sitemap).not.toContain("/preview");
+  });
+
   test("passes check mode in a clean clone without ignored build output", async () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root });
@@ -153,7 +166,9 @@ describe("static-site build", () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
-    const vercel = await readFile(join(repositoryRoot, "vercel.json"), "utf8");
+    const vercel = JSON.parse(
+      await readFile(join(repositoryRoot, "vercel.json"), "utf8"),
+    ) as { headers?: unknown };
 
     expect(html).not.toMatch(/<script[^>]+src=/);
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);
@@ -162,11 +177,41 @@ describe("static-site build", () => {
     expect(css).toContain('font-family: ui-monospace, "SFMono-Regular"');
     expect(await readFile(join(repositoryRoot, "site/social-card.svg"), "utf8"))
       .toContain('font-family="Nebula Sans, ui-sans-serif, system-ui, sans-serif"');
-    expect(vercel).toContain("default-src 'none'");
-    expect(vercel).toContain("font-src 'self'");
-    expect(vercel).not.toMatch(/font-src[^;]*(?:https?:|data:)/u);
-    expect(vercel).toContain("script-src 'none'");
-    expect(vercel).toContain('"X-Content-Type-Options"');
-    expect(vercel).toContain('"Permissions-Policy"');
+    expect(vercel.headers).toEqual([
+      {
+        source: "/preview/",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-ancestors https://hraness.com https://www.hraness.com; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
+          },
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+          },
+          { key: "Referrer-Policy", value: "no-referrer" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Robots-Tag", value: "noindex, nofollow" },
+        ],
+      },
+      {
+        source: "/((?!preview/?$).*)",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
+          },
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
+          },
+          { key: "Referrer-Policy", value: "no-referrer" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "X-Frame-Options", value: "DENY" },
+        ],
+      },
+    ]);
   });
 });
