@@ -1,6 +1,7 @@
 import { renderHranessSiteFooter } from "@hraness/site-footer";
 
 import {
+  deepseekHarnessReading,
   findSection,
   publicContent,
   type ContentBlock,
@@ -31,7 +32,12 @@ const renderInline = (content: readonly InlineContent[]): string =>
     })
     .join("");
 
-const renderBlock = (block: ContentBlock, sectionId: string, blockIndex: number): string => {
+const renderBlock = (
+  block: ContentBlock,
+  sectionId: string,
+  blockIndex: number,
+  subheadingLevel: "h2" | "h3" = "h3",
+): string => {
   switch (block.kind) {
     case "commands":
       return `<pre class="command-list" tabindex="0"><code>${escapeHtml(block.commands.join("\n"))}</code></pre>`;
@@ -43,23 +49,37 @@ const renderBlock = (block: ContentBlock, sectionId: string, blockIndex: number)
       return `<p>${renderInline(block.content)}</p>`;
     case "subheading": {
       const id = `${sectionId}-${blockIndex.toString()}-${block.text.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/(^-|-$)/g, "")}`;
-      return `<h3 id="${escapeHtml(id)}">${escapeHtml(block.text)}</h3>`;
+      return `<${subheadingLevel} id="${escapeHtml(id)}">${escapeHtml(block.text)}</${subheadingLevel}>`;
     }
   }
 };
 
-const renderSection = (section: ContentSection): string =>
+const renderSection = (
+  section: ContentSection,
+  headingLevel: "h1" | "h2" = "h2",
+): string =>
   `<section id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
-  <h2 id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</h2>
-  ${section.blocks.map((block, index) => renderBlock(block, section.id, index)).join("\n  ")}
+  <${headingLevel} id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
+  ${section.blocks.map((block, index) => renderBlock(
+    block,
+    section.id,
+    index,
+    headingLevel === "h1" ? "h2" : "h3",
+  )).join("\n  ")}
 </section>`;
 
 const renderHead = (
   content: PublicContent,
-  options: { readonly canonicalPath: string; readonly description: string; readonly title: string },
+  options: {
+    readonly canonicalPath: string;
+    readonly description: string;
+    readonly jsonLd?: Readonly<Record<string, unknown>>;
+    readonly openGraphType?: "article" | "website";
+    readonly title: string;
+  },
 ): string => {
   const canonicalUrl = `${content.siteUrl}${options.canonicalPath}`;
-  const jsonLd = JSON.stringify({
+  const jsonLd = JSON.stringify(options.jsonLd ?? {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     applicationCategory: "DeveloperApplication",
@@ -76,7 +96,7 @@ const renderHead = (
 <title>${escapeHtml(options.title)}</title>
 <meta name="description" content="${escapeHtml(options.description)}">
 <link rel="canonical" href="${escapeHtml(canonicalUrl)}">
-<meta property="og:type" content="website">
+<meta property="og:type" content="${escapeHtml(options.openGraphType ?? "website")}">
 <meta property="og:site_name" content="${escapeHtml(content.productName)}">
 <meta property="og:title" content="${escapeHtml(options.title)}">
 <meta property="og:description" content="${escapeHtml(options.description)}">
@@ -123,9 +143,10 @@ ${renderHead(content, {
     <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
     <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
+    ${renderBlock(deepseekHarnessReading.homeLink, "introduction", content.introduction.length)}
   </header>
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
-  ${content.sections.map(renderSection).join("\n  ")}
+  ${content.sections.map((section) => renderSection(section)).join("\n  ")}
 </main>
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
@@ -151,6 +172,54 @@ ${renderHead(content, {
   <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
   ${renderSection(privacy)}
   <p>Report a suspected boundary violation through <a href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
+</main>
+${renderProjectResources(content)}
+${renderHranessSiteFooter()}
+</body>
+</html>
+`;
+};
+
+export const renderDeepseekHarnessReadingHtml = (
+  content: PublicContent = publicContent,
+): string => {
+  const page = deepseekHarnessReading;
+  const canonicalUrl = `${content.siteUrl}${page.canonicalPath}`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+${renderHead(content, {
+  canonicalPath: page.canonicalPath,
+  description: page.description,
+  openGraphType: "article",
+  jsonLd: {
+    "@context": "https://schema.org",
+    "@type": "Article",
+    author: {
+      "@type": "Organization",
+      name: content.productName,
+      url: `${content.siteUrl}/`,
+    },
+    dateModified: page.datePublished,
+    datePublished: page.datePublished,
+    description: page.description,
+    headline: page.title,
+    mainEntityOfPage: canonicalUrl,
+    publisher: {
+      "@type": "Organization",
+      name: content.productName,
+      url: `${content.siteUrl}/`,
+    },
+    url: canonicalUrl,
+  },
+  title: `${page.title} | ${content.productName}`,
+})}
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to content</a>
+<main id="content" class="narrow-page">
+  <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
+  ${renderSection(page.section, "h1")}
 </main>
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
