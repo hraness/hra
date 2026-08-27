@@ -73,8 +73,10 @@ const renderHead = (
   options: {
     readonly canonicalPath: string;
     readonly description: string;
+    readonly includeStructuredData?: boolean;
     readonly jsonLd?: Readonly<Record<string, unknown>>;
     readonly openGraphType?: "article" | "website";
+    readonly robots?: string;
     readonly title: string;
   },
 ): string => {
@@ -90,11 +92,17 @@ const renderHead = (
     operatingSystem: "macOS, Linux",
     url: canonicalUrl,
   }).replaceAll("<", "\\u003c");
+  const robots = options.robots === undefined
+    ? ""
+    : `\n<meta name="robots" content="${escapeHtml(options.robots)}">`;
+  const structuredData = options.includeStructuredData === false
+    ? ""
+    : `\n<script type="application/ld+json">${jsonLd}</script>`;
 
   return `<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(options.title)}</title>
-<meta name="description" content="${escapeHtml(options.description)}">
+<meta name="description" content="${escapeHtml(options.description)}">${robots}
 <link rel="canonical" href="${escapeHtml(canonicalUrl)}">
 <meta property="og:type" content="${escapeHtml(options.openGraphType ?? "website")}">
 <meta property="og:site_name" content="${escapeHtml(content.productName)}">
@@ -106,8 +114,7 @@ const renderHead = (
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#11100e">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/styles.css">
-<script type="application/ld+json">${jsonLd}</script>`;
+<link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
 
 const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="project-resources">
@@ -154,6 +161,36 @@ ${renderHranessSiteFooter()}
 </html>
 `;
 };
+
+export const renderPreviewHtml = (content: PublicContent = publicContent): string =>
+  `<!doctype html>
+<html lang="en">
+<head>
+${renderHead(content, {
+  canonicalPath: "/",
+  description: content.description,
+  includeStructuredData: false,
+  robots: "noindex, nofollow",
+  title: `${content.productName} | Multi-account Codex CLI`,
+})}
+</head>
+<body class="preview-page">
+<main id="content" class="preview-shell">
+  <article class="preview-card" aria-labelledby="preview-title">
+    <p class="preview-eyebrow">Persistent Codex workspace</p>
+    <h1 id="preview-title">${escapeHtml(content.productName)}</h1>
+    <p class="preview-summary">${escapeHtml(content.description)}</p>
+    <ul class="preview-capabilities" aria-label="HRA capabilities">
+      <li><strong>Accounts</strong><span>Isolated by default</span></li>
+      <li><strong>Sessions</strong><span>Live and durable</span></li>
+      <li><strong>Sync</strong><span>Optional and encrypted</span></li>
+    </ul>
+    <p class="preview-status">Local-first <span aria-hidden="true">·</span> Bun CLI</p>
+  </article>
+</main>
+</body>
+</html>
+`;
 
 export const renderPrivacyHtml = (content: PublicContent = publicContent): string => {
   const privacy = findSection(content, "privacy");

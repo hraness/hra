@@ -20,6 +20,7 @@ import {
 } from "./content.ts";
 import {
   renderDeepseekHarnessReadingHtml,
+  renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
 } from "./template.ts";
@@ -591,6 +592,20 @@ describe("public content contract", () => {
         document.indexOf('data-slot="hraness-site-footer"'),
       );
     }
+  });
+
+  test("renders an inert noindex preview canonicalized to the full product page", () => {
+    const preview = renderPreviewHtml();
+    expect(preview).toContain('<body class="preview-page">');
+    expect(preview).toContain('<meta name="robots" content="noindex, nofollow">');
+    expect(preview).toContain('<link rel="canonical" href="https://hra.sh/">');
+    expect(preview).toContain(`<h1 id="preview-title">${publicContent.productName}</h1>`);
+    expect(preview.match(/<h1\b/gu)).toHaveLength(1);
+    expect(preview).not.toContain("<script");
+    expect(preview).not.toMatch(/analytics|auth(?:entication|orization)?|cookie|user data/iu);
+    expect(preview).not.toMatch(/<(?:a|button|form|input|select|textarea)\b/iu);
+    expect(preview).not.toContain("<footer");
+    expect(renderSitemapXml()).not.toContain("/preview");
   });
 
   test("provides keyboard and landmark structure without inline presentation", () => {
