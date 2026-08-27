@@ -391,65 +391,36 @@ const immediateClock = () => {
 };
 
 describe("domain cutover runbook", () => {
-  test("pins numeric identities and traffic-first moves in both directions", async () => {
+  test("pins retired provider identities as one-way safety tombstones", async () => {
     const runbook = await readFile(
       join(import.meta.dir, "..", "docs", "domain-cutover.md"),
       "utf8",
     );
 
+    expect(runbook).toContain("Status: retired on 2026-08-27.");
+    expect(runbook).toContain("permanently retired");
+    expect(runbook).toContain("no longer traffic targets");
+    expect(runbook).toContain("rollback authorities");
+    expect(runbook).toContain("safety tombstones");
+    expect(runbook).toContain("1334876494");
     expect(runbook).toContain("prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr");
-    expect(runbook).toContain("prj_8ciIt9t9foE3utG45frRN7cxckjS");
-    expect(runbook).toContain("team_UAd1iD2XogJlbFg4h14mRaPM");
-    expect(runbook).toContain("dpl_AmtYwx5XmgziAxGtNFMMKLGMnXUw");
-    expect(runbook).toContain("hra-1o6bv6wbl-hraness.vercel.app");
-    expect(runbook).toContain("<deployment-id>");
-    expect(runbook).toContain("<bare-automatic-hostname>.vercel.app");
-    expect(runbook).toContain("hosted:domain-cutover");
-    expect(runbook).toContain("hosted:domain-cutover preflight");
-    expect(runbook).toContain("It never sets an alias, moves domain ownership");
-    expect(runbook).toContain("exception while reading any managed alias");
-    expect(runbook).toContain("leaves stdout empty, and performs no mutation");
-    expect(runbook).toContain("/v4/aliases/hra.sh");
-    expect(runbook).toContain("deploymentId");
-    expect(runbook).toContain("source.commit");
-    expect(runbook).toContain(
-      "/v1/projects/prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr/domains/hra.sh/move",
-    );
-    expect(runbook).toContain(
-      "/v1/projects/prj_8ciIt9t9foE3utG45frRN7cxckjS/domains/hra.sh/move",
-    );
-    expect(runbook).toContain("https://www.hra.sh");
-    expect(runbook).toContain(".well-known/hra.json");
-    expect(runbook).toContain("autoAssignCustomDomains=false");
-    expect(runbook).toContain("{id,accountId,autoAssignCustomDomains}");
-    expect(runbook).toContain("--prod --skip-domain");
-    expect(runbook).toContain("vercel curl / --deployment <deployment-id>");
-    expect(runbook).toContain("publication.version");
-    expect(runbook).toContain("top-level `version`");
-    expect(runbook).toContain("443448b79e9016e00d52501f047fce3a408de092");
-    expect(runbook).toContain("version `0.1.15`");
-    expect(runbook).toContain("rather than generation alone");
-    expect(runbook).not.toContain("vercel curl / --deployment <deployment-id> --scope");
-    expect(runbook).toContain("/v4/aliases/hra-weld.vercel.app");
-    expect(runbook).toContain("/v4/aliases/try-hra.vercel.app");
-    expect(runbook).toContain("https://try-hra.vercel.app");
-    expect(runbook).not.toContain("--protection-bypass");
+    expect(runbook).toContain("2680173");
+    expect(runbook).toContain("4677913");
+    expect(runbook).toContain("Do not invoke that source directly for provider work.");
+    expect(runbook).toContain("current-project-only");
   });
 
-  test("does not prescribe detach-first or force-based movement", async () => {
+  test("contains no executable Vercel movement procedure", async () => {
     const runbook = await readFile(
       join(import.meta.dir, "..", "docs", "domain-cutover.md"),
       "utf8",
     );
     const commands = runbook.split("\n").filter((line) => line.startsWith("vercel "));
 
-    expect(commands.some((line) => line.includes("domains rm"))).toBe(false);
-    expect(commands.some((line) => line.includes("domains add"))).toBe(false);
-    expect(commands.some((line) => line.includes("--force"))).toBe(false);
-    expect(runbook).toContain("60 seconds");
-    expect(runbook).toContain("automatic restoration");
-    expect(runbook).toContain("alias target, domain source");
-    expect(runbook).toContain("alias source, domain target");
+    expect(commands).toEqual([]);
+    expect(runbook).not.toContain("hosted:domain-cutover preflight");
+    expect(runbook).not.toContain("--execute");
+    expect(runbook).not.toContain("/move");
   });
 });
 

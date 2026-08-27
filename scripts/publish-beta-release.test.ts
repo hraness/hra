@@ -867,31 +867,13 @@ describe("release publication arguments", () => {
     expect(await Bun.file(lifecycleSentinel).exists()).toBeFalse();
 
     const publisherSource = await Bun.file(join(import.meta.dir, "publish-beta-release.ts")).text();
-    const workflowSource = await Bun.file(
+    const retiredWorkflow = Bun.file(
       join(import.meta.dir, "..", ".github", "workflows", "release.yml"),
-    ).text();
+    );
     expect(publisherSource).not.toContain("pathToFileURL");
     expect(publisherSource).not.toContain('arguments: ["add", "--global"');
     expect(publisherSource).toContain('"pack",\n        "--ignore-scripts"');
-    expect(workflowSource).toContain("bun pm pack --ignore-scripts --destination release");
-    expect(workflowSource).toContain("src/install-preflight.ts");
-    expect(workflowSource).toContain("hra-install-safe");
-    expect(workflowSource.indexOf("hra-install-safe")).toBeLessThan(
-      workflowSource.indexOf('test -L "$BUN_INSTALL/bin/hra"'),
-    );
-    expect(workflowSource).toContain(
-      'test "$(bun ./src/install-preflight.ts "./release/hra-${GITHUB_REF_NAME}.tgz")" = hra-install-safe',
-    );
-    expect(workflowSource).toContain("HRA_PUBLIC_INSTALL_COMMAND");
-    expect(workflowSource).toContain("buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL)");
-    expect(workflowSource).not.toContain("bun add --global --backend=copyfile --ignore-scripts");
-    expect(workflowSource).toContain("lifecycle-disabled install changed consumer trust");
-    expect(workflowSource).not.toContain("bun add --global --backend=copyfile --trust");
-    const publicRuntimeProof = "public runtime SPDX does not match the installed package inventory";
-    expect(workflowSource.split(publicRuntimeProof)).toHaveLength(2);
-    expect(workflowSource.indexOf(publicRuntimeProof)).toBeGreaterThan(
-      workflowSource.indexOf("Accept the exact immutable public URL"),
-    );
+    expect(await retiredWorkflow.exists()).toBeFalse();
   });
 });
 
