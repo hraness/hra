@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 
+import { sessionEventCursorWireSchema } from "../domain/session-events";
 import { createSessionId } from "../domain/values";
 import {
   HRA_CURSOR_MAX_BYTES,
@@ -49,6 +50,7 @@ describe("SessionEventCursorCodec", () => {
     };
     const cursor = codec.encode(payload);
     expect(codec.decode(cursor)).toEqual(payload);
+    expect(sessionEventCursorWireSchema.parse(cursor)).toBe(cursor);
     expect(cursor).toStartWith("hra1.");
   });
 
@@ -62,6 +64,20 @@ describe("SessionEventCursorCodec", () => {
     })).toBe(
       "hra1.eyJ2ZXJzaW9uIjoxLCJzZXNzaW9uSWQiOiJzZXNzXzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwic3RyZWFtRXBvY2giOiIwMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDAiLCJzZXF1ZW5jZSI6NDJ9.iXukWPzXSWWXf738iBzxcw7GjkjXSHW9N7h5j9RWVTI",
     );
+  });
+
+  test("keeps opaque provider aliases stable only under the same durable key", () => {
+    const first = new SessionEventCursorCodec(FIXED_KEY);
+    const restarted = new SessionEventCursorCodec(FIXED_KEY);
+    const foreign = new SessionEventCursorCodec(
+      Uint8Array.from({ length: 32 }, (_, index) => 255 - index),
+    );
+    const raw = "token=LOW-ENTROPY-PROVIDER-ID";
+    const alias = first.projectPublicProviderIdentifier(raw);
+    expect(alias).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
+    expect(restarted.projectPublicProviderIdentifier(raw)).toBe(alias);
+    expect(foreign.projectPublicProviderIdentifier(raw)).not.toBe(alias);
+    expect(first.projectPublicProviderIdentifier(alias)).not.toBe(alias);
   });
 
   test("rejects tampering, foreign keys, noncanonical payloads, and oversized values", () => {

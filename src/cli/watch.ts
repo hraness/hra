@@ -1,5 +1,7 @@
 import type { LocalCommand } from "../domain/contracts";
 import {
+  advanceSessionEventContinuity,
+  initialSessionEventContinuity,
   sessionEventPageSchema,
   type SessionEventPage,
 } from "../domain/session-events";
@@ -17,6 +19,12 @@ export type SessionEventFollowResult = Readonly<{
 }>;
 
 type SessionEventJsonlOutput = Pick<Output, "writeStdout" | "writeStdoutAsync">;
+
+export type SessionEventPageWriter = (
+  page: SessionEventPage,
+  output: SessionEventJsonlOutput,
+  signal: AbortSignal,
+) => Promise<void>;
 
 const nonAbortedSignal = new AbortController().signal;
 
@@ -72,6 +80,7 @@ export const writeSessionEventPageJsonl = async (
 
 export const followSessionEvents = async (input: Readonly<{
   command: Extract<LocalCommand, { kind: "session.events" }>;
+  expectedSessionId?: string;
   fetchPage: SessionEventPageFetcher;
   maxPages?: number;
   output: SessionEventJsonlOutput;
@@ -81,6 +90,7 @@ export const followSessionEvents = async (input: Readonly<{
     signal: AbortSignal,
   ) => Promise<boolean>;
   signal: AbortSignal;
+  writePage?: SessionEventPageWriter;
   yieldAfterEmptyPage?: () => Promise<void>;
 }>): Promise<SessionEventFollowResult> => {
   if (input.command.waitMs <= 0) {
@@ -92,17 +102,19 @@ export const followSessionEvents = async (input: Readonly<{
   }
   const yieldAfterEmptyPage = input.yieldAfterEmptyPage
     ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 25)));
+  const writePage = input.writePage ?? writeSessionEventPageJsonl;
   let cursor = input.command.cursor ?? null;
   let pages = 0;
   let events = 0;
   let sessionId: string | null = null;
-  let lastEvent: Readonly<{ sequence: number; streamEpoch: string }> | null = null;
+  let continuity = initialSessionEventContinuity();
   let consecutiveFailures = 0;
   while (!input.signal.aborted && pages < maxPages) {
     let rawPage: unknown;
     try {
       rawPage = await input.fetchPage({
         ...input.command,
+        session: sessionId ?? input.command.session,
         ...(cursor === null ? { cursor: undefined } : { cursor }),
       }, input.signal);
     } catch (error: unknown) {
@@ -113,6 +125,9 @@ export const followSessionEvents = async (input: Readonly<{
     }
     consecutiveFailures = 0;
     const page = sessionEventPageSchema.parse(rawPage);
+    if (input.expectedSessionId !== undefined && page.sessionId !== input.expectedSessionId) {
+      throw new Error("SESSION_EVENT_FOLLOW_REQUEST_SESSION_MISMATCH");
+    }
     if (sessionId !== null && page.sessionId !== sessionId) {
       throw new Error("SESSION_EVENT_FOLLOW_SESSION_CHANGED");
     }
@@ -121,23 +136,9 @@ export const followSessionEvents = async (input: Readonly<{
     if ((page.events.length > 0 || page.gap !== null) && page.nextCursor === cursor) {
       throw new Error("SESSION_EVENT_FOLLOW_DID_NOT_ADVANCE");
     }
-    const pageStreamEpoch = page.events[0]?.streamEpoch;
-    for (const event of page.events) {
-      if (event.sessionId !== page.sessionId) throw new Error("SESSION_EVENT_FOLLOW_SESSION_MISMATCH");
-      if (pageStreamEpoch !== undefined && event.streamEpoch !== pageStreamEpoch) {
-        throw new Error("SESSION_EVENT_FOLLOW_PAGE_STREAM_MISMATCH");
-      }
-      if (lastEvent !== null) {
-        if (event.streamEpoch === lastEvent.streamEpoch && event.sequence <= lastEvent.sequence) {
-          throw new Error("SESSION_EVENT_FOLLOW_ORDER_MISMATCH");
-        }
-        if (event.streamEpoch !== lastEvent.streamEpoch && page.gap === null) {
-          throw new Error("SESSION_EVENT_FOLLOW_STREAM_CHANGED_WITHOUT_GAP");
-        }
-      }
-      lastEvent = { sequence: event.sequence, streamEpoch: event.streamEpoch };
-    }
-    await writeSessionEventPageJsonl(page, input.output, input.signal);
+    const nextContinuity = advanceSessionEventContinuity(continuity, page);
+    await writePage(page, input.output, input.signal);
+    continuity = nextContinuity;
     pages += 1;
     events += page.events.length;
     const didAdvance = page.nextCursor !== cursor;

@@ -1,6 +1,11 @@
 import { redactAbsolutePaths } from "../cloud/contracts";
 import type { InteractionDisplay } from "../domain/interactions";
 import type { SessionEvent, SessionEventBody } from "../domain/session-events";
+import {
+  createEphemeralPublicProviderIdentifierProjector,
+  PUBLIC_MCP_FORM_SUMMARY,
+  type PublicProviderIdentifierProjector,
+} from "../public-provider-identifier";
 import { redactCompleteSensitiveText } from "../sensitive-text";
 import { StreamingSensitiveRedactor } from "../streaming-sensitive-text";
 
@@ -166,7 +171,7 @@ export const sanitizeInteractionDisplay = (
       }
       return {
         ...display,
-        summary: safe(display.summary),
+        summary: PUBLIC_MCP_FORM_SUMMARY,
         serverName: safe(display.serverName),
         ...(fields === undefined ? {} : { fields }),
       };
@@ -174,18 +179,28 @@ export const sanitizeInteractionDisplay = (
   }
 };
 
-const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
+const sanitizeCompleteBody = (
+  body: SessionEventBody,
+  projectPublicProviderIdentifier: PublicProviderIdentifierProjector,
+): SessionEventBody => {
   const safe = (value: string): string => sanitizeProviderProse(value);
   const safeInline = (value: string): string => sanitizeProviderProse(value, false);
+  const publicId = (value: string): string => projectPublicProviderIdentifier(value);
   switch (body.type) {
     case "plan_updated": return {
       ...body,
+      turnId: publicId(body.turnId),
       steps: body.steps.map((step) => ({ ...step, text: safe(step.text) })),
       ...(body.explanation === undefined
         ? {}
         : { explanation: safe(body.explanation) }),
     };
-    case "interaction_requested": return { ...body, summary: safe(body.summary) };
+    case "interaction_requested": return {
+      ...body,
+      summary: body.interactionKind === "mcp_elicitation"
+        ? PUBLIC_MCP_FORM_SUMMARY
+        : safe(body.summary),
+    };
     case "warning": return {
       ...body,
       code: safeInline(body.code),
@@ -201,12 +216,16 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
       : { ...body, reason: safe(body.reason) };
     case "item_started": return {
       ...body,
+      turnId: publicId(body.turnId),
+      itemId: publicId(body.itemId),
       itemKind: safeInline(body.itemKind),
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
       ...(body.tool === undefined ? {} : { tool: sanitizeProviderToolLabel(body.tool) }),
     };
     case "item_completed": return {
       ...body,
+      turnId: publicId(body.turnId),
+      itemId: publicId(body.itemId),
       itemKind: safeInline(body.itemKind),
       ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
@@ -214,6 +233,8 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
     };
     case "tool_progress": return {
       ...body,
+      turnId: publicId(body.turnId),
+      itemId: publicId(body.itemId),
       toolKind: safeInline(body.toolKind),
       ...(body.status === undefined ? {} : { status: safeInline(body.status) }),
       ...(body.server === undefined ? {} : { server: sanitizeProviderToolLabel(body.server) }),
@@ -221,6 +242,8 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
     };
     case "file_change": return {
       ...body,
+      turnId: publicId(body.turnId),
+      itemId: publicId(body.itemId),
       status: safeInline(body.status),
       paths: body.paths.map((path) => ({
         ...path,
@@ -233,6 +256,7 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
     };
     case "turn_completed": return {
       ...body,
+      turnId: publicId(body.turnId),
       ...(body.errorCode === undefined
         ? {}
         : { errorCode: safeInline(body.errorCode) }),
@@ -240,12 +264,24 @@ const sanitizeCompleteBody = (body: SessionEventBody): SessionEventBody => {
     case "assistant_delta":
     case "reasoning_summary_delta":
       throw new Error("STREAMING_SESSION_DELTA_REQUIRES_CUSTODY");
-    case "diff_updated":
+    case "diff_updated": return {
+      ...body,
+      turnId: publicId(body.turnId),
+    };
+    case "session_status": return {
+      ...body,
+      activeTurnId: body.activeTurnId === null ? null : publicId(body.activeTurnId),
+    };
+    case "token_usage": return {
+      ...body,
+      turnId: body.turnId === null ? null : publicId(body.turnId),
+    };
+    case "turn_started": return {
+      ...body,
+      turnId: publicId(body.turnId),
+    };
     case "gap":
     case "interaction_state":
-    case "session_status":
-    case "token_usage":
-    case "turn_started":
       return body;
   }
 };
@@ -282,8 +318,14 @@ const itemKey = (
   itemId,
 ]);
 
-const bodyFrom = (template: DeltaBody, text: string): DeltaBody => ({
+const bodyFrom = (
+  template: DeltaBody,
+  text: string,
+  projectPublicProviderIdentifier: PublicProviderIdentifierProjector,
+): DeltaBody => ({
   ...template,
+  turnId: projectPublicProviderIdentifier(template.turnId),
+  itemId: projectPublicProviderIdentifier(template.itemId),
   text: sanitizeProviderProse(text),
 });
 
@@ -313,6 +355,7 @@ export class SessionEventStreamRedactor {
   readonly #maximumActiveStreamsPerSession: number;
   readonly #maximumStagedCodeUnits: number;
   readonly #maximumStagedNodes: number;
+  readonly #projectPublicProviderIdentifier: PublicProviderIdentifierProjector;
   #stagedCodeUnits = 0;
   #stagedNodes = 0;
 
@@ -321,6 +364,7 @@ export class SessionEventStreamRedactor {
     maximumActiveStreamsPerSession?: number;
     maximumStagedCodeUnits?: number;
     maximumStagedNodes?: number;
+    projectPublicProviderIdentifier?: PublicProviderIdentifierProjector;
   }> = {}) {
     const positive = (value: number | undefined, fallback: number): number => {
       const selected = value ?? fallback;
@@ -339,6 +383,8 @@ export class SessionEventStreamRedactor {
       2 * 1024 * 1024,
     );
     this.#maximumStagedNodes = positive(input.maximumStagedNodes, 4_096);
+    this.#projectPublicProviderIdentifier = input.projectPublicProviderIdentifier
+      ?? createEphemeralPublicProviderIdentifierProjector();
     if (this.#maximumActiveStreamsPerSession > this.#maximumActiveStreams) {
       throw new Error("SESSION_EVENT_REDACTION_SESSION_LIMIT_EXCEEDS_GLOBAL_LIMIT");
     }
@@ -355,7 +401,11 @@ export class SessionEventStreamRedactor {
         const released = this.#ensureCapacity(write, 0, false);
         this.#enqueue({
           rawText: "",
-          readyBody: bodyFrom(body, "[protected]"),
+          readyBody: bodyFrom(
+            body,
+            "[protected]",
+            this.#projectPublicProviderIdentifier,
+          ),
           write,
         });
         return [...released, ...this.#drainSession(write.sessionId)];
@@ -366,7 +416,11 @@ export class SessionEventStreamRedactor {
       if (this.#quarantinedSessions.has(write.sessionId)) {
         this.#enqueue({
           rawText: "",
-          readyBody: bodyFrom(body, "[protected]"),
+          readyBody: bodyFrom(
+            body,
+            "[protected]",
+            this.#projectPublicProviderIdentifier,
+          ),
           write,
         });
         return [...released, ...this.#drainSession(write.sessionId)];
@@ -398,7 +452,10 @@ export class SessionEventStreamRedactor {
     this.#flushForBoundary(write);
     this.#enqueue({
       rawText: "",
-      readyBody: sanitizeCompleteBody(body),
+      readyBody: sanitizeCompleteBody(
+        body,
+        this.#projectPublicProviderIdentifier,
+      ),
       write,
     });
     return [...released, ...this.#drainSession(write.sessionId)];
@@ -621,7 +678,11 @@ export class SessionEventStreamRedactor {
       }
       stream.pending.shift();
       stream.proven = stream.proven.slice(node.rawText.length);
-      this.#markReady(node, bodyFrom(stream.template, node.rawText));
+      this.#markReady(node, bodyFrom(
+        stream.template,
+        node.rawText,
+        this.#projectPublicProviderIdentifier,
+      ));
     }
   }
 
@@ -636,7 +697,11 @@ export class SessionEventStreamRedactor {
       || this.#stagedNodes + 1 > this.#maximumStagedNodes
     ) return false;
     const split = this.#splitPendingNode(stream, node, prefix.length);
-    this.#markReady(split.prefixNode, bodyFrom(stream.template, prefix));
+    this.#markReady(split.prefixNode, bodyFrom(
+      stream.template,
+      prefix,
+      this.#projectPublicProviderIdentifier,
+    ));
     return true;
   }
 
@@ -707,7 +772,11 @@ export class SessionEventStreamRedactor {
       firstProtected ??= node;
     }
     if (firstProtected === undefined) return false;
-    firstProtected.readyBody = bodyFrom(stream.template, "[protected]");
+    firstProtected.readyBody = bodyFrom(
+      stream.template,
+      "[protected]",
+      this.#projectPublicProviderIdentifier,
+    );
     stream.proven = safeSuffix;
     this.#releaseProvenNodes(stream, true);
     return stream.pending.length === 0 && stream.proven.length === 0;
@@ -717,7 +786,11 @@ export class SessionEventStreamRedactor {
     const first = stream.pending[0];
     for (const node of stream.pending) this.#markReady(node, null);
     if (first !== undefined) {
-      first.readyBody = bodyFrom(stream.template, "[protected]");
+      first.readyBody = bodyFrom(
+        stream.template,
+        "[protected]",
+        this.#projectPublicProviderIdentifier,
+      );
     }
     stream.pending.length = 0;
     stream.proven = "";

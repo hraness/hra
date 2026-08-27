@@ -28,6 +28,13 @@ import {
   type InteractionResolution,
   type PublicInteraction,
 } from "../domain/interactions";
+import {
+  SESSION_STATUS_PENDING_SUMMARY_LIMIT,
+  deriveSessionAttention,
+  sessionStatusSchema,
+  type ProviderObservation,
+  type SessionStatus,
+} from "../domain/observation";
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
 import {
@@ -400,28 +407,7 @@ const isSqliteUniqueConstraint = (error: unknown): boolean =>
 
 type LoginOutcome = CodexLoginOutcome;
 type BoundSessionRecord = SessionRecord & { providerThreadId: string };
-type PublicProviderObservation =
-  | Readonly<{
-      connectionId: string;
-      mode: "connected" | "resubscribed";
-      profileGeneration: number;
-      state: "live";
-    }>
-  | Readonly<{
-      code: "account_signed_out" | "resume_unavailable";
-      profileGeneration: number;
-      state: "unavailable";
-    }>
-  | Readonly<{
-      code: "session_quarantined" | "thread_mismatch";
-      profileGeneration: number;
-      state: "recovery_required";
-    }>
-  | Readonly<{
-      profileGeneration: number;
-      reason: "terminal" | "unbound";
-      state: "not_applicable";
-    }>;
+type PublicProviderObservation = ProviderObservation;
 type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.send"
   | "session.queue"
@@ -455,7 +441,7 @@ export class HraService {
   readonly #eventCursors: SessionEventCursorCodec;
   readonly #usageHistoryCursors: UsageHistoryCursorCodec;
   readonly #eventWaiters: SessionEventWaiters;
-  readonly #eventRedactor = new SessionEventStreamRedactor();
+  readonly #eventRedactor: SessionEventStreamRedactor;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
@@ -497,6 +483,13 @@ export class HraService {
     this.#daemonAuthority = input.daemonAuthority;
     this.#eventCursors = input.eventCursors
       ?? new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
+    this.#store.configurePublicProviderIdentifierProjector(
+      (value) => this.#eventCursors.projectPublicProviderIdentifier(value),
+    );
+    this.#eventRedactor = new SessionEventStreamRedactor({
+      projectPublicProviderIdentifier: (value) =>
+        this.#eventCursors.projectPublicProviderIdentifier(value),
+    });
     this.#usageHistoryCursors = input.usageHistoryCursors
       ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
@@ -1489,7 +1482,7 @@ export class HraService {
 
   #persistSessionEventWrites(writes: readonly SessionEventWrite[]): void {
     for (const write of writes) {
-      this.#store.appendSessionEvent(write);
+      this.#store.appendPublicSessionEvent(write);
       this.#eventWaiters.notify(write.sessionId);
     }
   }
@@ -2737,29 +2730,49 @@ export class HraService {
     const profile = this.#store.requireProfileById(session.profileId);
     if (session.providerThreadId === undefined) {
       return {
+        basis: "local_state",
+        coverage: "not_attempted",
+        freshness: "unknown",
+        observedAt: this.#now(),
         profileGeneration: profile.processGeneration,
         reason: "unbound",
+        source: "codex_app_server",
         state: "not_applicable",
       };
     }
     if (session.state === "terminal") {
       return {
+        basis: "local_state",
+        coverage: "not_attempted",
+        freshness: "unknown",
+        observedAt: this.#now(),
         profileGeneration: profile.processGeneration,
         reason: "terminal",
+        source: "codex_app_server",
         state: "not_applicable",
       };
     }
     if (session.state === "recovery_required") {
       return {
+        basis: "local_state",
         code: "session_quarantined",
+        coverage: "partial",
+        freshness: "fresh",
+        observedAt: this.#now(),
         profileGeneration: profile.processGeneration,
+        source: "codex_app_server",
         state: "recovery_required",
       };
     }
     if (profile.state !== "signed_in") {
       return {
+        basis: "local_state",
         code: "account_signed_out",
+        coverage: "unavailable",
+        freshness: "fresh",
+        observedAt: this.#now(),
         profileGeneration: profile.processGeneration,
+        source: "codex_app_server",
         state: "unavailable",
       };
     }
@@ -2788,8 +2801,13 @@ export class HraService {
       );
       if (exact === null) {
         return {
+          basis: "provider_read",
           code: "resume_unavailable",
+          coverage: "unavailable",
+          freshness: "fresh",
+          observedAt: this.#now(),
           profileGeneration: this.#currentProfileGeneration(authority),
+          source: "codex_app_server",
           state: "unavailable",
         };
       }
@@ -2802,8 +2820,13 @@ export class HraService {
       if (!(error instanceof CodexSessionObservationError)) throw error;
       this.#recordSessionObservationFailure(authority, exact, "resume_unavailable", false);
       return {
+        basis: "provider_read",
         code: "resume_unavailable",
+        coverage: "unavailable",
+        freshness: "fresh",
+        observedAt: this.#now(),
         profileGeneration: profile.processGeneration,
+        source: "codex_app_server",
         state: "unavailable",
       };
     }
@@ -2822,8 +2845,13 @@ export class HraService {
         && observation.projection.providerThreadId !== providerThreadId
       ) return this.#quarantineObservationMismatch(authority, session);
       return {
+        basis: "provider_read",
         code: "resume_unavailable",
+        coverage: "unavailable",
+        freshness: "fresh",
+        observedAt: this.#now(),
         profileGeneration: currentProfile.processGeneration,
+        source: "codex_app_server",
         state: "unavailable",
       };
     }
@@ -2861,9 +2889,14 @@ export class HraService {
       ? "resubscribed"
       : "connected";
     return {
+      basis: "provider_read",
       connectionId: observation.connectionId,
+      coverage: "complete",
+      freshness: "fresh",
       mode,
+      observedAt: this.#now(),
       profileGeneration: profile.processGeneration,
+      source: "codex_app_server",
       state: "live",
     };
   }
@@ -2939,8 +2972,13 @@ export class HraService {
       });
     }
     return {
+      basis: "provider_read",
       code: "thread_mismatch",
+      coverage: "partial",
+      freshness: "fresh",
+      observedAt: this.#now(),
       profileGeneration: authority.generation,
+      source: "codex_app_server",
       state: "recovery_required",
     };
   }
@@ -2970,37 +3008,53 @@ export class HraService {
     );
   }
 
-  async #sessionStatus(selector: string, signal: AbortSignal): Promise<unknown> {
-    const providerObservation = await this.#ensureSessionObservedLocked(selector, signal);
-    const session = this.#store.requireSession(selector);
-    const snapshot = this.#store.readSessionSnapshotWithEventPosition(session.id);
-    const pending = this.#interactionPage({
-      sessionId: session.id,
-      pending: true,
-      limit: 100,
-    });
-    return {
-      version: 1,
+  async #sessionStatus(
+    sessionId: SessionRecord["id"],
+    signal: AbortSignal,
+  ): Promise<SessionStatus> {
+    const providerObservation = await this.#ensureSessionObservedLocked(sessionId, signal);
+    const snapshot = this.#store.readSessionObservationSnapshot(
+      sessionId,
+      SESSION_STATUS_PENDING_SUMMARY_LIMIT,
+    );
+    return sessionStatusSchema.parse({
+      version: 2,
       session: snapshot.session,
+      advisory: {
+        execution: snapshot.session.execution,
+        attention: deriveSessionAttention({
+          execution: snapshot.session.execution,
+          localCoverage: "complete",
+          pendingInteractionCount: snapshot.interactions.pendingCount,
+          responseInFlightCount: snapshot.interactions.responseInFlightCount,
+        }),
+        queueDepth: snapshot.queue.depth,
+      },
+      localObservation: {
+        source: "sqlite",
+        coverage: "complete",
+        freshness: "fresh",
+        observedAt: snapshot.observedAt,
+      },
       providerObservation,
       eventStream: {
         cursor: this.#encodeEventCursor({
-          sessionId: session.id,
-          streamEpoch: snapshot.streamEpoch,
-          sequence: snapshot.observedThroughSequence,
+          sessionId,
+          streamEpoch: snapshot.eventStream.streamEpoch,
+          sequence: snapshot.eventStream.observedThroughSequence,
         }),
         retentionFloorCursor: this.#encodeEventCursor({
-          sessionId: session.id,
-          streamEpoch: snapshot.streamEpoch,
-          sequence: Math.max(0, snapshot.floorSequence - 1),
+          sessionId,
+          streamEpoch: snapshot.eventStream.streamEpoch,
+          sequence: Math.max(0, snapshot.eventStream.floorSequence - 1),
         }),
-        streamEpoch: snapshot.streamEpoch,
-        floorSequence: snapshot.floorSequence,
-        observedThroughSequence: snapshot.observedThroughSequence,
+        streamEpoch: snapshot.eventStream.streamEpoch,
+        floorSequence: snapshot.eventStream.floorSequence,
+        observedThroughSequence: snapshot.eventStream.observedThroughSequence,
       },
-      pendingInteractions: pending.interactions,
-      pendingInteractionsNextCursor: pending.nextCursor,
-    };
+      interactions: snapshot.interactions,
+      queue: snapshot.queue,
+    });
   }
 
   #interactionPage(input: Readonly<{
@@ -3112,12 +3166,19 @@ export class HraService {
         limit: command.limit,
       });
     }
-    if (listed.events.length === 0 && providerObservation.state !== "live") {
+    if (
+      listed.events.length === 0
+      && !streamRestored
+      && listed.gapReason === null
+      && providerObservation.state !== "live"
+    ) {
       this.#requireLiveProviderObservation(providerObservation);
     }
+    const gapCheckpointSequence = Math.max(0, listed.floorSequence - 1);
     const nextSequence = listed.events.at(-1)?.sequence
-      ?? requestedSequence
-      ?? Math.max(0, listed.floorSequence - 1);
+      ?? (streamRestored || listed.gapReason !== null
+        ? gapCheckpointSequence
+        : requestedSequence ?? gapCheckpointSequence);
     const page = {
       version: 1 as const,
       sessionId: session.id,
@@ -3167,8 +3228,16 @@ export class HraService {
       display: interaction.display,
       responseRecorded: interaction.responseDigest !== null,
       context: {
-        turnId: interaction.authority.turnId,
-        itemId: interaction.authority.itemId,
+        turnId: interaction.authority.turnId === null
+          ? null
+          : this.#eventCursors.projectPublicProviderIdentifier(
+              interaction.authority.turnId,
+            ),
+        itemId: interaction.authority.itemId === null
+          ? null
+          : this.#eventCursors.projectPublicProviderIdentifier(
+              interaction.authority.itemId,
+            ),
       },
       requestedAt: interaction.requestedAt,
       deadlineAt: interaction.deadlineAt,

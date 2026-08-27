@@ -8,7 +8,10 @@ import {
   providerRequestIdSchema,
   publicInteractionSchema,
 } from "./interactions";
+import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 import { createProfileId, createSessionId } from "./values";
+
+const providerIdentifierKey = Buffer.alloc(32, 0x41);
 
 describe("provider interactions", () => {
   test("binds complete protected authority to one live public revision and kind", () => {
@@ -125,7 +128,10 @@ describe("provider interactions", () => {
         availableDecisions: ["once" as const, "decline" as const, "cancel" as const],
       },
       responseRecorded: true,
-      context: { turnId: "turn-1", itemId: "item-1" },
+      context: {
+        turnId: projectPublicProviderIdentifier("turn-1", providerIdentifierKey),
+        itemId: projectPublicProviderIdentifier("item-1", providerIdentifierKey),
+      },
       requestedAt: 1,
       deadlineAt: 1_801,
       updatedAt: 2,
@@ -151,6 +157,21 @@ describe("provider interactions", () => {
       ...value,
       responseDigest: "b".repeat(64),
     })).toThrow();
+    const privateContext = `${["", "Users", "person", "private"].join("/")}/api_key=INTERACTION-CONTEXT-SECRET`;
+    expect(() => publicInteractionSchema.parse({
+      ...value,
+      context: { ...value.context, turnId: privateContext },
+    })).toThrow();
+    expect(publicInteractionSchema.parse({
+      ...value,
+      context: {
+        ...value.context,
+        turnId: projectPublicProviderIdentifier(
+          privateContext,
+          providerIdentifierKey,
+        ),
+      },
+    }).context.turnId).toMatch(/^opaque_v2_[a-f0-9]{64}$/u);
   });
 
   test("durable and public interactions reject URL elicitation and incoherent displays", () => {

@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { publicProviderIdentifierSchema } from "../public-provider-identifier";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "./values";
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -282,8 +283,8 @@ export const publicInteractionSchema = z.object({
   display: publicInteractionDisplaySchema,
   responseRecorded: z.boolean(),
   context: z.object({
-    turnId: nullableProviderIdentifierSchema,
-    itemId: nullableProviderIdentifierSchema,
+    turnId: publicProviderIdentifierSchema.nullable(),
+    itemId: publicProviderIdentifierSchema.nullable(),
   }).strict(),
   requestedAt: unixMillisecondsSchema,
   deadlineAt: unixMillisecondsSchema,

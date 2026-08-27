@@ -5,6 +5,10 @@ import { stripVTControlCharacters } from "node:util";
 
 type ShellRawSignal = "SIGQUIT" | "SIGTSTP";
 type ShellLifecycleSignal = "SIGHUP" | "SIGINT" | "SIGQUIT" | "SIGTERM" | "SIGTSTP";
+type InstalledSignalHook = Readonly<{
+  remove: () => void;
+  signal: ShellLifecycleSignal;
+}>;
 
 export type ShellTerminalLifecycleHooks = Readonly<{
   onSignal: (signal: ShellLifecycleSignal, listener: () => void) => () => void;
@@ -411,7 +415,7 @@ export class ShellTerminalCoordinator {
   #liveBackpressureOmitted = false;
   #liveHoldDepth = 0;
   #signalPropagationStarted = false;
-  #signalRemovers: (() => void)[] = [];
+  #signalHooks: InstalledSignalHook[] = [];
   readonly #lifecycleController = new AbortController();
   readonly #handleLiveDrain = (): void => {
     this.#liveBackpressured = false;
@@ -857,6 +861,19 @@ export class ShellTerminalCoordinator {
     }
   }
 
+  async withInterruptHandlingSuspended<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.#removeSignalHook("SIGINT")) {
+      this.close();
+      this.#fenceInput();
+      throw new Error("Shell interrupt ownership could not be released safely.");
+    }
+    try {
+      return await operation();
+    } finally {
+      this.#installSignalHooks();
+    }
+  }
+
   #bufferRawInput(value: Buffer): void {
     if (value.length === 0) return;
     if (this.#closed || this.#bufferedLinesOverflowed) {
@@ -1002,17 +1019,20 @@ export class ShellTerminalCoordinator {
     if (
       this.#closed
       || this.#lifecycleHooks === null
-      || this.#signalRemovers.length > 0
       || this.#signalPropagationStarted
     ) return;
-    const installed: (() => void)[] = [];
+    const installed: InstalledSignalHook[] = [];
     try {
       for (const signal of shellLifecycleSignals) {
-        installed.push(this.#lifecycleHooks.onSignal(signal, () => this.#handleLifecycleSignal(signal)));
+        if (this.#signalHooks.some((hook) => hook.signal === signal)) continue;
+        installed.push({
+          signal,
+          remove: this.#lifecycleHooks.onSignal(signal, () => this.#handleLifecycleSignal(signal)),
+        });
       }
-      this.#signalRemovers = installed;
+      this.#signalHooks.push(...installed);
     } catch (error: unknown) {
-      this.#signalRemovers = installed;
+      this.#signalHooks.push(...installed);
       this.#removeSignalHooks();
       this.close();
       this.#fenceInput();
@@ -1021,17 +1041,35 @@ export class ShellTerminalCoordinator {
   }
 
   #removeSignalHooks(): boolean {
-    const removers = this.#signalRemovers;
-    this.#signalRemovers = [];
-    const failed: (() => void)[] = [];
-    for (const remove of removers.reverse()) {
+    const hooks = this.#signalHooks;
+    this.#signalHooks = [];
+    const failed: InstalledSignalHook[] = [];
+    for (const hook of hooks.reverse()) {
       try {
-        remove();
+        hook.remove();
       } catch {
-        failed.push(remove);
+        failed.push(hook);
       }
     }
-    this.#signalRemovers = failed;
+    this.#signalHooks = failed;
+    return failed.length === 0;
+  }
+
+  #removeSignalHook(signal: ShellLifecycleSignal): boolean {
+    const retained: InstalledSignalHook[] = [];
+    const selected: InstalledSignalHook[] = [];
+    for (const hook of this.#signalHooks) {
+      (hook.signal === signal ? selected : retained).push(hook);
+    }
+    const failed: InstalledSignalHook[] = [];
+    for (const hook of selected.reverse()) {
+      try {
+        hook.remove();
+      } catch {
+        failed.push(hook);
+      }
+    }
+    this.#signalHooks = [...retained, ...failed];
     return failed.length === 0;
   }
 

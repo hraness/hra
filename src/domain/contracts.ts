@@ -7,6 +7,7 @@ import { interactionResolutionSchema } from "./interactions";
 import {
   SESSION_EVENT_PAGE_LIMIT,
   SESSION_EVENT_WAIT_MAX_MS,
+  sessionEventCursorWireSchema,
 } from "./session-events";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
 import {
@@ -14,6 +15,8 @@ import {
   messageSchema,
   noteSchema,
   profileIdSchema,
+  projectIdSchema,
+  sessionIdSchema,
   titleSchema,
   unixMillisecondsSchema,
 } from "./values";
@@ -29,8 +32,11 @@ const projectPathSchema = z.string().min(1).max(4096).refine(
   (value) => isAbsolute(value) && normalize(value) === value,
   "Project path must be absolute and normalized.",
 );
+export const LOCAL_DAEMON_PROTOCOL = "hra-control-plane-local-v2" as const;
+export const LOCAL_COMMAND_REQUEST_VERSION = 2 as const;
+
 const daemonStopAuthoritySchema = z.object({
-  protocol: z.literal("hra-control-plane-local-v1"),
+  protocol: z.literal(LOCAL_DAEMON_PROTOCOL),
   pid: z.number().int().positive(),
   nonce: z.string().uuid(),
   generation: z.number().int().positive(),
@@ -57,6 +63,71 @@ export const signedOutSessionListMetadataSchema = z.object({
 });
 
 export type SignedOutSessionListMetadata = z.infer<typeof signedOutSessionListMetadataSchema>;
+
+export const publicSessionListItemSchema = z.object({
+  id: sessionIdSchema,
+  profileId: profileIdSchema,
+  projectId: projectIdSchema.optional(),
+  title: titleSchema,
+  state: z.enum(["starting", "active", "idle", "terminal", "recovery_required"]),
+  preset: presetSchema,
+  fastEnabled: z.boolean(),
+  revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  createdAt: unixMillisecondsSchema,
+  updatedAt: unixMillisecondsSchema,
+});
+
+export const publicSessionListPageSchema = z.object({
+  accountId: profileIdSchema.nullable(),
+  sessions: z.array(publicSessionListItemSchema).max(100),
+  nextCursor: z.string().min(1).max(2_048).nullable(),
+  listing: signedOutSessionListMetadataSchema.optional(),
+  recovery: z.object({
+    required: z.literal(true),
+    diagnostic: z.literal(
+      "Provider reconciliation is paused while compact-projection recovery preserves exact local authority.",
+    ),
+  }).strict().optional(),
+}).superRefine((value, context) => {
+  if (value.accountId === null) {
+    if (value.nextCursor !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["nextCursor"],
+        message: "An unscoped session listing cannot continue.",
+      });
+    }
+    if (value.listing !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["listing"],
+        message: "Signed-out listing metadata requires an exact account.",
+      });
+    }
+  } else {
+    for (const [index, session] of value.sessions.entries()) {
+      if (session.profileId !== value.accountId) {
+        context.addIssue({
+          code: "custom",
+          path: ["sessions", index, "profileId"],
+          message: "Every scoped session must belong to the resolved account.",
+        });
+      }
+    }
+    if (
+      value.listing !== undefined
+      && value.listing.accountSelector !== value.accountId
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["listing", "accountSelector"],
+        message: "Signed-out listing metadata must bind the resolved account.",
+      });
+    }
+  }
+});
+
+export type PublicSessionListPage = z.infer<typeof publicSessionListPageSchema>;
 
 export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("doctor"), offline: z.boolean() }).strict(),
@@ -108,7 +179,7 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("session.events"),
     session: selectorSchema,
-    cursor: z.string().min(1).max(2_048).optional(),
+    cursor: sessionEventCursorWireSchema.optional(),
     limit: z.number().int().min(1).max(SESSION_EVENT_PAGE_LIMIT),
     waitMs: z.number().int().min(0).max(SESSION_EVENT_WAIT_MAX_MS),
   }).strict(),
@@ -180,7 +251,7 @@ export type LocalCommand = z.infer<typeof localCommandSchema>;
 
 export const commandEnvelopeSchema = z
   .object({
-    version: z.literal(1),
+    version: z.literal(LOCAL_COMMAND_REQUEST_VERSION),
     capability: z.string().regex(/^[A-Za-z0-9_-]{43}$/u),
     requestId: z.string().uuid(),
     command: localCommandSchema,

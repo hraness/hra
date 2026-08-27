@@ -64,6 +64,12 @@ export type SessionEventFollowCliInvocation = Readonly<{
   kind: "session.events.follow";
 }>;
 
+export type SessionEventWatchCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "session.events" }>;
+  jsonl: boolean;
+  kind: "session.events.watch";
+}>;
+
 export type AccountLoginCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "account.login" }> & Readonly<{
     idempotencyKey: string;
@@ -79,6 +85,7 @@ export type InteractionResolveCommand = Extract<LocalCommand, { kind: "interacti
 export type CliInvocation =
   | { group?: string; kind: "help" }
   | { kind: "version" }
+  | { kind: "status"; json: boolean }
   | { kind: "init"; yes: boolean; json: boolean }
   | { kind: "daemon.start"; json: boolean }
   | { kind: "daemon.run" }
@@ -88,6 +95,7 @@ export type CliInvocation =
   | ProtectedInteractionInspectCliInvocation
   | AccountLoginCliInvocation
   | SessionEventFollowCliInvocation
+  | SessionEventWatchCliInvocation
   | InteractionRequiredInvocation
   | ProjectionRecoveryCliInvocation
   | { kind: "command"; command: LocalCommand; json: boolean };
@@ -112,6 +120,7 @@ export const usage = `HRA
 
 Usage:
   hra
+  hra status [--json]
   hra init [--yes] [--json]
   hra doctor [--offline] [--json]
   hra daemon start|status|stop|run
@@ -119,8 +128,9 @@ Usage:
   hra plugin list <account> [--project <project>] [--refresh]
   hra plugin show <account> <plugin> [--project <project>] [--refresh]
   hra project add|list|use
-  hra session list|show|status|start|send|queue|steer|stop
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow|--jsonl]
+  hra session list|show|status|watch|start|send|queue|steer|stop
+  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+  hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|note|preset|fast|project
   hra interaction list|show|inspect|decide|grant|answer|submit
@@ -135,7 +145,8 @@ Usage:
 
 Output:
   --json                    Emit one versioned JSON result for supported commands.
-  --jsonl, --follow         Follow session events as versioned JSON Lines.
+  --jsonl                   Watch session events as versioned JSON Lines.
+  --follow                  Compatibility spelling for session events JSON Lines.
 
 Interactive:
   Run bare \`hra\` in a TTY to start the persistent agent-and-human shell.
@@ -151,6 +162,14 @@ Recommended profiles:
 Run ‘hra <group> --help’ for command examples.`;
 
 const groupUsage = {
+  status: `HRA status
+
+Usage:
+  hra status [--json]
+
+Examples:
+  hra status
+  hra status --json`,
   init: `HRA init
 
 Usage:
@@ -223,8 +242,9 @@ Examples:
 Usage:
   hra session list [--account <profile>] [--limit <1..100>] [--cursor <cursor>]
   hra session show <session> [--detail]
-  hra session status <session>
-  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--follow|--jsonl]
+  hra session status <session> [--json]
+  hra session watch <session> [--cursor <cursor>] [--jsonl]
+  hra session events <session> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session start <account> [--project <project>] [--preset <low|high|ultra>] [--fast]
   hra session send|queue|steer <session> <message>
@@ -238,6 +258,8 @@ Usage:
 
 Examples:
   hra session start personal --project jungle --preset high
+  hra session watch my-session
+  hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"`,
   interaction: `HRA interaction
@@ -707,7 +729,7 @@ const parseSessionNote = (cursor: Cursor): LocalCommand => {
 const parseSession = (
   cursor: Cursor,
   jsonl: boolean,
-): LocalCommand | SessionEventFollowCliInvocation => {
+): LocalCommand | SessionEventFollowCliInvocation | SessionEventWatchCliInvocation => {
   const action = take(cursor, "session action");
   switch (action) {
     case "list": {
@@ -747,6 +769,20 @@ const parseSession = (
       return follow
         ? { command: parsed, jsonl: true, kind: "session.events.follow" }
         : parsed;
+    }
+    case "watch": {
+      const eventCursor = option(cursor, "--cursor");
+      const session = take(cursor, "session");
+      finish(cursor);
+      const parsed = command({
+        kind: "session.events",
+        session,
+        cursor: eventCursor,
+        limit: 200,
+        waitMs: 30_000,
+      });
+      if (parsed.kind !== "session.events") throw new CliUsageError("Session watch command is invalid.");
+      return { command: parsed, jsonl, kind: "session.events.watch" };
     }
     case "interactions": {
       const pending = flag(cursor, "--pending");
@@ -994,7 +1030,14 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
   if (jsonl && group !== "session") {
-    throw new CliUsageError("--jsonl is supported only by `hra session events`.");
+    throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+  }
+  if (group === "status") {
+    finish(cursor);
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("--idempotency-key is not supported by status.");
+    }
+    return { kind: "status", json };
   }
   if (group === "init") { const yes = flag(cursor, "--yes"); finish(cursor); return { kind: "init", yes, json }; }
   if (group === "doctor") { const offline = flag(cursor, "--offline"); finish(cursor); return { kind: "command", command: { kind: "doctor", offline }, json }; }
@@ -1046,8 +1089,17 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       }
       return sessionCommand;
     }
+    if (sessionCommand.kind === "session.events.watch") {
+      if (json) {
+        throw new CliUsageError("Session watch does not support --json. Use --jsonl for machine output.");
+      }
+      if (idempotencyKey !== undefined) {
+        throw new CliUsageError("--idempotency-key is not supported by session.watch.");
+      }
+      return sessionCommand;
+    }
     if (jsonl) {
-      throw new CliUsageError("--jsonl is supported only by `hra session events`.");
+      throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
     }
     parsed = sessionCommand;
   }

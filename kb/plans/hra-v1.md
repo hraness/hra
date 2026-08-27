@@ -74,7 +74,7 @@ The Convex deployment coordinates devices and encrypted projections. It is never
 - `hra` with no arguments on a non-TTY prints bounded help and exits successfully. It never consumes stdin as a prompt or grants authority implicitly.
 - Existing one-shot commands remain composable. `--json` emits one versioned value on stdout. `--jsonl` emits only versioned event envelopes on stdout. Diagnostics and interactive prompts use stderr or the foreground TTY.
 - Every Codex account login is a dedicated one-shot CLI invocation. JSON and noninteractive callers must supply `--handoff-file` with an absolute canonical path to an empty single-link mode-`0600` regular file under a canonical current-user-owned mode-`0700` parent. HRA opens and holds both descriptors, strictly resolves the selector through the local account list, and dispatches the provider effect only with that exact account ID. The response must repeat that ID, carry a state coherent with its terminal or pending login status, name the canonical cancellation command, use the pinned HTTPS-or-loopback URL policy without URL credentials, and provide a closed device-code grammar. HRA writes and proves one bounded versioned document after the first pending response, closes both descriptors before reporting success, and emits only its path, disposition, and safe state. Missing protected output returns `INTERACTION_REQUIRED` with the already-generated idempotency key and exact replay command before transport. Same-key replay never claims or reconstructs one-time instructions; a login that has since completed or been canceled returns terminal signed-in or signed-out settlement. A post-effect parse, write, close, or identity-proof failure returns one `RECOVERY_REQUIRED` result with the exact cancellation and same-key recovery commands. A dedicated foreground human TTY renderer may show the validated URL and code directly; the generic renderer cannot.
-- Agents inspect a session through an atomic snapshot plus opaque versioned cursor and then request events after that cursor. The cursor binds session ID, stream epoch, and sequence and is validated as an indivisible value. `session events --wait-ms` provides bounded long polling; `session events --follow` reconnects internally and prints ordered JSONL. Each line must drain before its cursor advances or another page is fetched. Delivery is monotonic and at least once across pipe or process failure; consumers deduplicate by cursor. A retained page contains no duplicates. A retention, rebuild, restore, or provider-connection gap is typed and never silent. `--follow --json` is rejected instead of silently changing output modes, and cancellation destroys an in-flight local socket request.
+- Agents inspect a session through an atomic snapshot plus opaque versioned cursor and then request events after that cursor. The cursor binds session ID, stream epoch, and sequence and is validated as an indivisible value. `session events --wait-ms` provides bounded long polling; `session events --follow` reconnects internally and prints ordered JSONL. Each line must drain before its cursor advances or another page is fetched. Delivery is monotonic and at least once across pipe or process failure. Consumers deduplicate events by `(sessionId, streamEpoch, sequence)` and persist a page checkpoint only after durably applying every preceding line. A retained page contains no duplicates. A retention, rebuild, restore, or provider-connection gap is typed and never silent. `--follow --json` is rejected instead of silently changing output modes, and cancellation destroys an in-flight local socket request.
 - The live release operator gives agent mode one framed stdin and stdout protocol. Its first stdin frame is the bounded configuration document. Every later request has a fresh UUID and an exact `responseMode`. HRA identity documents use an absolute canonical invoking-user-owned mode-`0600` file. Codex device-login values use a caller-created empty mode-`0600` handoff file under a canonical mode-`0700` directory; HRA opens the child relative to a held parent descriptor with `O_NOFOLLOW | O_NONBLOCK`, writes and verifies the bounded document, preserves it, and emits only its protected path and disposition. Fixed nonsecret question, permission, and acknowledgement responses may be inline only under their declared closed mode. Agent stdout never contains an invite, OTP, device code, verification URL, protected answer, or permission value.
 - Human rendering coalesces small deltas without changing the durable cursor. JSON clients receive the bounded closed event variants and do not parse ANSI presentation.
 - A TTY proves only local terminal attachment, not a particular human. The shell never resolves an interaction merely because it is attached. Each response requires the exact interaction ID, kind, and current revision; concurrent shells may inspect the same prompt, but only one compare-and-swap response can win and every stale response fails before provider transport. TTY presence alone grants nothing.
@@ -97,7 +97,7 @@ The Convex deployment coordinates devices and encrypted projections. It is never
 - Ordinary messages, model output, and free-form shell text never grant approval. Permission grants accept only a protected `{"permissions":["<requested-name>"]}` document, must be a subset of the requested names, and preserve their requested turn or session scope. The live adapter rehydrates each selected safe name to its exact private provider key and value only immediately before the response write. Questions accept only a protected `{"answers":{"<question-id>":{"answers":["<answer>"]}}}` document whose IDs exactly match the request.
 - Plugin installation, plugin enablement, app authorization, MCP OAuth, and a tool's side-effect approval are separate upstream effects. Pinned Codex 0.149 exposes safe `plugin/list` discovery but no safely separated install, enable, disable, or OAuth methods. Its install path is a compound effect that enables the plugin and may then begin browser OAuth. HRA therefore exposes only `plugin list` and `plugin show` in this beta and rejects lifecycle commands at the parser boundary. Any MCP form carrying `codex_approval_kind` is rejected before durable admission, including the pinned `tool_suggestion` plugin lifecycle and `mcp_tool_call` side-effect contracts and every unknown future discriminator. Other standard MCP form elicitation remains a typed protected interaction only for the closed primitive schema contract. Opaque extended forms and URL elicitation fail before durable state because HRA cannot safely render the former and query or fragment data in the latter can contain bearer authority. No HRA path opens a browser or changes plugin authority.
 
-Each event page is one transactionally coherent object containing the requested cursor, retention floor, observed-through cursor, ordered events, typed gap metadata, and next cursor. Waiting uses transaction read, waiter registration, transaction recheck, then bounded await, so an append between read and sleep is observed. V1 constants are 200 events or 512 KiB per page, 64 KiB per event, and a 30-second maximum wait. Retention keeps only the newest 50,000 events that are no older than seven days and fit, newest first, within 64 MiB per session. Append and maintenance evict the oldest rows until all three ceilings hold, record the exact crossed ceiling in floor gap metadata, and apply count, age, then byte precedence when several boundaries coincide.
+Each event page is one transactionally coherent object containing the requested cursor, retention floor, observed-through cursor, ordered events, typed gap metadata, and next cursor. Every public cursor field uses the canonical bounded `hra1` wire envelope; cryptographic authority and semantic binding remain daemon checks. Waiting uses transaction read, waiter registration, transaction recheck, then bounded await, so an append between read and sleep is observed. V1 constants are 200 events or 512 KiB per page, 64 KiB per newly stored event, and a 30-second maximum wait. Public reads reserve at most 146 additional bytes for projecting the two shortest private identifiers in a legacy event. Retention keeps only the newest 50,000 events that are no older than seven days and fit, newest first, within 64 MiB per session. Append and every writable event-page read evict the oldest rows until all three ceilings hold, record the exact crossed ceiling in floor gap metadata, and apply count, age, then byte precedence when several boundaries coincide. A non-live session still returns the typed gap page when maintenance removes its last retained event.
 
 ### Accounts and usage
 
@@ -297,7 +297,7 @@ Bound event payloads and per-session retention by the published constants; advan
 
 Namespace all cloud custody and projection state by cloud user public ID. A same-root A to B to A handoff closes the current lifecycle, selects another namespace, and preserves both identities' key, device, cache, journal, and recovery state. No cloud-identity operation may block local Codex accounts or sessions.
 
-The new product's physical namespace is deliberately distinct from HRA v0 and from discarded development namespaces: `~/Library/Application Support/HRA Control Plane v1` on macOS, `~/.local/state/hra-control-plane-v1` on Linux, private `secret-values` and `secret-metadata` custody below that root, daemon protocol `hra-control-plane-local-v1`, and `hra-control-plane` cryptographic domain prefixes. This preproduction operator machine already has one generation-zero pointer in the v1 root whose value used the former prerelease Keychain backend. A foreground, daemon-fenced repository operator copies that exact digest-proven value into `secret-values` in place, retains the legacy entry, and never runs automatically. HRA v0 retains its `OPRTE` Application Support root, `kitchen.hraness` bundle and credential services, and every historical compatibility identifier unchanged.
+The new product's physical namespace is deliberately distinct from HRA v0 and from discarded development namespaces: `~/Library/Application Support/HRA Control Plane v1` on macOS, `~/.local/state/hra-control-plane-v1` on Linux, private `secret-values` and `secret-metadata` custody below that root, daemon protocol `hra-control-plane-local-v2`, and `hra-control-plane` cryptographic domain prefixes. This preproduction operator machine already has one generation-zero pointer in the v1 root whose value used the former prerelease Keychain backend. A foreground, daemon-fenced repository operator copies that exact digest-proven value into `secret-values` in place, retains the legacy entry, and never runs automatically. HRA v0 retains its `OPRTE` Application Support root, `kitchen.hraness` bundle and credential services, and every historical compatibility identifier unchanged.
 
 ## Convex state
 
@@ -548,6 +548,226 @@ The beta requires all of these scenarios:
 - Existing SQLite and encrypted Convex ledgers are enough for beta metrics. Turso remains a deferred implementation option behind an export repository, not a second source of truth.
 - Hosted sync is not enabled for the beta release until authenticated account erasure, abandoned-unverified cleanup, aggregate storage quotas, fair bounded maintenance, status-first revocation, invitation-gated OTP admission, identity-scoped local custody, device presence, ordered usage upload, and live two-device proof pass.
 - External cutover is a data-preserving rename sequence. HRA v0 keeps its runtime and provider identities. New HRA gets fresh state. Domain movement happens only after the new deployment passes acceptance behind a noncanonical URL.
+
+## Compounding Tech research proposal
+
+Status: implemented, adversarially reviewed, and fully gated locally on 2026-08-27.
+
+Implementation evidence:
+
+- The focused observation gate passes 545 tests with 8,083 assertions across 13 files. It covers the domain contracts, storage cuts, cursor codec and wire schema, streaming redaction, daemon service, parser, renderer, shell, watch pump, and CLI entry point.
+- The deterministic two-device acceptance scenario passes 32 tests with 313 assertions after projecting every provider identifier through the public alias boundary and using canonical cursor envelopes. The release-workflow checks pass against the regenerated installer digest.
+- The complete post-rebase repository test sweep passes 1,762 tests with 97,714 assertions across 101 files. The generated-site check, production CLI and site builds, package policy, and isolated installed-package daemon lifecycle also pass.
+- Independent adversarial review found no remaining P0-P2 defects. Its final focused CLI and shell-live gate passes 164 tests. The review specifically rechecked atomic human bootstrap output, the 1 MiB cap, tuple-only foreground resumption, current interaction preservation, cursor continuity, cancellation, and machine-output failure boundaries.
+
+The user accepted this adversarially revised scope on 2026-08-26. It preserves the current HRA v1 account, device, and session model. It does not reopen completed release decisions or authorize provider, deployment, DNS, migration, tag, or publication effects.
+
+### Evidence baseline
+
+The review covered every public repository in the Compounding Tech organization at these immutable revisions:
+
+| Repository | Revision | Relevant evidence |
+| --- | --- | --- |
+| st2 | [19485cf](https://github.com/compoundingtech/st2/commit/19485cf01201aab145e8bb71e7a5bd7497af0e0f) | Exact Codex thread and turn fencing, typed human blocking, crash-aware delivery, coverage-aware messages, desired versus observed reconciliation, invariant-linked tests |
+| evals | [bb91a15](https://github.com/compoundingtech/evals/commit/bb91a15948265f809c72f4d1b832e70ee4b568ee) | Model-free preflight, explicit paid execution, planted-negative graders, durable receipts |
+| personas | [03b4055](https://github.com/compoundingtech/personas/commit/03b40550b2e5dbde5c7c374211e5b8c95c672edb) | Separation of work state from runtime health; blanket permission bypass is a rejected interim design |
+| pty | [500eab2](https://github.com/compoundingtech/pty/commit/500eab269d251518e5575e641f29d57e6eb011c4) | Detached runtime ownership, causal snapshot to delta handoff, observer and operator roles, reconnect classification |
+| pty-rust | [e4d6cda](https://github.com/compoundingtech/pty-rust/commit/e4d6cda68e9a6dc268f35e790937d4fac519a1f0) | Single-owner actor pattern and direct evidence that a native rewrite can retain parity and backpressure problems |
+| pty-relay | [1ea6ea6](https://github.com/compoundingtech/pty-relay/commit/1ea6ea6c52899f2f4d021842712360c8f1c614cb) | Bounded client approval, typed reconnect, protected noninteractive secret input, bounded framing |
+| pty-layout | [1e480e3](https://github.com/compoundingtech/pty-layout/commit/1e480e3156495256db86e0e08533e1cb72e18ae9) | View membership distinct from session lifetime; list and subscribe races remain unresolved without cursors |
+| fabric | [a44c246](https://github.com/compoundingtech/fabric/commit/a44c246d3c1249ef3b86b347930d22988ca74579) | Cryptographic device identity, authenticated peer transport, peer-scoped health and recovery, semantic telemetry |
+| transplant | [61b7c47](https://github.com/compoundingtech/transplant/commit/61b7c4798e524f70d80de9e7aa7e5b77a92b448b) | Harness capability inventory, explicit portable and excluded resources, move distinct from fork |
+| intent | [e420471](https://github.com/compoundingtech/intent/commit/e4204714ab68dd35b9942b397b8cfe235a489c78) | Canonical ownership, evidence-backed decisions, deterministic checks distinct from semantic review |
+| compass | [b9467f8](https://github.com/compoundingtech/compass/commit/b9467f85522d1f5127d87a5d4f8a794721c1a85b) | Immutable revisions, append-only evidence, explicit divergence and unresolved ancestry |
+| smalltalk | [44667c1](https://github.com/compoundingtech/smalltalk/commit/44667c1290641c43e59176e8fbb42484fc8d4a1f) | Archived failure evidence for folder identity, mtime liveness, terminal-frame availability, and filesystem delivery |
+| convoy | [3b8eedd](https://github.com/compoundingtech/convoy/commit/3b8eedd4c3563cc0e823720ccd6550e0a81f3e7f) | Archived failure evidence for orchestration over weak signals, ignored flags, bypassed approvals, replay churn, and prose-only boundaries |
+
+The official Codex app-server contract confirms that HRA is integrating a bidirectional, version-specific JSON-RPC protocol. It streams typed thread, turn, item, and delta events and sends distinct client requests for command approval, file approval, user input, permission grants, MCP elicitation, dynamic tools, and app-tool approval. A PTY can hold a process, but terminal bytes cannot replace that structured authority. See [Codex app-server protocol and approvals](https://learn.chatgpt.com/docs/app-server).
+
+No external source code is to be copied as part of this proposal. Several reviewed repositories lack clear GitHub license metadata. HRA may adapt documented mechanisms and independently implement them; copying code requires separate license confirmation.
+
+### What the research changes
+
+HRA already implements most of the hard foundation: an exact Codex version and schema digest, one provider owner per account generation, durable session events with signed cursors and typed gaps, revision-bound interactions, a persistent human shell, one-shot JSON and JSONL, historical usage, device presence, idempotent mutation recovery, and protected input. The proposal extends that foundation instead of replacing it.
+
+| Mechanism | Decision for HRA |
+| --- | --- |
+| Exact provider reducer and thread, turn, connection, and generation fencing | Keep and make the observation contract easier to consume. st2 proves why these dimensions cannot collapse into one status flag. |
+| Causal snapshot followed by ordered deltas | Keep per session. Make the session snapshot, event cut, pending-interaction count, and advisory view one bounded SQLite read. |
+| Human and machine observer roles | Keep the existing human shell and JSON/JSONL surfaces. Observers never gain approval or mutation authority. |
+| Typed interaction lifecycle | Keep approval, question, permission, and supported MCP forms distinct. Unknown callbacks, plugin lifecycle, OAuth, URL elicitation, and unsupported forms remain closed. |
+| Coverage and freshness | Add them wherever status combines local authority with provider observation. Empty, stale, unavailable, partial, and not attempted remain distinct. |
+| Recovery guidance | Represent recovery as a closed typed intent. Render safe command arguments only in the CLI presentation layer; never persist arbitrary argv as authority. |
+| Invariant to proof traceability | Add a small registry that links load-bearing guarantees to existing deterministic and live evidence. Do not build another eval platform. |
+| Authenticated device identity and scoped recovery | Keep the existing account-authorized device model and Convex transport. Fabric is evidence for the principles, not a reason to add peer-to-peer transport. |
+| Generic agent catalog, scheduler, shared-folder bus, or PTY injection | Reject. HRA remains a Codex account, device, and session control plane. |
+| Rust or Zig rewrite | Reject without a measured bottleneck. Event semantics, authority, and recovery are the limiting problems. Native helpers remain narrow and protocol-bound. |
+
+### Revised model
+
+The three main objects remain:
+
+| Object | Owns | Does not imply |
+| --- | --- | --- |
+| Account | Codex authentication generation, subscription identity, provider capability evidence, usage observations, and owned sessions | A signed-in account does not imply a responsive provider process, fresh usage, or an online device. |
+| Device | Cryptographic device identity, registration and revocation state, local daemon generation, capabilities, and expiring presence evidence | A heartbeat does not imply that Codex responds, a turn progresses, or the device may execute a session. |
+| Session | Provider thread binding, account binding, current execution authority, queue, ordered semantic events, interactions, and recovery state | Active, blocked on a human, queued, observed live, and healthy are independent facts. |
+
+Turns, interactions, events, usage observations, device leases, and mutation attempts remain supporting ledgers, not additional top-level product objects.
+
+Session status exposes orthogonal axes rather than one lossy activity enum:
+
+- execution: the existing starting, active, idle, terminal, or recovery-required session state;
+- attention: none, human-action-required, response-in-flight, recovery-required, or unknown;
+- observation: provider source, account generation, connection, observed time, freshness, and coverage;
+- queue depth: an independent bounded count.
+
+The attention and observation views are pure advisory projections. They are never persisted as a second authority and never grant permission, settle an interaction, or select a mutation target.
+
+Presence remains a projection over separately sourced evidence. The CLI may render online as a convenience only when the server-time lease is current. Stored facts remain registration, revocation, heartbeat observation, expiry, custody, and capabilities.
+
+### CLI proposal
+
+The implemented agent and human observation surface is a small status and watch vocabulary:
+
+    hra status [--json]
+    hra session status <session> [--json]
+    hra session watch <session> [--cursor <cursor>] [--jsonl]
+
+The contracts are:
+
+1. hra status is a bounded, current local-only SQLite overview. It performs no provider, cloud, browser, login, usage refresh, recovery, or other effect. It returns state counts plus at most 50 attention records with inspection-only guidance. It omits notes, emails, transcripts, tool content, reasoning, ordinary titles, and device labels. Local coverage is complete for the explicitly listed SQLite tables within one read transaction. Provider and cloud coverage are always `not_attempted`, and device counts are unknown. It has no global cursor.
+2. hra session status produces one typed provider-observation result, attempting a Codex app-server read only when local state makes one applicable, then reads the session row, event cut, pending-interaction count, bounded pending summary, queue depth, and derived axes in one SQLite transaction. Each result carries its source, basis, generation, observed time, freshness, and coverage.
+3. hra session watch is a presentation alias over the existing session events follow path. It introduces no new daemon stream or storage. Human output remains bounded text; machine stdout is versioned JSONL; diagnostics remain on stderr; output drains before cursor advancement. Standalone human watch commits no initial interaction guidance until complete enumeration and caps that atomic UTF-8 bootstrap at 1 MiB. Foreground-watch resumption retains only bounded exact interaction tuples and filters fresh pages incrementally.
+4. Exact session wait is unavailable. Agents start `session watch` from the status cursor or repeat bounded status reads. HRA will not publish a wait predicate until every transition that can satisfy it advances a predicate revision in the same transaction as its authority change, and waiter registration rechecks that revision before sleeping.
+
+The bare hra shell uses the same projections and commands. It does not gain a full-screen interface or a second state model.
+
+### Implementation sequence after acceptance
+
+#### Research gate
+
+1. Create a field-source inventory for every proposed status field and wait predicate: source of truth, owning transaction, revision or generation, retention, freshness, privacy class, and gap behavior.
+2. Enumerate every reachable combination of session execution, interaction state, queue state, and provider observation. Prove that the advisory axes preserve different operator actions.
+3. Fold deterministic event fixtures into the proposed view and compare it with the stored session and interaction authority. Inject crashes around every transition that can change a wait predicate.
+4. Serialize maximum supported fixtures and keep root status below 256 KiB, well under the 4 MiB local response boundary.
+5. Stop here if the per-session event ledger cannot reconstruct every wait predicate. The fallback is the improved session status plus the existing session events stream, without wait.
+
+#### Research gate result (2026-08-26)
+
+The gate failed at step 3, so the fallback is now the release contract. The session event ledger cannot reconstruct every proposed wait predicate:
+
+- interaction admission commits the pending interaction before the corresponding public event is appended;
+- session execution, recovery, and queue transitions do not all append a predicate event in the same transaction as their authority change;
+- existing event waiters wake on session event sequence, so an authority-only transition has no wake edge.
+
+A crash or scheduling boundary between those operations can leave a predicate true in SQLite while the event cursor remains unchanged. `hra session wait` is therefore absent from the parser, help, command lists, shell, and runtime. The canonical docs state this absence and direct agents to atomic status, resumable watch, and bounded polling.
+
+The field-source inventory is:
+
+| Field group | Source of truth and owning transaction | Revision or generation | Retention and freshness | Privacy and gap behavior |
+| --- | --- | --- | --- | --- |
+| Session identity and execution | `sessions`, in the session-observation SQLite read transaction | Session revision and account binding | Current local authority, observed at transaction time | Bounded public IDs, a credential-and-path-redacted title, state, and timestamps; every raw provider turn or item ID becomes a secret-keyed opaque public alias. The durable local key keeps aliases coherent across status, events, interactions, and daemon restarts without publishing an offline-guessable digest. No note or provider thread ID crosses the boundary. An authority change without an event is visible in the next status read. |
+| Event cut | `session_event_streams`, in the same session-observation transaction | Stream epoch, retention floor, and observed-through sequence | Existing 50,000-event, seven-day, and 64 MiB per-session policy | Signed cursors bind the session and epoch. Retention, restore, and provider disconnect gaps remain typed. |
+| Pending interactions | `provider_interactions`, in the same session-observation transaction | Exact interaction revision plus account process generation in private authority | Current pending rows; public summary capped at 10 | Status exposes ID, kind, revision, blocking state, bounded summary, and deadline. Private request authority is excluded. Admission is not event-atomic, which is one reason wait is withheld. |
+| Responses in flight | `provider_interactions`, in the same session-observation transaction | Exact interaction revision and state | Exact count of `response_prepared` and `response_written` rows | Kept separate from pending human action. It cannot satisfy an interaction wait predicate. |
+| Queue axes | `queue_entries`, in the same session-observation transaction | Queue row identity and state | Current pending, dispatching, ambiguous, and failed rows | Status exposes counts only and never queued message text. Queue transitions are not a complete event wake source. |
+| Provider observation | One typed result before the local transaction. A Codex app-server read is attempted only when local state makes it applicable; otherwise the result records its local-state basis. | Account process generation and live connection ID where applicable | Provider-read results are fresh for that call; local gates report their own basis and make no provider-read claim. There is no shared retention or cursor with SQLite. | Closed live, unavailable, recovery-required, and not-applicable variants carry independent coverage, freshness, and basis. Raw provider payloads are excluded. |
+| Root account, session, interaction, queue, and usage overview | Declared local SQLite tables in one root-status read transaction | Row revisions remain internal; root status has no global revision or cursor | Current local counts and latest retained usage outcome per nonremoved account | Counts plus at most 50 ID-and-revision action records. Labels, emails, titles, notes, transcripts, payloads, paths, and queued text are excluded. |
+| Root provider, cloud, and device state | Not read by root status | None | `not_attempted`; device counts are unknown rather than zero | No daemon, provider, cloud, browser, login, usage refresh, or recovery effect is triggered. |
+
+The state-combination audit keeps the load-bearing facts separate. Execution, provider observation, queue depth, pending count, and response-in-flight count remain independent fields. Attention is only a headline precedence over exact local evidence: incomplete local coverage is unknown; recovery wins next; then pending human action; then response in flight; otherwise none. Terminal with a pending interaction, recovery with a pending interaction, idle with queued work, and a live provider with local recovery remain distinguishable because the underlying axes and counts are not discarded. Deterministic combination coverage belongs in `src/domain/observation.test.ts`; storage and service fixtures cover concrete mixed states.
+
+The repair prerequisite for exact wait is a per-session predicate revision updated inside every session, interaction, queue, timeout, disconnect, and recovery transaction that can change a supported predicate. Waiting must read the predicate and revision, register, transactionally recheck both, and only then sleep. Terminal predicates also need one closed absorbing-transition rule. The crash matrix and snapshot-to-first-wake race must pass before the command can be added.
+
+#### Observation contract
+
+1. Add one small domain module for coverage, advisory attention, and structured recovery intents.
+2. Add one bounded storage read that captures a session, its stream position, pending-interaction count and summary, and queue depth in one transaction.
+3. Publish the revised session-status schema and regenerate the public contract before the first beta.
+4. Preserve the existing provider-generation and interaction-revision fences. Do not put presentation argv or prose in domain records.
+
+#### Agent waiting
+
+1. Extract the existing status-to-follow observation loop from the persistent shell into a shared observer module.
+2. Withhold session wait until the predicate-revision repair above is implemented and proved.
+3. Add session watch only as an alias over the proven events-follow implementation.
+4. Prove snapshot-to-delta continuity, duplicate delivery, typed retention gaps, slow stdout, cancellation, and daemon restart for the shared status-and-watch path.
+
+#### Local overview
+
+1. Add the bounded local status query and renderer.
+2. Return state counts and a capped attention page with stable IDs and closed recovery intents.
+3. Mark provider and cloud sections with independent coverage instead of contacting them.
+4. Make the persistent shell render the same overview at startup only if it remains fast and nonintrusive under dogfood.
+
+#### Traceability and dogfood
+
+1. Add INVARIANTS.md with stable IDs, owner, guarantee, exact deterministic proofs, live evidence tier, and known limitation. Link the existing acceptance harness instead of replacing it.
+2. Require planted-negative evidence for any new judge. Keep authority and safety verdicts deterministic.
+3. Dogfood status and session watch in real agent workflows. Record polling volume, latency, cursor gaps, and user confusion. Do not record wait metrics until the predicate-revision gate passes.
+4. Consider a cross-session feed only if this evidence shows a frequent unmet workflow that status, watch, and bounded polling cannot solve.
+
+### Acceptance gates
+
+1. Root status performs zero network, provider, browser, login, usage-refresh, recovery, and mutation calls by default.
+2. Root status is at most 256 KiB, caps attention records at 50, reports every truncation, and stays below its bound with maximum safe-integer counts and the largest supported attention-record shape.
+3. Session status captures its local session, stream cut, pending-interaction count, bounded pending summary, and queue depth in one SQLite read transaction.
+4. Every combined source reports coverage as complete, partial, unavailable, or not-attempted and freshness separately as fresh, stale, or unknown, with an observation time and authority generation where one exists.
+5. The same snapshot followed by its cursor never misses a committed event. Duplicate, skipped, cross-account, or nonmonotonic delivery inside one run fails closed, and every gap is explicit. Delivery across a pipe or process failure is at least once: a durable consumer deduplicates restart replays by event identity and commits each emitted checkpoint only after every preceding line is durable.
+6. No wait command is exposed until every supported predicate has a transactionally complete revision and lost-wake proof. Provider loss, recovery, gaps, expired cursors, and stale generations must fail closed in any future implementation.
+7. An observer cannot submit input, change terminal geometry, settle an interaction, refresh usage, launch a login, or block the provider runtime through slow output.
+8. Execution, attention, observation, and queue combinations have deterministic property coverage. No distinct operator actions collapse into one advisory state.
+9. Approval and answer authority remains bound to exact account, session, turn, item, provider connection, generation, interaction revision, and requested capability.
+10. Unknown Codex versions and server-request shapes remain pinned or fail closed. Plugin installation and OAuth remain in Codex until an exact supported structured contract and protected renderer exist.
+11. Status and watch outputs contain no credential, provider payload, raw reasoning, tool arguments or results, arbitrary diagnostics, unsafe paths, untrusted argv, or cloud ciphertext.
+12. Parser, help, generated schemas, README examples, persistent-shell help, and installed-package acceptance agree on the status-and-watch contract and the absence of wait.
+13. INVARIANTS.md names exact green proof for every new load-bearing guarantee and records any live-only or unproven limitation.
+14. TypeScript and Bun remain the implementation language unless a repeatable benchmark identifies a specific boundary that cannot meet its target. Any native helper stays behind the stable framed protocol.
+
+### Adversarial review
+
+The first proposal included a global control feed. The review rejected it.
+
+Local account, session, interaction, queue, and usage state live in SQLite. Provider status is observed through a process and can reconcile local rows. Device registration, custody, and presence are read through Convex and in-memory bridge state. These sources have no shared transaction, revision, retention boundary, or gap cursor. Calling a merged feed global or atomic would be false. Mirroring them into a new ledger would create a second truth unless every mutation boundary were redesigned.
+
+A full global snapshot is also unbounded. HRA supports many session heads, each session may contain large notes and metadata, and the local transport has a finite response ceiling. The revised root status therefore returns counts and a small action page, not full objects.
+
+The reviewed PTY systems reinforce the decision. Their causal snapshot cut and explicit observer role are worth adapting, but their non-resumable file followers and unbounded slow-consumer paths are not. HRA already has the stronger durable per-session stream.
+
+Smalltalk and Convoy show the product-level failure mode: folder names, mtimes, PID files, screen changes, and terminal injection became claimed identity, liveness, availability, and delivery, then a scheduler inherited those claims. HRA must not become the same architecture behind a cleaner terminal.
+
+#### Assumption register
+
+| Assumption | Category | Load | Confidence | Testability |
+| --- | --- | --- | --- | --- |
+| HRA remains a personal Codex account, device, and session control plane rather than a generic multi-agent orchestrator. | Definitional | High | High | Cheap: accept or reject this product boundary explicitly. |
+| The existing per-session ledger captures every transition needed for idle, terminal, and pending-interaction predicates. | Factual | Critical | Rejected: false | Completed: reducer inventory and crash-boundary analysis disproved it. |
+| A local session, event cut, pending count, and queue depth can be read atomically without treating provider or cloud observation as part of that transaction. | Capability | Critical | High | Medium: one bounded read prototype plus concurrency tests. |
+| Session wait solves the actual agent need better than repeated bounded polling. | People | High | Rejected for the current ledger | Reconsider only after event capture and wake edges become transactionally complete. |
+| A bounded current local overview helps humans and agents without creating pressure for a global feed. | People | Medium | Medium | Cheap: fixture and dogfood review. |
+| Advisory axes remain presentation only and never become hidden mutation authority. | Causal | High | Medium | Medium: dependency rule, property tests, and mutation-path audit. |
+| Exact Codex version pinning and generated-schema review remain operationally affordable. | Continuity | High | High | Cheap: require a schema and behavior diff for every upgrade. |
+| Bun and TypeScript meet current latency and memory targets. | Capability | Medium | High | Cheap: benchmark startup, event replay, 100-session status, and slow consumers. |
+| Clean-room adaptation avoids unlicensed source reuse. | Factual | High | High | Cheap: diff and provenance review before commit. |
+
+The keystone assumption in the initial proposal was that the per-session ledger contained every transition required by the wait predicates. The research gate disproved it: wait could miss a satisfied condition or report one from stale evidence.
+
+The source inventory and reducer comparison exposed interaction, session, recovery, and queue authority changes without an event-atomic append or wake edge. Crash and scheduling boundaries therefore invalidate exact wait semantics even though the snapshot-to-first-follow race itself is closed by the atomic status cursor.
+
+The release therefore ships the improved atomic session status and compatible session event follow/watch commands without wait or a global feed. Wait remains withheld until event capture and wake edges are transactionally complete.
+
+### Explicit deferrals
+
+- A global or cross-session event feed, global watch, global cursor, and device wait.
+- A Turso second authority, OTLP export, or remote operational telemetry without an explicit safe consumer.
+- Peer-to-peer Fabric transport, manual all-pairs device trust, filesystem sync, or custom cryptography.
+- Session move, fork, transplant bundle, credential copying, or remote provider takeover.
+- Product-owned plan DAGs, executable plan code, agent catalogs, task graphs, recursive orchestration, scheduling, or supervisor topology.
+- PTY scraping, terminal-frame inference, filesystem mailboxes, folder or label identity, mtime liveness, PID-only health, or control-message injection.
+- Blanket approval bypass, basename-only executable allowlists, silently ignored flags, or unsupported capability fallback.
+- Plugin installation, OAuth, browser handoff, URL elicitation, and opaque extended forms until the exact Codex contract and protected UX are proven.
+- A Rust or Zig rewrite without measured evidence.
 
 ## Primary references
 

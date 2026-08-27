@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import { Database, constants as sqliteConstants } from "bun:sqlite";
 import { z } from "zod";
 
+import { redactAbsolutePaths } from "../cloud/contracts";
 import {
   INTERACTION_MAX_PENDING_MS,
   interactionDisplaySchema,
@@ -28,6 +29,16 @@ import {
   type InteractionRecord,
   type ProviderInteractionAuthority,
 } from "../domain/interactions";
+import {
+  ROOT_STATUS_ATTENTION_LIMIT,
+  SESSION_STATUS_PENDING_SUMMARY_LIMIT,
+  assertRootStatusBound,
+  rootStatusSchema,
+  sessionLocalObservationSnapshotSchema,
+  type RootStatus,
+  type RootStatusAttentionRecord,
+  type SessionLocalObservationSnapshot,
+} from "../domain/observation";
 import { presetSchema, type Preset } from "../domain/presets";
 import {
   effectiveRuntimeProfileSchema,
@@ -58,6 +69,14 @@ import {
   type MutationState,
   type QueueState,
 } from "../domain/transitions";
+import {
+  createEphemeralPublicProviderIdentifierProjector,
+  PUBLIC_MCP_FORM_SUMMARY,
+  projectPublicSessionEventBody,
+  type PublicProviderIdentifier,
+  type PublicProviderIdentifierProjector,
+} from "../public-provider-identifier";
+import { redactCompleteSensitiveText } from "../sensitive-text";
 import {
   attemptIdSchema,
   canonicalLabelKey,
@@ -93,6 +112,9 @@ import type {
   DesktopRecoveryBinding,
   DesktopRecoveryResolution,
 } from "../desktop/recovery";
+
+const processLocalPublicProviderIdentifierProjector =
+  createEphemeralPublicProviderIdentifierProjector();
 
 const profileStateSchema = z.enum(["signed_out", "login_pending", "signed_in", "recovery_required", "removed"]);
 const sessionStateSchema = z.enum(["starting", "active", "idle", "terminal", "recovery_required"]);
@@ -471,7 +493,24 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 24;
+const currentSchemaVersion = 25;
+const observationTitleMaximumBytes = 320;
+
+const safeObservationTitle = (value: string): string => {
+  const redacted = redactAbsolutePaths(redactCompleteSensitiveText(value, "[protected]"));
+  if (utf8Bytes(redacted) <= observationTitleMaximumBytes) return titleSchema.parse(redacted);
+  const marker = " [truncated]";
+  const availableBytes = observationTitleMaximumBytes - utf8Bytes(marker);
+  let prefix = "";
+  let prefixBytes = 0;
+  for (const scalar of redacted) {
+    const scalarBytes = utf8Bytes(scalar);
+    if (prefixBytes + scalarBytes > availableBytes) break;
+    prefix += scalar;
+    prefixBytes += scalarBytes;
+  }
+  return titleSchema.parse(`${prefix.trimEnd()}${marker}`);
+};
 const stateBusyTimeoutMs = 5_000;
 const securityScrubBusyTimeoutMs = 250;
 
@@ -1811,6 +1850,14 @@ const hasTableColumn = (database: Database, table: string, column: string): bool
   return database.query(`PRAGMA table_info(${table})`).all().some((row) => columnSchema.parse(row).name === column);
 };
 
+const ensureSessionEventProjectionVersion = (database: Database): void => {
+  if (!hasTableColumn(database, "session_events", "projection_version")) {
+    database.exec(
+      "ALTER TABLE session_events ADD COLUMN projection_version INTEGER NOT NULL DEFAULT 1 CHECK(projection_version IN (1,2))",
+    );
+  }
+};
+
 type LabelIdentityKind = "ACCOUNT" | "PROJECT";
 
 class StateLabelInvariantError extends Error {
@@ -2640,6 +2687,13 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 24;
     }
 
+    if (version < 25) {
+      ensureSessionEventProjectionVersion(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(25, now());
+      database.exec("PRAGMA user_version = 25");
+      version = 25;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -2665,6 +2719,7 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     database.exec(schemaVersion23);
     rebuildSchemaVersion24(database);
     assertSchemaVersion24Objects(database);
+    ensureSessionEventProjectionVersion(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -2771,7 +2826,10 @@ const mapInteraction = (row: unknown): InteractionRecord => {
   const requestId = parsed.request_id_type === "number"
     ? { type: "number" as const, value: z.number().int().safe().parse(parsed.request_id_number) }
     : { type: "string" as const, value: z.string().min(1).max(512).parse(parsed.request_id_text) };
-  const display = interactionDisplaySchema.parse(JSON.parse(parsed.display_json) as unknown);
+  const storedDisplay = interactionDisplaySchema.parse(JSON.parse(parsed.display_json) as unknown);
+  const display: InteractionDisplay = storedDisplay.kind === "mcp_elicitation"
+    ? { ...storedDisplay, summary: PUBLIC_MCP_FORM_SUMMARY }
+    : storedDisplay;
   return interactionRecordSchema.parse({
     version: 1,
     publicId: parsed.public_id,
@@ -2799,6 +2857,24 @@ const mapInteraction = (row: unknown): InteractionRecord => {
     deadlineAt: parsed.deadline_at,
     updatedAt: parsed.updated_at,
     terminalAt: parsed.terminal_at,
+  });
+};
+
+const storedSessionEventEnvelopeSchema = z.object({
+  body: z.unknown(),
+}).passthrough();
+
+const parseStoredSessionEvent = (
+  value: string,
+  projectionVersion: 1 | 2,
+  projector: PublicProviderIdentifierProjector,
+): SessionEvent => {
+  const stored = storedSessionEventEnvelopeSchema.parse(JSON.parse(value) as unknown);
+  return sessionEventSchema.parse({
+    ...stored,
+    body: projectionVersion === 2
+      ? stored.body
+      : projectPublicSessionEventBody(stored.body, projector),
   });
 };
 
@@ -2965,16 +3041,20 @@ export class StateStore {
   readonly #database: Database;
   readonly #now: () => number;
   readonly #readonly: boolean;
+  #publicProviderIdentifierProjector: PublicProviderIdentifierProjector;
   readonly paths: StatePaths;
 
   constructor(paths: StatePaths, options: {
     readonly?: boolean;
     now?: () => number;
     beforeDatabaseOpen?: (input: Readonly<{ flags: number; path: string }>) => void;
+    publicProviderIdentifierProjector?: PublicProviderIdentifierProjector;
   } = {}) {
     this.paths = paths;
     this.#now = options.now ?? Date.now;
     this.#readonly = options.readonly === true;
+    this.#publicProviderIdentifierProjector = options.publicProviderIdentifierProjector
+      ?? processLocalPublicProviderIdentifierProjector;
     const databaseFile = prepareStateDatabaseFile(paths.database, this.#readonly);
     const databaseOpenFlags = stateDatabaseOpenFlags(this.#readonly);
     options.beforeDatabaseOpen?.({ flags: databaseOpenFlags, path: paths.database });
@@ -3007,6 +3087,16 @@ export class StateStore {
 
   close(): void {
     this.#database.close(false);
+  }
+
+  configurePublicProviderIdentifierProjector(
+    projector: PublicProviderIdentifierProjector,
+  ): void {
+    this.#publicProviderIdentifierProjector = projector;
+  }
+
+  projectPublicProviderIdentifier(value: string): PublicProviderIdentifier {
+    return this.#publicProviderIdentifierProjector(value);
   }
 
   createProfile(label: string): ProfileRecord {
@@ -6064,6 +6154,374 @@ export class StateStore {
     return this.#readonly ? read() : read.immediate();
   }
 
+  readSessionObservationSnapshot(
+    sessionId: SessionId,
+    pendingLimit = SESSION_STATUS_PENDING_SUMMARY_LIMIT,
+  ): SessionLocalObservationSnapshot {
+    const parsedSessionId = sessionIdSchema.parse(sessionId);
+    const parsedPendingLimit = z.number().int().min(1)
+      .max(SESSION_STATUS_PENDING_SUMMARY_LIMIT).parse(pendingLimit);
+    const read = this.#database.transaction(() => {
+      const sessionRow = this.#database.query("SELECT * FROM sessions WHERE id=?").get(parsedSessionId);
+      if (sessionRow === null) throw new SelectionError("NOT_FOUND");
+      const session = mapSession(sessionRow);
+      const eventStream = mapSessionEventStreamPosition(this.#readSessionEventStream(parsedSessionId));
+      const interactionCounts = z.object({
+        pending_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        response_in_flight_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),0) AS pending_count,
+           COALESCE(SUM(CASE WHEN state IN ('response_prepared','response_written') THEN 1 ELSE 0 END),0)
+             AS response_in_flight_count
+         FROM provider_interactions WHERE session_id=?`,
+      ).get(parsedSessionId));
+      const pending = this.#database.query(
+        `SELECT * FROM provider_interactions
+         WHERE session_id=? AND state='pending'
+         ORDER BY deadline_at ASC,requested_at ASC,public_id ASC LIMIT ?`,
+      ).all(parsedSessionId, parsedPendingLimit).map((value) => {
+        const interaction = mapInteraction(value);
+        const safeSummary = redactAbsolutePaths(
+          redactCompleteSensitiveText(interaction.display.summary, "[protected]"),
+        );
+        const summary = safeSummary.length <= 512
+          ? safeSummary
+          : safeSummary.slice(0, 512);
+        return {
+          id: interaction.publicId,
+          kind: interaction.kind,
+          revision: interaction.revision,
+          blocking: interaction.blocking,
+          summary,
+          requestedAt: interaction.requestedAt,
+          deadlineAt: interaction.deadlineAt,
+        };
+      });
+      const queue = z.object({
+        depth: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        dispatching_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        ambiguous_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        failed_count: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),0) AS depth,
+           COALESCE(SUM(CASE WHEN state='dispatching' THEN 1 ELSE 0 END),0) AS dispatching_count,
+           COALESCE(SUM(CASE WHEN state='ambiguous' THEN 1 ELSE 0 END),0) AS ambiguous_count,
+           COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0) AS failed_count
+         FROM queue_entries WHERE session_id=?`,
+      ).get(parsedSessionId));
+      const observedAt = unixMillisecondsSchema.parse(this.#now());
+      return sessionLocalObservationSnapshotSchema.parse({
+        observedAt,
+        session: {
+          id: session.id,
+          accountId: session.profileId,
+          projectId: session.projectId ?? null,
+          title: safeObservationTitle(session.title),
+          execution: session.state,
+          activeTurnId: session.activeTurnId === undefined
+            ? null
+            : this.#publicProviderIdentifierProjector(session.activeTurnId),
+          revision: session.revision,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt,
+        },
+        eventStream,
+        interactions: {
+          pendingCount: interactionCounts.pending_count,
+          responseInFlightCount: interactionCounts.response_in_flight_count,
+          pending,
+          truncated: interactionCounts.pending_count > pending.length,
+        },
+        queue: {
+          depth: queue.depth,
+          dispatchingCount: queue.dispatching_count,
+          ambiguousCount: queue.ambiguous_count,
+          failedCount: queue.failed_count,
+        },
+      });
+    });
+    return read();
+  }
+
+  readRootStatusSnapshot(attentionLimit = ROOT_STATUS_ATTENTION_LIMIT): RootStatus {
+    const parsedAttentionLimit = z.number().int().min(1)
+      .max(ROOT_STATUS_ATTENTION_LIMIT).parse(attentionLimit);
+    const read = this.#database.transaction(() => {
+      const accounts = z.object({
+        signed_out: z.number().int().nonnegative(),
+        login_pending: z.number().int().nonnegative(),
+        signed_in: z.number().int().nonnegative(),
+        recovery_required: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='signed_out' THEN 1 ELSE 0 END),0) AS signed_out,
+           COALESCE(SUM(CASE WHEN state='login_pending' THEN 1 ELSE 0 END),0) AS login_pending,
+           COALESCE(SUM(CASE WHEN state='signed_in' THEN 1 ELSE 0 END),0) AS signed_in,
+           COALESCE(SUM(CASE WHEN state='recovery_required' THEN 1 ELSE 0 END),0) AS recovery_required
+         FROM profiles WHERE state!='removed'`,
+      ).get());
+      const sessions = z.object({
+        starting: z.number().int().nonnegative(),
+        active: z.number().int().nonnegative(),
+        idle: z.number().int().nonnegative(),
+        terminal: z.number().int().nonnegative(),
+        recovery_required: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='starting' THEN 1 ELSE 0 END),0) AS starting,
+           COALESCE(SUM(CASE WHEN state='active' THEN 1 ELSE 0 END),0) AS active,
+           COALESCE(SUM(CASE WHEN state='idle' THEN 1 ELSE 0 END),0) AS idle,
+           COALESCE(SUM(CASE WHEN state='terminal' THEN 1 ELSE 0 END),0) AS terminal,
+           COALESCE(SUM(CASE WHEN state='recovery_required' THEN 1 ELSE 0 END),0) AS recovery_required
+         FROM sessions`,
+      ).get());
+      const interactions = z.object({
+        pending: z.number().int().nonnegative(),
+        response_prepared: z.number().int().nonnegative(),
+        response_written: z.number().int().nonnegative(),
+        resolved: z.number().int().nonnegative(),
+        declined: z.number().int().nonnegative(),
+        canceled: z.number().int().nonnegative(),
+        expired: z.number().int().nonnegative(),
+        resolution_unknown: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),0) AS pending,
+           COALESCE(SUM(CASE WHEN state='response_prepared' THEN 1 ELSE 0 END),0) AS response_prepared,
+           COALESCE(SUM(CASE WHEN state='response_written' THEN 1 ELSE 0 END),0) AS response_written,
+           COALESCE(SUM(CASE WHEN state='resolved' THEN 1 ELSE 0 END),0) AS resolved,
+           COALESCE(SUM(CASE WHEN state='declined' THEN 1 ELSE 0 END),0) AS declined,
+           COALESCE(SUM(CASE WHEN state='canceled' THEN 1 ELSE 0 END),0) AS canceled,
+           COALESCE(SUM(CASE WHEN state='expired' THEN 1 ELSE 0 END),0) AS expired,
+           COALESCE(SUM(CASE WHEN state='resolution_unknown' THEN 1 ELSE 0 END),0) AS resolution_unknown
+         FROM provider_interactions`,
+      ).get());
+      const queue = z.object({
+        pending: z.number().int().nonnegative(),
+        dispatching: z.number().int().nonnegative(),
+        applied: z.number().int().nonnegative(),
+        failed: z.number().int().nonnegative(),
+        ambiguous: z.number().int().nonnegative(),
+        cancelled: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `SELECT
+           COALESCE(SUM(CASE WHEN state='pending' THEN 1 ELSE 0 END),0) AS pending,
+           COALESCE(SUM(CASE WHEN state='dispatching' THEN 1 ELSE 0 END),0) AS dispatching,
+           COALESCE(SUM(CASE WHEN state='applied' THEN 1 ELSE 0 END),0) AS applied,
+           COALESCE(SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END),0) AS failed,
+           COALESCE(SUM(CASE WHEN state='ambiguous' THEN 1 ELSE 0 END),0) AS ambiguous,
+           COALESCE(SUM(CASE WHEN state='cancelled' THEN 1 ELSE 0 END),0) AS cancelled
+         FROM queue_entries`,
+      ).get());
+      const usage = z.object({
+        observed: z.number().int().nonnegative(),
+        failed: z.number().int().nonnegative(),
+        missing: z.number().int().nonnegative(),
+      }).strict().parse(this.#database.query(
+        `WITH outcomes AS (
+           SELECT profile_id,source_revision,'observed' AS outcome FROM usage_snapshots
+           UNION ALL
+           SELECT profile_id,source_revision,'failed' AS outcome FROM usage_poll_failures
+         ), ranked AS (
+           SELECT profile_id,outcome,
+                  ROW_NUMBER() OVER (PARTITION BY profile_id ORDER BY source_revision DESC) AS outcome_rank
+           FROM outcomes
+         )
+         SELECT
+           COALESCE(SUM(CASE WHEN r.outcome='observed' THEN 1 ELSE 0 END),0) AS observed,
+           COALESCE(SUM(CASE WHEN r.outcome='failed' THEN 1 ELSE 0 END),0) AS failed,
+           COALESCE(SUM(CASE WHEN r.outcome IS NULL THEN 1 ELSE 0 END),0) AS missing
+         FROM profiles p
+         LEFT JOIN ranked r ON r.profile_id=p.id AND r.outcome_rank=1
+         WHERE p.state!='removed'`,
+      ).get());
+      const attentionRows = this.#database.query(
+        `SELECT attention.*,COUNT(*) OVER () AS total FROM (
+           SELECT 0 AS priority,'account_recovery_required' AS kind,p.id AS account_id,
+                  p.process_generation AS account_generation,NULL AS session_id,NULL AS session_revision,
+                  NULL AS interaction_id,NULL AS interaction_revision,NULL AS interaction_kind,
+                  NULL AS interaction_state,NULL AS blocking,NULL AS deadline_at,p.updated_at AS observed_at,
+                  p.id AS stable_id
+           FROM profiles p WHERE p.state='recovery_required'
+           UNION ALL
+           SELECT 1,'session_recovery_required',s.profile_id,p.process_generation,s.id,s.revision,
+                  NULL,NULL,NULL,NULL,NULL,NULL,s.updated_at,s.id
+           FROM sessions s JOIN profiles p ON p.id=s.profile_id
+           WHERE s.state='recovery_required' AND p.state!='removed'
+           UNION ALL
+           SELECT 2,'interaction_pending',i.profile_id,p.process_generation,i.session_id,NULL,
+                  i.public_id,i.revision,i.kind,i.state,i.blocking,i.deadline_at,i.requested_at,i.public_id
+           FROM provider_interactions i JOIN profiles p ON p.id=i.profile_id
+           WHERE i.state='pending' AND p.state!='removed'
+           UNION ALL
+           SELECT 3,'account_login_pending',p.id,p.process_generation,NULL,NULL,
+                  NULL,NULL,NULL,NULL,NULL,NULL,p.updated_at,p.id
+           FROM profiles p WHERE p.state='login_pending'
+           UNION ALL
+           SELECT 4,'interaction_response_in_flight',i.profile_id,p.process_generation,i.session_id,NULL,
+                  i.public_id,i.revision,i.kind,i.state,i.blocking,i.deadline_at,i.updated_at,i.public_id
+           FROM provider_interactions i JOIN profiles p ON p.id=i.profile_id
+           WHERE i.state IN ('response_prepared','response_written') AND p.state!='removed'
+         ) AS attention
+         ORDER BY priority ASC,observed_at ASC,kind ASC,stable_id ASC LIMIT ?`,
+      ).all(parsedAttentionLimit);
+      const attentionRowSchema = z.object({
+        priority: z.number().int().min(0).max(4),
+        kind: z.enum([
+          "account_login_pending",
+          "account_recovery_required",
+          "session_recovery_required",
+          "interaction_pending",
+          "interaction_response_in_flight",
+        ]),
+        account_id: profileIdSchema,
+        account_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+        session_id: sessionIdSchema.nullable(),
+        session_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+        interaction_id: z.string().uuid().nullable(),
+        interaction_revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).nullable(),
+        interaction_kind: interactionKindSchema.nullable(),
+        interaction_state: interactionStateSchema.nullable(),
+        blocking: z.union([z.literal(0), z.literal(1)]).nullable(),
+        deadline_at: unixMillisecondsSchema.nullable(),
+        observed_at: unixMillisecondsSchema,
+        stable_id: z.string().min(1),
+        total: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      }).strict();
+      const parsedAttentionRows = attentionRows.map((value) => attentionRowSchema.parse(value));
+      const records: RootStatusAttentionRecord[] = parsedAttentionRows.map((row) => {
+        if (row.kind === "account_login_pending") {
+          return {
+            kind: row.kind,
+            accountId: row.account_id,
+            accountGeneration: row.account_generation,
+            observedAt: row.observed_at,
+            intent: { kind: "inspect_account", accountId: row.account_id },
+          };
+        }
+        if (row.kind === "account_recovery_required") {
+          return {
+            kind: row.kind,
+            accountId: row.account_id,
+            accountGeneration: row.account_generation,
+            observedAt: row.observed_at,
+            intent: { kind: "inspect_account", accountId: row.account_id },
+          };
+        }
+        if (row.kind === "session_recovery_required") {
+          return {
+            kind: row.kind,
+            accountId: row.account_id,
+            sessionId: sessionIdSchema.parse(row.session_id),
+            sessionRevision: z.number().int().positive().parse(row.session_revision),
+            observedAt: row.observed_at,
+            intent: { kind: "inspect_session", sessionId: sessionIdSchema.parse(row.session_id) },
+          };
+        }
+        const interactionId = z.string().uuid().parse(row.interaction_id);
+        const interactionRevision = z.number().int().positive().parse(row.interaction_revision);
+        const interactionKind = interactionKindSchema.parse(row.interaction_kind);
+        const interactionState = interactionStateSchema.parse(row.interaction_state);
+        const requiresProtectedInspection = row.kind === "interaction_pending"
+          && (
+            interactionKind === "command_approval"
+            || interactionKind === "permission_approval"
+          );
+        return {
+          kind: row.kind,
+          accountId: row.account_id,
+          accountGeneration: row.account_generation,
+          sessionId: row.session_id,
+          interactionId,
+          interactionRevision,
+          interactionKind,
+          interactionState,
+          blocking: z.boolean().parse(row.blocking === 1),
+          deadlineAt: unixMillisecondsSchema.parse(row.deadline_at),
+          observedAt: row.observed_at,
+          intent: requiresProtectedInspection
+            ? { kind: "inspect_interaction", interactionId, expectedRevision: interactionRevision }
+            : { kind: "show_interaction", interactionId },
+        };
+      });
+      const attentionTotal = parsedAttentionRows[0]?.total ?? 0;
+      const observedAt = unixMillisecondsSchema.parse(this.#now());
+      return assertRootStatusBound(rootStatusSchema.parse({
+        version: 1,
+        scope: "local_only",
+        localObservation: {
+          source: "sqlite",
+          coverage: "complete",
+          freshness: "fresh",
+          observedAt,
+          tables: [
+            "profiles",
+            "sessions",
+            "provider_interactions",
+            "queue_entries",
+            "usage_snapshots",
+            "usage_poll_failures",
+          ],
+        },
+        providerObservation: {
+          source: "codex_app_server",
+          coverage: "not_attempted",
+          freshness: "unknown",
+          observedAt: null,
+        },
+        cloudObservation: {
+          source: "convex",
+          coverage: "not_attempted",
+          freshness: "unknown",
+          observedAt: null,
+          devices: { registered: null, online: null },
+        },
+        counts: {
+          accounts: {
+            signedOut: accounts.signed_out,
+            loginPending: accounts.login_pending,
+            signedIn: accounts.signed_in,
+            recoveryRequired: accounts.recovery_required,
+          },
+          sessions: {
+            starting: sessions.starting,
+            active: sessions.active,
+            idle: sessions.idle,
+            terminal: sessions.terminal,
+            recoveryRequired: sessions.recovery_required,
+          },
+          interactions: {
+            pending: interactions.pending,
+            responsePrepared: interactions.response_prepared,
+            responseWritten: interactions.response_written,
+            resolved: interactions.resolved,
+            declined: interactions.declined,
+            canceled: interactions.canceled,
+            expired: interactions.expired,
+            resolutionUnknown: interactions.resolution_unknown,
+          },
+          queue: {
+            pending: queue.pending,
+            dispatching: queue.dispatching,
+            applied: queue.applied,
+            failed: queue.failed,
+            ambiguous: queue.ambiguous,
+            cancelled: queue.cancelled,
+          },
+          usage,
+        },
+        attention: {
+          records,
+          total: attentionTotal,
+          truncated: attentionTotal > records.length,
+        },
+      }));
+    });
+    return read();
+  }
+
   #appendSessionEventInTransaction(input: Readonly<{
     sessionId: SessionId;
     accountId: ProfileId;
@@ -6110,8 +6568,8 @@ export class StateStore {
     this.#database.query(
       `INSERT INTO session_events(
          session_id,stream_epoch,sequence,recorded_at,account_id,provider_generation,
-         provider_connection_id,event_json,event_bytes
-       ) VALUES (?,?,?,?,?,?,?,?,?)`,
+         provider_connection_id,event_json,event_bytes,projection_version
+       ) VALUES (?,?,?,?,?,?,?,?,?,2)`,
     ).run(
       input.sessionId,
       stream.stream_epoch,
@@ -6153,6 +6611,31 @@ export class StateStore {
       providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
         .parse(input.providerGeneration),
       providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
+      body: sessionEventBodySchema.parse(projectPublicSessionEventBody(
+        input.body,
+        this.#publicProviderIdentifierProjector,
+      )),
+      recordedAt: unixMillisecondsSchema.parse(this.#now()),
+    };
+    const append = this.#database.transaction(
+      () => this.#appendSessionEventInTransaction(parsed),
+    );
+    return append.immediate();
+  }
+
+  appendPublicSessionEvent(input: {
+    sessionId: SessionId;
+    accountId: ProfileId;
+    providerGeneration: number;
+    providerConnectionId: string | null;
+    body: SessionEventBody;
+  }): SessionEvent {
+    const parsed = {
+      sessionId: sessionIdSchema.parse(input.sessionId),
+      accountId: profileIdSchema.parse(input.accountId),
+      providerGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+        .parse(input.providerGeneration),
+      providerConnectionId: z.string().uuid().nullable().parse(input.providerConnectionId),
       body: sessionEventBodySchema.parse(input.body),
       recordedAt: unixMillisecondsSchema.parse(this.#now()),
     };
@@ -6168,21 +6651,28 @@ export class StateStore {
   ): void {
     if (interaction.sessionId === null) return;
     const matching = this.#database.query(
-      `SELECT event_json FROM session_events
+      `SELECT event_json,projection_version FROM session_events
        WHERE session_id=?
          AND json_extract(event_json,'$.body.type')='interaction_state'
          AND json_extract(event_json,'$.body.interactionId')=?
          AND json_extract(event_json,'$.body.revision')=?
        ORDER BY sequence LIMIT 2`,
     ).all(interaction.sessionId, interaction.publicId, interaction.revision).map((value) =>
-      z.object({ event_json: z.string() }).strict().parse(value)
+      z.object({
+        event_json: z.string(),
+        projection_version: z.union([z.literal(1), z.literal(2)]),
+      }).strict().parse(value)
     );
     if (matching.length > 1) {
       throw new Error("INTERACTION_STATE_EVENT_DUPLICATED");
     }
     const existing = matching[0];
     if (existing !== undefined) {
-      const event = sessionEventSchema.parse(JSON.parse(existing.event_json) as unknown);
+      const event = parseStoredSessionEvent(
+        existing.event_json,
+        existing.projection_version,
+        this.#publicProviderIdentifierProjector,
+      );
       if (
         event.sessionId !== interaction.sessionId
         || event.accountId !== interaction.authority.profileId
@@ -6230,7 +6720,9 @@ export class StateStore {
     const sessionId = sessionIdSchema.parse(input.sessionId);
     const afterSequence = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable().parse(input.afterSequence);
     const limit = z.number().int().min(1).max(SESSION_EVENT_PAGE_LIMIT).parse(input.limit ?? SESSION_EVENT_PAGE_LIMIT);
-    const maintenanceNow = input.now === undefined ? undefined : unixMillisecondsSchema.parse(input.now);
+    const maintenanceNow = this.#readonly
+      ? undefined
+      : unixMillisecondsSchema.parse(input.now ?? this.#now());
     const read = this.#database.transaction(() => {
       this.#ensureSessionEventStream(sessionId);
       if (maintenanceNow !== undefined && !this.#readonly) {
@@ -6243,7 +6735,7 @@ export class StateStore {
       const fellBehind = afterSequence !== null && afterSequence < stream.floor_sequence - 1;
       const startSequence = Math.max(afterSequence ?? stream.floor_sequence - 1, stream.floor_sequence - 1);
       const rows = this.#database.query(
-        `SELECT event_json,event_bytes FROM session_events
+        `SELECT event_json,event_bytes,projection_version FROM session_events
          WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT ?`,
       ).all(sessionId, startSequence, limit);
       const events: SessionEvent[] = [];
@@ -6252,14 +6744,20 @@ export class StateStore {
         const parsed = z.object({
           event_json: z.string(),
           event_bytes: z.number().int().positive().max(SESSION_EVENT_MAX_BYTES),
+          projection_version: z.union([z.literal(1), z.literal(2)]),
         }).strict().parse(row);
-        if (events.length > 0 && pageBytes + parsed.event_bytes > SESSION_EVENT_PAGE_BYTES) break;
-        const next = sessionEventSchema.parse(JSON.parse(parsed.event_json) as unknown);
+        const next = parseStoredSessionEvent(
+          parsed.event_json,
+          parsed.projection_version,
+          this.#publicProviderIdentifierProjector,
+        );
+        const nextBytes = utf8Bytes(JSON.stringify(next));
+        if (events.length > 0 && pageBytes + nextBytes > SESSION_EVENT_PAGE_BYTES) break;
         if (next.sessionId !== sessionId || next.streamEpoch !== stream.stream_epoch) {
           throw new Error("SESSION_EVENT_STORED_AUTHORITY_MISMATCH");
         }
         events.push(next);
-        pageBytes += parsed.event_bytes;
+        pageBytes += nextBytes;
       }
       return {
         ...mapSessionEventStreamPosition(stream),
@@ -7247,6 +7745,29 @@ export class StateStore {
       reasonCode: row.reason_code,
       sourceRevision: row.source_revision,
     };
+  }
+
+  canInitializeDaemonCursorAuthority(): boolean {
+    const evidence = z.object({
+      daemon_generation: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      profiles: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      sessions: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      events: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      usage_rows: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    }).strict().parse(this.#database.query(
+      `SELECT
+         (SELECT generation FROM daemon_state WHERE singleton=1) AS daemon_generation,
+         (SELECT COUNT(*) FROM profiles) AS profiles,
+         (SELECT COUNT(*) FROM sessions) AS sessions,
+         (SELECT COUNT(*) FROM session_events) AS events,
+         ((SELECT COUNT(*) FROM usage_snapshots)
+           +(SELECT COUNT(*) FROM usage_poll_failures)) AS usage_rows`,
+    ).get());
+    return evidence.daemon_generation === 0
+      && evidence.profiles === 0
+      && evidence.sessions === 0
+      && evidence.events === 0
+      && evidence.usage_rows === 0;
   }
 
   nextDaemonGeneration(bootId: string): number {

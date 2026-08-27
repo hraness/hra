@@ -2,12 +2,17 @@ import { z } from "zod";
 
 import { redactAbsolutePaths } from "../cloud/contracts";
 import type { CommandResponse, LocalCommand } from "../domain/contracts";
+import { interactionDisplaySchema } from "../domain/interactions";
 import {
+  advanceSessionEventContinuity,
+  initialSessionEventContinuity,
+  sessionEventCursorWireSchema,
   sessionEventPageSchema,
   type SessionEvent,
   type SessionEventBody,
   type SessionEventPage,
 } from "../domain/session-events";
+import { sessionStatusSchema } from "../domain/observation";
 import { sessionIdSchema } from "../domain/values";
 import { StreamingSensitiveRedactor } from "../streaming-sensitive-text";
 import { terminalSafe } from "./render";
@@ -36,47 +41,82 @@ const interactionKindSchema = z.enum([
   "mcp_elicitation",
 ]);
 
-const pendingInteractionSchema = z.object({
+const pendingInteractionStateSchema = z.enum([
+  "pending",
+  "response_prepared",
+  "response_written",
+]);
+
+const authoritativePendingInteractionSchema = z.object({
   id: z.string().uuid(),
+  sessionId: sessionIdSchema,
   kind: interactionKindSchema,
-  state: z.enum(["pending", "response_prepared", "response_written"]),
+  state: pendingInteractionStateSchema,
+  revision: z.number().int().positive(),
+  blocking: z.boolean(),
+  display: interactionDisplaySchema,
+}).passthrough().superRefine((interaction, context) => {
+  if (interaction.kind !== interaction.display.kind) {
+    context.addIssue({
+      code: "custom",
+      message: "The interaction kind must match its complete public display.",
+      path: ["display", "kind"],
+    });
+  }
+}).transform((interaction) => ({
+  ...interaction,
+  guidance: "authoritative" as const,
+}));
+
+const summaryOnlyPendingInteractionSchema = z.object({
+  id: z.string().uuid(),
+  sessionId: sessionIdSchema,
+  kind: interactionKindSchema,
+  state: pendingInteractionStateSchema,
   revision: z.number().int().positive(),
   blocking: z.boolean(),
   display: z.object({
     summary: z.string().max(2_048),
   }).passthrough(),
-}).passthrough();
+}).passthrough().transform((interaction) => ({
+  ...interaction,
+  guidance: "show_only" as const,
+}));
 
-const providerObservationSchema = z.discriminatedUnion("state", [
+const pendingInteractionSchema = z.union([
+  authoritativePendingInteractionSchema,
+  summaryOnlyPendingInteractionSchema,
+]);
+
+const legacyProviderObservationSchema = z.discriminatedUnion("state", [
   z.object({
     state: z.literal("live"),
     profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     connectionId: z.string().uuid(),
     mode: z.enum(["connected", "resubscribed"]),
-  }).strict(),
+  }).passthrough(),
   z.object({
     state: z.literal("unavailable"),
     profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     code: z.enum(["account_signed_out", "resume_unavailable"]),
-  }).strict(),
+  }).passthrough(),
   z.object({
     state: z.literal("recovery_required"),
     profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     code: z.enum(["session_quarantined", "thread_mismatch"]),
-  }).strict(),
+  }).passthrough(),
   z.object({
     state: z.literal("not_applicable"),
     profileGeneration: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     reason: z.enum(["terminal", "unbound"]),
-  }).strict(),
+  }).passthrough(),
 ]);
 
-const shellLiveStatusSchema = z.object({
+const legacyShellLiveStatusSchema = z.object({
+  version: z.literal(1),
   session: z.object({ id: sessionIdSchema }).passthrough(),
-  providerObservation: providerObservationSchema,
-  eventStream: z.object({
-    cursor: z.string().min(1).max(2_048),
-  }).passthrough(),
+  providerObservation: legacyProviderObservationSchema,
+  eventStream: z.object({ cursor: sessionEventCursorWireSchema }).passthrough(),
   pendingInteractions: z.array(pendingInteractionSchema).max(100),
   pendingInteractionsNextCursor: z.string().min(1).max(2_048).nullable(),
 }).passthrough();
@@ -87,7 +127,15 @@ const shellLiveInteractionPageSchema = z.object({
   nextCursor: z.string().min(1).max(2_048).nullable(),
 }).strict();
 
-type PendingInteraction = z.infer<typeof pendingInteractionSchema>;
+export type PendingInteraction = z.infer<typeof pendingInteractionSchema>;
+export const pendingInteractionStateKey = (
+  interaction: Pick<PendingInteraction, "id" | "revision" | "state">,
+): string => JSON.stringify([
+  interaction.id,
+  interaction.revision,
+  interaction.state,
+]);
+type LiveCommandStyle = "cli" | "shell";
 
 type PendingDelta = Readonly<{
   itemId: string;
@@ -129,6 +177,7 @@ export type ShellLiveObserverInput = Readonly<{
 export type ShellLiveSelection = Readonly<{
   session: string;
   statusData: unknown;
+  suppressedInitialInteractionKeys?: ReadonlySet<string>;
 }>;
 
 const boundedCharacters = (
@@ -178,35 +227,114 @@ const interactionLabel = (kind: PendingInteraction["kind"]): string => {
   }
 };
 
-const pendingInteractionCommands = (interaction: PendingInteraction): readonly string[] => {
+const pendingInteractionCommands = (
+  interaction: PendingInteraction,
+  commandStyle: LiveCommandStyle,
+): readonly string[] => {
   const binding = `${interaction.id} --revision ${String(interaction.revision)}`;
-  const show = `  Show: /interaction show ${interaction.id}`;
-  switch (interaction.kind) {
+  const show = commandStyle === "cli"
+    ? `  Show: hra interaction show ${interaction.id}`
+    : `  Show: /interaction show ${interaction.id}`;
+  if (interaction.guidance === "show_only") {
+    return [
+      show,
+      "  Inspect the current interaction before resolving it; this event notice does not carry complete decision authority.",
+    ];
+  }
+
+  const decisionCommands = (decisions: readonly ("once" | "session" | "decline" | "cancel")[]): readonly string[] =>
+    decisions.map((decision) => {
+      if (commandStyle === "cli") {
+        return `  ${decision === "once" ? "Approve once" : decision === "session" ? "Approve for session" : decision === "decline" ? "Decline" : "Cancel"}: hra interaction decide ${binding} --decision ${decision}`;
+      }
+      if (decision === "once") return `  Approve once: /approve ${binding}`;
+      if (decision === "session") return `  Approve for session: /approve ${binding} --decision session`;
+      if (decision === "decline") return `  Decline: /decline ${binding}`;
+      return `  Cancel: /interaction decide ${binding} --decision cancel`;
+    });
+
+  if (commandStyle === "cli") {
+    switch (interaction.display.kind) {
+      case "command_approval":
+        return [
+          show,
+          `  Inspect authority: hra interaction inspect ${binding}`,
+          ...decisionCommands(interaction.display.availableDecisions),
+        ];
+      case "file_change_approval":
+        return [
+          show,
+          "  File-change approval is disabled because HRA cannot display exact affected paths.",
+          ...decisionCommands(interaction.display.availableDecisions.filter(
+            (decision) => decision === "decline" || decision === "cancel",
+          )),
+        ];
+      case "permission_approval":
+        return [
+          show,
+          `  Inspect authority: hra interaction inspect ${binding}`,
+          ...(interaction.display.requested.length === 0
+            ? []
+            : [`  Grant selected permissions: hra interaction grant ${binding} --input-stdin`]),
+          `  Decline: hra interaction decide ${binding} --decision decline`,
+        ];
+      case "user_input":
+        return [show, `  Answer: hra interaction answer ${binding} --input-stdin`];
+      case "mcp_elicitation":
+        if (interaction.display.mode !== "form" || interaction.display.fields === undefined) {
+          return [show, "  This MCP request cannot be resolved safely through HRA."];
+        }
+        return [
+          show,
+          `  Accept: hra interaction submit ${binding} --action accept --input-stdin`,
+          `  Decline: hra interaction submit ${binding} --action decline`,
+          `  Cancel: hra interaction submit ${binding} --action cancel`,
+        ];
+    }
+  }
+  switch (interaction.display.kind) {
     case "command_approval":
       return [
         show,
         `  Inspect authority: /inspect ${binding}`,
-        `  Resolve: /approve ${binding} (or /decline ${binding})`,
+        ...decisionCommands(interaction.display.availableDecisions),
       ];
     case "file_change_approval":
-      return [show, `  Resolve safely: /decline ${binding}`];
+      return [
+        show,
+        "  File-change approval is disabled because HRA cannot display exact affected paths.",
+        ...decisionCommands(interaction.display.availableDecisions.filter(
+          (decision) => decision === "decline" || decision === "cancel",
+        )),
+      ];
     case "permission_approval":
       return [
         show,
         `  Inspect authority: /inspect ${binding}`,
-        `  Resolve: /grant ${binding} (or /decline ${binding})`,
+        ...(interaction.display.requested.length === 0
+          ? []
+          : [`  Grant selected permissions: /grant ${binding}`]),
+        `  Decline: /decline ${binding}`,
       ];
     case "user_input":
-      return [show, `  Resolve: /answer ${binding}`];
+      return [show, `  Answer: /answer ${binding}`];
     case "mcp_elicitation":
+      if (interaction.display.mode !== "form" || interaction.display.fields === undefined) {
+        return [show, "  This MCP request cannot be resolved safely through HRA."];
+      }
       return [
         show,
-        `  Resolve: /submit ${binding} --action accept (or replace accept with decline or cancel)`,
+        `  Accept: /submit ${binding} --action accept`,
+        `  Decline: /submit ${binding} --action decline`,
+        `  Cancel: /submit ${binding} --action cancel`,
       ];
   }
 };
 
-const renderPendingInteraction = (interaction: PendingInteraction): string => {
+const renderPendingInteraction = (
+  interaction: PendingInteraction,
+  commandStyle: LiveCommandStyle,
+): string => {
   const detail = [
     `  revision ${String(interaction.revision)}${interaction.blocking ? ", blocking" : ""}`,
     `  ${safeLiveText(interaction.display.summary)}`,
@@ -215,7 +343,7 @@ const renderPendingInteraction = (interaction: PendingInteraction): string => {
     return [
       `Interaction required: ${interactionLabel(interaction.kind)} ${interaction.id}`,
       ...detail,
-      ...pendingInteractionCommands(interaction),
+      ...pendingInteractionCommands(interaction, commandStyle),
     ].join("\n");
   }
   return [
@@ -228,14 +356,17 @@ const renderPendingInteraction = (interaction: PendingInteraction): string => {
 };
 
 const interactionFromEvent = (
+  sessionId: string,
   body: Extract<SessionEventBody, { type: "interaction_requested" }>,
 ): PendingInteraction => ({
   id: body.interactionId,
+  sessionId: sessionIdSchema.parse(sessionId),
   kind: body.interactionKind,
   state: "pending",
   revision: body.revision,
   blocking: body.blocking,
   display: { summary: body.summary },
+  guidance: "show_only",
 });
 
 const liveToolTarget = (
@@ -265,7 +396,7 @@ const renderNonDeltaEvent = (event: SessionEvent): string | null => {
     case "plan_updated": return `Plan updated: ${String(body.steps.length)} step${body.steps.length === 1 ? "" : "s"}.`;
     case "diff_updated": return `Diff updated: ${String(body.changedFiles)} file${body.changedFiles === 1 ? "" : "s"}.`;
     case "token_usage": return null;
-    case "interaction_requested": return renderPendingInteraction(interactionFromEvent(body));
+    case "interaction_requested": return null;
     case "interaction_state": return `Interaction ${body.interactionId}: ${safeLiveText(body.state)}, revision ${String(body.revision)}.`;
     case "warning": return `Warning ${safeLiveText(body.code)}: ${safeLiveText(body.message)}`;
     case "error": return `Error ${safeLiveText(body.code)}${body.terminal ? " (terminal)" : ""}: ${safeLiveText(body.message)}`;
@@ -305,9 +436,88 @@ const raceWithAbort = async <T>(promise: Promise<T>, signal: AbortSignal): Promi
   });
 };
 
-class ShellLivePresenter {
+export const enumerateUnsettledSessionInteractions = async (input: Readonly<{
+  callDaemon: ShellLiveDaemonCaller;
+  cursor?: string | null;
+  expectedSessionId?: string;
+  initialInteractions?: readonly PendingInteraction[];
+  onInteractions(interactions: readonly PendingInteraction[]): void;
+  session: string;
+  signal: AbortSignal;
+}>): Promise<Readonly<{ sessionId: string }>> => {
+  let cursor = input.cursor;
+  let sessionId = input.expectedSessionId ?? null;
+  const initial = input.initialInteractions ?? [];
+  const seen = new Set<string>();
+  const seenCursors = new Set<string>(typeof cursor === "string" ? [cursor] : []);
+  let pageCount = 0;
+  let itemCount = 0;
+  const fail = (): never => {
+    throw new Error("HRA could not safely enumerate every pending interaction.");
+  };
+  for (const interaction of initial) {
+    if (sessionId === null) sessionId = interaction.sessionId;
+    if (interaction.sessionId !== sessionId) fail();
+    if (seen.has(interaction.id)) fail();
+    seen.add(interaction.id);
+  }
+  itemCount = initial.length;
+  if (initial.length > 0) input.onInteractions(initial);
+  if (cursor === null) {
+    if (sessionId === null) return fail();
+    return { sessionId };
+  }
+  while (!input.signal.aborted) {
+    if (pageCount >= liveInteractionPageCeiling || itemCount >= liveInteractionItemCeiling) fail();
+    const command: Extract<LocalCommand, { kind: "session.interactions" }> = {
+      kind: "session.interactions",
+      session: sessionId ?? input.session,
+      pending: true,
+      limit: liveInteractionPageLimit,
+      ...(cursor === undefined ? {} : { cursor }),
+    };
+    const raced = await raceWithAbort(
+      Promise.resolve().then(async () => await input.callDaemon(command, input.signal)),
+      input.signal,
+    );
+    if (raced.kind === "aborted") {
+      throw input.signal.reason ?? new DOMException("Session interaction observation stopped.", "AbortError");
+    }
+    if (raced.kind === "error") throw raced.error;
+    if (!raced.value.ok) {
+      throw Object.assign(new Error("HRA could not enumerate current pending interactions."), {
+        commandError: raced.value.error,
+      });
+    }
+    const parsed = shellLiveInteractionPageSchema.safeParse(raced.value.data);
+    if (!parsed.success) return fail();
+    const data = parsed.data;
+    if (sessionId === null) sessionId = data.sessionId;
+    if (
+      data.sessionId !== sessionId
+      || data.interactions.some((interaction) => interaction.sessionId !== data.sessionId)
+      || (data.nextCursor !== null && seenCursors.has(data.nextCursor))
+      || (data.interactions.length === 0 && data.nextCursor !== null)
+    ) return fail();
+    for (const interaction of data.interactions) {
+      if (seen.has(interaction.id)) fail();
+      seen.add(interaction.id);
+    }
+    itemCount += data.interactions.length;
+    if (itemCount > liveInteractionItemCeiling) fail();
+    if (data.interactions.length > 0) input.onInteractions(data.interactions);
+    pageCount += 1;
+    cursor = data.nextCursor;
+    if (cursor === null) return { sessionId };
+    seenCursors.add(cursor);
+  }
+  throw input.signal.reason ?? new DOMException("Session interaction observation stopped.", "AbortError");
+};
+
+export class ShellLivePresenter {
   readonly #write: (value: string) => void;
   readonly #coalesceMs: number;
+  readonly #commandStyle: LiveCommandStyle;
   readonly #deltaStreams = new Map<string, ActiveDeltaStream>();
   readonly #trustedDeltaItems = new Map<string, Readonly<{ itemId: string; turnId: string }>>();
   #deltaRedactionQuarantined = false;
@@ -317,9 +527,14 @@ class ShellLivePresenter {
   #lastRenderedEventIdentity: string | null = null;
   readonly #seenInteractionRevisions = new Map<string, number>();
 
-  constructor(write: (value: string) => void, coalesceMs: number) {
+  constructor(
+    write: (value: string) => void,
+    coalesceMs: number,
+    commandStyle: LiveCommandStyle = "shell",
+  ) {
     this.#write = write;
     this.#coalesceMs = coalesceMs;
+    this.#commandStyle = commandStyle;
   }
 
   showInitialInteractions(interactions: readonly PendingInteraction[]): void {
@@ -344,6 +559,10 @@ class ShellLivePresenter {
       "Trailing live delta text omitted because observation ended before its redaction boundary completed.",
     );
     this.#trustedDeltaItems.clear();
+  }
+
+  flush(): void {
+    this.#flushDelta();
   }
 
   #acceptEvent(event: SessionEvent): void {
@@ -407,7 +626,7 @@ class ShellLivePresenter {
       this.#flushDelta();
     }
     if (body.type === "interaction_requested") {
-      this.#showInteraction(interactionFromEvent(body));
+      this.#showInteraction(interactionFromEvent(event.sessionId, body));
       return;
     }
     if (body.type === "interaction_state") {
@@ -423,7 +642,7 @@ class ShellLivePresenter {
 
   #showInteraction(interaction: PendingInteraction): void {
     if (!this.#observeInteractionRevision(interaction.id, interaction.revision)) return;
-    this.#emit(renderPendingInteraction(interaction));
+    this.#emit(renderPendingInteraction(interaction, this.#commandStyle));
   }
 
   #observeInteractionRevision(id: string, revision: number): boolean {
@@ -561,8 +780,14 @@ export class ShellLiveObserver {
 
   async select(selection: ShellLiveSelection): Promise<void> {
     await this.stop();
-    const parsed = shellLiveStatusSchema.safeParse(selection.statusData);
-    if (!parsed.success || parsed.data.session.id !== selection.session) {
+    const current = sessionStatusSchema.safeParse(selection.statusData);
+    const legacy = legacyShellLiveStatusSchema.safeParse(selection.statusData);
+    const sessionId = current.success
+      ? current.data.session.id
+      : legacy.success
+        ? legacy.data.session.id
+        : null;
+    if (sessionId !== selection.session) {
       this.#safeWrite("\nLive updates unavailable: session status did not include a matching resumable event cursor.\n");
       return;
     }
@@ -576,23 +801,33 @@ export class ShellLiveObserver {
       }
     };
     const presenter = new ShellLivePresenter(write, this.#coalesceMs);
-    const initialInteractionIds = new Set<string>();
-    for (const interaction of parsed.data.pendingInteractions) {
-      if (initialInteractionIds.has(interaction.id)) {
-        this.#safeWrite("\nLive updates unavailable: session status repeated a pending interaction.\n");
-        return;
-      }
-      initialInteractionIds.add(interaction.id);
+    const pendingInteractions = current.success
+      ? []
+      : legacy.success ? legacy.data.pendingInteractions : [];
+    const interactionCursor = current.success
+      ? undefined
+      : legacy.success ? legacy.data.pendingInteractionsNextCursor : null;
+    const eventCursor = current.success
+      ? current.data.eventStream.cursor
+      : legacy.success ? legacy.data.eventStream.cursor : null;
+    if (eventCursor === null) {
+      this.#safeWrite("\nLive updates unavailable: session status did not include a matching resumable event cursor.\n");
+      return;
     }
-    presenter.showInitialInteractions(parsed.data.pendingInteractions);
     this.#controller = controller;
     this.#task = this.#observe({
       controller,
-      cursor: parsed.data.eventStream.cursor,
-      initialInteractionIds,
-      interactionCursor: parsed.data.pendingInteractionsNextCursor,
+      cursor: eventCursor,
+      initialInteractions: pendingInteractions,
+      interactionCursor,
       presenter,
-      session: parsed.data.session.id,
+      session: sessionId,
+      ...(selection.suppressedInitialInteractionKeys === undefined
+        ? {}
+        : {
+            suppressedInitialInteractionKeys:
+              selection.suppressedInitialInteractionKeys,
+          }),
     }).catch(() => undefined);
   }
 
@@ -623,26 +858,44 @@ export class ShellLiveObserver {
   async #observe(input: Readonly<{
     controller: AbortController;
     cursor: string;
-    initialInteractionIds: ReadonlySet<string>;
-    interactionCursor: string | null;
+    initialInteractions: readonly PendingInteraction[];
+    interactionCursor: string | null | undefined;
     presenter: ShellLivePresenter;
     session: string;
+    suppressedInitialInteractionKeys?: ReadonlySet<string>;
   }>): Promise<void> {
     const signal = input.controller.signal;
     let cursor = input.cursor;
     let consecutiveFailures = 0;
     let failureNoticeWritten = false;
-    let lastEvent: Readonly<{ sequence: number; streamEpoch: string }> | null = null;
+    let continuity = initialSessionEventContinuity();
     try {
       await waitFor(this.#startDelayMs, signal);
-      const interactionsDrained = await this.#drainPendingInteractions({
-        cursor: input.interactionCursor,
-        initialInteractionIds: input.initialInteractionIds,
-        presenter: input.presenter,
-        session: input.session,
-        signal,
-      });
-      if (!interactionsDrained) return;
+      try {
+        await enumerateUnsettledSessionInteractions({
+          callDaemon: this.#callDaemon,
+          ...(input.interactionCursor === undefined ? {} : { cursor: input.interactionCursor }),
+          expectedSessionId: input.session,
+          initialInteractions: input.initialInteractions,
+          onInteractions: (interactions) => input.presenter.showInitialInteractions(
+            input.suppressedInitialInteractionKeys === undefined
+              ? interactions
+              : interactions.filter((interaction) =>
+                  !input.suppressedInitialInteractionKeys?.has(
+                    pendingInteractionStateKey(interaction),
+                  )),
+          ),
+          session: input.session,
+          signal,
+        });
+      } catch {
+        if (!signal.aborted) {
+          this.#write(
+            "\nLive updates paused because HRA could not safely enumerate every pending interaction. Reselect the session to resume.\n",
+          );
+        }
+        return;
+      }
       while (!signal.aborted) {
         const command: Extract<LocalCommand, { kind: "session.events" }> = {
           kind: "session.events",
@@ -678,18 +931,7 @@ export class ShellLiveObserver {
           if ((page.events.length > 0 || page.gap !== null) && page.nextCursor === cursor) {
             throw new Error("cursor did not advance");
           }
-          for (const event of page.events) {
-            if (event.sessionId !== input.session) throw new Error("event session changed");
-            if (lastEvent !== null) {
-              if (event.streamEpoch === lastEvent.streamEpoch && event.sequence <= lastEvent.sequence) {
-                throw new Error("event order changed");
-              }
-              if (event.streamEpoch !== lastEvent.streamEpoch && page.gap === null) {
-                throw new Error("event stream changed without a gap");
-              }
-            }
-            lastEvent = { sequence: event.sequence, streamEpoch: event.streamEpoch };
-          }
+          continuity = advanceSessionEventContinuity(continuity, page);
         } catch {
           this.#write("\nLive updates paused because the daemon returned an invalid event page. Reselect the session to resume.\n");
           break;
@@ -709,60 +951,4 @@ export class ShellLiveObserver {
     }
   }
 
-  async #drainPendingInteractions(input: Readonly<{
-    cursor: string | null;
-    initialInteractionIds: ReadonlySet<string>;
-    presenter: ShellLivePresenter;
-    session: string;
-    signal: AbortSignal;
-  }>): Promise<boolean> {
-    let cursor = input.cursor;
-    if (cursor === null) return true;
-    const seen = new Set(input.initialInteractionIds);
-    const seenCursors = new Set([cursor]);
-    let pageCount = 0;
-    let itemCount = seen.size;
-    const fail = (): false => {
-      this.#write(
-        "\nLive updates paused because HRA could not safely enumerate every pending interaction. Reselect the session to resume.\n",
-      );
-      return false;
-    };
-    while (cursor !== null && !input.signal.aborted) {
-      if (pageCount >= liveInteractionPageCeiling || itemCount >= liveInteractionItemCeiling) {
-        return fail();
-      }
-      const command: Extract<LocalCommand, { kind: "session.interactions" }> = {
-        kind: "session.interactions",
-        session: input.session,
-        pending: true,
-        limit: liveInteractionPageLimit,
-        cursor,
-      };
-      const raced = await raceWithAbort(
-        Promise.resolve().then(async () => await this.#callDaemon(command, input.signal)),
-        input.signal,
-      );
-      if (raced.kind === "aborted") return false;
-      if (raced.kind === "error" || !raced.value.ok) return fail();
-      const parsed = shellLiveInteractionPageSchema.safeParse(raced.value.data);
-      if (
-        !parsed.success
-        || parsed.data.sessionId !== input.session
-        || (parsed.data.nextCursor !== null && seenCursors.has(parsed.data.nextCursor))
-        || (parsed.data.interactions.length === 0 && parsed.data.nextCursor !== null)
-      ) return fail();
-      for (const interaction of parsed.data.interactions) {
-        if (seen.has(interaction.id)) return fail();
-        seen.add(interaction.id);
-      }
-      itemCount += parsed.data.interactions.length;
-      if (itemCount > liveInteractionItemCeiling) return fail();
-      input.presenter.showInitialInteractions(parsed.data.interactions);
-      pageCount += 1;
-      cursor = parsed.data.nextCursor;
-      if (cursor !== null) seenCursors.add(cursor);
-    }
-    return !input.signal.aborted;
-  }
 }

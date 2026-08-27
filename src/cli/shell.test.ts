@@ -77,7 +77,11 @@ describe("HRA line shell", () => {
       kind: "dispatch",
     });
     expect(compileShellLine("/watch --cursor c1", { session: "release" })).toEqual({
-      argv: ["session", "events", "release", "--cursor", "c1", "--follow"],
+      argv: ["session", "watch", "release", "--cursor", "c1"],
+      kind: "dispatch",
+    });
+    expect(compileShellLine("/watch --jsonl", { session: "release" })).toEqual({
+      argv: ["session", "watch", "release", "--jsonl"],
       kind: "dispatch",
     });
     expect(compileShellLine("/interactions --limit 8", { session: "release" })).toEqual({
@@ -220,6 +224,15 @@ describe("HRA line shell", () => {
     expect(shellHelp).toContain("questions, choices, or form fields");
     expect(compileShellLine("/interaction show 70000000-0000-4000-8000-000000000001")).toEqual({
       argv: ["interaction", "show", "70000000-0000-4000-8000-000000000001"],
+      kind: "dispatch",
+    });
+  });
+
+  test("makes human and machine session watching discoverable in shell help", () => {
+    expect(shellHelp).toContain("/watch [--jsonl]");
+    expect(shellHelp).toContain("JSONL is opt-in");
+    expect(compileShellLine("/session watch release --jsonl")).toEqual({
+      argv: ["session", "watch", "release", "--jsonl"],
       kind: "dispatch",
     });
   });

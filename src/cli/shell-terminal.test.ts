@@ -709,6 +709,34 @@ describe("persistent shell terminal coordination", () => {
     expect(listeners.size).toBe(0);
   });
 
+  test("delegates only foreground interrupt ownership while retaining process lifecycle hooks", async () => {
+    const input = new PassThrough();
+    const listeners = new Map<string, () => void>();
+    const coordinator = new ShellTerminalCoordinator({
+      flushInput: () => undefined,
+      input,
+      lifecycleHooks: {
+        onSignal: (signal, listener) => {
+          expect(listeners.has(signal)).toBe(false);
+          listeners.set(signal, listener);
+          return () => { listeners.delete(signal); };
+        },
+        resignal: () => undefined,
+      },
+      output: new CapturingTty(80),
+    });
+    const expectedListeners = process.platform === "win32" ? 2 : 5;
+    await coordinator.withInterruptHandlingSuspended(async () => {
+      expect(listeners.has("SIGINT")).toBe(false);
+      expect(listeners.has("SIGTERM")).toBe(true);
+      expect(listeners.size).toBe(expectedListeners - 1);
+    });
+    expect(listeners.has("SIGINT")).toBe(true);
+    expect(listeners.size).toBe(expectedListeners);
+    coordinator.close();
+    expect(listeners.size).toBe(0);
+  });
+
   test("does not propagate a raw signal when the final terminal flush cannot be proved", async () => {
     const input = new PassThrough() as PassThrough & {
       isRaw: boolean;

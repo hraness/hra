@@ -4,6 +4,7 @@ import { runPersistentShell } from "../src/cli";
 const accountId = `acct_${"1".repeat(32)}`;
 const sessionId = `sess_${"2".repeat(32)}`;
 const messages: string[] = [];
+let watchStarted = false;
 
 const success = (data: unknown): CommandResponse => ({
   data,
@@ -12,7 +13,7 @@ const success = (data: unknown): CommandResponse => ({
   version: 1,
 });
 
-const callDaemon = (command: LocalCommand): Promise<CommandResponse> => {
+const callDaemon = (command: LocalCommand, signal?: AbortSignal): Promise<CommandResponse> => {
   if (command.kind === "daemon.status") {
     return Promise.resolve(success({
       daemon: {
@@ -20,7 +21,7 @@ const callDaemon = (command: LocalCommand): Promise<CommandResponse> => {
         generation: 1,
         nonce: "10000000-0000-4000-8000-000000000001",
         pid: process.pid,
-        protocol: "hra-control-plane-local-v1",
+        protocol: "hra-control-plane-local-v2",
       },
       running: true,
     }));
@@ -29,7 +30,23 @@ const callDaemon = (command: LocalCommand): Promise<CommandResponse> => {
     return Promise.resolve(success({ account: { id: accountId } }));
   }
   if (command.kind === "session.status") {
-    return Promise.resolve(success({ session: { id: sessionId, profileId: accountId } }));
+    return Promise.resolve(success({ version: 1, session: { id: sessionId, profileId: accountId } }));
+  }
+  if (command.kind === "session.interactions") {
+    return Promise.resolve(success({ sessionId, interactions: [], nextCursor: null }));
+  }
+  if (command.kind === "session.events") {
+    if (!watchStarted) {
+      watchStarted = true;
+      process.stdout.write("WATCH_STARTED\n");
+    }
+    return new Promise<CommandResponse>((_resolve, reject) => {
+      const abort = () => reject(
+        signal?.reason ?? new DOMException("Deterministic watch stopped.", "AbortError"),
+      );
+      if (signal?.aborted === true) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
+    });
   }
   if (command.kind === "session.send") {
     messages.push(command.message);
@@ -43,7 +60,12 @@ const exitCode = await runPersistentShell(undefined, {
   interactive: true,
 });
 if (exitCode !== 0) throw new Error(`The deterministic PTY shell exited with ${String(exitCode)}.`);
-if (messages.length !== 2 || messages[0] !== "/slash-one" || messages[1] !== "/slash-two") {
-  throw new Error("The deterministic PTY shell did not preserve exact leading-slash messages.");
+if (
+  messages.length !== 3
+  || messages[0] !== "/slash-one"
+  || messages[1] !== "/slash-two"
+  || messages[2] !== "/after-watch"
+) {
+  throw new Error("The deterministic PTY shell did not preserve exact leading-slash messages across watch cancellation.");
 }
-process.stdout.write("Deterministic PTY shell preserved // and /send payloads.\n");
+process.stdout.write("Deterministic PTY shell preserved // and /send payloads across watch cancellation.\n");

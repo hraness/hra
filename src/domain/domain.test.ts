@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import fc from "fast-check";
 
-import { commandEnvelopeSchema, localCommandSchema } from "./contracts";
+import {
+  commandEnvelopeSchema,
+  LOCAL_COMMAND_REQUEST_VERSION,
+  localCommandSchema,
+} from "./contracts";
 import { presetRequirements } from "./presets";
 import { canTransitionMutation, mutationStateSchema } from "./transitions";
 import { selectByIdOrLabel, utf8Bytes } from "./values";
@@ -32,8 +36,15 @@ describe("domain laws", () => {
     const command = { device: "device_target", idempotencyKey, kind: "device.approve" };
 
     expect(localCommandSchema.safeParse(command).success).toBe(true);
-    expect(commandEnvelopeSchema.safeParse({ capability, command, requestId, version: 1 }).success)
+    expect(commandEnvelopeSchema.safeParse({
+      capability,
+      command,
+      requestId,
+      version: LOCAL_COMMAND_REQUEST_VERSION,
+    }).success)
       .toBe(true);
+    expect(commandEnvelopeSchema.safeParse({ capability, command, requestId, version: 1 }).success)
+      .toBe(false);
     for (const invalidCommand of [
       { device: "device_target", kind: "device.approve" },
       {
@@ -47,7 +58,7 @@ describe("domain laws", () => {
         capability,
         command: invalidCommand,
         requestId,
-        version: 1,
+        version: LOCAL_COMMAND_REQUEST_VERSION,
       }).success).toBe(false);
     }
   });

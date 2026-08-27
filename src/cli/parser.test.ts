@@ -14,8 +14,23 @@ describe("CLI parser", () => {
   test("detects machine streaming intent only before the literal delimiter", () => {
     expect(requestsJsonlOutput(["session", "events", "release", "--jsonl"])).toBe(true);
     expect(requestsJsonlOutput(["session", "events", "release", "--follow"])).toBe(true);
+    expect(requestsJsonlOutput(["session", "watch", "release", "--jsonl"])).toBe(true);
     expect(requestsJsonlOutput(["session", "send", "release", "--", "please use --jsonl"])).toBe(false);
     expect(requestsJsonlOutput(["session", "send", "release", "--", "--follow"])).toBe(false);
+  });
+
+  test("parses root status without admitting effects or extra arguments", () => {
+    expect(parseCli(["status"])).toEqual({ json: false, kind: "status" });
+    expect(parseCli(["status", "--json"])).toEqual({ json: true, kind: "status" });
+    expect(() => parseCli(["status", "extra"])).toThrow(CliUsageError);
+    expect(() => parseCli(["status", "--jsonl"])).toThrow(
+      "supported only by `hra session events` and `hra session watch`",
+    );
+    expect(() => parseCli([
+      "status",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000001",
+    ])).toThrow("not supported by status");
   });
 
   test("keeps the protected login handoff path at the CLI boundary", () => {
@@ -603,6 +618,7 @@ describe("CLI parser", () => {
   });
 
   test("parses bounded session status, event pages, follow mode, and interactions", () => {
+    const eventCursor = `hra1.Y3Vyc29yLXYx.${"A".repeat(43)}`;
     expect(parseCli(["session", "status", "release"])).toEqual({
       command: { kind: "session.status", session: "release" },
       json: false,
@@ -613,7 +629,7 @@ describe("CLI parser", () => {
       "events",
       "release",
       "--cursor",
-      "cursor-v1",
+      eventCursor,
       "--limit",
       "80",
       "--wait-ms",
@@ -621,7 +637,7 @@ describe("CLI parser", () => {
       "--json",
     ])).toEqual({
       command: {
-        cursor: "cursor-v1",
+        cursor: eventCursor,
         kind: "session.events",
         limit: 80,
         session: "release",
@@ -660,6 +676,34 @@ describe("CLI parser", () => {
       jsonl: true,
       kind: "session.events.follow",
     });
+    expect(parseCli(["session", "watch", "release"])).toEqual({
+      command: {
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 30_000,
+      },
+      jsonl: false,
+      kind: "session.events.watch",
+    });
+    expect(parseCli([
+      "session",
+      "watch",
+      "release",
+      "--cursor",
+      eventCursor,
+      "--jsonl",
+    ])).toEqual({
+      command: {
+        cursor: eventCursor,
+        kind: "session.events",
+        limit: 200,
+        session: "release",
+        waitMs: 30_000,
+      },
+      jsonl: true,
+      kind: "session.events.watch",
+    });
     expect(parseCli([
       "session",
       "events",
@@ -682,9 +726,26 @@ describe("CLI parser", () => {
     expect(() => parseCli(["session", "events", "release", "--jsonl", "--json"]))
       .toThrow("mutually exclusive");
     expect(() => parseCli(["session", "status", "release", "--jsonl"]))
-      .toThrow("supported only by `hra session events`");
+      .toThrow("supported only by `hra session events` and `hra session watch`");
     expect(() => parseCli(["account", "list", "--jsonl"]))
-      .toThrow("supported only by `hra session events`");
+      .toThrow("supported only by `hra session events` and `hra session watch`");
+    expect(() => parseCli(["session", "watch", "release", "--json"]))
+      .toThrow("does not support --json");
+    expect(() => parseCli(["session", "watch", "release", "--follow"]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "watch", "release", "--limit", "1"]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "watch", "release", "--wait-ms", "1"]))
+      .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "wait", "release", "--for", "idle"]))
+      .toThrow("Unknown session action");
+    expect(() => parseCli([
+      "session",
+      "watch",
+      "release",
+      "--idempotency-key",
+      "00000000-0000-4000-8000-000000000001",
+    ])).toThrow("not supported by session.watch");
     expect(parseCli([
       "session",
       "interactions",
@@ -716,6 +777,19 @@ describe("CLI parser", () => {
     ]) expect(() => parseCli(argv)).toThrow(CliUsageError);
     expect(() => parseCli(["session", "events", "release", "--cursor", "x".repeat(2_049)]))
       .toThrow(CliUsageError);
+    expect(() => parseCli(["session", "watch", "release", "--cursor", "x".repeat(2_049)]))
+      .toThrow(CliUsageError);
+    for (const malformed of [
+      "provider-secret",
+      "hra1.page.signature",
+      `hra1.e31.${"A".repeat(43)}`,
+      `hra1.e30.${"x".repeat(43)}`,
+    ]) {
+      expect(() => parseCli(["session", "events", "release", "--cursor", malformed]))
+        .toThrow(CliUsageError);
+      expect(() => parseCli(["session", "watch", "release", "--cursor", malformed]))
+        .toThrow(CliUsageError);
+    }
     expect(() => parseCli(["session", "interactions", "release", "--cursor", "x".repeat(2_049)]))
       .toThrow(CliUsageError);
   });

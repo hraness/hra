@@ -41,8 +41,11 @@ if [ "$hra_pgid" -ne "$$" ]; then exit 89; fi
 initial_mode="$($HRA_PTY_STTY -g)" || exit 90
 printf '\n${authorityMarker}\t%s\n' "$$"
 printf '\n${PTY_BEGIN_MARKER}\n'
+# The foreground child owns Ctrl-C; keep the harness alive to report its final status.
+trap ':' 2
 "$@"
 command_status=$?
+trap - 2
 final_mode="$($HRA_PTY_STTY -g)" || exit 91
 if [ "$initial_mode" != "$final_mode" ]; then
   printf '\n${PTY_END_MARKER}\t%s\tchanged\n' "$command_status"
