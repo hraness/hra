@@ -634,7 +634,13 @@ describe("public content contract", () => {
     expect(reading).toContain('<meta property="og:type" content="article">');
     expect(reading).toContain('"@type":"Article"');
     expect(reading).not.toContain('"@type":"SoftwareApplication"');
-    expect(reading).toContain(`>${deepseekHarnessReading.heading}</h2>`);
+    expect(reading).toContain(
+      `<h1 id="reading-deepseek-harness-heading">${deepseekHarnessReading.heading}</h1>`,
+    );
+    expect(reading.match(/<h1\b/gu)).toHaveLength(1);
+    expect(reading).toContain(
+      '<h2 id="reading-deepseek-harness-2-deepseek-harness-as-published">',
+    );
     expect(reading).toContain(deepseekHarnessReading.description);
     expect(llms).toContain(
       `[${deepseekHarnessReading.title}](${publicContent.siteUrl}${deepseekHarnessReading.canonicalPath})`,
