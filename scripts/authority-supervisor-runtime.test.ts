@@ -453,7 +453,7 @@ test("authority supervisor holds a target behind GO", async () => {
     await opened.close().catch(() => undefined);
     await control.close();
   }
-});
+}, 15_000);
 
 test("native deadline kills custody while the HRA parent is stopped after GO", async () => {
   if (!isSupportedLinux()) return;

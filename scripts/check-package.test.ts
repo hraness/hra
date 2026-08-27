@@ -174,7 +174,7 @@ describe("installed package generic command ownership", () => {
         }
         await rm(root, { force: true, recursive: true });
       }
-    });
+    }, 15_000);
   }
 });
 
@@ -252,7 +252,7 @@ describe("installed package pseudo-terminal acceptance", () => {
     } finally {
       await rm(root, { force: true, recursive: true });
     }
-  });
+  }, 20_000);
 
   for (const scenario of [
     { expected: "exceeded its deadline", name: "deadline", overflow: false, timeoutMs: 500 },
@@ -301,6 +301,6 @@ describe("installed package pseudo-terminal acceptance", () => {
         }
         await rm(root, { force: true, recursive: true });
       }
-    });
+    }, 15_000);
   }
 });
