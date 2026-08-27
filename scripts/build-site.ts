@@ -11,6 +11,7 @@ import {
 } from "../site/content.ts";
 import {
   renderDeepseekHarnessReadingHtml,
+  renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
 } from "../site/template.ts";
@@ -51,6 +52,10 @@ const siteTextOutputs = (
   {
     path: join(repositoryRoot, "dist/site/privacy/index.html"),
     content: renderPrivacyHtml(),
+  },
+  {
+    path: join(repositoryRoot, "dist/site/preview/index.html"),
+    content: renderPreviewHtml(),
   },
   {
     path: join(repositoryRoot, "dist/site/reading/deepseek-harness/index.html"),

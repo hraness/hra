@@ -8,6 +8,6 @@
 
 - Lead with the real install command and the shortest successful first-run path.
 - Keep the site dependency-free at runtime, responsive, keyboard-readable, and useful without JavaScript.
-- Render the canonical `@hraness/site-footer` markup and styles on every HTML page. Keep HRA project resources outside the footer.
+- Render the canonical `@hraness/site-footer` markup and styles on every navigable HTML page. Keep the inert iframe preview free of links and other actions, and keep HRA project resources outside the footer.
 - State beta, platform, provider, privacy, and account-switch compatibility limits beside the relevant feature.
 - Do not add analytics, cookies, remote fonts, or a build-time network dependency in v1.
