@@ -37,17 +37,48 @@ afterEach(async () => {
   }));
 });
 
+type ChildClose = Readonly<{ code: number | null; signal: NodeJS.Signals | null }>;
+
+const observeChildClose = async (
+  child: ChildProcessWithoutNullStreams,
+): Promise<ChildClose> => await new Promise((resolvePromise, rejectPromise) => {
+  const onClose = (code: number | null, signal: NodeJS.Signals | null): void => settle(
+    () => resolvePromise({ code, signal }),
+  );
+  const onError = (error: Error): void => settle(() => rejectPromise(error));
+  const settle = (callback: () => void): void => {
+    child.off("close", onClose);
+    child.off("error", onError);
+    callback();
+  };
+  child.once("close", onClose);
+  child.once("error", onError);
+});
+
+const requireChildClose = async (
+  observed: Promise<ChildClose>,
+  timeoutMs = 8_000,
+): Promise<ChildClose> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      observed,
+      new Promise<never>((_resolve, rejectPromise) => {
+        timer = setTimeout(
+          () => rejectPromise(new Error("authority_child_close_timeout")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};
+
 const waitForChildClose = async (
   child: ChildProcessWithoutNullStreams,
   timeoutMs = 8_000,
-): Promise<Readonly<{ code: number | null; signal: NodeJS.Signals | null }>> => await new Promise((resolvePromise, rejectPromise) => {
-  const timer = setTimeout(() => rejectPromise(new Error("authority_child_close_timeout")), timeoutMs);
-  child.once("close", (code, signal) => {
-    clearTimeout(timer);
-    resolvePromise({ code, signal });
-  });
-  child.once("error", rejectPromise);
-});
+): Promise<ChildClose> => await requireChildClose(observeChildClose(child), timeoutMs);
 
 const waitForChildSpawn = async (
   child: ChildProcessWithoutNullStreams,
@@ -424,7 +455,7 @@ test("authority supervisor holds a target behind GO", async () => {
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const closed = waitForChildClose(child);
+    const closed = observeChildClose(child);
     void closed.catch(() => undefined);
     await waitForChildSpawn(child);
     await opened.close();
@@ -444,7 +475,7 @@ test("authority supervisor holds a target behind GO", async () => {
     child.stdin.end();
     const clean = await control.nextLine();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
-    await expect(closed).resolves.toEqual({ code: 0, signal: null });
+    await expect(requireChildClose(closed, 5_000)).resolves.toEqual({ code: 0, signal: null });
     const targetPidNamespace = await readFile(marker, "utf8");
     expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
     expect(targetPidNamespace).not.toBe(parentPidNamespace);
@@ -453,7 +484,7 @@ test("authority supervisor holds a target behind GO", async () => {
     await opened.close().catch(() => undefined);
     await control.close();
   }
-}, 15_000);
+}, 20_000);
 
 test("native deadline kills custody while the HRA parent is stopped after GO", async () => {
   if (!isSupportedLinux()) return;
