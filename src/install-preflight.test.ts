@@ -39,6 +39,10 @@ import {
 } from "./install-preflight-runtime";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
+// Two serialized staging installs may each consume their complete bounded
+// installer budget. Keep the outer test deadline above both inner budgets so
+// scheduling delay cannot terminate a valid second install.
+const SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS = 180_000;
 const temporaryRoots: string[] = [];
 let archivePath: string;
 let archiveSha256: string;
@@ -642,7 +646,7 @@ describe("transactional HRA installer", () => {
     });
     expect(await realpath(activePath)).toBe(activeTarget);
     expect(await readdir(join(bunRoot, "install", "hra", "versions"))).toEqual(versions);
-  }, 60_000);
+  }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
   test("keeps identical local and official archives in distinct namespaces and fetches the official asset", async () => {
     const root = await makeRoot("hra-install-source-classes-");
@@ -716,7 +720,7 @@ describe("transactional HRA installer", () => {
       expect(request.credentials).toBe("omit");
       expect(request.redirect).toBe("manual");
     }
-  }, 60_000);
+  }, SERIAL_STAGING_INSTALL_TEST_TIMEOUT_MS);
 
   test("rejects disallowed redirects, truncation, overrun, and a wrong official archive hash", async () => {
     const failures: readonly Readonly<{
