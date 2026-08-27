@@ -14,6 +14,7 @@ const allowedPublicScopes = new Set([
   "types",
   "typescript-eslint",
 ]);
+const allowedPublicScopedPackages = new Set(["@hraness/site-footer"]);
 
 const secretPatterns = [
   /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u,
@@ -32,7 +33,7 @@ const absoluteUserPaths = [
   /\/(?:Users|home)\/[^/\s"'`]+\//u,
   /(?:^|[^A-Za-z0-9])[A-Za-z]:\\Users\\[^\\\s"'`]+\\/u,
 ] as const;
-const scopedPackage = /@([a-z0-9][a-z0-9-]*)\//gu;
+const scopedPackage = /@([a-z0-9][a-z0-9-]*)\/[a-z0-9][a-z0-9._-]*/gu;
 
 export class PublicTextPolicyError extends Error {
   constructor(
@@ -49,7 +50,12 @@ export function assertPublicText(value: string, label: string): void {
 
   for (const match of value.matchAll(scopedPackage)) {
     const scope = match[1];
-    if (scope !== undefined && !allowedPublicScopes.has(scope)) {
+    const packageName = match[0];
+    if (
+      scope !== undefined
+      && !allowedPublicScopes.has(scope)
+      && !allowedPublicScopedPackages.has(packageName)
+    ) {
       throw new PublicTextPolicyError("PRIVATE_SCOPE", label);
     }
   }

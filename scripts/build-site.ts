@@ -1,5 +1,6 @@
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   publicContent,
@@ -80,7 +81,10 @@ const siteTextOutputs = (
   },
 ];
 
-const staticAssets = ["favicon.svg", "social-card.svg", "styles.css"] as const;
+const staticAssets = ["favicon.svg", "social-card.svg"] as const;
+const siteFooterStylesPath = fileURLToPath(
+  import.meta.resolve("@hraness/site-footer/styles.css"),
+);
 
 const readExisting = async (path: string): Promise<string | undefined> => {
   try {
@@ -127,6 +131,16 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(source, destination);
   }
+
+  const [productStyles, siteFooterStyles] = await Promise.all([
+    readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),
+    readFile(siteFooterStylesPath, "utf8"),
+  ]);
+  await writeFile(
+    join(options.repositoryRoot, "dist/site/styles.css"),
+    `${productStyles.trimEnd()}\n\n${siteFooterStyles.trim()}\n`,
+    "utf8",
+  );
 
   return mismatches;
 };

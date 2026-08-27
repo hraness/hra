@@ -53,6 +53,10 @@ describe("static-site build", () => {
       expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
     }
 
+    const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");
+    expect(builtStyles).toContain("fixture:styles.css");
+    expect(builtStyles).toContain(".hraness-site-footer {");
+
     expect(JSON.parse(
       await readFile(join(root, "dist/site/.well-known/hra.json"), "utf8"),
     )).toEqual({
