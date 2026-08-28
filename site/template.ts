@@ -3,11 +3,14 @@ import { renderHranessSiteFooter } from "@hraness/site-footer";
 import {
   deepseekHarnessReading,
   findSection,
+  headlongMicroharnessReading,
   publicContent,
+  readingPages,
   type ContentBlock,
   type ContentSection,
   type InlineContent,
   type PublicContent,
+  type ReadingPage,
 } from "./content.ts";
 
 const escapeHtml = (value: string): string =>
@@ -150,7 +153,7 @@ ${renderHead(content, {
     <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
     <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
-    ${renderBlock(deepseekHarnessReading.homeLink, "introduction", content.introduction.length)}
+    ${readingPages.map((page, index) => renderBlock(page.homeLink, "introduction", content.introduction.length + index)).join("\n    ")}
   </header>
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
   ${content.sections.map((section) => renderSection(section)).join("\n  ")}
@@ -217,10 +220,10 @@ ${renderHranessSiteFooter()}
 `;
 };
 
-export const renderDeepseekHarnessReadingHtml = (
+export const renderReadingHtml = (
+  page: ReadingPage,
   content: PublicContent = publicContent,
 ): string => {
-  const page = deepseekHarnessReading;
   const canonicalUrl = `${content.siteUrl}${page.canonicalPath}`;
   return `<!doctype html>
 <html lang="en">
@@ -264,3 +267,11 @@ ${renderHranessSiteFooter()}
 </html>
 `;
 };
+
+export const renderDeepseekHarnessReadingHtml = (
+  content: PublicContent = publicContent,
+): string => renderReadingHtml(deepseekHarnessReading, content);
+
+export const renderHeadlongMicroharnessReadingHtml = (
+  content: PublicContent = publicContent,
+): string => renderReadingHtml(headlongMicroharnessReading, content);

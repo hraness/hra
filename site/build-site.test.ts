@@ -41,6 +41,7 @@ describe("static-site build", () => {
       "dist/site/preview/index.html",
       "dist/site/privacy/index.html",
       "dist/site/reading/deepseek-harness/index.html",
+      "dist/site/reading/headlong-microharness/index.html",
       "dist/site/robots.txt",
       "dist/site/sitemap.xml",
       "dist/site/llms.txt",
@@ -128,6 +129,30 @@ describe("static-site build", () => {
     expect(llms).toContain("https://hra.sh/reading/deepseek-harness/");
     expect(home).toContain('href="/reading/deepseek-harness/"');
     expect(reading).toContain("A plugin catalog is not a Codex account loop");
+  });
+
+  test("lists the Headlong reading page in the built sitemap and llms index", async () => {
+    const root = await createFixtureRoot();
+    await buildSite({ check: false, repositoryRoot: root });
+    const sitemap = await readFile(join(root, "dist/site/sitemap.xml"), "utf8");
+    const llms = await readFile(join(root, "dist/site/llms.txt"), "utf8");
+    const home = await readFile(join(root, "dist/site/index.html"), "utf8");
+    const reading = await readFile(
+      join(root, "dist/site/reading/headlong-microharness/index.html"),
+      "utf8",
+    );
+    const deepseek = await readFile(
+      join(root, "dist/site/reading/deepseek-harness/index.html"),
+      "utf8",
+    );
+
+    expect(sitemap).toContain("<loc>https://hra.sh/reading/headlong-microharness/</loc>");
+    expect(llms).toContain("https://hra.sh/reading/headlong-microharness/");
+    expect(home).toContain('href="/reading/headlong-microharness/"');
+    expect(deepseek).toContain('href="/reading/headlong-microharness/"');
+    expect(reading).toContain("A microharness for persistence is not a Codex account loop");
+    expect(reading).not.toContain("/reading/headlong-always-on-loop");
+    expect(reading).not.toContain("/reading/not-a-codex-tui");
   });
 
   test("generates the inert preview without publishing it as an indexable document", async () => {
