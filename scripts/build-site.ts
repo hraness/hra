@@ -4,15 +4,16 @@ import { fileURLToPath } from "node:url";
 
 import {
   publicContent,
+  readingPages,
   renderLlmsText,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
   renderSitemapXml,
 } from "../site/content.ts";
 import {
-  renderDeepseekHarnessReadingHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
+  renderReadingHtml,
   renderSiteHtml,
 } from "../site/template.ts";
 
@@ -57,10 +58,10 @@ const siteTextOutputs = (
     path: join(repositoryRoot, "dist/site/preview/index.html"),
     content: renderPreviewHtml(),
   },
-  {
-    path: join(repositoryRoot, "dist/site/reading/deepseek-harness/index.html"),
-    content: renderDeepseekHarnessReadingHtml(),
-  },
+  ...readingPages.map((page) => ({
+    path: join(repositoryRoot, `dist/site${page.canonicalPath}index.html`),
+    content: renderReadingHtml(page),
+  })),
   {
     path: join(repositoryRoot, "dist/site/robots.txt"),
     content: `User-agent: *\nAllow: /\nSitemap: ${publicContent.siteUrl}/sitemap.xml\n`,

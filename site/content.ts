@@ -185,6 +185,11 @@ export const deepseekHarnessReading: ReadingPage = {
         text(" keeps the product split off this host: Direct owns application state, Wrench owns attested web operations, and Hra owns multi-subscription Codex parallelism. This generation-1 site publishes the Bun CLI and daemon that keep those isolated Codex accounts. It does not republish the comparison essay."),
       ),
       paragraph(
+        text("A sourced reading take: "),
+        link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
+        text(" reads Headlong as a persistence design, not as this host's isolated Codex account loop."),
+      ),
+      paragraph(
         text("When those Codex sessions need an attested web operation rather than a plugin slot, the "),
         link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
         text(" table names the operations a session can call on purpose."),
@@ -193,10 +198,80 @@ export const deepseekHarnessReading: ReadingPage = {
   },
 };
 
+export const headlongMicroharnessReading: ReadingPage = {
+  canonicalPath: "/reading/headlong-microharness/",
+  datePublished: "2026-08-28",
+  description:
+    "Headlong is a Laude microharness for persistent agents. HRA is a Bun CLI and local daemon for isolated Codex accounts, live sessions, and optional encrypted sync.",
+  heading: "A microharness for persistence is not a Codex account loop",
+  title: "A microharness for persistence is not a Codex account loop",
+  homeLink: paragraph(
+    text("A sourced reading take: "),
+    link("A microharness for persistence is not a Codex account loop", "/reading/headlong-microharness/"),
+    text(" reads Headlong as a persistence design, not as HRA's isolated Codex account job."),
+  ),
+  section: {
+    id: "reading-headlong-microharness",
+    heading: "A microharness for persistence is not a Codex account loop",
+    blocks: [
+      paragraph(text("Published 28 August 2026.")),
+      paragraph(
+        text("Headlong is an open-source microharness for persistent agents. Its published design keeps an agent thinking between external messages. HRA is a Bun CLI plus a local daemon. It keeps isolated Codex accounts, live sessions, and optional encrypted sync. Persistence is the shared noun: work that survives a dead window. The objects differ. A microharness for persistence is not multi-subscription Codex parallelism."),
+      ),
+      { kind: "subheading", text: "Headlong as published" },
+      paragraph(
+        text("The Laude Institute post "),
+        link("Headlong: a microharness for persistent agents", "https://www.laude.org/updates/headlong-a-microharness-for-persistent-agents"),
+        text(" describes a Bash core that treats incoming chat as observations in one thought stream. The agent decides if and when to reply."),
+      ),
+      paragraph(
+        text("The "),
+        link("Reading digest", "https://hraness.com/reading/headlong-a-microharness-for-persistent-agents"),
+        text(" records the same source as a gist. This page is the HRA take, not that digest. It is also not the generation-0 always-on-loop URL, which 404s on this host."),
+      ),
+      { kind: "subheading", text: "A design reference, not an implementation" },
+      paragraph(
+        text("HRA does not implement Headlong, wrap its thinker loop, or treat a self-guided inner monologue as a Codex provider. The Laude post is worth reading because it isolates persistence as a harness constraint. It is not a product claim about this host."),
+      ),
+      { kind: "subheading", text: "What HRA keeps on this host" },
+      paragraph(
+        text("The live product page is "),
+        link("HRA on hra.sh", "https://hra.sh/"),
+        text(". HRA owns isolated profiles, process generations, durable commands, local projections, optional encrypted sync, and recovery. Codex app-server owns login, transcripts, turns, tools, and approvals. One machine remains the fenced execution custodian for a session. Other paired devices may read or submit durable commands. They do not become a second provider writer."),
+      ),
+      paragraph(
+        text("Several Codex accounts stay independent subscriptions. HRA does not pool quota or replay a failed turn under another account. That is the account loop this host publishes: named profiles, live sessions, and a local daemon. It is not a Headlong thinker loop."),
+      ),
+      { kind: "subheading", text: "The harness noun stays on its own host" },
+      paragraph(
+        link("What is an agent harness?", "https://hraness.com/writing/what-is-an-agent-harness"),
+        text(" defines the noun and points at live surfaces. "),
+        link("Direct, Wrench, and Hra", "https://hraness.com/writing/direct-wrench-hra"),
+        text(" keeps the product split off this host: Direct owns application state, Wrench owns attested web operations, and Hra owns multi-subscription Codex parallelism. This generation-1 site publishes the Bun CLI and daemon that keep those isolated Codex accounts. It does not republish the comparison essay."),
+      ),
+      paragraph(
+        text("A sourced reading take: "),
+        link("A plugin catalog is not a Codex account loop", "/reading/deepseek-harness/"),
+        text(" reads DeepSeek Harness as a plugin-first design reference. This page reads Headlong as a persistence design. Neither page is the other source's digest."),
+      ),
+      paragraph(
+        text("When those Codex sessions need an attested web operation rather than a thought stream, the "),
+        link("Wrench provider capabilities", "https://wrench.rip/provider-capabilities/"),
+        text(" table names the operations a session can call on purpose."),
+      ),
+    ],
+  },
+};
+
+export const readingPages: readonly ReadingPage[] = [
+  deepseekHarnessReading,
+  headlongMicroharnessReading,
+];
+
 export const siteDocumentPaths: readonly string[] = [
   "/",
   "/privacy/",
-  deepseekHarnessReading.canonicalPath,
+  ...readingPages.map((page) => page.canonicalPath),
 ];
 
 export const publicReleaseState: "release-ready" | "staged" = "staged";
@@ -1022,7 +1097,9 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     "",
     "## Reading",
     "",
-    `- [${deepseekHarnessReading.title}](${content.siteUrl}${deepseekHarnessReading.canonicalPath})`,
+    ...readingPages.map(
+      (page) => `- [${page.title}](${content.siteUrl}${page.canonicalPath})`,
+    ),
     "",
   ].join("\n");
 

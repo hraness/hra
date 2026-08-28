@@ -12,6 +12,7 @@ import {
 } from "../src/install-preflight";
 import {
   deepseekHarnessReading,
+  headlongMicroharnessReading,
   publicContent,
   renderLlmsText,
   renderPrivacyMarkdown,
@@ -20,6 +21,7 @@ import {
 } from "./content.ts";
 import {
   renderDeepseekHarnessReadingHtml,
+  renderHeadlongMicroharnessReadingHtml,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
@@ -578,6 +580,7 @@ describe("public content contract", () => {
       renderSiteHtml(),
       renderPrivacyHtml(),
       renderDeepseekHarnessReadingHtml(),
+      renderHeadlongMicroharnessReadingHtml(),
     ]) {
       expect(document.match(/<footer\b/gu)).toHaveLength(1);
       const footer = /<footer\b[\s\S]*?<\/footer>/u.exec(document)?.[0];
@@ -630,6 +633,7 @@ describe("public content contract", () => {
       "https://hraness.com/writing/direct-wrench-hra",
       "https://github.com/deepseek-ai/deepseek-harness",
       "https://hraness.com/reading/deepseek-harness",
+      "/reading/headlong-microharness/",
       "https://wrench.rip/provider-capabilities/",
     ];
     const absentHrefs = [
@@ -670,6 +674,73 @@ describe("public content contract", () => {
       expect(reading).toContain(`href="${href}"`);
     }
     for (const document of [home, reading, llms, sitemap, markdown]) {
+      for (const href of absentHrefs) {
+        expect(document).not.toContain(href);
+      }
+      expect(document).not.toMatch(/<script(?! type="application\/ld\+json")/);
+    }
+    expect(reading).not.toMatch(/<script[^>]+src=/);
+    expect(reading).not.toContain("onclick=");
+    expect(reading).not.toContain("graphql");
+    expect(reading).not.toContain("GraphQL");
+    expect(reading).not.toContain("OAuth");
+    expect(reading).not.toContain("MCP");
+  });
+
+  test("ships one crawlable Headlong reading page without orphaning it", () => {
+    const home = renderSiteHtml();
+    const reading = renderHeadlongMicroharnessReadingHtml();
+    const deepseek = renderDeepseekHarnessReadingHtml();
+    const llms = renderLlmsText();
+    const sitemap = renderSitemapXml();
+    const markdown = renderReadmeMarkdown();
+    const requiredHrefs = [
+      "https://www.laude.org/updates/headlong-a-microharness-for-persistent-agents",
+      "https://hraness.com/reading/headlong-a-microharness-for-persistent-agents",
+      "https://hra.sh/",
+      "/reading/deepseek-harness/",
+      "https://hraness.com/writing/what-is-an-agent-harness",
+      "https://hraness.com/writing/direct-wrench-hra",
+      "https://wrench.rip/provider-capabilities/",
+    ];
+    const absentHrefs = [
+      "/reading/headlong-always-on-loop",
+      "/reading/not-a-codex-tui",
+      "stripedex.com",
+      "spongeresearch.com",
+    ];
+
+    expect(home).toContain('href="/reading/headlong-microharness/"');
+    expect(home).toContain("A microharness for persistence is not a Codex account loop");
+    expect(deepseek).toContain('href="/reading/headlong-microharness/"');
+    expect(reading).toContain(
+      `<link rel="canonical" href="https://hra.sh${headlongMicroharnessReading.canonicalPath}">`,
+    );
+    expect(reading).toContain('<meta property="og:type" content="article">');
+    expect(reading).toContain('"@type":"Article"');
+    expect(reading).not.toContain('"@type":"SoftwareApplication"');
+    expect(reading).toContain(
+      `<h1 id="reading-headlong-microharness-heading">${headlongMicroharnessReading.heading}</h1>`,
+    );
+    expect(reading.match(/<h1\b/gu)).toHaveLength(1);
+    expect(reading).toContain(
+      '<h2 id="reading-headlong-microharness-2-headlong-as-published">',
+    );
+    expect(reading).toContain(headlongMicroharnessReading.description);
+    expect(reading).toContain("This page is the HRA take, not that digest.");
+    expect(reading).toContain("generation-0 always-on-loop URL");
+    expect(reading).toContain("HRA does not implement Headlong");
+    expect(llms).toContain(
+      `[${headlongMicroharnessReading.title}](${publicContent.siteUrl}${headlongMicroharnessReading.canonicalPath})`,
+    );
+    expect(sitemap).toContain(
+      `<loc>${publicContent.siteUrl}${headlongMicroharnessReading.canonicalPath}</loc>`,
+    );
+    expect(markdown).not.toContain("/reading/headlong-microharness/");
+    for (const href of requiredHrefs) {
+      expect(reading).toContain(`href="${href}"`);
+    }
+    for (const document of [home, reading, deepseek, llms, sitemap, markdown]) {
       for (const href of absentHrefs) {
         expect(document).not.toContain(href);
       }
