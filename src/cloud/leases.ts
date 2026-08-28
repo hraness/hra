@@ -23,7 +23,7 @@ export type LeaseAcquireDisposition =
   | Readonly<{ kind: "renewed"; lease: LeaseSnapshot }>
   | Readonly<{
       kind: "rejected";
-      reason: "boot_generation" | "lease_live" | "wrong_device";
+      reason: "boot_generation" | "invalid_duration" | "lease_live" | "wrong_device";
     }>;
 
 export type HeartbeatDisposition =
@@ -31,7 +31,12 @@ export type HeartbeatDisposition =
   | Readonly<{ kind: "replay"; lease: LeaseSnapshot }>
   | Readonly<{
       kind: "rejected";
-      reason: "authority" | "fingerprint_conflict" | "sequence_gap" | "stale_sequence";
+      reason:
+        | "authority"
+        | "fingerprint_conflict"
+        | "invalid_duration"
+        | "sequence_gap"
+        | "stale_sequence";
     }>;
 
 function validLeaseDuration(value: number): boolean {
@@ -51,7 +56,7 @@ export function acquireLeaseDisposition(
   input: LeaseAcquireInput,
 ): LeaseAcquireDisposition {
   if (!validLeaseDuration(input.leaseDurationMs)) {
-    return { kind: "rejected", reason: "boot_generation" };
+    return { kind: "rejected", reason: "invalid_duration" };
   }
   if (existing === null) {
     if (!Number.isSafeInteger(input.bootGeneration) || input.bootGeneration < 1) {
@@ -132,8 +137,10 @@ export function heartbeatDisposition(
     || existing.bootId !== input.authority.bootId
     || existing.fence !== input.authority.fence
     || input.now >= existing.leaseUntil
-    || !validLeaseDuration(input.leaseDurationMs)
   ) return { kind: "rejected", reason: "authority" };
+  if (!validLeaseDuration(input.leaseDurationMs)) {
+    return { kind: "rejected", reason: "invalid_duration" };
+  }
 
   if (input.sequence === existing.heartbeatSequence) {
     if (input.fingerprint !== existing.heartbeatFingerprint) {
