@@ -13,7 +13,9 @@ import {
 } from "../src/cloud/contracts";
 import {
   authorityMatches,
+  commandAuthorityTransitionDisposition,
   commandTransitionDisposition,
+  type CommandAuthorityTransitionDisposition,
 } from "../src/cloud/commands";
 import {
   rejectAuthority,
@@ -56,6 +58,15 @@ function storedAuthority(value: Readonly<{
     bootId: value.bootId,
     fence: value.fence,
   };
+}
+
+function rejectCommandAuthorityTransition(
+  disposition: Extract<CommandAuthorityTransitionDisposition, { kind: "rejected" }>,
+): never {
+  if (disposition.reason === "invalid_transition") {
+    throw new Error("COMMAND_TRANSITION_CONFLICT");
+  }
+  rejectAuthority();
 }
 
 async function commandByPublicId(
@@ -413,13 +424,13 @@ async function requireCommandExecutionAuthority(
     session?.userId !== authority.userId
     || session.executionDeviceId !== authority.deviceId
   ) rejectAuthority();
-  await requireLiveExecutionLease(ctx, {
+  const lease = await requireLiveExecutionLease(ctx, {
     authority: authorityTupleValue,
     deviceId: authority.deviceId,
     sessionId: session._id,
     userId: authority.userId,
   });
-  return { authority, command, session };
+  return { authority, command, lease, session };
 }
 
 export const prepare = mutation({
@@ -454,14 +465,24 @@ export const prepare = mutation({
       await ctx.db.patch(current.command._id, commandPatch);
       return { publicId: current.command.publicId, replay: false, state: "expired" as const };
     }
-    if (current.command.state === "prepared") {
-      const bound = current.command.boundAuthority;
-      if (bound === undefined) rejectAuthority();
-      if (authorityMatches(storedAuthority(bound), args.authority)) {
-        return { publicId: current.command.publicId, replay: true, state: "prepared" as const };
-      }
+    const disposition = commandAuthorityTransitionDisposition({
+      boundAuthority: current.command.boundAuthority === undefined
+        ? null
+        : storedAuthority(current.command.boundAuthority),
+      leaseUntil: current.lease.leaseUntil,
+      liveAuthority: storedAuthority(current.lease),
+      next: "prepared",
+      now,
+      requestedAuthority: args.authority,
+      state: current.command.state,
+    });
+    if (disposition.kind === "rejected") rejectCommandAuthorityTransition(disposition);
+    if (disposition.kind === "replay") {
+      return { publicId: current.command.publicId, replay: true, state: "prepared" as const };
+    }
+    if (disposition.kind === "rebound") {
       const commandPatch = {
-        boundAuthority: args.authority,
+        boundAuthority: disposition.boundAuthority,
         updatedAt: now,
       } as const;
       await adjustCommandQuotaForPatch(
@@ -473,11 +494,9 @@ export const prepare = mutation({
       await ctx.db.patch(current.command._id, commandPatch);
       return { publicId: current.command.publicId, rebound: true, state: "prepared" as const };
     }
-    const transition = commandTransitionDisposition(current.command.state, "prepared");
-    if (transition.kind !== "applied") throw new Error("COMMAND_TRANSITION_CONFLICT");
     const commandPatch = {
-      boundAuthority: args.authority,
-      state: "prepared",
+      boundAuthority: disposition.boundAuthority,
+      state: disposition.state,
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(
@@ -499,11 +518,19 @@ export const markEffectStarted = mutation({
       args.commandPublicId,
       args.authority,
     );
-    const bound = current.command.boundAuthority;
-    if (bound === undefined || !authorityMatches(storedAuthority(bound), args.authority)) {
-      rejectAuthority();
-    }
     const now = Date.now();
+    const disposition = commandAuthorityTransitionDisposition({
+      boundAuthority: current.command.boundAuthority === undefined
+        ? null
+        : storedAuthority(current.command.boundAuthority),
+      leaseUntil: current.lease.leaseUntil,
+      liveAuthority: storedAuthority(current.lease),
+      next: "effect_started",
+      now,
+      requestedAuthority: args.authority,
+      state: current.command.state,
+    });
+    if (disposition.kind === "rejected") rejectCommandAuthorityTransition(disposition);
     if (current.command.state === "prepared" && current.command.deadline <= now) {
       const commandPatch = {
         nonterminal: false,
@@ -520,13 +547,11 @@ export const markEffectStarted = mutation({
       await ctx.db.patch(current.command._id, commandPatch);
       return { publicId: current.command.publicId, replay: false, state: "expired" as const };
     }
-    if (current.command.state === "effect_started") {
+    if (disposition.kind === "replay") {
       return { publicId: current.command.publicId, replay: true, state: "effect_started" as const };
     }
-    const transition = commandTransitionDisposition(current.command.state, "effect_started");
-    if (transition.kind !== "applied") throw new Error("COMMAND_TRANSITION_CONFLICT");
     const commandPatch = {
-      state: "effect_started",
+      state: disposition.state,
       updatedAt: now,
     } as const;
     await adjustCommandQuotaForPatch(
@@ -580,21 +605,30 @@ export const settle = mutation({
       // expires. No provider effect is replayed on this path.
       return { publicId: command.publicId, replay: true, state: args.state };
     }
-    await requireLiveExecutionLease(ctx, {
+    const lease = await requireLiveExecutionLease(ctx, {
       authority: args.authority,
       deviceId: target.deviceId,
       sessionId: session._id,
       userId: target.userId,
     });
-    const transition = commandTransitionDisposition(command.state, args.state);
-    if (transition.kind !== "applied") throw new Error("COMMAND_TRANSITION_CONFLICT");
     const now = Date.now();
+    const disposition = commandAuthorityTransitionDisposition({
+      boundAuthority: storedAuthority(bound),
+      leaseUntil: lease.leaseUntil,
+      liveAuthority: storedAuthority(lease),
+      next: args.state,
+      now,
+      requestedAuthority: args.authority,
+      state: command.state,
+    });
+    if (disposition.kind === "rejected") rejectCommandAuthorityTransition(disposition);
+    if (disposition.kind !== "applied") throw new Error("COMMAND_TRANSITION_CONFLICT");
     const commandPatch = {
       ...(args.result === undefined ? {} : { result: args.result }),
       nonterminal: false,
       resultCode: args.resultCode,
       resultDigest: args.resultDigest,
-      state: args.state,
+      state: disposition.state,
       ...terminalCleanupFields(command, now),
       updatedAt: now,
     };

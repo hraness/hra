@@ -17,7 +17,107 @@ const initial: LeaseSnapshot = {
   leaseUntil: 20_000,
 };
 
+const invalidLeaseDurations: readonly number[] = [
+  Number.NEGATIVE_INFINITY,
+  Number.MIN_SAFE_INTEGER,
+  -1,
+  0,
+  4_999,
+  5_000.5,
+  120_000.5,
+  120_001,
+  Number.MAX_SAFE_INTEGER,
+  Number.MAX_SAFE_INTEGER + 1,
+  Number.POSITIVE_INFINITY,
+  Number.NaN,
+];
+
 describe("execution lease laws", () => {
+  test("invalid acquire and heartbeat durations have a truthful fail-closed status", () => {
+    for (const leaseDurationMs of invalidLeaseDurations) {
+      expect(acquireLeaseDisposition(initial, {
+        bootGeneration: initial.bootGeneration,
+        bootId: initial.bootId,
+        devicePublicId: initial.devicePublicId,
+        leaseDurationMs,
+        now: 15_000,
+      })).toEqual({ kind: "rejected", reason: "invalid_duration" });
+      expect(heartbeatDisposition(initial, {
+        authority: {
+          bootGeneration: initial.bootGeneration,
+          bootId: initial.bootId,
+          fence: initial.fence,
+        },
+        fingerprint: "b".repeat(64),
+        leaseDurationMs,
+        now: 15_000,
+        sequence: initial.heartbeatSequence + 1,
+      })).toEqual({ kind: "rejected", reason: "invalid_duration" });
+    }
+  });
+
+  test("lease duration boundaries remain valid", () => {
+    for (const leaseDurationMs of [5_000, 120_000]) {
+      expect(acquireLeaseDisposition(null, {
+        bootGeneration: initial.bootGeneration,
+        bootId: initial.bootId,
+        devicePublicId: initial.devicePublicId,
+        leaseDurationMs,
+        now: 15_000,
+      }).kind).toBe("acquired");
+      expect(heartbeatDisposition(initial, {
+        authority: {
+          bootGeneration: initial.bootGeneration,
+          bootId: initial.bootId,
+          fence: initial.fence,
+        },
+        fingerprint: "b".repeat(64),
+        leaseDurationMs,
+        now: 15_000,
+        sequence: initial.heartbeatSequence + 1,
+      }).kind).toBe("advanced");
+    }
+  });
+
+  test("heartbeat rejects stale or expired authority before invalid duration", () => {
+    const staleAuthorities = [
+      { bootGeneration: 2, bootId: initial.bootId, fence: initial.fence },
+      { bootGeneration: 1, bootId: "boot_stale_0001", fence: initial.fence },
+      { bootGeneration: 1, bootId: initial.bootId, fence: initial.fence + 1 },
+    ] as const;
+    for (const authority of staleAuthorities) {
+      expect(heartbeatDisposition(initial, {
+        authority,
+        fingerprint: "b".repeat(64),
+        leaseDurationMs: 0,
+        now: 15_000,
+        sequence: initial.heartbeatSequence + 1,
+      })).toEqual({ kind: "rejected", reason: "authority" });
+    }
+    expect(heartbeatDisposition(initial, {
+      authority: {
+        bootGeneration: initial.bootGeneration,
+        bootId: initial.bootId,
+        fence: initial.fence,
+      },
+      fingerprint: "b".repeat(64),
+      leaseDurationMs: 0,
+      now: initial.leaseUntil,
+      sequence: initial.heartbeatSequence + 1,
+    })).toEqual({ kind: "rejected", reason: "authority" });
+    expect(heartbeatDisposition(initial, {
+      authority: {
+        bootGeneration: initial.bootGeneration,
+        bootId: initial.bootId,
+        fence: initial.fence,
+      },
+      fingerprint: "b".repeat(64),
+      leaseDurationMs: 0,
+      now: initial.leaseUntil - 1,
+      sequence: initial.heartbeatSequence + 1,
+    })).toEqual({ kind: "rejected", reason: "invalid_duration" });
+  });
+
   test("takeover happens only at expiry under a strictly newer daemon generation", () => {
     const base = {
       bootGeneration: 2,
