@@ -34,6 +34,7 @@ import type {
   DeploymentReadback,
   ManagedAlias,
   ProjectReadback,
+  VercelCommandRunner,
 } from "./domain-cutover";
 import {
   BoundedProcessCleanupUnprovenError,
@@ -94,6 +95,17 @@ const commandResult = (
   exitCode,
   stderr: Buffer.alloc(0),
   stdout: value === undefined ? Buffer.alloc(0) : Buffer.from(JSON.stringify(value)),
+});
+
+const refuseUnexpectedHistoricalVercel: VercelCommandRunner = async () => {
+  throw new Error("historical publication test reached Vercel");
+};
+
+const createHistoricalPublicationProvider = (
+  options: ConstructorParameters<typeof GitHubReleasePublicationProvider>[0],
+): GitHubReleasePublicationProvider => new GitHubReleasePublicationProvider({
+  ...options,
+  vercelRunner: refuseUnexpectedHistoricalVercel,
 });
 
 const assetNames = [
@@ -701,6 +713,19 @@ afterEach(async () => {
 });
 
 describe("release publication arguments", () => {
+  test("the retired publisher has no ambient Vercel capability", () => {
+    let githubCalls = 0;
+    expect(() => new GitHubReleasePublicationProvider({
+      ghCli: "/provider/must-not-run",
+      githubCommand: async () => {
+        githubCalls += 1;
+        return commandResult(undefined);
+      },
+      vercelCli: "/provider/must-not-run",
+    })).toThrow("operator_retired");
+    expect(githubCalls).toBe(0);
+  });
+
   test("requires an exact run, source commit, CLI, tag, and explicit publish acknowledgement", () => {
     const common = [
       "--tag", tag,
@@ -856,7 +881,7 @@ describe("release publication arguments", () => {
     });
     expect(packed.exitCode).toBe(0);
 
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       recoveryDirectory: join(root, "process-recovery"),
       vercelCli: "/not-used/vercel",
@@ -950,7 +975,7 @@ describe("release publication cleanup", () => {
       },
     }), { status: 200 });
     Object.defineProperty(stalled, "url", { value: "https://downloads.example.test/hra.tgz" });
-    const stalledProvider = new GitHubReleasePublicationProvider({
+    const stalledProvider = createHistoricalPublicationProvider({
       fetcher: Object.assign(() => Promise.resolve(stalled), {
         preconnect: () => undefined,
       }) as typeof fetch,
@@ -970,7 +995,7 @@ describe("release publication cleanup", () => {
     const bytes = new TextEncoder().encode("exact public archive");
     const insecure = new Response(bytes, { status: 200 });
     Object.defineProperty(insecure, "url", { value: "http://downloads.example.test/hra.tgz" });
-    const insecureProvider = new GitHubReleasePublicationProvider({
+    const insecureProvider = createHistoricalPublicationProvider({
       fetcher: Object.assign(() => Promise.resolve(insecure), {
         preconnect: () => undefined,
       }) as typeof fetch,
@@ -1135,7 +1160,7 @@ describe("release publication lease identity", () => {
       }),
       commandResult(leaseRun()),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       environment: { HOME: root },
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
@@ -1197,7 +1222,7 @@ describe("release publication lease identity", () => {
     ] as const) {
       const root = await makeRoot();
       let remoteCommands = 0;
-      const provider = new GitHubReleasePublicationProvider({
+      const provider = createHistoricalPublicationProvider({
         ghCli: "/not-used/gh",
         githubCommand: async () => {
           remoteCommands += 1;
@@ -1227,7 +1252,7 @@ describe("release publication lease identity", () => {
     const receiptDirectory = join(root, "receipts");
     await mkdir(receiptDirectory, { mode: 0o755 });
     let remoteCommands = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         remoteCommands += 1;
@@ -1257,7 +1282,7 @@ describe("release publication lease identity", () => {
     ], { encoding: "utf8" });
     expect(acl.status).toBe(0);
     let remoteCommands = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         remoteCommands += 1;
@@ -1276,7 +1301,7 @@ describe("release publication lease identity", () => {
   test("rejects a receipt whose exact descriptor readback differs", async () => {
     const root = await makeRoot();
     let remoteCommands = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         remoteCommands += 1;
@@ -1311,7 +1336,7 @@ describe("release publication lease identity", () => {
         }),
         commandResult(leaseRun()),
       ];
-      const provider = new GitHubReleasePublicationProvider({
+      const provider = createHistoricalPublicationProvider({
         ghCli: "/not-used/gh",
         githubCommand: async (arguments_) => {
           commands.push([...arguments_]);
@@ -1341,7 +1366,7 @@ describe("release publication lease identity", () => {
 
   test("fails closed when terminal cancellation or publication state cannot persist", async () => {
     const root = await makeRoot();
-    const cancelledProvider = new GitHubReleasePublicationProvider({
+    const cancelledProvider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun({
         conclusion: "cancelled",
@@ -1362,7 +1387,7 @@ describe("release publication lease identity", () => {
       phase: "before_publication",
     });
 
-    const publishedProvider = new GitHubReleasePublicationProvider({
+    const publishedProvider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun({
         conclusion: "success",
@@ -1403,7 +1428,7 @@ describe("release publication lease identity", () => {
       }),
       commandResult(leaseRun()),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1439,7 +1464,7 @@ describe("release publication lease identity", () => {
       commandResult({ workflow_runs: firstPage }),
       commandResult({ workflow_runs: [leaseRun()] }),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1467,7 +1492,7 @@ describe("release publication lease identity", () => {
       commandResult(undefined, 1),
       commandResult(undefined, 1),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         const response = responses.shift();
@@ -1499,7 +1524,7 @@ describe("release publication lease identity", () => {
       commandResult({ workflow_runs: [] }),
       commandResult({ workflow_runs: [] }),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         const response = responses.shift();
@@ -1527,7 +1552,7 @@ describe("release publication lease identity", () => {
     const fullPage = Array.from({ length: 100 }, (_, index) => ({
       display_title: `unrelated ${String(index)}`,
     }));
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1577,7 +1602,7 @@ describe("release publication lease identity", () => {
       commandResult(undefined),
       commandResult(cancelled(secondRunId)),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1624,7 +1649,7 @@ describe("release publication lease identity", () => {
         workflow_runs: [{ display_title: `HRA publication lease ${lease.holder}` }],
       }),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         const response = responses.shift();
@@ -1648,7 +1673,7 @@ describe("release publication lease identity", () => {
 
   test("maps provider cancellation success to publication and rejects other conclusions", async () => {
     const root = await makeRoot();
-    const successProvider = new GitHubReleasePublicationProvider({
+    const successProvider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun({
         conclusion: "success",
@@ -1660,7 +1685,7 @@ describe("release publication lease identity", () => {
     });
     await expect(successProvider.cancelPublicationLease(lease)).resolves.toBe("published");
 
-    const failureProvider = new GitHubReleasePublicationProvider({
+    const failureProvider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun({
         conclusion: "failure",
@@ -1680,7 +1705,7 @@ describe("release publication lease identity", () => {
     const root = await makeRoot();
     const startedAt = Date.parse("2026-08-23T12:00:00.000Z");
     let now = startedAt;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun(
         now - startedAt >= 4 * 60 * 1_000
@@ -1710,7 +1735,7 @@ describe("release publication lease identity", () => {
       commandResult({ id: lease.runId }),
       commandResult(leaseRun({ conclusion: "success", status: "completed" })),
     ];
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         const response = responses.shift();
@@ -1731,7 +1756,7 @@ describe("release publication lease identity", () => {
   test("keeps an exact run identity change terminal during completion", async () => {
     const root = await makeRoot();
     let sleeps = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult(leaseRun({ run_attempt: 2 })),
       leaseReceiptDirectory: join(root, "receipts"),
@@ -1751,7 +1776,7 @@ describe("release publication lease identity", () => {
     const cleanup = new BoundedProcessCleanupUnprovenError(42_421, "github-lease-read");
     const commands: string[][] = [];
     let sleeps = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1774,7 +1799,7 @@ describe("release publication lease identity", () => {
     const cleanup = new BoundedProcessCleanupUnprovenError(42_422, "github-lease-dispatch");
     const commands: string[][] = [];
     const receiptPath = join(root, "receipts", `${tag}-${lease.holder}.json`);
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1817,7 +1842,7 @@ describe("release publication lease identity", () => {
     };
     const commands: string[][] = [];
     let cancelled = false;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async (arguments_) => {
         commands.push([...arguments_]);
@@ -1895,7 +1920,7 @@ describe("release publication lease identity", () => {
       prerelease: true,
       tag_name: tag,
     };
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => commandResult({ workflow_runs: [] }),
       leaseReceiptDirectory: receiptDirectory,
@@ -1939,7 +1964,7 @@ describe("release publication lease identity", () => {
     const receipt = await writeRecoveryReceipt(receiptDirectory);
     await chmod(receipt, 0o644);
     let remoteReads = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         remoteReads += 1;
@@ -1965,7 +1990,7 @@ describe("release publication lease identity", () => {
     const receipt = await writeRecoveryReceipt(receiptDirectory);
     await link(receipt, join(receiptDirectory, "second-link"));
     let remoteReads = 0;
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       githubCommand: async () => {
         remoteReads += 1;
@@ -1989,7 +2014,7 @@ describe("release publication lease identity", () => {
 describe("accepted release bundle", () => {
   test("packs the reviewed source deterministically with lifecycle scripts disabled", async () => {
     const root = await makeRoot();
-    const provider = new GitHubReleasePublicationProvider({
+    const provider = createHistoricalPublicationProvider({
       ghCli: "/not-used/gh",
       recoveryDirectory: join(root, "process-recovery"),
       vercelCli: "/not-used/vercel",

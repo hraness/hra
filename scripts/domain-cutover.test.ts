@@ -12,7 +12,8 @@ import {
   buildVercelEnvironment,
   DomainCutoverError,
   executeCutoverPlan,
-  executeDomainCutover,
+  executeDomainCutover as executeRetiredDomainCutover,
+  executeHistoricalDomainCutoverWithExplicitCapability as executeDomainCutover,
   parseArguments,
   parseCutoverPlan,
   preflightCutoverPlan,
@@ -391,26 +392,27 @@ const immediateClock = () => {
 };
 
 describe("domain cutover runbook", () => {
-  test("pins retired provider identities as one-way safety tombstones", async () => {
+  test("pins current provider authority and retired identities as one-way tombstones", async () => {
     const runbook = await readFile(
       join(import.meta.dir, "..", "docs", "domain-cutover.md"),
       "utf8",
     );
 
-    expect(runbook).toContain("Status: retired on 2026-08-27.");
-    expect(runbook).toContain("permanently retired");
-    expect(runbook).toContain("no longer traffic targets");
-    expect(runbook).toContain("rollback authorities");
+    expect(runbook).toContain("HRA v0 status: retired on 2026-08-27.");
+    expect(runbook).toContain("current-project-only");
+    expect(runbook).toContain("1343008607");
+    expect(runbook).toContain("prj_8ciIt9t9foE3utG45frRN7cxckjS");
+    expect(runbook).toContain("2854545");
+    expect(runbook).toContain("5089017");
     expect(runbook).toContain("safety tombstones");
     expect(runbook).toContain("1334876494");
     expect(runbook).toContain("prj_eRfUBHdHkEbvIaB8x7dyyZhBc3wr");
     expect(runbook).toContain("2680173");
     expect(runbook).toContain("4677913");
-    expect(runbook).toContain("Do not invoke that source directly for provider work.");
-    expect(runbook).toContain("current-project-only");
+    expect(runbook).toContain("Do not invoke or import it for provider work.");
   });
 
-  test("contains no executable Vercel movement procedure", async () => {
+  test("exposes only the checked current-project alias procedure", async () => {
     const runbook = await readFile(
       join(import.meta.dir, "..", "docs", "domain-cutover.md"),
       "utf8",
@@ -419,12 +421,87 @@ describe("domain cutover runbook", () => {
 
     expect(commands).toEqual([]);
     expect(runbook).not.toContain("hosted:domain-cutover preflight");
-    expect(runbook).not.toContain("--execute");
+    expect(runbook).toContain("release:canonical-alias preflight");
+    expect(runbook).toContain("release:canonical-alias --execute");
+    expect(runbook).toContain("--confirm-exact");
+    expect(runbook).toContain("approve both` do not authorize this alias change");
+    expect(runbook).toContain("automatic restoration");
+    expect(runbook).toContain("compensation_failed");
+    expect(runbook).toContain("HRA v0 is never a fallback");
     expect(runbook).not.toContain("/move");
   });
 });
 
 describe("domain cutover operator", () => {
+  test("the retired entry point refuses before any supplied provider capability", async () => {
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    let runnerCalls = 0;
+
+    expect(await executeRetiredDomainCutover({
+      arguments: ["--execute", "--vercel-cli", "/safe/vercel"],
+      inputDocument: JSON.stringify(forwardPlan),
+      runner: async () => {
+        runnerCalls += 1;
+        throw new Error("retired operator reached provider capability");
+      },
+      stderr: {
+        write(chunk: string | Uint8Array): boolean {
+          stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+          return true;
+        },
+      },
+      stdout: {
+        write(chunk: string | Uint8Array): boolean {
+          stdout.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+          return true;
+        },
+      },
+    })).toBe(1);
+    expect(runnerCalls).toBe(0);
+    expect(stdout).toEqual([]);
+    expect(JSON.parse(stderr.join(""))).toEqual({
+      code: "operator_retired",
+      schemaVersion: 1,
+      status: "refused",
+    });
+  });
+
+  test("the retired executable refuses without parsing input or invoking a provider", async () => {
+    const child = Bun.spawn([
+      process.execPath,
+      join(import.meta.dir, "domain-cutover.ts"),
+      "--execute",
+      "--vercel-cli",
+      "/provider/must-not-run",
+    ], {
+      cwd: join(import.meta.dir, ".."),
+      env: {},
+      stderr: "pipe",
+      stdin: "ignore",
+      stdout: "pipe",
+    });
+    const [exitCode, stderr, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ]);
+
+    expect(exitCode).toBe(1);
+    expect(stdout).toBe("");
+    expect(JSON.parse(stderr)).toEqual({
+      code: "operator_retired",
+      schemaVersion: 1,
+      status: "refused",
+    });
+  });
+
+  test("the historical provider refuses without an explicitly supplied capability", () => {
+    expect(() => new VercelCutoverProvider({
+      vercelCli: "/safe/vercel",
+    })).toThrow(new DomainCutoverError("operator_retired"));
+  });
+
   test("refuses an unavailable authority backend without turning it into a provider read failure", async () => {
     const stdout: string[] = [];
     const stderr: string[] = [];

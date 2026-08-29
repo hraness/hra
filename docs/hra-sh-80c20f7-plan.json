@@ -1,0 +1,32 @@
+{
+  "alias": "hra.sh",
+  "convex": {
+    "deploymentId": 5089017,
+    "deploymentName": "qualified-hummingbird-537",
+    "deploymentUrl": "https://qualified-hummingbird-537.convex.cloud",
+    "projectId": 2854545,
+    "teamId": 513923
+  },
+  "idempotencyKey": "607f32a6-98a9-4597-b54e-32e72fe32b56",
+  "kind": "current-project-canonical-alias",
+  "repository": {
+    "id": 1343008607,
+    "name": "hraness/hra"
+  },
+  "schemaVersion": 1,
+  "vercel": {
+    "projectId": "prj_8ciIt9t9foE3utG45frRN7cxckjS",
+    "source": {
+      "deploymentId": "dpl_7pK5Y4G5G6rrNWzExGCYCjr6kMKN",
+      "deploymentUrl": "hra-jhl2jlm30-hraness.vercel.app",
+      "sourceCommit": "31e5d5f3b9c1731ecc26b699796f4a9f2012d856"
+    },
+    "target": {
+      "deploymentId": "dpl_5um4zKKeN7WhLT58xoycxRkeoVKZ",
+      "deploymentUrl": "hra-rao9utssa-hraness.vercel.app",
+      "sourceCommit": "80c20f7b1aa06aaec4a8bc03dbea249911de4717"
+    },
+    "teamId": "team_UAd1iD2XogJlbFg4h14mRaPM"
+  },
+  "version": "0.1.0"
+}

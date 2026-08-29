@@ -36,7 +36,7 @@ describe("release workflow", () => {
     );
   });
 
-  test("keeps the retired fallback-bound release path unreachable", async () => {
+  test("keeps the retired fallback-bound path unreachable while exposing the current alias operator", async () => {
     const root = join(import.meta.dir, "..");
     const packageJson = asRecord(
       JSON.parse(await readFile(join(root, "package.json"), "utf8")),
@@ -53,9 +53,16 @@ describe("release workflow", () => {
     expect(scripts["hosted:domain-cutover"]).toBeUndefined();
     expect(scripts["release:candidate"]).toBeUndefined();
     expect(scripts["release:publish"]).toBeUndefined();
-    expect(domainRecord).toContain("Status: retired on 2026-08-27.");
-    expect(domainRecord).toContain("no longer traffic targets");
-    expect(domainRecord).toContain("rollback authorities");
+    expect(scripts["release:canonical-alias"])
+      .toBe("bun ./scripts/current-project-alias-release.ts");
+    expect(domainRecord).toContain("HRA v0 status: retired on 2026-08-27.");
+    expect(domainRecord).toContain("current-project-only");
+    expect(domainRecord).toContain("HRA v0 is never a fallback");
+    expect(domainRecord).toContain("--confirm-exact");
+    expect(domainRecord).toContain("canonical-alias-release");
+    expect(domainRecord).toContain("unresolved_prior_intent");
+    expect(domainRecord).toContain("reasserts only the plan's exact source");
+    expect(domainRecord).toContain("unresolved_current_intent");
     expect(releaseRecord).toContain("Status: retired on 2026-08-27 without publication.");
     expect(releaseRecord).toContain("no `v0.1.0` tag");
     expect(releaseRecord).toContain("no authorized publication path");

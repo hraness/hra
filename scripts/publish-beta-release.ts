@@ -58,6 +58,7 @@ import {
   type DeploymentReadback,
   type ManagedAlias,
   type ProjectReadback,
+  type VercelCommandRunner,
 } from "./domain-cutover";
 import {
   SystemReleaseCandidateProvider,
@@ -1912,6 +1913,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       root?: string;
       sleep?: (milliseconds: number) => Promise<void>;
       vercelCli: string;
+      vercelRunner?: VercelCommandRunner;
       writeStderr?: (value: string) => void;
     }>,
   ) {
@@ -1931,6 +1933,7 @@ export class GitHubReleasePublicationProvider implements ReleasePublicationProvi
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
       guard: this.guard,
+      ...(options.vercelRunner === undefined ? {} : { runner: options.vercelRunner }),
       vercelCli: options.vercelCli,
     });
   }
