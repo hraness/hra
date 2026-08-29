@@ -17,6 +17,7 @@ const allowedPublicScopes = new Set([
 const allowedPublicScopedPackages = new Set([
   "@hraness/design-kit",
   "@hraness/site-footer",
+  "@hraness/ui",
 ]);
 
 const secretPatterns = [

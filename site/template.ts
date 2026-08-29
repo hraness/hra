@@ -1,4 +1,7 @@
 import { renderHranessSiteFooter } from "@hraness/site-footer";
+import { AskAiAboutThis } from "@hraness/ui";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import {
   deepseekHarnessReading,
@@ -20,6 +23,12 @@ const escapeHtml = (value: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+
+export const renderAskAiAboutThis = (canonicalUrl: string): string =>
+  renderToStaticMarkup(createElement(AskAiAboutThis, {
+    className: "hra-ask-ai",
+    url: canonicalUrl,
+  }));
 
 const renderInline = (content: readonly InlineContent[]): string =>
   content
@@ -158,6 +167,7 @@ ${renderHead(content, {
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
   ${content.sections.map((section) => renderSection(section)).join("\n  ")}
 </main>
+${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
 </body>
@@ -213,6 +223,7 @@ ${renderHead(content, {
   ${renderSection(privacy)}
   <p>Report a suspected boundary violation through <a href="${escapeHtml(content.links.privateSecurityReport)}">private vulnerability reporting</a>.</p>
 </main>
+${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
 </body>
@@ -261,6 +272,7 @@ ${renderHead(content, {
   <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
   ${renderSection(page.section, "h1")}
 </main>
+${renderAskAiAboutThis(canonicalUrl)}
 ${renderProjectResources(content)}
 ${renderHranessSiteFooter()}
 </body>

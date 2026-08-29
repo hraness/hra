@@ -66,6 +66,8 @@ describe("public text policy", () => {
       .not.toThrow();
     expect(() => assertPublicText("@hraness/site-footer", "public dependency"))
       .not.toThrow();
+    expect(() => assertPublicText("@hraness/ui", "public dependency"))
+      .not.toThrow();
     const privatePackage = `@${["hraness", "private-package"].join("/")}`;
     expect(() => assertPublicText(privatePackage, "private dependency"))
       .toThrow(PublicTextPolicyError);
