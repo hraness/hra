@@ -94,6 +94,34 @@ describe("public text policy", () => {
     }
   });
 
+  test("admits only bounded, structurally valid editorial WebP files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-webp-"));
+    const repositoryRoot = join(import.meta.dir, "..");
+    const editorialDirectory = join(root, "site", "images", "editorial");
+    try {
+      await mkdir(editorialDirectory, { recursive: true });
+      const reviewed = await readFile(join(
+        repositoryRoot,
+        "site",
+        "images",
+        "editorial",
+        "deepseek-harness-384.webp",
+      ));
+      await writeFile(join(editorialDirectory, "reviewed-384.webp"), reviewed);
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+
+      reviewed[0] = 0;
+      await writeFile(join(editorialDirectory, "reviewed-384.webp"), reviewed);
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+
+      await unlink(join(editorialDirectory, "reviewed-384.webp"));
+      await writeFile(join(root, "unreviewed.webp"), reviewed);
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   test("ignores the regular .git pointer used by linked worktrees", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-worktree-"));
     try {

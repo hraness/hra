@@ -106,6 +106,121 @@ main {
   max-width: 60rem;
 }
 
+.home-reading {
+  border-top: 1px solid var(--rule);
+  display: block;
+  margin-top: 2.5rem;
+  padding-block: 1.5rem 0;
+}
+
+.home-reading > * {
+  grid-column: auto;
+}
+
+.home-reading-heading {
+  align-items: baseline;
+  display: flex;
+  gap: 1rem;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.home-reading-heading h2 {
+  font-size: 1.2rem;
+  margin: 0;
+}
+
+.home-reading-heading a,
+.reading-card strong {
+  font-family: var(--font-sans);
+}
+
+.reading-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.reading-card {
+  background: color-mix(in srgb, var(--surface), transparent 28%);
+  border: 1px solid var(--rule);
+  min-width: 0;
+}
+
+.reading-card a {
+  color: inherit;
+  display: block;
+  height: 100%;
+  text-decoration: none;
+}
+
+.reading-card a:hover strong {
+  text-decoration: underline;
+  text-decoration-thickness: 0.12em;
+  text-underline-offset: 0.18em;
+}
+
+.reading-card a:focus-visible {
+  outline: 0.2rem solid currentcolor;
+  outline-offset: 0.2rem;
+}
+
+.reading-card img,
+.editorial-figure img {
+  aspect-ratio: 16 / 9;
+  display: block;
+  height: auto;
+  object-fit: cover;
+  width: 100%;
+}
+
+.reading-card span {
+  color: var(--muted);
+  display: grid;
+  font-size: 0.88rem;
+  gap: 0.35rem;
+  line-height: 1.45;
+  padding: 0.8rem 0.9rem 0.9rem;
+}
+
+.reading-card strong {
+  color: var(--foreground);
+  font-size: 0.98rem;
+  line-height: 1.25;
+}
+
+.reading-index {
+  max-width: 74rem;
+}
+
+.reading-index > header {
+  margin-bottom: 2rem;
+}
+
+.reading-index > header h1 {
+  font-size: clamp(3rem, 9vw, 6rem);
+  margin-bottom: 1rem;
+}
+
+.editorial-figure {
+  margin: 0 0 2.25rem;
+  max-width: 72ch;
+}
+
+.editorial-figure figcaption {
+  border-bottom: 1px solid var(--rule);
+  color: var(--muted);
+  display: grid;
+  font-size: 0.78rem;
+  gap: 0.25rem;
+  line-height: 1.45;
+  padding: 0.65rem 0 0.75rem;
+}
+
+.editorial-figure figcaption small {
+  font-size: 0.68rem;
+}
+
 h1,
 h2,
 h3,
@@ -384,6 +499,10 @@ li + li {
   }
 
   .preview-capabilities {
+    grid-template-columns: 1fr;
+  }
+
+  .reading-grid {
     grid-template-columns: 1fr;
   }
 
