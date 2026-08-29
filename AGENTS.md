@@ -5,6 +5,7 @@
 - `site/` contains the static public website generated from the README content contract.
 - `scripts/` contains deterministic checks, builds, and release helpers.
 - `kb/` contains maintained product knowledge and executable implementation plans.
+- `.agents/skills/` contains the portable five-skill phased planning and execution pack.
 - `README.md`, `SECURITY.md`, `CONTRIBUTING.md`, `WRITING.md`, and `STYLE.md` define the public product and contribution contract.
 
 # Guidelines
