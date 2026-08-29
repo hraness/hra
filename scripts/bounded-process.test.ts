@@ -71,7 +71,7 @@ describe("bounded detached process groups", () => {
   test("every release and hosted runner delegates to the same owned group boundary", async () => {
     for (const file of [
       "configure-hosted-sync.ts",
-      "domain-cutover.ts",
+      "current-project-alias-release.ts",
       "publish-beta-release.ts",
       "release-candidate.ts",
     ]) {

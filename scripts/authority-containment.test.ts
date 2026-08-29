@@ -40,7 +40,8 @@ describe("authority containment refusal rendering", () => {
       ["deploy-hosted-sync.ts", 2],
       ["manage-hosted-admission.ts", 2],
       ["manage-hosted-invites.ts", 2],
-      ["domain-cutover.ts", 2],
+      ["current-project-alias-release.ts", 1],
+      ["domain-cutover.ts", 1],
       ["release-candidate.ts", 1],
       ["publish-beta-release.ts", 1],
     ] as const;

@@ -1,0 +1,1903 @@
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  createReadStream,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  type Stats,
+} from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isatty } from "node:tty";
+
+import { dlopen } from "bun:ffi";
+import { z } from "zod";
+
+import { assertSafeDarwinInstallAcl } from "../src/install-normalizer";
+import { createBoundedAuthorityFetch } from "./bounded-authority-fetch";
+import {
+  BoundedProcessInvocationGuard,
+  boundedProcessRecoveryDirectory,
+  isBoundedProcessCleanupUnprovenError,
+  isBoundedProcessRecoveryJournalError,
+  recoverBoundedProcessJournal,
+  rethrowBoundedProcessTerminalError,
+  requireBoundedProcessCleanup,
+  runBoundedProcess,
+  type BoundedProcessContainment,
+} from "./bounded-process";
+import {
+  isAuthorityContainmentUnavailable,
+  renderAuthorityContainmentUnavailable,
+  rethrowAuthorityContainmentUnavailable,
+} from "./authority-containment";
+import {
+  HRA_CONVEX_PROJECT_ID,
+  HRA_CONVEX_TEAM_ID,
+  parseConvexTarget,
+  verifyConvexDefaultTarget,
+  type ConvexTarget,
+  type ConvexTargetVerifier,
+} from "./convex-target";
+import {
+  canonicalDigest,
+  ensureProtectedDirectory,
+  HRA_RELEASE_VERSION,
+  HRA_REPOSITORY,
+  HRA_REPOSITORY_ID,
+  HRA_VERCEL_PROJECT_ID,
+  HRA_VERCEL_TEAM_ID,
+  readProtectedJson,
+  withSelfDigest,
+  writeProtectedJsonNoReplace,
+} from "./release-evidence";
+
+const canonicalAlias = "hra.sh";
+const supportedBunVersion = "1.3.14";
+const supportedVercelVersion = "58.4.0";
+const commandTimeoutMs = 30_000;
+const commandTerminationGraceMs = 1_000;
+const convergenceTimeoutMs = 60_000;
+const outputMaximumBytes = 128 * 1024;
+const inputMaximumBytes = 32 * 1024;
+const markerMaximumBytes = 16 * 1024;
+
+const commitSchema = z.string().regex(/^[0-9a-f]{40}$/u);
+const idempotencyKeySchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+);
+const deploymentIdSchema = z.string().regex(/^dpl_[A-Za-z0-9]{20,80}$/u);
+const deploymentUrlSchema = z.string()
+  .max(253)
+  .regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.vercel\.app$/u)
+  .refine((value) => value.indexOf(".vercel.app") === value.length - ".vercel.app".length);
+
+const endpointSchema = z.object({
+  deploymentId: deploymentIdSchema,
+  deploymentUrl: deploymentUrlSchema,
+  sourceCommit: commitSchema,
+}).strict();
+
+export const currentProjectAliasReleasePlanSchema = z.object({
+  alias: z.literal(canonicalAlias),
+  convex: z.object({
+    deploymentId: z.number().int().positive().safe(),
+    deploymentName: z.string()
+      .min(5)
+      .max(160)
+      .regex(/^[a-z][a-z0-9]*-[a-z][a-z0-9]*-[0-9]+$/u),
+    deploymentUrl: z.string().url(),
+    projectId: z.literal(HRA_CONVEX_PROJECT_ID),
+    teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  }).strict(),
+  idempotencyKey: idempotencyKeySchema,
+  kind: z.literal("current-project-canonical-alias"),
+  repository: z.object({
+    id: z.literal(HRA_REPOSITORY_ID),
+    name: z.literal(HRA_REPOSITORY),
+  }).strict(),
+  schemaVersion: z.literal(1),
+  vercel: z.object({
+    projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+    source: endpointSchema,
+    target: endpointSchema,
+    teamId: z.literal(HRA_VERCEL_TEAM_ID),
+  }).strict(),
+  version: z.literal(HRA_RELEASE_VERSION),
+}).strict().superRefine((plan, context) => {
+  try {
+    parseConvexTarget(plan.convex);
+  } catch {
+    context.addIssue({ code: "custom", message: "convex_target_invalid" });
+  }
+  if (
+    plan.vercel.source.deploymentId === plan.vercel.target.deploymentId
+    || plan.vercel.source.deploymentUrl === plan.vercel.target.deploymentUrl
+    || plan.vercel.source.sourceCommit === plan.vercel.target.sourceCommit
+  ) context.addIssue({ code: "custom", message: "alias_transition_invalid" });
+});
+
+export type CurrentProjectAliasReleasePlan = z.infer<
+  typeof currentProjectAliasReleasePlanSchema
+>;
+export type CurrentProjectAliasEndpoint = z.infer<typeof endpointSchema>;
+
+const aliasReadbackSchema = z.object({
+  alias: z.literal(canonicalAlias),
+  deployment: z.object({
+    id: deploymentIdSchema,
+    url: deploymentUrlSchema,
+  }),
+  deploymentId: deploymentIdSchema,
+  projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+});
+
+const aliasMutationReadbackSchema = z.object({
+  alias: z.literal(canonicalAlias),
+  created: z.union([
+    z.number().int().nonnegative().safe(),
+    z.string().datetime({ offset: true }),
+  ]),
+  oldDeploymentId: deploymentIdSchema.nullable().optional(),
+  uid: z.string().min(1).max(256),
+});
+
+const deploymentReadbackSchema = z.object({
+  gitSource: z.object({
+    ref: z.literal("main"),
+    repoId: z.literal(HRA_REPOSITORY_ID),
+    sha: commitSchema,
+    type: z.literal("github"),
+  }),
+  id: deploymentIdSchema,
+  projectId: z.literal(HRA_VERCEL_PROJECT_ID),
+  readyState: z.literal("READY"),
+  target: z.literal("production"),
+  url: deploymentUrlSchema,
+});
+
+const projectReadbackSchema = z.object({
+  accountId: z.literal(HRA_VERCEL_TEAM_ID),
+  autoAssignCustomDomains: z.literal(false),
+  id: z.literal(HRA_VERCEL_PROJECT_ID),
+});
+
+const markerSchema = z.object({
+  generation: z.literal(1),
+  product: z.literal("HRA"),
+  repository: z.object({
+    id: z.literal(HRA_REPOSITORY_ID),
+    path: z.literal(HRA_REPOSITORY),
+  }).strict(),
+  schemaVersion: z.literal(2),
+  source: z.object({ commit: commitSchema }).strict(),
+  version: z.literal(HRA_RELEASE_VERSION),
+}).strict();
+
+const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+const mutationKeyForIdentity = (
+  idempotencyKey: string,
+  planDigest: string,
+  effect: "assign-target" | "restore-source",
+): string => canonicalDigest({ effect, idempotencyKey, planDigest });
+const normalizedAliasAuthoritySchema = z.object({
+  alias: z.literal(canonicalAlias),
+  convex: z.object({
+    deploymentId: z.number().int().positive().safe(),
+    deploymentName: z.string(),
+    deploymentUrl: z.string().url(),
+    projectId: z.literal(HRA_CONVEX_PROJECT_ID),
+    teamId: z.literal(HRA_CONVEX_TEAM_ID),
+  }).strict(),
+  marker: z.object({ generation: z.literal(1), sourceCommit: commitSchema }).strict(),
+  project: z.object({
+    accountId: z.literal(HRA_VERCEL_TEAM_ID),
+    autoAssignCustomDomains: z.literal(false),
+    id: z.literal(HRA_VERCEL_PROJECT_ID),
+  }).strict(),
+  repository: z.object({
+    id: z.literal(HRA_REPOSITORY_ID),
+    name: z.literal(HRA_REPOSITORY),
+  }).strict(),
+  source: endpointSchema,
+  target: endpointSchema,
+  version: z.literal(HRA_RELEASE_VERSION),
+}).strict();
+
+export const currentAliasReleaseIntentSchema = z.object({
+  confirmationDigest: digestSchema,
+  idempotencyKey: idempotencyKeySchema,
+  kind: z.literal("current-project-canonical-alias-intent"),
+  planDigest: digestSchema,
+  schemaVersion: z.literal(1),
+  selfDigest: digestSchema,
+  sourceAuthority: normalizedAliasAuthoritySchema,
+  sourceAuthorityDigest: digestSchema,
+  sourceRecoveryKey: digestSchema,
+  targetAuthorityDigest: digestSchema,
+  targetMutationKey: digestSchema,
+}).strict().superRefine((value, context) => {
+  const reconstructedPlan = {
+    alias: value.sourceAuthority.alias,
+    convex: value.sourceAuthority.convex,
+    idempotencyKey: value.idempotencyKey,
+    kind: "current-project-canonical-alias",
+    repository: value.sourceAuthority.repository,
+    schemaVersion: 1,
+    vercel: {
+      projectId: value.sourceAuthority.project.id,
+      source: value.sourceAuthority.source,
+      target: value.sourceAuthority.target,
+      teamId: value.sourceAuthority.project.accountId,
+    },
+    version: value.sourceAuthority.version,
+  } as const;
+  const reconstructedTargetAuthority = {
+    ...value.sourceAuthority,
+    marker: {
+      generation: 1,
+      sourceCommit: value.sourceAuthority.target.sourceCommit,
+    },
+  } as const;
+  const reconstructedConfirmation = [
+    "reassign",
+    value.sourceAuthority.alias,
+    "in",
+    value.sourceAuthority.project.id,
+    "from",
+    `${value.sourceAuthority.source.deploymentId}@${value.sourceAuthority.source.deploymentUrl}`,
+    "to",
+    `${value.sourceAuthority.target.deploymentId}@${value.sourceAuthority.target.deploymentUrl}`,
+    "using",
+    "plan",
+    value.idempotencyKey,
+  ].join(" ");
+  if (
+    canonicalDigest(value.sourceAuthority) !== value.sourceAuthorityDigest
+    || value.sourceAuthority.marker.sourceCommit
+      !== value.sourceAuthority.source.sourceCommit
+    || canonicalDigest(reconstructedPlan) !== value.planDigest
+    || canonicalDigest(reconstructedTargetAuthority) !== value.targetAuthorityDigest
+    || canonicalDigest(reconstructedConfirmation) !== value.confirmationDigest
+    || mutationKeyForIdentity(
+      value.idempotencyKey,
+      value.planDigest,
+      "assign-target",
+    ) !== value.targetMutationKey
+    || mutationKeyForIdentity(
+      value.idempotencyKey,
+      value.planDigest,
+      "restore-source",
+    ) !== value.sourceRecoveryKey
+  ) {
+    context.addIssue({ code: "custom", message: "source_authority_digest_invalid" });
+  }
+});
+
+export const currentAliasReleaseReceiptSchema = z.object({
+  changed: z.boolean(),
+  finalAuthority: normalizedAliasAuthoritySchema,
+  finalAuthorityDigest: digestSchema,
+  finalState: z.enum(["source", "target"]),
+  idempotencyKey: idempotencyKeySchema,
+  intentDigest: digestSchema,
+  kind: z.literal("current-project-canonical-alias-receipt"),
+  planDigest: digestSchema,
+  schemaVersion: z.literal(1),
+  selfDigest: digestSchema,
+  targetDeploymentId: deploymentIdSchema,
+  targetSourceCommit: commitSchema,
+}).strict().superRefine((value, context) => {
+  if (
+    canonicalDigest(value.finalAuthority) !== value.finalAuthorityDigest
+    || value.finalAuthority.marker.sourceCommit !== (
+      value.finalState === "source"
+        ? value.finalAuthority.source.sourceCommit
+        : value.finalAuthority.target.sourceCommit
+    )
+  ) context.addIssue({ code: "custom", message: "final_authority_digest_invalid" });
+});
+
+export type CurrentAliasReadback = z.infer<typeof aliasReadbackSchema>;
+export type CurrentAliasMutationReadback = z.infer<typeof aliasMutationReadbackSchema>;
+export type CurrentDeploymentReadback = z.infer<typeof deploymentReadbackSchema>;
+export type CurrentProjectReadback = z.infer<typeof projectReadbackSchema>;
+export type CurrentAliasReleaseIntent = z.infer<typeof currentAliasReleaseIntentSchema>;
+export type CurrentAliasReleaseReceipt = z.infer<typeof currentAliasReleaseReceiptSchema>;
+
+type CurrentAliasReleaseFailureCode =
+  | "alias_reverted"
+  | "bun_version_unsupported"
+  | "compensation_failed"
+  | "confirmation_required"
+  | "durable_state_capacity_exhausted"
+  | "durable_state_invalid"
+  | "execution_locked"
+  | "input_invalid"
+  | "input_not_protected"
+  | "input_timed_out"
+  | "input_too_large"
+  | "intent_write_failed"
+  | "provider_command_failed"
+  | "provider_readback_invalid"
+  | "receipt_authority_mismatch"
+  | "receipt_write_failed"
+  | "source_not_authoritative"
+  | "target_result_ambiguous"
+  | "unresolved_current_intent"
+  | "unresolved_prior_intent"
+  | "usage_invalid"
+  | "vercel_version_unsupported";
+
+type DurableFailureContext = Readonly<{
+  idempotencyKey: string;
+  intentPath: string;
+  lockPath: string;
+  receiptPath: string;
+}>;
+
+export class CurrentAliasReleaseError extends Error {
+  constructor(
+    readonly code: CurrentAliasReleaseFailureCode,
+    readonly durableContext?: DurableFailureContext,
+  ) {
+    super(code);
+    this.name = "CurrentAliasReleaseError";
+  }
+}
+
+export const assertCurrentAliasReleaseBunVersion = (
+  version: string = Bun.version,
+): void => {
+  if (version !== supportedBunVersion) {
+    throw new CurrentAliasReleaseError("bun_version_unsupported");
+  }
+};
+
+type FlockLibrary = Readonly<{
+  close: () => void;
+  symbols: Readonly<{ flock: (descriptor: number, operation: number) => number }>;
+}>;
+
+const openFlockLibrary = (): FlockLibrary => {
+  const linuxCandidates = process.arch === "x64"
+    ? [
+        "/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/lib64/libc.so.6",
+        "/usr/lib64/libc.so.6",
+        "/lib/libc.musl-x86_64.so.1",
+        "/usr/lib/libc.musl-x86_64.so.1",
+        "/lib/ld-musl-x86_64.so.1",
+        "/usr/lib/ld-musl-x86_64.so.1",
+      ]
+    : process.arch === "arm64"
+      ? [
+          "/lib/aarch64-linux-gnu/libc.so.6",
+          "/usr/lib/aarch64-linux-gnu/libc.so.6",
+          "/lib64/libc.so.6",
+          "/usr/lib64/libc.so.6",
+          "/lib/libc.musl-aarch64.so.1",
+          "/usr/lib/libc.musl-aarch64.so.1",
+          "/lib/ld-musl-aarch64.so.1",
+          "/usr/lib/ld-musl-aarch64.so.1",
+        ]
+      : [];
+  const candidates = process.platform === "darwin"
+    ? ["/usr/lib/libSystem.B.dylib"]
+    : linuxCandidates;
+  for (const candidate of candidates) {
+    try {
+      return dlopen(candidate, {
+        flock: { args: ["i32", "i32"], returns: "i32" },
+      });
+    } catch {
+      // Try the next platform-specific libc name.
+    }
+  }
+  throw new CurrentAliasReleaseError("durable_state_invalid");
+};
+
+let aliasReleaseFlockLibrary: FlockLibrary | undefined;
+const flock = (descriptor: number, operation: number): number => {
+  aliasReleaseFlockLibrary ??= openFlockLibrary();
+  return aliasReleaseFlockLibrary.symbols.flock(descriptor, operation);
+};
+
+const flockExclusive = 2;
+const flockNonblocking = 4;
+const flockUnlock = 8;
+const executionLockName = ".canonical-alias-release.lock";
+
+const sameFileIdentity = (
+  left: Stats,
+  right: Stats,
+): boolean => left.dev === right.dev
+  && left.ino === right.ino
+  && left.uid === right.uid
+  && left.mode === right.mode
+  && left.nlink === right.nlink
+  && left.size === right.size;
+
+const assertExecutionLockIdentity = (descriptor: number, path: string): void => {
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new CurrentAliasReleaseError("durable_state_invalid");
+  let held;
+  let current;
+  try {
+    held = fstatSync(descriptor);
+    current = lstatSync(path);
+    assertSafeDarwinInstallAcl(descriptor, uid, path);
+  } catch {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  if (
+    !held.isFile()
+    || !current.isFile()
+    || current.isSymbolicLink()
+    || held.uid !== uid
+    || held.nlink !== 1
+    || (held.mode & 0o777) !== 0o600
+    || held.size !== 0
+    || !sameFileIdentity(held, current)
+  ) throw new CurrentAliasReleaseError("durable_state_invalid");
+};
+
+export type CurrentAliasReleaseExecutionLock = Readonly<{
+  assertHeld: () => void;
+  path: string;
+  release: () => void;
+}>;
+
+export const currentAliasReleaseStateDirectory = (): string => join(
+  dirname(boundedProcessRecoveryDirectory()),
+  "canonical-alias-release",
+);
+
+const acquireCurrentAliasReleaseExecutionLock = (
+  stateDirectoryInput: string,
+): CurrentAliasReleaseExecutionLock => {
+  let directory: string;
+  try {
+    directory = ensureProtectedDirectory(stateDirectoryInput);
+  } catch {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  const path = join(directory, executionLockName);
+  let descriptor = -1;
+  let directoryDescriptor = -1;
+  let locked = false;
+  try {
+    directoryDescriptor = openSync(directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+    descriptor = openSync(
+      path,
+      constants.O_CREAT | constants.O_NOFOLLOW | constants.O_RDWR,
+      0o600,
+    );
+    assertExecutionLockIdentity(descriptor, path);
+    fsyncSync(descriptor);
+    fsyncSync(directoryDescriptor);
+    if (flock(descriptor, flockExclusive | flockNonblocking) !== 0) {
+      throw new CurrentAliasReleaseError("execution_locked");
+    }
+    locked = true;
+    assertExecutionLockIdentity(descriptor, path);
+    let released = false;
+    return {
+      assertHeld: () => {
+        if (released) throw new CurrentAliasReleaseError("execution_locked");
+        assertExecutionLockIdentity(descriptor, path);
+      },
+      path,
+      release: () => {
+        if (released) return;
+        released = true;
+        let failed = false;
+        try {
+          assertExecutionLockIdentity(descriptor, path);
+        } catch {
+          failed = true;
+        }
+        if (flock(descriptor, flockUnlock) !== 0) failed = true;
+        closeSync(descriptor);
+        descriptor = -1;
+        locked = false;
+        if (failed) throw new CurrentAliasReleaseError("durable_state_invalid");
+      },
+    };
+  } catch (error: unknown) {
+    if (locked && descriptor >= 0) flock(descriptor, flockUnlock);
+    if (descriptor >= 0) closeSync(descriptor);
+    if (error instanceof CurrentAliasReleaseError) throw error;
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  } finally {
+    if (directoryDescriptor >= 0) closeSync(directoryDescriptor);
+  }
+};
+
+type AliasAuthorityState = "blocked" | "source" | "target";
+
+type AliasAuthorityObservation = Readonly<{
+  reason:
+    | "alias_not_planned"
+    | "exact_source"
+    | "exact_target"
+    | "marker_mismatch";
+  state: AliasAuthorityState;
+}>;
+
+export interface CurrentProjectAliasReleaseProvider {
+  readAlias(): Promise<CurrentAliasReadback>;
+  readDeployment(deploymentId: string): Promise<CurrentDeploymentReadback>;
+  readMarker(): Promise<unknown>;
+  readProject(): Promise<CurrentProjectReadback>;
+  setAlias(
+    endpoint: CurrentProjectAliasEndpoint,
+    idempotencyKey: string,
+  ): Promise<CurrentAliasMutationReadback>;
+  verifyConvexTarget(target: ConvexTarget): Promise<void>;
+  verifyVercelVersion(): Promise<void>;
+}
+
+export const requiredAliasConfirmation = (
+  plan: CurrentProjectAliasReleasePlan,
+): string => [
+  "reassign",
+  plan.alias,
+  "in",
+  plan.vercel.projectId,
+  "from",
+  `${plan.vercel.source.deploymentId}@${plan.vercel.source.deploymentUrl}`,
+  "to",
+  `${plan.vercel.target.deploymentId}@${plan.vercel.target.deploymentUrl}`,
+  "using",
+  "plan",
+  plan.idempotencyKey,
+].join(" ");
+
+export const currentAliasReleasePlanDigest = (
+  plan: CurrentProjectAliasReleasePlan,
+): string => canonicalDigest(plan);
+
+export const currentAliasReleaseMutationKey = (
+  plan: CurrentProjectAliasReleasePlan,
+  effect: "assign-target" | "restore-source",
+): string => mutationKeyForIdentity(
+  plan.idempotencyKey,
+  currentAliasReleasePlanDigest(plan),
+  effect,
+);
+
+export const currentAliasReleaseApiArguments = (
+  endpoint: CurrentProjectAliasEndpoint,
+  idempotencyKey: string,
+): readonly string[] => {
+  const parsedEndpoint = endpointSchema.safeParse(endpoint);
+  if (!parsedEndpoint.success || !digestSchema.safeParse(idempotencyKey).success) {
+    throw new CurrentAliasReleaseError("usage_invalid");
+  }
+  return [
+    "api",
+    `/v2/deployments/${parsedEndpoint.data.deploymentId}/aliases`,
+    "--method",
+    "POST",
+    "--raw-field",
+    `alias=${canonicalAlias}`,
+    "--header",
+    `Idempotency-Key:${idempotencyKey}`,
+    "--scope",
+    HRA_VERCEL_TEAM_ID,
+    "--raw",
+  ];
+};
+
+const normalizedAliasAuthority = (
+  plan: CurrentProjectAliasReleasePlan,
+  state: "source" | "target",
+): z.infer<typeof normalizedAliasAuthoritySchema> => ({
+  alias: plan.alias,
+  convex: plan.convex,
+  marker: {
+    generation: 1,
+    sourceCommit: plan.vercel[state].sourceCommit,
+  },
+  project: {
+    accountId: plan.vercel.teamId,
+    autoAssignCustomDomains: false,
+    id: plan.vercel.projectId,
+  },
+  repository: plan.repository,
+  source: plan.vercel.source,
+  target: plan.vercel.target,
+  version: plan.version,
+});
+
+const authorityDigest = (
+  plan: CurrentProjectAliasReleasePlan,
+  state: "source" | "target",
+): string => canonicalDigest(normalizedAliasAuthority(plan, state));
+
+export const currentAliasReleaseIntentFor = (
+  plan: CurrentProjectAliasReleasePlan,
+): CurrentAliasReleaseIntent => {
+  const planDigest = currentAliasReleasePlanDigest(plan);
+  const sourceAuthority = normalizedAliasAuthority(plan, "source");
+  return currentAliasReleaseIntentSchema.parse(withSelfDigest({
+    confirmationDigest: canonicalDigest(requiredAliasConfirmation(plan)),
+    idempotencyKey: plan.idempotencyKey,
+    kind: "current-project-canonical-alias-intent" as const,
+    planDigest,
+    schemaVersion: 1 as const,
+    sourceAuthority,
+    sourceAuthorityDigest: authorityDigest(plan, "source"),
+    sourceRecoveryKey: currentAliasReleaseMutationKey(plan, "restore-source"),
+    targetAuthorityDigest: authorityDigest(plan, "target"),
+    targetMutationKey: currentAliasReleaseMutationKey(plan, "assign-target"),
+  }));
+};
+
+export type CurrentAliasReleaseStatePaths = Readonly<{
+  intent: string;
+  receipt: string;
+}>;
+
+export const currentAliasReleaseStatePaths = (
+  plan: CurrentProjectAliasReleasePlan,
+  stateDirectoryInput: string,
+): CurrentAliasReleaseStatePaths => {
+  let stateDirectory: string;
+  try {
+    stateDirectory = ensureProtectedDirectory(stateDirectoryInput);
+  } catch {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  if (resolve(stateDirectoryInput) !== stateDirectory) {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  const idempotencyKey = plan.idempotencyKey;
+  return {
+    intent: join(stateDirectory, `${idempotencyKey}.intent.json`),
+    receipt: join(stateDirectory, `${idempotencyKey}.receipt.json`),
+  };
+};
+
+const reserveCurrentAliasReleaseIntent = (
+  path: string,
+  plan: CurrentProjectAliasReleasePlan,
+  afterPublication?: (
+    path: string,
+    intent: CurrentAliasReleaseIntent,
+  ) => void,
+): CurrentAliasReleaseIntent => {
+  const intent = currentAliasReleaseIntentFor(plan);
+  try {
+    writeProtectedJsonNoReplace(path, intent, currentAliasReleaseIntentSchema, {
+      allowExactReplay: true,
+    });
+    afterPublication?.(path, intent);
+    return readProtectedJson(path, currentAliasReleaseIntentSchema, {
+      recoverInterruptedPublication: true,
+    });
+  } catch {
+    throw new CurrentAliasReleaseError("intent_write_failed");
+  }
+};
+
+const currentAliasReleaseReceiptFor = (
+  plan: CurrentProjectAliasReleasePlan,
+  intent: CurrentAliasReleaseIntent,
+  changed: boolean,
+  finalState: "source" | "target",
+): CurrentAliasReleaseReceipt => currentAliasReleaseReceiptSchema.parse(withSelfDigest({
+  changed,
+  finalAuthority: normalizedAliasAuthority(plan, finalState),
+  finalAuthorityDigest: authorityDigest(plan, finalState),
+  finalState,
+  idempotencyKey: intent.idempotencyKey,
+  intentDigest: intent.selfDigest,
+  kind: "current-project-canonical-alias-receipt" as const,
+  planDigest: intent.planDigest,
+  schemaVersion: 1 as const,
+  targetDeploymentId: plan.vercel.target.deploymentId,
+  targetSourceCommit: plan.vercel.target.sourceCommit,
+}));
+
+type CurrentAliasReleaseDurableState = Readonly<{
+  intent: CurrentAliasReleaseIntent | null;
+  receipt: CurrentAliasReleaseReceipt | null;
+}>;
+
+const stateFilePattern = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(intent|receipt)\.json$/u;
+export const currentAliasReleaseStateEntryMaximum = 4_097;
+
+export const assertCurrentAliasReleaseStateCapacity = (
+  existingEntries: number,
+  reservedEntries: number,
+): void => {
+  if (
+    !Number.isSafeInteger(existingEntries)
+    || existingEntries < 0
+    || !Number.isSafeInteger(reservedEntries)
+    || reservedEntries < 0
+    || existingEntries + reservedEntries > currentAliasReleaseStateEntryMaximum
+  ) throw new CurrentAliasReleaseError("durable_state_capacity_exhausted");
+};
+
+export const assertCurrentAliasReleaseScanCapacity = (entries: number): void => {
+  if (
+    !Number.isSafeInteger(entries)
+    || entries < 0
+    || entries > currentAliasReleaseStateEntryMaximum + 1
+  ) throw new CurrentAliasReleaseError("durable_state_capacity_exhausted");
+};
+
+const inspectCurrentAliasReleaseDurableState = (
+  plan: CurrentProjectAliasReleasePlan,
+  stateDirectory: string,
+): CurrentAliasReleaseDurableState => {
+  let names: string[];
+  try {
+    names = readdirSync(stateDirectory);
+  } catch {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  // One extra entry may be the hard-link publication artifact recovered while
+  // reading the one record a prior process was publishing when it stopped.
+  assertCurrentAliasReleaseScanCapacity(names.length);
+  const intents = new Map<string, CurrentAliasReleaseIntent>();
+  const receipts = new Map<string, CurrentAliasReleaseReceipt>();
+  for (const name of names) {
+    const match = stateFilePattern.exec(name);
+    if (match === null) continue;
+    const idempotencyKey = match[1];
+    const kind = match[2];
+    if (idempotencyKey === undefined || kind === undefined) {
+      throw new CurrentAliasReleaseError("durable_state_invalid");
+    }
+    try {
+      if (kind === "intent") {
+        const intent = readProtectedJson(
+          join(stateDirectory, name),
+          currentAliasReleaseIntentSchema,
+          { recoverInterruptedPublication: true },
+        );
+        if (intent.idempotencyKey !== idempotencyKey) {
+          throw new CurrentAliasReleaseError("durable_state_invalid");
+        }
+        intents.set(idempotencyKey, intent);
+      } else {
+        const receipt = readProtectedJson(
+          join(stateDirectory, name),
+          currentAliasReleaseReceiptSchema,
+          { recoverInterruptedPublication: true },
+        );
+        if (receipt.idempotencyKey !== idempotencyKey) {
+          throw new CurrentAliasReleaseError("durable_state_invalid");
+        }
+        receipts.set(idempotencyKey, receipt);
+      }
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("durable_state_invalid");
+    }
+  }
+  let remaining: string[];
+  let stable: string[];
+  try {
+    remaining = readdirSync(stateDirectory);
+    stable = readdirSync(stateDirectory);
+  } catch {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  const expectedStable = [
+    executionLockName,
+    ...[...intents.keys()].map((key) => `${key}.intent.json`),
+    ...[...receipts.keys()].map((key) => `${key}.receipt.json`),
+  ];
+  if (
+    [...remaining].sort().join("\0") !== [...stable].sort().join("\0")
+    || [...stable].sort().join("\0") !== expectedStable.sort().join("\0")
+  ) {
+    throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  for (const [idempotencyKey, receipt] of receipts) {
+    const intent = intents.get(idempotencyKey);
+    if (
+      intent === undefined
+      || receipt.intentDigest !== intent.selfDigest
+      || receipt.planDigest !== intent.planDigest
+      || receipt.finalAuthorityDigest !== (
+        receipt.finalState === "source"
+          ? intent.sourceAuthorityDigest
+          : intent.targetAuthorityDigest
+      )
+      || receipt.targetDeploymentId !== receipt.finalAuthority.target.deploymentId
+      || receipt.targetSourceCommit !== receipt.finalAuthority.target.sourceCommit
+    ) throw new CurrentAliasReleaseError("durable_state_invalid");
+  }
+  for (const idempotencyKey of intents.keys()) {
+    if (!receipts.has(idempotencyKey) && idempotencyKey !== plan.idempotencyKey) {
+      throw new CurrentAliasReleaseError("unresolved_prior_intent", {
+        idempotencyKey,
+        intentPath: join(stateDirectory, `${idempotencyKey}.intent.json`),
+        lockPath: join(stateDirectory, executionLockName),
+        receiptPath: join(stateDirectory, `${idempotencyKey}.receipt.json`),
+      });
+    }
+  }
+  const intent = intents.get(plan.idempotencyKey) ?? null;
+  const receipt = receipts.get(plan.idempotencyKey) ?? null;
+  assertCurrentAliasReleaseStateCapacity(
+    stable.length,
+    intent === null ? 2 : receipt === null ? 1 : 0,
+  );
+  if (intent !== null) {
+    const expected = currentAliasReleaseIntentFor(plan);
+    if (intent.selfDigest !== expected.selfDigest) {
+      throw new CurrentAliasReleaseError("durable_state_invalid");
+    }
+  }
+  if (receipt !== null && intent !== null) {
+    const expected = currentAliasReleaseReceiptFor(
+      plan,
+      intent,
+      receipt.changed,
+      receipt.finalState,
+    );
+    if (receipt.selfDigest !== expected.selfDigest) {
+      throw new CurrentAliasReleaseError("durable_state_invalid");
+    }
+  }
+  return { intent, receipt };
+};
+
+const aliasMatches = (
+  value: CurrentAliasReadback,
+  endpoint: CurrentProjectAliasEndpoint,
+): boolean => value.deploymentId === endpoint.deploymentId
+  && value.deployment.id === endpoint.deploymentId
+  && value.deployment.url === endpoint.deploymentUrl;
+
+const deploymentMatches = (
+  value: CurrentDeploymentReadback,
+  endpoint: CurrentProjectAliasEndpoint,
+): boolean => value.id === endpoint.deploymentId
+  && value.url === endpoint.deploymentUrl
+  && value.gitSource.sha === endpoint.sourceCommit;
+
+const markerMatches = (
+  value: unknown,
+  endpoint: CurrentProjectAliasEndpoint,
+): boolean => {
+  const parsed = markerSchema.safeParse(value);
+  return parsed.success && parsed.data.source.commit === endpoint.sourceCommit;
+};
+
+export const parseCurrentProjectAliasReleasePlan = (
+  document: string,
+): CurrentProjectAliasReleasePlan => {
+  if (
+    document.trim().length === 0
+    || Buffer.byteLength(document, "utf8") > inputMaximumBytes
+  ) throw new CurrentAliasReleaseError("input_invalid");
+  try {
+    return currentProjectAliasReleasePlanSchema.parse(JSON.parse(document) as unknown);
+  } catch {
+    throw new CurrentAliasReleaseError("input_invalid");
+  }
+};
+
+export const observeCurrentAliasAuthority = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+): Promise<AliasAuthorityObservation> => {
+  await provider.verifyVercelVersion();
+  await provider.verifyConvexTarget(parseConvexTarget(plan.convex));
+  await provider.readProject();
+  const source = await provider.readDeployment(plan.vercel.source.deploymentId);
+  if (!deploymentMatches(source, plan.vercel.source)) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  const target = await provider.readDeployment(plan.vercel.target.deploymentId);
+  if (!deploymentMatches(target, plan.vercel.target)) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  const alias = await provider.readAlias();
+  const state = aliasMatches(alias, plan.vercel.source)
+    ? "source"
+    : aliasMatches(alias, plan.vercel.target)
+      ? "target"
+      : "blocked";
+  if (state === "blocked") return { reason: "alias_not_planned", state };
+  const marker = await provider.readMarker();
+  if (!markerMatches(marker, plan.vercel[state])) {
+    return { reason: "marker_mismatch", state: "blocked" };
+  }
+  return {
+    reason: state === "source" ? "exact_source" : "exact_target",
+    state,
+  };
+};
+
+type ReleaseClock = Readonly<{
+  now: () => number;
+  sleep: (milliseconds: number) => Promise<void>;
+}>;
+
+const defaultClock: ReleaseClock = {
+  now: Date.now,
+  sleep: async (milliseconds) => {
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+  },
+};
+
+const rethrowTerminalProviderError = (error: unknown): void => {
+  rethrowAuthorityContainmentUnavailable(error);
+  rethrowBoundedProcessTerminalError(error);
+};
+
+const probeAliasEndpoint = async (
+  provider: CurrentProjectAliasReleaseProvider,
+  expected: CurrentProjectAliasEndpoint,
+  clock: ReleaseClock,
+  timeoutMs: number,
+): Promise<boolean> => {
+  const deadline = clock.now() + timeoutMs;
+  for (;;) {
+    try {
+      const alias = await provider.readAlias();
+      if (aliasMatches(alias, expected) && markerMatches(await provider.readMarker(), expected)) {
+        return true;
+      }
+    } catch (error: unknown) {
+      rethrowTerminalProviderError(error);
+    }
+    const remaining = deadline - clock.now();
+    if (remaining <= 0) return false;
+    await clock.sleep(Math.min(250, remaining));
+  }
+};
+
+export type CurrentAliasReleaseOutcome = Readonly<{
+  changed: boolean;
+  replayed: boolean;
+}>;
+
+const restoreCurrentAliasReleaseSource = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  clock: ReleaseClock,
+  timeoutMs: number,
+  assertMutationAuthority: () => void,
+): Promise<never> => {
+  assertMutationAuthority();
+  try {
+    const response = await provider.setAlias(
+      plan.vercel.source,
+      currentAliasReleaseMutationKey(plan, "restore-source"),
+    );
+    if (response.oldDeploymentId !== plan.vercel.target.deploymentId) {
+      throw new CurrentAliasReleaseError("compensation_failed");
+    }
+  } catch (error: unknown) {
+    rethrowTerminalProviderError(error);
+    if (error instanceof CurrentAliasReleaseError) throw error;
+    throw new CurrentAliasReleaseError("compensation_failed");
+  }
+  const sourceRestored = await probeAliasEndpoint(
+    provider,
+    plan.vercel.source,
+    clock,
+    timeoutMs,
+  );
+  if (sourceRestored) {
+    try {
+      const recovered = await observeCurrentAliasAuthority(plan, provider);
+      if (recovered.state === "source") {
+        throw new CurrentAliasReleaseError("alias_reverted");
+      }
+    } catch (error: unknown) {
+      if (error instanceof CurrentAliasReleaseError && error.code === "alias_reverted") {
+        throw error;
+      }
+      rethrowTerminalProviderError(error);
+    }
+  }
+  throw new CurrentAliasReleaseError("compensation_failed");
+};
+
+const executeCurrentAliasReleasePlan = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  confirmation: string | undefined,
+  clock: ReleaseClock = defaultClock,
+  timeoutMs = convergenceTimeoutMs,
+  assertMutationAuthority: () => void,
+): Promise<CurrentAliasReleaseOutcome> => {
+  if (confirmation !== requiredAliasConfirmation(plan)) {
+    throw new CurrentAliasReleaseError("confirmation_required");
+  }
+  const initial = await observeCurrentAliasAuthority(plan, provider);
+  if (initial.state === "blocked") {
+    throw new CurrentAliasReleaseError("source_not_authoritative");
+  }
+  if (initial.state === "target") return { changed: false, replayed: true };
+
+  assertMutationAuthority();
+  let response: CurrentAliasMutationReadback;
+  try {
+    response = await provider.setAlias(
+      plan.vercel.target,
+      currentAliasReleaseMutationKey(plan, "assign-target"),
+    );
+  } catch (error: unknown) {
+    rethrowTerminalProviderError(error);
+    throw new CurrentAliasReleaseError("target_result_ambiguous");
+  }
+  if (response.oldDeploymentId !== plan.vercel.source.deploymentId) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+
+  const targetConverged = await probeAliasEndpoint(
+    provider,
+    plan.vercel.target,
+    clock,
+    timeoutMs,
+  );
+  if (targetConverged) {
+    try {
+      const postflight = await observeCurrentAliasAuthority(plan, provider);
+      if (postflight.state === "target") return { changed: true, replayed: false };
+    } catch (error: unknown) {
+      rethrowTerminalProviderError(error);
+    }
+  }
+
+  return await restoreCurrentAliasReleaseSource(
+    plan,
+    provider,
+    clock,
+    timeoutMs,
+    assertMutationAuthority,
+  );
+};
+
+const reconcileCurrentAliasReleaseIntent = async (
+  plan: CurrentProjectAliasReleasePlan,
+  provider: CurrentProjectAliasReleaseProvider,
+  clock: ReleaseClock,
+  timeoutMs: number,
+  assertMutationAuthority: () => void,
+): Promise<CurrentAliasReleaseOutcome> => {
+  void plan;
+  void provider;
+  void clock;
+  void timeoutMs;
+  void assertMutationAuthority;
+  throw new CurrentAliasReleaseError("unresolved_current_intent");
+};
+
+export type VercelCommandRequest = Readonly<{
+  arguments: readonly string[];
+  containment: BoundedProcessContainment;
+  environment: Readonly<Record<string, string>>;
+  executable: string;
+  phase: string;
+}>;
+
+export type VercelCommandResult = Readonly<{
+  exitCode: number;
+  stderr: string;
+  stdout: string;
+}>;
+
+export type VercelCommandRunner = (
+  request: VercelCommandRequest,
+) => Promise<VercelCommandResult>;
+
+const runVercelCommand: VercelCommandRunner = async (request) => {
+  const result = requireBoundedProcessCleanup(await runBoundedProcess({
+    arguments: request.arguments,
+    containment: request.containment,
+    cwd: process.cwd(),
+    environment: request.environment,
+    executable: request.executable,
+    outputMaximumBytes,
+    phase: request.phase,
+    terminationGraceMs: commandTerminationGraceMs,
+    timeoutMs: commandTimeoutMs,
+  }));
+  return {
+    exitCode: result.exitCode,
+    stderr: result.stderr.toString("utf8"),
+    stdout: result.stdout.toString("utf8"),
+  };
+};
+
+const childEnvironmentNames = [
+  "APPDATA",
+  "HOME",
+  "LOCALAPPDATA",
+  "PATH",
+  "SystemRoot",
+  "TMPDIR",
+  "USERPROFILE",
+  "XDG_CONFIG_HOME",
+] as const;
+
+export const buildVercelEnvironment = (
+  source: Readonly<NodeJS.ProcessEnv>,
+): Readonly<Record<string, string>> => {
+  const environment: Record<string, string> = { NO_COLOR: "1", TERM: "dumb" };
+  for (const name of childEnvironmentNames) {
+    const value = source[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  return environment;
+};
+
+const readBoundedBody = async (response: Response): Promise<string> => {
+  if (response.status !== 200 || response.body === null) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.startsWith("application/json")) {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      bytes += result.value.byteLength;
+      if (bytes > markerMaximumBytes) {
+        throw new CurrentAliasReleaseError("provider_readback_invalid");
+      }
+      chunks.push(result.value);
+    }
+  } catch (error: unknown) {
+    await reader.cancel().catch(() => undefined);
+    if (error instanceof CurrentAliasReleaseError) throw error;
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+};
+
+const parseProviderJson = <Value>(document: string, schema: z.ZodType<Value>): Value => {
+  if (
+    document.trim().length === 0
+    || Buffer.byteLength(document, "utf8") > outputMaximumBytes
+  ) throw new CurrentAliasReleaseError("provider_readback_invalid");
+  try {
+    return schema.parse(JSON.parse(document) as unknown);
+  } catch {
+    throw new CurrentAliasReleaseError("provider_readback_invalid");
+  }
+};
+
+type VercelCurrentProjectAliasProviderOptions = Readonly<{
+  convexVerifier?: ConvexTargetVerifier;
+  environment?: Readonly<NodeJS.ProcessEnv>;
+  fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  guard?: BoundedProcessInvocationGuard;
+  runner?: VercelCommandRunner;
+  vercelCli: string;
+}>;
+
+class VercelCurrentProjectAliasProvider
+implements CurrentProjectAliasReleaseProvider {
+  readonly #convexVerifier: ConvexTargetVerifier;
+  readonly #environment: Readonly<Record<string, string>>;
+  readonly #fetcher: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  readonly #guard: BoundedProcessInvocationGuard;
+  readonly #runner: VercelCommandRunner;
+  readonly #vercelCli: string;
+
+  constructor(options: VercelCurrentProjectAliasProviderOptions) {
+    if (!isAbsolute(options.vercelCli) || options.vercelCli.length > 4_096) {
+      throw new CurrentAliasReleaseError("usage_invalid");
+    }
+    this.#convexVerifier = options.convexVerifier ?? verifyConvexDefaultTarget;
+    this.#environment = buildVercelEnvironment(options.environment ?? process.env);
+    this.#fetcher = createBoundedAuthorityFetch(
+      options.fetcher ?? fetch,
+      5_000,
+      "vercel_marker_timeout",
+    );
+    this.#guard = options.guard ?? new BoundedProcessInvocationGuard();
+    this.#runner = options.runner ?? runVercelCommand;
+    this.#vercelCli = options.vercelCli;
+  }
+
+  async #invoke(arguments_: readonly string[], phase: string): Promise<string> {
+    let result: VercelCommandResult;
+    try {
+      result = await this.#guard.observe(async () => await this.#runner({
+        arguments: ["--non-interactive", ...arguments_],
+        containment: "authority",
+        environment: this.#environment,
+        executable: this.#vercelCli,
+        phase,
+      }));
+    } catch (error: unknown) {
+      rethrowTerminalProviderError(error);
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("provider_command_failed");
+    }
+    if (result.exitCode !== 0) {
+      throw new CurrentAliasReleaseError("provider_command_failed");
+    }
+    return result.stdout;
+  }
+
+  async verifyVercelVersion(): Promise<void> {
+    const version = (await this.#invoke(["--version"], "vercel-version-read")).trim();
+    if (version !== supportedVercelVersion) {
+      throw new CurrentAliasReleaseError("vercel_version_unsupported");
+    }
+  }
+
+  async verifyConvexTarget(target: ConvexTarget): Promise<void> {
+    try {
+      await this.#convexVerifier(target);
+    } catch (error: unknown) {
+      rethrowTerminalProviderError(error);
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+
+  async readProject(): Promise<CurrentProjectReadback> {
+    return parseProviderJson(await this.#invoke([
+      "api",
+      `/v9/projects/${HRA_VERCEL_PROJECT_ID}`,
+      "--scope",
+      HRA_VERCEL_TEAM_ID,
+      "--raw",
+    ], "vercel-project-read"), projectReadbackSchema);
+  }
+
+  async readDeployment(deploymentId: string): Promise<CurrentDeploymentReadback> {
+    if (!deploymentIdSchema.safeParse(deploymentId).success) {
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+    return parseProviderJson(await this.#invoke([
+      "api",
+      `/v13/deployments/${deploymentId}`,
+      "--scope",
+      HRA_VERCEL_TEAM_ID,
+      "--raw",
+    ], "vercel-deployment-read"), deploymentReadbackSchema);
+  }
+
+  async readAlias(): Promise<CurrentAliasReadback> {
+    return parseProviderJson(await this.#invoke([
+      "api",
+      `/v4/aliases/${canonicalAlias}`,
+      "--scope",
+      HRA_VERCEL_TEAM_ID,
+      "--raw",
+    ], "vercel-alias-read"), aliasReadbackSchema);
+  }
+
+  async readMarker(): Promise<unknown> {
+    try {
+      this.#guard.assertMayProceed();
+      const response = await this.#fetcher(
+        `https://${canonicalAlias}/.well-known/hra.json?release=${randomUUID()}`,
+        {
+          cache: "no-store",
+          headers: { accept: "application/json", "cache-control": "no-cache" },
+          method: "GET",
+          redirect: "error",
+        },
+      );
+      const document = await readBoundedBody(response);
+      return JSON.parse(document) as unknown;
+    } catch (error: unknown) {
+      rethrowTerminalProviderError(error);
+      if (error instanceof CurrentAliasReleaseError) throw error;
+      throw new CurrentAliasReleaseError("provider_readback_invalid");
+    }
+  }
+
+  async setAlias(
+    endpoint: CurrentProjectAliasEndpoint,
+    idempotencyKey: string,
+  ): Promise<CurrentAliasMutationReadback> {
+    return parseProviderJson(
+      await this.#invoke(
+        currentAliasReleaseApiArguments(endpoint, idempotencyKey),
+        `vercel-alias-set-${idempotencyKey.slice(0, 32)}`,
+      ),
+      aliasMutationReadbackSchema,
+    );
+  }
+}
+
+type ParsedArguments = Readonly<{
+  confirmation?: string;
+  operation: "execute" | "preflight";
+  planFd: number;
+  vercelCli: string;
+}>;
+
+export const parseArguments = (arguments_: readonly string[]): ParsedArguments => {
+  let confirmation: string | undefined;
+  let operation: ParsedArguments["operation"] | undefined;
+  let planFd = 0;
+  let vercelCli: string | undefined;
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === "preflight" && operation === undefined) {
+      operation = "preflight";
+      continue;
+    }
+    if (argument === "--execute" && operation === undefined) {
+      operation = "execute";
+      continue;
+    }
+    if (argument === "--confirm-exact" && confirmation === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || value.length > 2_048) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      confirmation = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "--plan-fd" && planFd === 0) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !/^[0-9]+$/u.test(value)) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      planFd = Number(value);
+      if (!Number.isSafeInteger(planFd) || planFd < 3 || planFd > 255) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      index += 1;
+      continue;
+    }
+    if (argument === "--vercel-cli" && vercelCli === undefined) {
+      const value = arguments_[index + 1];
+      if (value === undefined || !isAbsolute(value) || value.length > 4_096) {
+        throw new CurrentAliasReleaseError("usage_invalid");
+      }
+      vercelCli = value;
+      index += 1;
+      continue;
+    }
+    throw new CurrentAliasReleaseError("usage_invalid");
+  }
+  if (
+    operation === undefined
+    || vercelCli === undefined
+    || operation === "preflight" && confirmation !== undefined
+  ) throw new CurrentAliasReleaseError("usage_invalid");
+  return {
+    ...(confirmation === undefined ? {} : { confirmation }),
+    operation,
+    planFd,
+    vercelCli,
+  };
+};
+
+export const readPlanInput = async (fd: number, timeoutMs = 15_000): Promise<string> => {
+  if (isatty(fd)) throw new CurrentAliasReleaseError("input_not_protected");
+  return await new Promise<string>((resolvePromise, rejectPromise) => {
+    const stream = createReadStream("", { autoClose: fd !== 0, fd });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let finished = false;
+    const finish = (error?: CurrentAliasReleaseError): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (error === undefined) resolvePromise(Buffer.concat(chunks).toString("utf8"));
+      else rejectPromise(error);
+    };
+    const timer = setTimeout(() => {
+      stream.destroy();
+      finish(new CurrentAliasReleaseError("input_timed_out"));
+    }, timeoutMs);
+    stream.on("data", (chunk: Buffer) => {
+      bytes += chunk.byteLength;
+      if (bytes > inputMaximumBytes) {
+        stream.destroy();
+        finish(new CurrentAliasReleaseError("input_too_large"));
+      } else chunks.push(chunk);
+    });
+    stream.once("error", () => finish(new CurrentAliasReleaseError("input_invalid")));
+    stream.once("end", () => finish());
+  });
+};
+
+type ExecuteOptions = Readonly<{
+  afterIntentPublication?: (
+    path: string,
+    intent: CurrentAliasReleaseIntent,
+  ) => void;
+  arguments: readonly string[];
+  clock?: ReleaseClock;
+  convexVerifier?: ConvexTargetVerifier;
+  environment?: Readonly<NodeJS.ProcessEnv>;
+  fetcher?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  inputDocument: string;
+  provider?: CurrentProjectAliasReleaseProvider;
+  receiptWriter?: (
+    path: string,
+    receipt: CurrentAliasReleaseReceipt,
+  ) => void;
+  runner?: VercelCommandRunner;
+  stateDirectory?: string;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  timeoutMs?: number;
+}>;
+
+const renderFailure = (
+  error: unknown,
+  stderr: Pick<NodeJS.WriteStream, "write">,
+  durableContext?: DurableFailureContext,
+  unresolvedIntent = false,
+): number => {
+  const effectiveDurableContext = error instanceof CurrentAliasReleaseError
+      && error.durableContext !== undefined
+    ? error.durableContext
+    : durableContext;
+  const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
+  if (authorityUnavailable !== undefined) {
+    if (unresolvedIntent && isAuthorityContainmentUnavailable(error)) {
+      stderr.write(`${JSON.stringify({
+        code: "authority_containment_unavailable",
+        ...(effectiveDurableContext === undefined ? {} : effectiveDurableContext),
+        reason: error.reason,
+        schemaVersion: 1,
+        status: "recovery_required",
+      })}\n`);
+      return 75;
+    }
+    stderr.write(authorityUnavailable);
+    return 1;
+  }
+  if (isBoundedProcessCleanupUnprovenError(error)) {
+    stderr.write(`${JSON.stringify({
+      code: "process_cleanup_unproven",
+      phase: error.phase,
+      processGroupId: error.processGroupId,
+      processes: error.processes,
+      recoveryPaths: error.recoveryPaths,
+      ...(effectiveDurableContext === undefined ? {} : effectiveDurableContext),
+      schemaVersion: 1,
+      status: "recovery_required",
+    })}\n`);
+    return 75;
+  }
+  if (isBoundedProcessRecoveryJournalError(error)) {
+    stderr.write(`${JSON.stringify({
+      code: "process_recovery_journal_blocked",
+      reason: error.reason,
+      recoveryPaths: error.recoveryPaths,
+      ...(effectiveDurableContext === undefined ? {} : effectiveDurableContext),
+      schemaVersion: 1,
+      status: "recovery_required",
+    })}\n`);
+    return 75;
+  }
+  const code = error instanceof CurrentAliasReleaseError
+    ? error.code
+    : "input_invalid";
+  const recoveryRequired = unresolvedIntent
+    || code === "compensation_failed"
+    || code === "durable_state_capacity_exhausted"
+    || code === "receipt_authority_mismatch"
+    || code === "receipt_write_failed"
+    || code === "intent_write_failed"
+    || code === "unresolved_prior_intent"
+    || code === "durable_state_invalid" && effectiveDurableContext !== undefined;
+  const status = recoveryRequired
+    ? "recovery_required"
+    : code === "alias_reverted"
+      ? "reverted"
+      : "refused";
+  stderr.write(`${JSON.stringify({
+    code,
+    ...(effectiveDurableContext === undefined ? {} : effectiveDurableContext),
+    schemaVersion: 1,
+    status,
+  })}\n`);
+  return recoveryRequired ? 75 : 1;
+};
+
+const writeCurrentAliasReleaseReceipt = (
+  path: string,
+  receipt: CurrentAliasReleaseReceipt,
+): void => {
+  try {
+    writeProtectedJsonNoReplace(path, receipt, currentAliasReleaseReceiptSchema, {
+      allowExactReplay: true,
+    });
+  } catch {
+    throw new CurrentAliasReleaseError("receipt_write_failed");
+  }
+};
+
+const executeCurrentProjectAliasRelease = async (
+  options: ExecuteOptions,
+): Promise<number> => {
+  let durableContext: DurableFailureContext | undefined;
+  let unresolvedIntent = false;
+  try {
+    assertCurrentAliasReleaseBunVersion();
+    const arguments_ = parseArguments(options.arguments);
+    const plan = parseCurrentProjectAliasReleasePlan(options.inputDocument);
+    const stateDirectory = options.stateDirectory ?? currentAliasReleaseStateDirectory();
+    const unverifiedStateDirectory = resolve(stateDirectory);
+    const unverifiedPaths = {
+      intent: join(unverifiedStateDirectory, `${plan.idempotencyKey}.intent.json`),
+      receipt: join(unverifiedStateDirectory, `${plan.idempotencyKey}.receipt.json`),
+    };
+    durableContext = {
+      idempotencyKey: plan.idempotencyKey,
+      intentPath: unverifiedPaths.intent,
+      lockPath: join(unverifiedStateDirectory, executionLockName),
+      receiptPath: unverifiedPaths.receipt,
+    };
+    if (arguments_.operation === "preflight") {
+      const lock = acquireCurrentAliasReleaseExecutionLock(stateDirectory);
+      let preflightExitCode = 75;
+      let preflightOutput = "";
+      try {
+        const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+        durableContext = {
+          idempotencyKey: plan.idempotencyKey,
+          intentPath: paths.intent,
+          lockPath: lock.path,
+          receiptPath: paths.receipt,
+        };
+        const durableState = inspectCurrentAliasReleaseDurableState(
+          plan,
+          dirname(paths.intent),
+        );
+        unresolvedIntent = durableState.intent !== null && durableState.receipt === null;
+        if (unresolvedIntent) {
+          throw new CurrentAliasReleaseError("unresolved_current_intent");
+        }
+        const guard = new BoundedProcessInvocationGuard();
+        for (const path of [lock.path, paths.intent, paths.receipt]) {
+          guard.retainRecoveryPath(path);
+        }
+        const provider = options.provider ?? new VercelCurrentProjectAliasProvider({
+          ...(options.convexVerifier === undefined
+            ? {}
+            : { convexVerifier: options.convexVerifier }),
+          ...(options.environment === undefined ? {} : { environment: options.environment }),
+          ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+          guard,
+          ...(options.runner === undefined ? {} : { runner: options.runner }),
+          vercelCli: arguments_.vercelCli,
+        });
+        const observation = await observeCurrentAliasAuthority(plan, provider);
+        if (
+          durableState.receipt !== null
+          && durableState.receipt.finalState !== observation.state
+        ) throw new CurrentAliasReleaseError("receipt_authority_mismatch");
+        if (durableState.receipt?.finalState === "source") {
+          throw new CurrentAliasReleaseError("alias_reverted");
+        }
+        const ready = observation.state === "source";
+        const idempotencyKey = plan.idempotencyKey;
+        preflightOutput = `${JSON.stringify({
+          alias: plan.alias,
+          idempotencyKey,
+          nextAction: ready
+            ? "confirm_exact_record_then_execute"
+            : observation.state === "target"
+              ? "none"
+              : "stop_and_investigate",
+          observedState: observation.state,
+          reason: observation.reason,
+          ...(ready ? { requiredConfirmation: requiredAliasConfirmation(plan) } : {}),
+          schemaVersion: 1,
+          sourceDeploymentId: plan.vercel.source.deploymentId,
+          status: ready
+            ? "ready"
+            : observation.state === "target"
+              ? "already_committed"
+              : "blocked",
+          targetDeploymentId: plan.vercel.target.deploymentId,
+          targetProjectId: plan.vercel.projectId,
+        })}\n`;
+        preflightExitCode = observation.state === "blocked" ? 1 : 0;
+      } finally {
+        lock.release();
+      }
+      options.stdout.write(preflightOutput);
+      return preflightExitCode;
+    }
+    if (arguments_.confirmation !== requiredAliasConfirmation(plan)) {
+      throw new CurrentAliasReleaseError("confirmation_required");
+    }
+    const lock = acquireCurrentAliasReleaseExecutionLock(stateDirectory);
+    let output: string;
+    try {
+      const paths = currentAliasReleaseStatePaths(plan, stateDirectory);
+      const idempotencyKey = plan.idempotencyKey;
+      durableContext = {
+        idempotencyKey,
+        intentPath: paths.intent,
+        lockPath: lock.path,
+        receiptPath: paths.receipt,
+      };
+      const guard = new BoundedProcessInvocationGuard();
+      for (const path of [lock.path, paths.intent, paths.receipt]) {
+        guard.retainRecoveryPath(path);
+      }
+      const durableState = inspectCurrentAliasReleaseDurableState(
+        plan,
+        dirname(paths.intent),
+      );
+      unresolvedIntent = durableState.intent !== null && durableState.receipt === null;
+      const provider = options.provider ?? new VercelCurrentProjectAliasProvider({
+        ...(options.convexVerifier === undefined
+          ? {}
+          : { convexVerifier: options.convexVerifier }),
+        ...(options.environment === undefined ? {} : { environment: options.environment }),
+        ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+        guard,
+        ...(options.runner === undefined ? {} : { runner: options.runner }),
+        vercelCli: arguments_.vercelCli,
+      });
+      let initial: AliasAuthorityObservation;
+      try {
+        initial = await observeCurrentAliasAuthority(plan, provider);
+      } catch (error: unknown) {
+        rethrowTerminalProviderError(error);
+        if (durableState.receipt !== null) {
+          throw new CurrentAliasReleaseError("receipt_authority_mismatch");
+        }
+        throw error;
+      }
+      let receipt: CurrentAliasReleaseReceipt;
+      let replayed: boolean;
+      let intent = durableState.intent;
+      const intentWasPreexisting = intent !== null;
+      if (durableState.receipt !== null) {
+        if (initial.state !== durableState.receipt.finalState) {
+          throw new CurrentAliasReleaseError("receipt_authority_mismatch");
+        }
+        if (durableState.receipt.finalState === "source") {
+          throw new CurrentAliasReleaseError("alias_reverted");
+        }
+        receipt = durableState.receipt;
+        replayed = true;
+      } else {
+        if (intent === null) {
+          if (initial.state === "blocked") {
+            throw new CurrentAliasReleaseError("source_not_authoritative");
+          }
+          if (initial.state === "target") {
+            output = `${JSON.stringify({
+              alias: plan.alias,
+              changed: false,
+              idempotencyKey,
+              replayed: true,
+              schemaVersion: 1,
+              status: "already_committed",
+              targetDeploymentId: plan.vercel.target.deploymentId,
+              targetDeploymentUrl: plan.vercel.target.deploymentUrl,
+              targetProjectId: plan.vercel.projectId,
+              targetSourceCommit: plan.vercel.target.sourceCommit,
+            })}\n`;
+            lock.assertHeld();
+            lock.release();
+            options.stdout.write(output);
+            return 0;
+          }
+          lock.assertHeld();
+          unresolvedIntent = true;
+          intent = reserveCurrentAliasReleaseIntent(
+            paths.intent,
+            plan,
+            options.afterIntentPublication,
+          );
+        }
+        let outcome: CurrentAliasReleaseOutcome;
+        try {
+          outcome = intentWasPreexisting
+            ? await reconcileCurrentAliasReleaseIntent(
+                plan,
+                provider,
+                options.clock ?? defaultClock,
+                options.timeoutMs ?? convergenceTimeoutMs,
+                lock.assertHeld,
+              )
+            : await executeCurrentAliasReleasePlan(
+                plan,
+                provider,
+                arguments_.confirmation,
+                options.clock ?? defaultClock,
+                options.timeoutMs ?? convergenceTimeoutMs,
+                lock.assertHeld,
+              );
+        } catch (error: unknown) {
+          if (!(error instanceof CurrentAliasReleaseError) || error.code !== "alias_reverted") {
+            throw error;
+          }
+          lock.assertHeld();
+          const reverted = currentAliasReleaseReceiptFor(plan, intent, true, "source");
+          try {
+            (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
+              paths.receipt,
+              reverted,
+            );
+            receipt = readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema, {
+              recoverInterruptedPublication: true,
+            });
+          } catch {
+            throw new CurrentAliasReleaseError("receipt_write_failed");
+          }
+          if (receipt.selfDigest !== reverted.selfDigest) {
+            throw new CurrentAliasReleaseError("receipt_write_failed");
+          }
+          unresolvedIntent = false;
+          throw error;
+        }
+        lock.assertHeld();
+        const candidate = currentAliasReleaseReceiptFor(
+          plan,
+          intent,
+          outcome.changed,
+          "target",
+        );
+        try {
+          (options.receiptWriter ?? writeCurrentAliasReleaseReceipt)(
+            paths.receipt,
+            candidate,
+          );
+          receipt = readProtectedJson(paths.receipt, currentAliasReleaseReceiptSchema, {
+            recoverInterruptedPublication: true,
+          });
+        } catch {
+          throw new CurrentAliasReleaseError("receipt_write_failed");
+        }
+        if (receipt.selfDigest !== candidate.selfDigest) {
+          throw new CurrentAliasReleaseError("receipt_write_failed");
+        }
+        unresolvedIntent = false;
+        replayed = outcome.replayed;
+      }
+      if (intent === null) throw new CurrentAliasReleaseError("durable_state_invalid");
+      output = `${JSON.stringify({
+        alias: plan.alias,
+        changed: receipt.changed,
+        idempotencyKey,
+        intentDigest: intent.selfDigest,
+        receiptDigest: receipt.selfDigest,
+        replayed,
+        schemaVersion: 1,
+        status: "committed",
+        targetDeploymentId: plan.vercel.target.deploymentId,
+        targetDeploymentUrl: plan.vercel.target.deploymentUrl,
+        targetProjectId: plan.vercel.projectId,
+        targetSourceCommit: plan.vercel.target.sourceCommit,
+      })}\n`;
+    } finally {
+      lock.release();
+    }
+    options.stdout.write(output);
+    return 0;
+  } catch (error: unknown) {
+    return renderFailure(error, options.stderr, durableContext, unresolvedIntent);
+  }
+};
+
+export type CurrentProjectAliasReleaseExplicitCapability = Readonly<{
+  afterIntentPublication?: (
+    path: string,
+    intent: CurrentAliasReleaseIntent,
+  ) => void;
+  provider: CurrentProjectAliasReleaseProvider;
+  receiptWriter?: (
+    path: string,
+    receipt: CurrentAliasReleaseReceipt,
+  ) => void;
+  stateDirectory: string;
+}>;
+
+export type CurrentProjectAliasReleaseExplicitRequest = Readonly<{
+  arguments: readonly string[];
+  clock?: ReleaseClock;
+  inputDocument: string;
+  stderr: Pick<NodeJS.WriteStream, "write">;
+  stdout: Pick<NodeJS.WriteStream, "write">;
+  timeoutMs?: number;
+}>;
+
+const isExplicitAliasReleaseProvider = (
+  value: unknown,
+): value is CurrentProjectAliasReleaseProvider => {
+  if (typeof value !== "object" || value === null) return false;
+  for (const method of [
+    "readAlias",
+    "readDeployment",
+    "readMarker",
+    "readProject",
+    "setAlias",
+    "verifyConvexTarget",
+    "verifyVercelVersion",
+  ] as const) {
+    if (typeof Reflect.get(value, method) !== "function") return false;
+  }
+  return true;
+};
+
+// This seam carries no ambient or built-in provider authority. A caller must supply the
+// narrowly scoped provider capability and durable-state root explicitly, so importing the
+// module cannot reach the authenticated Vercel session or bypass the executable's wrapper.
+export const executeCurrentProjectAliasReleaseWithExplicitCapability = async (
+  capability: CurrentProjectAliasReleaseExplicitCapability,
+  request: CurrentProjectAliasReleaseExplicitRequest,
+): Promise<number> => {
+  assertCurrentAliasReleaseBunVersion();
+  const runtimeCapability: unknown = capability;
+  const capabilityObject = typeof runtimeCapability === "object" && runtimeCapability !== null
+    ? runtimeCapability
+    : undefined;
+  const provider = capabilityObject === undefined
+    ? undefined
+    : Reflect.get(capabilityObject, "provider") as unknown;
+  const stateDirectory = capabilityObject === undefined
+    ? undefined
+    : Reflect.get(capabilityObject, "stateDirectory") as unknown;
+  if (
+    capabilityObject === undefined
+    || !isExplicitAliasReleaseProvider(provider)
+    || typeof stateDirectory !== "string"
+    || !isAbsolute(stateDirectory)
+  ) {
+    return renderFailure(
+      new CurrentAliasReleaseError("usage_invalid"),
+      request.stderr,
+    );
+  }
+  return await executeCurrentProjectAliasRelease({
+    ...(capability.afterIntentPublication === undefined
+      ? {}
+      : { afterIntentPublication: capability.afterIntentPublication }),
+    arguments: request.arguments,
+    ...(request.clock === undefined ? {} : { clock: request.clock }),
+    inputDocument: request.inputDocument,
+    provider,
+    ...(capability.receiptWriter === undefined
+      ? {}
+      : { receiptWriter: capability.receiptWriter }),
+    stateDirectory,
+    stderr: request.stderr,
+    stdout: request.stdout,
+    ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+  });
+};
+
+if (import.meta.main) {
+  let exitCode = 75;
+  try {
+    assertCurrentAliasReleaseBunVersion();
+    const arguments_ = parseArguments(process.argv.slice(2));
+    await recoverBoundedProcessJournal();
+    const inputDocument = await readPlanInput(arguments_.planFd);
+    exitCode = await executeCurrentProjectAliasRelease({
+      arguments: process.argv.slice(2),
+      inputDocument,
+      stderr: process.stderr,
+      stdout: process.stdout,
+    });
+  } catch (error: unknown) {
+    exitCode = renderFailure(error, process.stderr);
+  }
+  process.exitCode = exitCode;
+}

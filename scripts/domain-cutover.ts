@@ -10,11 +10,8 @@ import {
   type BoundedProcessContainment,
   isBoundedProcessCleanupUnprovenError,
   isBoundedProcessRecoveryJournalError,
-  recoverBoundedProcessJournal,
   retainBoundedProcessRecoveryPath,
   rethrowBoundedProcessCleanupUnproven as rethrowLocalProcessCleanupUnproven,
-  requireBoundedProcessCleanup,
-  runBoundedProcess,
 } from "./bounded-process";
 import {
   renderAuthorityContainmentUnavailable,
@@ -47,8 +44,6 @@ const canonicalAlias = "hra.sh";
 const fallbackAlias = "hra-weld.vercel.app";
 const newStagingAlias = "try-hra.vercel.app";
 const supportedVercelVersion = "54.18.0";
-const commandTimeoutMs = 30_000;
-const commandTerminationGraceMs = 1_000;
 const convergenceTimeoutMs = 60_000;
 const domainPageLimit = 20;
 const maximumDomainPages = 64;
@@ -267,6 +262,7 @@ type CutoverFailureCode =
   | "input_not_protected"
   | "input_timed_out"
   | "input_too_large"
+  | "operator_retired"
   | "source_not_authoritative"
   | "usage_invalid"
   | "vercel_version_unsupported";
@@ -1063,25 +1059,6 @@ export type VercelCommandRunner = (
   request: VercelCommandRequest,
 ) => Promise<VercelCommandResult>;
 
-export const runVercelCommand: VercelCommandRunner = async (request) => {
-  const result = requireBoundedProcessCleanup(await runBoundedProcess({
-    arguments: request.arguments,
-    containment: request.containment,
-    cwd: process.cwd(),
-    environment: request.environment,
-    executable: request.executable,
-    outputMaximumBytes,
-    phase: request.phase,
-    terminationGraceMs: commandTerminationGraceMs,
-    timeoutMs: commandTimeoutMs,
-  }));
-  return {
-    exitCode: result.exitCode,
-    stderr: result.stderr.toString("utf8"),
-    stdout: result.stdout.toString("utf8"),
-  };
-};
-
 const childEnvironmentNames = [
   "APPDATA",
   "HOME",
@@ -1145,7 +1122,8 @@ export class VercelCutoverProvider implements CutoverProvider {
       markerTimeoutMs,
       "vercel_marker_timeout",
     );
-    this.#runner = options.runner ?? runVercelCommand;
+    if (options.runner === undefined) throw new DomainCutoverError("operator_retired");
+    this.#runner = options.runner;
     this.#vercelCli = options.vercelCli;
   }
 
@@ -1612,6 +1590,22 @@ type ExecuteOptions = Readonly<{
 }>;
 
 export async function executeDomainCutover(options: ExecuteOptions): Promise<number> {
+  options.stderr.write(`${JSON.stringify({
+    code: "operator_retired",
+    schemaVersion: 1,
+    status: "refused",
+  })}\n`);
+  return 1;
+}
+
+/**
+ * Historical logic retained for deterministic evidence tests only. The caller
+ * must supply the complete effect capability; this module has no ambient
+ * subprocess runner and its public/default operator entry points refuse.
+ */
+export async function executeHistoricalDomainCutoverWithExplicitCapability(
+  options: ExecuteOptions & Readonly<{ runner: VercelCommandRunner }>,
+): Promise<number> {
   let evidenceRecoveryPaths: readonly string[] = [];
   try {
     const arguments_ = parseArguments(options.arguments);
@@ -1621,7 +1615,7 @@ export async function executeDomainCutover(options: ExecuteOptions): Promise<num
       ...(options.environment === undefined ? {} : { environment: options.environment }),
       ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
       guard,
-      ...(options.runner === undefined ? {} : { runner: options.runner }),
+      runner: options.runner,
       vercelCli: arguments_.vercelCli,
     });
     await provider.verifyVersion();
@@ -1737,61 +1731,10 @@ export async function executeDomainCutover(options: ExecuteOptions): Promise<num
 }
 
 if (import.meta.main) {
-  let exitCode = 75;
-  try {
-    const arguments_ = parseArguments(process.argv.slice(2));
-    try {
-      await recoverBoundedProcessJournal();
-    } catch (error: unknown) {
-      let retained = error;
-      if (arguments_.evidencePath !== undefined) {
-        retained = retainBoundedProcessRecoveryPath(retained, arguments_.evidencePath);
-        retained = retainBoundedProcessRecoveryPath(
-          retained,
-          `${arguments_.evidencePath}.reservation`,
-        );
-      }
-      throw retained;
-    }
-    const inputDocument = await readPlanInput(arguments_.planFd);
-    exitCode = await executeDomainCutover({
-      arguments: process.argv.slice(2),
-      inputDocument,
-      stderr: process.stderr,
-      stdout: process.stdout,
-    });
-  } catch (error: unknown) {
-    const authorityUnavailable = renderAuthorityContainmentUnavailable(error);
-    if (authorityUnavailable !== undefined) {
-      process.stderr.write(authorityUnavailable);
-      exitCode = 1;
-    } else {
-      const cleanup = isBoundedProcessCleanupUnprovenError(error) ? error : undefined;
-      const journal = isBoundedProcessRecoveryJournalError(error) ? error : undefined;
-      const code = error instanceof DomainCutoverError
-        ? error.code
-        : cleanup === undefined && journal === undefined
-          ? "input_invalid"
-          : cleanup !== undefined
-            ? "process_cleanup_unproven"
-            : "process_recovery_journal_blocked";
-      process.stderr.write(`${JSON.stringify({
-        code,
-        ...(cleanup === undefined ? {} : {
-          phase: cleanup.phase,
-          processGroupId: cleanup.processGroupId,
-          processes: cleanup.processes,
-          recoveryPaths: cleanup.recoveryPaths,
-        }),
-        ...(journal === undefined ? {} : {
-          reason: journal.reason,
-          recoveryPaths: journal.recoveryPaths,
-        }),
-        schemaVersion: 1,
-        status: cleanup === undefined && journal === undefined ? "refused" : "recovery_required",
-      })}\n`);
-      if (cleanup === undefined && journal === undefined) exitCode = 1;
-    }
-  }
-  process.exitCode = exitCode;
+  process.stderr.write(`${JSON.stringify({
+    code: "operator_retired",
+    schemaVersion: 1,
+    status: "refused",
+  })}\n`);
+  process.exitCode = 1;
 }
