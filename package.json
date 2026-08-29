@@ -22,6 +22,8 @@
     "hosted:configure": "bun ./scripts/configure-hosted-sync.ts",
     "hosted:deploy": "bun ./scripts/deploy-hosted-sync.ts",
     "hosted:invites": "bun ./scripts/manage-hosted-invites.ts",
+    "hosted:replace-target": "bun ./scripts/replace-hosted-convex-target.ts",
+    "hosted:status": "bun ./scripts/hosted-status.ts",
     "operator:migrate-legacy-secrets": "bun ./scripts/migrate-legacy-secrets.ts",
     "release:canonical-alias": "bun ./scripts/current-project-alias-release.ts",
     "lint": "eslint .",

@@ -1,10 +1,10 @@
 # Hosted sync deployment
 
-Do not perform any provider write in this runbook until the user supplies the exact authorization phrase `approve both`. That phrase authorizes the paired hosted setup only: Resend GitHub OAuth and creation of the sending-only Resend key, followed by the checked hosted secret and bootstrap writes described here.
+Do not perform any provider write in this runbook until the user supplies the exact authorization phrase `approve both`. That phrase authorizes only the paired hosted setup: Resend GitHub OAuth and creation of the sending-only Resend key, the checked hosted secret and bootstrap writes described here, and the guarded fresh-target replacement transaction in the existing current Convex project.
 
 `approve both` does not authorize DNS. Do not add, change, or remove any DNS record, domain assignment, or production alias until the user separately confirms the exact record-level change. This runbook targets current HRA only. The retired HRA v0 Vercel and Convex resources are not fallback or rollback authorities.
 
-Use this sequence only for a new HRA Convex project and production deployment. The setup helper refuses an existing HRA environment by default. It does not support overwrite.
+Use this sequence only in the existing current HRA Convex project. A recovery creates one distinct, non-default production deployment in that project; it never creates a replacement project. The setup helper refuses an existing HRA environment by default and does not support overwrite.
 
 Never copy retired HRA v0 data, deployment URLs, deploy keys, authentication keys, HMAC material, Resend credentials, environment values, or backups into the current project. Do not recreate or select a retired resource.
 
@@ -40,27 +40,76 @@ Execution first acquires and holds HRA's exact daemon lifecycle authority in mai
 
 The operation is safe to replay after a crash or refusal. Exact copies are accepted without another Keychain read, missing copies resume, and an existing conflicting or unsafe file stops the run without overwrite. A pointer change during execution is a refusal even when an earlier copy succeeded; stop HRA and replay so the current complete pointer set can be proved. The operator never deletes or changes an entry in the legacy Keychain service. Keep those entries as recovery evidence until the prerelease installation is no longer needed, then review any manual cleanup separately.
 
+## Replace a quarantined current target
+
+Use this exceptional preproduction recovery path only after the exact `approve both` authorization and only when the current default production deployment is unsuitable for bootstrap. It stays inside the current project and never reads, selects, imports, recreates, or modifies a retired v0 resource.
+
+Log in with the Convex CLI first. Its global `config.json` must be a regular, single-link, mode-`0600` file. Do not supply a deploy key or deployment selector through an environment variable, `.env`, or `.env.local`. Choose one UUIDv7 replacement ID and one unused absolute evidence path whose existing parent is an invoking-user-owned mode-`0700` directory. Both values remain fixed across the whole transaction.
+
+Create and receipt one distinct non-default production target from the exact current-default tuple:
+
+```sh
+bun run hosted:replace-target -- create --execute \
+  --replacement-id <UUIDV7> \
+  --evidence-path /protected/release/convex-replacement.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+The operator first proves that supplied tuple is the current default, writes a protected create intent and dispatch receipt, creates only a production deployment with a unique `hra-replace-…` reference and `isDefault: false`, then reads the reference, new target, and old default back. It emits one closed JSON record. A `created_receipted` result means the new target is distinct and non-default while the supplied target remains default; record only the returned target tuple in the private release record.
+
+Read durable replacement state with the same tuple, replacement ID, and evidence path:
+
+```sh
+bun run hosted:replace-target -- status \
+  --replacement-id <UUIDV7> \
+  --evidence-path /protected/release/convex-replacement.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+For `created_receipted`, `demoted_receipted`, and `complete`, status performs the corresponding authority-contained remote read before reporting that state. Other intent or dispatched states describe protected local evidence only and make no remote success claim. A `*_dispatched_reconciliation_required` result must be resumed with the same `create --execute` or `switch --execute` command, never with a new replacement ID or evidence path. The operator reconciles the recorded phase before any recorded successor mutation.
+
+After the create receipt is current, switch the project default with the same values:
+
+```sh
+bun run hosted:replace-target -- switch --execute \
+  --replacement-id <UUIDV7> \
+  --evidence-path /protected/release/convex-replacement.json \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+Convex requires the former default to be demoted before another production deployment can be promoted. The operator persists separate demote and promote dispatches, verifies the deliberate no-default intermediate state, and then promotes the replacement. It never promotes after an indeterminate demotion and never demotes again after an indeterminate promotion; a resumed switch reconciles the recorded phase first. Do not run deploy, configure, bootstrap, invitations, a DNS change, or an alias change while the project has no default. `complete` is emitted only after the replacement is read back as default and the former target as non-default.
+
+This changes Convex default selection only. It does not change HRA's checked source target, release evidence, site environment, user deployment custody, DNS, domain assignment, or production alias. Bind the returned target tuple into a separately reviewed source release before treating it as HRA's hosted-sync endpoint.
+
 ## Create fresh state
 
-1. Create a new Convex project and production deployment in Convex team `cclrte` with numeric team ID `513923`.
-2. Record the new Convex project ID, production deployment ID, deployment name, deployment URL, and site URL in the private release record.
-3. Read those values back from Convex. Attach the readback to the release record and prove that both current numeric IDs and the deployment URL differ from retired HRA v0 project ID `2680173`, deployment ID `4677913`, and its historical deployment URL. Stop on a missing, reused, or name-only identity.
-4. Log in with the Convex CLI. Its global `config.json` must be a regular, single-link, mode-`0600` file. Do not supply a deploy key or deployment selector through an environment variable, `.env`, or `.env.local`.
-5. Record the exact clean 40-character lowercase Git commit. Deploy that source before any authentication or invitation write. Substitute the five provider values and exact commit below:
+Record the exact clean 40-character lowercase Git commit. Deploy that source before any authentication or invitation write. Substitute the verified current target tuple and exact commit below:
 
-   ```sh
-   bun run hosted:deploy -- \
-     --deployment steady-otter-321 \
-     --team-id 513923 \
-     --project-id 2854545 \
-     --deployment-id 7654321 \
-     --deployment-url https://steady-otter-321.convex.cloud \
-     --source-commit 0123456789abcdef0123456789abcdef01234567
-   ```
+```sh
+bun run hosted:deploy -- \
+  --deployment steady-otter-321 \
+  --team-id 513923 \
+  --project-id 2854545 \
+  --deployment-id 7654321 \
+  --deployment-url https://steady-otter-321.convex.cloud \
+  --source-commit 0123456789abcdef0123456789abcdef01234567
+```
 
-   The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, the exact project, deployment, production type, generated deployment name, URL, and two matching default-production facts: the deployment reports `isDefault: true` and the project names that deployment as `prodDeploymentName`. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the retired HRA v0 numeric IDs.
+The helper requires `HEAD` to equal that commit and the entire checkout, including untracked files, to be clean before and after deployment. It refuses any caller team ID except `513923`, then reads the authenticated Convex management API before and after the mutation and requires team slug `cclrte`, team ID `513923`, the exact project, deployment, production type, generated deployment name, URL, and two matching default-production facts: the deployment reports `isDefault: true` and the project names that deployment as `prodDeploymentName`. It rejects selectors such as `prod`, `local`, and `team:project:prod`, and rejects the retired HRA v0 numeric IDs.
 
-   The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. Convex uses that value as project context and deploys to the project's current default production deployment, so the matching default-production readbacks are part of the target guard rather than an informational check. After Convex resolves the actual deployment credentials and before it pushes, its mandatory `--cmd` exposes the resolved canonical cloud URL only to a silent local assertion. That assertion must match the exact expected deployment URL or the deploy stops before `runPush`; a later default change cannot redirect the already-resolved credentials. The helper disables Convex's optional pre-command WorkOS provisioning because HRA does not use Convex AuthKit and no provider mutation may precede this assertion. It otherwise invokes `convex deploy --env-file` with confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. Provider output is suppressed. A failure, changed default, resolved-target mismatch, or dirty postflight leaves the deployment quarantined for inspection; do not retry it.
+The helper creates a private exclusive environment file containing only `CONVEX_DEPLOYMENT=prod:<generated-name>`. Convex uses that value as project context and deploys to the project's current default production deployment, so the matching default-production readbacks are part of the target guard rather than an informational check. After Convex resolves the actual deployment credentials and before it pushes, its mandatory `--cmd` exposes the resolved canonical cloud URL only to a silent local assertion. That assertion must match the exact expected deployment URL or the deploy stops before `runPush`; a later default change cannot redirect the already-resolved credentials. The helper disables Convex's optional pre-command WorkOS provisioning because HRA does not use Convex AuthKit and no provider mutation may precede this assertion. It otherwise invokes `convex deploy --env-file` with confirmation disabled, strict typechecking, code generation disabled, sanitized inherited environment variables, bounded provider output, and a ten-minute deadline. Provider output is suppressed. A failure, changed default, resolved-target mismatch, or dirty postflight leaves the deployment quarantined for inspection; do not retry it.
 
 ## Release deployment evidence
 
@@ -150,6 +199,57 @@ The helper reads at most 8 KiB, rejects a terminal descriptor, and ignores inher
 - `HRA_AUTH_EMAIL_FROM`
 
 If any target name already exists, the names response is ambiguous, Convex refuses the batch, or the final names readback is incomplete, the helper closes with a generic error. A failure after the batch may have left a complete or partial provider write. Do not retry or overwrite. Inspect names only, then replace the still-unused deployment if the result is uncertain.
+
+## Read hosted preflight status
+
+Before a controlled live-acceptance run, an operator can read one bounded,
+non-atomic preflight observation for the exact default production deployment:
+
+```sh
+bun run hosted:status -- \
+  --source-commit <exact-40-char-lowercase-commit> \
+  --deployment <CURRENT_DEFAULT_DEPLOYMENT_NAME> \
+  --team-id <CURRENT_TEAM_ID> \
+  --project-id <CURRENT_PROJECT_ID> \
+  --deployment-id <CURRENT_DEFAULT_DEPLOYMENT_ID> \
+  --deployment-url <CURRENT_DEFAULT_DEPLOYMENT_URL>
+```
+
+The command requires a caller-supplied exact 40-character lowercase source
+commit and all five exact target fields, proves the default target immediately
+before and after every provider read, and emits one JSON line. It does not
+prove that the caller's checkout is clean or that the supplied commit is the
+intended release. Every valid observation exits zero. Add `--require-passed`
+when an agent needs a shell gate: it still emits the record but exits one
+unless the status is `preflight_passed`.
+Malformed, unavailable, or ambiguous provider reads exit one; unresolved local
+custody exits 75.
+
+The record exposes only the release-attestation binding state, whether all six
+HRA-managed environment *names* are present and which of those static names
+are missing, a capped count of occupied bootstrap tables plus a closed
+bootstrap classification, and the safe admission generation/state. It never
+emits environment values, unrelated environment names, invitation material,
+quota totals, user counts, or database rows. `CONVEX_SITE_URL` is
+Convex-owned runtime configuration, not an HRA-managed protected value, so it
+is intentionally neither required nor reported by this command.
+
+`preflight_passed` means the bound release attestation names the supplied
+source commit, the six managed names are present, and the deployment presents
+the exact first-bootstrap authority frame with open generation-zero admission.
+The JSON `releaseAttestation.state` is `current`, `other`, or `unbound`; HRA
+does not print the deployed commit. Its closed `nextAction` is guidance only,
+not authorization for a mutation. This does not validate environment values or
+sender verification, acquire a provider lock, send an OTP, or prove a live
+encrypted-sync path. The reads are sequential and do not acquire a provider
+lock or snapshot, so treat the result only as a bounded non-atomic prerequisite
+for the controlled live-acceptance scenario.
+
+This is provider-read-only, not filesystem-pure: its contained Convex CLI
+reads use the Linux authority backend and startup may reconcile the local
+process-recovery journal. It must not be run on macOS or another platform
+without that backend, and it must not be used as an authorization shortcut for
+configure, bootstrap, DNS, or alias changes.
 
 ## Establish hosted authority and issue the first invite
 

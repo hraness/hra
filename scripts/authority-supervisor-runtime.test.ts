@@ -475,7 +475,11 @@ test("authority supervisor holds a target behind GO", async () => {
     child.stdin.end();
     const clean = await control.nextLine();
     expect(clean).toBe(`HRA_AUTHORITY_SUPERVISOR/1 CLEAN nonce=${nonce} exit=0`);
-    await expect(requireChildClose(closed)).resolves.toEqual({ code: 0, signal: null });
+    // This observation starts before READY, so it includes CI scheduling around
+    // namespace setup as well as the post-GO shutdown. Keep it bounded by the
+    // enclosing 20-second test timeout without making a normal Linux runner
+    // race an arbitrary eight-second deadline.
+    await expect(requireChildClose(closed, 15_000)).resolves.toEqual({ code: 0, signal: null });
     const targetPidNamespace = await readFile(marker, "utf8");
     expect(targetPidNamespace).toBe(`pid:[${namespaceMatch?.[1] ?? "missing"}]`);
     expect(targetPidNamespace).not.toBe(parentPidNamespace);
