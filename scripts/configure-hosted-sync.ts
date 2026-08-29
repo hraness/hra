@@ -6,6 +6,11 @@ import { isatty } from "node:tty";
 import { z } from "zod";
 
 import {
+  isHraOtpReplyTo,
+  hraOtpReplyToEnvironmentName,
+} from "../convex/otpEmailConfig";
+
+import {
   type BoundedProcessContainment,
   isBoundedProcessCleanupUnprovenError,
   isBoundedProcessRecoveryJournalError,
@@ -33,7 +38,7 @@ export const HOSTED_ENVIRONMENT_NAMES = [
   "JWKS",
   "HRA_AUTH_HMAC_SECRET",
   "HRA_RESEND_API_KEY",
-  "HRA_AUTH_EMAIL_FROM",
+  hraOtpReplyToEnvironmentName,
 ] as const;
 
 export const HRA_SITE_URL = "https://hra.sh" as const;
@@ -54,10 +59,8 @@ const hasControlCharacter = (value: string): boolean => {
 };
 
 const hostedInputSchema = z.object({
-  authEmailFrom: z.string()
-    .min(3)
-    .max(320)
-    .refine((value) => !hasControlCharacter(value) && !value.includes("'")),
+  authEmailReplyTo: z.string()
+    .refine(isHraOtpReplyTo),
   resendApiKey: z.string()
     .min(8)
     .max(512)
@@ -228,7 +231,7 @@ export function serializeHostedEnvironment(
   const hmac = generated.hmacSecret;
   const resend = input.resendApiKey;
   const values: Record<(typeof HOSTED_ENVIRONMENT_NAMES)[number], string> = {
-    HRA_AUTH_EMAIL_FROM: input.authEmailFrom,
+    HRA_AUTH_EMAIL_REPLY_TO: input.authEmailReplyTo,
     HRA_AUTH_HMAC_SECRET: hmac,
     HRA_RESEND_API_KEY: resend,
     JWKS: generated.jwks,

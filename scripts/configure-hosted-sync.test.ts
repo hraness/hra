@@ -58,7 +58,7 @@ const pemMarker = (verb: "BEGIN" | "END"): string =>
   [`-----${verb}`, "PRIVATE", "KEY-----"].join(" ");
 
 const validInput = {
-  authEmailFrom: "HRA Auth <auth@hra.sh>",
+  authEmailReplyTo: "ben@substrate.run",
   resendApiKey: ["re", "hostile", "resend", "sentinel", "7d48f4"].join("_"),
   siteUrl: HRA_SITE_URL,
 } as const;
@@ -178,7 +178,7 @@ describe("fresh hosted configuration", () => {
     const hmac = generatedSentinels.hmacSecret;
     const resend = validInput.resendApiKey;
     expect(Object.fromEntries(configured)).toEqual({
-      HRA_AUTH_EMAIL_FROM: validInput.authEmailFrom,
+      HRA_AUTH_EMAIL_REPLY_TO: validInput.authEmailReplyTo,
       HRA_AUTH_HMAC_SECRET: hmac,
       HRA_RESEND_API_KEY: resend,
       JWKS: generatedSentinels.jwks,
@@ -402,6 +402,10 @@ describe("fresh hosted configuration", () => {
       .toThrow("input_invalid");
     expect(() => parseHostedInput(JSON.stringify({ ...validInput, resendApiKey: "not-a-key" })))
       .toThrow("input_invalid");
+    expect(() => parseHostedInput(JSON.stringify({
+      ...validInput,
+      authEmailReplyTo: "HRA <hra@auth.hraness.com>",
+    }))).toThrow("input_invalid");
   });
 
   test("serializes deterministic dotenv input and sanitizes inherited secret variables", () => {
