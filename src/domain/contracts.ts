@@ -11,6 +11,16 @@ import {
 } from "./session-events";
 import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "./usage-metrics";
 import {
+  WORK_EVENT_PAGE_LIMIT,
+  WORK_TASK_HISTORY_ITEM_LIMIT,
+  WORK_WAIT_MAX_MS,
+  workEventCursorWireSchema,
+  workIdSchema,
+  workOperationSchema,
+  workTaskIdSchema,
+} from "./work";
+import { workProtocolQuerySchema } from "./work-protocol";
+import {
   labelSchema,
   messageSchema,
   noteSchema,
@@ -19,6 +29,7 @@ import {
   sessionIdSchema,
   titleSchema,
   unixMillisecondsSchema,
+  utf8Bytes,
 } from "./values";
 
 const selectorSchema = z.string().trim().min(1).max(200);
@@ -34,6 +45,7 @@ const projectPathSchema = z.string().min(1).max(4096).refine(
 );
 export const LOCAL_DAEMON_PROTOCOL = "hra-control-plane-local-v2" as const;
 export const LOCAL_COMMAND_REQUEST_VERSION = 2 as const;
+export const LOCAL_COMMAND_REQUEST_MAX_BYTES = 4 * 1024 * 1024;
 
 const daemonStopAuthoritySchema = z.object({
   protocol: z.literal(LOCAL_DAEMON_PROTOCOL),
@@ -245,6 +257,43 @@ export const localCommandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("sync.status") }).strict(),
   z.object({ kind: z.literal("sync.now") }).strict(),
   z.object({ kind: z.literal("sync.projection-recover"), session: selectorSchema, idempotencyKey: requiredIdempotencyKeySchema, acknowledgeGap: z.literal(true) }).strict(),
+  z.object({ kind: z.literal("work.protocol"), query: workProtocolQuerySchema }).strict(),
+  z.object({
+    kind: z.literal("work.apply"),
+    requestId: z.string().uuid(),
+    operation: workOperationSchema,
+  }).strict(),
+  z.object({ kind: z.literal("work.snapshot"), work: workIdSchema, actor: sessionIdSchema.optional() }).strict(),
+  z.object({
+    kind: z.literal("work.task"),
+    task: workTaskIdSchema,
+    historyLimit: z.number().int().min(1).max(WORK_TASK_HISTORY_ITEM_LIMIT).optional(),
+    historyCursor: workEventCursorWireSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal("work.poll"),
+    work: workIdSchema,
+    actor: sessionIdSchema.optional(),
+    cursor: workEventCursorWireSchema.optional(),
+    actionCursor: workEventCursorWireSchema.optional(),
+    limit: z.number().int().min(1).max(50),
+    waitMs: z.number().int().min(0).max(WORK_WAIT_MAX_MS),
+  }).strict().superRefine((value, context) => {
+    if (value.actionCursor !== undefined && value.waitMs !== 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["waitMs"],
+        message: "A continued work action page cannot long-poll; waitMs must be zero.",
+      });
+    }
+  }),
+  z.object({
+    kind: z.literal("work.events"),
+    work: workIdSchema,
+    cursor: workEventCursorWireSchema.optional(),
+    limit: z.number().int().min(1).max(WORK_EVENT_PAGE_LIMIT),
+    waitMs: z.number().int().min(0).max(WORK_WAIT_MAX_MS),
+  }).strict(),
 ]);
 
 export type LocalCommand = z.infer<typeof localCommandSchema>;
@@ -256,7 +305,15 @@ export const commandEnvelopeSchema = z
     requestId: z.string().uuid(),
     command: localCommandSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((request, context) => {
+    if (utf8Bytes(JSON.stringify(request)) > LOCAL_COMMAND_REQUEST_MAX_BYTES) {
+      context.addIssue({
+        code: "custom",
+        message: "The local command envelope exceeds its serialized UTF-8 byte bound.",
+      });
+    }
+  });
 
 // This validates only the transport envelope. Successful data stays unknown
 // until the caller validates it against the command that produced it.

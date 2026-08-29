@@ -4,6 +4,7 @@ import { z } from "zod";
 import { InvalidCommandResponseError, renderFailure, renderProtectedInteractionDetail, renderRootStatus, renderSuccess, safeDiagnostic, type Output } from "./render";
 import type { ProtectedInteractionDetailDocument, PublicInteraction } from "../domain/interactions";
 import type { SessionEventPage } from "../domain/session-events";
+import { WORK_STREAM_FAILURE_MAX_BYTES } from "../domain/work";
 import { projectPublicProviderIdentifier } from "../public-provider-identifier";
 
 const publicProviderId = (value: string) =>
@@ -2015,6 +2016,24 @@ describe("CLI rendering", () => {
     expect(payload.error).toEqual({
       code: "INTERNAL",
       message: "HRA could not complete the request safely.",
+    });
+
+    const oversized = capture();
+    renderFailure({
+      code: "UNAVAILABLE",
+      message: "Provider unavailable.",
+      details: Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+        `detail-${String(index)}`,
+        "\u0080".repeat(1_024),
+      ])),
+    }, true, oversized.output);
+    expect(oversized.stdout).toHaveLength(1);
+    expect(Buffer.byteLength(oversized.stdout[0] ?? "", "utf8"))
+      .toBeLessThanOrEqual(WORK_STREAM_FAILURE_MAX_BYTES);
+    expect(JSON.parse(oversized.stdout[0] ?? "")).toEqual({
+      ok: false,
+      version: 1,
+      error: { code: "UNAVAILABLE", message: "Provider unavailable." },
     });
   });
 

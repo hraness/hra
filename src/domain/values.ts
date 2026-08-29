@@ -20,7 +20,8 @@ export const titleSchema = boundedText("Title", 320);
 export const noteSchema = z.string().refine((value) => utf8Bytes(value) <= 16_384, {
   message: "Note must be at most 16384 UTF-8 bytes.",
 });
-export const messageSchema = boundedText("Message", 262_144);
+export const MESSAGE_MAX_BYTES = 262_144;
+export const messageSchema = boundedText("Message", MESSAGE_MAX_BYTES);
 
 export const profileIdSchema = z.string().regex(/^acct_[0-9a-f]{32}$/u);
 export const projectIdSchema = z.string().regex(/^proj_[0-9a-f]{32}$/u);

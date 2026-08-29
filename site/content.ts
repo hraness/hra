@@ -503,6 +503,107 @@ export const publicContent: PublicContent = {
       ],
     },
     {
+      id: "agent-work-protocol",
+      heading: "Agent work protocol",
+      blocks: [
+        {
+          kind: "notice",
+          label: "Release status",
+          content: [
+            text("This section documents the frozen source contract for the planned beta. No published "),
+            code("v0.1.0"),
+            text(" tag currently exposes these commands."),
+          ],
+        },
+        paragraph(
+          text("The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing Codex sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex app-server still owns model execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine."),
+        ),
+        {
+          kind: "commands",
+          commands: [
+            "hra work protocol [--operation <kind>|--type <name>|--topic <topic>]",
+            "hra work apply --input-stdin",
+            "hra work snapshot <work> [--actor <session>]",
+            "hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]",
+            "hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1-50>] [--wait-ms <0-30000>]",
+            "hra work events <work> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>]",
+            "hra work watch <work> [--cursor <cursor>]",
+          ],
+        },
+        paragraph(
+          text("The seven commands are agent-only. Non-streaming commands emit compact JSON without requiring "),
+          code("--json"),
+          text(". "),
+          code("work watch"),
+          text(" emits resumable JSON Lines. "),
+          code("work apply"),
+          text(" is the only mutation entry point. It reads one strict "),
+          code("{protocol,version,requestId,operation}"),
+          text(" request from nonterminal standard input or an explicit file descriptor. The nested operation carries its UUIDv7 "),
+          code("idempotencyKey"),
+          text("; success and failure echo the request ID, and work capabilities are never accepted as argv fields. Same-key replay preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. "),
+          code("work protocol"),
+          text(" is queryable by operation, type, or topic. It returns exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures."),
+        ),
+        paragraph(
+          text("Each task carries an exact account ID, project ID, preset, and Fast setting. HRA never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel."),
+        ),
+        paragraph(
+          text("Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and HRA-owned completion gates must accept the exact submission revision."),
+        ),
+        paragraph(
+          text("Dispatch binds one already-existing exact actor session and always starts a new turn. HRA's task graph is the durable task queue; queue and steer are reserved for coordination signals. HRA commits the claim, monotonic fence, route, session binding, request digest, and prepared effect before the provider call. If the provider effect may have started but cannot be proved, the attempt becomes recovery-required. HRA does not redispatch, steal, or reroute it speculatively."),
+        ),
+        paragraph(
+          text("Coordinator, member, and exact-attempt capabilities scope every mutation and never appear in snapshots, polls, or events. Poll action arrays have a separate signed, actor-bound continuation with a frozen projection time; a changed work stream invalidates it instead of returning stale authority."),
+        ),
+        paragraph(
+          text("Signal delivery and recipient acknowledgement are separate facts. "),
+          code("deliveryState"),
+          text(" reports pending, accepted, failed, or unknown provider delivery. "),
+          code("acknowledgedAt"),
+          text(" records the recipient acknowledgement independently, including when delivery remains pending or unknown."),
+        ),
+        paragraph(
+          text("Snapshots expose bounded recent work-level signals and an omitted count. With no history option, "),
+          code("work task"),
+          text(" returns task detail with active and latest attempt lineage, the latest full attempt report, the latest submission and its ordered reviews, and bounded recent task signals. Either "),
+          code("--history-limit"),
+          text(" or "),
+          code("--history-cursor"),
+          text(" selects a separate task-history page over the task's attempts, reports, submissions, reviews, and task signals; a cursor-only continuation defaults to 20 items. Each complete compact JSON response for snapshot, task detail, and task history, including its envelope and terminating newline, is capped at 512 KiB. Only recent or historical arrays are trimmed, and omitted or remaining counts and continuations make every reduction explicit."),
+        ),
+        paragraph(
+          text("A signed task-history continuation freezes the work stream sequence and epoch, task membership high-water ordinal, task revision, projection time, and next offset. Append-only bounded public projection versions reconstruct every returned record as of that cut. Later mutations and later history memberships are excluded from every continued page, so pagination is coherent even while agents keep working."),
+        ),
+        paragraph(
+          text("Each JSONL gap, event, or checkpoint frame, including its terminating newline and terminal-safe escaping, is capped at 512 KiB. A terminal stream failure is one compact JSON document on stderr capped at 64 KiB. The queryable protocol advertises both wire limits."),
+        ),
+        paragraph(
+          text("Accepted submissions, reviews, evidence references, receipts, and completed tasks are durable prefixes. Later failure or cancellation preserves them. No SQLite writer transaction spans Codex reasoning, provider I/O, artifact hashing, or Git inspection. This applies the durable-prefix lesson in "),
+          link("Agent Swarms are a Distributed Systems Problem", "https://www.trychroma.com/engineering/transactions"),
+          text(" without adopting generic page locking, wound-wait, or speculative replay."),
+        ),
+        paragraph(
+          code("task.claimNext"),
+          text(" records an exact idempotent empty result when no task is ready without appending an event or advancing the work revision. "),
+          code("work.release"),
+          text(" is the other stream-neutral mutation. It requires terminal work, the exact coordinator capability and revision, and "),
+          code("acknowledgeDataLoss: true"),
+          text(". Only an unresolved attempt dispatch blocks release. An ambiguous signal delivery may be discarded under that acknowledgement and is counted in the tombstone."),
+        ),
+        paragraph(
+          text("A successful release atomically deletes the work graph and durable history, including the task-history membership index and projection versions, then retains a separately bounded tombstone with the final stream head, terminal and release request digests, discarded-record counts for both history tables and the rest of the graph, and a digest of that release boundary. While the tombstone remains, only the same release idempotency key and canonical request digest have an exact replay result. Replay guarantees for every earlier operation have ended. Tombstones have count, byte, and maximum-age bounds, so their retention timestamp is an upper bound rather than a promise."),
+        ),
+        paragraph(
+          text("This release is an explicit logical destructive purge, not a forensic-erasure promise. SQLite secure deletion is defense in depth, but the command does not promise immediate physical sanitization of prior database pages, WAL frames, backups, snapshots, or storage media."),
+        ),
+        paragraph(
+          text("Local SQLite is the only execution authority for work admission, claims, fences, dispatch receipts, submissions, reviews, signals, and the work-scoped event cursor. The initial work protocol has no cloud execution or cross-device takeover path. Turso is deferred behind a repository boundary and cannot be added as a second authority beside SQLite or encrypted Convex projections."),
+        ),
+      ],
+    },
+    {
       id: "cloud-sign-in-and-device-pairing",
       heading: "Cloud sign-in and device pairing",
       blocks: [
@@ -623,6 +724,9 @@ export const publicContent: PublicContent = {
           ],
           [
             text("Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only."),
+          ],
+          [
+            text("Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions."),
           ],
           [
             text("Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease."),
@@ -922,6 +1026,13 @@ export const publicContent: PublicContent = {
             "hra session preset <session> <low|high|ultra>",
             "hra session fast <session> <on|off>",
             "hra session project <session> <project>",
+            "hra work protocol [--operation <kind>|--type <name>|--topic <topic>]",
+            "hra work apply --input-stdin|--input-fd <fd>",
+            "hra work snapshot <work> [--actor <session>]",
+            "hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]",
+            "hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1-50>] [--wait-ms <0-30000>]",
+            "hra work events <work> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--json|--jsonl|--follow]",
+            "hra work watch <work> [--cursor <cursor>]",
             "hra interaction list [session] [--pending] [--limit <1-100>] [--cursor <cursor>]",
             "hra interaction show <interaction-id>",
             "hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]",
@@ -987,10 +1098,10 @@ export const publicContent: PublicContent = {
       heading: "Authority boundaries",
       blocks: [
         paragraph(
-          text("Codex app-server remains authoritative for provider login, transcripts, turns, tools, approvals, models, plugins, and usage. HRA owns isolated profiles, durable commands, process generations, local projections, optional encrypted sync, and recovery records."),
+          text("Codex app-server remains authoritative for provider login, transcripts, turns, tools, approvals, models, plugins, and usage. HRA owns isolated profiles, durable commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than Codex app-server."),
         ),
         paragraph(
-          text("Cloud service availability is not required for local login, local execution, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account."),
+          text("Cloud service availability is not required for local login, local execution, local work coordination, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account. SQLite remains the local work execution authority; Turso is deferred and non-authoritative."),
         ),
       ],
     },

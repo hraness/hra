@@ -160,6 +160,110 @@ const requireSuccess = (label: string, result: ProcessResult): ProcessResult => 
   return result;
 };
 
+export const requireGitHistoryOutput = (label: string, result: ProcessResult): string => {
+  if (result.exitCode !== 0 || result.stderr !== "") {
+    throw new Error(`${label} failed or emitted diagnostics with exit ${String(result.exitCode)}.`);
+  }
+  return result.stdout;
+};
+
+const gitHistoryCommitMaximum = 100_000;
+const gitCommitPattern = /^[0-9a-f]{40}$/u;
+
+export const parseGitHistoryCommitList = (value: string): readonly string[] => {
+  const commits = value.endsWith("\n")
+    ? value.slice(0, -1).split("\n")
+    : value.split("\n");
+  if (
+    commits.length < 1
+    || commits.length > gitHistoryCommitMaximum
+    || commits.some((commit) => !gitCommitPattern.test(commit))
+    || new Set(commits).size !== commits.length
+  ) {
+    throw new Error("Git history enumeration was empty, malformed, duplicate, or over its commit bound.");
+  }
+  return Object.freeze(commits);
+};
+
+export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {
+  const shallow = requireGitHistoryOutput(
+    "Git history shallow-repository check",
+    await run(
+      "/usr/bin/git",
+      ["--no-replace-objects", "rev-parse", "--is-shallow-repository"],
+      { cwd: repositoryRoot },
+    ),
+  );
+  if (shallow !== "false\n") {
+    throw new Error("Git history scan requires one exact non-shallow repository.");
+  }
+  const enumerate = async (): Promise<readonly string[]> => parseGitHistoryCommitList(
+    requireGitHistoryOutput(
+      "Git history enumeration",
+      await run(
+        "/usr/bin/git",
+        ["--no-replace-objects", "rev-list", "--max-count=100001", "--all"],
+        { cwd: repositoryRoot },
+      ),
+    ),
+  );
+  const commits = await enumerate();
+
+  for (const commit of commits) {
+    const completePatch = requireGitHistoryOutput(
+      `Git history sensitive-text commit ${commit}`,
+      await run(
+        "/usr/bin/git",
+        [
+          "--no-replace-objects",
+          "show",
+          "--format=",
+          "--patch",
+          "--root",
+          "--diff-merges=first-parent",
+          "--no-ext-diff",
+          "--no-textconv",
+          commit,
+        ],
+        { cwd: repositoryRoot },
+      ),
+    );
+    assertPublicSensitiveText(completePatch, `Git history commit ${commit}`);
+
+    const authoredPatch = requireGitHistoryOutput(
+      `Git history public-text commit ${commit}`,
+      await run(
+        "/usr/bin/git",
+        [
+          "--no-replace-objects",
+          "show",
+          "--format=",
+          "--patch",
+          "--root",
+          "--diff-merges=first-parent",
+          "--no-ext-diff",
+          "--no-textconv",
+          commit,
+          "--",
+          ".",
+          ":(exclude)bun.lock",
+        ],
+        { cwd: repositoryRoot },
+      ),
+    );
+    assertPublicText(authoredPatch, `Git history commit ${commit}`);
+  }
+
+  const finalCommits = await enumerate();
+  const initialCommitSet = new Set(commits);
+  if (
+    finalCommits.length !== commits.length
+    || finalCommits.some((commit) => !initialCommitSet.has(commit))
+  ) {
+    throw new Error("Git refs changed while complete history was being scanned.");
+  }
+};
+
 const assertSessionObservationHelp = (label: string, result: ProcessResult): void => {
   requireSuccess(label, result);
   if (result.stderr !== "") throw new Error(`${label} wrote diagnostics.`);
@@ -369,30 +473,7 @@ if (!packageJson.files.includes("!src/storage/legacy-secret-migration.ts")) {
 await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"), constants.R_OK);
 
 await assertPublicTree(repositoryRoot);
-const completeHistory = requireSuccess(
-  "Git history sensitive-text check",
-  await run("/usr/bin/git", ["log", "--all", "--format=", "--patch", "--no-ext-diff", "--no-textconv"], { cwd: repositoryRoot }),
-);
-assertPublicSensitiveText(completeHistory.stdout, "Git history");
-const authoredHistory = requireSuccess(
-  "Git history public-text check",
-  await run(
-    "/usr/bin/git",
-    [
-      "log",
-      "--all",
-      "--format=",
-      "--patch",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--",
-      ".",
-      ":(exclude)bun.lock",
-    ],
-    { cwd: repositoryRoot },
-  ),
-);
-assertPublicText(authoredHistory.stdout, "Git history");
+await assertCompleteGitHistoryPublic(repositoryRoot);
 
 const generated = requireSuccess(
   "generated public tree check",

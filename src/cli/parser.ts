@@ -7,6 +7,11 @@ import { ACCOUNT_USAGE_HISTORY_PAGE_LIMIT } from "../domain/usage-metrics";
 import { isUuidV7 } from "../cloud/contracts";
 import { parseAuthCredentials } from "../cloud/authCredentials";
 import { createCloudUuidV7 } from "../cloud/local-control";
+import {
+  WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+  WORK_TASK_HISTORY_ITEM_LIMIT,
+} from "../domain/work";
+import { workProtocolQuerySchema } from "../domain/work-protocol";
 
 type InteractionRequiredInvocation = Readonly<{
   error: Readonly<{
@@ -70,6 +75,18 @@ export type SessionEventWatchCliInvocation = Readonly<{
   kind: "session.events.watch";
 }>;
 
+export type WorkApplyCliInvocation = Readonly<{
+  input: ProtectedInputSource;
+  json: true;
+  kind: "work.apply-input";
+}>;
+
+export type WorkEventFollowCliInvocation = Readonly<{
+  command: Extract<LocalCommand, { kind: "work.events" }>;
+  jsonl: true;
+  kind: "work.events.follow";
+}>;
+
 export type AccountLoginCliInvocation = Readonly<{
   command: Extract<LocalCommand, { kind: "account.login" }> & Readonly<{
     idempotencyKey: string;
@@ -96,6 +113,8 @@ export type CliInvocation =
   | AccountLoginCliInvocation
   | SessionEventFollowCliInvocation
   | SessionEventWatchCliInvocation
+  | WorkApplyCliInvocation
+  | WorkEventFollowCliInvocation
   | InteractionRequiredInvocation
   | ProjectionRecoveryCliInvocation
   | { kind: "command"; command: LocalCommand; json: boolean };
@@ -133,6 +152,7 @@ Usage:
   hra session watch <session> [--cursor <cursor>] [--jsonl]
   hra session interactions <session> [--pending] [--limit <1..100>] [--cursor <cursor>]
   hra session rename|recover|abandon|note|preset|fast|project
+  hra work protocol|apply|snapshot|task|poll|events|watch
   hra interaction list|show|inspect|decide|grant|answer|submit
   hra remote list|show|command|send|queue|steer|stop|preset|fast
   hra turn inspect
@@ -146,7 +166,7 @@ Usage:
 Output:
   --json                    Emit one versioned JSON result for supported commands.
   --jsonl                   Watch session events as versioned JSON Lines.
-  --follow                  Compatibility spelling for session events JSON Lines.
+  --follow                  Follow session or work events as JSON Lines.
 
 Interactive:
   Run bare \`hra\` in a TTY to start the persistent agent-and-human shell.
@@ -262,6 +282,24 @@ Examples:
   hra session watch my-session --jsonl
   hra session events my-session --wait-ms 30000 --jsonl
   hra session send my-session -- "run --help exactly"`,
+  work: `HRA work
+
+Usage:
+  hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
+  hra work apply --input-stdin|--input-fd <fd>
+  hra work snapshot <work> [--actor <session>]
+  hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
+  hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
+  hra work events <work> [--cursor <cursor>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+  hra work watch <work> [--cursor <cursor>]
+
+Work commands are agent-only and always emit compact JSON. Mutation documents are strict, bounded, and carry their own idempotency key. Watch emits JSON Lines.
+
+Examples:
+  hra work protocol
+  hra work apply --input-stdin < request.json
+  hra work poll work_0123456789abcdef0123456789abcdef --wait-ms 30000
+  hra work watch work_0123456789abcdef0123456789abcdef`,
   interaction: `HRA interaction
 
 Usage:
@@ -345,16 +383,49 @@ export function usageForGroup(group: string | undefined): string {
   return selected ?? usage;
 }
 
+const outputModeCommandArguments = (argv: readonly string[]): readonly string[] => {
+  const delimiter = argv.indexOf("--");
+  const regular = delimiter < 0 ? argv : argv.slice(0, delimiter);
+  const commandArguments: string[] = [];
+  for (let index = 0; index < regular.length; index += 1) {
+    const value = regular[index];
+    if (value === undefined) continue;
+    if (value === "--idempotency-key") {
+      index += 1;
+      continue;
+    }
+    if (
+      value === "--json"
+      || value === "--jsonl"
+      || value === "--help"
+      || value === "-h"
+      || value === "--version"
+      || value === "-v"
+    ) continue;
+    commandArguments.push(value);
+  }
+  return commandArguments;
+};
+
 export function requestsJsonOutput(argv: readonly string[]): boolean {
   const delimiter = argv.indexOf("--");
   const options = delimiter < 0 ? argv : argv.slice(0, delimiter);
-  return options.includes("--json");
+  const command = outputModeCommandArguments(argv)[0];
+  return options.includes("--json") || command === "work";
 }
 
 export function requestsJsonlOutput(argv: readonly string[]): boolean {
   const delimiter = argv.indexOf("--");
   const options = delimiter < 0 ? argv : argv.slice(0, delimiter);
-  return options.includes("--jsonl") || options.includes("--follow");
+  const commandArguments = outputModeCommandArguments(argv);
+  return options.includes("--jsonl")
+    || options.includes("--follow")
+    || (commandArguments[0] === "work" && commandArguments[1] === "watch");
+}
+
+export function requestsWorkApplyProtocol(argv: readonly string[]): boolean {
+  const commandArguments = outputModeCommandArguments(argv);
+  return commandArguments[0] === "work" && commandArguments[1] === "apply";
 }
 
 type Cursor = { values: string[] };
@@ -808,6 +879,137 @@ const parseSession = (
   }
 };
 
+const parseWork = (
+  cursor: Cursor,
+  jsonl: boolean,
+): LocalCommand | WorkApplyCliInvocation | WorkEventFollowCliInvocation => {
+  const action = take(cursor, "work action");
+  switch (action) {
+    case "protocol":
+      if (jsonl) throw new CliUsageError("work protocol emits one JSON document, not JSON Lines.");
+      {
+        const operation = option(cursor, "--operation");
+        const typeName = option(cursor, "--type");
+        const topic = option(cursor, "--topic");
+        const selectors = [operation, typeName, topic].filter((value) => value !== undefined);
+        if (selectors.length > 1) {
+          throw new CliUsageError("Use at most one work protocol selector: --operation, --type, or --topic.");
+        }
+        const query = operation !== undefined
+          ? { kind: "operation" as const, operation }
+          : typeName !== undefined
+            ? { kind: "type" as const, name: typeName }
+            : topic !== undefined
+              ? { kind: "topic" as const, topic }
+              : { kind: "index" as const };
+        const parsedQuery = workProtocolQuerySchema.safeParse(query);
+        if (!parsedQuery.success) {
+          throw new CliUsageError(parsedQuery.error.issues[0]?.message ?? "Invalid work protocol selector.");
+        }
+        finish(cursor);
+        return { kind: "work.protocol", query: parsedQuery.data };
+      }
+    case "apply": {
+      if (jsonl) throw new CliUsageError("work apply emits one JSON document, not JSON Lines.");
+      const input = protectedInput(cursor, true);
+      finish(cursor);
+      if (input === undefined) throw new CliUsageError("Work apply requires --input-stdin or --input-fd.");
+      return { input, json: true, kind: "work.apply-input" };
+    }
+    case "snapshot": {
+      if (jsonl) throw new CliUsageError("work snapshot emits one JSON document, not JSON Lines.");
+      const actor = option(cursor, "--actor");
+      const work = take(cursor, "work");
+      finish(cursor);
+      return command({ kind: "work.snapshot", work, actor });
+    }
+    case "task": {
+      if (jsonl) throw new CliUsageError("work task emits one JSON document, not JSON Lines.");
+      const rawHistoryLimit = option(cursor, "--history-limit");
+      const historyCursor = option(cursor, "--history-cursor");
+      const task = take(cursor, "task");
+      finish(cursor);
+      if (rawHistoryLimit === undefined && historyCursor === undefined) {
+        return command({ kind: "work.task", task });
+      }
+      const historyLimit = boundedDecimal(
+        rawHistoryLimit,
+        "work task history limit",
+        1,
+        WORK_TASK_HISTORY_ITEM_LIMIT,
+        WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+      );
+      return command({
+        kind: "work.task",
+        task,
+        historyLimit,
+        ...(historyCursor === undefined ? {} : { historyCursor }),
+      });
+    }
+    case "poll": {
+      if (jsonl) throw new CliUsageError("work poll emits one JSON document, not JSON Lines.");
+      const actor = option(cursor, "--actor");
+      const pollCursor = option(cursor, "--cursor");
+      const actionCursor = option(cursor, "--action-cursor");
+      const limit = boundedDecimal(option(cursor, "--limit"), "work poll limit", 1, 50, 20);
+      const waitMs = boundedDecimal(option(cursor, "--wait-ms"), "work poll wait", 0, 30_000, 0);
+      if (actionCursor !== undefined && waitMs !== 0) {
+        throw new CliUsageError("A continued work action page requires --wait-ms 0.");
+      }
+      const work = take(cursor, "work");
+      finish(cursor);
+      return command({
+        kind: "work.poll",
+        work,
+        actor,
+        cursor: pollCursor,
+        actionCursor,
+        limit,
+        waitMs,
+      });
+    }
+    case "events":
+    case "watch": {
+      if (
+        action === "watch"
+        && ["--limit", "--wait-ms", "--follow"].some((optionName) =>
+          cursor.values.includes(optionName))
+      ) {
+        throw new CliUsageError("work watch supports only <work>, --cursor, and --jsonl.");
+      }
+      const eventCursor = option(cursor, "--cursor");
+      const followFlag = flag(cursor, "--follow");
+      const follow = action === "watch" || jsonl || followFlag;
+      const limit = boundedDecimal(option(cursor, "--limit"), "work event limit", 1, 200, 200);
+      const waitMs = boundedDecimal(
+        option(cursor, "--wait-ms"),
+        "work event wait",
+        0,
+        30_000,
+        follow ? 30_000 : 0,
+      );
+      if (follow && waitMs === 0) {
+        throw new CliUsageError("Following work events requires --wait-ms from 1 to 30000.");
+      }
+      const work = take(cursor, "work");
+      finish(cursor);
+      const parsed = command({
+        kind: "work.events",
+        work,
+        cursor: eventCursor,
+        limit,
+        waitMs,
+      });
+      if (parsed.kind !== "work.events") throw new CliUsageError("Work event command is invalid.");
+      return follow
+        ? { command: parsed, jsonl: true, kind: "work.events.follow" }
+        : parsed;
+    }
+    default:
+      throw new CliUsageError("Unknown work action. Run `hra work --help` for supported actions.");
+  }
+};
+
 type ParsedInteraction =
   | Readonly<{ command: LocalCommand; kind: "command" }>
   | ProtectedInteractionCliInvocation
@@ -1029,8 +1231,10 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
   if (flag(cursor, "--version") || flag(cursor, "-v")) { finish(cursor); return { kind: "version" }; }
   cursor.values.push(...literalTail);
   const group = take(cursor, "command");
-  if (jsonl && group !== "session") {
-    throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
+  if (jsonl && group !== "session" && group !== "work") {
+    throw new CliUsageError(
+      "--jsonl is supported only by `hra session events` and `hra session watch`, or by `hra work events` and `hra work watch`.",
+    );
   }
   if (group === "status") {
     finish(cursor);
@@ -1102,6 +1306,19 @@ export function parseCli(argv: readonly string[], cwd = process.cwd()): CliInvoc
       throw new CliUsageError("--jsonl is supported only by `hra session events` and `hra session watch`.");
     }
     parsed = sessionCommand;
+  }
+  else if (group === "work") {
+    if (idempotencyKey !== undefined) {
+      throw new CliUsageError("Work mutations carry one idempotencyKey inside the strict input document.");
+    }
+    const workCommand = parseWork(cursor, jsonl);
+    if (workCommand.kind === "work.apply-input" || workCommand.kind === "work.events.follow") {
+      if (json && workCommand.kind === "work.events.follow") {
+        throw new CliUsageError("Work event following is already JSON Lines and cannot be combined with --json.");
+      }
+      return workCommand;
+    }
+    return { kind: "command", command: workCommand, json: true };
   }
   else if (group === "turn") { const action = take(cursor, "turn action"); if (action !== "inspect") throw new CliUsageError("Unknown turn action. Run `hra turn --help` for supported actions."); const session = take(cursor, "session"); const turn = take(cursor, "turn"); finish(cursor); parsed = { kind: "turn.inspect", session, turn }; }
   else if (group === "interaction") {

@@ -102,6 +102,14 @@ import {
   type SessionId,
 } from "../domain/values";
 import { resolveUsableCanonicalProjectDirectory } from "./project-directory";
+import {
+  WORK_SCHEMA_SQL,
+  WorkStore,
+  assertWorkSchema,
+  type WorkCapabilityIssuer,
+  type WorkCapabilityVerifier,
+  type WorkCursorEncoder,
+} from "./work-store";
 import type { StatePaths } from "./paths";
 import type {
   DesktopSwitchGeneration,
@@ -213,6 +221,15 @@ export type ProfileRecord = {
   createdAt: number;
   updatedAt: number;
 };
+
+export type ProfileAuthorityChangeResult = Readonly<{
+  profile: ProfileRecord;
+  affectedWorkIds: readonly string[];
+}>;
+
+export type ProfileStateChangeResult = ProfileAuthorityChangeResult & Readonly<{
+  changed: boolean;
+}>;
 
 export type ProjectRecord = {
   id: ProjectId;
@@ -493,7 +510,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 25;
+const currentSchemaVersion = 26;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -2694,6 +2711,14 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 25;
     }
 
+    if (version < 26) {
+      database.exec(WORK_SCHEMA_SQL);
+      assertWorkSchema(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(26, now());
+      database.exec("PRAGMA user_version = 26");
+      version = 26;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -2720,6 +2745,8 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     rebuildSchemaVersion24(database);
     assertSchemaVersion24Objects(database);
     ensureSessionEventProjectionVersion(database);
+    database.exec(WORK_SCHEMA_SQL);
+    assertWorkSchema(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3077,6 +3104,7 @@ export class StateStore {
         if (hasPendingSecurityScrub(this.#database)) throw new Error("STATE_SECURITY_SCRUB_REQUIRED");
       }
       assertSchemaVersion24Objects(this.#database);
+      assertWorkSchema(this.#database);
       assertCanonicalLabelKeys(this.#database);
       assertStateDatabaseFile(paths.database, databaseFile);
     } catch (error) {
@@ -3087,6 +3115,24 @@ export class StateStore {
 
   close(): void {
     this.#database.close(false);
+  }
+
+  createWorkStore(
+    daemonGeneration: number,
+    encodeCursor: WorkCursorEncoder,
+    capabilities: Readonly<{
+      issue: WorkCapabilityIssuer;
+      verify: WorkCapabilityVerifier;
+    }>,
+  ): WorkStore {
+    return new WorkStore(this.#database, {
+      daemonGeneration,
+      encodeCursor,
+      issueCapability: capabilities.issue,
+      verifyCapability: capabilities.verify,
+      projectProviderIdentifier: (value) => this.#publicProviderIdentifierProjector(value),
+      now: this.#now,
+    });
   }
 
   configurePublicProviderIdentifierProjector(
@@ -3141,6 +3187,22 @@ export class StateStore {
   }
 
   advanceProfileGeneration(profileId: ProfileId, expectedGeneration: number): ProfileRecord {
+    return this.#advanceProfileGeneration(profileId, expectedGeneration).profile;
+  }
+
+  advanceProfileGenerationWithWorkRetirement(
+    profileId: ProfileId,
+    expectedGeneration: number,
+    workStore: WorkStore,
+  ): ProfileAuthorityChangeResult {
+    return this.#advanceProfileGeneration(profileId, expectedGeneration, workStore);
+  }
+
+  #advanceProfileGeneration(
+    profileId: ProfileId,
+    expectedGeneration: number,
+    workStore?: WorkStore,
+  ): ProfileAuthorityChangeResult {
     const now = this.#now();
     const advance = this.#database.transaction(() => {
       const current = mapProfile(this.#database.query("SELECT * FROM profiles WHERE id=? AND state!='removed'").get(profileId));
@@ -3172,18 +3234,66 @@ export class StateStore {
       const state = current.state === "login_pending" && activeLogin.length === 0
         ? "recovery_required"
         : current.state;
+      const affectedWorkIds = workStore?.prepareProfileAuthorityChange(
+        profileId,
+        expectedGeneration,
+      ) ?? [];
       const result = this.#database
         .query("UPDATE profiles SET process_generation = ?, state=?, updated_at = ? WHERE id = ? AND process_generation = ? AND state != 'removed'")
         .run(expectedGeneration + 1, state, now, profileId, expectedGeneration);
       if (result.changes !== 1) throw new Error("Profile generation authority changed.");
+      return [...affectedWorkIds];
     });
-    advance.immediate();
-    return this.requireProfile(profileId);
+    const affectedWorkIds = advance.immediate();
+    return { profile: this.requireProfile(profileId), affectedWorkIds };
   }
 
   setProfileState(profileId: ProfileId, expectedGeneration: number, state: z.infer<typeof profileStateSchema>, identity?: { email?: string; plan?: string }): boolean {
+    return this.#setProfileState(profileId, expectedGeneration, state, identity).changed;
+  }
+
+  setProfileStateWithWorkRetirement(
+    profileId: ProfileId,
+    expectedGeneration: number,
+    state: z.infer<typeof profileStateSchema>,
+    workStore: WorkStore,
+    identity?: { email?: string; plan?: string },
+  ): ProfileStateChangeResult {
+    const result = this.#setProfileState(
+      profileId,
+      expectedGeneration,
+      state,
+      identity,
+      workStore,
+    );
+    return {
+      ...result,
+      profile: this.requireProfileById(profileId, { includeRemoved: true }),
+    };
+  }
+
+  #setProfileState(
+    profileId: ProfileId,
+    expectedGeneration: number,
+    state: z.infer<typeof profileStateSchema>,
+    identity?: { email?: string; plan?: string },
+    workStore?: WorkStore,
+  ): Omit<ProfileStateChangeResult, "profile"> {
     const now = this.#now();
     const update = this.#database.transaction(() => {
+      const current = this.#database.query(
+        "SELECT process_generation,state FROM profiles WHERE id=? AND state!='removed'",
+      ).get(profileId) as { process_generation: number; state: z.infer<typeof profileStateSchema> } | null;
+      if (
+        current === null
+        || current.process_generation !== expectedGeneration
+        || (current.state === "recovery_required" && state !== "recovery_required")
+      ) {
+        return { affectedWorkIds: [] as string[], changed: false };
+      }
+      const affectedWorkIds = state === "signed_in"
+        ? []
+        : [...(workStore?.prepareProfileAuthorityChange(profileId, expectedGeneration) ?? [])];
       const result = this.#database.query(
         `UPDATE profiles
          SET state=?,provider_email=?,provider_plan=?,updated_at=?
@@ -3203,7 +3313,8 @@ export class StateStore {
           expectedGeneration,
         );
       }
-      return result.changes === 1;
+      if (result.changes !== 1) throw new Error("Profile state authority changed.");
+      return { affectedWorkIds, changed: true };
     });
     return update.immediate();
   }
@@ -4711,9 +4822,11 @@ export class StateStore {
       >>[];
       sessionId: SessionId;
     }>[];
+    workStore?: WorkStore;
   }): Readonly<{
     profile: ProfileRecord;
     retiredSessionIds: readonly SessionId[];
+    affectedWorkIds: readonly string[];
   }> {
     const parsedAttemptId = attemptIdSchema.parse(input.attemptId);
     const parsedProfileId = profileIdSchema.parse(input.profileId);
@@ -4777,6 +4890,7 @@ export class StateStore {
         || row.profile_state === "recovery_required"
       ) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       const retiredSessionIds = new Set<SessionId>();
+      let affectedWorkIds: readonly string[] = [];
       if (evidence.kind === "account.login") {
         for (const retirement of providerRetirements) {
           const session = z.object({
@@ -4840,6 +4954,10 @@ export class StateStore {
           });
           retiredSessionIds.add(retirement.sessionId);
         }
+        affectedWorkIds = input.workStore?.prepareProfileAuthorityChange(
+          parsedProfileId,
+          expectedCurrentGeneration,
+        ) ?? [];
         const advanced = this.#database.query("UPDATE profiles SET process_generation=?,state='login_pending',provider_email=NULL,provider_plan=NULL,updated_at=? WHERE id=? AND process_generation=?").run(parsedGeneration, now, parsedProfileId, expectedCurrentGeneration);
         if (advanced.changes !== 1) throw new Error("MUTATION_EFFECT_AUTHORITY_CHANGED");
       }
@@ -4849,6 +4967,7 @@ export class StateStore {
       return {
         profile: this.requireProfile(parsedProfileId),
         retiredSessionIds: [...retiredSessionIds].sort(),
+        affectedWorkIds: [...affectedWorkIds].sort(),
       };
     });
     return begin.immediate();

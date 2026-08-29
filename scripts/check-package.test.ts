@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import type { DaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import type { DaemonIdentity } from "../src/daemon/daemon-startup";
 import {
+  assertCompleteGitHistoryPublic,
+  parseGitHistoryCommitList,
+  requireGitHistoryOutput,
   runPackageCommand,
   waitForOwnedInstalledDaemonReady,
 } from "./check-package";
@@ -75,6 +78,36 @@ setInterval(() => undefined, 1000);
 `;
 };
 
+const runHistoryFixtureGit = (root: string, ...arguments_: readonly string[]) => Bun.spawnSync(
+  [
+    "/usr/bin/git",
+    "-c",
+    "commit.gpgSign=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    ...arguments_,
+  ],
+  { cwd: root, env: { ...process.env, GIT_MERGE_AUTOEDIT: "no" } },
+);
+
+const requireHistoryFixtureGit = (root: string, ...arguments_: readonly string[]): string => {
+  const result = runHistoryFixtureGit(root, ...arguments_);
+  if (result.exitCode !== 0) {
+    throw new Error(`Git history fixture command failed: ${arguments_[0] ?? "unknown"}.`);
+  }
+  return Buffer.from(result.stdout).toString("utf8").trim();
+};
+
+const initializeHistoryFixture = async (root: string, body = "base\n"): Promise<string> => {
+  requireHistoryFixtureGit(root, "init", "--initial-branch=main");
+  requireHistoryFixtureGit(root, "config", "user.name", "HRA History Fixture");
+  requireHistoryFixtureGit(root, "config", "user.email", "history-fixture@example.invalid");
+  await writeFile(join(root, "document.txt"), body, "utf8");
+  requireHistoryFixtureGit(root, "add", "document.txt");
+  requireHistoryFixtureGit(root, "commit", "-m", "base");
+  return requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+};
+
 describe("installed package daemon ownership", () => {
   test("times out delayed receipt publication without losing the exact owned pid", async () => {
     const pid = 42_424;
@@ -110,6 +143,127 @@ describe("installed package daemon ownership", () => {
 });
 
 describe("installed package generic command ownership", () => {
+  test("scans complete Git history one bounded commit patch at a time", async () => {
+    const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
+    expect(source).toContain('["--no-replace-objects", "rev-list", "--max-count=100001", "--all"]');
+    expect(source).toContain('["--no-replace-objects", "rev-parse", "--is-shallow-repository"]');
+    expect(source).toContain('"--diff-merges=first-parent"');
+    expect(source).not.toContain('["log", "--all", "--format=", "--patch"');
+
+    const first = "a".repeat(40);
+    const second = "b".repeat(40);
+    expect(parseGitHistoryCommitList(`${first}\n${second}\n`)).toEqual([first, second]);
+    for (const invalid of [
+      "",
+      `${first}\n${first}\n`,
+      `${first.toUpperCase()}\n`,
+      `${"c".repeat(39)}\n`,
+      `${first}\n\n${second}\n`,
+    ]) {
+      expect(() => parseGitHistoryCommitList(invalid)).toThrow("Git history enumeration");
+    }
+    const overBound = `${Array.from(
+      { length: 100_001 },
+      (_, index) => index.toString(16).padStart(40, "0"),
+    ).join("\n")}\n`;
+    expect(() => parseGitHistoryCommitList(overBound)).toThrow("over its commit bound");
+  });
+
+  test("keeps failed history command payloads out of diagnostics", () => {
+    const sentinel = ["sk", "proj", "A".repeat(24)].join("-");
+    const error = (() => {
+      try {
+        requireGitHistoryOutput("Git history fixture", {
+          exitCode: 1,
+          stderr: sentinel,
+          stdout: sentinel,
+        });
+      } catch (caught: unknown) {
+        return caught;
+      }
+      return undefined;
+    })();
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toBe("Error: Git history fixture failed or emitted diagnostics with exit 1.");
+    expect(String(error)).not.toContain(sentinel);
+  });
+
+  test("scans resolution-only merge content against the first parent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-history-merge-"));
+    try {
+      await initializeHistoryFixture(root);
+      const document = join(root, "document.txt");
+      requireHistoryFixtureGit(root, "checkout", "-b", "feature");
+      await writeFile(document, "feature\n", "utf8");
+      requireHistoryFixtureGit(root, "commit", "-am", "feature");
+      requireHistoryFixtureGit(root, "checkout", "main");
+      await writeFile(document, "main\n", "utf8");
+      requireHistoryFixtureGit(root, "commit", "-am", "main");
+      expect(runHistoryFixtureGit(root, "merge", "--no-ff", "--no-edit", "feature").exitCode).not.toBe(0);
+      const sentinel = ["sk", "proj", "B".repeat(24)].join("-");
+      await writeFile(document, `resolved\n${sentinel}\n`, "utf8");
+      requireHistoryFixtureGit(root, "add", "document.txt");
+      requireHistoryFixtureGit(root, "commit", "-m", "resolution");
+
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 30_000);
+
+  test("scans roots, deleted content, side refs, and unreplaced objects", async () => {
+    const sentinel = ["sk", "proj", "C".repeat(24)].join("-");
+    for (const scenario of ["deleted-root", "side-ref", "replacement"] as const) {
+      const root = await mkdtemp(join(tmpdir(), `hra-history-${scenario}-`));
+      try {
+        const rootCommit = await initializeHistoryFixture(
+          root,
+          scenario === "deleted-root" ? `${sentinel}\n` : "safe\n",
+        );
+        const document = join(root, "document.txt");
+        if (scenario === "deleted-root") {
+          await writeFile(document, "safe\n", "utf8");
+          requireHistoryFixtureGit(root, "commit", "-am", "delete historical sentinel");
+        } else if (scenario === "side-ref") {
+          requireHistoryFixtureGit(root, "checkout", "-b", "side");
+          await writeFile(document, `${sentinel}\n`, "utf8");
+          requireHistoryFixtureGit(root, "commit", "-am", "side sentinel");
+          requireHistoryFixtureGit(root, "checkout", "main");
+        } else {
+          await writeFile(document, `${sentinel}\n`, "utf8");
+          requireHistoryFixtureGit(root, "commit", "-am", "replace-hidden sentinel");
+          const secretCommit = requireHistoryFixtureGit(root, "rev-parse", "HEAD");
+          requireHistoryFixtureGit(root, "replace", secretCommit, rootCommit);
+        }
+        await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    }
+  }, 30_000);
+
+  test("keeps lockfile scope exemption narrow and refuses shallow history", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-history-lock-policy-"));
+    try {
+      const head = await initializeHistoryFixture(root);
+      const lockfile = join(root, "bun.lock");
+      await writeFile(lockfile, `${["@", "private", "-", "scope", "/", "package"].join("")}\n`, "utf8");
+      requireHistoryFixtureGit(root, "add", "bun.lock");
+      requireHistoryFixtureGit(root, "commit", "-m", "lock scope");
+      await expect(assertCompleteGitHistoryPublic(root)).resolves.toBeUndefined();
+
+      const sentinel = ["sk", "proj", "D".repeat(24)].join("-");
+      await writeFile(lockfile, `${sentinel}\n`, "utf8");
+      requireHistoryFixtureGit(root, "commit", "-am", "lock secret");
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
+
+      await writeFile(join(root, ".git", "shallow"), `${head}\n`, "utf8");
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("non-shallow repository");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   test("routes every package command class through the bounded detached-group runner", async () => {
     const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
     expect(source).toContain("const run = runPackageCommand;");

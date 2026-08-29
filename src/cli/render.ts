@@ -29,6 +29,35 @@ import {
 } from "../domain/session-events";
 import { accountUsageHistoryPageSchema } from "../domain/usage-metrics";
 import { profileIdSchema, sessionIdSchema } from "../domain/values";
+import {
+  WORK_PROTOCOL,
+  WORK_PROTOCOL_VERSION,
+  WORK_EVENT_PAGE_MAX_BYTES,
+  WORK_POLL_MAX_BYTES,
+  WORK_SNAPSHOT_MAX_BYTES,
+  WORK_STREAM_FAILURE_MAX_BYTES,
+  WORK_TASK_DETAIL_MAX_BYTES,
+  WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+  WORK_TASK_HISTORY_PAGE_MAX_BYTES,
+  workEventPageSchema,
+  workOperationResultSchema,
+  workPollSchema,
+  workSnapshotSchema,
+  workTaskDetailSchema,
+  workTaskHistoryPageSchema,
+  type WorkOperation,
+  type WorkOperationResult,
+  type WorkTaskSpec,
+  type WorkTaskSummary,
+} from "../domain/work";
+import {
+  workAgentProtocolResponseSchema,
+  workProtocolDocumentSchema,
+} from "../domain/work-protocol";
+import {
+  terminalSafeJson,
+  workReadSuccessWireDocument,
+} from "../domain/terminal-json";
 import { isSensitiveDiagnosticKey, redactCompleteSensitiveText } from "./sensitive-text";
 
 export type Output = {
@@ -100,29 +129,7 @@ export const renderProtectedInteractionDetail = (
   return lines.join("\n");
 };
 
-const jsonEscapeScalar = (scalar: string): string => {
-  const codePoint = scalar.codePointAt(0);
-  if (codePoint === undefined) return "\\ufffd";
-  if (codePoint <= 0xFFFF) return `\\u${codePoint.toString(16).padStart(4, "0")}`;
-  const adjusted = codePoint - 0x10000;
-  const high = 0xD800 + (adjusted >> 10);
-  const low = 0xDC00 + (adjusted & 0x3FF);
-  return `\\u${high.toString(16)}\\u${low.toString(16)}`;
-};
-
-export const safeJson = (value: unknown, space?: number): string => {
-  const candidate: unknown = JSON.stringify(value, null, space);
-  const serialized = typeof candidate === "string" ? candidate : "null";
-  let output = "";
-  for (const scalar of serialized) {
-    output += scalar === "\n"
-      ? scalar
-      : unsafeTerminalScalar.test(scalar) && !safeJoinControl.test(scalar)
-        ? jsonEscapeScalar(scalar)
-        : scalar;
-  }
-  return output;
-};
+export const safeJson = terminalSafeJson;
 
 const diagnosticMaximumBytes = 2_048;
 const diagnosticMaximumDepth = 4;
@@ -553,7 +560,226 @@ const hasOnlyInteractionsBoundToSession = (value: unknown, sessionId: string): b
 const hasOpaqueCursorOrNull = (value: unknown): boolean =>
   value === null || opaqueCursor(value) !== undefined;
 
+const workRouteMatches = (
+  left: Readonly<{ accountId: string; projectId: string }>,
+  right: Readonly<{ accountId: string; projectId: string }>,
+): boolean => left.accountId === right.accountId && left.projectId === right.projectId;
+
+const workTaskBatchMatches = (
+  specs: readonly WorkTaskSpec[],
+  tasks: readonly WorkTaskSummary[],
+): boolean => specs.length === tasks.length && tasks.every((task) => {
+  const spec = specs.find((candidate) => candidate.clientRef === task.clientRef);
+  return spec !== undefined
+    && workRouteMatches(spec.route, task.route)
+    && spec.preset === task.preset
+    && spec.fast === task.fast
+    && spec.priority === task.priority;
+});
+
+const workExecutionRoutesMatch = (
+  left: readonly Readonly<{ accountId: string; projectId: string; preset: string; fast: boolean }>[],
+  right: readonly Readonly<{ accountId: string; projectId: string; preset: string; fast: boolean }>[],
+): boolean => left.length === right.length && left.every((route) => right.some((candidate) =>
+  candidate.accountId === route.accountId
+  && candidate.projectId === route.projectId
+  && candidate.preset === route.preset
+  && candidate.fast === route.fast));
+
+const workResultMatchesOperation = (
+  operation: WorkOperation,
+  result: WorkOperationResult,
+): boolean => {
+  switch (result.kind) {
+    case "work.create":
+      return operation.kind === result.kind
+        && result.work.clientRef === operation.clientRef
+        && result.work.coordinatorSessionId === operation.coordinatorSessionId
+        && result.work.objective === operation.objective
+        && workExecutionRoutesMatch(operation.routes, result.routes)
+        && workTaskBatchMatches(operation.tasks, result.tasks);
+    case "task.addBatch":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && workTaskBatchMatches(operation.tasks, result.tasks);
+    case "work.join":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.actorSessionId === operation.actorSessionId;
+    case "task.claim":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.task.id === operation.taskId
+        && result.attempt.taskId === operation.taskId
+        && result.attempt.actorSessionId === operation.actorSessionId;
+    case "task.claimNext":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && (result.task === null
+          ? result.attempt === null
+          : result.attempt !== null
+            && result.attempt.taskId === result.task.id
+            && result.attempt.actorSessionId === operation.actorSessionId
+            && workRouteMatches(result.task.route, operation.route));
+    case "task.claimBatch":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.claims.length === operation.claims.length
+        && result.claims.every((claim, index) => {
+          const requested = operation.claims[index];
+          return requested !== undefined
+            && claim.task.id === requested.taskId
+            && claim.attempt.taskId === requested.taskId
+            && claim.attempt.actorSessionId === requested.actorSessionId;
+        });
+    case "attempt.renew":
+    case "attempt.release":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.attempt.id === operation.attemptId
+        && result.attempt.fence === operation.fence
+        && result.attempt.actorSessionId === operation.actorSessionId;
+    case "attempt.dispatch":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.attempt.id === operation.attemptId
+        && result.attempt.fence === operation.fence
+        && result.attempt.actorSessionId === operation.actorSessionId
+        && result.effect.kind === "dispatch"
+        && result.effect.idempotencyKey === operation.idempotencyKey
+        && result.effect.subjectId === operation.attemptId
+        && result.effect.targetSessionId === operation.targetSessionId
+        && result.effect.instructionDigest.length > 0;
+    case "attempt.report":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.attempt.id === operation.attemptId
+        && result.attempt.fence === operation.fence
+        && result.attempt.actorSessionId === operation.actorSessionId
+        && (operation.report.kind === "submit"
+          ? result.submission !== null
+            && result.submission.attemptId === operation.attemptId
+            && result.submission.taskId === result.attempt.taskId
+          : result.submission === null);
+    case "submission.review":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.submission.id === operation.submissionId
+        && result.submission.contentDigest === operation.expectedContentDigest
+        && result.review.submissionId === operation.submissionId
+        && result.review.reviewerSessionId === operation.reviewerSessionId
+        && result.review.decision === operation.review.decision;
+    case "signal.send":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.signal.senderSessionId === operation.senderSessionId
+        && result.signal.targetSessionId === operation.targetSessionId
+        && result.signal.taskId === (operation.taskId ?? null)
+        && result.signal.replyToSignalId === (operation.replyToSignalId ?? null)
+        && result.signal.mode === operation.mode
+        && result.signal.body === operation.body
+        && result.effect.kind === "signal"
+        && result.effect.idempotencyKey === operation.idempotencyKey
+        && result.effect.subjectId === result.signal.id
+        && result.effect.targetSessionId === operation.targetSessionId
+        && result.effect.instructionDigest.length > 0;
+    case "signal.ack":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.signal.id === operation.signalId
+        && result.signal.targetSessionId === operation.actorSessionId;
+    case "work.complete":
+    case "work.fail":
+    case "work.cancel":
+      return operation.kind === result.kind && result.work.id === operation.workId;
+    case "work.release":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.workRevision === operation.expectedWorkRevision
+        && result.tombstone.workId === operation.workId
+        && result.tombstone.coordinatorSessionId === operation.actorSessionId
+        && result.tombstone.finalRevision === operation.expectedWorkRevision;
+    case "attempt.reconcile":
+      return operation.kind === result.kind
+        && result.workId === operation.workId
+        && result.attempt.id === operation.attemptId
+        && result.attempt.fence === operation.fence
+        && result.attempt.actorSessionId === operation.actorSessionId
+        && (result.submission === null
+          || (
+            result.submission.attemptId === operation.attemptId
+            && result.submission.taskId === result.attempt.taskId
+          ));
+  }
+};
+
 const assertCommandSuccessData = (command: LocalCommand, data: unknown): void => {
+  if (command.kind === "work.protocol") {
+    const parsed = workProtocolDocumentSchema.safeParse(data);
+    if (
+      !parsed.success
+      || JSON.stringify(parsed.data.query) !== JSON.stringify(command.query)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "work.apply") {
+    const parsed = workOperationResultSchema.safeParse(data);
+    if (!parsed.success || !workResultMatchesOperation(command.operation, parsed.data)) {
+      invalidCommandResponse(command);
+    }
+    return;
+  }
+  if (command.kind === "work.snapshot") {
+    const parsed = workSnapshotSchema.safeParse(data);
+    if (
+      !parsed.success
+      || parsed.data.work.id !== command.work
+      || (
+        command.actor !== undefined
+        && !parsed.data.joinedSessionIds.includes(command.actor)
+      )
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "work.task") {
+    const historyMode = command.historyLimit !== undefined
+      || command.historyCursor !== undefined;
+    if (historyMode) {
+      const parsed = workTaskHistoryPageSchema.safeParse(data);
+      if (
+        !parsed.success
+        || parsed.data.taskId !== command.task
+        || parsed.data.requestedCursor !== (command.historyCursor ?? null)
+        || parsed.data.items.length > (
+          command.historyLimit ?? WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT
+        )
+      ) invalidCommandResponse(command);
+      return;
+    }
+    const parsed = workTaskDetailSchema.safeParse(data);
+    if (!parsed.success || parsed.data.task.id !== command.task) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "work.poll") {
+    const parsed = workPollSchema.safeParse(data);
+    if (
+      !parsed.success
+      || parsed.data.workId !== command.work
+      || parsed.data.actorSessionId !== (command.actor ?? null)
+      || parsed.data.eventPage.requestedCursor !== (command.cursor ?? null)
+      || parsed.data.requestedActionCursor !== (command.actionCursor ?? null)
+    ) invalidCommandResponse(command);
+    return;
+  }
+  if (command.kind === "work.events") {
+    const parsed = workEventPageSchema.safeParse(data);
+    if (
+      !parsed.success
+      || parsed.data.workId !== command.work
+      || parsed.data.requestedCursor !== (command.cursor ?? null)
+    ) invalidCommandResponse(command);
+    return;
+  }
   if (command.kind === "device.list") {
     if (parseCloudDeviceList(data) === null) invalidCommandResponse(command);
     return;
@@ -649,6 +875,16 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
 };
 
 const publicInteractionData = (command: LocalCommand, data: unknown): unknown => {
+  if (command.kind === "work.protocol") return workProtocolDocumentSchema.parse(data);
+  if (command.kind === "work.apply") return workOperationResultSchema.parse(data);
+  if (command.kind === "work.snapshot") return workSnapshotSchema.parse(data);
+  if (command.kind === "work.task") {
+    return command.historyLimit !== undefined || command.historyCursor !== undefined
+      ? workTaskHistoryPageSchema.parse(data)
+      : workTaskDetailSchema.parse(data);
+  }
+  if (command.kind === "work.poll") return workPollSchema.parse(data);
+  if (command.kind === "work.events") return workEventPageSchema.parse(data);
   if (command.kind === "account.login") return publicAccountLoginData(data);
   if (command.kind === "device.list") {
     const parsed = parseCloudDeviceList(data);
@@ -1715,6 +1951,37 @@ const renderSyncStatus = (data: unknown): string => {
 export function renderSuccess(command: LocalCommand, data: unknown, json: boolean, output: Output): void {
   assertCommandSuccessData(command, data);
   if (json) {
+    if (command.kind === "work.apply") {
+      output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
+        protocol: WORK_PROTOCOL,
+        version: WORK_PROTOCOL_VERSION,
+        requestId: command.requestId,
+        ok: true,
+        result: publicInteractionData(command, data),
+      }))}\n`);
+      return;
+    }
+    if (
+      command.kind === "work.snapshot"
+      || command.kind === "work.task"
+      || command.kind === "work.poll"
+      || command.kind === "work.events"
+    ) {
+      const publicData = publicInteractionData(command, data);
+      const line = workReadSuccessWireDocument(command.kind, publicData);
+      const maximum = command.kind === "work.snapshot"
+        ? WORK_SNAPSHOT_MAX_BYTES
+        : command.kind === "work.task"
+          ? command.historyLimit !== undefined || command.historyCursor !== undefined
+            ? WORK_TASK_HISTORY_PAGE_MAX_BYTES
+            : WORK_TASK_DETAIL_MAX_BYTES
+          : command.kind === "work.poll"
+            ? WORK_POLL_MAX_BYTES
+            : WORK_EVENT_PAGE_MAX_BYTES;
+      if (Buffer.byteLength(line, "utf8") > maximum) invalidCommandResponse(command);
+      output.writeStdout(line);
+      return;
+    }
     output.writeStdout(`${safeJson({
       ok: true,
       version: 1,
@@ -1865,7 +2132,19 @@ export function renderFailure(error: { code: string; message: string; details?: 
       : { details: safeDiagnosticDetails(error.details, 0, error.trustedLocalPaths === true) }),
   };
   if (json) {
-    output.writeStdout(`${safeJson({ ok: false, version: 1, error: safeError })}\n`);
+    const document = (errorValue: typeof safeError): string =>
+      `${safeJson({ ok: false, version: 1, error: errorValue })}\n`;
+    let line = document(safeError);
+    if (Buffer.byteLength(line, "utf8") > WORK_STREAM_FAILURE_MAX_BYTES) {
+      line = document({ code: safeError.code, message: safeError.message });
+    }
+    if (Buffer.byteLength(line, "utf8") > WORK_STREAM_FAILURE_MAX_BYTES) {
+      line = document({
+        code: "INTERNAL",
+        message: "HRA could not serialize a bounded failure response safely.",
+      });
+    }
+    output.writeStdout(line);
   } else {
     output.writeStderr(`hra: ${safeError.message}\n`);
     if (safeError.details !== undefined) {

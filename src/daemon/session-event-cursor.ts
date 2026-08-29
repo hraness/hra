@@ -7,6 +7,18 @@ import {
   sessionEventCursorPayloadSchema,
   type SessionEventCursorPayload,
 } from "../domain/session-events";
+import {
+  workActionCursorPayloadSchema,
+  workEventCursorPayloadSchema,
+  workIdSchema,
+  workTaskHistoryCursorPayloadSchema,
+  workTaskIdSchema,
+  type WorkActionCursorPayload,
+  type WorkEventCursorPayload,
+  type WorkId,
+  type WorkTaskHistoryCursorPayload,
+  type WorkTaskId,
+} from "../domain/work";
 import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import {
   projectPublicProviderIdentifier,
@@ -195,6 +207,47 @@ const canonicalLocalSessionListPayload = (
   afterSessionId: payload.afterSessionId,
 });
 
+const canonicalWorkEventPayload = (payload: WorkEventCursorPayload): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  workId: payload.workId,
+  streamEpoch: payload.streamEpoch,
+  sequence: payload.sequence,
+});
+
+const canonicalWorkActionPayload = (payload: WorkActionCursorPayload): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  workId: payload.workId,
+  streamEpoch: payload.streamEpoch,
+  sequence: payload.sequence,
+  projectionAt: payload.projectionAt,
+  actorSessionId: payload.actorSessionId,
+  offsets: {
+    readyTasks: payload.offsets.readyTasks,
+    ownedAttempts: payload.offsets.ownedAttempts,
+    recoveryAttempts: payload.offsets.recoveryAttempts,
+    reviewableSubmissions: payload.offsets.reviewableSubmissions,
+    signals: payload.offsets.signals,
+    preparedEffects: payload.offsets.preparedEffects,
+  },
+});
+
+const canonicalWorkTaskHistoryPayload = (
+  payload: WorkTaskHistoryCursorPayload,
+): string => JSON.stringify({
+  version: payload.version,
+  type: payload.type,
+  workId: payload.workId,
+  taskId: payload.taskId,
+  streamEpoch: payload.streamEpoch,
+  sequence: payload.sequence,
+  projectionAt: payload.projectionAt,
+  highWaterOrdinal: payload.highWaterOrdinal,
+  taskRevision: payload.taskRevision,
+  offset: payload.offset,
+});
+
 const sameInteractionFilter = (
   actual: InteractionCursorFilter,
   expected: InteractionCursorFilter,
@@ -285,6 +338,130 @@ export class SessionEventCursorCodec {
       throw new SessionEventCursorError(
         "Session event cursor payload is not canonical.",
         "noncanonical",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodeWorkEvent(input: WorkEventCursorPayload): string {
+    const payload = workEventCursorPayloadSchema.parse(input);
+    return this.#encodeCanonical(canonicalWorkEventPayload(payload), "Work event cursor");
+  }
+
+  decodeWorkEvent(cursor: string, expectedWorkId: WorkId): WorkEventCursorPayload {
+    const workId = workIdSchema.parse(expectedWorkId);
+    const envelope = this.#decodeEnvelope(cursor, "Work event cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "work"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a work event cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = workEventCursorPayloadSchema.safeParse(envelope.value);
+    if (!parsed.success || canonicalWorkEventPayload(parsed.data) !== envelope.payloadJson) {
+      throw new SessionEventCursorError(
+        "Work event cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (parsed.data.workId !== workId) {
+      throw new SessionEventCursorError(
+        "Work event cursor belongs to another work plan.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodeWorkAction(input: WorkActionCursorPayload): string {
+    const payload = workActionCursorPayloadSchema.parse(input);
+    return this.#encodeCanonical(canonicalWorkActionPayload(payload), "Work action cursor");
+  }
+
+  decodeWorkAction(
+    cursor: string,
+    expectedWorkId: WorkId,
+    expectedActorSessionId: string | null,
+  ): WorkActionCursorPayload {
+    const workId = workIdSchema.parse(expectedWorkId);
+    const actorSessionId = expectedActorSessionId === null
+      ? null
+      : sessionIdSchema.parse(expectedActorSessionId);
+    const envelope = this.#decodeEnvelope(cursor, "Work action cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "work_actions"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a work action cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = workActionCursorPayloadSchema.safeParse(envelope.value);
+    if (!parsed.success || canonicalWorkActionPayload(parsed.data) !== envelope.payloadJson) {
+      throw new SessionEventCursorError(
+        "Work action cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (
+      parsed.data.workId !== workId
+      || parsed.data.actorSessionId !== actorSessionId
+    ) {
+      throw new SessionEventCursorError(
+        "Work action cursor filters do not match this poll.",
+        "filter_mismatch",
+      );
+    }
+    return parsed.data;
+  }
+
+  encodeWorkTaskHistory(input: WorkTaskHistoryCursorPayload): string {
+    const payload = workTaskHistoryCursorPayloadSchema.parse(input);
+    return this.#encodeCanonical(
+      canonicalWorkTaskHistoryPayload(payload),
+      "Work task history cursor",
+    );
+  }
+
+  decodeWorkTaskHistory(
+    cursor: string,
+    expectedTaskId: WorkTaskId,
+  ): WorkTaskHistoryCursorPayload {
+    const taskId = workTaskIdSchema.parse(expectedTaskId);
+    const envelope = this.#decodeEnvelope(cursor, "Work task history cursor");
+    if (
+      typeof envelope.value !== "object"
+      || envelope.value === null
+      || !("type" in envelope.value)
+      || envelope.value.type !== "work_task_history"
+    ) {
+      throw new SessionEventCursorError(
+        "Another HRA cursor type cannot be used as a work task history cursor.",
+        "type_mismatch",
+      );
+    }
+    const parsed = workTaskHistoryCursorPayloadSchema.safeParse(envelope.value);
+    if (
+      !parsed.success
+      || canonicalWorkTaskHistoryPayload(parsed.data) !== envelope.payloadJson
+    ) {
+      throw new SessionEventCursorError(
+        "Work task history cursor payload is not canonical.",
+        "noncanonical",
+      );
+    }
+    if (parsed.data.taskId !== taskId) {
+      throw new SessionEventCursorError(
+        "Work task history cursor belongs to another work task.",
+        "filter_mismatch",
       );
     }
     return parsed.data;
