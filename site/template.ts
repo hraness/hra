@@ -8,13 +8,19 @@ import {
   findSection,
   headlongMicroharnessReading,
   publicContent,
-  readingPages,
   type ContentBlock,
   type ContentSection,
   type InlineContent,
   type PublicContent,
   type ReadingPage,
 } from "./content.ts";
+import {
+  editorialImage,
+  editorialImages,
+  editorialImageSrcSet,
+  editorialImageUrl,
+  type EditorialImage,
+} from "./editorial-images.ts";
 
 const escapeHtml = (value: string): string =>
   value
@@ -69,9 +75,11 @@ const renderBlock = (
 const renderSection = (
   section: ContentSection,
   headingLevel: "h1" | "h2" = "h2",
+  afterHeading = "",
 ): string =>
   `<section id="${escapeHtml(section.id)}" aria-labelledby="${escapeHtml(section.id)}-heading">
   <${headingLevel} id="${escapeHtml(section.id)}-heading">${escapeHtml(section.heading)}</${headingLevel}>
+  ${afterHeading}
   ${section.blocks.map((block, index) => renderBlock(
     block,
     section.id,
@@ -86,6 +94,13 @@ const renderHead = (
     readonly canonicalPath: string;
     readonly description: string;
     readonly includeStructuredData?: boolean;
+    readonly image?: Readonly<{
+      alt: string;
+      height?: number;
+      src: string;
+      type?: string;
+      width?: number;
+    }>;
     readonly jsonLd?: Readonly<Record<string, unknown>>;
     readonly openGraphType?: "article" | "website";
     readonly robots?: string;
@@ -93,6 +108,10 @@ const renderHead = (
   },
 ): string => {
   const canonicalUrl = `${content.siteUrl}${options.canonicalPath}`;
+  const image = options.image ?? {
+    alt: "HRA command line prompt",
+    src: `${content.siteUrl}/social-card.svg`,
+  };
   const jsonLd = JSON.stringify(options.jsonLd ?? {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
@@ -121,13 +140,37 @@ const renderHead = (
 <meta property="og:title" content="${escapeHtml(options.title)}">
 <meta property="og:description" content="${escapeHtml(options.description)}">
 <meta property="og:url" content="${escapeHtml(canonicalUrl)}">
-<meta property="og:image" content="${escapeHtml(content.siteUrl)}/social-card.svg">
-<meta property="og:image:alt" content="HRA command line prompt">
+<meta property="og:image" content="${escapeHtml(image.src)}">
+${image.type === undefined ? "" : `<meta property="og:image:type" content="${escapeHtml(image.type)}">\n`}${image.width === undefined ? "" : `<meta property="og:image:width" content="${image.width.toString()}">\n`}${image.height === undefined ? "" : `<meta property="og:image:height" content="${image.height.toString()}">\n`}<meta property="og:image:alt" content="${escapeHtml(image.alt)}">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="${escapeHtml(image.src)}">
+<meta name="twitter:image:alt" content="${escapeHtml(image.alt)}">
 <meta name="theme-color" content="#11100e">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/styles.css">${structuredData}`;
 };
+
+const renderEditorialFigure = (image: EditorialImage): string =>
+  `<figure class="editorial-figure">
+    <img alt="${escapeHtml(image.alt)}" decoding="async" fetchpriority="high" height="${image.height.toString()}" sizes="(max-width: 68rem) calc(100vw - 2rem), 68rem" src="${image.src}" srcset="${editorialImageSrcSet(image)}" width="${image.width.toString()}">
+    <figcaption><span>${escapeHtml(image.caption)}</span><small>${escapeHtml(image.credit)}</small></figcaption>
+  </figure>`;
+
+const renderReadingCards = (): string => editorialImages.map((image) =>
+  `<article class="reading-card">
+    <a href="${image.canonicalPath}">
+      <img alt="" decoding="async" height="${image.height.toString()}" loading="lazy" sizes="(max-width: 48rem) calc(100vw - 2rem), 50vw" src="${image.src}" srcset="${editorialImageSrcSet(image)}" width="${image.width.toString()}">
+      <span><strong>${escapeHtml(image.cardTitle)}</strong>${escapeHtml(image.cardDescription)}</span>
+    </a>
+  </article>`).join("\n");
+
+const renderHomeReading = (): string => `<section class="home-reading" aria-labelledby="home-reading-heading">
+  <div class="home-reading-heading">
+    <h2 id="home-reading-heading">Reading</h2>
+    <a href="/reading/">View all</a>
+  </div>
+  <div class="reading-grid">${renderReadingCards()}</div>
+</section>`;
 
 const renderProjectResources = (content: PublicContent): string => `<aside aria-label="HRA project information" class="project-resources">
   <p>${escapeHtml(content.productName)} is MIT licensed.</p>
@@ -162,7 +205,7 @@ ${renderHead(content, {
     <pre class="doctor-command" tabindex="0"><code>${escapeHtml(content.doctorCommand)}</code></pre>
     <pre class="init-command" tabindex="0"><code>${escapeHtml(content.initCommand)}</code></pre>
     ${content.introduction.map((block, index) => renderBlock(block, "introduction", index)).join("\n    ")}
-    ${readingPages.map((page, index) => renderBlock(page.homeLink, "introduction", content.introduction.length + index)).join("\n    ")}
+    ${renderHomeReading()}
   </header>
   <nav class="section-nav" aria-label="Documentation">${navigation}</nav>
   ${content.sections.map((section) => renderSection(section)).join("\n  ")}
@@ -236,12 +279,24 @@ export const renderReadingHtml = (
   content: PublicContent = publicContent,
 ): string => {
   const canonicalUrl = `${content.siteUrl}${page.canonicalPath}`;
+  const image = editorialImage(page.canonicalPath);
+  if (image === undefined) {
+    throw new Error(`Reading page is missing its editorial image: ${page.canonicalPath}`);
+  }
+  const imageUrl = editorialImageUrl(image);
   return `<!doctype html>
 <html lang="en">
 <head>
 ${renderHead(content, {
   canonicalPath: page.canonicalPath,
   description: page.description,
+  image: {
+    alt: image.alt,
+    height: image.height,
+    src: imageUrl,
+    type: "image/webp",
+    width: image.width,
+  },
   openGraphType: "article",
   jsonLd: {
     "@context": "https://schema.org",
@@ -255,6 +310,15 @@ ${renderHead(content, {
     datePublished: page.datePublished,
     description: page.description,
     headline: page.title,
+    image: {
+      "@type": "ImageObject",
+      caption: image.caption,
+      contentUrl: imageUrl,
+      creditText: image.credit,
+      height: image.height,
+      url: imageUrl,
+      width: image.width,
+    },
     mainEntityOfPage: canonicalUrl,
     publisher: {
       "@type": "Organization",
@@ -270,7 +334,7 @@ ${renderHead(content, {
 <a class="skip-link" href="#content">Skip to content</a>
 <main id="content" class="narrow-page">
   <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
-  ${renderSection(page.section, "h1")}
+  ${renderSection(page.section, "h1", renderEditorialFigure(image))}
 </main>
 ${renderAskAiAboutThis(canonicalUrl)}
 ${renderProjectResources(content)}
@@ -279,6 +343,34 @@ ${renderHranessSiteFooter()}
 </html>
 `;
 };
+
+export const renderReadingIndexHtml = (
+  content: PublicContent = publicContent,
+): string => `<!doctype html>
+<html lang="en">
+<head>
+${renderHead(content, {
+  canonicalPath: "/reading/",
+  description: "Sourced HRA reading notes about persistent agent harnesses, plugin catalogs, and isolated Codex account loops.",
+  title: `Reading | ${content.productName}`,
+})}
+</head>
+<body>
+<a class="skip-link" href="#content">Skip to content</a>
+<main id="content" class="narrow-page reading-index">
+  <p><a href="/">← ${escapeHtml(content.productName)}</a></p>
+  <header>
+    <h1>Reading</h1>
+    <p>Sourced notes on adjacent agent-harness designs and the boundary HRA keeps.</p>
+  </header>
+  <div class="reading-grid">${renderReadingCards()}</div>
+</main>
+${renderAskAiAboutThis(`${content.siteUrl}/reading/`)}
+${renderProjectResources(content)}
+${renderHranessSiteFooter()}
+</body>
+</html>
+`;
 
 export const renderDeepseekHarnessReadingHtml = (
   content: PublicContent = publicContent,

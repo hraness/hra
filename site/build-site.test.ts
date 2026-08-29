@@ -5,10 +5,12 @@ import { join } from "node:path";
 
 import { buildSite } from "../scripts/build-site.ts";
 import { readingPages } from "./content.ts";
+import { editorialImages } from "./editorial-images.ts";
 import {
   renderAskAiAboutThis,
   renderPreviewHtml,
   renderPrivacyHtml,
+  renderReadingIndexHtml,
   renderReadingHtml,
   renderSiteHtml,
 } from "./template.ts";
@@ -19,11 +21,18 @@ const createFixtureRoot = async (): Promise<string> => {
   const root = await mkdtemp(join(tmpdir(), "hra-site-test-"));
   temporaryRoots.push(root);
   await mkdir(join(root, "site"), { recursive: true });
+  await mkdir(join(root, "site/images/editorial"), { recursive: true });
   await Promise.all(
     ["favicon.svg", "social-card.svg", "styles.css"].map(async (asset) => {
       await writeFile(join(root, "site", asset), `fixture:${asset}\n`, "utf8");
     }),
   );
+  await Promise.all(editorialImages.map(async (image) => {
+    await writeFile(
+      join(root, "site", image.src),
+      new Uint8Array([82, 73, 70, 70, 87, 69, 66, 80]),
+    );
+  }));
   return root;
 };
 
@@ -62,6 +71,7 @@ describe("static-site build", () => {
     const publicPages = [
       [renderSiteHtml(), "https://hra.sh/"],
       [renderPrivacyHtml(), subjectUrl],
+      [renderReadingIndexHtml(), "https://hra.sh/reading/"],
       ...readingPages.map((page) => [
         renderReadingHtml(page),
         `https://hra.sh${page.canonicalPath}`,
@@ -88,6 +98,7 @@ describe("static-site build", () => {
       "dist/site/index.html",
       "dist/site/preview/index.html",
       "dist/site/privacy/index.html",
+      "dist/site/reading/index.html",
       "dist/site/reading/deepseek-harness/index.html",
       "dist/site/reading/headlong-microharness/index.html",
       "dist/site/robots.txt",
@@ -104,6 +115,9 @@ describe("static-site build", () => {
 
     for (const path of expectedPaths) {
       expect((await readFile(join(root, path), "utf8")).length).toBeGreaterThan(0);
+    }
+    for (const image of editorialImages) {
+      expect((await readFile(join(root, "dist/site", image.src))).byteLength).toBeGreaterThan(0);
     }
 
     const builtStyles = await readFile(join(root, "dist/site/styles.css"), "utf8");

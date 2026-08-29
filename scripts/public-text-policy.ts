@@ -81,6 +81,24 @@ export function assertPublicSensitiveText(value: string, label: string): void {
 
 const excludedDirectories = new Set([".git", "dist", "node_modules"]);
 const textFile = /(?:^|\/)(?:LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yaml|yml|zig)$/u;
+const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
+const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
+
+const assertEditorialWebp = async (path: string, label: string): Promise<void> => {
+  const bytes = await readFile(path);
+  const riffSize = bytes.byteLength >= 8 ? bytes.readUInt32LE(4) : -1;
+  const chunkType = bytes.byteLength >= 16 ? bytes.toString("ascii", 12, 16) : "";
+  if (
+    bytes.byteLength < 20
+    || bytes.byteLength > 2_000_000
+    || bytes.toString("ascii", 0, 4) !== "RIFF"
+    || riffSize !== bytes.byteLength - 8
+    || bytes.toString("ascii", 8, 12) !== "WEBP"
+    || !webpChunkTypes.has(chunkType)
+  ) {
+    throw new PublicTextPolicyError("UNREVIEWED_FILE_TYPE", label);
+  }
+};
 
 export async function assertPublicTree(root: string): Promise<void> {
   const visit = async (path: string): Promise<void> => {
@@ -93,6 +111,8 @@ export async function assertPublicTree(root: string): Promise<void> {
         if (!excludedDirectories.has(entry.name)) await visit(child);
       } else if (entry.isFile() && isAuthoritySupervisorArtifactRelativePath(label)) {
         await assertAuthoritySupervisorArtifactPublicFile(root, label);
+      } else if (entry.isFile() && editorialWebp.test(label)) {
+        await assertEditorialWebp(child, label);
       } else if (entry.isFile() && textFile.test(child)) {
         const value = await readFile(child, "utf8");
         if (entry.name === "bun.lock") assertPublicSensitiveText(value, label);

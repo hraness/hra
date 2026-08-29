@@ -13,6 +13,7 @@ import {
 import {
   renderPreviewHtml,
   renderPrivacyHtml,
+  renderReadingIndexHtml,
   renderReadingHtml,
   renderSiteHtml,
 } from "../site/template.ts";
@@ -57,6 +58,10 @@ const siteTextOutputs = (
   {
     path: join(repositoryRoot, "dist/site/preview/index.html"),
     content: renderPreviewHtml(),
+  },
+  {
+    path: join(repositoryRoot, "dist/site/reading/index.html"),
+    content: renderReadingIndexHtml(),
   },
   ...readingPages.map((page) => ({
     path: join(repositoryRoot, `dist/site${page.canonicalPath}index.html`),
@@ -150,6 +155,11 @@ export const buildSite = async (options: BuildOptions): Promise<readonly string[
     await mkdir(dirname(destination), { recursive: true });
     await copyFile(source, destination);
   }
+  await cp(
+    join(options.repositoryRoot, "site/images"),
+    join(options.repositoryRoot, "dist/site/images"),
+    { recursive: true },
+  );
 
   const [productStyles, designKitFontsStyles, siteFooterStyles] = await Promise.all([
     readFile(join(options.repositoryRoot, "site/styles.css"), "utf8"),

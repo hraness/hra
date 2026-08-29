@@ -1,4 +1,5 @@
 import { buildHraGlobalInstallCommand } from "../src/install-preflight";
+import { editorialImage, editorialImageUrl } from "./editorial-images.ts";
 
 export type EndpointAvailability = "beta-not-yet-live" | "live" | "release-ready";
 
@@ -271,6 +272,7 @@ export const readingPages: readonly ReadingPage[] = [
 export const siteDocumentPaths: readonly string[] = [
   "/",
   "/privacy/",
+  "/reading/",
   ...readingPages.map((page) => page.canonicalPath),
 ];
 
@@ -1097,20 +1099,40 @@ export const renderLlmsText = (content: PublicContent = publicContent): string =
     "",
     "## Reading",
     "",
+    `- [Reading index](${content.siteUrl}/reading/)`,
     ...readingPages.map(
       (page) => `- [${page.title}](${content.siteUrl}${page.canonicalPath})`,
     ),
     "",
   ].join("\n");
 
-export const renderSitemapXml = (content: PublicContent = publicContent): string =>
-  [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`,
-    ...siteDocumentPaths.map((path) => `  <url><loc>${content.siteUrl}${path}</loc></url>`),
-    "</urlset>",
-    "",
-  ].join("\n");
+const escapeXml = (value: string): string => value
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;")
+  .replaceAll('"', "&quot;")
+  .replaceAll("'", "&apos;");
+
+export const renderSitemapXml = (content: PublicContent = publicContent): string => {
+  const urls = siteDocumentPaths.map((path) => {
+    const image = editorialImage(path);
+    const imageMarkup = image === undefined ? "" : `
+    <image:image>
+      <image:loc>${escapeXml(editorialImageUrl(image))}</image:loc>
+      <image:title>${escapeXml(image.title)}</image:title>
+      <image:caption>${escapeXml(image.caption)}</image:caption>
+    </image:image>`;
+    return `  <url>
+    <loc>${escapeXml(`${content.siteUrl}${path}`)}</loc>${imageMarkup}
+  </url>`;
+  }).join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+${urls}
+</urlset>
+`;
+};
 
 export const findSection = (content: PublicContent, id: string): ContentSection => {
   const section = content.sections.find((candidate) => candidate.id === id);
