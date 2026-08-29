@@ -4,6 +4,7 @@ import { describe, expect, test } from "bun:test";
 import fc from "fast-check";
 
 import { sessionEventCursorWireSchema } from "../domain/session-events";
+import { createWorkId, createWorkTaskId, workEventCursorWireSchema } from "../domain/work";
 import { createSessionId } from "../domain/values";
 import {
   HRA_CURSOR_MAX_BYTES,
@@ -119,6 +120,140 @@ describe("SessionEventCursorCodec", () => {
     expect(decoded.sessionId).toBe(sessionId);
     expect(decoded.sessionId).not.toBe(otherSessionId);
     expect(decoded.sequence).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  test("round trips one canonical work-bound epoch cursor", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const payload = {
+      version: 1 as const,
+      type: "work" as const,
+      workId: createWorkId(),
+      streamEpoch: crypto.randomUUID(),
+      sequence: 42,
+    };
+    const cursor = codec.encodeWorkEvent(payload);
+    expect(codec.decodeWorkEvent(cursor, payload.workId)).toEqual(payload);
+    expect(workEventCursorWireSchema.parse(cursor)).toBe(cursor);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+  });
+
+  test("binds work cursors to their exact work plan, cursor type, and signing key", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const workId = createWorkId();
+    const otherWorkId = createWorkId();
+    const cursor = codec.encodeWorkEvent({
+      version: 1,
+      type: "work",
+      workId,
+      streamEpoch: crypto.randomUUID(),
+      sequence: Number.MAX_SAFE_INTEGER,
+    });
+    expectCursorRejection(
+      () => codec.decodeWorkEvent(cursor, otherWorkId),
+      "filter_mismatch",
+    );
+    expectCursorRejection(() => codec.decode(cursor), "type_mismatch");
+    const eventCursor = codec.encode({
+      version: 1,
+      sessionId: createSessionId(),
+      streamEpoch: crypto.randomUUID(),
+      sequence: 1,
+    });
+    expectCursorRejection(
+      () => codec.decodeWorkEvent(eventCursor, workId),
+      "type_mismatch",
+    );
+    const foreign = new SessionEventCursorCodec(
+      Uint8Array.from({ length: 32 }, (_, index) => 255 - index),
+    );
+    expectCursorRejection(
+      () => foreign.decodeWorkEvent(cursor, workId),
+      "invalid_signature",
+    );
+    const [prefix, payload, signature] = cursor.split(".");
+    const replacement = signature?.startsWith("A") === true ? "B" : "A";
+    const tampered = `${prefix}.${payload}.${replacement}${signature?.slice(1)}`;
+    expectCursorRejection(
+      () => codec.decodeWorkEvent(tampered, workId),
+      "invalid_signature",
+    );
+  });
+
+  test("binds action continuations to the exact work, actor, stream cut, and cursor type", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const workId = createWorkId();
+    const actorSessionId = createSessionId();
+    const payload = {
+      version: 1 as const,
+      type: "work_actions" as const,
+      workId,
+      streamEpoch: crypto.randomUUID(),
+      sequence: 19,
+      projectionAt: 123_456,
+      actorSessionId,
+      offsets: {
+        readyTasks: 3,
+        ownedAttempts: 2,
+        recoveryAttempts: 1,
+        reviewableSubmissions: 4,
+        signals: 5,
+        preparedEffects: 6,
+      },
+    };
+    const cursor = codec.encodeWorkAction(payload);
+    expect(codec.decodeWorkAction(cursor, workId, actorSessionId)).toEqual(payload);
+    expect(workEventCursorWireSchema.parse(cursor)).toBe(cursor);
+    expectCursorRejection(
+      () => codec.decodeWorkAction(cursor, createWorkId(), actorSessionId),
+      "filter_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeWorkAction(cursor, workId, createSessionId()),
+      "filter_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeWorkEvent(cursor, workId),
+      "type_mismatch",
+    );
+  });
+
+  test("binds task-history continuations to the exact work and task", () => {
+    const codec = new SessionEventCursorCodec(FIXED_KEY);
+    const workId = createWorkId();
+    const taskId = createWorkTaskId();
+    const payload = {
+      version: 1 as const,
+      type: "work_task_history" as const,
+      workId,
+      taskId,
+      streamEpoch: crypto.randomUUID(),
+      sequence: 41,
+      projectionAt: 123_456,
+      highWaterOrdinal: 77,
+      taskRevision: 9,
+      offset: 50,
+    };
+    const cursor = codec.encodeWorkTaskHistory(payload);
+    expect(codec.decodeWorkTaskHistory(cursor, taskId)).toEqual(payload);
+    expect(workEventCursorWireSchema.parse(cursor)).toBe(cursor);
+    expect(Buffer.byteLength(cursor, "utf8")).toBeLessThanOrEqual(HRA_CURSOR_MAX_BYTES);
+    expectCursorRejection(
+      () => codec.decodeWorkTaskHistory(cursor, createWorkTaskId()),
+      "filter_mismatch",
+    );
+    expectCursorRejection(
+      () => codec.decodeWorkAction(cursor, workId, null),
+      "type_mismatch",
+    );
+    const [prefix, encoded, signature] = cursor.split(".");
+    const replacement = signature?.startsWith("A") === true ? "B" : "A";
+    expectCursorRejection(
+      () => codec.decodeWorkTaskHistory(
+        `${prefix}.${encoded}.${replacement}${signature?.slice(1)}`,
+        taskId,
+      ),
+      "invalid_signature",
+    );
   });
 
   test("round trips global and exact-session interaction keysets", () => {

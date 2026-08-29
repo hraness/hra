@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
@@ -158,6 +158,224 @@ const requireSuccess = (label: string, result: ProcessResult): ProcessResult => 
     throw new Error(`${label} failed with exit ${String(result.exitCode)}:\n${result.stderr}${result.stdout}`);
   }
   return result;
+};
+
+export const requireGitHistoryOutput = (label: string, result: ProcessResult): string => {
+  if (result.exitCode !== 0 || result.stderr !== "") {
+    throw new Error(`${label} failed or emitted diagnostics with exit ${String(result.exitCode)}.`);
+  }
+  return result.stdout;
+};
+
+const gitHistoryCommitMaximum = 100_000;
+const gitCommitPattern = /^[0-9a-f]{40}$/u;
+const gitHistoryCommandOutputMaximumBytes = 32 * 1024 * 1024;
+const gitHistoryCommandTimeoutMaximumMs = 60_000;
+const gitHistoryScanOutputMaximumBytes = 1024 * 1024 * 1024;
+const gitHistoryScanTimeoutMs = 10 * 60_000;
+
+type GitHistoryCommand =
+  | Readonly<{ kind: "enumerate" }>
+  | Readonly<{ commit: string; kind: "public_patch" }>
+  | Readonly<{ commit: string; kind: "sensitive_patch" }>
+  | Readonly<{ kind: "shallow" }>;
+
+type GitHistorySpawnResult = Readonly<{
+  exitCode: number;
+  exitedDueToMaxBuffer: boolean;
+  exitedDueToTimeout: boolean;
+  stderr: Buffer;
+  stdout: Buffer;
+}>;
+
+export const buildGitHistoryEnvironment = (
+  repositoryRoot: string,
+  temporaryDirectory: string,
+): NodeJS.ProcessEnv => {
+  if (
+    !isAbsolute(repositoryRoot)
+    || resolve(repositoryRoot) !== repositoryRoot
+    || !isAbsolute(temporaryDirectory)
+    || resolve(temporaryDirectory) !== temporaryDirectory
+  ) {
+    throw new Error("Git history command directories must be absolute and normalized.");
+  }
+  return Object.freeze({
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_NO_LAZY_FETCH: "1",
+    GIT_NO_REPLACE_OBJECTS: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "cat",
+    GIT_TERMINAL_PROMPT: "0",
+    HOME: repositoryRoot,
+    LANG: "C",
+    LC_ALL: "C",
+    PATH: "/usr/bin:/bin",
+    TMPDIR: temporaryDirectory,
+    XDG_CONFIG_HOME: "/dev/null",
+  });
+};
+
+export const projectGitHistorySpawnResult = (
+  result: GitHistorySpawnResult,
+): ProcessResult => {
+  const outputBytes = result.stdout.byteLength + result.stderr.byteLength;
+  if (
+    !Number.isSafeInteger(outputBytes)
+    || outputBytes > gitHistoryCommandOutputMaximumBytes
+    || result.exitCode !== 0
+    || result.exitedDueToMaxBuffer
+    || result.exitedDueToTimeout
+    || result.stderr.byteLength !== 0
+  ) {
+    return { exitCode: 1, stderr: "", stdout: "" };
+  }
+  const stdout = result.stdout.toString("utf8");
+  if (Buffer.byteLength(stdout, "utf8") > gitHistoryCommandOutputMaximumBytes) {
+    return { exitCode: 1, stderr: "", stdout: "" };
+  }
+  return { exitCode: 0, stderr: "", stdout };
+};
+
+const gitHistoryCommandArguments = (command: GitHistoryCommand): readonly string[] => {
+  if (command.kind === "shallow") {
+    return ["--no-replace-objects", "rev-parse", "--is-shallow-repository"];
+  }
+  if (command.kind === "enumerate") {
+    return ["--no-replace-objects", "rev-list", "--max-count=100001", "--all"];
+  }
+  if (!gitCommitPattern.test(command.commit)) {
+    throw new Error("Git history patch requested a malformed commit.");
+  }
+  const common = [
+    "--no-replace-objects",
+    "show",
+    "--format=",
+    "--patch",
+    "--text",
+    "--root",
+    "--diff-merges=first-parent",
+    "--no-ext-diff",
+    "--no-textconv",
+    command.commit,
+  ];
+  return command.kind === "sensitive_patch"
+    ? common
+    : [...common, "--", ".", ":(exclude)bun.lock"];
+};
+
+const runGitHistoryCommand = (
+  repositoryRoot: string,
+  temporaryDirectory: string,
+  command: GitHistoryCommand,
+  timeoutMs: number,
+): ProcessResult => {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return { exitCode: 1, stderr: "", stdout: "" };
+  }
+  try {
+    const result = Bun.spawnSync({
+      cmd: ["/usr/bin/git", "--no-pager", ...gitHistoryCommandArguments(command)],
+      cwd: repositoryRoot,
+      env: buildGitHistoryEnvironment(repositoryRoot, temporaryDirectory),
+      killSignal: "SIGKILL",
+      maxBuffer: gitHistoryCommandOutputMaximumBytes,
+      stderr: "pipe",
+      stdin: "ignore",
+      stdout: "pipe",
+      timeout: Math.min(timeoutMs, gitHistoryCommandTimeoutMaximumMs),
+    });
+    return projectGitHistorySpawnResult({
+      exitCode: result.exitCode,
+      exitedDueToMaxBuffer: result.exitedDueToMaxBuffer ?? false,
+      exitedDueToTimeout: result.exitedDueToTimeout ?? false,
+      stderr: result.stderr,
+      stdout: result.stdout,
+    });
+  } catch {
+    return { exitCode: 1, stderr: "", stdout: "" };
+  }
+};
+
+export const parseGitHistoryCommitList = (value: string): readonly string[] => {
+  const commits = value.endsWith("\n")
+    ? value.slice(0, -1).split("\n")
+    : value.split("\n");
+  if (
+    commits.length < 1
+    || commits.length > gitHistoryCommitMaximum
+    || commits.some((commit) => !gitCommitPattern.test(commit))
+    || new Set(commits).size !== commits.length
+  ) {
+    throw new Error("Git history enumeration was empty, malformed, duplicate, or over its commit bound.");
+  }
+  return Object.freeze(commits);
+};
+
+export const assertCompleteGitHistoryPublic = async (repositoryRoot: string): Promise<void> => {
+  const temporaryDirectory = await realpath(tmpdir());
+  const startedAt = performance.now();
+  let scannedOutputBytes = 0;
+  const readHistory = (command: GitHistoryCommand): ProcessResult => {
+    const remainingMs = Math.floor(gitHistoryScanTimeoutMs - (performance.now() - startedAt));
+    if (remainingMs < 1) {
+      throw new Error("Git history scan exceeded its aggregate time bound.");
+    }
+    const result = runGitHistoryCommand(
+      repositoryRoot,
+      temporaryDirectory,
+      command,
+      remainingMs,
+    );
+    scannedOutputBytes += Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr);
+    if (scannedOutputBytes > gitHistoryScanOutputMaximumBytes) {
+      throw new Error("Git history scan exceeded its aggregate output bound.");
+    }
+    return result;
+  };
+  const shallow = requireGitHistoryOutput(
+    "Git history shallow-repository check",
+    readHistory({ kind: "shallow" }),
+  );
+  if (shallow !== "false\n") {
+    throw new Error("Git history scan requires one exact non-shallow repository.");
+  }
+  const enumerate = async (): Promise<readonly string[]> => parseGitHistoryCommitList(
+    requireGitHistoryOutput(
+      "Git history enumeration",
+      readHistory({ kind: "enumerate" }),
+    ),
+  );
+  const commits = await enumerate();
+
+  for (const commit of commits) {
+    const completePatch = requireGitHistoryOutput(
+      `Git history sensitive-text commit ${commit}`,
+      readHistory({ commit, kind: "sensitive_patch" }),
+    );
+    assertPublicSensitiveText(completePatch, `Git history commit ${commit}`);
+
+    const authoredPatch = requireGitHistoryOutput(
+      `Git history public-text commit ${commit}`,
+      readHistory({ commit, kind: "public_patch" }),
+    );
+    assertPublicText(authoredPatch, `Git history commit ${commit}`);
+  }
+
+  const finalCommits = await enumerate();
+  const initialCommitSet = new Set(commits);
+  if (
+    finalCommits.length !== commits.length
+    || finalCommits.some((commit) => !initialCommitSet.has(commit))
+  ) {
+    throw new Error("Git refs changed while complete history was being scanned.");
+  }
+  if (performance.now() - startedAt > gitHistoryScanTimeoutMs) {
+    throw new Error("Git history scan exceeded its aggregate time bound.");
+  }
 };
 
 const assertSessionObservationHelp = (label: string, result: ProcessResult): void => {
@@ -369,30 +587,7 @@ if (!packageJson.files.includes("!src/storage/legacy-secret-migration.ts")) {
 await access(join(repositoryRoot, "src", "storage", "legacy-secret-migration.ts"), constants.R_OK);
 
 await assertPublicTree(repositoryRoot);
-const completeHistory = requireSuccess(
-  "Git history sensitive-text check",
-  await run("/usr/bin/git", ["log", "--all", "--format=", "--patch", "--no-ext-diff", "--no-textconv"], { cwd: repositoryRoot }),
-);
-assertPublicSensitiveText(completeHistory.stdout, "Git history");
-const authoredHistory = requireSuccess(
-  "Git history public-text check",
-  await run(
-    "/usr/bin/git",
-    [
-      "log",
-      "--all",
-      "--format=",
-      "--patch",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--",
-      ".",
-      ":(exclude)bun.lock",
-    ],
-    { cwd: repositoryRoot },
-  ),
-);
-assertPublicText(authoredHistory.stdout, "Git history");
+await assertCompleteGitHistoryPublic(repositoryRoot);
 
 const generated = requireSuccess(
   "generated public tree check",

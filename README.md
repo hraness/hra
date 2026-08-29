@@ -1,7 +1,7 @@
 # HRA
 
 ```sh
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 1872e46e643fd0adcab8522d375f302c4563c2bc64533db40d126d88d7efe7bc)" = hra-install-safe
 ```
 
 ```sh
@@ -24,7 +24,7 @@ HRA requires Bun 1.3.14 plus curl with HTTPS and TLS 1.2 support. The CLI and lo
 
 ```text
 bun --version
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 1872e46e643fd0adcab8522d375f302c4563c2bc64533db40d126d88d7efe7bc)" = hra-install-safe
 hra --version
 hra doctor --offline
 ```
@@ -36,7 +36,7 @@ Before replacing the installed binary, stop the persistent daemon and confirm th
 ```text
 hra daemon stop
 hra daemon status --json
-test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 70f95483499f43f1869553143632310b62d93f26d17784ad778f4f8f1db73449)" = hra-install-safe
+test "$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 1 --retry-max-time 60 --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts | bun -e 'const[a,h]=process.argv.slice(1);const b=await Bun.stdin.bytes();const d=new Bun.CryptoHasher("sha256").update(b).digest("hex");if(d!==h)throw new Error("The tagged HRA preflight digest is invalid.");const j=new Bun.Transpiler({loader:"ts",target:"bun"}).transformSync(b);const u=URL.createObjectURL(new Blob([j],{type:"text/javascript"}));try{const m=await import(u);await m.installHraRelease(a);process.stdout.write(`${m.HRA_INSTALL_SUCCESS}\n`);}finally{URL.revokeObjectURL(u)}' -- https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz 1872e46e643fd0adcab8522d375f302c4563c2bc64533db40d126d88d7efe7bc)" = hra-install-safe
 hra --version
 hra doctor --offline
 hra daemon start
@@ -114,6 +114,50 @@ hra session interactions <session-id> --pending --json
 
 If the event stream reports a blocking interaction, read its exact ID and revision, inspect the live authority through the protected path, and resolve only the interaction kind you received. Keep following while a separate one-shot invocation handles the approval, question, permission grant, or supported MCP form. The protected interaction commands and input documents are defined below.
 
+## Agent work protocol
+
+> **Release status.** This section documents the frozen source contract for the planned beta. No published `v0.1.0` tag currently exposes these commands.
+
+The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing Codex sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex app-server still owns model execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
+
+```text
+hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
+hra work apply --input-stdin
+hra work snapshot <work> [--actor <session>]
+hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
+hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1-50>] [--wait-ms <0-30000>]
+hra work events <work> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>]
+hra work watch <work> [--cursor <cursor>]
+```
+
+The seven commands are agent-only. Non-streaming commands emit compact JSON without requiring `--json`. `work watch` emits resumable JSON Lines. `work apply` is the only mutation entry point. It reads one strict `{protocol,version,requestId,operation}` request from nonterminal standard input or an explicit file descriptor. The nested operation carries its UUIDv7 `idempotencyKey`; success and failure echo the request ID, and work capabilities are never accepted as argv fields. Same-key replay preserves the durable decision, stable identities, and capabilities without adding a mutation, event, or revision, while mutable public records and the work revision are reprojected from current state. It is not a byte-identical response promise. A retained release tombstone is the exact stored-result exception. `work protocol` is queryable by operation, type, or topic. It returns exact field contracts, value syntax, capability semantics, operation kinds, hard bounds, and the closed recovery and process-exit guidance for failures.
+
+Each task carries an exact account ID, project ID, preset, and Fast setting. HRA never chooses another subscription from quota, availability, usage, or incidental ordering. A provider limit blocks or fails that attempt. It does not rotate the task to another account. Explicit tasks on separate accounts may run in parallel.
+
+Readiness is derived from the open work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. A final assistant message is not completion. The worker submits a bounded structured result and evidence; declared independent reviews and HRA-owned completion gates must accept the exact submission revision.
+
+Dispatch binds one already-existing exact actor session and always starts a new turn. HRA's task graph is the durable task queue; queue and steer are reserved for coordination signals. HRA commits the claim, monotonic fence, route, session binding, request digest, and prepared effect before the provider call. If the provider effect may have started but cannot be proved, the attempt becomes recovery-required. HRA does not redispatch, steal, or reroute it speculatively.
+
+Coordinator, member, and exact-attempt capabilities scope every mutation and never appear in snapshots, polls, or events. Poll action arrays have a separate signed, actor-bound continuation with a frozen projection time; a changed work stream invalidates it instead of returning stale authority.
+
+Signal delivery and recipient acknowledgement are separate facts. `deliveryState` reports pending, accepted, failed, or unknown provider delivery. `acknowledgedAt` records the recipient acknowledgement independently, including when delivery remains pending or unknown.
+
+Snapshots expose bounded recent work-level signals and an omitted count. With no history option, `work task` returns task detail with active and latest attempt lineage, the latest full attempt report, the latest submission and its ordered reviews, and bounded recent task signals. Either `--history-limit` or `--history-cursor` selects a separate task-history page over the task's attempts, reports, submissions, reviews, and task signals; a cursor-only continuation defaults to 20 items. Each complete compact JSON response for snapshot, task detail, and task history, including its envelope and terminating newline, is capped at 512 KiB. Only recent or historical arrays are trimmed, and omitted or remaining counts and continuations make every reduction explicit.
+
+A signed task-history continuation freezes the work stream sequence and epoch, task membership high-water ordinal, task revision, projection time, and next offset. Append-only bounded public projection versions reconstruct every returned record as of that cut. Later mutations and later history memberships are excluded from every continued page, so pagination is coherent even while agents keep working.
+
+Each JSONL gap, event, or checkpoint frame, including its terminating newline and terminal-safe escaping, is capped at 512 KiB. A terminal stream failure is one compact JSON document on stderr capped at 64 KiB. The queryable protocol advertises both wire limits.
+
+Accepted submissions, reviews, evidence references, receipts, and completed tasks are durable prefixes. Later failure or cancellation preserves them. No SQLite writer transaction spans Codex reasoning, provider I/O, artifact hashing, or Git inspection. This applies the durable-prefix lesson in [Agent Swarms are a Distributed Systems Problem](https://www.trychroma.com/engineering/transactions) without adopting generic page locking, wound-wait, or speculative replay.
+
+`task.claimNext` records an exact idempotent empty result when no task is ready without appending an event or advancing the work revision. `work.release` is the other stream-neutral mutation. It requires terminal work, the exact coordinator capability and revision, and `acknowledgeDataLoss: true`. Only an unresolved attempt dispatch blocks release. An ambiguous signal delivery may be discarded under that acknowledgement and is counted in the tombstone.
+
+A successful release atomically deletes the work graph and durable history, including the task-history membership index and projection versions, then retains a separately bounded tombstone with the final stream head, terminal and release request digests, discarded-record counts for both history tables and the rest of the graph, and a digest of that release boundary. While the tombstone remains, only the same release idempotency key and canonical request digest have an exact replay result. Replay guarantees for every earlier operation have ended. Tombstones have count, byte, and maximum-age bounds, so their retention timestamp is an upper bound rather than a promise.
+
+This release is an explicit logical destructive purge, not a forensic-erasure promise. SQLite secure deletion is defense in depth, but the command does not promise immediate physical sanitization of prior database pages, WAL frames, backups, snapshots, or storage media.
+
+Local SQLite is the only execution authority for work admission, claims, fences, dispatch receipts, submissions, reviews, signals, and the work-scoped event cursor. The initial work protocol has no cloud execution or cross-device takeover path. Turso is deferred behind a repository boundary and cannot be added as a second authority beside SQLite or encrypted Convex projections.
+
 ## Cloud sign-in and device pairing
 
 The hosted endpoint is beta-not-yet-live. An unset `HRA_CONVEX_URL` selects HRA's hosted deployment. Set it to an explicit empty value before the first daemon starts to disable cloud transport. A nonempty HTTPS value selects a self-managed Convex deployment. The first valid selection permanently binds that local state root; a later mismatch fails closed instead of moving credentials or recovery state. After deliberately disabling a bound state root, `hra sync status` and `hra doctor` report its exact restart prerequisite: unset `HRA_CONVEX_URL` for the hosted deployment, or restore the bound URL for a self-managed deployment. HRA accepts cloud credentials only as protected JSON on standard input or a nonterminal file descriptor. It rejects email addresses, identity invites, and verification codes on the command line:
@@ -160,6 +204,7 @@ Cloud-account erasure is an explicit and irreversible fallback, not the default 
 - Compact sessions: list sessions, read user and final assistant messages, inspect elapsed time plus bounded observed file and Git actions, then open one turn for full provider-visible detail.
 - Durable controls: send, queue, steer, stop, rename, and keep one editable note per session. Provider and desktop effects use exact authority, idempotency keys, and process-generation fencing.
 - Named projects: a project is a canonical directory that may contain several repositories. Changing it affects future turns only.
+- Agent work coordination: the frozen beta contract specifies bounded local task graphs, fenced attempts, structured submissions, independent reviews, signals, and a resumable work event stream for exact existing sessions.
 - Optional encrypted sync: paired devices share a bounded session projection and submit commands to the one machine holding the execution lease.
 
 ## Terminal and agent interfaces
@@ -356,6 +401,13 @@ hra session note set <session> <note>
 hra session preset <session> <low|high|ultra>
 hra session fast <session> <on|off>
 hra session project <session> <project>
+hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
+hra work apply --input-stdin|--input-fd <fd>
+hra work snapshot <work> [--actor <session>]
+hra work task <task> [--history-limit <1..50>] [--history-cursor <cursor>]
+hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1-50>] [--wait-ms <0-30000>]
+hra work events <work> [--cursor <cursor>] [--limit <1-200>] [--wait-ms <0-30000>] [--json|--jsonl|--follow]
+hra work watch <work> [--cursor <cursor>]
 hra interaction list [session] [--pending] [--limit <1-100>] [--cursor <cursor>]
 hra interaction show <interaction-id>
 hra interaction inspect <interaction-id> --revision <n> [--handoff-file <absolute-path>]
@@ -389,9 +441,9 @@ The beta does not expose destructive local profile or project deletion. `account
 
 ## Authority boundaries
 
-Codex app-server remains authoritative for provider login, transcripts, turns, tools, approvals, models, plugins, and usage. HRA owns isolated profiles, durable commands, process generations, local projections, optional encrypted sync, and recovery records.
+Codex app-server remains authoritative for provider login, transcripts, turns, tools, approvals, models, plugins, and usage. HRA owns isolated profiles, durable commands, process generations, local projections, optional encrypted sync, and recovery records. The frozen work contract assigns local coordination records to HRA rather than Codex app-server.
 
-Cloud service availability is not required for local login, local execution, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account.
+Cloud service availability is not required for local login, local execution, local work coordination, local recovery, or reading local sessions. Multiple Codex accounts remain independent subscriptions. HRA does not pool quota or replay a limited turn under another account. SQLite remains the local work execution authority; Turso is deferred and non-authoritative.
 
 ## Project
 

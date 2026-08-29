@@ -8,6 +8,8 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { isatty } from "node:tty";
 
+import { z } from "zod";
+
 import {
   CliUsageError,
   accountLoginCancelCommand,
@@ -19,6 +21,7 @@ import {
   projectionRecoveryReplayCommand,
   requestsJsonOutput,
   requestsJsonlOutput,
+  requestsWorkApplyProtocol,
   usageForGroup,
   type CliInvocation,
   type ProjectionRecoveryCliInvocation,
@@ -45,6 +48,7 @@ import {
 } from "./cli/shell-live";
 import { discardReadableUntilEnd, ShellTerminalCoordinator } from "./cli/shell-terminal";
 import { followSessionEvents } from "./cli/watch";
+import { followWorkEvents } from "./cli/work-watch";
 import {
   BridgedCloudControl,
   CloudDaemonJournalRecoveryBlocker,
@@ -77,12 +81,22 @@ import {
   type CloudSecretCustodyPort,
 } from "./cloud/index";
 import { resolvePinnedCodexRuntime } from "./codex/index";
-import type { CommandResponse, LocalCommand } from "./domain/contracts";
+import { localCommandSchema, type CommandResponse, type LocalCommand } from "./domain/contracts";
 import {
   PROTECTED_INTERACTION_TERMINAL_MAXIMUM_BYTES,
 } from "./domain/interactions";
 import { sessionStatusSchema } from "./domain/observation";
 import { profileIdSchema, selectByIdOrLabel, sessionIdSchema } from "./domain/values";
+import {
+  WORK_PROTOCOL_REQUEST_MAX_BYTES,
+  WORK_PROTOCOL,
+  WORK_PROTOCOL_VERSION,
+  workProtocolRequestSchema,
+} from "./domain/work";
+import {
+  workAgentProtocolResponseSchema,
+  type WorkAgentProtocolError,
+} from "./domain/work-protocol";
 import {
   LocalDaemonServer,
   LocalDaemonIndeterminateError,
@@ -126,6 +140,7 @@ import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./stor
 import { resolveUsableCanonicalProjectDirectory } from "./storage/project-directory";
 import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
+import { WorkCapabilityCodec } from "./storage/work-capability";
 import { HRA_VERSION } from "./version";
 
 const writeProcessStdoutAsync = (value: string, signal: AbortSignal): Promise<void> =>
@@ -229,10 +244,13 @@ const flushProtectedTerminalInput = (fd: number): void => {
   throw new CliUsageError("Protected terminal input could not establish an empty input queue.");
 };
 
-const decodeProtectedJson = (bytes: Buffer): unknown => {
+const decodeProtectedJson = (
+  bytes: Buffer,
+  maximumBytes = protectedInputMaximumBytes,
+): unknown => {
   if (bytes.byteLength === 0) throw new CliUsageError("Protected input is empty.");
-  if (bytes.byteLength > protectedInputMaximumBytes) {
-    throw new CliUsageError(`Protected input exceeds ${String(protectedInputMaximumBytes)} UTF-8 bytes.`);
+  if (bytes.byteLength > maximumBytes) {
+    throw new CliUsageError(`Protected input exceeds ${String(maximumBytes)} UTF-8 bytes.`);
   }
   try {
     const source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -244,12 +262,15 @@ const decodeProtectedJson = (bytes: Buffer): unknown => {
   }
 };
 
-const readBoundedDescriptor = (fd: number): Buffer => {
+const readBoundedDescriptor = (
+  fd: number,
+  maximumBytes = protectedInputMaximumBytes,
+): Buffer => {
   const chunks: Buffer[] = [];
   let total = 0;
   try {
     for (;;) {
-      const chunk = Buffer.allocUnsafe(Math.min(8 * 1024, protectedInputMaximumBytes + 1 - total));
+      const chunk = Buffer.allocUnsafe(Math.min(8 * 1024, maximumBytes + 1 - total));
       const read = readSync(fd, chunk, 0, chunk.byteLength, null);
       if (read === 0) {
         chunk.fill(0);
@@ -257,8 +278,8 @@ const readBoundedDescriptor = (fd: number): Buffer => {
       }
       chunks.push(chunk.subarray(0, read));
       total += read;
-      if (total > protectedInputMaximumBytes) {
-        throw new CliUsageError(`Protected interaction input exceeds ${String(protectedInputMaximumBytes)} UTF-8 bytes.`);
+      if (total > maximumBytes) {
+        throw new CliUsageError(`Protected input exceeds ${String(maximumBytes)} UTF-8 bytes.`);
       }
     }
     return Buffer.concat(chunks, total);
@@ -919,6 +940,7 @@ const readProtectedDocument = async (
   source: ProtectedInputSource,
   output: Output,
   signal?: AbortSignal,
+  maximumBytes = protectedInputMaximumBytes,
 ): Promise<unknown> => {
   const fd = source.kind === "stdin" ? 0 : source.fd;
   let bytes: Buffer;
@@ -929,13 +951,13 @@ const readProtectedDocument = async (
       }
       bytes = await readHiddenProtectedLine(output, signal);
     } else {
-      bytes = readBoundedDescriptor(fd);
+      bytes = readBoundedDescriptor(fd, maximumBytes);
     }
   } catch (error: unknown) {
     if (error instanceof CliUsageError) throw error;
     throw new CliUsageError("Protected input could not be read from the selected descriptor.");
   }
-  return decodeProtectedJson(bytes);
+  return decodeProtectedJson(bytes, maximumBytes);
 };
 
 export type ProtectedTerminalLifecycleHooks = Readonly<{
@@ -1060,6 +1082,21 @@ export async function resolveUsageHistoryCursorCodec(
     custody,
     options.allowInitialization ?? true,
   ));
+}
+
+export async function resolveWorkCapabilityCodec(
+  custody: GenerationalSecretCustody,
+  options: Readonly<{ allowInitialization?: boolean }> = {},
+): Promise<WorkCapabilityCodec> {
+  const encoded = await resolveCursorAuthorityKey(
+    custody,
+    options.allowInitialization ?? true,
+  );
+  const key = Buffer.from(encoded, "base64url");
+  if (key.toString("base64url") !== encoded) {
+    throw new Error("Work capability authority is not canonical base64url.");
+  }
+  return new WorkCapabilityCodec(key);
 }
 
 const syncDiagnosticLimit = 16;
@@ -2816,6 +2853,9 @@ export async function runDaemon(
     const usageHistoryCursors = await resolveUsageHistoryCursorCodec(secretCustody, {
       allowInitialization: allowCursorAuthorityInitialization,
     });
+    const workCapabilities = await resolveWorkCapabilityCodec(secretCustody, {
+      allowInitialization: allowCursorAuthorityInitialization,
+    });
     activeStore.configurePublicProviderIdentifierProjector(
       (value) => eventCursors.projectPublicProviderIdentifier(value),
     );
@@ -2998,6 +3038,7 @@ export async function runDaemon(
       daemonGeneration: generation,
       eventCursors,
       usageHistoryCursors,
+      workCapabilities,
       ...(desktop === undefined ? {} : { desktop }),
       requestStop,
     });
@@ -3205,18 +3246,19 @@ const readInvocationProtectedDocument = async (
   source: ProtectedInputSource,
   output: Output,
   input: CliMainInput,
+  maximumBytes = protectedInputMaximumBytes,
 ): Promise<unknown> => {
   if (input.readProtectedDocument !== undefined) return await input.readProtectedDocument(source);
   const fd = protectedInputDescriptor(source);
   const terminal = (input.isTerminalDescriptor ?? isatty)(fd);
-  if (!terminal) return await readProtectedDocument(source, output);
+  if (!terminal) return await readProtectedDocument(source, output, undefined, maximumBytes);
   if (!input.interactive || !process.stderr.isTTY) {
     throw new CliUsageError(
       "Terminal protected input requires an interactive stdin and a visible terminal on stderr. Redirect one protected JSON document from a non-terminal stdin or file descriptor instead.",
     );
   }
   return await withProtectedTerminalLifecycle(async (signal) =>
-    await readProtectedDocument(source, output, signal));
+    await readProtectedDocument(source, output, signal, maximumBytes));
 };
 
 async function executeProtectedInteraction(
@@ -3246,6 +3288,231 @@ async function executeProtectedAuthLogin(
   const response = await commandCaller(input)(command);
   if (!response.ok) return renderFailure(response.error, invocation.json, output);
   renderSuccess(command, response.data, invocation.json, output);
+  return 0;
+}
+
+type WorkCommandError = Extract<CommandResponse, { ok: false }>["error"];
+
+type WorkFailureMapping = Readonly<{
+  commandCode: WorkCommandError["code"];
+  protocolCode: WorkAgentProtocolError["code"];
+  recovery: WorkAgentProtocolError["recovery"];
+  retryable: boolean;
+}>;
+
+const workProtocolErrorMessages = {
+  invalid_request: "The work request is invalid.",
+  not_found: "A required work entity was not found.",
+  conflict: "The work mutation conflicts with current durable state.",
+  fence_mismatch: "The attempt fence no longer authorizes this mutation.",
+  lease_expired: "The attempt lease expired before this mutation.",
+  not_owner: "The actor does not own the selected attempt.",
+  route_mismatch: "The selected session does not satisfy the durable task route.",
+  invalid_state: "The work mutation is not valid in the current durable state.",
+  limit_exceeded: "A durable work protocol limit prevents this operation.",
+  effect_unknown: "The work effect is uncertain; replay the exact same request document.",
+  internal: "The work mutation failed at an internal boundary.",
+} as const satisfies Readonly<Record<WorkAgentProtocolError["code"], string>>;
+
+const workFailureByReason = {
+  ATTEMPT_EXHAUSTED: { commandCode: "CONFLICT", protocolCode: "limit_exceeded", recovery: "none", retryable: false },
+  ATTEMPT_NOT_OWNER: { commandCode: "CONFLICT", protocolCode: "not_owner", recovery: "refresh_state_then_new_request", retryable: false },
+  ATTEMPT_NOT_CLAIMABLE: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  ATTEMPT_NOT_FOUND: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  ATTEMPT_RECOVERY_REQUIRED: { commandCode: "RECOVERY_REQUIRED", protocolCode: "effect_unknown", recovery: "replay_exact_request", retryable: true },
+  BAD_CURSOR: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  BAD_IDEMPOTENCY_KEY: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  DEPENDENCY_CYCLE: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  DEPENDENCY_INCOMPLETE: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  EVIDENCE_INVALID: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  FENCE_MISMATCH: { commandCode: "CONFLICT", protocolCode: "fence_mismatch", recovery: "refresh_state_then_new_request", retryable: false },
+  IDEMPOTENCY_CONFLICT: { commandCode: "CONFLICT", protocolCode: "conflict", recovery: "refresh_state_then_new_request", retryable: false },
+  LEASE_EXPIRED: { commandCode: "CONFLICT", protocolCode: "lease_expired", recovery: "refresh_state_then_new_request", retryable: false },
+  MEMBER_NOT_FOUND: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  NO_READY_TASK: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  NOT_REVIEWABLE: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  REVISION_CONFLICT: { commandCode: "CONFLICT", protocolCode: "conflict", recovery: "refresh_state_then_new_request", retryable: false },
+  ROUTE_MISMATCH: { commandCode: "CONFLICT", protocolCode: "route_mismatch", recovery: "refresh_state_then_new_request", retryable: false },
+  SELF_REVIEW: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  SIGNAL_NOT_FOUND: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  TASK_DEPTH_EXCEEDED: { commandCode: "INVALID_INPUT", protocolCode: "limit_exceeded", recovery: "none", retryable: false },
+  TASK_LIMIT_EXCEEDED: { commandCode: "INVALID_INPUT", protocolCode: "limit_exceeded", recovery: "none", retryable: false },
+  TASK_NOT_FOUND: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  UNKNOWN_DEPENDENCY: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  UNKNOWN_PARENT: { commandCode: "INVALID_INPUT", protocolCode: "invalid_request", recovery: "none", retryable: false },
+  WORK_CAPACITY_EXCEEDED: { commandCode: "CONFLICT", protocolCode: "limit_exceeded", recovery: "none", retryable: false },
+  WORK_NOT_ACTIVE: { commandCode: "CONFLICT", protocolCode: "invalid_state", recovery: "refresh_state_then_new_request", retryable: false },
+  WORK_NOT_FOUND: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  WORK_RELEASED: { commandCode: "NOT_FOUND", protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+} as const satisfies Readonly<Record<string, WorkFailureMapping>>;
+
+type WorkFailureReason = keyof typeof workFailureByReason;
+
+const workCommandExitCodes = {
+  INVALID_INPUT: 2,
+  NOT_FOUND: 4,
+  AMBIGUOUS: 1,
+  CONFLICT: 1,
+  INTERACTION_REQUIRED: 6,
+  UNAVAILABLE: 5,
+  RECOVERY_REQUIRED: 7,
+  INTERNAL: 1,
+} as const satisfies Readonly<Record<WorkCommandError["code"], number>>;
+
+const workFailureReason = (details: unknown): WorkFailureReason | null => {
+  if (details === null || typeof details !== "object" || Array.isArray(details)) return null;
+  const reason = (details as Readonly<Record<string, unknown>>).reason;
+  return typeof reason === "string" && Object.hasOwn(workFailureByReason, reason)
+    ? reason as WorkFailureReason
+    : null;
+};
+
+const fallbackWorkFailure = {
+  INVALID_INPUT: { protocolCode: "invalid_request", recovery: "none", retryable: false },
+  NOT_FOUND: { protocolCode: "not_found", recovery: "refresh_state_then_new_request", retryable: false },
+  AMBIGUOUS: { protocolCode: "conflict", recovery: "refresh_state_then_new_request", retryable: false },
+  CONFLICT: { protocolCode: "conflict", recovery: "refresh_state_then_new_request", retryable: false },
+  INTERACTION_REQUIRED: { protocolCode: "invalid_state", recovery: "none", retryable: false },
+  UNAVAILABLE: { protocolCode: "internal", recovery: "retry_same_request", retryable: true },
+  RECOVERY_REQUIRED: { protocolCode: "effect_unknown", recovery: "replay_exact_request", retryable: true },
+  INTERNAL: { protocolCode: "internal", recovery: "none", retryable: false },
+} as const satisfies Readonly<Record<
+  WorkCommandError["code"],
+  Readonly<{ protocolCode: WorkAgentProtocolError["code"]; recovery: WorkAgentProtocolError["recovery"]; retryable: boolean }>
+>>;
+
+const mapWorkFailure = (failure: WorkCommandError): Readonly<{
+  error: WorkAgentProtocolError;
+  exitCode: number;
+}> => {
+  const reason = workFailureReason(failure.details);
+  const exact = reason === null ? null : workFailureByReason[reason];
+  const mapped = exact !== null && exact.commandCode === failure.code
+    ? exact
+    : fallbackWorkFailure[failure.code];
+  return {
+    error: {
+      code: mapped.protocolCode,
+      message: workProtocolErrorMessages[mapped.protocolCode],
+      recovery: mapped.recovery,
+      retryable: mapped.retryable,
+      exitCode: workCommandExitCodes[failure.code],
+    },
+    exitCode: workCommandExitCodes[failure.code],
+  };
+};
+
+const writeWorkProtocolFailure = (
+  requestId: string | null,
+  error: WorkAgentProtocolError,
+  output: Output,
+): void => {
+  output.writeStdout(`${safeJson(workAgentProtocolResponseSchema.parse({
+    protocol: WORK_PROTOCOL,
+    version: WORK_PROTOCOL_VERSION,
+    requestId,
+    ok: false,
+    error,
+  }))}\n`);
+};
+
+const admittedWorkRequestCorrelation = (document: unknown): string | null => {
+  if (document === null || typeof document !== "object" || Array.isArray(document)) return null;
+  const record = document as Readonly<Record<string, unknown>>;
+  const keys = Object.keys(record).sort();
+  if (
+    JSON.stringify(keys) !== JSON.stringify(["operation", "protocol", "requestId", "version"])
+    || record.protocol !== WORK_PROTOCOL
+    || record.version !== WORK_PROTOCOL_VERSION
+    || typeof record.requestId !== "string"
+  ) return null;
+  const parsed = z.string().uuid().safeParse(record.requestId);
+  return parsed.success ? parsed.data : null;
+};
+
+async function executeWorkApply(
+  invocation: Extract<CliInvocation, { kind: "work.apply-input" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const descriptor = protectedInputDescriptor(invocation.input);
+  if ((input.isTerminalDescriptor ?? isatty)(descriptor)) {
+    writeWorkProtocolFailure(null, {
+      code: "invalid_state",
+      message: "Work operations require one bounded JSON document from non-terminal stdin or a file descriptor.",
+      recovery: "none",
+      retryable: false,
+      exitCode: 6,
+    }, output);
+    return 6;
+  }
+  let document: unknown;
+  try {
+    document = await readInvocationProtectedDocument(
+      invocation.input,
+      output,
+      input,
+      WORK_PROTOCOL_REQUEST_MAX_BYTES,
+    );
+  } catch {
+    writeWorkProtocolFailure(null, {
+      code: "invalid_request",
+      message: "The work request input is not one bounded JSON document.",
+      recovery: "none",
+      retryable: false,
+      exitCode: 2,
+    }, output);
+    return 2;
+  }
+  const request = workProtocolRequestSchema.safeParse(document);
+  if (!request.success) {
+    writeWorkProtocolFailure(admittedWorkRequestCorrelation(document), {
+      code: "invalid_request",
+      message: "The work request document does not match the strict versioned HRA work protocol.",
+      recovery: "none",
+      retryable: false,
+      exitCode: 2,
+    }, output);
+    return 2;
+  }
+  const command = localCommandSchema.parse({
+    kind: "work.apply",
+    requestId: request.data.requestId,
+    operation: request.data.operation,
+  });
+  if (command.kind !== "work.apply") throw new CliUsageError("The work operation is invalid.");
+  let response: CommandResponse;
+  try {
+    response = await commandCaller(input)(command);
+  } catch (error: unknown) {
+    if (!(error instanceof LocalDaemonIndeterminateError)) throw error;
+    writeWorkProtocolFailure(request.data.requestId, {
+      code: "effect_unknown",
+      message: "The local transport outcome is uncertain; replay the exact same request document.",
+      recovery: "replay_exact_request",
+      retryable: true,
+      exitCode: 7,
+    }, output);
+    return 7;
+  }
+  if (!response.ok) {
+    const failure = mapWorkFailure(response.error);
+    writeWorkProtocolFailure(request.data.requestId, failure.error, output);
+    return failure.exitCode;
+  }
+  try {
+    renderSuccess(command, response.data, true, output);
+  } catch (error: unknown) {
+    if (!(error instanceof InvalidCommandResponseError)) throw error;
+    writeWorkProtocolFailure(request.data.requestId, {
+      code: "effect_unknown",
+      message: "The daemon reported success without a valid bound result; replay the exact same request document.",
+      recovery: "replay_exact_request",
+      retryable: true,
+      exitCode: 7,
+    }, output);
+    return 7;
+  }
   return 0;
 }
 
@@ -3765,6 +4032,95 @@ async function executeSessionEventObserver(
       : renderJsonlFailure(failure, output);
   } finally {
     await finalize();
+  }
+}
+
+async function executeWorkEventObserver(
+  invocation: Extract<CliInvocation, { kind: "work.events.follow" }>,
+  output: Output,
+  input: CliMainInput,
+): Promise<number> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(new Error("Work event observation stopped."));
+  const callDaemon = commandCaller(input);
+  process.once("SIGINT", abort);
+  if (input.sessionObserverSignalMode !== "foreground_interrupt") {
+    process.once("SIGTERM", abort);
+  }
+  try {
+    await followWorkEvents({
+      command: invocation.command,
+      fetchPage: async (command, signal) => {
+        const response = await callDaemon(command, signal);
+        if (!response.ok) {
+          throw Object.assign(new Error(response.error.message), {
+            commandError: response.error,
+          });
+        }
+        return response.data;
+      },
+      output,
+      retryFetchError: async (error, consecutiveFailures, signal) => {
+        const commandError = error !== null && typeof error === "object" && "commandError" in error
+          ? (error as { commandError?: unknown }).commandError
+          : undefined;
+        const retryableCommand = commandError !== null
+          && typeof commandError === "object"
+          && "code" in commandError
+          && commandError.code === "UNAVAILABLE";
+        if (
+          !(error instanceof LocalDaemonIndeterminateError)
+          && !isLocalDaemonUnavailable(error)
+          && !retryableCommand
+        ) return false;
+        const delayMs = Math.min(1_000, 25 * (2 ** Math.min(consecutiveFailures - 1, 5)));
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) {
+            resolve();
+            return;
+          }
+          const onAbort = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, delayMs);
+          signal.addEventListener("abort", onAbort, { once: true });
+        });
+        return !signal.aborted;
+      },
+      signal: controller.signal,
+    });
+    return 0;
+  } catch (error: unknown) {
+    if (controller.signal.aborted || isClosedStdout(error)) return 0;
+    const commandError = error !== null && typeof error === "object" && "commandError" in error
+      ? (error as { commandError?: unknown }).commandError
+      : undefined;
+    if (
+      commandError !== null
+      && typeof commandError === "object"
+      && "code" in commandError
+      && typeof commandError.code === "string"
+      && "message" in commandError
+      && typeof commandError.message === "string"
+    ) {
+      return renderJsonlFailure(
+        commandError as { code: string; message: string; details?: unknown },
+        output,
+      );
+    }
+    return renderJsonlFailure({
+      code: "INTERNAL",
+      message: "Work event observation failed before a safe page was available.",
+    }, output);
+  } finally {
+    process.off("SIGINT", abort);
+    if (input.sessionObserverSignalMode !== "foreground_interrupt") {
+      process.off("SIGTERM", abort);
+    }
   }
 }
 
@@ -4301,6 +4657,9 @@ async function executeInvocation(
   if (invocation.kind === "auth.login-protected") {
     return await executeProtectedAuthLogin(invocation, output, input);
   }
+  if (invocation.kind === "work.apply-input") {
+    return await executeWorkApply(invocation, output, input);
+  }
   if (invocation.kind === "interaction.resolve-protected") {
     return await executeProtectedInteraction(invocation, output, input);
   }
@@ -4309,6 +4668,9 @@ async function executeInvocation(
   }
   if (invocation.kind === "session.events.follow" || invocation.kind === "session.events.watch") {
     return await executeSessionEventObserver(invocation, output, input);
+  }
+  if (invocation.kind === "work.events.follow") {
+    return await executeWorkEventObserver(invocation, output, input);
   }
   if (invocation.kind === "interaction-required") {
     return renderFailure(invocation.error, invocation.json, output);
@@ -4480,6 +4842,16 @@ export async function main(
         ? sanitizeSyncDiagnostic(message)
         : message;
     if (error instanceof CliUsageError) {
+      if (requestsWorkApplyProtocol(argv)) {
+        writeWorkProtocolFailure(null, {
+          code: "invalid_request",
+          message: "The work apply invocation is invalid.",
+          recovery: "none",
+          retryable: false,
+          exitCode: 2,
+        }, output);
+        return 2;
+      }
       if (jsonl) return renderJsonlFailure({ code: "INVALID_INPUT", message: error.message }, output);
       if (json) return renderFailure({ code: "INVALID_INPUT", message: error.message }, true, output);
       output.writeStderr(`hra: ${safeDiagnostic(error.message)}\n\n${usageForGroup(undefined)}\n`);

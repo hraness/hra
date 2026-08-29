@@ -55,6 +55,45 @@ describe("local daemon transport", () => {
     expect((await readFile(paths.capability, "utf8")).trim()).toHaveLength(43);
   });
 
+  test("rejects a syntactically valid response bound to another request", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    await writeFile(paths.capability, `${randomBytes(32).toString("base64url")}\n`, { mode: 0o600 });
+    const secret = "HOSTILE_CROSS_REQUEST_SUCCESS";
+    const raw = createServer((socket) => {
+      let received = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        received = Buffer.concat([
+          received,
+          Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk),
+        ]);
+        if (received.indexOf(0x0a) < 0) return;
+        socket.end(`${JSON.stringify({
+          ok: true,
+          version: 1,
+          requestId: randomUUID(),
+          data: { accepted: secret },
+        })}\n`);
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      raw.once("error", reject);
+      raw.listen(paths.socket, resolve);
+    });
+    await chmod(paths.socket, 0o600);
+    try {
+      await expect(callLocalDaemon({
+        paths,
+        command: { kind: "daemon.status" },
+        deadlineMs: 1_000,
+      })).rejects.toBeInstanceOf(LocalDaemonIndeterminateError);
+    } finally {
+      await new Promise<void>((resolve) => raw.close(() => resolve()));
+      await unlink(paths.socket).catch(() => undefined);
+    }
+  });
+
   test("rejects a mismatched request protocol before entering the command handler", async () => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "hra-daemon-")));
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });

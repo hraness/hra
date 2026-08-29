@@ -47,9 +47,28 @@ import {
   storedAccountUsageSnapshotSchema,
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
+import {
+  WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+  workActionCursorPayloadSchema,
+  workEventPageSchema,
+  workEventCursorPayloadSchema,
+  workOperationResultSchema,
+  workPollSchema,
+  workPreparedEffectStatusSchema,
+  workTaskHistoryCursorPayloadSchema,
+  type WorkEventPage,
+  type WorkId,
+  type WorkOperation,
+  type WorkOperationResult,
+  type WorkPoll,
+  type WorkPreparedEffect,
+} from "../domain/work";
+import { describeWorkProtocol } from "../domain/work-protocol";
+import { workPreparedEffectMessage } from "../domain/work-message";
 import { canonicalLabelKey, profileIdSchema, sessionIdSchema } from "../domain/values";
 import { initializeProfilePaths, profilePaths, type StatePaths } from "../storage/paths";
 import { resolveUsableCanonicalProjectDirectory } from "../storage/project-directory";
+import { WorkCapabilityCodec } from "../storage/work-capability";
 import {
   SelectionError,
   StateSecurityScrubRequiredError,
@@ -61,6 +80,12 @@ import {
   type SessionRecord,
   type StateStore,
 } from "../storage/state-store";
+import {
+  WorkStoreError,
+  canonicalWorkJson,
+  type WorkPreparedEffectAuthorization,
+  type WorkStore,
+} from "../storage/work-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
 import { commandFailureBrand } from "./local-transport";
 import {
@@ -81,6 +106,10 @@ import {
   type InteractionCursorScope,
 } from "./session-event-cursor";
 import { SessionEventWaiterLimitError, SessionEventWaiters } from "./session-event-waiters";
+import {
+  WorkEventWaiterLimitError,
+  WorkEventWaiters,
+} from "./work-event-waiters";
 import {
   UsageHistoryCursorCodec,
   UsageHistoryCursorError,
@@ -353,6 +382,13 @@ class IndeterminateLocalCommitError extends Error {
   }
 }
 
+class WorkEffectExecutionSuppressed extends Error {
+  constructor() {
+    super("The durable work-effect authority rejected nested execution.");
+    this.name = "WorkEffectExecutionSuppressed";
+  }
+}
+
 class InteractionPersistenceBoundaryError extends Error {
   constructor(
     readonly focalInteraction: InteractionRecord,
@@ -441,6 +477,8 @@ export class HraService {
   readonly #eventCursors: SessionEventCursorCodec;
   readonly #usageHistoryCursors: UsageHistoryCursorCodec;
   readonly #eventWaiters: SessionEventWaiters;
+  readonly #work: WorkStore;
+  readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
@@ -472,6 +510,8 @@ export class HraService {
     eventCursors?: SessionEventCursorCodec;
     usageHistoryCursors?: UsageHistoryCursorCodec;
     eventWaiters?: SessionEventWaiters;
+    workWaiters?: WorkEventWaiters;
+    workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
     now?: () => number;
     requestStop: () => void;
@@ -495,6 +535,40 @@ export class HraService {
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
+    const workCapabilities = input.workCapabilities
+      ?? new WorkCapabilityCodec(WorkCapabilityCodec.generateKey());
+    this.#work = this.#store.createWorkStore(
+      this.#daemonGeneration,
+      (payload) => payload.type === "work"
+        ? this.#eventCursors.encodeWorkEvent(workEventCursorPayloadSchema.parse(payload))
+        : payload.type === "work_actions"
+          ? this.#eventCursors.encodeWorkAction(workActionCursorPayloadSchema.parse(payload))
+          : this.#eventCursors.encodeWorkTaskHistory(
+              workTaskHistoryCursorPayloadSchema.parse(payload),
+            ),
+      {
+        issue: (authority) => authority.scope === "attempt"
+          ? workCapabilities.issue({
+              scope: authority.scope,
+              workId: authority.workId,
+              sessionId: authority.sessionId,
+              subjectId: authority.attemptId,
+              fence: authority.fence,
+            })
+          : workCapabilities.issue(authority),
+        verify: (capability, authority) => authority.scope === "attempt"
+          ? workCapabilities.verify({
+              scope: authority.scope,
+              workId: authority.workId,
+              sessionId: authority.sessionId,
+              subjectId: authority.attemptId,
+              fence: authority.fence,
+              capability,
+            })
+          : workCapabilities.verify({ ...authority, capability }),
+      },
+    );
+    this.#workWaiters = input.workWaiters ?? new WorkEventWaiters();
     this.#now = input.now ?? Date.now;
     this.#desktop = input.desktop;
     this.#requestStop = input.requestStop;
@@ -662,6 +736,15 @@ export class HraService {
         };
         case "interaction.inspect": return await this.#inspectInteraction(command, context.signal);
         case "interaction.resolve": return await this.#resolveInteraction(command, context);
+        case "work.protocol": return describeWorkProtocol(command.query);
+        case "work.apply": return await this.#applyWorkOperation(
+          command.operation,
+          context.signal,
+        );
+        case "work.snapshot": return this.#readWorkSnapshot(command.work, command.actor);
+        case "work.task": return this.#readWorkTask(command);
+        case "work.poll": return await this.#pollWork(command, context.signal);
+        case "work.events": return await this.#readWorkEvents(command, context.signal);
         case "auth.login": {
           const result = await this.#fencedEffect(async () => await this.#cloud.auth({
             email: command.email,
@@ -755,6 +838,48 @@ export class HraService {
       }
       if (error instanceof SessionEventWaiterLimitError) {
         throw new CommandFailure("UNAVAILABLE", error.message);
+      }
+      if (error instanceof WorkEventWaiterLimitError) {
+        throw new CommandFailure("UNAVAILABLE", error.message);
+      }
+      if (error instanceof WorkStoreError) {
+        const details = { reason: error.code };
+        switch (error.code) {
+          case "WORK_NOT_FOUND":
+          case "TASK_NOT_FOUND":
+          case "ATTEMPT_NOT_FOUND":
+          case "SIGNAL_NOT_FOUND":
+          case "MEMBER_NOT_FOUND":
+          case "WORK_RELEASED":
+            throw new CommandFailure("NOT_FOUND", error.message, details);
+          case "BAD_CURSOR":
+          case "BAD_IDEMPOTENCY_KEY":
+          case "DEPENDENCY_CYCLE":
+          case "EVIDENCE_INVALID":
+          case "TASK_DEPTH_EXCEEDED":
+          case "TASK_LIMIT_EXCEEDED":
+          case "UNKNOWN_DEPENDENCY":
+          case "UNKNOWN_PARENT":
+            throw new CommandFailure("INVALID_INPUT", error.message, details);
+          case "ATTEMPT_RECOVERY_REQUIRED":
+            throw new CommandFailure("RECOVERY_REQUIRED", error.message, details);
+          case "WORK_CAPACITY_EXCEEDED":
+            throw new CommandFailure("CONFLICT", error.message, details);
+          case "ATTEMPT_EXHAUSTED":
+          case "ATTEMPT_NOT_OWNER":
+          case "ATTEMPT_NOT_CLAIMABLE":
+          case "DEPENDENCY_INCOMPLETE":
+          case "FENCE_MISMATCH":
+          case "IDEMPOTENCY_CONFLICT":
+          case "LEASE_EXPIRED":
+          case "NO_READY_TASK":
+          case "NOT_REVIEWABLE":
+          case "REVISION_CONFLICT":
+          case "ROUTE_MISMATCH":
+          case "SELF_REVIEW":
+          case "WORK_NOT_ACTIVE":
+            throw new CommandFailure("CONFLICT", error.message, details);
+        }
       }
       if (error instanceof AccountKeyLossPreconditionError) {
         switch (error.code) {
@@ -955,6 +1080,8 @@ export class HraService {
     if (recoveredQueue.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredQueue.unresolved.length)} dispatching queue authorities.`);
     }
+    await this.#recoverPreparedWorkEffects(this.#interactionDeadlineAbort.signal);
+    await this.#daemonAuthority.assertCurrent();
     const pendingSessions = new Set<string>();
     for (const queued of this.#store.listRecoverableQueue()) {
       const session = this.#store.requireSession(queued.sessionId);
@@ -987,6 +1114,57 @@ export class HraService {
     }
     this.#scheduleRecoverySessionObservations(activeSessions);
     this.#wakeInteractionDeadlinePump();
+  }
+
+  async #recoverPreparedWorkEffects(signal: AbortSignal): Promise<void> {
+    let cursor: Parameters<WorkStore["recoverablePreparedEffects"]>[0];
+    for (;;) {
+      if (this.#workEffectRecoveryStopped(signal)) return;
+      await this.#daemonAuthority.assertCurrent();
+      const page = this.#work.recoverablePreparedEffects(cursor, 32);
+      for (const recoverable of page.effects) {
+        if (this.#workEffectRecoveryStopped(signal)) return;
+        await this.#daemonAuthority.assertCurrent();
+        this.#assertPreparedEffectBinding(recoverable.effect, recoverable.status);
+
+        let executionError: unknown;
+        if (recoverable.status.state === "prepared") {
+          try {
+            await this.#performPreparedWorkEffect(
+              recoverable.effect,
+              recoverable.idempotencyKey,
+              signal,
+            );
+          } catch (error: unknown) {
+            executionError = error;
+          }
+        }
+
+        await this.#daemonAuthority.assertCurrent();
+        let projected = this.#work.reprojectPreparedEffect(recoverable.idempotencyKey);
+        this.#assertPreparedEffectBinding(recoverable.effect, projected);
+        if (projected.state === "prepared") {
+          projected = this.#work.settlePreparedEffectNoEffect(
+            recoverable.idempotencyKey,
+            "startup_preflight_no_effect",
+          );
+          this.#assertPreparedEffectBinding(recoverable.effect, projected);
+        }
+        this.#workWaiters.notify(recoverable.effect.workId);
+        if (executionError instanceof StateSecurityScrubRequiredError) {
+          throw executionError;
+        }
+      }
+      if (page.nextCursor === null) return;
+      cursor = page.nextCursor;
+      // Keep each startup read and recovery batch bounded while allowing close
+      // and notification work to run before the next page is admitted.
+      await new Promise<void>((resolveYield) => setTimeout(resolveYield, 0));
+    }
+  }
+
+  #workEffectRecoveryStopped(signal: AbortSignal): boolean {
+    return this.#state !== "open" || signal.aborted;
   }
 
   async settled(): Promise<void> {
@@ -1221,15 +1399,17 @@ export class HraService {
         await this.#daemonAuthority.assertCurrent();
         if (blocked || this.#profileHasProjectionRecoveryInFlight(profile.id)) return;
         if (!account.signedIn && current.state === "login_pending") return;
-        this.#store.setProfileState(
+        const stateChange = this.#store.setProfileStateWithWorkRetirement(
           current.id,
           current.processGeneration,
           account.signedIn ? "signed_in" : "signed_out",
+          this.#work,
           {
             ...(account.email === undefined ? {} : { email: account.email }),
             ...(account.plan === undefined ? {} : { plan: account.plan }),
           },
         );
+        this.#notifyAffectedWork(stateChange.affectedWorkIds);
       };
       if (this.#mutationTails.has(`account:${profile.id}`)) await apply();
       else await this.#serialize(`account:${profile.id}`, apply);
@@ -1261,7 +1441,12 @@ export class HraService {
         }
         if (current.processGeneration !== authority.generation) return;
         this.#handleProviderDisconnected(authority, fact.connectionId, fact.reason);
-        this.#store.advanceProfileGeneration(authority.id, authority.generation);
+        const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
+          authority.id,
+          authority.generation,
+          this.#work,
+        );
+        this.#notifyAffectedWork(retirement.affectedWorkIds);
       });
       return;
     }
@@ -1868,7 +2053,12 @@ export class HraService {
         }
       }
       try {
-        this.#store.advanceProfileGeneration(profile.id, profile.processGeneration);
+        const retirement = this.#store.advanceProfileGenerationWithWorkRetirement(
+          profile.id,
+          profile.processGeneration,
+          this.#work,
+        );
+        this.#notifyAffectedWork(retirement.affectedWorkIds);
       } catch (error: unknown) {
         projectionErrors.push(error);
       }
@@ -2233,10 +2423,18 @@ export class HraService {
             },
       };
     }
-    if (!this.#store.setProfileState(profile.id, profile.processGeneration, account.signedIn ? "signed_in" : "signed_out", {
-      ...(account.email === undefined ? {} : { email: account.email }),
-      ...(account.plan === undefined ? {} : { plan: account.plan }),
-    })) {
+    const stateChange = this.#store.setProfileStateWithWorkRetirement(
+      profile.id,
+      profile.processGeneration,
+      account.signedIn ? "signed_in" : "signed_out",
+      this.#work,
+      {
+        ...(account.email === undefined ? {} : { email: account.email }),
+        ...(account.plan === undefined ? {} : { plan: account.plan }),
+      },
+    );
+    this.#notifyAffectedWork(stateChange.affectedWorkIds);
+    if (!stateChange.changed) {
       throw new CommandFailure("CONFLICT", "Account generation changed during reconciliation.");
     }
     return { account: this.#publicProfile(this.#store.requireProfile(profile.id)) };
@@ -2284,7 +2482,9 @@ export class HraService {
               profileGeneration: targetGeneration,
               evidence: { kind: "account.login", method: deviceCode ? "device_code" : "browser" },
               providerRetirements: retirements,
+              workStore: this.#work,
             });
+            this.#notifyAffectedWork(begun.affectedWorkIds);
             this.#applyAccountLoginProviderRetirements(
               retirements,
               begun.retiredSessionIds,
@@ -2350,7 +2550,13 @@ export class HraService {
         if (attempt?.state === "effect_started" || attempt?.state === "ambiguous") {
           this.#quarantineProfile(observed);
         } else if (observed.state === "login_pending") {
-          this.#store.setProfileState(current.id, targetGeneration, "signed_out");
+          const stateChange = this.#store.setProfileStateWithWorkRetirement(
+            current.id,
+            targetGeneration,
+            "signed_out",
+            this.#work,
+          );
+          this.#notifyAffectedWork(stateChange.affectedWorkIds);
         }
       }
       throw error;
@@ -2428,6 +2634,7 @@ export class HraService {
   async #logout(selector: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
     const profile = this.#store.requireProfile(selector);
     await this.#assertNoCompactProjectionRecoveryForProfile(profile.id);
+    this.#work.assertProfileCanChangeAuthority(profile.id);
     const key = idempotencyKey ?? randomUUID();
     if (profile.state === "recovery_required") {
       throw new CommandFailure("RECOVERY_REQUIRED", "This account has an indeterminate logout. Run `hra account show` to reconcile its exact provider state before another logout.");
@@ -2439,12 +2646,14 @@ export class HraService {
       request: {},
       idempotencyKey: key,
       beginEffect: (attemptId) => {
-        this.#store.beginAccountMutationEffect({
+        const begun = this.#store.beginAccountMutationEffect({
           attemptId,
           profileId: profile.id,
           profileGeneration: profile.processGeneration,
           evidence: { kind: "account.logout", baselineSignedIn: profile.state !== "signed_out" },
+          workStore: this.#work,
         });
+        this.#notifyAffectedWork(begun.affectedWorkIds);
       },
       effect: async () => {
         if (profile.state !== "signed_out") await this.#fencedEffect(async () => await this.#codex.logout({ authority: authorityFor(this.#paths, profile), signal }));
@@ -2455,7 +2664,16 @@ export class HraService {
       onAmbiguous: () => this.#quarantineProfile(profile),
     });
     const current = this.#store.requireProfile(profile.id);
-    if (current.state !== "signed_out" && !this.#store.setProfileState(profile.id, profile.processGeneration, "signed_out")) {
+    const stateChange = current.state === "signed_out"
+      ? null
+      : this.#store.setProfileStateWithWorkRetirement(
+          profile.id,
+          profile.processGeneration,
+          "signed_out",
+          this.#work,
+        );
+    if (stateChange !== null) this.#notifyAffectedWork(stateChange.affectedWorkIds);
+    if (stateChange !== null && !stateChange.changed) {
       this.#quarantineProfile(profile);
       throw new CommandFailure("RECOVERY_REQUIRED", "Codex logged out, but its local account state could not be committed. Run `hra account show` to reconcile it.");
     }
@@ -3214,6 +3432,388 @@ export class HraService {
       events: [...listed.events],
     };
     return sessionEventPageSchema.parse(page);
+  }
+
+  #workSequence(workId: WorkId): number {
+    const page = this.#work.events(workId, 0, 1);
+    return this.#eventCursors.decodeWorkEvent(
+      page.observedThroughCursor,
+      workId,
+    ).sequence;
+  }
+
+  #notifyWorkIfAdvanced(workId: WorkId, priorSequence: number): void {
+    if (this.#workSequence(workId) !== priorSequence) this.#workWaiters.notify(workId);
+  }
+
+  #notifyAffectedWork(workIds: readonly string[]): void {
+    for (const workId of new Set(workIds)) this.#workWaiters.notify(workId);
+  }
+
+  #normalizeWorkEventPage(input: Readonly<{
+    workId: WorkId;
+    requestedCursor: string | undefined;
+    decodedCursor: ReturnType<SessionEventCursorCodec["decodeWorkEvent"]> | undefined;
+    page: WorkEventPage;
+    readFromStart: () => WorkEventPage;
+  }>): WorkEventPage {
+    let page = input.page;
+    if (
+      input.decodedCursor !== undefined
+      && input.decodedCursor.streamEpoch !== page.streamEpoch
+    ) {
+      page = input.readFromStart();
+      return workEventPageSchema.parse({
+        ...page,
+        requestedCursor: input.requestedCursor ?? null,
+        gap: {
+          reason: "stream_reset",
+          requestedSequence: input.decodedCursor.sequence,
+          retainedFromSequence: 1,
+        },
+      });
+    }
+    const observed = this.#eventCursors.decodeWorkEvent(
+      page.observedThroughCursor,
+      input.workId,
+    );
+    if (
+      input.decodedCursor !== undefined
+      && input.decodedCursor.sequence > observed.sequence
+    ) {
+      throw new CommandFailure(
+        "CONFLICT",
+        "The work event cursor is ahead of the current durable stream.",
+      );
+    }
+    return workEventPageSchema.parse({
+      ...page,
+      requestedCursor: input.requestedCursor ?? null,
+    });
+  }
+
+  #readWorkSnapshot(workId: WorkId, actorSessionId?: string): unknown {
+    const priorSequence = this.#workSequence(workId);
+    const snapshot = this.#work.snapshot(workId, actorSessionId);
+    this.#notifyWorkIfAdvanced(workId, priorSequence);
+    return snapshot;
+  }
+
+  #readWorkTask(command: Extract<LocalCommand, { kind: "work.task" }>): unknown {
+    const historyMode = command.historyLimit !== undefined
+      || command.historyCursor !== undefined;
+    if (historyMode) {
+      const decoded = command.historyCursor === undefined
+        ? undefined
+        : this.#eventCursors.decodeWorkTaskHistory(command.historyCursor, command.task);
+      if (decoded !== undefined) {
+        // A continuation keeps its signed point-in-time projection while later
+        // work events append independently to the live stream.
+        return this.#work.taskHistory(
+          command.task,
+          command.historyLimit ?? WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+          decoded,
+        );
+      }
+      const prior = this.#work.taskPosition(command.task);
+      const page = this.#work.taskHistory(
+        command.task,
+        command.historyLimit ?? WORK_TASK_HISTORY_DEFAULT_ITEM_LIMIT,
+      );
+      const observed = this.#eventCursors.decodeWorkEvent(
+        page.observedThroughCursor,
+        page.workId,
+      ).sequence;
+      if (observed !== prior.sequence) this.#workWaiters.notify(page.workId);
+      return page;
+    }
+    const prior = this.#work.taskPosition(command.task);
+    const detail = this.#work.task(command.task);
+    const current = this.#work.taskPosition(command.task);
+    if (current.sequence !== prior.sequence) this.#workWaiters.notify(detail.workId);
+    return detail;
+  }
+
+  async #readWorkEvents(
+    command: Extract<LocalCommand, { kind: "work.events" }>,
+    signal: AbortSignal,
+  ): Promise<WorkEventPage> {
+    const decodedCursor = command.cursor === undefined
+      ? undefined
+      : this.#eventCursors.decodeWorkEvent(command.cursor, command.work);
+    const read = (): WorkEventPage => {
+      const priorSequence = this.#workSequence(command.work);
+      this.#work.snapshot(command.work);
+      this.#notifyWorkIfAdvanced(command.work, priorSequence);
+      return this.#normalizeWorkEventPage({
+        workId: command.work,
+        requestedCursor: command.cursor,
+        decodedCursor,
+        page: this.#work.events(
+          command.work,
+          decodedCursor?.sequence ?? 0,
+          command.limit,
+        ),
+        readFromStart: () => this.#work.events(command.work, 0, command.limit),
+      });
+    };
+    let page = read();
+    if (page.events.length === 0 && page.gap === null && command.waitMs > 0) {
+      const expectedSequence = this.#eventCursors.decodeWorkEvent(
+        page.observedThroughCursor,
+        command.work,
+      ).sequence;
+      await this.#workWaiters.wait({
+        workId: command.work,
+        expectedSequence,
+        waitMs: command.waitMs,
+        signal,
+        readSequence: () => this.#workSequence(command.work),
+      });
+      page = read();
+    }
+    return page;
+  }
+
+  async #pollWork(
+    command: Extract<LocalCommand, { kind: "work.poll" }>,
+    signal: AbortSignal,
+  ): Promise<WorkPoll> {
+    const actionCursor = command.actionCursor;
+    if (actionCursor !== undefined && command.waitMs !== 0) {
+      throw new CommandFailure(
+        "INVALID_INPUT",
+        "A work action continuation is a fixed snapshot page and requires waitMs=0.",
+      );
+    }
+    const decodedCursor = command.cursor === undefined
+      ? undefined
+      : this.#eventCursors.decodeWorkEvent(command.cursor, command.work);
+    const decodedActionCursor = actionCursor === undefined
+      ? undefined
+      : this.#eventCursors.decodeWorkAction(
+          actionCursor,
+          command.work,
+          command.actor ?? null,
+        );
+    const read = (): WorkPoll => {
+      const priorSequence = this.#workSequence(command.work);
+      const readPoll = (afterSequence: number): WorkPoll => this.#work.poll(
+        command.work,
+        command.actor,
+        afterSequence,
+        command.limit,
+        decodedActionCursor,
+      );
+      let poll = readPoll(decodedCursor?.sequence ?? 0);
+      const eventPage = this.#normalizeWorkEventPage({
+        workId: command.work,
+        requestedCursor: command.cursor,
+        decodedCursor,
+        page: poll.eventPage,
+        readFromStart: () => {
+          poll = readPoll(0);
+          return poll.eventPage;
+        },
+      });
+      this.#notifyWorkIfAdvanced(command.work, priorSequence);
+      return workPollSchema.parse({ ...poll, eventPage });
+    };
+    let poll = read();
+    if (
+      poll.eventPage.events.length === 0
+      && poll.eventPage.gap === null
+      && command.waitMs > 0
+      && poll.readyTasks.length === 0
+      && poll.ownedAttempts.length === 0
+      && poll.recoveryAttempts.length === 0
+      && poll.reviewableSubmissions.length === 0
+      && poll.signals.length === 0
+      && poll.preparedEffects.length === 0
+    ) {
+      const expectedSequence = this.#eventCursors.decodeWorkEvent(
+        poll.eventPage.observedThroughCursor,
+        command.work,
+      ).sequence;
+      const waitMs = poll.nextWakeAt === null
+        ? command.waitMs
+        : Math.min(command.waitMs, Math.max(0, poll.nextWakeAt - this.#now()));
+      if (waitMs > 0) {
+        await this.#workWaiters.wait({
+          workId: command.work,
+          expectedSequence,
+          waitMs,
+          signal,
+          readSequence: () => this.#workSequence(command.work),
+        });
+      }
+      poll = read();
+    }
+    return poll;
+  }
+
+  #assertPreparedEffectBinding(
+    effect: WorkPreparedEffect,
+    status: NonNullable<ReturnType<WorkStore["effectStatus"]>>,
+  ): void {
+    const subjectId = effect.kind === "dispatch" ? effect.attemptId : effect.signalId;
+    if (
+      status.kind !== effect.kind
+      || status.subjectId !== subjectId
+      || status.targetSessionId !== effect.targetSessionId
+      || status.instructionDigest !== digestText(canonicalWorkJson(effect))
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The prepared work effect no longer matches its durable authority binding.",
+      );
+    }
+  }
+
+  #assertPreparedEffectStatusProjection(
+    projected: unknown,
+    status: NonNullable<ReturnType<WorkStore["effectStatus"]>>,
+  ): void {
+    if (
+      canonicalWorkJson(workPreparedEffectStatusSchema.parse(projected))
+      !== canonicalWorkJson(status)
+    ) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The public work-effect receipt no longer matches its durable authority binding.",
+      );
+    }
+  }
+
+  async #performPreparedWorkEffect(
+    effect: WorkPreparedEffect,
+    idempotencyKey: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const session = this.#store.requireSession(effect.targetSessionId);
+    const message = workPreparedEffectMessage(effect);
+    return await this.#serializeSessionAuthority(session, async () => {
+      const beforeEffect = (): void => {
+        const authorization = this.#work.authorizePreparedEffect(idempotencyKey);
+        this.#assertPreparedEffectBinding(effect, authorization.status);
+        if (!authorization.executable) throw new WorkEffectExecutionSuppressed();
+        this.#assertAuthorizedWorkEffect(effect, authorization);
+      };
+      if (effect.kind === "dispatch") {
+        await this.#send(session.id, message, effect.nestedMutationKey, signal, beforeEffect);
+        return;
+      }
+      if (effect.mode === "queue") {
+        await this.#queue(session.id, message, effect.nestedMutationKey, beforeEffect);
+        return;
+      }
+      await this.#steer(session.id, message, effect.nestedMutationKey, signal, beforeEffect);
+    });
+  }
+
+  #assertAuthorizedWorkEffect(
+    expected: WorkPreparedEffect,
+    authorization: Extract<WorkPreparedEffectAuthorization, { executable: true }>,
+  ): void {
+    this.#assertPreparedEffectBinding(authorization.effect, authorization.status);
+    if (canonicalWorkJson(authorization.effect) !== canonicalWorkJson(expected)) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The persisted work effect does not match the operation projection and was not executed.",
+      );
+    }
+  }
+
+  #projectSettledWorkEffect(
+    operation: Extract<WorkOperation, { kind: "attempt.dispatch" | "signal.send" }>,
+    effect: WorkPreparedEffect,
+  ): WorkOperationResult {
+    const status = this.#work.reprojectPreparedEffect(operation.idempotencyKey);
+    this.#assertPreparedEffectBinding(effect, status);
+    if (status.state === "accepted") {
+      const replay = workOperationResultSchema.parse(
+        this.#work.apply(operation, operation.idempotencyKey),
+      );
+      if (replay.kind !== "attempt.dispatch" && replay.kind !== "signal.send") {
+        throw new CommandFailure("RECOVERY_REQUIRED", "The settled work effect replay changed operation kind.");
+      }
+      this.#assertPreparedEffectStatusProjection(replay.effect, status);
+      return replay;
+    }
+    if (status.state === "failed") {
+      throw new CommandFailure(
+        "CONFLICT",
+        "The exact work effect was durably settled without an external effect.",
+        { idempotencyKey: operation.idempotencyKey, subjectId: status.subjectId },
+      );
+    }
+    throw new CommandFailure(
+      "RECOVERY_REQUIRED",
+      status.state === "unknown"
+        ? "The exact nested effect has an unknown outcome and will not be replayed."
+        : "The exact nested effect has unsettled durable authority and will not be replayed.",
+      { idempotencyKey: operation.idempotencyKey, subjectId: status.subjectId },
+    );
+  }
+
+  async #applyWorkOperation(
+    operation: WorkOperation,
+    signal: AbortSignal,
+  ): Promise<WorkOperationResult> {
+    const result = workOperationResultSchema.parse(
+      this.#work.apply(operation, operation.idempotencyKey),
+    );
+    const workId = result.workId;
+    this.#workWaiters.notify(workId);
+    if (result.kind !== "attempt.dispatch" && result.kind !== "signal.send") return result;
+    if (
+      (operation.kind !== "attempt.dispatch" && operation.kind !== "signal.send")
+      || operation.kind !== result.kind
+    ) {
+      throw new CommandFailure("RECOVERY_REQUIRED", "The work effect result changed operation kind.");
+    }
+
+    const prepared = this.#work.preparedEffect(operation.idempotencyKey);
+    if (prepared === null) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The work effect result has no matching durable prepared-effect receipt.",
+      );
+    }
+    const { effect, status } = prepared;
+    this.#assertPreparedEffectStatusProjection(result.effect, status);
+    this.#assertPreparedEffectBinding(effect, status);
+    if (status.state !== "prepared") {
+      return this.#projectSettledWorkEffect(operation, effect);
+    }
+
+    let executionError: unknown;
+    try {
+      await this.#performPreparedWorkEffect(effect, operation.idempotencyKey, signal);
+    } catch (error: unknown) {
+      executionError = error;
+    }
+    try {
+      let projected = this.#work.reprojectPreparedEffect(operation.idempotencyKey);
+      this.#assertPreparedEffectBinding(effect, projected);
+      if (projected.state === "prepared") {
+        projected = this.#work.settlePreparedEffectNoEffect(
+          operation.idempotencyKey,
+          "nested_preflight_no_effect",
+        );
+        this.#assertPreparedEffectBinding(effect, projected);
+      }
+      this.#workWaiters.notify(workId);
+    } catch (settlementError: unknown) {
+      if (settlementError instanceof StateSecurityScrubRequiredError) throw settlementError;
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The nested work effect could not be projected into its durable work receipt; replay the exact operation document.",
+        { idempotencyKey: operation.idempotencyKey, subjectId: status.subjectId },
+      );
+    }
+    if (executionError instanceof StateSecurityScrubRequiredError) throw executionError;
+    return this.#projectSettledWorkEffect(operation, effect);
   }
 
   #publicInteraction(interaction: InteractionRecord): PublicInteraction {
@@ -4064,7 +4664,13 @@ export class HraService {
     };
   }
 
-  async #send(selector: string, message: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
+  async #send(
+    selector: string,
+    message: string,
+    idempotencyKey: string | undefined,
+    signal: AbortSignal,
+    beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
+  ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
@@ -4114,6 +4720,8 @@ export class HraService {
           signal,
         });
       });
+      // Work authorization and nested begin are one synchronous fence boundary.
+      beforeEffect?.(attemptId);
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
@@ -4147,7 +4755,13 @@ export class HraService {
     return { session: reconciled, turnId: result.turnId, effectiveRuntimeProfile: result.effectiveRuntimeProfile ?? null, idempotencyKey: key };
   }
 
-  async #steer(selector: string, message: string, idempotencyKey: string | undefined, signal: AbortSignal): Promise<unknown> {
+  async #steer(
+    selector: string,
+    message: string,
+    idempotencyKey: string | undefined,
+    signal: AbortSignal,
+    beforeEffect?: (attemptId: MutationAttemptRecord["id"]) => void,
+  ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
@@ -4165,6 +4779,8 @@ export class HraService {
     }, beginEffect: async (attemptId) => {
       baseline = await this.#readExactSessionProjection(session, profile, false, signal);
       activeTurnId = baseline.activeTurnId;
+      // Work authorization and nested begin are one synchronous fence boundary.
+      beforeEffect?.(attemptId);
       this.#store.beginSessionMutationEffect({
         attemptId,
         sessionId: session.id,
@@ -4182,11 +4798,18 @@ export class HraService {
     return { steered: true, turnId: result.activeTurnId, idempotencyKey: key };
   }
 
-  async #queue(selector: string, message: string, idempotencyKey: string | undefined): Promise<unknown> {
+  async #queue(
+    selector: string,
+    message: string,
+    idempotencyKey: string | undefined,
+    beforeEffect?: () => void,
+  ): Promise<unknown> {
     const session = this.#requireBoundSession(selector);
     const profile = this.#store.requireProfile(session.profileId);
     this.#assertSignedIn(profile);
     const key = idempotencyKey ?? randomUUID();
+    // Work authorization and durable enqueue are one synchronous fence boundary.
+    beforeEffect?.();
     const queued = this.#store.enqueueIdempotent({ sessionId: session.id, profileGeneration: profile.processGeneration, message, idempotencyKey: key });
     const observed = this.#store.requireSession(session.id);
     if (queued.state === "pending" && observed.state === "idle") {
@@ -4630,10 +5253,20 @@ export class HraService {
     if (current.processGeneration !== profile.processGeneration) {
       throw new Error("Account generation changed before recovery quarantine.");
     }
-    if (current.state !== "recovery_required" && !this.#store.setProfileState(profile.id, profile.processGeneration, "recovery_required", {
-      ...(current.providerEmail === undefined ? {} : { email: current.providerEmail }),
-      ...(current.providerPlan === undefined ? {} : { plan: current.providerPlan }),
-    })) {
+    const stateChange = current.state === "recovery_required"
+      ? null
+      : this.#store.setProfileStateWithWorkRetirement(
+          profile.id,
+          profile.processGeneration,
+          "recovery_required",
+          this.#work,
+          {
+            ...(current.providerEmail === undefined ? {} : { email: current.providerEmail }),
+            ...(current.providerPlan === undefined ? {} : { plan: current.providerPlan }),
+          },
+        );
+    if (stateChange !== null) this.#notifyAffectedWork(stateChange.affectedWorkIds);
+    if (stateChange !== null && !stateChange.changed) {
       throw new Error("Account could not be quarantined after an indeterminate provider effect.");
     }
     return this.#store.requireProfile(profile.id);

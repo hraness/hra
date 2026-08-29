@@ -1,6 +1,6 @@
 ---
 title: HRA v1
-description: Release plan for an elegant persistent Codex control plane for humans and agents, with isolated accounts, durable interactions and event streams, device presence, historical usage metrics, encrypted multi-device sync, and safe desktop account switching.
+description: Release plan for a persistent Codex control plane for humans and agents, with isolated accounts, bounded work coordination, durable interactions and event streams, device presence, historical usage metrics, encrypted multi-device sync, and safe desktop account switching.
 type: plan
 status: in-progress
 area: hra
@@ -17,17 +17,26 @@ tags:
 
 HRA is a persistent Codex control plane for people and agents. Running `hra` in a terminal starts or attaches to the owner-private daemon, opens a line-oriented shell, and remains connected until the person exits. The same binary exposes bounded one-shot JSON and cursor-based JSONL commands, so an agent can inspect a session repeatedly, follow visible progress during a turn, and respond to an exact pending interaction without scraping terminal presentation.
 
-HRA keeps several Codex subscriptions isolated on one device, records historical usage, derives honest token-velocity windows, supervises sessions, safely brokers Codex approvals and questions, reports enrolled-device presence, and optionally syncs encrypted projections and remote commands across devices. The supported desktop account switch remains an explicit journaled machine mutation.
+HRA keeps several Codex subscriptions isolated on one device, records historical usage, derives honest token-velocity windows, supervises sessions, safely brokers Codex approvals and questions, and coordinates bounded work across exact already-existing sessions. It reports enrolled-device presence and optionally syncs encrypted session projections and remote commands across devices. The supported desktop account switch remains an explicit journaled machine mutation.
 
-The first beta is complete when a new user can install `hra`, link two Codex accounts, leave the daemon running, start and follow a session from the human shell or JSON interface, resolve an approval or question by exact interaction ID, inspect account usage history and device presence, control a session from a second enrolled device, switch the supported desktop application to a chosen account, and recover safely from terminal, process, network, and machine restarts.
+The first beta is complete when a new user can install `hra`, link two Codex accounts, leave the daemon running, start and follow a session from the human shell or JSON interface, coordinate a bounded task graph across exact sessions through the agent-only work protocol, resolve an approval or question by exact interaction ID, inspect account usage history and device presence, control a session from a second enrolled device, switch the supported desktop application to a chosen account, and recover safely from terminal, process, network, and machine restarts.
 
 ## Main model
 
-The public model has three first-class objects. Cloud login identity remains internal and separate.
+The runtime model has three first-class objects. Cloud login identity remains internal and separate.
 
 - An **account** is one isolated Codex subscription profile. It owns a user label, provider identity observations, one supervised app-server generation at a time, capabilities, usage snapshots, and sessions. It never contains copied provider credentials.
 - A **device** is one durable HRA installation enrolled under an HRA cloud identity. It owns a revocable credential, encryption-key status, last successful heartbeat, and sessions for which its daemon is execution custodian. A process is not a device. Registering a device does not grant decryption or execution authority.
 - A **session** is an HRA projection of one provider thread, bound to one account and one execution-custodian device. It owns ordered turns, a durable safe event stream, pending interactions, user metadata, queues, recovery records, and an optional cloud execution lease.
+
+The agent-only coordination model adds six closed local records without adding another model runtime or `Agent` object:
+
+- **Work** is one bounded objective and acyclic task graph.
+- **Task** is one finite objective with an exact account and project route.
+- **Attempt** is one fenced claim and provider-effect lineage bound to an exact actor session.
+- **Submission** is one immutable structured result with bounded evidence references.
+- **Review** is one immutable decision over an exact submission revision.
+- **Signal** is one attributable bounded message with separate storage, provider acceptance, acknowledgement, failure, and unknown states.
 
 An HRA cloud identity authenticates a person to the optional sync service. It may enroll devices but is never presented as a Codex account and does not imply possession of the encrypted workspace key.
 
@@ -38,6 +47,7 @@ HRA owns:
 - named local account profiles and one isolated `CODEX_HOME` per profile;
 - one supervised Codex app-server generation per active profile;
 - a local SQLite control plane, append-only safe event and metrics ledgers, mutation journal, device identity, and pathless cloud projection;
+- bounded work graphs, claims, monotonic fences, exact session dispatch bindings, submissions, reviews, signals, and work-scoped event cursors in local SQLite;
 - typed pending interactions with exact provider request identity and compare-and-swap resolution;
 - a persistent human shell and stable JSON and JSONL agent interfaces;
 - user-facing presets, session names and notes, durable queues, remote commands, execution leases, and recovery;
@@ -52,7 +62,7 @@ Codex app-server owns:
 - account usage and rate-limit source data;
 - permission and organization requirements.
 
-The Convex deployment coordinates devices and encrypted projections. It is never required for local login, local execution, local recovery, or reading local Codex sessions.
+The Convex deployment coordinates devices and encrypted session projections. It is never required for local login, local execution, local work coordination, local recovery, or reading local Codex sessions.
 
 ## Release decisions
 
@@ -79,6 +89,27 @@ The Convex deployment coordinates devices and encrypted projections. It is never
 - Human rendering coalesces small deltas without changing the durable cursor. JSON clients receive the bounded closed event variants and do not parse ANSI presentation.
 - A TTY proves only local terminal attachment, not a particular human. The shell never resolves an interaction merely because it is attached. Each response requires the exact interaction ID, kind, and current revision; concurrent shells may inspect the same prompt, but only one compare-and-swap response can win and every stale response fails before provider transport. TTY presence alone grants nothing.
 - Secret-bearing commands accept only one explicit bounded input channel: `--input-fd <n>` or `--input-stdin`. They are mutually exclusive. Noninteractive mode consumes stdin only when requested and never prompts. OTPs, invite capabilities, secret question answers, elicitation content that may contain secrets, and similar values never appear in argv.
+
+### Agent-first work coordination
+
+- Reverse the earlier blanket exclusion of product-owned task graphs. HRA v1 includes one bounded declarative work graph for coordinating already-existing exact HRA sessions. This is a narrow coordination substrate, not a generic multi-agent runtime, executable workflow engine, planner loop, or human workflow editor.
+- Keep six primitives: work, task, attempt, submission, review, and signal. A session is the actor. Task readiness is derived from work state, time bounds, accepted dependency submissions, and absence of a live or ambiguous attempt. Readiness is never a second mutable authority.
+- Route each task to one exact local account ID and project ID with its requested preset and Fast setting. HRA never chooses another subscription from usage, quota, freshness, availability, or incidental order. Provider failure or a limit cannot trigger automatic account rotation, rerouting, or replay.
+- Admit claims in local SQLite with an expected task revision and monotonic task fence. Renewal, release, report, review, signal acknowledgement, and reconciliation require the exact identifiers, scoped capability, revision, and fence named by their closed operation.
+- Bind dispatch to one already-existing exact actor session whose account generation and project match the task route. Persist the attempt, binding, request digest, and prepared provider effect before the send-only turn start. Task queueing is the HRA graph; queue and steer remain signal modes. A result that may have escaped but cannot be proved becomes recovery-required and is never redispatched, stolen, or rerouted speculatively.
+- Accept every mutation through one strict `hra work apply --input-stdin` request shaped `{protocol,version,requestId,operation}`. The closed nested operation carries its discriminated `kind`, UUIDv7 `idempotencyKey`, and operation-specific fields. No work mutation or capability is encoded as argv fields.
+- Define ordinary same-key replay as preservation of the durable decision, stable identities, and capabilities with no new mutation, event, or revision. Reproject mutable public records and `workRevision` from current state rather than promising byte-identical output. Keep the retained `work.release` tombstone as the exact stored-result exception and the only replay authority after purge.
+- Expose exactly seven agent commands: `protocol`, `apply`, `snapshot`, `task`, `poll`, `events`, and `watch`. `work protocol` has mutually exclusive operation, type, and topic selectors and publishes the recovery-directive and process-exit matrix. Non-streaming work commands always emit compact JSON. `work task` has distinct detail and history modes without adding another command. `watch` emits resumable JSONL gap, event, and checkpoint frames, drains output before cursor advancement, and preserves at-least-once delivery.
+- Require structured bounded submissions and evidence. A terminal assistant message or worker claim does not complete a task. Declared independent reviews decide an exact immutable submission, and work completion checks only closed HRA-owned gates. HRA does not run arbitrary shell commands as completion gates.
+- Keep signal provider delivery in `deliveryState` and recipient acknowledgement in the independent nullable `acknowledgedAt` field. Acknowledgement neither rewrites an unknown delivery outcome nor proves the recipient acted.
+- With no history option, return current task detail. Supplying either `--history-limit <1..50>` or `--history-cursor <cursor>` selects a separate task-history page over attempts, reports, submissions, reviews, and task-bound signals; a cursor-only continuation defaults to 20 items. Sign the exact work and task, stream epoch and sequence, membership high-water ordinal, task revision, projection time, and offset. Immutable bounded public projection versions must make every continued page coherent as of that cut and exclude all later mutations and memberships.
+- Cap each complete compact snapshot, task-detail, and task-history JSON response, including its envelope and terminating newline, at 512 KiB of serialized UTF-8. Trim only recent or historical arrays. Report omitted and remaining counts, per-kind remaining counts, and continuation explicitly; never silently remove core state, active authority, or current lineage.
+- Cap each complete terminal-safe work JSONL gap, event, and checkpoint frame, including its newline, at 512 KiB and its terminal failure document at 64 KiB. Publish both limits through `work protocol`, validate all frames for a page before its first write, and advance the cursor only after every frame drains.
+- Make an empty `task.claimNext` result same-key replayable without appending an event or advancing the work revision. A successful claim still advances both. Treat `work.release` as the other stream-neutral mutation: terminal coordinator compare-and-swap plus `acknowledgeDataLoss: true`, followed by one guarded atomic graph purge and bounded replay tombstone. Define this as logical destructive deletion, not forensic erasure; secure deletion is defense in depth and does not promise immediate sanitization of SQLite pages, WAL frames, backups, snapshots, or storage media.
+- Preserve accepted prefixes after work failure or cancellation. Permit explicit release only after terminal settlement and when no attempt dispatch remains prepared, started, or unknown. Signal delivery ambiguity may be discarded under the release acknowledgement and must be counted in the tombstone. The guarded purge also counts and removes the task-history membership index and public projection versions. While retained, the tombstone replays only the exact release key and request digest; every earlier operation's replay guarantee has ended.
+- Keep local SQLite as the sole work execution authority. Work graph admission, claims, fences, dispatch receipts, submissions, reviews, signals, predicate revisions, and event cursors commit locally. The initial protocol adds no cloud work executor or cross-device claim path.
+- Preserve accepted submissions, reviews, evidence, receipts, completed tasks, and compact events as durable prefixes after later failure or cancellation. Keep Codex calls, filesystem hashing, and Git inspection outside SQLite writer transactions; commit their checked observations with a short authority-and-revision recheck.
+- Keep storage behind a domain-owned repository boundary. Turso is deferred until a concrete server-side SQL consumer and complete tenancy, authentication, encryption, retention, erasure, and conflict contract exist. It may later replace an authority or receive an immutable export; it cannot become a second canonical work authority beside SQLite or Convex.
 
 ### Codex events and interactions
 
@@ -249,6 +280,14 @@ hra session project <session> <project>
 hra session recover|abandon <session>
 hra turn inspect <session> <turn> [--json]
 
+hra work protocol [--operation <kind>|--type <name>|--topic <topic>]
+hra work apply --input-fd <n>|--input-stdin
+hra work snapshot <work> [--actor <session>]
+hra work task <task>
+hra work poll <work> [--actor <session>] [--cursor <event-cursor>] [--action-cursor <action-cursor>] [--limit <1..50>] [--wait-ms <0..30000>]
+hra work events <work> [--cursor <opaque>] [--limit <1..200>] [--wait-ms <0..30000>] [--json|--jsonl|--follow]
+hra work watch <work> [--cursor <opaque>]
+
 hra interaction list [session] [--pending] [--limit <1..100>] [--cursor <opaque>]
 hra interaction show <interaction>
 hra interaction inspect <interaction> --revision <n> [--handoff-file <absolute-path>]
@@ -270,6 +309,8 @@ hra sync projection recover <session> --acknowledge-gap [--idempotency-key <uuid
 hra daemon start|status|stop|run
 ```
 
+Work commands are machine-only. `protocol`, `snapshot`, `task`, `poll`, and a finite `events` read emit compact JSON by default. `work protocol` accepts at most one of `--operation`, `--type`, or `--topic`; each selector returns one deterministic contract shard under the same digest. `watch`, `events --jsonl`, and `events --follow` emit only JSONL gap, event, and checkpoint frames. `apply` reads one strict versioned request from the selected protected input channel; its nested operation owns the UUIDv7 `idempotencyKey`. Unknown fields, operation kinds, and argv mutation data fail before daemon transport. Every admitted apply failure echoes its request ID and returns a closed recovery directive plus the process exit status.
+
 `auth login` reads one exact protected JSON document: `{ "email": "person@example.com" }` requests a code for an existing identity, `{ "email": "person@example.com", "invite": "hra_invite_identity_v1_…" }` requests first admission, and `{ "email": "person@example.com", "code": "01234567" }` verifies. Email, invite, and code flags do not exist. In JSON mode, a protected-input descriptor that is itself a terminal is rejected before any read, prompt, or daemon call. The single JSON error names the required nonterminal stdin or file-descriptor boundary and gives a replayable redirection command.
 
 Selectors accept an exact ID or an unambiguous case-insensitive label. Ambiguity lists safe candidates and performs no effect. An interaction mutation always requires its exact public ID and current revision. The protected input is a single bounded JSON document whose schema depends on the command; the daemon reads at most 64 KiB, rejects trailing data, and zeroes the in-process buffer after dispatch where the runtime permits. Secret user-input answers are read with no echo in the shell or through the explicit protected input channel. They are rejected in argv and never echoed, logged, synced, cached, or recorded in history.
@@ -286,12 +327,17 @@ Use SQLite for control-plane authority and append-only receipts. Minimum owned e
 - sessions, provider bindings, selected preset, Fast value, note, and execution lease;
 - turn summaries and bounded display items;
 - per-session event streams with monotonic sequence, retention floor, safe event bodies, and explicit gap markers;
+- work records, bounded task graphs, derived readiness inputs, attempts with monotonic fences and leases, immutable submissions and reviews, signals, prepared effects, idempotency receipts, predicate revisions, and work-scoped event streams;
 - typed interactions with private provider callback identity, public ID, revision, status, deadline, sanitized display, and terminal receipt;
 - mutation attempts, queue entries, switch journal, and recovery records. A queued message remains available only while pending, dispatching, or unresolved ambiguous. Settlement records durable scrub authority in the same transaction. The trusted secure-delete connection then replaces the message with a fixed tombstone, generation-fences concurrent settlements, and truncates superseded WAL frames before returning. Upgrades with uncertain prior custody use one retryable VACUUM. A failed post-commit scrub has a distinct result that stops the daemon after the response boundary and completes before restart. Resolution insertion is valid only after exact ambiguous effect recovery has released the session quarantine, with coherent JSON evidence, kind-specific receipt shape, and an exact recovered-turn runtime binding for a proven application;
 - HRA cloud identity namespaces, device generation, presence connection state, and encrypted-sync cursors;
 - usage snapshots, upload cursor, freshness, reset and gap classification, and derived velocity windows.
 
 Read the session snapshot and event cursor in one SQLite transaction so no event falls between them. Encode cursors as bounded opaque base64url tokens with schema version, session public ID, random stream epoch, and decimal sequence; sign them with the local daemon capability key so clients cannot forge fields. Event pagination exposes the floor and observed-through cursor atomically. The one-request local transport reserves at least 16 of its 32 connection slots for ordinary commands and admits at most 16 simultaneous long polls.
+
+Read each work snapshot, predicate revision, task projections, attempts, signals, and work event cut in one SQLite transaction. Every work mutation updates current rows, appends its event, advances the predicate revision, and settles its idempotency receipt in one transaction. The work stream is scoped to one work ID and uses an opaque signed `(workId, streamEpoch, sequence)` cursor. It does not merge provider, account, device, session, interaction, usage, or cloud state into a false global feed.
+
+SQLite is the only work execution authority in v1. The domain schemas and narrow store seam keep storage details out of daemon and CLI contracts. Turso remains deferred and non-authoritative. It cannot mirror live claims or fences as a second truth; any future adoption requires a concrete consumer and a decision to replace one authority or carry immutable exports.
 
 Bound event payloads and per-session retention by the published constants; advance the floor only by adding visible gap metadata. Coalesce deltas for display without changing stored order. Do not duplicate the provider's raw transcript store. Local projections are rebuildable from bounded app-server reads plus HRA-owned metadata and explicit gap evidence.
 
@@ -376,6 +422,17 @@ The provider-retirement decision is one-way. Current HRA incident response may f
 - Implement atomic status, bounded event long-poll, reconnecting JSONL follow, interaction inspection and kind-specific resolution, plus read-only plugin discovery with explicit lifecycle rejection.
 - Prove TTY versus non-TTY behavior, protected input, clean stdout, stale-revision races across shells, append-at-every-wait-boundary, retention during pagination, partial stdout failure, database restore, foreign cursor rejection, slow readers, signal handling, daemon persistence, and parity between shell and one-shot service commands.
 
+### Phase 2a: agent-first work coordination
+
+- Freeze the six-primitive domain, exact account and project routing, derived readiness, monotonic fences, request-before-effect dispatch, structured submission and review gates, and local-only authority boundary.
+- Add the normalized SQLite repository, transactional work event and predicate revision, prepared-effect recovery, daemon waiters, and the seven-command agent-only CLI.
+- Prove atomic graph and fanout admission, idempotent replay and changed-meaning conflict, concurrent claim exclusion, stale-fence rejection, expiry before and after possible provider effect, exact existing-session route checks, send-only attempt receipts, signal queue-versus-steer receipts, independent review, and completion gates.
+- Prove JSON and JSONL bounds, whole-page validation before output, snapshot-to-cursor continuity, drain-aware cursor advancement, at-least-once replay, slow consumers, retry bounds, abort, malformed and foreign cursors, work or epoch changes, and empty long-poll wake behavior.
+- Keep `work task` as one command with separate current-detail and fixed-cut history modes. Prove limits from 1 through 50, cursor-only continuation with the default of 20, fixed membership and record versions across later writes, foreign or forged cursor rejection, per-kind accounting, and progress under byte trimming.
+- Advertise and enforce the 512 KiB serialized UTF-8 ceilings for the complete compact snapshot, task-detail, and task-history JSON responses. Prove exact envelope and newline accounting, deterministic trimming of only recent or historical arrays, exact omission accounting, continuation progress, and fail-closed behavior when valid core state alone cannot fit.
+- Advertise and enforce the 512 KiB complete work JSONL frame ceiling and 64 KiB terminal stream-failure ceiling. Prove wrapper, cursor, terminal-safe escaping, and newline accounting at the exact wire boundary, plus no partial page output when any frame is oversized.
+- Keep all work authority local in the first beta. Do not add Turso, Convex work execution, remote claim, cross-device attempt takeover, automatic account routing, or provider failover.
+
 ### Phase 3: historical metrics and device presence
 
 - Add staggered account polling, bounded local history, ordered coalesced snapshot backlog upload, source/reset/gap classification, 1-, 5-, and 15-minute velocity, and session token telemetry.
@@ -433,16 +490,17 @@ The beta requires all of these scenarios:
 23. Unicode, arbitrary JSON, pagination, ordering, reducer, cursor, encryption, idempotency, quota, lifecycle, and state-machine property suites pass, followed by the repository-wide release gate.
 24. A clean environment installs one working `hra` binary from the immutable beta tag without a global Node or Codex dependency. README commands pass against the packaged artifact, and the built website has the same contract.
 25. The first publication path uses only current HRA provider identities and rejects the retired HRA v0 numeric tombstones. Current-head CI, release artifacts, `hra.sh`, `www.hra.sh`, security paths, two-account acceptance, and two-device acceptance are live and read back from providers. Incident recovery remains inside current HRA; it does not route traffic, authentication, or data to HRA v0.
+26. The seven work commands, queryable protocol descriptor, strict stdin mutation union, SQLite repository, daemon service, parser, help, JSON renderer, JSONL observer, README, and packaged binary agree. Deterministic tests prove atomic graph admission, exact account and project routing, concurrent claim fencing, request-before-effect recovery, structured submissions, independent review and completion gates, signal-delivery and acknowledgement separation, stream-neutral empty claim-next replay, guarded terminal history release, fixed-cut task-history pagination, whole-response byte ceilings with explicit omissions, work-scoped cursor continuity, bounded slow-consumer behavior, and absence of automatic account rotation, remote work takeover, or a second Turso authority. This is current-source evidence only until the first immutable beta tag and package are published.
 
 ## Explicit exclusions
 
 - Automatic account rotation, quota pooling, or rate-limit evasion.
 - A desktop or web application for new HRA. The line-oriented interactive CLI and static website are in scope; a full-screen terminal IDE is not.
 - Cloud execution or silent provider-session takeover on another machine.
-- Managed worktrees, recursive agent orchestration, adaptive routing, task graphs, or provider failover.
+- Managed worktrees, arbitrary executable workflow code, self-modifying supervisor topology, recurring autonomous scheduling, adaptive account routing, cross-device task takeover, or provider failover. Bounded declarative work and task graphs for exact local HRA sessions are included.
 - Noninteractive plugin installation, OAuth consent, browser opening, or blanket approval of unknown requests.
 - Sync of credentials, raw reasoning, arbitrary tool output, or full provider payloads.
-- Turso or another second metrics-replication authority without a concrete server-side analytics consumer.
+- Turso or another second work or metrics authority. A future immutable export or replacement authority requires a concrete server-side consumer and a complete ownership, encryption, retention, erasure, and conflict contract.
 - Renaming or migrating installed HRA v0 runtime storage, Keychain, bundle, opaque data identifiers, or installed-user state. Provider retirement does not authorize local user-state deletion or reuse of a retired numeric provider identity.
 - Windows desktop application switching in the first beta. Local CLI and cloud read/control support may expand after macOS is proven.
 
@@ -453,6 +511,7 @@ The beta requires all of these scenarios:
 | Phase 0 | Complete | The first implementation, compact-recovery fix, Codex 0.149 source audit, `fx` audit, Turso decision, hosted hostile audit, exact provider namespace inventory, independent eight-P0 adversarial review, amended plan, and closeout audit exist. The closeout found no remaining P0 and its four P1 clarifications are incorporated. |
 | Phase 1 | Implemented locally with one-account live provider evidence | The pinned request matrix and digest are exhaustive; safe events, signed cursors, retention gaps, durable typed interactions, write-adjacent unknown resolution, process-generation fencing, and stale-revision rejection have deterministic coverage. A real paid disposable Codex account now proves login, one streamed turn, exact event content, bounded detail, exact turn inspection, and persisted restart recovery. The release-required two-account acceptance remains pending. |
 | Phase 2 | Implemented and gated locally | `hra` provides the persistent line shell, protected input, one-shot JSON, reconnecting JSONL follow, atomic status/events, interaction commands, and read-only plugin discovery. Session status exposes one closed provider-observation state. New sessions explicitly use paginated Codex history; existing legacy sessions use bounded summary projection and exact one-turn compatibility inspection without hydrating complete history. Resume remains single-flight per account generation and connection, while every later status reconciliation reads a fresh fenced provider projection. Durable event streams carry bounded safe tool identity without arguments or results, and stale generation or signed-out facts cannot cross an asynchronous recovery check. The daemon and renderer share one strict public interaction DTO, refuse terminal protected input before any JSON-mode prompt or effect, expose complete command and permission authority only through revision-bound protected inspection, and reject unsupported file-change and MCP URL callbacks before storage. Installed-package acceptance proves the real binary and its owned daemon lifecycle. |
+| Phase 2a | Current-source implementation and adversarial review complete; unpublished | The current tree contains the six-primitive domain, SQLite repository, capability codec, exact mutation protocol, guarded prepared effects, bounded event and poll cursors, daemon recovery paths, predicate waiters, parser, machine renderer, JSONL observer, terminal `work.release`, queryable protocol shards, separate signal delivery and acknowledgement, stream-neutral empty claim-next replay, fixed-cut task-history pagination, immutable bounded history projections, and 512 KiB snapshot, task-detail, and task-history caps with explicit omissions. A focused nine-file contract gate passes 150 tests with 5,519 assertions, and the final adversarial pass found no P0, P1, or P2. The repository-wide gate, packaged acceptance, release, and deployment remain pending. No published tag or live service exposes the work protocol. |
 | Phase 3 | Implemented and gated locally | Staggered polling, bounded historical success and failure ledgers, source-ordered usage-history pagination, exact velocity windows, durable sliding daily upload anchors, record-and-byte quota capacity proof, identity-scoped A to B to A custody, automatic registration, graceful disconnect, fenced server-time device presence, and observation-only encrypted interaction state have deterministic coverage. Live hosted multi-device proof remains pending. |
 | Phase 4 | Current source is deployed unbound; attested bootstrap awaits the protected repair commit and exact provider gate | Account deletion, abandoned cleanup, hard aggregate/resource quota, exact Convex Auth accounting, fair maintenance, status-first revocation, invitation-gated admission, atomic request-bound hosted bootstrap, exact lost-response recovery, and durable post-acceptance friend gating pass hostile deterministic suites. Exact protected `main` source `7e1643f391abf0f33112136deba6520bd179170e` was deployed normally to fresh default production deployment `qualified-hummingbird-537`, installing the tracked unbound release-attestation query without authentication or application writes. Its first attested bootstrap attempt stopped determinately during local Convex typechecking before `runPush` because the archived source lacked installed dependencies; numeric target postflight and the runtime attestation remained exact and unbound. The mode-`0600`, single-link failed intent remains quarantined with SHA-256 `68d84cd1775a0a8b34fdf80890c8d86f0f7c5a360774fe622512539c195fd4f0`, with no live process or recovery journal. This revision installs the exact frozen archive dependencies through Bun's copyfile backend without lifecycle scripts before the provider boundary, requires single-link archived files, composes every failed temporary-tree cleanup path, and documents the fresh source-qualified supersession path. Resend now has an unverified `hra.sh` domain registration, but no HRA API key, DNS record, hosted secret, genesis authority, invitation, or live acceptance exists. The ordinary unbound deploy and Resend registration are retained as a recorded procedural deviation: they occurred under broad completion approval despite the existing stricter literal runbook gate. Exact `approve both` and the exact DNS-record approval remain pending for every further hosted write. |
 | Phase 5 | Closeout and executable acceptance harness adversarially gated; live run pending | Profiles, sessions, interactions, usage, presence, deletion, desktop switching, encrypted sync, compact recovery, shell live updates, generated public contracts, site generation, and package installation pass the revised repository-wide gate. The independently rereviewed two-installation harness drives the production parser and protected-input path, supervises real daemon generations, proves continuous exact-turn authority and HITL settlement, requires exact requested, prepared, written, command-start, every-progress, command-completion, and terminal ordering, and rejects unrelated side effects. Agent OAuth values use a caller-owned protected file; descriptor-relative child opens reject symlinks, FIFOs, and parent substitution. The final focused live suite passes 125 tests with 1,621 assertions. Real Codex two-account and hosted two-device execution remain pending. |
@@ -550,6 +609,9 @@ The beta requires all of these scenarios:
 - A local terminal session is not assumed to be the last compact event. Exact-origin live execution authority may append a late interaction tail or reacquire its terminal lease, while commands, mutable state resurrection, detail writes, and new epochs remain closed. Recovery crash-journals a bounded public-only current interaction baseline so an old remote pending revision cannot outlive a newer local terminal revision. Human remote rendering suppresses action guidance whenever recovery has a gap and reduces ordinary history to the highest revision per interaction.
 - Local CLI diagnostics never repeat untrusted argv or arbitrary runtime error text. JSON emits closed classified failures, terminal output strips control scalars, follow output waits for downstream drain before cursor advancement, and only `pending` interactions are described as resolvable. Prepared or written responses are in progress; `resolution_unknown` requires recovery and must not be retried.
 - A detached process group is a local cleanup aid, not a provider-authority proof. Its child can create a new session or double fork. Only the Linux reaper backend may be used for credential-bearing provider subprocesses, and it must prove the exact namespace PID 1 has been reaped before HRA calls cleanup proven. A PID namespace still does not sandbox arbitrary same-user code or make a remote effect absent; separate filesystem and credential isolation would be a future product boundary.
+- The earlier blanket deferral of product-owned task graphs is reversed. HRA needs a closed local coordination substrate because several isolated Codex subscriptions are intended to run explicit parallel tasks. The accepted boundary is bounded declarative work over exact existing HRA sessions. Generic executable workflows, recursive self-directed orchestration, automatic account routing, provider failover, and cross-device task takeover remain excluded.
+- Work failure and cancellation preserve completed accepted prefixes. `work.release` is a separate logical destructive-purge boundary that requires terminal coordinator authority and explicit data-loss acknowledgement, blocks unresolved attempt dispatch, permits acknowledged deletion of ambiguous signal delivery, and replaces the graph with a separately bounded tombstone whose exact replay scope is release-only. It does not promise forensic sanitization of SQLite, WAL, backups, snapshots, or storage media.
+- Empty claim-next reads may settle a same-key idempotency result without advancing the work stream. The earlier invariant that every fresh mutation appends an event applies only to fresh state-changing mutations, with `work.release` as the explicit purge exception.
 - Existing SQLite and encrypted Convex ledgers are enough for beta metrics. Turso remains a deferred implementation option behind an export repository, not a second source of truth.
 - Hosted sync is not enabled for the beta release until authenticated account erasure, abandoned-unverified cleanup, aggregate storage quotas, fair bounded maintenance, status-first revocation, invitation-gated OTP admission, identity-scoped local custody, device presence, ordered usage upload, and live two-device proof pass.
 - HRA v0 remains only as an archived GitHub and local-coexistence reference. Its former Vercel and Convex identities are retired denylisted tombstones, not rollback authorities. Current HRA needs a new current-project-only release and recovery design before publication.
@@ -746,7 +808,7 @@ Smalltalk and Convoy show the product-level failure mode: folder names, mtimes, 
 
 | Assumption | Category | Load | Confidence | Testability |
 | --- | --- | --- | --- | --- |
-| HRA remains a personal Codex account, device, and session control plane rather than a generic multi-agent orchestrator. | Definitional | High | High | Cheap: accept or reject this product boundary explicitly. |
+| HRA remains a Codex account, device, and session control plane with one closed local work protocol rather than a generic executable multi-agent runtime. | Definitional | High | High | Cheap: keep the seven-command surface and six primitives closed under contract review. |
 | The existing per-session ledger captures every transition needed for idle, terminal, and pending-interaction predicates. | Factual | Critical | Rejected: false | Completed: reducer inventory and crash-boundary analysis disproved it. |
 | A local session, event cut, pending count, and queue depth can be read atomically without treating provider or cloud observation as part of that transaction. | Capability | Critical | High | Medium: one bounded read prototype plus concurrency tests. |
 | Session wait solves the actual agent need better than repeated bounded polling. | People | High | Rejected for the current ledger | Reconsider only after event capture and wake edges become transactionally complete. |
@@ -768,7 +830,7 @@ The release therefore ships the improved atomic session status and compatible se
 - A Turso second authority, OTLP export, or remote operational telemetry without an explicit safe consumer.
 - Peer-to-peer Fabric transport, manual all-pairs device trust, filesystem sync, or custom cryptography.
 - Session move, fork, transplant bundle, credential copying, or remote provider takeover.
-- Product-owned plan DAGs, executable plan code, agent catalogs, task graphs, recursive orchestration, scheduling, or supervisor topology.
+- Executable plan code, agent catalogs, recursive self-directed orchestration, recurring scheduling, or supervisor topology beyond the bounded local HRA work and task graph.
 - PTY scraping, terminal-frame inference, filesystem mailboxes, folder or label identity, mtime liveness, PID-only health, or control-message injection.
 - Blanket approval bypass, basename-only executable allowlists, silently ignored flags, or unsupported capability fallback.
 - Plugin installation, OAuth, browser handoff, URL elicitation, and opaque extended forms until the exact Codex contract and protected UX are proven.

@@ -988,12 +988,17 @@ const runPromptFailureProbe = async (source: string): Promise<FifoProbeResult> =
   return { message: parsed.message, rejected: parsed.rejected };
 };
 
-const probeDeviceLoginBinding = (
+const probeDeviceLoginBinding = async (
   documentPath: string,
   expectedAccountId: string,
-): ReturnType<typeof spawnSync> => {
+): Promise<Readonly<{
+  signal: NodeJS.Signals | null;
+  status: number | null;
+  stderr: string;
+  stdout: string;
+}>> => {
   const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;
-  return spawnSync(process.execPath, [
+  const child = spawn(process.execPath, [
     "-e",
     [
       `import { JsonlLiveAcceptanceOperator } from ${JSON.stringify(moduleUrl)};`,
@@ -1010,9 +1015,39 @@ const probeDeviceLoginBinding = (
     ].join("\n"),
   ], {
     cwd: join(import.meta.dir, ".."),
-    encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const completion = new Promise<Readonly<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>>((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise);
+    child.once("close", (code, signal) => resolvePromise({ code, signal }));
+  });
+  const blocked = Symbol("blocked");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      completion,
+      new Promise<typeof blocked>((resolvePromise) => {
+        timer = setTimeout(() => resolvePromise(blocked), 3_000);
+      }),
+    ]);
+    if (result === blocked) {
+      child.kill("SIGKILL");
+      await completion;
+      throw new Error("Device-login binding probe blocked instead of failing promptly.");
+    }
+    return { signal: result.signal, status: result.code, stderr, stdout };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 };
 
 describe("live acceptance release scenario", () => {
@@ -1873,7 +1908,7 @@ describe("live acceptance release scenario", () => {
         verificationUrl,
         version: 1,
       }), { flag: "wx", mode: 0o600 });
-      const result = probeDeviceLoginBinding(handoffPath, expectedAccountId);
+      const result = await probeDeviceLoginBinding(handoffPath, expectedAccountId);
       expect({ signal: result.signal, status: result.status }).toEqual({ signal: null, status: 0 });
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe("device_login_account_changed");
@@ -1882,7 +1917,7 @@ describe("live acceptance release scenario", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 
   test("JSONL rejects a protected device-login document with a noncanonical cancel command", async () => {
     const createdDirectory = await mkdtemp(join(tmpdir(), "hra-login-cancel-binding-"));
@@ -1903,7 +1938,7 @@ describe("live acceptance release scenario", () => {
         verificationUrl,
         version: 1,
       }), { flag: "wx", mode: 0o600 });
-      const result = probeDeviceLoginBinding(handoffPath, expectedAccountId);
+      const result = await probeDeviceLoginBinding(handoffPath, expectedAccountId);
       expect({ signal: result.signal, status: result.status }).toEqual({ signal: null, status: 0 });
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe("device_login_cancel_command_changed");
@@ -1912,7 +1947,7 @@ describe("live acceptance release scenario", () => {
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
-  });
+  }, 10_000);
 
   test("JSONL operator refuses inline authentication documents", async () => {
     const moduleUrl = pathToFileURL(join(import.meta.dir, "live-acceptance-scenario.ts")).href;

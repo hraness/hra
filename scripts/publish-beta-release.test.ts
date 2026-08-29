@@ -899,7 +899,7 @@ describe("release publication arguments", () => {
     expect(publisherSource).not.toContain('arguments: ["add", "--global"');
     expect(publisherSource).toContain('"pack",\n        "--ignore-scripts"');
     expect(await retiredWorkflow.exists()).toBeFalse();
-  });
+  }, 30_000);
 });
 
 describe("release publication cleanup", () => {

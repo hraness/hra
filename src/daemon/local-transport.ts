@@ -7,13 +7,14 @@ import { basename, dirname, join } from "node:path";
 import {
   commandEnvelopeSchema,
   commandResponseSchema,
+  LOCAL_COMMAND_REQUEST_MAX_BYTES,
   LOCAL_COMMAND_REQUEST_VERSION,
   type CommandResponse,
   type LocalCommand,
 } from "../domain/contracts";
 import { ensurePrivateDirectory, type StatePaths } from "../storage/paths";
 
-const maximumRequestBytes = 1_048_576;
+const maximumRequestBytes = LOCAL_COMMAND_REQUEST_MAX_BYTES;
 const maximumResponseBytes = 4_194_304;
 // Cold session creation can spend 10 seconds initializing Codex, 10 seconds on
 // launch credential preflight, twice 10 + 40 seconds on credential review and
@@ -491,6 +492,9 @@ export async function callLocalDaemon(input: {
       if (newline < 0) return;
       try {
         const response = commandResponseSchema.parse(JSON.parse(received.subarray(0, newline).toString("utf8")) as unknown);
+        if (response.requestId !== requestId) {
+          throw new Error("LOCAL_DAEMON_RESPONSE_REQUEST_ID_MISMATCH");
+        }
         settle(() => resolvePromise(response));
       } catch (error: unknown) {
         settle(() => rejectPromise(new LocalDaemonIndeterminateError("The HRA daemon returned an invalid response.", error)));
