@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { buildSite } from "../scripts/build-site.ts";
-import { renderPreviewHtml, renderSiteHtml } from "./template.ts";
+import { readingPages } from "./content.ts";
+import {
+  renderAskAiAboutThis,
+  renderPreviewHtml,
+  renderPrivacyHtml,
+  renderReadingHtml,
+  renderSiteHtml,
+} from "./template.ts";
 
 const temporaryRoots: string[] = [];
 
@@ -29,6 +36,47 @@ afterEach(async () => {
 });
 
 describe("static-site build", () => {
+  test("renders one crawlable Ask AI row on each public page with exact provider prompts", () => {
+    const subjectUrl = "https://hra.sh/privacy/";
+    const prompt = `Tell me about ${subjectUrl}`;
+    const row = renderAskAiAboutThis(subjectUrl);
+    const providers = [
+      ["chatgpt", "https://chatgpt.com/", "q"],
+      ["claude", "https://claude.ai/new", "q"],
+      ["perplexity", "https://perplexity.ai/", "q"],
+      ["grok", "https://x.com/i/grok", "text"],
+    ] as const;
+
+    expect(row.match(/<nav\b/gu)).toHaveLength(1);
+    expect(row).toContain('aria-label="Ask AI about this"');
+    expect(row.match(/data-slot="ask-ai-about-this-link"/gu)).toHaveLength(4);
+    expect(row.match(/target="_blank"/gu)).toHaveLength(4);
+    expect(row.match(/rel="noopener noreferrer nofollow"/gu)).toHaveLength(4);
+    for (const [provider, baseUrl, parameter] of providers) {
+      const destination = new URL(baseUrl);
+      destination.searchParams.set(parameter, prompt);
+      expect(row).toContain(`data-ask-ai-provider="${provider}"`);
+      expect(row).toContain(`href="${destination.href.replaceAll("&", "&amp;")}"`);
+    }
+
+    const publicPages = [
+      [renderSiteHtml(), "https://hra.sh/"],
+      [renderPrivacyHtml(), subjectUrl],
+      ...readingPages.map((page) => [
+        renderReadingHtml(page),
+        `https://hra.sh${page.canonicalPath}`,
+      ] as const),
+    ] as const;
+    for (const [html, canonicalUrl] of publicPages) {
+      const destination = new URL("https://chatgpt.com/");
+      destination.searchParams.set("q", `Tell me about ${canonicalUrl}`);
+      expect(html.match(/data-slot="ask-ai-about-this"/gu)).toHaveLength(1);
+      expect(html).toContain(destination.href.replaceAll("&", "&amp;"));
+    }
+
+    expect(renderPreviewHtml()).not.toContain('data-slot="ask-ai-about-this"');
+  });
+
   test("writes every named public artifact and then passes check mode", async () => {
     const root = await createFixtureRoot();
     expect(await buildSite({ check: false, repositoryRoot: root })).toEqual([]);

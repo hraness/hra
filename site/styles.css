@@ -30,10 +30,72 @@ body {
 }
 
 main,
+.hra-ask-ai,
 .project-resources {
   margin-inline: auto;
   max-width: 74rem;
   padding-inline: clamp(1rem, 4vw, 3rem);
+}
+
+.hra-ask-ai {
+  display: flex;
+  align-items: center;
+  padding-block: 1.25rem;
+  border-top: 1px solid var(--rule);
+  color: var(--muted);
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-label"] {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-links"] {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-link"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.875rem;
+  padding: 0 0.625rem;
+  border: 1px solid var(--rule);
+  border-radius: 0.25rem;
+  color: inherit;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-link"]:hover {
+  border-color: currentColor;
+  color: var(--foreground);
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-link"]:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+
+.hra-ask-ai [data-slot="ask-ai-about-this-icon"] {
+  display: block;
+  flex: 0 0 auto;
+}
+
+@media (pointer: coarse) {
+  .hra-ask-ai [data-slot="ask-ai-about-this-link"] {
+    min-height: 3rem;
+  }
 }
 
 main {
