@@ -6,8 +6,13 @@ import {
   invitePublicIdFromCapabilityDigest,
   isInvitePublicId,
 } from "../src/cloud/inviteAuthority";
+import { isFiniteTimestamp, isSafeNonNegativeInteger } from "../src/cloud/contracts";
 import { isAuthDigest } from "./authPolicy";
-import { internalMutation, internalQuery, type MutationCtx } from "./server";
+import {
+  internalMutation,
+  internalQuery,
+  type MutationCtx,
+} from "./server";
 import {
   quotaAccountResource,
   quotaCategory,
@@ -1043,6 +1048,218 @@ export const genesisHostedAuthority = internalMutation({
         state: "issued" as const,
       },
       replay: false,
+    };
+  },
+});
+
+/*
+ * This bounded, non-secret projection is deliberately narrower than the
+ * bootstrap mutation's recovery readback. It lets an operator distinguish an
+ * untouched deployment from the exact first hosted-bootstrap frame without
+ * returning an invitation, a quota value, or an application row.
+ */
+export const hostedBootstrapStatus = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const [
+      quota,
+      control,
+      users,
+      authSessions,
+      authAccounts,
+      authRefreshTokens,
+      authVerificationCodes,
+      authVerifiers,
+      authRateLimits,
+      authSubjects,
+      authEmailAttemptEvents,
+      authOtpChallenges,
+      invites,
+      devices,
+      deviceSessions,
+      deviceBindChallenges,
+      deviceKeyEnvelopes,
+      recoveryEnvelopes,
+      devicePresence,
+      sessionHeads,
+      sessionChunks,
+      sessionStreamEpochs,
+      executionLeases,
+      sessionCommands,
+      codexAccounts,
+      deviceAccountBindings,
+      accountUsageSnapshots,
+      idempotencyReceipts,
+      securityEvents,
+      accountDeletionJobs,
+      accountDeletionReceipts,
+      deviceRevocationJobs,
+      storageUsageByUser,
+      storageResourceUsageByUser,
+      storageResourceUsageByAccount,
+      maintenanceState,
+    ] = await Promise.all([
+      ctx.db.query("storageUsageService").take(2),
+      ctx.db.query("serviceControl").take(2),
+      ctx.db.query("users").take(2),
+      ctx.db.query("authSessions").take(2),
+      ctx.db.query("authAccounts").take(2),
+      ctx.db.query("authRefreshTokens").take(2),
+      ctx.db.query("authVerificationCodes").take(2),
+      ctx.db.query("authVerifiers").take(2),
+      ctx.db.query("authRateLimits").take(2),
+      ctx.db.query("authSubjects").take(2),
+      ctx.db.query("authEmailAttemptEvents").take(2),
+      ctx.db.query("authOtpChallenges").take(2),
+      ctx.db.query("authInvites").take(2),
+      ctx.db.query("devices").take(2),
+      ctx.db.query("deviceSessions").take(2),
+      ctx.db.query("deviceBindChallenges").take(2),
+      ctx.db.query("deviceKeyEnvelopes").take(2),
+      ctx.db.query("recoveryEnvelopes").take(2),
+      ctx.db.query("devicePresence").take(2),
+      ctx.db.query("sessionHeads").take(2),
+      ctx.db.query("sessionChunks").take(2),
+      ctx.db.query("sessionStreamEpochs").take(2),
+      ctx.db.query("executionLeases").take(2),
+      ctx.db.query("sessionCommands").take(2),
+      ctx.db.query("codexAccounts").take(2),
+      ctx.db.query("deviceAccountBindings").take(2),
+      ctx.db.query("accountUsageSnapshots").take(2),
+      ctx.db.query("idempotencyReceipts").take(2),
+      ctx.db.query("securityEvents").take(2),
+      ctx.db.query("accountDeletionJobs").take(2),
+      ctx.db.query("accountDeletionReceipts").take(2),
+      ctx.db.query("deviceRevocationJobs").take(2),
+      ctx.db.query("storageUsageByUser").take(2),
+      ctx.db.query("storageResourceUsageByUser").take(2),
+      ctx.db.query("storageResourceUsageByAccount").take(2),
+      ctx.db.query("maintenanceState").take(2),
+    ]);
+    const rows = [
+      quota,
+      control,
+      users,
+      authSessions,
+      authAccounts,
+      authRefreshTokens,
+      authVerificationCodes,
+      authVerifiers,
+      authRateLimits,
+      authSubjects,
+      authEmailAttemptEvents,
+      authOtpChallenges,
+      invites,
+      devices,
+      deviceSessions,
+      deviceBindChallenges,
+      deviceKeyEnvelopes,
+      recoveryEnvelopes,
+      devicePresence,
+      sessionHeads,
+      sessionChunks,
+      sessionStreamEpochs,
+      executionLeases,
+      sessionCommands,
+      codexAccounts,
+      deviceAccountBindings,
+      accountUsageSnapshots,
+      idempotencyReceipts,
+      securityEvents,
+      accountDeletionJobs,
+      accountDeletionReceipts,
+      deviceRevocationJobs,
+      storageUsageByUser,
+      storageResourceUsageByUser,
+      storageResourceUsageByAccount,
+      maintenanceState,
+    ];
+    const occupiedTableCount = rows.filter((entry) => entry.length !== 0).length;
+    const serviceControlCount = control.length === 0 ? 0 : control.length === 1 ? 1 : 2;
+    if (occupiedTableCount === 0) {
+      return { occupiedTableCount, serviceControlCount, state: "uninitialized" as const };
+    }
+
+    const service = quota[0];
+    const controlRow = control[0];
+    const invite = invites[0];
+    let inviteBytes: number | undefined;
+    try {
+      if (invite !== undefined) inviteBytes = logicalDocumentBytes(invite);
+    } catch {
+      inviteBytes = undefined;
+    }
+    const inviteValid = (
+      invites.length === 1
+      && invite !== undefined
+      && isAuthDigest(invite.capabilityDigest)
+      && isInvitePublicId(invite.publicId)
+      && invitePublicIdFromCapabilityDigest(invite.capabilityDigest) === invite.publicId
+      && invite.purpose === "identity"
+      && invite.state === "issued"
+      && invite.issuedByUserId === undefined
+      && invite.boundAt === undefined
+      && invite.boundEmailDigest === undefined
+      && invite.consumedAt === undefined
+      && invite.revokedAt === undefined
+      && invite.requestedLifetimeMs === identityInviteLifetimeMs
+      && isFiniteTimestamp(invite.createdAt)
+      && isFiniteTimestamp(invite.expiresAt)
+      && isFiniteTimestamp(invite.admissionExpiresAt)
+      && isFiniteTimestamp(invite.updatedAt)
+      && invite.admissionExpiresAt === invite.expiresAt
+      && invite.expiresAt - invite.createdAt === identityInviteLifetimeMs
+      && invite.updatedAt === invite.createdAt
+      && invite.expiresAt > Date.now()
+    );
+    const controlValid = (
+      control.length === 1
+      && controlRow !== undefined
+      && controlRow.authAdmissionGeneration === 0
+      && controlRow.authAdmissions === "open"
+      && controlRow.lastMutationId === undefined
+      && controlRow.bootstrapAcceptedAt === undefined
+      && isFiniteTimestamp(controlRow.updatedAt)
+      && isFiniteTimestamp(controlRow.bootstrapCompletedAt)
+      && controlRow.bootstrapCompletedAt === controlRow.updatedAt
+      && isAuthDigest(controlRow.bootstrapInviteCapabilityDigest)
+      && isInvitePublicId(controlRow.bootstrapInvitePublicId)
+      && controlRow.bootstrapInviteLifetimeMs === identityInviteLifetimeMs
+      && invitePublicIdFromCapabilityDigest(controlRow.bootstrapInviteCapabilityDigest)
+        === controlRow.bootstrapInvitePublicId
+      && invite !== undefined
+      && controlRow.bootstrapInviteCapabilityDigest === invite.capabilityDigest
+      && controlRow.bootstrapInvitePublicId === invite.publicId
+      && controlRow.bootstrapInviteLifetimeMs === invite.requestedLifetimeMs
+      && controlRow.bootstrapCompletedAt === invite.createdAt
+    );
+    const quotaValid = (
+      quota.length === 1
+      && service !== undefined
+      && service.enforcement === "hard"
+      && isSafeNonNegativeInteger(service.identities)
+      && isSafeNonNegativeInteger(service.logicalBytes)
+      && isSafeNonNegativeInteger(service.records)
+      && isSafeNonNegativeInteger(service.serviceLogicalBytes)
+      && isSafeNonNegativeInteger(service.serviceRecords)
+      && isSafeNonNegativeInteger(service.userLogicalBytes)
+      && isSafeNonNegativeInteger(service.userRecords)
+      && isFiniteTimestamp(service.updatedAt)
+      && service.identities === 0
+      && service.records === 1
+      && service.serviceRecords === 1
+      && service.userRecords === 0
+      && service.userLogicalBytes === 0
+      && service.logicalBytes === service.serviceLogicalBytes + service.userLogicalBytes
+      && service.records === service.serviceRecords + service.userRecords
+      && service.logicalBytes === inviteBytes
+      && service.serviceLogicalBytes === inviteBytes
+    );
+    const ready = occupiedTableCount === 3 && quotaValid && controlValid && inviteValid;
+    return {
+      occupiedTableCount,
+      serviceControlCount,
+      state: ready ? "ready" as const : "inconsistent" as const,
     };
   },
 });

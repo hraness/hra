@@ -33,9 +33,20 @@ type HostedGenesisResult = Readonly<{
   }>;
   replay: boolean;
 }>;
+type HostedBootstrapStatus = Readonly<{
+  occupiedTableCount: number;
+  serviceControlCount: 0 | 1 | 2;
+  state: "inconsistent" | "ready" | "uninitialized";
+}>;
 
 const hostedGenesis = makeFunctionReference<"mutation", Args, HostedGenesisResult>(
   "quota:genesisHostedAuthority",
+);
+const genericGenesis = makeFunctionReference<"mutation", Args, unknown>(
+  "quota:genesisHardAuthority",
+);
+const hostedBootstrapStatus = makeFunctionReference<"query", Args, HostedBootstrapStatus>(
+  "quota:hostedBootstrapStatus",
 );
 const recordIssue = makeFunctionReference<"mutation", Args, unknown>(
   "authInvites:recordIssue",
@@ -59,6 +70,126 @@ const genesisArguments = (authority: Awaited<ReturnType<typeof prepare>>) => ({
 });
 
 describe("atomic hosted authority bootstrap", () => {
+  test("reports only the exact active first hosted-bootstrap frame as ready", async () => {
+    const empty = convexTest(schema, modules);
+    expect(await empty.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 0,
+      serviceControlCount: 0,
+      state: "uninitialized",
+    });
+
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(authority));
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 3,
+      serviceControlCount: 1,
+      state: "ready",
+    });
+  });
+
+  test("does not report a generic hard authority plus a plausible invite as hosted-ready", async () => {
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    await runtime.mutation(genericGenesis, {});
+    await runtime.run(async (ctx) => {
+      const now = Date.now();
+      const inviteId = await ctx.db.insert("authInvites", {
+        admissionExpiresAt: now + identityInviteLifetimeMs,
+        capabilityDigest: authority.capabilityDigest,
+        createdAt: now,
+        expiresAt: now + identityInviteLifetimeMs,
+        publicId: authority.publicId,
+        purpose: "identity",
+        requestedLifetimeMs: identityInviteLifetimeMs,
+        state: "issued",
+        updatedAt: now,
+      });
+      const [invite, quota] = await Promise.all([
+        ctx.db.get(inviteId),
+        ctx.db.query("storageUsageService").unique(),
+      ]);
+      if (invite === null || quota === null) throw new Error("missing generic bootstrap fixture");
+      const bytes = logicalDocumentBytes(invite);
+      await ctx.db.patch(quota._id, {
+        logicalBytes: bytes,
+        records: 1,
+        serviceLogicalBytes: bytes,
+        serviceRecords: 1,
+        updatedAt: now,
+      });
+    });
+
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 3,
+      serviceControlCount: 1,
+      state: "inconsistent",
+    });
+  });
+
+  test("treats mismatched bootstrap binding and quota byte drift as inconsistent", async () => {
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    const other = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(authority));
+    await runtime.run(async (ctx) => {
+      const control = await ctx.db.query("serviceControl").unique();
+      if (control === null) throw new Error("missing hosted bootstrap control");
+      await ctx.db.patch(control._id, {
+        bootstrapInviteCapabilityDigest: other.capabilityDigest,
+        bootstrapInvitePublicId: other.publicId,
+      });
+    });
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({
+      occupiedTableCount: 3,
+      state: "inconsistent",
+    });
+
+    await runtime.run(async (ctx) => {
+      const quota = await ctx.db.query("storageUsageService").unique();
+      if (quota === null) throw new Error("missing hosted bootstrap quota");
+      await ctx.db.patch(quota._id, {
+        logicalBytes: quota.logicalBytes + 1,
+      });
+    });
+    expect(await runtime.query(hostedBootstrapStatus, {})).toMatchObject({
+      occupiedTableCount: 3,
+      state: "inconsistent",
+    });
+  });
+
+  test("treats an expired issued bootstrap invite as inconsistent", async () => {
+    const runtime = convexTest(schema, modules);
+    const authority = await prepare();
+    await runtime.mutation(hostedGenesis, genesisArguments(authority));
+    await runtime.run(async (ctx) => {
+      const [control, invite] = await Promise.all([
+        ctx.db.query("serviceControl").unique(),
+        ctx.db.query("authInvites").unique(),
+      ]);
+      if (control === null || invite === null) throw new Error("missing hosted bootstrap fixture");
+      const createdAt = Date.now() - identityInviteLifetimeMs - 10_000;
+      const expiresAt = createdAt + identityInviteLifetimeMs;
+      await Promise.all([
+        ctx.db.patch(control._id, {
+          bootstrapCompletedAt: createdAt,
+          updatedAt: createdAt,
+        }),
+        ctx.db.patch(invite._id, {
+          admissionExpiresAt: expiresAt,
+          createdAt,
+          expiresAt,
+          updatedAt: createdAt,
+        }),
+      ]);
+    });
+    expect(await runtime.query(hostedBootstrapStatus, {})).toEqual({
+      occupiedTableCount: 3,
+      serviceControlCount: 1,
+      state: "inconsistent",
+    });
+  });
+
   test("creates one quota authority, bootstrap binding, and charged first invite", async () => {
     const runtime = convexTest(schema, modules);
     const authority = await prepare();
