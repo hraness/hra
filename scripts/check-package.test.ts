@@ -7,7 +7,9 @@ import type { DaemonAuthorityReceipt } from "../src/daemon/daemon-lock";
 import type { DaemonIdentity } from "../src/daemon/daemon-startup";
 import {
   assertCompleteGitHistoryPublic,
+  buildGitHistoryEnvironment,
   parseGitHistoryCommitList,
+  projectGitHistorySpawnResult,
   requireGitHistoryOutput,
   runPackageCommand,
   waitForOwnedInstalledDaemonReady,
@@ -148,7 +150,13 @@ describe("installed package generic command ownership", () => {
     expect(source).toContain('["--no-replace-objects", "rev-list", "--max-count=100001", "--all"]');
     expect(source).toContain('["--no-replace-objects", "rev-parse", "--is-shallow-repository"]');
     expect(source).toContain('"--diff-merges=first-parent"');
+    expect(source).toContain('"--text"');
+    expect(source).toContain("Bun.spawnSync");
+    expect(source).toContain('killSignal: "SIGKILL"');
+    expect(source).toContain("gitHistoryScanOutputMaximumBytes");
+    expect(source).toContain("gitHistoryScanTimeoutMs");
     expect(source).not.toContain('["log", "--all", "--format=", "--patch"');
+    expect(source).not.toMatch(/await run\(\s*"\/usr\/bin\/git"/u);
 
     const first = "a".repeat(40);
     const second = "b".repeat(40);
@@ -186,6 +194,73 @@ describe("installed package generic command ownership", () => {
     expect(error).toBeInstanceOf(Error);
     expect(String(error)).toBe("Error: Git history fixture failed or emitted diagnostics with exit 1.");
     expect(String(error)).not.toContain(sentinel);
+  });
+
+  test("keeps synchronous history reads ambient-free, bounded, and nondisclosing", () => {
+    const environment = buildGitHistoryEnvironment("/private/hra-source", "/private/hra-temp");
+    expect(environment).toEqual({
+      GIT_ATTR_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_SYSTEM: "/dev/null",
+      GIT_NO_LAZY_FETCH: "1",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_PAGER: "cat",
+      GIT_TERMINAL_PROMPT: "0",
+      HOME: "/private/hra-source",
+      LANG: "C",
+      LC_ALL: "C",
+      PATH: "/usr/bin:/bin",
+      TMPDIR: "/private/hra-temp",
+      XDG_CONFIG_HOME: "/dev/null",
+    });
+    expect(() => buildGitHistoryEnvironment("relative", "/private/hra-temp"))
+      .toThrow("absolute and normalized");
+
+    const safe = projectGitHistorySpawnResult({
+      exitCode: 0,
+      exitedDueToMaxBuffer: false,
+      exitedDueToTimeout: false,
+      stderr: Buffer.alloc(0),
+      stdout: Buffer.from("safe\n"),
+    });
+    expect(safe).toEqual({ exitCode: 0, stderr: "", stdout: "safe\n" });
+
+    const sentinel = Buffer.from([0x73, 0x6b, 0x2d, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74]);
+    for (const result of [
+      projectGitHistorySpawnResult({
+        exitCode: 1,
+        exitedDueToMaxBuffer: false,
+        exitedDueToTimeout: false,
+        stderr: sentinel,
+        stdout: sentinel,
+      }),
+      projectGitHistorySpawnResult({
+        exitCode: 0,
+        exitedDueToMaxBuffer: false,
+        exitedDueToTimeout: true,
+        stderr: Buffer.alloc(0),
+        stdout: sentinel,
+      }),
+      projectGitHistorySpawnResult({
+        exitCode: 0,
+        exitedDueToMaxBuffer: true,
+        exitedDueToTimeout: false,
+        stderr: Buffer.alloc(0),
+        stdout: Buffer.alloc(32 * 1024 * 1024 + 1),
+      }),
+      projectGitHistorySpawnResult({
+        exitCode: 0,
+        exitedDueToMaxBuffer: false,
+        exitedDueToTimeout: false,
+        stderr: Buffer.alloc(0),
+        stdout: Buffer.alloc(12 * 1024 * 1024, 0xff),
+      }),
+    ]) {
+      expect(result).toEqual({ exitCode: 1, stderr: "", stdout: "" });
+      expect(`${result.stderr}${result.stdout}`).not.toContain("secret");
+    }
   });
 
   test("scans resolution-only merge content against the first parent", async () => {
@@ -242,6 +317,32 @@ describe("installed package generic command ownership", () => {
     }
   }, 30_000);
 
+  test("forces binary-classified historical blobs through text policy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-history-binary-text-"));
+    try {
+      await initializeHistoryFixture(root);
+      const sentinel = Buffer.from([
+        0x73,
+        0x6b,
+        0x2d,
+        0x70,
+        0x72,
+        0x6f,
+        0x6a,
+        0x2d,
+        ...Buffer.alloc(24, 0x45),
+      ]);
+      await writeFile(
+        join(root, "document.txt"),
+        Buffer.concat([Buffer.from([0x00]), sentinel, Buffer.from("\n")]),
+      );
+      requireHistoryFixtureGit(root, "commit", "-am", "binary-classified sentinel");
+      await expect(assertCompleteGitHistoryPublic(root)).rejects.toThrow("SECRET_SHAPE");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  }, 30_000);
+
   test("keeps lockfile scope exemption narrow and refuses shallow history", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-history-lock-policy-"));
     try {
@@ -264,7 +365,7 @@ describe("installed package generic command ownership", () => {
     }
   }, 30_000);
 
-  test("routes every package command class through the bounded detached-group runner", async () => {
+  test("routes every effectful and consumer command through the detached-group runner", async () => {
     const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
     expect(source).toContain("const run = runPackageCommand;");
     for (const command of [
