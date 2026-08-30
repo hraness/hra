@@ -108,6 +108,11 @@ const legacyAdapterMetadataSchema = z.object({
 });
 type LegacyAdapterMetadata = z.infer<typeof legacyAdapterMetadataSchema>;
 type ParsedAdapterMetadata = Readonly<{ legacy: boolean; metadata: AdapterMetadata }>;
+type CleanupMetadataAuthority = Readonly<{
+  bindingDigest: string;
+  handleHash: string;
+  ohBindingSha256: string;
+}>;
 type PendingMetadata =
   | Readonly<{ status: "complete"; metadata: AdapterMetadata }>
   | Readonly<{ status: "incomplete" }>
@@ -219,6 +224,15 @@ const legacyMetadataDigest = (value: Omit<LegacyAdapterMetadata, "adapterDigest"
     value.parent?.head.digest ?? "no-parent",
     value.receiptDigest,
     String(value.version),
+  ]);
+
+const legacyReceiptDigest = (value: LegacyAdapterMetadata): string =>
+  digestParts("hra-facts-memory-store-receipt-v1", [
+    value.bindingDigest,
+    value.handleHash,
+    String(value.initialHead.sequence),
+    value.initialHead.digest,
+    String(value.createdAt),
   ]);
 
 const parseAdapterMetadata = (value: unknown): ParsedAdapterMetadata => {
@@ -483,6 +497,80 @@ const readMetadataFile = (path: string): AdapterMetadata | null => {
     return migrated;
   }
   return result.metadata;
+};
+
+/** Cleanup-only authority reader. It never normalizes, migrates, or returns a head. */
+const readCleanupMetadataAuthority = (path: string): CleanupMetadataAuthority | null => {
+  let descriptor: number;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error: unknown) {
+    if (errorCode(error) === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const before = fstatSync(descriptor);
+    const owner = process.getuid?.();
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || (before.mode & 0o077) !== 0
+      || (owner !== undefined && before.uid !== owner)
+      || before.size < 2
+      || before.size > metadataMaximumBytes
+    ) throw new Error("FACTS_MEMORY_OH_METADATA_UNSAFE");
+    const text = readFileSync(descriptor, "utf8");
+    const after = fstatSync(descriptor);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || Buffer.byteLength(text, "utf8") !== after.size
+    ) throw new Error("FACTS_MEMORY_OH_METADATA_CHANGED");
+    let value: unknown;
+    try {
+      value = JSON.parse(text) as unknown;
+    } catch {
+      throw new Error("FACTS_MEMORY_OH_METADATA_INVALID");
+    }
+    const current = adapterMetadataSchema.safeParse(value);
+    let authority: CleanupMetadataAuthority;
+    if (current.success) {
+      const { adapterDigest, ...body } = current.data;
+      const receipt = receiptFromMetadata(current.data);
+      if (
+        metadataDigest(body) !== adapterDigest
+        || digestFactsMemoryReceipt({
+          bindingDigest: receipt.bindingDigest,
+          createdAt: receipt.createdAt,
+          handleHash: receipt.handleHash,
+          head: receipt.head,
+          version: receipt.version,
+        }) !== receipt.receiptDigest
+      ) throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
+      authority = current.data;
+    } else {
+      const legacy = legacyAdapterMetadataSchema.safeParse(value);
+      if (!legacy.success) throw new Error("FACTS_MEMORY_OH_METADATA_INVALID");
+      const { adapterDigest, ...body } = legacy.data;
+      if (
+        legacyMetadataDigest(body) !== adapterDigest
+        || legacyReceiptDigest(legacy.data) !== legacy.data.receiptDigest
+      ) throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
+      authority = legacy.data;
+    }
+    if (
+      authority.handleHash
+      !== digestParts("hra-oh-handle-v1", [authority.bindingDigest, authority.ohBindingSha256])
+    ) throw new Error("FACTS_MEMORY_OH_METADATA_AUTHORITY_MISMATCH");
+    return {
+      bindingDigest: authority.bindingDigest,
+      handleHash: authority.handleHash,
+      ohBindingSha256: authority.ohBindingSha256,
+    };
+  } finally {
+    closeSync(descriptor);
+  }
 };
 
 const readPendingMetadataFile = (path: string): PendingMetadata => {
@@ -838,6 +926,13 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     const directory = input.directory;
     return this.#serializeDirectories([directory], async () => {
       assertPrivateDirectory(directory);
+      let cleanupAuthority: CleanupMetadataAuthority | null = null;
+      try {
+        cleanupAuthority = readCleanupMetadataAuthority(join(directory, adapterMetadataName));
+      } catch {
+        // Inspection and the bounded database reopen below remain independent;
+        // an invalid sidecar can never authorize oversized cleanup.
+      }
       let metadata: AdapterMetadata | null = null;
       try {
         metadata = readMetadataFile(join(directory, adapterMetadataName));
@@ -857,10 +952,14 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
         if (
           !(error instanceof Error)
           || error.message !== "FACTS_MEMORY_OH_DATABASE_TOO_LARGE"
-          || metadata === null
+          || cleanupAuthority === null
         ) throw error;
-        this.#assertMetadataBinding(metadata, binding);
-        return { handleHash: metadata.handleHash };
+        if (
+          cleanupAuthority.bindingDigest !== binding.bindingDigest
+          || cleanupAuthority.handleHash
+            !== this.#handleHash(binding, cleanupAuthority.ohBindingSha256)
+        ) throw new Error("FACTS_MEMORY_OH_METADATA_BINDING_MISMATCH");
+        return { handleHash: cleanupAuthority.handleHash };
       }
       const authority = await this.#open(binding, directory, true);
       try {
