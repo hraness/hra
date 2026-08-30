@@ -23,6 +23,8 @@ import {
   type FactsMemoryBinding,
   type FactsMemoryCheckpoint,
 } from "../domain/facts-memory";
+import { HraFactsMemoryLifecycle } from "../daemon/facts-memory-lifecycle";
+import { FactsMemoryControlStore } from "./facts-memory-control";
 import { LocalFactsMemoryBroker } from "./local-facts-memory-broker";
 import { OhSqliteFactsMemoryEngine } from "./oh-facts-memory-engine";
 import { ensurePrivateDirectory } from "./paths";
@@ -35,7 +37,9 @@ const metadataName = ".hra-oh-adapter-v1.json";
 const pendingMetadataName = ".hra-oh-adapter-v1.pending";
 
 const roots: string[] = [];
+const controls: FactsMemoryControlStore[] = [];
 afterEach(async () => {
+  for (const control of controls.splice(0)) control.close();
   await Promise.all(roots.splice(0).map(async (root) => await rm(root, { force: true, recursive: true })));
 });
 
@@ -53,7 +57,9 @@ const openOhAuthority = (binding: FactsMemoryBinding, directory: string) =>
     path: join(directory, "oh.sqlite"),
     profile: OH_WORKING_STORE_PROFILE_V1,
     realmId: `hra:${binding.bindingDigest}`,
-    spaceId: `hra:${binding.sessionId}`,
+    spaceId: binding.epoch === 1
+      ? `hra:${binding.sessionId}`
+      : `hra:${binding.sessionId}:epoch:${String(binding.epoch)}`,
   });
 
 const inspectionHead = async (
@@ -115,6 +121,18 @@ describe("released Oh SQLite facts-memory adapter", () => {
     await expect(lstat(join(root, binding.sessionId, pendingMetadataName)))
       .rejects.toMatchObject({ code: "ENOENT" });
 
+    const legacyMetadataPath = join(root, binding.sessionId, metadataName);
+    const legacyMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+      initialHead: Record<string, unknown>;
+    };
+    delete legacyMetadata.initialHead.operationSha256;
+    await writeFile(legacyMetadataPath, JSON.stringify(legacyMetadata), { mode: 0o600 });
+    await expect(restartedBroker.inspect(binding)).resolves.toMatchObject({ status: "present" });
+
+    await chmod(legacyMetadataPath, 0o666);
+    await expect(restartedBroker.inspect(binding)).rejects.toThrow("FACTS_MEMORY_OH_METADATA_UNSAFE");
+    await chmod(legacyMetadataPath, 0o600);
+
     await chmod(databasePath, 0o666);
     expect((await lstat(databasePath)).mode & 0o077).not.toBe(0);
     await expect(broker.inspect(binding)).resolves.toMatchObject({ status: "present" });
@@ -152,6 +170,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       sessionId: binding.sessionId,
     }))).rejects.toThrow();
 
+    await writeFile(legacyMetadataPath, '{"tampered":true}', { mode: 0o600 });
     await broker.purge({
       binding,
       expectedHandleHash: created.handleHash,
@@ -317,6 +336,135 @@ describe("released Oh SQLite facts-memory adapter", () => {
     const reopened = openOhAuthority(child, childDirectory);
     expect((await reopened.store.verify()).operations).toBe(1);
     await reopened.store.close();
+  });
+
+  test("reconciles a child commit through lifecycle after the recorded parent checkpoint advances", async () => {
+    const { broker, root } = await fixture();
+    const control = new FactsMemoryControlStore(join(root, "control.sqlite"), { now: () => 90 });
+    controls.push(control);
+    const lifecycle = new HraFactsMemoryLifecycle({ broker, control });
+    const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    await lifecycle.ensureSession({ ownerId, sessionId: parent.sessionId, expiresAt: 1_000 });
+    const source = createKnowledgeGraphRecordV1({
+      dependencies: [],
+      key: "entity:crash-source",
+      kind: "entity",
+      v: 1,
+      value: { name: "Crash source" },
+    });
+    const parentAuthority = openOhAuthority(parent, join(root, parent.sessionId));
+    await parentAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: source, v: 1 }],
+      expectedHead: await parentAuthority.store.head(),
+      operationId: "host.test.crash.parent",
+    });
+    await parentAuthority.store.close();
+    const resumed = await lifecycle.resumeSession({ ownerId, sessionId: parent.sessionId });
+    if (resumed.head === null) throw new Error("Expected exact parent checkpoint.");
+    const checkpoint: FactsMemoryCheckpoint = { ...parent, head: resumed.head };
+    const operationKey = `fork:${child.sessionId}`;
+    control.reserve({ binding: child, createOperationKey: operationKey, expiresAt: 2_000, parent: checkpoint });
+    control.markCreating(child);
+    const childDirectory = join(root, child.sessionId);
+    await ensurePrivateDirectory(childDirectory);
+    const interruptedChild = openOhAuthority(child, childDirectory);
+    await interruptedChild.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: source, v: 1 }],
+      expectedHead: await interruptedChild.store.head(),
+      operationId: `hra.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
+    });
+    await interruptedChild.store.close();
+    control.markCreateAmbiguous(child);
+
+    const advancedParent = openOhAuthority(parent, join(root, parent.sessionId));
+    const later = createKnowledgeGraphRecordV1({
+      dependencies: [],
+      key: "entity:crash-later",
+      kind: "entity",
+      v: 1,
+      value: { name: "Later" },
+    });
+    await advancedParent.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: later, v: 1 }],
+      expectedHead: await advancedParent.store.head(),
+      operationId: "host.test.crash.parent.later",
+    });
+    await advancedParent.store.close();
+
+    await expect(lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId: child.sessionId,
+      ownerId,
+      parentSessionId: parent.sessionId,
+    })).resolves.toMatchObject({ state: "active" });
+    const reopened = openOhAuthority(child, childDirectory);
+    expect((await reopened.store.snapshot({ maximumRecords: 8_192 })).records.map(({ key }) => key))
+      .toEqual([source.key]);
+    expect((await reopened.store.verify()).operations).toBe(1);
+    await reopened.store.close();
+  });
+
+  test("rejects a copied sidecar over a valid divergent same-binding history", async () => {
+    const { broker, root } = await fixture();
+    const binding = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    await broker.create({ binding, operationKey: `create:${binding.sessionId}` });
+    const directory = join(root, binding.sessionId);
+    const first = openOhAuthority(binding, directory);
+    await first.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+        dependencies: [], key: "entity:accepted", kind: "entity", v: 1, value: { branch: "accepted" },
+      }), v: 1 }],
+      expectedHead: await first.store.head(),
+      operationId: "host.test.accepted",
+    });
+    await first.store.close();
+    const accepted = await inspectionHead(broker, binding);
+
+    await rm(join(directory, "oh.sqlite"));
+    const replacement = openOhAuthority(binding, directory);
+    for (const [key, operationId] of [
+      ["entity:alternate-one", "host.test.alternate.one"],
+      ["entity:alternate-two", "host.test.alternate.two"],
+    ] as const) {
+      await replacement.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record: createKnowledgeGraphRecordV1({
+          dependencies: [], key, kind: "entity", v: 1, value: { branch: key },
+        }), v: 1 }],
+        expectedHead: await replacement.store.head(),
+        operationId,
+      });
+    }
+    await replacement.store.close();
+    await expect(broker.inspect(binding, accepted)).rejects.toThrow();
+  });
+
+  test("physically isolates a recreated expired session in its next epoch", async () => {
+    const { broker, root } = await fixture();
+    const control = new FactsMemoryControlStore(join(root, "control.sqlite"), { now: () => 90 });
+    controls.push(control);
+    const lifecycle = new HraFactsMemoryLifecycle({ broker, control });
+    const first = await lifecycle.ensureSession({ ownerId, sessionId: parentSessionId, expiresAt: 100 });
+    expect(await lifecycle.sweepExpired(100)).toMatchObject({ purged: 1 });
+    const second = await lifecycle.ensureSession({ ownerId, sessionId: parentSessionId, expiresAt: 1_000 });
+    expect([first.epoch, second.epoch]).toEqual([1, 2]);
+    await expect(lstat(join(root, parentSessionId))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(join(root, `${parentSessionId}.epoch-2`))).isDirectory()).toBe(true);
+    await expect(broker.purge({
+      binding: createFactsMemoryBinding({ ownerId, sessionId: parentSessionId }),
+      expectedHandleHash: first.handleHash,
+      operationKey: `cleanup:${parentSessionId}:expired`,
+    })).resolves.toBeDefined();
+    await expect(broker.inspect(createFactsMemoryBinding({
+      epoch: 2,
+      ownerId,
+      sessionId: parentSessionId,
+    }))).resolves.toMatchObject({ status: "present" });
   });
 
   test("rejects metadata tampering, path aliases, and an inexact parent checkpoint", async () => {

@@ -501,6 +501,7 @@ export class HraService {
   #interactionDeadlineWake: (() => void) | undefined;
   #stopScheduled = false;
   #state: "open" | "closing" | "closed" = "open";
+  #terminalFactsMemoryReconciled = false;
   #closeTask: Promise<void> | undefined;
 
   constructor(input: {
@@ -583,6 +584,7 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#reconcileTerminalFactsMemory();
       await this.#factsMemory?.sweepExpired(this.#now());
       const result = await this.#executeAdmitted(command, context);
       await this.#daemonAuthority.assertCurrent();
@@ -1096,6 +1098,7 @@ export class HraService {
     if (recoveredQueue.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredQueue.unresolved.length)} dispatching queue authorities.`);
     }
+    await this.#reconcileTerminalFactsMemory();
     await this.#recoverPreparedWorkEffects(this.#interactionDeadlineAbort.signal);
     await this.#daemonAuthority.assertCurrent();
     const pendingSessions = new Set<string>();
@@ -1661,7 +1664,7 @@ export class HraService {
     this.#sessionsAwaitingResubscription.delete(current.id);
     await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
     await this.#daemonAuthority.assertCurrent();
-    await this.#cleanupFactsMemory(this.#store.requireSession(current.id), "archive");
+    await this.#cleanupTerminalFactsMemory(this.#store.requireSession(current.id));
   }
 
   #appendSessionEvent(
@@ -2998,6 +3001,11 @@ export class HraService {
     }
   }
 
+  async #cleanupTerminalFactsMemory(session: SessionRecord): Promise<void> {
+    this.#terminalFactsMemoryReconciled = false;
+    await this.#cleanupFactsMemory(session, "archive");
+  }
+
   async #ensureSessionObservedLocked(
     selector: string,
     signal: AbortSignal,
@@ -3017,7 +3025,7 @@ export class HraService {
       };
     }
     if (session.state === "terminal") {
-      await this.#cleanupFactsMemory(session, "archive");
+      await this.#cleanupTerminalFactsMemory(session);
       return {
         basis: "local_state",
         coverage: "not_attempted",
@@ -3163,7 +3171,7 @@ export class HraService {
         });
       }
       if (reconciled.state === "terminal") {
-        await this.#cleanupFactsMemory(reconciled, "archive");
+        await this.#cleanupTerminalFactsMemory(reconciled);
       }
     }
     const mode = this.#sessionResubscriptionConnections.get(session.id) === observation.connectionId
@@ -4565,9 +4573,10 @@ export class HraService {
       }
     }
     const projects = this.#store.listProjects();
-    const sessions = remote.sessions.map((projection) => {
+    const sessions: SessionRecord[] = [];
+    for (const projection of remote.sessions) {
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
-      return this.#store.upsertProviderSession({
+      const session = this.#store.upsertProviderSession({
         profileId: profile.id,
         providerThreadId: projection.providerThreadId,
         ...(projectId === undefined ? {} : { projectId }),
@@ -4576,7 +4585,9 @@ export class HraService {
         ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
         ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
       });
-    });
+      sessions.push(session);
+      if (session.state === "terminal") await this.#cleanupTerminalFactsMemory(session);
+    }
     return { accountId: profile.id, sessions, nextCursor };
   }
 
@@ -5368,10 +5379,31 @@ export class HraService {
 
   async #updateSession(selector: string, fields: (session: SessionRecord) => Omit<Parameters<StateStore["updateSessionMetadata"]>[0], "sessionId">): Promise<SessionRecord> {
     const session = this.#store.requireSession(selector);
-    return await this.#serializeSessionAuthority(session, () => {
+    return await this.#serializeSessionAuthority(session, async () => {
       const current = this.#store.requireSession(session.id);
-      return this.#store.updateSessionMetadata({ sessionId: current.id, ...fields(current) });
+      const updated = this.#store.updateSessionMetadata({ sessionId: current.id, ...fields(current) });
+      if (updated.state !== "terminal" && updated.state !== "recovery_required") {
+        await this.#ensureFactsMemory(updated);
+      }
+      return updated;
     });
+  }
+
+  async #reconcileTerminalFactsMemory(): Promise<void> {
+    if (this.#terminalFactsMemoryReconciled || this.#factsMemory === undefined) {
+      this.#terminalFactsMemoryReconciled = true;
+      return;
+    }
+    let afterId: string | null = null;
+    for (;;) {
+      const page = this.#store.listCloudSessionPage({ afterId, limit: 100 });
+      for (const session of page.sessions) {
+        if (session.state === "terminal") await this.#cleanupTerminalFactsMemory(session);
+      }
+      if (page.isDone || page.continueAfterId === null) break;
+      afterId = page.continueAfterId;
+    }
+    this.#terminalFactsMemoryReconciled = true;
   }
 
   #publicProfile(profile: ProfileRecord): unknown {

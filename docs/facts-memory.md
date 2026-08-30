@@ -6,7 +6,7 @@ The daemon composes a concrete local adapter for release-verified Oh v0.2.0. `pa
 
 ## Authority boundary
 
-HRA derives one binding from the exact account ID and session ID. One HRA session is one facts-memory branch; a fork creates a different child session bound to one immutable checkpoint of its exact parent session. A caller cannot select a database, directory, branch namespace, space, authority, rule set, query engine, or purge credential. No facts-memory command exists in the local command union.
+HRA derives one binding from the exact account ID, session ID, and host-owned positive epoch. Epoch 1 retains the original account/session binding for compatibility. Only a completed `expired` purge may advance that same session to the next epoch; an archived or abandoned session is permanently retired. One HRA session epoch is one facts-memory branch, and a fork creates a different child session bound to one immutable checkpoint of its exact parent epoch. A caller cannot select an epoch, database, directory, branch namespace, space, authority, rule set, query engine, or purge credential. No facts-memory command exists in the local command union.
 
 The lifecycle control database may contain only:
 
@@ -14,23 +14,26 @@ The lifecycle control database may contain only:
 - their binding digest;
 - fixed create, fork, cleanup, and expiry state;
 - an opaque handle hash;
-- exact public store heads and receipt digests;
+- exact public store heads—sequence, Oh operation SHA-256, and an HRA head digest—and receipt digests;
 - an exact parent binding and head for a fork;
-- bounded timestamps, reasons, and revisions.
+- the current epoch, one fixed-size digest chaining the preceding expired-purge boundary, and bounded timestamps, reasons, and revisions.
 
 It has no column for facts, records, payloads, rules, projections, credentials, tokens, database paths, or raw handles. Semantic data remains in Oh.
+
+The table retains exactly one current row per HRA session. Expiry reactivation updates that row with an incremented epoch and hash-chains the prior purge receipt into one fixed-size summary; it does not append unbounded generation history. Every state transition compares the exact session, epoch, and revision. The empty head is exactly sequence zero with no operation SHA; every positive sequence requires one operation SHA.
 
 ## Local layout
 
 HRA keeps lifecycle metadata in `facts-memory-control.sqlite` under its private state root. Each session's Oh database, adapter lifecycle sidecar, and every related SQLite WAL, SHM, projection cache, and derived cache belong under one host-derived directory:
 
 ```text
-<HRA state root>/facts-memory-sessions/<exact session ID>/
+<HRA state root>/facts-memory-sessions/<exact session ID>/             # epoch 1
+<HRA state root>/facts-memory-sessions/<exact session ID>.epoch-<N>/   # epoch N > 1
 ```
 
 The directory path never enters the lifecycle database or a command response. HRA requires an absolute canonical current-user-owned mode-0700 root, rejects symbolic links and path traversal, bounds recursive inspection, and rejects linked or replaced entries before cleanup. The adapter opens SQLite and metadata through no-follow custody, enforces and reads back mode 0600 on `oh.sqlite`, its observed WAL and SHM files, and its metadata, and relies on the enclosing mode-0700 directory for any transient or future cache entry it does not interpret.
 
-Cleanup first asks the Oh adapter to quiesce the exact store. HRA then revalidates the complete session tree, atomically renames it to a host-derived quarantine name, and removes that whole tree. A retry completes a crash-left quarantine instead of replaying semantic operations. A purge receipt is committed only after both the live and quarantine paths are absent.
+Cleanup first asks the Oh adapter to quiesce the exact epoch store. Reopening remains fail-closed on malformed metadata, but cleanup does not let an unreadable or legacy sidecar permanently strand a terminal session: after the broker validates the private tree, a remaining database must reopen under the exact Oh binding and derive the expected opaque handle; if the database is already absent, the control record's epoch-bound handle fences removal of the residual exact directory. HRA then revalidates the complete session tree, atomically renames it to a host-derived epoch-specific quarantine name, and removes that whole tree. A retry completes a crash-left quarantine instead of replaying semantic operations. A purge receipt is committed only after both the live and quarantine paths are absent. A stale purge holds only its old epoch binding and path, so it cannot address a later reactivated directory.
 
 This is honest local custody, not a sandbox or forensic erasure guarantee. Another process running as the same operating-system user can read or race local files despite these checks. Backups, filesystem snapshots, and storage media may retain prior bytes.
 
@@ -39,12 +42,15 @@ This is honest local custody, not a sandbox or forensic erasure guarantee. Anoth
 The lifecycle implements these internal host operations:
 
 - `ensureSession` reserves authority before store creation, reconciles a lost create response by exact inspection, and never speculatively creates a second store.
-- `resumeSession` revalidates owner, session, opaque handle, immutable creation receipt, and a monotonic exact head.
-- `forkSession` resumes the parent first and binds the child to that exact parent head. A retry uses the recorded checkpoint even if the parent later advances.
+- `resumeSession` revalidates owner, session, epoch, opaque handle, immutable creation receipt, and an exact accepted head. If the store advanced, the adapter must prove the prior operation reference is on the current Oh chain before HRA accepts the new head; sequence growth alone is insufficient.
+- `forkSession` resumes the parent first and durably binds the child to that exact parent head. Oh snapshots that recorded historical operation reference, so a retry can reconcile a completed child commit after the parent advances without borrowing the parent's current head or operation authority.
 - `cleanupSession` covers archive, abandon, and expiry. It retains cleanup authority until the entire session directory is proven absent.
-- `sweepExpired` processes a bounded page. The service uses a 30-day session-memory TTL and extends it only from persisted HRA session activity.
+- `sweepExpired` selects a bounded page, then re-reads the exact epoch, revision, state, and expiry under the session lifecycle tail before cleanup. A renewal queued ahead of a stale sweep wins and cannot be purged by that old page.
+- `recovery_required` is fail-closed but not terminal. A later host ensure or resume repeats exact inspection and restores `active` only when the immutable binding, handle, creation receipt, and accepted-head ancestry all re-prove. Exact archive or abandon cleanup remains available; tampered custody is never silently blessed.
 
-Session start and provider resume call the lifecycle seam. A terminal provider state cleans up with reason `archive`. Explicit session abandonment proves memory cleanup before HRA releases the local recovery authority. HRA's existing provider cancellation and recovery semantics are unchanged.
+The service uses a 30-day session-memory TTL. Session start and provider resume renew it from the session's persisted `updatedAt`; successful note, preset, Fast-mode, and project mutations renew it again after their durable metadata commit. Terminal provider deletion, observation, and list-import paths clean up with reason `archive`. Daemon recovery and the first command scan retained sessions in bounded pages to retry any terminal cleanup whose local state commit preceded a crash. Explicit session abandonment proves memory cleanup before HRA releases the local recovery authority. HRA's existing provider cancellation and recovery semantics are unchanged.
+
+An expired purge may be reactivated only by a later live-session ensure. That creates the next epoch with a new binding, operation keys, Oh realm, space, and directory. Archive and abandon never reactivate. The control database's v1 schema migrates transactionally into epoch 1. Empty-head rows remain directly compatible. A nonempty legacy row has no stored raw Oh operation reference, so it enters `recovery_required` and can return to active only when inspection re-proves the exact legacy sequence and digest while recovering the raw operation SHA. A legacy nonempty fork also lacks its parent's raw checkpoint reference and is cleanup-only; HRA will not infer ancestry from a sequence. Epoch-1 adapter sidecars with an empty initial head are read compatibly, while an old nonempty fork sidecar that cannot supply exact operation references fails closed.
 
 ## Released Oh adapter
 
@@ -52,11 +58,11 @@ Session start and provider resume call the lifecycle seam. A terminal provider s
 
 1. one HRA binding selects one Oh realm, space, and `oh.sqlite` path entirely at host composition;
 2. create accepts only an empty working store and publishes a bounded, checksummed lifecycle sidecar after closing it;
-3. inspection verifies Oh replay and materialization while returning only HRA's opaque handle hash, immutable creation receipt, and current exact head;
-4. a new fork verifies the parent's exact current head, requests an exact snapshot at that Oh head, proves the returned head again, and copies the record bytes into a new child authority;
+3. inspection verifies Oh replay and materialization while returning only HRA's opaque handle hash, immutable creation receipt, and current exact head; it uses Oh's historical head lookup to prove the last control-plane operation reference is an ancestor before accepting an advance;
+4. a new fork requests an exact snapshot at the recorded parent operation reference, proves the returned sequence, operation SHA, and digest again, and copies the record bytes into a new child authority;
 5. the child copy is one fresh host-owned operation, so it preserves record and dependency digests but deliberately does not copy the parent's operation IDs, actor authority, timestamps, or history;
 6. the released working lane bounds an exact fork to 8,192 records; a larger parent fails closed and leaves the child unfinalized;
-7. replay after a completed child commit uses the same host-derived operation ID and content, allowing Oh to reconcile a crash before metadata publication;
+7. replay after a completed child commit uses the same epoch-scoped host-derived operation ID and content, allowing Oh to reconcile a crash before metadata publication even when the parent has advanced;
 8. quiesce reopens and verifies the exact authority, closes it, and returns custody to the broker, which removes the whole validated session directory.
 
 The adapter does not call Oh's logical whole-space purge before physical cleanup. Doing so would create a crash state that could no longer be reopened for HRA's quarantine retry. The broker instead proves the only local authority is closed, validates and quarantines its sole session directory, and removes the complete directory before committing the HRA purge receipt.

@@ -570,8 +570,13 @@ class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   #receipt(sessionId: string, state: HraFactsMemoryLifecycleReceipt["state"] = "active"): HraFactsMemoryLifecycleReceipt {
     return {
       bindingDigest: "a".repeat(64),
+      epoch: 1,
       handleHash: state === "purged" ? null : "b".repeat(64),
-      head: state === "purged" ? null : { digest: "c".repeat(64), sequence: 0 },
+      head: state === "purged" ? null : {
+        digest: "c".repeat(64),
+        operationSha256: null,
+        sequence: 0,
+      },
       sessionId,
       state,
     };
@@ -1787,6 +1792,95 @@ describe("HraService", () => {
     }).success).toBe(false);
   });
 
+  test("cleans list-driven terminalization and reconciles a crash-left terminal on restart", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const { sessionId } = await createIdleSession(value, "List terminal memory");
+    const session = value.store.requireSession(sessionId);
+    if (session.providerThreadId === undefined) throw new Error("Expected provider binding.");
+    value.codex.listedProjections = [{
+      providerThreadId: session.providerThreadId,
+      providerUpdatedAt: (session.providerUpdatedAt ?? 0) + 1,
+      status: "terminal",
+      title: "List terminal memory",
+    }];
+    await value.service.execute({
+      account: session.profileId,
+      kind: "session.list",
+      limit: 20,
+    }, { signal });
+    expect(value.store.requireSession(sessionId).state).toBe("terminal");
+    expect(factsMemory.cleanups).toContainEqual({
+      ownerId: session.profileId,
+      reason: "archive",
+      sessionId,
+    });
+
+    const crashFactsMemory = new FakeFactsMemoryLifecycle();
+    const otherSession = value.store.upsertProviderSession({
+      profileId: session.profileId,
+      providerThreadId: "provider-thread-crash-terminal",
+      providerUpdatedAt: 1,
+      state: "idle",
+      title: "Crash terminal memory",
+    });
+    if (otherSession.providerThreadId === undefined) throw new Error("Expected provider binding.");
+    value.store.upsertProviderSession({
+      profileId: otherSession.profileId,
+      providerThreadId: otherSession.providerThreadId,
+      providerUpdatedAt: (otherSession.providerUpdatedAt ?? 0) + 1,
+      state: "terminal",
+      title: otherSession.title,
+    });
+    const restarted = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: new FakeCodex(),
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      factsMemory: crashFactsMemory,
+      requestStop: () => undefined,
+    });
+    await restarted.recover();
+    expect(crashFactsMemory.cleanups).toContainEqual({
+      ownerId: otherSession.profileId,
+      reason: "archive",
+      sessionId: otherSession.id,
+    });
+    await restarted.close();
+  });
+
+  test("renews facts-memory expiry after metadata-only durable activity", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    let now = 1_000;
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      () => now,
+      factsMemory,
+    );
+    const { sessionId } = await createIdleSession(value, "Metadata memory renewal");
+    factsMemory.ensures.length = 0;
+    now += 29 * 24 * 60 * 60 * 1_000;
+    await value.service.execute({
+      kind: "session.note.set",
+      note: "day twenty-nine activity",
+      session: sessionId,
+    }, { signal });
+    expect(factsMemory.ensures).toEqual([{
+      expiresAt: now + 30 * 24 * 60 * 60 * 1_000,
+      ownerId: value.store.requireSession(sessionId).profileId,
+      sessionId,
+    }]);
+  });
+
   test("purges facts memory before releasing an abandoned local recovery authority", async () => {
     const factsMemory = new FakeFactsMemoryLifecycle();
     const value = await fixture(
@@ -1855,6 +1949,8 @@ describe("HraService", () => {
       session: details.sessionId,
       detail: false,
     }, { signal })).resolves.toMatchObject({ session: { id: details.sessionId } });
+    expect(factsMemory.ensures.filter(({ sessionId }) => sessionId === details.sessionId).length)
+      .toBeGreaterThanOrEqual(2);
     expect(value.codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
   });
 

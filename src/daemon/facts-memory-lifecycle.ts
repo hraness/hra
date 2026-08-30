@@ -10,6 +10,7 @@ import {
   factsMemoryStoreReceiptSchema,
   type FactsMemoryBinding,
   type FactsMemoryCheckpoint,
+  type FactsMemoryHead,
   type FactsMemoryPurgeReceipt,
   type FactsMemoryStoreReceipt,
   type FactsMemoryStoreInspection,
@@ -46,7 +47,10 @@ export interface FactsMemoryBrokerPort {
     operationKey: string;
     parent: FactsMemoryCheckpoint;
   }>): Promise<FactsMemoryStoreReceipt>;
-  inspect(binding: FactsMemoryBinding): Promise<FactsMemoryBrokerInspection>;
+  inspect(
+    binding: FactsMemoryBinding,
+    expectedHead?: FactsMemoryHead,
+  ): Promise<FactsMemoryBrokerInspection>;
   purge(input: Readonly<{
     binding: FactsMemoryBinding;
     expectedHandleHash: string | null;
@@ -56,6 +60,7 @@ export interface FactsMemoryBrokerPort {
 
 export type HraFactsMemoryLifecycleReceipt = Readonly<{
   bindingDigest: string;
+  epoch: number;
   handleHash: string | null;
   head: FactsMemoryControlRecord["head"];
   sessionId: string;
@@ -88,6 +93,7 @@ export interface HraFactsMemoryLifecyclePort {
 
 const lifecycleReceipt = (record: FactsMemoryControlRecord): HraFactsMemoryLifecycleReceipt => ({
   bindingDigest: record.binding.bindingDigest,
+  epoch: record.binding.epoch,
   handleHash: record.handleHash,
   head: record.head,
   sessionId: record.binding.sessionId,
@@ -168,11 +174,21 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     ownerId: string;
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt> {
-    const binding = createFactsMemoryBinding(input);
-    return this.#serialize(binding.sessionId, async () => {
+    return this.#serialize(input.sessionId, async () => {
+      const current = this.#control.get(input.sessionId);
+      if (current !== null && current.binding.ownerId !== input.ownerId) {
+        throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+      }
+      const binding = createFactsMemoryBinding({
+        epoch: current?.state === "purged" && current.cleanupReason === "expired"
+          ? current.binding.epoch + 1
+          : current?.binding.epoch ?? 1,
+        ownerId: input.ownerId,
+        sessionId: input.sessionId,
+      });
       const record = this.#control.reserve({
         binding,
-        createOperationKey: `create:${binding.sessionId}`,
+        createOperationKey: this.#createOperationKey(binding, "create"),
         expiresAt: input.expiresAt,
       });
       return lifecycleReceipt(await this.#ensureReserved(record));
@@ -186,16 +202,19 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     parentSessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt> {
     const childExpiresAt = unixMillisecondsSchema.parse(input.childExpiresAt);
-    const child = createFactsMemoryBinding({ ownerId: input.ownerId, sessionId: input.childSessionId });
-    const parentBinding = createFactsMemoryBinding({
-      ownerId: input.ownerId,
-      sessionId: input.parentSessionId,
-    });
-    if (child.sessionId === parentBinding.sessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
-    if (this.#control.get(child.sessionId) !== null) {
-      return await this.#serialize(child.sessionId, async () => {
-        const existing = this.#control.requireExact(child);
-        this.#assertForkReservation(existing, parentBinding);
+    if (input.childSessionId === input.parentSessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
+    const existingChild = this.#control.get(input.childSessionId);
+    if (existingChild !== null) {
+      return await this.#serialize(input.childSessionId, async () => {
+        const current = this.#control.get(input.childSessionId);
+        if (current === null || current.binding.ownerId !== input.ownerId) {
+          throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+        }
+        const existing = this.#control.requireExact(current.binding);
+        this.#assertForkReservation(existing, {
+          ownerId: input.ownerId,
+          sessionId: input.parentSessionId,
+        });
         return lifecycleReceipt(await this.#ensureReserved(existing));
       });
     }
@@ -210,20 +229,33 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     if (parentRecord.state !== "active" || parentRecord.head === null) {
       throw new Error("FACTS_MEMORY_PARENT_NOT_ACTIVE");
     }
+    const exactParent = this.#control.get(input.parentSessionId);
+    if (exactParent === null || exactParent.binding.ownerId !== input.ownerId) {
+      throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+    }
     const checkpoint: FactsMemoryCheckpoint = {
-      ...parentBinding,
+      ...exactParent.binding,
       head: parentRecord.head,
     };
-    return await this.#serialize(child.sessionId, async () => {
-      const raced = this.#control.get(child.sessionId);
+    return await this.#serialize(input.childSessionId, async () => {
+      const raced = this.#control.get(input.childSessionId);
       if (raced !== null) {
-        const existing = this.#control.requireExact(child);
-        this.#assertForkReservation(existing, parentBinding);
+        if (raced.binding.ownerId !== input.ownerId) throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+        const existing = this.#control.requireExact(raced.binding);
+        this.#assertForkReservation(existing, {
+          ownerId: input.ownerId,
+          sessionId: input.parentSessionId,
+        });
         return lifecycleReceipt(await this.#ensureReserved(existing));
       }
+      const child = createFactsMemoryBinding({
+        epoch: 1,
+        ownerId: input.ownerId,
+        sessionId: input.childSessionId,
+      });
       const reserved = this.#control.reserve({
         binding: child,
-        createOperationKey: `fork:${child.sessionId}`,
+        createOperationKey: this.#createOperationKey(child, "fork"),
         expiresAt: childExpiresAt,
         parent: checkpoint,
       });
@@ -235,12 +267,15 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     ownerId: string;
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt> {
-    const binding = createFactsMemoryBinding(input);
-    return this.#serialize(binding.sessionId, async () => {
+    return this.#serialize(input.sessionId, async () => {
+      const current = this.#control.get(input.sessionId);
+      if (current === null) throw new Error("FACTS_MEMORY_NOT_FOUND");
+      if (current.binding.ownerId !== input.ownerId) throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+      const binding = current.binding;
       const record = this.#control.requireExact(binding);
       if (record.state !== "active") return lifecycleReceipt(await this.#ensureReserved(record));
       try {
-        const inspection = await this.#inspect(binding);
+        const inspection = await this.#inspect(binding, record.head ?? undefined);
         if (inspection.status === "missing") throw new Error("FACTS_MEMORY_ACTIVE_STORE_MISSING");
         return lifecycleReceipt(this.#control.refreshHead(
           binding,
@@ -258,26 +293,12 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     reason: FactsMemoryCleanupReason;
     sessionId: string;
   }>): Promise<HraFactsMemoryLifecycleReceipt | null> {
-    const binding = createFactsMemoryBinding(input);
     const requestedReason = factsMemoryCleanupReasonSchema.parse(input.reason);
-    return this.#serialize(binding.sessionId, async () => {
-      if (this.#control.get(binding.sessionId) === null) return null;
-      const existing = this.#control.requireExact(binding);
-      const reason = existing.cleanupReason ?? requestedReason;
-      const operationKey = existing.cleanupOperationKey
-        ?? `cleanup:${binding.sessionId}:${reason}`;
-      const pending = this.#control.beginCleanup({
-        binding,
-        operationKey,
-        reason,
-      });
-      if (pending.state === "purged") return lifecycleReceipt(pending);
-      const purge = assertPurgeReceipt(binding, await this.#broker.purge({
-        binding,
-        expectedHandleHash: pending.handleHash,
-        operationKey: pending.cleanupOperationKey ?? operationKey,
-      }));
-      return lifecycleReceipt(this.#control.finalizePurged(binding, purge));
+    return this.#serialize(input.sessionId, async () => {
+      const existing = this.#control.get(input.sessionId);
+      if (existing === null) return null;
+      if (existing.binding.ownerId !== input.ownerId) throw new Error("FACTS_MEMORY_AUTHORITY_MISMATCH");
+      return lifecycleReceipt(await this.#cleanupRecord(existing, requestedReason));
     });
   }
 
@@ -287,10 +308,22 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     let purged = 0;
     for (const record of records) {
       try {
-        const result = await this.cleanupSession({
-          ownerId: record.binding.ownerId,
-          reason: record.cleanupReason ?? "expired",
-          sessionId: record.binding.sessionId,
+        const result = await this.#serialize(record.binding.sessionId, async () => {
+          const current = this.#control.get(record.binding.sessionId);
+          if (
+            current === null
+            || current.binding.bindingDigest !== record.binding.bindingDigest
+            || current.binding.epoch !== record.binding.epoch
+            || current.revision !== record.revision
+          ) return null;
+          if (
+            current.state !== "cleanup_pending"
+            && (current.expiresAt > now || current.state === "purged")
+          ) return null;
+          return lifecycleReceipt(await this.#cleanupRecord(
+            current,
+            current.cleanupReason ?? "expired",
+          ));
         });
         if (result?.state === "purged") purged += 1;
       } catch {
@@ -304,7 +337,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     const binding = record.binding;
     if (record.state === "active") {
       try {
-        const inspection = await this.#inspect(binding);
+        const inspection = await this.#inspect(binding, record.head ?? undefined);
         if (inspection.status === "missing") throw new Error("FACTS_MEMORY_ACTIVE_STORE_MISSING");
         return this.#control.refreshHead(binding, assertInspection(binding, inspection.inspection));
       } catch (error: unknown) {
@@ -315,11 +348,11 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
     if (record.state === "cleanup_pending" || record.state === "purged") {
       throw new Error("FACTS_MEMORY_STORE_RETIRED");
     }
-    if (record.state === "recovery_required") throw new Error("FACTS_MEMORY_RECOVERY_REQUIRED");
+    if (record.state === "recovery_required") return await this.#recover(record);
     if (record.state === "creating" || record.state === "create_ambiguous") {
       let inspection: FactsMemoryBrokerInspection;
       try {
-        inspection = await this.#inspect(binding);
+        inspection = await this.#inspect(binding, record.head ?? undefined);
       } catch (error: unknown) {
         this.#markRecoveryRequired(binding);
         throw error;
@@ -415,20 +448,98 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
 
   #assertForkReservation(
     record: FactsMemoryControlRecord,
-    parent: FactsMemoryBinding,
+    parent: Readonly<{ ownerId: string; sessionId: string }>,
   ): void {
     if (
       record.createKind !== "fork"
-      || record.createOperationKey !== `fork:${record.binding.sessionId}`
+      || record.createOperationKey !== this.#createOperationKey(record.binding, "fork")
       || record.parent === null
-      || record.parent.bindingDigest !== parent.bindingDigest
       || record.parent.ownerId !== parent.ownerId
       || record.parent.sessionId !== parent.sessionId
     ) throw new Error("FACTS_MEMORY_FORK_RESERVATION_MISMATCH");
   }
 
-  async #inspect(binding: FactsMemoryBinding): Promise<FactsMemoryBrokerInspection> {
-    return factsMemoryBrokerInspectionSchema.parse(await this.#broker.inspect(binding));
+  async #inspect(
+    binding: FactsMemoryBinding,
+    expectedHead?: FactsMemoryHead,
+  ): Promise<FactsMemoryBrokerInspection> {
+    return factsMemoryBrokerInspectionSchema.parse(await this.#broker.inspect(binding, expectedHead));
+  }
+
+  async #recover(record: FactsMemoryControlRecord): Promise<FactsMemoryControlRecord> {
+    const binding = record.binding;
+    let inspection: FactsMemoryBrokerInspection;
+    try {
+      inspection = await this.#inspect(binding, record.head ?? undefined);
+    } catch {
+      throw new Error("FACTS_MEMORY_RECOVERY_REQUIRED");
+    }
+    if (inspection.status === "present") {
+      try {
+        const inspected = assertInspection(binding, inspection.inspection);
+        if (record.handleHash === null) {
+          const initial = assertInitialReceipt(binding, {
+            version: inspected.version,
+            bindingDigest: inspected.bindingDigest,
+            createdAt: inspected.createdAt,
+            handleHash: inspected.handleHash,
+            head: inspected.initialHead,
+            receiptDigest: inspected.receiptDigest,
+          });
+          const active = this.#control.recoverCreated(binding, initial);
+          return this.#control.refreshHead(active.binding, inspected);
+        }
+        return this.#control.recoverActive(binding, inspected);
+      } catch {
+        throw new Error("FACTS_MEMORY_RECOVERY_REQUIRED");
+      }
+    }
+    if (record.handleHash !== null || record.legacyHead !== null || record.legacyParentHead !== null) {
+      throw new Error("FACTS_MEMORY_RECOVERY_REQUIRED");
+    }
+    let receipt: FactsMemoryStoreReceipt;
+    try {
+      receipt = assertInitialReceipt(binding, record.parent === null
+        ? await this.#broker.create({ binding, operationKey: record.createOperationKey })
+        : await this.#broker.fork({
+            binding,
+            operationKey: record.createOperationKey,
+            parent: record.parent,
+          }));
+      return this.#control.recoverCreated(binding, receipt);
+    } catch {
+      throw new Error("FACTS_MEMORY_RECOVERY_REQUIRED");
+    }
+  }
+
+  async #cleanupRecord(
+    existing: FactsMemoryControlRecord,
+    requestedReason: FactsMemoryCleanupReason,
+  ): Promise<FactsMemoryControlRecord> {
+    const binding = existing.binding;
+    const exact = this.#control.requireExact(binding);
+    const reason = exact.cleanupReason ?? requestedReason;
+    const operationKey = exact.cleanupOperationKey ?? this.#cleanupOperationKey(binding, reason);
+    const pending = this.#control.beginCleanup({ binding, operationKey, reason });
+    if (pending.state === "purged") return pending;
+    const purge = assertPurgeReceipt(binding, await this.#broker.purge({
+      binding,
+      expectedHandleHash: pending.handleHash,
+      operationKey: pending.cleanupOperationKey ?? operationKey,
+    }));
+    return this.#control.finalizePurged(binding, purge);
+  }
+
+  #createOperationKey(binding: FactsMemoryBinding, kind: "create" | "fork"): string {
+    return binding.epoch === 1
+      ? `${kind}:${binding.sessionId}`
+      : `${kind}:${binding.sessionId}:epoch:${String(binding.epoch)}`;
+  }
+
+  #cleanupOperationKey(binding: FactsMemoryBinding, reason: FactsMemoryCleanupReason): string {
+    return binding.epoch === 1
+      ? `cleanup:${binding.sessionId}:${reason}`
+      : `cleanup:${binding.sessionId}:epoch:${String(binding.epoch)}:${reason}`;
   }
 
   #serialize<T>(key: string, operation: () => Promise<T>): Promise<T> {

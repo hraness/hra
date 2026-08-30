@@ -20,6 +20,7 @@ import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
 import {
   OH_WORKING_STORE_PROFILE_V1,
   parseOhHeadV1,
+  parseOhHeadRefV1,
   parseOhStoreBindingV1,
   type OhHeadV1,
   type OhStoreAuthorityV1,
@@ -77,6 +78,35 @@ type PendingMetadata =
   | Readonly<{ status: "incomplete" }>
   | Readonly<{ status: "missing" }>;
 
+const normalizeLegacyMetadata = (value: unknown): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const metadata = { ...(value as Record<string, unknown>) };
+  if (
+    metadata.initialHead !== null
+    && typeof metadata.initialHead === "object"
+    && !Array.isArray(metadata.initialHead)
+  ) {
+    const head = { ...(metadata.initialHead as Record<string, unknown>) };
+    if (!Object.hasOwn(head, "operationSha256") && head.sequence === 0) {
+      head.operationSha256 = null;
+    }
+    metadata.initialHead = head;
+  }
+  if (metadata.parent !== null && typeof metadata.parent === "object" && !Array.isArray(metadata.parent)) {
+    const parent = { ...(metadata.parent as Record<string, unknown>) };
+    if (!Object.hasOwn(parent, "epoch")) parent.epoch = 1;
+    if (parent.head !== null && typeof parent.head === "object" && !Array.isArray(parent.head)) {
+      const head = { ...(parent.head as Record<string, unknown>) };
+      if (!Object.hasOwn(head, "operationSha256") && head.sequence === 0) {
+        head.operationSha256 = null;
+      }
+      parent.head = head;
+    }
+    metadata.parent = parent;
+  }
+  return metadata;
+};
+
 const digestParts = (domain: string, parts: readonly string[]): string => {
   const digest = createHash("sha256");
   digest.update(domain);
@@ -99,7 +129,20 @@ const digestOhHead = (head: OhHeadV1): string => digestParts("hra-oh-head-v1", [
 const projectOhHead = (value: unknown): FactsMemoryHead => {
   const head = parseOhHeadV1(value);
   if (head === null) throw new Error("FACTS_MEMORY_OH_HEAD_INVALID");
-  return factsMemoryHeadSchema.parse({ digest: digestOhHead(head), sequence: head.sequence });
+  return factsMemoryHeadSchema.parse({
+    digest: digestOhHead(head),
+    operationSha256: head.operationSha256,
+    sequence: head.sequence,
+  });
+};
+
+const ohHeadRef = (head: FactsMemoryHead) => {
+  const value = parseOhHeadRefV1({
+    operationSha256: head.operationSha256,
+    sequence: head.sequence,
+  });
+  if (value === null) throw new Error("FACTS_MEMORY_OH_HEAD_INVALID");
+  return value;
 };
 
 const metadataDigest = (value: Omit<AdapterMetadata, "adapterDigest">): string =>
@@ -109,13 +152,16 @@ const metadataDigest = (value: Omit<AdapterMetadata, "adapterDigest">): string =
     value.createKind,
     value.handleHash,
     String(value.initialHead.sequence),
+    ...(value.initialHead.operationSha256 === null ? [] : [value.initialHead.operationSha256]),
     value.initialHead.digest,
     value.ohBindingSha256,
     value.operationKey,
     value.parent?.bindingDigest ?? "no-parent",
+    ...(value.parent === null || value.parent.epoch === 1 ? [] : [String(value.parent.epoch)]),
     value.parent?.ownerId ?? "no-parent",
     value.parent?.sessionId ?? "no-parent",
     value.parent === null ? "no-parent" : String(value.parent.head.sequence),
+    value.parent?.head.operationSha256 ?? "no-parent",
     value.parent?.head.digest ?? "no-parent",
     value.receiptDigest,
     String(value.version),
@@ -137,9 +183,11 @@ const checkpointsEqual = (
 ): boolean => left === null || right === null
   ? left === right
   : left.bindingDigest === right.bindingDigest
+    && left.epoch === right.epoch
     && left.ownerId === right.ownerId
     && left.sessionId === right.sessionId
     && left.head.sequence === right.head.sequence
+    && left.head.operationSha256 === right.head.operationSha256
     && left.head.digest === right.head.digest;
 
 const errorCode = (error: unknown): string | null =>
@@ -227,7 +275,7 @@ const readMetadataFile = (path: string): AdapterMetadata | null => {
     } catch {
       throw new Error("FACTS_MEMORY_OH_METADATA_INVALID");
     }
-    const parsed = adapterMetadataSchema.parse(value);
+    const parsed = adapterMetadataSchema.parse(normalizeLegacyMetadata(value));
     const { adapterDigest, ...body } = parsed;
     const receipt = receiptFromMetadata(parsed);
     if (
@@ -279,7 +327,7 @@ const readPendingMetadataFile = (path: string): PendingMetadata => {
     } catch {
       return { status: "incomplete" };
     }
-    const parsedResult = adapterMetadataSchema.safeParse(value);
+    const parsedResult = adapterMetadataSchema.safeParse(normalizeLegacyMetadata(value));
     if (!parsedResult.success) return { status: "incomplete" };
     const parsed = parsedResult.data;
     const { adapterDigest, ...body } = parsed;
@@ -477,6 +525,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
 
       const parentBinding = factsMemoryBindingSchema.parse({
         bindingDigest: parent.bindingDigest,
+        epoch: parent.epoch,
         ownerId: parent.ownerId,
         sessionId: parent.sessionId,
       });
@@ -486,22 +535,14 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       const parentAuthority = await this.#open(parentBinding, parentDirectory, true);
       let snapshot: Awaited<ReturnType<typeof parentAuthority.store.snapshot>>;
       try {
-        const verification = await parentAuthority.store.verify();
-        const currentHead = projectOhHead(verification.head);
-        if (
-          currentHead.sequence !== parent.head.sequence
-          || currentHead.digest !== parent.head.digest
-        ) throw new Error("FACTS_MEMORY_PARENT_CHECKPOINT_MISMATCH");
         snapshot = await parentAuthority.store.snapshot({
-          head: {
-            operationSha256: verification.head.operationSha256,
-            sequence: verification.head.sequence,
-          },
+          head: ohHeadRef(parent.head),
           maximumRecords: maximumForkRecords,
         });
         const snapshotHead = projectOhHead(snapshot.head);
         if (
           snapshotHead.sequence !== parent.head.sequence
+          || snapshotHead.operationSha256 !== parent.head.operationSha256
           || snapshotHead.digest !== parent.head.digest
         ) {
           throw new Error("FACTS_MEMORY_PARENT_CHECKPOINT_MISMATCH");
@@ -555,6 +596,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
   inspect(input: Readonly<{
     binding: FactsMemoryBinding;
     directory: string;
+    expectedHead?: FactsMemoryHead;
   }>): Promise<FactsMemoryBrokerInspection> {
     const binding = factsMemoryBindingSchema.parse(input.binding);
     const directory = input.directory;
@@ -566,11 +608,21 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
         const pending = readPendingMetadataFile(join(directory, adapterMetadataPendingName));
         if (pending.status !== "complete") return { status: "missing" };
         metadata = pending.metadata;
-        recoveredInspection = await this.#inspectComplete(binding, directory, metadata);
+        recoveredInspection = await this.#inspectComplete(
+          binding,
+          directory,
+          metadata,
+          input.expectedHead,
+        );
         publishMetadata(directory, metadata);
       }
       return {
-        inspection: recoveredInspection ?? await this.#inspectComplete(binding, directory, metadata),
+        inspection: recoveredInspection ?? await this.#inspectComplete(
+          binding,
+          directory,
+          metadata,
+          input.expectedHead,
+        ),
         status: "present",
       };
     });
@@ -579,16 +631,23 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
   quiesceForPurge(input: Readonly<{
     binding: FactsMemoryBinding;
     directory: string;
-  }>): Promise<void> {
+  }>): Promise<Readonly<{ handleHash: string | null }>> {
     const binding = factsMemoryBindingSchema.parse(input.binding);
     const directory = input.directory;
     return this.#serializeDirectories([directory], async () => {
       assertPrivateDirectory(directory);
-      const metadata = readMetadataFile(join(directory, adapterMetadataName));
+      let metadata: AdapterMetadata | null = null;
+      try {
+        metadata = readMetadataFile(join(directory, adapterMetadataName));
+      } catch {
+        // Recovery cleanup owns the complete validated 0700 session directory.
+        // A malformed or legacy sidecar cannot authorize reopening, but the Oh
+        // database binding below can still prove the exact store before purge.
+      }
       const databasePath = join(directory, databaseName);
       if (!existsSync(databasePath)) {
         if (metadata !== null) throw new Error("FACTS_MEMORY_OH_DATABASE_MISSING");
-        return;
+        return { handleHash: null };
       }
       const authority = await this.#open(binding, directory, true);
       try {
@@ -599,9 +658,14 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
           if (
             head.sequence < metadata.initialHead.sequence
             || (head.sequence === metadata.initialHead.sequence
-              && head.digest !== metadata.initialHead.digest)
+              && (head.operationSha256 !== metadata.initialHead.operationSha256
+                || head.digest !== metadata.initialHead.digest))
           ) throw new Error("FACTS_MEMORY_OH_HEAD_REGRESSION");
+          if (head.sequence > metadata.initialHead.sequence) {
+            await authority.store.changesSince(ohHeadRef(metadata.initialHead), { limit: 1 });
+          }
         }
+        return { handleHash: this.#handleHash(binding, authority.store.binding.bindingSha256) };
       } finally {
         await authority.store.close();
       }
@@ -621,7 +685,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       path,
       profile: OH_WORKING_STORE_PROFILE_V1,
       realmId: `hra:${binding.bindingDigest}`,
-      spaceId: `hra:${binding.sessionId}`,
+      spaceId: this.#spaceId(binding),
     });
     enforcePrivateSqliteFiles(directory);
     const persisted = parseOhStoreBindingV1(authority.store.binding);
@@ -629,7 +693,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       persisted === null
       || persisted.profile.profileSha256 !== OH_WORKING_STORE_PROFILE_V1.profileSha256
       || persisted.realmId !== `hra:${binding.bindingDigest}`
-      || persisted.spaceId !== `hra:${binding.sessionId}`
+      || persisted.spaceId !== this.#spaceId(binding)
       || authority.host.binding.bindingSha256 !== persisted.bindingSha256
     ) {
       await authority.store.close();
@@ -643,6 +707,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     binding: FactsMemoryBinding,
     directory: string,
     metadata: AdapterMetadata,
+    expectedHead?: FactsMemoryHead,
   ): Promise<FactsMemoryStoreInspection> {
     this.#assertMetadataBinding(metadata, binding);
     const authority = await this.#open(binding, directory, true);
@@ -650,11 +715,27 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       this.#assertMetadataAuthority(metadata, binding, authority);
       const verification = await authority.store.verify();
       const head = projectOhHead(verification.head);
+      if (expectedHead !== undefined) {
+        const expected = factsMemoryHeadSchema.parse(expectedHead);
+        if (head.sequence < expected.sequence) throw new Error("FACTS_MEMORY_OH_HEAD_REGRESSION");
+        if (head.sequence === expected.sequence) {
+          if (
+            head.operationSha256 !== expected.operationSha256
+            || head.digest !== expected.digest
+          ) throw new Error("FACTS_MEMORY_OH_HEAD_EQUIVOCATION");
+        } else {
+          await authority.store.changesSince(ohHeadRef(expected), { limit: 1 });
+        }
+      }
       if (
         head.sequence < metadata.initialHead.sequence
         || (head.sequence === metadata.initialHead.sequence
-          && head.digest !== metadata.initialHead.digest)
+          && (head.operationSha256 !== metadata.initialHead.operationSha256
+            || head.digest !== metadata.initialHead.digest))
       ) throw new Error("FACTS_MEMORY_OH_HEAD_REGRESSION");
+      if (head.sequence > metadata.initialHead.sequence) {
+        await authority.store.changesSince(ohHeadRef(metadata.initialHead), { limit: 1 });
+      }
       const receipt = receiptFromMetadata(metadata);
       const base = {
         bindingDigest: binding.bindingDigest,
@@ -708,6 +789,12 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
 
   #handleHash(binding: FactsMemoryBinding, ohBindingSha256: string): string {
     return digestParts("hra-oh-handle-v1", [binding.bindingDigest, ohBindingSha256]);
+  }
+
+  #spaceId(binding: FactsMemoryBinding): string {
+    return binding.epoch === 1
+      ? `hra:${binding.sessionId}`
+      : `hra:${binding.sessionId}:epoch:${String(binding.epoch)}`;
   }
 
   #metadata(input: Readonly<{

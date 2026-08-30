@@ -6,6 +6,7 @@ import {
   digestFactsMemoryPurgeReceipt,
   digestFactsMemoryReceipt,
   factsMemoryBindingSchema,
+  factsMemoryHeadSchema,
   factsMemoryPurgeReceiptSchema,
   factsMemoryStoreReceiptSchema,
 } from "./facts-memory";
@@ -45,7 +46,7 @@ describe("facts-memory public authority values", () => {
       bindingDigest: binding.bindingDigest,
       createdAt: 1,
       handleHash: "c".repeat(64),
-      head: { digest: "d".repeat(64), sequence: 0 },
+      head: { digest: "d".repeat(64), operationSha256: null, sequence: 0 },
     };
     const receipt = factsMemoryStoreReceiptSchema.parse({
       ...base,
@@ -62,5 +63,23 @@ describe("facts-memory public authority values", () => {
       ...purgeBase,
       purgeDigest: digestFactsMemoryPurgeReceipt(purgeBase),
     }).purgeDigest).toHaveLength(64);
+  });
+
+  test("requires null operation authority only at the empty head", () => {
+    expect(factsMemoryHeadSchema.safeParse({
+      digest: "a".repeat(64),
+      operationSha256: null,
+      sequence: 0,
+    }).success).toBe(true);
+    expect(factsMemoryHeadSchema.safeParse({
+      digest: "a".repeat(64),
+      operationSha256: "b".repeat(64),
+      sequence: 0,
+    }).success).toBe(false);
+    expect(factsMemoryHeadSchema.safeParse({
+      digest: "a".repeat(64),
+      operationSha256: null,
+      sequence: 1,
+    }).success).toBe(false);
   });
 });

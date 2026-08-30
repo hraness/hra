@@ -11,11 +11,13 @@ import {
   factsMemoryBindingSchema,
   factsMemoryCheckpointSchema,
   factsMemoryDigestSchema,
+  factsMemoryHeadSchema,
   factsMemoryPurgeReceiptSchema,
   factsMemoryStoreInspectionSchema,
   factsMemoryStoreReceiptSchema,
   type FactsMemoryBinding,
   type FactsMemoryCheckpoint,
+  type FactsMemoryHead,
   type FactsMemoryPurgeReceipt,
   type FactsMemoryStoreInspection,
   type FactsMemoryStoreReceipt,
@@ -53,11 +55,12 @@ export interface LocalOhFactsMemoryEnginePort {
   inspect(input: Readonly<{
     binding: FactsMemoryBinding;
     directory: string;
+    expectedHead?: FactsMemoryHead;
   }>): Promise<FactsMemoryBrokerInspection>;
   quiesceForPurge(input: Readonly<{
     binding: FactsMemoryBinding;
     directory: string;
-  }>): Promise<void>;
+  }>): Promise<Readonly<{ handleHash: string | null }>>;
 }
 
 const isMissing = async (path: string): Promise<boolean> => {
@@ -111,19 +114,32 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
     const parent = factsMemoryCheckpointSchema.parse(input.parent);
     if (binding.sessionId === parent.sessionId) throw new Error("FACTS_MEMORY_SELF_FORK");
     if (binding.ownerId !== parent.ownerId) throw new Error("FACTS_MEMORY_PARENT_AUTHORITY_MISMATCH");
-    const parentDirectory = await this.#requireExistingDirectory(parent.sessionId);
-    const parentInspection = engineInspectionSchema.parse(await this.#engine.inspect({
-      binding: {
-        bindingDigest: parent.bindingDigest,
-        ownerId: parent.ownerId,
-        sessionId: parent.sessionId,
-      },
-      directory: parentDirectory,
-    }));
+    const parentBinding = factsMemoryBindingSchema.parse({
+      bindingDigest: parent.bindingDigest,
+      epoch: parent.epoch,
+      ownerId: parent.ownerId,
+      sessionId: parent.sessionId,
+    });
+    const parentDirectory = await this.#requireExistingDirectory(parentBinding);
+    let parentInspection: z.infer<typeof engineInspectionSchema>;
+    try {
+      parentInspection = engineInspectionSchema.parse(await this.#engine.inspect({
+        binding: parentBinding,
+        directory: parentDirectory,
+        expectedHead: parent.head,
+      }));
+    } catch (cause: unknown) {
+      throw new Error("FACTS_MEMORY_PARENT_CHECKPOINT_MISMATCH", { cause });
+    }
+    const inspectedParent = parentInspection.status === "present"
+      ? this.#assertInspection(parent, parentInspection.inspection)
+      : null;
     if (
-      parentInspection.status !== "present"
-      || this.#assertInspection(parent, parentInspection.inspection).head.sequence !== parent.head.sequence
-      || parentInspection.inspection.head.digest !== parent.head.digest
+      inspectedParent === null
+      || inspectedParent.head.sequence < parent.head.sequence
+      || (inspectedParent.head.sequence === parent.head.sequence
+        && (inspectedParent.head.operationSha256 !== parent.head.operationSha256
+          || inspectedParent.head.digest !== parent.head.digest))
     ) throw new Error("FACTS_MEMORY_PARENT_CHECKPOINT_MISMATCH");
     const directory = await this.#prepareCreateDirectory(binding);
     const receipt = this.#assertReceipt(binding, await this.#engine.fork({
@@ -136,13 +152,20 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
     return receipt;
   }
 
-  async inspect(bindingValue: FactsMemoryBinding): Promise<FactsMemoryBrokerInspection> {
+  async inspect(
+    bindingValue: FactsMemoryBinding,
+    expectedHead?: FactsMemoryHead,
+  ): Promise<FactsMemoryBrokerInspection> {
     const binding = factsMemoryBindingSchema.parse(bindingValue);
     await this.#requireRoot();
-    const directory = this.#sessionDirectory(binding.sessionId);
+    const directory = this.#sessionDirectory(binding);
     if (await isMissing(directory)) return { status: "missing" };
     await this.#assertPrivateTree(directory);
-    const inspection = engineInspectionSchema.parse(await this.#engine.inspect({ binding, directory }));
+    const inspection = engineInspectionSchema.parse(await this.#engine.inspect({
+      binding,
+      directory,
+      ...(expectedHead === undefined ? {} : { expectedHead: factsMemoryHeadSchema.parse(expectedHead) }),
+    }));
     if (inspection.status === "present") this.#assertInspection(binding, inspection.inspection);
     return inspection;
   }
@@ -156,24 +179,23 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
     const expectedHandleHash = factsMemoryDigestSchema.nullable().parse(input.expectedHandleHash);
     operationKeySchema.parse(input.operationKey);
     await this.#requireRoot();
-    const directory = this.#sessionDirectory(binding.sessionId);
-    const quarantine = this.#quarantineDirectory(binding.sessionId);
+    const directory = this.#sessionDirectory(binding);
+    const quarantine = this.#quarantineDirectory(binding);
     let handleHash = expectedHandleHash;
     if (!(await isMissing(directory))) {
       if (!(await isMissing(quarantine))) throw new Error("FACTS_MEMORY_PURGE_QUARANTINE_CONFLICT");
       await this.#assertPrivateTree(directory);
-      const inspection = engineInspectionSchema.parse(await this.#engine.inspect({ binding, directory }));
-      if (inspection.status === "present") {
-        const inspected = this.#assertInspection(binding, inspection.inspection);
-        if (
-          expectedHandleHash !== null
-          && inspected.handleHash !== expectedHandleHash
-        ) throw new Error("FACTS_MEMORY_PURGE_HANDLE_MISMATCH");
-        handleHash = inspected.handleHash;
-      } else if (expectedHandleHash !== null) {
-        throw new Error("FACTS_MEMORY_PURGE_STORE_MISSING");
+      const quiesced = z.object({ handleHash: factsMemoryDigestSchema.nullable() }).strict().parse(
+        await this.#engine.quiesceForPurge({ binding, directory }),
+      );
+      if (
+        expectedHandleHash !== null
+        && quiesced.handleHash !== null
+        && quiesced.handleHash !== expectedHandleHash
+      ) {
+        throw new Error("FACTS_MEMORY_PURGE_HANDLE_MISMATCH");
       }
-      await this.#engine.quiesceForPurge({ binding, directory });
+      handleHash = quiesced.handleHash ?? expectedHandleHash;
       await this.#assertPrivateTree(directory);
       await rename(directory, quarantine);
     }
@@ -198,17 +220,17 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
 
   async #prepareCreateDirectory(binding: FactsMemoryBinding): Promise<string> {
     await this.#requireRoot();
-    const quarantine = this.#quarantineDirectory(binding.sessionId);
+    const quarantine = this.#quarantineDirectory(binding);
     if (!(await isMissing(quarantine))) throw new Error("FACTS_MEMORY_CLEANUP_PENDING");
-    const directory = this.#sessionDirectory(binding.sessionId);
+    const directory = this.#sessionDirectory(binding);
     if (await isMissing(directory)) await ensurePrivateDirectory(directory);
     await this.#assertPrivateTree(directory);
     return directory;
   }
 
-  async #requireExistingDirectory(sessionId: string): Promise<string> {
+  async #requireExistingDirectory(binding: FactsMemoryBinding): Promise<string> {
     await this.#requireRoot();
-    const directory = this.#sessionDirectory(sessionId);
+    const directory = this.#sessionDirectory(binding);
     if (await isMissing(directory)) throw new Error("FACTS_MEMORY_PARENT_STORE_MISSING");
     await this.#assertPrivateTree(directory);
     return directory;
@@ -219,19 +241,25 @@ export class LocalFactsMemoryBroker implements FactsMemoryBrokerPort {
     if (canonical !== this.#root) throw new Error("FACTS_MEMORY_ROOT_UNSAFE");
   }
 
-  #sessionDirectory(sessionIdValue: string): string {
-    const sessionId = sessionIdSchema.parse(sessionIdValue);
-    const target = resolve(join(this.#root, sessionId));
+  #sessionDirectory(bindingValue: FactsMemoryBinding): string {
+    const binding = factsMemoryBindingSchema.parse(bindingValue);
+    const component = this.#directoryComponent(binding);
+    const target = resolve(join(this.#root, component));
     const relativeTarget = relative(this.#root, target);
-    if (relativeTarget !== sessionId || relativeTarget.startsWith("..")) {
+    if (relativeTarget !== component || relativeTarget.startsWith("..")) {
       throw new Error("FACTS_MEMORY_PATH_ESCAPE");
     }
     return target;
   }
 
-  #quarantineDirectory(sessionIdValue: string): string {
-    const sessionId = sessionIdSchema.parse(sessionIdValue);
-    return resolve(join(this.#root, `.purging-${sessionId}`));
+  #quarantineDirectory(bindingValue: FactsMemoryBinding): string {
+    const binding = factsMemoryBindingSchema.parse(bindingValue);
+    return resolve(join(this.#root, `.purging-${this.#directoryComponent(binding)}`));
+  }
+
+  #directoryComponent(binding: FactsMemoryBinding): string {
+    const sessionId = sessionIdSchema.parse(binding.sessionId);
+    return binding.epoch === 1 ? sessionId : `${sessionId}.epoch-${String(binding.epoch)}`;
   }
 
   #assertReceipt(binding: FactsMemoryBinding, value: unknown): FactsMemoryStoreReceipt {

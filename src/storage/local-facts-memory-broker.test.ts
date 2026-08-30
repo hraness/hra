@@ -9,6 +9,7 @@ import {
   digestFactsMemoryReceipt,
   type FactsMemoryBinding,
   type FactsMemoryCheckpoint,
+  type FactsMemoryHead,
   type FactsMemoryStoreReceipt,
 } from "../domain/facts-memory";
 import type { FactsMemoryBrokerInspection } from "../daemon/facts-memory-lifecycle";
@@ -24,7 +25,7 @@ const childSessionId = `sess_${"2".repeat(32)}`;
 
 const receipt = (
   binding: FactsMemoryBinding,
-  head = { digest: "d".repeat(64), sequence: 0 },
+  head: FactsMemoryHead = { digest: "d".repeat(64), operationSha256: null, sequence: 0 },
 ): FactsMemoryStoreReceipt => {
   const base = {
     version: 1 as const,
@@ -52,6 +53,7 @@ const inspection = (stored: FactsMemoryStoreReceipt) => {
 class FakeLocalOhEngine implements LocalOhFactsMemoryEnginePort {
   readonly stores = new Map<string, FactsMemoryStoreReceipt>();
   quiesceCalls = 0;
+  quiesceHandleOverride: string | undefined;
 
   async create(input: { binding: FactsMemoryBinding; directory: string }): Promise<FactsMemoryStoreReceipt> {
     await writeFile(join(input.directory, "store.sqlite"), "semantic bytes");
@@ -82,9 +84,12 @@ class FakeLocalOhEngine implements LocalOhFactsMemoryEnginePort {
       : { status: "present", inspection: inspection(stored) };
   }
 
-  async quiesceForPurge(input: { directory: string }): Promise<void> {
+  async quiesceForPurge(input: { directory: string }): Promise<{ handleHash: string | null }> {
     this.quiesceCalls += 1;
-    this.stores.delete(input.directory);
+    const handleHash = this.quiesceHandleOverride
+      ?? this.stores.get(input.directory)?.handleHash
+      ?? null;
+    return { handleHash };
   }
 }
 
@@ -164,7 +169,7 @@ describe("local Oh facts-memory custody", () => {
       operationKey: `fork:${childSessionId}`,
       parent: {
         ...parent,
-        head: { digest: "e".repeat(64), sequence: 1 },
+        head: { digest: "e".repeat(64), operationSha256: "a".repeat(64), sequence: 1 },
       },
     })).rejects.toThrow("FACTS_MEMORY_PARENT_CHECKPOINT_MISMATCH");
     expect(engine.stores.has(join(root, childSessionId))).toBe(false);
@@ -187,5 +192,18 @@ describe("local Oh facts-memory custody", () => {
       ...binding,
       bindingDigest: "f".repeat(64),
     })).rejects.toThrow();
+  });
+
+  test("retains the exact directory when quiescence proves a different handle", async () => {
+    const { broker, engine, root } = await fixture();
+    const binding = createFactsMemoryBinding({ ownerId, sessionId });
+    const created = await broker.create({ binding, operationKey: `create:${sessionId}` });
+    engine.quiesceHandleOverride = "e".repeat(64);
+    await expect(broker.purge({
+      binding,
+      expectedHandleHash: created.handleHash,
+      operationKey: `cleanup:${sessionId}:archive`,
+    })).rejects.toThrow("FACTS_MEMORY_PURGE_HANDLE_MISMATCH");
+    expect(await realpath(join(root, sessionId))).toBe(join(root, sessionId));
   });
 });
