@@ -1,9 +1,16 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, join, resolve } from "node:path";
 
 import { parseNpmRelease } from "./release-distribution-policy";
+import {
+  decideNpmPublicationTransition,
+} from "./npm-publication-transition";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
+import { verifyNpmProvenance, type NpmProvenanceAttemptPolicy } from "./verify-npm-provenance";
+
+const maximumAttestationBytes = 512 * 1024;
 
 const argument = process.argv[2];
 if (argument === undefined) throw new Error("Usage: publish-npm-release.ts ARTIFACT.tgz");
@@ -15,10 +22,33 @@ if (basename(tarball) !== releaseArchiveName(inspection.version)) {
   throw new Error("npm publication received the wrong release artifact name.");
 }
 const verifiedTag = process.env.VERIFIED_TAG;
+const verifiedSha = process.env.VERIFIED_SHA;
+const runId = process.env.GITHUB_RUN_ID;
 const runAttempt = process.env.GITHUB_RUN_ATTEMPT;
-if (verifiedTag !== `v${inspection.version}` || runAttempt === undefined || !/^[1-9][0-9]*$/u.test(runAttempt)) {
-  throw new Error("npm publication requires one verified tag and workflow attempt.");
+const preflightArtifactState = process.env.HRA_NPM_PREFLIGHT_STATE;
+const preflightRunAttempt = process.env.HRA_NPM_PREFLIGHT_RUN_ATTEMPT;
+const preflightRunId = process.env.HRA_NPM_PREFLIGHT_RUN_ID;
+if (
+  verifiedTag !== `v${inspection.version}`
+  || verifiedSha === undefined
+  || !/^[0-9a-f]{40}$/u.test(verifiedSha)
+  || runId === undefined
+  || !/^[1-9][0-9]*$/u.test(runId)
+  || runAttempt === undefined
+  || !/^[1-9][0-9]*$/u.test(runAttempt)
+  || (preflightArtifactState !== "absent" && preflightArtifactState !== "exact")
+  || preflightRunAttempt === undefined
+  || preflightRunId === undefined
+) {
+  throw new Error("npm publication requires one verified source and registry preflight identity.");
 }
+const releaseSha = verifiedSha;
+const releaseTag = verifiedTag;
+const workflowRunAttempt = runAttempt;
+const workflowRunId = runId;
+const registryPreflightState = preflightArtifactState;
+const registryPreflightRunAttempt = preflightRunAttempt;
+const registryPreflightRunId = preflightRunId;
 const expectedIntegrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
 const expectedShasum = createHash("sha1").update(bytes).digest("hex");
 const url = `https://registry.npmjs.org/${encodeURIComponent(inspection.name)}/${inspection.version}`;
@@ -40,7 +70,81 @@ async function lookup(): Promise<boolean> {
   return true;
 }
 
-if (await lookup()) {
+async function attestations(): Promise<unknown> {
+  const attestationsUrl =
+    `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`;
+  const response = await fetch(attestationsUrl, {
+    cache: "no-store",
+    headers: { Accept: "application/json", "Cache-Control": "no-cache" },
+    redirect: "error",
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (response.status !== 200) {
+    throw new Error(`npm Sigstore attestations returned HTTP ${String(response.status)}.`);
+  }
+  const declared = response.headers.get("content-length");
+  if (declared !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(declared) || Number(declared) > maximumAttestationBytes)) {
+    throw new Error("npm Sigstore attestations exceed their declared byte bound.");
+  }
+  const reader = response.body?.getReader();
+  if (reader === undefined) throw new Error("npm Sigstore attestations have no body.");
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) break;
+      length += item.value.byteLength;
+      if (length > maximumAttestationBytes) {
+        throw new Error("npm Sigstore attestations exceed their byte bound.");
+      }
+      chunks.push(item.value);
+    }
+  } finally {
+    try { await reader.cancel(); } catch { /* the bounded result remains authoritative */ }
+    reader.releaseLock();
+  }
+  const payload = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload)) as unknown;
+  } catch {
+    throw new Error("npm Sigstore attestations returned malformed JSON.");
+  }
+}
+
+async function admitProvenance(attemptPolicy: NpmProvenanceAttemptPolicy): Promise<void> {
+  const tufCachePath = await mkdtemp(join(tmpdir(), "hra-publish-sigstore-tuf-"));
+  try {
+    await verifyNpmProvenance({
+      attemptPolicy,
+      attestations: await attestations(),
+      integrity: expectedIntegrity,
+      runAttempt: workflowRunAttempt,
+      runId: workflowRunId,
+      sha: releaseSha,
+      tag: releaseTag,
+      tufCachePath,
+    });
+  } finally {
+    await rm(tufCachePath, { force: true, recursive: true });
+  }
+}
+
+const transition = decideNpmPublicationTransition({
+  currentArtifactState: await lookup() ? "exact" : "absent",
+  currentRunAttempt: workflowRunAttempt,
+  currentRunId: workflowRunId,
+  preflightArtifactState: registryPreflightState,
+  preflightRunAttempt: registryPreflightRunAttempt,
+  preflightRunId: registryPreflightRunId,
+});
+if (transition.action === "admit_existing") {
+  await admitProvenance(transition.attemptPolicy);
   console.log(`${inspection.name}@${inspection.version} already contains the exact trusted-publisher bytes.`);
 } else {
   if (process.env.HRA_APPROVE_NPM_PUBLICATION !== `publish:${inspection.name}@${inspection.version}`) {
@@ -70,7 +174,10 @@ if (await lookup()) {
     "NPM_CONFIG_REGISTRY",
     "PATH",
     "RUNNER_ENVIRONMENT",
-  ].flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name] as string]]));
+  ].flatMap((name) => {
+    const value = process.env[name];
+    return value === undefined ? [] : [[name, value]];
+  }));
   const child = Bun.spawn([
     "npm", "publish", tarball, "--access", "public", "--provenance",
   ], { env: cleanEnvironment, stderr: "pipe", stdin: "ignore", stdout: "pipe" });
@@ -107,5 +214,6 @@ if (await lookup()) {
     }
   }
   if (!observed) throw new Error("npm publication did not become readable with exact provenance-bearing bytes.");
+  await admitProvenance("exact");
   console.log(`Published exact ${inspection.name}@${inspection.version} through npm trusted publishing.`);
 }

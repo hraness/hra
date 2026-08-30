@@ -4,6 +4,9 @@ type JsonRecord = Record<string, unknown>;
 
 const SLSA_V1 = "https://slsa.dev/provenance/v1";
 const FULCIO_GITHUB_ISSUER = "https://token.actions.githubusercontent.com";
+const GITHUB_BUILD_TYPE = "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1";
+const GITHUB_BUILDER_ID = "https://github.com/actions/runner/github-hosted";
+const GITHUB_REPOSITORY_URL = "https://github.com/hraness/hra";
 const GITHUB_OIDS = Object.freeze({
   "1.3.6.1.4.1.57264.1.1": "push",
   "1.3.6.1.4.1.57264.1.2": "__SHA__",
@@ -11,6 +14,8 @@ const GITHUB_OIDS = Object.freeze({
   "1.3.6.1.4.1.57264.1.4": "hraness/hra",
   "1.3.6.1.4.1.57264.1.5": "__REF__",
 });
+
+export type NpmProvenanceAttemptPolicy = "exact" | "same_run_not_later";
 
 function record(value: unknown, label: string): JsonRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -27,7 +32,63 @@ function exactKeys(value: JsonRecord, keys: readonly string[], label: string): v
   }
 }
 
+export function assertNpmProvenanceBuildIdentity(
+  value: unknown,
+  input: Readonly<{
+    attemptPolicy: NpmProvenanceAttemptPolicy;
+    runAttempt: string;
+    runId: string;
+    sha: string;
+    tag: string;
+  }>,
+): string {
+  if (!/^[1-9][0-9]*$/u.test(input.runId) || !/^[1-9][0-9]*$/u.test(input.runAttempt)) {
+    throw new Error("npm provenance requires exact workflow run identity.");
+  }
+  const predicate = record(value, "SLSA predicate");
+  const buildDefinition = record(predicate.buildDefinition, "SLSA build definition");
+  const externalParameters = record(buildDefinition.externalParameters, "SLSA external parameters");
+  const workflow = record(externalParameters.workflow, "SLSA workflow");
+  const dependencies = buildDefinition.resolvedDependencies;
+  if (
+    buildDefinition.buildType !== GITHUB_BUILD_TYPE
+    || workflow.repository !== GITHUB_REPOSITORY_URL
+    || workflow.path !== ".github/workflows/release.yml"
+    || workflow.ref !== `refs/tags/${input.tag}`
+    || !Array.isArray(dependencies)
+    || dependencies.length !== 1
+  ) throw new Error("SLSA provenance has the wrong release workflow identity.");
+  const dependency = record(dependencies[0], "SLSA resolved dependency");
+  const dependencyDigest = record(dependency.digest, "SLSA resolved dependency digest");
+  exactKeys(dependencyDigest, ["gitCommit"], "SLSA resolved dependency digest");
+  if (
+    dependency.uri !== `git+${GITHUB_REPOSITORY_URL}@refs/tags/${input.tag}`
+    || dependencyDigest.gitCommit !== input.sha
+  ) throw new Error("SLSA provenance does not bind the exact release ref and commit.");
+
+  const runDetails = record(predicate.runDetails, "SLSA run details");
+  const builder = record(runDetails.builder, "SLSA builder");
+  const metadata = record(runDetails.metadata, "SLSA run metadata");
+  const invocationPrefix = `${GITHUB_REPOSITORY_URL}/actions/runs/${input.runId}/attempts/`;
+  if (builder.id !== GITHUB_BUILDER_ID || typeof metadata.invocationId !== "string") {
+    throw new Error("SLSA provenance has the wrong GitHub-hosted builder identity.");
+  }
+  const publishedAttempt = metadata.invocationId.startsWith(invocationPrefix)
+    ? metadata.invocationId.slice(invocationPrefix.length)
+    : "";
+  if (!/^[1-9][0-9]*$/u.test(publishedAttempt)) {
+    throw new Error("SLSA provenance is missing exact workflow-run identity.");
+  }
+  if (
+    input.attemptPolicy === "exact"
+      ? publishedAttempt !== input.runAttempt
+      : BigInt(publishedAttempt) > BigInt(input.runAttempt)
+  ) throw new Error("SLSA provenance came from an inadmissible workflow attempt.");
+  return publishedAttempt;
+}
+
 export async function verifyNpmProvenance(input: Readonly<{
+  attemptPolicy: NpmProvenanceAttemptPolicy;
   attestations: unknown;
   integrity: string;
   runId: string;
@@ -84,15 +145,5 @@ export async function verifyNpmProvenance(input: Readonly<{
     throw new Error("npm provenance subject does not bind the exact package bytes.");
   }
   const predicate = record(statement.predicate, "SLSA predicate");
-  const runDetails = JSON.stringify(predicate);
-  for (const exact of [
-    "hraness/hra",
-    `.github/workflows/release.yml`,
-    `refs/tags/${input.tag}`,
-    input.sha,
-    input.runId,
-    input.runAttempt,
-  ]) {
-    if (!runDetails.includes(exact)) throw new Error("SLSA provenance is missing exact source or workflow-run identity.");
-  }
+  assertNpmProvenanceBuildIdentity(predicate, input);
 }

@@ -20,6 +20,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
+      npm_preflight_run_attempt: ${{ steps.npm_preflight.outputs.run_attempt }}
+      npm_preflight_run_id: ${{ steps.npm_preflight.outputs.run_id }}
+      npm_preflight_state: ${{ steps.npm_preflight.outputs.state }}
       verified_sha: ${{ steps.identity.outputs.sha }}
       verified_tag: ${{ steps.identity.outputs.tag }}
       verified_tag_object: ${{ steps.identity.outputs.tag_object }}
@@ -100,6 +103,17 @@ jobs:
           test -f "artifacts/$expected"
           test "$(find artifacts -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" = "1"
           bun run ./scripts/release-artifact-checksum.ts write "$GITHUB_WORKSPACE/artifacts/$expected" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+      - name: Record exact npm registry preflight
+        id: npm_preflight
+        run: |
+          set -euo pipefail
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          state="$(bun run ./scripts/check-npm-artifact-state.ts "$artifact")"
+          if [[ "$state" != "absent" && "$state" != "exact" ]]; then
+            echo "::error::npm registry preflight returned an invalid state"
+            exit 1
+          fi
+          printf 'state=%s\nrun_id=%s\nrun_attempt=%s\n' "$state" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Preserve exact release bytes
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -161,6 +175,9 @@ jobs:
       VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
       VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.verified_tag_object }}
       HRA_APPROVE_NPM_PUBLICATION: ${{ vars.HRA_APPROVE_NPM_PUBLICATION }}
+      HRA_NPM_PREFLIGHT_RUN_ATTEMPT: ${{ needs.verify.outputs.npm_preflight_run_attempt }}
+      HRA_NPM_PREFLIGHT_RUN_ID: ${{ needs.verify.outputs.npm_preflight_run_id }}
+      HRA_NPM_PREFLIGHT_STATE: ${{ needs.verify.outputs.npm_preflight_state }}
     steps:
       - name: Check out verified source with complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

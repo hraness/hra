@@ -6,6 +6,8 @@
 /scripts/check-public-release.ts @0thernet
 /scripts/check-release-package.ts @0thernet
 /scripts/check-npm-trusted-publishing.ts @0thernet
+/scripts/check-npm-artifact-state.ts @0thernet
+/scripts/npm-publication-transition.ts @0thernet
 /scripts/package-policy.ts @0thernet
 /scripts/publish-github-release.ts @0thernet
 /scripts/publish-npm-release.ts @0thernet

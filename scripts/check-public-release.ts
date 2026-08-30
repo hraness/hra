@@ -117,6 +117,7 @@ const tufCachePath = await mkdtemp(`${tmpdir()}/hra-sigstore-tuf-`);
 try {
   const attestationsUrl = `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`;
   await verifyNpmProvenance({
+    attemptPolicy: "same_run_not_later",
     attestations: await json(attestationsUrl, "npm Sigstore attestations"),
     integrity: npmRelease.integrity,
     runAttempt,

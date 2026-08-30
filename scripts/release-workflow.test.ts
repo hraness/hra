@@ -71,10 +71,13 @@ describe("release workflow", () => {
     expect(workflow).toContain("npm pack --ignore-scripts --pack-destination artifacts .");
     expect(workflow).toContain("release-artifact-checksum.ts");
     expect(workflow).toContain("check-release-package.ts");
+    expect(workflow).toContain("check-npm-artifact-state.ts");
     expect(workflow).toContain("publish-npm-release.ts");
     expect(workflow).toContain("publish-github-release.ts");
     expect(workflow).toContain("check-public-release.ts");
     expect(workflow).toContain("os: [ubuntu-24.04, macos-15]");
+    expect(workflow).toContain("npm_preflight_run_attempt");
+    expect(workflow).toContain("HRA_NPM_PREFLIGHT_RUN_ATTEMPT");
     expect(workflow).not.toContain("release-candidate.ts");
     expect(workflow).not.toContain("publish-beta-release.ts");
     expect(workflow).not.toContain("hra-weld.vercel.app");
