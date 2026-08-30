@@ -63,6 +63,7 @@
     "multi-account"
   ],
   "dependencies": {
+    "@hraness/oh": "github:hraness/oh#v0.2.0",
     "@openai/codex": "0.149.0",
     "convex": "1.45.0",
     "zod": "4.4.3"

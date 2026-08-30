@@ -64,6 +64,8 @@ describe("public text policy", () => {
   test("allows only the reviewed public Hraness packages", () => {
     expect(() => assertPublicText("@hraness/design-kit", "public dependency"))
       .not.toThrow();
+    expect(() => assertPublicText("@hraness/oh", "public dependency"))
+      .not.toThrow();
     expect(() => assertPublicText("@hraness/site-footer", "public dependency"))
       .not.toThrow();
     expect(() => assertPublicText("@hraness/ui", "public dependency"))

@@ -1,8 +1,8 @@
 # Session facts memory
 
-HRA now has a narrow host-owned lifecycle seam for session facts memory. HRA coordinates custody. Oh owns the semantic store, graph, query, projection, and rule behavior.
+HRA has a narrow host-owned lifecycle seam for session facts memory. HRA coordinates custody. Oh owns the semantic store, graph, query, projection, and rule behavior.
 
-The default Oh adapter is intentionally not bound yet. Oh v0.2.0 is release-verified and immutable at commit `89fb133`; this source tree defines and tests the lifecycle side of its adapter boundary without vendoring or reproducing Oh.
+The daemon composes a concrete local adapter for release-verified Oh v0.2.0. `package.json` pins its immutable release tag and `bun.lock` resolves exact commit `89fb133`. HRA does not vendor Oh or reproduce its graph and Datalog semantics. The adapter imports only Oh's base, store, and SQLite surfaces; neither Suss nor Cozo is an HRA runtime dependency.
 
 ## Authority boundary
 
@@ -22,17 +22,17 @@ It has no column for facts, records, payloads, rules, projections, credentials, 
 
 ## Local layout
 
-HRA keeps lifecycle metadata in `facts-memory-control.sqlite` under its private state root. Each session's Oh database and every related SQLite WAL, SHM, projection cache, and derived cache belong under one host-derived directory:
+HRA keeps lifecycle metadata in `facts-memory-control.sqlite` under its private state root. Each session's Oh database, adapter lifecycle sidecar, and every related SQLite WAL, SHM, projection cache, and derived cache belong under one host-derived directory:
 
 ```text
 <HRA state root>/facts-memory-sessions/<exact session ID>/
 ```
 
-The directory path never enters the lifecycle database or a command response. HRA requires an absolute canonical current-user-owned mode-0700 root, rejects symbolic links and path traversal, bounds recursive inspection, and rejects linked or replaced entries before cleanup.
+The directory path never enters the lifecycle database or a command response. HRA requires an absolute canonical current-user-owned mode-0700 root, rejects symbolic links and path traversal, bounds recursive inspection, and rejects linked or replaced entries before cleanup. The adapter opens SQLite and metadata through no-follow custody, enforces and reads back mode 0600 on `oh.sqlite`, its observed WAL and SHM files, and its metadata, and relies on the enclosing mode-0700 directory for any transient or future cache entry it does not interpret.
 
 Cleanup first asks the Oh adapter to quiesce the exact store. HRA then revalidates the complete session tree, atomically renames it to a host-derived quarantine name, and removes that whole tree. A retry completes a crash-left quarantine instead of replaying semantic operations. A purge receipt is committed only after both the live and quarantine paths are absent.
 
-This is honest local custody, not a sandbox or forensic erasure guarantee. Another process running as the same operating-system user can race path-based checks. Backups, filesystem snapshots, and storage media may retain prior bytes.
+This is honest local custody, not a sandbox or forensic erasure guarantee. Another process running as the same operating-system user can read or race local files despite these checks. Backups, filesystem snapshots, and storage media may retain prior bytes.
 
 ## Lifecycle
 
@@ -46,20 +46,19 @@ The lifecycle implements these internal host operations:
 
 Session start and provider resume call the lifecycle seam. A terminal provider state cleans up with reason `archive`. Explicit session abandonment proves memory cleanup before HRA releases the local recovery authority. HRA's existing provider cancellation and recovery semantics are unchanged.
 
-## Oh adapter requirements
+## Released Oh adapter
 
-The `LocalOhFactsMemoryEnginePort` implementation for immutable Oh v0.2.0 must:
+`OhSqliteFactsMemoryEngine` maps the lifecycle port to Oh's exact working-store profile:
 
-1. initialize one working-profile SQLite authority inside the provided directory;
-2. return only the strict public receipt and inspection types;
-3. preserve the immutable creation receipt while reporting the current exact head separately;
-4. fork only after verifying the exact parent binding and head supplied by HRA;
-5. quiesce all local handles before HRA renames and removes the directory;
-6. remain idempotent for the host-fixed operation key;
-7. keep facts, rules, projections, paths, credentials, raw locators, and purge capabilities behind the adapter.
+1. one HRA binding selects one Oh realm, space, and `oh.sqlite` path entirely at host composition;
+2. create accepts only an empty working store and publishes a bounded, checksummed lifecycle sidecar after closing it;
+3. inspection verifies Oh replay and materialization while returning only HRA's opaque handle hash, immutable creation receipt, and current exact head;
+4. a new fork verifies the parent's exact current head, requests an exact snapshot at that Oh head, proves the returned head again, and copies the record bytes into a new child authority;
+5. the child copy is one fresh host-owned operation, so it preserves record and dependency digests but deliberately does not copy the parent's operation IDs, actor authority, timestamps, or history;
+6. the released working lane bounds an exact fork to 8,192 records; a larger parent fails closed and leaves the child unfinalized;
+7. replay after a completed child commit uses the same host-derived operation ID and content, allowing Oh to reconcile a crash before metadata publication;
+8. quiesce reopens and verifies the exact authority, closes it, and returns custody to the broker, which removes the whole validated session directory.
 
-Activation requires a reviewed mapping from these port methods to the release-verified Oh v0.2.0 store/profile API. Until that mapping exists, HRA does not construct a placeholder semantic store or claim that the optional memory backend is active.
+The adapter does not call Oh's logical whole-space purge before physical cleanup. Doing so would create a crash state that could no longer be reopened for HRA's quarantine retry. The broker instead proves the only local authority is closed, validates and quarantines its sole session directory, and removes the complete directory before committing the HRA purge receipt.
 
-Oh's host-bound program-purpose and nomination-destination registries remain behind that future adapter. Their semantic query and nomination inputs do not enter HRA's lifecycle port or control database.
-
-The future Oh factory binds actor identity at host composition. Model input never supplies actor, time, operation ID, database locator, or purge authority; semantic remember, query, and nomination calls must preserve Oh's released locator-free request and receipt shapes.
+This activates storage lifecycle, not a model-facing facts API. Oh's host-bound actor, program-purpose, and nomination-destination registries remain behind a future semantic host facade for Sponge and other consumers. Their remember, query, and nomination inputs do not enter HRA's lifecycle port or control database. Model input must never supply actor, time, operation ID, database locator, store, space, rules, nomination destination, or purge authority, and any future facade must retain Oh's released locator-free request and receipt shapes.
