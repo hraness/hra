@@ -40,6 +40,7 @@ const absoluteUserPaths = [
   /(?:^|[^A-Za-z0-9])[A-Za-z]:\\Users\\[^\\\s"'`]+\\/u,
 ] as const;
 const scopedPackage = /@([a-z0-9][a-z0-9-]*)\/[a-z0-9][a-z0-9._-]*/gu;
+const gitTagReferencePackageShape = ["@refs", "tags"].join("/");
 
 export class PublicTextPolicyError extends Error {
   constructor(
@@ -57,10 +58,13 @@ export function assertPublicText(value: string, label: string): void {
   for (const match of value.matchAll(scopedPackage)) {
     const scope = match[1];
     const packageName = match[0];
+    const matchEnd = match.index + packageName.length;
+    const isGitTagReference = packageName === gitTagReferencePackageShape && value[matchEnd] === "/";
     if (
       scope !== undefined
       && !allowedPublicScopes.has(scope)
       && !allowedPublicScopedPackages.has(packageName)
+      && !isGitTagReference
     ) {
       throw new PublicTextPolicyError("PRIVATE_SCOPE", label);
     }
@@ -82,7 +86,7 @@ export function assertPublicSensitiveText(value: string, label: string): void {
 }
 
 const excludedDirectories = new Set([".git", "dist", "node_modules"]);
-const textFile = /(?:^|\/)(?:LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yaml|yml|zig)$/u;
+const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yaml|yml|zig)$/u;
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
 

@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
+import { readBoundedJsonResponse } from "./bounded-json-response";
 import { parseNpmRelease } from "./release-distribution-policy";
 import {
   decideNpmPublicationTransition,
@@ -62,7 +63,7 @@ async function lookup(): Promise<boolean> {
   });
   if (response.status === 404) return false;
   if (response.status !== 200) throw new Error(`npm registry returned HTTP ${String(response.status)}.`);
-  const payload = await response.json() as unknown;
+  const payload = await readBoundedJsonResponse(response, "npm registry exact release");
   const coordinate = parseNpmRelease(payload, inspection.version);
   if (coordinate.integrity !== expectedIntegrity || coordinate.shasum !== expectedShasum) {
     throw new Error(`${inspection.name}@${inspection.version} exists with different immutable bytes.`);
@@ -70,60 +71,37 @@ async function lookup(): Promise<boolean> {
   return true;
 }
 
-async function attestations(): Promise<unknown> {
-  const attestationsUrl =
-    `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`;
-  const response = await fetch(attestationsUrl, {
+async function registryJson(url: string, label: string): Promise<unknown> {
+  const response = await fetch(url, {
     cache: "no-store",
     headers: { Accept: "application/json", "Cache-Control": "no-cache" },
     redirect: "error",
     signal: AbortSignal.timeout(20_000),
   });
   if (response.status !== 200) {
-    throw new Error(`npm Sigstore attestations returned HTTP ${String(response.status)}.`);
+    throw new Error(`${label} returned HTTP ${String(response.status)}.`);
   }
-  const declared = response.headers.get("content-length");
-  if (declared !== null && (!/^(?:0|[1-9][0-9]*)$/u.test(declared) || Number(declared) > maximumAttestationBytes)) {
-    throw new Error("npm Sigstore attestations exceed their declared byte bound.");
-  }
-  const reader = response.body?.getReader();
-  if (reader === undefined) throw new Error("npm Sigstore attestations have no body.");
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  try {
-    for (;;) {
-      const item = await reader.read();
-      if (item.done) break;
-      length += item.value.byteLength;
-      if (length > maximumAttestationBytes) {
-        throw new Error("npm Sigstore attestations exceed their byte bound.");
-      }
-      chunks.push(item.value);
-    }
-  } finally {
-    try { await reader.cancel(); } catch { /* the bounded result remains authoritative */ }
-    reader.releaseLock();
-  }
-  const payload = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    payload.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload)) as unknown;
-  } catch {
-    throw new Error("npm Sigstore attestations returned malformed JSON.");
-  }
+  return readBoundedJsonResponse(response, label, maximumAttestationBytes);
 }
 
-async function admitProvenance(attemptPolicy: NpmProvenanceAttemptPolicy): Promise<void> {
+async function admitProvenance(
+  attemptPolicy: NpmProvenanceAttemptPolicy,
+  maximumAttempt: string,
+): Promise<void> {
   const tufCachePath = await mkdtemp(join(tmpdir(), "hra-publish-sigstore-tuf-"));
   try {
     await verifyNpmProvenance({
       attemptPolicy,
-      attestations: await attestations(),
+      attestations: await registryJson(
+        `https://registry.npmjs.org/-/npm/v1/attestations/@hraness%2fhra@${inspection.version}`,
+        "npm Sigstore attestations",
+      ),
       integrity: expectedIntegrity,
+      maximumAttempt,
+      registryKeys: await registryJson(
+        "https://registry.npmjs.org/-/npm/v1/keys",
+        "npm registry keys",
+      ),
       runAttempt: workflowRunAttempt,
       runId: workflowRunId,
       sha: releaseSha,
@@ -144,7 +122,7 @@ const transition = decideNpmPublicationTransition({
   preflightRunId: registryPreflightRunId,
 });
 if (transition.action === "admit_existing") {
-  await admitProvenance(transition.attemptPolicy);
+  await admitProvenance(transition.attemptPolicy, transition.maximumProvenanceAttempt);
   console.log(`${inspection.name}@${inspection.version} already contains the exact trusted-publisher bytes.`);
 } else {
   if (process.env.HRA_APPROVE_NPM_PUBLICATION !== `publish:${inspection.name}@${inspection.version}`) {
@@ -214,6 +192,6 @@ if (transition.action === "admit_existing") {
     }
   }
   if (!observed) throw new Error("npm publication did not become readable with exact provenance-bearing bytes.");
-  await admitProvenance("exact");
+  await admitProvenance("exact", workflowRunAttempt);
   console.log(`Published exact ${inspection.name}@${inspection.version} through npm trusted publishing.`);
 }

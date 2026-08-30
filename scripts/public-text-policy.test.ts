@@ -77,6 +77,17 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
+  test("distinguishes annotated Git tag references from package scopes", () => {
+    expect(() => assertPublicText(
+      "https://github.com/hraness/hra@refs/tags/v0.1.0",
+      "Git tag reference",
+    )).not.toThrow();
+    expect(() => assertPublicText(["@refs", "tags"].join("/"), "unreviewed package"))
+      .toThrow(PublicTextPolicyError);
+    expect(() => assertPublicText(["@refs", "private", "v0.1.0"].join("/"), "unreviewed reference"))
+      .toThrow(PublicTextPolicyError);
+  });
+
   test("scans SVG text and rejects unreviewed file types", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-"));
     const svg = join(root, "image.svg");
@@ -93,6 +104,19 @@ describe("public text policy", () => {
       expect(error).toBeInstanceOf(PublicTextPolicyError);
       expect(error).toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
       expect((error as Error).message).not.toContain(root);
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
+  test("scans the exact GitHub CODEOWNERS control as public text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hra-public-policy-codeowners-"));
+    try {
+      await mkdir(join(root, ".github"));
+      await writeFile(join(root, ".github", "CODEOWNERS"), "* @hraness\n", "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+      await writeFile(join(root, ".github", "UNREVIEWED"), "ordinary text\n", "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "UNREVIEWED_FILE_TYPE" });
     } finally {
       await rm(root, { force: true, recursive: true });
     }

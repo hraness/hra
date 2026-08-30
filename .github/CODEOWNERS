@@ -7,6 +7,9 @@
 /scripts/check-release-package.ts @0thernet
 /scripts/check-npm-trusted-publishing.ts @0thernet
 /scripts/check-npm-artifact-state.ts @0thernet
+/scripts/bounded-json-response.ts @0thernet
+/scripts/github-publisher-environment.ts @0thernet
+/scripts/github-release-identity.ts @0thernet
 /scripts/npm-publication-transition.ts @0thernet
 /scripts/package-policy.ts @0thernet
 /scripts/publish-github-release.ts @0thernet
@@ -15,6 +18,7 @@
 /scripts/release-distribution-policy.ts @0thernet
 /scripts/release-package-policy.ts @0thernet
 /scripts/verify-npm-provenance.ts @0thernet
+/scripts/verify-npm-provenance-crypto.mjs @0thernet
 /src/install-normalizer.ts @0thernet
 /src/install-preflight-runtime.ts @0thernet
 /src/install-preflight.ts @0thernet

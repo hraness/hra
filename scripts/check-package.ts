@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants } from "node:fs";
-import { access, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { access, lstat, mkdtemp, mkdir, open, opendir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
@@ -22,7 +22,7 @@ import {
 import { rootStatusSchema } from "../src/domain/observation";
 import type { StatePaths } from "../src/storage/paths";
 import { resolveStatePaths } from "../src/storage/paths";
-import { assertHraInstallManifest } from "../src/install-normalizer";
+import { assertHraInstallManifest, assertSafeDarwinInstallAcl } from "../src/install-normalizer";
 import { HRA_INSTALL_PREFLIGHT_SUCCESS } from "../src/install-preflight";
 import {
   requireBoundedProcessCleanup,
@@ -154,6 +154,257 @@ export const runPackageCommand = async (
     stderr: result.stderr.toString("utf8"),
     stdout: result.stdout.toString("utf8"),
   };
+};
+
+export const parsePackageDependencyCache = (stdout: string): string => {
+  if (
+    Buffer.byteLength(stdout, "utf8") > 4_096
+    || stdout.includes("\r")
+  ) throw new Error("Bun returned a non-canonical dependency cache path.");
+  const path = stdout.endsWith("\n") ? stdout.slice(0, -1) : stdout;
+  if (
+    path.length < 1
+    || path.includes("\n")
+    || path.includes("\0")
+    || !isAbsolute(path)
+    || resolve(path) !== path
+  ) throw new Error("Bun returned a non-canonical dependency cache path.");
+  return path;
+};
+
+type PackageDependencyCacheIdentity = Readonly<{
+  dev: number;
+  ino: number;
+  mode: number;
+  uid: number;
+}>;
+
+const packageDependencyCacheIdentity = (metadata: Stats): PackageDependencyCacheIdentity => ({
+  dev: metadata.dev,
+  ino: metadata.ino,
+  mode: metadata.mode & 0o7777,
+  uid: metadata.uid,
+});
+
+const samePackageDependencyCacheIdentity = (
+  left: PackageDependencyCacheIdentity,
+  right: PackageDependencyCacheIdentity,
+): boolean => left.dev === right.dev
+  && left.ino === right.ino
+  && left.mode === right.mode
+  && left.uid === right.uid;
+
+type HeldPackageDependencyCacheDirectory = Readonly<{
+  handle: Awaited<ReturnType<typeof open>>;
+  identity: PackageDependencyCacheIdentity;
+  path: string;
+  requiresCurrentOwner: boolean;
+}>;
+
+const packageDependencyCacheDirectoryPathsThrough = (path: string): readonly string[] => {
+  const root = parse(path).root;
+  if (root.length === 0 || !path.startsWith(root)) throw new Error("Bun dependency cache path is invalid.");
+  const paths = [root];
+  let current = root;
+  for (const component of path.slice(root.length).split(sep).filter((value) => value.length > 0)) {
+    current = join(current, component);
+    paths.push(current);
+  }
+  return paths;
+};
+
+const assertPackageDependencyCacheDirectory = (
+  metadata: Stats,
+  path: string,
+  uid: number,
+): void => {
+  const permissions = metadata.mode & 0o777;
+  const rootOwnedStickyBoundary = metadata.uid === 0
+    && (metadata.mode & 0o1000) !== 0
+    && (permissions & 0o022) !== 0;
+  if (
+    !metadata.isDirectory()
+    || metadata.isSymbolicLink()
+    || (metadata.uid !== uid && metadata.uid !== 0)
+    || (permissions & 0o100) === 0
+    || ((permissions & 0o022) !== 0 && !rootOwnedStickyBoundary)
+  ) throw new Error(`Bun dependency cache path custody is invalid: ${path}`);
+};
+
+class PackageDependencyCacheCustody {
+  readonly #held: HeldPackageDependencyCacheDirectory[] = [];
+
+  constructor(private readonly uid: number) {}
+
+  async holdThrough(path: string): Promise<void> {
+    let currentUserBoundarySeen = false;
+    try {
+      for (const directoryPath of packageDependencyCacheDirectoryPathsThrough(path)) {
+        const pathMetadata = await lstat(directoryPath);
+        assertPackageDependencyCacheDirectory(pathMetadata, directoryPath, this.uid);
+        if (await realpath(directoryPath) !== directoryPath) {
+          throw new Error(`Bun dependency cache path is not canonical: ${directoryPath}`);
+        }
+        if (pathMetadata.uid === this.uid) currentUserBoundarySeen = true;
+        if (currentUserBoundarySeen && pathMetadata.uid !== this.uid) {
+          throw new Error(`Bun dependency cache path leaves current-user custody: ${directoryPath}`);
+        }
+        const handle = await open(
+          directoryPath,
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+        try {
+          const descriptorMetadata = await handle.stat();
+          assertPackageDependencyCacheDirectory(descriptorMetadata, directoryPath, this.uid);
+          if (currentUserBoundarySeen && descriptorMetadata.uid !== this.uid) {
+            throw new Error(`Bun dependency cache descriptor leaves current-user custody: ${directoryPath}`);
+          }
+          const identity = packageDependencyCacheIdentity(pathMetadata);
+          if (!samePackageDependencyCacheIdentity(identity, packageDependencyCacheIdentity(descriptorMetadata))) {
+            throw new Error(`Bun dependency cache path changed while opening custody: ${directoryPath}`);
+          }
+          assertSafeDarwinInstallAcl(handle.fd, this.uid, directoryPath);
+          this.#held.push({
+            handle,
+            identity,
+            path: directoryPath,
+            requiresCurrentOwner: currentUserBoundarySeen,
+          });
+        } catch (error: unknown) {
+          await handle.close();
+          throw error;
+        }
+      }
+    } catch (error: unknown) {
+      try {
+        await this.close();
+      } catch (closeError: unknown) {
+        throw new AggregateError([error, closeError], "Bun dependency cache custody opening and cleanup both failed.");
+      }
+      throw error;
+    }
+  }
+
+  async assertAll(): Promise<void> {
+    for (const held of this.#held) {
+      const [canonicalPath, pathMetadata, descriptorMetadata] = await Promise.all([
+        realpath(held.path),
+        lstat(held.path),
+        held.handle.stat(),
+      ]);
+      assertPackageDependencyCacheDirectory(pathMetadata, held.path, this.uid);
+      assertPackageDependencyCacheDirectory(descriptorMetadata, held.path, this.uid);
+      if (
+        canonicalPath !== held.path
+        || (held.requiresCurrentOwner && (pathMetadata.uid !== this.uid || descriptorMetadata.uid !== this.uid))
+        || !samePackageDependencyCacheIdentity(held.identity, packageDependencyCacheIdentity(pathMetadata))
+        || !samePackageDependencyCacheIdentity(held.identity, packageDependencyCacheIdentity(descriptorMetadata))
+      ) throw new Error(`Bun dependency cache path identity changed while in use: ${held.path}`);
+      assertSafeDarwinInstallAcl(held.handle.fd, this.uid, held.path);
+    }
+  }
+
+  async close(): Promise<void> {
+    const held = this.#held.splice(0).reverse();
+    const results = await Promise.allSettled(held.map(async ({ handle }) => await handle.close()));
+    const errors = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map(({ reason }) => reason as unknown);
+    if (errors.length > 0) throw new AggregateError(errors, "Bun dependency cache custody cleanup failed.");
+  }
+}
+
+export const withPackageDependencyCacheCustody = async <Value>(
+  path: string,
+  operation: () => Promise<Value>,
+): Promise<Value> => {
+  const uid = process.getuid?.();
+  if (uid === undefined || !isAbsolute(path) || resolve(path) !== path || await realpath(path) !== path) {
+    throw new Error("Bun dependency cache custody is invalid.");
+  }
+  const cacheMetadata = await lstat(path);
+  if (
+    !cacheMetadata.isDirectory()
+    || cacheMetadata.isSymbolicLink()
+    || cacheMetadata.uid !== uid
+    || (cacheMetadata.mode & 0o022) !== 0
+  ) throw new Error("Bun dependency cache custody is invalid.");
+  const custody = new PackageDependencyCacheCustody(uid);
+  await custody.holdThrough(path);
+  let operationFailed = false;
+  let operationError: unknown;
+  let custodyFailed = false;
+  let custodyError: unknown;
+  let closeFailed = false;
+  let closeError: unknown;
+  let operationValue: Value | undefined;
+  try {
+    try {
+      try {
+        operationValue = await operation();
+      } catch (error: unknown) {
+        operationFailed = true;
+        operationError = error;
+      }
+      await custody.assertAll();
+    } catch (error: unknown) {
+      custodyFailed = true;
+      custodyError = error;
+    }
+  } finally {
+    try {
+      await custody.close();
+    } catch (error: unknown) {
+      closeFailed = true;
+      closeError = error;
+    }
+  }
+  const errors: Error[] = [];
+  const pushError = (failed: boolean, error: unknown, label: string): void => {
+    if (failed) errors.push(error instanceof Error ? error : new Error(label, { cause: error }));
+  };
+  pushError(operationFailed, operationError, "Bun dependency cache operation failed with a non-error value.");
+  pushError(custodyFailed, custodyError, "Bun dependency cache custody failed with a non-error value.");
+  pushError(closeFailed, closeError, "Bun dependency cache cleanup failed with a non-error value.");
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Bun dependency cache use and custody settlement both failed.");
+  }
+  const error = errors[0];
+  if (error !== undefined) throw error;
+  return operationValue as Value;
+};
+
+export const packageDependencyCacheDiscoveryEnvironment = (
+  environment: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv => {
+  const discoveryEnvironment = { ...environment };
+  delete discoveryEnvironment.BUN_INSTALL_CACHE_DIR;
+  return discoveryEnvironment;
+};
+
+const resolvePackageDependencyCache = async (repositoryRoot: string): Promise<string> => {
+  const discoveryEnvironment = packageDependencyCacheDiscoveryEnvironment(process.env);
+  const result = requireSuccess(
+    "Bun dependency cache discovery",
+    await run(process.execPath, ["pm", "cache"], {
+      cwd: repositoryRoot,
+      env: discoveryEnvironment,
+    }),
+  );
+  if (result.stderr !== "") throw new Error("Bun dependency cache discovery returned diagnostics.");
+  const path = parsePackageDependencyCache(result.stdout);
+  await withPackageDependencyCacheCustody(path, async () => {
+    await access(path, constants.R_OK | constants.W_OK);
+    let entries = 0;
+    for await (const entry of await opendir(path)) {
+      entries += 1;
+      if (entry.name.length < 1 || entries > 100_000) {
+        throw new Error("Bun dependency cache inventory is invalid.");
+      }
+    }
+    if (entries === 0) throw new Error("Bun dependency cache inventory is invalid.");
+  });
+  return path;
 };
 
 const run = runPackageCommand;
@@ -599,6 +850,7 @@ const generated = requireSuccess(
   await run(process.execPath, ["run", "build:site", "--", "--check"], { cwd: repositoryRoot }),
 );
 if (generated.stdout.trim().length > 0) process.stdout.write(generated.stdout);
+const dependencyCacheRoot = await resolvePackageDependencyCache(repositoryRoot);
 
 const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "hra-package-")));
 let removeTemporaryRoot = true;
@@ -678,6 +930,7 @@ try {
     ...process.env,
     BUN_INSTALL: globalInstallRoot,
     BUN_INSTALL_BIN: join(globalInstallRoot, "bin"),
+    BUN_INSTALL_CACHE_DIR: dependencyCacheRoot,
     BUN_INSTALL_GLOBAL_DIR: join(globalInstallRoot, "install", "global"),
     HOME: consumerHome,
     TMPDIR: consumerTemporaryDirectory,
@@ -685,11 +938,12 @@ try {
   const installGlobalTransaction = async (label: string): Promise<void> => {
     const preflight = requireSuccess(
       label,
-      await run(process.execPath, [join(repositoryRoot, "src", "install-preflight.ts"), archive], {
-        cwd: consumerDirectory,
-        env: isolatedEnvironment,
-        phase: "package-transactional-global-install",
-      }),
+      await withPackageDependencyCacheCustody(dependencyCacheRoot, async () =>
+        await run(process.execPath, [join(repositoryRoot, "src", "install-preflight.ts"), archive], {
+          cwd: consumerDirectory,
+          env: isolatedEnvironment,
+          phase: "package-transactional-global-install",
+        })),
     );
     if (preflight.stderr !== "" || preflight.stdout !== `${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`) {
       throw new Error(`${label} did not return its one exact success token.`);
@@ -697,10 +951,11 @@ try {
   };
   requireSuccess(
     "clean lifecycle-disabled consumer install",
-    await run(process.execPath, ["add", "--backend=copyfile", "--ignore-scripts", archive], {
-      cwd: consumerDirectory,
-      env: isolatedEnvironment,
-    }),
+    await withPackageDependencyCacheCustody(dependencyCacheRoot, async () =>
+      await run(process.execPath, ["add", "--backend=copyfile", "--ignore-scripts", archive], {
+        cwd: consumerDirectory,
+        env: isolatedEnvironment,
+      })),
   );
   const localPackageRoot = join(consumerDirectory, "node_modules", "@hraness", "hra");
   const executable = join(consumerDirectory, "node_modules", ".bin", "hra");

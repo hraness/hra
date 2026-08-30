@@ -92,9 +92,16 @@ if (environment("GITHUB_REPOSITORY") !== publicRepository) {
 }
 const token = environment("GITHUB_TOKEN");
 const verifiedSha = environment("VERIFIED_SHA", /^[0-9a-f]{40}$/u);
+const verifiedTagObject = environment("VERIFIED_TAG_OBJECT", /^[0-9a-f]{40}$/u);
 const verifiedTag = environment("VERIFIED_TAG", /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u);
 const runId = environment("GITHUB_RUN_ID", /^[1-9][0-9]*$/u);
 const runAttempt = environment("GITHUB_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
+const preflightState = environment("HRA_NPM_PREFLIGHT_STATE", /^(?:absent|exact)$/u);
+const preflightRunId = environment("HRA_NPM_PREFLIGHT_RUN_ID", /^[1-9][0-9]*$/u);
+const preflightRunAttempt = environment("HRA_NPM_PREFLIGHT_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
+if (preflightRunId !== runId || BigInt(preflightRunAttempt) > BigInt(runAttempt)) {
+  throw new Error("Public release admission requires this run's bounded npm preflight observation.");
+}
 const manifest = JSON.parse(await readFile(resolve(import.meta.dir, "..", "package.json"), "utf8")) as unknown;
 const inspection = assertReleasePackageReady(manifest);
 if (verifiedTag !== `v${inspection.version}`) throw new Error("Release tag and package version do not agree.");
@@ -120,6 +127,8 @@ try {
     attemptPolicy: "same_run_not_later",
     attestations: await json(attestationsUrl, "npm Sigstore attestations"),
     integrity: npmRelease.integrity,
+    maximumAttempt: preflightState === "exact" ? preflightRunAttempt : runAttempt,
+    registryKeys: await json("https://registry.npmjs.org/-/npm/v1/keys", "npm registry keys"),
     runAttempt,
     runId,
     sha: verifiedSha,
@@ -136,11 +145,10 @@ const tagRef = await json(`${api}/git/ref/tags/${verifiedTag}`, "GitHub annotate
 };
 if (
   tagRef.object?.type !== "tag"
-  || typeof tagRef.object.sha !== "string"
-  || !/^[0-9a-f]{40}$/u.test(tagRef.object.sha)
-  || tagRef.object.url !== `${api}/git/tags/${tagRef.object.sha}`
-) throw new Error("GitHub release ref is not one annotated tag object.");
-const tag = await json(tagRef.object.url, "GitHub annotated tag", token) as {
+  || tagRef.object.sha !== verifiedTagObject
+  || tagRef.object.url !== `${api}/git/tags/${verifiedTagObject}`
+) throw new Error("GitHub release ref is not the verified annotated tag object.");
+const tag = await json(`${api}/git/tags/${verifiedTagObject}`, "GitHub annotated tag", token) as {
   object?: { sha?: unknown; type?: unknown };
   tag?: unknown;
 };

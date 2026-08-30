@@ -20,6 +20,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
+      artifact_digest: ${{ steps.release_artifact.outputs.artifact-digest }}
+      artifact_id: ${{ steps.release_artifact.outputs.artifact-id }}
       npm_preflight_run_attempt: ${{ steps.npm_preflight.outputs.run_attempt }}
       npm_preflight_run_id: ${{ steps.npm_preflight.outputs.run_id }}
       npm_preflight_state: ${{ steps.npm_preflight.outputs.state }}
@@ -115,9 +117,10 @@ jobs:
           fi
           printf 'state=%s\nrun_id=%s\nrun_attempt=%s\n' "$state" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Preserve exact release bytes
+        id: release_artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: hra-release
+          name: hra-release-${{ github.run_attempt }}
           path: artifacts/
           if-no-files-found: error
           retention-days: 7
@@ -146,10 +149,18 @@ jobs:
           bun-version-file: .bun-version
       - name: Install exact locked dependencies without lifecycle scripts
         run: bun install --frozen-lockfile --ignore-scripts
+      - name: Require exact artifact identity
+        env:
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+        run: |
+          [[ "$VERIFIED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERIFIED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
       - name: Download exact release bytes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: hra-release
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          merge-multiple: true
           path: artifacts
       - name: Verify checksum and complete installed-package behavior
         run: |
@@ -169,8 +180,6 @@ jobs:
     timeout-minutes: 30
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_TOKEN: ${{ github.token }}
       VERIFIED_SHA: ${{ needs.verify.outputs.verified_sha }}
       VERIFIED_TAG: ${{ needs.verify.outputs.verified_tag }}
       VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.verified_tag_object }}
@@ -200,12 +209,22 @@ jobs:
         run: |
           bun run ./scripts/check-release-package.ts
           bun run ./scripts/check-npm-trusted-publishing.ts
+      - name: Require exact artifact identity
+        env:
+          VERIFIED_ARTIFACT_DIGEST: ${{ needs.verify.outputs.artifact_digest }}
+          VERIFIED_ARTIFACT_ID: ${{ needs.verify.outputs.artifact_id }}
+        run: |
+          [[ "$VERIFIED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$VERIFIED_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
       - name: Download validated release bytes
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: hra-release
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          merge-multiple: true
           path: artifacts
       - name: Revalidate remote authority and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag_object="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$VERIFIED_TAG" --jq 'select(.object.type == "tag") | .object.sha')"
@@ -217,13 +236,17 @@ jobs:
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
           artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+      - name: Create immutable GitHub Release from the same bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
       - name: Publish exact tarball through npm trusted publishing
         run: |
           artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/publish-npm-release.ts "$artifact"
-      - name: Create immutable GitHub Release from the same bytes
-        run: |
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
       - name: Admit exact public npm and GitHub state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun run ./scripts/check-public-release.ts

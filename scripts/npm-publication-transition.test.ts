@@ -16,6 +16,7 @@ describe("npm publication retry transition", () => {
     expect(decideNpmPublicationTransition(base)).toEqual({
       action: "publish",
       attemptPolicy: "exact",
+      maximumProvenanceAttempt: "1",
     });
     expect(decideNpmPublicationTransition({
       ...base,
@@ -23,6 +24,7 @@ describe("npm publication retry transition", () => {
     })).toEqual({
       action: "admit_existing",
       attemptPolicy: "exact",
+      maximumProvenanceAttempt: "1",
     });
   });
 
@@ -34,6 +36,7 @@ describe("npm publication retry transition", () => {
     })).toEqual({
       action: "admit_existing",
       attemptPolicy: "same_run_not_later",
+      maximumProvenanceAttempt: "2",
     });
   });
 
@@ -46,6 +49,21 @@ describe("npm publication retry transition", () => {
     })).toEqual({
       action: "admit_existing",
       attemptPolicy: "same_run_not_later",
+      maximumProvenanceAttempt: "3",
+    });
+  });
+
+  test("caps an existing package at the exact attempt that preflight already observed", () => {
+    expect(decideNpmPublicationTransition({
+      ...base,
+      currentArtifactState: "exact",
+      currentRunAttempt: "3",
+      preflightArtifactState: "exact",
+      preflightRunAttempt: "2",
+    })).toEqual({
+      action: "admit_existing",
+      attemptPolicy: "same_run_not_later",
+      maximumProvenanceAttempt: "2",
     });
   });
 
