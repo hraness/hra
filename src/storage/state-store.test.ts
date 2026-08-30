@@ -76,6 +76,20 @@ const usageFingerprint = "a".repeat(64);
 const resetAccountFingerprint = (email: string): string =>
   createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
 
+const prepareAuthorizedReset = (
+  store: StateStore,
+  input: Parameters<StateStore["prepareAccountRateLimitReset"]>[0],
+) => {
+  expect(store.authorizeAccountRateLimitResetPolicy({
+    profileId: input.profileId,
+    processGeneration: input.processGeneration,
+    accountFingerprint: input.accountFingerprint,
+    weeklyWindowDurationMinutes: 10_080,
+    weeklyWindowResetsAt: input.weeklyWindowResetsAt,
+  }).decision).toBe("allow");
+  return store.prepareAccountRateLimitReset(input);
+};
+
 function usageSnapshot(input: Readonly<{
   accountFingerprint?: string;
   fillerBytes?: number;
@@ -1002,6 +1016,8 @@ describe("StateStore", () => {
       title: "Retained history",
       profileId: profile.id,
     });
+    expect(() => store.requireAccountRateLimitResetPolicy(profile.id))
+      .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
   });
 
   test("enforces every queue transition at both the store and SQLite boundaries", async () => {
@@ -1557,7 +1573,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -4217,7 +4233,410 @@ describe("StateStore", () => {
     });
   });
 
-  test("journals automatic weekly reset redemption before dispatch and reuses uncertainty keys", async () => {
+  test("creates new profiles with explicit active reset policy atomically", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Policy active");
+    expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "active_unbound",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+      revision: 1,
+    });
+
+    const writer = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      writer.exec(`
+        CREATE TRIGGER test_reset_policy_insert_failure
+        BEFORE INSERT ON account_rate_limit_reset_policies
+        WHEN NEW.profile_id IN (SELECT id FROM profiles WHERE label='Policy rollback')
+        BEGIN SELECT RAISE(ABORT, 'injected policy insert failure'); END;
+      `);
+    } finally {
+      writer.close(false);
+    }
+    expect(() => store.createProfile("Policy rollback"))
+      .toThrow("injected policy insert failure");
+    expect(store.listProfiles().map((candidate) => candidate.label))
+      .not.toContain("Policy rollback");
+  });
+
+  test("migrates every nonremoved v27 profile into fail-closed reconciliation", async () => {
+    const { store } = await fixture();
+    const email = "legacy-policy@example.com";
+    const signedIn = signInProfile(store, "Legacy signed in", email);
+    const signedOut = store.createProfile("Legacy signed out");
+    const removed = store.createProfile("Legacy removed");
+    store.removeProfile(removed.id);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const prepared = prepareAuthorizedReset(store, {
+      profileId: signedIn.id,
+      processGeneration: signedIn.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    });
+    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey).state)
+      .toBe("effect_started");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const legacy = new Database(paths.database, { create: false, strict: true });
+    try {
+      legacy.exec(`
+        DROP TRIGGER account_rate_limit_reset_attempt_policy_insert_guard;
+        DROP TRIGGER account_rate_limit_reset_attempt_policy_begin_guard;
+        DROP TRIGGER account_rate_limit_reset_attempt_policy_close_guard;
+        DROP TRIGGER account_rate_limit_reset_rebind_policy_guard;
+        DROP TRIGGER account_rate_limit_reset_policy_insert_guard;
+        DROP TRIGGER account_rate_limit_reset_policy_transition_guard;
+        DROP TRIGGER account_rate_limit_reset_policy_delete_guard;
+        DROP TABLE account_rate_limit_reset_policies;
+        DELETE FROM migrations WHERE version=28;
+        PRAGMA user_version=27;
+      `);
+    } finally {
+      legacy.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    for (const profileId of [signedIn.id, signedOut.id]) {
+      expect(migrated.requireAccountRateLimitResetPolicy(profileId)).toMatchObject({
+        state: "reconciliation_required",
+        accountFingerprint: null,
+        weeklyWindowResetsAt: null,
+        revision: 1,
+      });
+    }
+    expect(() => migrated.requireAccountRateLimitResetPolicy(removed.id))
+      .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+    expect(migrated.readRecoverableAccountRateLimitReset(
+      signedIn.id,
+      accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      outcome: null,
+      state: "effect_started",
+    });
+    expect(() => migrated.prepareAccountRateLimitReset({
+      profileId: signedIn.id,
+      processGeneration: signedIn.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+    const inspector = new Database(paths.database, { readonly: true, strict: true });
+    try {
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
+      expect(inspector.query(
+        "SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts",
+      ).get()).toEqual({ count: 1 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("reconciles retained partial-v28 policies when user_version is still 27", async () => {
+    const { store } = await fixture();
+    const email = "partial-policy@example.com";
+    const profile = signInProfile(store, "Partial reset policy", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const prepared = prepareAuthorizedReset(store, {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(prepared.idempotencyKey);
+    const previousPolicy = store.requireAccountRateLimitResetPolicy(profile.id);
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+
+    const partial = new Database(paths.database, { create: false, strict: true });
+    try {
+      partial.exec("DELETE FROM migrations WHERE version=28; PRAGMA user_version=27");
+    } finally {
+      partial.close(false);
+    }
+
+    const migrated = new StateStore(paths, { now: () => 2_000 });
+    stores.push(migrated);
+    expect(migrated.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "reconciliation_required",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+      revision: previousPolicy.revision + 1,
+    });
+    expect(migrated.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      outcome: null,
+      state: "effect_started",
+    });
+  });
+
+  test("persists monotonic reset-policy reconciliation across identity and window changes", async () => {
+    const { store } = await fixture();
+    const firstEmail = "policy-first@example.com";
+    const profile = signInProfile(store, "Policy transitions", firstEmail);
+    const firstFingerprint = resetAccountFingerprint(firstEmail);
+    const firstWindow = 500_000_000;
+    const first = store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: firstFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow,
+    });
+    expect(first).toMatchObject({ decision: "allow", policy: { state: "active_bound" } });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: firstFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow - 1,
+    })).toMatchObject({
+      decision: "block",
+      reason: "weekly_window_nonmonotonic",
+      policy: { revision: first.policy.revision },
+    });
+
+    const secondEmail = "policy-second@example.com";
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: secondEmail, plan: "Plus" },
+    )).toBe(true);
+    const secondFingerprint = resetAccountFingerprint(secondEmail);
+    const suppressed = store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow,
+    });
+    expect(suppressed).toMatchObject({
+      decision: "suppress",
+      reason: "reconciliation_window",
+      policy: { state: "window_suppressed" },
+    });
+    store.nextDaemonGeneration(`boot_${"w".repeat(32)}`);
+    const restarted = store.requireProfileById(profile.id);
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow,
+    })).toMatchObject({
+      decision: "suppress",
+      policy: { revision: suppressed.policy.revision },
+    });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow + 1,
+    })).toMatchObject({ decision: "allow", policy: { state: "active_bound" } });
+
+    const thirdEmail = "policy-third@example.com";
+    expect(store.setProfileState(
+      profile.id,
+      restarted.processGeneration,
+      "signed_in",
+      { email: thirdEmail, plan: "Plus" },
+    )).toBe(true);
+    const thirdFingerprint = resetAccountFingerprint(thirdEmail);
+    const pending = store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: thirdFingerprint,
+      weeklyWindowDurationMinutes: 300,
+      weeklyWindowResetsAt: firstWindow + 2,
+    });
+    expect(pending).toMatchObject({
+      decision: "block",
+      reason: "account_identity_changed",
+      policy: { state: "reconciliation_required" },
+    });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: thirdFingerprint,
+      weeklyWindowDurationMinutes: 300,
+      weeklyWindowResetsAt: firstWindow + 2,
+    })).toMatchObject({
+      decision: "block",
+      reason: "weekly_window_unavailable",
+      policy: { revision: pending.policy.revision, state: "reconciliation_required" },
+    });
+  });
+
+  test("refuses to reopen a current database with missing reset policy authority", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Missing reset policy");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      damaged.exec("DROP TRIGGER account_rate_limit_reset_policy_delete_guard");
+      damaged.query(
+        "DELETE FROM account_rate_limit_reset_policies WHERE profile_id=?",
+      ).run(profile.id);
+    } finally {
+      damaged.close(false);
+    }
+    expect(() => new StateStore(paths))
+      .toThrow("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_MISSING");
+  });
+
+  test("readonly open rejects a stale same-name reset-policy guard", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      damaged.exec(`
+        DROP TRIGGER account_rate_limit_reset_policy_transition_guard;
+        CREATE TRIGGER account_rate_limit_reset_policy_transition_guard
+        BEFORE UPDATE ON account_rate_limit_reset_policies
+        BEGIN SELECT 1; END;
+      `);
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V28_STRUCTURE_INVALID");
+  });
+
+  test("readonly open rejects a weakened same-name reset-policy table", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      const triggers = damaged.query(
+        `SELECT name,sql FROM sqlite_master
+         WHERE type='trigger' AND (
+           name LIKE 'account_rate_limit_reset_policy_%'
+           OR name='account_rate_limit_reset_attempt_transition_guard'
+           OR name LIKE 'account_rate_limit_reset_attempt_policy_%'
+           OR name IN (
+             'account_rate_limit_reset_rebind_policy_guard',
+             'account_rate_limit_reset_rebind_insert_guard'
+           )
+         ) ORDER BY name`,
+      ).all().map((row) => z.object({ name: z.string(), sql: z.string() })
+        .strict().parse(row));
+      for (const trigger of triggers) {
+        damaged.exec(`DROP TRIGGER ${trigger.name}`);
+      }
+      damaged.exec(`
+        ALTER TABLE account_rate_limit_reset_policies
+          RENAME TO account_rate_limit_reset_policies_strict;
+        CREATE TABLE account_rate_limit_reset_policies (
+          profile_id TEXT PRIMARY KEY,
+          state TEXT NOT NULL,
+          account_fingerprint TEXT,
+          weekly_window_resets_at INTEGER,
+          revision INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO account_rate_limit_reset_policies
+          SELECT * FROM account_rate_limit_reset_policies_strict;
+        DROP TABLE account_rate_limit_reset_policies_strict;
+      `);
+      for (const trigger of triggers) damaged.exec(trigger.sql);
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_SCHEMA_V28_STRUCTURE_INVALID");
+  });
+
+  test("readonly open rejects a corrupt reset-policy row under exact guards", async () => {
+    const { store } = await fixture();
+    const profile = store.createProfile("Corrupt reset policy");
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      const transition = z.object({ sql: z.string() }).strict().parse(
+        damaged.query(
+          `SELECT sql FROM sqlite_master
+           WHERE type='trigger'
+             AND name='account_rate_limit_reset_policy_transition_guard'`,
+        ).get(),
+      ).sql;
+      damaged.exec(`
+        DROP TRIGGER account_rate_limit_reset_policy_transition_guard;
+        PRAGMA ignore_check_constraints=ON;
+      `);
+      damaged.query(
+        `UPDATE account_rate_limit_reset_policies
+         SET state='active_bound',account_fingerprint=NULL,
+           weekly_window_resets_at=NULL,revision=revision+1
+         WHERE profile_id=?`,
+      ).run(profile.id);
+      damaged.exec(transition);
+      damaged.exec("PRAGMA ignore_check_constraints=OFF");
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID");
+  });
+
+  test("readonly open rejects reset policy authority outside the live profile set", async () => {
+    const { store } = await fixture();
+    const paths = store.paths;
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const damaged = new Database(paths.database, { create: false, strict: true });
+    try {
+      const insertGuard = z.object({ sql: z.string() }).strict().parse(
+        damaged.query(
+          `SELECT sql FROM sqlite_master
+           WHERE type='trigger'
+             AND name='account_rate_limit_reset_policy_insert_guard'`,
+        ).get(),
+      ).sql;
+      damaged.exec(`
+        DROP TRIGGER account_rate_limit_reset_policy_insert_guard;
+        PRAGMA foreign_keys=OFF;
+      `);
+      damaged.query(
+        `INSERT INTO account_rate_limit_reset_policies(
+           profile_id,state,account_fingerprint,weekly_window_resets_at,
+           revision,created_at,updated_at
+         ) VALUES (?,'active_unbound',NULL,NULL,1,1000,1000)`,
+      ).run("acct_00000000000000000000000000000028");
+      damaged.exec(insertGuard);
+      damaged.exec("PRAGMA foreign_keys=ON");
+    } finally {
+      damaged.close(false);
+    }
+
+    expect(() => new StateStore(paths, { readonly: true }))
+      .toThrow("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_ORPHANED");
+  });
+
+  test("journals automatic weekly reset redemption and blocks indeterminate effects", async () => {
     const { store } = await fixture();
     const email = "reset@example.com";
     const profile = signInProfile(store, "Reset journal", email);
@@ -4225,10 +4644,10 @@ describe("StateStore", () => {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint: resetAccountFingerprint(email),
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     };
-    const prepared = store.prepareAccountRateLimitReset(input);
+    const prepared = prepareAuthorizedReset(store, input);
     expect(prepared).toMatchObject({
       profileId: input.profileId,
       originProcessGeneration: input.processGeneration,
@@ -4253,17 +4672,15 @@ describe("StateStore", () => {
       profile.id,
       input.accountFingerprint,
     )?.idempotencyKey).toBe(prepared.idempotencyKey);
-    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey).state)
-      .toBe("effect_started");
-    expect(store.settleAccountRateLimitReset(prepared.idempotencyKey, "alreadyRedeemed"))
-      .toMatchObject({ state: "settled", outcome: "alreadyRedeemed" });
+    expect(() => store.beginAccountRateLimitReset(prepared.idempotencyKey))
+      .toThrow("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
     expect(store.latestAccountRateLimitResetAttempt(
       profile.id,
       input.accountFingerprint,
     )).toMatchObject({
       idempotencyKey: prepared.idempotencyKey,
-      state: "settled",
-      outcome: "alreadyRedeemed",
+      state: "ambiguous",
+      outcome: null,
     });
     expect(store.latestAccountRateLimitResetAttempt(
       profile.id,
@@ -4277,7 +4694,118 @@ describe("StateStore", () => {
     expect(store.readRecoverableAccountRateLimitReset(
       profile.id,
       input.accountFingerprint,
-    )).toBeNull();
+    )).toMatchObject({ idempotencyKey: prepared.idempotencyKey, state: "ambiguous" });
+  });
+
+  test("enforces reset-policy dispatch and ambiguous-effect guards in SQLite", async () => {
+    const { store } = await fixture();
+    const firstEmail = "raw-policy@example.com";
+    const first = signInProfile(store, "Raw policy guard", firstEmail);
+    const firstFingerprint = resetAccountFingerprint(firstEmail);
+    const prepared = prepareAuthorizedReset(store, {
+      profileId: first.id,
+      processGeneration: first.processGeneration,
+      accountFingerprint: firstFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    });
+    const changedEmail = "raw-policy-changed@example.com";
+    expect(store.setProfileState(
+      first.id,
+      first.processGeneration,
+      "signed_in",
+      { email: changedEmail, plan: "Plus" },
+    )).toBe(true);
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: first.id,
+      processGeneration: first.processGeneration,
+      accountFingerprint: resetAccountFingerprint(changedEmail),
+      weeklyWindowDurationMinutes: null,
+      weeklyWindowResetsAt: null,
+    })).toMatchObject({
+      decision: "block",
+      reason: "account_identity_changed",
+      policy: { state: "reconciliation_required" },
+    });
+
+    const secondEmail = "raw-ambiguous@example.com";
+    const second = signInProfile(store, "Raw ambiguous guard", secondEmail);
+    const secondFingerprint = resetAccountFingerprint(secondEmail);
+    const ambiguous = prepareAuthorizedReset(store, {
+      profileId: second.id,
+      processGeneration: second.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowResetsAt: 500_000_000,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(ambiguous.idempotencyKey);
+    store.deferAccountRateLimitReset(ambiguous.idempotencyKey, "ambiguous");
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => inspector.query(
+        `INSERT INTO account_rate_limit_reset_attempts(
+           idempotency_key,profile_id,origin_process_generation,
+           current_process_generation,account_fingerprint,weekly_window_resets_at,
+           observed_used_percent,state,created_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,'prepared',?,?)`,
+      ).run(
+        "00000000-0000-4000-8000-000000000028",
+        first.id,
+        first.processGeneration,
+        first.processGeneration,
+        resetAccountFingerprint(changedEmail),
+        500_000_001,
+        99,
+        2_000,
+        2_000,
+      )).toThrow("policy does not authorize preparation");
+      expect(() => inspector.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET state='effect_started' WHERE idempotency_key=?`,
+      ).run(prepared.idempotencyKey))
+        .toThrow("policy does not authorize dispatch");
+      expect(() => inspector.query(
+        `INSERT INTO account_rate_limit_reset_rebinds(
+           idempotency_key,from_process_generation,to_process_generation,
+           account_fingerprint,created_at
+         ) VALUES (?,?,?,?,?)`,
+      ).run(
+        ambiguous.idempotencyKey,
+        ambiguous.currentProcessGeneration,
+        ambiguous.currentProcessGeneration + 1,
+        secondFingerprint,
+        2_000,
+      )).toThrow("rebind authority is invalid");
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("refuses to begin a reset after its authorized window expires", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-expired-begin-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const email = "expired-begin@example.com";
+    const profile = signInProfile(store, "Expired reset begin", email);
+    const prepared = prepareAuthorizedReset(store, {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(email),
+      weeklyWindowResetsAt: 5_000,
+      observedUsedPercent: 99,
+    });
+
+    now = prepared.weeklyWindowResetsAt;
+    expect(() => store.beginAccountRateLimitReset(prepared.idempotencyKey))
+      .toThrow("ACCOUNT_RATE_LIMIT_RESET_WINDOW_NOT_FRESH");
+    expect(store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      prepared.accountFingerprint,
+    )).toMatchObject({ idempotencyKey: prepared.idempotencyKey, state: "prepared" });
   });
 
   test("orders the most recent reset attempt by a durable sequence across clock rollback and vacuum", async () => {
@@ -4290,22 +4818,22 @@ describe("StateStore", () => {
     const email = "ordered-reset@example.com";
     const profile = signInProfile(store, "Ordered reset", email);
     const accountFingerprint = resetAccountFingerprint(email);
-    const first = store.prepareAccountRateLimitReset({
+    const first = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     });
     store.beginAccountRateLimitReset(first.idempotencyKey);
     store.settleAccountRateLimitReset(first.idempotencyKey, "reset");
 
     now = 9_000;
-    const second = store.prepareAccountRateLimitReset({
+    const second = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_100_000_000,
+      weeklyWindowResetsAt: 500_100_000,
       observedUsedPercent: 99,
     });
     expect(second.attemptSequence).toBeGreaterThan(first.attemptSequence);
@@ -4344,9 +4872,9 @@ describe("StateStore", () => {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint: resetAccountFingerprint(email),
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
     };
-    const first = store.prepareAccountRateLimitReset({
+    const first = prepareAuthorizedReset(store, {
       ...base,
       observedUsedPercent: 99,
     });
@@ -4369,15 +4897,20 @@ describe("StateStore", () => {
     const email = "recovery@example.com";
     const profile = signInProfile(store, "Reset recovery", email);
     const accountFingerprint = resetAccountFingerprint(email);
-    const prepared = store.prepareAccountRateLimitReset({
+    const prepared = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     });
     store.beginAccountRateLimitReset(prepared.idempotencyKey);
-    expect(store.recoverAccountRateLimitResetAttempts())
+    expect(store.recoverAccountRateLimitResetAttempts({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: prepared.weeklyWindowResetsAt,
+    }))
       .toEqual([prepared.idempotencyKey]);
     expect(store.readRecoverableAccountRateLimitReset(
       profile.id,
@@ -4389,20 +4922,25 @@ describe("StateStore", () => {
     expect(store.requireProfileById(profile.id).state).toBe("signed_in");
   });
 
-  test("rebinds one recoverable reset across daemon generations with the same key", async () => {
+  test("keeps an ambiguous reset blocked across daemon generations", async () => {
     const { store } = await fixture();
     const email = "restart-reset@example.com";
     const profile = signInProfile(store, "Reset restart", email);
     const accountFingerprint = resetAccountFingerprint(email);
-    const prepared = store.prepareAccountRateLimitReset({
+    const prepared = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     });
     store.beginAccountRateLimitReset(prepared.idempotencyKey);
-    store.recoverAccountRateLimitResetAttempts();
+    store.recoverAccountRateLimitResetAttempts({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: prepared.weeklyWindowResetsAt,
+    });
     store.nextDaemonGeneration(`boot_${"r".repeat(32)}`);
     const restarted = store.requireProfileById(profile.id);
 
@@ -4416,35 +4954,18 @@ describe("StateStore", () => {
       currentProcessGeneration: profile.processGeneration,
       state: "ambiguous",
     });
-    const rebound = store.rebindAccountRateLimitReset({
+    expect(() => store.rebindAccountRateLimitReset({
       idempotencyKey: prepared.idempotencyKey,
       expectedCurrentProcessGeneration: profile.processGeneration,
       nextProcessGeneration: restarted.processGeneration,
       accountFingerprint,
-    });
-    expect(rebound).toMatchObject({
-      idempotencyKey: prepared.idempotencyKey,
-      originProcessGeneration: profile.processGeneration,
-      currentProcessGeneration: restarted.processGeneration,
-      state: "ambiguous",
-    });
-    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([{
-      sequence: 1,
-      idempotencyKey: prepared.idempotencyKey,
-      fromProcessGeneration: profile.processGeneration,
-      toProcessGeneration: restarted.processGeneration,
-      accountFingerprint,
-      createdAt: expect.any(Number),
-    }]);
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
+    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([]);
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
-      expect(() => inspector.query(
-        `UPDATE account_rate_limit_reset_rebinds SET created_at=created_at+1
-         WHERE idempotency_key=?`,
-      ).run(prepared.idempotencyKey)).toThrow("append-only");
-      expect(() => inspector.query(
-        "DELETE FROM account_rate_limit_reset_rebinds WHERE idempotency_key=?",
-      ).run(prepared.idempotencyKey)).toThrow("append-only");
+      expect(inspector.query(
+        "SELECT * FROM account_rate_limit_reset_rebinds WHERE idempotency_key=?",
+      ).all(prepared.idempotencyKey)).toEqual([]);
     } finally {
       inspector.close(false);
     }
@@ -4467,8 +4988,8 @@ describe("StateStore", () => {
     const email = "pruned-rebind-reset@example.com";
     const profile = signInProfile(store, "Reset rebind prune", email);
     const accountFingerprint = resetAccountFingerprint(email);
-    const expiringWindowResetsAt = 2_000;
-    const prepared = store.prepareAccountRateLimitReset({
+    const expiringWindowResetsAt = 500_000;
+    const prepared = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
@@ -4488,9 +5009,8 @@ describe("StateStore", () => {
     expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey))
       .toHaveLength(1);
 
-    now = 1_000_000;
     for (let index = 0; index < 129; index += 1) {
-      const historical = store.prepareAccountRateLimitReset({
+      const historical = prepareAuthorizedReset(store, {
         profileId: restarted.id,
         processGeneration: restarted.processGeneration,
         accountFingerprint,
@@ -4500,6 +5020,14 @@ describe("StateStore", () => {
       store.beginAccountRateLimitReset(historical.idempotencyKey);
       store.settleAccountRateLimitReset(historical.idempotencyKey, "noCredit");
     }
+    now = 1_000_000;
+    prepareAuthorizedReset(store, {
+      profileId: restarted.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 1_500_000,
+      observedUsedPercent: 99,
+    });
 
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
@@ -4523,10 +5051,10 @@ describe("StateStore", () => {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     };
-    const prepared = store.prepareAccountRateLimitReset(input);
+    const prepared = prepareAuthorizedReset(store, input);
     store.beginAccountRateLimitReset(prepared.idempotencyKey);
     store.settleAccountRateLimitReset(prepared.idempotencyKey, "reset");
     store.nextDaemonGeneration(`boot_${"s".repeat(32)}`);
@@ -4554,15 +5082,15 @@ describe("StateStore", () => {
       accountFingerprint: resetAccountFingerprint(email),
       observedUsedPercent: 99,
     };
-    const settled = store.prepareAccountRateLimitReset({
+    const settled = prepareAuthorizedReset(store, {
       ...base,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
     });
     store.beginAccountRateLimitReset(settled.idempotencyKey);
     store.settleAccountRateLimitReset(settled.idempotencyKey, "reset");
-    const closed = store.prepareAccountRateLimitReset({
+    const closed = prepareAuthorizedReset(store, {
       ...base,
-      weeklyWindowResetsAt: 2_000_000_001_000,
+      weeklyWindowResetsAt: 500_001_000,
     });
     store.closeAccountRateLimitReset(closed.idempotencyKey, "weekly_window_changed");
 
@@ -4578,14 +5106,12 @@ describe("StateStore", () => {
     } finally {
       inspector.close(false);
     }
-    expect(store.prepareAccountRateLimitReset({
-      ...base,
-      weeklyWindowResetsAt: 2_000_000_000_000,
-      observedUsedPercent: 100,
-    })).toMatchObject({
-      idempotencyKey: settled.idempotencyKey,
-      outcome: "reset",
-      state: "settled",
+    expect(store.latestAccountRateLimitResetAttempt(
+      profile.id,
+      base.accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: closed.idempotencyKey,
+      state: "closed",
     });
   });
 
@@ -4596,24 +5122,18 @@ describe("StateStore", () => {
     let now = 1_000;
     const store = new StateStore(paths, { now: () => now++ });
     stores.push(store);
-    const firstEmail = "retained-reset-000@example.com";
-    const profile = signInProfile(store, "Reset retention", firstEmail);
-    const liveWindowResetsAt = 1_000_000;
+    const email = "retained-reset@example.com";
+    const profile = signInProfile(store, "Reset retention", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const firstWindowResetsAt = 500_000;
     let firstKey: string | null = null;
 
     for (let index = 0; index < 130; index += 1) {
-      const email = `retained-reset-${String(index).padStart(3, "0")}@example.com`;
-      expect(store.setProfileState(
-        profile.id,
-        profile.processGeneration,
-        "signed_in",
-        { email, plan: "Plus" },
-      )).toBe(true);
-      const prepared = store.prepareAccountRateLimitReset({
+      const prepared = prepareAuthorizedReset(store, {
         profileId: profile.id,
         processGeneration: profile.processGeneration,
-        accountFingerprint: resetAccountFingerprint(email),
-        weeklyWindowResetsAt: liveWindowResetsAt,
+        accountFingerprint,
+        weeklyWindowResetsAt: firstWindowResetsAt + index,
         observedUsedPercent: 99,
       });
       firstKey ??= prepared.idempotencyKey;
@@ -4621,34 +5141,15 @@ describe("StateStore", () => {
       store.settleAccountRateLimitReset(prepared.idempotencyKey, "reset");
     }
     if (firstKey === null) throw new Error("Expected the first reset latch.");
+    expect(store.latestAccountRateLimitResetAttempt(profile.id, accountFingerprint))
+      .not.toBeNull();
 
-    expect(store.setProfileState(
-      profile.id,
-      profile.processGeneration,
-      "signed_in",
-      { email: firstEmail, plan: "Plus" },
-    )).toBe(true);
-    expect(store.prepareAccountRateLimitReset({
+    now = firstWindowResetsAt + 1_000;
+    prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
-      accountFingerprint: resetAccountFingerprint(firstEmail),
-      weeklyWindowResetsAt: liveWindowResetsAt,
-      observedUsedPercent: 100,
-    }).idempotencyKey).toBe(firstKey);
-
-    now = liveWindowResetsAt + 1;
-    const currentEmail = "retained-reset-current@example.com";
-    expect(store.setProfileState(
-      profile.id,
-      profile.processGeneration,
-      "signed_in",
-      { email: currentEmail, plan: "Plus" },
-    )).toBe(true);
-    store.prepareAccountRateLimitReset({
-      profileId: profile.id,
-      processGeneration: profile.processGeneration,
-      accountFingerprint: resetAccountFingerprint(currentEmail),
-      weeklyWindowResetsAt: liveWindowResetsAt + 1_000_000,
+      accountFingerprint,
+      weeklyWindowResetsAt: now + 500_000,
       observedUsedPercent: 99,
     });
 
@@ -4658,7 +5159,10 @@ describe("StateStore", () => {
         `SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts
          WHERE profile_id=? AND state IN ('settled','closed')
            AND weekly_window_resets_at<=?`,
-      ).get(profile.id, liveWindowResetsAt)).toEqual({ count: 128 });
+      ).get(profile.id, now)).toEqual({ count: 128 });
+      expect(inspector.query(
+        "SELECT 1 FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(firstKey)).toBeNull();
     } finally {
       inspector.close(false);
     }
@@ -4673,10 +5177,10 @@ describe("StateStore", () => {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     };
-    const prepared = store.prepareAccountRateLimitReset(input);
+    const prepared = prepareAuthorizedReset(store, input);
     store.nextDaemonGeneration(`boot_${"i".repeat(32)}`);
     const restarted = store.requireProfileById(profile.id);
     expect(store.setProfileState(
@@ -4709,9 +5213,9 @@ describe("StateStore", () => {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint: resetAccountFingerprint(email),
-      weeklyWindowResetsAt: 2_000_000_000_000,
+      weeklyWindowResetsAt: 500_000_000,
     };
-    const first = store.prepareAccountRateLimitReset({
+    const first = prepareAuthorizedReset(store, {
       ...base,
       observedUsedPercent: 99,
     });
@@ -5206,8 +5710,8 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }, { version: 28 }]);
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
         .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
@@ -5221,6 +5725,15 @@ describe("StateStore", () => {
       ]) expect(resetAttemptColumns).toContainEqual(expect.objectContaining(expected));
       expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_rebinds)").all())
         .toContainEqual(expect.objectContaining({ name: "sequence", type: "INTEGER", pk: 1 }));
+      const resetPolicyColumns = inspector
+        .query("PRAGMA table_info(account_rate_limit_reset_policies)").all();
+      for (const expected of [
+        { name: "profile_id", type: "TEXT", notnull: 1, pk: 1 },
+        { name: "state", type: "TEXT", notnull: 1 },
+        { name: "account_fingerprint", type: "TEXT", notnull: 0 },
+        { name: "weekly_window_resets_at", type: "INTEGER", notnull: 0 },
+        { name: "revision", type: "INTEGER", notnull: 1 },
+      ]) expect(resetPolicyColumns).toContainEqual(expect.objectContaining(expected));
       expect(inspector.query("PRAGMA table_info(profiles)").all())
         .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
       expect(inspector.query("PRAGMA table_info(projects)").all())
@@ -5465,7 +5978,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -5573,7 +6086,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -5688,7 +6201,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -5745,7 +6258,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -5833,7 +6346,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -5936,7 +6449,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -6050,7 +6563,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -6079,6 +6592,7 @@ describe("StateStore", () => {
         { version: 25, applied_at: 2000 },
         { version: 26, applied_at: 2000 },
         { version: 27, applied_at: 2000 },
+        { version: 28, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -6125,7 +6639,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -6145,9 +6659,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 28");
+    newer.exec("PRAGMA user_version = 29");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:28:27");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:29:28");
   });
 });
