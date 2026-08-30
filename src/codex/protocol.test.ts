@@ -11,6 +11,7 @@ import { INTERACTION_MAX_PENDING_MS } from "../domain/interactions.ts";
 import { CodexError } from "./errors.ts";
 import { resolvePinnedCodexRuntime } from "./runtime.ts";
 import {
+  OPERATIONS,
   PINNED_CODEX_NOTIFICATION_MATRIX,
   PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST,
   PINNED_CODEX_SERVER_REQUEST_MATRIX,
@@ -27,6 +28,8 @@ import {
   parseManagedLoginCancel,
   parsePluginCatalog,
   parseProviderRequestId,
+  parseRateLimits,
+  parseRateLimitResetCreditConsumption,
   parseThreadItemsPage,
   parseThreadMetadataRead,
   parseThreadTurnsPage,
@@ -137,6 +140,22 @@ describe("pinned server requests and safe notifications", () => {
         "utf8",
       );
       const requestSource = await readFile(join(outputDirectory, "ServerRequest.ts"), "utf8");
+      const clientRequestSource = await readFile(
+        join(outputDirectory, "ClientRequest.ts"),
+        "utf8",
+      );
+      const resetParamsSource = await readFile(
+        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditParams.ts"),
+        "utf8",
+      );
+      const resetResponseSource = await readFile(
+        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditResponse.ts"),
+        "utf8",
+      );
+      const resetOutcomeSource = await readFile(
+        join(outputDirectory, "v2", "ConsumeAccountRateLimitResetCreditOutcome.ts"),
+        "utf8",
+      );
       const methods = (source: string): readonly string[] =>
         [...source.matchAll(/\{ "method": "([^"]+)"/gu)].map((match) => match[1]!);
       const digest = (source: string): string =>
@@ -146,6 +165,21 @@ describe("pinned server requests and safe notifications", () => {
       expect(digest(notificationSource)).toBe(PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST);
       expect(methods(requestSource)).toEqual(Object.keys(PINNED_CODEX_SERVER_REQUEST_MATRIX));
       expect(digest(requestSource)).toBe(PINNED_CODEX_SERVER_REQUEST_SCHEMA_DIGEST);
+      expect(clientRequestSource).toContain(
+        '{ "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, }',
+      );
+      expect(digest(clientRequestSource)).toBe(
+        "40dcb766794599f1a91c03c945ee21450c676faed7b5c7eae8152d3c10c5c585",
+      );
+      expect(digest(resetParamsSource)).toBe(
+        "f5f79c58b90a126b7620b38bc88d09a3b096543f71cdd949d19bac3c2b03399d",
+      );
+      expect(digest(resetResponseSource)).toBe(
+        "3240fe476768362847266693ffdfb4fdd8d8f0d7b628962255b229a182d76682",
+      );
+      expect(digest(resetOutcomeSource)).toBe(
+        "2fc33514e9745ffeeefada2c51362dc66e6f9c5f6f76d28b0a9a8cf278a2e8fe",
+      );
     } finally {
       await rm(outputDirectory, { recursive: true, force: true });
     }
@@ -155,6 +189,125 @@ describe("pinned server requests and safe notifications", () => {
     expect(parseManagedLoginCancel({ status: "canceled" })).toEqual({ status: "canceled" });
     expect(parseManagedLoginCancel({ status: "notFound" })).toEqual({ status: "notFound" });
     expect(() => parseManagedLoginCancel({ status: "completed" })).toThrow(CodexError);
+  });
+
+  test("declares the pinned reset-credit mutation with indeterminate-response reconciliation", () => {
+    expect(OPERATIONS["account/rateLimitResetCredit/consume"]).toEqual({
+      method: "account/rateLimitResetCredit/consume",
+      effect: "account-mutation",
+      deadlineMs: 15_000,
+      lostResponse: "reconcile",
+      experimental: false,
+    });
+  });
+
+  test("projects only the safe reset-credit count from account rate limits", () => {
+    const resetCreditId = "RESET_CREDIT_ID_SENTINEL";
+    const rateLimits = {
+      rateLimits: {
+        limitId: "codex",
+        limitName: "Codex",
+        primary: { usedPercent: 99, windowDurationMins: 10_080, resetsAt: 2_000_000_000 },
+        secondary: null,
+        planType: "pro",
+        rateLimitReachedType: null,
+      },
+      rateLimitsByLimitId: null,
+      rateLimitResetCredits: {
+        availableCount: 1,
+        credits: [{
+          id: resetCreditId,
+          resetType: "codexRateLimits",
+          status: "available",
+          grantedAt: 1,
+          expiresAt: null,
+          title: null,
+          description: null,
+        }],
+      },
+    };
+    const projected = parseRateLimits(rateLimits);
+    expect(projected.resetCreditsAvailable).toBe(1);
+    expect(JSON.stringify(projected)).not.toContain(resetCreditId);
+    expect(parseRateLimits({
+      ...rateLimits,
+      rateLimitResetCredits: null,
+    }).resetCreditsAvailable).toBe(0);
+  });
+
+  test("uses the authoritative reset-credit count when details are omitted or capped", () => {
+    const base = {
+      rateLimits: {
+        limitId: null,
+        limitName: "Codex",
+        primary: { usedPercent: 99, windowDurationMins: 10_080, resetsAt: 2_000_000_000 },
+        secondary: null,
+        planType: "pro",
+        rateLimitReachedType: null,
+      },
+      rateLimitsByLimitId: null,
+    };
+    const exact = {
+      id: "opaque-id",
+      resetType: "codexRateLimits",
+      status: "available",
+      grantedAt: 1,
+      expiresAt: null,
+      title: null,
+      description: null,
+    };
+    expect(parseRateLimits({
+      ...base,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+    }).resetCreditsAvailable).toBe(1);
+    expect(parseRateLimits({
+      ...base,
+      rateLimitResetCredits: { availableCount: 2, credits: [exact] },
+    }).resetCreditsAvailable).toBe(2);
+    expect(parseRateLimits({
+      ...base,
+      rateLimitResetCredits: {
+        availableCount: 3,
+        credits: [{ ...exact, resetType: "futureResetType", status: "futureStatus" }],
+      },
+    }).resetCreditsAvailable).toBe(3);
+  });
+
+  test("rejects malformed reset-credit counts and consumption outcomes", () => {
+    const rateLimits = {
+      rateLimits: {
+        limitId: "codex",
+        limitName: null,
+        primary: null,
+        secondary: null,
+        planType: null,
+        rateLimitReachedType: null,
+      },
+      rateLimitsByLimitId: null,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+    };
+    for (const availableCount of [-1, 1.5, "1", Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => parseRateLimits({
+        ...rateLimits,
+        rateLimitResetCredits: { availableCount, credits: null },
+      })).toThrow(CodexError);
+    }
+    expect(() => parseRateLimits({
+      rateLimits: rateLimits.rateLimits,
+      rateLimitsByLimitId: null,
+    })).toThrow(CodexError);
+
+    for (const outcome of ["reset", "nothingToReset", "noCredit", "alreadyRedeemed"] as const) {
+      expect(parseRateLimitResetCreditConsumption({ outcome })).toEqual({ outcome });
+    }
+    for (const malformed of [
+      {},
+      { outcome: null },
+      { outcome: "futureOutcome" },
+      null,
+    ]) {
+      expect(() => parseRateLimitResetCreditConsumption(malformed)).toThrow(CodexError);
+    }
   });
 
   test("covers the exact generated 0.149.0 ServerNotification union", () => {
@@ -242,6 +395,7 @@ describe("pinned server requests and safe notifications", () => {
     );
     expect(() => assertPinnedCodexNotificationMatrix()).not.toThrow();
     expect(codexNotificationDisposition("thread/deleted")).toBe("routed");
+    expect(codexNotificationDisposition("account/rateLimits/updated")).toBe("routed");
     expect(codexNotificationDisposition("turn/diff/updated")).toBe("reduced");
     expect(codexNotificationDisposition("thread/realtime/outputAudio/delta")).toBe("ignored");
     expect(codexNotificationDisposition("future/notification")).toBeNull();
@@ -257,6 +411,9 @@ describe("pinned server requests and safe notifications", () => {
       type: "threadDeleted",
       threadId: "thread-1",
     });
+    expect(parseFact("account/rateLimits/updated", {
+      rateLimits: { usedPercent: 99, private: "discarded" },
+    })).toEqual({ type: "rateLimitsUpdated" });
     expect(parseFact("skills/changed", { private: "discarded" })).toEqual({
       type: "notificationIgnored",
       method: "skills/changed",

@@ -38,13 +38,20 @@ import {
 import { effectiveRuntimeProfileSchema } from "../domain/runtime-profile";
 import { sessionEventPageSchema, type SessionEventBody, type SessionEventPage } from "../domain/session-events";
 import {
+  AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
+  AUTO_RATE_LIMIT_RESET_USED_PERCENT,
   accountUsageHistoryEntrySchema,
   accountUsageHistoryPageSchema,
   accountUsageCounterSamples,
+  automaticRateLimitResetDecision,
+  automaticRateLimitResetObservation,
+  automaticRateLimitResetStatusSchema,
   createStoredAccountUsageSnapshot,
   observedAccountTokenVelocity,
   providerUsagePayload,
   storedAccountUsageSnapshotSchema,
+  type AutomaticRateLimitResetLastAttempt,
+  type AutomaticRateLimitResetRefreshStatus,
   type UsageVelocityWindow,
 } from "../domain/usage-metrics";
 import {
@@ -76,6 +83,7 @@ import {
   USAGE_LOCAL_RETAIN_AGE_MS,
   type MutationAttemptRecord,
   type MutationEffectEvidence,
+  type AccountRateLimitResetAttemptRecord,
   type ProfileRecord,
   type SessionRecord,
   type StateStore,
@@ -436,6 +444,11 @@ const stoppedReceiptSchema = z.discriminatedUnion("stopped", [
 const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
+const accountFingerprintForProfile = (
+  profile: Pick<ProfileRecord, "providerEmail">,
+): string | null => profile.providerEmail === undefined
+  ? null
+  : digestText(profile.providerEmail.trim().toLowerCase());
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
 export const FACTS_MEMORY_SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
@@ -446,6 +459,36 @@ const isSqliteUniqueConstraint = (error: unknown): boolean =>
 type LoginOutcome = CodexLoginOutcome;
 type BoundSessionRecord = SessionRecord & { providerThreadId: string };
 type PublicProviderObservation = ProviderObservation;
+type AutomaticRateLimitResetAttemptResult = Readonly<{
+  authoritativeReread: boolean;
+  refresh: AutomaticRateLimitResetRefreshStatus;
+}>;
+const publicAutomaticRateLimitResetLastAttempt = (
+  attempt: AccountRateLimitResetAttemptRecord | null,
+): AutomaticRateLimitResetLastAttempt | null => {
+  if (attempt === null) return null;
+  const weeklyWindowResetsAt = attempt.weeklyWindowResetsAt;
+  switch (attempt.state) {
+    case "prepared": return { state: "prepared", weeklyWindowResetsAt };
+    case "effect_started":
+    case "ambiguous": return { state: "recovery_pending", weeklyWindowResetsAt };
+    case "retryable": return { state: "retry_pending", weeklyWindowResetsAt };
+    case "settled": {
+      if (attempt.outcome === null) throw new Error("Settled reset attempt is missing its outcome.");
+      return { state: "settled", outcome: attempt.outcome, weeklyWindowResetsAt };
+    }
+    case "closed": {
+      if (attempt.localResolution === null) {
+        throw new Error("Closed reset attempt is missing its local resolution.");
+      }
+      return {
+        state: "closed",
+        reason: attempt.localResolution,
+        weeklyWindowResetsAt,
+      };
+    }
+  }
+};
 type RemoteSessionCommand = Extract<LocalCommand, { kind:
   | "session.send"
   | "session.queue"
@@ -496,6 +539,9 @@ export class HraService {
   readonly #sessionsAwaitingResubscription = new Set<string>();
   readonly #queuePreEffectRetryCounts = new Map<string, number>();
   readonly #queuePreEffectRetryScheduled = new Set<string>();
+  readonly #usageRefreshes = new Map<string, Promise<void>>();
+  readonly #usageRefreshDirty = new Set<string>();
+  readonly #backgroundAbort = new AbortController();
   readonly #interactionDeadlineAbort = new AbortController();
   #interactionDeadlineTask: Promise<void> | undefined;
   #interactionDeadlineWake: (() => void) | undefined;
@@ -1071,9 +1117,19 @@ export class HraService {
     (afterResponse ?? ((callback) => setTimeout(callback, 0)))(this.#requestStop);
   }
 
+  #failStopAfterResetJournalFailure(message: string): void {
+    this.#state = "closing";
+    this.#interactionDeadlineAbort.abort(new Error(message));
+    this.#interactionDeadlineWake?.();
+    this.#interactionDeadlineWake = undefined;
+    this.#daemonAuthority.close();
+    this.#scheduleStop();
+  }
+
   close(): Promise<void> {
     if (this.#closeTask !== undefined) return this.#closeTask;
     this.#state = "closing";
+    this.#backgroundAbort.abort(new Error("HRA service is closing."));
     this.#interactionDeadlineAbort.abort(new Error("HRA service is closing."));
     this.#interactionDeadlineWake?.();
     this.#interactionDeadlineWake = undefined;
@@ -1096,6 +1152,7 @@ export class HraService {
   async #recoverAdmitted(): Promise<void> {
     await this.#cloud.supersedeTerminalCompactProjectionRecoveries();
     await this.#daemonAuthority.assertCurrent();
+    this.#store.recoverAccountRateLimitResetAttempts();
     const recoveredMutations = this.#store.recoverEffectStartedMutations();
     if (recoveredMutations.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredMutations.unresolved.length)} effect-started mutation authorities.`);
@@ -1477,6 +1534,10 @@ export class HraService {
     }
     if (fact.type === "providerConnected") return;
     if (fact.type === "notificationIgnored") return;
+    if (fact.type === "rateLimitsUpdated") {
+      this.#scheduleUsageRefresh(authority);
+      return;
+    }
     if (fact.type === "loginCompleted") {
       if (fact.success || fact.loginId === null) return;
       const loginId = fact.loginId;
@@ -1939,6 +2000,7 @@ export class HraService {
         terminal: fact.terminal,
       };
       case "accountUpdated":
+      case "rateLimitsUpdated":
       case "loginCompleted":
       case "serverRequestResolved":
       case "notificationIgnored":
@@ -2415,6 +2477,22 @@ export class HraService {
     if (profile.state === "recovery_required") {
       const unsettled = this.#store.listUnsettledMutations({ authorityId: profile.id })
         .filter((attempt) => attempt.authorityGeneration === profile.processGeneration && (attempt.kind === "account.login" || attempt.kind === "account.logout"));
+      if (unsettled.length === 0) {
+        const reconciled = this.#store.reconcileProfileRecoveryFromAccountRead({
+          profileId: profile.id,
+          expectedGeneration: profile.processGeneration,
+          provider: account,
+        });
+        return {
+          account: this.#publicProfile(reconciled),
+          providerProjection: account,
+          recovery: {
+            required: false,
+            cleared: true,
+            resolution: "provider_state_reconciled",
+          },
+        };
+      }
       if (unsettled.length !== 1) {
         return { account: this.#publicProfile(profile), providerProjection: account, recovery: { required: true, cleared: false, diagnostic: "No single exact account recovery authority is available." } };
       }
@@ -2731,59 +2809,90 @@ export class HraService {
     const profiles = selector === undefined ? this.#store.listProfiles() : [this.#store.requireProfile(selector)];
     const usage = [];
     for (const profile of profiles) {
+      let automaticResetRefresh: AutomaticRateLimitResetRefreshStatus | undefined;
       if (refresh) {
         this.#assertSignedIn(profile);
-        const sourceSequence = this.#store.allocateNextUsageRevision(profile.id);
-        let snapshot: Awaited<ReturnType<CodexRuntimePort["readUsage"]>>;
-        try {
-          snapshot = await this.#fencedEffect(async () =>
-            await this.#codex.readUsage({ authority: authorityFor(this.#paths, profile), signal }));
-        } catch (error: unknown) {
-          if (!signal.aborted) {
-            this.#store.recordUsagePollFailure(
-              profile.id,
-              sourceSequence,
-              this.#now(),
-              "account_usage_read_failed",
-            );
-          }
-          throw error;
+        const snapshot = await this.#readAndRecordUsage(profile, signal);
+        const refreshedProfile = this.#store.requireProfileById(profile.id);
+        const reset = await this.#attemptAutomaticRateLimitReset(
+          refreshedProfile,
+          snapshot.payload,
+          signal,
+        );
+        automaticResetRefresh = reset.refresh;
+        if (reset.authoritativeReread) {
+          // Every closed reset outcome is followed by an authoritative read.
+          // The provider response itself never substitutes for updated limits.
+          await this.#readAndRecordUsage(
+            this.#store.requireProfileById(profile.id),
+            signal,
+          );
         }
-        const receivedAt = this.#now();
-        const previous = this.#store.latestUsage(profile.id);
-        const stored = createStoredAccountUsageSnapshot({
-          providerPayload: snapshot.payload,
-          sourceSequence,
-          observedAt: snapshot.observedAt,
-          receivedAt,
-          accountFingerprint: profile.providerEmail === undefined
-            ? null
-            : digestText(profile.providerEmail.trim().toLowerCase()),
-          providerGeneration: profile.processGeneration,
-          daemonGeneration: this.#daemonGeneration,
-          previousPayload: previous?.payload ?? null,
-        });
-        this.#store.recordUsage(profile.id, sourceSequence, snapshot.observedAt, stored);
       }
-      const latest = this.#store.latestUsage(profile.id);
-      const latestFailure = this.#store.latestUsagePollFailure(profile.id);
       const now = this.#now();
+      const currentProfile = this.#store.requireProfileById(profile.id);
+      const currentFingerprint = accountFingerprintForProfile(currentProfile);
+      const latestRecorded = currentFingerprint === null
+        ? null
+        : this.#store.latestUsageForAccount(profile.id, currentFingerprint);
+      const latestFailure = currentFingerprint === null
+        ? null
+        : this.#store.latestUsagePollFailure(profile.id, currentFingerprint);
+      const parsedLatest = latestRecorded === null
+        ? null
+        : storedAccountUsageSnapshotSchema.safeParse(latestRecorded.payload);
+      const latest = parsedLatest?.success === true
+        && currentFingerprint !== null
+        && parsedLatest.data.observation.accountFingerprint === currentFingerprint
+        ? latestRecorded
+        : null;
       const samples = accountUsageCounterSamples(this.#store.usageRange({
         profileId: profile.id,
         fromObservedAt: Math.max(0, now - 30 * 60_000),
         throughObservedAt: now,
         limit: 2_000,
-      }));
+      })).filter((sample) => sample.accountFingerprint === currentFingerprint);
       const windows = ["1m", "5m", "15m"] satisfies readonly UsageVelocityWindow[];
       const velocity = Object.fromEntries(windows.map((window) => [
         window,
         observedAccountTokenVelocity({ samples, window, now }),
       ]));
-      const parsedStored = latest === null
-        ? null
-        : storedAccountUsageSnapshotSchema.safeParse(latest.payload);
+      const parsedStored = latest === null ? null : parsedLatest;
+      const resetObservation = latest === null
+        ? { available: false as const, reason: "weekly_window_unavailable" as const }
+        : automaticRateLimitResetObservation({
+            providerPayload: providerUsagePayload(latest.payload),
+            now,
+          });
+      const automaticResetLastAttempt = publicAutomaticRateLimitResetLastAttempt(
+        currentFingerprint === null
+          ? null
+          : this.#store.latestAccountRateLimitResetAttempt(
+              currentProfile.id,
+              currentFingerprint,
+            ),
+      );
       usage.push({
-        account: this.#publicProfile(profile),
+        account: this.#publicProfile(currentProfile),
+        automaticReset: automaticRateLimitResetStatusSchema.parse({
+          threshold: {
+            remainingPercent: AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT,
+            usedPercent: AUTO_RATE_LIMIT_RESET_USED_PERCENT,
+          },
+          observation: resetObservation.available
+            ? {
+                state: "available",
+                creditsAvailable: resetObservation.creditsAvailable,
+                remainingPercent: Math.max(0, 100 - resetObservation.usedPercent),
+                usedPercent: resetObservation.usedPercent,
+                weeklyWindowResetsAt: resetObservation.weeklyWindowResetsAt,
+              }
+            : { state: "unavailable", reason: resetObservation.reason },
+          lastAttempt: automaticResetLastAttempt,
+          ...(automaticResetRefresh === undefined
+            ? {}
+            : { refresh: automaticResetRefresh }),
+        }),
         poll: latestFailure !== null
           && (latest === null || latestFailure.sourceRevision > latest.sourceRevision)
           ? { state: "failed", ...latestFailure }
@@ -2807,18 +2916,382 @@ export class HraService {
     return { usage };
   }
 
+  async #readAndRecordUsage(
+    profile: ProfileRecord,
+    signal: AbortSignal,
+  ): Promise<Awaited<ReturnType<CodexRuntimePort["readUsage"]>>> {
+    let verifiedProfile = this.#store.requireProfileById(profile.id);
+    const expectedFingerprint = accountFingerprintForProfile(verifiedProfile);
+    const priorAttempt = expectedFingerprint === null
+      ? null
+      : this.#store.readRecoverableAccountRateLimitReset(
+          profile.id,
+          expectedFingerprint,
+        );
+    const accountFingerprint = await this.#proveUsageAccountIdentity({
+      profile: verifiedProfile,
+      expectedFingerprint,
+      attempt: priorAttempt,
+      signal,
+    });
+    verifiedProfile = this.#store.requireProfileById(profile.id);
+    const sourceSequence = this.#store.allocateNextUsageRevision(profile.id);
+    let snapshot: Awaited<ReturnType<CodexRuntimePort["readUsage"]>>;
+    try {
+      snapshot = await this.#fencedEffect(async () =>
+        await this.#codex.readUsage({
+          authority: authorityFor(this.#paths, verifiedProfile),
+          signal,
+        }));
+    } catch (error: unknown) {
+      if (!signal.aborted) {
+        this.#store.recordUsagePollFailure(
+          profile.id,
+          accountFingerprint,
+          sourceSequence,
+          this.#now(),
+          "account_usage_read_failed",
+        );
+      }
+      throw error;
+    }
+    const receivedAt = this.#now();
+    const attemptAfterRead = this.#store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    );
+    const confirmedFingerprint = await this.#proveUsageAccountIdentity({
+      profile: verifiedProfile,
+      expectedFingerprint: accountFingerprint,
+      attempt: attemptAfterRead,
+      signal,
+    });
+    if (confirmedFingerprint !== accountFingerprint) {
+      throw new Error("ACCOUNT_USAGE_IDENTITY_PROOF_CHANGED_WITHOUT_CONFLICT");
+    }
+    verifiedProfile = this.#store.requireProfileById(profile.id);
+    const previous = this.#store.latestUsageForAccount(
+      profile.id,
+      accountFingerprint,
+    );
+    const stored = createStoredAccountUsageSnapshot({
+      providerPayload: snapshot.payload,
+      sourceSequence,
+      observedAt: snapshot.observedAt,
+      receivedAt,
+      accountFingerprint,
+      providerGeneration: verifiedProfile.processGeneration,
+      daemonGeneration: this.#daemonGeneration,
+      previousPayload: previous?.payload ?? null,
+    });
+    this.#store.recordUsage(profile.id, sourceSequence, snapshot.observedAt, stored);
+    return snapshot;
+  }
+
+  async #attemptAutomaticRateLimitReset(
+    profile: ProfileRecord,
+    providerPayload: unknown,
+    signal: AbortSignal,
+  ): Promise<AutomaticRateLimitResetAttemptResult> {
+    const now = this.#now();
+    const storedFingerprint = accountFingerprintForProfile(profile);
+    let attempt = storedFingerprint === null
+      ? null
+      : this.#store.readRecoverableAccountRateLimitReset(profile.id, storedFingerprint);
+    const decision = automaticRateLimitResetDecision({
+      providerPayload,
+      now,
+    });
+    if (attempt === null && !decision.eligible) {
+      return {
+        authoritativeReread: false,
+        refresh: { state: "not_eligible", reason: decision.reason },
+      };
+    }
+
+    const accountFingerprint = await this.#proveUsageAccountIdentity({
+      profile,
+      expectedFingerprint: attempt?.accountFingerprint ?? storedFingerprint,
+      attempt,
+      signal,
+    });
+    attempt ??= this.#store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    );
+    if (
+      attempt !== null
+      && attempt.currentProcessGeneration !== profile.processGeneration
+    ) {
+      attempt = this.#store.rebindAccountRateLimitReset({
+        idempotencyKey: attempt.idempotencyKey,
+        expectedCurrentProcessGeneration: attempt.currentProcessGeneration,
+        nextProcessGeneration: profile.processGeneration,
+        accountFingerprint,
+      });
+    }
+
+    if (attempt !== null) {
+      if (attempt.state === "settled") {
+        if (attempt.outcome === null) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_SETTLED_OUTCOME_MISSING");
+        }
+        return {
+          authoritativeReread: false,
+          refresh: { state: "latched", outcome: attempt.outcome },
+        };
+      }
+      if (attempt.state === "closed") {
+        if (attempt.localResolution === null) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSED_RESOLUTION_MISSING");
+        }
+        return {
+          authoritativeReread: false,
+          refresh: { state: "latched", reason: attempt.localResolution },
+        };
+      }
+      const observation = automaticRateLimitResetObservation({
+        providerPayload,
+        now,
+      });
+      if (
+        now >= attempt.weeklyWindowResetsAt
+        || (
+          observation.available
+          && observation.weeklyWindowResetsAt !== attempt.weeklyWindowResetsAt
+        )
+      ) {
+        this.#store.closeAccountRateLimitReset(
+          attempt.idempotencyKey,
+          "weekly_window_changed",
+        );
+        return {
+          authoritativeReread: false,
+          refresh: { state: "window_changed" },
+        };
+      }
+      if (!observation.available) {
+        return {
+          authoritativeReread: false,
+          refresh: attempt.state === "ambiguous"
+            ? { state: "recovery_pending" }
+            : {
+                state: "not_eligible",
+                reason: "weekly_window_unavailable",
+              },
+        };
+      }
+      if (
+        attempt.state !== "ambiguous"
+        && (
+          observation.creditsAvailable < 1
+          || observation.usedPercent < AUTO_RATE_LIMIT_RESET_USED_PERCENT
+        )
+      ) {
+        return {
+          authoritativeReread: false,
+          refresh: {
+            state: "waiting",
+            reason: observation.creditsAvailable < 1
+              ? "credits_unavailable"
+              : "below_threshold",
+          },
+        };
+      }
+    } else {
+      if (!decision.eligible) {
+        return {
+          authoritativeReread: false,
+          refresh: { state: "not_eligible", reason: decision.reason },
+        };
+      }
+      attempt = this.#store.prepareAccountRateLimitReset({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint,
+        weeklyWindowResetsAt: decision.weeklyWindowResetsAt,
+        observedUsedPercent: decision.usedPercent,
+      });
+    }
+    // prepareAccountRateLimitReset returns an existing terminal latch for the
+    // same account/window. Re-check here so a settled or locally closed
+    // logical redemption can never cross the provider mutation boundary.
+    if (attempt.state === "settled") {
+      if (attempt.outcome === null) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_SETTLED_OUTCOME_MISSING");
+      }
+      return {
+        authoritativeReread: false,
+        refresh: { state: "latched", outcome: attempt.outcome },
+      };
+    }
+    if (attempt.state === "closed") {
+      if (attempt.localResolution === null) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSED_RESOLUTION_MISSING");
+      }
+      return {
+        authoritativeReread: false,
+        refresh: { state: "latched", reason: attempt.localResolution },
+      };
+    }
+    if (attempt.state === "effect_started") {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
+    }
+
+    await this.#daemonAuthority.assertCurrent();
+    if (signal.aborted) throw signal.reason;
+    this.#store.beginAccountRateLimitReset(attempt.idempotencyKey);
+    let outcome: Awaited<ReturnType<CodexRuntimePort["consumeRateLimitReset"]>>;
+    try {
+      outcome = await this.#codex.consumeRateLimitReset({
+        authority: authorityFor(this.#paths, profile),
+        idempotencyKey: attempt.idempotencyKey,
+        signal,
+      });
+    } catch (providerError: unknown) {
+      const retryState = providerError instanceof IndeterminateCodexEffectError
+        ? "ambiguous"
+        : "retryable";
+      try {
+        // Only the client's explicit indeterminate-effect error can bypass a
+        // later eligibility recheck. Definite rejections and pre-dispatch
+        // failures retain the same key but return to the retryable gate.
+        this.#store.deferAccountRateLimitReset(attempt.idempotencyKey, retryState);
+      } catch (journalError: unknown) {
+        this.#failStopAfterResetJournalFailure(
+          "Automatic reset recovery evidence could not be committed.",
+        );
+        throw new AggregateError(
+          [providerError, journalError],
+          "An automatic reset may have reached Codex and its recovery state could not be committed.",
+        );
+      }
+      // A successful usage read remains successful. The next serialized poll
+      // retries this exact logical redemption with the same upstream key.
+      return {
+        authoritativeReread: false,
+        refresh: {
+          state: retryState === "ambiguous" ? "recovery_pending" : "retry_pending",
+        },
+      };
+    }
+    try {
+      this.#store.settleAccountRateLimitReset(attempt.idempotencyKey, outcome);
+    } catch (journalError: unknown) {
+      this.#failStopAfterResetJournalFailure(
+        "An automatic reset outcome could not be committed.",
+      );
+      throw new AggregateError(
+        [journalError],
+        `Codex returned the automatic reset outcome ${outcome}, but HRA could not commit it.`,
+      );
+    }
+    return {
+      authoritativeReread: true,
+      refresh: { state: "settled", outcome },
+    };
+  }
+
+  async #proveUsageAccountIdentity(input: {
+    profile: ProfileRecord;
+    expectedFingerprint: string | null;
+    attempt: AccountRateLimitResetAttemptRecord | null;
+    signal: AbortSignal;
+  }): Promise<string> {
+    const account = await this.#fencedEffect(async () =>
+      await this.#codex.readAccount({
+        authority: authorityFor(this.#paths, input.profile),
+        signal: input.signal,
+      }));
+    const verifiedEmail = !account.signedIn || account.email === undefined
+      ? null
+      : account.email;
+    if (account.signedIn && verifiedEmail === null) {
+      throw new CommandFailure(
+        "UNAVAILABLE",
+        "Codex is signed in but did not expose an account email, so HRA skipped the usage refresh and automatic reset.",
+      );
+    }
+    const actualFingerprint = verifiedEmail === null
+      ? null
+      : digestText(verifiedEmail.trim().toLowerCase());
+    const persistedFingerprint = accountFingerprintForProfile(input.profile);
+    const identityChanged = actualFingerprint === null
+      || (input.expectedFingerprint !== null
+        && actualFingerprint !== input.expectedFingerprint)
+      || (persistedFingerprint !== null
+        && actualFingerprint !== persistedFingerprint);
+    if (identityChanged) {
+      if (input.attempt !== null) {
+        this.#store.closeAccountRateLimitReset(
+          input.attempt.idempotencyKey,
+          "account_identity_changed",
+        );
+      }
+      const stateChange = this.#store.setProfileStateWithWorkRetirement(
+        input.profile.id,
+        input.profile.processGeneration,
+        account.signedIn ? "signed_in" : "signed_out",
+        this.#work,
+        {
+          ...(verifiedEmail === null ? {} : { email: verifiedEmail }),
+          ...(account.plan === undefined ? {} : { plan: account.plan }),
+        },
+      );
+      this.#notifyAffectedWork(stateChange.affectedWorkIds);
+      if (!stateChange.changed) {
+        throw new CommandFailure(
+          "CONFLICT",
+          "Account generation changed while reconciling usage identity.",
+        );
+      }
+      throw new CommandFailure(
+        "CONFLICT",
+        "The signed-in Codex account changed during usage refresh. HRA reconciled the account and discarded the unverified usage result; run the usage refresh again.",
+      );
+    }
+    if (verifiedEmail === null) {
+      throw new Error("ACCOUNT_USAGE_IDENTITY_PROOF_INVALID");
+    }
+    if (input.profile.providerEmail === undefined) {
+      const stateChange = this.#store.setProfileStateWithWorkRetirement(
+        input.profile.id,
+        input.profile.processGeneration,
+        "signed_in",
+        this.#work,
+        {
+          email: verifiedEmail,
+          ...(account.plan === undefined ? {} : { plan: account.plan }),
+        },
+      );
+      this.#notifyAffectedWork(stateChange.affectedWorkIds);
+      if (!stateChange.changed) {
+        throw new Error("ACCOUNT_USAGE_IDENTITY_COMMIT_CONFLICT");
+      }
+    }
+    return actualFingerprint;
+  }
+
   #usageHistory(
     command: Extract<LocalCommand, { kind: "account.usage-history" }>,
   ): unknown {
     const profile = this.#store.requireProfile(command.account);
+    const accountFingerprint = accountFingerprintForProfile(profile);
     const now = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(this.#now());
     let fromObservedAt: number;
     let throughObservedAt: number;
     let afterSourceRevision = 0;
     let issuedAt = now;
     if (command.cursor !== undefined) {
+      if (accountFingerprint === null) {
+        throw new UsageHistoryCursorError(
+          "Usage-history cursor belongs to an account identity that is no longer verified.",
+          "account_mismatch",
+        );
+      }
       const decoded = this.#usageHistoryCursors.decode(command.cursor, {
         accountId: profile.id,
+        accountFingerprint,
         now,
         ...(command.fromObservedAt === undefined
           ? {}
@@ -2856,8 +3329,18 @@ export class HraService {
       }
     }
 
+    if (accountFingerprint === null) {
+      return accountUsageHistoryPageSchema.parse({
+        account: { id: profile.id, label: profile.label },
+        range: { fromObservedAt, throughObservedAt },
+        entries: [],
+        nextCursor: null,
+      });
+    }
+
     const listed = this.#store.usageHistoryPage({
       profileId: profile.id,
+      accountFingerprint,
       fromObservedAt,
       throughObservedAt,
       afterSourceRevision,
@@ -2888,6 +3371,7 @@ export class HraService {
           version: 1,
           type: "account_usage_history",
           accountId: profile.id,
+          accountFingerprint,
           fromObservedAt,
           throughObservedAt,
           afterSourceRevision: listed.nextSourceRevision,
@@ -5565,6 +6049,57 @@ export class HraService {
       const observed = this.#store.requireSession(session.id);
       if (observed.state === "idle") this.#scheduleQueueDispatch(observed);
     }
+  }
+
+  #scheduleUsageRefresh(authority: ProfileAuthority): void {
+    if (this.#state !== "open") return;
+    if (this.#usageRefreshes.has(authority.id)) {
+      this.#usageRefreshDirty.add(authority.id);
+      return;
+    }
+    const task = Promise.resolve().then(async () => {
+      for (;;) {
+        this.#usageRefreshDirty.delete(authority.id);
+        if (this.#state !== "open" || this.#backgroundAbort.signal.aborted) return;
+        let profile: ProfileRecord;
+        try {
+          profile = this.#store.requireProfileById(authority.id);
+        } catch {
+          return;
+        }
+        if (
+          profile.processGeneration !== authority.generation
+          || profile.state !== "signed_in"
+        ) return;
+        await this.#serialize(`account:${profile.id}`, async () => {
+          const current = this.#store.requireProfileById(profile.id);
+          if (
+            current.processGeneration !== authority.generation
+            || current.state !== "signed_in"
+          ) return;
+          await this.#usage(
+            current.id,
+            true,
+            this.#backgroundAbort.signal,
+          );
+        });
+        if (!this.#usageRefreshDirty.has(authority.id)) return;
+      }
+    });
+    const tracked = task.catch((error: unknown) => {
+      if (error instanceof StateSecurityScrubRequiredError) this.#requestStop();
+    });
+    this.#usageRefreshes.set(authority.id, tracked);
+    this.#background.add(tracked);
+    void tracked.then(() => {
+      if (this.#usageRefreshes.get(authority.id) === tracked) {
+        this.#usageRefreshes.delete(authority.id);
+      }
+      this.#background.delete(tracked);
+      if (this.#usageRefreshDirty.delete(authority.id) && this.#state === "open") {
+        this.#scheduleUsageRefresh(authority);
+      }
+    });
   }
 
   async #serialize<T>(key: string, operation: () => Promise<T> | T): Promise<T> {

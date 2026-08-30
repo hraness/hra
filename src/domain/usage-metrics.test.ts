@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  AUTO_RATE_LIMIT_RESET_USED_PERCENT,
+  CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES,
   accountUsageCounterSamples,
+  automaticRateLimitResetDecision,
+  automaticRateLimitResetStatusSchema,
   createStoredAccountUsageSnapshot,
   observedAccountTokenVelocity,
   providerUsagePayload,
@@ -167,5 +171,259 @@ describe("observedAccountTokenVelocity", () => {
       fromSourceSequence: 4,
       throughSourceSequence: 5,
     });
+  });
+});
+
+describe("automaticRateLimitResetStatusSchema", () => {
+  const base = {
+    threshold: { remainingPercent: 1, usedPercent: 99 },
+    observation: {
+      state: "unavailable" as const,
+      reason: "weekly_window_unavailable" as const,
+    },
+  };
+  const weeklyWindowResetsAt = 2_000_000_000_000;
+
+  test("accepts only exact privacy-safe attempt state pairings", () => {
+    const attempts: unknown[] = [
+      null,
+      { state: "prepared", weeklyWindowResetsAt },
+      { state: "retry_pending", weeklyWindowResetsAt },
+      { state: "recovery_pending", weeklyWindowResetsAt },
+      { state: "settled", outcome: "reset", weeklyWindowResetsAt },
+      { state: "closed", reason: "weekly_window_changed", weeklyWindowResetsAt },
+    ];
+    for (const lastAttempt of attempts) {
+      expect(automaticRateLimitResetStatusSchema.safeParse({
+        ...base,
+        lastAttempt,
+      }).success).toBe(true);
+    }
+  });
+
+  test("rejects private extras and invalid state-field combinations", () => {
+    for (const value of [
+      {
+        ...base,
+        lastAttempt: {
+          state: "settled",
+          weeklyWindowResetsAt,
+        },
+      },
+      {
+        ...base,
+        lastAttempt: {
+          state: "closed",
+          outcome: "reset",
+          weeklyWindowResetsAt,
+        },
+      },
+      {
+        ...base,
+        lastAttempt: {
+          state: "settled",
+          outcome: "reset",
+          weeklyWindowResetsAt,
+          idempotencyKey: "00000000-0000-4000-8000-000000000001",
+        },
+      },
+      {
+        ...base,
+        lastAttempt: {
+          state: "settled",
+          outcome: "reset",
+          weeklyWindowResetsAt,
+          accountFingerprint: digest,
+        },
+      },
+      {
+        ...base,
+        lastAttempt: null,
+        resetCredit: { id: "private-credit", description: "private" },
+      },
+      {
+        ...base,
+        lastAttempt: null,
+        refresh: { state: "settled", reason: "weekly_window_changed" },
+      },
+    ]) {
+      expect(automaticRateLimitResetStatusSchema.safeParse(value).success).toBe(false);
+    }
+  });
+});
+
+describe("automaticRateLimitResetDecision", () => {
+  const weeklyWindowResetsAtSeconds = 2_000_000_000;
+  const weeklyWindowResetsAt = weeklyWindowResetsAtSeconds * 1_000;
+  const now = weeklyWindowResetsAt - 3 * 24 * 60 * 60_000;
+  const providerPayload = (input: {
+    available?: number;
+    usedPercent?: number;
+    duration?: number | null;
+    resetsAt?: number | null;
+    limitId?: string;
+    slot?: "primary" | "secondary";
+  } = {}) => ({
+    usage: { summary: { lifetimeTokens: 1 } },
+    rateLimits: {
+      primary: {
+        limitId: input.limitId ?? "codex",
+        primary: input.slot === "secondary" ? null : {
+          usedPercent: input.usedPercent ?? 99,
+          windowDurationMins: input.duration ?? 10_080,
+          resetsAt: input.resetsAt ?? weeklyWindowResetsAtSeconds,
+        },
+        secondary: input.slot === "secondary" ? {
+          usedPercent: input.usedPercent ?? 99,
+          windowDurationMins: input.duration ?? 10_080,
+          resetsAt: input.resetsAt ?? weeklyWindowResetsAtSeconds,
+        } : null,
+      },
+      byLimitId: null,
+      resetCreditsAvailable: input.available ?? 1,
+    },
+  });
+
+  test("triggers at one percent remaining in either weekly window slot", () => {
+    for (const slot of ["primary", "secondary"] as const) {
+      expect(automaticRateLimitResetDecision({
+        providerPayload: providerPayload({
+          slot,
+          usedPercent: AUTO_RATE_LIMIT_RESET_USED_PERCENT,
+        }),
+        now,
+      })).toEqual({
+        eligible: true,
+        remainingPercent: 1,
+        usedPercent: 99,
+        weeklyWindowResetsAt,
+      });
+    }
+  });
+
+  test("does not trigger below the threshold or without a credit", () => {
+    expect(automaticRateLimitResetDecision({
+      providerPayload: providerPayload({ usedPercent: 98.999 }),
+      now,
+    })).toEqual({ eligible: false, reason: "below_threshold" });
+    expect(automaticRateLimitResetDecision({
+      providerPayload: providerPayload({ available: 0 }),
+      now,
+    })).toEqual({ eligible: false, reason: "credits_unavailable" });
+  });
+
+  test("fails closed for stale, malformed, nonweekly, and non-Codex windows", () => {
+    for (const payload of [
+      providerPayload({ resetsAt: 1 }),
+      providerPayload({ resetsAt: 2_000_000_000_000 }),
+      providerPayload({ resetsAt: 2_000_000_000.5 }),
+      providerPayload({ duration: 300 }),
+      providerPayload({ limitId: "other" }),
+      { rateLimits: { resetCreditsAvailable: 1 } },
+    ]) {
+      const decision = automaticRateLimitResetDecision({
+        providerPayload: payload,
+        now,
+      });
+      expect(decision.eligible).toBe(false);
+    }
+  });
+
+  test("accepts at most one weekly duration of reset horizon", () => {
+    const maximumFutureReset = now
+      + CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000;
+    expect(automaticRateLimitResetDecision({
+      providerPayload: providerPayload({ resetsAt: maximumFutureReset / 1_000 }),
+      now,
+    })).toMatchObject({ eligible: true, weeklyWindowResetsAt: maximumFutureReset });
+    for (const resetsAt of [
+      maximumFutureReset / 1_000 + 1,
+      99_999_999_999,
+    ]) {
+      expect(automaticRateLimitResetDecision({
+        providerPayload: providerPayload({ resetsAt }),
+        now,
+      })).toEqual({ eligible: false, reason: "weekly_window_unavailable" });
+    }
+  });
+
+  test("selects the exact Codex bucket from a multi-limit response", () => {
+    const codex = {
+      ...providerPayload({ usedPercent: 99 }).rateLimits.primary,
+      limitId: null,
+    };
+    const other = providerPayload({ usedPercent: 100, limitId: "other" }).rateLimits.primary;
+    expect(automaticRateLimitResetDecision({
+      providerPayload: {
+        rateLimits: {
+          primary: other,
+          byLimitId: { other, codex },
+          resetCreditsAvailable: 1,
+        },
+      },
+      now,
+    })).toMatchObject({ eligible: true, usedPercent: 99 });
+  });
+
+  test("treats the keyed Codex bucket as canonical when the root projection disagrees", () => {
+    const staleRoot = providerPayload({ usedPercent: 100 }).rateLimits.primary;
+    const currentCodex = providerPayload({ usedPercent: 20 }).rateLimits.primary;
+    expect(automaticRateLimitResetDecision({
+      providerPayload: {
+        rateLimits: {
+          primary: staleRoot,
+          byLimitId: { codex: currentCodex },
+          resetCreditsAvailable: 1,
+        },
+      },
+      now,
+    })).toEqual({ eligible: false, reason: "below_threshold" });
+  });
+
+  test("rejects contradictory or inferred Codex identities in a keyed map", () => {
+    const codex = providerPayload({ usedPercent: 99 }).rateLimits.primary;
+    const other = providerPayload({ usedPercent: 99, limitId: "other" }).rateLimits.primary;
+    for (const byLimitId of [
+      { codex: other },
+      { other: codex },
+    ]) {
+      expect(automaticRateLimitResetDecision({
+        providerPayload: {
+          rateLimits: {
+            primary: codex,
+            byLimitId,
+            resetCreditsAvailable: 1,
+          },
+        },
+        now,
+      })).toEqual({ eligible: false, reason: "weekly_window_unavailable" });
+    }
+  });
+
+  test("accepts the historical null-id Codex bucket only without a contradictory map", () => {
+    const historical = {
+      ...providerPayload({ usedPercent: 99 }).rateLimits.primary,
+      limitId: null,
+    };
+    expect(automaticRateLimitResetDecision({
+      providerPayload: {
+        rateLimits: {
+          primary: historical,
+          byLimitId: null,
+          resetCreditsAvailable: 1,
+        },
+      },
+      now,
+    })).toMatchObject({ eligible: true, usedPercent: 99 });
+    expect(automaticRateLimitResetDecision({
+      providerPayload: {
+        rateLimits: {
+          primary: historical,
+          byLimitId: { other: providerPayload({ limitId: "other" }).rateLimits.primary },
+          resetCreditsAvailable: 1,
+        },
+      },
+      now,
+    })).toEqual({ eligible: false, reason: "weekly_window_unavailable" });
   });
 });

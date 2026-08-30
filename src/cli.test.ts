@@ -1645,6 +1645,20 @@ describe("CLI entry point", () => {
     const firstWave = new Promise<void>((resolve) => { releaseWave = resolve; });
     const commands: LocalCommand[] = [];
     const captured = capture();
+    const automaticReset = (accountId: string) => ({
+      threshold: { remainingPercent: 1, usedPercent: 99 },
+      observation: {
+        state: "unavailable" as const,
+        reason: "weekly_window_unavailable" as const,
+      },
+      lastAttempt: accountId === accounts[1]?.id
+        ? {
+            state: "settled" as const,
+            outcome: "reset" as const,
+            weeklyWindowResetsAt: 2_000_000_000_000,
+          }
+        : null,
+    });
     expect(await main(["account", "usage", "--refresh", "--json"], captured.output, {
       callDaemon: async (command) => {
         commands.push(command);
@@ -1672,7 +1686,12 @@ describe("CLI entry point", () => {
             ok: true,
             version: 1,
             requestId: crypto.randomUUID(),
-            data: { usage: [{ account: { id: command.account } }] },
+            data: {
+              usage: [{
+                account: { id: command.account },
+                automaticReset: automaticReset(command.account),
+              }],
+            },
           };
         }
         if (command.kind === "account.usage" && !command.refresh && command.account === undefined) {
@@ -1683,6 +1702,7 @@ describe("CLI entry point", () => {
             data: {
               usage: [...accounts].reverse().map((account) => ({
                 account,
+                automaticReset: automaticReset(account.id),
                 poll: { state: "never_observed" },
                 snapshot: null,
                 velocity: {},
@@ -1700,7 +1720,10 @@ describe("CLI entry point", () => {
     const payload = JSON.parse(captured.read().stdout) as {
       data: {
         refresh: { outcomes: Array<{ accountId: string; code?: string; state: string }> };
-        usage: Array<{ account: { id: string } }>;
+        usage: Array<{
+          account: { id: string };
+          automaticReset?: unknown;
+        }>;
       };
     };
     expect(payload.data.refresh.outcomes.map((outcome) => outcome.accountId)).toEqual(
@@ -1709,6 +1732,15 @@ describe("CLI entry point", () => {
     expect(payload.data.refresh.outcomes[0]).toMatchObject({ state: "skipped" });
     expect(payload.data.refresh.outcomes[3]).toMatchObject({ code: "UNAVAILABLE", state: "failed" });
     expect(payload.data.usage.map((entry) => entry.account.id)).toEqual(accounts.map((account) => account.id));
+    expect(payload.data.usage[1]).toMatchObject({
+      automaticReset: {
+        lastAttempt: {
+          state: "settled",
+          outcome: "reset",
+          weeklyWindowResetsAt: 2_000_000_000_000,
+        },
+      },
+    });
     expect(captured.read().stdout).not.toContain("do-not-return");
     expect(captured.read().stdout).not.toContain("/private/account");
     expect(captured.read().stderr).toBe("");

@@ -298,6 +298,85 @@ describe("CodexAppServerClient", () => {
     await client.close();
   });
 
+  test("consumes a reset credit with only the caller-persisted UUID", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const idempotencyKey = "00000000-0000-4000-8000-000000000001";
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/rateLimitResetCredit/consume") {
+        runtime.respond({ id: message.id, result: { outcome: "reset" } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.consumeRateLimitResetCredit(idempotencyKey)).resolves.toEqual({
+      authority: { profileId: "profile-a", processGeneration: 7 },
+      value: { outcome: "reset" },
+    });
+    expect(process.writes.at(-1)).toEqual({
+      id: 3,
+      method: "account/rateLimitResetCredit/consume",
+      params: { idempotencyKey },
+    });
+    expect(JSON.stringify(process.writes.at(-1))).not.toContain("creditId");
+
+    const writesBeforeInvalid = process.writes.length;
+    await expect(client.consumeRateLimitResetCredit("not-a-uuid")).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+    });
+    expect(process.writes).toHaveLength(writesBeforeInvalid);
+    await client.close();
+  });
+
+  test("classifies an unsupported reset-credit outcome as indeterminate", async () => {
+    const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
+    const process = new FakeProcess((message, runtime) => {
+      if (message.method === "initialize") {
+        runtime.respond({
+          id: message.id,
+          result: {
+            userAgent: "codex-cli/0.149.0",
+            codexHome,
+            platformFamily: "unix",
+            platformOs: "macos",
+          },
+        });
+      } else if (message.method === "account/rateLimitResetCredit/consume") {
+        runtime.respond({ id: message.id, result: { outcome: "futureOutcome" } });
+      }
+    });
+    const client = createClient({
+      process,
+      authority: { profileId: "profile-a", processGeneration: 1 },
+      expectedCodexHome: codexHome,
+      isAuthorityCurrent: () => true,
+    });
+    await client.initialize();
+
+    await expect(client.consumeRateLimitResetCredit(
+      "00000000-0000-4000-8000-000000000002",
+    )).rejects.toMatchObject({
+      code: "INDETERMINATE_EFFECT",
+      operation: "account/rateLimitResetCredit/consume",
+    });
+    await client.close();
+  });
+
   test("fails closed when an effective credential store is not file-backed", async () => {
     const codexHome = "/tmp/hra-control-plane/profile-a/codex-home";
     const process = new FakeProcess((message, runtime) => {

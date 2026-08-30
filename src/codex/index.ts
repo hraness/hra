@@ -64,6 +64,8 @@ export type {
   Page,
   PermissionProfile,
   PresetAlias,
+  RateLimitResetCreditConsumption,
+  RateLimitResetCreditOutcome,
   RateLimitSnapshot,
   RateLimitWindow,
   ReasoningEffort,

@@ -27,7 +27,10 @@ import {
   type SessionEvent,
   type SessionEventPage,
 } from "../domain/session-events";
-import { accountUsageHistoryPageSchema } from "../domain/usage-metrics";
+import {
+  accountUsageHistoryPageSchema,
+  automaticRateLimitResetStatusSchema,
+} from "../domain/usage-metrics";
 import { profileIdSchema, sessionIdSchema } from "../domain/values";
 import {
   WORK_PROTOCOL,
@@ -791,6 +794,19 @@ const assertCommandSuccessData = (command: LocalCommand, data: unknown): void =>
     }
     return;
   }
+  if (command.kind === "account.usage") {
+    const root = object(data);
+    if (
+      root === null
+      || !Array.isArray(root.usage)
+      || !root.usage.every((entry) => {
+        const record = object(entry);
+        return record !== null
+          && automaticRateLimitResetStatusSchema.safeParse(record.automaticReset).success;
+      })
+    ) invalidCommandResponse(command);
+    return;
+  }
   if (command.kind === "session.list") {
     const parsed = publicSessionListPageSchema.safeParse(data);
     const exactRequestedAccount = profileIdSchema.safeParse(command.account);
@@ -1429,6 +1445,67 @@ const usagePercent = (payload: unknown): number | null => {
   return typeof primary?.usedPercent === "number" ? primary.usedPercent : null;
 };
 
+const automaticResetRows = (value: unknown): readonly string[] => {
+  const parsed = automaticRateLimitResetStatusSchema.safeParse(value);
+  if (!parsed.success) return [];
+  const root = parsed.data;
+  const rows: string[] = [];
+  const threshold = root.threshold;
+  rows.push(
+    `  automatic reset policy: ${threshold.usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% used (${threshold.remainingPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% remaining)`,
+  );
+  const observation = root.observation;
+  if (
+    observation.state === "available"
+  ) {
+    rows.push(
+      `  weekly Codex limit: ${observation.usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% used; ${observation.remainingPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% remaining; resets ${instant(observation.weeklyWindowResetsAt)}`,
+    );
+    if (typeof observation.creditsAvailable === "number") {
+      rows.push(`  reset credits available: ${observation.creditsAvailable.toLocaleString("en-US")}`);
+    }
+  } else {
+    rows.push("  weekly Codex limit: unavailable");
+  }
+  const lastAttempt = root.lastAttempt;
+  if (lastAttempt !== null) {
+    const detail = "outcome" in lastAttempt
+      ? lastAttempt.outcome
+      : "reason" in lastAttempt
+        ? lastAttempt.reason
+        : lastAttempt.state;
+    const label = lastAttempt.state === "settled"
+      ? `settled (${detail})`
+      : lastAttempt.state === "recovery_pending"
+        ? "same-key recovery pending"
+        : lastAttempt.state === "retry_pending"
+          ? "same-key retry pending"
+          : lastAttempt.state === "closed"
+            ? `closed (${detail})`
+            : lastAttempt.state.replaceAll("_", " ");
+    rows.push(
+      `  most recent automatic reset attempt: ${line(label)}; source window resets ${instant(lastAttempt.weeklyWindowResetsAt)}`,
+    );
+  }
+  const refresh = root.refresh;
+  if (refresh !== undefined) {
+    const detail = "outcome" in refresh
+      ? refresh.outcome
+      : "reason" in refresh
+        ? refresh.reason
+        : refresh.state;
+    const label = refresh.state === "settled"
+      ? `settled (${detail})`
+      : refresh.state === "recovery_pending"
+        ? "same-key recovery pending"
+        : refresh.state === "retry_pending"
+          ? "same-key retry pending"
+          : `${refresh.state.replaceAll("_", " ")} (${detail})`;
+    rows.push(`  automatic reset refresh: ${line(label)}`);
+  }
+  return rows;
+};
+
 const renderAccountUsageHistory = (
   command: Extract<LocalCommand, { kind: "account.usage-history" }>,
   data: unknown,
@@ -1499,8 +1576,13 @@ const renderAccountUsage = (data: unknown): string => {
       }
       const lifetimeTokens = usageLifetimeTokens(payload);
       if (lifetimeTokens !== null) rows.push(`  lifetime tokens: ${lifetimeTokens.toLocaleString("en-US")}`);
-      const usedPercent = usagePercent(payload);
-      if (usedPercent !== null) rows.push(`  primary limit used: ${usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}%`);
+      const resetRows = automaticResetRows(entry?.automaticReset);
+      if (resetRows.length > 0) {
+        rows.push(...resetRows);
+      } else {
+        const usedPercent = usagePercent(payload);
+        if (usedPercent !== null) rows.push(`  primary limit used: ${usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}%`);
+      }
       rows.push(
         `  velocity: 1m ${usageVelocity(velocity?.["1m"])}; 5m ${usageVelocity(velocity?.["5m"])}; 15m ${usageVelocity(velocity?.["15m"])}`,
       );
