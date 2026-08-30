@@ -1454,6 +1454,14 @@ const automaticResetRows = (value: unknown): readonly string[] => {
   rows.push(
     `  automatic reset policy: ${threshold.usedPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% used (${threshold.remainingPercent.toLocaleString("en-US", { maximumFractionDigits: 2 })}% remaining)`,
   );
+  const reconciliation = root.policy;
+  rows.push(
+    reconciliation.state === "active"
+      ? "  automatic reset reconciliation: active"
+      : reconciliation.state === "reconciliation_required"
+        ? "  automatic reset reconciliation: required before automatic resets"
+        : `  automatic reset reconciliation: current weekly window suppressed through ${instant(reconciliation.weeklyWindowResetsAt)}`,
+  );
   const observation = root.observation;
   if (
     observation.state === "available"

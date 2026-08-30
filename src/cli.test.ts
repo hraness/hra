@@ -1647,6 +1647,7 @@ describe("CLI entry point", () => {
     const captured = capture();
     const automaticReset = (accountId: string) => ({
       threshold: { remainingPercent: 1, usedPercent: 99 },
+      policy: { state: "active" as const },
       observation: {
         state: "unavailable" as const,
         reason: "weekly_window_unavailable" as const,
