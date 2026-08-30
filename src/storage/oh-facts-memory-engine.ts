@@ -55,6 +55,11 @@ const maximumForkRecords = 8_192;
 const metadataMaximumBytes = 16 * 1024;
 const hostActorId = "hra.memory.host";
 
+export const HRA_OH_FACTS_MEMORY_LIMITS_V1 = Object.freeze({
+  forkSnapshotBytes: 8 * 1024 * 1024,
+  sqliteLogicalBytes: 96 * 1024 * 1024,
+});
+
 const adapterMetadataSchema = z.object({
   adapterDigest: factsMemoryDigestSchema,
   bindingDigest: factsMemoryDigestSchema,
@@ -233,7 +238,10 @@ const parseAdapterMetadata = (value: unknown): ParsedAdapterMetadata => {
   if (legacyMetadataDigest(legacyBody) !== adapterDigest) {
     throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
   }
-  if (legacy.data.initialHead.sequence !== 0 || legacy.data.parent !== null) {
+  if (
+    legacy.data.initialHead.sequence !== 0
+    || (legacy.data.parent !== null && legacy.data.parent.head.sequence !== 0)
+  ) {
     throw new Error("FACTS_MEMORY_OH_LEGACY_NONEMPTY_RECOVERY_REQUIRED");
   }
   const normalizedLegacy = normalizeLegacyMetadata(legacy.data);
@@ -325,6 +333,50 @@ const enforcePrivateSqliteFiles = (directory: string): void => {
       closeSync(descriptor);
     }
     assertPrivateDatabase(path);
+  }
+};
+
+const assertBoundedLogicalDatabase = (directory: string): void => {
+  let logicalBytes = 0;
+  for (const name of [databaseName, `${databaseName}-wal`] as const) {
+    const path = join(directory, name);
+    let descriptor: number;
+    try {
+      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (error: unknown) {
+      if (errorCode(error) === "ENOENT") continue;
+      throw error;
+    }
+    try {
+      const metadata = fstatSync(descriptor);
+      const owner = process.getuid?.();
+      if (
+        !metadata.isFile()
+        || metadata.nlink !== 1
+        || (metadata.mode & 0o077) !== 0
+        || (owner !== undefined && metadata.uid !== owner)
+      ) throw new Error("FACTS_MEMORY_OH_DATABASE_UNSAFE");
+      if (
+        metadata.size > HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes - logicalBytes
+      ) throw new Error("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+      logicalBytes += metadata.size;
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+};
+
+const assertBoundedForkSnapshot = (records: readonly unknown[]): void => {
+  let encodedBytes = 2;
+  for (const [index, record] of records.entries()) {
+    const encoded = JSON.stringify(record);
+    const separatorBytes = index === 0 ? 0 : 1;
+    const recordBytes = Buffer.byteLength(encoded, "utf8");
+    if (
+      recordBytes + separatorBytes
+      > HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes - encodedBytes
+    ) throw new Error("FACTS_MEMORY_OH_FORK_SNAPSHOT_TOO_LARGE");
+    encodedBytes += recordBytes + separatorBytes;
   }
 };
 
@@ -611,7 +663,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       let receipt: FactsMemoryStoreReceipt;
       let metadata: AdapterMetadata;
       try {
-        const verification = await authority.store.verify();
+        const verification = await this.#verifyBounded(authority, directory);
         const initialHead = projectOhHead(verification.head);
         if (initialHead.sequence !== 0 || verification.operations !== 0 || verification.records !== 0) {
           throw new Error("FACTS_MEMORY_OH_CREATE_NOT_EMPTY");
@@ -699,6 +751,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
       } finally {
         await parentAuthority.store.close();
       }
+      assertBoundedForkSnapshot(snapshot.records);
 
       const childAuthority = await this.#open(binding, directory, false);
       let receipt: FactsMemoryStoreReceipt;
@@ -712,7 +765,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
             operationId: `hra.fork.${digestParts("hra-oh-fork-operation-v1", [operationKey])}`,
           });
         }
-        const verification = await childAuthority.store.verify();
+        const verification = await this.#verifyBounded(childAuthority, directory);
         if (
           verification.records !== snapshot.records.length
           || verification.head.recordsSha256 !== snapshot.head.recordsSha256
@@ -798,9 +851,20 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
         if (metadata !== null) throw new Error("FACTS_MEMORY_OH_DATABASE_MISSING");
         return { handleHash: null };
       }
+      try {
+        assertBoundedLogicalDatabase(directory);
+      } catch (error: unknown) {
+        if (
+          !(error instanceof Error)
+          || error.message !== "FACTS_MEMORY_OH_DATABASE_TOO_LARGE"
+          || metadata === null
+        ) throw error;
+        this.#assertMetadataBinding(metadata, binding);
+        return { handleHash: metadata.handleHash };
+      }
       const authority = await this.#open(binding, directory, true);
       try {
-        const verification = await authority.store.verify();
+        const verification = await this.#verifyBounded(authority, directory);
         if (metadata !== null) {
           this.#assertMetadataAuthority(metadata, binding, authority);
           const head = projectOhHead(verification.head);
@@ -830,26 +894,33 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     const path = join(directory, databaseName);
     if (requireExisting && !existsSync(path)) throw new Error("FACTS_MEMORY_OH_DATABASE_MISSING");
     enforcePrivateSqliteFiles(directory);
+    assertBoundedLogicalDatabase(directory);
     const authority = createOhSqliteStoreAuthorityV1({
       path,
       profile: OH_WORKING_STORE_PROFILE_V1,
       realmId: `hra:${binding.bindingDigest}`,
       spaceId: this.#spaceId(binding),
     });
-    enforcePrivateSqliteFiles(directory);
-    const persisted = parseOhStoreBindingV1(authority.store.binding);
-    if (
-      persisted === null
-      || persisted.profile.profileSha256 !== OH_WORKING_STORE_PROFILE_V1.profileSha256
-      || persisted.realmId !== `hra:${binding.bindingDigest}`
-      || persisted.spaceId !== this.#spaceId(binding)
-      || authority.host.binding.bindingSha256 !== persisted.bindingSha256
-    ) {
-      await authority.store.close();
+    try {
       enforcePrivateSqliteFiles(directory);
-      throw new Error("FACTS_MEMORY_OH_BINDING_MISMATCH");
+      assertBoundedLogicalDatabase(directory);
+      const persisted = parseOhStoreBindingV1(authority.store.binding);
+      if (
+        persisted === null
+        || persisted.profile.profileSha256 !== OH_WORKING_STORE_PROFILE_V1.profileSha256
+        || persisted.realmId !== `hra:${binding.bindingDigest}`
+        || persisted.spaceId !== this.#spaceId(binding)
+        || authority.host.binding.bindingSha256 !== persisted.bindingSha256
+      ) throw new Error("FACTS_MEMORY_OH_BINDING_MISMATCH");
+      return authority;
+    } catch (error: unknown) {
+      try {
+        await authority.store.close();
+      } catch (closeError: unknown) {
+        throw new AggregateError([error, closeError], "Failed to close rejected Oh authority.");
+      }
+      throw error;
     }
-    return authority;
   }
 
   async #inspectComplete(
@@ -862,7 +933,7 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     const authority = await this.#open(binding, directory, true);
     try {
       this.#assertMetadataAuthority(metadata, binding, authority);
-      const verification = await authority.store.verify();
+      const verification = await this.#verifyBounded(authority, directory);
       const head = projectOhHead(verification.head);
       if (expectedHead !== undefined) {
         const expected = factsMemoryHeadSchema.parse(expectedHead);
@@ -902,6 +973,16 @@ export class OhSqliteFactsMemoryEngine implements LocalOhFactsMemoryEnginePort {
     } finally {
       await authority.store.close();
     }
+  }
+
+  async #verifyBounded(
+    authority: OhStoreAuthorityV1,
+    directory: string,
+  ): Promise<Awaited<ReturnType<OhStoreAuthorityV1["store"]["verify"]>>> {
+    assertBoundedLogicalDatabase(directory);
+    const verification = await authority.store.verify();
+    assertBoundedLogicalDatabase(directory);
+    return verification;
   }
 
   #assertCreation(

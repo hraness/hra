@@ -8,6 +8,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -27,7 +28,10 @@ import {
 import { HraFactsMemoryLifecycle } from "../daemon/facts-memory-lifecycle";
 import { FactsMemoryControlStore } from "./facts-memory-control";
 import { LocalFactsMemoryBroker } from "./local-facts-memory-broker";
-import { OhSqliteFactsMemoryEngine } from "./oh-facts-memory-engine";
+import {
+  HRA_OH_FACTS_MEMORY_LIMITS_V1,
+  OhSqliteFactsMemoryEngine,
+} from "./oh-facts-memory-engine";
 import { ensurePrivateDirectory } from "./paths";
 
 const ownerId = `acct_${"a".repeat(32)}`;
@@ -64,6 +68,18 @@ const openOhAuthority = (binding: FactsMemoryBinding, directory: string) =>
       : `hra:${binding.sessionId}:epoch:${String(binding.epoch)}`,
   });
 
+const sqliteLogicalBytes = async (directory: string): Promise<number> => {
+  let bytes = 0;
+  for (const name of ["oh.sqlite", "oh.sqlite-wal"] as const) {
+    try {
+      bytes += (await stat(join(directory, name))).size;
+    } catch (error: unknown) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+  }
+  return bytes;
+};
+
 const inspectionHead = async (
   broker: LocalFactsMemoryBroker,
   binding: FactsMemoryBinding,
@@ -81,6 +97,72 @@ const digestParts = (domain: string, parts: readonly string[]): string => {
     digest.update(part);
   }
   return digest.digest("hex");
+};
+
+type AdapterMetadataFixture = Readonly<{
+  adapterDigest: string;
+  bindingDigest: string;
+  createdAt: number;
+  createKind: "create" | "fork";
+  handleHash: string;
+  initialHead: Readonly<{ digest: string; operationSha256: string | null; sequence: number }>;
+  ohBindingSha256: string;
+  operationKey: string;
+  parent: null | Readonly<{
+    bindingDigest: string;
+    epoch: number;
+    head: Readonly<{ digest: string; operationSha256: string | null; sequence: number }>;
+    ownerId: string;
+    sessionId: string;
+  }>;
+  receiptDigest: string;
+  version: 1;
+}>;
+
+const legacyMetadataFixture = (current: AdapterMetadataFixture) => {
+  const body = {
+    bindingDigest: current.bindingDigest,
+    createdAt: current.createdAt,
+    createKind: current.createKind,
+    handleHash: current.handleHash,
+    initialHead: {
+      digest: current.initialHead.digest,
+      sequence: current.initialHead.sequence,
+    },
+    ohBindingSha256: current.ohBindingSha256,
+    operationKey: current.operationKey,
+    parent: current.parent === null ? null : {
+      bindingDigest: current.parent.bindingDigest,
+      head: {
+        digest: current.parent.head.digest,
+        sequence: current.parent.head.sequence,
+      },
+      ownerId: current.parent.ownerId,
+      sessionId: current.parent.sessionId,
+    },
+    receiptDigest: current.receiptDigest,
+    version: 1 as const,
+  };
+  return {
+    ...body,
+    adapterDigest: digestParts("hra-oh-adapter-metadata-v1", [
+      body.bindingDigest,
+      String(body.createdAt),
+      body.createKind,
+      body.handleHash,
+      String(body.initialHead.sequence),
+      body.initialHead.digest,
+      body.ohBindingSha256,
+      body.operationKey,
+      body.parent?.bindingDigest ?? "no-parent",
+      body.parent?.ownerId ?? "no-parent",
+      body.parent?.sessionId ?? "no-parent",
+      body.parent === null ? "no-parent" : String(body.parent.head.sequence),
+      body.parent?.head.digest ?? "no-parent",
+      body.receiptDigest,
+      String(body.version),
+    ]),
+  };
 };
 
 describe("released Oh SQLite facts-memory adapter", () => {
@@ -126,55 +208,11 @@ describe("released Oh SQLite facts-memory adapter", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
 
     const legacyMetadataPath = join(root, binding.sessionId, metadataName);
-    const currentMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
-      adapterDigest: string;
-      bindingDigest: string;
-      createdAt: number;
-      createKind: "create";
-      handleHash: string;
-      initialHead: { digest: string; operationSha256: null; sequence: 0 };
-      ohBindingSha256: string;
-      operationKey: string;
-      parent: null;
-      receiptDigest: string;
-      version: 1;
-    };
-    const legacyBody = {
-      bindingDigest: currentMetadata.bindingDigest,
-      createdAt: currentMetadata.createdAt,
-      createKind: currentMetadata.createKind,
-      handleHash: currentMetadata.handleHash,
-      initialHead: {
-        digest: currentMetadata.initialHead.digest,
-        sequence: currentMetadata.initialHead.sequence,
-      },
-      ohBindingSha256: currentMetadata.ohBindingSha256,
-      operationKey: currentMetadata.operationKey,
-      parent: currentMetadata.parent,
-      receiptDigest: currentMetadata.receiptDigest,
-      version: currentMetadata.version,
-    };
-    const legacyAdapterDigest = digestParts("hra-oh-adapter-metadata-v1", [
-      legacyBody.bindingDigest,
-      String(legacyBody.createdAt),
-      legacyBody.createKind,
-      legacyBody.handleHash,
-      String(legacyBody.initialHead.sequence),
-      legacyBody.initialHead.digest,
-      legacyBody.ohBindingSha256,
-      legacyBody.operationKey,
-      "no-parent",
-      "no-parent",
-      "no-parent",
-      "no-parent",
-      "no-parent",
-      legacyBody.receiptDigest,
-      String(legacyBody.version),
-    ]);
-    await writeFile(legacyMetadataPath, JSON.stringify({
-      ...legacyBody,
-      adapterDigest: legacyAdapterDigest,
-    }), { mode: 0o600 });
+    const currentMetadata = JSON.parse(
+      await readFile(legacyMetadataPath, "utf8"),
+    ) as AdapterMetadataFixture;
+    const legacyMetadata = legacyMetadataFixture(currentMetadata);
+    await writeFile(legacyMetadataPath, JSON.stringify(legacyMetadata), { mode: 0o600 });
     await writeFile(join(root, binding.sessionId, migratingMetadataName), "{", { mode: 0o600 });
     expect(await restartedBroker.inspect(binding)).toMatchObject({ status: "present" });
     const migratedMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
@@ -182,7 +220,7 @@ describe("released Oh SQLite facts-memory adapter", () => {
       initialHead: Record<string, unknown>;
     };
     expect(migratedMetadata.initialHead.operationSha256).toBeNull();
-    expect(migratedMetadata.adapterDigest).not.toBe(legacyAdapterDigest);
+    expect(migratedMetadata.adapterDigest).not.toBe(legacyMetadata.adapterDigest);
     await expect(lstat(join(root, binding.sessionId, migratingMetadataName)))
       .rejects.toMatchObject({ code: "ENOENT" });
 
@@ -234,6 +272,87 @@ describe("released Oh SQLite facts-memory adapter", () => {
       operationKey: `cleanup:${binding.sessionId}:archive`,
     });
     await expect(lstat(join(root, binding.sessionId))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("migrates an exact empty legacy fork across a completed migration crash", async () => {
+    const { broker, root } = await fixture();
+    const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    await broker.create({ binding: parent, operationKey: `create:${parent.sessionId}` });
+    const emptyParentHead = await inspectionHead(broker, parent);
+    expect(emptyParentHead).toMatchObject({ operationSha256: null, sequence: 0 });
+    await broker.fork({
+      binding: child,
+      operationKey: `fork:${child.sessionId}`,
+      parent: { ...parent, head: emptyParentHead },
+    });
+
+    const childDirectory = join(root, child.sessionId);
+    const metadataPath = join(childDirectory, metadataName);
+    const currentMetadata = JSON.parse(await readFile(metadataPath, "utf8")) as AdapterMetadataFixture;
+    expect(currentMetadata.initialHead).toMatchObject({ operationSha256: null, sequence: 0 });
+    expect(currentMetadata.parent).toMatchObject({
+      epoch: 1,
+      head: { operationSha256: null, sequence: 0 },
+    });
+    const legacyMetadata = legacyMetadataFixture(currentMetadata);
+    expect(Object.hasOwn(legacyMetadata.initialHead, "operationSha256")).toBe(false);
+    expect(legacyMetadata.parent === null || Object.hasOwn(legacyMetadata.parent, "epoch")).toBe(false);
+    expect(
+      legacyMetadata.parent === null || Object.hasOwn(legacyMetadata.parent.head, "operationSha256"),
+    ).toBe(false);
+
+    await writeFile(metadataPath, JSON.stringify(legacyMetadata), { mode: 0o600 });
+    await writeFile(
+      join(childDirectory, migratingMetadataName),
+      JSON.stringify(currentMetadata),
+      { mode: 0o600 },
+    );
+    await expect(broker.inspect(child)).resolves.toMatchObject({
+      status: "present",
+      inspection: { initialHead: { operationSha256: null, sequence: 0 } },
+    });
+    expect(JSON.parse(await readFile(metadataPath, "utf8"))).toEqual(currentMetadata);
+    await expect(lstat(join(childDirectory, migratingMetadataName)))
+      .rejects.toMatchObject({ code: "ENOENT" });
+
+    const source = createKnowledgeGraphRecordV1({
+      dependencies: [],
+      key: "entity:legacy-nonempty",
+      kind: "entity",
+      v: 1,
+      value: { name: "Nonempty" },
+    });
+    const parentAuthority = openOhAuthority(parent, join(root, parent.sessionId));
+    await parentAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: [{ kind: "put", record: source, v: 1 }],
+      expectedHead: await parentAuthority.store.head(),
+      operationId: "host.test.legacy-nonempty",
+    });
+    await parentAuthority.store.close();
+    const nonemptyChild = createFactsMemoryBinding({
+      ownerId,
+      sessionId: `sess_${"5".repeat(32)}`,
+    });
+    await broker.fork({
+      binding: nonemptyChild,
+      operationKey: `fork:${nonemptyChild.sessionId}`,
+      parent: { ...parent, head: await inspectionHead(broker, parent) },
+    });
+    const nonemptyDirectory = join(root, nonemptyChild.sessionId);
+    const nonemptyMetadataPath = join(nonemptyDirectory, metadataName);
+    const nonemptyMetadata = JSON.parse(
+      await readFile(nonemptyMetadataPath, "utf8"),
+    ) as AdapterMetadataFixture;
+    await rename(nonemptyMetadataPath, join(nonemptyDirectory, pendingMetadataName));
+    await writeFile(
+      join(nonemptyDirectory, pendingMetadataName),
+      JSON.stringify(legacyMetadataFixture(nonemptyMetadata)),
+      { mode: 0o600 },
+    );
+    await expect(broker.inspect(nonemptyChild))
+      .rejects.toThrow("FACTS_MEMORY_OH_LEGACY_NONEMPTY_RECOVERY_REQUIRED");
   });
 
   test("repairs a crash-partial pending sidecar without accepting a path alias", async () => {
@@ -561,6 +680,79 @@ describe("released Oh SQLite facts-memory adapter", () => {
     await writeFile(path, JSON.stringify(metadata), { encoding: "utf8", mode: 0o600 });
     await expect(broker.inspect(parent)).rejects.toThrow("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
   });
+
+  test("bounds fork serialization before child open and history before verification", async () => {
+    const { broker, root } = await fixture();
+    const parent = createFactsMemoryBinding({ ownerId, sessionId: parentSessionId });
+    const child = createFactsMemoryBinding({ ownerId, sessionId: childSessionId });
+    await broker.create({ binding: parent, operationKey: `create:${parent.sessionId}` });
+    const payload = "x".repeat(950_000);
+    const records = Array.from({ length: 10 }, (_, index) => createKnowledgeGraphRecordV1({
+      dependencies: [],
+      key: `entity:oversized-${String(index).padStart(2, "0")}`,
+      kind: "entity",
+      v: 1,
+      value: { payload },
+    }));
+    expect(Buffer.byteLength(JSON.stringify(records), "utf8"))
+      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.forkSnapshotBytes);
+    const parentDirectory = join(root, parent.sessionId);
+    const parentAuthority = openOhAuthority(parent, parentDirectory);
+    await parentAuthority.store.commit({
+      actorId: "hra.memory.host",
+      changes: records.map((record) => ({ kind: "put" as const, record, v: 1 as const })),
+      expectedHead: await parentAuthority.store.head(),
+      operationId: "host.test.oversized-fork",
+    });
+    await parentAuthority.store.close();
+    expect(await sqliteLogicalBytes(parentDirectory))
+      .toBeLessThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+
+    await expect(broker.fork({
+      binding: child,
+      operationKey: `fork:${child.sessionId}`,
+      parent: { ...parent, head: await inspectionHead(broker, parent) },
+    })).rejects.toThrow("FACTS_MEMORY_OH_FORK_SNAPSHOT_TOO_LARGE");
+    await expect(lstat(join(root, child.sessionId, "oh.sqlite")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+    await expect(broker.inspect(child)).resolves.toEqual({ status: "missing" });
+
+    const churn = createFactsMemoryBinding({
+      ownerId,
+      sessionId: `sess_${"6".repeat(32)}`,
+    });
+    const churnReceipt = await broker.create({
+      binding: churn,
+      operationKey: `create:${churn.sessionId}`,
+    });
+    const churnDirectory = join(root, churn.sessionId);
+    const churnAuthority = openOhAuthority(churn, churnDirectory);
+    for (let index = 0; index < 110; index += 1) {
+      const record = createKnowledgeGraphRecordV1({
+        dependencies: [],
+        key: "entity:churn",
+        kind: "entity",
+        v: 1,
+        value: { index, payload },
+      });
+      await churnAuthority.store.commit({
+        actorId: "hra.memory.host",
+        changes: [{ kind: "put", record, v: 1 }],
+        expectedHead: await churnAuthority.store.head(),
+        operationId: `host.test.churn.${String(index)}`,
+      });
+    }
+    await churnAuthority.store.close();
+    expect(await sqliteLogicalBytes(churnDirectory))
+      .toBeGreaterThan(HRA_OH_FACTS_MEMORY_LIMITS_V1.sqliteLogicalBytes);
+    await expect(broker.inspect(churn)).rejects.toThrow("FACTS_MEMORY_OH_DATABASE_TOO_LARGE");
+    await expect(broker.purge({
+      binding: churn,
+      expectedHandleHash: churnReceipt.handleHash,
+      operationKey: `cleanup:${churn.sessionId}:expired`,
+    })).resolves.toBeDefined();
+    await expect(lstat(churnDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+  }, 30_000);
 
   test("fails closed above the released memory lane bound and has no Suss runtime", async () => {
     const { broker, root } = await fixture();
