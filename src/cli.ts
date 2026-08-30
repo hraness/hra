@@ -125,6 +125,7 @@ import {
   type DaemonIdentity,
 } from "./daemon/daemon-startup";
 import { PinnedCodexRuntimeManager } from "./daemon/codex-runtime-adapter";
+import { HraFactsMemoryLifecycle } from "./daemon/facts-memory-lifecycle";
 import { UnavailableCloudControl, type CloudControlPort, type CodexRuntimePort, type CompactProjectionRecoveryBlocker } from "./daemon/ports";
 import { SessionEventCursorCodec } from "./daemon/session-event-cursor";
 import { CommandFailure, HraService } from "./daemon/service";
@@ -137,6 +138,8 @@ import {
   type HraInstallation,
 } from "./installation";
 import { initializeStatePaths, resolveStatePaths, type StatePaths } from "./storage/paths";
+import { FactsMemoryControlStore } from "./storage/facts-memory-control";
+import { LocalFactsMemoryBroker } from "./storage/local-facts-memory-broker";
 import { resolveUsableCanonicalProjectDirectory } from "./storage/project-directory";
 import type { GenerationalSecretCustody } from "./storage/secret-custody";
 import { StateStore } from "./storage/state-store";
@@ -2808,6 +2811,7 @@ export async function runDaemon(
   await mkdir(paths.runtime, { recursive: true, mode: 0o700 });
   const daemonLock = await DaemonLock.acquire(paths);
   let store: StateStore | undefined;
+  let factsMemoryControl: FactsMemoryControlStore | undefined;
   let codex: PinnedCodexRuntimeManager | undefined;
   let service: HraService | undefined;
   let server: LocalDaemonServer | undefined;
@@ -3018,6 +3022,15 @@ export async function runDaemon(
       }
     }
     checkpointBoot();
+    factsMemoryControl = new FactsMemoryControlStore(paths.factsMemoryControl);
+    const { OhSqliteFactsMemoryEngine } = await import("./storage/oh-facts-memory-engine");
+    const factsMemory = new HraFactsMemoryLifecycle({
+      broker: new LocalFactsMemoryBroker({
+        engine: new OhSqliteFactsMemoryEngine(),
+        root: paths.factsMemorySessions,
+      }),
+      control: factsMemoryControl,
+    });
     const desktop = process.platform === "darwin" && installation.desktopSwitching
       ? (() => {
           const bundle = new ExactChatGptBundlePort("/Applications/ChatGPT.app");
@@ -3039,6 +3052,7 @@ export async function runDaemon(
       eventCursors,
       usageHistoryCursors,
       workCapabilities,
+      factsMemory,
       ...(desktop === undefined ? {} : { desktop }),
       requestStop,
     });
@@ -3150,6 +3164,9 @@ export async function runDaemon(
       process.exit(70);
     }
 
+    if (factsMemoryControl !== undefined) {
+      try { factsMemoryControl.close(); } catch (error: unknown) { cleanupErrors.push(error); }
+    }
     if (store !== undefined) {
       if (generation !== undefined && bootId !== undefined) {
         try { store.markDaemonStopped(generation, bootId); } catch (error: unknown) { cleanupErrors.push(error); }

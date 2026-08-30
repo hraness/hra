@@ -87,6 +87,7 @@ import {
   type WorkStore,
 } from "../storage/work-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
+import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { commandFailureBrand } from "./local-transport";
 import {
   CodexSessionObservationError,
@@ -436,6 +437,7 @@ const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
+export const FACTS_MEMORY_SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
 const isSqliteUniqueConstraint = (error: unknown): boolean =>
   error instanceof Error
@@ -480,6 +482,7 @@ export class HraService {
   readonly #work: WorkStore;
   readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
+  readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
@@ -498,6 +501,8 @@ export class HraService {
   #interactionDeadlineWake: (() => void) | undefined;
   #stopScheduled = false;
   #state: "open" | "closing" | "closed" = "open";
+  #terminalFactsMemoryRevision = 1;
+  #terminalFactsMemoryReconciledRevision = 0;
   #closeTask: Promise<void> | undefined;
 
   constructor(input: {
@@ -510,6 +515,7 @@ export class HraService {
     eventCursors?: SessionEventCursorCodec;
     usageHistoryCursors?: UsageHistoryCursorCodec;
     eventWaiters?: SessionEventWaiters;
+    factsMemory?: HraFactsMemoryLifecyclePort;
     workWaiters?: WorkEventWaiters;
     workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
@@ -533,6 +539,7 @@ export class HraService {
     this.#usageHistoryCursors = input.usageHistoryCursors
       ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
+    this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
     const workCapabilities = input.workCapabilities
@@ -578,6 +585,8 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#reconcileTerminalFactsMemory();
+      await this.#factsMemory?.sweepExpired(this.#now());
       const result = await this.#executeAdmitted(command, context);
       await this.#daemonAuthority.assertCurrent();
       return result;
@@ -699,7 +708,17 @@ export class HraService {
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
         case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
-        case "session.abandon": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "abandon", context.signal)); }
+        case "session.abandon": {
+          const session = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthority(session, async () => {
+            const current = this.#store.requireSession(session.id);
+            if (current.state !== "recovery_required") {
+              return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
+            }
+            await this.#cleanupFactsMemory(current, "abandon");
+            return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
+          });
+        }
         case "session.note.get": { const session = this.#store.requireSession(command.session); return { sessionId: session.id, note: session.note, revision: session.revision }; }
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
@@ -970,7 +989,12 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#reconcileTerminalFactsMemory();
+      await this.#factsMemory?.sweepExpired(this.#now());
       const result = await this.#executeRemoteAdmitted(command, expectedAuthority, context);
+      await this.#reconcileCommittedSessionFactsMemory(
+        this.#store.requireSession(expectedAuthority.sessionId),
+      );
       await this.#daemonAuthority.assertCurrent();
       return result;
     } catch (error: unknown) {
@@ -1080,6 +1104,7 @@ export class HraService {
     if (recoveredQueue.unresolved.length > 0) {
       throw new Error(`Daemon recovery cannot resolve ${String(recoveredQueue.unresolved.length)} dispatching queue authorities.`);
     }
+    await this.#reconcileTerminalFactsMemory();
     await this.#recoverPreparedWorkEffects(this.#interactionDeadlineAbort.signal);
     await this.#daemonAuthority.assertCurrent();
     const pendingSessions = new Set<string>();
@@ -1596,11 +1621,23 @@ export class HraService {
     if (recoveryUnsettled || this.#projectionRecoveriesInFlight.has(session.id)) return;
     let dispatchQueue = false;
     if (this.#mutationTails.has(`session:${session.id}`)) {
+      const priorRevision = this.#store.requireSession(session.id).revision;
       dispatchQueue = this.#applyCodexFact(authority, fact, session);
+      const committed = this.#store.requireSession(session.id);
+      if (committed.revision !== priorRevision) {
+        await this.#reconcileCommittedSessionFactsMemory(committed);
+      }
     } else {
       try {
-        dispatchQueue = await this.#serializeSessionAuthority(session, () =>
-          this.#applyCodexFact(authority, fact, session));
+        dispatchQueue = await this.#serializeSessionAuthority(session, async () => {
+          const priorRevision = this.#store.requireSession(session.id).revision;
+          const shouldDispatch = this.#applyCodexFact(authority, fact, session);
+          const committed = this.#store.requireSession(session.id);
+          if (committed.revision !== priorRevision) {
+            await this.#reconcileCommittedSessionFactsMemory(committed);
+          }
+          return shouldDispatch;
+        });
       } catch (error: unknown) {
         if (error instanceof CommandFailure && error.code === "RECOVERY_REQUIRED") return;
         throw error;
@@ -1639,6 +1676,7 @@ export class HraService {
     });
     if (terminal.event !== undefined) this.#eventWaiters.notify(current.id);
     for (const interaction of terminal.interactions) this.#appendInteractionState(interaction);
+    await this.#cleanupTerminalFactsMemory(this.#store.requireSession(current.id));
     this.#sessionProviderConnections.delete(current.id);
     this.#sessionObservationFailures.delete(current.id);
     this.#sessionResubscriptionConnections.delete(current.id);
@@ -2940,6 +2978,67 @@ export class HraService {
     });
   }
 
+  #factsMemoryExpiry(session: SessionRecord): number {
+    const admittedAt = Math.max(session.updatedAt, this.#now());
+    return Math.min(Number.MAX_SAFE_INTEGER, admittedAt + FACTS_MEMORY_SESSION_TTL_MS);
+  }
+
+  async #ensureFactsMemory(session: SessionRecord): Promise<void> {
+    if (this.#factsMemory === undefined) return;
+    try {
+      await this.#factsMemory.ensureSession({
+        expiresAt: this.#factsMemoryExpiry(session),
+        ownerId: session.profileId,
+        sessionId: session.id,
+      });
+    } catch (cause: unknown) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session facts-memory authority could not be created or reconciled. The provider session remains under its existing HRA authority; retry this exact session operation after reconciling local memory custody.",
+        { cause: cause instanceof Error ? cause.name : "error", sessionId: session.id },
+      );
+    }
+  }
+
+  async #cleanupFactsMemory(
+    session: SessionRecord,
+    reason: "abandon" | "archive" | "expired",
+  ): Promise<void> {
+    if (this.#factsMemory === undefined) return;
+    try {
+      await this.#factsMemory.cleanupSession({
+        ownerId: session.profileId,
+        reason,
+        sessionId: session.id,
+      });
+    } catch (cause: unknown) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session facts-memory directory could not be proven fully purged. HRA retained the cleanup authority for an exact retry.",
+        { cause: cause instanceof Error ? cause.name : "error", sessionId: session.id },
+      );
+    }
+  }
+
+  async #cleanupTerminalFactsMemory(
+    session: SessionRecord,
+    reason: "abandon" | "archive" = "archive",
+  ): Promise<void> {
+    this.#terminalFactsMemoryRevision += 1;
+    await this.#cleanupFactsMemory(session, reason);
+  }
+
+  async #reconcileCommittedSessionFactsMemory(
+    session: SessionRecord,
+    terminalReason: "abandon" | "archive" = "archive",
+  ): Promise<void> {
+    if (session.state === "terminal") {
+      await this.#cleanupTerminalFactsMemory(session, terminalReason);
+    } else if (session.state !== "recovery_required") {
+      await this.#ensureFactsMemory(session);
+    }
+  }
+
   async #ensureSessionObservedLocked(
     selector: string,
     signal: AbortSignal,
@@ -2959,6 +3058,7 @@ export class HraService {
       };
     }
     if (session.state === "terminal") {
+      await this.#cleanupTerminalFactsMemory(session);
       return {
         basis: "local_state",
         coverage: "not_attempted",
@@ -2982,6 +3082,7 @@ export class HraService {
         state: "recovery_required",
       };
     }
+    await this.#ensureFactsMemory(session);
     if (profile.state !== "signed_in") {
       return {
         basis: "local_state",
@@ -3102,6 +3203,7 @@ export class HraService {
           activeTurnId: reconciled.activeTurnId ?? null,
         });
       }
+      await this.#reconcileCommittedSessionFactsMemory(reconciled);
     }
     const mode = this.#sessionResubscriptionConnections.get(session.id) === observation.connectionId
       ? "resubscribed"
@@ -4502,9 +4604,10 @@ export class HraService {
       }
     }
     const projects = this.#store.listProjects();
-    const sessions = remote.sessions.map((projection) => {
+    const sessions: SessionRecord[] = [];
+    for (const projection of remote.sessions) {
       const projectId = projection.projectRoot === undefined ? undefined : projects.find((project) => project.rootPath === projection.projectRoot)?.id;
-      return this.#store.upsertProviderSession({
+      const session = this.#store.upsertProviderSession({
         profileId: profile.id,
         providerThreadId: projection.providerThreadId,
         ...(projectId === undefined ? {} : { projectId }),
@@ -4513,7 +4616,9 @@ export class HraService {
         ...(projection.activeTurnId === undefined ? {} : { activeTurnId: projection.activeTurnId }),
         ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
       });
-    });
+      sessions.push(session);
+      await this.#reconcileCommittedSessionFactsMemory(session);
+    }
     return { accountId: profile.id, sessions, nextCursor };
   }
 
@@ -4654,6 +4759,18 @@ export class HraService {
         if (localSessionId !== undefined) this.#quarantineSession(localSessionId);
       },
     });
+    try {
+      await this.#ensureFactsMemory(this.#store.requireSession(outcome.sessionId));
+    } catch (error: unknown) {
+      if (error instanceof CommandFailure) {
+        throw new CommandFailure(error.code, error.message, {
+          idempotencyKey: key,
+          nextCommand: `hra session show ${outcome.sessionId}`,
+          sessionId: outcome.sessionId,
+        });
+      }
+      throw error;
+    }
     await this.#ensureSessionObservedLocked(outcome.sessionId, signal);
     return {
       session: this.#store.requireSession(outcome.sessionId),
@@ -4987,6 +5104,7 @@ export class HraService {
           expectedRevision: session.revision,
           resolution: "abandoned",
         });
+        await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
         this.#scheduleIdleQueue(resolved);
         return {
           session: resolved,
@@ -5016,6 +5134,7 @@ export class HraService {
           ...(projection.providerUpdatedAt === undefined ? {} : { providerUpdatedAt: projection.providerUpdatedAt }),
         },
       });
+      await this.#reconcileCommittedSessionFactsMemory(resolved);
       this.#scheduleIdleQueue(resolved);
       return {
         session: resolved,
@@ -5058,6 +5177,7 @@ export class HraService {
         resolution: "abandoned",
         resolutionEvidence: { action: "user_abandon", providerEffectRetried: false, providerStateDeleted: false },
       });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
       this.#scheduleIdleQueue(resolved);
       return { session: resolved, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
@@ -5084,6 +5204,7 @@ export class HraService {
         resolutionEvidence: { action: "user_abandon", providerEffectRetried: false, providerStateDeleted: false, observedProviderUpdatedAt: projection.providerUpdatedAt ?? null },
         provider,
       });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
       this.#scheduleIdleQueue(resolved);
       return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
@@ -5101,6 +5222,7 @@ export class HraService {
       receipt: proof.receipt,
       provider,
     });
+    await this.#reconcileCommittedSessionFactsMemory(resolved);
     this.#scheduleIdleQueue(resolved);
     return { session: resolved, projection, idempotencyKey: attempt.idempotencyKey, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
@@ -5171,6 +5293,7 @@ export class HraService {
         resolutionEvidence: { action: "user_abandon", providerEffectRetried: false, providerStateDeleted: false, observedProviderUpdatedAt: projection.providerUpdatedAt ?? null },
         provider,
       });
+      await this.#reconcileCommittedSessionFactsMemory(resolved, "abandon");
       this.#scheduleIdleQueue(resolved);
       return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "abandoned", providerEffectRetried: false, providerStateDeleted: false } };
     }
@@ -5190,6 +5313,7 @@ export class HraService {
       receipt,
       provider,
     });
+    await this.#reconcileCommittedSessionFactsMemory(resolved);
     this.#scheduleIdleQueue(resolved);
     return { session: resolved, projection, queueId: record.queueId, recovery: { resolved: true, resolution: "proven_applied", providerEffectRetried: false } };
   }
@@ -5293,10 +5417,48 @@ export class HraService {
 
   async #updateSession(selector: string, fields: (session: SessionRecord) => Omit<Parameters<StateStore["updateSessionMetadata"]>[0], "sessionId">): Promise<SessionRecord> {
     const session = this.#store.requireSession(selector);
-    return await this.#serializeSessionAuthority(session, () => {
+    return await this.#serializeSessionAuthority(session, async () => {
       const current = this.#store.requireSession(session.id);
-      return this.#store.updateSessionMetadata({ sessionId: current.id, ...fields(current) });
+      const updated = this.#store.updateSessionMetadata({ sessionId: current.id, ...fields(current) });
+      if (updated.state !== "terminal" && updated.state !== "recovery_required") {
+        await this.#ensureFactsMemory(updated);
+      }
+      return updated;
     });
+  }
+
+  async #reconcileTerminalFactsMemory(): Promise<void> {
+    const targetRevision = this.#terminalFactsMemoryRevision;
+    if (
+      this.#terminalFactsMemoryReconciledRevision >= targetRevision
+      || this.#factsMemory === undefined
+    ) {
+      this.#terminalFactsMemoryReconciledRevision = targetRevision;
+      return;
+    }
+    let afterId: string | null = null;
+    let failed = false;
+    for (;;) {
+      const page = this.#store.listCloudSessionPage({ afterId, limit: 100 });
+      for (const session of page.sessions) {
+        if (session.state !== "terminal") continue;
+        try {
+          await this.#cleanupFactsMemory(session, "archive");
+        } catch {
+          // A damaged terminal row keeps its retry generation open, but cannot
+          // prevent unrelated commands or startup recovery from proceeding.
+          failed = true;
+        }
+      }
+      if (page.isDone || page.continueAfterId === null) break;
+      afterId = page.continueAfterId;
+    }
+    if (!failed) {
+      this.#terminalFactsMemoryReconciledRevision = Math.max(
+        this.#terminalFactsMemoryReconciledRevision,
+        targetRevision,
+      );
+    }
   }
 
   #publicProfile(profile: ProfileRecord): unknown {
