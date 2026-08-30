@@ -367,7 +367,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  archivePath = join(root, "hra-0.1.0.tgz");
+  archivePath = join(root, "hraness-hra-0.1.0.tgz");
   await chmod(archivePath, 0o600);
   archiveSha256 = createHash("sha256").update(await readFile(archivePath)).digest("hex");
 });
@@ -389,7 +389,7 @@ describe("transactional HRA installer", () => {
       "https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     expect(createHash("sha256").update(runtimeBytes).digest("hex")).toBe(
@@ -613,9 +613,9 @@ describe("transactional HRA installer", () => {
     expect(activeMetadata.isSymbolicLink()).toBeTrue();
     const activeTarget = await realpath(activePath);
     expect(activeTarget).toContain(`${join(bunRoot, "install", "hra", "versions")}/`);
-    expect(activeTarget).toEndWith("/install/global/node_modules/hra/src/cli.ts");
+    expect(activeTarget).toEndWith("/install/global/node_modules/@hraness/hra/src/cli.ts");
     expect((await lstat(activeTarget)).mode & 0o777).toBe(0o755);
-    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "hra")).exists()).toBeFalse();
+    expect(await Bun.file(join(bunRoot, "install", "global", "node_modules", "@hraness", "hra")).exists()).toBeFalse();
     expect(await Bun.file(join(bunRoot, "install", "hra", "install-intent.json")).exists()).toBeFalse();
     const versions = await readdir(join(bunRoot, "install", "hra", "versions"));
     expect(versions).toHaveLength(1);
@@ -636,7 +636,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { hra: "0.1.0" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.1.0" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({
@@ -864,7 +864,7 @@ describe("transactional HRA installer", () => {
       "  afterStageCleanupCustody: async () => {",
       `    const stage = (await fs.readdir(${JSON.stringify(authorityRoot)})).find((entry) => entry.startsWith(".staging-"));`,
       "    if (!stage) throw new Error(\"The extracted package stage is missing.\");",
-      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/hra/src/domain/values.ts");`,
+      `    const packageFile = path.join(${JSON.stringify(authorityRoot)}, stage, "install/global/node_modules/@hraness/hra/src/domain/values.ts");`,
       "    const bytes = Buffer.from(await fs.readFile(packageFile));",
       "    bytes[0] = (bytes[0] ?? 0) ^ 1;",
       "    await fs.writeFile(packageFile, bytes);",
@@ -1160,7 +1160,7 @@ describe("transactional HRA installer", () => {
       await Bun.sleep(10);
       recovered = await runInstaller(root);
     }
-    expect(recovered.exitCode).toBe(0);
+    expect(recovered.exitCode, recovered.stderr).toBe(0);
     expect(recovered.stdout).toBe(`${HRA_INSTALL_PREFLIGHT_SUCCESS}\n`);
     expect((await lstat(join(bunRoot, "bin", "hra"))).isSymbolicLink()).toBeTrue();
     expect((await readdir(authorityRoot)).some((entry) => entry.startsWith(".staging-"))).toBeFalse();
@@ -1198,7 +1198,7 @@ describe("transactional HRA installer", () => {
     expect((await lstat(publishedTarget)).mode & 0o777).toBe(0o755);
 
     const recovered = await runInstaller(root);
-    expect(recovered.exitCode).toBe(0);
+    expect(recovered.exitCode, recovered.stderr).toBe(0);
     expect(await realpath(activePath)).toBe(publishedTarget);
     expect(await Bun.file(join(root, "bun root", "install", "hra", "install-intent.json")).exists()).toBeFalse();
   }, 60_000);

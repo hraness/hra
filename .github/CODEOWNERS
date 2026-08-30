@@ -1,0 +1,18 @@
+# Release authority and supply-chain controls require the repository owner.
+/.github/ @0thernet
+/package.json @0thernet
+/bun.lock @0thernet
+/scripts/check-package.ts @0thernet
+/scripts/check-public-release.ts @0thernet
+/scripts/check-release-package.ts @0thernet
+/scripts/check-npm-trusted-publishing.ts @0thernet
+/scripts/package-policy.ts @0thernet
+/scripts/publish-github-release.ts @0thernet
+/scripts/publish-npm-release.ts @0thernet
+/scripts/release-artifact-checksum.ts @0thernet
+/scripts/release-distribution-policy.ts @0thernet
+/scripts/release-package-policy.ts @0thernet
+/scripts/verify-npm-provenance.ts @0thernet
+/src/install-normalizer.ts @0thernet
+/src/install-preflight-runtime.ts @0thernet
+/src/install-preflight.ts @0thernet

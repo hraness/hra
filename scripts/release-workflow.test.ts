@@ -36,7 +36,7 @@ describe("release workflow", () => {
     );
   });
 
-  test("keeps the retired fallback-bound path unreachable while exposing the current alias operator", async () => {
+  test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
     const root = join(import.meta.dir, "..");
     const packageJson = asRecord(
       JSON.parse(await readFile(join(root, "package.json"), "utf8")),
@@ -49,7 +49,7 @@ describe("release workflow", () => {
       readFile(join(root, "docs", "beta-release.md"), "utf8"),
     ]);
 
-    expect(await Bun.file(releaseWorkflow).exists()).toBeFalse();
+    expect(await Bun.file(releaseWorkflow).exists()).toBeTrue();
     expect(scripts["hosted:domain-cutover"]).toBeUndefined();
     expect(scripts["release:candidate"]).toBeUndefined();
     expect(scripts["release:publish"]).toBeUndefined();
@@ -63,9 +63,23 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: retired on 2026-08-27 without publication.");
+    expect(releaseRecord).toContain("Status: prepared but blocked before publication.");
     expect(releaseRecord).toContain("no `v0.1.0` tag");
-    expect(releaseRecord).toContain("no authorized publication path");
+    expect(releaseRecord).toContain("`@hraness/oh` is a GitHub runtime dependency");
+    const workflow = await readFile(releaseWorkflow, "utf8");
+    expect(workflow).toContain("id-token: write");
+    expect(workflow).toContain("npm pack --ignore-scripts --pack-destination artifacts .");
+    expect(workflow).toContain("release-artifact-checksum.ts");
+    expect(workflow).toContain("check-release-package.ts");
+    expect(workflow).toContain("publish-npm-release.ts");
+    expect(workflow).toContain("publish-github-release.ts");
+    expect(workflow).toContain("check-public-release.ts");
+    expect(workflow).toContain("os: [ubuntu-24.04, macos-15]");
+    expect(workflow).not.toContain("release-candidate.ts");
+    expect(workflow).not.toContain("publish-beta-release.ts");
+    expect(workflow).not.toContain("hra-weld.vercel.app");
+    expect(workflow).not.toContain("try-hra.vercel.app");
+    expect(workflow).not.toContain("convex");
   });
 
   test("gives the public-text gate complete Git history in CI", async () => {

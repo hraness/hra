@@ -16,6 +16,7 @@ const allowedPublicScopes = new Set([
 ]);
 const allowedPublicScopedPackages = new Set([
   "@hraness/design-kit",
+  "@hraness/hra",
   "@hraness/oh",
   "@hraness/site-footer",
   "@hraness/ui",

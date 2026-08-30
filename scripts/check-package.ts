@@ -33,7 +33,7 @@ import {
   assertPublicText,
   assertPublicTree,
 } from "./public-text-policy";
-import { assertProductionPackageOnly } from "./package-policy";
+import { assertProductionPackageOnly, assertReviewedReleaseInventory } from "./package-policy";
 import {
   assertPseudoTerminalSuccess,
   PTY_BEGIN_MARKER,
@@ -47,7 +47,12 @@ const packageSchema = z.object({
   exports: z.object({ ".": z.literal("./src/index.ts") }).strict(),
   files: z.array(z.string()).min(1),
   homepage: z.literal("https://hra.sh"),
-  name: z.literal("hra"),
+  license: z.literal("MIT"),
+  name: z.literal("@hraness/hra"),
+  publishConfig: z.object({
+    access: z.literal("public"),
+    registry: z.literal("https://registry.npmjs.org"),
+  }).strict(),
   repository: z.object({
     type: z.literal("git"),
     url: z.literal("git+https://github.com/hraness/hra.git"),
@@ -571,7 +576,7 @@ const terminateOwnedInstalledDaemon = async (daemon: OwnedInstalledDaemon): Prom
   });
 };
 
-export async function checkPackage(): Promise<void> {
+export async function checkPackage(suppliedArchive?: string): Promise<void> {
 const repositoryRoot = resolve(import.meta.dir, "..");
 const packageJson = packageSchema.parse(
   JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8")) as unknown,
@@ -619,11 +624,30 @@ try {
   }
   await symlink(process.execPath, join(runtimeBin, "bun"));
 
-  requireSuccess(
-    "package archive creation",
-    await run(process.execPath, ["pm", "pack", "--ignore-scripts", "--destination", packageDirectory], { cwd: repositoryRoot }),
-  );
-  const archive = join(packageDirectory, `${packageJson.name}-${packageJson.version}.tgz`);
+  const expectedArchiveName = `hraness-hra-${packageJson.version}.tgz`;
+  let archive: string;
+  if (suppliedArchive === undefined) {
+    requireSuccess(
+      "package archive creation",
+      await run("npm", ["pack", "--ignore-scripts", "--pack-destination", packageDirectory, "."], { cwd: repositoryRoot }),
+    );
+    archive = join(packageDirectory, expectedArchiveName);
+  } else {
+    archive = resolve(suppliedArchive);
+    const archiveMetadata = await lstat(archive);
+    if (
+      archive !== suppliedArchive
+      || basename(archive) !== expectedArchiveName
+      || !archiveMetadata.isFile()
+      || archiveMetadata.isSymbolicLink()
+      || archiveMetadata.nlink !== 1
+      || archiveMetadata.size < 1
+      || archiveMetadata.size > 64 * 1024 * 1024
+      || await realpath(archive) !== archive
+    ) {
+      throw new Error(`Supplied package archive must be one exact bounded ${expectedArchiveName} regular file.`);
+    }
+  }
   const inspectionDirectory = join(temporaryRoot, "inspection");
   await mkdir(inspectionDirectory, { recursive: true, mode: 0o700 });
   requireSuccess(
@@ -632,6 +656,7 @@ try {
   );
   await assertPublicTree(inspectionDirectory);
   await assertProductionPackageOnly(inspectionDirectory);
+  await assertReviewedReleaseInventory(join(inspectionDirectory, "package"));
   assertHraInstallManifest(
     JSON.parse(await readFile(join(inspectionDirectory, "package", "package.json"), "utf8")) as unknown,
   );
@@ -677,7 +702,7 @@ try {
       env: isolatedEnvironment,
     }),
   );
-  const localPackageRoot = join(consumerDirectory, "node_modules", "hra");
+  const localPackageRoot = join(consumerDirectory, "node_modules", "@hraness", "hra");
   const executable = join(consumerDirectory, "node_modules", ".bin", "hra");
   assertHraInstallManifest(
     JSON.parse(await readFile(join(localPackageRoot, "package.json"), "utf8")) as unknown,
@@ -694,14 +719,14 @@ try {
   );
   await assertProductionPackageOnly(localPackageRoot, "installed");
   z.object({
-    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "hra")),
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/hra")),
     trustedDependencies: z.undefined().optional(),
   }).passthrough().parse(
     JSON.parse(await readFile(join(consumerDirectory, "package.json"), "utf8")) as unknown,
   );
   requireSuccess(
     "side-effect-free package import",
-    await run(process.execPath, ["-e", "await import('hra')"], {
+    await run(process.execPath, ["-e", "await import('@hraness/hra')"], {
       cwd: consumerDirectory,
       env: isolatedEnvironment,
     }),
@@ -757,7 +782,7 @@ try {
   }
   const globalCli = await realpath(globalExecutable);
   const globalPackageRoot = dirname(dirname(globalCli));
-  const globalVersionRoot = resolve(globalPackageRoot, "..", "..", "..", "..");
+  const globalVersionRoot = resolve(globalPackageRoot, "..", "..", "..", "..", "..");
   if (!globalVersionRoot.startsWith(`${join(globalInstallRoot, "install", "hra", "versions")}${sep}`)) {
     throw new Error("The active global HRA command is outside its protected complete-version root.");
   }
@@ -771,14 +796,14 @@ try {
   await access(globalNormalizer, constants.R_OK);
   await assertProductionPackageOnly(globalPackageRoot, "installed");
   z.object({
-    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "hra")),
+    dependencies: z.record(z.string(), z.string()).refine((value) => Object.hasOwn(value, "@hraness/hra")),
     trustedDependencies: z.undefined().optional(),
   }).passthrough().parse(
     JSON.parse(
       await readFile(join(globalVersionRoot, "install", "global", "package.json"), "utf8"),
     ) as unknown,
   );
-  if (await Bun.file(join(globalInstallRoot, "install", "global", "node_modules", "hra")).exists()) {
+  if (await Bun.file(join(globalInstallRoot, "install", "global", "node_modules", "@hraness", "hra")).exists()) {
     throw new Error("The transactional global install exposed HRA in Bun's final global package path.");
   }
   const globalHelp = requireSuccess(
@@ -1170,4 +1195,8 @@ try {
 }
 }
 
-if (import.meta.main) await checkPackage();
+if (import.meta.main) {
+  const arguments_ = process.argv.slice(2);
+  if (arguments_.length > 1) throw new Error("Usage: check-package.ts [ABSOLUTE-ARTIFACT.tgz]");
+  await checkPackage(arguments_[0]);
+}

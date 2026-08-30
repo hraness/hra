@@ -1,8 +1,12 @@
 {
-  "name": "hra",
+  "name": "@hraness/hra",
   "version": "0.1.0",
   "description": "A persistent Codex CLI for isolated accounts, live sessions, and encrypted device sync.",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -83,6 +87,7 @@
     "fast-check": "4.3.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "sigstore": "4.1.1",
     "typescript": "5.9.2",
     "typescript-eslint": "8.67.0"
   }

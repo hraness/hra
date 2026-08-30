@@ -369,10 +369,10 @@ describe("installed package generic command ownership", () => {
     const source = await readFile(join(import.meta.dir, "check-package.ts"), "utf8");
     expect(source).toContain("const run = runPackageCommand;");
     for (const command of [
-      '["pm", "pack", "--ignore-scripts"',
+      'await run("npm", ["pack", "--ignore-scripts", "--pack-destination"',
       '["-xzpf", archive, "-C", inspectionDirectory]',
       '["add", "--backend=copyfile", "--ignore-scripts", archive]',
-      '["-e", "await import(\'hra\')"]',
+      '["-e", "await import(\'@hraness/hra\')"]',
       'run(executable, ["--help"]',
       'run(executable, ["--version"]',
       'run(executable, ["doctor", "--offline", "--json"]',

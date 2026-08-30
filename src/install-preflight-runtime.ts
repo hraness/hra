@@ -26,12 +26,12 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export const HRA_INSTALL_BUN_VERSION = "1.3.14";
-export const HRA_INSTALL_PACKAGE_NAME = "hra";
+export const HRA_INSTALL_PACKAGE_NAME = "@hraness/hra";
 export const HRA_INSTALL_PACKAGE_VERSION = "0.1.0";
 export const HRA_INSTALL_CLI_SHA256 = "4ec12b00de84a5c5e830fc8cac3f2303cb0dffa6d262dc2c51773bce5039f308";
-export const HRA_INSTALL_NORMALIZER_SHA256 = "70366a2e55b9fd27aedb49b4bc453164b35b3744ff80dddcf335ba06ee407711";
-export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.1.0/hra-v0.1.0.tgz";
-export const HRA_INSTALL_ARCHIVE_NAME = "hra-v0.1.0.tgz";
+export const HRA_INSTALL_NORMALIZER_SHA256 = "912fca4d54e35fa7f474be77ea10d7401b4ac0686c706b22faba4e3e53bb4144";
+export const HRA_INSTALL_ARCHIVE_URL = "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz";
+export const HRA_INSTALL_ARCHIVE_NAME = "hraness-hra-0.1.0.tgz";
 export const HRA_INSTALL_RELEASE_API_URL = "https://api.github.com/repos/hraness/hra/releases/tags/v0.1.0";
 export const HRA_INSTALL_RELEASE_TAG = "v0.1.0";
 export const HRA_INSTALL_REPOSITORY_API_URL = "https://api.github.com/repos/hraness/hra";
@@ -640,7 +640,7 @@ if (testMode === "normal") {
     heldArchiveIdentity = verifiedArchive.identity;
     archiveSnapshot = verifiedArchive.snapshot;
     if (archiveSnapshot === undefined) throw new Error("The private HRA archive snapshot is unavailable.");
-    const route = "/" + randomUUID() + "/hra-v0.1.0.tgz";
+    const route = "/" + randomUUID() + "/hraness-hra-0.1.0.tgz";
     let requests = 0;
     archiveServer = Bun.serve({
       hostname: "127.0.0.1",
@@ -1547,7 +1547,7 @@ type CompleteReceipt = HraInstallArchiveIdentity & Readonly<{
   entryCount: number;
   id: string;
   normalizerSha256: string;
-  packageName: "hra";
+  packageName: "@hraness/hra";
   packageVersion: string;
   totalBytes: number;
   treeSha256: string;
@@ -1735,7 +1735,7 @@ const assertManifest = async (
     } catch {
       throw new InstallPreflightError("The installed HRA package manifest is not valid JSON.");
     }
-    if (!isRecord(value) || value.name !== "hra" || value.version !== expectedVersion) {
+    if (!isRecord(value) || value.name !== HRA_INSTALL_PACKAGE_NAME || value.version !== expectedVersion) {
       throw new InstallPreflightError("The installed HRA package identity is not exact.");
     }
     if (
@@ -1794,7 +1794,7 @@ const verifyCompleteVersion = async (
   const record = (value: readonly (number | string)[]): void => {
     treeHasher.update(`${JSON.stringify(value)}\n`, "utf8");
   };
-  const cliPath = join(versionRoot, "install", "global", "node_modules", "hra", "src", "cli.ts");
+  const cliPath = join(versionRoot, "install", "global", "node_modules", "@hraness", "hra", "src", "cli.ts");
   const normalizerPath = join(dirname(cliPath), "install-normalizer.ts");
   const visit = async (directory: string): Promise<void> => {
     const directoryHandle = await open(
@@ -1947,7 +1947,7 @@ const verifyActiveTarget = async (
   expectedRelease?: ReleaseIdentity,
 ): Promise<VerifiedVersion> => {
   const target = isAbsolute(rawTarget) ? resolve(rawTarget) : resolve(dirname(activePath), rawTarget);
-  const versionRoot = resolve(target, "..", "..", "..", "..", "..", "..");
+  const versionRoot = resolve(target, "..", "..", "..", "..", "..", "..", "..");
   const verified = await verifyCompleteVersion(versionRoot, authorityRoot, uid, expectedRelease);
   if (verified.cliPath !== target || await realpath(activePath) !== target) {
     throw new InstallPreflightError("The active hra command does not resolve to its verified version entry point.");
@@ -2660,7 +2660,7 @@ const completeStagedVersion = async (
     hooks,
     uid,
   });
-  const packageRoot = join(intent.stagingRoot, "install", "global", "node_modules", "hra");
+  const packageRoot = join(intent.stagingRoot, "install", "global", "node_modules", "@hraness", "hra");
   const normalizerPath = join(packageRoot, "src", "install-normalizer.ts");
   const normalizerBytes = await readExactFile(normalizerPath, uid, 2 * 1024 * 1024, [0o600, 0o644]);
   let imported: unknown;
@@ -2875,6 +2875,7 @@ const recoverInterruptedInstall = async (input: Readonly<{
     "install",
     "global",
     "node_modules",
+    "@hraness",
     "hra",
     "src",
     "cli.ts",
@@ -3270,12 +3271,12 @@ const installIntoStage = async (input: Readonly<{
     const globalDependencies = globalManifest.dependencies;
     if (
       !isRecord(globalDependencies)
-      || !hasExactKeys(globalDependencies, ["hra"])
-      || typeof globalDependencies.hra !== "string"
+      || !hasExactKeys(globalDependencies, [HRA_INSTALL_PACKAGE_NAME])
+      || typeof globalDependencies[HRA_INSTALL_PACKAGE_NAME] !== "string"
     ) throw new InstallPreflightError("Bun staging did not record one exact isolated HRA dependency.");
     let stagedArchiveUrl: URL;
     try {
-      stagedArchiveUrl = new URL(globalDependencies.hra);
+      stagedArchiveUrl = new URL(globalDependencies[HRA_INSTALL_PACKAGE_NAME]);
     } catch {
       throw new InstallPreflightError("Bun staging recorded an invalid isolated HRA archive URL.");
     }
@@ -3290,13 +3291,13 @@ const installIntoStage = async (input: Readonly<{
       || stagedArchivePort > 65_535
       || stagedArchiveUrl.search !== ""
       || stagedArchiveUrl.hash !== ""
-      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hra-v0\.1\.0\.tgz$/u.test(stagedArchiveUrl.pathname)
+      || !/^\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/hraness-hra-0\.1\.0\.tgz$/u.test(stagedArchiveUrl.pathname)
     ) throw new InstallPreflightError("Bun staging left its descriptor-bound loopback archive authority.");
     await unlinkHeldChild(stageCustody, globalInstallRoot, "bun.lock", { missing: true });
     await stageCustody.assertAll();
     await writeAtomicJson(
       globalManifestPath,
-      { dependencies: { hra: HRA_INSTALL_PACKAGE_VERSION } },
+      { dependencies: { [HRA_INSTALL_PACKAGE_NAME]: HRA_INSTALL_PACKAGE_VERSION } },
       input.uid,
       stageCustody,
     );
