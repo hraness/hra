@@ -160,6 +160,7 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   readonly #broker: FactsMemoryBrokerPort;
   readonly #control: FactsMemoryControlStore;
   readonly #tails = new Map<string, Promise<unknown>>();
+  #sweepAfterSessionId: string | null = null;
 
   constructor(input: Readonly<{
     broker: FactsMemoryBrokerPort;
@@ -303,7 +304,14 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   }
 
   async sweepExpired(now: number): Promise<Readonly<{ attempted: number; failed: number; purged: number }>> {
-    const records = this.#control.listExpired(now);
+    let records = this.#control.listExpired(now, 16, this.#sweepAfterSessionId);
+    if (records.length === 0 && this.#sweepAfterSessionId !== null) {
+      this.#sweepAfterSessionId = null;
+      records = this.#control.listExpired(now, 16, null);
+    }
+    if (records.length > 0) {
+      this.#sweepAfterSessionId = records.at(-1)?.binding.sessionId ?? null;
+    }
     let failed = 0;
     let purged = 0;
     for (const record of records) {
@@ -518,8 +526,13 @@ export class HraFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
   ): Promise<FactsMemoryControlRecord> {
     const binding = existing.binding;
     const exact = this.#control.requireExact(binding);
-    const reason = exact.cleanupReason ?? requestedReason;
-    const operationKey = exact.cleanupOperationKey ?? this.#cleanupOperationKey(binding, reason);
+    const sealsExpiredPurge = exact.state === "purged"
+      && exact.cleanupReason === "expired"
+      && requestedReason !== "expired";
+    const reason = sealsExpiredPurge ? requestedReason : exact.cleanupReason ?? requestedReason;
+    const operationKey = sealsExpiredPurge
+      ? this.#cleanupOperationKey(binding, reason)
+      : exact.cleanupOperationKey ?? this.#cleanupOperationKey(binding, reason);
     const pending = this.#control.beginCleanup({ binding, operationKey, reason });
     if (pending.state === "purged") return pending;
     const purge = assertPurgeReceipt(binding, await this.#broker.purge({

@@ -63,8 +63,10 @@ class FakeBroker implements FactsMemoryBrokerPort {
   forkCalls = 0;
   purgeCalls = 0;
   failCreateAfterCommit = false;
+  failForkAfterCommit = false;
   failInspectOnce = false;
   failPurgeOnce = false;
+  readonly failPurgeSessions = new Set<string>();
   inspectGate: Promise<void> | undefined;
   inspectEntered: (() => void) | undefined;
   lastParent: FactsMemoryCheckpoint | null = null;
@@ -87,6 +89,10 @@ class FakeBroker implements FactsMemoryBrokerPort {
     const receipt = storeReceipt(input.binding, input.parent.head);
     this.receipts.set(input.binding.sessionId, receipt);
     this.heads.set(input.binding.sessionId, receipt.head);
+    if (this.failForkAfterCommit) {
+      this.failForkAfterCommit = false;
+      throw new Error("lost fork response");
+    }
     return receipt;
   }
 
@@ -111,6 +117,9 @@ class FakeBroker implements FactsMemoryBrokerPort {
 
   async purge(input: { binding: FactsMemoryBinding; expectedHandleHash: string | null }) {
     this.purgeCalls += 1;
+    if (this.failPurgeSessions.has(input.binding.sessionId)) {
+      throw new Error("persistent purge failure");
+    }
     const present = this.receipts.get(input.binding.sessionId);
     const handleHash = present?.handleHash ?? input.expectedHandleHash ?? "e".repeat(64);
     this.receipts.delete(input.binding.sessionId);
@@ -329,6 +338,37 @@ describe("HRA facts-memory lifecycle", () => {
     });
   });
 
+  test("fences a parent epoch until a crash-left child fork becomes exactly recoverable", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
+    broker.failForkAfterCommit = true;
+    await expect(lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId,
+      ownerId,
+      parentSessionId: sessionId,
+    })).rejects.toThrow("lost fork response");
+    expect(control.get(childSessionId)?.state).toBe("create_ambiguous");
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).rejects.toThrow("FACTS_MEMORY_PARENT_REFERENCED");
+    expect(control.get(sessionId)?.state).toBe("active");
+
+    await expect(lifecycle.forkSession({
+      childExpiresAt: 2_000,
+      childSessionId,
+      ownerId,
+      parentSessionId: sessionId,
+    })).resolves.toMatchObject({ state: "active" });
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
+  });
+
   test("refuses to reinterpret an existing child as a fork or change its parent", async () => {
     const { lifecycle } = await fixture();
     await lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 1_000 });
@@ -437,6 +477,43 @@ describe("HRA facts-memory lifecycle", () => {
     await lifecycle.cleanupSession({ ownerId, reason: "archive", sessionId });
     await expect(lifecycle.ensureSession({ ownerId, sessionId, expiresAt: 2_000 }))
       .rejects.toThrow("FACTS_MEMORY_STORE_RETIRED");
+  });
+
+  test("seals an already expired purge as archive or abandon before reactivation", async () => {
+    const { control, lifecycle } = await fixture();
+    for (const [index, reason] of (["archive", "abandon"] as const).entries()) {
+      const terminalSessionId = `sess_${String(index + 40).padStart(32, "0")}`;
+      await lifecycle.ensureSession({ ownerId, sessionId: terminalSessionId, expiresAt: 100 });
+      await lifecycle.sweepExpired(100);
+      expect(control.get(terminalSessionId)).toMatchObject({
+        cleanupReason: "expired",
+        state: "purged",
+      });
+      await expect(lifecycle.cleanupSession({
+        ownerId,
+        reason,
+        sessionId: terminalSessionId,
+      })).resolves.toMatchObject({ state: "purged" });
+      expect(control.get(terminalSessionId)).toMatchObject({ cleanupReason: reason, state: "purged" });
+      await expect(lifecycle.ensureSession({
+        ownerId,
+        sessionId: terminalSessionId,
+        expiresAt: 1_000,
+      })).rejects.toThrow("FACTS_MEMORY_STORE_RETIRED");
+    }
+  });
+
+  test("advances its bounded expiry cursor past sixteen poisoned cleanups", async () => {
+    const { broker, control, lifecycle } = await fixture();
+    const sessionIds = Array.from({ length: 17 }, (_, index) =>
+      `sess_${String(index + 100).padStart(32, "0")}`);
+    for (const candidate of sessionIds) {
+      await lifecycle.ensureSession({ ownerId, sessionId: candidate, expiresAt: 100 });
+    }
+    for (const candidate of sessionIds.slice(0, 16)) broker.failPurgeSessions.add(candidate);
+    expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 16, failed: 16, purged: 0 });
+    expect(await lifecycle.sweepExpired(100)).toEqual({ attempted: 1, failed: 0, purged: 1 });
+    expect(control.get(sessionIds[16] as string)?.state).toBe("purged");
   });
 
   test("fences a stale expiry page behind a queued renewal", async () => {

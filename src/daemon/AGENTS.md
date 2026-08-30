@@ -9,4 +9,4 @@
 - Validate owner, mode, type, link count, containment, and canonical path before using an endpoint.
 - Use absolute wall-clock deadlines, close admission before shutdown, abort in-flight reads, and join every owned task before storage closes.
 - Serialize mutations by their authority key. Allow bounded independent reads that cannot observe torn state.
-- Reconcile facts-memory creation, accepted-head ancestry, historical exact-head fork, and whole-directory cleanup by immutable owner/session/epoch binding. Do not expose semantic-store selection or purge through commands or tools.
+- Reconcile facts-memory creation, accepted-head ancestry, historical exact-head fork, and whole-directory cleanup by immutable owner/session/epoch binding. Fence parent cleanup behind unresolved child forks, admit live TTL from current host time, and clean every terminal commit immediately plus restart-safe isolated scans. Do not expose semantic-store selection or purge through commands or tools.

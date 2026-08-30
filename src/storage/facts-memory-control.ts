@@ -472,6 +472,18 @@ export class FactsMemoryControlStore {
     if (parent !== undefined && parent.ownerId !== binding.ownerId) {
       throw new Error("FACTS_MEMORY_PARENT_AUTHORITY_MISMATCH");
     }
+    if (parent !== undefined) {
+      const parentRecord = this.get(parent.sessionId);
+      if (
+        parentRecord === null
+        || parentRecord.state !== "active"
+        || parentRecord.binding.epoch !== parent.epoch
+        || parentRecord.binding.ownerId !== parent.ownerId
+        || parentRecord.binding.bindingDigest !== parent.bindingDigest
+        || parentRecord.head === null
+        || !headsEqual(parentRecord.head, parent.head)
+      ) throw new Error("FACTS_MEMORY_PARENT_NOT_ACTIVE");
+    }
     const now = unixMillisecondsSchema.parse(this.#now());
     const latest = this.get(binding.sessionId);
     if (latest !== null && latest.binding.epoch !== binding.epoch) {
@@ -668,12 +680,51 @@ export class FactsMemoryControlStore {
     const current = this.requireExact(input.binding);
     const operationKey = operationKeySchema.parse(input.operationKey);
     const reason = factsMemoryCleanupReasonSchema.parse(input.reason);
-    if (current.state === "purged" || current.state === "cleanup_pending") {
+    if (current.state === "purged") {
+      if (current.cleanupOperationKey === operationKey && current.cleanupReason === reason) {
+        return current;
+      }
+      if (
+        current.cleanupReason !== "expired"
+        || reason === "expired"
+        || current.cleanupReceiptDigest === null
+        || current.purgedAt === null
+      ) throw new Error("FACTS_MEMORY_CLEANUP_REPLAY_MISMATCH");
+      const reusedValue = this.#database.query(
+        "SELECT session_id FROM facts_memory_lifecycles WHERE cleanup_operation_key=?",
+      ).get(operationKey);
+      const reused = reusedValue === null ? null : operationKeyOwnerRowSchema.parse(reusedValue);
+      if (reused !== null && reused.session_id !== current.binding.sessionId) {
+        throw new Error("FACTS_MEMORY_OPERATION_KEY_REUSED");
+      }
+      const sealed = this.#database.query(
+        `UPDATE facts_memory_lifecycles SET cleanup_reason=?,cleanup_operation_key=?,
+         revision=revision+1,updated_at=? WHERE session_id=? AND epoch=? AND revision=?
+         AND state='purged' AND cleanup_reason='expired'`,
+      ).run(
+        reason,
+        operationKey,
+        this.#now(),
+        current.binding.sessionId,
+        current.binding.epoch,
+        current.revision,
+      );
+      if (sealed.changes !== 1) throw new Error("FACTS_MEMORY_CLEANUP_CAS_CONFLICT");
+      return this.requireExact(current.binding);
+    }
+    if (current.state === "cleanup_pending") {
       if (current.cleanupOperationKey !== operationKey || current.cleanupReason !== reason) {
         throw new Error("FACTS_MEMORY_CLEANUP_REPLAY_MISMATCH");
       }
       return current;
     }
+    const unresolvedChild = this.#database.query(
+      `SELECT session_id FROM facts_memory_lifecycles
+       WHERE parent_session_id=? AND parent_epoch=?
+         AND state IN ('reserved','creating','create_ambiguous','recovery_required')
+       ORDER BY session_id LIMIT 1`,
+    ).get(current.binding.sessionId, current.binding.epoch);
+    if (unresolvedChild !== null) throw new Error("FACTS_MEMORY_PARENT_REFERENCED");
     const reusedValue = this.#database.query(
       "SELECT session_id FROM facts_memory_lifecycles WHERE cleanup_operation_key=?",
     ).get(operationKey);
@@ -731,15 +782,21 @@ export class FactsMemoryControlStore {
     return this.requireExact(current.binding);
   }
 
-  listExpired(nowValue: number, limit = 16): readonly FactsMemoryControlRecord[] {
+  listExpired(
+    nowValue: number,
+    limit = 16,
+    afterSessionId: string | null = null,
+  ): readonly FactsMemoryControlRecord[] {
     const now = unixMillisecondsSchema.parse(nowValue);
     const bounded = z.number().int().min(1).max(64).parse(limit);
+    const after = afterSessionId === null ? null : sessionIdSchema.parse(afterSessionId);
     return this.#database.query(
       `SELECT * FROM facts_memory_lifecycles
-       WHERE state='cleanup_pending'
-          OR (expires_at<=? AND state IN ('reserved','creating','create_ambiguous','active','recovery_required'))
-       ORDER BY CASE WHEN state='cleanup_pending' THEN 0 ELSE 1 END,expires_at,session_id LIMIT ?`,
-    ).all(now, bounded).map(mapRow);
+       WHERE (? IS NULL OR session_id>?) AND (
+         state='cleanup_pending'
+         OR (expires_at<=? AND state IN ('reserved','creating','create_ambiguous','active','recovery_required'))
+       ) ORDER BY session_id LIMIT ?`,
+    ).all(after, after, now, bounded).map(mapRow);
   }
 
   /** Test/operator proof that the control plane contains authority metadata, never facts. */

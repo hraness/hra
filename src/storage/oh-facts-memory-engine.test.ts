@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createKnowledgeGraphRecordV1 } from "@hraness/oh";
+import { OH_LIBSQL_STORE_LIMITS_V1 } from "@hraness/oh/libsql";
 import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
 import { OH_WORKING_STORE_PROFILE_V1 } from "@hraness/oh/store";
 
@@ -35,6 +36,7 @@ const parentSessionId = `sess_${"1".repeat(32)}`;
 const childSessionId = `sess_${"2".repeat(32)}`;
 const metadataName = ".hra-oh-adapter-v1.json";
 const pendingMetadataName = ".hra-oh-adapter-v1.pending";
+const migratingMetadataName = ".hra-oh-adapter-v1.migrating";
 
 const roots: string[] = [];
 const controls: FactsMemoryControlStore[] = [];
@@ -90,6 +92,8 @@ describe("released Oh SQLite facts-memory adapter", () => {
       .toBe("github:hraness/oh#v0.2.0");
     const lockfile = await readFile(join(import.meta.dir, "..", "..", "bun.lock"), "utf8");
     expect(lockfile).toContain("@hraness/oh@github:hraness/oh#89fb133");
+    expect(OH_LIBSQL_STORE_LIMITS_V1.snapshotComponentBytes).toBe(6 * 1024 * 1024);
+    expect(OH_LIBSQL_STORE_LIMITS_V1.providerResponseBytes).toBe(9_000_000);
     await expect(lstat(join(import.meta.dir, "..", "..", "node_modules", "@suss", "datalog")))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -122,12 +126,65 @@ describe("released Oh SQLite facts-memory adapter", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
 
     const legacyMetadataPath = join(root, binding.sessionId, metadataName);
-    const legacyMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+    const currentMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+      adapterDigest: string;
+      bindingDigest: string;
+      createdAt: number;
+      createKind: "create";
+      handleHash: string;
+      initialHead: { digest: string; operationSha256: null; sequence: 0 };
+      ohBindingSha256: string;
+      operationKey: string;
+      parent: null;
+      receiptDigest: string;
+      version: 1;
+    };
+    const legacyBody = {
+      bindingDigest: currentMetadata.bindingDigest,
+      createdAt: currentMetadata.createdAt,
+      createKind: currentMetadata.createKind,
+      handleHash: currentMetadata.handleHash,
+      initialHead: {
+        digest: currentMetadata.initialHead.digest,
+        sequence: currentMetadata.initialHead.sequence,
+      },
+      ohBindingSha256: currentMetadata.ohBindingSha256,
+      operationKey: currentMetadata.operationKey,
+      parent: currentMetadata.parent,
+      receiptDigest: currentMetadata.receiptDigest,
+      version: currentMetadata.version,
+    };
+    const legacyAdapterDigest = digestParts("hra-oh-adapter-metadata-v1", [
+      legacyBody.bindingDigest,
+      String(legacyBody.createdAt),
+      legacyBody.createKind,
+      legacyBody.handleHash,
+      String(legacyBody.initialHead.sequence),
+      legacyBody.initialHead.digest,
+      legacyBody.ohBindingSha256,
+      legacyBody.operationKey,
+      "no-parent",
+      "no-parent",
+      "no-parent",
+      "no-parent",
+      "no-parent",
+      legacyBody.receiptDigest,
+      String(legacyBody.version),
+    ]);
+    await writeFile(legacyMetadataPath, JSON.stringify({
+      ...legacyBody,
+      adapterDigest: legacyAdapterDigest,
+    }), { mode: 0o600 });
+    await writeFile(join(root, binding.sessionId, migratingMetadataName), "{", { mode: 0o600 });
+    expect(await restartedBroker.inspect(binding)).toMatchObject({ status: "present" });
+    const migratedMetadata = JSON.parse(await readFile(legacyMetadataPath, "utf8")) as {
+      adapterDigest: string;
       initialHead: Record<string, unknown>;
     };
-    delete legacyMetadata.initialHead.operationSha256;
-    await writeFile(legacyMetadataPath, JSON.stringify(legacyMetadata), { mode: 0o600 });
-    await expect(restartedBroker.inspect(binding)).resolves.toMatchObject({ status: "present" });
+    expect(migratedMetadata.initialHead.operationSha256).toBeNull();
+    expect(migratedMetadata.adapterDigest).not.toBe(legacyAdapterDigest);
+    await expect(lstat(join(root, binding.sessionId, migratingMetadataName)))
+      .rejects.toMatchObject({ code: "ENOENT" });
 
     await chmod(legacyMetadataPath, 0o666);
     await expect(restartedBroker.inspect(binding)).rejects.toThrow("FACTS_MEMORY_OH_METADATA_UNSAFE");
@@ -395,6 +452,12 @@ describe("released Oh SQLite facts-memory adapter", () => {
     });
     await advancedParent.store.close();
 
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId: parent.sessionId,
+    })).rejects.toThrow("FACTS_MEMORY_PARENT_REFERENCED");
+    expect((await lstat(join(root, parent.sessionId))).isDirectory()).toBe(true);
     await expect(lifecycle.forkSession({
       childExpiresAt: 2_000,
       childSessionId: child.sessionId,
@@ -406,6 +469,11 @@ describe("released Oh SQLite facts-memory adapter", () => {
       .toEqual([source.key]);
     expect((await reopened.store.verify()).operations).toBe(1);
     await reopened.store.close();
+    await expect(lifecycle.cleanupSession({
+      ownerId,
+      reason: "archive",
+      sessionId: parent.sessionId,
+    })).resolves.toMatchObject({ state: "purged" });
   });
 
   test("rejects a copied sidecar over a valid divergent same-binding history", async () => {

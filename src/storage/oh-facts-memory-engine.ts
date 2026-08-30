@@ -14,7 +14,7 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { createOhSqliteStoreAuthorityV1 } from "@hraness/oh/sqlite";
 import {
@@ -42,12 +42,13 @@ import {
   type FactsMemoryStoreInspection,
   type FactsMemoryStoreReceipt,
 } from "../domain/facts-memory";
-import { unixMillisecondsSchema } from "../domain/values";
+import { profileIdSchema, sessionIdSchema, unixMillisecondsSchema } from "../domain/values";
 import type { FactsMemoryBrokerInspection } from "../daemon/facts-memory-lifecycle";
 import type { LocalOhFactsMemoryEnginePort } from "./local-facts-memory-broker";
 
 const adapterMetadataName = ".hra-oh-adapter-v1.json";
 const adapterMetadataPendingName = ".hra-oh-adapter-v1.pending";
+const adapterMetadataMigrationName = ".hra-oh-adapter-v1.migrating";
 const databaseName = "oh.sqlite";
 const operationKeySchema = z.string().min(1).max(200);
 const maximumForkRecords = 8_192;
@@ -73,6 +74,35 @@ const adapterMetadataSchema = z.object({
 });
 
 type AdapterMetadata = z.infer<typeof adapterMetadataSchema>;
+const legacyHeadSchema = z.object({
+  digest: factsMemoryDigestSchema,
+  sequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+const legacyCheckpointSchema = z.object({
+  bindingDigest: factsMemoryDigestSchema,
+  head: legacyHeadSchema,
+  ownerId: profileIdSchema,
+  sessionId: sessionIdSchema,
+}).strict();
+const legacyAdapterMetadataSchema = z.object({
+  adapterDigest: factsMemoryDigestSchema,
+  bindingDigest: factsMemoryDigestSchema,
+  createdAt: unixMillisecondsSchema,
+  createKind: z.enum(["create", "fork"]),
+  handleHash: factsMemoryDigestSchema,
+  initialHead: legacyHeadSchema,
+  ohBindingSha256: factsMemoryDigestSchema,
+  operationKey: operationKeySchema,
+  parent: legacyCheckpointSchema.nullable(),
+  receiptDigest: factsMemoryDigestSchema,
+  version: z.literal(1),
+}).strict().superRefine((value, context) => {
+  if ((value.createKind === "create") !== (value.parent === null)) {
+    context.addIssue({ code: "custom", message: "Legacy Oh adapter creation kind and parent disagree." });
+  }
+});
+type LegacyAdapterMetadata = z.infer<typeof legacyAdapterMetadataSchema>;
+type ParsedAdapterMetadata = Readonly<{ legacy: boolean; metadata: AdapterMetadata }>;
 type PendingMetadata =
   | Readonly<{ status: "complete"; metadata: AdapterMetadata }>
   | Readonly<{ status: "incomplete" }>
@@ -167,6 +197,62 @@ const metadataDigest = (value: Omit<AdapterMetadata, "adapterDigest">): string =
     String(value.version),
   ]);
 
+const legacyMetadataDigest = (value: Omit<LegacyAdapterMetadata, "adapterDigest">): string =>
+  digestParts("hra-oh-adapter-metadata-v1", [
+    value.bindingDigest,
+    String(value.createdAt),
+    value.createKind,
+    value.handleHash,
+    String(value.initialHead.sequence),
+    value.initialHead.digest,
+    value.ohBindingSha256,
+    value.operationKey,
+    value.parent?.bindingDigest ?? "no-parent",
+    value.parent?.ownerId ?? "no-parent",
+    value.parent?.sessionId ?? "no-parent",
+    value.parent === null ? "no-parent" : String(value.parent.head.sequence),
+    value.parent?.head.digest ?? "no-parent",
+    value.receiptDigest,
+    String(value.version),
+  ]);
+
+const parseAdapterMetadata = (value: unknown): ParsedAdapterMetadata => {
+  const normalized = adapterMetadataSchema.safeParse(normalizeLegacyMetadata(value));
+  if (normalized.success) {
+    const { adapterDigest, ...body } = normalized.data;
+    if (metadataDigest(body) === adapterDigest) {
+      return { legacy: false, metadata: normalized.data };
+    }
+  }
+  const legacy = legacyAdapterMetadataSchema.safeParse(value);
+  if (!legacy.success) {
+    if (normalized.success) throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
+    throw normalized.error;
+  }
+  const { adapterDigest, ...legacyBody } = legacy.data;
+  if (legacyMetadataDigest(legacyBody) !== adapterDigest) {
+    throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
+  }
+  if (legacy.data.initialHead.sequence !== 0 || legacy.data.parent !== null) {
+    throw new Error("FACTS_MEMORY_OH_LEGACY_NONEMPTY_RECOVERY_REQUIRED");
+  }
+  const normalizedLegacy = normalizeLegacyMetadata(legacy.data);
+  if (normalizedLegacy === null || typeof normalizedLegacy !== "object" || Array.isArray(normalizedLegacy)) {
+    throw new Error("FACTS_MEMORY_OH_METADATA_INVALID");
+  }
+  const currentWithPlaceholder = adapterMetadataSchema.parse({
+    ...(normalizedLegacy as Record<string, unknown>),
+    adapterDigest: "0".repeat(64),
+  });
+  return {
+    legacy: true,
+    metadata: adapterMetadataSchema.parse({
+      ...currentWithPlaceholder,
+      adapterDigest: metadataDigest(currentWithPlaceholder),
+    }),
+  };
+};
+
 const receiptFromMetadata = (metadata: AdapterMetadata): FactsMemoryStoreReceipt =>
   factsMemoryStoreReceiptSchema.parse({
     bindingDigest: metadata.bindingDigest,
@@ -242,8 +328,55 @@ const enforcePrivateSqliteFiles = (directory: string): void => {
   }
 };
 
+function migrateLegacyMetadataFile(path: string, metadata: AdapterMetadata): void {
+  const directory = dirname(path);
+  const pendingPath = join(directory, adapterMetadataMigrationName);
+  let descriptor: number;
+  try {
+    descriptor = openSync(
+      pendingPath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+      0o600,
+    );
+  } catch (error: unknown) {
+    if (errorCode(error) !== "EEXIST") throw error;
+    const pending = readPendingMetadataFile(pendingPath);
+    if (pending.status === "complete") {
+      if (JSON.stringify(pending.metadata) !== JSON.stringify(metadata)) {
+        throw new Error("FACTS_MEMORY_OH_METADATA_MIGRATION_CONFLICT");
+      }
+      renameSync(pendingPath, path);
+      syncDirectory(directory);
+      return;
+    }
+    try {
+      descriptor = openSync(pendingPath, constants.O_WRONLY | constants.O_NOFOLLOW);
+    } catch {
+      throw new Error("FACTS_MEMORY_OH_METADATA_MIGRATION_CONFLICT");
+    }
+  }
+  try {
+    const before = fstatSync(descriptor);
+    const owner = process.getuid?.();
+    if (
+      !before.isFile()
+      || before.nlink !== 1
+      || (owner !== undefined && before.uid !== owner)
+    ) throw new Error("FACTS_MEMORY_OH_METADATA_UNSAFE");
+    fchmodSync(descriptor, 0o600);
+    ftruncateSync(descriptor, 0);
+    writeFileSync(descriptor, JSON.stringify(metadata), "utf8");
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  renameSync(pendingPath, path);
+  syncDirectory(directory);
+}
+
 const readMetadataFile = (path: string): AdapterMetadata | null => {
   let descriptor: number | undefined;
+  let result: ParsedAdapterMetadata;
   try {
     descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error: unknown) {
@@ -275,12 +408,10 @@ const readMetadataFile = (path: string): AdapterMetadata | null => {
     } catch {
       throw new Error("FACTS_MEMORY_OH_METADATA_INVALID");
     }
-    const parsed = adapterMetadataSchema.parse(normalizeLegacyMetadata(value));
-    const { adapterDigest, ...body } = parsed;
-    const receipt = receiptFromMetadata(parsed);
+    result = parseAdapterMetadata(value);
+    const receipt = receiptFromMetadata(result.metadata);
     if (
-      metadataDigest(body) !== adapterDigest
-      || digestFactsMemoryReceipt({
+      digestFactsMemoryReceipt({
         bindingDigest: receipt.bindingDigest,
         createdAt: receipt.createdAt,
         handleHash: receipt.handleHash,
@@ -288,10 +419,18 @@ const readMetadataFile = (path: string): AdapterMetadata | null => {
         version: receipt.version,
       }) !== receipt.receiptDigest
     ) throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
-    return parsed;
   } finally {
     closeSync(descriptor);
   }
+  if (result.legacy) {
+    migrateLegacyMetadataFile(path, result.metadata);
+    const migrated = readMetadataFile(path);
+    if (migrated === null || JSON.stringify(migrated) !== JSON.stringify(result.metadata)) {
+      throw new Error("FACTS_MEMORY_OH_METADATA_MIGRATION_READBACK_MISMATCH");
+    }
+    return migrated;
+  }
+  return result.metadata;
 };
 
 const readPendingMetadataFile = (path: string): PendingMetadata => {
@@ -327,14 +466,24 @@ const readPendingMetadataFile = (path: string): PendingMetadata => {
     } catch {
       return { status: "incomplete" };
     }
-    const parsedResult = adapterMetadataSchema.safeParse(normalizeLegacyMetadata(value));
-    if (!parsedResult.success) return { status: "incomplete" };
-    const parsed = parsedResult.data;
-    const { adapterDigest, ...body } = parsed;
-    const receipt = receiptFromMetadata(parsed);
+    let parsed: ParsedAdapterMetadata;
+    try {
+      parsed = parseAdapterMetadata(value);
+    } catch (error: unknown) {
+      if (
+        error instanceof Error
+        && (
+          error.message === "FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH"
+          || error.message === "FACTS_MEMORY_OH_LEGACY_NONEMPTY_RECOVERY_REQUIRED"
+        )
+      ) {
+        throw error;
+      }
+      return { status: "incomplete" };
+    }
+    const receipt = receiptFromMetadata(parsed.metadata);
     if (
-      metadataDigest(body) !== adapterDigest
-      || digestFactsMemoryReceipt({
+      digestFactsMemoryReceipt({
         bindingDigest: receipt.bindingDigest,
         createdAt: receipt.createdAt,
         handleHash: receipt.handleHash,
@@ -342,7 +491,7 @@ const readPendingMetadataFile = (path: string): PendingMetadata => {
         version: receipt.version,
       }) !== receipt.receiptDigest
     ) throw new Error("FACTS_MEMORY_OH_METADATA_DIGEST_MISMATCH");
-    return { status: "complete", metadata: parsed };
+    return { status: "complete", metadata: parsed.metadata };
   } finally {
     closeSync(descriptor);
   }
