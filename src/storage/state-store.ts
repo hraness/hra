@@ -4006,9 +4006,6 @@ export class StateStore {
       if (result.changes !== 1) throw new Error("Profile state authority changed.");
       if (changedBoundIdentity) {
         const previousAccountFingerprint = policy.accountFingerprint;
-        if (previousAccountFingerprint === null) {
-          throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID");
-        }
         this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
           profileId,
           accountFingerprint: previousAccountFingerprint,
@@ -4028,7 +4025,7 @@ export class StateStore {
           throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_CONFLICT");
         }
       }
-      if (result.changes === 1 && (state === "signed_in" || state === "signed_out")) {
+      if (state === "signed_in" || state === "signed_out") {
         this.#database.query(`UPDATE provider_login_authorities
                               SET state='settled',settlement=?,updated_at=?
                               WHERE profile_id=? AND process_generation=? AND state='active'`).run(
@@ -8473,7 +8470,7 @@ export class StateStore {
         return { decision: "block", reason: "account_identity_changed", policy };
       }
 
-      if (!hasFreshExactWeeklyWindow || weeklyWindowResetsAt === null) {
+      if (!hasFreshExactWeeklyWindow) {
         return {
           decision: "block",
           reason: "weekly_window_unavailable",
@@ -8863,9 +8860,6 @@ export class StateStore {
       const authorizedWindowResetsAt = row.state === "ambiguous"
         ? policy.weeklyWindowResetsAt
         : row.weeklyWindowResetsAt;
-      if (authorizedWindowResetsAt === null) {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
-      }
       const weeklyWindowMaximum = Math.min(
         Number.MAX_SAFE_INTEGER,
         now + CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000,
