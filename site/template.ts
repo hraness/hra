@@ -1,4 +1,7 @@
-import { renderHranessSiteFooter } from "@hraness/site-footer";
+import {
+  renderHranessSiteFooter,
+  type HranessMailingListConfig,
+} from "@hraness/site-footer";
 import { AskAiAboutThis } from "@hraness/ui";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -29,6 +32,23 @@ const escapeHtml = (value: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+
+export const hraMailingListConfig = (
+  turnstileSitekey = process.env.NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY,
+): HranessMailingListConfig => turnstileSitekey === undefined
+  || turnstileSitekey.length === 0
+  ? { kind: "none" }
+  : {
+    audience: "hra",
+    kind: "signup",
+    turnstileSitekey,
+  };
+
+export const renderHraSiteFooter = (
+  turnstileSitekey = process.env.NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY,
+): string => renderHranessSiteFooter({
+  mailingList: hraMailingListConfig(turnstileSitekey),
+});
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {
@@ -212,7 +232,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -268,7 +288,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/privacy/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -338,7 +358,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(canonicalUrl)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;
@@ -367,7 +387,7 @@ ${renderHead(content, {
 </main>
 ${renderAskAiAboutThis(`${content.siteUrl}/reading/`)}
 ${renderProjectResources(content)}
-${renderHranessSiteFooter()}
+${renderHraSiteFooter()}
 </body>
 </html>
 `;

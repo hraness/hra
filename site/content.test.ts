@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import {
   HRANESS_HOME_URL,
-  HRANESS_NEWSLETTER_URL,
   hranessSocialLinks,
 } from "@hraness/site-footer";
 
@@ -22,6 +21,8 @@ import {
 import {
   renderDeepseekHarnessReadingHtml,
   renderHeadlongMicroharnessReadingHtml,
+  hraMailingListConfig,
+  renderHraSiteFooter,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderSiteHtml,
@@ -572,7 +573,6 @@ describe("public content contract", () => {
   test("renders the canonical Hraness network footer on every HTML page", () => {
     const expectedHrefs = [
       HRANESS_HOME_URL,
-      HRANESS_NEWSLETTER_URL,
       ...hranessSocialLinks.map(({ href }) => href),
     ];
 
@@ -587,6 +587,8 @@ describe("public content contract", () => {
       expect(footer).toContain('data-slot="hraness-site-footer"');
       expect(footer?.match(/data-slot="hraness-mark"/gu)).toHaveLength(1);
       expect(footer?.match(/data-slot="social-icon"/gu)).toHaveLength(10);
+      expect(footer).toContain('data-mailing-list="none"');
+      expect(footer).not.toContain("substack.com");
       expect(
         [...(footer?.matchAll(/<a\b[^>]*\shref="([^"]+)"/gu) ?? [])]
           .map((match) => match[1]),
@@ -595,6 +597,29 @@ describe("public content contract", () => {
         document.indexOf('data-slot="hraness-site-footer"'),
       );
     }
+  });
+
+  test("renders only the HRA mailing audience when Turnstile is configured", () => {
+    const sitekey = "1x00000000000000000000AA";
+    expect(hraMailingListConfig(sitekey)).toEqual({
+      audience: "hra",
+      kind: "signup",
+      turnstileSitekey: sitekey,
+    });
+    expect(hraMailingListConfig(undefined)).toEqual({ kind: "none" });
+    expect(hraMailingListConfig("")).toEqual({ kind: "none" });
+
+    const footer = renderHraSiteFooter(sitekey);
+    expect(footer).toContain('data-mailing-list="signup"');
+    expect(footer).toContain('name="audience" type="hidden" value="hra"');
+    expect(footer).toContain('data-action="mailing_hra"');
+    expect(footer).toContain(
+      'action="https://account.hraness.com/api/mailing/subscribe"',
+    );
+    expect(footer).toContain(
+      'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
+    );
+    expect(footer).not.toContain("substack.com");
   });
 
   test("renders an inert noindex preview canonicalized to the full product page", () => {
