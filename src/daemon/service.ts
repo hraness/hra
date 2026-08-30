@@ -87,6 +87,7 @@ import {
   type WorkStore,
 } from "../storage/work-store";
 import { DaemonAuthoritySafetyError, type DaemonAuthorityFence } from "./daemon-lock";
+import type { HraFactsMemoryLifecyclePort } from "./facts-memory-lifecycle";
 import { commandFailureBrand } from "./local-transport";
 import {
   CodexSessionObservationError,
@@ -436,6 +437,7 @@ const renamedReceiptSchema = z.object({ renamed: z.literal(true) }).strict();
 
 const digestText = (value: string): string => createHash("sha256").update(value).digest("hex");
 const QUEUE_PRE_EFFECT_RETRY_DELAYS_MS = [25, 100, 250] as const;
+export const FACTS_MEMORY_SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
 
 const isSqliteUniqueConstraint = (error: unknown): boolean =>
   error instanceof Error
@@ -480,6 +482,7 @@ export class HraService {
   readonly #work: WorkStore;
   readonly #workWaiters: WorkEventWaiters;
   readonly #eventRedactor: SessionEventStreamRedactor;
+  readonly #factsMemory: HraFactsMemoryLifecyclePort | undefined;
   readonly #daemonGeneration: number;
   readonly #now: () => number;
   readonly #mutationTails = new Map<string, Promise<unknown>>();
@@ -510,6 +513,7 @@ export class HraService {
     eventCursors?: SessionEventCursorCodec;
     usageHistoryCursors?: UsageHistoryCursorCodec;
     eventWaiters?: SessionEventWaiters;
+    factsMemory?: HraFactsMemoryLifecyclePort;
     workWaiters?: WorkEventWaiters;
     workCapabilities?: WorkCapabilityCodec;
     daemonGeneration?: number;
@@ -533,6 +537,7 @@ export class HraService {
     this.#usageHistoryCursors = input.usageHistoryCursors
       ?? new UsageHistoryCursorCodec(UsageHistoryCursorCodec.generateKey());
     this.#eventWaiters = input.eventWaiters ?? new SessionEventWaiters();
+    this.#factsMemory = input.factsMemory;
     this.#daemonGeneration = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
       .parse(input.daemonGeneration ?? 0);
     const workCapabilities = input.workCapabilities
@@ -578,6 +583,7 @@ export class HraService {
     const finish = this.#beginOperation();
     try {
       await this.#daemonAuthority.assertCurrent();
+      await this.#factsMemory?.sweepExpired(this.#now());
       const result = await this.#executeAdmitted(command, context);
       await this.#daemonAuthority.assertCurrent();
       return result;
@@ -699,7 +705,17 @@ export class HraService {
         case "session.stop": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#stop(session.id, command.idempotencyKey, context.signal)); }
         case "session.rename": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#rename(session.id, command.name, command.idempotencyKey, context.signal)); }
         case "session.recover": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "recover", context.signal)); }
-        case "session.abandon": { const session = this.#store.requireSession(command.session); return await this.#serializeSessionAuthority(session, async () => this.#resolveSessionRecovery(session.id, "abandon", context.signal)); }
+        case "session.abandon": {
+          const session = this.#store.requireSession(command.session);
+          return await this.#serializeSessionAuthority(session, async () => {
+            const current = this.#store.requireSession(session.id);
+            if (current.state !== "recovery_required") {
+              return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
+            }
+            await this.#cleanupFactsMemory(current, "abandon");
+            return await this.#resolveSessionRecovery(current.id, "abandon", context.signal);
+          });
+        }
         case "session.note.get": { const session = this.#store.requireSession(command.session); return { sessionId: session.id, note: session.note, revision: session.revision }; }
         case "session.note.edit": throw new CommandFailure("INTERACTION_REQUIRED", "Open the editor through the local `hra session note edit` command.");
         case "session.note.set": return { session: await this.#updateSession(command.session, (session) => ({ note: command.note, expectedRevision: session.revision })) };
@@ -1645,6 +1661,7 @@ export class HraService {
     this.#sessionsAwaitingResubscription.delete(current.id);
     await this.#cloud.supersedeCompactProjectionRecoveryForProviderDeletion(current.id);
     await this.#daemonAuthority.assertCurrent();
+    await this.#cleanupFactsMemory(this.#store.requireSession(current.id), "archive");
   }
 
   #appendSessionEvent(
@@ -2940,6 +2957,47 @@ export class HraService {
     });
   }
 
+  #factsMemoryExpiry(session: SessionRecord): number {
+    return Math.min(Number.MAX_SAFE_INTEGER, session.updatedAt + FACTS_MEMORY_SESSION_TTL_MS);
+  }
+
+  async #ensureFactsMemory(session: SessionRecord): Promise<void> {
+    if (this.#factsMemory === undefined) return;
+    try {
+      await this.#factsMemory.ensureSession({
+        expiresAt: this.#factsMemoryExpiry(session),
+        ownerId: session.profileId,
+        sessionId: session.id,
+      });
+    } catch (cause: unknown) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session facts-memory authority could not be created or reconciled. The provider session remains under its existing HRA authority; retry this exact session operation after reconciling local memory custody.",
+        { cause: cause instanceof Error ? cause.name : "error", sessionId: session.id },
+      );
+    }
+  }
+
+  async #cleanupFactsMemory(
+    session: SessionRecord,
+    reason: "abandon" | "archive" | "expired",
+  ): Promise<void> {
+    if (this.#factsMemory === undefined) return;
+    try {
+      await this.#factsMemory.cleanupSession({
+        ownerId: session.profileId,
+        reason,
+        sessionId: session.id,
+      });
+    } catch (cause: unknown) {
+      throw new CommandFailure(
+        "RECOVERY_REQUIRED",
+        "The session facts-memory directory could not be proven fully purged. HRA retained the cleanup authority for an exact retry.",
+        { cause: cause instanceof Error ? cause.name : "error", sessionId: session.id },
+      );
+    }
+  }
+
   async #ensureSessionObservedLocked(
     selector: string,
     signal: AbortSignal,
@@ -2959,6 +3017,7 @@ export class HraService {
       };
     }
     if (session.state === "terminal") {
+      await this.#cleanupFactsMemory(session, "archive");
       return {
         basis: "local_state",
         coverage: "not_attempted",
@@ -2982,6 +3041,7 @@ export class HraService {
         state: "recovery_required",
       };
     }
+    await this.#ensureFactsMemory(session);
     if (profile.state !== "signed_in") {
       return {
         basis: "local_state",
@@ -3101,6 +3161,9 @@ export class HraService {
           status: projection.status,
           activeTurnId: reconciled.activeTurnId ?? null,
         });
+      }
+      if (reconciled.state === "terminal") {
+        await this.#cleanupFactsMemory(reconciled, "archive");
       }
     }
     const mode = this.#sessionResubscriptionConnections.get(session.id) === observation.connectionId
@@ -4654,6 +4717,18 @@ export class HraService {
         if (localSessionId !== undefined) this.#quarantineSession(localSessionId);
       },
     });
+    try {
+      await this.#ensureFactsMemory(this.#store.requireSession(outcome.sessionId));
+    } catch (error: unknown) {
+      if (error instanceof CommandFailure) {
+        throw new CommandFailure(error.code, error.message, {
+          idempotencyKey: key,
+          nextCommand: `hra session show ${outcome.sessionId}`,
+          sessionId: outcome.sessionId,
+        });
+      }
+      throw error;
+    }
     await this.#ensureSessionObservedLocked(outcome.sessionId, signal);
     return {
       session: this.#store.requireSession(outcome.sessionId),

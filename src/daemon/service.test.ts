@@ -24,7 +24,7 @@ import {
   type CloudProjectionRecoveryJournalEntry,
 } from "../cloud/daemon-journal";
 import { renderSuccess } from "../cli/render";
-import type { LocalCommand } from "../domain/contracts";
+import { localCommandSchema, type LocalCommand } from "../domain/contracts";
 import {
   PROTECTED_INTERACTION_DETAIL_MAXIMUM_BYTES,
   encodeProtectedInteractionDetailDocument,
@@ -48,6 +48,10 @@ import {
 import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
+import type {
+  HraFactsMemoryLifecyclePort,
+  HraFactsMemoryLifecycleReceipt,
+} from "./facts-memory-lifecycle";
 import { CodexSessionObservationError, UnavailableCloudControl, type CloudControlPort, type CodexAccountProjection, type CodexLoginOutcome, type CodexRuntimePort, type CodexSessionProjection, type CompactProjectionRecoveryBlocker, type DesktopSwitchPort, type ProfileAuthority, type RuntimeStartReview } from "./ports";
 import { SessionEventCursorCodec } from "./session-event-cursor";
 import { CommandFailure, HraService } from "./service";
@@ -557,6 +561,49 @@ class FakeDesktop implements DesktopSwitchPort {
   }
 }
 
+class FakeFactsMemoryLifecycle implements HraFactsMemoryLifecyclePort {
+  readonly cleanups: Array<Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]> = [];
+  readonly ensures: Array<Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]> = [];
+  readonly sweeps: number[] = [];
+  ensureErrorOnce: Error | undefined;
+
+  #receipt(sessionId: string, state: HraFactsMemoryLifecycleReceipt["state"] = "active"): HraFactsMemoryLifecycleReceipt {
+    return {
+      bindingDigest: "a".repeat(64),
+      handleHash: state === "purged" ? null : "b".repeat(64),
+      head: state === "purged" ? null : { digest: "c".repeat(64), sequence: 0 },
+      sessionId,
+      state,
+    };
+  }
+
+  async cleanupSession(input: Parameters<HraFactsMemoryLifecyclePort["cleanupSession"]>[0]) {
+    this.cleanups.push(input);
+    return this.#receipt(input.sessionId, "purged");
+  }
+
+  async ensureSession(input: Parameters<HraFactsMemoryLifecyclePort["ensureSession"]>[0]) {
+    this.ensures.push(input);
+    const error = this.ensureErrorOnce;
+    this.ensureErrorOnce = undefined;
+    if (error !== undefined) throw error;
+    return this.#receipt(input.sessionId);
+  }
+
+  async forkSession(input: Parameters<HraFactsMemoryLifecyclePort["forkSession"]>[0]) {
+    return this.#receipt(input.childSessionId);
+  }
+
+  async resumeSession(input: Parameters<HraFactsMemoryLifecyclePort["resumeSession"]>[0]) {
+    return this.#receipt(input.sessionId);
+  }
+
+  async sweepExpired(now: number) {
+    this.sweeps.push(now);
+    return { attempted: 0, failed: 0, purged: 0 };
+  }
+}
+
 const stores: StateStore[] = [];
 const serviceRoots: string[] = [];
 afterEach(async () => {
@@ -570,6 +617,7 @@ async function fixture(
   cloud = new FakeCloud(),
   requestStop: () => void = () => undefined,
   now: () => number = Date.now,
+  factsMemory?: HraFactsMemoryLifecyclePort,
 ): Promise<{ service: HraService; store: StateStore; codex: FakeCodex; cloud: FakeCloud; daemonAuthority: FakeDaemonAuthority; documents: string; eventCursors: SessionEventCursorCodec; paths: ReturnType<typeof resolveStatePaths> }> {
   const home = await realpath(await mkdtemp(join(tmpdir(), "hra-service-")));
   serviceRoots.push(home);
@@ -582,7 +630,7 @@ async function fixture(
   const codex = new FakeCodex();
   const daemonAuthority = new FakeDaemonAuthority();
   const eventCursors = new SessionEventCursorCodec(SessionEventCursorCodec.generateKey());
-  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
+  return { service: new HraService({ store, paths, codex, cloud, daemonAuthority, ...(desktop === undefined ? {} : { desktop }), eventCursors, ...(factsMemory === undefined ? {} : { factsMemory }), now, requestStop }), store, codex, cloud, daemonAuthority, documents, eventCursors, paths };
 }
 
 async function createIdleSession(
@@ -1695,6 +1743,119 @@ describe("HraService", () => {
     expect(await service.execute({ kind: "session.stop", session: started.session.id }, { signal })).toMatchObject({ stopped: true });
     expect(await service.execute({ kind: "session.note.set", session: started.session.id, note: "One note" }, { signal })).toMatchObject({ session: { note: "One note" } });
     expect(await service.execute({ kind: "session.rename", session: started.session.id, name: "Release" }, { signal })).toMatchObject({ session: { title: "Release" } });
+  });
+
+  test("hooks host-owned facts memory into start, resume, terminal archive, and expiry without a model command", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const now = () => 10_000;
+    const { service, documents, codex } = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      now,
+      factsMemory,
+    );
+    const added = await service.execute({ kind: "account.add", label: "Memory" }, { signal }) as { account: { id: string } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await service.execute({ kind: "project.add", label: "Memory docs", path: documents }, { signal });
+    const started = await service.execute({
+      kind: "session.start",
+      account: added.account.id,
+      preset: "high",
+      fast: false,
+    }, { signal }) as { session: { id: string } };
+    expect(factsMemory.ensures.length).toBeGreaterThanOrEqual(2);
+    expect(factsMemory.ensures.every((entry) =>
+      entry.ownerId === added.account.id && entry.sessionId === started.session.id)).toBe(true);
+    expect(JSON.stringify(factsMemory.ensures)).not.toMatch(/path|store|space|authority|rule|purge|credential/iu);
+
+    codex.readProjection = {
+      providerThreadId: "provider-thread",
+      status: "terminal",
+      title: "Archived",
+    };
+    await service.execute({ kind: "session.show", session: started.session.id, detail: false }, { signal });
+    expect(factsMemory.cleanups).toContainEqual({
+      ownerId: added.account.id,
+      reason: "archive",
+      sessionId: started.session.id,
+    });
+    expect(factsMemory.sweeps.length).toBeGreaterThan(0);
+    expect(localCommandSchema.safeParse({
+      kind: "facts-memory.query",
+      path: "/tmp/agent-selected",
+    }).success).toBe(false);
+  });
+
+  test("purges facts memory before releasing an abandoned local recovery authority", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const { sessionId } = await createIdleSession(value, "Abandon memory");
+    value.store.quarantineSession(sessionId);
+    await expect(value.service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .resolves.toMatchObject({ recovery: { resolution: "abandoned" } });
+    expect(factsMemory.cleanups.at(-1)).toEqual({
+      ownerId: value.store.requireSession(sessionId).profileId,
+      reason: "abandon",
+      sessionId,
+    });
+  });
+
+  test("does not purge facts memory when abandon is rejected for a live session", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const { sessionId } = await createIdleSession(value, "Live abandon memory");
+    await expect(value.service.execute({ kind: "session.abandon", session: sessionId }, { signal }))
+      .rejects.toMatchObject({ code: "CONFLICT" });
+    expect(factsMemory.cleanups).toEqual([]);
+  });
+
+  test("returns the created session authority when memory finalization needs an exact retry", async () => {
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    factsMemory.ensureErrorOnce = new Error("lost memory receipt");
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
+    const added = await value.service.execute({ kind: "account.add", label: "Memory retry" }, { signal }) as { account: { id: string } };
+    await value.service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    await value.service.execute({ kind: "project.add", label: "Memory retry docs", path: value.documents }, { signal });
+    let details: { idempotencyKey: string; nextCommand: string; sessionId: `sess_${string}` } | undefined;
+    try {
+      await value.service.execute({
+        kind: "session.start",
+        account: added.account.id,
+        preset: "high",
+        fast: false,
+      }, { signal });
+    } catch (error: unknown) {
+      expect(error).toMatchObject({ code: "RECOVERY_REQUIRED" });
+      details = (error as CommandFailure).details as typeof details;
+    }
+    expect(details).toBeDefined();
+    if (details === undefined) throw new Error("Expected memory recovery details.");
+    expect(details.nextCommand).toBe(`hra session show ${details.sessionId}`);
+    await expect(value.service.execute({
+      kind: "session.show",
+      session: details.sessionId,
+      detail: false,
+    }, { signal })).resolves.toMatchObject({ session: { id: details.sessionId } });
+    expect(value.codex.calls.filter((call) => call.startsWith("start:"))).toHaveLength(1);
   });
 
   test("refreshes usage without treating missing data as zero", async () => {
@@ -5232,7 +5393,14 @@ describe("HraService", () => {
   });
 
   test("routes provider close and delete lifecycle without leaving a mutable stale session", async () => {
-    const value = await fixture();
+    const factsMemory = new FakeFactsMemoryLifecycle();
+    const value = await fixture(
+      undefined,
+      new FakeCloud(),
+      () => undefined,
+      Date.now,
+      factsMemory,
+    );
     const { sessionId } = await createIdleSession(value, "Provider lifecycle");
     const session = value.store.requireSession(sessionId);
     const profile = value.store.requireProfileById(session.profileId);
@@ -5329,6 +5497,11 @@ describe("HraService", () => {
       event.body.type === "session_status" && event.body.status === "terminal")
       .map((event) => event.body))
       .toEqual([{ type: "session_status", status: "terminal", activeTurnId: null }]);
+    expect(factsMemory.cleanups).toContainEqual({
+      ownerId: profile.id,
+      reason: "archive",
+      sessionId,
+    });
     await expect(value.service.execute({
       kind: "session.send",
       session: sessionId,
