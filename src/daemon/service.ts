@@ -3057,7 +3057,7 @@ export class HraService {
       profile.id,
       accountFingerprint,
     );
-    if (attempt?.state === "effect_started" || attempt?.state === "ambiguous") {
+    if (attempt?.state === "effect_started") {
       return {
         authoritativeReread: false,
         refresh: { state: "recovery_pending" },
@@ -3076,35 +3076,38 @@ export class HraService {
       };
     }
     if (attempt !== null) {
-      if (
-        decisionNow >= attempt.weeklyWindowResetsAt
-        || (
-          observation.available
-          && observation.weeklyWindowResetsAt !== attempt.weeklyWindowResetsAt
-        )
-      ) {
-        this.#store.closeAccountRateLimitReset(
-          attempt.idempotencyKey,
-          "weekly_window_changed",
-        );
-        return {
-          authoritativeReread: false,
-          refresh: { state: "window_changed" },
-        };
-      }
-      if (
-        observation.creditsAvailable < 1
-        || observation.usedPercent < AUTO_RATE_LIMIT_RESET_USED_PERCENT
-      ) {
-        return {
-          authoritativeReread: false,
-          refresh: {
-            state: "waiting",
-            reason: observation.creditsAvailable < 1
-              ? "credits_unavailable"
-              : "below_threshold",
-          },
-        };
+      // An ambiguous attempt represents an upstream effect that may already
+      // have succeeded. Reconcile only that durable idempotency key after the
+      // policy admits a fresh observation; current credits, usage, and window
+      // cannot prove whether the earlier dispatch committed.
+      if (attempt.state !== "ambiguous") {
+        if (
+          decisionNow >= attempt.weeklyWindowResetsAt
+          || observation.weeklyWindowResetsAt !== attempt.weeklyWindowResetsAt
+        ) {
+          this.#store.closeAccountRateLimitReset(
+            attempt.idempotencyKey,
+            "weekly_window_changed",
+          );
+          return {
+            authoritativeReread: false,
+            refresh: { state: "window_changed" },
+          };
+        }
+        if (
+          observation.creditsAvailable < 1
+          || observation.usedPercent < AUTO_RATE_LIMIT_RESET_USED_PERCENT
+        ) {
+          return {
+            authoritativeReread: false,
+            refresh: {
+              state: "waiting",
+              reason: observation.creditsAvailable < 1
+                ? "credits_unavailable"
+                : "below_threshold",
+            },
+          };
+        }
       }
     } else {
       if (!decision.eligible) {
@@ -3191,7 +3194,7 @@ export class HraService {
         refresh: { state: "latched", reason: attempt.localResolution },
       };
     }
-    if (attempt.state === "effect_started" || attempt.state === "ambiguous") {
+    if (attempt.state === "effect_started") {
       return {
         authoritativeReread: false,
         refresh: { state: "recovery_pending" },
@@ -3215,9 +3218,9 @@ export class HraService {
         ? "ambiguous"
         : "retryable";
       try {
-        // Indeterminate effects remain durably blocked for reconciliation.
-        // Definite rejections and pre-dispatch failures retain the same key
-        // and return to the ordinary policy and eligibility gates.
+        // Every failure retains the original key. An indeterminate effect can
+        // bypass ordinary eligibility only after durable policy authorization;
+        // determinate failures return through the ordinary window gates.
         this.#store.deferAccountRateLimitReset(attempt.idempotencyKey, retryState);
       } catch (journalError: unknown) {
         this.#failStopAfterResetJournalFailure(
@@ -3228,8 +3231,8 @@ export class HraService {
           "An automatic reset may have reached Codex and its recovery state could not be committed.",
         );
       }
-      // A successful usage read remains successful. Only determinate failures
-      // can be retried automatically with the same upstream key.
+      // A successful usage read remains successful. A later refresh can retry
+      // only this exact durable upstream key after policy authorization.
       return {
         authoritativeReread: false,
         refresh: {

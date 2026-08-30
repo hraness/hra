@@ -4326,6 +4326,40 @@ describe("StateStore", () => {
       weeklyWindowResetsAt: 500_000_000,
       observedUsedPercent: 99,
     })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+    const replacementEmail = "legacy-policy-replacement@example.com";
+    expect(migrated.setProfileState(
+      signedIn.id,
+      signedIn.processGeneration,
+      "signed_in",
+      { email: replacementEmail, plan: "Plus" },
+    )).toBe(true);
+    const replacementFingerprint = resetAccountFingerprint(replacementEmail);
+    expect(migrated.authorizeAccountRateLimitResetPolicy({
+      profileId: signedIn.id,
+      processGeneration: signedIn.processGeneration,
+      accountFingerprint: replacementFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: 500_100_000,
+    })).toMatchObject({
+      decision: "suppress",
+      policy: {
+        accountFingerprint: replacementFingerprint,
+        state: "window_suppressed",
+      },
+    });
+    expect(migrated.readRecoverableAccountRateLimitReset(
+      signedIn.id,
+      accountFingerprint,
+    )).toBeNull();
+    expect(migrated.latestAccountRateLimitResetAttempt(
+      signedIn.id,
+      accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      localResolution: "account_identity_changed",
+      outcome: null,
+      state: "closed",
+    });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
       expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 28 });
@@ -4380,12 +4414,17 @@ describe("StateStore", () => {
     });
   });
 
-  test("persists monotonic reset-policy reconciliation across identity and window changes", async () => {
-    const { store } = await fixture();
+  test("persists reset-policy reconciliation until the suppressed boundary has elapsed", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-policy-boundary-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
     const firstEmail = "policy-first@example.com";
     const profile = signInProfile(store, "Policy transitions", firstEmail);
     const firstFingerprint = resetAccountFingerprint(firstEmail);
-    const firstWindow = 500_000_000;
+    const firstWindow = 10_000;
     const first = store.authorizeAccountRateLimitResetPolicy({
       profileId: profile.id,
       processGeneration: profile.processGeneration,
@@ -4405,6 +4444,16 @@ describe("StateStore", () => {
       reason: "weekly_window_nonmonotonic",
       policy: { revision: first.policy.revision },
     });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: firstFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow + 1_000,
+    })).toMatchObject({
+      decision: "allow",
+      policy: { state: "active_bound", weeklyWindowResetsAt: firstWindow + 1_000 },
+    });
 
     const secondEmail = "policy-second@example.com";
     expect(store.setProfileState(
@@ -4413,13 +4462,19 @@ describe("StateStore", () => {
       "signed_in",
       { email: secondEmail, plan: "Plus" },
     )).toBe(true);
+    expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "reconciliation_required",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+    });
     const secondFingerprint = resetAccountFingerprint(secondEmail);
+    const suppressedWindow = 20_000;
     const suppressed = store.authorizeAccountRateLimitResetPolicy({
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint: secondFingerprint,
       weeklyWindowDurationMinutes: 10_080,
-      weeklyWindowResetsAt: firstWindow,
+      weeklyWindowResetsAt: suppressedWindow,
     });
     expect(suppressed).toMatchObject({
       decision: "suppress",
@@ -4433,7 +4488,7 @@ describe("StateStore", () => {
       processGeneration: restarted.processGeneration,
       accountFingerprint: secondFingerprint,
       weeklyWindowDurationMinutes: 10_080,
-      weeklyWindowResetsAt: firstWindow,
+      weeklyWindowResetsAt: suppressedWindow,
     })).toMatchObject({
       decision: "suppress",
       policy: { revision: suppressed.policy.revision },
@@ -4443,8 +4498,67 @@ describe("StateStore", () => {
       processGeneration: restarted.processGeneration,
       accountFingerprint: secondFingerprint,
       weeklyWindowDurationMinutes: 10_080,
-      weeklyWindowResetsAt: firstWindow + 1,
-    })).toMatchObject({ decision: "allow", policy: { state: "active_bound" } });
+      weeklyWindowResetsAt: suppressedWindow - 1_000,
+    })).toMatchObject({
+      decision: "block",
+      reason: "weekly_window_nonmonotonic",
+      policy: { revision: suppressed.policy.revision },
+    });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: suppressedWindow + 1_000,
+    })).toMatchObject({
+      decision: "block",
+      reason: "weekly_window_nonmonotonic",
+      policy: { revision: suppressed.policy.revision },
+    });
+    now = suppressedWindow - 1;
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: suppressedWindow,
+    })).toMatchObject({
+      decision: "suppress",
+      policy: { revision: suppressed.policy.revision },
+    });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: suppressedWindow + 1_000,
+    })).toMatchObject({
+      decision: "block",
+      reason: "weekly_window_nonmonotonic",
+      policy: { revision: suppressed.policy.revision },
+    });
+    now = suppressedWindow;
+    const activated = store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: suppressedWindow + 1_000,
+    });
+    expect(activated).toMatchObject({
+      decision: "allow",
+      policy: { state: "active_bound", weeklyWindowResetsAt: suppressedWindow + 1_000 },
+    });
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint: secondFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: suppressedWindow + 2_000,
+    })).toMatchObject({
+      decision: "allow",
+      policy: { state: "active_bound", weeklyWindowResetsAt: suppressedWindow + 2_000 },
+    });
 
     const thirdEmail = "policy-third@example.com";
     expect(store.setProfileState(
@@ -4453,17 +4567,22 @@ describe("StateStore", () => {
       "signed_in",
       { email: thirdEmail, plan: "Plus" },
     )).toBe(true);
+    expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+      state: "reconciliation_required",
+      accountFingerprint: null,
+      weeklyWindowResetsAt: null,
+    });
     const thirdFingerprint = resetAccountFingerprint(thirdEmail);
     const pending = store.authorizeAccountRateLimitResetPolicy({
       profileId: profile.id,
       processGeneration: restarted.processGeneration,
       accountFingerprint: thirdFingerprint,
       weeklyWindowDurationMinutes: 300,
-      weeklyWindowResetsAt: firstWindow + 2,
+      weeklyWindowResetsAt: suppressedWindow + 3_000,
     });
     expect(pending).toMatchObject({
       decision: "block",
-      reason: "account_identity_changed",
+      reason: "weekly_window_unavailable",
       policy: { state: "reconciliation_required" },
     });
     expect(store.authorizeAccountRateLimitResetPolicy({
@@ -4471,12 +4590,89 @@ describe("StateStore", () => {
       processGeneration: restarted.processGeneration,
       accountFingerprint: thirdFingerprint,
       weeklyWindowDurationMinutes: 300,
-      weeklyWindowResetsAt: firstWindow + 2,
+      weeklyWindowResetsAt: suppressedWindow + 3_000,
     })).toMatchObject({
       decision: "block",
       reason: "weekly_window_unavailable",
       policy: { revision: pending.policy.revision, state: "reconciliation_required" },
     });
+  });
+
+  test("re-pends bound identity drift and closes every old-identity recoverable state", async () => {
+    const { store } = await fixture();
+    const recoverableStates = [
+      "prepared",
+      "retryable",
+      "ambiguous",
+      "effect_started",
+    ] as const;
+
+    for (const [index, recoverableState] of recoverableStates.entries()) {
+      const firstEmail = `identity-${recoverableState}@example.com`;
+      const profile = signInProfile(
+        store,
+        `Identity ${recoverableState}`,
+        firstEmail,
+      );
+      expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+        state: "active_unbound",
+        accountFingerprint: null,
+      });
+      const firstFingerprint = resetAccountFingerprint(firstEmail);
+      const prepared = prepareAuthorizedReset(store, {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint: firstFingerprint,
+        weeklyWindowResetsAt: 500_000_000 + index,
+        observedUsedPercent: 99,
+      });
+      if (recoverableState !== "prepared") {
+        store.beginAccountRateLimitReset(prepared.idempotencyKey);
+      }
+      if (recoverableState === "retryable" || recoverableState === "ambiguous") {
+        store.deferAccountRateLimitReset(prepared.idempotencyKey, recoverableState);
+      }
+      const policyBeforeDrift = store.requireAccountRateLimitResetPolicy(profile.id);
+      const secondEmail = `replacement-${recoverableState}@example.com`;
+      expect(store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_in",
+        { email: secondEmail, plan: "Plus" },
+      )).toBe(true);
+
+      expect(store.requireAccountRateLimitResetPolicy(profile.id)).toMatchObject({
+        state: "reconciliation_required",
+        accountFingerprint: null,
+        weeklyWindowResetsAt: null,
+        revision: policyBeforeDrift.revision + 1,
+      });
+      expect(store.latestAccountRateLimitResetAttempt(profile.id, firstFingerprint))
+        .toMatchObject({
+          idempotencyKey: prepared.idempotencyKey,
+          localResolution: "account_identity_changed",
+          outcome: null,
+          state: "closed",
+        });
+      expect(store.readRecoverableAccountRateLimitReset(profile.id, firstFingerprint))
+        .toBeNull();
+
+      const secondFingerprint = resetAccountFingerprint(secondEmail);
+      expect(store.authorizeAccountRateLimitResetPolicy({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint: secondFingerprint,
+        weeklyWindowDurationMinutes: 10_080,
+        weeklyWindowResetsAt: 500_100_000 + index,
+      })).toMatchObject({
+        decision: "suppress",
+        reason: "reconciliation_window",
+        policy: {
+          accountFingerprint: secondFingerprint,
+          state: "window_suppressed",
+        },
+      });
+    }
   });
 
   test("refuses to reopen a current database with missing reset policy authority", async () => {
@@ -4636,7 +4832,7 @@ describe("StateStore", () => {
       .toThrow("STATE_ACCOUNT_RATE_LIMIT_RESET_POLICY_ORPHANED");
   });
 
-  test("journals automatic weekly reset redemption and blocks indeterminate effects", async () => {
+  test("journals automatic weekly reset redemption and retries only the same indeterminate key", async () => {
     const { store } = await fixture();
     const email = "reset@example.com";
     const profile = signInProfile(store, "Reset journal", email);
@@ -4668,12 +4864,20 @@ describe("StateStore", () => {
       .toBe("effect_started");
     expect(store.deferAccountRateLimitReset(prepared.idempotencyKey, "ambiguous").state)
       .toBe("ambiguous");
+    expect(() => store.closeAccountRateLimitReset(
+      prepared.idempotencyKey,
+      "weekly_window_changed",
+    )).toThrow("ACCOUNT_RATE_LIMIT_RESET_CLOSE_RESOLUTION_INVALID");
     expect(store.readRecoverableAccountRateLimitReset(
       profile.id,
       input.accountFingerprint,
     )?.idempotencyKey).toBe(prepared.idempotencyKey);
-    expect(() => store.beginAccountRateLimitReset(prepared.idempotencyKey))
-      .toThrow("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
+    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey)).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      state: "effect_started",
+    });
+    expect(store.deferAccountRateLimitReset(prepared.idempotencyKey, "ambiguous"))
+      .toMatchObject({ idempotencyKey: prepared.idempotencyKey, state: "ambiguous" });
     expect(store.latestAccountRateLimitResetAttempt(
       profile.id,
       input.accountFingerprint,
@@ -4716,6 +4920,8 @@ describe("StateStore", () => {
       "signed_in",
       { email: changedEmail, plan: "Plus" },
     )).toBe(true);
+    expect(store.latestAccountRateLimitResetAttempt(first.id, firstFingerprint))
+      .toMatchObject({ idempotencyKey: prepared.idempotencyKey, state: "closed" });
     expect(store.authorizeAccountRateLimitResetPolicy({
       profileId: first.id,
       processGeneration: first.processGeneration,
@@ -4724,7 +4930,7 @@ describe("StateStore", () => {
       weeklyWindowResetsAt: null,
     })).toMatchObject({
       decision: "block",
-      reason: "account_identity_changed",
+      reason: "weekly_window_unavailable",
       policy: { state: "reconciliation_required" },
     });
 
@@ -4743,6 +4949,19 @@ describe("StateStore", () => {
 
     const inspector = new Database(store.paths.database, { create: false, strict: true });
     try {
+      expect(() => inspector.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET state='closed',local_resolution='weekly_window_changed'
+         WHERE idempotency_key=?`,
+      ).run(ambiguous.idempotencyKey))
+        .toThrow("illegal account rate-limit reset transition");
+      inspector.query(
+        `UPDATE account_rate_limit_reset_policies
+         SET state='reconciliation_required',account_fingerprint=NULL,
+           weekly_window_resets_at=NULL,revision=revision+1,
+           updated_at=MAX(updated_at,?)
+         WHERE profile_id=?`,
+      ).run(2_000, second.id);
       expect(() => inspector.query(
         `INSERT INTO account_rate_limit_reset_attempts(
            idempotency_key,profile_id,origin_process_generation,
@@ -4763,7 +4982,7 @@ describe("StateStore", () => {
       expect(() => inspector.query(
         `UPDATE account_rate_limit_reset_attempts
          SET state='effect_started' WHERE idempotency_key=?`,
-      ).run(prepared.idempotencyKey))
+      ).run(ambiguous.idempotencyKey))
         .toThrow("policy does not authorize dispatch");
       expect(() => inspector.query(
         `INSERT INTO account_rate_limit_reset_rebinds(
@@ -4776,7 +4995,7 @@ describe("StateStore", () => {
         ambiguous.currentProcessGeneration + 1,
         secondFingerprint,
         2_000,
-      )).toThrow("rebind authority is invalid");
+      )).toThrow("policy does not authorize rebind");
     } finally {
       inspector.close(false);
     }
@@ -4922,16 +5141,22 @@ describe("StateStore", () => {
     expect(store.requireProfileById(profile.id).state).toBe("signed_in");
   });
 
-  test("keeps an ambiguous reset blocked across daemon generations", async () => {
-    const { store } = await fixture();
+  test("rebinds and retries an ambiguous key only after a later policy window activates", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-later-recovery-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
     const email = "restart-reset@example.com";
     const profile = signInProfile(store, "Reset restart", email);
     const accountFingerprint = resetAccountFingerprint(email);
+    const firstWindow = 10_000;
     const prepared = prepareAuthorizedReset(store, {
       profileId: profile.id,
       processGeneration: profile.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: 500_000_000,
+      weeklyWindowResetsAt: firstWindow,
       observedUsedPercent: 99,
     });
     store.beginAccountRateLimitReset(prepared.idempotencyKey);
@@ -4941,6 +5166,28 @@ describe("StateStore", () => {
       accountFingerprint,
       weeklyWindowResetsAt: prepared.weeklyWindowResetsAt,
     });
+
+    const migration = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      migration.query(
+        `UPDATE account_rate_limit_reset_policies
+         SET state='reconciliation_required',account_fingerprint=NULL,
+           weekly_window_resets_at=NULL,revision=revision+1,
+           updated_at=MAX(updated_at,?)
+         WHERE profile_id=?`,
+      ).run(now, profile.id);
+    } finally {
+      migration.close(false);
+    }
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: firstWindow,
+    })).toMatchObject({ decision: "suppress", policy: { state: "window_suppressed" } });
+    expect(() => store.beginAccountRateLimitReset(prepared.idempotencyKey))
+      .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
     store.nextDaemonGeneration(`boot_${"r".repeat(32)}`);
     const restarted = store.requireProfileById(profile.id);
 
@@ -4959,23 +5206,90 @@ describe("StateStore", () => {
       expectedCurrentProcessGeneration: profile.processGeneration,
       nextProcessGeneration: restarted.processGeneration,
       accountFingerprint,
-    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
     expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([]);
-    const inspector = new Database(store.paths.database, { create: false, strict: true });
-    try {
-      expect(inspector.query(
-        "SELECT * FROM account_rate_limit_reset_rebinds WHERE idempotency_key=?",
-      ).all(prepared.idempotencyKey)).toEqual([]);
-    } finally {
-      inspector.close(false);
-    }
-    expect(store.prepareAccountRateLimitReset({
-      profileId: restarted.id,
+    now = firstWindow;
+    const laterWindow = 20_000;
+    expect(store.authorizeAccountRateLimitResetPolicy({
+      profileId: profile.id,
       processGeneration: restarted.processGeneration,
       accountFingerprint,
-      weeklyWindowResetsAt: prepared.weeklyWindowResetsAt,
-      observedUsedPercent: 99.9,
-    }).idempotencyKey).toBe(prepared.idempotencyKey);
+      weeklyWindowDurationMinutes: 10_080,
+      weeklyWindowResetsAt: laterWindow,
+    })).toMatchObject({
+      decision: "allow",
+      policy: { state: "active_bound", weeklyWindowResetsAt: laterWindow },
+    });
+    expect(store.rebindAccountRateLimitReset({
+      idempotencyKey: prepared.idempotencyKey,
+      expectedCurrentProcessGeneration: profile.processGeneration,
+      nextProcessGeneration: restarted.processGeneration,
+      accountFingerprint,
+    })).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      state: "ambiguous",
+      weeklyWindowResetsAt: firstWindow,
+    });
+    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey)).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      state: "effect_started",
+      weeklyWindowResetsAt: firstWindow,
+    });
+    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey))
+      .toHaveLength(1);
+  });
+
+  test("keeps prepared and retryable attempts bound to their exact active window", async () => {
+    const { store } = await fixture();
+    const attempts: Array<{
+      accountFingerprint: string;
+      idempotencyKey: string;
+      profileId: ReturnType<typeof signInProfile>["id"];
+      processGeneration: number;
+    }> = [];
+    for (const [index, state] of (["prepared", "retryable"] as const).entries()) {
+      const email = `exact-window-${state}@example.com`;
+      const profile = signInProfile(store, `Exact window ${state}`, email);
+      const accountFingerprint = resetAccountFingerprint(email);
+      const weeklyWindowResetsAt = 500_000_000 + index * 10_000;
+      const prepared = prepareAuthorizedReset(store, {
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint,
+        weeklyWindowResetsAt,
+        observedUsedPercent: 99,
+      });
+      if (state === "retryable") {
+        store.beginAccountRateLimitReset(prepared.idempotencyKey);
+        store.deferAccountRateLimitReset(prepared.idempotencyKey, "retryable");
+      }
+      expect(store.authorizeAccountRateLimitResetPolicy({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint,
+        weeklyWindowDurationMinutes: 10_080,
+        weeklyWindowResetsAt: weeklyWindowResetsAt + 1_000,
+      })).toMatchObject({ decision: "allow", policy: { state: "active_bound" } });
+      expect(() => store.beginAccountRateLimitReset(prepared.idempotencyKey))
+        .toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+      attempts.push({
+        accountFingerprint,
+        idempotencyKey: prepared.idempotencyKey,
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+      });
+    }
+
+    store.nextDaemonGeneration(`boot_${"e".repeat(32)}`);
+    for (const attempt of attempts) {
+      const restarted = store.requireProfileById(attempt.profileId);
+      expect(() => store.rebindAccountRateLimitReset({
+        idempotencyKey: attempt.idempotencyKey,
+        expectedCurrentProcessGeneration: attempt.processGeneration,
+        nextProcessGeneration: restarted.processGeneration,
+        accountFingerprint: attempt.accountFingerprint,
+      })).toThrow("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+    }
   });
 
   test("cascades rebind evidence when expired parent history is pruned", async () => {
@@ -5168,7 +5482,7 @@ describe("StateStore", () => {
     }
   });
 
-  test("rejects identity-mismatched rebinds without minting a duplicate key", async () => {
+  test("closes identity-mismatched recovery without minting a duplicate key", async () => {
     const { store } = await fixture();
     const email = "identity-reset@example.com";
     const profile = signInProfile(store, "Reset identity", email);
@@ -5195,9 +5509,16 @@ describe("StateStore", () => {
       expectedCurrentProcessGeneration: profile.processGeneration,
       nextProcessGeneration: restarted.processGeneration,
       accountFingerprint,
-    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_REBIND_IDENTITY_MISMATCH");
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
     expect(store.readRecoverableAccountRateLimitReset(profile.id, accountFingerprint))
-      .toMatchObject({ idempotencyKey: prepared.idempotencyKey });
+      .toBeNull();
+    expect(store.latestAccountRateLimitResetAttempt(profile.id, accountFingerprint))
+      .toMatchObject({
+        idempotencyKey: prepared.idempotencyKey,
+        localResolution: "account_identity_changed",
+        outcome: null,
+        state: "closed",
+      });
     expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([]);
     expect(() => store.prepareAccountRateLimitReset({
       ...input,

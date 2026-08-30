@@ -1802,7 +1802,12 @@ WHEN NOT (
   (OLD.state='prepared' AND NEW.state='effect_started') OR
   (OLD.state='effect_started' AND NEW.state IN ('ambiguous','retryable','settled')) OR
   (OLD.state IN ('ambiguous','retryable') AND NEW.state='effect_started') OR
-  (OLD.state IN ('prepared','ambiguous','retryable') AND NEW.state='closed') OR
+  (OLD.state IN ('prepared','retryable') AND NEW.state='closed') OR
+  (
+    OLD.state='ambiguous'
+    AND NEW.state='closed'
+    AND NEW.local_resolution='account_identity_changed'
+  ) OR
   OLD.state=NEW.state
 )
 BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset transition'); END;
@@ -1919,14 +1924,11 @@ WHEN NEW.profile_id!=OLD.profile_id
       OLD.state='reconciliation_required'
       AND NEW.state='window_suppressed'
     ) OR (
-      OLD.state IN ('window_suppressed','active_bound')
-      AND NEW.state='window_suppressed'
-      AND NEW.account_fingerprint!=OLD.account_fingerprint
-    ) OR (
       OLD.state='window_suppressed'
       AND NEW.state='active_bound'
       AND NEW.account_fingerprint=OLD.account_fingerprint
       AND NEW.weekly_window_resets_at>OLD.weekly_window_resets_at
+      AND NEW.updated_at>=OLD.weekly_window_resets_at
     ) OR (
       OLD.state IN (
         'active_unbound','reconciliation_required','window_suppressed','active_bound'
@@ -1953,8 +1955,13 @@ BEFORE UPDATE OF state ON account_rate_limit_reset_attempts
 WHEN NOT (
   (OLD.state='prepared' AND NEW.state='effect_started') OR
   (OLD.state='effect_started' AND NEW.state IN ('ambiguous','retryable','settled')) OR
-  (OLD.state='retryable' AND NEW.state='effect_started') OR
+  (OLD.state IN ('ambiguous','retryable') AND NEW.state='effect_started') OR
   (OLD.state IN ('prepared','retryable') AND NEW.state='closed') OR
+  (
+    OLD.state='ambiguous'
+    AND NEW.state='closed'
+    AND NEW.local_resolution='account_identity_changed'
+  ) OR
   OLD.state=NEW.state
 )
 BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset transition'); END;
@@ -1979,7 +1986,15 @@ WHEN NEW.state='effect_started'
     WHERE p.profile_id=OLD.profile_id
       AND p.state='active_bound'
       AND p.account_fingerprint=OLD.account_fingerprint
-      AND p.weekly_window_resets_at=OLD.weekly_window_resets_at
+      AND (
+        (
+          OLD.state IN ('prepared','retryable')
+          AND p.weekly_window_resets_at=OLD.weekly_window_resets_at
+        ) OR (
+          OLD.state='ambiguous'
+          AND p.weekly_window_resets_at>=OLD.weekly_window_resets_at
+        )
+      )
   )
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize dispatch'); END;
 DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_policy_close_guard;
@@ -1990,9 +2005,21 @@ WHEN NEW.state='closed'
   AND NOT EXISTS (
     SELECT 1 FROM account_rate_limit_reset_policies p
     WHERE p.profile_id=OLD.profile_id
-      AND p.state='active_bound'
-      AND p.account_fingerprint=OLD.account_fingerprint
-      AND p.weekly_window_resets_at>=OLD.weekly_window_resets_at
+      AND (
+        (
+          p.state='active_bound'
+          AND p.account_fingerprint=OLD.account_fingerprint
+          AND p.weekly_window_resets_at>=OLD.weekly_window_resets_at
+        ) OR (
+          NEW.local_resolution='account_identity_changed'
+          AND p.state='window_suppressed'
+        ) OR (
+          NEW.local_resolution='weekly_window_changed'
+          AND p.state='window_suppressed'
+          AND p.account_fingerprint=OLD.account_fingerprint
+          AND p.weekly_window_resets_at>OLD.weekly_window_resets_at
+        )
+      )
   )
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize closure'); END;
 DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_policy_guard;
@@ -2005,7 +2032,15 @@ WHEN NOT EXISTS (
   WHERE a.idempotency_key=NEW.idempotency_key
     AND p.state='active_bound'
     AND p.account_fingerprint=a.account_fingerprint
-    AND p.weekly_window_resets_at>=a.weekly_window_resets_at
+    AND (
+      (
+        a.state IN ('prepared','retryable')
+        AND p.weekly_window_resets_at=a.weekly_window_resets_at
+      ) OR (
+        a.state='ambiguous'
+        AND p.weekly_window_resets_at>=a.weekly_window_resets_at
+      )
+    )
 )
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset policy does not authorize rebind'); END;
 DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_insert_guard;
@@ -2016,7 +2051,7 @@ WHEN NOT EXISTS (
   WHERE a.idempotency_key=NEW.idempotency_key
     AND a.current_process_generation=NEW.from_process_generation
     AND a.account_fingerprint=NEW.account_fingerprint
-    AND a.state IN ('prepared','retryable')
+    AND a.state IN ('prepared','ambiguous','retryable')
 )
 BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind authority is invalid'); END;
 `;
@@ -3908,6 +3943,28 @@ export class StateStore {
     };
   }
 
+  #closeRecoverableAccountRateLimitResetIdentityAttempts(input: {
+    profileId: ProfileId;
+    accountFingerprint: string;
+    selection: "matching" | "different";
+    now: number;
+  }): void {
+    const fingerprintPredicate = input.selection === "matching" ? "=" : "!=";
+    this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts
+       SET state='ambiguous',updated_at=MAX(updated_at,?)
+       WHERE profile_id=? AND account_fingerprint${fingerprintPredicate}?
+         AND state='effect_started'`,
+    ).run(input.now, input.profileId, input.accountFingerprint);
+    this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts
+       SET state='closed',local_resolution='account_identity_changed',
+         updated_at=MAX(updated_at,?)
+       WHERE profile_id=? AND account_fingerprint${fingerprintPredicate}?
+         AND state IN ('prepared','ambiguous','retryable')`,
+    ).run(input.now, input.profileId, input.accountFingerprint);
+  }
+
   #setProfileState(
     profileId: ProfileId,
     expectedGeneration: number,
@@ -3927,6 +3984,13 @@ export class StateStore {
       ) {
         return { affectedWorkIds: [] as string[], changed: false };
       }
+      const policy = this.requireAccountRateLimitResetPolicy(profileId);
+      const nextAccountFingerprint = state === "signed_in" && identity?.email !== undefined
+        ? canonicalAccountFingerprint(identity.email)
+        : null;
+      const changedBoundIdentity = nextAccountFingerprint !== null
+        && policy.accountFingerprint !== null
+        && policy.accountFingerprint !== nextAccountFingerprint;
       const affectedWorkIds = state === "signed_in"
         ? []
         : [...(workStore?.prepareProfileAuthorityChange(profileId, expectedGeneration) ?? [])];
@@ -3939,6 +4003,31 @@ export class StateStore {
            AND (state!='recovery_required' OR ?='recovery_required')`,
       )
       .run(state, identity?.email ?? null, identity?.plan ?? null, now, profileId, expectedGeneration, state);
+      if (result.changes !== 1) throw new Error("Profile state authority changed.");
+      if (changedBoundIdentity) {
+        const previousAccountFingerprint = policy.accountFingerprint;
+        if (previousAccountFingerprint === null) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_INVALID");
+        }
+        this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+          profileId,
+          accountFingerprint: previousAccountFingerprint,
+          selection: "matching",
+          now,
+        });
+        const policyChanged = this.#database.query(
+          `UPDATE account_rate_limit_reset_policies
+           SET state='reconciliation_required',account_fingerprint=NULL,
+             weekly_window_resets_at=NULL,revision=revision+1,
+             updated_at=MAX(updated_at,?)
+           WHERE profile_id=? AND revision=?
+             AND state IN ('window_suppressed','active_bound')
+             AND account_fingerprint=?`,
+        ).run(now, profileId, policy.revision, previousAccountFingerprint);
+        if (policyChanged.changes !== 1) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_CONFLICT");
+        }
+      }
       if (result.changes === 1 && (state === "signed_in" || state === "signed_out")) {
         this.#database.query(`UPDATE provider_login_authorities
                               SET state='settled',settlement=?,updated_at=?
@@ -3949,7 +4038,6 @@ export class StateStore {
           expectedGeneration,
         );
       }
-      if (result.changes !== 1) throw new Error("Profile state authority changed.");
       return { affectedWorkIds, changed: true };
     });
     return update.immediate();
@@ -8371,18 +8459,12 @@ export class StateStore {
         policy.accountFingerprint !== null
         && policy.accountFingerprint !== accountFingerprint
       ) {
-        if (hasFreshExactWeeklyWindow && weeklyWindowResetsAt !== null) {
-          policy = transition({
-            state: "window_suppressed",
-            accountFingerprint,
-            weeklyWindowResetsAt,
-          });
-          return {
-            decision: "suppress",
-            reason: "reconciliation_window",
-            policy,
-          };
-        }
+        this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+          profileId,
+          accountFingerprint: policy.accountFingerprint,
+          selection: "matching",
+          now,
+        });
         policy = transition({
           state: "reconciliation_required",
           accountFingerprint: null,
@@ -8414,6 +8496,12 @@ export class StateStore {
             accountFingerprint,
             weeklyWindowResetsAt,
           });
+          this.#closeRecoverableAccountRateLimitResetIdentityAttempts({
+            profileId,
+            accountFingerprint,
+            selection: "different",
+            now,
+          });
           return {
             decision: "suppress",
             reason: "reconciliation_window",
@@ -8435,6 +8523,13 @@ export class StateStore {
             return {
               decision: "suppress",
               reason: "reconciliation_window",
+              policy,
+            };
+          }
+          if (now < policy.weeklyWindowResetsAt) {
+            return {
+              decision: "block",
+              reason: "weekly_window_nonmonotonic",
               policy,
             };
           }
@@ -8632,16 +8727,19 @@ export class StateStore {
         row.accountFingerprint !== accountFingerprint
         || row.currentProcessGeneration !== expectedCurrentProcessGeneration
       ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_AUTHORITY_CHANGED");
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
+      }
       const policy = this.requireAccountRateLimitResetPolicy(row.profileId);
+      const policyWindowAuthorizesAttempt = policy.weeklyWindowResetsAt !== null
+        && (row.state === "ambiguous"
+          ? policy.weeklyWindowResetsAt >= row.weeklyWindowResetsAt
+          : policy.weeklyWindowResetsAt === row.weeklyWindowResetsAt);
       if (
         policy.state !== "active_bound"
         || policy.accountFingerprint !== row.accountFingerprint
-        || policy.weeklyWindowResetsAt === null
-        || policy.weeklyWindowResetsAt < row.weeklyWindowResetsAt
+        || !policyWindowAuthorizesAttempt
       ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
-      if (!["prepared", "retryable"].includes(row.state)) {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
-      }
       const authority = z.object({
         process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         provider_email: z.string().email(),
@@ -8701,8 +8799,11 @@ export class StateStore {
         "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
       ).get(key));
       if (row.state === "closed" && row.localResolution === resolution) return row;
-      if (!["prepared", "retryable"].includes(row.state)) {
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_STATE_INVALID");
+      }
+      if (row.state === "ambiguous" && resolution !== "account_identity_changed") {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_RESOLUTION_INVALID");
       }
       const changed = this.#database.query(
         `UPDATE account_rate_limit_reset_attempts
@@ -8742,20 +8843,36 @@ export class StateStore {
            AND p.process_generation=r.current_process_generation
            AND lower(trim(p.provider_email)) IS NOT NULL`,
       ).get(key));
+      if (row.state === "effect_started") {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
+      }
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
+      }
       const policy = this.requireAccountRateLimitResetPolicy(row.profileId);
+      const policyWindowAuthorizesAttempt = policy.weeklyWindowResetsAt !== null
+        && (row.state === "ambiguous"
+          ? policy.weeklyWindowResetsAt >= row.weeklyWindowResetsAt
+          : policy.weeklyWindowResetsAt === row.weeklyWindowResetsAt);
       if (
         policy.state !== "active_bound"
         || policy.accountFingerprint !== row.accountFingerprint
-        || policy.weeklyWindowResetsAt !== row.weeklyWindowResetsAt
+        || !policyWindowAuthorizesAttempt
       ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
       const now = unixMillisecondsSchema.parse(this.#now());
+      const authorizedWindowResetsAt = row.state === "ambiguous"
+        ? policy.weeklyWindowResetsAt
+        : row.weeklyWindowResetsAt;
+      if (authorizedWindowResetsAt === null) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_POLICY_NOT_ACTIVE");
+      }
       const weeklyWindowMaximum = Math.min(
         Number.MAX_SAFE_INTEGER,
         now + CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000,
       );
       if (
-        row.weeklyWindowResetsAt <= now
-        || row.weeklyWindowResetsAt > weeklyWindowMaximum
+        authorizedWindowResetsAt <= now
+        || authorizedWindowResetsAt > weeklyWindowMaximum
       ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_WINDOW_NOT_FRESH");
       const identity = z.object({ provider_email: z.string().email() }).strict().parse(
         this.#database.query(
@@ -8765,12 +8882,6 @@ export class StateStore {
       );
       if (canonicalAccountFingerprint(identity.provider_email) !== row.accountFingerprint) {
         throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
-      }
-      if (row.state === "effect_started") {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
-      }
-      if (!["prepared", "retryable"].includes(row.state)) {
-        throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
       }
       const changed = this.#database.query(
         `UPDATE account_rate_limit_reset_attempts
