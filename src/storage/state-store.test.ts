@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { renameSync, symlinkSync } from "node:fs";
 import { chmod, lstat, mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -72,8 +73,11 @@ function signInProfile(store: StateStore, label: string, email: string) {
 }
 
 const usageFingerprint = "a".repeat(64);
+const resetAccountFingerprint = (email: string): string =>
+  createHash("sha256").update(email.trim().toLowerCase()).digest("hex");
 
 function usageSnapshot(input: Readonly<{
+  accountFingerprint?: string;
   fillerBytes?: number;
   lifetimeTokens: number;
   observedAt: number;
@@ -82,7 +86,7 @@ function usageSnapshot(input: Readonly<{
   sourceSequence: number;
 }>): StoredAccountUsageSnapshot {
   return createStoredAccountUsageSnapshot({
-    accountFingerprint: usageFingerprint,
+    accountFingerprint: input.accountFingerprint ?? usageFingerprint,
     daemonGeneration: 1,
     observedAt: input.observedAt,
     previousPayload: input.previous,
@@ -1553,7 +1557,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query(
         "SELECT applied_at FROM migrations WHERE version=23",
       ).get()).toEqual({ applied_at: 3_000 });
@@ -2828,10 +2832,20 @@ describe("StateStore", () => {
     const missing = store.createProfile("Missing private label");
     const removed = signInProfile(store, "Removed private label", "removed-private@example.com");
     store.recordUsage(observed.id, 1, 100, { sentinel: "old-observed-payload" });
-    store.recordUsagePollFailure(observed.id, 2, 200);
+    store.recordUsagePollFailure(
+      observed.id,
+      resetAccountFingerprint("observed-private@example.com"),
+      2,
+      200,
+    );
     store.recordUsage(observed.id, 3, 300, { sentinel: "latest-observed-payload" });
     store.recordUsage(failed.id, 1, 100, { sentinel: "old-failed-payload" });
-    store.recordUsagePollFailure(failed.id, 2, 200);
+    store.recordUsagePollFailure(
+      failed.id,
+      resetAccountFingerprint("failed-private@example.com"),
+      2,
+      200,
+    );
     store.recordUsage(removed.id, 1, 100, { sentinel: "removed-account-payload" });
     store.removeProfile(removed.id);
 
@@ -4203,16 +4217,551 @@ describe("StateStore", () => {
     });
   });
 
+  test("journals automatic weekly reset redemption before dispatch and reuses uncertainty keys", async () => {
+    const { store } = await fixture();
+    const email = "reset@example.com";
+    const profile = signInProfile(store, "Reset journal", email);
+    const input = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(email),
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    };
+    const prepared = store.prepareAccountRateLimitReset(input);
+    expect(prepared).toMatchObject({
+      profileId: input.profileId,
+      originProcessGeneration: input.processGeneration,
+      currentProcessGeneration: input.processGeneration,
+      accountFingerprint: input.accountFingerprint,
+      weeklyWindowResetsAt: input.weeklyWindowResetsAt,
+      observedUsedPercent: input.observedUsedPercent,
+      outcome: null,
+      localResolution: null,
+      state: "prepared",
+    });
+    expect(store.prepareAccountRateLimitReset({
+      ...input,
+      observedUsedPercent: 99.8,
+    }).idempotencyKey).toBe(prepared.idempotencyKey);
+
+    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey).state)
+      .toBe("effect_started");
+    expect(store.deferAccountRateLimitReset(prepared.idempotencyKey, "ambiguous").state)
+      .toBe("ambiguous");
+    expect(store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      input.accountFingerprint,
+    )?.idempotencyKey).toBe(prepared.idempotencyKey);
+    expect(store.beginAccountRateLimitReset(prepared.idempotencyKey).state)
+      .toBe("effect_started");
+    expect(store.settleAccountRateLimitReset(prepared.idempotencyKey, "alreadyRedeemed"))
+      .toMatchObject({ state: "settled", outcome: "alreadyRedeemed" });
+    expect(store.latestAccountRateLimitResetAttempt(
+      profile.id,
+      input.accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      state: "settled",
+      outcome: "alreadyRedeemed",
+    });
+    expect(store.latestAccountRateLimitResetAttempt(
+      profile.id,
+      resetAccountFingerprint("someone-else@example.com"),
+    )).toBeNull();
+
+    expect(store.prepareAccountRateLimitReset({
+      ...input,
+      observedUsedPercent: 100,
+    }).idempotencyKey).toBe(prepared.idempotencyKey);
+    expect(store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      input.accountFingerprint,
+    )).toBeNull();
+  });
+
+  test("orders the most recent reset attempt by a durable sequence across clock rollback and vacuum", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-sequence-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 10_000;
+    const store = new StateStore(paths, { now: () => now });
+    stores.push(store);
+    const email = "ordered-reset@example.com";
+    const profile = signInProfile(store, "Ordered reset", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const first = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(first.idempotencyKey);
+    store.settleAccountRateLimitReset(first.idempotencyKey, "reset");
+
+    now = 9_000;
+    const second = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_100_000_000,
+      observedUsedPercent: 99,
+    });
+    expect(second.attemptSequence).toBeGreaterThan(first.attemptSequence);
+    expect(second.createdAt).toBeLessThan(first.createdAt);
+    expect(store.latestAccountRateLimitResetAttempt(profile.id, accountFingerprint))
+      .toMatchObject({
+        attemptSequence: second.attemptSequence,
+        idempotencyKey: second.idempotencyKey,
+        state: "prepared",
+        weeklyWindowResetsAt: second.weeklyWindowResetsAt,
+      });
+
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    const maintenance = new Database(paths.database, { create: false, strict: true });
+    try {
+      maintenance.exec("VACUUM");
+    } finally {
+      maintenance.close(false);
+    }
+    const reopened = new StateStore(paths);
+    stores.push(reopened);
+    expect(reopened.latestAccountRateLimitResetAttempt(profile.id, accountFingerprint))
+      .toMatchObject({
+        attemptSequence: second.attemptSequence,
+        idempotencyKey: second.idempotencyKey,
+        state: "prepared",
+      });
+  });
+
+  test("retries a known no-op only after the weekly percentage advances", async () => {
+    const { store } = await fixture();
+    const email = "noop@example.com";
+    const profile = signInProfile(store, "Reset no-op", email);
+    const base = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(email),
+      weeklyWindowResetsAt: 2_000_000_000_000,
+    };
+    const first = store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(first.idempotencyKey);
+    store.settleAccountRateLimitReset(first.idempotencyKey, "nothingToReset");
+    expect(store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 99.9,
+    }).idempotencyKey).toBe(first.idempotencyKey);
+    const finalPercent = store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 100,
+    });
+    expect(finalPercent.idempotencyKey).not.toBe(first.idempotencyKey);
+    expect(finalPercent.state).toBe("prepared");
+  });
+
+  test("recovers effect-adjacent reset attempts without changing account state", async () => {
+    const { store } = await fixture();
+    const email = "recovery@example.com";
+    const profile = signInProfile(store, "Reset recovery", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const prepared = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(prepared.idempotencyKey);
+    expect(store.recoverAccountRateLimitResetAttempts())
+      .toEqual([prepared.idempotencyKey]);
+    expect(store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    )).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      state: "ambiguous",
+    });
+    expect(store.requireProfileById(profile.id).state).toBe("signed_in");
+  });
+
+  test("rebinds one recoverable reset across daemon generations with the same key", async () => {
+    const { store } = await fixture();
+    const email = "restart-reset@example.com";
+    const profile = signInProfile(store, "Reset restart", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const prepared = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(prepared.idempotencyKey);
+    store.recoverAccountRateLimitResetAttempts();
+    store.nextDaemonGeneration(`boot_${"r".repeat(32)}`);
+    const restarted = store.requireProfileById(profile.id);
+
+    const recoverable = store.readRecoverableAccountRateLimitReset(
+      profile.id,
+      accountFingerprint,
+    );
+    expect(recoverable).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      originProcessGeneration: profile.processGeneration,
+      currentProcessGeneration: profile.processGeneration,
+      state: "ambiguous",
+    });
+    const rebound = store.rebindAccountRateLimitReset({
+      idempotencyKey: prepared.idempotencyKey,
+      expectedCurrentProcessGeneration: profile.processGeneration,
+      nextProcessGeneration: restarted.processGeneration,
+      accountFingerprint,
+    });
+    expect(rebound).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      originProcessGeneration: profile.processGeneration,
+      currentProcessGeneration: restarted.processGeneration,
+      state: "ambiguous",
+    });
+    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([{
+      sequence: 1,
+      idempotencyKey: prepared.idempotencyKey,
+      fromProcessGeneration: profile.processGeneration,
+      toProcessGeneration: restarted.processGeneration,
+      accountFingerprint,
+      createdAt: expect.any(Number),
+    }]);
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => inspector.query(
+        `UPDATE account_rate_limit_reset_rebinds SET created_at=created_at+1
+         WHERE idempotency_key=?`,
+      ).run(prepared.idempotencyKey)).toThrow("append-only");
+      expect(() => inspector.query(
+        "DELETE FROM account_rate_limit_reset_rebinds WHERE idempotency_key=?",
+      ).run(prepared.idempotencyKey)).toThrow("append-only");
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.prepareAccountRateLimitReset({
+      profileId: restarted.id,
+      processGeneration: restarted.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: prepared.weeklyWindowResetsAt,
+      observedUsedPercent: 99.9,
+    }).idempotencyKey).toBe(prepared.idempotencyKey);
+  });
+
+  test("cascades rebind evidence when expired parent history is pruned", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-rebind-prune-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now++ });
+    stores.push(store);
+    const email = "pruned-rebind-reset@example.com";
+    const profile = signInProfile(store, "Reset rebind prune", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const expiringWindowResetsAt = 2_000;
+    const prepared = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: expiringWindowResetsAt,
+      observedUsedPercent: 99,
+    });
+    store.nextDaemonGeneration(`boot_${"p".repeat(32)}`);
+    const restarted = store.requireProfileById(profile.id);
+    store.rebindAccountRateLimitReset({
+      idempotencyKey: prepared.idempotencyKey,
+      expectedCurrentProcessGeneration: profile.processGeneration,
+      nextProcessGeneration: restarted.processGeneration,
+      accountFingerprint,
+    });
+    store.beginAccountRateLimitReset(prepared.idempotencyKey);
+    store.settleAccountRateLimitReset(prepared.idempotencyKey, "reset");
+    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey))
+      .toHaveLength(1);
+
+    now = 1_000_000;
+    for (let index = 0; index < 129; index += 1) {
+      const historical = store.prepareAccountRateLimitReset({
+        profileId: restarted.id,
+        processGeneration: restarted.processGeneration,
+        accountFingerprint,
+        weeklyWindowResetsAt: expiringWindowResetsAt + index + 1,
+        observedUsedPercent: 99,
+      });
+      store.beginAccountRateLimitReset(historical.idempotencyKey);
+      store.settleAccountRateLimitReset(historical.idempotencyKey, "noCredit");
+    }
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        "SELECT 1 FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(prepared.idempotencyKey)).toBeNull();
+      expect(inspector.query(
+        "SELECT 1 FROM account_rate_limit_reset_rebinds WHERE idempotency_key=?",
+      ).get(prepared.idempotencyKey)).toBeNull();
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("keeps a successful weekly-window latch across daemon generations", async () => {
+    const { store } = await fixture();
+    const email = "latched-reset@example.com";
+    const profile = signInProfile(store, "Reset latch", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const input = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    };
+    const prepared = store.prepareAccountRateLimitReset(input);
+    store.beginAccountRateLimitReset(prepared.idempotencyKey);
+    store.settleAccountRateLimitReset(prepared.idempotencyKey, "reset");
+    store.nextDaemonGeneration(`boot_${"s".repeat(32)}`);
+    const restarted = store.requireProfileById(profile.id);
+
+    expect(store.prepareAccountRateLimitReset({
+      ...input,
+      processGeneration: restarted.processGeneration,
+      observedUsedPercent: 100,
+    })).toMatchObject({
+      idempotencyKey: prepared.idempotencyKey,
+      originProcessGeneration: profile.processGeneration,
+      outcome: "reset",
+      state: "settled",
+    });
+  });
+
+  test("keeps terminal reset evidence immutable", async () => {
+    const { store } = await fixture();
+    const email = "immutable-reset@example.com";
+    const profile = signInProfile(store, "Reset evidence", email);
+    const base = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(email),
+      observedUsedPercent: 99,
+    };
+    const settled = store.prepareAccountRateLimitReset({
+      ...base,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+    });
+    store.beginAccountRateLimitReset(settled.idempotencyKey);
+    store.settleAccountRateLimitReset(settled.idempotencyKey, "reset");
+    const closed = store.prepareAccountRateLimitReset({
+      ...base,
+      weeklyWindowResetsAt: 2_000_000_001_000,
+    });
+    store.closeAccountRateLimitReset(closed.idempotencyKey, "weekly_window_changed");
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(() => inspector.query(
+        "UPDATE account_rate_limit_reset_attempts SET outcome='noCredit' WHERE idempotency_key=?",
+      ).run(settled.idempotencyKey)).toThrow("terminal evidence is immutable");
+      expect(() => inspector.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET local_resolution='account_identity_changed' WHERE idempotency_key=?`,
+      ).run(closed.idempotencyKey)).toThrow("terminal evidence is immutable");
+    } finally {
+      inspector.close(false);
+    }
+    expect(store.prepareAccountRateLimitReset({
+      ...base,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 100,
+    })).toMatchObject({
+      idempotencyKey: settled.idempotencyKey,
+      outcome: "reset",
+      state: "settled",
+    });
+  });
+
+  test("retains every live-window latch while bounding expired reset history", async () => {
+    const home = await realpath(await mkdtemp(join(tmpdir(), "hra-reset-retention-")));
+    const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
+    await initializeStatePaths(paths);
+    let now = 1_000;
+    const store = new StateStore(paths, { now: () => now++ });
+    stores.push(store);
+    const firstEmail = "retained-reset-000@example.com";
+    const profile = signInProfile(store, "Reset retention", firstEmail);
+    const liveWindowResetsAt = 1_000_000;
+    let firstKey: string | null = null;
+
+    for (let index = 0; index < 130; index += 1) {
+      const email = `retained-reset-${String(index).padStart(3, "0")}@example.com`;
+      expect(store.setProfileState(
+        profile.id,
+        profile.processGeneration,
+        "signed_in",
+        { email, plan: "Plus" },
+      )).toBe(true);
+      const prepared = store.prepareAccountRateLimitReset({
+        profileId: profile.id,
+        processGeneration: profile.processGeneration,
+        accountFingerprint: resetAccountFingerprint(email),
+        weeklyWindowResetsAt: liveWindowResetsAt,
+        observedUsedPercent: 99,
+      });
+      firstKey ??= prepared.idempotencyKey;
+      store.beginAccountRateLimitReset(prepared.idempotencyKey);
+      store.settleAccountRateLimitReset(prepared.idempotencyKey, "reset");
+    }
+    if (firstKey === null) throw new Error("Expected the first reset latch.");
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: firstEmail, plan: "Plus" },
+    )).toBe(true);
+    expect(store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(firstEmail),
+      weeklyWindowResetsAt: liveWindowResetsAt,
+      observedUsedPercent: 100,
+    }).idempotencyKey).toBe(firstKey);
+
+    now = liveWindowResetsAt + 1;
+    const currentEmail = "retained-reset-current@example.com";
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: currentEmail, plan: "Plus" },
+    )).toBe(true);
+    store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(currentEmail),
+      weeklyWindowResetsAt: liveWindowResetsAt + 1_000_000,
+      observedUsedPercent: 99,
+    });
+
+    const inspector = new Database(store.paths.database, { create: false, strict: true });
+    try {
+      expect(inspector.query(
+        `SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts
+         WHERE profile_id=? AND state IN ('settled','closed')
+           AND weekly_window_resets_at<=?`,
+      ).get(profile.id, liveWindowResetsAt)).toEqual({ count: 128 });
+    } finally {
+      inspector.close(false);
+    }
+  });
+
+  test("rejects identity-mismatched rebinds without minting a duplicate key", async () => {
+    const { store } = await fixture();
+    const email = "identity-reset@example.com";
+    const profile = signInProfile(store, "Reset identity", email);
+    const accountFingerprint = resetAccountFingerprint(email);
+    const input = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint,
+      weeklyWindowResetsAt: 2_000_000_000_000,
+      observedUsedPercent: 99,
+    };
+    const prepared = store.prepareAccountRateLimitReset(input);
+    store.nextDaemonGeneration(`boot_${"i".repeat(32)}`);
+    const restarted = store.requireProfileById(profile.id);
+    expect(store.setProfileState(
+      restarted.id,
+      restarted.processGeneration,
+      "signed_in",
+      { email: "different@example.com", plan: "Plus" },
+    )).toBe(true);
+
+    expect(() => store.rebindAccountRateLimitReset({
+      idempotencyKey: prepared.idempotencyKey,
+      expectedCurrentProcessGeneration: profile.processGeneration,
+      nextProcessGeneration: restarted.processGeneration,
+      accountFingerprint,
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_REBIND_IDENTITY_MISMATCH");
+    expect(store.readRecoverableAccountRateLimitReset(profile.id, accountFingerprint))
+      .toMatchObject({ idempotencyKey: prepared.idempotencyKey });
+    expect(store.listAccountRateLimitResetRebinds(prepared.idempotencyKey)).toEqual([]);
+    expect(() => store.prepareAccountRateLimitReset({
+      ...input,
+      processGeneration: restarted.processGeneration,
+    })).toThrow("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+  });
+
+  test("admits one later no-credit attempt per whole-percent observation and bounds repeats", async () => {
+    const { store } = await fixture();
+    const email = "credit-reset@example.com";
+    const profile = signInProfile(store, "Reset credit", email);
+    const base = {
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: resetAccountFingerprint(email),
+      weeklyWindowResetsAt: 2_000_000_000_000,
+    };
+    const first = store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 99,
+    });
+    store.beginAccountRateLimitReset(first.idempotencyKey);
+    store.settleAccountRateLimitReset(first.idempotencyKey, "noCredit");
+
+    const later = store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 99.5,
+    });
+    expect(later.idempotencyKey).not.toBe(first.idempotencyKey);
+    store.beginAccountRateLimitReset(later.idempotencyKey);
+    store.settleAccountRateLimitReset(later.idempotencyKey, "noCredit");
+    expect(store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 99.8,
+    }).idempotencyKey).toBe(later.idempotencyKey);
+
+    const exhausted = store.prepareAccountRateLimitReset({
+      ...base,
+      observedUsedPercent: 100,
+    });
+    expect(exhausted.idempotencyKey).not.toBe(later.idempotencyKey);
+  });
+
   test("pages successful and failed usage observations in one exact source order", async () => {
     const { store } = await fixture();
     const profile = store.createProfile("Usage history page");
-    store.recordUsage(profile.id, 1, 30_000, { privateProviderPayload: "first" });
-    store.recordUsagePollFailure(profile.id, 2, 10_000);
-    store.recordUsage(profile.id, 3, 20_000, { privateProviderPayload: "third" });
-    store.recordUsagePollFailure(profile.id, 4, 50_000);
+    const firstPayload = usageSnapshot({
+      lifetimeTokens: 100,
+      observedAt: 30_000,
+      previous: null,
+      receivedAt: 30_000,
+      sourceSequence: 1,
+    });
+    const thirdPayload = usageSnapshot({
+      lifetimeTokens: 300,
+      observedAt: 20_000,
+      previous: firstPayload,
+      receivedAt: 20_000,
+      sourceSequence: 3,
+    });
+    store.recordUsage(profile.id, 1, 30_000, firstPayload);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 2, 10_000);
+    store.recordUsage(profile.id, 3, 20_000, thirdPayload);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 4, 50_000);
 
     const first = store.usageHistoryPage({
       profileId: profile.id,
+      accountFingerprint: usageFingerprint,
       fromObservedAt: 5_000,
       throughObservedAt: 40_000,
       limit: 2,
@@ -4223,7 +4772,7 @@ describe("StateStore", () => {
           state: "observed",
           sourceRevision: 1,
           observedAt: 30_000,
-          payload: { privateProviderPayload: "first" },
+          payload: firstPayload,
         },
         {
           state: "failed",
@@ -4236,6 +4785,7 @@ describe("StateStore", () => {
     });
     expect(store.usageHistoryPage({
       profileId: profile.id,
+      accountFingerprint: usageFingerprint,
       fromObservedAt: 5_000,
       throughObservedAt: 40_000,
       afterSourceRevision: first.nextSourceRevision ?? 0,
@@ -4245,7 +4795,7 @@ describe("StateStore", () => {
         state: "observed",
         sourceRevision: 3,
         observedAt: 20_000,
-        payload: { privateProviderPayload: "third" },
+        payload: thirdPayload,
       }],
       nextSourceRevision: null,
     });
@@ -4256,19 +4806,102 @@ describe("StateStore", () => {
     const profile = store.createProfile("Usage source order");
     store.recordUsage(profile.id, 1, 30_000, { totalTokens: 100 });
     store.recordUsage(profile.id, 2, 10_000, { totalTokens: 200 });
-    store.recordUsagePollFailure(profile.id, 3, 40_000);
-    store.recordUsagePollFailure(profile.id, 4, 5_000);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 3, 40_000);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 4, 5_000);
 
     expect(store.latestUsage(profile.id)).toEqual({
       sourceRevision: 2,
       observedAt: 10_000,
       payload: { totalTokens: 200 },
     });
-    expect(store.latestUsagePollFailure(profile.id)).toEqual({
+    expect(store.latestUsagePollFailure(profile.id, usageFingerprint)).toEqual({
       sourceRevision: 4,
       observedAt: 5_000,
       reasonCode: "account_usage_read_failed",
     });
+  });
+
+  test("scopes usage snapshots and failures to the exact account after an identity change", async () => {
+    const { store } = await fixture();
+    const firstEmail = "usage-a@example.com";
+    const secondEmail = "usage-b@example.com";
+    const firstFingerprint = resetAccountFingerprint(firstEmail);
+    const secondFingerprint = resetAccountFingerprint(secondEmail);
+    const profile = signInProfile(store, "Usage identity", firstEmail);
+    const first = usageSnapshot({
+      accountFingerprint: firstFingerprint,
+      lifetimeTokens: 100,
+      observedAt: 10_000,
+      previous: null,
+      receivedAt: 1_000,
+      sourceSequence: 1,
+    });
+    store.recordUsage(profile.id, 1, 10_000, first);
+    store.recordUsagePollFailure(profile.id, firstFingerprint, 2, 20_000);
+
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: secondEmail, plan: "Plus" },
+    )).toBe(true);
+    const second = usageSnapshot({
+      accountFingerprint: secondFingerprint,
+      lifetimeTokens: 200,
+      observedAt: 30_000,
+      previous: null,
+      receivedAt: 1_000 + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 3,
+    });
+    store.recordUsage(profile.id, 3, 30_000, second);
+    store.recordUsagePollFailure(profile.id, secondFingerprint, 4, 40_000);
+    const staleFirst = usageSnapshot({
+      accountFingerprint: firstFingerprint,
+      lifetimeTokens: 300,
+      observedAt: 50_000,
+      previous: first,
+      receivedAt: 1_000 + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 5,
+    });
+    store.recordUsage(profile.id, 5, 50_000, staleFirst);
+    store.recordUsagePollFailure(profile.id, null, 6, 60_000);
+
+    expect(store.latestUsage(profile.id)).toMatchObject({ sourceRevision: 5 });
+    expect(store.latestUsageForAccount(profile.id, firstFingerprint))
+      .toEqual({ sourceRevision: 5, observedAt: 50_000, payload: staleFirst });
+    expect(store.latestUsageForAccount(profile.id, secondFingerprint))
+      .toEqual({ sourceRevision: 3, observedAt: 30_000, payload: second });
+    expect(store.latestUsagePollFailure(profile.id, firstFingerprint))
+      .toMatchObject({ sourceRevision: 2 });
+    expect(store.latestUsagePollFailure(profile.id, secondFingerprint))
+      .toMatchObject({ sourceRevision: 4 });
+
+    expect(store.usageHistoryPage({
+      accountFingerprint: secondFingerprint,
+      profileId: profile.id,
+      fromObservedAt: 0,
+      throughObservedAt: 60_000,
+      limit: 10,
+    }).entries.map((entry) => entry.sourceRevision)).toEqual([3, 4]);
+    expect(store.usageHistoryPage({
+      accountFingerprint: firstFingerprint,
+      profileId: profile.id,
+      fromObservedAt: 0,
+      throughObservedAt: 60_000,
+      limit: 10,
+    }).entries.map((entry) => entry.sourceRevision)).toEqual([1, 2, 5]);
+    expect(store.usageAfterRevision({
+      accountFingerprint: secondFingerprint,
+      afterSourceRevision: 0,
+      limit: 10,
+      profileId: profile.id,
+    }).map((snapshot) => snapshot.sourceRevision)).toEqual([3]);
+    expect(store.usageAfterRevision({
+      accountFingerprint: firstFingerprint,
+      afterSourceRevision: 0,
+      limit: 10,
+      profileId: profile.id,
+    }).map((snapshot) => snapshot.sourceRevision)).toEqual([1, 5]);
   });
 
   test("pages successful usage by exact source revision independent of observation time", async () => {
@@ -4297,11 +4930,12 @@ describe("StateStore", () => {
     });
     store.recordUsage(profile.id, 1, 30_000, first);
     store.recordUsage(profile.id, 2, 10_000, second);
-    store.recordUsagePollFailure(profile.id, 3, 40_000);
+    store.recordUsagePollFailure(profile.id, usageFingerprint, 3, 40_000);
     store.recordUsage(profile.id, 4, 20_000, fourth);
 
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
+      accountFingerprint: usageFingerprint,
       limit: 2,
       profileId: profile.id,
     })).toEqual([
@@ -4310,6 +4944,7 @@ describe("StateStore", () => {
     ]);
     expect(store.usageAfterRevision({
       afterSourceRevision: 2,
+      accountFingerprint: usageFingerprint,
       limit: 1,
       profileId: profile.id,
     })).toEqual([
@@ -4343,11 +4978,13 @@ describe("StateStore", () => {
 
     expect(store.usageAfterRevision({
       afterSourceRevision: 0,
+      accountFingerprint: usageFingerprint,
       limit: 10,
       profileId: profile.id,
     }).map((snapshot) => snapshot.sourceRevision)).toEqual([1, 3, 5]);
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
+      accountFingerprint: usageFingerprint,
       limit: 10,
       profileId: profile.id,
     }).map((snapshot) => snapshot.sourceRevision)).toEqual([3, 5]);
@@ -4380,6 +5017,7 @@ describe("StateStore", () => {
       .toBeGreaterThan(1);
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
+      accountFingerprint: usageFingerprint,
       limit: 10,
       profileId: profile.id,
     })).toEqual([]);
@@ -4405,6 +5043,7 @@ describe("StateStore", () => {
     store.recordUsage(profile.id, 71, now, next);
     expect(store.usageAfterRevision({
       afterSourceRevision: 1,
+      accountFingerprint: usageFingerprint,
       limit: 10,
       profileId: profile.id,
     }).map((snapshot) => snapshot.sourceRevision)).toEqual([71]);
@@ -4567,8 +5206,21 @@ describe("StateStore", () => {
     const { store } = await fixture();
     const inspector = new Database(store.paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
-      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }]);
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
+      expect(inspector.query("SELECT version FROM migrations ORDER BY version").all()).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }, { version: 21 }, { version: 22 }, { version: 23 }, { version: 24 }, { version: 25 }, { version: 26 }, { version: 27 }]);
+      expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
+        .toContainEqual(expect.objectContaining({ name: "attempt_sequence", type: "INTEGER", pk: 1 }));
+      expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_attempts)").all())
+        .toContainEqual(expect.objectContaining({ name: "idempotency_key", type: "TEXT", notnull: 1, pk: 0 }));
+      const resetAttemptColumns = inspector
+        .query("PRAGMA table_info(account_rate_limit_reset_attempts)").all();
+      for (const expected of [
+        { name: "origin_process_generation", type: "INTEGER", notnull: 1 },
+        { name: "current_process_generation", type: "INTEGER", notnull: 1 },
+        { name: "account_fingerprint", type: "TEXT", notnull: 1 },
+      ]) expect(resetAttemptColumns).toContainEqual(expect.objectContaining(expected));
+      expect(inspector.query("PRAGMA table_info(account_rate_limit_reset_rebinds)").all())
+        .toContainEqual(expect.objectContaining({ name: "sequence", type: "INTEGER", pk: 1 }));
       expect(inspector.query("PRAGMA table_info(profiles)").all())
         .toContainEqual(expect.objectContaining({ name: "label_key", type: "TEXT" }));
       expect(inspector.query("PRAGMA table_info(projects)").all())
@@ -4582,6 +5234,9 @@ describe("StateStore", () => {
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at", type: "REAL" }));
       expect(inspector.query("PRAGMA table_info(desktop_switches)").all()).toContainEqual(expect.objectContaining({ name: "switch_generation", type: "INTEGER" }));
       expect(inspector.query("PRAGMA table_info(usage_poll_failures)").all()).toContainEqual(expect.objectContaining({ name: "reason_code", type: "TEXT" }));
+      expect(inspector.query("PRAGMA table_info(usage_poll_failures)").all()).toContainEqual(
+        expect.objectContaining({ name: "account_fingerprint", type: "TEXT", notnull: 0 }),
+      );
       expect(inspector.query("PRAGMA table_info(usage_cloud_upload_anchors)").all())
         .toContainEqual(expect.objectContaining({ name: "received_at", type: "INTEGER" }));
       expect(inspector.query("PRAGMA table_info(provider_interactions)").all())
@@ -4810,7 +5465,7 @@ describe("StateStore", () => {
     stores.push(migrated);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query(
         `SELECT name FROM sqlite_master
          WHERE type='trigger' AND name IN (
@@ -4918,7 +5573,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(JSON.stringify(inspector.query(
         "SELECT display_json FROM provider_interactions ORDER BY public_id",
       ).all())).not.toContain("allowsSessionApproval");
@@ -5033,7 +5688,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([
@@ -5090,7 +5745,7 @@ describe("StateStore", () => {
 
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query(
         "SELECT revision,state FROM provider_interaction_transitions WHERE public_id=? ORDER BY revision",
       ).all(interactionId)).toEqual([{ revision: 1, state: "pending" }]);
@@ -5178,7 +5833,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
         expect(inspector.query(
           "SELECT enqueue_sequence FROM queue_entries ORDER BY enqueue_sequence",
         ).all()).toEqual([
@@ -5281,7 +5936,7 @@ describe("StateStore", () => {
 
       const inspector = new Database(paths.database, { readonly: true, strict: true });
       try {
-        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+        expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
         expect(inspector.query(
           "SELECT reason,required_at FROM security_scrub_authority WHERE singleton=1",
         ).get()).toEqual({ reason: "mcp_url_redaction", required_at: 9_000 });
@@ -5395,7 +6050,7 @@ describe("StateStore", () => {
     expect("providerUpdatedAt" in preserved).toBe(false);
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query("SELECT version, applied_at FROM migrations ORDER BY version").all()).toEqual([
         { version: 1, applied_at: 1000 },
         { version: 2, applied_at: 2000 },
@@ -5423,6 +6078,7 @@ describe("StateStore", () => {
         { version: 24, applied_at: 2000 },
         { version: 25, applied_at: 2000 },
         { version: 26, applied_at: 2000 },
+        { version: 27, applied_at: 2000 },
       ]);
       expect(inspector.query("PRAGMA table_info(sessions)").all()).toContainEqual(expect.objectContaining({ name: "provider_updated_at" }));
       expect(inspector.query("SELECT label,label_key FROM profiles").get()).toEqual({
@@ -5469,7 +6125,7 @@ describe("StateStore", () => {
     });
     const inspector = new Database(paths.database, { readonly: true, strict: true });
     try {
-      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 26 });
+      expect(inspector.query("PRAGMA user_version").get()).toEqual({ user_version: 27 });
       expect(inspector.query("SELECT applied_at FROM migrations WHERE version=3").get()).toEqual({
         applied_at: 9_000,
       });
@@ -5489,9 +6145,9 @@ describe("StateStore", () => {
     const paths = resolveStatePaths({ homeDirectory: home, platform: "darwin" });
     await initializeStatePaths(paths);
     const newer = new Database(paths.database, { create: true, strict: true });
-    newer.exec("PRAGMA user_version = 27");
+    newer.exec("PRAGMA user_version = 28");
     newer.close(false);
     await chmod(paths.database, 0o600);
-    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:27:26");
+    expect(() => new StateStore(paths)).toThrow("STATE_SCHEMA_NEWER:28:27");
   });
 });

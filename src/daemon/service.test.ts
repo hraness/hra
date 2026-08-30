@@ -45,7 +45,7 @@ import {
   createStoredAccountUsageSnapshot,
   storedAccountUsageSnapshotSchema,
 } from "../domain/usage-metrics";
-import { initializeStatePaths, resolveStatePaths } from "../storage/paths";
+import { initializeStatePaths, profilePaths, resolveStatePaths } from "../storage/paths";
 import { StateStore } from "../storage/state-store";
 import { DaemonAuthoritySafetyError } from "./daemon-lock";
 import type {
@@ -136,7 +136,13 @@ class FakeCodex implements CodexRuntimePort {
   };
   accountProjection: CodexAccountProjection = { signedIn: true, email: "person@example.com", plan: "Plus" };
   usageResult: { revision: number; observedAt: number; payload: unknown } = { revision: 1, observedAt: 2_000, payload: { primary: { usedPercent: 25 } } };
+  readonly usageResults: Array<{ revision: number; observedAt: number; payload: unknown }> = [];
   usageError: Error | undefined;
+  beforeReadUsageReturn?: () => Promise<void>;
+  resetOutcome: "reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit" = "reset";
+  resetError: Error | undefined;
+  beforeResetReturn?: () => Promise<void>;
+  readonly resetIdempotencyKeys: string[] = [];
   readonly pluginRequests: Array<Parameters<CodexRuntimePort["listPlugins"]>[0]> = [];
   pluginCatalog: CodexPluginCatalog = {
     marketplaces: [{
@@ -192,8 +198,18 @@ class FakeCodex implements CodexRuntimePort {
   }
   async readUsage(): Promise<{ revision: number; observedAt: number; payload: unknown }> {
     this.calls.push("usage");
+    await this.beforeReadUsageReturn?.();
     if (this.usageError !== undefined) throw this.usageError;
-    return this.usageResult;
+    return this.usageResults.shift() ?? this.usageResult;
+  }
+  async consumeRateLimitReset(
+    input: Parameters<CodexRuntimePort["consumeRateLimitReset"]>[0],
+  ): ReturnType<CodexRuntimePort["consumeRateLimitReset"]> {
+    this.calls.push("reset");
+    this.resetIdempotencyKeys.push(input.idempotencyKey);
+    await this.beforeResetReturn?.();
+    if (this.resetError !== undefined) throw this.resetError;
+    return this.resetOutcome;
   }
   async listSessions(input: Parameters<CodexRuntimePort["listSessions"]>[0]): ReturnType<CodexRuntimePort["listSessions"]> {
     this.calls.push("list");
@@ -787,6 +803,9 @@ const providerMutationCalls = (codex: FakeCodex): readonly string[] => codex.cal
 );
 
 const signal = new AbortController().signal;
+const automaticResetWindowResetsAtSeconds = Math.floor(Date.now() / 1_000)
+  + 3 * 24 * 60 * 60;
+const automaticResetWindowResetsAt = automaticResetWindowResetsAtSeconds * 1_000;
 
 const renderHuman = (command: LocalCommand, data: unknown): string => {
   let stdout = "";
@@ -2153,6 +2172,1070 @@ describe("HraService", () => {
     expect(after).toMatchObject({ usage: [{ snapshot: { payload: { primary: { usedPercent: 25 } } } }] });
   });
 
+  test("reconciles a changed provider identity before reading below-threshold usage", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage identity",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    codex.accountProjection = {
+      signedIn: true,
+      email: "other@example.com",
+      plan: "Plus",
+    };
+    codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: { primary: { usedPercent: 20 }, privateIdentity: "other" },
+    };
+    const callsBefore = codex.calls.length;
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls.slice(callsBefore)).toEqual(["readAccount"]);
+    expect(store.latestUsage(added.account.id)).toBeNull();
+    expect(codex.resetIdempotencyKeys).toEqual([]);
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: false,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{
+        account: { providerEmail: "other@example.com" },
+        poll: { state: "never_observed" },
+        snapshot: null,
+      }],
+    });
+  });
+
+  test("discards usage when the provider identity changes during the read", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Usage identity sandwich",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: { primary: { usedPercent: 20 }, privateIdentity: "other" },
+    };
+    codex.beforeReadUsageReturn = async () => {
+      codex.accountProjection = {
+        signedIn: true,
+        email: "other@example.com",
+        plan: "Plus",
+      };
+    };
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.calls.slice(-3)).toEqual(["readAccount", "usage", "readAccount"]);
+    expect(store.latestUsage(added.account.id)).toBeNull();
+    expect(codex.resetIdempotencyKeys).toEqual([]);
+  });
+
+  test("automatically consumes one reset at one percent remaining and rereads limits", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Auto reset" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    const limits = (usedPercent: number, credits: number) => ({
+      usage: { summary: { lifetimeTokens: 10 } },
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: { usedPercent: 80, windowDurationMins: 300, resetsAt: automaticResetWindowResetsAtSeconds },
+          secondary: { usedPercent, windowDurationMins: 10_080, resetsAt: automaticResetWindowResetsAtSeconds },
+        },
+        byLimitId: null,
+        resetCreditsAvailable: credits,
+      },
+    });
+    const afterReset = { revision: 2, observedAt: 2_001, payload: limits(0, 0) };
+    codex.usageResult = afterReset;
+    codex.usageResults.push(
+      { revision: 1, observedAt: 2_000, payload: limits(99, 1) },
+      afterReset,
+    );
+
+    const response = await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.calls.slice(-8)).toEqual([
+      "readAccount",
+      "usage",
+      "readAccount",
+      "readAccount",
+      "reset",
+      "readAccount",
+      "usage",
+      "readAccount",
+    ]);
+    expect(codex.resetIdempotencyKeys).toHaveLength(1);
+    expect(store.usageRange({ profileId: added.account.id }).map((row) => row.sourceRevision))
+      .toEqual([1, 2]);
+    expect(response).toMatchObject({
+      usage: [{
+        automaticReset: {
+          threshold: { remainingPercent: 1, usedPercent: 99 },
+          observation: {
+            state: "available",
+            creditsAvailable: 0,
+            remainingPercent: 100,
+            usedPercent: 0,
+          },
+          lastAttempt: {
+            state: "settled",
+            outcome: "reset",
+            weeklyWindowResetsAt: automaticResetWindowResetsAt,
+          },
+          refresh: { state: "settled", outcome: "reset" },
+        },
+        snapshot: { sourceRevision: 2, payload: limits(0, 0) },
+      }],
+    });
+
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toHaveLength(1);
+  });
+
+  test("persists a background reset result for later passive usage status", async () => {
+    const { service, codex, store, paths } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Background reset",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const limits = (usedPercent: number, credits: number) => ({
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: null,
+          secondary: {
+            usedPercent,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+        },
+        byLimitId: null,
+        resetCreditsAvailable: credits,
+      },
+    });
+    const afterReset = { revision: 2, observedAt: 2_001, payload: limits(0, 0) };
+    codex.usageResult = afterReset;
+    codex.usageResults.push(
+      { revision: 1, observedAt: 2_000, payload: limits(99, 1) },
+      afterReset,
+    );
+    const profile = store.requireProfileById(added.account.id);
+    const owned = profilePaths(paths, profile.id);
+    await service.observeCodexFact({
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: owned.codexHome,
+      desktopUserData: owned.desktopUserData,
+    }, { type: "rateLimitsUpdated" });
+    await service.settled();
+
+    const passive = await service.execute({
+      kind: "account.usage",
+      account: profile.id,
+      refresh: false,
+    }, { signal }) as { usage: Array<{ automaticReset: Record<string, unknown> }> };
+    expect(codex.calls.slice(-8)).toEqual([
+      "readAccount",
+      "usage",
+      "readAccount",
+      "readAccount",
+      "reset",
+      "readAccount",
+      "usage",
+      "readAccount",
+    ]);
+    expect(passive).toMatchObject({
+      usage: [{
+        automaticReset: {
+          lastAttempt: {
+            state: "settled",
+            outcome: "reset",
+            weeklyWindowResetsAt: automaticResetWindowResetsAt,
+          },
+        },
+      }],
+    });
+    expect(passive.usage[0]?.automaticReset).not.toHaveProperty("refresh");
+    const automaticReset = JSON.stringify(passive.usage[0]?.automaticReset);
+    expect(automaticReset).not.toContain(codex.resetIdempotencyKeys[0] as string);
+    expect(automaticReset).not.toContain(
+      createHash("sha256").update("person@example.com").digest("hex"),
+    );
+  });
+
+  test("settles known reset no-ops without degrading successful usage polling", async () => {
+    for (const outcome of ["nothingToReset", "noCredit"] as const) {
+      const { service, codex } = await fixture();
+      const added = await service.execute({
+        kind: "account.add",
+        label: `Reset ${outcome}`,
+      }, { signal }) as { account: { id: string } };
+      await service.execute({
+        kind: "account.login",
+        account: added.account.id,
+        deviceCode: false,
+      }, { signal });
+      const payload = {
+        usage: { summary: { lifetimeTokens: 10 } },
+        rateLimits: {
+          primary: {
+            limitId: "codex",
+            primary: null,
+            secondary: {
+              usedPercent: 99,
+              windowDurationMins: 10_080,
+              resetsAt: automaticResetWindowResetsAtSeconds,
+            },
+          },
+          byLimitId: null,
+          resetCreditsAvailable: 1,
+        },
+      };
+      codex.usageResult = { revision: 1, observedAt: 2_000, payload };
+      codex.resetOutcome = outcome;
+      const first = await service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal });
+      expect(first).toMatchObject({
+        usage: [{
+          automaticReset: { refresh: { state: "settled", outcome } },
+          poll: { state: "observed" },
+        }],
+      });
+      expect(codex.resetIdempotencyKeys).toHaveLength(1);
+      await service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal });
+      expect(codex.resetIdempotencyKeys).toHaveLength(outcome === "noCredit" ? 2 : 1);
+      await service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal });
+      expect(codex.resetIdempotencyKeys).toHaveLength(outcome === "noCredit" ? 2 : 1);
+    }
+  });
+
+  test("reconciles an indeterminate reset with the exact persisted key", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Reset retry" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    const payload = {
+      usage: { summary: { lifetimeTokens: 10 } },
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: null,
+          secondary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    };
+    codex.usageResult = { revision: 1, observedAt: 2_000, payload };
+    codex.resetError = new IndeterminateCodexEffectError(
+      "account/rateLimitResetCredit/consume",
+      99,
+    );
+    const indeterminate = await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(indeterminate).toMatchObject({
+      usage: [{ automaticReset: {
+        lastAttempt: {
+          state: "recovery_pending",
+          weeklyWindowResetsAt: automaticResetWindowResetsAt,
+        },
+        refresh: { state: "recovery_pending" },
+      } }],
+    });
+    const key = codex.resetIdempotencyKeys[0];
+    if (key === undefined) throw new Error("Expected a persisted reset idempotency key.");
+    expect(typeof key).toBe("string");
+    expect(store.readRecoverableAccountRateLimitReset(
+      added.account.id,
+      createHash("sha256").update("person@example.com").digest("hex"),
+    )).toMatchObject({ idempotencyKey: key, state: "ambiguous" });
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: false,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: { lastAttempt: {
+        state: "recovery_pending",
+        weeklyWindowResetsAt: automaticResetWindowResetsAt,
+      } } }],
+    });
+
+    codex.resetError = undefined;
+    codex.resetOutcome = "alreadyRedeemed";
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toEqual([key, key]);
+    expect(store.readRecoverableAccountRateLimitReset(
+      added.account.id,
+      createHash("sha256").update("person@example.com").digest("hex"),
+    )).toBeNull();
+  });
+
+  test("preserves an ambiguous reset key while its live weekly bucket is unavailable", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset missing bucket",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const eligiblePayload = {
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    };
+    codex.usageResult = { revision: 1, observedAt: 2_000, payload: eligiblePayload };
+    codex.resetError = new IndeterminateCodexEffectError(
+      "account/rateLimitResetCredit/consume",
+      99,
+    );
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    const key = codex.resetIdempotencyKeys[0];
+    if (key === undefined) throw new Error("Expected an ambiguous reset key.");
+
+    codex.resetError = undefined;
+    codex.usageResult = {
+      revision: 2,
+      observedAt: 3_000,
+      payload: { rateLimits: { temporarilyUnavailable: true } },
+    };
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: { refresh: { state: "recovery_pending" } } }],
+    });
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    expect(store.readRecoverableAccountRateLimitReset(added.account.id, fingerprint))
+      .toMatchObject({ idempotencyKey: key, state: "ambiguous" });
+    expect(codex.resetIdempotencyKeys).toEqual([key]);
+
+    codex.usageResult = { revision: 3, observedAt: 4_000, payload: eligiblePayload };
+    codex.resetOutcome = "alreadyRedeemed";
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toEqual([key, key]);
+  });
+
+  test("never redispatches a terminal reset latch returned by preparation", async () => {
+    const settled = await fixture();
+    const settledAccount = await settled.service.execute({
+      kind: "account.add",
+      label: "Settled reset latch",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await settled.service.execute({
+      kind: "account.login",
+      account: settledAccount.account.id,
+      deviceCode: false,
+    }, { signal });
+    const eligiblePayload = {
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    };
+    settled.codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: eligiblePayload,
+    };
+    await settled.service.execute({
+      kind: "account.usage",
+      account: settledAccount.account.id,
+      refresh: true,
+    }, { signal });
+    await expect(settled.service.execute({
+      kind: "account.usage",
+      account: settledAccount.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: {
+        refresh: { state: "latched", outcome: "reset" },
+      } }],
+    });
+    expect(settled.codex.resetIdempotencyKeys).toHaveLength(1);
+
+    const closed = await fixture();
+    const closedAccount = await closed.service.execute({
+      kind: "account.add",
+      label: "Closed reset latch",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await closed.service.execute({
+      kind: "account.login",
+      account: closedAccount.account.id,
+      deviceCode: false,
+    }, { signal });
+    const profile = closed.store.requireProfileById(closedAccount.account.id);
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    const prepared = closed.store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: fingerprint,
+      weeklyWindowResetsAt: automaticResetWindowResetsAt,
+      observedUsedPercent: 99,
+    });
+    closed.store.closeAccountRateLimitReset(
+      prepared.idempotencyKey,
+      "weekly_window_changed",
+    );
+    closed.codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: eligiblePayload,
+    };
+    await expect(closed.service.execute({
+      kind: "account.usage",
+      account: closedAccount.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: {
+        refresh: { state: "latched", reason: "weekly_window_changed" },
+      } }],
+    });
+    expect(closed.codex.resetIdempotencyKeys).toEqual([]);
+  });
+
+  test("rechecks eligibility after a determinate reset rejection", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset rejection",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const payload = (usedPercent: number) => ({
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: {
+            usedPercent,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    });
+    codex.usageResult = { revision: 1, observedAt: 2_000, payload: payload(99) };
+    codex.resetError = new CodexRemoteError(-32_000, "request failed");
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: { refresh: { state: "retry_pending" } } }],
+    });
+    const key = codex.resetIdempotencyKeys[0];
+    if (key === undefined) throw new Error("Expected a retryable reset key.");
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    expect(store.readRecoverableAccountRateLimitReset(added.account.id, fingerprint))
+      .toMatchObject({ idempotencyKey: key, state: "retryable" });
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: false,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: { lastAttempt: {
+        state: "retry_pending",
+        weeklyWindowResetsAt: automaticResetWindowResetsAt,
+      } } }],
+    });
+
+    codex.resetError = undefined;
+    codex.usageResult = { revision: 2, observedAt: 3_000, payload: payload(98) };
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{
+        automaticReset: {
+          refresh: { state: "waiting", reason: "below_threshold" },
+        },
+      }],
+    });
+    expect(codex.resetIdempotencyKeys).toEqual([key]);
+
+    codex.usageResult = { revision: 3, observedAt: 4_000, payload: payload(99) };
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toEqual([key, key]);
+  });
+
+  test("closes an ambiguous reset when its weekly window advances without quarantining", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset window",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const payload = (resetsAt: number) => ({
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt,
+          },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    });
+    codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: payload(automaticResetWindowResetsAtSeconds),
+    };
+    codex.resetError = new IndeterminateCodexEffectError(
+      "account/rateLimitResetCredit/consume",
+      99,
+    );
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    codex.resetError = undefined;
+    codex.usageResult = {
+      revision: 2,
+      observedAt: 3_000,
+      payload: payload(automaticResetWindowResetsAtSeconds + 100_000),
+    };
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{ automaticReset: { refresh: { state: "window_changed" } } }],
+    });
+    expect(codex.resetIdempotencyKeys).toHaveLength(1);
+    expect(store.requireProfileById(added.account.id).state).toBe("signed_in");
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toHaveLength(2);
+  });
+
+  test("rebinds an ambiguous reset across a replacement app-server generation", async () => {
+    const value = await fixture();
+    const added = await value.service.execute({
+      kind: "account.add",
+      label: "Reset restart",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const payload = {
+      usage: { summary: { lifetimeTokens: 10 } },
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: null,
+          secondary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    };
+    value.codex.usageResult = { revision: 1, observedAt: 2_000, payload };
+    value.codex.resetError = new IndeterminateCodexEffectError(
+      "account/rateLimitResetCredit/consume",
+      99,
+    );
+    await value.service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    const key = value.codex.resetIdempotencyKeys[0];
+    if (key === undefined) throw new Error("Expected an ambiguous reset key.");
+    const originalGeneration = value.store.requireProfileById(added.account.id)
+      .processGeneration;
+    await value.service.close();
+    const replacementGeneration = value.store.requireProfileById(added.account.id)
+      .processGeneration;
+    expect(replacementGeneration).toBe(originalGeneration + 1);
+
+    const replacementCodex = new FakeCodex();
+    replacementCodex.usageResult = { revision: 2, observedAt: 3_000, payload };
+    replacementCodex.resetOutcome = "alreadyRedeemed";
+    const replacement = new HraService({
+      store: value.store,
+      paths: value.paths,
+      codex: replacementCodex,
+      cloud: new FakeCloud(),
+      daemonAuthority: new FakeDaemonAuthority(),
+      daemonGeneration: 2,
+      requestStop: () => undefined,
+    });
+    await replacement.recover();
+    await replacement.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    expect(replacementCodex.resetIdempotencyKeys).toEqual([key]);
+    expect(value.store.listAccountRateLimitResetRebinds(key)).toEqual([
+      expect.objectContaining({
+        fromProcessGeneration: originalGeneration,
+        toProcessGeneration: replacementGeneration,
+      }),
+    ]);
+    await replacement.close();
+  });
+
+  test("keeps a prepared reset dormant until the same weekly window is eligible again", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset threshold recheck",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const profile = store.requireProfileById(added.account.id);
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    const resetAt = automaticResetWindowResetsAt;
+    const prepared = store.prepareAccountRateLimitReset({
+      profileId: profile.id,
+      processGeneration: profile.processGeneration,
+      accountFingerprint: fingerprint,
+      weeklyWindowResetsAt: resetAt,
+      observedUsedPercent: 99,
+    });
+    codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: {
+        rateLimits: {
+          primary: {
+            limitId: "codex",
+            primary: {
+              usedPercent: 98,
+              windowDurationMins: 10_080,
+              resetsAt: resetAt / 1_000,
+            },
+            secondary: null,
+          },
+          byLimitId: null,
+          resetCreditsAvailable: 1,
+        },
+      },
+    };
+    await service.execute({
+      kind: "account.usage",
+      account: profile.id,
+      refresh: true,
+    }, { signal });
+    expect(codex.resetIdempotencyKeys).toEqual([]);
+    expect(store.readRecoverableAccountRateLimitReset(profile.id, fingerprint))
+      .toMatchObject({ idempotencyKey: prepared.idempotencyKey, state: "prepared" });
+  });
+
+  test("closes an ambiguous reset and reconciles when fresh account identity changes", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset identity",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const payload = {
+      rateLimits: {
+        primary: {
+          limitId: "codex",
+          primary: {
+            usedPercent: 99,
+            windowDurationMins: 10_080,
+            resetsAt: automaticResetWindowResetsAtSeconds,
+          },
+          secondary: null,
+        },
+        byLimitId: null,
+        resetCreditsAvailable: 1,
+      },
+    };
+    codex.usageResult = { revision: 1, observedAt: 2_000, payload };
+    codex.resetError = new IndeterminateCodexEffectError(
+      "account/rateLimitResetCredit/consume",
+      99,
+    );
+    await service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    codex.resetError = undefined;
+    codex.accountProjection = {
+      signedIn: true,
+      email: "someone-else@example.com",
+      plan: "Plus",
+    };
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(codex.resetIdempotencyKeys).toHaveLength(1);
+    expect(store.requireProfileById(added.account.id)).toMatchObject({
+      state: "signed_in",
+      providerEmail: "someone-else@example.com",
+      providerPlan: "Plus",
+    });
+    await expect(service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: false,
+    }, { signal })).resolves.toMatchObject({
+      usage: [{
+        account: { providerEmail: "someone-else@example.com" },
+        automaticReset: {
+          lastAttempt: null,
+          observation: {
+            state: "unavailable",
+            reason: "weekly_window_unavailable",
+          },
+        },
+        snapshot: null,
+      }],
+    });
+  });
+
+  test("account show clears a reset-era recovery quarantine without a generic mutation", async () => {
+    const { service, codex, store } = await fixture();
+    const added = await service.execute({
+      kind: "account.add",
+      label: "Reset recovery",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const profile = store.requireProfileById(added.account.id);
+    expect(store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "recovery_required",
+      {
+        ...(profile.providerEmail === undefined ? {} : { email: profile.providerEmail }),
+        ...(profile.providerPlan === undefined ? {} : { plan: profile.providerPlan }),
+      },
+    )).toBe(true);
+    codex.accountProjection = {
+      signedIn: true,
+      email: "person@example.com",
+      plan: "Plus",
+    };
+    await expect(service.execute({
+      kind: "account.show",
+      account: added.account.id,
+    }, { signal })).resolves.toMatchObject({
+      account: { state: "signed_in" },
+      recovery: {
+        cleared: true,
+        required: false,
+        resolution: "provider_state_reconciled",
+      },
+    });
+  });
+
+  test("synchronously fences provider authority when reset journaling fails", async () => {
+    for (const boundary of ["defer", "settle"] as const) {
+      let stopCalls = 0;
+      const value = await fixture(
+        undefined,
+        new FakeCloud(),
+        () => { stopCalls += 1; },
+      );
+      const added = await value.service.execute({
+        kind: "account.add",
+        label: `Reset journal ${boundary}`,
+      }, { signal }) as { account: { id: `acct_${string}` } };
+      await value.service.execute({
+        kind: "account.login",
+        account: added.account.id,
+        deviceCode: false,
+      }, { signal });
+      value.codex.usageResult = {
+        revision: 1,
+        observedAt: 2_000,
+        payload: {
+          rateLimits: {
+            primary: {
+              limitId: "codex",
+              primary: {
+                usedPercent: 99,
+                windowDurationMins: 10_080,
+                resetsAt: automaticResetWindowResetsAtSeconds,
+              },
+              secondary: null,
+            },
+            byLimitId: null,
+            resetCreditsAvailable: 1,
+          },
+        },
+      };
+      if (boundary === "defer") {
+        value.codex.resetError = new IndeterminateCodexEffectError(
+          "account/rateLimitResetCredit/consume",
+          99,
+        );
+        Object.defineProperty(value.store, "deferAccountRateLimitReset", {
+          configurable: true,
+          value: () => { throw new Error("injected reset defer failure"); },
+        });
+      } else {
+        Object.defineProperty(value.store, "settleAccountRateLimitReset", {
+          configurable: true,
+          value: () => { throw new Error("injected reset settlement failure"); },
+        });
+      }
+      await expect(value.service.execute({
+        kind: "account.usage",
+        account: added.account.id,
+        refresh: true,
+      }, { signal })).rejects.toBeInstanceOf(AggregateError);
+      expect(value.daemonAuthority.current).toBe(false);
+      expect(value.daemonAuthority.closeCalls).toBe(1);
+      const callsAtFence = value.codex.calls.length;
+      await expect(value.service.execute({
+        kind: "account.logout",
+        account: added.account.id,
+      }, { signal })).rejects.toMatchObject({ code: "UNAVAILABLE" });
+      expect(value.codex.calls).toHaveLength(callsAtFence);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      expect(stopCalls).toBe(1);
+    }
+  });
+
+  test("commits a returned reset outcome even when shutdown closes daemon authority", async () => {
+    const value = await fixture();
+    const added = await value.service.execute({
+      kind: "account.add",
+      label: "Reset shutdown",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    value.codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: {
+        rateLimits: {
+          primary: {
+            limitId: "codex",
+            primary: {
+              usedPercent: 99,
+              windowDurationMins: 10_080,
+              resetsAt: automaticResetWindowResetsAtSeconds,
+            },
+            secondary: null,
+          },
+          byLimitId: null,
+          resetCreditsAvailable: 1,
+        },
+      },
+    };
+    let signalReset!: () => void;
+    const resetStarted = new Promise<void>((resolve) => { signalReset = resolve; });
+    let releaseReset!: () => void;
+    const resetGate = new Promise<void>((resolve) => { releaseReset = resolve; });
+    value.codex.beforeResetReturn = async () => {
+      signalReset();
+      await resetGate;
+    };
+    const refresh = value.service.execute({
+      kind: "account.usage",
+      account: added.account.id,
+      refresh: true,
+    }, { signal });
+    await resetStarted;
+    const closing = value.service.close();
+    releaseReset();
+    await expect(refresh).rejects.toBeInstanceOf(DaemonAuthoritySafetyError);
+    await closing;
+    const fingerprint = createHash("sha256").update("person@example.com").digest("hex");
+    expect(value.store.readRecoverableAccountRateLimitReset(
+      added.account.id,
+      fingerprint,
+    )).toBeNull();
+  });
+
+  test("coalesces rate-limit notifications into authoritative serialized reads", async () => {
+    const { service, codex, store, paths } = await fixture();
+    const added = await service.execute({ kind: "account.add", label: "Reset wake" }, { signal }) as { account: { id: `acct_${string}` } };
+    await service.execute({ kind: "account.login", account: added.account.id, deviceCode: false }, { signal });
+    const profile = store.requireProfileById(added.account.id);
+    const owned = profilePaths(paths, profile.id);
+    const authority: ProfileAuthority = {
+      id: profile.id,
+      generation: profile.processGeneration,
+      codexHome: owned.codexHome,
+      desktopUserData: owned.desktopUserData,
+    };
+    codex.usageResult = {
+      revision: 1,
+      observedAt: 2_000,
+      payload: {
+        usage: { summary: { lifetimeTokens: 10 } },
+        rateLimits: {
+          primary: {
+            limitId: "codex",
+            primary: null,
+            secondary: {
+              usedPercent: 98,
+              windowDurationMins: 10_080,
+              resetsAt: automaticResetWindowResetsAtSeconds,
+            },
+          },
+          byLimitId: null,
+          resetCreditsAvailable: 1,
+        },
+      },
+    };
+    let reads = 0;
+    let signalFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { signalFirst = resolve; });
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let signalTrailing!: () => void;
+    const trailingStarted = new Promise<void>((resolve) => { signalTrailing = resolve; });
+    codex.beforeReadUsageReturn = async () => {
+      reads += 1;
+      if (reads === 1) {
+        signalFirst();
+        await firstGate;
+      } else if (reads === 2) {
+        signalTrailing();
+      }
+    };
+
+    await service.observeCodexFact(authority, { type: "rateLimitsUpdated" });
+    await firstStarted;
+    await service.observeCodexFact(authority, { type: "rateLimitsUpdated" });
+    releaseFirst();
+    await trailingStarted;
+    await service.execute({
+      kind: "account.usage",
+      account: profile.id,
+      refresh: false,
+    }, { signal });
+    expect(reads).toBe(2);
+    expect(codex.resetIdempotencyKeys).toEqual([]);
+  });
+
   test("allocates durable usage authority and returns an observed trailing velocity", async () => {
     const { service, codex, store } = await fixture();
     const added = await service.execute({ kind: "account.add", label: "Velocity" }, { signal }) as { account: { id: `acct_${string}` } };
@@ -2192,6 +3275,14 @@ describe("HraService", () => {
       { kind: "account.add", label: "Usage history" },
       { signal },
     ) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const accountFingerprint = createHash("sha256")
+      .update("person@example.com")
+      .digest("hex");
     const sentinel = "PRIVATE_PROVIDER_PAYLOAD_SENTINEL";
     const first = createStoredAccountUsageSnapshot({
       providerPayload: {
@@ -2201,7 +3292,7 @@ describe("HraService", () => {
       sourceSequence: 1,
       observedAt: now - 180_000,
       receivedAt: now - 179_000,
-      accountFingerprint: "a".repeat(64),
+      accountFingerprint,
       providerGeneration: 0,
       daemonGeneration: 1,
       previousPayload: null,
@@ -2214,15 +3305,25 @@ describe("HraService", () => {
       sourceSequence: 3,
       observedAt: now - 60_000,
       receivedAt: now - 59_000,
-      accountFingerprint: "a".repeat(64),
+      accountFingerprint,
       providerGeneration: 0,
       daemonGeneration: 1,
       previousPayload: first,
     });
     value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
-    value.store.recordUsagePollFailure(added.account.id, 2, now - 120_000);
+    value.store.recordUsagePollFailure(
+      added.account.id,
+      accountFingerprint,
+      2,
+      now - 120_000,
+    );
     value.store.recordUsage(added.account.id, 3, third.observation.observedAt, third);
-    value.store.recordUsagePollFailure(added.account.id, 4, now - 30_000);
+    value.store.recordUsagePollFailure(
+      added.account.id,
+      accountFingerprint,
+      4,
+      now - 30_000,
+    );
 
     const firstPage = await value.service.execute({
       kind: "account.usage-history",
@@ -2303,6 +3404,73 @@ describe("HraService", () => {
     });
   });
 
+  test("binds usage-history rows and cursors to the current account identity", async () => {
+    const now = 1_700_000_000_000;
+    const value = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
+    const added = await value.service.execute({
+      kind: "account.add",
+      label: "Identity history",
+    }, { signal }) as { account: { id: `acct_${string}` } };
+    await value.service.execute({
+      kind: "account.login",
+      account: added.account.id,
+      deviceCode: false,
+    }, { signal });
+    const firstFingerprint = createHash("sha256")
+      .update("person@example.com")
+      .digest("hex");
+    const first = createStoredAccountUsageSnapshot({
+      providerPayload: { usage: { summary: { lifetimeTokens: 10 } } },
+      sourceSequence: 1,
+      observedAt: now - 2_000,
+      receivedAt: now - 1_900,
+      accountFingerprint: firstFingerprint,
+      providerGeneration: 1,
+      daemonGeneration: 1,
+      previousPayload: null,
+    });
+    value.store.recordUsage(added.account.id, 1, first.observation.observedAt, first);
+    value.store.recordUsagePollFailure(
+      added.account.id,
+      firstFingerprint,
+      2,
+      now - 1_000,
+    );
+    const firstPage = await value.service.execute({
+      kind: "account.usage-history",
+      account: added.account.id,
+      fromObservedAt: now - 3_000,
+      throughObservedAt: now,
+      limit: 1,
+    }, { signal }) as { entries: unknown[]; nextCursor: string };
+    expect(firstPage.entries).toHaveLength(1);
+    expect(firstPage.nextCursor).toBeString();
+
+    const profile = value.store.requireProfileById(added.account.id);
+    expect(value.store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: "other@example.com", plan: "Plus" },
+    )).toBe(true);
+    await expect(value.service.execute({
+      kind: "account.usage-history",
+      account: added.account.id,
+      cursor: firstPage.nextCursor,
+      limit: 1,
+    }, { signal })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+      details: { reason: "account_mismatch" },
+    });
+    await expect(value.service.execute({
+      kind: "account.usage-history",
+      account: added.account.id,
+      fromObservedAt: now - 3_000,
+      throughObservedAt: now,
+      limit: 10,
+    }, { signal })).resolves.toMatchObject({ entries: [], nextCursor: null });
+  });
+
   test("rejects usage-history ranges outside the retained window", async () => {
     const now = 1_700_000_000_000;
     const { service } = await fixture(undefined, new FakeCloud(), () => undefined, () => now);
@@ -2370,6 +3538,9 @@ describe("HraService", () => {
       { kind: "account.login", account: added.account.id, deviceCode: false },
       { signal },
     );
+    const accountFingerprint = createHash("sha256")
+      .update("person@example.com")
+      .digest("hex");
     codex.usageError = new Error("provider failure at /private/secret with token=do-not-store");
     await expect(service.execute(
       { kind: "account.usage", account: added.account.id, refresh: true },
@@ -2377,11 +3548,14 @@ describe("HraService", () => {
     )).rejects.toThrow("provider failure");
 
     expect(store.latestUsage(added.account.id)).toBeNull();
-    expect(store.latestUsagePollFailure(added.account.id)).toMatchObject({
+    expect(store.latestUsagePollFailure(added.account.id, accountFingerprint)).toMatchObject({
       reasonCode: "account_usage_read_failed",
       sourceRevision: 1,
     });
-    expect(JSON.stringify(store.latestUsagePollFailure(added.account.id))).not.toContain("secret");
+    expect(JSON.stringify(store.latestUsagePollFailure(
+      added.account.id,
+      accountFingerprint,
+    ))).not.toContain("secret");
     const status = await service.execute(
       { kind: "account.usage", account: added.account.id, refresh: false },
       { signal },

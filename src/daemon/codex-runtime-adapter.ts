@@ -798,6 +798,19 @@ export class PinnedCodexRuntimeManager implements CodexRuntimePort {
     });
   }
 
+  async consumeRateLimitReset(input: {
+    authority: ProfileAuthority;
+    idempotencyKey: string;
+    signal: AbortSignal;
+  }): Promise<"reset" | "alreadyRedeemed" | "nothingToReset" | "noCredit"> {
+    return await this.#admit(async () => {
+      if (input.signal.aborted) throw input.signal.reason;
+      const client = await this.#client(input.authority);
+      input.signal.throwIfAborted();
+      return (await client.consumeRateLimitResetCredit(input.idempotencyKey)).value.outcome;
+    });
+  }
+
   async listPlugins(input: {
     authority: ProfileAuthority;
     projectRoot?: string;

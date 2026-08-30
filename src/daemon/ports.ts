@@ -1,5 +1,6 @@
 import type { Preset } from "../domain/presets";
 import type { EffectiveRuntimeProfile } from "../domain/runtime-profile";
+import type { AccountRateLimitResetOutcome } from "../domain/usage-metrics";
 import type { CodexTurnStatus } from "../codex/protocol";
 import type { CodexPluginCatalog } from "../codex/protocol";
 import type {
@@ -125,6 +126,11 @@ export interface CodexRuntimePort {
   logout(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<void>;
   readAccount(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<CodexAccountProjection>;
   readUsage(input: { authority: ProfileAuthority; signal: AbortSignal }): Promise<{ revision: number; observedAt: number; payload: unknown }>;
+  consumeRateLimitReset(input: {
+    authority: ProfileAuthority;
+    idempotencyKey: string;
+    signal: AbortSignal;
+  }): Promise<AccountRateLimitResetOutcome>;
   listPlugins(input: { authority: ProfileAuthority; projectRoot?: string; forceRefetch: boolean; signal: AbortSignal }): Promise<CodexPluginCatalog>;
   listSessions(input: {
     authority: ProfileAuthority;
@@ -223,6 +229,7 @@ export class UnavailableCodexRuntime implements CodexRuntimePort {
   logout(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readAccount(): Promise<never> { return Promise.reject(this.#unavailable()); }
   readUsage(): Promise<never> { return Promise.reject(this.#unavailable()); }
+  consumeRateLimitReset(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listPlugins(): Promise<never> { return Promise.reject(this.#unavailable()); }
   listSessions(): Promise<never> { return Promise.reject(this.#unavailable()); }
   reviewSessionStart(): Promise<never> { return Promise.reject(this.#unavailable()); }

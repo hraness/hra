@@ -166,7 +166,7 @@ export const PINNED_CODEX_NOTIFICATION_MATRIX = Object.freeze({
   "mcpServer/oauthLogin/completed": "ignored",
   "mcpServer/startupStatus/updated": "ignored",
   "account/updated": "routed",
-  "account/rateLimits/updated": "ignored",
+  "account/rateLimits/updated": "routed",
   "app/list/updated": "ignored",
   "remoteControl/status/changed": "ignored",
   "externalAgentConfig/import/progress": "ignored",
@@ -213,7 +213,7 @@ export const PINNED_CODEX_NOTIFICATION_SCHEMA_DIGEST =
   "e00fcc3b3c376e808a5feefaa233fdd49ea50acfa15cb629eb40fcf27b706777";
 
 const PINNED_CODEX_NOTIFICATION_MATRIX_DIGEST =
-  "eac0df5638382c1722b9700ddfec9dbbce8cbcb4b6f4a1af410bf23ff6e47185";
+  "2fa021b1b21db701118f3b0cb34047aca8c0632a084a62ca1efce45fbaca3047";
 
 export function assertPinnedCodexNotificationMatrix(): void {
   const signature = `${PINNED_CODEX_VERSION}\n${Object.entries(PINNED_CODEX_NOTIFICATION_MATRIX)
@@ -246,7 +246,12 @@ export interface FencedCodexValue<T> {
   readonly value: T;
 }
 
-export type CodexOperationEffect = "read" | "auth" | "thread-mutation" | "turn-mutation";
+export type CodexOperationEffect =
+  | "read"
+  | "auth"
+  | "account-mutation"
+  | "thread-mutation"
+  | "turn-mutation";
 export type LostResponsePolicy = "retry-read" | "reconcile";
 
 export interface CodexOperationDescriptor {
@@ -262,6 +267,7 @@ export type CodexMethod =
   | "account/login/cancel"
   | "account/login/start"
   | "account/logout"
+  | "account/rateLimitResetCredit/consume"
   | "account/rateLimits/read"
   | "account/usage/read"
   | "app/list"
@@ -289,6 +295,12 @@ export const OPERATIONS: Readonly<Record<CodexMethod, CodexOperationDescriptor>>
   "account/login/cancel": operation("account/login/cancel", "auth", 10_000, "retry-read"),
   "account/login/start": operation("account/login/start", "auth", 20_000, "reconcile"),
   "account/logout": operation("account/logout", "auth", 10_000, "reconcile"),
+  "account/rateLimitResetCredit/consume": operation(
+    "account/rateLimitResetCredit/consume",
+    "account-mutation",
+    15_000,
+    "reconcile",
+  ),
   "account/rateLimits/read": operation(
     "account/rateLimits/read",
     "read",
@@ -408,6 +420,20 @@ export interface RateLimitSnapshot {
 export interface AccountRateLimits {
   readonly primary: RateLimitSnapshot;
   readonly byLimitId: Readonly<Record<string, RateLimitSnapshot>> | null;
+  readonly resetCreditsAvailable: number;
+}
+
+export const RATE_LIMIT_RESET_CREDIT_OUTCOMES = [
+  "reset",
+  "nothingToReset",
+  "noCredit",
+  "alreadyRedeemed",
+] as const;
+export type RateLimitResetCreditOutcome =
+  (typeof RATE_LIMIT_RESET_CREDIT_OUTCOMES)[number];
+
+export interface RateLimitResetCreditConsumption {
+  readonly outcome: RateLimitResetCreditOutcome;
 }
 
 export const REASONING_EFFORTS = [
@@ -670,6 +696,7 @@ type CodexFactBody =
       readonly reason: "eof" | "process_exit" | "closed" | "protocol_fault";
     }
   | { readonly type: "accountUpdated"; readonly authMode: string | null; readonly planType: string | null }
+  | { readonly type: "rateLimitsUpdated" }
   | { readonly type: "loginCompleted"; readonly loginId: string | null; readonly success: boolean }
   | { readonly type: "threadStatusChanged"; readonly threadId: string; readonly status: CodexThreadStatus }
   | { readonly type: "threadDeleted"; readonly threadId: string }
@@ -944,6 +971,33 @@ export function parseRateLimits(value: unknown): AccountRateLimits {
   return {
     primary: parseRateLimitSnapshot(root.rateLimits, "rateLimits"),
     byLimitId,
+    resetCreditsAvailable: parseRateLimitResetCreditsAvailable(root.rateLimitResetCredits),
+  };
+}
+
+function parseRateLimitResetCreditsAvailable(value: unknown): number {
+  if (value === null) return 0;
+  const summary = record(value, "rateLimitResetCredits");
+  const availableCount = safeInteger(
+    summary.availableCount,
+    "rateLimitResetCredits.availableCount",
+  );
+  if (availableCount < 0) {
+    throw protocol("rateLimitResetCredits.availableCount must be nonnegative");
+  }
+  return availableCount;
+}
+
+export function parseRateLimitResetCreditConsumption(
+  value: unknown,
+): RateLimitResetCreditConsumption {
+  const root = record(value, "account/rateLimitResetCredit/consume result");
+  return {
+    outcome: oneOf(
+      root.outcome,
+      "account/rateLimitResetCredit/consume outcome",
+      RATE_LIMIT_RESET_CREDIT_OUTCOMES,
+    ),
   };
 }
 
@@ -2493,6 +2547,11 @@ export function parseFact(method: string, params: unknown): CodexFact {
       authMode: nullableString(root.authMode, "account authMode", 128),
       planType: nullableString(root.planType, "account planType", 128),
     };
+  }
+  if (method === "account/rateLimits/updated") {
+    // Sparse pushes only wake an authoritative read. Their mutable values are
+    // deliberately not projected into HRA state or reset decisions.
+    return { type: "rateLimitsUpdated" };
   }
   if (method === "account/login/completed") {
     return {

@@ -5,8 +5,18 @@ import { z } from "zod";
 import { profileIdSchema, unixMillisecondsSchema } from "../domain/values";
 
 const CURSOR_PREFIX = "hrau1";
+const ACCOUNT_BINDING_CONTEXT = "hra:usage-history-cursor:account-binding:v1";
 export const USAGE_HISTORY_CURSOR_MAX_BYTES = 2_048;
 export const USAGE_HISTORY_CURSOR_TTL_MS = 5 * 60_000;
+
+const accountFingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const accountBindingSchema = z.string()
+  .length(43)
+  .regex(/^[A-Za-z0-9_-]+$/u)
+  .refine((value) => {
+    const decoded = Buffer.from(value, "base64url");
+    return decoded.byteLength === 32 && decoded.toString("base64url") === value;
+  }, "Usage-history cursor account binding is not canonical.");
 
 export type UsageHistoryCursorErrorReason =
   | "account_mismatch"
@@ -32,6 +42,7 @@ export const usageHistoryCursorPayloadSchema = z.object({
   version: z.literal(1),
   type: z.literal("account_usage_history"),
   accountId: profileIdSchema,
+  accountBinding: accountBindingSchema,
   fromObservedAt: unixMillisecondsSchema,
   throughObservedAt: unixMillisecondsSchema,
   afterSourceRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -60,8 +71,14 @@ export const usageHistoryCursorPayloadSchema = z.object({
 
 export type UsageHistoryCursorPayload = z.infer<typeof usageHistoryCursorPayloadSchema>;
 
+export type UsageHistoryCursorEncodeInput = Readonly<
+  Omit<UsageHistoryCursorPayload, "accountBinding" | "expiresAt">
+  & { accountFingerprint: string }
+>;
+
 export type UsageHistoryCursorFilter = Readonly<{
   accountId: string;
+  accountFingerprint: string;
   fromObservedAt?: number;
   throughObservedAt?: number;
 }>;
@@ -70,6 +87,7 @@ const canonicalPayload = (payload: UsageHistoryCursorPayload): string => JSON.st
   version: payload.version,
   type: payload.type,
   accountId: payload.accountId,
+  accountBinding: payload.accountBinding,
   fromObservedAt: payload.fromObservedAt,
   throughObservedAt: payload.throughObservedAt,
   afterSourceRevision: payload.afterSourceRevision,
@@ -110,9 +128,12 @@ export class UsageHistoryCursorCodec {
     return randomBytes(32).toString("base64url");
   }
 
-  encode(input: Omit<UsageHistoryCursorPayload, "expiresAt">): string {
+  encode(input: UsageHistoryCursorEncodeInput): string {
+    const { accountFingerprint, ...position } = input;
+    const parsedFingerprint = accountFingerprintSchema.parse(accountFingerprint);
     const payload = usageHistoryCursorPayloadSchema.parse({
-      ...input,
+      ...position,
+      accountBinding: this.#accountBinding(parsedFingerprint).toString("base64url"),
       expiresAt: input.issuedAt + USAGE_HISTORY_CURSOR_TTL_MS,
     });
     const encodedPayload = Buffer.from(canonicalPayload(payload), "utf8").toString("base64url");
@@ -177,6 +198,18 @@ export class UsageHistoryCursorCodec {
         "account_mismatch",
       );
     }
+    const parsedFingerprint = accountFingerprintSchema.parse(expected.accountFingerprint);
+    const providedBinding = Buffer.from(parsed.data.accountBinding, "base64url");
+    const expectedBinding = this.#accountBinding(parsedFingerprint);
+    if (
+      providedBinding.byteLength !== expectedBinding.byteLength
+      || !timingSafeEqual(providedBinding, expectedBinding)
+    ) {
+      throw new UsageHistoryCursorError(
+        "Usage-history cursor belongs to another account identity.",
+        "account_mismatch",
+      );
+    }
     if (
       (expected.fromObservedAt !== undefined
         && parsed.data.fromObservedAt !== unixMillisecondsSchema.parse(expected.fromObservedAt))
@@ -202,6 +235,14 @@ export class UsageHistoryCursorCodec {
       .update(CURSOR_PREFIX)
       .update("\0")
       .update(encodedPayload)
+      .digest();
+  }
+
+  #accountBinding(accountFingerprint: string): Buffer {
+    return createHmac("sha256", this.#key)
+      .update(ACCOUNT_BINDING_CONTEXT)
+      .update("\0")
+      .update(accountFingerprint)
       .digest();
   }
 }

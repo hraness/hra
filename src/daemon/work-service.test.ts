@@ -221,6 +221,7 @@ class WorkRuntime implements CodexRuntimePort {
   cancelLogin(): Promise<never> { return this.#closed(); }
   async logout(): Promise<void> { this.logoutCalls += 1; }
   readUsage(): Promise<never> { return this.#closed(); }
+  consumeRateLimitReset(): Promise<never> { return this.#closed(); }
   listPlugins(): Promise<never> { return this.#closed(); }
   listSessions(): Promise<never> { return this.#closed(); }
   interrupt(): Promise<never> { return this.#closed(); }

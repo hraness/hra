@@ -46,7 +46,9 @@ import {
 } from "../domain/runtime-profile";
 import {
   ACCOUNT_USAGE_HISTORY_PAGE_LIMIT,
+  accountRateLimitResetOutcomeSchema,
   storedAccountUsageSnapshotSchema,
+  type AccountRateLimitResetOutcome,
 } from "../domain/usage-metrics";
 import {
   SESSION_EVENT_MAX_BYTES,
@@ -312,6 +314,105 @@ export type UsageHistoryLedgerPage = Readonly<{
   nextSourceRevision: number | null;
 }>;
 
+const accountRateLimitResetAttemptStateSchema = z.enum([
+  "prepared",
+  "effect_started",
+  "ambiguous",
+  "retryable",
+  "settled",
+  "closed",
+]);
+
+const accountRateLimitResetLocalResolutionSchema = z.enum([
+  "weekly_window_changed",
+  "account_identity_changed",
+]);
+
+export type AccountRateLimitResetAttemptRecord = Readonly<{
+  attemptSequence: number;
+  idempotencyKey: string;
+  profileId: ProfileId;
+  originProcessGeneration: number;
+  currentProcessGeneration: number;
+  accountFingerprint: string;
+  weeklyWindowResetsAt: number;
+  observedUsedPercent: number;
+  state: z.infer<typeof accountRateLimitResetAttemptStateSchema>;
+  outcome: AccountRateLimitResetOutcome | null;
+  localResolution: z.infer<typeof accountRateLimitResetLocalResolutionSchema> | null;
+  createdAt: number;
+  updatedAt: number;
+}>;
+
+export type AccountRateLimitResetRebindRecord = Readonly<{
+  sequence: number;
+  idempotencyKey: string;
+  fromProcessGeneration: number;
+  toProcessGeneration: number;
+  accountFingerprint: string;
+  createdAt: number;
+}>;
+
+const accountRateLimitResetAttemptRowSchema = z.object({
+  attempt_sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  idempotency_key: z.string().uuid(),
+  profile_id: profileIdSchema,
+  origin_process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  current_process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  account_fingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  weekly_window_resets_at: unixMillisecondsSchema,
+  observed_used_percent: z.number().finite().min(99).max(100),
+  state: accountRateLimitResetAttemptStateSchema,
+  outcome: accountRateLimitResetOutcomeSchema.nullable(),
+  local_resolution: accountRateLimitResetLocalResolutionSchema.nullable(),
+  created_at: unixMillisecondsSchema,
+  updated_at: unixMillisecondsSchema,
+}).strict();
+
+const accountRateLimitResetRebindRowSchema = z.object({
+  sequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  idempotency_key: z.string().uuid(),
+  from_process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  to_process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  account_fingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  created_at: unixMillisecondsSchema,
+}).strict();
+
+const mapAccountRateLimitResetAttempt = (
+  value: unknown,
+): AccountRateLimitResetAttemptRecord => {
+  const row = accountRateLimitResetAttemptRowSchema.parse(value);
+  return {
+    attemptSequence: row.attempt_sequence,
+    idempotencyKey: row.idempotency_key,
+    profileId: row.profile_id,
+    originProcessGeneration: row.origin_process_generation,
+    currentProcessGeneration: row.current_process_generation,
+    accountFingerprint: row.account_fingerprint,
+    weeklyWindowResetsAt: row.weekly_window_resets_at,
+    observedUsedPercent: row.observed_used_percent,
+    state: row.state,
+    outcome: row.outcome,
+    localResolution: row.local_resolution,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+const mapAccountRateLimitResetRebind = (
+  value: unknown,
+): AccountRateLimitResetRebindRecord => {
+  const row = accountRateLimitResetRebindRowSchema.parse(value);
+  return {
+    sequence: row.sequence,
+    idempotencyKey: row.idempotency_key,
+    fromProcessGeneration: row.from_process_generation,
+    toProcessGeneration: row.to_process_generation,
+    accountFingerprint: row.account_fingerprint,
+    createdAt: row.created_at,
+  };
+};
+
 export type QueueRecord = {
   id: QueueId;
   sessionId: SessionId;
@@ -421,6 +522,11 @@ const desktopAccountKeySchema = z
   .transform((value) => value.normalize("NFKC").toLocaleLowerCase("en-US"));
 const positiveGenerationSchema = z.number().int().positive();
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/u);
+
+const canonicalAccountFingerprint = (email: string): string =>
+  sha256Schema.parse(createHash("sha256")
+    .update(email.trim().toLowerCase())
+    .digest("hex"));
 const providerThreadIdSchema = z.string().min(1).max(200);
 const providerLoginIdSchema = z.string().min(1).max(512).refine(
   (value) => !/\p{Cc}/u.test(value),
@@ -510,7 +616,7 @@ type DesktopSwitchPlan =
       diagnostic: string;
     };
 
-const currentSchemaVersion = 26;
+const currentSchemaVersion = 27;
 const observationTitleMaximumBytes = 320;
 
 const safeObservationTitle = (value: string): string => {
@@ -1571,6 +1677,119 @@ CREATE INDEX IF NOT EXISTS queue_entries_message_scrub_candidates
   WHERE message!='[queue message removed after settlement]';
 `;
 
+const schemaVersion27 = `
+CREATE TABLE IF NOT EXISTS account_rate_limit_reset_attempts (
+  attempt_sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK(attempt_sequence BETWEEN 1 AND 9007199254740991),
+  idempotency_key TEXT NOT NULL UNIQUE CHECK(length(idempotency_key) = 36),
+  profile_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  origin_process_generation INTEGER NOT NULL CHECK(origin_process_generation BETWEEN 1 AND 9007199254740991),
+  current_process_generation INTEGER NOT NULL CHECK(current_process_generation BETWEEN origin_process_generation AND 9007199254740991),
+  account_fingerprint TEXT NOT NULL CHECK(length(account_fingerprint) = 64 AND account_fingerprint NOT GLOB '*[^a-f0-9]*'),
+  weekly_window_resets_at INTEGER NOT NULL CHECK(weekly_window_resets_at BETWEEN 0 AND 9007199254740991),
+  observed_used_percent REAL NOT NULL CHECK(observed_used_percent BETWEEN 99 AND 100),
+  state TEXT NOT NULL CHECK(state IN ('prepared','effect_started','ambiguous','retryable','settled','closed')),
+  outcome TEXT CHECK(outcome IN ('reset','alreadyRedeemed','nothingToReset','noCredit')),
+  local_resolution TEXT CHECK(local_resolution IN ('weekly_window_changed','account_identity_changed')),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+  CHECK(
+    (state='settled' AND outcome IS NOT NULL AND local_resolution IS NULL) OR
+    (state='closed' AND outcome IS NULL AND local_resolution IS NOT NULL) OR
+    (state NOT IN ('settled','closed') AND outcome IS NULL AND local_resolution IS NULL)
+  )
+) STRICT;
+CREATE INDEX IF NOT EXISTS account_rate_limit_reset_attempts_identity_window
+  ON account_rate_limit_reset_attempts(
+    profile_id,account_fingerprint,weekly_window_resets_at,attempt_sequence
+  );
+CREATE UNIQUE INDEX IF NOT EXISTS account_rate_limit_reset_attempts_one_recoverable
+  ON account_rate_limit_reset_attempts(profile_id,account_fingerprint)
+  WHERE state IN ('prepared','effect_started','ambiguous','retryable');
+CREATE UNIQUE INDEX IF NOT EXISTS account_rate_limit_reset_attempts_one_success
+  ON account_rate_limit_reset_attempts(
+    profile_id,account_fingerprint,weekly_window_resets_at
+  ) WHERE outcome IN ('reset','alreadyRedeemed');
+CREATE TABLE IF NOT EXISTS account_rate_limit_reset_rebinds (
+  sequence INTEGER PRIMARY KEY,
+  idempotency_key TEXT NOT NULL REFERENCES account_rate_limit_reset_attempts(idempotency_key) ON DELETE CASCADE,
+  from_process_generation INTEGER NOT NULL CHECK(from_process_generation BETWEEN 1 AND 9007199254740991),
+  to_process_generation INTEGER NOT NULL CHECK(to_process_generation BETWEEN 1 AND 9007199254740991),
+  account_fingerprint TEXT NOT NULL CHECK(length(account_fingerprint) = 64 AND account_fingerprint NOT GLOB '*[^a-f0-9]*'),
+  created_at INTEGER NOT NULL CHECK(created_at >= 0),
+  CHECK(to_process_generation > from_process_generation),
+  UNIQUE(idempotency_key,to_process_generation)
+) STRICT;
+CREATE INDEX IF NOT EXISTS account_rate_limit_reset_rebinds_attempt
+  ON account_rate_limit_reset_rebinds(idempotency_key,sequence);
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_transition_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_transition_guard
+BEFORE UPDATE OF state ON account_rate_limit_reset_attempts
+WHEN NOT (
+  (OLD.state='prepared' AND NEW.state='effect_started') OR
+  (OLD.state='effect_started' AND NEW.state IN ('ambiguous','retryable','settled')) OR
+  (OLD.state IN ('ambiguous','retryable') AND NEW.state='effect_started') OR
+  (OLD.state IN ('prepared','ambiguous','retryable') AND NEW.state='closed') OR
+  OLD.state=NEW.state
+)
+BEGIN SELECT RAISE(ABORT, 'illegal account rate-limit reset transition'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_terminal_evidence_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_terminal_evidence_guard
+BEFORE UPDATE OF outcome,local_resolution ON account_rate_limit_reset_attempts
+WHEN OLD.state IN ('settled','closed')
+  AND (
+    OLD.outcome IS NOT NEW.outcome
+    OR OLD.local_resolution IS NOT NEW.local_resolution
+  )
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset terminal evidence is immutable'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_identity_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_identity_guard
+BEFORE UPDATE OF profile_id,origin_process_generation,account_fingerprint,
+  weekly_window_resets_at,observed_used_percent,created_at
+ON account_rate_limit_reset_attempts
+WHEN OLD.profile_id!=NEW.profile_id
+  OR OLD.origin_process_generation!=NEW.origin_process_generation
+  OR OLD.account_fingerprint!=NEW.account_fingerprint
+  OR OLD.weekly_window_resets_at!=NEW.weekly_window_resets_at
+  OR OLD.observed_used_percent!=NEW.observed_used_percent
+  OR OLD.created_at!=NEW.created_at
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset identity is immutable'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_attempt_rebind_guard;
+CREATE TRIGGER account_rate_limit_reset_attempt_rebind_guard
+BEFORE UPDATE OF current_process_generation ON account_rate_limit_reset_attempts
+WHEN OLD.current_process_generation!=NEW.current_process_generation
+  AND NOT EXISTS (
+    SELECT 1 FROM account_rate_limit_reset_rebinds r
+    WHERE r.idempotency_key=OLD.idempotency_key
+      AND r.from_process_generation=OLD.current_process_generation
+      AND r.to_process_generation=NEW.current_process_generation
+      AND r.account_fingerprint=OLD.account_fingerprint
+  )
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind evidence is missing'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_insert_guard;
+CREATE TRIGGER account_rate_limit_reset_rebind_insert_guard
+BEFORE INSERT ON account_rate_limit_reset_rebinds
+WHEN NOT EXISTS (
+  SELECT 1 FROM account_rate_limit_reset_attempts a
+  WHERE a.idempotency_key=NEW.idempotency_key
+    AND a.current_process_generation=NEW.from_process_generation
+    AND a.account_fingerprint=NEW.account_fingerprint
+    AND a.state IN ('prepared','ambiguous','retryable')
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind authority is invalid'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_update_guard;
+CREATE TRIGGER account_rate_limit_reset_rebind_update_guard
+BEFORE UPDATE ON account_rate_limit_reset_rebinds
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind evidence is append-only'); END;
+DROP TRIGGER IF EXISTS account_rate_limit_reset_rebind_delete_guard;
+CREATE TRIGGER account_rate_limit_reset_rebind_delete_guard
+BEFORE DELETE ON account_rate_limit_reset_rebinds
+WHEN EXISTS (
+  SELECT 1 FROM account_rate_limit_reset_attempts a
+  WHERE a.idempotency_key=OLD.idempotency_key
+)
+BEGIN SELECT RAISE(ABORT, 'account rate-limit reset rebind evidence is append-only'); END;
+`;
+
 const schemaVersion24Objects = [
   {
     name: "profiles_label_key_active",
@@ -1873,6 +2092,26 @@ const ensureSessionEventProjectionVersion = (database: Database): void => {
       "ALTER TABLE session_events ADD COLUMN projection_version INTEGER NOT NULL DEFAULT 1 CHECK(projection_version IN (1,2))",
     );
   }
+};
+
+const ensureUsagePollFailureAccountFingerprint = (database: Database): void => {
+  if (!hasTableColumn(database, "usage_poll_failures", "account_fingerprint")) {
+    database.exec(
+      `ALTER TABLE usage_poll_failures ADD COLUMN account_fingerprint TEXT
+       CHECK(
+         account_fingerprint IS NULL OR (
+           length(account_fingerprint)=64
+           AND account_fingerprint NOT GLOB '*[^a-f0-9]*'
+         )
+       )`,
+    );
+  }
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS usage_poll_failures_identity_recent
+     ON usage_poll_failures(
+       profile_id,account_fingerprint,source_revision DESC
+     )`,
+  );
 };
 
 type LabelIdentityKind = "ACCOUNT" | "PROJECT";
@@ -2719,6 +2958,14 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
       version = 26;
     }
 
+    if (version < 27) {
+      database.exec(schemaVersion27);
+      ensureUsagePollFailureAccountFingerprint(database);
+      database.query("INSERT OR IGNORE INTO migrations(version, applied_at) VALUES (?, ?)").run(27, now());
+      database.exec("PRAGMA user_version = 27");
+      version = 27;
+    }
+
     // Reapplying additive objects and idempotent authority backfills makes a
     // restart after any pre-release partial fixture safe without changing rows.
     database.exec(schemaVersion9);
@@ -2747,6 +2994,8 @@ const migrateWritableDatabase = (database: Database, now: () => number): void =>
     ensureSessionEventProjectionVersion(database);
     database.exec(WORK_SCHEMA_SQL);
     assertWorkSchema(database);
+    database.exec(schemaVersion27);
+    ensureUsagePollFailureAccountFingerprint(database);
     if (hasSettledQueueMessagesToScrub(database)) {
       requireQueueMessageScrub(database, now(), true);
     }
@@ -3317,6 +3566,70 @@ export class StateStore {
       return { affectedWorkIds, changed: true };
     });
     return update.immediate();
+  }
+
+  reconcileProfileRecoveryFromAccountRead(input: {
+    profileId: ProfileId;
+    expectedGeneration: number;
+    provider: { signedIn: boolean; email?: string; plan?: string };
+  }): ProfileRecord {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const expectedGeneration = z.number().int().nonnegative()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.expectedGeneration);
+    const provider = z.object({
+      signedIn: z.boolean(),
+      email: z.string().email().optional(),
+      plan: z.string().max(128).optional(),
+    }).strict().parse(input.provider);
+    const reconcile = this.#database.transaction(() => {
+      const generic = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          `SELECT COUNT(*) AS count FROM mutation_attempts m
+           LEFT JOIN mutation_resolutions r ON r.attempt_id=m.id
+           WHERE m.authority_id=? AND m.authority_generation=?
+             AND m.state IN ('effect_started','ambiguous')
+             AND r.attempt_id IS NULL`,
+        ).get(profileId, expectedGeneration),
+      );
+      const resets = z.object({ count: z.number().int().nonnegative() }).strict().parse(
+        this.#database.query(
+          `SELECT COUNT(*) AS count FROM account_rate_limit_reset_attempts
+           WHERE profile_id=? AND current_process_generation=?
+             AND state IN ('prepared','effect_started','ambiguous','retryable')`,
+        ).get(profileId, expectedGeneration),
+      );
+      if (generic.count !== 0 || resets.count !== 0) {
+        throw new Error("PROFILE_RECOVERY_AUTHORITY_UNSETTLED");
+      }
+      const state = provider.signedIn ? "signed_in" : "signed_out";
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const changed = this.#database.query(
+        `UPDATE profiles SET state=?,provider_email=?,provider_plan=?,updated_at=?
+         WHERE id=? AND process_generation=? AND state='recovery_required'`,
+      ).run(
+        state,
+        provider.signedIn ? provider.email ?? null : null,
+        provider.signedIn ? provider.plan ?? null : null,
+        now,
+        profileId,
+        expectedGeneration,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("PROFILE_RECOVERY_AUTHORITY_CHANGED");
+      }
+      this.#database.query(
+        `UPDATE provider_login_authorities
+         SET state='settled',settlement=?,updated_at=?
+         WHERE profile_id=? AND process_generation=? AND state='active'`,
+      ).run(
+        state === "signed_in" ? "signed_in" : "provider_disconnected",
+        now,
+        profileId,
+        expectedGeneration,
+      );
+    });
+    reconcile.immediate();
+    return this.requireProfileById(profileId);
   }
 
   removeProfile(profileId: ProfileId): void {
@@ -7568,6 +7881,355 @@ export class StateStore {
     return terminalize.immediate();
   }
 
+  prepareAccountRateLimitReset(input: {
+    profileId: ProfileId;
+    processGeneration: number;
+    accountFingerprint: string;
+    weeklyWindowResetsAt: number;
+    observedUsedPercent: number;
+  }): AccountRateLimitResetAttemptRecord {
+    const profileId = profileIdSchema.parse(input.profileId);
+    const processGeneration = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+      .parse(input.processGeneration);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
+    const weeklyWindowResetsAt = unixMillisecondsSchema.parse(input.weeklyWindowResetsAt);
+    const observedUsedPercent = z.number().finite().min(99).max(100)
+      .parse(input.observedUsedPercent);
+    const prepare = this.#database.transaction(() => {
+      const authority = z.object({
+        process_generation: z.number().int().positive(),
+        state: z.literal("signed_in"),
+        provider_email: z.string().email(),
+      }).strict().parse(this.#database.query(
+        "SELECT process_generation,state,provider_email FROM profiles WHERE id=?",
+      ).get(profileId));
+      if (
+        authority.process_generation !== processGeneration
+        || canonicalAccountFingerprint(authority.provider_email) !== accountFingerprint
+      ) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+      }
+      const recoverable = this.#database.query(
+        `SELECT * FROM account_rate_limit_reset_attempts
+         WHERE profile_id=? AND account_fingerprint=?
+           AND state IN ('prepared','effect_started','ambiguous','retryable')
+         ORDER BY attempt_sequence LIMIT 2`,
+      ).all(profileId, accountFingerprint).map(mapAccountRateLimitResetAttempt);
+      if (recoverable.length > 1) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_ATTEMPT_AMBIGUOUS");
+      }
+      const pending = recoverable[0];
+      if (pending !== undefined) {
+        if (pending.weeklyWindowResetsAt === weeklyWindowResetsAt) return pending;
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_ATTEMPT_UNRESOLVED");
+      }
+      const rows = this.#database.query(
+        `SELECT * FROM account_rate_limit_reset_attempts
+         WHERE profile_id=? AND account_fingerprint=? AND weekly_window_resets_at=?
+         ORDER BY attempt_sequence DESC`,
+      ).all(profileId, accountFingerprint, weeklyWindowResetsAt)
+        .map(mapAccountRateLimitResetAttempt);
+      const successful = rows.find((row) =>
+        row.outcome === "reset" || row.outcome === "alreadyRedeemed");
+      if (successful !== undefined) return successful;
+      const closed = rows.find((row) => row.state === "closed");
+      if (closed !== undefined) return closed;
+      const latestNothingToReset = rows.find((row) => row.outcome === "nothingToReset");
+      if (
+        latestNothingToReset !== undefined
+        && Math.floor(observedUsedPercent)
+          <= Math.floor(latestNothingToReset.observedUsedPercent)
+      ) return latestNothingToReset;
+      const noCreditAtCurrentWholePercent = rows.filter((row) =>
+        row.outcome === "noCredit"
+        && Math.floor(row.observedUsedPercent) === Math.floor(observedUsedPercent));
+      if (noCreditAtCurrentWholePercent.length >= 2) {
+        return noCreditAtCurrentWholePercent[0] as AccountRateLimitResetAttemptRecord;
+      }
+
+      const now = unixMillisecondsSchema.parse(this.#now());
+      const idempotencyKey = randomUUID();
+      this.#database.query(
+        `INSERT INTO account_rate_limit_reset_attempts(
+           idempotency_key,profile_id,origin_process_generation,
+           current_process_generation,account_fingerprint,weekly_window_resets_at,
+           observed_used_percent,state,created_at,updated_at
+         ) VALUES (?,?,?,?,?,?,?,'prepared',?,?)`,
+      ).run(
+        idempotencyKey,
+        profileId,
+        processGeneration,
+        processGeneration,
+        accountFingerprint,
+        weeklyWindowResetsAt,
+        observedUsedPercent,
+        now,
+        now,
+      );
+      // A live provider window can still rely on every terminal row as a
+      // success or retry latch. Bound only expired history; unresolved recovery
+      // evidence and every still-live window remain untouched.
+      this.#database.query(
+        `DELETE FROM account_rate_limit_reset_attempts
+         WHERE profile_id=? AND state IN ('settled','closed')
+           AND weekly_window_resets_at<=?
+           AND idempotency_key NOT IN (
+           SELECT idempotency_key FROM account_rate_limit_reset_attempts
+           WHERE profile_id=? AND state IN ('settled','closed')
+             AND weekly_window_resets_at<=?
+           ORDER BY attempt_sequence DESC LIMIT 128
+         )`,
+      ).run(profileId, now, profileId, now);
+      return mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(idempotencyKey));
+    });
+    return prepare.immediate();
+  }
+
+  readRecoverableAccountRateLimitReset(
+    profileId: ProfileId,
+    accountFingerprint: string,
+  ): AccountRateLimitResetAttemptRecord | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedFingerprint = sha256Schema.parse(accountFingerprint);
+    const rows = this.#database.query(
+      `SELECT * FROM account_rate_limit_reset_attempts
+       WHERE profile_id=? AND account_fingerprint=?
+         AND state IN ('prepared','effect_started','ambiguous','retryable')
+       ORDER BY attempt_sequence LIMIT 2`,
+    ).all(parsedProfileId, parsedFingerprint).map(mapAccountRateLimitResetAttempt);
+    if (rows.length > 1) throw new Error("ACCOUNT_RATE_LIMIT_RESET_ATTEMPT_AMBIGUOUS");
+    return rows[0] ?? null;
+  }
+
+  latestAccountRateLimitResetAttempt(
+    profileId: ProfileId,
+    accountFingerprint: string,
+  ): AccountRateLimitResetAttemptRecord | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedFingerprint = sha256Schema.parse(accountFingerprint);
+    const row = this.#database.query(
+      `SELECT * FROM account_rate_limit_reset_attempts
+       WHERE profile_id=? AND account_fingerprint=?
+       ORDER BY attempt_sequence DESC LIMIT 1`,
+    ).get(parsedProfileId, parsedFingerprint);
+    return row === null ? null : mapAccountRateLimitResetAttempt(row);
+  }
+
+  rebindAccountRateLimitReset(input: {
+    idempotencyKey: string;
+    expectedCurrentProcessGeneration: number;
+    nextProcessGeneration: number;
+    accountFingerprint: string;
+  }): AccountRateLimitResetAttemptRecord {
+    const idempotencyKey = z.string().uuid().parse(input.idempotencyKey);
+    const expectedCurrentProcessGeneration = z.number().int().positive()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.expectedCurrentProcessGeneration);
+    const nextProcessGeneration = z.number().int().positive()
+      .max(Number.MAX_SAFE_INTEGER).parse(input.nextProcessGeneration);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
+    const rebind = this.#database.transaction(() => {
+      const row = mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(idempotencyKey));
+      if (
+        row.accountFingerprint !== accountFingerprint
+        || row.currentProcessGeneration !== expectedCurrentProcessGeneration
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_AUTHORITY_CHANGED");
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_STATE_INVALID");
+      }
+      const authority = z.object({
+        process_generation: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        provider_email: z.string().email(),
+        state: z.literal("signed_in"),
+      }).strict().parse(this.#database.query(
+        "SELECT process_generation,provider_email,state FROM profiles WHERE id=?",
+      ).get(row.profileId));
+      if (
+        authority.process_generation !== nextProcessGeneration
+        || canonicalAccountFingerprint(authority.provider_email) !== accountFingerprint
+      ) throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_IDENTITY_MISMATCH");
+      if (row.currentProcessGeneration === nextProcessGeneration) return row;
+      if (nextProcessGeneration < row.currentProcessGeneration) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_GENERATION_REGRESSION");
+      }
+      const now = unixMillisecondsSchema.parse(this.#now());
+      this.#database.query(
+        `INSERT INTO account_rate_limit_reset_rebinds(
+           idempotency_key,from_process_generation,to_process_generation,
+           account_fingerprint,created_at
+         ) VALUES (?,?,?,?,?)`,
+      ).run(
+        idempotencyKey,
+        row.currentProcessGeneration,
+        nextProcessGeneration,
+        accountFingerprint,
+        now,
+      );
+      const changed = this.#database.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET current_process_generation=?,updated_at=MAX(updated_at,?)
+         WHERE idempotency_key=? AND current_process_generation=?`,
+      ).run(
+        nextProcessGeneration,
+        now,
+        idempotencyKey,
+        row.currentProcessGeneration,
+      );
+      if (changed.changes !== 1) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_REBIND_CONFLICT");
+      }
+      return mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(idempotencyKey));
+    });
+    return rebind.immediate();
+  }
+
+  closeAccountRateLimitReset(
+    idempotencyKey: string,
+    localResolution: z.infer<typeof accountRateLimitResetLocalResolutionSchema>,
+  ): AccountRateLimitResetAttemptRecord {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const resolution = accountRateLimitResetLocalResolutionSchema.parse(localResolution);
+    const close = this.#database.transaction(() => {
+      const row = mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(key));
+      if (row.state === "closed" && row.localResolution === resolution) return row;
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_STATE_INVALID");
+      }
+      const changed = this.#database.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET state='closed',local_resolution=?,updated_at=MAX(updated_at,?)
+         WHERE idempotency_key=? AND state=?`,
+      ).run(resolution, unixMillisecondsSchema.parse(this.#now()), key, row.state);
+      if (changed.changes !== 1) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_CLOSE_CONFLICT");
+      }
+      return mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(key));
+    });
+    return close.immediate();
+  }
+
+  listAccountRateLimitResetRebinds(
+    idempotencyKey: string,
+  ): readonly AccountRateLimitResetRebindRecord[] {
+    const key = z.string().uuid().parse(idempotencyKey);
+    return this.#database.query(
+      `SELECT * FROM account_rate_limit_reset_rebinds
+       WHERE idempotency_key=? ORDER BY sequence`,
+    ).all(key).map(mapAccountRateLimitResetRebind);
+  }
+
+  beginAccountRateLimitReset(
+    idempotencyKey: string,
+  ): AccountRateLimitResetAttemptRecord {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const begin = this.#database.transaction(() => {
+      const row = mapAccountRateLimitResetAttempt(this.#database.query(
+        `SELECT r.* FROM account_rate_limit_reset_attempts r
+         JOIN profiles p ON p.id=r.profile_id
+         WHERE r.idempotency_key=? AND p.state='signed_in'
+           AND p.process_generation=r.current_process_generation
+           AND lower(trim(p.provider_email)) IS NOT NULL`,
+      ).get(key));
+      const identity = z.object({ provider_email: z.string().email() }).strict().parse(
+        this.#database.query(
+          `SELECT p.provider_email FROM account_rate_limit_reset_attempts r
+           JOIN profiles p ON p.id=r.profile_id WHERE r.idempotency_key=?`,
+        ).get(key),
+      );
+      if (canonicalAccountFingerprint(identity.provider_email) !== row.accountFingerprint) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+      }
+      if (row.state === "settled") return row;
+      if (row.state === "effect_started") {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_EFFECT_ALREADY_STARTED");
+      }
+      if (!["prepared", "ambiguous", "retryable"].includes(row.state)) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
+      }
+      const changed = this.#database.query(
+        `UPDATE account_rate_limit_reset_attempts
+         SET state='effect_started',updated_at=MAX(updated_at,?)
+         WHERE idempotency_key=? AND state=?`,
+      ).run(unixMillisecondsSchema.parse(this.#now()), key, row.state);
+      if (changed.changes !== 1) {
+        throw new Error("ACCOUNT_RATE_LIMIT_RESET_AUTHORITY_CHANGED");
+      }
+      return mapAccountRateLimitResetAttempt(this.#database.query(
+        "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+      ).get(key));
+    });
+    return begin.immediate();
+  }
+
+  deferAccountRateLimitReset(
+    idempotencyKey: string,
+    state: "ambiguous" | "retryable",
+  ): AccountRateLimitResetAttemptRecord {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const parsedState = accountRateLimitResetAttemptStateSchema
+      .extract(["ambiguous", "retryable"]).parse(state);
+    const changed = this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts SET state=?,updated_at=MAX(updated_at,?)
+       WHERE idempotency_key=? AND state='effect_started'`,
+    ).run(parsedState, unixMillisecondsSchema.parse(this.#now()), key);
+    if (changed.changes !== 1) {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_SETTLEMENT_CONFLICT");
+    }
+    return mapAccountRateLimitResetAttempt(this.#database.query(
+      "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+    ).get(key));
+  }
+
+  settleAccountRateLimitReset(
+    idempotencyKey: string,
+    outcome: AccountRateLimitResetOutcome,
+  ): AccountRateLimitResetAttemptRecord {
+    const key = z.string().uuid().parse(idempotencyKey);
+    const parsedOutcome = accountRateLimitResetOutcomeSchema.parse(outcome);
+    const changed = this.#database.query(
+      `UPDATE account_rate_limit_reset_attempts
+       SET state='settled',outcome=?,updated_at=MAX(updated_at,?)
+       WHERE idempotency_key=? AND state='effect_started'`,
+    ).run(parsedOutcome, unixMillisecondsSchema.parse(this.#now()), key);
+    if (changed.changes !== 1) {
+      throw new Error("ACCOUNT_RATE_LIMIT_RESET_SETTLEMENT_CONFLICT");
+    }
+    return mapAccountRateLimitResetAttempt(this.#database.query(
+      "SELECT * FROM account_rate_limit_reset_attempts WHERE idempotency_key=?",
+    ).get(key));
+  }
+
+  recoverAccountRateLimitResetAttempts(): readonly string[] {
+    const recover = this.#database.transaction(() => {
+      const keys = this.#database.query(
+        `SELECT idempotency_key FROM account_rate_limit_reset_attempts
+         WHERE state='effect_started' ORDER BY attempt_sequence`,
+      ).all().map((row) => z.object({ idempotency_key: z.string().uuid() })
+        .strict().parse(row).idempotency_key);
+      for (const key of keys) {
+        const changed = this.#database.query(
+          `UPDATE account_rate_limit_reset_attempts
+           SET state='ambiguous',updated_at=MAX(updated_at,?)
+           WHERE idempotency_key=? AND state='effect_started'`,
+        ).run(unixMillisecondsSchema.parse(this.#now()), key);
+        if (changed.changes !== 1) {
+          throw new Error("ACCOUNT_RATE_LIMIT_RESET_RECOVERY_CONFLICT");
+        }
+      }
+      return keys;
+    });
+    return recover.immediate();
+  }
+
   recordUsage(profileId: ProfileId, sourceRevision: number, observedAt: number, payload: unknown): void {
     const parsedProfileId = profileIdSchema.parse(profileId);
     const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(sourceRevision);
@@ -7606,11 +8268,13 @@ export class StateStore {
 
   recordUsagePollFailure(
     profileId: ProfileId,
+    accountFingerprint: string | null,
     sourceRevision: number,
     observedAt: number,
     reasonCode: UsagePollFailureRecord["reasonCode"] = "account_usage_read_failed",
   ): void {
     const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedFingerprint = sha256Schema.nullable().parse(accountFingerprint);
     const parsedRevision = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(sourceRevision);
     const parsedObservedAt = unixMillisecondsSchema.parse(observedAt);
     const parsedReason = z.literal("account_usage_read_failed").parse(reasonCode);
@@ -7620,18 +8284,32 @@ export class StateStore {
       ).get(parsedProfileId, parsedRevision);
       if (observed !== null) throw new Error("Usage source revision is already a successful observation.");
       const existing = this.#database.query(
-        `SELECT observed_at,reason_code FROM usage_poll_failures
+        `SELECT account_fingerprint,observed_at,reason_code FROM usage_poll_failures
          WHERE profile_id=? AND source_revision=?`,
-      ).get(parsedProfileId, parsedRevision) as { observed_at: number; reason_code: string } | null;
+      ).get(parsedProfileId, parsedRevision) as {
+        account_fingerprint: string | null;
+        observed_at: number;
+        reason_code: string;
+      } | null;
       if (
         existing !== null
-        && (existing.observed_at !== parsedObservedAt || existing.reason_code !== parsedReason)
+        && (
+          existing.account_fingerprint !== parsedFingerprint
+          || existing.observed_at !== parsedObservedAt
+          || existing.reason_code !== parsedReason
+        )
       ) throw new Error("Usage failure source revision conflict.");
       this.#database.query(
         `INSERT OR IGNORE INTO usage_poll_failures(
-           profile_id,source_revision,observed_at,reason_code
-         ) VALUES (?,?,?,?)`,
-      ).run(parsedProfileId, parsedRevision, parsedObservedAt, parsedReason);
+           profile_id,account_fingerprint,source_revision,observed_at,reason_code
+         ) VALUES (?,?,?,?,?)`,
+      ).run(
+        parsedProfileId,
+        parsedFingerprint,
+        parsedRevision,
+        parsedObservedAt,
+        parsedReason,
+      );
       this.#database.query(
         `INSERT INTO usage_revision_authority(profile_id,next_revision) VALUES (?,?)
          ON CONFLICT(profile_id) DO UPDATE SET next_revision=MAX(next_revision,excluded.next_revision)`,
@@ -7719,12 +8397,14 @@ export class StateStore {
 
   usageHistoryPage(input: {
     profileId: ProfileId;
+    accountFingerprint: string;
     fromObservedAt: number;
     throughObservedAt: number;
     afterSourceRevision?: number;
     limit: number;
   }): UsageHistoryLedgerPage {
     const profileId = profileIdSchema.parse(input.profileId);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
     const fromObservedAt = unixMillisecondsSchema.parse(input.fromObservedAt);
     const throughObservedAt = unixMillisecondsSchema.parse(input.throughObservedAt);
     if (fromObservedAt > throughObservedAt) throw new Error("USAGE_RANGE_INVALID");
@@ -7742,20 +8422,26 @@ export class StateStore {
       `SELECT source_revision,observed_at,state,payload_json,reason_code FROM (
          SELECT source_revision,observed_at,'observed' AS state,payload_json,NULL AS reason_code
          FROM usage_snapshots
-         WHERE profile_id=? AND observed_at>=? AND observed_at<=? AND source_revision>?
+         WHERE profile_id=?
+           AND json_type(payload_json,'$.observation.accountFingerprint')='text'
+           AND json_extract(payload_json,'$.observation.accountFingerprint')=?
+           AND observed_at>=? AND observed_at<=? AND source_revision>?
          UNION ALL
          SELECT source_revision,observed_at,'failed' AS state,NULL AS payload_json,reason_code
          FROM usage_poll_failures
-         WHERE profile_id=? AND observed_at>=? AND observed_at<=? AND source_revision>?
+         WHERE profile_id=? AND account_fingerprint=?
+           AND observed_at>=? AND observed_at<=? AND source_revision>?
        )
        ORDER BY source_revision
        LIMIT ?`,
     ).all(
       profileId,
+      accountFingerprint,
       fromObservedAt,
       throughObservedAt,
       afterSourceRevision,
       profileId,
+      accountFingerprint,
       fromObservedAt,
       throughObservedAt,
       afterSourceRevision,
@@ -7811,10 +8497,12 @@ export class StateStore {
 
   usageAfterRevision(input: {
     profileId: ProfileId;
+    accountFingerprint: string;
     afterSourceRevision: number;
     limit: number;
   }): readonly UsageSnapshotRecord[] {
     const profileId = profileIdSchema.parse(input.profileId);
+    const accountFingerprint = sha256Schema.parse(input.accountFingerprint);
     const afterSourceRevision = z.number()
       .int()
       .nonnegative()
@@ -7827,8 +8515,10 @@ export class StateStore {
        JOIN usage_snapshots u
          ON u.profile_id=a.profile_id AND u.source_revision=a.source_revision
        WHERE a.profile_id=? AND a.source_revision>?
+         AND json_type(u.payload_json,'$.observation.accountFingerprint')='text'
+         AND json_extract(u.payload_json,'$.observation.accountFingerprint')=?
        ORDER BY a.source_revision LIMIT ?`,
-    ).all(profileId, afterSourceRevision, limit);
+    ).all(profileId, afterSourceRevision, accountFingerprint, limit);
     const mapRow = (row: unknown): UsageSnapshotRecord => {
       const parsed = z.object({
         source_revision: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -7849,12 +8539,41 @@ export class StateStore {
     return row === null ? null : { sourceRevision: row.source_revision, observedAt: row.observed_at, payload: JSON.parse(row.payload_json) as unknown };
   }
 
-  latestUsagePollFailure(profileId: ProfileId): UsagePollFailureRecord | null {
+  latestUsageForAccount(
+    profileId: ProfileId,
+    accountFingerprint: string,
+  ): UsageSnapshotRecord | null {
     const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedFingerprint = sha256Schema.parse(accountFingerprint);
+    const row = this.#database.query(
+      `SELECT source_revision,observed_at,payload_json FROM usage_snapshots
+       WHERE profile_id=?
+         AND json_type(payload_json,'$.observation.accountFingerprint')='text'
+         AND json_extract(payload_json,'$.observation.accountFingerprint')=?
+       ORDER BY source_revision DESC LIMIT 1`,
+    ).get(parsedProfileId, parsedFingerprint) as {
+      source_revision: number;
+      observed_at: number;
+      payload_json: string;
+    } | null;
+    return row === null ? null : {
+      sourceRevision: row.source_revision,
+      observedAt: row.observed_at,
+      payload: JSON.parse(row.payload_json) as unknown,
+    };
+  }
+
+  latestUsagePollFailure(
+    profileId: ProfileId,
+    accountFingerprint: string,
+  ): UsagePollFailureRecord | null {
+    const parsedProfileId = profileIdSchema.parse(profileId);
+    const parsedFingerprint = sha256Schema.parse(accountFingerprint);
     const row = this.#database.query(
       `SELECT source_revision,observed_at,reason_code FROM usage_poll_failures
-       WHERE profile_id=? ORDER BY source_revision DESC LIMIT 1`,
-    ).get(parsedProfileId) as {
+       WHERE profile_id=? AND account_fingerprint=?
+       ORDER BY source_revision DESC LIMIT 1`,
+    ).get(parsedProfileId, parsedFingerprint) as {
       source_revision: number;
       observed_at: number;
       reason_code: UsagePollFailureRecord["reasonCode"];

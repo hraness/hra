@@ -2235,6 +2235,22 @@ describe("CLI rendering", () => {
         },
         usage: [{
           account: { id: "acct_00000000000000000000000000000000", label: "Work" },
+          automaticReset: {
+            threshold: { remainingPercent: 1, usedPercent: 99 },
+            observation: {
+              state: "available",
+              creditsAvailable: 1,
+              remainingPercent: 72.5,
+              usedPercent: 27.5,
+              weeklyWindowResetsAt: 1_700_500_000_000,
+            },
+            lastAttempt: {
+              state: "settled",
+              outcome: "reset",
+              weeklyWindowResetsAt: 1_700_500_000_000,
+            },
+            refresh: { state: "not_eligible", reason: "below_threshold" },
+          },
           poll: { observedAt: 1_700_000_000_000, sourceRevision: 4, state: "observed" },
           snapshot: {
             observedAt: 1_700_000_000_000,
@@ -2257,13 +2273,64 @@ describe("CLI rendering", () => {
     const rendered = target.stdout.join("");
     expect(rendered).toContain("Work\n");
     expect(rendered).toContain("lifetime tokens: 12,345");
-    expect(rendered).toContain("primary limit used: 27.5%");
+    expect(rendered).toContain("automatic reset policy: 99% used (1% remaining)");
+    expect(rendered).toContain("weekly Codex limit: 27.5% used; 72.5% remaining");
+    expect(rendered).toContain("reset credits available: 1");
+    expect(rendered).toContain("most recent automatic reset attempt: settled (reset)");
+    expect(rendered).toContain("automatic reset refresh: not eligible (below_threshold)");
     expect(rendered).toContain("1m 42.3 tokens/min");
     expect(rendered).toContain("Refresh outcomes");
     expect(rendered).toContain("acct_00000000000000000000000000000000: refreshed");
     expect(rendered).toContain("acct_11111111111111111111111111111111: skipped (signed_out)");
     expect(rendered).toContain("5m unavailable (insufficient_history)");
     expect(rendered).not.toContain("must-not-render");
+  });
+
+  test("rejects malformed or private automatic-reset fields before human or JSON output", () => {
+    const command = {
+      account: "work",
+      kind: "account.usage" as const,
+      refresh: false,
+    };
+    const base = {
+      threshold: { remainingPercent: 1, usedPercent: 99 },
+      observation: {
+        state: "unavailable",
+        reason: "weekly_window_unavailable",
+      },
+      lastAttempt: null,
+    };
+    for (const automaticReset of [
+      { ...base, idempotencyKey: "00000000-0000-4000-8000-000000000001" },
+      {
+        ...base,
+        lastAttempt: {
+          state: "settled",
+          outcome: "reset",
+          weeklyWindowResetsAt: 2_000_000_000_000,
+          accountFingerprint: "a".repeat(64),
+        },
+      },
+      {
+        ...base,
+        lastAttempt: {
+          state: "closed",
+          outcome: "reset",
+          weeklyWindowResetsAt: 2_000_000_000_000,
+        },
+      },
+    ]) {
+      for (const json of [false, true]) {
+        const target = capture();
+        expect(() => renderSuccess(
+          command,
+          { usage: [{ automaticReset }] },
+          json,
+          target.output,
+        )).toThrow(InvalidCommandResponseError);
+        expect(target.stdout).toEqual([]);
+      }
+    }
   });
 
   test("fails closed instead of dumping malformed interaction or event payloads", () => {

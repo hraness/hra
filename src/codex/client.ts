@@ -42,6 +42,7 @@ import {
   parsePluginCatalog,
   parseProviderRequestId,
   parseRateLimits,
+  parseRateLimitResetCreditConsumption,
   parseThreadMutation,
   parseThreadStart,
   parseThreadMetadataRead,
@@ -74,6 +75,7 @@ import {
   type PermissionProfile,
   type CodexPluginCatalog,
   type PresetAlias,
+  type RateLimitResetCreditConsumption,
   type ResolvedPreset,
   type ThreadPage,
   type ThreadStartResult,
@@ -434,6 +436,16 @@ export class CodexAppServerClient {
 
   async accountRateLimits(): Promise<FencedCodexValue<AccountRateLimits>> {
     return this.#closedRequest("account/rateLimits/read", {}, parseRateLimits);
+  }
+
+  async consumeRateLimitResetCredit(
+    idempotencyKey: string,
+  ): Promise<FencedCodexValue<RateLimitResetCreditConsumption>> {
+    return this.#closedRequest(
+      "account/rateLimitResetCredit/consume",
+      { idempotencyKey: persistedUuid(idempotencyKey, "rate-limit reset idempotency key") },
+      parseRateLimitResetCreditConsumption,
+    );
   }
 
   async discoverCapabilities(
@@ -1601,6 +1613,16 @@ function parseEmptyResult(value: unknown): Readonly<Record<string, never>> {
     throw new CodexError("PROTOCOL_ERROR", "empty result contained unexpected fields");
   }
   return Object.freeze({});
+}
+
+function persistedUuid(value: string, label: string): string {
+  if (
+    typeof value !== "string"
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+  ) {
+    throw new CodexError("INVALID_INPUT", `${label} must be a UUID`);
+  }
+  return value;
 }
 
 function canonicalAbsolute(value: string, label: string): string {

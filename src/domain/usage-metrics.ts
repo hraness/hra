@@ -5,6 +5,260 @@ import { z } from "zod";
 import { labelSchema, profileIdSchema, unixMillisecondsSchema } from "./values";
 
 export const ACCOUNT_USAGE_HISTORY_PAGE_LIMIT = 100;
+export const CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES = 7 * 24 * 60;
+const CODEX_WEEKLY_RATE_LIMIT_WINDOW_MS =
+  CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES * 60_000;
+export const AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT = 1;
+export const AUTO_RATE_LIMIT_RESET_USED_PERCENT =
+  100 - AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT;
+
+export const accountRateLimitResetOutcomeSchema = z.enum([
+  "reset",
+  "alreadyRedeemed",
+  "nothingToReset",
+  "noCredit",
+]);
+
+export type AccountRateLimitResetOutcome = z.infer<
+  typeof accountRateLimitResetOutcomeSchema
+>;
+
+const automaticRateLimitResetLocalResolutionSchema = z.enum([
+  "weekly_window_changed",
+  "account_identity_changed",
+]);
+
+const automaticRateLimitResetAttemptWindowShape = {
+  weeklyWindowResetsAt: unixMillisecondsSchema,
+} as const;
+
+export const automaticRateLimitResetLastAttemptSchema = z.union([
+  z.object({
+    state: z.literal("prepared"),
+    ...automaticRateLimitResetAttemptWindowShape,
+  }).strict(),
+  z.object({
+    state: z.literal("retry_pending"),
+    ...automaticRateLimitResetAttemptWindowShape,
+  }).strict(),
+  z.object({
+    state: z.literal("recovery_pending"),
+    ...automaticRateLimitResetAttemptWindowShape,
+  }).strict(),
+  z.object({
+    state: z.literal("settled"),
+    outcome: accountRateLimitResetOutcomeSchema,
+    ...automaticRateLimitResetAttemptWindowShape,
+  }).strict(),
+  z.object({
+    state: z.literal("closed"),
+    reason: automaticRateLimitResetLocalResolutionSchema,
+    ...automaticRateLimitResetAttemptWindowShape,
+  }).strict(),
+]);
+
+export type AutomaticRateLimitResetLastAttempt = z.infer<
+  typeof automaticRateLimitResetLastAttemptSchema
+>;
+
+export const automaticRateLimitResetRefreshStatusSchema = z.union([
+  z.object({
+    state: z.literal("not_eligible"),
+    reason: z.enum([
+      "credits_unavailable",
+      "weekly_window_unavailable",
+      "below_threshold",
+    ]),
+  }).strict(),
+  z.object({
+    state: z.literal("waiting"),
+    reason: z.enum(["credits_unavailable", "below_threshold"]),
+  }).strict(),
+  z.object({ state: z.literal("window_changed") }).strict(),
+  z.object({
+    state: z.literal("latched"),
+    outcome: accountRateLimitResetOutcomeSchema,
+  }).strict(),
+  z.object({
+    state: z.literal("latched"),
+    reason: automaticRateLimitResetLocalResolutionSchema,
+  }).strict(),
+  z.object({ state: z.literal("retry_pending") }).strict(),
+  z.object({ state: z.literal("recovery_pending") }).strict(),
+  z.object({
+    state: z.literal("settled"),
+    outcome: accountRateLimitResetOutcomeSchema,
+  }).strict(),
+]);
+
+export type AutomaticRateLimitResetRefreshStatus = z.infer<
+  typeof automaticRateLimitResetRefreshStatusSchema
+>;
+
+export const automaticRateLimitResetStatusSchema = z.object({
+  threshold: z.object({
+    remainingPercent: z.literal(AUTO_RATE_LIMIT_RESET_REMAINING_PERCENT),
+    usedPercent: z.literal(AUTO_RATE_LIMIT_RESET_USED_PERCENT),
+  }).strict(),
+  observation: z.union([
+    z.object({
+      state: z.literal("available"),
+      creditsAvailable: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      remainingPercent: z.number().finite().min(0).max(100),
+      usedPercent: z.number().finite().min(0).max(100),
+      weeklyWindowResetsAt: unixMillisecondsSchema,
+    }).strict(),
+    z.object({
+      state: z.literal("unavailable"),
+      reason: z.literal("weekly_window_unavailable"),
+    }).strict(),
+  ]),
+  lastAttempt: automaticRateLimitResetLastAttemptSchema.nullable(),
+  refresh: automaticRateLimitResetRefreshStatusSchema.optional(),
+}).strict();
+
+export type AutomaticRateLimitResetDecision =
+  | Readonly<{
+      eligible: true;
+      remainingPercent: number;
+      usedPercent: number;
+      weeklyWindowResetsAt: number;
+    }>
+  | Readonly<{
+      eligible: false;
+      reason:
+        | "credits_unavailable"
+        | "weekly_window_unavailable"
+        | "below_threshold";
+    }>;
+
+export type AutomaticRateLimitResetObservation =
+  | Readonly<{
+      available: true;
+      creditsAvailable: number;
+      usedPercent: number;
+      weeklyWindowResetsAt: number;
+    }>
+  | Readonly<{
+      available: false;
+      reason: "weekly_window_unavailable";
+    }>;
+
+const automaticResetWindowSchema = z.object({
+  usedPercent: z.number().finite().min(0).max(100),
+  windowDurationMins: z.number().finite().nullable(),
+  resetsAt: z.number().finite().nonnegative().nullable(),
+}).passthrough();
+
+const automaticResetLimitSchema = z.object({
+  limitId: z.string().nullable(),
+  primary: automaticResetWindowSchema.nullable(),
+  secondary: automaticResetWindowSchema.nullable(),
+}).passthrough();
+
+const automaticResetPayloadSchema = z.object({
+  rateLimits: z.object({
+    primary: automaticResetLimitSchema,
+    byLimitId: z.record(z.string(), automaticResetLimitSchema).nullable(),
+    resetCreditsAvailable: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  }).passthrough(),
+}).passthrough();
+
+const providerResetTimestampMilliseconds = (value: number): number | null => {
+  // Codex 0.149 defines resetsAt as integer Unix seconds. Accepting an
+  // ambiguous millisecond value could turn a malformed bucket into mutation
+  // authority, so conversion is deliberately one-way and bounded.
+  if (!Number.isSafeInteger(value) || value < 0 || value >= 100_000_000_000) {
+    return null;
+  }
+  const milliseconds = value * 1_000;
+  return Number.isSafeInteger(milliseconds)
+    ? milliseconds
+    : null;
+};
+
+/**
+ * Chooses only the exact Codex seven-day bucket. Other provider limits must
+ * never spend an account reset credit merely because they happen to be high.
+ */
+export function automaticRateLimitResetDecision(input: {
+  providerPayload: unknown;
+  now: number;
+}): AutomaticRateLimitResetDecision {
+  const observation = automaticRateLimitResetObservation(input);
+  if (!observation.available) {
+    return { eligible: false, reason: observation.reason };
+  }
+  if (observation.creditsAvailable < 1) {
+    return { eligible: false, reason: "credits_unavailable" };
+  }
+  if (observation.usedPercent < AUTO_RATE_LIMIT_RESET_USED_PERCENT) {
+    return { eligible: false, reason: "below_threshold" };
+  }
+  return {
+    eligible: true,
+    remainingPercent: Math.max(0, 100 - observation.usedPercent),
+    usedPercent: observation.usedPercent,
+    weeklyWindowResetsAt: observation.weeklyWindowResetsAt,
+  };
+}
+
+export function automaticRateLimitResetObservation(input: {
+  providerPayload: unknown;
+  now: number;
+}): AutomaticRateLimitResetObservation {
+  const now = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).parse(input.now);
+  const parsed = automaticResetPayloadSchema.safeParse(input.providerPayload);
+  if (!parsed.success) {
+    return { available: false, reason: "weekly_window_unavailable" };
+  }
+
+  const byLimitId = parsed.data.rateLimits.byLimitId;
+  const primary = parsed.data.rateLimits.primary;
+  const limitIds = Object.keys(byLimitId ?? {});
+  const keyedCodex = byLimitId?.codex;
+  const codexLimit = limitIds.length > 0
+    ? keyedCodex !== undefined
+      && (keyedCodex.limitId === null || keyedCodex.limitId === "codex")
+      ? keyedCodex
+      : undefined
+    : primary.limitId === null || primary.limitId === "codex"
+      ? primary
+      : undefined;
+  const weekly = codexLimit === undefined
+    ? []
+    : [codexLimit.primary, codexLimit.secondary]
+    .flatMap((window) => {
+      if (
+        window === null
+        || window.windowDurationMins !== CODEX_WEEKLY_RATE_LIMIT_WINDOW_MINUTES
+        || window.resetsAt === null
+      ) return [];
+      const weeklyWindowResetsAt = providerResetTimestampMilliseconds(window.resetsAt);
+      if (
+        weeklyWindowResetsAt === null
+        || weeklyWindowResetsAt <= now
+        || weeklyWindowResetsAt - now > CODEX_WEEKLY_RATE_LIMIT_WINDOW_MS
+      ) return [];
+      return [{
+        usedPercent: window.usedPercent,
+        weeklyWindowResetsAt,
+      }];
+    })
+    .sort((left, right) =>
+      right.usedPercent - left.usedPercent
+      || left.weeklyWindowResetsAt - right.weeklyWindowResetsAt);
+  const candidate = weekly[0];
+  if (candidate === undefined) {
+    return { available: false, reason: "weekly_window_unavailable" };
+  }
+  return {
+    available: true,
+    creditsAvailable: parsed.data.rateLimits.resetCreditsAvailable,
+    usedPercent: candidate.usedPercent,
+    weeklyWindowResetsAt: candidate.weeklyWindowResetsAt,
+  };
+}
 
 const accountUsageHistoryBaseSchema = z.object({
   sourceRevision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),

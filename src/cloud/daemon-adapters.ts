@@ -484,6 +484,9 @@ function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
+const accountFingerprint = (email: string): string =>
+  sha256(email.trim().toLowerCase());
+
 function utf8Bytes(value: string): number {
   return new TextEncoder().encode(value).byteLength;
 }
@@ -1890,6 +1893,9 @@ export function projectStoredUsage(payload: unknown): UsageProjection {
     const rateLimits = parseRateLimits({
       rateLimits: payload.rateLimits.primary,
       rateLimitsByLimitId: payload.rateLimits.byLimitId,
+      // Reset inventory is intentionally local-only and never enters the
+      // encrypted usage projection or its compatibility parser.
+      rateLimitResetCredits: null,
     });
     const limits: UsageLimit[] = [usageLimit(rateLimits.primary, "primary", false)];
     for (const [key, snapshot] of Object.entries(rateLimits.byLimitId ?? {})) {
@@ -2774,8 +2780,12 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
       && profile.providerEmail !== undefined,
     );
     for (const profile of profiles.slice(0, input.limit)) {
-      const latest = this.#store.latestUsage(profile.id);
-      if (latest === null || profile.providerEmail === undefined) continue;
+      if (profile.providerEmail === undefined) continue;
+      const latest = this.#store.latestUsageForAccount(
+        profile.id,
+        accountFingerprint(profile.providerEmail),
+      );
+      if (latest === null) continue;
       snapshots.push({
         localReference: profile.id,
         matchReference: profile.providerEmail,
@@ -2808,12 +2818,14 @@ export class StateBackedCloudDaemonAdapter implements CloudDaemonLocalSourcePort
       || profile.providerEmail === undefined
     ) return [];
     const providerEmail = profile.providerEmail;
+    const providerAccountFingerprint = accountFingerprint(providerEmail);
     const metadata = {
       label: boundedText(profile.label, 160),
       email: boundedText(providerEmail, 320),
       plan: profile.providerPlan === undefined ? null : boundedText(profile.providerPlan, 160),
     } as const;
     return this.#store.usageAfterRevision({
+      accountFingerprint: providerAccountFingerprint,
       afterSourceRevision: input.afterSourceRevision,
       limit: input.limit,
       profileId: profile.id,

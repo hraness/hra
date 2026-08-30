@@ -130,9 +130,14 @@ class FakeCodex implements CodexRuntimePort {
             rateLimitReachedType: null,
           },
           byLimitId: null,
+          resetCreditsAvailable: 1,
+          resetCreditSentinel: "PRIVATE-RESET-CREDIT-SENTINEL",
         },
       },
     });
+  }
+  consumeRateLimitReset(): Promise<never> {
+    return Promise.reject(new Error("unused reset mutation"));
   }
 }
 
@@ -181,7 +186,7 @@ async function fixture(): Promise<Readonly<{
     sourceSequence,
     observedAt: usage.observedAt,
     receivedAt: usage.observedAt,
-    accountFingerprint: null,
+    accountFingerprint: sha256("person@example.com"),
     providerGeneration: current.processGeneration,
     daemonGeneration: 1,
     previousPayload: null,
@@ -335,6 +340,8 @@ describe("state-backed cloud daemon adapter", () => {
         },
       });
       expect(JSON.stringify(usage)).not.toContain(privateRootFixture);
+      expect(JSON.stringify(usage)).not.toContain("resetCreditsAvailable");
+      expect(JSON.stringify(usage)).not.toContain("PRIVATE-RESET-CREDIT-SENTINEL");
 
       adapter.close();
       adapter = new StateBackedCloudDaemonAdapter({
@@ -351,6 +358,75 @@ describe("state-backed cloud daemon adapter", () => {
         signal,
       });
       expect(replay.events).toEqual(first.events);
+    } finally {
+      adapter.close();
+      value.store.close();
+    }
+  });
+
+  test("exports only usage rows for the current account after an identity change", async () => {
+    const value = await fixture();
+    const profile = value.store.listProfiles()[0];
+    if (profile === undefined) throw new Error("missing profile fixture");
+    const first = value.store.latestUsage(profile.id);
+    if (first === null) throw new Error("missing usage fixture");
+    const firstReceivedAt = storedAccountUsageSnapshotSchema.parse(first.payload)
+      .observation.receivedAt;
+    const secondEmail = "second-person@example.com";
+    expect(value.store.setProfileState(
+      profile.id,
+      profile.processGeneration,
+      "signed_in",
+      { email: secondEmail, plan: "Plus" },
+    )).toBe(true);
+    const provider = await value.codex.readUsage();
+    value.store.recordUsage(profile.id, 2, 2_000, createStoredAccountUsageSnapshot({
+      accountFingerprint: sha256(secondEmail),
+      daemonGeneration: 1,
+      observedAt: 2_000,
+      previousPayload: null,
+      providerGeneration: profile.processGeneration,
+      providerPayload: provider.payload,
+      receivedAt: firstReceivedAt + USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 2,
+    }));
+    value.store.recordUsage(profile.id, 3, 3_000, createStoredAccountUsageSnapshot({
+      accountFingerprint: sha256("person@example.com"),
+      daemonGeneration: 1,
+      observedAt: 3_000,
+      previousPayload: first.payload,
+      providerGeneration: profile.processGeneration,
+      providerPayload: provider.payload,
+      receivedAt: firstReceivedAt + 2 * USAGE_CLOUD_UPLOAD_MIN_INTERVAL_MS,
+      sourceSequence: 3,
+    }));
+    expect(value.store.latestUsage(profile.id)).toMatchObject({ sourceRevision: 3 });
+
+    const adapter = new StateBackedCloudDaemonAdapter({
+      codex: value.codex,
+      executeRemote: () => Promise.resolve({}),
+      paths: value.paths,
+      store: value.store,
+    });
+    try {
+      const signal = new AbortController().signal;
+      const current = await adapter.listUsage({ limit: 25, signal });
+      expect(current).toHaveLength(1);
+      expect(current[0]).toMatchObject({
+        matchReference: secondEmail,
+        sourceRevision: 2,
+      });
+      const history = await adapter.listUsageHistory({
+        afterSourceRevision: 0,
+        limit: 25,
+        localReference: profile.id,
+        signal,
+        sourceGeneration: profile.processGeneration,
+      });
+      expect(history.map((snapshot) => ({
+        matchReference: snapshot.matchReference,
+        sourceRevision: snapshot.sourceRevision,
+      }))).toEqual([{ matchReference: secondEmail, sourceRevision: 2 }]);
     } finally {
       adapter.close();
       value.store.close();
@@ -1300,7 +1376,7 @@ describe("state-backed cloud daemon adapter", () => {
     for (const [sourceSequence, observedAt] of [[2, 9_000], [3, 8_000]] as const) {
       const provider = await value.codex.readUsage();
       value.store.recordUsage(profile.id, sourceSequence, observedAt, createStoredAccountUsageSnapshot({
-        accountFingerprint: null,
+        accountFingerprint: sha256("person@example.com"),
         daemonGeneration: 1,
         observedAt,
         previousPayload: null,
