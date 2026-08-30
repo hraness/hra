@@ -3201,7 +3201,7 @@ export class HraService {
       };
     }
 
-    if (signal.aborted) throw signal.reason;
+    signal.throwIfAborted();
     const begun = this.#store.beginAccountRateLimitReset(attempt.idempotencyKey);
     if (begun.state !== "effect_started") {
       throw new Error("ACCOUNT_RATE_LIMIT_RESET_BEGIN_STATE_INVALID");
