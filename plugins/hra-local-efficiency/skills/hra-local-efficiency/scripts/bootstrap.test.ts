@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -55,8 +56,12 @@ describe("machine bootstrap", () => {
     const bunBin = join(root, "bin");
     mkdirSync(codexHome, { recursive: true });
     mkdirSync(bunBin, { recursive: true });
+    mkdirSync(join(codexHome, "rules"), { recursive: true });
     writeFileSync(join(codexHome, "AGENTS.md"), "# Existing\n\nKeep me.\n");
     chmodSync(join(codexHome, "AGENTS.md"), 0o600);
+    const rulesPath = join(codexHome, "rules", "hra-local-efficiency.rules");
+    writeFileSync(rulesPath, "# Existing rule before the managed block.\n");
+    chmodSync(rulesPath, 0o640);
     const modulePath = join(root, "host-resources.js");
     writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
     const environment = {
@@ -84,6 +89,33 @@ describe("machine bootstrap", () => {
     expect(guidance.match(/hra-local-efficiency:start/gu)).toHaveLength(1);
     expect(statSync(join(codexHome, "AGENTS.md")).mode & 0o777).toBe(0o600);
     expect(readlinkSync(join(bunBin, "hra-host-run"))).toContain("host-run.ts");
+    let rules = readFileSync(rulesPath, "utf8");
+    expect(rules).toContain("# Existing rule before the managed block.\n");
+    expect(rules.match(/hra-local-efficiency:rules:start/gu)).toHaveLength(1);
+    expect(rules).toContain(`pattern = [${JSON.stringify(join(bunBin, "hra-host-run"))}]`);
+    expect(rules).toContain('decision = "prompt"');
+    expect(rules).not.toContain('decision = "allow"');
+    expect(statSync(rulesPath).mode & 0o777).toBe(0o640);
+
+    rules += "# Existing rule after the managed block.\n";
+    writeFileSync(rulesPath, rules);
+    const reapplied = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--apply",
+        "--skip-dependency-install",
+        "--codex-home",
+        codexHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      env: environment,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    expect(reapplied.exitCode, reapplied.stderr.toString()).toBe(0);
+    expect(readFileSync(rulesPath, "utf8")).toBe(rules);
 
     const second = Bun.spawnSync({
       cmd: [
@@ -101,6 +133,59 @@ describe("machine bootstrap", () => {
     });
     expect(second.exitCode, second.stderr.toString()).toBe(0);
     expect(readFileSync(join(codexHome, "AGENTS.md"), "utf8")).toBe(guidance);
+    expect(readFileSync(rulesPath, "utf8")).toBe(rules);
+
+    writeFileSync(rulesPath, rules.replace('decision = "prompt"', 'decision = "allow"'));
+    const drifted = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--check",
+        "--codex-home",
+        codexHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      env: environment,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    expect(drifted.exitCode).toBe(1);
+    expect(drifted.stderr.toString()).toContain("Codex host-access rule differs");
+  });
+
+  test("refuses a symlinked Codex rule without changing its target", () => {
+    const root = mkdtempSync(join(tmpdir(), "hra-local-efficiency-bootstrap-rule-link-"));
+    temporary.push(root);
+    const codexHome = join(root, "codex");
+    const bunBin = join(root, "bin");
+    const rulesDirectory = join(codexHome, "rules");
+    mkdirSync(rulesDirectory, { recursive: true });
+    mkdirSync(bunBin);
+    const managedTarget = join(root, "managed-rule.rules");
+    writeFileSync(managedTarget, "# Managed elsewhere\n");
+    symlinkSync(managedTarget, join(rulesDirectory, "hra-local-efficiency.rules"));
+    const modulePath = join(root, "host-resources.js");
+    writeFileSync(modulePath, "export const createHostResourceCoordinator = () => ({})\n");
+
+    const result = Bun.spawnSync({
+      cmd: [
+        process.execPath,
+        import.meta.dir + "/bootstrap.ts",
+        "--apply",
+        "--skip-dependency-install",
+        "--codex-home",
+        codexHome,
+        "--bun-bin",
+        bunBin,
+      ],
+      env: { ...process.env, HRA_ATET_HOST_RESOURCES_MODULE: modulePath },
+      stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString()).toContain("non-regular Codex rule file");
+    expect(readFileSync(managedTarget, "utf8")).toBe("# Managed elsewhere\n");
+    expect(existsSync(join(codexHome, "AGENTS.md"))).toBe(false);
   });
 
   test("refuses a dotfiles-managed global guidance symlink", () => {

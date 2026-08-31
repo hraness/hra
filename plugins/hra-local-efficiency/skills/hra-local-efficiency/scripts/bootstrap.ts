@@ -37,6 +37,8 @@ export type BootstrapOptions = {
 
 const startMarker = "<!-- hra-local-efficiency:start -->";
 const endMarker = "<!-- hra-local-efficiency:end -->";
+const rulesStartMarker = "# hra-local-efficiency:rules:start";
+const rulesEndMarker = "# hra-local-efficiency:rules:end";
 const atetRelease = "Atet v2.0.0 host-resource runtime";
 const atetCommit = "58132fa6e8ac09a87d1fdffc17be40c8b1fd9d6d";
 const pluginName = "hra-local-efficiency";
@@ -75,11 +77,15 @@ const atetArtifacts = Object.freeze([
   }),
 ]);
 
-function regularFileModeOrDefault(path: string): number {
+function regularFileModeOrDefault(
+  path: string,
+  description = "global guidance",
+  defaultMode = 0o644,
+): number {
   try {
     const metadata = lstatSync(path);
     if (!metadata.isFile()) {
-      throw new Error(`refusing to replace non-regular global guidance: ${path}`);
+      throw new Error(`refusing to replace non-regular ${description}: ${path}`);
     }
     return metadata.mode & 0o777;
   } catch (error: unknown) {
@@ -88,7 +94,7 @@ function regularFileModeOrDefault(path: string): number {
       && error !== null
       && "code" in error
       && error.code === "ENOENT"
-    ) return 0o644;
+    ) return defaultMode;
     throw error;
   }
 }
@@ -399,6 +405,44 @@ function expectedGlobalAgents(codexHome: string): string {
   );
 }
 
+export function codexRulesPath(codexHome: string): string {
+  return join(codexHome, "rules", "hra-local-efficiency.rules");
+}
+
+export function managedCodexRule(bunBin: string): string {
+  const hostRun = join(resolve(bunBin), "hra-host-run");
+  const hostRunJson = JSON.stringify(hostRun);
+  const shellWord = `'${hostRun.replaceAll("'", `'"'"'`)}'`;
+  const sample = JSON.stringify(
+    `${shellWord} --mode=heavy --label=repo-check -- bun run check`,
+  );
+  const basenameSample = JSON.stringify(
+    "hra-host-run --mode=heavy --label=repo-check -- bun run check",
+  );
+  const lookalikeSample = JSON.stringify(
+    `'${`${hostRun}ner`.replaceAll("'", `'"'"'`)}' --mode=heavy --label=repo-check -- bun run check`,
+  );
+  return `${rulesStartMarker}\n`
+    + "# Keep this prompt-only: hra-host-run can wrap arbitrary child commands.\n"
+    + "prefix_rule(\n"
+    + `    pattern = [${hostRunJson}],\n`
+    + "    decision = \"prompt\",\n"
+    + "    justification = \"HRA host scheduling needs reviewed access to machine-wide state; inspect the complete wrapped command before approval.\",\n"
+    + `    match = [${sample}],\n`
+    + `    not_match = [${basenameSample}, ${lookalikeSample}],\n`
+    + ")\n"
+    + `${rulesEndMarker}\n`;
+}
+
+function expectedCodexRules(codexHome: string, bunBin: string): string {
+  return replaceManagedBlock(
+    readText(codexRulesPath(codexHome)),
+    managedCodexRule(bunBin),
+    rulesStartMarker,
+    rulesEndMarker,
+  );
+}
+
 export function checkInstallation(
   options: BootstrapOptions,
   environment: Readonly<NodeJS.ProcessEnv> = process.env,
@@ -412,6 +456,15 @@ export function checkInstallation(
   }
   if (readText(agentsPath) !== expectedGlobalAgents(options.codexHome)) {
     failures.push(`global guidance differs: ${agentsPath}`);
+  }
+  const rulesPath = codexRulesPath(options.codexHome);
+  try {
+    regularFileModeOrDefault(rulesPath, "Codex rule file", 0o600);
+    if (readText(rulesPath) !== expectedCodexRules(options.codexHome, options.bunBin)) {
+      failures.push(`Codex host-access rule differs: ${rulesPath}`);
+    }
+  } catch (error: unknown) {
+    failures.push(error instanceof Error ? error.message : String(error));
   }
   for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
     const path = join(options.codexHome, profile);
@@ -429,11 +482,16 @@ export function checkInstallation(
 }
 
 async function applyInstallation(options: BootstrapOptions): Promise<void> {
-  mkdirSync(options.codexHome, { recursive: true, mode: 0o700 });
-  mkdirSync(options.bunBin, { recursive: true, mode: 0o700 });
   const agentsPath = join(options.codexHome, "AGENTS.md");
   const agentsMode = regularFileModeOrDefault(agentsPath);
-  writeAtomic(agentsPath, expectedGlobalAgents(options.codexHome), agentsMode);
+  const rulesPath = codexRulesPath(options.codexHome);
+  const rulesMode = regularFileModeOrDefault(rulesPath, "Codex rule file", 0o600);
+  const agentsValue = expectedGlobalAgents(options.codexHome);
+  const rulesValue = expectedCodexRules(options.codexHome, options.bunBin);
+  mkdirSync(options.codexHome, { recursive: true, mode: 0o700 });
+  mkdirSync(options.bunBin, { recursive: true, mode: 0o700 });
+  writeAtomic(agentsPath, agentsValue, agentsMode);
+  writeAtomic(rulesPath, rulesValue, rulesMode);
   for (const profile of ["hra-worker.config.toml", "hra-routine.config.toml"]) {
     const path = join(options.codexHome, profile);
     const expected = normalizeTrailingNewline(asset(profile));
