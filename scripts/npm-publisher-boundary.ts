@@ -43,6 +43,18 @@ export type NpmPublisherSpawn = (
   options: PublisherSpawnOptions,
 ) => PublisherChild;
 
+const githubOidcUuid = String.raw`[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}`;
+const currentGitHubOidcPath = new RegExp(
+  String.raw`^\/[0-9]+\/\/idtoken\/${githubOidcUuid}\/${githubOidcUuid}\/?$`,
+  "u",
+);
+
+function validGitHubOidcEndpoint(url: URL): boolean {
+  const legacyEndpoint = url.pathname.includes("/_apis/distributedtask/hubs/")
+    && url.pathname.endsWith("/idtoken");
+  return legacyEndpoint || currentGitHubOidcPath.test(url.pathname);
+}
+
 function validGitHubOidcRequestUrl(value: string | undefined): boolean {
   if (value === undefined || value.length < 1 || value.length > 4_096) return false;
   try {
@@ -55,11 +67,10 @@ function validGitHubOidcRequestUrl(value: string | undefined): boolean {
       && url.hostname !== "actions.githubusercontent.com"
       && url.hostname.endsWith(".actions.githubusercontent.com")
       && !url.pathname.includes("%")
-      && url.pathname.includes("/_apis/distributedtask/hubs/")
-      && url.pathname.endsWith("/idtoken")
+      && validGitHubOidcEndpoint(url)
+      && Array.from(url.searchParams).length === 1
       && url.searchParams.getAll("api-version").length === 1
-      && url.searchParams.get("api-version") === "2.0"
-      && !url.searchParams.has("audience");
+      && url.searchParams.get("api-version") === "2.0";
   } catch {
     return false;
   }
