@@ -160,17 +160,18 @@ jobs:
       - name: Create one exact npm tarball and checksum
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          npm pack --ignore-scripts --pack-destination artifacts .
+          release_artifacts="$RUNNER_TEMP/hra-release-artifacts"
+          mkdir "$release_artifacts"
+          npm pack --ignore-scripts --pack-destination "$release_artifacts" .
           expected="$(bun -e 'import { releaseArchiveName } from "./scripts/release-package-policy"; const value = await Bun.file("package.json").json(); process.stdout.write(releaseArchiveName(value.version))')"
-          test -f "artifacts/$expected"
-          test "$(find artifacts -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" = "1"
-          bun run ./scripts/release-artifact-checksum.ts write "$GITHUB_WORKSPACE/artifacts/$expected" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+          test -f "$release_artifacts/$expected"
+          test "$(find "$release_artifacts" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" = "1"
+          bun run ./scripts/release-artifact-checksum.ts write "$release_artifacts/$expected" "$release_artifacts/SHA256SUMS"
       - name: Record exact npm registry preflight
         id: npm_preflight
         run: |
           set -euo pipefail
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           state="$(bun run ./scripts/check-npm-artifact-state.ts "$artifact")"
           if [[ "$state" != "absent" && "$state" != "exact" ]]; then
             echo "::error::npm registry preflight returned an invalid state"
@@ -182,7 +183,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hra-release-${{ github.run_attempt }}
-          path: artifacts/
+          path: ${{ runner.temp }}/hra-release-artifacts/
           if-no-files-found: error
           retention-days: 7
 
@@ -246,7 +247,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: artifacts
+          path: ${{ runner.temp }}/hra-release-artifacts
       - name: Enable isolated user namespaces for native custody checks
         if: runner.os == 'Linux'
         run: |
@@ -257,9 +258,9 @@ jobs:
       - name: Verify checksum and complete installed-package behavior
         run: |
           set -euo pipefail
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           test -n "$artifact"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
           bun run ./scripts/check-package.ts "$artifact"
       - name: Restore Ubuntu user-namespace restriction
         if: ${{ always() && runner.os == 'Linux' }}
@@ -343,7 +344,7 @@ jobs:
         with:
           artifact-ids: ${{ needs.verify.outputs.artifact_id }}
           merge-multiple: true
-          path: artifacts
+          path: ${{ runner.temp }}/hra-release-artifacts
       - name: Revalidate remote authority and checksum
         env:
           GH_TOKEN: ${{ github.token }}
@@ -356,17 +357,17 @@ jobs:
           test "$remote_tag" = "$VERIFIED_SHA"
           git fetch --force --no-tags origin "$remote_main"
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
       - name: Create immutable GitHub Release from the same bytes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
-          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$GITHUB_WORKSPACE/artifacts/SHA256SUMS"
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/publish-github-release.ts "$VERIFIED_TAG" "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
       - name: Publish exact tarball through npm trusted publishing
         run: |
-          artifact="$(find "$GITHUB_WORKSPACE/artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/publish-npm-release.ts "$artifact"
       - name: Admit exact public npm and GitHub state
         env:

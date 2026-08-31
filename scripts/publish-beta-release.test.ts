@@ -1976,7 +1976,9 @@ describe("accepted release bundle", () => {
       Bun.file(join(import.meta.dir, "..", ".github", "workflows", "release.yml")).text(),
     ]);
     expect(packageDocument).toMatchObject({ name: "@hraness/hra" });
-    expect(workflow).toContain("npm pack --ignore-scripts --pack-destination artifacts .");
+    expect(workflow).toContain('npm pack --ignore-scripts --pack-destination "$release_artifacts" .');
+    expect(workflow).toContain('release_artifacts="$RUNNER_TEMP/hra-release-artifacts"');
+    expect(workflow).not.toContain("$GITHUB_WORKSPACE/artifacts");
     expect(workflow).not.toContain("readReviewedSourceAuthority");
     expect(workflow).not.toContain("publish-beta-release.ts");
   });
