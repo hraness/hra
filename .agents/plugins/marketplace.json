@@ -1,0 +1,20 @@
+{
+  "name": "hraness",
+  "interface": {
+    "displayName": "Hraness"
+  },
+  "plugins": [
+    {
+      "name": "hra-local-efficiency",
+      "source": {
+        "source": "local",
+        "path": "./plugins/hra-local-efficiency"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

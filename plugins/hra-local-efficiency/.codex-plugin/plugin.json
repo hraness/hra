@@ -1,0 +1,37 @@
+{
+  "name": "hra-local-efficiency",
+  "version": "0.1.0",
+  "description": "Machine-wide local scheduling, validation ownership, and guarded maintenance for Hraness Codex work.",
+  "author": {
+    "name": "Hraness",
+    "url": "https://github.com/hraness"
+  },
+  "homepage": "https://github.com/hraness/hra/tree/main/plugins/hra-local-efficiency",
+  "repository": "https://github.com/hraness/hra",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "local-development",
+    "scheduling",
+    "validation",
+    "worktrees"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "HRA Local Efficiency",
+    "shortDescription": "Coordinate fast, safe local Codex work.",
+    "longDescription": "Preserves useful agent fan-out while coordinating heavyweight commands, avoiding duplicate validation, auditing stale tasks, and reclaiming verified clean worktrees.",
+    "developerName": "Hraness",
+    "category": "Productivity",
+    "capabilities": [
+      "Local scheduling",
+      "Validation receipts",
+      "Workspace maintenance"
+    ],
+    "defaultPrompt": [
+      "Install the local efficiency baseline on this Mac.",
+      "Audit local Codex resource and worktree health.",
+      "Run this repository's heavy validation safely."
+    ]
+  }
+}

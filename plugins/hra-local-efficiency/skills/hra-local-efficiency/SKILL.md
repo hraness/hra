@@ -1,0 +1,120 @@
+---
+name: hra-local-efficiency
+description: >-
+  Install, audit, and operate the Hraness local Codex efficiency baseline across
+  repositories and Macs. Use for host-wide heavyweight-command scheduling,
+  validation ownership and exact-tree receipts, stale-task reporting, guarded
+  Git worktree cleanup, model-lane setup, or checking whether a Hraness machine
+  follows the standard. Preserve useful agent fan-out and all repository final
+  gates. Do not use for cloud execution or cloud optimization.
+---
+
+# HRA local efficiency
+
+Keep parallel agents. Reduce only duplicated validation, conflicting local
+compute, stale state, and verified disposable disk use.
+
+## Choose the mode
+
+- **Install or update this Mac:** run `bun run scripts/bootstrap.ts --apply`
+  from this skill directory, then run it again with `--check`.
+- **Inspect this Mac:** run `bun run scripts/workspace-audit.ts` and
+  `bun run scripts/session-audit.ts`. Both are read-only by default. Add
+  `--sizes` only when the slower recursive worktree-size estimate is useful.
+- **Run heavyweight local work:** use `hra-host-run --mode=shared|heavy|exclusive
+  --label=LABEL -- COMMAND ...`.
+- **Record or reuse deterministic focused validation:** use `hra-validate`.
+  Reuse is opt-in and is never valid for a required final integration,
+  merge-queue, deployment, release, authenticated-browser, or network-sensitive
+  gate.
+- **Reclaim Git worktrees:** audit first with `workspace-audit.ts`, then invoke
+  `worktree-cleanup.ts` separately in each owning repository with every approved
+  absolute path named through `--remove`.
+- **Adopt or check repository guidance:** use `repo-adoption.ts --check` or
+  `--apply`. It edits only the exact managed policy block in a root `AGENTS.md`.
+
+Run scripts from the installed skill directory when the convenience commands
+are unavailable. `bootstrap.ts` installs or refreshes those commands under the
+user's Bun bin directory. It verifies a minimal pinned Atet host-resource
+runtime in the user's local data directory; it never replaces a global Atet
+package or command.
+
+## Preserve the invariants
+
+- Do not cap agent count merely to reduce fan-out. Parallel reasoning and
+  independent implementation lanes remain desirable.
+- Give each focused check one worker owner. The integrator reviews the diff and
+  reported evidence, repeating a focused command only when the tree changed,
+  evidence is missing, or a repair invalidated it.
+- Give each CI run, merge-queue item, provider operation, or deployment wait one
+  waiter. Do not hold a compute lease while waiting on external state.
+- Run the repository's aggregate/final gate once after convergence. Never use a
+  receipt to skip a repository-required final replayed-tree or delivery gate.
+- The host scheduler is an outer layer. Jungle and HRA keep their repository
+  schedulers underneath it; invoke `hra-host-run` only around top-level
+  commands. Nested `hra-host-run` calls inherit the outer lease and do not
+  acquire again.
+- Keep roots and integrators on the caller's selected model. Bounded independent
+  workers may use the installed `hra-worker` or `hra-routine` profiles when the
+  task merits them; measure repair rate rather than assuming cheaper is better.
+- This baseline is local-only. Do not create, configure, or route work to Codex
+  cloud through this skill.
+
+## Resource modes
+
+Use `shared` for one narrow check, `heavy` for production builds and ordinary
+repository-wide checks, and `exclusive` for full monorepo validation, native
+packaging, capture hardware, or fixed-port browser suites.
+
+Known mappings:
+
+- Jungle `check:affected`: heavy; Jungle full `check`: exclusive.
+- HRA `check`: heavy; HRA `check:complete`, production build, and native
+  package work: exclusive.
+- Personal template and Tiff full check/build: heavy.
+- Narrow file or package tests: normally unscheduled.
+
+The wrapper runs the original public command unchanged. It does not substitute
+a weaker check.
+
+## Validation receipts
+
+`hra-validate` fingerprints the Git HEAD, tracked diff, untracked file content
+and executable/link mode, working directory, exact command, Bun/Node versions,
+lockfiles, and caller contexts. It never follows untracked symlinks. Successful
+receipts live under the repository's Git common directory
+so linked worktrees can share exact evidence. Receipts and wrapper output retain
+only a safe operation label, program name, and command digest—not raw argv or
+context values. Reuse fails closed when the index contains skip-worktree or
+assume-unchanged entries, a populated gitlink/submodule, or an unsupported
+untracked file type.
+
+Use `--reuse --ttl-minutes=N` only for deterministic focused commands. Force a
+real run after relevant environment or external state changes. Failed commands
+are reported for diagnosis but never reused as success.
+
+## Cleanup safety
+
+Size is a discovery signal, not deletion authority. A removable worktree must
+be registered, present, clean including untracked and ignored files, free of
+skip-worktree and assume-unchanged index flags and populated gitlinks, neither
+primary nor the invoking worktree, explicitly named, and merged into an exactly
+fetched, fully qualified remote target. The cleanup script validates the full
+manifest before deletion and revalidates every target at action time. It never
+forces removal or deletes branches.
+
+Treat unregistered temporary directories, Codex transcripts, application
+databases, credentials, private corpora, archives, and dirty worktrees as user
+state. Never sweep a temporary-path prefix.
+
+## Machine standard
+
+`bootstrap.ts` manages one marked block in the global Codex `AGENTS.md`, two
+optional CLI profiles, a minimal private scheduler runtime, and convenience
+commands. It preserves all content outside its markers, leaves exact profile
+symlinks intact, and refuses conflicting unmanaged targets. Use `--check` in
+automation and after plugin upgrades.
+
+The HRA repository marketplace is the cross-machine source of truth. Upgrade
+the marketplace and reinstall the plugin, then rerun bootstrap and start a new
+Codex task so the refreshed skill is discovered.
