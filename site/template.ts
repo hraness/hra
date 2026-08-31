@@ -64,12 +64,15 @@ export const hraMailingListConfig = (
 
 export const renderHraSiteFooter = (
   turnstileSitekey = process.env[HRA_MAILING_TURNSTILE_SITEKEY_ENV],
-): string => renderHranessSiteFooter({
-  mailingList: hraMailingListConfig({
+): string => {
+  const environment: Record<string, string | undefined> = {
     [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
     VERCEL_ENV: process.env.VERCEL_ENV,
-  }),
-});
+  };
+  return renderHranessSiteFooter({
+    mailingList: hraMailingListConfig(environment),
+  });
+};
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>
   renderToStaticMarkup(createElement(AskAiAboutThis, {

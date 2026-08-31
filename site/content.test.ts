@@ -641,10 +641,12 @@ describe("public content contract", () => {
     expect(hraMailingListConfig({ VERCEL_ENV: "preview" }))
       .toEqual({ kind: "none" });
     for (const turnstileSitekey of [undefined, ""]) {
-      expect(() => hraMailingListConfig({
-        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
-        VERCEL_ENV: "production",
-      }))
+      expect(() => {
+        hraMailingListConfig({
+          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+          VERCEL_ENV: "production",
+        });
+      })
         .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
     for (const turnstileSitekey of [
@@ -652,9 +654,11 @@ describe("public content contract", () => {
       "1x00000000000000000000AA!",
       "x".repeat(101),
     ]) {
-      expect(() => hraMailingListConfig({
-        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
-      }))
+      expect(() => {
+        hraMailingListConfig({
+          [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        });
+      })
         .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
     }
   });
