@@ -8,6 +8,7 @@ import { readingPages } from "./content.ts";
 import { editorialImages } from "./editorial-images.ts";
 import {
   renderAskAiAboutThis,
+  renderHraSiteFooter,
   renderPreviewHtml,
   renderPrivacyHtml,
   renderReadingIndexHtml,
@@ -281,7 +282,7 @@ describe("static-site build", () => {
     expect(await readFile(join(root, "dist/site/styles.css"), "utf8")).toBe("stale\n");
   });
 
-  test("ships no remote runtime assets and configures restrictive response headers", async () => {
+  test("admits only the configured Turnstile runtime and restrictive response headers", async () => {
     const repositoryRoot = join(import.meta.dir, "..");
     const html = renderSiteHtml();
     const css = await readFile(join(repositoryRoot, "site/styles.css"), "utf8");
@@ -290,6 +291,9 @@ describe("static-site build", () => {
     ) as { headers?: unknown };
 
     expect(html).not.toMatch(/<script[^>]+src=/);
+    expect(renderHraSiteFooter("1x00000000000000000000AA")).toContain(
+      'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
+    );
     expect(html).not.toMatch(/<link[^>]+rel="(?:icon|stylesheet)"[^>]+href="https?:\/\//);
     expect(css).not.toMatch(/url\(["']?https?:\/\//);
     expect(css).toContain('--font-sans: "Nebula Sans", ui-sans-serif, system-ui');
@@ -321,7 +325,7 @@ describe("static-site build", () => {
         headers: [
           {
             key: "Content-Security-Policy",
-            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; manifest-src 'self'; script-src 'none'; style-src 'self'",
+            value: "default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'self'; form-action https://account.hraness.com; frame-ancestors 'none'; frame-src https://challenges.cloudflare.com; img-src 'self' data:; manifest-src 'self'; script-src https://challenges.cloudflare.com; style-src 'self'",
           },
           { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
           {
