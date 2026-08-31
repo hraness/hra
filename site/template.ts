@@ -33,21 +33,42 @@ const escapeHtml = (value: string): string =>
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 
+export const HRA_MAILING_TURNSTILE_SITEKEY_ENV =
+  "NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY" as const;
+
+const turnstileSitekeyPattern = /^[A-Za-z0-9_-]{20,100}$/u;
+
 export const hraMailingListConfig = (
-  turnstileSitekey = process.env.NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY,
-): HranessMailingListConfig => turnstileSitekey === undefined
-  || turnstileSitekey.length === 0
-  ? { kind: "none" }
-  : {
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): HranessMailingListConfig => {
+  const turnstileSitekey = environment[HRA_MAILING_TURNSTILE_SITEKEY_ENV];
+  if (turnstileSitekey === undefined || turnstileSitekey.length === 0) {
+    if (environment.VERCEL_ENV === "production") {
+      throw new Error(
+        `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be configured for Vercel Production.`,
+      );
+    }
+    return { kind: "none" };
+  }
+  if (!turnstileSitekeyPattern.test(turnstileSitekey)) {
+    throw new Error(
+      `${HRA_MAILING_TURNSTILE_SITEKEY_ENV} must be a 20-100 character URL-safe public Cloudflare Turnstile sitekey.`,
+    );
+  }
+  return {
     audience: "hra",
     kind: "signup",
     turnstileSitekey,
   };
+};
 
 export const renderHraSiteFooter = (
-  turnstileSitekey = process.env.NEXT_PUBLIC_HRANESS_MAILING_TURNSTILE_SITEKEY,
+  turnstileSitekey = process.env[HRA_MAILING_TURNSTILE_SITEKEY_ENV],
 ): string => renderHranessSiteFooter({
-  mailingList: hraMailingListConfig(turnstileSitekey),
+  mailingList: hraMailingListConfig({
+    [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+    VERCEL_ENV: process.env.VERCEL_ENV,
+  }),
 });
 
 export const renderAskAiAboutThis = (canonicalUrl: string): string =>

@@ -19,6 +19,7 @@ import {
   renderSitemapXml,
 } from "./content.ts";
 import {
+  HRA_MAILING_TURNSTILE_SITEKEY_ENV,
   renderDeepseekHarnessReadingHtml,
   renderHeadlongMicroharnessReadingHtml,
   hraMailingListConfig,
@@ -611,13 +612,17 @@ describe("public content contract", () => {
 
   test("renders only the HRA mailing audience when Turnstile is configured", () => {
     const sitekey = "1x00000000000000000000AA";
-    expect(hraMailingListConfig(sitekey)).toEqual({
+    expect(hraMailingListConfig({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: sitekey,
+    })).toEqual({
       audience: "hra",
       kind: "signup",
       turnstileSitekey: sitekey,
     });
-    expect(hraMailingListConfig(undefined)).toEqual({ kind: "none" });
-    expect(hraMailingListConfig("")).toEqual({ kind: "none" });
+    expect(hraMailingListConfig({})).toEqual({ kind: "none" });
+    expect(hraMailingListConfig({
+      [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: "",
+    })).toEqual({ kind: "none" });
 
     const footer = renderHraSiteFooter(sitekey);
     expect(footer).toContain('data-mailing-list="signup"');
@@ -630,6 +635,28 @@ describe("public content contract", () => {
       'src="https://challenges.cloudflare.com/turnstile/v0/api.js"',
     );
     expect(footer).not.toContain("substack.com");
+  });
+
+  test("fails production closed on missing or malformed Turnstile configuration", () => {
+    expect(hraMailingListConfig({ VERCEL_ENV: "preview" }))
+      .toEqual({ kind: "none" });
+    for (const turnstileSitekey of [undefined, ""]) {
+      expect(() => hraMailingListConfig({
+        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+        VERCEL_ENV: "production",
+      }))
+        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+    }
+    for (const turnstileSitekey of [
+      "too-short",
+      "1x00000000000000000000AA!",
+      "x".repeat(101),
+    ]) {
+      expect(() => hraMailingListConfig({
+        [HRA_MAILING_TURNSTILE_SITEKEY_ENV]: turnstileSitekey,
+      }))
+        .toThrow(HRA_MAILING_TURNSTILE_SITEKEY_ENV);
+    }
   });
 
   test("renders an inert noindex preview canonicalized to the full product page", () => {
