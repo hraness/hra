@@ -210,14 +210,16 @@ const legacyMetadataFixture = (current: AdapterMetadataFixture): LegacyMetadataF
   });
 
 describe("released Oh SQLite facts-memory adapter", () => {
-  test("pins the immutable v0.2.0 release without installing optional semantic peers", async () => {
+  test("pins the immutable public v0.2.7 release without installing optional semantic peers", async () => {
     const packageDocument = JSON.parse(
       await readFile(join(import.meta.dir, "..", "..", "package.json"), "utf8"),
     ) as { dependencies?: Record<string, string> };
     expect(packageDocument.dependencies?.["@hraness/oh"])
-      .toBe("github:hraness/oh#v0.2.0");
+      .toBe("0.2.7");
     const lockfile = await readFile(join(import.meta.dir, "..", "..", "bun.lock"), "utf8");
-    expect(lockfile).toContain("@hraness/oh@github:hraness/oh#89fb133");
+    expect(lockfile).toContain('"@hraness/oh": ["@hraness/oh@0.2.7"');
+    expect(lockfile).toContain("sha512-+9OIjJqEzriKdcV2dMze5y6Kl/DzjdbHwSghxVRkxHAhQIsdOoRujFynxgBQL2PXRqFJMRBmSQKnu8R5D/EXLg==");
+    expect(lockfile).not.toContain("@hraness/oh@github:");
     expect(OH_LIBSQL_STORE_LIMITS_V1.snapshotComponentBytes).toBe(6 * 1024 * 1024);
     expect(OH_LIBSQL_STORE_LIMITS_V1.providerResponseBytes).toBe(9_000_000);
     await expect(lstat(join(import.meta.dir, "..", "..", "node_modules", "@suss", "datalog")))

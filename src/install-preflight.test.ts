@@ -43,6 +43,22 @@ const repositoryRoot = resolve(import.meta.dir, "..");
 // dependency resolution metadata removed. The package gate separately checks
 // the unchanged production tarball and its exact dependency policy.
 const TEST_STAGING_DEADLINE_MS = 45_000;
+const PUBLIC_LOADER_INSTALL_CALL = "await m.installHraRelease(a);";
+const BOUNDED_TEST_LOADER_INSTALL_CALL =
+  `await m.installHraRelease(a,{stageDeadlineMilliseconds:${String(TEST_STAGING_DEADLINE_MS)}});`;
+const BOUNDED_TEST_PREFLIGHT_LOADER = HRA_INSTALL_PREFLIGHT_LOADER.replace(
+  PUBLIC_LOADER_INSTALL_CALL,
+  BOUNDED_TEST_LOADER_INSTALL_CALL,
+);
+if (
+  HRA_INSTALL_PREFLIGHT_LOADER.indexOf(PUBLIC_LOADER_INSTALL_CALL)
+    !== HRA_INSTALL_PREFLIGHT_LOADER.lastIndexOf(PUBLIC_LOADER_INSTALL_CALL)
+  || BOUNDED_TEST_PREFLIGHT_LOADER === HRA_INSTALL_PREFLIGHT_LOADER
+  || BOUNDED_TEST_PREFLIGHT_LOADER.replace(
+    BOUNDED_TEST_LOADER_INSTALL_CALL,
+    PUBLIC_LOADER_INSTALL_CALL,
+  ) !== HRA_INSTALL_PREFLIGHT_LOADER
+) throw new Error("The installer test loader did not receive its one bounded staging deadline.");
 // Two serialized staging installs may each consume their complete bounded
 // installer budget. Keep the outer test deadline above both inner budgets so
 // scheduling delay cannot terminate a valid second install.
@@ -216,7 +232,9 @@ const runTrustedLoader = async (
   const child = trackDirectTestChild(Bun.spawn([
     process.execPath,
     "-e",
-    HRA_INSTALL_PREFLIGHT_LOADER,
+    sourceSha256 === HRA_INSTALL_PREFLIGHT_SOURCE_SHA256
+      ? BOUNDED_TEST_PREFLIGHT_LOADER
+      : HRA_INSTALL_PREFLIGHT_LOADER,
     "--",
     archivePath,
     sourceSha256,
@@ -435,7 +453,7 @@ afterAll(async () => {
 describe("transactional HRA installer", () => {
   test("strips only dependency maps from the private installer fixture", () => {
     expect(sourcePackageManifest.dependencies).toEqual({
-      "@hraness/oh": "github:hraness/oh#v0.2.0",
+      "@hraness/oh": "0.2.7",
       "@openai/codex": "0.149.0",
       convex: "1.45.0",
       zod: "4.4.3",

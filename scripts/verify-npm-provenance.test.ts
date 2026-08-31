@@ -4,6 +4,7 @@ import {
   assertNpmPublishAttestation,
   assertNpmProvenanceBuildIdentity,
   assertNpmProvenanceSubject,
+  canonicalAsciiDerUtf8String,
   npmProvenanceSignerPolicy,
   npmRegistryKeySelector,
   selectNpmProvenanceAttestations,
@@ -193,6 +194,12 @@ describe("npm provenance attestation-set and signer admission", () => {
 
   test("binds the Fulcio certificate to the exact public workflow run", () => {
     const invocation = "https://github.com/hraness/hra/actions/runs/123/attempts/2";
+    const repositorySubject = [
+      "repo:hraness",
+      "307125679/hra",
+      "1343008607:ref:refs/tags/v0.1.0",
+    ].join("@");
+    const der = canonicalAsciiDerUtf8String;
     const policy = npmProvenanceSignerPolicy(tag, sha, invocation);
     expect(policy.certificateIdentityURI).toBe(
       "^https://github\\.com/hraness/hra/\\.github/workflows/release\\.yml@refs/tags/v0\\.1\\.0$",
@@ -202,27 +209,43 @@ describe("npm provenance attestation-set and signer admission", () => {
       "1.3.6.1.4.1.57264.1.3": sha,
       "1.3.6.1.4.1.57264.1.5": "hraness/hra",
       "1.3.6.1.4.1.57264.1.6": "refs/tags/v0.1.0",
-      "1.3.6.1.4.1.57264.1.11": "github-hosted",
-      "1.3.6.1.4.1.57264.1.12": "https://github.com/hraness/hra",
-      "1.3.6.1.4.1.57264.1.13": sha,
-      "1.3.6.1.4.1.57264.1.14": "refs/tags/v0.1.0",
-      "1.3.6.1.4.1.57264.1.15": "1343008607",
-      "1.3.6.1.4.1.57264.1.18": "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.0",
-      "1.3.6.1.4.1.57264.1.19": sha,
-      "1.3.6.1.4.1.57264.1.20": "push",
-      "1.3.6.1.4.1.57264.1.21": invocation,
-      "1.3.6.1.4.1.57264.1.22": "public",
-      "1.3.6.1.4.1.57264.1.24": "repo:hraness/hra:ref:refs/tags/v0.1.0",
+      "1.3.6.1.4.1.57264.1.11": der("github-hosted"),
+      "1.3.6.1.4.1.57264.1.12": der("https://github.com/hraness/hra"),
+      "1.3.6.1.4.1.57264.1.13": der(sha),
+      "1.3.6.1.4.1.57264.1.14": der("refs/tags/v0.1.0"),
+      "1.3.6.1.4.1.57264.1.15": der("1343008607"),
+      "1.3.6.1.4.1.57264.1.18": der(
+        "https://github.com/hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.0",
+      ),
+      "1.3.6.1.4.1.57264.1.19": der(sha),
+      "1.3.6.1.4.1.57264.1.20": der("push"),
+      "1.3.6.1.4.1.57264.1.21": der(invocation),
+      "1.3.6.1.4.1.57264.1.22": der("public"),
+      "1.3.6.1.4.1.57264.1.24": der(
+        repositorySubject,
+      ),
     });
     expect(policy.certificateOIDs["1.3.6.1.4.1.57264.1.1"]).toBeUndefined();
     expect(npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateOIDs["1.3.6.1.4.1.57264.1.21"])
-      .not.toBe(invocation);
+      .not.toBe(der(invocation));
     expect(npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/hra/actions/runs/123/attempts/1").certificateIdentityURI)
       .toBe(policy.certificateIdentityURI);
     expect(() => npmProvenanceSignerPolicy(tag, sha,
       "https://github.com/hraness/other/actions/runs/123/attempts/2")).toThrow();
+  });
+
+  test("encodes only bounded canonical ASCII as one short-form DER UTF8String", () => {
+    expect(Buffer.from(canonicalAsciiDerUtf8String("public"))).toEqual(
+      Buffer.from([0x0c, 0x06, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63]),
+    );
+    const boundary = Buffer.from(canonicalAsciiDerUtf8String("a".repeat(127)));
+    expect(boundary.subarray(0, 2)).toEqual(Buffer.from([0x0c, 0x7f]));
+    expect(boundary.byteLength).toBe(129);
+    for (const invalid of ["", "a".repeat(128), "non-ascii-é", "line\nbreak"]) {
+      expect(() => canonicalAsciiDerUtf8String(invalid)).toThrow("bounded nonempty canonical ASCII");
+    }
   });
 
   test("admits only bounded canonical npm registry signing keys", () => {

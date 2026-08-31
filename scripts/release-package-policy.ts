@@ -1,5 +1,6 @@
 const stableSemver = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const exactRegistryVersion = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u;
+export const HRA_RELEASE_OH_VERSION = "0.2.7";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -48,9 +49,12 @@ export function inspectReleasePackage(value: unknown): ReleasePackageInspection 
   ) throw new Error("The HRA public package identity, license, registry, version, or binary is invalid.");
 
   const blockers = Object.entries(dependencies)
-    .filter(([, version]) => !exactRegistryVersion.test(version))
-    .map(([name, version]) => `${name}=${version}`)
-    .sort();
+    .filter(([name, version]) => name === "@hraness/oh"
+      ? version !== HRA_RELEASE_OH_VERSION
+      : !exactRegistryVersion.test(version))
+    .map(([name, version]) => `${name}=${version}`);
+  if (!Object.hasOwn(dependencies, "@hraness/oh")) blockers.push("@hraness/oh=<missing>");
+  blockers.sort();
   return Object.freeze({
     blockers: Object.freeze(blockers),
     name: "@hraness/hra",
@@ -61,7 +65,7 @@ export function inspectReleasePackage(value: unknown): ReleasePackageInspection 
 export function assertReleasePackageReady(value: unknown): ReleasePackageInspection {
   const inspection = inspectReleasePackage(value);
   if (inspection.blockers.length > 0) {
-    throw new Error(`HRA release is blocked by non-registry runtime dependencies: ${inspection.blockers.join(", ")}`);
+    throw new Error(`HRA release is blocked by runtime dependency policy: ${inspection.blockers.join(", ")}`);
   }
   return inspection;
 }

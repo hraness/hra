@@ -2,8 +2,10 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 
-import { readBoundedJsonResponse } from "./bounded-json-response";
-import { parseNpmRelease } from "./release-distribution-policy";
+import {
+  npmRegistryReleaseMetadata,
+  parseNpmRelease,
+} from "./release-distribution-policy";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
 
 const argument = process.argv[2];
@@ -24,14 +26,15 @@ const response = await fetch(
     signal: AbortSignal.timeout(10_000),
   },
 );
-if (response.status === 404) {
+const metadata: Record<string, unknown> | null = await npmRegistryReleaseMetadata(
+  response,
+  inspection.version,
+  "version",
+);
+if (metadata === null) {
   console.log("absent");
 } else {
-  if (response.status !== 200) throw new Error(`npm registry returned HTTP ${String(response.status)}.`);
-  const coordinate = parseNpmRelease(
-    await readBoundedJsonResponse(response, "npm registry exact release"),
-    inspection.version,
-  );
+  const coordinate = parseNpmRelease(metadata, inspection.version);
   const expectedIntegrity = `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
   const expectedShasum = createHash("sha1").update(bytes).digest("hex");
   if (coordinate.integrity !== expectedIntegrity || coordinate.shasum !== expectedShasum) {
