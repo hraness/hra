@@ -62,6 +62,8 @@ describe("public text policy", () => {
   });
 
   test("allows only the reviewed public Hraness packages", () => {
+    expect(() => assertPublicText("@hraness/atet", "public dependency"))
+      .not.toThrow();
     expect(() => assertPublicText("@hraness/hra", "public dependency"))
       .not.toThrow();
     expect(() => assertPublicText("@hraness/design-kit", "public dependency"))
@@ -88,7 +90,7 @@ describe("public text policy", () => {
       .toThrow(PublicTextPolicyError);
   });
 
-  test("scans SVG text and rejects unreviewed file types", async () => {
+  test("scans SVG and TOML text and rejects unreviewed file types", async () => {
     const root = await mkdtemp(join(tmpdir(), "hra-public-policy-"));
     const svg = join(root, "image.svg");
     const token = ["github", "pat"].join("_") + "_" + "abcdefghijklmnopqrstuvwxyz123456";
@@ -96,6 +98,12 @@ describe("public text policy", () => {
       await writeFile(svg, `<svg><text>${token}</text></svg>`, "utf8");
       await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
       await unlink(svg);
+      const toml = join(root, "profile.toml");
+      await writeFile(toml, 'model = "routine"\n', "utf8");
+      await expect(assertPublicTree(root)).resolves.toBeUndefined();
+      await writeFile(toml, `credential = "${token}"\n`, "utf8");
+      await expect(assertPublicTree(root)).rejects.toMatchObject({ code: "SECRET_SHAPE" });
+      await unlink(toml);
       await writeFile(join(root, "payload.bin"), "ordinary bytes", "utf8");
       const error = await assertPublicTree(root).then(
         () => new Error("Expected the public-tree policy to reject an unreviewed file."),

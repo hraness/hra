@@ -1,0 +1,6 @@
+interface:
+  display_name: "HRA Local Efficiency"
+  short_description: "Coordinate fast, safe local Codex work"
+  default_prompt: "Use $hra-local-efficiency to install, audit, or improve this Hraness development machine without cloud execution."
+policy:
+  allow_implicit_invocation: true

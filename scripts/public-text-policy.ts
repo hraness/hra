@@ -15,6 +15,7 @@ const allowedPublicScopes = new Set([
   "typescript-eslint",
 ]);
 const allowedPublicScopedPackages = new Set([
+  "@hraness/atet",
   "@hraness/design-kit",
   "@hraness/hra",
   "@hraness/oh",
@@ -86,7 +87,7 @@ export function assertPublicSensitiveText(value: string, label: string): void {
 }
 
 const excludedDirectories = new Set([".git", "dist", "node_modules"]);
-const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|ts|tsx|txt|xml|yaml|yml|zig)$/u;
+const textFile = /(?:^|\/)(?:CODEOWNERS|LICENSE|\.bun-version|\.editorconfig|\.gitattributes|\.gitignore)$|\.(?:css|html|json|lock|md|mjs|svg|toml|ts|tsx|txt|xml|yaml|yml|zig)$/u;
 const editorialWebp = /^site\/images\/editorial\/[a-z0-9]+(?:-[a-z0-9]+)*(?:-384|-768)?\.webp$/u;
 const webpChunkTypes = new Set(["VP8 ", "VP8L", "VP8X"]);
 

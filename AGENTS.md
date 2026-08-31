@@ -6,6 +6,9 @@
 - `scripts/` contains deterministic checks, builds, and release helpers.
 - `kb/` contains maintained product knowledge and executable implementation plans.
 - `.agents/skills/` contains the portable five-skill phased planning and execution pack.
+- `.agents/plugins/` contains the repository marketplace catalog.
+- `plugins/hra-local-efficiency/` contains the local-only Codex efficiency plugin and its operating skill.
+- `docs/local-efficiency-plugin.md` documents cross-machine marketplace installation and maintainer validation.
 - `README.md`, `SECURITY.md`, `CONTRIBUTING.md`, `WRITING.md`, and `STYLE.md` define the public product and contribution contract.
 
 # Guidelines
@@ -24,3 +27,7 @@
 - Follow `WRITING.md` for repository prose and `STYLE.md` for public copy. Keep README and website claims byte-derived from one content source.
 - Update the active plan in `kb/plans/` as work changes. Do not call a phase complete without the acceptance evidence named there.
 - Preserve public independence. Do not include private paths, credentials, private package dependencies, internal project names, or unpublished provenance.
+
+<!-- hra-local-efficiency:start -->
+- Preserve useful agent fan-out. Give each expensive focused validation command and external wait one owner; the integration owner reviews that evidence and runs the repository-required aggregate or final gate once after convergence. Reuse evidence only for the exact Git tree, command, lockfiles, toolchain, relevant environment, and validity period, and never to skip a required final integration, merge, release, deployment, or production-verification gate. On Hraness development machines, use `$hra-local-efficiency` and the installed host scheduler for heavyweight top-level commands when available.
+<!-- hra-local-efficiency:end -->

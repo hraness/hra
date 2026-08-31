@@ -18,5 +18,5 @@
     "target": "ES2024",
     "types": ["bun"]
   },
-  "include": ["src/**/*.ts", "convex/**/*.ts", "scripts/**/*.ts", "site/**/*.ts"]
+  "include": ["src/**/*.ts", "convex/**/*.ts", "scripts/**/*.ts", "site/**/*.ts", "plugins/**/*.ts"]
 }

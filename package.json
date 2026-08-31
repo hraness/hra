@@ -20,6 +20,8 @@
     "build:site": "bun ./scripts/build-site.ts",
     "check": "bun run lint && bun run typecheck && bun run test && bun run build:site -- --check && bun run build && bun run check:package",
     "check:package": "bun run test:package-policy && bun ./scripts/check-package.ts",
+    "local-efficiency:apply": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --apply",
+    "local-efficiency:check": "bun run ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts/bootstrap.ts --check",
     "acceptance:live": "bun ./scripts/live-acceptance.ts",
     "hosted:bootstrap": "bun ./scripts/bootstrap-hosted-sync.ts",
     "hosted:admission": "bun ./scripts/manage-hosted-admission.ts",
@@ -32,7 +34,8 @@
     "release:canonical-alias": "bun ./scripts/current-project-alias-release.ts",
     "lint": "eslint .",
     "start": "bun ./src/cli.ts",
-    "test": "bun test ./scripts --isolate --max-concurrency=1 && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1",
+    "test": "bun test ./scripts --isolate --max-concurrency=1 && bun run test:local-efficiency-plugin && bun test ./src --isolate --max-concurrency=1 && bun test ./convex ./site --isolate --max-concurrency=1",
+    "test:local-efficiency-plugin": "bun test ./plugins/hra-local-efficiency/skills/hra-local-efficiency/scripts --isolate --max-concurrency=1",
     "test:simulation": "bun test ./src/cloud/deterministic-authority-simulation.test.ts --isolate --max-concurrency=1",
     "test:package-policy": "sh -c 'umask 077; exec bun test ./scripts/package-policy.test.ts --isolate --max-concurrency=1'",
     "typecheck": "tsc --noEmit"
