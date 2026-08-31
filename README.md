@@ -12,7 +12,7 @@ hra doctor --offline
 hra init --yes
 ```
 
-> **Immutable local CLI release; hosted sync not yet live.** The exact install command below works once GitHub exposes the immutable `v0.1.5` Release and its verified archive. The website is live; the public CLI stays immutable once admitted, and optional hosted sync remains beta-not-yet-live.
+> **Immutable local CLI release; hosted sync not yet live.** The exact install command below is live from the immutable `v0.1.5` GitHub Release and its verified archive. npm exposes the same provenance-bearing bytes as latest. The public CLI is immutable and admitted; optional hosted sync remains beta-not-yet-live.
 
 HRA is one Bun CLI plus a local daemon. It keeps Codex accounts isolated, gives you a compact session interface, and optionally syncs encrypted session projections and commands across your enrolled machines.
 
@@ -118,7 +118,7 @@ If the event stream reports a blocking interaction, read its exact ID and revisi
 
 ## Agent work protocol
 
-> **Local release boundary.** These commands are part of the immutable `v0.1.5` local CLI release and become installable through the exact command above once its GitHub Release exists. Hosted sync is not required for this local protocol.
+> **Local release boundary.** These commands are part of the immutable `v0.1.5` local CLI release and are installable through the exact command above. Hosted sync is not required for this local protocol.
 
 The frozen source contract defines a narrow local coordination kernel for agents operating several already-existing Codex sessions. It records six bounded objects: work, tasks, attempts, submissions, reviews, and signals. Codex app-server still owns model execution, turns, tools, context, and approvals. HRA does not add a second model loop or a generic executable workflow engine.
 

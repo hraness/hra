@@ -14,6 +14,7 @@ import {
   headlongMicroharnessReading,
   oracleAndFirmReading,
   publicContent,
+  publicReleaseState,
   renderLlmsText,
   renderPrivacyMarkdown,
   renderReadmeMarkdown,
@@ -54,7 +55,7 @@ describe("public content contract", () => {
     });
   });
 
-  test("leads both public surfaces with the release-ready immutable CLI install command", () => {
+  test("leads both public surfaces with the live immutable CLI install command", () => {
     const markdown = renderReadmeMarkdown();
     const html = renderSiteHtml();
     const encodedInstallCommand = htmlText(publicContent.installCommand);
@@ -79,25 +80,31 @@ describe("public content contract", () => {
     );
   });
 
-  test("marks the local release ready and website live while keeping hosted sync unavailable", () => {
+  test("marks the local release and website live while keeping hosted sync unavailable", () => {
+    expect(publicReleaseState).toBe("live");
     expect(publicContent.endpoints).toEqual({
-      betaTag: "release-ready",
+      betaTag: "live",
       githubRepository: "live",
       hostedSync: "beta-not-yet-live",
       website: "live",
     });
     for (const surface of [renderReadmeMarkdown(), renderSiteHtml()]) {
       expect(surface).toContain("Immutable local CLI release; hosted sync not yet live");
-      expect(surface).toContain("works once GitHub exposes the immutable");
-      expect(surface).toContain("public CLI stays immutable once admitted");
+      expect(surface).toContain("is live from the immutable");
+      expect(surface).toContain("npm exposes the same provenance-bearing bytes as latest");
+      expect(surface).toContain("public CLI is immutable and admitted");
       expect(surface).not.toContain("release tag is release-ready");
       expect(surface).toContain("optional hosted sync remains beta-not-yet-live");
       expect(surface).toContain("Local release boundary");
-      expect(surface).toContain("once its GitHub Release exists");
+      expect(surface).toContain("are installable through the exact command above");
+      expect(surface).not.toContain("once its GitHub Release exists");
+      expect(surface).not.toContain("works once GitHub exposes the immutable");
       expect(surface).not.toContain("install command becomes usable");
       expect(surface).not.toContain("Beta not yet live");
       expect(surface).not.toContain("No published `v0.1.5` tag currently exposes these commands");
     }
+    expect(renderLlmsText()).toContain("Install the live v0.1.5 beta");
+    expect(renderLlmsText()).not.toContain("Install after the v0.1.5 beta tag is live");
   });
 
   test("publishes protected cloud auth and the exact device-pairing path", () => {
