@@ -11,10 +11,7 @@ if (exitCode !== 0 || stdout.length > 128 || stderr.length > 1_024) {
 const version = stdout.trim();
 const match = /^([0-9]+)\.([0-9]+)\.([0-9]+)$/u.exec(version);
 if (match === null) throw new Error("npm returned an invalid version.");
-const major = Number(match[1]);
-const minor = Number(match[2]);
-const patch = Number(match[3]);
-if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
-  throw new Error(`npm ${version} is too old for trusted publishing; require >=11.5.1.`);
+if (version !== "11.19.0") {
+  throw new Error(`npm ${version} is not the reviewed trusted-publishing client 11.19.0.`);
 }
-console.log(`npm ${version} supports trusted publishing.`);
+console.log("npm 11.19.0 is the reviewed trusted-publishing client.");

@@ -84,8 +84,8 @@ jobs:
       - name: Install Node and npm trusted-publishing client
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.19.0"
-          registry-url: https://registry.npmjs.org
+          node-version: "24.20.0"
+          package-manager-cache: false
       - name: Verify annotated tag, exact main head, and package version
         id: identity
         env:
@@ -324,8 +324,8 @@ jobs:
       - name: Install Node and npm trusted-publishing client
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.19.0"
-          registry-url: https://registry.npmjs.org
+          node-version: "24.20.0"
+          package-manager-cache: false
       - name: Install exact locked dependencies without lifecycle scripts
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Require registry readiness and trusted publishing support
@@ -359,6 +359,11 @@ jobs:
           git merge-base --is-ancestor "$VERIFIED_SHA" "$remote_main"
           artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
           bun run ./scripts/release-artifact-checksum.ts check "$artifact" "$RUNNER_TEMP/hra-release-artifacts/SHA256SUMS"
+      - name: Prove npm trusted-publisher exchange without publication
+        if: needs.verify.outputs.npm_preflight_state == 'absent'
+        run: |
+          artifact="$(find "$RUNNER_TEMP/hra-release-artifacts" -maxdepth 1 -type f -name '*.tgz')"
+          bun run ./scripts/check-npm-trusted-publisher-oidc.ts "$artifact"
       - name: Create immutable GitHub Release from the same bytes
         env:
           GH_TOKEN: ${{ github.token }}

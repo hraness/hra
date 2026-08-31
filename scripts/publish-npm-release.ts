@@ -12,6 +12,10 @@ import {
 import {
   decideNpmPublicationTransition,
 } from "./npm-publication-transition";
+import {
+  assertNpmPublisherIdentity,
+  runNpmPublisher,
+} from "./npm-publisher-boundary";
 import { assertReleasePackageReady, releaseArchiveName } from "./release-package-policy";
 import { verifyNpmProvenance, type NpmProvenanceAttemptPolicy } from "./verify-npm-provenance";
 
@@ -160,61 +164,19 @@ if (transition.action === "admit_existing") {
   if (process.env.HRA_APPROVE_NPM_PUBLICATION !== `publish:${inspection.name}@${inspection.version}`) {
     throw new Error("The first npm publication requires its exact explicit approval value.");
   }
-  const cleanEnvironment = Object.fromEntries([
-    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
-    "ACTIONS_ID_TOKEN_REQUEST_URL",
-    "CI",
-    "GITHUB_ACTION",
-    "GITHUB_ACTIONS",
-    "GITHUB_ACTOR_ID",
-    "GITHUB_EVENT_NAME",
-    "GITHUB_JOB",
-    "GITHUB_REF",
-    "GITHUB_REF_NAME",
-    "GITHUB_REPOSITORY",
-    "GITHUB_REPOSITORY_ID",
-    "GITHUB_RUN_ATTEMPT",
-    "GITHUB_RUN_ID",
-    "GITHUB_SERVER_URL",
-    "GITHUB_SHA",
-    "GITHUB_WORKFLOW",
-    "GITHUB_WORKFLOW_REF",
-    "GITHUB_WORKFLOW_SHA",
-    "HOME",
-    "NPM_CONFIG_REGISTRY",
-    "PATH",
-    "RUNNER_ENVIRONMENT",
-  ].flatMap((name) => {
-    const value = process.env[name];
-    return value === undefined ? [] : [[name, value]];
-  }));
-  const child = Bun.spawn([
-    "npm", "publish", tarball, "--access", "public", "--provenance",
-  ], { env: cleanEnvironment, stderr: "pipe", stdin: "ignore", stdout: "pipe" });
-  const timer = setTimeout(() => child.kill(9), 5 * 60_000);
-  const boundedOutput = async (stream: ReadableStream<Uint8Array>): Promise<void> => {
-    const reader = stream.getReader();
-    let bytes = 0;
-    try {
-      for (;;) {
-        const item = await reader.read();
-        if (item.done) break;
-        bytes += item.value.byteLength;
-        if (bytes > 1024 * 1024) {
-          child.kill(9);
-          throw new Error("npm trusted publication exceeded its output bound.");
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  };
-  const [exitCode] = await Promise.all([
-    child.exited.finally(() => clearTimeout(timer)),
-    boundedOutput(child.stdout),
-    boundedOutput(child.stderr),
-  ]);
-  if (exitCode !== 0) throw new Error("npm trusted publication failed without exposing provider output.");
+  assertNpmPublisherIdentity(process.env, releaseTag, releaseSha);
+  const publication = await runNpmPublisher({
+    dryRun: false,
+    source: process.env,
+    tarball,
+  });
+  if (
+    publication.exitCode !== 0
+    || !publication.trustedExchangeProven
+    || publication.failure !== null
+  ) {
+    throw new Error(`npm trusted publication failed (${publication.failure ?? "unclassified"}).`);
+  }
   let observed: CompleteNpmRelease | null = null;
   let lookupFailure: unknown;
   for (let attempt = 0; attempt < 60; attempt += 1) {

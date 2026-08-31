@@ -143,10 +143,21 @@ export function assertNpmProvenanceBuildIdentity(
   const predicate = record(value, "SLSA predicate");
   const buildDefinition = record(predicate.buildDefinition, "SLSA build definition");
   const externalParameters = record(buildDefinition.externalParameters, "SLSA external parameters");
+  const internalParameters = record(buildDefinition.internalParameters, "SLSA internal parameters");
+  const githubParameters = record(internalParameters.github, "SLSA GitHub internal parameters");
+  exactKeys(internalParameters, ["github"], "SLSA internal parameters");
+  exactKeys(
+    githubParameters,
+    ["event_name", "repository_id", "repository_owner_id"],
+    "SLSA GitHub internal parameters",
+  );
   const workflow = record(externalParameters.workflow, "SLSA workflow");
   const dependencies = buildDefinition.resolvedDependencies;
   if (
     buildDefinition.buildType !== GITHUB_BUILD_TYPE
+    || githubParameters.event_name !== "push"
+    || githubParameters.repository_id !== GITHUB_REPOSITORY_ID
+    || githubParameters.repository_owner_id !== GITHUB_REPOSITORY_OWNER_ID
     || workflow.repository !== GITHUB_REPOSITORY_URL
     || workflow.path !== ".github/workflows/release.yml"
     || workflow.ref !== `refs/tags/${input.tag}`
