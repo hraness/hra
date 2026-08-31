@@ -79,12 +79,12 @@ describe("public text policy", () => {
 
   test("distinguishes annotated Git tag references from package scopes", () => {
     expect(() => assertPublicText(
-      "https://github.com/hraness/hra@refs/tags/v0.1.0",
+      "https://github.com/hraness/hra@refs/tags/v0.1.1",
       "Git tag reference",
     )).not.toThrow();
     expect(() => assertPublicText(["@refs", "tags"].join("/"), "unreviewed package"))
       .toThrow(PublicTextPolicyError);
-    expect(() => assertPublicText(["@refs", "private", "v0.1.0"].join("/"), "unreviewed reference"))
+    expect(() => assertPublicText(["@refs", "private", "v0.1.1"].join("/"), "unreviewed reference"))
       .toThrow(PublicTextPolicyError);
   });
 

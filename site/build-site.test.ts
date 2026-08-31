@@ -163,7 +163,7 @@ describe("static-site build", () => {
     })).rejects.toThrow("Release commit");
   });
 
-  test("keeps the deployment identity version aligned with the package", async () => {
+  test("keeps immutable hosted deployment identity separate from the forward CLI version", async () => {
     const root = await createFixtureRoot();
     await buildSite({ check: false, repositoryRoot: root });
     const identity = JSON.parse(
@@ -173,7 +173,9 @@ describe("static-site build", () => {
       await readFile(join(import.meta.dir, "..", "package.json"), "utf8"),
     ) as { version?: unknown };
 
-    expect(identity.version).toBe(packageJson.version);
+    expect(identity.version).toBe("0.1.0");
+    expect(packageJson.version).toBe("0.1.1");
+    expect(identity.version).not.toBe(packageJson.version);
   });
 
   test("lists the DeepSeek Harness reading page in the built sitemap and llms index", async () => {
