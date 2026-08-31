@@ -147,7 +147,7 @@ const officialReleaseRecord = (
   draft: false,
   id: 9_715_113,
   immutable: true,
-  tag_name: "v0.1.0",
+  tag_name: "v0.1.1",
   ...overrides,
 });
 
@@ -404,7 +404,7 @@ beforeAll(async () => {
     root,
   ], { cwd: repositoryRoot });
   if (packed.exitCode !== 0) throw new Error(`Could not build installer fixture: ${packed.stderr}${packed.stdout}`);
-  const productionArchivePath = join(root, "hraness-hra-0.1.0.tgz");
+  const productionArchivePath = join(root, "hraness-hra-0.1.1.tgz");
   const extractedRoot = join(root, "extracted");
   await mkdir(extractedRoot, { mode: 0o700 });
   const extracted = await run(["tar", "-xzf", productionArchivePath, "-C", extractedRoot], { cwd: root });
@@ -466,10 +466,10 @@ describe("transactional HRA installer", () => {
 
   test("binds the public command to one tagged preflight and one exact tagged archive", async () => {
     expect(HRA_INSTALL_PREFLIGHT_SOURCE_URL).toBe(
-      "https://raw.githubusercontent.com/hraness/hra/v0.1.0/src/install-preflight-runtime.ts",
+      "https://raw.githubusercontent.com/hraness/hra/v0.1.1/src/install-preflight-runtime.ts",
     );
     expect(HRA_INSTALL_ARCHIVE_URL).toBe(
-      "https://github.com/hraness/hra/releases/download/v0.1.0/hraness-hra-0.1.0.tgz",
+      "https://github.com/hraness/hra/releases/download/v0.1.1/hraness-hra-0.1.1.tgz",
     );
     const runtimeBytes = await readFile(resolve(import.meta.dir, "install-preflight-runtime.ts"));
     expect(createHash("sha256").update(runtimeBytes).digest("hex")).toBe(
@@ -516,7 +516,7 @@ describe("transactional HRA installer", () => {
       archiveAssetId: 8_675_309,
       archiveBytes: 123,
       archiveReleaseId: 9_715_113,
-      archiveReleaseTag: "v0.1.0",
+      archiveReleaseTag: "v0.1.1",
       archiveRepositoryId: HRA_INSTALL_REPOSITORY_ID,
       archiveSha256,
       archiveSource: "official",
@@ -533,7 +533,7 @@ describe("transactional HRA installer", () => {
       {
         label: "wrong tag",
         message: "not an immutable published release",
-        record: officialReleaseRecord({ tag_name: "v0.1.1" }),
+        record: officialReleaseRecord({ tag_name: "v0.1.2" }),
       },
       {
         label: "draft release",
@@ -557,7 +557,7 @@ describe("transactional HRA installer", () => {
         message: "one exact archive asset",
         record: officialReleaseRecord({
           assets: [officialArchiveAsset({
-            browser_download_url: "https://example.com/hra-v0.1.0.tgz",
+            browser_download_url: "https://example.com/hra-v0.1.1.tgz",
             name: "other.tgz",
           })],
         }),
@@ -614,7 +614,7 @@ describe("transactional HRA installer", () => {
       expect(call.init.signal).toBeInstanceOf(AbortSignal);
       expect(headers.get("accept")).toBe("application/vnd.github+json");
       expect(headers.get("accept-encoding")).toBe("identity");
-      expect(headers.get("user-agent")).toBe("hra-installer/0.1.0");
+      expect(headers.get("user-agent")).toBe("hra-installer/0.1.1");
       expect(headers.get("x-github-api-version")).toBe("2022-11-28");
       expect(headers.get("authorization")).toBeNull();
     }
@@ -716,7 +716,7 @@ describe("transactional HRA installer", () => {
       "install",
       "global",
       "package.json",
-    ))).toEqual({ dependencies: { "@hraness/hra": "0.1.0" } });
+    ))).toEqual({ dependencies: { "@hraness/hra": "0.1.1" } });
 
     const second = await runInstaller(root);
     expect(second).toEqual({

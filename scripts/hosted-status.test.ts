@@ -42,7 +42,7 @@ const requiredEnvironmentNames = [
   "JWKS",
   "HRA_AUTH_HMAC_SECRET",
   "HRA_RESEND_API_KEY",
-  "HRA_AUTH_EMAIL_REPLY_TO",
+  "HRA_AUTH_EMAIL_FROM",
 ] as const;
 
 const outputWriter = (chunks: string[]): Pick<NodeJS.WriteStream, "write"> => ({

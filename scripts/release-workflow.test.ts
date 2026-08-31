@@ -85,7 +85,7 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("Current V2 claims from `.11` onward");
     expect(releaseRecord).toContain("repository path `hraness/hra`, numeric owner ID");
     expect(releaseRecord).toContain("`307125679`, numeric repository ID `1343008607`");
-    expect(releaseRecord).toContain("ref `refs/tags/v0.1.0`");
+    expect(releaseRecord).toContain("ref `refs/tags/v0.1.1`");
   });
 
   test("gives GitHub publisher commands only their explicit non-OIDC environment", () => {
@@ -146,24 +146,174 @@ describe("release workflow", () => {
     }
   });
 
+  test("keeps release authority-supervisor prerequisites byte-aligned with CI", async () => {
+    const root = join(import.meta.dir, "..");
+    const [ciSource, releaseSource] = await Promise.all([
+      readFile(join(root, ".github", "workflows", "ci.yml"), "utf8"),
+      readFile(join(root, ".github", "workflows", "release.yml"), "utf8"),
+    ]);
+    const ciJobs = asRecord(asRecord(Bun.YAML.parse(ciSource), "CI workflow").jobs, "CI jobs");
+    const releaseJobs = asRecord(
+      asRecord(Bun.YAML.parse(releaseSource), "release workflow").jobs,
+      "release jobs",
+    );
+    const ciCheck = asRecord(ciJobs.check, "CI check job");
+    const releaseVerify = asRecord(releaseJobs.verify, "release verify job");
+    const releaseExactArtifact = asRecord(releaseJobs.exact_artifact, "release exact-artifact job");
+    if (
+      !Array.isArray(ciCheck.steps)
+      || !Array.isArray(releaseVerify.steps)
+      || !Array.isArray(releaseExactArtifact.steps)
+    ) {
+      throw new TypeError("CI, release verify, and exact-artifact steps must be arrays");
+    }
+    const ciSteps = ciCheck.steps.map((step, index) => asRecord(step, `CI step ${index}`));
+    const releaseSteps = releaseVerify.steps
+      .map((step, index) => asRecord(step, `release verify step ${index}`));
+    const exactArtifactSteps = releaseExactArtifact.steps
+      .map((step, index) => asRecord(step, `release exact-artifact step ${index}`));
+    const authoritySteps = [
+      "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
+      "Rebuild and verify authority-supervisor artifacts (Linux)",
+      "Enable isolated user namespaces for native custody checks",
+      "Run Linux authority-supervisor custody test",
+      "Restore Ubuntu user-namespace restriction",
+    ] as const;
+
+    const exactlyOneStep = (
+      steps: readonly Record<string, unknown>[],
+      name: string,
+      label: string,
+    ): Record<string, unknown> => {
+      const matches = steps.filter((step) => step.name === name);
+      expect(matches, `${label} must contain exactly one ${name} step`).toHaveLength(1);
+      const [match] = matches;
+      if (match === undefined) throw new TypeError(`${label} is missing ${name}`);
+      return match;
+    };
+
+    for (const name of authoritySteps) {
+      const ciStep = exactlyOneStep(ciSteps, name, "CI check");
+      const releaseStep = exactlyOneStep(releaseSteps, name, "release verify");
+      expect(ciStep.if).toBe(
+        name === "Restore Ubuntu user-namespace restriction"
+          ? "${{ always() && runner.os == 'Linux' }}"
+          : "runner.os == 'Linux'",
+      );
+      expect(releaseStep.if).toBe(ciStep.if);
+      expect(releaseStep.run).toBe(ciStep.run);
+    }
+
+    const zigDownload = String(exactlyOneStep(
+      ciSteps,
+      "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
+      "CI check",
+    ).run);
+    expect(zigDownload).toContain(
+      'HRA_ZIG_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"',
+    );
+    expect(zigDownload).toContain(
+      '"https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"',
+    );
+    expect(zigDownload).toContain("sha256sum --check --status");
+    expect(String(exactlyOneStep(
+      ciSteps,
+      "Rebuild and verify authority-supervisor artifacts (Linux)",
+      "CI check",
+    ).run)).toBe(
+      'bun ./scripts/verify-authority-supervisor-build.ts --zig "$RUNNER_TEMP/hra-zig-0.16.0/zig-x86_64-linux-0.16.0/zig"',
+    );
+    const enableNamespaces = String(exactlyOneStep(
+      ciSteps,
+      "Enable isolated user namespaces for native custody checks",
+      "CI check",
+    ).run);
+    expect(enableNamespaces).toContain(
+      'test "$(/usr/sbin/sysctl --values kernel.unprivileged_userns_clone)" = "1"',
+    );
+    expect(enableNamespaces).toContain(
+      "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=0",
+    );
+    expect(enableNamespaces).toContain(
+      'test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "0"',
+    );
+    expect(enableNamespaces).toContain(
+      "/usr/bin/unshare --user --map-root-user --fork /usr/bin/true",
+    );
+    expect(String(exactlyOneStep(
+      ciSteps,
+      "Run Linux authority-supervisor custody test",
+      "CI check",
+    ).run)).toBe(
+      "bun test scripts/authority-supervisor-runtime.test.ts --isolate --max-concurrency=1",
+    );
+    const restoreNamespaces = String(exactlyOneStep(
+      ciSteps,
+      "Restore Ubuntu user-namespace restriction",
+      "CI check",
+    ).run);
+    expect(restoreNamespaces).toContain(
+      "sudo /usr/sbin/sysctl --write kernel.apparmor_restrict_unprivileged_userns=1",
+    );
+    expect(restoreNamespaces).toContain(
+      'test "$(/usr/sbin/sysctl --values kernel.apparmor_restrict_unprivileged_userns)" = "1"',
+    );
+
+    const verifyOrder = [
+      "Install exact locked dependencies without lifecycle scripts",
+      "Download pinned Zig 0.16.0 for authority supervisor (Linux)",
+      "Rebuild and verify authority-supervisor artifacts (Linux)",
+      "Enable isolated user namespaces for native custody checks",
+      "Run Linux authority-supervisor custody test",
+      "Run complete repository gate",
+      "Restore Ubuntu user-namespace restriction",
+      "Create one exact npm tarball and checksum",
+    ] as const;
+    const verifyIndexes = verifyOrder.map((name) => {
+      exactlyOneStep(releaseSteps, name, "release verify");
+      return releaseSteps.findIndex((step) => step.name === name);
+    });
+    expect(verifyIndexes).toEqual([...verifyIndexes].sort((left, right) => left - right));
+    const releaseGateIndex = verifyIndexes[5];
+    const restoreIndex = verifyIndexes[6];
+    expect(restoreIndex).toBe((releaseGateIndex ?? -2) + 1);
+
+    for (const name of [
+      "Enable isolated user namespaces for native custody checks",
+      "Restore Ubuntu user-namespace restriction",
+    ] as const) {
+      const ciStep = exactlyOneStep(ciSteps, name, "CI check");
+      const releaseStep = exactlyOneStep(exactArtifactSteps, name, "release exact-artifact");
+      expect(releaseStep.if).toBe(ciStep.if);
+      expect(releaseStep.run).toBe(ciStep.run);
+    }
+    const packageCheckName = "Verify checksum and complete installed-package behavior";
+    exactlyOneStep(exactArtifactSteps, packageCheckName, "release exact-artifact");
+    const packageCheckIndex = exactArtifactSteps.findIndex((step) => step.name === packageCheckName);
+    expect(exactArtifactSteps[packageCheckIndex - 1]?.name)
+      .toBe("Enable isolated user namespaces for native custody checks");
+    expect(exactArtifactSteps[packageCheckIndex + 1]?.name)
+      .toBe("Restore Ubuntu user-namespace restriction");
+  });
+
   test("binds residual draft identity to the exact same run and artifact authority", () => {
     const source = {
       GITHUB_EVENT_NAME: "push",
-      GITHUB_REF: "refs/tags/v0.1.0",
-      GITHUB_REF_NAME: "v0.1.0",
+      GITHUB_REF: "refs/tags/v0.1.1",
+      GITHUB_REF_NAME: "v0.1.1",
       GITHUB_REF_TYPE: "tag",
       GITHUB_REPOSITORY: "hraness/hra",
       GITHUB_REPOSITORY_ID: "1343008607",
       GITHUB_RUN_ATTEMPT: "2",
       GITHUB_RUN_ID: "123",
-      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.0",
+      GITHUB_WORKFLOW_REF: "hraness/hra/.github/workflows/release.yml@refs/tags/v0.1.1",
     };
-    const run = githubReleaseRun("v0.1.0", source);
+    const run = githubReleaseRun("v0.1.1", source);
     const input = {
       artifacts: [{ name: "hra.tgz", sha256: "c".repeat(64), size: 7 }],
       commitSha: "a".repeat(40),
       run,
-      tag: "v0.1.0",
+      tag: "v0.1.1",
       tagObjectSha: "b".repeat(40),
     } as const;
     const body = draftReleaseBody(input);
@@ -181,14 +331,15 @@ describe("release workflow", () => {
     });
     expect(() => parseReleaseBody(futureAttemptBody, input, "draft"))
       .toThrow("workflow-attempt ordering");
-    expect(() => githubReleaseRun("v0.1.0", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
+    expect(() => githubReleaseRun("v0.1.1", { ...source, GITHUB_RUN_ATTEMPT: "3", GITHUB_RUN_ID: "124" }))
       .not.toThrow();
   });
 
-  test("publishes the exact transactional installer in the historical release notes", async () => {
-    const [releaseNotes, readme] = await Promise.all([
+  test("publishes the exact transactional installer in the forward release notes", async () => {
+    const [releaseNotes, readme, thirdPartyNotices] = await Promise.all([
       readFile(join(import.meta.dir, "..", "docs", "beta-release-notes.md"), "utf8"),
       readFile(join(import.meta.dir, "..", "README.md"), "utf8"),
+      readFile(join(import.meta.dir, "..", "THIRD_PARTY_NOTICES.md"), "utf8"),
     ]);
     const installCommand = buildHraGlobalInstallCommand(HRA_INSTALL_ARCHIVE_URL);
 
@@ -199,6 +350,12 @@ describe("release workflow", () => {
     expect(releaseNotes).not.toContain(
       'bun "$BUN_INSTALL_GLOBAL_DIR/node_modules/hra/src/install-normalizer.ts"',
     );
+    expect(releaseNotes).toContain("Optional hosted encrypted sync is not yet live.");
+    expect(releaseNotes).not.toContain("Cloud enrollment is invitation-only");
+    expect(releaseNotes).not.toContain("artifact-identity SPDX");
+    expect(releaseNotes).not.toContain("runtime SPDX inventory");
+    expect(thirdPartyNotices).toContain("exact tarball plus `SHA256SUMS`");
+    expect(thirdPartyNotices).not.toContain("SPDX");
   });
 
   test("keeps the retired fallback-bound path unreachable and exposes only the exact artifact workflow", async () => {
@@ -228,12 +385,18 @@ describe("release workflow", () => {
     expect(domainRecord).toContain("unresolved_prior_intent");
     expect(domainRecord).toContain("reasserts only the plan's exact source");
     expect(domainRecord).toContain("unresolved_current_intent");
-    expect(releaseRecord).toContain("Status: durable `v0.1.0` release-transition and retry contract.");
-    expect(releaseRecord).toContain("no `v0.1.0` tag");
+    expect(releaseRecord).toContain("Status: durable `v0.1.1` forward-release and retry contract.");
+    expect(releaseRecord).toContain("At retirement, `hraness/hra` had no `v0.1.0` tag");
+    expect(releaseRecord).toContain("## Immutable v0.1.0 failure record");
+    expect(releaseRecord).toContain("Release workflow run `33363290345`, attempt 1");
+    expect(releaseRecord).toContain("job `99398751969`");
+    expect(releaseRecord).toContain("before registry-only package policy, tarball or checksum creation");
+    expect(releaseRecord).toContain("The unexpanded exact-artifact matrix and the publish job were skipped");
+    expect(releaseRecord).toContain("The publication variable was deleted after the failure");
     expect(releaseRecord).toContain("immutable public registry release `@hraness/oh@0.2.7`");
     expect(releaseRecord).toContain("coordinate completed its non-executable bootstrap");
     expect(releaseRecord).toContain("npm trusted publishing names repository `hraness/hra` and workflow `release.yml`");
-    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.0` becomes authoritative only when");
+    expect(releaseRecord).toContain("Stable `@hraness/hra@0.1.1` becomes authoritative only when");
     expect(releaseRecord).toContain("Immutable local CLI release; hosted sync not yet live.");
     expect(releaseRecord).toContain("tag remains `release-ready` until exact release admission");
     expect(releaseRecord).toContain("Neither phase claims that hosted sync is available.");
@@ -242,11 +405,11 @@ describe("release workflow", () => {
     expect(releaseRecord).toContain("`@hraness/hra@0.1.0-bootstrap.0`");
     expect(releaseRecord).toContain("npm also assigns `latest` to the first published version");
     expect(releaseRecord).toContain("resolves through both `bootstrap` and `latest`");
-    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.0`");
+    expect(releaseRecord).toContain("replaces the bootstrap seed as `latest` with exact stable `0.1.1`");
     expect(releaseRecord).toContain("every earlier attempt's bounded GitHub Jobs API record");
     expect(releaseRecord).toContain("again immediately before the POST");
-    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.0`");
-    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.0`");
+    expect(releaseRecord).toContain("`dist-tags.latest` to name `0.1.1`");
+    expect(releaseRecord).toContain("`HRA_APPROVE_NPM_PUBLICATION=publish:@hraness/hra@0.1.1`");
     expect(releaseRecord).toContain("npm CLI 11.15.0 or newer");
     const workflow = await readFile(releaseWorkflow, "utf8");
     expect(workflow).toContain("id-token: write");
