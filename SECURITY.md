@@ -8,7 +8,7 @@ Do not open a public issue for a suspected vulnerability. Use GitHub's private v
 
 ## Supported versions
 
-The immutable `v0.1.0` and `v0.1.1` source tags produced no npm package or GitHub Release and are not supported installations. The `v0.1.2` CLI becomes supported only after the release workflow admits its exact npm and immutable GitHub artifacts. After that admission, only the latest published beta receives security fixes.
+The immutable `v0.1.0` and `v0.1.1` source tags produced no npm package or GitHub Release and are not supported installations. Immutable `v0.1.2` produced a GitHub Release but no npm package and is also unsupported. The `v0.1.3` CLI becomes supported only after the release workflow admits its exact npm and immutable GitHub artifacts. After that admission, only the latest published beta receives security fixes.
 
 ## Product boundary
 
