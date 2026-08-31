@@ -1,6 +1,6 @@
 {
   "name": "@hraness/hra",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A persistent Codex CLI for isolated accounts, live sessions, and encrypted device sync.",
   "license": "MIT",
   "publishConfig": {
